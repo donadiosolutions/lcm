@@ -253,10 +253,14 @@ function executor(options: {
           drifted_function_count: null,
         }] as unknown as R[]);
       }
+      const expectedFunctionCount =
+        ((config as { values?: unknown[] }).values?.[1] as unknown[]).length;
       return result([{
         baseline_applied: true,
-        expected_function_count: 3,
-        existing_function_count: options.identityFunctions === "inconsistent" ? 4 : 3,
+        expected_function_count: expectedFunctionCount,
+        existing_function_count: options.identityFunctions === "inconsistent"
+          ? expectedFunctionCount + 1
+          : expectedFunctionCount,
         drifted_function_count: options.identityFunctions === "drifted" ? 1 : 0,
       }] as unknown as R[]);
     }
@@ -412,6 +416,7 @@ describe("PostgreSQL migration runner", () => {
       expect.objectContaining({ id: "0002_schema_baseline", sha256: "3f255f3c3a402047313f197c63434742259033cbb0ef590276569eb684d8d260" }),
       expect.objectContaining({ id: "0003_machine_identity_key", sha256: "bdc38d19bde5825eb1d59e9044769cbf9cac52be5c9fe34237f93ec347c3807b" }),
       expect.objectContaining({ id: "0004_machine_display_name", sha256: "f12b4e5493da187e4c8cd4083766010b896961225cadd6fe568e4e99264e3421" }),
+      expect.objectContaining({ id: "0005_summary_context_integrity", sha256: "e16cb52a34bd06c0226e2dcff0273982eea975c394b1d7fa2cf6c8bcab1c2b3f" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -438,6 +443,39 @@ describe("PostgreSQL migration runner", () => {
     expect(instructionsDefinition).toContain(
       "UNIQUE (project_id, machine_id, scope_hash)",
     );
+    const summaryIntegritySql = migrations[4]?.sql ?? "";
+    expect(summaryIntegritySql).toMatch(
+      /^LOCK TABLE lcm\.summary_parents IN SHARE ROW EXCLUSIVE MODE;/u,
+    );
+    expect(summaryIntegritySql.indexOf("LOCK TABLE lcm.summary_parents"))
+      .toBeLessThan(summaryIntegritySql.indexOf("DO $preflight$"));
+    expect(summaryIntegritySql.indexOf("DO $preflight$"))
+      .toBeLessThan(summaryIntegritySql.indexOf(
+        "CREATE FUNCTION lcm.enforce_summary_parent_dag_integrity()",
+      ));
+    expect(summaryIntegritySql.indexOf(
+      "CREATE FUNCTION lcm.enforce_summary_parent_dag_integrity()",
+    )).toBeLessThan(summaryIntegritySql.indexOf(
+      "CREATE TRIGGER summary_parents_enforce_dag_integrity",
+    ));
+    expect(summaryIntegritySql).toContain(
+      "WITH RECURSIVE ancestors (summary_key)",
+    );
+    expect(summaryIntegritySql).not.toContain("visited_summary_keys");
+    expect(summaryIntegritySql).toContain(
+      "pg_catalog.lower(NEW.project_id::pg_catalog.text)",
+    );
+    expect(summaryIntegritySql).toContain(
+      "OPERATOR(pg_catalog.||) ':conversation:'",
+    );
+    expect(summaryIntegritySql).toContain(
+      "ENABLE ALWAYS TRIGGER summary_parents_enforce_dag_integrity",
+    );
+    expect(summaryIntegritySql).toContain("USING ERRCODE = 'raise_exception'");
+    expect(summaryIntegritySql).toContain(
+      "ON FUNCTION lcm.enforce_summary_parent_dag_integrity()",
+    );
+    expect(summaryIntegritySql).toContain("FROM PUBLIC;");
     expect(() => loadPostgreSqlMigrations(() => { throw new Error("missing private path"); }))
       .toThrowError(expect.objectContaining({ operation: "loadMigrations" }));
     expect(() => loadPostgreSqlMigrations(() => "altered migration"))
@@ -449,10 +487,10 @@ describe("PostgreSQL migration runner", () => {
     const snapshot = snapshots.at(-1)!;
 
     expect(getPostgreSqlSchemaSnapshotExpectations(snapshot)).toMatchObject({
-      definitionGroupCounts: [52, 3, 174, 15, 225, 6, 24, 30, 210],
+      definitionGroupCounts: [52, 4, 174, 15, 225, 6, 24, 30, 210],
       definitionGroupHashes: [
         "6d95eda805e9cd5d0b246daaa763a6919262f64e1129dc93f0ee95291276a7fd",
-        "229e8dd0e6a1c953dd18b4220da95be28121db72f4fbba199e1d6808c4b7afcc",
+        "ab34552f4ae69dbd972264066f812027f0bdb0d4494f39a909d5c3c1e141484e",
         "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
         "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
         "e2581c7c70cbec57d64bb02ac1520fe27336efb326618b36add668cb1431e98c",
@@ -461,8 +499,18 @@ describe("PostgreSQL migration runner", () => {
         "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
         "e0daf9a1d97b62f6baf491c35d3b45d5082336538e44da8651afaa1180e11e8a",
       ],
-      definitionObjectCount: 739,
+      definitionObjectCount: 740,
     });
+    expect(snapshot.identityFunctions).toContainEqual({
+      name: "enforce_summary_parent_dag_integrity",
+      sha256: "def465f244b48c9bc9ea47c123cb6aefb68ac6775429aed024f2a9ea518adadf",
+    });
+    expect(snapshot.managedObjectIdentities).toContain(
+      "function|enforce_summary_parent_dag_integrity|",
+    );
+    expect(snapshot.triggerIdentities).toContain(
+      "summary_parents|summary_parents_enforce_dag_integrity",
+    );
     expect(snapshots.map(({ migrationId, definitionHashes }) => ({
       migrationId,
       constraintSha256: definitionHashes.constraint,
@@ -479,6 +527,11 @@ describe("PostgreSQL migration runner", () => {
       },
       {
         migrationId: "0004_machine_display_name",
+        constraintSha256:
+          "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
+      },
+      {
+        migrationId: "0005_summary_context_integrity",
         constraintSha256:
           "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
       },
@@ -555,12 +608,14 @@ describe("PostgreSQL migration runner", () => {
           "0002_schema_baseline",
           "0003_machine_identity_key",
           "0004_machine_display_name",
+          "0005_summary_context_integrity",
         ],
         current: [
           "0001_migration_ledger",
           "0002_schema_baseline",
           "0003_machine_identity_key",
           "0004_machine_display_name",
+          "0005_summary_context_integrity",
         ],
       });
     expect(fake.operations).toEqual(expect.arrayContaining([
@@ -573,6 +628,8 @@ describe("PostgreSQL migration runner", () => {
     expect(fake.operations.indexOf("applyMigration:0003_machine_identity_key"))
       .toBeLessThan(fake.operations.indexOf("preflightBaselineDefinitions"));
     expect(fake.operations.indexOf("applyMigration:0004_machine_display_name"))
+      .toBeLessThan(fake.operations.indexOf("preflightBaselineDefinitions"));
+    expect(fake.operations.indexOf("applyMigration:0005_summary_context_integrity"))
       .toBeLessThan(fake.operations.indexOf("preflightBaselineDefinitions"));
     expect(fake.operations.indexOf("preflightBaselineDefinitions"))
       .toBeLessThan(fake.operations.indexOf("preflightSearchConfiguration"));
@@ -1105,7 +1162,7 @@ describe("PostgreSQL migration runner", () => {
     {
       label: "an unowned managed object",
       managedOwnership: "unowned" as const,
-      existingObjectCount: 36,
+      existingObjectCount: 37,
       unownedObjectCount: 1,
       requiredOwner: "lcm_test_migrator",
     },
@@ -1133,7 +1190,7 @@ describe("PostgreSQL migration runner", () => {
     {
       label: "a changed current role",
       managedOwnership: "different-user" as const,
-      existingObjectCount: 36,
+      existingObjectCount: 37,
       unownedObjectCount: 0,
       requiredOwner: "different_migrator",
     },
@@ -1416,6 +1473,17 @@ describe("PostgreSQL migration runner", () => {
       ]);
     expect(inventorySql).toContain("pg_catalog.unnest");
     expect(inventorySql).toContain("WHEN 'S' THEN 's'::pg_catalog.\"char\"");
+    for (const summaryContextGrantIdentity of [
+      "'table|summaries'",
+      "'table|summary_parents'",
+      "'table|large_files'",
+      "'table|summary_large_files'",
+      "'source_message_token_count'",
+      "'parent_summary_key'",
+      "'exploration_summary'",
+    ]) {
+      expect(inventorySql).toContain(summaryContextGrantIdentity);
+    }
     for (const hardcodedGroupCount of [
       52, 3, 174, 15, 225, 6, 24, 30, 210,
     ]) {

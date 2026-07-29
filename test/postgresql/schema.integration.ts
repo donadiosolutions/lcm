@@ -598,6 +598,7 @@ describe("PostgreSQL schema baseline", () => {
         migrator_insert: boolean;
         public_file_identity_execute: boolean;
         public_identity_execute: boolean;
+        public_summary_dag_execute: boolean;
         runtime_select: boolean;
         public_select: boolean;
       }>({
@@ -614,12 +615,18 @@ describe("PostgreSQL schema baseline", () => {
                    'public',
                    'lcm.enforce_large_file_id_uniqueness()',
                    'EXECUTE'
-                 ) AS public_file_identity_execute`,
+                 ) AS public_file_identity_execute,
+                 has_function_privilege(
+                   'public',
+                   'lcm.enforce_summary_parent_dag_integrity()',
+                   'EXECUTE'
+                 ) AS public_summary_dag_execute`,
       }, { domain: "factory", operation: "inspectSchemaPrivileges" });
       expect(privileges.rows[0]).toEqual({
         migrator_insert: true,
         public_file_identity_execute: false,
         public_identity_execute: false,
+        public_summary_dag_execute: false,
         runtime_select: false,
         public_select: false,
       });
@@ -633,6 +640,133 @@ describe("PostgreSQL schema baseline", () => {
         text: "SELECT key FROM lcm.operator_owned_metadata",
       }, { domain: "factory", operation: "verifyUnknownSchemaObject" }))
         .resolves.toMatchObject({ rows: [{ key: "preserve-me" }] });
+    });
+  });
+
+  it("enforces summary DAG integrity under the conversation lock namespace", async () => {
+    await withPostgreSqlTestDatabase("schema-summary-dag-integrity", async (database) => {
+      const scope = await seedScope(database.migrator);
+      const summaries = await database.migrator.query<{
+        summary_id: string;
+        summary_key: string;
+      }>({
+        text: `INSERT INTO lcm.summaries
+                 (summary_id, project_id, conversation_id, kind, content, token_count)
+               VALUES
+                 ('dag-a', $1, $2, 'leaf', 'dag a', 1),
+                 ('dag-b', $1, $2, 'condensed', 'dag b', 1),
+                 ('dag-c', $1, $2, 'condensed', 'dag c', 1),
+                 ('dag-d', $1, $2, 'condensed', 'dag d', 1),
+                 ('dag-remote', $3, $4, 'leaf', 'dag remote', 1)
+               RETURNING summary_id, summary_key`,
+        values: [
+          scope.projectId,
+          scope.conversationId,
+          scope.otherProjectId,
+          scope.otherConversationId,
+        ],
+      }, { domain: "factory", operation: "seedDagIntegritySummaries" });
+      const summaryKeys = new Map(
+        summaries.rows.map(({ summary_id, summary_key }) => [summary_id, summary_key]),
+      );
+      await expect(database.migrator.query({
+        text: `INSERT INTO lcm.summary_parents
+                 (project_id, conversation_id, summary_key, parent_summary_key, ordinal)
+               VALUES
+                 ($1, $2, $3, $4, 0),
+                 ($1, $2, $3, $5, 1),
+                 ($1, $2, $4, $6, 0)`,
+        values: [
+          scope.projectId,
+          scope.conversationId,
+          summaryKeys.get("dag-a"),
+          summaryKeys.get("dag-b"),
+          summaryKeys.get("dag-c"),
+          summaryKeys.get("dag-d"),
+        ],
+      }, { domain: "factory", operation: "seedValidMultiParentDag" }))
+        .resolves.toBeDefined();
+
+      await expect(database.migrator.query({
+        text: `INSERT INTO lcm.summary_parents
+                 (project_id, conversation_id, summary_key, parent_summary_key, ordinal)
+               VALUES ($1, $2, $3, $4, 0)`,
+        values: [
+          scope.projectId,
+          scope.conversationId,
+          summaryKeys.get("dag-d"),
+          summaryKeys.get("dag-a"),
+        ],
+      }, { domain: "factory", operation: "rejectRecursiveSummaryCycle" }))
+        .rejects.toMatchObject({ backend: "postgresql", sqlState: "P0001" });
+
+      for (const [operation, parentSummaryKey] of [
+        ["rejectCrossScopeSummaryParent", summaryKeys.get("dag-remote")],
+        ["rejectOrphanSummaryParent", "00000000-0000-7000-8000-000000000001"],
+      ] as const) {
+        await expect(database.migrator.query({
+          text: `INSERT INTO lcm.summary_parents
+                   (project_id, conversation_id, summary_key, parent_summary_key, ordinal)
+                 VALUES ($1, $2, $3, $4, 2)`,
+          values: [
+            scope.projectId,
+            scope.conversationId,
+            summaryKeys.get("dag-a"),
+            parentSummaryKey,
+          ],
+        }, { domain: "factory", operation }))
+          .rejects.toMatchObject({ backend: "postgresql", sqlState: "23503" });
+      }
+
+      await expect(database.migrator.transaction(async (transaction) => {
+        await transaction.query({
+          text: "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        }, { domain: "factory", operation: "setUnsupportedDagIsolation" });
+        await transaction.query({
+          text: `INSERT INTO lcm.summary_parents
+                   (project_id, conversation_id, summary_key, parent_summary_key, ordinal)
+                 VALUES ($1, $2, $3, $4, 0)`,
+          values: [
+            scope.projectId,
+            scope.conversationId,
+            summaryKeys.get("dag-c"),
+            summaryKeys.get("dag-d"),
+          ],
+        }, { domain: "factory", operation: "rejectUnsupportedDagIsolation" });
+      })).rejects.toMatchObject({ backend: "postgresql", sqlState: "0A000" });
+
+      await expect(database.migrator.query<{
+        edge_count: string;
+        enabled_mode: string;
+        function_body: string;
+        function_config: string[];
+      }>({
+        text: `SELECT trigger.tgenabled::pg_catalog.text AS enabled_mode,
+                      procedure.prosrc AS function_body,
+                      procedure.proconfig AS function_config,
+                      (SELECT pg_catalog.count(*)::pg_catalog.text
+                       FROM lcm.summary_parents) AS edge_count
+               FROM pg_catalog.pg_trigger AS trigger
+               JOIN pg_catalog.pg_class AS relation
+                 ON relation.oid = trigger.tgrelid
+               JOIN pg_catalog.pg_proc AS procedure
+                 ON procedure.oid = trigger.tgfoid
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.oid = relation.relnamespace
+               WHERE namespace.nspname = 'lcm'
+                 AND relation.relname = 'summary_parents'
+                 AND trigger.tgname = 'summary_parents_enforce_dag_integrity'`,
+      }, { domain: "factory", operation: "inspectDagIntegrityTrigger" }))
+        .resolves.toMatchObject({
+          rows: [{
+            edge_count: "3",
+            enabled_mode: "A",
+            function_body: expect.stringContaining(
+              "OPERATOR(pg_catalog.||) ':conversation:'",
+            ),
+            function_config: ["search_path=pg_catalog, public"],
+          }],
+        });
     });
   });
 

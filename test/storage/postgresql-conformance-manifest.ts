@@ -7,6 +7,11 @@ import {
   exerciseRecallRepositoryConformance,
   exerciseRedactionAdminRepositoryConformance,
 } from "./memory-conformance.js";
+import {
+  exerciseContextRepositoryConformance,
+  exerciseLargeFileRepositoryConformance,
+  exerciseSummaryRepositoryConformance,
+} from "./summary-context-conformance.js";
 
 type ProjectRepositoryDomain = keyof ProjectRepositories;
 
@@ -63,6 +68,15 @@ export const POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS = {
   conversations: {
     implementation: PostgreSqlExports.PostgreSqlConversationRepository,
   },
+  summaries: {
+    implementation: PostgreSqlExports.PostgreSqlSummaryRepository,
+  },
+  context: {
+    implementation: PostgreSqlExports.PostgreSqlContextRepository,
+  },
+  largeFiles: {
+    implementation: PostgreSqlExports.PostgreSqlLargeFileRepository,
+  },
   promotedMemory: {
     implementation: PostgreSqlExports.PostgreSqlPromotedMemoryRepository,
   },
@@ -80,6 +94,15 @@ export const POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS = {
 export const POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE = {
   conversations: {
     exercise: exerciseConversationRepositoryConformance,
+  },
+  summaries: {
+    exercise: exerciseSummaryRepositoryConformance,
+  },
+  context: {
+    exercise: exerciseContextRepositoryConformance,
+  },
+  largeFiles: {
+    exercise: exerciseLargeFileRepositoryConformance,
   },
   promotedMemory: {
     exercise: exercisePromotedMemoryRepositoryConformance,

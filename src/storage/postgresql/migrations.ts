@@ -34,6 +34,11 @@ const MIGRATION_MANIFEST = [
     filename: "0004_machine_display_name.sql",
     sha256: "f12b4e5493da187e4c8cd4083766010b896961225cadd6fe568e4e99264e3421",
   },
+  {
+    id: "0005_summary_context_integrity",
+    filename: "0005_summary_context_integrity.sql",
+    sha256: "e16cb52a34bd06c0226e2dcff0273982eea975c394b1d7fa2cf6c8bcab1c2b3f",
+  },
 ] as const;
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
@@ -452,24 +457,50 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
     ],
     migrationId: "0002_schema_baseline",
   };
+  const machineIdentity: PostgreSqlSchemaSnapshot = {
+    ...baseline,
+    definitionHashes: {
+      ...baseline.definitionHashes,
+      constraint: "4698227bc02a8d777955eb41286a4964dda8da82d1561c9a154b67e2a034906f",
+    },
+    migrationId: "0003_machine_identity_key",
+  };
+  const machineDisplayName: PostgreSqlSchemaSnapshot = {
+    ...machineIdentity,
+    definitionHashes: {
+      ...machineIdentity.definitionHashes,
+      constraint: "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
+    },
+    migrationId: "0004_machine_display_name",
+  };
+  const summaryContextIntegrity: PostgreSqlSchemaSnapshot = {
+    ...machineDisplayName,
+    definitionHashes: {
+      ...machineDisplayName.definitionHashes,
+      trigger: "ab34552f4ae69dbd972264066f812027f0bdb0d4494f39a909d5c3c1e141484e",
+    },
+    identityFunctions: [
+      ...machineDisplayName.identityFunctions,
+      {
+        name: "enforce_summary_parent_dag_integrity",
+        sha256: "def465f244b48c9bc9ea47c123cb6aefb68ac6775429aed024f2a9ea518adadf",
+      },
+    ],
+    managedObjectIdentities: [
+      ...machineDisplayName.managedObjectIdentities,
+      "function|enforce_summary_parent_dag_integrity|",
+    ],
+    migrationId: "0005_summary_context_integrity",
+    triggerIdentities: [
+      ...machineDisplayName.triggerIdentities,
+      "summary_parents|summary_parents_enforce_dag_integrity",
+    ],
+  };
   return [
     baseline,
-    {
-      ...baseline,
-      definitionHashes: {
-        ...baseline.definitionHashes,
-        constraint: "4698227bc02a8d777955eb41286a4964dda8da82d1561c9a154b67e2a034906f",
-      },
-      migrationId: "0003_machine_identity_key",
-    },
-    {
-      ...baseline,
-      definitionHashes: {
-        ...baseline.definitionHashes,
-        constraint: "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
-      },
-      migrationId: "0004_machine_display_name",
-    },
+    machineIdentity,
+    machineDisplayName,
+    summaryContextIntegrity,
   ];
 }
 
@@ -1752,7 +1783,11 @@ export async function runPostgreSqlMigrations(
                            ANY (
                              ARRAY[
                                'table|message_parts',
-                               'table|summary_messages'
+                               'table|summary_messages',
+                               'table|summaries',
+                               'table|summary_parents',
+                               'table|large_files',
+                               'table|summary_large_files'
                              ]::pg_catalog.text[]
                            )
                          AND privilege.privilege_type OPERATOR(pg_catalog.=) 'SELECT'
@@ -1937,6 +1972,122 @@ export async function runPostgreSqlMigrations(
                                     OPERATOR(pg_catalog.=) 'INSERT'
                                 )
                               )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=) 'summaries'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'summary_id',
+                                    'project_id',
+                                    'conversation_id',
+                                    'kind',
+                                    'depth',
+                                    'content',
+                                    'token_count',
+                                    'earliest_at',
+                                    'latest_at',
+                                    'descendant_count',
+                                    'descendant_token_count',
+                                    'source_message_token_count'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type
+                                OPERATOR(pg_catalog.=) 'INSERT'
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'summary_messages'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'project_id',
+                                    'conversation_id',
+                                    'summary_key',
+                                    'message_id',
+                                    'ordinal'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type
+                                OPERATOR(pg_catalog.=) 'INSERT'
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'summary_parents'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'project_id',
+                                    'conversation_id',
+                                    'summary_key',
+                                    'parent_summary_key',
+                                    'ordinal'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type
+                                OPERATOR(pg_catalog.=) 'INSERT'
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'summary_large_files'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'project_id',
+                                    'conversation_id',
+                                    'summary_key',
+                                    'file_id',
+                                    'ordinal'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type
+                                OPERATOR(pg_catalog.=) 'INSERT'
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'context_items'
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'conversation_id',
+                                        'ordinal',
+                                        'item_type',
+                                        'message_id',
+                                        'summary_key'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    'ordinal'
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'UPDATE'
+                                )
+                              )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'large_files'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'file_id',
+                                    'project_id',
+                                    'conversation_id',
+                                    'file_name',
+                                    'mime_type',
+                                    'byte_size',
+                                    'storage_uri',
+                                    'exploration_summary'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type
+                                OPERATOR(pg_catalog.=) 'INSERT'
                             )
                             OR (
                               relation.relname OPERATOR(pg_catalog.=) 'message_parts'

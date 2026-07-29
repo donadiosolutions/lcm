@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   PostgreSqlConversationRepository,
+  PostgreSqlContextRepository,
   PostgreSqlCoordinationRepository,
+  PostgreSqlLargeFileRepository,
   PostgreSqlPromotedMemoryRepository,
   PostgreSqlRecallRepository,
   PostgreSqlRedactionAdminRepository,
+  PostgreSqlSummaryRepository,
 } from "../../src/storage/postgresql/index.js";
 import { exerciseConversationRepositoryConformance } from "./conversation-conformance.js";
 import {
@@ -14,6 +17,11 @@ import {
   exerciseRedactionAdminRepositoryConformance,
 } from "./memory-conformance.js";
 import {
+  exerciseContextRepositoryConformance,
+  exerciseLargeFileRepositoryConformance,
+  exerciseSummaryRepositoryConformance,
+} from "./summary-context-conformance.js";
+import {
   POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS,
   POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE,
 } from "./postgresql-conformance-manifest.js";
@@ -22,6 +30,9 @@ describe("PostgreSQL project repository conformance manifest", () => {
   it("registers every exposed project repository with its backend-neutral contract", () => {
     expect(Object.keys(POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS)).toEqual([
       "conversations",
+      "summaries",
+      "context",
+      "largeFiles",
       "promotedMemory",
       "recall",
       "redactionAdmin",
@@ -33,6 +44,18 @@ describe("PostgreSQL project repository conformance manifest", () => {
       .toBe(PostgreSqlConversationRepository);
     expect(POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE.conversations.exercise)
       .toBe(exerciseConversationRepositoryConformance);
+    expect(POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS.summaries.implementation)
+      .toBe(PostgreSqlSummaryRepository);
+    expect(POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE.summaries.exercise)
+      .toBe(exerciseSummaryRepositoryConformance);
+    expect(POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS.context.implementation)
+      .toBe(PostgreSqlContextRepository);
+    expect(POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE.context.exercise)
+      .toBe(exerciseContextRepositoryConformance);
+    expect(POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS.largeFiles.implementation)
+      .toBe(PostgreSqlLargeFileRepository);
+    expect(POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE.largeFiles.exercise)
+      .toBe(exerciseLargeFileRepositoryConformance);
     expect(POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS.promotedMemory.implementation)
       .toBe(PostgreSqlPromotedMemoryRepository);
     expect(POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE.promotedMemory.exercise)

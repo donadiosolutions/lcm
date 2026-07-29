@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { Client, type DatabaseError } from "pg";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   loadPostgreSqlMigrations,
@@ -6,10 +9,14 @@ import {
   runPostgreSqlMigrations,
 } from "../../src/storage/postgresql/migrations.js";
 import type { PostgreSqlMigration } from "../../src/storage/postgresql/contracts.js";
-import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import {
+  PostgreSqlRuntime,
+  POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+} from "../../src/storage/postgresql/runtime.js";
 import {
   assertHarnessReady,
   createPostgreSqlTestDatabase,
+  type PostgreSqlTestDatabase,
   settings,
   withPostgreSqlTestDatabase,
   writePostgreSqlBaselineDefinitionFingerprints,
@@ -33,11 +40,88 @@ CREATE TABLE IF NOT EXISTS lcm.schema_migrations (
   applied_at timestamptz NOT NULL DEFAULT statement_timestamp()
 );`;
 
+async function waitForSummaryMigrationRelationLock(
+  admin: PostgreSqlRuntime,
+): Promise<void> {
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    const result = await admin.query<{ blocked: boolean }>({
+      text: `SELECT EXISTS (
+               SELECT 1
+               FROM pg_catalog.pg_stat_activity
+               WHERE datname OPERATOR(pg_catalog.=)
+                   pg_catalog.current_database()
+                 AND usename OPERATOR(pg_catalog.=) 'lcm_test_migrator'
+                 AND state OPERATOR(pg_catalog.=) 'active'
+                 AND wait_event_type OPERATOR(pg_catalog.=) 'Lock'
+                 AND query LIKE
+                   '%LOCK TABLE lcm.summary_parents IN SHARE ROW EXCLUSIVE MODE%'
+             ) AS blocked`,
+    }, { domain: "factory", operation: "waitForSummaryMigrationRelationLock" });
+    if (result.rows[0]?.blocked === true) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("summary integrity migration did not wait on its relation lock");
+}
+
+async function applySummaryContextRuntimeGrant(
+  database: PostgreSqlTestDatabase,
+): Promise<void> {
+  const template = readFileSync(
+    join(
+      process.cwd(),
+      "docs",
+      "postgresql-runtime-summary-context-grants.sql",
+    ),
+    "utf8",
+  );
+  const sql = template
+    .split("\n")
+    .filter((line) => !line.startsWith("\\"))
+    .join("\n")
+    .replaceAll(':"lcm_runtime_role"', '"lcm_test_runtime"');
+  await database.migrator.query({ text: sql }, {
+    domain: "factory",
+    operation: "applySummaryContextRuntimeGrantBeforeMigration",
+  });
+}
+
+async function executeRawMigrationExpectingFailure(
+  database: PostgreSqlTestDatabase,
+  pending: PostgreSqlMigration,
+): Promise<DatabaseError> {
+  const client = new Client(
+    POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(
+      settings(database.migratorUrl),
+    ),
+  );
+  await client.connect();
+  try {
+    await client.query("BEGIN");
+    try {
+      await client.query(pending.sql);
+      throw new Error("damaged summary graph unexpectedly passed migration");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      if (
+        !(error instanceof Error)
+        || !("code" in error)
+        || typeof error.code !== "string"
+      ) {
+        throw error;
+      }
+      return error as DatabaseError;
+    }
+  } finally {
+    await client.end();
+  }
+}
+
 describe("PostgreSQL migrations and database isolation", () => {
   it.each([
     { label: "0002 baseline", migrationCount: 2, snapshotCount: 1 },
     { label: "0003 machine identity", migrationCount: 3, snapshotCount: 2 },
     { label: "0004 machine display name", migrationCount: 4, snapshotCount: 3 },
+    { label: "0005 summary context integrity", migrationCount: 5, snapshotCount: 4 },
   ])("validates the registered $label catalog snapshot", async ({
     label,
     migrationCount,
@@ -73,6 +157,366 @@ describe("PostgreSQL migrations and database isolation", () => {
     }
   });
 
+  it("locks out concurrent writers before cycle preflight and rolls back installation", async () => {
+    const database = await createPostgreSqlTestDatabase(
+      "migration-summary-cycle-preflight",
+      { runMigrations: false },
+    );
+    const writer = new PostgreSqlRuntime(settings(database.migratorUrl));
+    const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+    let releaseWriter: (() => void) | undefined;
+    let writerReady: (() => void) | undefined;
+    const writerRelease = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
+    const writerStarted = new Promise<void>((resolve) => {
+      writerReady = resolve;
+    });
+    let writerRun: Promise<void> | undefined;
+    try {
+      const migrations = loadPostgreSqlMigrations();
+      const snapshots = loadPostgreSqlSchemaSnapshots();
+      await runPostgreSqlMigrations(database.migrator, {
+        migrations: migrations.slice(0, 4),
+        schemaSnapshots: snapshots.slice(0, 3),
+      });
+      const project = await database.migrator.query<{ project_id: string }>({
+        text: `INSERT INTO lcm.projects (identity_key, display_name)
+               VALUES (pg_catalog.repeat('c', 64), 'Cycle preflight')
+               RETURNING project_id`,
+      }, { domain: "factory", operation: "seedCyclePreflightProject" });
+      const projectId = project.rows[0]?.project_id;
+      const conversation = await database.migrator.query<{
+        conversation_id: string;
+      }>({
+        text: `INSERT INTO lcm.conversations (project_id, session_id)
+               VALUES ($1, 'cycle-preflight')
+               RETURNING conversation_id`,
+        values: [projectId],
+      }, { domain: "factory", operation: "seedCyclePreflightConversation" });
+      const conversationId = conversation.rows[0]?.conversation_id;
+      const summaries = await database.migrator.query<{
+        summary_id: string;
+        summary_key: string;
+      }>({
+        text: `INSERT INTO lcm.summaries
+                 (summary_id, project_id, conversation_id, kind, content, token_count)
+               VALUES
+                 ('cycle-a', $1, $2, 'leaf', 'cycle a', 1),
+                 ('cycle-b', $1, $2, 'leaf', 'cycle b', 1),
+                 ('cycle-c', $1, $2, 'leaf', 'cycle c', 1)
+               RETURNING summary_id, summary_key`,
+        values: [projectId, conversationId],
+      }, { domain: "factory", operation: "seedCyclePreflightSummaries" });
+      const summaryKeys = new Map(
+        summaries.rows.map(({ summary_id, summary_key }) => [summary_id, summary_key]),
+      );
+      await database.migrator.query({
+        text: `INSERT INTO lcm.summary_parents
+                 (project_id, conversation_id, summary_key, parent_summary_key, ordinal)
+               VALUES
+                 ($1, $2, $3, $4, 0),
+                 ($1, $2, $4, $5, 0)`,
+        values: [
+          projectId,
+          conversationId,
+          summaryKeys.get("cycle-a"),
+          summaryKeys.get("cycle-b"),
+          summaryKeys.get("cycle-c"),
+        ],
+      }, { domain: "factory", operation: "seedSummaryCyclePath" });
+
+      writerRun = writer.transaction(async (transaction) => {
+        await transaction.query({
+          text: `INSERT INTO lcm.summary_parents
+                   (project_id, conversation_id, summary_key, parent_summary_key, ordinal)
+                 VALUES ($1, $2, $3, $4, 0)`,
+          values: [
+            projectId,
+            conversationId,
+            summaryKeys.get("cycle-c"),
+            summaryKeys.get("cycle-a"),
+          ],
+        }, { domain: "factory", operation: "seedConcurrentClosingCycleEdge" });
+        writerReady?.();
+        await writerRelease;
+      }, { domain: "factory", operation: "holdConcurrentClosingCycleEdge" });
+      await writerStarted;
+
+      const migrationRun = runPostgreSqlMigrations(database.migrator);
+      await waitForSummaryMigrationRelationLock(admin);
+      releaseWriter?.();
+      await writerRun;
+      await expect(migrationRun)
+        .rejects.toMatchObject({
+          backend: "postgresql",
+          operation: "applyMigration:0005_summary_context_integrity",
+          sqlState: "23000",
+        });
+      await expect(database.migrator.query<{
+        applied: boolean;
+        function_exists: boolean;
+        preserved_edges: string;
+      }>({
+        text: `SELECT
+                 EXISTS (
+                   SELECT 1
+                   FROM lcm.schema_migrations
+                   WHERE id = '0005_summary_context_integrity'
+                 ) AS applied,
+                 pg_catalog.to_regprocedure(
+                   'lcm.enforce_summary_parent_dag_integrity()'
+                 ) IS NOT NULL AS function_exists,
+                 (SELECT pg_catalog.count(*)::pg_catalog.text
+                  FROM lcm.summary_parents) AS preserved_edges`,
+      }, { domain: "factory", operation: "verifyCyclePreflightRollback" }))
+        .resolves.toMatchObject({
+          rows: [{
+            applied: false,
+            function_exists: false,
+            preserved_edges: "3",
+          }],
+        });
+    } finally {
+      releaseWriter?.();
+      await writerRun?.catch(() => undefined);
+      await writer.close();
+      await admin.close();
+      await database.drop();
+    }
+  });
+
+  it("reports every deterministic 0005 damage preflight without repairing rows and accepts reviewed grants", async () => {
+    const database = await createPostgreSqlTestDatabase(
+      "migration-summary-damage",
+      { runMigrations: false },
+    );
+    const admin = new PostgreSqlRuntime(settings(database.adminUrl, {
+      poolMax: 1,
+    }));
+    try {
+      const migrations = loadPostgreSqlMigrations();
+      const snapshots = loadPostgreSqlSchemaSnapshots();
+      await runPostgreSqlMigrations(database.migrator, {
+        migrations: migrations.slice(0, 4),
+        schemaSnapshots: snapshots.slice(0, 3),
+      });
+      const project = await database.migrator.query<{ project_id: string }>({
+        text: `INSERT INTO lcm.projects (identity_key, display_name)
+               VALUES (pg_catalog.repeat('d', 64), 'Damage preflight')
+               RETURNING project_id`,
+      }, { domain: "factory", operation: "seedDamagePreflightProject" });
+      const projectId = project.rows[0].project_id;
+      const conversations = await database.migrator.query<{
+        conversation_id: string;
+        session_id: string;
+      }>({
+        text: `INSERT INTO lcm.conversations (project_id, session_id)
+               VALUES
+                 ($1, 'damage-primary'),
+                 ($1, 'damage-foreign')
+               RETURNING conversation_id::pg_catalog.text, session_id`,
+        values: [projectId],
+      }, { domain: "factory", operation: "seedDamagePreflightConversations" });
+      const conversationBySession = new Map(
+        conversations.rows.map((row) => [row.session_id, row.conversation_id]),
+      );
+      const primaryConversationId = conversationBySession.get("damage-primary")!;
+      const foreignConversationId = conversationBySession.get("damage-foreign")!;
+      const summaries = await database.migrator.query<{
+        summary_id: string;
+        summary_key: string;
+      }>({
+        text: `INSERT INTO lcm.summaries (
+                 summary_id, project_id, conversation_id, kind, content,
+                 token_count
+               )
+               VALUES
+                 ('damage-child-a', $1, $2, 'leaf', 'child a', 1),
+                 ('damage-child-b', $1, $2, 'leaf', 'child b', 1),
+                 ('damage-parent-a', $1, $2, 'leaf', 'parent a', 1),
+                 ('damage-parent-b', $1, $2, 'leaf', 'parent b', 1),
+                 ('damage-foreign-a', $1, $3, 'leaf', 'foreign a', 1),
+                 ('damage-foreign-b', $1, $3, 'leaf', 'foreign b', 1)
+               RETURNING summary_id, summary_key::pg_catalog.text`,
+        values: [projectId, primaryConversationId, foreignConversationId],
+      }, { domain: "factory", operation: "seedDamagePreflightSummaries" });
+      const key = new Map(
+        summaries.rows.map((row) => [row.summary_id, row.summary_key]),
+      );
+      const generated = await database.migrator.query<{ value: string }>({
+        text: `SELECT value::pg_catalog.text
+               FROM (
+                 VALUES (pg_catalog.uuidv7()), (pg_catalog.uuidv7()),
+                        (pg_catalog.uuidv7()), (pg_catalog.uuidv7())
+               ) AS generated(value)
+               ORDER BY value`,
+      }, { domain: "factory", operation: "createDamagePreflightOrphans" });
+      const orphanKeys = generated.rows.map((row) => row.value);
+      const pending = migrations[4]!;
+
+      const insertDamagedEdges = async (
+        childKeys: readonly [string, string],
+        parentKeys: readonly [string, string],
+      ): Promise<void> => {
+        await admin.query({
+          text: "SET session_replication_role = replica",
+        }, { domain: "factory", operation: "enableDamagePreflightReplicaMode" });
+        await admin.query({
+          text: `INSERT INTO lcm.summary_parents (
+                   project_id, conversation_id, summary_key,
+                   parent_summary_key, ordinal
+                 )
+                 VALUES
+                   ($1, $2, $3, $4, 0),
+                   ($1, $2, $5, $6, 0)`,
+          values: [
+            projectId,
+            primaryConversationId,
+            childKeys[0],
+            parentKeys[0],
+            childKeys[1],
+            parentKeys[1],
+          ],
+        }, { domain: "factory", operation: "seedDamagedSummaryEdges" });
+        await admin.query({
+          text: "SET session_replication_role = origin",
+        }, { domain: "factory", operation: "restoreDamagePreflightOriginMode" });
+      };
+      const clearDamagedEdges = async (): Promise<void> => {
+        await admin.query({
+          text: "SET session_replication_role = replica",
+        }, { domain: "factory", operation: "enableDamageCleanupReplicaMode" });
+        await admin.query({
+          text: "DELETE FROM lcm.summary_parents",
+        }, { domain: "factory", operation: "clearDamagedSummaryEdges" });
+        await admin.query({
+          text: "SET session_replication_role = origin",
+        }, { domain: "factory", operation: "restoreDamageCleanupOriginMode" });
+      };
+      const expectDamage = async (
+        constraint: string,
+        identity: string,
+      ): Promise<void> => {
+        const error = await executeRawMigrationExpectingFailure(
+          database,
+          pending,
+        );
+        expect(error.code).toBe("23000");
+        expect(error.constraint).toBe(constraint);
+        expect(error.message).toContain(projectId);
+        expect(error.message).toContain(primaryConversationId);
+        expect(error.message).toContain(identity);
+        await expect(database.migrator.query<{
+          applied: boolean;
+          function_exists: boolean;
+          preserved_edges: number;
+        }>({
+          text: `SELECT
+                   EXISTS (
+                     SELECT 1
+                     FROM lcm.schema_migrations
+                     WHERE id = '0005_summary_context_integrity'
+                   ) AS applied,
+                   pg_catalog.to_regprocedure(
+                     'lcm.enforce_summary_parent_dag_integrity()'
+                   ) IS NOT NULL AS function_exists,
+                   (
+                     SELECT COUNT(*)::pg_catalog.int4
+                     FROM lcm.summary_parents
+                   ) AS preserved_edges`,
+        }, { domain: "factory", operation: "inspectDamagePreflightRollback" }))
+          .resolves.toMatchObject({
+            rows: [{
+              applied: false,
+              function_exists: false,
+              preserved_edges: 2,
+            }],
+          });
+      };
+
+      const primaryChildren = [
+        key.get("damage-child-a")!,
+        key.get("damage-child-b")!,
+      ].sort() as [string, string];
+      const foreignChildren = [
+        key.get("damage-foreign-a")!,
+        key.get("damage-foreign-b")!,
+      ].sort() as [string, string];
+      const primaryParents = [
+        key.get("damage-parent-a")!,
+        key.get("damage-parent-b")!,
+      ].sort() as [string, string];
+
+      await insertDamagedEdges(
+        [orphanKeys[0]!, orphanKeys[1]!],
+        primaryParents,
+      );
+      await expectDamage(
+        "summary_parents_project_id_conversation_id_summary_key_fkey",
+        orphanKeys[0]!,
+      );
+      await clearDamagedEdges();
+
+      await insertDamagedEdges(foreignChildren, primaryParents);
+      await expectDamage(
+        "summary_parents_project_id_conversation_id_summary_key_fkey",
+        foreignChildren[0],
+      );
+      await clearDamagedEdges();
+
+      await insertDamagedEdges(
+        primaryChildren,
+        [orphanKeys[2]!, orphanKeys[3]!],
+      );
+      await expectDamage(
+        "summary_parents_project_id_conversation_id_parent_summary__fkey",
+        orphanKeys[2]!,
+      );
+      await clearDamagedEdges();
+
+      await insertDamagedEdges(primaryChildren, foreignChildren);
+      await expectDamage(
+        "summary_parents_project_id_conversation_id_parent_summary__fkey",
+        foreignChildren[0],
+      );
+      await clearDamagedEdges();
+
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.summary_parents
+                 DROP CONSTRAINT summary_parents_check`,
+      }, { domain: "factory", operation: "openSelfEdgeDamageFixture" });
+      await insertDamagedEdges(primaryChildren, primaryChildren);
+      await expectDamage(
+        "summary_parents_check",
+        primaryChildren[0],
+      );
+      await clearDamagedEdges();
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.summary_parents
+                 ADD CONSTRAINT summary_parents_check
+                 CHECK (summary_key <> parent_summary_key)`,
+      }, { domain: "factory", operation: "restoreSummaryParentSelfCheck" });
+
+      await applySummaryContextRuntimeGrant(database);
+      await expect(runPostgreSqlMigrations(database.migrator)).resolves.toEqual({
+        applied: ["0005_summary_context_integrity"],
+        current: migrations.map(({ id }) => id),
+      });
+      await expect(runPostgreSqlMigrations(database.migrator)).resolves.toEqual({
+        applied: [],
+        current: migrations.map(({ id }) => id),
+      });
+    } finally {
+      await admin.query({
+        text: "SET session_replication_role = origin",
+      }, { domain: "factory", operation: "restoreDamageFixtureOriginMode" })
+        .catch(() => undefined);
+      await admin.close();
+      await database.drop();
+    }
+  });
+
   it("applies empty, repeated, and concurrent migration runs deterministically", async () => {
     const database = await createPostgreSqlTestDatabase("migration-concurrency", { runMigrations: false });
     try {
@@ -93,6 +537,7 @@ describe("PostgreSQL migrations and database isolation", () => {
             "0002_schema_baseline",
             "0003_machine_identity_key",
             "0004_machine_display_name",
+            "0005_summary_context_integrity",
           ], []]);
         await expect(database.migrator.query<{ key: string }>({
           text: "SELECT key FROM lcm.operator_owned_metadata",
@@ -342,7 +787,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         text: "GRANT CREATE ON SCHEMA lcm TO PUBLIC",
       }, { domain: "factory", operation: "driftPublicSchemaCreate" });
       const later = migration(
-        "0005_public_acl_probe",
+        "0006_public_acl_probe",
         "CREATE TABLE lcm.public_acl_probe (id integer PRIMARY KEY);",
       );
 
@@ -368,7 +813,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       }, { domain: "factory", operation: "verifyRecurringPublicAclRollback" }))
         .resolves.toMatchObject({
           rows: [{
-              applied_count: "4",
+              applied_count: "5",
             probe_exists: false,
             public_create: true,
           }],
@@ -514,7 +959,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         await expect(database.migrator.query<{ applied_count: string }>({
           text: "SELECT count(*)::text AS applied_count FROM lcm.schema_migrations_backup",
         }, { domain: "factory", operation: "verifyLedgerRowsPreservedAfterRelkindDrift" }))
-          .resolves.toMatchObject({ rows: [{ applied_count: "4" }] });
+          .resolves.toMatchObject({ rows: [{ applied_count: "5" }] });
       } finally {
         if (replacementViewCreated) {
           await database.migrator.query({
@@ -534,7 +979,7 @@ describe("PostgreSQL migrations and database isolation", () => {
     await withPostgreSqlTestDatabase("managed-owner-drift", async (database) => {
       const admin = new PostgreSqlRuntime(settings(database.adminUrl));
       const later = migration(
-        "0005_managed_owner_probe",
+        "0006_managed_owner_probe",
         "CREATE TABLE lcm.managed_owner_probe (id integer PRIMARY KEY);",
       );
       try {
@@ -596,7 +1041,7 @@ describe("PostgreSQL migrations and database isolation", () => {
               migrations: [...loadPostgreSqlMigrations(), later],
             }).catch((error: unknown) => error);
             expect(failure).toMatchObject({
-              existingObjectCount: 36,
+              existingObjectCount: 37,
               operation: "preflightManagedObjectOwnership",
               requiredOwner: "lcm_test_migrator",
               schemaName: "lcm",
@@ -628,7 +1073,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         }, { domain: "factory", operation: "verifyManagedOwnerRollback" }))
           .resolves.toMatchObject({
             rows: [{
-              applied_count: "4",
+              applied_count: "5",
               operator_preserved: true,
               probe_exists: false,
             }],
@@ -710,8 +1155,8 @@ describe("PostgreSQL migrations and database isolation", () => {
       await expect(runPostgreSqlMigrations(database.migrator))
         .rejects.toMatchObject({
           baselineApplied: true,
-          expectedObjectCount: 36,
-          existingObjectCount: 35,
+          expectedObjectCount: 37,
+          existingObjectCount: 36,
           missingObjectCount: 1,
           operation: "preflightManagedObjectOwnership",
         });
@@ -740,8 +1185,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 739,
-          existingObjectCount: 738,
+          expectedObjectCount: 740,
+          existingObjectCount: 739,
           missingObjectCount: 1,
           operation: "preflightBaselineDefinitions",
         });
@@ -761,8 +1206,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 739,
-          existingObjectCount: 739,
+          expectedObjectCount: 740,
+          existingObjectCount: 740,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -857,8 +1302,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 739,
-          existingObjectCount: 739,
+          expectedObjectCount: 740,
+          existingObjectCount: 740,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -876,8 +1321,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 739,
-            existingObjectCount: 739,
+            expectedObjectCount: 740,
+            existingObjectCount: 740,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -900,8 +1345,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 739,
-          existingObjectCount: 738,
+          expectedObjectCount: 740,
+          existingObjectCount: 739,
           missingObjectCount: 1,
           operation: "preflightBaselineDefinitions",
         });
@@ -919,8 +1364,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 739,
-            existingObjectCount: 739,
+            expectedObjectCount: 740,
+            existingObjectCount: 740,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -972,8 +1417,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 739,
-          existingObjectCount: 739,
+          expectedObjectCount: 740,
+          existingObjectCount: 740,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -990,8 +1435,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 739,
-          existingObjectCount: 739,
+          expectedObjectCount: 740,
+          existingObjectCount: 740,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1007,8 +1452,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 739,
-          existingObjectCount: 739,
+          expectedObjectCount: 740,
+          existingObjectCount: 740,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1026,8 +1471,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 739,
-            existingObjectCount: 739,
+            expectedObjectCount: 740,
+            existingObjectCount: 740,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -1050,8 +1495,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 739,
-            existingObjectCount: 739,
+            expectedObjectCount: 740,
+            existingObjectCount: 740,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -1072,8 +1517,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 739,
-          existingObjectCount: 739,
+          expectedObjectCount: 740,
+          existingObjectCount: 740,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1110,8 +1555,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 739,
-          existingObjectCount: 739,
+          expectedObjectCount: 740,
+          existingObjectCount: 740,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1128,8 +1573,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 739,
-            existingObjectCount: 739,
+            expectedObjectCount: 740,
+            existingObjectCount: 740,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -1151,8 +1596,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 739,
-          existingObjectCount: 739,
+          expectedObjectCount: 740,
+          existingObjectCount: 740,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1169,8 +1614,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 739,
-            existingObjectCount: 739,
+            expectedObjectCount: 740,
+            existingObjectCount: 740,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -1199,8 +1644,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 739,
-          existingObjectCount: 739,
+          expectedObjectCount: 740,
+          existingObjectCount: 740,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1210,7 +1655,7 @@ describe("PostgreSQL migrations and database isolation", () => {
   it("rolls back a pending migration that violates its target schema snapshot", async () => {
     await withPostgreSqlTestDatabase("target-schema-snapshot", async (database) => {
       const invalidTarget = migration(
-        "0005_invalid_column_snapshot",
+        "0006_invalid_column_snapshot",
         "ALTER TABLE lcm.projects ALTER COLUMN identity_key DROP NOT NULL",
       );
       await expect(runPostgreSqlMigrations(database.migrator, {
@@ -1228,7 +1673,7 @@ describe("PostgreSQL migrations and database isolation", () => {
                  EXISTS (
                    SELECT 1
                    FROM lcm.schema_migrations
-                   WHERE id = '0005_invalid_column_snapshot'
+                   WHERE id = '0006_invalid_column_snapshot'
                  ) AS applied,
                  attribute.attnotnull AS not_null
                FROM pg_catalog.pg_attribute AS attribute
@@ -1252,7 +1697,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       const packagedSnapshots = loadPostgreSqlSchemaSnapshots();
       const baselineSnapshot = packagedSnapshots.at(-1)!;
       const addManagedObject = migration(
-        "0005_add_managed_snapshot_probe",
+        "0006_add_managed_snapshot_probe",
         "CREATE TABLE lcm.managed_snapshot_probe (id integer PRIMARY KEY)",
       );
       const futureSnapshot = {
@@ -1269,7 +1714,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       })).resolves.toMatchObject({ applied: [addManagedObject.id] });
 
       const dropManagedObject = migration(
-        "0006_drop_managed_snapshot_probe",
+        "0007_drop_managed_snapshot_probe",
         "DROP TABLE lcm.managed_snapshot_probe",
       );
       const damagedTargetSnapshot = {
@@ -1285,8 +1730,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         ],
       })).rejects.toMatchObject({
         baselineApplied: true,
-        expectedObjectCount: 37,
-        existingObjectCount: 36,
+        expectedObjectCount: 38,
+        existingObjectCount: 37,
         missingObjectCount: 1,
         operation: "preflightManagedObjectOwnership",
       });
@@ -1298,7 +1743,7 @@ describe("PostgreSQL migrations and database isolation", () => {
                  EXISTS (
                    SELECT 1
                    FROM lcm.schema_migrations
-                   WHERE id = '0006_drop_managed_snapshot_probe'
+                   WHERE id = '0007_drop_managed_snapshot_probe'
                  ) AS applied,
                  pg_catalog.to_regclass('lcm.managed_snapshot_probe')
                    IS NOT NULL AS table_exists`,
@@ -1336,8 +1781,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedFunctionCount: 1,
-          existingFunctionCount: 3,
-          expectedFunctionCount: 3,
+          existingFunctionCount: 4,
+          expectedFunctionCount: 4,
           operation: "preflightIdentityFunctionDefinitions",
         });
     });
@@ -1359,8 +1804,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedFunctionCount: 1,
-            existingFunctionCount: 3,
-            expectedFunctionCount: 3,
+            existingFunctionCount: 4,
+            expectedFunctionCount: 4,
             operation: "preflightIdentityFunctionDefinitions",
           });
       } finally {
@@ -1420,7 +1865,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       expect(new Set(databases.map((database) => database.name)).size).toBe(3);
       await Promise.all(databases.map(async (database) => {
         const forbidden = migration(
-          "0005_runtime_forbidden",
+          "0006_runtime_forbidden",
           "CREATE TABLE lcm.runtime_forbidden (id integer);",
         );
         await expect(runPostgreSqlMigrations(database.runtime, {
