@@ -8,6 +8,7 @@ import { cwdToProjectHash, findSessionFiles, importSessions } from "../src/impor
 import type { DaemonClient } from "../src/daemon/client.js";
 import { projectId } from "../src/daemon/project.js";
 import { resolveProjectIdentity } from "../src/project-map.js";
+import * as codexTranscript from "../src/codex-transcript.js";
 
 // --- cwdToProjectHash ---
 
@@ -852,7 +853,7 @@ describe("importSessions — provider: codex", () => {
     return dir;
   }
 
-  function makeGitProject(remote: string): string {
+  function makeGitProject(remote: string, register = true): string {
     const project = makeTmpDir();
     execFileSync("git", ["init", "-q"], { cwd: project });
     execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: project });
@@ -861,9 +862,38 @@ describe("importSessions — provider: codex", () => {
     writeFileSync(join(project, "README.md"), "test\n");
     execFileSync("git", ["add", "README.md"], { cwd: project });
     execFileSync("git", ["commit", "-qm", "initial"], { cwd: project });
-    resolveProjectIdentity(project);
+    if (register) resolveProjectIdentity(project);
     return project;
   }
+
+  it("registers the current Git identity before resolving first-import subdirectory sessions", async () => {
+    const project = makeGitProject("https://example.invalid/first-import.git", false);
+    const subdirectory = join(project, "src", "nested");
+    mkdirSync(subdirectory, { recursive: true });
+    const codexDir = makeTmpDir();
+    const archived = join(codexDir, "archived_sessions");
+    mkdirSync(archived, { recursive: true });
+    writeFileSync(join(archived, "first-import.jsonl"), [
+      makeCodexSessionMetaLine("first-import", subdirectory),
+      makeCodexResponseItemLine("user", "first command"),
+    ].join("\n"));
+    const calls: unknown[] = [];
+
+    const result = await importSessions(makeMockClient(async (_path, body) => {
+      calls.push(body);
+      return { ingested: 1, totalTokens: 10 };
+    }), {
+      provider: "codex",
+      cwd: subdirectory,
+      _codexDir: codexDir,
+    });
+
+    expect(result).toMatchObject({ imported: 1, unresolved: 0 });
+    expect(calls[0]).toMatchObject({
+      session_id: "first-import",
+      cwd: project,
+    });
+  });
 
   it("imports Codex sessions from _codexDir/archived_sessions/", async () => {
     const codexDir = makeTmpDir();
@@ -1028,6 +1058,32 @@ describe("importSessions — provider: codex", () => {
       _codexDir: "/nonexistent/codex/dir",
     });
 
+    expect(client.post).not.toHaveBeenCalled();
+    expect(result.imported).toBe(0);
+  });
+
+  it("returns cleanly if the Codex catalogue empties between discovery snapshots", async () => {
+    const codexDir = makeTmpDir();
+    const archivedDir = join(codexDir, "archived_sessions");
+    mkdirSync(archivedDir, { recursive: true });
+    writeFileSync(
+      join(archivedDir, "vanishing.jsonl"),
+      makeCodexSessionMetaLine("vanishing", "/workspace"),
+    );
+    const discovered = codexTranscript.findAllCodexTranscripts(codexDir);
+    const find = vi.spyOn(codexTranscript, "findAllCodexTranscripts")
+      .mockReturnValueOnce(discovered)
+      .mockReturnValueOnce([]);
+    const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 100 }));
+
+    const result = await importSessions(client, {
+      provider: "codex",
+      dryRun: true,
+      cwd: "/workspace",
+      _codexDir: codexDir,
+    });
+
+    expect(find).toHaveBeenCalledTimes(2);
     expect(client.post).not.toHaveBeenCalled();
     expect(result.imported).toBe(0);
   });

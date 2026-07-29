@@ -7,6 +7,7 @@ import {
 import {
   basename,
   dirname,
+  isAbsolute,
   join,
   parse,
   resolve,
@@ -44,14 +45,21 @@ function readGitPointer(path: string, allowedRoot: string, label: string): strin
   }
 }
 
-function parseGitDir(pointerPath: string, worktreeRoot: string): string {
+function parseGitDir(
+  pointerPath: string,
+  worktreeRoot: string,
+): { readonly gitDir: string; readonly isRelative: boolean } {
   const content = readGitPointer(pointerPath, worktreeRoot, "Git worktree");
   const trimmed = content.trim();
   const match = /^gitdir:\s*(.+)$/iu.exec(trimmed);
   if (!match) {
     throw new Error(`invalid Git worktree metadata at ${pointerPath}: expected one gitdir line`);
   }
-  return existingRealDirectory(resolve(worktreeRoot, match[1]), "Git directory");
+  const target = match[1]!;
+  return {
+    gitDir: existingRealDirectory(resolve(worktreeRoot, target), "Git directory"),
+    isRelative: !isAbsolute(target),
+  };
 }
 
 function resolveCommonDir(gitDir: string): string {
@@ -75,6 +83,48 @@ function canonicalForCommonDir(commonDir: string): string {
   return basename(commonDir) === ".git"
     ? existingRealDirectory(dirname(commonDir), "Git primary checkout")
     : commonDir;
+}
+
+function configHasCoreWorktree(config: string): boolean {
+  let inCore = false;
+  for (const line of config.split(/\r?\n/u)) {
+    const section = /^\s*\[([^\]]+)\]\s*$/u.exec(line);
+    if (section) {
+      inCore = section[1]!.trim().toLowerCase() === "core";
+      continue;
+    }
+    if (inCore && /^\s*worktree\s*=/iu.test(line)) return true;
+  }
+  return false;
+}
+
+function configEnablesWorktreeConfig(config: string): boolean {
+  let inExtensions = false;
+  for (const line of config.split(/\r?\n/u)) {
+    const section = /^\s*\[([^\]]+)\]\s*$/u.exec(line);
+    if (section) {
+      inExtensions = section[1]!.trim().toLowerCase() === "extensions";
+      continue;
+    }
+    if (
+      inExtensions
+      && /^\s*worktreeconfig(?:\s*=\s*(?:true|yes|on|1))?\s*$/iu.test(line)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasConfiguredWorktree(gitDir: string): boolean {
+  const config = readGitPointer(join(gitDir, "config"), gitDir, "Git config");
+  if (configHasCoreWorktree(config)) return true;
+  if (!configEnablesWorktreeConfig(config)) return false;
+  const worktreeConfigPath = join(gitDir, "config.worktree");
+  if (!existsSync(worktreeConfigPath)) return false;
+  return configHasCoreWorktree(
+    readGitPointer(worktreeConfigPath, gitDir, "Git worktree config"),
+  );
 }
 
 function validateGitDirectory(gitDir: string, commonDir: string): void {
@@ -103,10 +153,13 @@ function inspectGitMarker(worktreeRoot: string): GitProjectAnchor | null {
   }
 
   let gitDir: string;
+  let relativeGitPointer = false;
   if (stat.isDirectory()) {
     gitDir = existingRealDirectory(marker, "Git directory");
   } else if (stat.isFile()) {
-    gitDir = parseGitDir(marker, worktreeRoot);
+    const parsedPointer = parseGitDir(marker, worktreeRoot);
+    gitDir = parsedPointer.gitDir;
+    relativeGitPointer = parsedPointer.isRelative;
   } else {
     throw new Error(`invalid Git metadata type at ${marker}`);
   }
@@ -115,10 +168,12 @@ function inspectGitMarker(worktreeRoot: string): GitProjectAnchor | null {
   validateGitDirectory(gitDir, commonDir);
   return {
     // A normal submodule has a `.git` pointer into the superproject's
-    // `.git/modules/...` directory but no `commondir`. Its checkout—not that
-    // metadata directory—is its independent local project anchor.
-    canonical: stat.isFile() && commonDir === gitDir
-      ? worktreeRoot
+    // `.git/modules/...` directory, no `commondir`, and an explicit core
+    // worktree. A primary checkout created with `--separate-git-dir` also has
+    // no `commondir`, but Git writes its pointer as an absolute path. Keep that
+    // external directory as the anchor so linked worktrees resolve identically.
+    canonical: stat.isFile() && relativeGitPointer && commonDir === gitDir
+      ? hasConfiguredWorktree(commonDir) ? worktreeRoot : canonicalForCommonDir(commonDir)
       : canonicalForCommonDir(commonDir),
     worktreeRoot,
     commonDir,

@@ -974,6 +974,41 @@ describe("identity service", () => {
     await expect(repository.resolveProject(MACHINE_ID, canonical)).resolves.toBeNull();
   });
 
+  it("captures one create identity after the project lock when a symlink is retargeted", async () => {
+    await register();
+    const original = makeProject("create-retarget-original");
+    const replacement = makeProject("create-retarget-replacement");
+    const entered = join(home, "create-retarget-entered");
+    symlinkSync(original, entered);
+    let retargeted = false;
+
+    const created = await createProject(POSTGRESQL_CONFIG, entered, {}, {
+      ...deps,
+      _afterProjectIdentityLock: () => {
+        if (retargeted) return;
+        retargeted = true;
+        rmSync(entered);
+        symlinkSync(replacement, entered);
+      },
+    });
+
+    expect(created.local).toMatchObject({
+      canonical: replacement,
+      remoteProjectId: PROJECT_A,
+    });
+    expect(repository.createProject).toHaveBeenCalledWith(expect.objectContaining({
+      path: entered,
+      normalizedPath: replacement,
+      aliases: [{ path: entered, normalizedPath: replacement }],
+    }));
+    expect(showProjectMapEntry(created.local.id).entry).toEqual({
+      canonical: replacement,
+      aliases: [entered],
+      remoteProjectId: PROJECT_A,
+    });
+    expect(showProjectMapEntry(original).entry.remoteProjectId).toBeUndefined();
+  });
+
   it("restores the prior local map when symlink project creation fails remotely", async () => {
     await register();
     const canonical = makeProject("create-symlink-remote-failure-target");
@@ -1769,6 +1804,49 @@ describe("identity service", () => {
         remoteProjectId: PROJECT_A,
       },
     });
+  });
+
+  it("reconciles legacy worktree entries before local link and unlink lookups", async () => {
+    const { main, linked } = makeRepository("legacy-local-link");
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    const alias = makeProject("legacy-local-link-alias");
+    mkdirSync(join(home, ".lcm"), { recursive: true });
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+
+    await expect(linkProject(SQLITE_CONFIG, linked, alias, {}, deps))
+      .resolves.toMatchObject({ local: { id: targetHash, canonical } });
+    expect(listProjectMapEntries()).toEqual({
+      [targetHash]: { canonical, aliases: [linked, alias] },
+    });
+
+    const unlinkRepository = makeRepository("legacy-local-unlink");
+    const unlinkCanonical = resolveGitProjectAnchor(unlinkRepository.main)!.canonical;
+    const unlinkTargetHash = hashProjectPath(unlinkCanonical);
+    const unlinkSourceHash = hashProjectPath(unlinkRepository.linked);
+    const unlinkAlias = makeProject("legacy-local-unlink-alias");
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [unlinkSourceHash]: {
+        canonical: unlinkRepository.linked,
+        aliases: [unlinkAlias],
+      },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    clearWorktreeReconciliationCache();
+
+    await expect(unlinkProject(SQLITE_CONFIG, unlinkAlias, deps))
+      .resolves.toEqual({ hash: unlinkTargetHash, aliasRemoved: true });
+    const unlinkedMap = listProjectMapEntries();
+    expect(unlinkedMap[unlinkTargetHash]).toEqual({
+      canonical: unlinkCanonical,
+      aliases: [unlinkRepository.linked],
+    });
+    expect(Object.values(unlinkedMap).flatMap((entry) => entry.aliases))
+      .not.toContain(unlinkAlias);
   });
 
   it("rejects conflicting legacy worktree bindings before remote link or local mutation", async () => {

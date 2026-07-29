@@ -15,6 +15,7 @@ import {
   resolveProjectIdentity,
 } from "./project-map.js";
 import { resolveCodexSessions } from "./codex-project-resolution.js";
+import { findAllCodexTranscripts } from "./codex-transcript.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
 
@@ -332,13 +333,8 @@ export async function importSessions(
 
   // --- Codex CLI sessions ---
   if (provider === "codex" || provider === "all") {
-    // Resolve exactly once against a read-only map snapshot so an empty
-    // Codex catalogue (and dry-run discovery) cannot backfill project state.
-    const resolvedCodexSessions = resolveCodexSessions(
-      options._codexDir,
-      readProjectMapSnapshot(),
-    );
-    if (resolvedCodexSessions.length === 0) return result;
+    // An empty catalogue remains a read-only no-op.
+    if (findAllCodexTranscripts(options._codexDir).length === 0) return result;
     const requestedCwd = options.cwd ?? process.cwd();
     const current = options.dryRun
       ? (() => {
@@ -346,6 +342,19 @@ export async function importSessions(
         return { id: hashProjectPath(canonical), canonical };
       })()
       : resolveProjectIdentity(requestedCwd);
+    // Register the current live Git identity before snapshotting the catalogue.
+    // Otherwise a first-ever import from a repository subdirectory cannot
+    // match that repository until a later invocation happens to populate the
+    // map. Dry runs add the same identity only to their in-memory snapshot.
+    const mapSnapshot = readProjectMapSnapshot();
+    if (options.dryRun && mapSnapshot[current.id] === undefined) {
+      mapSnapshot[current.id] = { canonical: current.canonical, aliases: [] };
+    }
+    const resolvedCodexSessions = resolveCodexSessions(
+      options._codexDir,
+      mapSnapshot,
+    );
+    if (resolvedCodexSessions.length === 0) return result;
     const codexSessions: SessionEntry[] = [];
     for (const session of resolvedCodexSessions) {
       let resolution = session.resolution;

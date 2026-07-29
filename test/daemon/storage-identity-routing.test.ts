@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -217,6 +217,50 @@ describe("daemon storage identity routing", () => {
     expect(response.end).toHaveBeenLastCalledWith(expect.stringContaining(
       "\"code\":\"STORAGE_BACKEND_STAGED\"",
     ));
+  });
+
+  it("returns staged compact and store failures before legacy metadata or scrub I/O", async () => {
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Machine A",
+    }, { homeDir: home });
+    const local = resolveProjectIdentity(cwd);
+    setRemoteProjectBinding(PROJECT_ID, { hash: local.id });
+    const localProjectDir = join(home, ".lcm", "projects", local.id);
+    mkdirSync(join(localProjectDir, "sensitive-patterns.txt"), { recursive: true });
+    const response = {
+      writeHead: vi.fn(),
+      end: vi.fn(),
+    };
+    const config = {
+      storage: POSTGRESQL_STORAGE,
+      llm: { provider: "disabled" },
+      security: { sensitivePatterns: [], notify_on_filter: false },
+    } as unknown as DaemonConfig;
+
+    await createCompactHandler(config, new UnavailablePostgreSqlStorageBackendFactory())(
+      {} as never,
+      response as never,
+      JSON.stringify({ session_id: "staged-before-local-io", cwd }),
+    );
+    expect(response.end).toHaveBeenLastCalledWith(expect.stringContaining(
+      "\"code\":\"STORAGE_BACKEND_STAGED\"",
+    ));
+    expect(existsSync(join(localProjectDir, "meta.json"))).toBe(false);
+
+    response.end.mockClear();
+    await createStoreHandler(config, new UnavailablePostgreSqlStorageBackendFactory())(
+      {} as never,
+      response as never,
+      JSON.stringify({ text: "remember", cwd }),
+    );
+    expect(response.end).toHaveBeenLastCalledWith(expect.stringContaining(
+      "\"code\":\"STORAGE_BACKEND_STAGED\"",
+    ));
+    expect(response.end).not.toHaveBeenCalledWith(expect.stringContaining("\"code\":500"));
+    expect(existsSync(join(localProjectDir, "meta.json"))).toBe(false);
   });
 
   it("uses and closes the default factory for admitted PostgreSQL no-ops", async () => {

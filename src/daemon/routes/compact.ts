@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import {
   ConfigValidationError,
   LLM_REASONING_EFFORTS,
@@ -10,7 +11,7 @@ import {
   type LlmRequestPolicy,
 } from "../config.js";
 import {
-  projectPaths,
+  projectIdentity,
   ensureProjectDirForIdentity,
   isSafeTranscriptPath,
 } from "../project.js";
@@ -29,11 +30,15 @@ import {
 import { validateCwd } from "../validate-cwd.js";
 import {
   createStorageBackendFactory,
-  resolveStorageIdentityContext,
   type ProjectStorage,
   type StorageBackendFactory,
+  type StorageIdentityContext,
 } from "../../storage/index.js";
-import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  stagedPostgreSqlFactoryUnavailableResponse,
+  storageRouteFailureResponse,
+} from "./storage-lifecycle.js";
 
 interface CompactRequestBody {
   session_id: string;
@@ -268,20 +273,42 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
     const effectiveRequestTimeoutMs = effectiveRequestPolicy?.requestTimeoutMs ?? null;
     const effectiveRetry = effectiveProvider === "openai" ? effectiveRequestPolicy!.retry : null;
 
+    activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+    let admittedIdentity: StorageIdentityContext & { readonly localProjectId: string };
+    try {
+      admittedIdentity = projectIdentity(cwd, config.storage);
+    } catch (err) {
+      const storageFailure = storageRouteFailureResponse(
+        activeFactory,
+        err,
+        "compact",
+      );
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
+      } else {
+        sendJson(res, 500, {
+          error: err instanceof Error ? err.message : "compact failed",
+        });
+      }
+      await closeRouteStorage(undefined, ownedFactory);
+      return;
+    }
+    const stagedFailure = stagedPostgreSqlFactoryUnavailableResponse(
+      activeFactory,
+      "compact",
+    );
+    if (stagedFailure) {
+      sendJson(res, 503, stagedFailure);
+      await closeRouteStorage(undefined, ownedFactory);
+      return;
+    }
+
     // Guard must be checked and set synchronously (before any await) to prevent
     // concurrent requests from racing through the has() check before add() runs.
     if (compactingNow.has(session_id)) {
       if (config.storage.backend === "postgresql") {
         try {
-          const paths = projectPaths(cwd);
-          const identity = resolveStorageIdentityContext(config.storage, {
-            id: paths.id,
-            canonical: paths.canonical,
-            ...(paths.remoteProjectId ? { remoteProjectId: paths.remoteProjectId } : {}),
-          });
-          activeFactory = storageFactory
-            ?? (ownedFactory = createStorageBackendFactory(config.storage));
-          const project = await activeFactory.openProject(identity);
+          const project = await activeFactory.openProject(admittedIdentity);
           await closeRouteStorage(project, undefined);
         } catch (err) {
           const storageFailure = storageRouteFailureResponse(
@@ -324,15 +351,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
       );
       if (!summarize) {
         if (config.storage.backend === "postgresql") {
-          const paths = projectPaths(cwd);
-          const identity = resolveStorageIdentityContext(config.storage, {
-            id: paths.id,
-            canonical: paths.canonical,
-            ...(paths.remoteProjectId ? { remoteProjectId: paths.remoteProjectId } : {}),
-          });
-          activeFactory = storageFactory
-            ?? (ownedFactory = createStorageBackendFactory(config.storage));
-          const project = await activeFactory.openProject(identity);
+          const project = await activeFactory.openProject(admittedIdentity);
           await closeRouteStorage(project, undefined);
         }
         sendJson(res, 200, {
@@ -348,26 +367,25 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         });
         return;
       }
-      const paths = projectPaths(cwd);
       const localIdentity = {
-        id: paths.id,
-        canonical: paths.canonical,
-        ...(paths.remoteProjectId ? { remoteProjectId: paths.remoteProjectId } : {}),
+        id: admittedIdentity.localProjectId,
+        canonical: admittedIdentity.canonical,
+        ...(admittedIdentity.remoteProjectId
+          ? { remoteProjectId: admittedIdentity.remoteProjectId }
+          : {}),
       };
-      const identity = resolveStorageIdentityContext(config.storage, localIdentity);
-      const pid = paths.id;
+      let project: ProjectStorage | undefined;
+      project = await activeFactory.openProject(admittedIdentity);
+      const pid = admittedIdentity.localProjectId;
       const result = await enqueue(pid, async () => {
-        ensureProjectDirForIdentity(localIdentity);
-
-        const scrubber = await ScrubEngine.forProject(
-          config.security?.sensitivePatterns ?? [],
-          paths.dir,
-        );
-
-        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-        let project: ProjectStorage | undefined;
         try {
-          project = await activeFactory.openProject(identity);
+          const localProjectDir = ensureProjectDirForIdentity(localIdentity);
+
+          const scrubber = await ScrubEngine.forProject(
+            config.security?.sensitivePatterns ?? [],
+            localProjectDir,
+          );
+
           const conversation = await project.conversations.getOrCreateConversation(session_id);
 
           // Ingest new messages from the transcript into the DB.
@@ -453,14 +471,14 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
 
           // Update meta.json
           try {
-            const metaPath = paths.metaPath;
+            const metaPath = join(localProjectDir, "meta.json");
             let meta: Record<string, unknown> = {};
             try {
               meta = JSON.parse(readFileSync(metaPath, "utf-8"));
             } catch (error) {
               if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
             }
-            meta.cwd = paths.canonical;
+            meta.cwd = localIdentity.canonical;
             meta.lastCompact = new Date().toISOString();
             writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
           } catch { /* non-fatal */ }

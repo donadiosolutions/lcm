@@ -325,7 +325,7 @@ function mappedPathObservation(
 
 function mapFingerprint(
   map: Record<string, ProjectMapEntry>,
-  targetHash: string,
+  strictHashes: ReadonlySet<string>,
 ): string {
   return fingerprint(
     Object.entries(map)
@@ -336,7 +336,7 @@ function mapFingerprint(
         [...entry.aliases].map((alias) => resolve(alias)).sort(),
         entry.remoteProjectId ?? null,
         [entry.canonical, ...entry.aliases]
-          .map((path) => mappedPathObservation(path, hash !== targetHash))
+          .map((path) => mappedPathObservation(path, !strictHashes.has(hash)))
           .sort(([left], [right]) => left.localeCompare(right)),
       ]),
   );
@@ -395,10 +395,28 @@ function reconciliationDiscovery(
   codexDir?: string,
   maxEntries?: number,
   observer?: (path: string) => void,
+  strictSourceHashes: readonly string[] = [],
 ): ReconciliationDiscovery {
   const codex = codexCatalogueFingerprint(codexDir, maxEntries, observer);
+  return reconciliationDiscoveryForSources(
+    map,
+    targetHash,
+    codex,
+    strictSourceHashes,
+  );
+}
+
+function reconciliationDiscoveryForSources(
+  map: Record<string, ProjectMapEntry>,
+  targetHash: string,
+  codex: CodexCatalogueObservation,
+  strictSourceHashes: readonly string[],
+): ReconciliationDiscovery {
   return {
-    mapFingerprint: mapFingerprint(map, targetHash),
+    mapFingerprint: mapFingerprint(
+      map,
+      new Set([targetHash, ...strictSourceHashes]),
+    ),
     codexFingerprint: codex.fingerprint,
     complete: codex.complete,
   };
@@ -684,7 +702,51 @@ function mergeInstructionRows(source: DatabaseSync, target: DatabaseSync, table:
 
 function instructionCacheTimestamp(value: SQLInputValue): number | null {
   if (typeof value !== "string") return null;
-  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/u.test(value)
+  const match = /^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})(?<separator>[T ])(?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2})(?<fraction>\.\d{1,3})?(?<zone>Z|[+-]\d{2}:\d{2})?$/u
+    .exec(value);
+  if (!match?.groups) return null;
+  const {
+    year,
+    month,
+    day,
+    separator,
+    hour,
+    minute,
+    second,
+    fraction,
+    zone,
+  } = match.groups;
+  if (
+    (separator === " " && (fraction !== undefined || zone !== undefined))
+    || (separator === "T" && zone === undefined)
+  ) {
+    return null;
+  }
+  const numericYear = Number(year);
+  const numericMonth = Number(month);
+  const numericDay = Number(day);
+  const numericHour = Number(hour);
+  const numericMinute = Number(minute);
+  const numericSecond = Number(second);
+  const calendar = new Date(0);
+  calendar.setUTCFullYear(numericYear, numericMonth - 1, numericDay);
+  calendar.setUTCHours(numericHour, numericMinute, numericSecond, 0);
+  if (
+    calendar.getUTCFullYear() !== numericYear
+    || calendar.getUTCMonth() !== numericMonth - 1
+    || calendar.getUTCDate() !== numericDay
+    || calendar.getUTCHours() !== numericHour
+    || calendar.getUTCMinutes() !== numericMinute
+    || calendar.getUTCSeconds() !== numericSecond
+  ) {
+    return null;
+  }
+  if (zone && zone !== "Z") {
+    const zoneHour = Number(zone.slice(1, 3));
+    const zoneMinute = Number(zone.slice(4, 6));
+    if (zoneHour > 23 || zoneMinute > 59) return null;
+  }
+  const normalized = separator === " "
     ? `${value.replace(" ", "T")}Z`
     : value;
   const parsed = Date.parse(normalized);
@@ -1554,6 +1616,7 @@ export function reconcileWorktrees(
           opts._codexDir,
           opts._maxDiscoveryEntries,
           opts._discoveryObserver,
+          fastJournal.sourceHashes,
         ),
       )
     ) {
@@ -1569,9 +1632,7 @@ export function reconcileWorktrees(
     ) {
       throw new Error("worktree reconciliation journal does not match the requested project");
     }
-    const discovery = reconciliationDiscovery(
-      map,
-      targetHash,
+    const codexDiscovery = codexCatalogueFingerprint(
       opts._codexDir,
       opts._maxDiscoveryEntries,
       opts._discoveryObserver,
@@ -1584,6 +1645,12 @@ export function reconcileWorktrees(
       opts.homeDir,
       opts._codexDir,
       opts._historicalResolver,
+    );
+    const discovery = reconciliationDiscoveryForSources(
+      map,
+      targetHash,
+      codexDiscovery,
+      discovered.sources.map(({ hash }) => hash),
     );
     const discoveredHashes = discovered.sources.map(({ hash }) => hash);
     const priorHashes = new Set(existingJournal?.sourceHashes ?? []);

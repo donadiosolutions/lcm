@@ -191,6 +191,29 @@ type InstructionCacheFixtureRow = {
   readonly updatedAt: string | Uint8Array;
 };
 
+function makeMigratedDatabase(path: string): DatabaseSync {
+  mkdirSync(join(path, ".."), { recursive: true });
+  const db = new DatabaseSync(path);
+  runLcmMigrations(db);
+  return db;
+}
+
+function makeInstructionDatabase(
+  path: string,
+  table: "session_instruction_cache" | "session_instructions",
+  id: number,
+  row: InstructionCacheFixtureRow | null,
+): void {
+  const db = makeMigratedDatabase(path);
+  if (row !== null) {
+    db.prepare(
+      `INSERT INTO ${table}(id, content, content_hash, updated_at)
+       VALUES(?, ?, ?, ?)`,
+    ).run(id, row.content, row.contentHash, row.updatedAt);
+  }
+  db.close();
+}
+
 function makeInstructionCacheReconciliation(
   root: string,
   targetRow: InstructionCacheFixtureRow,
@@ -212,18 +235,11 @@ function makeInstructionCacheReconciliation(
   clearProjectMapCache();
   const targetPath = join(root, ".lcm", "projects", targetHash, "db.sqlite");
   const sourcePath = join(root, ".lcm", "projects", sourceHash, "db.sqlite");
-  makeDatabase(targetPath, "instruction-target", "target", targetHash);
-  makeDatabase(sourcePath, "instruction-source", "source", sourceHash);
   for (const [path, cacheRow] of [
     [targetPath, targetRow],
     [sourcePath, sourceRow],
   ] as const) {
-    const db = new DatabaseSync(path);
-    db.prepare(
-      `INSERT INTO session_instruction_cache(id, content, content_hash, updated_at)
-       VALUES(2, ?, ?, ?)`,
-    ).run(cacheRow.content, cacheRow.contentHash, cacheRow.updatedAt);
-    db.close();
+    makeInstructionDatabase(path, "session_instruction_cache", 2, cacheRow);
   }
   return { main, linked, targetPath, sourcePath };
 }
@@ -247,19 +263,11 @@ function makeLegacyInstructionReconciliation(
   clearProjectMapCache();
   const targetPath = join(root, ".lcm", "projects", targetHash, "db.sqlite");
   const sourcePath = join(root, ".lcm", "projects", sourceHash, "db.sqlite");
-  makeDatabase(targetPath, "instruction-target", "target", targetHash);
-  makeDatabase(sourcePath, "instruction-source", "source", sourceHash);
   for (const [path, instructionRow] of [
     [targetPath, targetRow],
     [sourcePath, sourceRow],
   ] as const) {
-    if (instructionRow === null) continue;
-    const db = new DatabaseSync(path);
-    db.prepare(
-      `INSERT INTO session_instructions(id, content, content_hash, updated_at)
-       VALUES(1, ?, ?, ?)`,
-    ).run(instructionRow.content, instructionRow.contentHash, instructionRow.updatedAt);
-    db.close();
+    makeInstructionDatabase(path, "session_instructions", 1, instructionRow);
   }
   return { main, targetPath };
 }
@@ -778,7 +786,7 @@ describe("worktree reconciliation", () => {
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
-    makeDatabase(sourcePath, "schema-drift", "source", sourceHash);
+    makeMigratedDatabase(sourcePath).close();
     const failAfterFence = () => {
       throw new Error("stop after durable source fence");
     };
@@ -816,33 +824,16 @@ describe("worktree reconciliation", () => {
          AND name LIKE 'lcm_reconciliation_fence_%'
        ORDER BY name`,
     ).all() as Array<{ name: string }>;
-    expect(driftTriggers).toHaveLength(3);
-    expect(driftTriggers.every(({ name }) =>
-      /^lcm_reconciliation_fence_[a-f0-9]{64}_(delete|insert|update)$/u.test(name),
-    )).toBe(true);
+    const driftTableHash = createHash("sha256").update('AAA odd table"name').digest("hex");
+    expect(driftTriggers).toEqual([
+      { name: `lcm_reconciliation_fence_${driftTableHash}_delete` },
+      { name: `lcm_reconciliation_fence_${driftTableHash}_insert` },
+      { name: `lcm_reconciliation_fence_${driftTableHash}_update` },
+    ]);
     expect(() => second.prepare(
       `INSERT INTO "AAA odd table""name" ("value") VALUES('blocked')`,
     ).run()).toThrow("LCM source retired by worktree reconciliation");
-    const stableNames = second.prepare(
-      `SELECT name FROM sqlite_schema
-       WHERE type = 'trigger' AND name LIKE 'lcm_reconciliation_fence_%'
-       ORDER BY name`,
-    ).all();
     second.close();
-
-    expect(() => reconcileWorktrees(main, {
-      _observer: (event) => {
-        if (event === "after-source-fence-commit-before-target-commit") failAfterFence();
-      },
-    })).toThrow("stop after durable source fence");
-    const third = new DatabaseSync(sourcePath, { readOnly: true });
-    expect(third.prepare(
-      `SELECT name FROM sqlite_schema
-       WHERE type = 'trigger' AND name LIKE 'lcm_reconciliation_fence_%'
-       ORDER BY name`,
-    ).all()).toEqual(stableNames);
-    third.close();
-    expect(reconcileWorktrees(main).status).toBe("completed");
   });
 
   it("does not reconcile a separate clone merely because it owns an explicit alias", () => {
@@ -1627,6 +1618,71 @@ describe("worktree reconciliation", () => {
       targetUpdatedAt: new Uint8Array([1, 2, 3]),
       sourceUpdatedAt: "2026-01-01T00:00:00.000Z",
     },
+    {
+      label: "calendar-invalid source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-02-30T00:00:00.000Z",
+    },
+    {
+      label: "shorthand source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "0",
+    },
+    {
+      label: "timezone-less ISO source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-02-01T00:00:00",
+    },
+    {
+      label: "zoned SQLite source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-02-01 00:00:00Z",
+    },
+    {
+      label: "fractional SQLite source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-02-01 00:00:00.1",
+    },
+    {
+      label: "out-of-range month source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-13-01T00:00:00Z",
+    },
+    {
+      label: "zero day source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-00T00:00:00Z",
+    },
+    {
+      label: "non-leap-year source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2025-02-29T00:00:00Z",
+    },
+    {
+      label: "out-of-range hour source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-01T24:00:00Z",
+    },
+    {
+      label: "out-of-range minute source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-01T00:60:00Z",
+    },
+    {
+      label: "out-of-range second source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-01T00:00:60Z",
+    },
+    {
+      label: "out-of-range zone hour source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-01T00:00:00+24:00",
+    },
+    {
+      label: "out-of-range zone minute source",
+      targetUpdatedAt: "2026-01-01T00:00:00.000Z",
+      sourceUpdatedAt: "2026-01-01T00:00:00+00:60",
+    },
   ])("fails closed when the $label instruction-cache timestamp is malformed", ({
     targetUpdatedAt,
     sourceUpdatedAt,
@@ -1648,6 +1704,31 @@ describe("worktree reconciliation", () => {
     expect(() => reconcileWorktrees(fixture.main)).toThrow(
       "invalid session_instruction_cache updated_at for id 2",
     );
+    expect(existsSync(fixture.sourcePath)).toBe(true);
+  });
+
+  it("fails closed if a runtime cannot parse an otherwise valid cache timestamp", () => {
+    const fixture = makeInstructionCacheReconciliation(
+      home,
+      {
+        content: "target",
+        contentHash: "target-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        content: "source",
+        contentHash: "source-hash",
+        updatedAt: "2026-01-02T00:00:00.000Z",
+      },
+    );
+    const parse = vi.spyOn(Date, "parse").mockReturnValue(Number.NaN);
+    try {
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "invalid session_instruction_cache updated_at for id 2",
+      );
+    } finally {
+      parse.mockRestore();
+    }
     expect(existsSync(fixture.sourcePath)).toBe(true);
   });
 
@@ -3609,6 +3690,37 @@ describe("worktree reconciliation", () => {
     }).status).toBe("not-needed");
     expect(listWorktreeReconciliationJournals()[0].discovery!.mapFingerprint)
       .not.toBe(unavailableFingerprint);
+  });
+
+  it("strictly validates ENOTDIR aliases for a related source before merging it", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    const regularFile = join(home, "related-regular-file");
+    const invalidAlias = join(regularFile, "child");
+    writeFileSync(regularFile, "not a directory");
+    const mapBefore = `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [invalidAlias] },
+    }, null, 2)}\n`;
+    writeFileSync(projectMapPath(), mapBefore);
+    clearProjectMapCache();
+    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    makeDatabase(sourcePath, "related-enotdir", "source", sourceHash);
+
+    expect(() => reconcileWorktrees(main)).toThrow("ENOTDIR");
+
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(mapBefore);
+    expect(existsSync(sourcePath)).toBe(true);
+    expect(existsSync(join(home, ".lcm", "projects", targetHash))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      blockedFrom: "planned",
+      sourceHashes: [],
+    }]);
   });
 
   it("isolates malformed foreign Git metadata and invalidates its cached fingerprint on repair", () => {

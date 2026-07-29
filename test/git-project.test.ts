@@ -52,9 +52,10 @@ function makeLinkedWorktree(primary: string, linked: string, name = "linked"): s
   return linked;
 }
 
-function git(cwd: string, ...args: string[]): void {
+function git(cwd: string, ...args: string[]): string {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr || result.stdout);
+  return result.stdout.trim();
 }
 
 describe("Git project identity", () => {
@@ -137,6 +138,18 @@ describe("Git project identity", () => {
     expect(anchor).toMatchObject({ canonical: submodule, worktreeRoot: submodule });
     expect(anchor?.commonDir).toContain(join(".git", "modules", "modules", "sub"));
     expect(resolveGitProjectAnchor(superproject)?.canonical).toBe(superproject);
+
+    git(submodule, "config", "--unset", "core.worktree");
+    git(submodule, "config", "extensions.worktreeConfig", "true");
+    git(submodule, "config", "--worktree", "core.worktree", submodule);
+    expect(git(submodule, "config", "--show-origin", "--get", "core.worktree"))
+      .toContain("config.worktree");
+    expect(git(submodule, "rev-parse", "--show-toplevel")).toBe(submodule);
+    clearGitProjectAnchorCache();
+    expect(resolveGitProjectAnchor(join(submodule, "nested"))).toMatchObject({
+      canonical: submodule,
+      worktreeRoot: submodule,
+    });
   });
 
   it("revalidates cached anchors when nearer or changed Git metadata appears", () => {
@@ -201,6 +214,52 @@ describe("Git project identity", () => {
       worktreeRoot: linked,
       commonDir: shared,
     });
+
+    const relativeCheckout = makeDirectory(join(root, "relative-checkout"));
+    writeFileSync(join(relativeCheckout, ".git"), "gitdir: ../shared.git\n");
+    expect(resolveGitProjectAnchor(relativeCheckout)).toEqual({
+      canonical: shared,
+      worktreeRoot: relativeCheckout,
+      commonDir: shared,
+    });
+
+    writeFileSync(
+      join(shared, "config"),
+      "[core]\nrepositoryformatversion = 0\n[extensions]\nworktreeConfig = true\n",
+    );
+    clearGitProjectAnchorCache();
+    expect(resolveGitProjectAnchor(relativeCheckout)?.canonical).toBe(shared);
+  });
+
+  it("uses one external anchor for a separate-git-dir primary and its linked worktree", () => {
+    const primary = makeDirectory(join(root, "separate-primary"));
+    const shared = join(root, "separate-metadata");
+    git(root, "init", "-q", "--separate-git-dir", shared, primary);
+    git(primary, "config", "user.email", "test@example.invalid");
+    git(primary, "config", "user.name", "LCM Test");
+    git(primary, "config", "core.worktree", primary);
+    writeFileSync(join(primary, "README.md"), "separate metadata\n");
+    git(primary, "add", "README.md");
+    git(primary, "commit", "-qm", "initial");
+    const linked = join(root, "separate-linked");
+    git(primary, "worktree", "add", "-q", "-b", "separate-linked", linked);
+    expect(git(primary, "rev-parse", "--show-toplevel")).toBe(primary);
+    expect(git(linked, "rev-parse", "--show-toplevel")).toBe(linked);
+
+    expect(resolveGitProjectAnchor(primary)).toEqual({
+      canonical: shared,
+      worktreeRoot: primary,
+      commonDir: shared,
+    });
+    expect(resolveGitProjectAnchor(linked)).toEqual({
+      canonical: shared,
+      worktreeRoot: linked,
+      commonDir: shared,
+    });
+
+    git(primary, "config", "extensions.worktreeConfig", "true");
+    clearGitProjectAnchorCache();
+    expect(resolveGitProjectAnchor(primary)?.canonical).toBe(shared);
   });
 
   it("rejects malformed, oversized, symlinked, and invalid Git metadata", () => {

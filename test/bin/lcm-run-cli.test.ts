@@ -64,7 +64,10 @@ const state = vi.hoisted(() => ({
     current: ["0001_migration_ledger"],
   },
   provisionError: undefined as unknown,
-  reconcileWorktrees: vi.fn(),
+  reconcileWorktrees: vi.fn((path: string) => ({
+    targetHash: path,
+    canonical: path,
+  })),
   daemonClientInstances: 0,
 }));
 
@@ -786,7 +789,51 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(state.reconcileWorktrees).not.toHaveBeenCalled();
     expect(await invoke(["export", "--all"])).toBeUndefined();
     expect(state.reconcileWorktrees).toHaveBeenCalledOnce();
-    expect(state.reconcileWorktrees).toHaveBeenCalledWith(process.cwd());
+    expect(state.reconcileWorktrees).toHaveBeenCalledWith("/project");
+  });
+
+  it("deduplicates export-all candidates by their reconciled project identity", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    state.entries = [
+      { name: "canonical", isDirectory: () => true },
+      { name: "legacy", isDirectory: () => true },
+    ];
+    state.fileText = JSON.stringify({ cwd: "/linked-worktree" });
+    state.reconcileWorktrees.mockReturnValue({
+      targetHash: "canonical-hash",
+      canonical: "/primary",
+    });
+
+    expect(await invoke(["export", "--all"])).toBeUndefined();
+
+    expect(state.reconcileWorktrees).toHaveBeenCalledTimes(2);
+    expect(portable.exportKnowledge).toHaveBeenCalledOnce();
+    expect(portable.exportKnowledge).toHaveBeenCalledWith(
+      "/primary",
+      expect.objectContaining({ output: expect.stringContaining("lcm-export-") }),
+    );
+  });
+
+  it("warns and skips export-all candidates that cannot be reconciled", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    state.entries = [
+      { name: "error", isDirectory: () => true },
+      { name: "primitive", isDirectory: () => true },
+    ];
+    state.fileText = JSON.stringify({ cwd: "/unavailable" });
+    state.reconcileWorktrees
+      .mockImplementationOnce(() => { throw new Error("map changed"); })
+      .mockImplementationOnce(() => { throw "source vanished"; });
+
+    expect(await invoke(["export", "--all"])).toBeUndefined();
+
+    expect(state.reconcileWorktrees).toHaveBeenCalledTimes(2);
+    expect(stderr).toHaveBeenCalledWith(
+      "  Warning: could not reconcile /unavailable: map changed\n",
+    );
+    expect(stderr).toHaveBeenCalledWith(
+      "  Warning: could not reconcile /unavailable: source vanished\n",
+    );
   });
 
   it("renders TTY summaries for compact and import", async () => {

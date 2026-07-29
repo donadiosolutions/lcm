@@ -13,11 +13,23 @@ import {
 } from "../../installer/install.js";
 import { NATIVE_PATTERNS, ScrubEngine, readGitleaksSyncDate } from "../scrub.js";
 import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
-import { projectDir } from "../daemon/project.js";
 import { collectEventStats, collectDetailedEventStats } from "../db/events-stats.js";
 import { validateRegex } from "../store/regex-safety.js";
-import { configPath, daemonPidPath, daemonTokenPath } from "../runtime-paths.js";
-import { projectMapPath, validateProjectMap, type ProjectMapValidation } from "../project-map.js";
+import {
+  configPath,
+  daemonPidPath,
+  daemonTokenPath,
+  projectsDir,
+} from "../runtime-paths.js";
+import {
+  hashProjectPath,
+  normalizeProjectIdentityPath,
+  normalizeProjectPath,
+  projectMapPath,
+  readProjectMapSnapshot,
+  validateProjectMap,
+  type ProjectMapValidation,
+} from "../project-map.js";
 import { packageExecutable, packageRootFor } from "../runtime-root.js";
 import { sanitizeTerminalText } from "../terminal-sanitize.js";
 import { managedDaemonPath } from "../daemon/managed-path.js";
@@ -288,6 +300,30 @@ function checkWorktreeReconciliations(results: CheckResult[], deps: DoctorDeps):
       message: String(error),
     });
   }
+}
+
+function diagnosticProjectPatternsPath(cwd: string, homeDir: string): string {
+  const normalized = normalizeProjectPath(cwd);
+  let canonical = normalized;
+  try {
+    canonical = normalizeProjectIdentityPath(cwd);
+  } catch {
+    // Other doctor checks report malformed Git metadata. Pattern diagnostics
+    // must remain read-only and must not prevent accumulated results rendering.
+  }
+  let hash = hashProjectPath(canonical);
+  try {
+    const matches = Object.entries(readProjectMapSnapshot(homeDir))
+      .filter(([, entry]) => (
+        normalizeProjectPath(entry.canonical) === canonical
+        || [entry.canonical, ...entry.aliases]
+          .some((path) => normalizeProjectPath(path) === normalized)
+      ));
+    if (matches.length === 1) hash = matches[0]![0];
+  } catch {
+    // The project-map check already reports malformed or unreadable state.
+  }
+  return join(projectsDir(homeDir), hash, "sensitive-patterns.txt");
 }
 
 function daemonProcessPath(deps: DoctorDeps, pid: number | undefined): string | undefined {
@@ -1020,7 +1056,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   }
 
   const cwd = deps.cwd ?? process.cwd();
-  const patternsFile = join(projectDir(cwd), "sensitive-patterns.txt");
+  const patternsFile = diagnosticProjectPatternsPath(cwd, deps.homedir);
   const projectPatterns = await ScrubEngine.loadProjectPatterns(patternsFile);
 
   // Load global user patterns count for informational display

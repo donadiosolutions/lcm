@@ -44,6 +44,7 @@ const state = vi.hoisted(() => ({
   beforeQueuedWork: undefined as (() => void) | undefined,
   scrubber: vi.fn(async () => ({ scrubWithCounts: (content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }) })),
   openProject: vi.fn(),
+  openProjectError: undefined as unknown,
 }));
 
 vi.mock("../../../src/daemon/config.js", async (importOriginal) => {
@@ -74,6 +75,11 @@ vi.mock("../../../src/daemon/summarizer.js", () => ({
 }));
 
 vi.mock("../../../src/daemon/project.js", () => ({
+  projectIdentity: (cwd: string, storageConfig: unknown) => {
+    if (state.identityError !== undefined) throw state.identityError;
+    const local = state.paths(cwd);
+    return state.identity(cwd, storageConfig, local);
+  },
   projectPaths: state.paths,
   ensureProjectDirForIdentity: state.ensureProject,
   isSafeTranscriptPath: () => true,
@@ -131,6 +137,7 @@ vi.mock("../../../src/storage/index.js", () => ({
   createStorageBackendFactory: () => ({
     openProject: async (...args: unknown[]) => {
       state.openProject(...args);
+      if (state.openProjectError !== undefined) throw state.openProjectError;
       const conversations = {
         getOrCreateConversation: async () => ({ conversationId: "conversation" }),
         getMessageCount: async () => 0,
@@ -239,10 +246,12 @@ describe("compact route coverage", () => {
           }
     ));
     state.ensureProject.mockClear();
+    state.ensureProject.mockReturnValue("/tmp/project");
     state.queuedKeys = [];
     state.beforeQueuedWork = undefined;
     state.scrubber.mockClear();
     state.openProject.mockClear();
+    state.openProjectError = undefined;
   });
 
   it("formats million-token and zero-input compactions", () => {
@@ -262,18 +271,66 @@ describe("compact route coverage", () => {
     expect(state.openProject).not.toHaveBeenCalled();
   });
 
-  it("keeps successful SQLite identity ahead of local compaction setup", async () => {
+  it("uses a generic message for a non-error PostgreSQL identity failure", async () => {
+    state.identityError = "identity failed";
+
+    await expect(call(JSON.stringify({ session_id: "identity-primitive", cwd: "/tmp" })))
+      .resolves.toEqual({ error: "compact failed" });
+    expect(state.ensureProject).not.toHaveBeenCalled();
+    expect(state.scrubber).not.toHaveBeenCalled();
+    expect(state.openProject).not.toHaveBeenCalled();
+  });
+
+  it("admits successful SQLite storage ahead of local compaction setup", async () => {
     await expect(call(JSON.stringify({ session_id: "sqlite-order", cwd: "/tmp" })))
       .resolves.toMatchObject({ actionTaken: false });
     expect(state.ensureProject).toHaveBeenCalledOnce();
     expect(state.scrubber).toHaveBeenCalledOnce();
     expect(state.openProject).toHaveBeenCalledOnce();
     expect(state.identity.mock.invocationCallOrder[0])
+      .toBeLessThan(state.openProject.mock.invocationCallOrder[0]);
+    expect(state.openProject.mock.invocationCallOrder[0])
       .toBeLessThan(state.ensureProject.mock.invocationCallOrder[0]);
     expect(state.ensureProject.mock.invocationCallOrder[0])
       .toBeLessThan(state.scrubber.mock.invocationCallOrder[0]);
-    expect(state.scrubber.mock.invocationCallOrder[0])
-      .toBeLessThan(state.openProject.mock.invocationCallOrder[0]);
+  });
+
+  it.each([
+    [
+      "local project directory",
+      () => state.ensureProject.mockImplementationOnce(() => {
+        throw new Error("local project setup failed");
+      }),
+      "local project setup failed",
+    ],
+    [
+      "scrubber",
+      () => state.scrubber.mockRejectedValueOnce(new Error("scrubber setup failed")),
+      "scrubber setup failed",
+    ],
+  ])("closes shared admitted storage when %s setup fails", async (
+    label,
+    failSetup,
+    expectedError,
+  ) => {
+    const closeProject = vi.fn(async () => undefined);
+    const closeFactory = vi.fn(async () => undefined);
+    const sharedFactory = {
+      openProject: vi.fn(async () => ({ close: closeProject })),
+      close: closeFactory,
+    };
+    failSetup();
+    const output = response();
+
+    await createCompactHandler(config(), sharedFactory as never)(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: `setup-${label}`, cwd: "/tmp" }),
+    );
+
+    expect(output.json()).toEqual({ error: expectedError });
+    expect(closeProject).toHaveBeenCalledOnce();
+    expect(closeFactory).not.toHaveBeenCalled();
   });
 
   it("uses one local and remote identity snapshot across queued execution", async () => {
@@ -294,6 +351,7 @@ describe("compact route coverage", () => {
       metaPath: "/lcm/projects/local-hash-b/meta.json",
     };
     state.paths.mockReturnValueOnce(first);
+    state.ensureProject.mockReturnValue(first.dir);
     state.beforeQueuedWork = () => {
       state.paths.mockReturnValue(concurrent);
     };
@@ -532,16 +590,15 @@ describe("compact route coverage", () => {
   });
 
   it.each([
-    ["Error", new Error("identity resolver failed"), "identity resolver failed"],
-    ["non-Error", "identity resolver failed", "compact failed"],
+    ["Error", new Error("storage open failed"), "storage open failed"],
+    ["non-Error", "storage open failed", "compact failed"],
   ])("reports a %s PostgreSQL duplicate-admission failure", async (
     _label,
-    identityError,
+    openProjectError,
     expectedError,
   ) => {
     let release!: () => void;
     state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
-    state.identityError = identityError;
     const value = config();
     value.storage = {
       backend: "postgresql",
@@ -561,6 +618,7 @@ describe("compact route coverage", () => {
       first.res,
       JSON.stringify({ session_id: "postgres-duplicate-error", cwd: "/tmp" }),
     );
+    state.openProjectError = openProjectError;
     const duplicate = response();
     await handler(
       {} as never,
@@ -569,8 +627,80 @@ describe("compact route coverage", () => {
     );
 
     expect(duplicate.json()).toEqual({ error: expectedError });
+    state.openProjectError = undefined;
     release();
     await firstCall;
+  });
+
+  it("classifies a PostgreSQL duplicate storage identity failure", async () => {
+    let release!: () => void;
+    state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const handler = createCompactHandler(value);
+    const first = response();
+    const firstCall = handler(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "postgres-duplicate-storage-identity", cwd: "/tmp" }),
+    );
+    state.openProjectError = new StorageIdentityConfigurationError("project binding changed");
+    const duplicate = response();
+    await handler(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "postgres-duplicate-storage-identity", cwd: "/tmp" }),
+    );
+
+    expect(duplicate.json()).toMatchObject({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      storageBackend: "postgresql",
+    });
+    state.openProjectError = undefined;
+    release();
+    await firstCall;
+  });
+
+  it("classifies a storage identity failure after PostgreSQL admission", async () => {
+    state.paths.mockImplementation((cwd: string) => ({
+      id: "pid",
+      dir: "/tmp/project",
+      dbPath: "/tmp/project/lcm.db",
+      metaPath: "/tmp/project/meta.json",
+      canonical: cwd,
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+    }));
+    state.openProjectError = new StorageIdentityConfigurationError("project binding changed");
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+
+    await expect(call(
+      JSON.stringify({ session_id: "postgres-storage-identity", cwd: "/tmp" }),
+      value,
+    )).resolves.toMatchObject({
+      code: "STORAGE_IDENTITY_REQUIRED",
+      storageBackend: "postgresql",
+    });
   });
 
   it("handles no newly parsed transcript messages without security config", async () => {

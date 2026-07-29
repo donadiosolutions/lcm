@@ -180,6 +180,10 @@ Codex import defaults to the current canonical project. Add `--all` to consider
 all locally verified projects. LCM conservatively reconciles deleted
 `~/.codex/worktrees/` sessions from exact thread ownership or a unique local
 repository match and reports unresolved or ambiguous sessions without guessing.
+On a repository's first LCM command, import registers the current verified Git
+identity before indexing Codex history, so sessions started in subdirectories
+are included immediately. `lcm export --all` reconciles every metadata-backed
+candidate and exports each final canonical project only once.
 
 If you also want MCP inside Codex, run `lcm connectors install codex --type mcp`. Today that prints the TOML block you must add manually to `.codex/config.toml`.
 

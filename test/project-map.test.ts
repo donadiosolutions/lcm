@@ -958,7 +958,7 @@ describe("project map", () => {
     expect(() => setRemoteProjectBinding(remoteProjectId, {
       canonical,
       _afterLockForTesting: () => writeFileSync(lockPath, "changed"),
-    })).toThrow("ownership changed before release");
+    })).toThrow("mutation succeeded but lock ownership changed during cleanup");
   });
 
   it.each([

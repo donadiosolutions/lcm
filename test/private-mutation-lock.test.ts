@@ -61,6 +61,59 @@ function strandOwnedLock(
 }
 
 describe("private mutation lock release recovery", () => {
+  it("recovers an owned lock when cleanup fails after a successful mutation", () => {
+    const { lockPath } = makeLock();
+    const releaseFailure = new Error("release observer failed");
+
+    expect(() => withPrivateMutationLock(lockPath, "test", () => "committed", (event) => {
+      if (event === "before-main-lock-release-read") throw releaseFailure;
+    })).toThrow(releaseFailure);
+    expect(existsSync(lockPath)).toBe(false);
+    expect(withPrivateMutationLock(lockPath, "test", () => "next"))
+      .toBe("next");
+  });
+
+  it("tracks an owned lock when successful-mutation cleanup remains unavailable", () => {
+    const { lockPath } = makeLock();
+    const cleanupFailure = new Error("injected recovery deletion failure");
+    let deleteAttempts = 0;
+
+    expect(() => withPrivateMutationLock(lockPath, "test", () => "committed", (event) => {
+      if (event === "before-main-lock-release-read") {
+        throw new Error("release observer failed");
+      }
+    }, {
+      deleteRegularFile(path) {
+        deleteAttempts += 1;
+        if (deleteAttempts === 1) throw cleanupFailure;
+        return deleteRegularFile(path);
+      },
+    })).toThrow("mutation succeeded but lock cleanup could not be recovered");
+
+    expect(existsSync(lockPath)).toBe(true);
+    expect(withPrivateMutationLock(lockPath, "test", () => "recovered"))
+      .toBe("recovered");
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("tracks a successful mutation when the owned lock cannot be reread", () => {
+    const { lockPath, strandedPath } = makeLock();
+    let changed = false;
+
+    expect(() => withPrivateMutationLock(lockPath, "test", () => "committed", (event, path) => {
+      if (event !== "before-main-lock-release-read" || changed) return;
+      changed = true;
+      renameSync(path, strandedPath);
+      mkdirSync(path);
+    })).toThrow("mutation succeeded but lock cleanup could not be recovered");
+
+    rmSync(lockPath, { recursive: true });
+    renameSync(strandedPath, lockPath);
+    expect(withPrivateMutationLock(lockPath, "test", () => "recovered"))
+      .toBe("recovered");
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
   it("surfaces the initial cleanup failure after deleting its owned lock", () => {
     const { lockPath } = makeLock();
     const primary = new Error("protected mutation failed");

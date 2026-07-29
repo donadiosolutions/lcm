@@ -11,7 +11,11 @@ import {
   type ProjectStorage,
   type StorageBackendFactory,
 } from "../../storage/index.js";
-import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
+import {
+  closeRouteStorage,
+  stagedPostgreSqlFactoryUnavailableResponse,
+  storageRouteFailureResponse,
+} from "./storage-lifecycle.js";
 
 /** Cache entry for a per-project ScrubEngine. */
 interface ScrubCacheEntry {
@@ -75,12 +79,20 @@ export function createStoreHandler(
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
     try {
+      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
       const identity = projectIdentity(projectPath, config.storage);
+      const stagedFailure = stagedPostgreSqlFactoryUnavailableResponse(
+        activeFactory,
+        "store",
+      );
+      if (stagedFailure) {
+        sendJson(res, 503, stagedFailure);
+        return;
+      }
+      project = await activeFactory.openProject(identity);
       const scrubber = await getScrubEngine(config, projectDir(projectPath));
       const scrubbedText = scrubber.scrub(text);
       const scrubbedTags = tags.map((tag: string) => scrubber.scrub(tag));
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await activeFactory.openProject(identity);
 
       const id = await project.promotedMemory.insert({
         content: scrubbedText,

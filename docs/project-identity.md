@@ -4,7 +4,10 @@ LCM keeps SQLite as the zero-configuration storage backend. A local project is
 identified by the SHA-256 hash of its normalized canonical path. For a Git
 repository, LCM first resolves the verified Git common directory and uses the
 primary checkout as that canonical path, so linked worktrees share one local
-project. Non-Git directories continue to use their normalized path directly.
+project. A primary checkout created with `git init --separate-git-dir` and all
+of its linked worktrees instead share that external Git directory as their
+stable local anchor. Git submodules remain independent projects anchored at
+their own checkouts. Non-Git directories continue to use their normalized path directly.
 The database and passive-learning sidecar remain under:
 
 ```text
@@ -53,16 +56,20 @@ merge markers continue from the verified state.
 Reconciliation also fingerprints every mapped path so a repaired or remounted
 worktree invalidates a completed discovery result. An `ENOTDIR` observation for
 an unrelated map entry is recorded as stable unavailable evidence instead of
-blocking the requested project. The requested project's own map entry remains
-strict, and `ENOTDIR` there—or any other unexpected filesystem error
-anywhere—still fails closed.
+blocking the requested project. The requested project's own map entry and every
+source proven to belong to that repository remain strict before any source
+merge, archive, or map publication. `ENOTDIR` there—or any other unexpected
+filesystem error anywhere—still fails closed.
 
 The instruction cache is a fixed-slot table, so reconciliation arbitrates each
 slot by `updated_at`. Byte-for-byte identical rows are deduplicated. When two
 different valid rows occupy the same slot, LCM retains the row with the newer
 timestamp; an equal timestamp is a divergent collision and blocks the run.
 Malformed timestamps block reconciliation only when differing rows require
-arbitration; exact byte-identical rows deduplicate without timestamp parsing.
+arbitration; accepted values are SQLite UTC timestamps
+(`YYYY-MM-DD HH:mm:ss`) or complete ISO timestamps with an explicit `Z` or
+numeric offset. Calendar-invalid, shorthand, and timezone-less ISO values fail
+closed. Exact byte-identical rows deduplicate without timestamp parsing.
 In every blocked case, the original source project
 and event stores have not been discarded: after a successful reconciliation
 they are archived as recoverable timestamped backups, and before success the
@@ -81,7 +88,8 @@ mutation. It previews the currently discovered sources and status only. A real
 run revalidates that evidence while holding the reconciliation locks and can
 still block if the source state changes or a writer cannot be fenced safely.
 
-`lcm doctor` reports completed, partial, and blocked journals.
+`lcm doctor` reports completed, partial, and blocked journals without retrying a
+blocked reconciliation while collecting project-sensitive-pattern diagnostics.
 
 For deleted Codex-managed worktrees, reconciliation and import use bounded
 `session_meta`, exact `codex-thread.json` ownership, and the
@@ -326,6 +334,10 @@ identity lock with machine recovery. Project operations take the project lock
 first and the cross-domain lock second; recovery takes only the cross-domain
 lock. This keeps one machine ID stable across each PostgreSQL mutation and its
 local map commit without deadlocking local-only SQLite alias operations.
+Project creation snapshots the entered lexical path and its resolved identity
+after the identity locks are acquired, so a retargeted symlink cannot bind one
+local project to another project's PostgreSQL path. Local link and unlink
+commands reconcile legacy worktree entries before resolving their target.
 
 Stale-lock recovery uses a private, owner-recorded reclaim lease. If its
 process crashes, another process may take over only after proving that lease
@@ -333,6 +345,10 @@ owner's PID/start generation is stale. Immutable `.stale-<nonce>` tombstone
 directories prevent a delayed contender from moving or deleting a successor
 lease; they are harmless audit artifacts and may be removed during maintenance
 only when no project-map mutation is active.
+If the protected mutation succeeds but releasing its exact-owner lock encounters
+a transient filesystem failure, LCM applies the same ownership-checked cleanup
+and same-process recovery used for failed mutations; a committed operation
+cannot strand a live lock for the rest of the daemon process.
 
 Remote mutations use PostgreSQL transactions. Only a transport failure after
 `COMMIT` triggers authoritative readback; deterministic collisions and unknown
@@ -410,6 +426,10 @@ at a cause-free unavailable-backend boundary after validating machine
 registration and the explicit project binding. LCM does not fall back to
 SQLite, return false empty results from manual read routes, or advertise
 PostgreSQL data capabilities during this staged state.
+In particular, `/compact` and `/store` perform staged backend admission before
+creating legacy local project metadata or loading project scrub patterns, so a
+rejected PostgreSQL request cannot mutate SQLite-era state or replace the
+documented `503` with a scrubber error.
 
 ## Ambiguity and doctor
 
