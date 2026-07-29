@@ -36,7 +36,7 @@ const WAITING_CI_RUN_STATES = new Set([
 
 const GREPTILE_REQUIRED_PATHS = [
   /^(?:bin|installer|src)\/.+/u,
-  /^scripts\/.+\.mjs$/u,
+  /^scripts\/.*\.mjs$/u,
   /^\.github\/(?:actions|codeql|workflows|scripts)\/.+/u,
   /^package(?:-lock)?\.json$/u,
   /^greptile\.json$/u,

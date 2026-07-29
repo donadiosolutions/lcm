@@ -65,6 +65,7 @@ test("classifies every coverable and trust-sensitive path family", () => {
     "src/prompts/system.yaml",
     "src/connectors/templates/base.md",
     "src/storage/postgresql/migrations/001_initial.sql",
+    "scripts/.mjs",
     "scripts/build-runtime.mjs",
     "scripts/release/channel/select.mjs",
     ".github/codeql/security-extended.yml",
