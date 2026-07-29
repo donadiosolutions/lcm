@@ -21,6 +21,10 @@ repository conformance under this same staged boundary. Issue #90 extends the
 staged coordination adapter with distributed transaction locks, fenced leases,
 passive-inbox claims, bounded cleanup, and diagnostics. It does not activate
 the PostgreSQL application backend or start a domain worker.
+Issue #87 adds staged summary-DAG, context-item, and large-file repositories,
+an always-enabled recursive cycle guard, and least-privilege runtime grants.
+These adapters are available for direct programmatic use and conformance, but
+they likewise do not activate daemon or CLI routing.
 
 The design is single-user and multi-machine. Project scoping prevents accidental
 cross-project relationships; it is not a tenant or authorization boundary and
@@ -71,8 +75,9 @@ does not add row-level security.
   target snapshot's managed inventory is checked again before commit.
   The recurring allowlist covers the
   migration ledger, 23 domain tables, six generated identity sequences, four
-  helper or trigger functions, and the LCM text-search dictionary and
-  configuration. Unknown `lcm` objects are ignored and never mutated. This makes
+  helper or trigger functions through `0004`, the fifth summary-DAG integrity
+  function after `0005`, and the LCM text-search dictionary and configuration.
+  Unknown `lcm` objects are ignored and never mutated. This makes
   unqualified PostgreSQL built-ins in the immutable migrations resolve to native
   catalog objects while retaining intentional access to extension objects in
   `public`; the setting reverts on either commit or rollback. Extension
@@ -91,11 +96,11 @@ does not add row-level security.
   duplicate snapshot migration IDs and IDs absent from the supplied migration
   history.
 - The `0002` snapshot checks an explicit definition inventory of all 52 named
-  secondary indexes, all 168 table constraints, all three identity-enforcement
+  secondary indexes, all 174 table constraints, all three identity-enforcement
   triggers, all 15 stored generated columns, all six generated identity
   sequences, all 24 permanent tables, the complete effective ACLs of those
-  tables and six sequences, all 205 ordinary columns, and the exact effective
-  column ACL state of all 220 ordinary and generated columns: 723 definitions
+  tables and six sequences, all 210 ordinary columns, and the exact effective
+  column ACL state of all 225 ordinary and generated columns: 739 definitions
   total. The ordinary-column allowlist includes
   `recall_surfacing.surfaced_at`, and a live-catalog regression requires the
   allowlist to equal the complete ordinary-column inventory of the 24 tables.
@@ -122,8 +127,9 @@ does not add row-level security.
   parent/child relationship involving a managed table. Relation ACL
   fingerprints expand the effective ACL, including PostgreSQL's default ACL
   when `relacl` is null. They normalize the owning role and exact non-grantable
-  identity-, conversation-, native-transcript-, and memory-repository privilege shapes granted to named
-  runtime roles by the documented scripts. Any `PUBLIC`, grantable,
+  identity-, conversation-, native-transcript-, memory-, coordination-, and
+  summary/context-repository privilege shapes granted to named runtime roles
+  by the documented scripts. Any `PUBLIC`, grantable,
   foreign-grantor, missing-owner, or privilege outside that allowlist on an
   allowlisted table or identity sequence therefore fails closed.
   Column ACL fingerprints retain every allowlisted column even when `attacl`
@@ -140,10 +146,17 @@ does not add row-level security.
   and definition inventory.
   Additional operator-created objects remain outside the allowlist and are
   ignored.
+- The `0005` snapshot carries the complete `0004` inventory forward and adds
+  one always-enabled summary-parent trigger definition plus the exact
+  `lcm.enforce_summary_parent_dag_integrity()` managed function. It therefore
+  checks four application triggers and 740 definitions in total while leaving
+  every table, column, constraint, index, generated column, sequence, and
+  released `0002` artifact unchanged.
 - Recurring migration readiness fingerprints the bodies and security
-  configuration of `lcm.enforce_summary_id_uniqueness()` and
-  `lcm.enforce_large_file_id_uniqueness()`, and
-  `lcm.enforce_session_ingest_id_uniqueness()`. The check covers the stored
+  configuration of `lcm.enforce_summary_id_uniqueness()`,
+  `lcm.enforce_large_file_id_uniqueness()`,
+  `lcm.enforce_session_ingest_id_uniqueness()`, and
+  `lcm.enforce_summary_parent_dag_integrity()`. The check covers the stored
   body, language and trigger return type, invoker/security and leakproof flags,
   volatility, parallel safety, fixed `search_path`, and the complete normalized
   function ACL. Only non-grantable `EXECUTE` by the owning role is accepted;
@@ -396,8 +409,8 @@ baseline. Provider backup retention is independent of live-table deletion.
 | --- | --- | --- |
 | `summaries` | Owned by a conversation and cascades with it. Coverage, parent, context, and file links govern direct deletion. Promoted-memory provenance is an unbound external identifier. | Exact, unbounded caller `summary_id` text is unique within a project and defaults to UUIDv7 text when omitted. A generated SHA-256 candidate plus exact residual comparison enforces and looks up that identity; a UUIDv7 `summary_key` is the bounded primary/relationship key. Leaf/condensed kind, nonnegative counts, and ordered optional timestamps are enforced. Conversation/project B-tree order uses the stable internal key; FTS and normalized trigram GIN indexes cover content. |
 | `summary_messages` | Summary-owned coverage join: deleting the summary cascades coverage, while direct source-message deletion fails at commit. | Bounded `summary_key` relationships carry explicit project/conversation scope. The source side is deferred `NO ACTION` so a populated conversation-root cascade can delete both sides; source message and ordinal are unique per summary and ordinal is nonnegative. `summary_messages_message_idx` supports reverse message coverage. |
-| `summary_parents` | Child-summary-owned DAG edge: deleting the child cascades its outgoing edges, while direct parent deletion fails at commit. | Bounded child and parent summary keys carry explicit project/conversation scope. The parent side is deferred `NO ACTION` so a populated conversation-root cascade can delete the entire graph; parent and ordinal are unique per child, ordinal is nonnegative, and self-edges are rejected. `summary_parents_parent_idx` supports deterministic reverse traversal. General cycle rejection is a transactional repository invariant owned by #87 with #90 fencing; adapters remain disabled until it is implemented. |
-| `context_items` | Ordered projection owned by a conversation and cascades with it. Direct deletion of a referenced message or summary fails at commit. | `(project_id, conversation_id, ordinal)` primary key; message IDs and bounded summary keys are deferred `NO ACTION` references so populated conversation-root cascades remain valid; nonnegative ordinal; exactly one source reference consistent with `item_type`. Partial message and summary indexes support reverse membership checks. Atomic range replacement and stale-fence rejection belong to #87/#90. |
+| `summary_parents` | Child-summary-owned DAG edge: deleting the child cascades its outgoing edges, while direct parent deletion fails at commit. | Bounded child and parent summary keys carry explicit project/conversation scope. The parent side is deferred `NO ACTION` so a populated conversation-root cascade can delete the entire graph; parent and ordinal are unique per child, ordinal is nonnegative, and self-edges are rejected. `summary_parents_parent_idx` supports deterministic reverse traversal. Migration `0005` adds an always-enabled recursive cycle guard under #90's exact per-conversation advisory-lock namespace. The repository separately validates the complete input set and any bound final-write fence in the same transaction. |
+| `context_items` | Ordered projection owned by a conversation and cascades with it. Direct deletion of a referenced message or summary fails at commit. | `(project_id, conversation_id, ordinal)` primary key; message IDs and bounded summary keys are deferred `NO ACTION` references so populated conversation-root cascades remain valid; nonnegative ordinal; exactly one source reference consistent with `item_type`. Partial message and summary indexes support reverse membership checks. Issue #87 serializes suffix append and complete inclusive-range replacement under #90's conversation lock, validates an optional final-write fence, and resequences the projection contiguously in one transaction. |
 | `large_files` | Metadata owned by a conversation and cascades with it; external bytes at `storage_uri` have their own lifecycle. | Exact, unbounded caller `file_id` text is unique within a project and defaults to UUIDv7 text when omitted. A generated SHA-256 candidate plus exact residual comparison enforces and looks up that identity; UUIDv7 `file_key` is the bounded primary, scoped, and ordering key. Optional byte size is nonnegative and storage URI is nonblank. |
 | `summary_large_files` | Ordered file-reference array owned by a summary and deleted with it. The file ID is opaque provenance: it can remain unresolved or name a file owned by another conversation without blocking summary creation. Direct deletion of a matching `large_files` row preserves the historical summary reference. | The owner project, conversation, and bounded summary key remain protected by a scoped summary foreign key. Ordinal identity preserves caller order and repeated IDs; exact unbounded file text plus its generated SHA-256 candidate supports bounded lookup. File IDs deliberately have no existence foreign key, and an exact residual predicate is required. |
 
@@ -559,6 +572,13 @@ on a provider does not justify silently expanding the baseline.
    is rendered through the deterministic `Machine <uuid>` fallback. Existing
    invalid non-null names stop the migration without being rewritten; correct
    them from verified machine records before retrying.
+   `0005` preflights the existing summary DAG for scoped orphan damage and
+   cycles, then installs
+   `lcm.enforce_summary_parent_dag_integrity()` as an `ENABLE ALWAYS` trigger.
+   The trigger takes the exact #90 project/conversation advisory lock before
+   recursively checking the proposed edge. Existing damage aborts the
+   migration without repairing or dropping relationships, and `PUBLIC`
+   function execution remains revoked.
 4. Each pending migration and its ledger row execute in that same transaction.
    Any DDL, constraint, index, privilege, or ledger failure rolls back the whole
    pending set. Repeated and concurrent runs converge on the same ordered
@@ -734,6 +754,17 @@ required to consume `fenced_leases_fencing_token_seq`; it does not grant
 sequence inspection, restart, or table-truncate authority. See
 [PostgreSQL cross-machine coordination](postgresql-coordination.md) for the
 complete runtime grant and operator contract.
+
+The issue #87 summary/context grant provides reads on conversations, messages,
+summaries, their relationship tables, context items, and large-file metadata.
+Writes are column-limited to new summaries, graph/coverage/file-reference
+edges, context items, and large-file metadata; only context rows may be
+deleted, and only their ordinal may be updated. It grants exact execution on
+`lcm.normalize_search_text(text)` for generated summary search state, but no
+trigger-function execution, sequence access, graph deletion, `TRUNCATE`, or
+grant option. Fenced callers also need the separate coordination grant. See
+[PostgreSQL summaries, context, and large files](postgresql-summary-context.md)
+for the complete runtime, transaction, diagnostic, and recovery contract.
 
 ## Backup and point-in-time recovery
 

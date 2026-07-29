@@ -27,6 +27,7 @@ import {
   exerciseRecallRepositoryConformance,
   exerciseRedactionAdminRepositoryConformance,
 } from "./memory-conformance.js";
+import { exerciseSummaryContextRepositoryConformance } from "./summary-context-conformance.js";
 
 function harness(): StorageContractHarness {
   const root = createTemporaryDirectory("lcm-storage-contract-");
@@ -75,6 +76,22 @@ describe("SQLite storage backend conformance", () => {
       await exerciseCoordinationRepositoryConformance(
         storage.coordination,
       );
+    } finally {
+      await factory.close();
+    }
+  });
+
+  it("passes the shared summary, context, and large-file repository contracts", async () => {
+    const root = createTemporaryDirectory("lcm-storage-summary-context-contract-");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({
+        id: project.id,
+        dbPath: join(root, "db.sqlite"),
+      }),
+    });
+    try {
+      const storage = await factory.openProject(projectIdentity(root));
+      await exerciseSummaryContextRepositoryConformance(storage);
     } finally {
       await factory.close();
     }
