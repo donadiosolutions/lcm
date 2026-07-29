@@ -493,18 +493,20 @@ function assertNonEmptyDescription(value, name) {
   return value;
 }
 
-export function redactPromptText(value, maximum = 8_000) {
-  if (!Number.isSafeInteger(maximum) || maximum < 0) {
-    throw new TypeError("Maximum prompt text length must be a non-negative integer");
-  }
-  const input = String(value ?? "");
-  const wasTruncated = input.length > maximum;
-  let bounded = input.slice(0, maximum);
+function truncatePromptCodeUnits(value, maximum) {
+  let bounded = value.slice(0, maximum);
   const finalCodeUnit = bounded.charCodeAt(bounded.length - 1);
   if (finalCodeUnit >= 0xD800 && finalCodeUnit <= 0xDBFF) {
     bounded = bounded.slice(0, -1);
   }
-  bounded = bounded
+  return bounded;
+}
+
+export function redactPromptText(value, maximum = 8_000) {
+  if (!Number.isSafeInteger(maximum) || maximum < 0) {
+    throw new TypeError("Maximum prompt text length must be a non-negative integer");
+  }
+  const redacted = String(value ?? "")
     .replace(
       /-----BEGIN [A-Z0-9 ]{0,72}PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]{0,72}PRIVATE KEY-----/gu,
       "[REDACTED]",
@@ -516,26 +518,45 @@ export function redactPromptText(value, maximum = 8_000) {
     .replace(
       /\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})\b/gu,
       "[REDACTED]",
-    );
-  if (wasTruncated) {
-    bounded = bounded.replace(
-      /\b(?:github_pat_[A-Za-z0-9_]*|gh[pousr]_[A-Za-z0-9_]*|sk-[A-Za-z0-9_-]*|AKIA[A-Z0-9]*)$/gu,
-      "[REDACTED]",
-    );
-  }
-  return bounded
+    )
     .replace(
       /(\bbearer\s+)[A-Za-z0-9._~+/-]{8,}={0,2}/giu,
       "$1[REDACTED]",
     )
     .replace(
-      /(\b(?:password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*)(?:"[^"\r\n]{1,512}"|'[^'\r\n]{1,512}'|[^\s,;]{4,512})/giu,
+      /(\b(?:password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*)(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s,;]+)/giu,
       "$1[REDACTED]",
     )
     .replace(
       /([a-z][a-z0-9+.-]*:\/\/[^:\s/@]+:)[^@\s/]+@/giu,
       "$1[REDACTED]@",
     );
+  const wasTruncated = redacted.length > maximum;
+  let bounded = truncatePromptCodeUnits(redacted, maximum);
+  if (wasTruncated) {
+    bounded = truncatePromptCodeUnits(
+      bounded
+      .replace(
+        /\b(?:github_pat_[A-Za-z0-9_]*|gh[pousr]_[A-Za-z0-9_]*|sk-[A-Za-z0-9_-]*|AKIA[A-Z0-9]*)$/gu,
+        "[REDACTED]",
+      )
+      .replace(
+        /(\bbearer\s+)[A-Za-z0-9._~+/-]*$/giu,
+        "$1[REDACTED]",
+      )
+      .replace(
+        /(\b(?:password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*)(?:"[^"\r\n]*|'[^'\r\n]*|[^\s,;]*)$/giu,
+        "$1[REDACTED]",
+      )
+      .replace(
+        /([a-z][a-z0-9+.-]*:\/\/[^:\s/@]+:)[^@\s/]*$/giu,
+        "$1[REDACTED]",
+      ),
+      maximum,
+    )
+      .replace(/\[R(?:E(?:D(?:A(?:C(?:T(?:E(?:D)?)?)?)?)?)?)?$/u, "");
+  }
+  return bounded;
 }
 
 function resolveNamedCatalog(expectedNames, actualEntries, name) {
@@ -1272,6 +1293,29 @@ export function parseAndValidateSecurityResult(output, policy, expectedIssueNumb
   });
 }
 
+export function parseSecurityClassificationForApplication({
+  hasWork,
+  classificationStatus,
+  output,
+  policy,
+  expectedIssueNumbers,
+}) {
+  if (typeof hasWork !== "boolean") {
+    throw new TypeError("Security classification work flag must be a boolean");
+  }
+  if (!hasWork) return Object.freeze([]);
+  if (classificationStatus !== "success") {
+    throw new Error("Security classification did not complete successfully");
+  }
+  const normalizedOutput = typeof output === "string" ? output.trim() : output;
+  if (normalizedOutput === "" || normalizedOutput === null || normalizedOutput === undefined) {
+    throw new Error("Security classification returned an empty result");
+  }
+  return Object.freeze(
+    parseAndValidateSecurityResult(normalizedOutput, policy, expectedIssueNumbers),
+  );
+}
+
 export function buildSecurityPlanningUpdates(decision, liveCatalog) {
   assertPlainObject(decision, "Security decision");
   const updates = [];
@@ -1287,7 +1331,9 @@ export function buildSecurityPlanningUpdates(decision, liveCatalog) {
     fieldId: liveCatalog.fields.securityStatus.id,
     singleSelectOptionId: status.id,
     confidence: decision.statusConfidence.toUpperCase(),
-    rationale: decision.statusRationale.slice(0, 280),
+    rationale: decision.statusConfidence === "low"
+      ? "Low-confidence Security status remained at Triage."
+      : "Security status selected by the dedicated Codex security-triage pass.",
   });
   if (
     decision.securityNature !== SECURITY_NATURE_UNKNOWN
@@ -1302,14 +1348,14 @@ export function buildSecurityPlanningUpdates(decision, liveCatalog) {
       fieldId: liveCatalog.fields.securityNature.id,
       singleSelectOptionId: nature.id,
       confidence: decision.natureConfidence.toUpperCase(),
-      rationale: decision.natureRationale.slice(0, 280),
+      rationale: "Security nature selected by the dedicated Codex security-triage pass.",
     });
   } else {
     updates.push({
       fieldId: liveCatalog.fields.securityNature.id,
       delete: true,
       confidence: decision.natureConfidence.toUpperCase(),
-      rationale: decision.natureRationale.slice(0, 280),
+      rationale: "Low-confidence or unknown Security nature remained unset.",
     });
   }
   return Object.freeze(updates);
