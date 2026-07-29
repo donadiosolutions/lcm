@@ -579,6 +579,10 @@ describe("PostgreSQL memory repositories", () => {
         ...instructionScope,
         sessionId: "",
       }),
+      () => coordination.getSessionInstructions({
+        ...instructionScope,
+        worktreePath: "",
+      }),
       () => coordination.upsertSessionInstructions(
         instructionScope,
         "bad\0content",
@@ -828,6 +832,24 @@ describe("PostgreSQL memory repositories", () => {
       machineId,
     ).getSessionIngest("session-a")).rejects.toMatchObject({
       field: "completed_at",
+    });
+
+    const invalidInstructionClient = executor(() => result([{
+      client_name: "other",
+      session_id: instructionScope.sessionId,
+      worktree_path: instructionScope.worktreePath,
+      cwd_path: instructionScope.cwdPath,
+      content: "rules",
+      content_hash: "hash",
+      updated_at: "2026-01-04T00:00:00.000Z",
+    }]));
+    await expect(new PostgreSqlCoordinationRepository(
+      invalidInstructionClient,
+      projectId,
+      machineId,
+    ).getSessionInstructions(instructionScope)).rejects.toMatchObject({
+      field: "client_name",
+      operation: "getSessionInstructions",
     });
 
     const noInstructions = executor(() => result([]));

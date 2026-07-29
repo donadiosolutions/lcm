@@ -60,7 +60,14 @@ function executor(options: {
   sessionReplicationRole?: "origin" | "replica" | "local" | "missing" | "invalid";
   schemaAcl?: "absent" | "ready" | "public" | "missing" | "invalid" | "inconsistent";
   managedOwnership?: "ready" | "unowned" | "missing-object" | "missing" | "invalid" | "inconsistent" | "different-user";
-  baselineDefinitions?: "ready" | "missing-object" | "drifted" | "missing" | "invalid" | "inconsistent";
+  baselineDefinitions?:
+    | "ready"
+    | "missing-object"
+    | "drifted"
+    | "missing"
+    | "invalid"
+    | "invalid-hash"
+    | "inconsistent";
   identityFunctions?: "ready" | "drifted" | "missing" | "invalid" | "inconsistent";
 } = {}) {
   const operations: string[] = [];
@@ -277,6 +284,8 @@ function executor(options: {
         actualDefinitionGroupHashes[0] = "f".repeat(64);
       } else if (options.baselineDefinitions === "drifted") {
         actualDefinitionGroupHashes[0] = "f".repeat(64);
+      } else if (options.baselineDefinitions === "invalid-hash") {
+        actualDefinitionGroupHashes[0] = "not-a-sha256";
       }
       return result([{
         actual_definition_group_counts: actualDefinitionGroupCounts,
@@ -1252,6 +1261,15 @@ describe("PostgreSQL migration runner", () => {
       driftedDefinitionGroupCount: null,
     },
     {
+      label: "a malformed definition fingerprint",
+      baselineDefinitions: "invalid-hash" as const,
+      baselineApplied: true,
+      expectedObjectCount: 739,
+      existingObjectCount: 739,
+      missingObjectCount: 0,
+      driftedDefinitionGroupCount: 0,
+    },
+    {
       label: "contradictory catalog counts",
       baselineDefinitions: "inconsistent" as const,
       baselineApplied: true,
@@ -1286,6 +1304,7 @@ describe("PostgreSQL migration runner", () => {
     expect(failure).toMatchObject({
       actualDefinitionGroups: baselineDefinitions === "missing"
         || baselineDefinitions === "invalid"
+        || baselineDefinitions === "invalid-hash"
         ? null
         : expect.arrayContaining([
           expect.objectContaining({
