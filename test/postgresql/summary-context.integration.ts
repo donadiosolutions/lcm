@@ -262,6 +262,85 @@ async function waitForRuntimeLockWaiters(
   );
 }
 
+async function waitForSharedAdvisoryLockWaiters(
+  database: PostgreSqlTestDatabase,
+  minimum: number,
+): Promise<void> {
+  let observed: readonly {
+    readonly classid: number;
+    readonly objid: number;
+    readonly objsubid: number;
+    readonly waiter_count: number;
+    readonly blocking_pids: number[];
+  }[] = [];
+  for (let attempt = 0; attempt < 160; attempt += 1) {
+    const result = await database.migrator.query<{
+      classid: number;
+      objid: number;
+      objsubid: number;
+      waiter_pid: number;
+      blocking_pids: number[];
+    }>({
+      text: `SELECT DISTINCT pending.classid,
+                             pending.objid,
+                             pending.objsubid,
+                             activity.pid::pg_catalog.int4 AS waiter_pid,
+                             pg_catalog.pg_blocking_pids(activity.pid)
+                               AS blocking_pids
+             FROM pg_catalog.pg_stat_activity AS activity
+             INNER JOIN pg_catalog.pg_locks AS pending
+               ON pending.pid = activity.pid
+              AND pending.locktype = 'advisory'
+              AND NOT pending.granted
+             WHERE activity.datname = pg_catalog.current_database()
+               AND activity.usename = 'lcm_test_runtime'
+               AND activity.state = 'active'
+               AND activity.wait_event_type = 'Lock'
+             ORDER BY pending.classid, pending.objid, pending.objsubid,
+                      waiter_pid`,
+    }, { domain: "summaries", operation: "waitForSharedAdvisoryLockWaiters" });
+    const byIdentity = new Map<string, {
+      classid: number;
+      objid: number;
+      objsubid: number;
+      waiter_pids: number[];
+      blocking_pids: number[];
+    }>();
+    for (const row of result.rows) {
+      const identity = `${row.classid}:${row.objid}:${row.objsubid}`;
+      const aggregate = byIdentity.get(identity) ?? {
+        classid: row.classid,
+        objid: row.objid,
+        objsubid: row.objsubid,
+        waiter_pids: [],
+        blocking_pids: [],
+      };
+      aggregate.waiter_pids.push(row.waiter_pid);
+      aggregate.blocking_pids.push(...row.blocking_pids);
+      byIdentity.set(identity, aggregate);
+    }
+    observed = [...byIdentity.values()].map((row) => ({
+      classid: row.classid,
+      objid: row.objid,
+      objsubid: row.objsubid,
+      waiter_count: new Set(row.waiter_pids).size,
+      blocking_pids: [...new Set(row.blocking_pids)].sort((left, right) => (
+        left - right
+      )),
+    }));
+    if (observed.some((row) => (
+      row.waiter_count >= minimum
+      && new Set(row.blocking_pids).size >= 1
+    ))) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(
+    `expected ${minimum} waiters for one advisory lock identity; observed ${
+      JSON.stringify(observed)
+    }`,
+  );
+}
+
 function sorted(values: readonly string[]): string[] {
   return [...values].sort();
 }
@@ -442,20 +521,39 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
                    'lcm.normalize_search_text(text)',
                    'EXECUTE'
                  ) AS normalize_execute,
-                 has_function_privilege(
-                   'public',
-                   'lcm.normalize_search_text(text)',
-                   'EXECUTE'
+                 EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_proc AS procedure
+                   CROSS JOIN LATERAL pg_catalog.aclexplode(
+                     COALESCE(
+                       procedure.proacl,
+                       pg_catalog.acldefault('f', procedure.proowner)
+                     )
+                   ) AS privilege
+                   WHERE procedure.oid =
+                     'lcm.normalize_search_text(text)'::pg_catalog.regprocedure
+                     AND privilege.grantee = 0
+                     AND privilege.privilege_type = 'EXECUTE'
                  ) AS normalize_public_execute,
                  has_function_privilege(
                    'lcm_test_runtime',
                    'lcm.enforce_summary_parent_dag_integrity()',
                    'EXECUTE'
                  ) AS cycle_execute,
-                 has_function_privilege(
-                   'public',
-                   'lcm.enforce_summary_parent_dag_integrity()',
-                   'EXECUTE'
+                 EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_proc AS procedure
+                   CROSS JOIN LATERAL pg_catalog.aclexplode(
+                     COALESCE(
+                       procedure.proacl,
+                       pg_catalog.acldefault('f', procedure.proowner)
+                     )
+                   ) AS privilege
+                   WHERE procedure.oid =
+                     'lcm.enforce_summary_parent_dag_integrity()'
+                       ::pg_catalog.regprocedure
+                     AND privilege.grantee = 0
+                     AND privilege.privilege_type = 'EXECUTE'
                  ) AS cycle_public_execute,
                  EXISTS (
                    SELECT 1
@@ -518,7 +616,7 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
         "postgresql-summary-context",
       );
 
-      expect(result.summaries.subtree).toHaveLength(8);
+      expect(result.summaries.subtree).toHaveLength(13);
       expect(result.context.map((item) => item.ordinal)).toEqual([0, 1, 2, 3]);
       expect(result.largeFiles).toHaveLength(2);
       expect(result.summaries.inserted.root.fileIds).toEqual([
@@ -823,11 +921,7 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
           firstRace.linkSummaryToParents("race-a", ["race-b"]),
           secondRace.linkSummaryToParents("race-b", ["race-a"]),
         ]);
-        await waitForRuntimeLockWaiters(
-          database,
-          "pg_advisory_xact_lock",
-          2,
-        );
+        await waitForSharedAdvisoryLockWaiters(database, 2);
         releaseBarrier();
         await barrier;
         const outcomes = await pendingRace;
@@ -1137,6 +1231,94 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
         content: "duplicate",
         tokenCount: 1,
       })).rejects.toMatchObject({ conflict: "integrity" });
+      await expect(first.summaries.insertSummary({
+        conversationId: firstConversation.conversationId,
+        summaryId: "invalid-high-\ud800",
+        kind: "leaf",
+        content: "invalid high surrogate",
+        tokenCount: 1,
+      })).rejects.toMatchObject({ field: "summary_id" });
+      await expect(first.summaries.insertSummary({
+        conversationId: firstConversation.conversationId,
+        summaryId: "invalid-low",
+        kind: "leaf",
+        content: "invalid-low-\udc00",
+        tokenCount: 1,
+      })).rejects.toMatchObject({ field: "content" });
+      const pairedSurrogate = await first.summaries.insertSummary({
+        conversationId: firstConversation.conversationId,
+        summaryId: "valid-pair-\ud83d\ude80",
+        kind: "leaf",
+        content: "valid pair \ud83d\ude80",
+        tokenCount: 1,
+        fileIds: ["valid-file-pair-\ud83d\ude80"],
+      });
+      expect(pairedSurrogate).toMatchObject({
+        summaryId: "valid-pair-\ud83d\ude80",
+        content: "valid pair \ud83d\ude80",
+        fileIds: ["valid-file-pair-\ud83d\ude80"],
+      });
+
+      await createSummary(
+        first.summaries,
+        otherConversation.conversationId,
+        "ordinal-exhaustion-existing",
+      );
+      await createSummary(
+        first.summaries,
+        otherConversation.conversationId,
+        "ordinal-exhaustion-new",
+      );
+      const exhaustionKey = await database.migrator.query<{
+        summary_key: string;
+      }>({
+        text: `SELECT summary_key
+               FROM lcm.summaries
+               WHERE project_id = $1
+                 AND conversation_id = $2
+                 AND summary_id = 'ordinal-exhaustion-existing'`,
+        values: [firstProjectId, otherConversation.conversationId],
+      }, { domain: "context", operation: "findOrdinalExhaustionSummary" });
+      await database.migrator.query({
+        text: `INSERT INTO lcm.context_items (
+                 project_id, conversation_id, ordinal, item_type, summary_key
+               )
+               VALUES ($1, $2, 2147483647, 'summary', $3)`,
+        values: [
+          firstProjectId,
+          otherConversation.conversationId,
+          exhaustionKey.rows[0].summary_key,
+        ],
+      }, { domain: "context", operation: "seedContextOrdinalExhaustion" });
+      await expect(first.context.appendContextSummary(
+        otherConversation.conversationId,
+        "ordinal-exhaustion-new",
+      )).rejects.toMatchObject({
+        name: "PostgreSqlSummaryContextDataError",
+        domain: "context",
+        operation: "appendContextSummary",
+        field: "ordinal",
+      });
+      await expect(database.migrator.query<{
+        count: number;
+        minimum: number;
+        maximum: number;
+      }>({
+        text: `SELECT COUNT(*)::pg_catalog.int4 AS count,
+                      MIN(ordinal)::pg_catalog.int4 AS minimum,
+                      MAX(ordinal)::pg_catalog.int4 AS maximum
+               FROM lcm.context_items
+               WHERE project_id = $1
+                 AND conversation_id = $2`,
+        values: [firstProjectId, otherConversation.conversationId],
+      }, { domain: "context", operation: "inspectContextOrdinalExhaustion" }))
+        .resolves.toMatchObject({
+          rows: [{
+            count: 1,
+            minimum: 2_147_483_647,
+            maximum: 2_147_483_647,
+          }],
+        });
 
       await database.migrator.query({
         text: `INSERT INTO lcm.large_files (
@@ -1282,28 +1464,42 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
       );
       expect(await first.summaries.getSummary("fenced-successor")).not.toBeNull();
 
+      await expect(coordinator.releaseLease({
+        resourceType: "conversation",
+        resourceKey: firstConversation.conversationId.toString(),
+        processId,
+        operation,
+        fencingToken: successor!.fencingToken,
+      })).resolves.toMatchObject({ releasedAt: expect.any(String) });
+      const expiring = await coordinator.acquireLease({
+        resourceType: "conversation",
+        resourceKey: firstConversation.conversationId.toString(),
+        processId,
+        operation,
+        ttlMs: 1,
+      });
+      expect(expiring!.fencingToken).toBeGreaterThan(
+        successor!.fencingToken,
+      );
       await database.migrator.query({
-        text: `UPDATE lcm.fenced_leases
-               SET expires_at =
-                 pg_catalog.statement_timestamp() - interval '1 second'
-               WHERE project_id = $1
-                 AND resource_type = 'conversation'
-                 AND resource_key = $2
-                 AND fencing_token = $3::pg_catalog.int8`,
-        values: [
-          firstProjectId,
-          firstConversation.conversationId.toString(),
-          successor!.fencingToken.toString(),
-        ],
-      }, { domain: "coordination", operation: "expireSummaryContextLease" });
+        text: "SELECT pg_catalog.pg_sleep(0.02)",
+      }, { domain: "coordination", operation: "waitForSummaryContextLeaseExpiry" });
+      const expired = repositories(database, firstProjectId, {
+        fence: {
+          machineId,
+          processId,
+          operation,
+          fencingToken: expiring!.fencingToken,
+        },
+      });
       await expectLeaseFenceFailure(createSummary(
-        current.summaries,
+        expired.summaries,
         firstConversation.conversationId,
         "fenced-expired",
       ), {
         projectId: firstProjectId,
         machineId,
-        fencingToken: successor!.fencingToken,
+        fencingToken: expiring!.fencingToken,
       });
       expect(await first.summaries.getSummary("fenced-expired")).toBeNull();
 
@@ -1315,7 +1511,7 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
         ttlMs: 60_000,
       });
       expect(finalLease!.fencingToken).toBeGreaterThan(
-        successor!.fencingToken,
+        expiring!.fencingToken,
       );
       const raceMessage = await first.conversations.createMessage({
         conversationId: firstConversation.conversationId,
@@ -1557,7 +1753,7 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
         summaryId: `plan-child-${index.toString().padStart(2, "0")}`,
         depthFromRoot: 1,
         parentSummaryId: "plan-root",
-        path: index.toString().padStart(10, "0"),
+        path: "0000",
         childCount: 0,
       })));
     });
