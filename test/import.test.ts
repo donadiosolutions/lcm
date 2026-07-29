@@ -8,6 +8,7 @@ import { cwdToProjectHash, findSessionFiles, importSessions } from "../src/impor
 import type { DaemonClient } from "../src/daemon/client.js";
 import { projectId } from "../src/daemon/project.js";
 import { resolveProjectIdentity } from "../src/project-map.js";
+import * as codexTranscript from "../src/codex-transcript.js";
 
 // --- cwdToProjectHash ---
 
@@ -1057,6 +1058,32 @@ describe("importSessions — provider: codex", () => {
       _codexDir: "/nonexistent/codex/dir",
     });
 
+    expect(client.post).not.toHaveBeenCalled();
+    expect(result.imported).toBe(0);
+  });
+
+  it("returns cleanly if the Codex catalogue empties between discovery snapshots", async () => {
+    const codexDir = makeTmpDir();
+    const archivedDir = join(codexDir, "archived_sessions");
+    mkdirSync(archivedDir, { recursive: true });
+    writeFileSync(
+      join(archivedDir, "vanishing.jsonl"),
+      makeCodexSessionMetaLine("vanishing", "/workspace"),
+    );
+    const discovered = codexTranscript.findAllCodexTranscripts(codexDir);
+    const find = vi.spyOn(codexTranscript, "findAllCodexTranscripts")
+      .mockReturnValueOnce(discovered)
+      .mockReturnValueOnce([]);
+    const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 100 }));
+
+    const result = await importSessions(client, {
+      provider: "codex",
+      dryRun: true,
+      cwd: "/workspace",
+      _codexDir: codexDir,
+    });
+
+    expect(find).toHaveBeenCalledTimes(2);
     expect(client.post).not.toHaveBeenCalled();
     expect(result.imported).toBe(0);
   });

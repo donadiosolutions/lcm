@@ -814,6 +814,28 @@ describe("runCli failure and alternate presentation branches", () => {
     );
   });
 
+  it("warns and skips export-all candidates that cannot be reconciled", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    state.entries = [
+      { name: "error", isDirectory: () => true },
+      { name: "primitive", isDirectory: () => true },
+    ];
+    state.fileText = JSON.stringify({ cwd: "/unavailable" });
+    state.reconcileWorktrees
+      .mockImplementationOnce(() => { throw new Error("map changed"); })
+      .mockImplementationOnce(() => { throw "source vanished"; });
+
+    expect(await invoke(["export", "--all"])).toBeUndefined();
+
+    expect(state.reconcileWorktrees).toHaveBeenCalledTimes(2);
+    expect(stderr).toHaveBeenCalledWith(
+      "  Warning: could not reconcile /unavailable: map changed\n",
+    );
+    expect(stderr).toHaveBeenCalledWith(
+      "  Warning: could not reconcile /unavailable: source vanished\n",
+    );
+  });
+
   it("renders TTY summaries for compact and import", async () => {
     const descriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
     Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });

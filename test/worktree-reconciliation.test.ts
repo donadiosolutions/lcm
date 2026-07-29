@@ -1716,6 +1716,31 @@ describe("worktree reconciliation", () => {
     expect(existsSync(fixture.sourcePath)).toBe(true);
   });
 
+  it("fails closed if a runtime cannot parse an otherwise valid cache timestamp", () => {
+    const fixture = makeInstructionCacheReconciliation(
+      home,
+      {
+        content: "target",
+        contentHash: "target-hash",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        content: "source",
+        contentHash: "source-hash",
+        updatedAt: "2026-01-02T00:00:00.000Z",
+      },
+    );
+    const parse = vi.spyOn(Date, "parse").mockReturnValue(Number.NaN);
+    try {
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "invalid session_instruction_cache updated_at for id 2",
+      );
+    } finally {
+      parse.mockRestore();
+    }
+    expect(existsSync(fixture.sourcePath)).toBe(true);
+  });
+
   it("deduplicates an exact cache row without arbitrating its malformed timestamp", () => {
     const malformed = {
       content: "legacy exact",
