@@ -6,7 +6,11 @@ import { DatabaseSync } from "node:sqlite";
 import { getLcmConnection, closeLcmConnection } from "../../src/db/connection.js";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import { getLcmDbFeatures } from "../../src/db/features.js";
-import { upsertRedactionCounts } from "../../src/db/redaction-stats.js";
+import {
+  getRedactionCounts,
+  upsertRedactionCounts,
+  validateRedactionCounts,
+} from "../../src/db/redaction-stats.js";
 
 const tempDirs: string[] = [];
 
@@ -163,5 +167,97 @@ describe("upsertRedactionCounts", () => {
     ).all() as { category: string }[];
     expect(rows).toHaveLength(1);
     expect(rows[0].category).toBe("global");
+  });
+
+  it("reads every category with zero defaults and a total", () => {
+    const db = makeDb();
+    expect(getRedactionCounts(db, "empty")).toEqual({
+      gitleaks: 0,
+      builtIn: 0,
+      global: 0,
+      project: 0,
+      total: 0,
+    });
+    upsertRedactionCounts(db, "project", {
+      gitleaks: 1,
+      builtIn: 2,
+      global: 3,
+      project: 4,
+    });
+    expect(getRedactionCounts(db, "project")).toEqual({
+      gitleaks: 1,
+      builtIn: 2,
+      global: 3,
+      project: 4,
+      total: 10,
+    });
+  });
+
+  it.each([
+    ["negative", -1],
+    ["fractional", 1.5],
+    ["unsafe", Number.MAX_SAFE_INTEGER + 1],
+  ])("rejects %s counters before writing", (_label, value) => {
+    const db = makeDb();
+    const counts = {
+      gitleaks: 0,
+      builtIn: 0,
+      global: 0,
+      project: 0,
+    };
+    counts.project = value;
+    expect(() => validateRedactionCounts(counts)).toThrow(TypeError);
+    expect(() => upsertRedactionCounts(db, "invalid", counts)).toThrow(
+      TypeError,
+    );
+    expect(getRedactionCounts(db, "invalid").total).toBe(0);
+  });
+
+  it("fails closed on malformed persisted counters", () => {
+    const db = makeDb();
+    db.prepare(
+      `INSERT INTO redaction_stats (project_id, category, count)
+       VALUES ('corrupt', 'project', -1)`,
+    ).run();
+    expect(() => getRedactionCounts(db, "corrupt")).toThrow(TypeError);
+    expect(() => upsertRedactionCounts(db, "corrupt", {
+      gitleaks: 0,
+      builtIn: 0,
+      global: 0,
+      project: 1,
+    })).toThrow(TypeError);
+    expect(db.prepare(
+      `SELECT count FROM redaction_stats
+       WHERE project_id = 'corrupt' AND category = 'project'`,
+    ).get()).toEqual({ count: -1 });
+  });
+
+  it("fails closed when the persisted total is unsafe", () => {
+    const db = makeDb();
+    db.prepare(
+      `INSERT INTO redaction_stats (project_id, category, count)
+       VALUES
+         ('overflow', 'gitleaks', ?),
+         ('overflow', 'built_in', ?)`,
+    ).run(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+    expect(() => getRedactionCounts(db, "overflow")).toThrow(TypeError);
+  });
+
+  it("rejects an increment that would create an unsafe counter", () => {
+    const db = makeDb();
+    db.prepare(
+      `INSERT INTO redaction_stats (project_id, category, count)
+       VALUES ('overflow-write', 'gitleaks', ?)`,
+    ).run(Number.MAX_SAFE_INTEGER);
+    expect(() => upsertRedactionCounts(db, "overflow-write", {
+      gitleaks: 1,
+      builtIn: 0,
+      global: 0,
+      project: 0,
+    })).toThrow(TypeError);
+    expect(db.prepare(
+      `SELECT count FROM redaction_stats
+       WHERE project_id = 'overflow-write' AND category = 'gitleaks'`,
+    ).get()).toEqual({ count: Number.MAX_SAFE_INTEGER });
   });
 });

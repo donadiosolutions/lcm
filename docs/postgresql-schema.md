@@ -15,6 +15,9 @@ operations are available, but storage-backed health, status, statistics, and
 data routes remain fail-closed until the remaining domain repositories pass
 conformance, issue #92 enables the backend, and issue #224 activates normal
 daemon/CLI transcript routing.
+The promoted-memory, recall, redaction-administration, and session-coordination
+adapters added by issue #88 are available for direct programmatic use and
+repository conformance under this same staged boundary.
 
 The design is single-user and multi-machine. Project scoping prevents accidental
 cross-project relationships; it is not a tenant or authorization boundary and
@@ -116,7 +119,7 @@ does not add row-level security.
   parent/child relationship involving a managed table. Relation ACL
   fingerprints expand the effective ACL, including PostgreSQL's default ACL
   when `relacl` is null. They normalize the owning role and exact non-grantable
-  identity- and conversation-repository privilege shapes granted to named
+  identity-, conversation-, native-transcript-, and memory-repository privilege shapes granted to named
   runtime roles by the documented scripts. Any `PUBLIC`, grantable,
   foreign-grantor, missing-owner, or privilege outside that allowlist on an
   allowlisted table or identity sequence therefore fails closed.
@@ -637,11 +640,11 @@ connection details, or raw database errors.
 
 After schema creation, an administrator grants each implemented repository
 only its exact runtime privileges with the reviewed
-[`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql)
-and
+[`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql),
 [`postgresql-runtime-conversation-grants.sql`](postgresql-runtime-conversation-grants.sql),
+[`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql),
 and
-[`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql)
+[`postgresql-runtime-memory-grants.sql`](postgresql-runtime-memory-grants.sql)
 scripts:
 
 ```bash
@@ -656,6 +659,10 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file docs/postgresql-runtime-transcript-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-memory-grants.sql
 ```
 
 Replace `lcm_runtime` with the deployment's runtime role. The script grants
@@ -702,6 +709,18 @@ table. Matching ingest-key retries are therefore handled through readback,
 while a conflicting immutable record fails closed. See
 [PostgreSQL native transcripts](postgresql-native-transcripts.md) for the
 sanitized-record and local-quarantine contract.
+
+The memory script grants full reads and project-scoped deletion on the six
+issue #88 mutable-state tables, column-limited inserts and updates, exact
+normalization-function execution for generated promoted search columns, and
+`USAGE` only on recall/instruction identity sequences. It grants no deletion of
+project identity, conversations, summaries, transcripts, checkpoints, events,
+leases, or outboxes. The repository purge removes promoted memory and tags,
+recall surfacing, redaction counters, completed session ingest, and session
+instructions in one transaction and returns exact affected-row counts. Any
+failure rolls back all preceding deletes; generated promoted search state
+cannot remain after its source row is deleted. See
+[PostgreSQL memory and administration](postgresql-memory-administration.md).
 
 Migration privilege hardening is likewise confined to LCM-owned objects: it
 does not change ACLs on unknown objects already present in `lcm`. If an

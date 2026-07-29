@@ -281,6 +281,7 @@ export interface PromotedMemoryRecord {
   id: string;
   content: string;
   tags: string[];
+  metadata: JsonObject;
   sourceSummaryId: string | null;
   projectId: string;
   sessionId: string | null;
@@ -291,13 +292,13 @@ export interface PromotedMemoryRecord {
 }
 
 export interface PromotedMemoryRepository {
-  insert(input: { content: string; tags?: string[]; sourceSummaryId?: string; sourceProjectId?: string; sessionId?: string; depth?: number; confidence?: number }): Promise<string>;
+  insert(input: { content: string; tags?: string[]; metadata?: JsonObject; sourceSummaryId?: string; sourceProjectId?: string; sessionId?: string; depth?: number; confidence?: number }): Promise<string>;
   getById(id: string): Promise<PromotedMemoryRecord | null>;
   getAll(options?: { sourceProjectId?: string; since?: string; tags?: string[] }): Promise<PromotedMemoryRecord[]>;
   listContentPrefixes(limit: number): Promise<string[]>;
   archive(id: string): Promise<void>;
   deleteById(id: string): Promise<void>;
-  update(id: string, fields: { content?: string; confidence?: number; tags?: string[] }): Promise<void>;
+  update(id: string, fields: { content?: string; confidence?: number; tags?: string[]; metadata?: JsonObject }): Promise<void>;
   findStale(options: { staleAfterDays: number; staleSurfacingWithoutUseLimit: number; sourceProjectId?: string }): Promise<Array<PromotedMemoryRecord & { surfacingCount: number; usageCount: number; daysSinceCreated: number }>>;
   revive(id: string): Promise<void>;
 }
@@ -309,7 +310,25 @@ export interface RecallRepository {
 }
 
 export interface RedactionAdminRepository {
-  upsertCounts(counts: { gitleaks: number; builtIn: number; global: number; project: number }): Promise<void>;
+  upsertCounts(counts: RedactionCounts): Promise<void>;
+  getCounts(): Promise<RedactionCounts & { total: number }>;
+  purgeProjectState(): Promise<RedactionPurgeResult>;
+}
+
+export interface RedactionCounts {
+  gitleaks: number;
+  builtIn: number;
+  global: number;
+  project: number;
+}
+
+export interface RedactionPurgeResult {
+  promotedMemories: number;
+  promotedTags: number;
+  recallSurfacings: number;
+  redactionCounters: number;
+  sessionIngestLogs: number;
+  sessionInstructions: number;
 }
 
 export interface LexicalSearchRepository {

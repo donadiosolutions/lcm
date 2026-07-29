@@ -1670,6 +1670,21 @@ export async function runPostgreSqlMigrations(
                          acl_relations.object_identity OPERATOR(pg_catalog.=)
                            ANY (
                              ARRAY[
+                               'table|promoted_memories',
+                               'table|promoted_memory_tags',
+                               'table|recall_surfacing',
+                               'table|redaction_counters',
+                               'table|session_ingest_log',
+                               'table|session_instructions'
+                             ]::pg_catalog.text[]
+                           )
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=)
+                           ANY (ARRAY['SELECT', 'DELETE']::pg_catalog.text[])
+                       )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           ANY (
+                             ARRAY[
                                'table|messages',
                                'table|context_items'
                              ]::pg_catalog.text[]
@@ -1692,7 +1707,9 @@ export async function runPostgreSqlMigrations(
                            ANY (
                              ARRAY[
                                'sequence|conversations_conversation_id_seq',
-                               'sequence|messages_message_id_seq'
+                               'sequence|messages_message_id_seq',
+                               'sequence|recall_surfacing_surfacing_id_seq',
+                               'sequence|session_instructions_instruction_id_seq'
                              ]::pg_catalog.text[]
                            )
                          AND privilege.privilege_type OPERATOR(pg_catalog.=) 'USAGE'
@@ -1954,6 +1971,158 @@ export async function runPostgreSqlMigrations(
                                         'quarantined_count',
                                         'revision',
                                         'checkpoint',
+                                        'updated_at'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'UPDATE'
+                                )
+                              )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'promoted_memories'
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'content',
+                                        'source_summary_id',
+                                        'source_project_id',
+                                        'session_id',
+                                        'depth',
+                                        'confidence',
+                                        'metadata'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'content',
+                                        'confidence',
+                                        'metadata',
+                                        'archived_at'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'UPDATE'
+                                )
+                              )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'promoted_memory_tags'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'project_id',
+                                    'memory_id',
+                                    'ordinal',
+                                    'tag'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type
+                                OPERATOR(pg_catalog.=) 'INSERT'
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'recall_surfacing'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'project_id',
+                                    'memory_id',
+                                    'session_id'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type
+                                OPERATOR(pg_catalog.=) 'INSERT'
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'redaction_counters'
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'category',
+                                        'count'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY['count', 'updated_at']::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'UPDATE'
+                                )
+                              )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'session_ingest_log'
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'session_id',
+                                        'message_count'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'message_count',
+                                        'completed_at'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'UPDATE'
+                                )
+                              )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=)
+                                'session_instructions'
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'machine_id',
+                                        'slot',
+                                        'content',
+                                        'content_hash'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'INSERT'
+                                )
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'content',
+                                        'content_hash',
                                         'updated_at'
                                       ]::pg_catalog.text[]
                                     )

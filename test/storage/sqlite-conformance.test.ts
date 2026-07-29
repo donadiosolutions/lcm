@@ -17,8 +17,15 @@ import {
   createSqliteRepositoryStores,
 } from "../../src/storage/sqlite/repositories.js";
 import { closeLcmConnection, getPoolStats, isLcmConnectionOpen } from "../../src/db/connection.js";
+import { runLcmMigrations } from "../../src/db/migration.js";
 import { createTemporaryDirectory } from "../fixtures/runtime.js";
 import { defineCoreStorageConformance, type StorageContractHarness } from "./conformance.js";
+import {
+  exerciseCoordinationRepositoryConformance,
+  exercisePromotedMemoryRepositoryConformance,
+  exerciseRecallRepositoryConformance,
+  exerciseRedactionAdminRepositoryConformance,
+} from "./memory-conformance.js";
 
 function harness(): StorageContractHarness {
   const root = createTemporaryDirectory("lcm-storage-contract-");
@@ -43,6 +50,34 @@ function harness(): StorageContractHarness {
 
 describe("SQLite storage backend conformance", () => {
   defineCoreStorageConformance(harness);
+
+  it("passes the shared memory and administration repository contracts", async () => {
+    const root = createTemporaryDirectory("lcm-storage-memory-contract-");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({
+        id: project.id,
+        dbPath: join(root, "db.sqlite"),
+      }),
+    });
+    try {
+      const storage = await factory.openProject(projectIdentity(root));
+      await exercisePromotedMemoryRepositoryConformance(
+        storage.promotedMemory,
+      );
+      await exerciseRecallRepositoryConformance(
+        storage.recall,
+        storage.promotedMemory,
+      );
+      await exerciseRedactionAdminRepositoryConformance(
+        storage.redactionAdmin,
+      );
+      await exerciseCoordinationRepositoryConformance(
+        storage.coordination,
+      );
+    } finally {
+      await factory.close();
+    }
+  });
 
   it("short-circuits empty repository atomic operations before invoking the executor", async () => {
     const prepare = vi.fn(() => {
@@ -164,6 +199,104 @@ describe("SQLite storage backend conformance", () => {
     expect(JSON.stringify([bulkFailure, partFailure])).not.toContain("private");
     expect(invoke).not.toHaveBeenCalled();
     expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it("validates administrative counters before invocation and fails closed on malformed timestamps", async () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      runLcmMigrations(db);
+      const stores = createSqliteRepositoryStores(db);
+      const invoke = vi.fn(async (
+        _domain: unknown,
+        _operation: unknown,
+        callback: () => unknown,
+      ) => callback());
+      const repositories = createSqliteRepositories(
+        stores,
+        "safe-project",
+        invoke,
+      );
+      await expect(repositories.redactionAdmin.upsertCounts({
+        gitleaks: 0,
+        builtIn: 0,
+        global: 0,
+        project: -1,
+      })).rejects.toMatchObject({
+        backend: "sqlite",
+        domain: "redaction-admin",
+        operation: "upsertCounts",
+      });
+      expect(invoke).not.toHaveBeenCalled();
+
+      db.prepare(
+        `INSERT INTO redaction_stats (project_id, category, count)
+         VALUES ('safe-project', 'project', -1)`,
+      ).run();
+      await expect(repositories.redactionAdmin.getCounts())
+        .rejects.toThrow(TypeError);
+      await expect(repositories.promotedMemory.getAll({
+        since: "not-a-date",
+      })).rejects.toThrow(TypeError);
+
+      const memoryId = await repositories.promotedMemory.insert({
+        content: "malformed timestamp",
+        tags: ["one", "two"],
+      });
+      db.prepare(
+        "UPDATE promoted SET created_at = ?, archived_at = ? WHERE id = ?",
+      ).run("not-a-date", "2026-01-01 00:00:00", memoryId);
+      await expect(repositories.promotedMemory.getById(memoryId))
+        .rejects.toThrow("stored timestamp is malformed");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("purges all mutable project memory state and its FTS mirror atomically", async () => {
+    const root = createTemporaryDirectory("lcm-storage-purge-");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({
+        id: project.id,
+        dbPath: join(root, "db.sqlite"),
+      }),
+    });
+    try {
+      const storage = await factory.openProject(projectIdentity(root));
+      const memoryId = await storage.promotedMemory.insert({
+        content: "purge needle",
+        tags: ["one", "two"],
+      });
+      await storage.recall.logSurfacing([memoryId], null);
+      await storage.redactionAdmin.upsertCounts({
+        gitleaks: 1,
+        builtIn: 0,
+        global: 0,
+        project: 0,
+      });
+      await storage.coordination.recordSessionIngest("session", 1);
+      await storage.coordination.upsertSessionInstructions(1, "rules", "hash");
+      expect(await storage.recall.getFeedback(["missing"])).toEqual(new Map([[
+        "missing",
+        { usageCount: 0, surfacingCount: 0, lastSurfacedAt: null },
+      ]]));
+      await storage.promotedMemory.archive(memoryId);
+      expect(await storage.promotedMemory.getById(memoryId)).toMatchObject({
+        archivedAt: expect.stringMatching(/Z$/u),
+      });
+      await storage.promotedMemory.revive(memoryId);
+
+      expect(await storage.redactionAdmin.purgeProjectState()).toEqual({
+        promotedMemories: 1,
+        promotedTags: 2,
+        recallSurfacings: 1,
+        redactionCounters: 1,
+        sessionIngestLogs: 1,
+        sessionInstructions: 1,
+      });
+      expect(await storage.lexicalSearch.searchPromoted("purge", 5)).toEqual([]);
+    } finally {
+      await factory.close();
+    }
   });
 
   it("keeps a scoped transaction usable after invalid conversation batch inputs", async () => {
@@ -956,7 +1089,10 @@ describe("SQLite storage backend conformance", () => {
     expect(await storage.lexicalSearch.searchPromoted("changed", 5)).toEqual([]);
     await storage.promotedMemory.revive(memoryId);
     expect(await storage.lexicalSearch.searchPromoted("changed", 5)).toHaveLength(1);
-    await storage.promotedMemory.deleteById(memoryId);
+    expect(await storage.redactionAdmin.purgeProjectState()).toMatchObject({
+      promotedMemories: 1,
+      promotedTags: 1,
+    });
     expect(await storage.promotedMemory.getById(memoryId)).toBeNull();
     await factory.close();
   });

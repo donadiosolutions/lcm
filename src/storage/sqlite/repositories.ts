@@ -1,7 +1,16 @@
 import type { DatabaseSync } from "node:sqlite";
-import { PromotedStore, parsePromotedTags, type PromotedRow } from "../../db/promoted.js";
+import {
+  PromotedStore,
+  parsePromotedMetadata,
+  parsePromotedTags,
+  type PromotedRow,
+} from "../../db/promoted.js";
 import { RecallStore } from "../../db/recall.js";
-import { upsertRedactionCounts } from "../../db/redaction-stats.js";
+import {
+  getRedactionCounts,
+  upsertRedactionCounts,
+  validateRedactionCounts,
+} from "../../db/redaction-stats.js";
 import {
   ConversationStore,
   getConversationStoreAtomicCore,
@@ -54,14 +63,29 @@ function promotedRecord(row: PromotedRow): PromotedMemoryRecord {
     id: row.id,
     content: row.content,
     tags: parsePromotedTags(row.tags),
+    metadata: parsePromotedMetadata(row.metadata),
     sourceSummaryId: row.source_summary_id,
     projectId: row.project_id,
     sessionId: row.session_id,
     depth: row.depth,
     confidence: row.confidence,
-    createdAt: row.created_at,
-    archivedAt: row.archived_at,
+    createdAt: canonicalUtcTimestamp(row.created_at),
+    archivedAt: row.archived_at === null
+      ? null
+      : canonicalUtcTimestamp(row.archived_at),
   };
+}
+
+function canonicalUtcTimestamp(value: string): string {
+  const sqliteUtc = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/u
+    .test(value)
+    ? `${value.replace(" ", "T")}Z`
+    : value;
+  const timestamp = new Date(sqliteUtc);
+  if (!Number.isFinite(timestamp.getTime())) {
+    throw new TypeError("stored timestamp is malformed");
+  }
+  return timestamp.toISOString();
 }
 
 export function createSqliteRepositories(
@@ -174,7 +198,14 @@ export function createSqliteRepositories(
       }),
       getAll: (options) => invoke("promoted-memory", "getAll", () => {
         const { sourceProjectId, ...filters } = options ?? {};
-        return promoted.getAll({ ...filters, projectId: sourceProjectId }).map(promotedRecord);
+        const since = filters.since === undefined
+          ? undefined
+          : canonicalUtcTimestamp(filters.since);
+        return promoted.getAll({
+          ...filters,
+          since,
+          projectId: sourceProjectId,
+        }).map(promotedRecord);
       }),
       listContentPrefixes: (limit) => invoke("promoted-memory", "listContentPrefixes", () => promoted.listContentPrefixes(limit)),
       archive: (id) => invoke("promoted-memory", "archive", () => promoted.archive(id)),
@@ -191,11 +222,81 @@ export function createSqliteRepositories(
     },
     recall: {
       logSurfacing: (ids, sessionId) => invoke("recall", "logSurfacing", () => recall.logSurfacing(ids, sessionId)),
-      getFeedback: (ids) => invoke("recall", "getFeedback", () => recall.getFeedback(ids)),
+      getFeedback: (ids) => invoke("recall", "getFeedback", () => {
+        const feedback = recall.getFeedback(ids);
+        return new Map([...feedback].map(([id, value]) => [
+          id,
+          {
+            ...value,
+            lastSurfacedAt: value.lastSurfacedAt === null
+              ? null
+              : canonicalUtcTimestamp(value.lastSurfacedAt),
+          },
+        ]));
+      }),
       getStats: () => invoke("recall", "getStats", () => recall.getStats()),
     },
     redactionAdmin: {
-      upsertCounts: (counts) => invoke("redaction-admin", "upsertCounts", () => upsertRedactionCounts(db, projectId, counts)),
+      upsertCounts: (counts) => {
+        let normalized;
+        try {
+          normalized = validateRedactionCounts(counts);
+        } catch (error) {
+          return Promise.reject(normalizeStorageError(error, {
+            backend: "sqlite",
+            projectId,
+            domain: "redaction-admin",
+            operation: "upsertCounts",
+          }));
+        }
+        return invoke(
+          "redaction-admin",
+          "upsertCounts",
+          () => upsertRedactionCounts(db, projectId, normalized),
+          true,
+        );
+      },
+      getCounts: () => invoke(
+        "redaction-admin",
+        "getCounts",
+        () => getRedactionCounts(db, projectId),
+      ),
+      purgeProjectState: () => invoke("redaction-admin", "purgeProjectState", () => {
+        const promotedRows = db.prepare("SELECT tags FROM promoted").all() as Array<{
+          tags: string;
+        }>;
+        const promotedTags = promotedRows.reduce(
+          (total, row) => total + parsePromotedTags(row.tags).length,
+          0,
+        );
+        const hasPromotedFts = db.prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'promoted_fts'",
+        ).get() !== undefined;
+        if (hasPromotedFts) db.prepare("DELETE FROM promoted_fts").run();
+        const recallSurfacings = Number(
+          db.prepare("DELETE FROM recall_surfacing").run().changes,
+        );
+        const promotedMemories = Number(
+          db.prepare("DELETE FROM promoted").run().changes,
+        );
+        const redactionCounters = Number(db.prepare(
+          "DELETE FROM redaction_stats WHERE project_id = ?",
+        ).run(projectId).changes);
+        const sessionIngestLogs = Number(
+          db.prepare("DELETE FROM session_ingest_log").run().changes,
+        );
+        const sessionInstructions = Number(
+          db.prepare("DELETE FROM session_instruction_cache").run().changes,
+        );
+        return {
+          promotedMemories,
+          promotedTags,
+          recallSurfacings,
+          redactionCounters,
+          sessionIngestLogs,
+          sessionInstructions,
+        };
+      }, true),
     },
     lexicalSearch: {
       searchMessages: (input) => invoke("lexical-search", "searchMessages", () => conversations.searchMessages(input)),
@@ -208,7 +309,11 @@ export function createSqliteRepositories(
         const row = db.prepare(
           "SELECT session_id, message_count, completed_at FROM session_ingest_log WHERE session_id = ?",
         ).get(sessionId) as { session_id: string; message_count: number; completed_at: string } | undefined;
-        return row ? { sessionId: row.session_id, messageCount: row.message_count, completedAt: row.completed_at } : null;
+        return row ? {
+          sessionId: row.session_id,
+          messageCount: row.message_count,
+          completedAt: canonicalUtcTimestamp(row.completed_at),
+        } : null;
       }),
       recordSessionIngest: (sessionId, messageCount) => invoke("coordination", "recordSessionIngest", () => {
         db.prepare(
@@ -226,7 +331,7 @@ export function createSqliteRepositories(
           id: row.id,
           content: row.content,
           contentHash: row.content_hash,
-          updatedAt: row.updated_at,
+          updatedAt: canonicalUtcTimestamp(row.updated_at),
         } : null;
       }),
       upsertSessionInstructions: (id, content, contentHash) => invoke("coordination", "upsertSessionInstructions", () => {

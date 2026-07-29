@@ -183,11 +183,14 @@ adapter is also rejected. The dedicated
 the existing `npm run typecheck` and CI gate without adding it to the production
 build or public runtime API.
 
-The staged conversation adapter is the current registration. Its PostgreSQL
-integration test invokes the same
-`exerciseConversationRepositoryConformance` suite used by SQLite, then adds
-PostgreSQL-only least-privilege, project-isolation, and transactional checks.
-When implementing the remaining adapters tracked by #86-#91:
+The staged manifest currently registers conversations plus the issue #88
+promoted-memory, recall, redaction-administration, and coordination adapters.
+Their PostgreSQL integration tests invoke the same backend-neutral exercises
+used by SQLite, then add PostgreSQL-only least-privilege, project-isolation,
+concurrency, transactional purge, and rollback checks. The native-transcript
+adapter has its own explicit staged contract because it is not a
+`ProjectRepositories` domain. When implementing the remaining adapters tracked
+by #87 and #89-#91:
 
 1. Put backend-neutral behavior in a shared suite whose input is the matching
    `ProjectRepositories` interface, not a PostgreSQL concrete class.
@@ -398,6 +401,10 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file=docs/postgresql-runtime-transcript-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file=docs/postgresql-runtime-memory-grants.sql
 ```
 
 Replace `lcm_runtime` with the existing runtime role. The scripts quote the
@@ -419,6 +426,15 @@ conversation and message fields needed for exact native-session linkage;
 checkpoint-field-only `UPDATE` on `ingest_checkpoints`. It does not grant
 writes to generated transcript fields, payload updates, `DELETE`, `TRUNCATE`,
 sequence or function privileges, or access to unrelated repository tables.
+
+The memory script grants reads and project-scoped deletion only on promoted
+memory/tags, recall surfacing, redaction counters, completed session ingest,
+and session instructions. Inserts and updates are column-limited; sequence
+access is `USAGE` only for recall and instruction identities. Generated search
+columns, project reassignment, unrelated domains, `TRUNCATE`, and sequence
+inspection or mutation remain forbidden. Exact execution of
+`lcm.normalize_search_text(text)` is required for promoted-memory and tag
+generated columns.
 
 Applying these repository grants does not activate the PostgreSQL backend.
 Daemon/CLI routing remains gated by #224 and the #92 cutover. Re-run migration

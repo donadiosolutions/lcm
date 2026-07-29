@@ -533,6 +533,7 @@ export function runLcmMigrations(
       id TEXT PRIMARY KEY,
       content TEXT NOT NULL,
       tags TEXT NOT NULL DEFAULT '[]',
+      metadata TEXT NOT NULL DEFAULT '{}',
       source_summary_id TEXT,
       project_id TEXT NOT NULL,
       session_id TEXT,
@@ -544,8 +545,12 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS promoted_project_idx ON promoted (project_id, created_at);
   `);
 
-  // Add archived_at to promoted if not present
+  // Add post-baseline promoted fields for existing databases.
   const promotedColumns = db.prepare(`PRAGMA table_info(promoted)`).all() as Array<{ name?: string }>;
+  const hasPromotedMetadata = promotedColumns.some((col) => col.name === "metadata");
+  if (!hasPromotedMetadata) {
+    db.exec(`ALTER TABLE promoted ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'`);
+  }
   const hasArchivedAt = promotedColumns.some((col) => col.name === "archived_at");
   if (!hasArchivedAt) {
     db.exec(`ALTER TABLE promoted ADD COLUMN archived_at TEXT DEFAULT NULL`);

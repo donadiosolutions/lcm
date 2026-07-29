@@ -19,11 +19,13 @@ and hostname validation, sanitized SQLSTATE errors, abort cancellation,
 transactional migrations, extension readiness, and the complete durable schema
 baseline. Machine and project identity operations use that runtime directly.
 The general application storage factory remains staged while the domain
-adapters tracked by #87-#91 implement the remaining shared repository
+adapters tracked by #87 and #89-#91 implement the remaining shared repository
 contracts. The PostgreSQL conversation adapter is available to conformance
 tests, and the native-transcript adapter is available to explicit
-programmatic backfill and conformance, but neither is selected by normal daemon
-or CLI composition. With PostgreSQL selected, the daemon still opens its
+programmatic backfill and conformance. The promoted-memory, recall,
+redaction-administration, and coordination adapters are available to direct
+programmatic callers and conformance under the same staged boundary. None is
+selected by normal daemon or CLI composition. With PostgreSQL selected, the daemon still opens its
 loopback listener and exposes
 an authenticated `/health` response with HTTP `503`, backend
 `postgresql`, and storage status `unavailable`; storage-backed routes also
@@ -61,6 +63,11 @@ storage routes explicitly unavailable behind the staged loopback daemon rather
 than falling back to SQLite. See
 [PostgreSQL native transcripts](postgresql-native-transcripts.md) for the
 local-scrubbing, checkpoint, quarantine, and rollback boundaries.
+The issue #88 adapters implement the existing `ProjectRepositories` contracts
+for promoted memory, recall, redaction administration, and coordination, but
+remain deliberately absent from the unavailable PostgreSQL storage factory.
+See [PostgreSQL memory and administration](postgresql-memory-administration.md)
+for their metadata, concurrency, purge, and retention contract.
 
 ### PostgreSQL runtime and migrations
 
@@ -130,7 +137,7 @@ generated state, fully deparsed expression, and resolved collation. Tables must 
 row-level security neither enabled nor forced, and cannot participate in
 inheritance or partition parent/child relationships.
 Effective relation ACLs normalize the owner plus only the exact reviewed
-identity-, conversation-, and native-transcript-runtime grant shapes. Added `PUBLIC`,
+identity-, conversation-, native-transcript-, and memory-runtime grant shapes. Added `PUBLIC`,
 out-of-shape named-role privileges, foreign grantors, or grant options fail
 closed while null and explicit owner-only defaults compare equally. Column ACL
 fingerprints preserve every no-ACL identity and accept only the reviewed
@@ -171,11 +178,11 @@ The project scope groups operations by domain:
 | `summaries` | Summary records and DAG lineage |
 | `context` | Ordered context replacement, depth discovery, and token totals |
 | `largeFiles` | Large-file metadata and retrieval |
-| `promotedMemory` | Durable memory records, tags, confidence, archival, revival, and stale-candidate selection |
+| `promotedMemory` | Durable memory records, exact ordered tags, object metadata, confidence, archival, revival, and stale-candidate selection |
 | `recall` | Surfacing history, feedback, and recall statistics |
 | `lexicalSearch` | Backend-specific message, summary, and promoted-memory search with stable ordering, ranking, filtering, and fallback behavior |
-| `redactionAdmin` | Redaction counters and the bounded administrative operations needed by normal workflows |
-| `coordination` | Ingest checkpoints and other project-scoped workflow coordination |
+| `redactionAdmin` | Additive redaction counters, readback, and atomic purge of repository-owned mutable project state |
+| `coordination` | Completed-session ingest records and machine-scoped instruction-cache coordination |
 
 The caller that opens a `ProjectStorage` owns it and closes it in `finally`.
 Closing a project scope or factory is idempotent. Transaction-scoped
