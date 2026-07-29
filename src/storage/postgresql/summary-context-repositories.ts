@@ -33,6 +33,8 @@ import {
 const MIN_SAFE_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const MAX_POSTGRESQL_INTEGER = 2_147_483_647;
+const POSTGRESQL_INTEGER_PATH_WIDTH =
+  MAX_POSTGRESQL_INTEGER.toString().length;
 const MAX_SHORT_TRANSACTION_ATTEMPTS = 3;
 const SHORT_TRANSACTION_RETRY_SQLSTATES = new Set(["40001", "40P01"]);
 const INTEGRITY_SQLSTATES = new Set(["23503", "23505", "23514", "P0001"]);
@@ -848,7 +850,12 @@ class RepositoryCore {
         while (true) {
           try {
             return await root.transaction(
-              callback,
+              async (transaction) => {
+                await transaction.query({
+                  text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                }, this.context(domain, operation));
+                return callback(transaction);
+              },
               this.context(domain, operation),
             );
           } catch (error) {
@@ -865,8 +872,10 @@ class RepositoryCore {
           }
         }
       }
-      return await this.serializedScoped(operation, (executor) =>
-        executor.savepoint(callback, this.context(domain, operation)));
+      return await this.serializedScoped(operation, async (executor) => {
+        await this.assertReadCommitted(executor, domain, operation);
+        return executor.savepoint(callback, this.context(domain, operation));
+      });
     } catch (error) {
       throw this.mappedError(error, domain, operation);
     }
@@ -1021,7 +1030,7 @@ class RepositoryCore {
 
   private async assertReadCommitted(
     executor: PostgreSqlQueryExecutor,
-    domain: MutationDomain,
+    domain: "summaries" | "context" | "large-files",
     operation: string,
   ): Promise<void> {
     const result = await executor.query<IsolationRow>({
@@ -1881,6 +1890,7 @@ export class PostgreSqlSummaryRepository implements SummaryRepository {
       while (current.size > 0) {
         const next = new Map<string, Traversal>();
         for (const entry of [...current.values()].sort(compareTraversal)) {
+          if (visited.has(entry.key)) continue;
           const node = nodes.get(entry.key)!;
           visited.add(entry.key);
           output.push({
@@ -1895,9 +1905,10 @@ export class PostgreSqlSummaryRepository implements SummaryRepository {
           for (const edge of adjacency.get(entry.key) ?? []) {
             if (visited.has(edge.childKey)) continue;
             const ordinalText = edge.ordinal.toString();
-            const segment = ordinalText.length < 4
-              ? ordinalText.padStart(4, "0")
-              : ordinalText;
+            const segment = ordinalText.padStart(
+              POSTGRESQL_INTEGER_PATH_WIDTH,
+              "0",
+            );
             const candidate: Traversal = {
               key: edge.childKey,
               depthFromRoot: entry.depthFromRoot + 1,
@@ -1907,11 +1918,14 @@ export class PostgreSqlSummaryRepository implements SummaryRepository {
                 : `${entry.path}.${segment}`,
             };
             const prior = next.get(edge.childKey);
+            const pathOrder = prior === undefined
+              ? 0
+              : compareText(candidate.path, prior.path);
             if (
               prior === undefined
-              || candidate.path < prior.path
+              || pathOrder < 0
               || (
-                candidate.path === prior.path
+                pathOrder === 0
                 && candidate.parentKey! < prior.parentKey!
               )
             ) next.set(edge.childKey, candidate);
@@ -2499,6 +2513,9 @@ export class PostgreSqlContextRepository implements ContextRepository {
         }, this.core.context("context", operation));
         const shift = snapshot.endOrdinal - snapshot.startOrdinal;
         if (shift > 0) {
+          // PostgreSQL checks this non-deferrable unique index immediately.
+          // Ascending single-row moves ensure each target ordinal is vacant;
+          // one set UPDATE cannot guarantee a safe row visitation order.
           const suffix = await transaction.query<{ ordinal: unknown }>({
             text: `SELECT ordinal
                    FROM lcm.context_items

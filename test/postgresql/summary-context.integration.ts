@@ -632,6 +632,7 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
       const result = await exerciseSummaryContextRepositoryConformance(
         repositories(database, projectId),
         "postgresql-summary-context",
+        { subtreePathWidth: 10 },
       );
 
       expect(result.summaries.subtree).toHaveLength(13);
@@ -644,6 +645,102 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
         "postgresql-summary-context:unicode:資料/δ",
       ]);
     });
+  });
+
+  it("establishes read committed for atomic large-file inserts", async () => {
+    await withPostgreSqlTestDatabase(
+      "summary-large-file-isolation",
+      async (database) => {
+        await grantSummaryContextRuntimePrivileges(database);
+        const projectId = await createProject(
+          database,
+          "Summary large-file isolation",
+        );
+        const conversationId = await createConversationAsMigrator(
+          database,
+          projectId,
+          "summary-large-file-isolation",
+        );
+        await expect(database.runtime.query<{
+          transaction_isolation: string;
+        }>({
+          text: `SELECT pg_catalog.current_setting(
+                          'transaction_isolation'
+                        ) AS transaction_isolation`,
+        }, {
+          domain: "large-files",
+          operation: "verifyLargeFileIsolationDefault",
+          projectId,
+        })).resolves.toMatchObject({
+          rows: [{ transaction_isolation: "repeatable read" }],
+        });
+        await database.migrator.query({
+          text: `CREATE FUNCTION public.require_large_file_read_committed()
+                 RETURNS trigger
+                 LANGUAGE plpgsql
+                 SECURITY DEFINER
+                 SET search_path = pg_catalog
+                 AS $function$
+                 BEGIN
+                   IF pg_catalog.current_setting('transaction_isolation')
+                        OPERATOR(pg_catalog.<>) 'read committed' THEN
+                     RAISE EXCEPTION 'large-file insert isolation'
+                       USING ERRCODE = '25001';
+                   END IF;
+                   RETURN NEW;
+                 END
+                 $function$;
+                 CREATE TRIGGER require_large_file_read_committed
+                 BEFORE INSERT ON lcm.large_files
+                 FOR EACH ROW
+                 EXECUTE FUNCTION
+                   public.require_large_file_read_committed()`,
+        }, {
+          domain: "large-files",
+          operation: "requireLargeFileReadCommitted",
+          projectId,
+        });
+
+        const repository = new PostgreSqlLargeFileRepository(
+          database.runtime,
+          projectId,
+        );
+        await expect(repository.insertLargeFile({
+          fileId: "root-read-committed",
+          conversationId,
+          storageUri: "lcm://isolation/root",
+        })).resolves.toMatchObject({ fileId: "root-read-committed" });
+
+        await database.runtime.transaction(async (transaction) => {
+          await transaction.query({ text: "SELECT 1" }, {
+            domain: "large-files",
+            operation: "establishLargeFileRepeatableReadSnapshot",
+            projectId,
+          });
+          const scoped = new PostgreSqlLargeFileRepository(
+            transaction,
+            projectId,
+          );
+          await expect(scoped.insertLargeFile({
+            fileId: "scoped-repeatable-read",
+            conversationId,
+            storageUri: "lcm://isolation/scoped",
+          })).rejects.toMatchObject({
+            domain: "large-files",
+            field: "transaction_isolation",
+            operation: "insertLargeFile",
+            projectId,
+          });
+        }, {
+          domain: "large-files",
+          operation: "rejectScopedLargeFileRepeatableRead",
+          projectId,
+        });
+        await expect(repository.getLargeFile("scoped-repeatable-read"))
+          .resolves.toBeNull();
+      },
+      { defaultTransactionIsolation: "REPEATABLE READ" },
+    );
   });
 
   it("rolls back the summary when ordered file-reference insertion fails", async () => {
@@ -1771,7 +1868,7 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
         summaryId: `plan-child-${index.toString().padStart(2, "0")}`,
         depthFromRoot: 1,
         parentSummaryId: "plan-root",
-        path: "0000",
+        path: "0000000000",
         childCount: 0,
       })));
     });

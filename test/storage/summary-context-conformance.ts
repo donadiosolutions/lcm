@@ -21,6 +21,7 @@ export interface SummaryRepositoryConformanceInput {
   readonly primaryConversationId: number;
   readonly secondaryConversationId: number;
   readonly messageIds: readonly [number, number, number, number];
+  readonly subtreePathWidth?: number;
 }
 
 export interface SummaryRepositoryConformanceResult {
@@ -58,6 +59,10 @@ export interface SummaryContextConformanceRepositories {
   readonly summaries: SummaryRepository;
   readonly context: ContextRepository;
   readonly largeFiles: LargeFileRepository;
+}
+
+export interface SummaryContextConformanceOptions {
+  readonly subtreePathWidth?: number;
 }
 
 function requireConformanceInput<T>(
@@ -98,6 +103,7 @@ export async function exerciseSummaryRepositoryConformance(
     primaryConversationId,
     secondaryConversationId,
     messageIds,
+    subtreePathWidth = 4,
   } = requireConformanceInput(prepared, "summary");
   const { summaries } = fixtures;
   const inserted = {
@@ -347,7 +353,10 @@ export async function exerciseSummaryRepositoryConformance(
   expect(diamondLeaf).toMatchObject({
     depthFromRoot: 3,
     parentSummaryId: summaries.diamondLayerTwoLeft.summaryId,
-    path: "0000.0000.0000",
+    path: Array.from(
+      { length: 3 },
+      () => "0".repeat(subtreePathWidth),
+    ).join("."),
     childCount: 0,
   });
   expect(await repository.getSummarySubtree(`${summaries.root.summaryId}:missing`))
@@ -519,6 +528,7 @@ export async function exerciseLargeFileRepositoryConformance(
 export async function exerciseSummaryContextRepositoryConformance(
   repositories: SummaryContextConformanceRepositories,
   namespace?: string,
+  options: SummaryContextConformanceOptions = {},
 ): Promise<SummaryContextRepositoryConformanceResult> {
   const fixtures = createSummaryContextConformanceFixtures(namespace);
   const primary = await repositories.conversations.createConversation({
@@ -545,6 +555,9 @@ export async function exerciseSummaryContextRepositoryConformance(
     primaryConversationId: primary.conversationId,
     secondaryConversationId: secondary.conversationId,
     messageIds,
+    ...(options.subtreePathWidth === undefined
+      ? {}
+      : { subtreePathWidth: options.subtreePathWidth }),
   };
 
   const summaries = await exerciseSummaryRepositoryConformance(

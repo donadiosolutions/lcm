@@ -254,10 +254,10 @@ describe("PostgreSQL summary repository", () => {
         summaryId: "child-a",
         depthFromRoot: 1,
         parentSummaryId: "summary-a",
-        path: "0000",
+        path: "0000000000",
       },
-      { summaryId: "other", path: "0001" },
-      { summaryId: "wide-a", path: "10000" },
+      { summaryId: "other", path: "0000000001" },
+      { summaryId: "wide-a", path: "0000010000" },
     ]);
     const subtreeSql = db.query.mock.calls.find(
       ([config]) => config.text.includes("WITH RECURSIVE reachable"),
@@ -921,6 +921,8 @@ describe("PostgreSQL large-file repository", () => {
     await expect(repository.getLargeFilesByConversation(41))
       .resolves.toHaveLength(1);
 
+    expect(db.query.mock.calls[0]?.[0].text)
+      .toBe("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
     const lookup = db.query.mock.calls.find(
       ([config]) => config.text.includes("file_id_sha256"),
     )?.[0];
@@ -1291,6 +1293,8 @@ describe("PostgreSQL summary/context defensive branches", () => {
     const targetOne = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9090";
     const targetTwo = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f90a0";
     const targetThree = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f90b0";
+    const targetFour = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f90c0";
+    const targetFive = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f90d0";
     const edgeRow = (
       key: string,
       id: string,
@@ -1311,15 +1315,22 @@ describe("PostgreSQL summary/context defensive branches", () => {
         otherKey,
         "parent-b",
         summaryKey,
-        0,
+        10_000,
         "2026-01-01T00:00:00.000Z",
       ),
       edgeRow(
         childKey,
         "parent-a",
         summaryKey,
-        0,
+        2_000,
         "2026-01-02T00:00:00.000Z",
+      ),
+      edgeRow(
+        wideKey,
+        "equal-path-parent",
+        summaryKey,
+        2_000,
+        "2026-01-01T00:00:00.000Z",
       ),
       edgeRow(targetOne, "target-one", otherKey, 1),
       edgeRow(targetOne, "target-one", childKey, 0),
@@ -1327,6 +1338,10 @@ describe("PostgreSQL summary/context defensive branches", () => {
       edgeRow(targetTwo, "target-two", childKey, 1),
       edgeRow(targetThree, "target-three", otherKey, 0),
       edgeRow(targetThree, "target-three", childKey, 0),
+      edgeRow(targetFour, "target-four", wideKey, 1),
+      edgeRow(targetFour, "target-four", childKey, 0),
+      edgeRow(targetFive, "target-five", wideKey, 0),
+      edgeRow(targetFive, "target-five", childKey, 0),
     ];
     const repository = new PostgreSqlSummaryRepository(
       executor((config) => {
@@ -1346,20 +1361,77 @@ describe("PostgreSQL summary/context defensive branches", () => {
       .toMatchObject({
         depthFromRoot: 2,
         parentSummaryId: "parent-a",
-        path: "0000.0000",
+        path: "0000002000.0000000000",
       });
     expect(resultRows.find((row) => row.summaryId === "target-two"))
       .toMatchObject({
         depthFromRoot: 2,
-        parentSummaryId: "parent-b",
-        path: "0000.0000",
+        parentSummaryId: "parent-a",
+        path: "0000002000.0000000001",
       });
     expect(resultRows.find((row) => row.summaryId === "target-three"))
       .toMatchObject({
         depthFromRoot: 2,
         parentSummaryId: "parent-a",
-        path: "0000.0000",
+        path: "0000002000.0000000000",
       });
+    expect(resultRows.find((row) => row.summaryId === "target-four"))
+      .toMatchObject({
+        parentSummaryId: "parent-a",
+        path: "0000002000.0000000000",
+      });
+    expect(resultRows.find((row) => row.summaryId === "target-five"))
+      .toMatchObject({
+        parentSummaryId: "parent-a",
+        path: "0000002000.0000000000",
+      });
+  });
+
+  it("emits a direct child once when an indirect copy is already queued", async () => {
+    const edgeRow = (
+      key: string,
+      id: string,
+      parent: string | null,
+      ordinal: number | null,
+    ): QueryResultRow => ({
+      ...summaryRow,
+      summary_key: key,
+      summary_id: id,
+      edge_parent_summary_key: parent,
+      edge_ordinal: ordinal,
+    });
+    const repository = new PostgreSqlSummaryRepository(
+      executor((config) => {
+        if (config.text.includes("SELECT summary_key, summary_id")) {
+          return result([identityRow]);
+        }
+        if (config.text.includes("WITH RECURSIVE reachable")) {
+          return result([
+            edgeRow(summaryKey, "summary-a", null, null),
+            edgeRow(otherKey, "bridge", summaryKey, 2_000),
+            edgeRow(childKey, "direct-child", summaryKey, 10_000),
+            edgeRow(childKey, "direct-child", otherKey, 0),
+          ]);
+        }
+        throw new Error(`unexpected SQL: ${config.text}`);
+      }),
+      projectId,
+    );
+
+    const rows = await repository.getSummarySubtree("summary-a");
+    expect(rows.map((row) => row.summaryId)).toEqual([
+      "summary-a",
+      "bridge",
+      "direct-child",
+    ]);
+    expect(rows.filter((row) => row.summaryId === "direct-child"))
+      .toEqual([
+        expect.objectContaining({
+          depthFromRoot: 1,
+          parentSummaryId: "summary-a",
+          path: "0000010000",
+        }),
+      ]);
   });
 
   it("parses valid JSON file IDs and nullable large-file metadata", async () => {
@@ -1458,8 +1530,11 @@ describe("PostgreSQL summary/context defensive branches", () => {
     });
   });
 
-  it("uses a scoped savepoint for atomic large-file insertion", async () => {
-    const scoped = scopedExecutor(() => result([largeFileRow]));
+  it("requires read committed before a scoped atomic large-file insertion", async () => {
+    const scoped = scopedExecutor((config) =>
+      config.text.includes("transaction_isolation")
+        ? result([{ transaction_isolation: "read committed" }])
+        : result([largeFileRow]));
     await expect(new PostgreSqlLargeFileRepository(
       scoped,
       projectId,
@@ -1469,6 +1544,29 @@ describe("PostgreSQL summary/context defensive branches", () => {
       storageUri: "s3://bucket/key",
     })).resolves.toMatchObject({ fileId: "file-a" });
     expect(scoped.savepoint).toHaveBeenCalledOnce();
+    expect(scoped.query.mock.calls[0]?.[0].text)
+      .toContain("transaction_isolation");
+
+    const wrongIsolation = scopedExecutor((config) =>
+      config.text.includes("transaction_isolation")
+        ? result([{ transaction_isolation: "repeatable read" }])
+        : result([largeFileRow]));
+    await expect(new PostgreSqlLargeFileRepository(
+      wrongIsolation,
+      projectId,
+    ).insertLargeFile({
+      fileId: "file-b",
+      conversationId: 41,
+      storageUri: "s3://bucket/other",
+    })).rejects.toMatchObject({
+      domain: "large-files",
+      field: "transaction_isolation",
+      operation: "insertLargeFile",
+    });
+    expect(wrongIsolation.savepoint).not.toHaveBeenCalled();
+    expect(wrongIsolation.query.mock.calls.some(
+      ([config]) => config.text.includes("INSERT INTO lcm.large_files"),
+    )).toBe(false);
   });
 
   it("bounds atomic retries and never replays ambiguous commits", async () => {
@@ -2043,7 +2141,10 @@ describe("PostgreSQL summary/context defensive branches", () => {
     fileInput.storageUri = "s3://redirected";
     fileInput.explorationSummary = "redirected";
     await filePromise;
-    expect(fileDb.query.mock.calls[0]?.[0].values).toEqual([
+    const fileInsert = fileDb.query.mock.calls.find(
+      ([config]) => config.text.includes("INSERT INTO lcm.large_files"),
+    )?.[0];
+    expect(fileInsert?.values).toEqual([
       projectId,
       "file-a",
       41,
