@@ -1,6 +1,12 @@
 import * as PostgreSqlExports from "../../src/storage/postgresql/index.js";
 import type { ProjectRepositories } from "../../src/storage/contracts.js";
 import { exerciseConversationRepositoryConformance } from "./conversation-conformance.js";
+import {
+  exerciseCoordinationRepositoryConformance,
+  exercisePromotedMemoryRepositoryConformance,
+  exerciseRecallRepositoryConformance,
+  exerciseRedactionAdminRepositoryConformance,
+} from "./memory-conformance.js";
 
 type ProjectRepositoryDomain = keyof ProjectRepositories;
 
@@ -57,10 +63,34 @@ export const POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS = {
   conversations: {
     implementation: PostgreSqlExports.PostgreSqlConversationRepository,
   },
+  promotedMemory: {
+    implementation: PostgreSqlExports.PostgreSqlPromotedMemoryRepository,
+  },
+  recall: {
+    implementation: PostgreSqlExports.PostgreSqlRecallRepository,
+  },
+  redactionAdmin: {
+    implementation: PostgreSqlExports.PostgreSqlRedactionAdminRepository,
+  },
+  coordination: {
+    implementation: PostgreSqlExports.PostgreSqlCoordinationRepository,
+  },
 } as const satisfies PostgreSqlProjectRepositoryAdapterManifest;
 
 export const POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE = {
   conversations: {
     exercise: exerciseConversationRepositoryConformance,
+  },
+  promotedMemory: {
+    exercise: exercisePromotedMemoryRepositoryConformance,
+  },
+  recall: {
+    exercise: exerciseRecallRepositoryConformance,
+  },
+  redactionAdmin: {
+    exercise: exerciseRedactionAdminRepositoryConformance,
+  },
+  coordination: {
+    exercise: exerciseCoordinationRepositoryConformance,
   },
 } as const satisfies PostgreSqlProjectRepositoryConformanceManifest;

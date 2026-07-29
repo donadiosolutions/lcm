@@ -299,8 +299,9 @@ After migration, apply only the reviewed scripts required by the repositories
 that this runtime role will use:
 [`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql),
 [`postgresql-runtime-conversation-grants.sql`](postgresql-runtime-conversation-grants.sql),
+[`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql),
 and
-[`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql).
+[`postgresql-runtime-memory-grants.sql`](postgresql-runtime-memory-grants.sql).
 Run them as an administrator, substituting the deployment's restricted runtime
 role:
 
@@ -316,6 +317,10 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file docs/postgresql-runtime-transcript-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-memory-grants.sql
 ```
 
 The transcript grant permits immutable inserts, provenance reads, and bounded
@@ -324,6 +329,12 @@ unrelated table access. Applying it makes the programmatic repository usable,
 not the staged daemon/CLI routes. See
 [PostgreSQL native transcripts](postgresql-native-transcripts.md) before
 running an explicit backfill.
+The memory grant permits direct use of the staged promoted-memory, recall,
+redaction-administration, and session-coordination repositories. Deletes are
+limited to their six owned mutable-state tables; generated search data is
+removed with promoted memory, while identity, conversations, summaries,
+transcripts, checkpoints, events, and leases are retained. See
+[PostgreSQL memory and administration](postgresql-memory-administration.md).
 
 Finally restore `LCM_POSTGRES_URL` to the restricted runtime-role URL, run
 `lcm machine register`, pair projects explicitly, and restart the daemon.

@@ -116,6 +116,7 @@ export function defineCoreStorageConformance(
     const memoryId = await storage.promotedMemory.insert({
       content: "durable needle",
       tags: ["architecture", "Foo", "foo", "", " spaced ", "Foo"],
+      metadata: { origin: "conformance", nested: { revision: 1 } },
       sourceSummaryId: "external-summary",
       sourceProjectId: "source-a",
       sessionId: "session-a",
@@ -123,6 +124,7 @@ export function defineCoreStorageConformance(
     } as Parameters<typeof storage.promotedMemory.insert>[0]);
     expect(await storage.promotedMemory.getById(memoryId)).toMatchObject({
       tags: ["architecture", "Foo", "foo", "", " spaced ", "Foo"],
+      metadata: { nested: { revision: 1 }, origin: "conformance" },
       projectId: "source-a",
       sourceSummaryId: "external-summary",
     });
@@ -136,8 +138,17 @@ export function defineCoreStorageConformance(
     expect(await storage.promotedMemory.getAll({ tags: ["foo"] })).toHaveLength(1);
     expect(await storage.promotedMemory.getAll({ tags: ["FOO"] })).toEqual([]);
     expect(await storage.promotedMemory.getAll({ sourceProjectId: "missing" })).toEqual([]);
+    expect(await storage.promotedMemory.getAll({ sourceProjectId: "" })).toEqual([]);
+    expect(await storage.promotedMemory.getAll({
+      since: "1970-01-01T00:00:00Z",
+    })).toHaveLength(1);
     expect(await storage.promotedMemory.listContentPrefixes(5)).toEqual(["durable needle"]);
-    await storage.promotedMemory.update(memoryId, { content: "updated needle", confidence: 0.8, tags: ["updated"] });
+    await storage.promotedMemory.update(memoryId, {
+      content: "updated needle",
+      confidence: 0.8,
+      tags: ["updated"],
+      metadata: { revision: 2 },
+    });
     expect(await storage.promotedMemory.findStale({
       staleAfterDays: -1,
       staleSurfacingWithoutUseLimit: 2,
@@ -147,6 +158,11 @@ export function defineCoreStorageConformance(
       staleAfterDays: -1,
       staleSurfacingWithoutUseLimit: 2,
       sourceProjectId: "missing",
+    })).toEqual([]);
+    expect(await storage.promotedMemory.findStale({
+      staleAfterDays: -1,
+      staleSurfacingWithoutUseLimit: 2,
+      sourceProjectId: "",
     })).toEqual([]);
     await storage.promotedMemory.archive(memoryId);
     expect(await storage.promotedMemory.getAll()).toEqual([]);
@@ -173,6 +189,13 @@ export function defineCoreStorageConformance(
     expect((await storage.recall.getStats()).memoriesSurfaced).toBe(3);
     await storage.redactionAdmin.upsertCounts({ gitleaks: 1, builtIn: 1, global: 1, project: 1 });
     await storage.redactionAdmin.upsertCounts({ gitleaks: 0, builtIn: 0, global: 0, project: 0 });
+    expect(await storage.redactionAdmin.getCounts()).toEqual({
+      gitleaks: 1,
+      builtIn: 1,
+      global: 1,
+      project: 1,
+      total: 4,
+    });
     await storage.coordination.recordSessionIngest("session-a", 3);
     expect(await storage.coordination.getSessionIngest("session-a")).toMatchObject({ messageCount: 3 });
     expect(await storage.coordination.getSessionIngest("missing")).toBeNull();
@@ -201,6 +224,16 @@ export function defineCoreStorageConformance(
     await storage.promotedMemory.deleteById(memoryId);
     expect(await storage.promotedMemory.getById(memoryId)).toBeNull();
     expect((await storage.recall.getFeedback([memoryId])).get(memoryId)?.surfacingCount).toBe(1);
+    expect(await storage.redactionAdmin.purgeProjectState()).toMatchObject({
+      promotedMemories: 0,
+      promotedTags: 0,
+      recallSurfacings: 4,
+      redactionCounters: 4,
+      sessionIngestLogs: 1,
+      sessionInstructions: 1,
+    });
+    expect(await storage.conversations.getConversation(first.conversationId))
+      .toMatchObject({ sessionId: "session-a" });
     await storage.close();
     await harness.factory.close();
   });

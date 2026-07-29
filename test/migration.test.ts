@@ -418,6 +418,44 @@ describe("promoted table migration", () => {
 
     db.close();
   });
+
+  it("adds metadata and archive fields to an existing promoted table without data loss", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-promoted-metadata-"));
+    tempDirs.push(tempDir);
+    const db = getLcmConnection(join(tempDir, "legacy.db"));
+    db.exec(`
+      CREATE TABLE promoted (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        tags TEXT NOT NULL DEFAULT '[]',
+        source_summary_id TEXT,
+        project_id TEXT NOT NULL,
+        session_id TEXT,
+        depth INTEGER NOT NULL DEFAULT 0,
+        confidence REAL NOT NULL DEFAULT 1.0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO promoted (id, content, project_id)
+      VALUES ('legacy', 'preserved', 'project');
+    `);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const columns = db.prepare("PRAGMA table_info(promoted)").all() as Array<{
+      name: string;
+    }>;
+    expect(columns.map(({ name }) => name)).toEqual(expect.arrayContaining([
+      "metadata",
+      "archived_at",
+    ]));
+    expect(db.prepare(
+      "SELECT content, metadata, archived_at FROM promoted WHERE id = 'legacy'",
+    ).get()).toEqual({
+      content: "preserved",
+      metadata: "{}",
+      archived_at: null,
+    });
+  });
 });
 
 describe("redaction_stats table migration", () => {

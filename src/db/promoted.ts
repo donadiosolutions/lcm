@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import type { JsonObject, JsonValue } from "../storage/contracts.js";
 
 // A fresh one-term fallback match clears the default prompt-search minimum of
 // two while still leaving room for recency, affinity, and feedback penalties.
@@ -9,6 +10,7 @@ export type PromotedRow = {
   id: string;
   content: string;
   tags: string;
+  metadata: string;
   source_summary_id: string | null;
   project_id: string;
   session_id: string | null;
@@ -21,6 +23,7 @@ export type PromotedRow = {
 export type InsertParams = {
   content: string;
   tags?: string[];
+  metadata?: JsonObject;
   sourceSummaryId?: string;
   projectId: string;
   sessionId?: string;
@@ -51,6 +54,98 @@ export function parsePromotedTags(serialized: string): string[] {
   }
 }
 
+function validatedJsonString(value: string): string {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 0) throw new TypeError("metadata contains an unsupported string");
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const following = value.charCodeAt(index + 1);
+      if (!(following >= 0xdc00 && following <= 0xdfff)) {
+        throw new TypeError("metadata contains an unsupported string");
+      }
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new TypeError("metadata contains an unsupported string");
+    }
+  }
+  return value;
+}
+
+function promotedJsonValue(
+  value: unknown,
+  seen = new Set<object>(),
+  depth = 1,
+): JsonValue {
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "string") return validatedJsonString(value);
+  if (typeof value === "number") {
+    if (
+      !Number.isFinite(value)
+      || Object.is(value, -0)
+      || (Number.isInteger(value) && !Number.isSafeInteger(value))
+    ) {
+      throw new TypeError("metadata contains an unsupported number");
+    }
+    return value;
+  }
+  if (typeof value !== "object" || depth > 100 || seen.has(value)) {
+    throw new TypeError("metadata must be finite acyclic JSON");
+  }
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return Object.freeze(value.map((element) =>
+        promotedJsonValue(element, seen, depth + 1))) as JsonValue[];
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError("metadata must be a JSON object");
+    }
+    if (Object.getOwnPropertySymbols(value).length > 0) {
+      throw new TypeError("metadata must not contain symbol keys");
+    }
+    const normalized: Record<string, JsonValue> = {};
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    for (const key of Object.keys(descriptors).sort()) {
+      const descriptor = descriptors[key]!;
+      if (!descriptor.enumerable) continue;
+      if (!("value" in descriptor)) {
+        throw new TypeError("metadata must not contain accessors");
+      }
+      validatedJsonString(key);
+      Object.defineProperty(normalized, key, {
+        enumerable: true,
+        value: promotedJsonValue(descriptor.value, seen, depth + 1),
+      });
+    }
+    return Object.freeze(normalized);
+  } finally {
+    seen.delete(value);
+  }
+}
+
+export function normalizePromotedMetadata(value: unknown): JsonObject {
+  const candidate = promotedJsonValue(value);
+  if (candidate === null || Array.isArray(candidate) || typeof candidate !== "object") {
+    throw new TypeError("metadata must be a JSON object");
+  }
+  return candidate;
+}
+
+export function serializePromotedMetadata(value: unknown): string {
+  return JSON.stringify(normalizePromotedMetadata(value));
+}
+
+export function parsePromotedMetadata(serialized: string): JsonObject {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(serialized);
+  } catch {
+    throw new TypeError("stored promoted metadata is malformed");
+  }
+  return normalizePromotedMetadata(parsed);
+}
+
 export class PromotedStore {
   constructor(
     private db: DatabaseSync,
@@ -63,15 +158,17 @@ export class PromotedStore {
       throw new TypeError("tags must be an array of strings");
     }
     const tags = JSON.stringify(params.tags ?? []);
+    const metadata = serializePromotedMetadata(params.metadata ?? {});
 
     const insertRow = (): void => {
       this.db.prepare(
-        `INSERT INTO promoted (id, content, tags, source_summary_id, project_id, session_id, depth, confidence)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO promoted (id, content, tags, metadata, source_summary_id, project_id, session_id, depth, confidence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         id,
         params.content,
         tags,
+        metadata,
         params.sourceSummaryId ?? null,
         params.projectId,
         params.sessionId ?? null,
@@ -155,12 +252,12 @@ export class PromotedStore {
     let sql = "SELECT * FROM promoted WHERE archived_at IS NULL";
     const params: (string | number)[] = [];
 
-    if (opts?.projectId) {
+    if (opts?.projectId !== undefined) {
       sql += " AND project_id = ?";
       params.push(opts.projectId);
     }
-    if (opts?.since) {
-      sql += " AND created_at >= ?";
+    if (opts?.since !== undefined) {
+      sql += " AND julianday(created_at) >= julianday(?)";
       params.push(opts.since);
     }
     sql += " ORDER BY created_at ASC";
@@ -212,7 +309,10 @@ export class PromotedStore {
     });
   }
 
-  update(id: string, fields: { content?: string; confidence?: number; tags?: string[] }): void {
+  update(id: string, fields: { content?: string; confidence?: number; tags?: string[]; metadata?: JsonObject }): void {
+    const serializedMetadata = fields.metadata === undefined
+      ? undefined
+      : serializePromotedMetadata(fields.metadata);
     const row = this.db.prepare("SELECT rowid, content, tags FROM promoted WHERE id = ?").get(id) as
       | { rowid: number; content: string; tags: string }
       | undefined;
@@ -222,14 +322,14 @@ export class PromotedStore {
       const newTags = fields.tags !== undefined ? JSON.stringify(fields.tags) : row.tags;
       if (!this.fts5Available) {
         this.db.prepare(
-          "UPDATE promoted SET content = ?, confidence = COALESCE(?, confidence), tags = ? WHERE id = ?"
-        ).run(fields.content, fields.confidence ?? null, newTags, id);
+          "UPDATE promoted SET content = ?, confidence = COALESCE(?, confidence), tags = ?, metadata = COALESCE(?, metadata) WHERE id = ?"
+        ).run(fields.content, fields.confidence ?? null, newTags, serializedMetadata ?? null, id);
         return;
       }
       this.withFtsSavepoint(() => {
         this.db.prepare(
-          "UPDATE promoted SET content = ?, confidence = COALESCE(?, confidence), tags = ? WHERE id = ?"
-        ).run(fields.content!, fields.confidence ?? null, newTags, id);
+          "UPDATE promoted SET content = ?, confidence = COALESCE(?, confidence), tags = ?, metadata = COALESCE(?, metadata) WHERE id = ?"
+        ).run(fields.content!, fields.confidence ?? null, newTags, serializedMetadata ?? null, id);
         this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
         this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
           row.rowid,
@@ -245,17 +345,23 @@ export class PromotedStore {
         const newTags = JSON.stringify(fields.tags);
         if (!this.fts5Available) {
           this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
-          return;
+        } else {
+          this.withFtsSavepoint(() => {
+            this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
+            this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+            this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
+              row.rowid,
+              row.content,
+              newTags,
+            );
+          });
         }
-        this.withFtsSavepoint(() => {
-          this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
-          this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
-          this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
-            row.rowid,
-            row.content,
-            newTags,
-          );
-        });
+      }
+      if (serializedMetadata !== undefined) {
+        this.db.prepare("UPDATE promoted SET metadata = ? WHERE id = ?").run(
+          serializedMetadata,
+          id,
+        );
       }
     }
   }
@@ -289,7 +395,7 @@ export class PromotedStore {
     let sql = `SELECT * FROM promoted WHERE archived_at IS NULL AND created_at < ?`;
     const params: (string | number)[] = [cutoff];
 
-    if (opts.projectId) {
+    if (opts.projectId !== undefined) {
       sql += " AND project_id = ?";
       params.push(opts.projectId);
     }

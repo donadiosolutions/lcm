@@ -5,6 +5,7 @@ export * from "./errors.js";
 export * from "./extensions.js";
 export * from "./identity-repository.js";
 export * from "./migrations.js";
+export * from "./memory-repositories.js";
 export * from "./native-transcript-repository.js";
 export * from "./runtime.js";
 export * from "./search-configuration.js";
