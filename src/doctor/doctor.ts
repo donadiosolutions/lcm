@@ -138,6 +138,23 @@ function readDoctorDaemonToken(deps: DoctorDeps): string | null {
   }
 }
 
+async function readDoctorAuthenticatedHealth(
+  deps: DoctorDeps,
+  port: number,
+): Promise<DoctorDaemonHealth | null> {
+  return readRecognizedDaemonHealth(
+    deps.fetch,
+    port,
+    readDoctorDaemonToken(deps),
+  );
+}
+
+function storageReadinessFromHealth(
+  health: DoctorDaemonHealth,
+): DaemonStorageReadiness {
+  return health.status === "ok" ? "ready" : "unavailable";
+}
+
 export interface DoctorRunOptions {
   verbose?: boolean;
   eventsMaxDbs?: number;
@@ -765,14 +782,10 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       let postRestartStorageReadiness: DaemonStorageReadiness = "unverified";
       if (ensureResult.connected) {
         try {
-          const h = await readRecognizedDaemonHealth(
-            deps.fetch,
-            config.port,
-            readDoctorDaemonToken(deps),
-          );
+          const h = await readDoctorAuthenticatedHealth(deps, config.port);
           if (h) {
             postRestartOk = true;
-            postRestartStorageReadiness = h.status === "ok" ? "ready" : "unavailable";
+            postRestartStorageReadiness = storageReadinessFromHealth(h);
             daemonStorageReadiness = postRestartStorageReadiness;
             postRestartVersion = h.version;
           }
@@ -867,9 +880,10 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
         results.push({ name: "daemon", category: "Daemon", status: "warn", message: `localhost:${config.port} — started${warning}`, fixApplied: true });
         daemonHealthy = true;
-        // Startup established liveness, but doctor did not perform its own
-        // authenticated post-validation storage diagnostic on this path.
-        daemonStorageReadiness = "unverified";
+        try {
+          const h = await readDoctorAuthenticatedHealth(deps, config.port);
+          if (h) daemonStorageReadiness = storageReadinessFromHealth(h);
+        } catch { /* non-fatal */ }
       } else {
         results.push({ name: "daemon", category: "Daemon", status: "fail", message: `localhost:${config.port} not responding\n     Fix: lcm daemon start` });
       }

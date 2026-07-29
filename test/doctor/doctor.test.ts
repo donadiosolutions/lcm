@@ -680,7 +680,183 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult?.message).toContain("daemon parent invariant is not verified");
   });
 
-  it("does not recognize a successful HTTP response with unavailable non-staged health", async () => {
+  it("authenticates healthy storage after auto-start before promising queue drain", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 3737,
+      spawned: true,
+      pid: 4242,
+      startMethod: "systemd-user",
+    });
+    mockCollectEventStats.mockReturnValue({
+      captured: 100,
+      unprocessed: 5,
+      errors: 0,
+      lastCapture: "2026-03-26 10:00:00",
+    });
+    const fetch = vi.fn()
+      .mockRejectedValueOnce(new Error("daemon offline"))
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          status: "ok",
+          version: "0.5.0",
+          storageBackend: "sqlite",
+          uptime: 1,
+          pid: 4242,
+        }),
+      });
+
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch,
+      readFileSync: (path: string) => path.endsWith("daemon.token")
+        ? "doctor-token"
+        : minimalDeps().readFileSync(path),
+    }));
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:3737/health",
+      {
+        headers: { Authorization: "Bearer doctor-token" },
+        signal: expect.any(AbortSignal),
+      },
+    );
+    expect(results.find((result) => result.name === "daemon")).toMatchObject({
+      status: "warn",
+      fixApplied: true,
+      message: expect.stringContaining("started"),
+    });
+    expect(results.find((result) => result.name === "events-capture")).toMatchObject({
+      status: "pass",
+      message: expect.stringContaining("queued for automatic daemon processing"),
+    });
+  });
+
+  it("reports authenticated staged storage after PostgreSQL auto-start", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-autostart-"));
+    const caFile = join(dir, "ca.pem");
+    writeFileSync(caFile, "test-ca");
+    const previousUrl = process.env.LCM_POSTGRES_URL;
+    const previousCaFile = process.env.LCM_POSTGRES_CA_FILE;
+    process.env.LCM_POSTGRES_URL = "postgresql://user:password@db.example/lcm";
+    process.env.LCM_POSTGRES_CA_FILE = caFile;
+    const stagedHealth = {
+      status: "unavailable",
+      version: "0.5.0",
+      storageBackend: "postgresql",
+      uptime: 1,
+      pid: 4242,
+      storage: {
+        status: "unavailable",
+        error: {
+          code: "STORAGE_INITIALIZATION_FAILED",
+          backend: "postgresql",
+          domain: "factory",
+          operation: "health",
+        },
+      },
+    };
+    const fetch = vi.fn()
+      .mockRejectedValueOnce(new Error("daemon offline"))
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: async () => stagedHealth,
+      });
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 3737,
+      spawned: true,
+      pid: 4242,
+      startMethod: "systemd-user",
+    });
+    mockCollectEventStats.mockReturnValue({
+      captured: 100,
+      unprocessed: 5,
+      errors: 0,
+      lastCapture: "2026-03-26 10:00:00",
+    });
+    try {
+      const results = await runDoctor(minimalDeps({
+        cwd: "/tmp/nonexistent-project-xyz",
+        fetch,
+        readFileSync: (path: string) => {
+          if (path.endsWith("config.json")) {
+            return JSON.stringify({ storage: { backend: "postgresql" } });
+          }
+          if (path.endsWith("daemon.token")) return "doctor-token";
+          return minimalDeps().readFileSync(path);
+        },
+      }));
+
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenNthCalledWith(
+        2,
+        "http://127.0.0.1:3737/health",
+        {
+          headers: { Authorization: "Bearer doctor-token" },
+          signal: expect.any(AbortSignal),
+        },
+      );
+      expect(results.find((result) => result.name === "events-capture")).toMatchObject({
+        status: "warn",
+        message: expect.stringContaining("storage is unavailable"),
+      });
+      expect(results.find((result) => result.name === "events-capture")?.message)
+        .not.toContain("could not be authenticated");
+    } finally {
+      if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousUrl;
+      if (previousCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousCaFile;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps auto-started storage unverified when the daemon token is unreadable", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 3737,
+      spawned: true,
+      pid: 4242,
+      startMethod: "systemd-user",
+    });
+    mockCollectEventStats.mockReturnValue({
+      captured: 100,
+      unprocessed: 5,
+      errors: 0,
+      lastCapture: "2026-03-26 10:00:00",
+    });
+    const fetch = vi.fn().mockRejectedValueOnce(new Error("daemon offline"));
+
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch,
+      readFileSync: (path: string) => {
+        if (path.endsWith("daemon.token")) throw new Error("permission denied");
+        return minimalDeps().readFileSync(path);
+      },
+    }));
+
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(results.find((result) => result.name === "daemon")).toMatchObject({
+      status: "warn",
+      fixApplied: true,
+      message: expect.stringContaining("started"),
+    });
+    expect(results.find((result) => result.name === "events-capture")).toMatchObject({
+      status: "warn",
+      message: expect.stringContaining("storage readiness could not be authenticated"),
+    });
+    expect(results.find((result) => result.name === "events-capture")?.message)
+      .toContain("restore access to the daemon token and authenticated diagnostics");
+  });
+
+  it("does not recognize unavailable non-staged health before or after auto-start", async () => {
     vi.mocked(ensureDaemon).mockResolvedValueOnce({
       connected: true,
       port: 3737,
@@ -695,9 +871,20 @@ describe("runDoctor daemon version mismatch", () => {
     const results = await runDoctor(minimalDeps({
       cwd: "/tmp/nonexistent-project-xyz",
       fetch,
+      readFileSync: (path: string) => path.endsWith("daemon.token")
+        ? "doctor-token"
+        : minimalDeps().readFileSync(path),
     }));
 
-    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:3737/health",
+      {
+        headers: { Authorization: "Bearer doctor-token" },
+        signal: expect.any(AbortSignal),
+      },
+    );
     expect(results.find((result) => result.name === "daemon")).toMatchObject({
       status: "warn",
       fixApplied: true,
