@@ -1267,6 +1267,12 @@ test("documents safe initial and incremental Question migration paths", async ()
   const wait = protocol.indexOf("wait for every\n   in-flight run");
   const snapshot = protocol.indexOf("Snapshot every open and closed issue");
   const reconcile = protocol.indexOf("reconcile every issue\n   created after the snapshot");
+  const currentLegacyLabels = protocol.indexOf(
+    "every issue currently carrying a legacy label",
+  );
+  const currentQuestionLabels = protocol.indexOf(
+    "includes every issue that currently\n   carries `question`",
+  );
   const verify = protocol.indexOf("Verify the complete, reconciled inventory");
   const remove = protocol.indexOf("delete the path's\n   legacy labels");
   const resume = protocol.indexOf("Resume the issue-labeler first");
@@ -1276,7 +1282,9 @@ test("documents safe initial and incremental Question migration paths", async ()
     && wait > pause
     && snapshot > wait
     && reconcile > snapshot
-    && verify > reconcile
+    && currentLegacyLabels > reconcile
+    && currentQuestionLabels > currentLegacyLabels
+    && verify > currentQuestionLabels
     && remove > verify
     && resume > remove
     && resumeStale > resume,
@@ -1322,7 +1330,7 @@ test("documents safe initial and incremental Question migration paths", async ()
   );
   assert.match(
     followup,
-    /pause both mutating workflows[\s\S]*?snapshot every open and closed issue[\s\S]*?Create the native `Question` Issue type[\s\S]*?set\s+only its Issue type to `Question`[\s\S]*?final rescan for queued and newly created issues[\s\S]*?Verify every issue in the reconciled inventory[\s\S]*?delete the `question` label only after that verification\s+succeeds[\s\S]*?resume the issue-labeler[\s\S]*?resume stale/u,
+    /pause both mutating workflows[\s\S]*?snapshot every open and closed issue[\s\S]*?Create the native `Question` Issue type[\s\S]*?set\s+only its Issue type to `Question`[\s\S]*?final rescan for queued and newly created issues and\s+every issue that currently carries `question`[\s\S]*?Add each one to the reviewed\s+inventory and apply the same mapping before verification[\s\S]*?Verify every issue\s+in the reconciled inventory[\s\S]*?delete the `question` label only after that verification\s+succeeds[\s\S]*?resume the issue-labeler[\s\S]*?resume stale/u,
   );
   assert.match(
     followup,

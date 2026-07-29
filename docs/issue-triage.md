@@ -137,11 +137,15 @@ migration.
    migration can be identified.
 3. Perform the selected migration while both workflows remain paused.
 4. Before final verification, rescan the repository and reconcile every issue
-   created after the snapshot as well as every issue carrying
-   `needs-codex-triage`. Add each one to the reviewed inventory, apply the same
+   created after the snapshot, every issue carrying `needs-codex-triage`, and
+   every issue currently carrying a legacy label that the selected path will
+   delete. For the Question follow-up, this includes every issue that currently
+   carries `question`, even if the issue predates the snapshot or received the
+   label after it. Add each one to the reviewed inventory, apply the same
    migration rules, add the queue label to any newly created issue that does
    not have it, and retain that label for normal classification after the
-   workflow resumes.
+   workflow resumes. If this inventory changes before legacy-label deletion,
+   repeat the rescan, reconciliation, and verification.
 5. Verify the complete, reconciled inventory. Deprecate and delete the path's
    legacy labels only after this verification succeeds.
 6. Resume the issue-labeler first and dispatch its catch-up run. Confirm that
@@ -206,10 +210,13 @@ Do not rerun or rewrite the historical migration.
    reviewed and declassified as non-security before it receives `Question`.
    Resolve all other reviewed exceptions individually instead of overwriting
    their existing Issue type.
-4. Perform the protocol's final rescan for queued and newly created issues.
-   Verify every issue in the reconciled inventory against the reviewed mapping
-   and confirm that no Priority, security field, other Planning Field value,
-   state, or unrelated label changed.
+4. Perform the protocol's final rescan for queued and newly created issues and
+   every issue that currently carries `question`, including pre-snapshot issues
+   that received the label during the migration. Add each one to the reviewed
+   inventory and apply the same mapping before verification. Verify every issue
+   in the reconciled inventory against the reviewed mapping and confirm that no
+   Priority, security field, other Planning Field value, state, or unrelated
+   label changed.
 5. Deprecate and delete the `question` label only after that verification
    succeeds. Then resume the issue-labeler, run its catch-up, and resume stale
    in the order required by the rollout safety protocol.
