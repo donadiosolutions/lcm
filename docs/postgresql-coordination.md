@@ -66,9 +66,11 @@ callers cannot create ambiguous lock families.
 
 Supply a positive `timeoutMs` and optionally an `AbortSignal`. LCM applies the
 timeout transaction-locally, restores the prior setting after acquisition, and
-passes cancellation to the bounded runtime query path. Errors identify only
-the operation, project, and machine; they do not expose the resource key, SQL,
-bound values, URL, or credentials.
+passes cancellation to the bounded runtime query path. A PostgreSQL
+`lock_timeout` result is retryable so callers can back off; cancellation and
+permanent failures remain non-retryable. Errors identify only the operation,
+project, and machine; they do not expose the resource key, SQL, bound values,
+URL, or credentials.
 
 Keep the transaction short. Do not call a model, provider, remote service, or
 other unbounded operation while holding the lock.

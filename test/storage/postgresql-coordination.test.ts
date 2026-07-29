@@ -16,6 +16,7 @@ import {
   PostgreSqlLeaseFenceError,
   PostgreSqlWorkCoordinator,
 } from "../../src/storage/postgresql/coordination.js";
+import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 import { StorageOperationError } from "../../src/storage/errors.js";
 
 const projectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
@@ -367,6 +368,48 @@ describe("PostgreSQL work coordination", () => {
         { retryable: true },
       ),
       true,
+    ],
+    [
+      new PostgreSqlStorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        {
+          domain: "coordination",
+          operation: "compact",
+          projectId,
+          machineId,
+        },
+        "55P03",
+        false,
+      ),
+      true,
+    ],
+    [
+      new PostgreSqlStorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        {
+          domain: "coordination",
+          operation: "compact",
+          projectId,
+          machineId,
+        },
+        "57014",
+        false,
+      ),
+      false,
+    ],
+    [
+      new PostgreSqlStorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        {
+          domain: "coordination",
+          operation: "compact",
+          projectId,
+          machineId,
+        },
+        "22023",
+        false,
+      ),
+      false,
     ],
   ])("sanitizes lock failures with machine context %#", async (
     failure,

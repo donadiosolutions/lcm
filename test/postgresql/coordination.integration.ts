@@ -468,6 +468,7 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
           projectId: scope.projectId,
           machineId: scope.machineIds[1],
           operation: "cancelled-contender",
+          retryable: false,
         });
         expect(JSON.stringify(cancellationError)).not.toContain(
           "shared-resource",
@@ -540,6 +541,7 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
           projectId: scope.projectId,
           machineId: scope.machineIds[1],
           operation: "timed-contender",
+          retryable: true,
         });
 
         await expect(contender.transaction(async (transaction) => {

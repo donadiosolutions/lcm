@@ -8,6 +8,7 @@ import type {
   PostgreSqlQueryOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
+import { PostgreSqlStorageOperationError } from "./errors.js";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -316,6 +317,15 @@ function coordinationError(
     field,
     machineId,
   );
+}
+
+function isRetryableTransactionLockFailure(error: unknown): boolean {
+  if (!(error instanceof StorageOperationError)) return false;
+  if (error.retryable) return true;
+  // 55P03 is context-dependent. Only a bounded coordination lock_timeout
+  // makes lock unavailability safe for callers to retry.
+  return error instanceof PostgreSqlStorageOperationError
+    && error.sqlState === "55P03";
 }
 
 function text(
@@ -851,7 +861,7 @@ export class PostgreSqlWorkCoordinator {
         this.projectId,
         this.machineId,
         operation,
-        error instanceof StorageOperationError && error.retryable,
+        isRetryableTransactionLockFailure(error),
       );
     }
   }
