@@ -1276,6 +1276,24 @@ test("documents safe initial and incremental Question migration paths", async ()
   const verify = protocol.indexOf("Verify the complete, reconciled inventory");
   const remove = protocol.indexOf("delete the path's\n   legacy labels");
   const resume = protocol.indexOf("Resume the issue-labeler first");
+  const replayHighWater = protocol.indexOf(
+    "record a post-resume highest\n   issue number",
+  );
+  const replay = protocol.indexOf(
+    "bounded, paginated replay of every issue\n   created since the snapshot through that high-water mark",
+  );
+  const replayQueue = protocol.indexOf(
+    "idempotently add\n   `needs-codex-triage` to every issue that remains unclassified",
+  );
+  const replayOverlap = protocol.indexOf(
+    "resume may overlap the replay with live `issues.opened` events",
+  );
+  const replayVerify = protocol.indexOf(
+    "Verify that every replayed issue\n   either completes classification or remains queued for retry",
+  );
+  const replayFailClosed = protocol.indexOf(
+    "Keep stale paused and fail closed",
+  );
   const resumeStale = protocol.indexOf("resume the stale workflow");
   assert.ok(
     pause >= 0
@@ -1287,7 +1305,14 @@ test("documents safe initial and incremental Question migration paths", async ()
     && verify > currentQuestionLabels
     && remove > verify
     && resume > remove
-    && resumeStale > resume,
+    && replayHighWater > resume
+    && replay > replayHighWater
+    && replayQueue > replay
+    && replayOverlap > replayQueue
+    && replayVerify > replayOverlap
+    && replayFailClosed > replayVerify
+    && resumeStale > replayFailClosed,
+    "The labeler must resume into a bounded, idempotent replay that is verified before stale resumes",
   );
 
   const initial = documentation.slice(initialStart, followupStart);
@@ -1330,7 +1355,7 @@ test("documents safe initial and incremental Question migration paths", async ()
   );
   assert.match(
     followup,
-    /pause both mutating workflows[\s\S]*?snapshot every open and closed issue[\s\S]*?Create the native `Question` Issue type[\s\S]*?set\s+only its Issue type to `Question`[\s\S]*?final rescan for queued and newly created issues and\s+every issue that currently carries `question`[\s\S]*?Add each one to the reviewed\s+inventory and apply the same mapping before verification[\s\S]*?Verify every issue\s+in the reconciled inventory[\s\S]*?delete the `question` label only after that verification\s+succeeds[\s\S]*?resume the issue-labeler[\s\S]*?resume stale/u,
+    /pause both mutating workflows[\s\S]*?snapshot every open and closed issue[\s\S]*?Create the native `Question` Issue type[\s\S]*?set\s+only its Issue type to `Question`[\s\S]*?final rescan for queued and newly created issues and\s+every issue that currently carries `question`[\s\S]*?Add each one to the reviewed\s+inventory and apply the same mapping before verification[\s\S]*?Verify every issue\s+in the reconciled inventory[\s\S]*?delete the `question` label only after that verification\s+succeeds[\s\S]*?issue-labeler resume,[\s\S]*?bounded post-resume replay,[\s\S]*?catch-up,[\s\S]*?verification,[\s\S]*?stale-resume/u,
   );
   assert.match(
     followup,

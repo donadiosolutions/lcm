@@ -148,9 +148,21 @@ migration.
    repeat the rescan, reconciliation, and verification.
 5. Verify the complete, reconciled inventory. Deprecate and delete the path's
    legacy labels only after this verification succeeds.
-6. Resume the issue-labeler first and dispatch its catch-up run. Confirm that
-   the queued inventory drains without violating the verified field
-   constraints, then resume the stale workflow.
+6. Resume the issue-labeler first. Immediately record a post-resume highest
+   issue number, then perform a bounded, paginated replay of every issue
+   created since the snapshot through that high-water mark. Deduplicate by
+   issue number, re-read each issue's live state, and idempotently add
+   `needs-codex-triage` to every issue that remains unclassified because it is
+   absent from the verified inventory or lacks a completed classification. An
+   already-present queue label is a successful no-op. Issues opened after
+   resume may overlap the replay with live `issues.opened` events; the
+   idempotent enqueue makes that overlap safe. Issues above the high-water mark
+   remain covered by those live events.
+7. Dispatch the issue-labeler's catch-up run. Verify that every replayed issue
+   either completes classification or remains queued for retry, and confirm
+   that the queued inventory drains without violating the verified field
+   constraints. Keep stale paused and fail closed on any replay, enqueue,
+   catch-up, or verification error. Only then resume the stale workflow.
 
 ## Initial rollout for new installations
 
@@ -218,8 +230,9 @@ Do not rerun or rewrite the historical migration.
    Priority, security field, other Planning Field value, state, or unrelated
    label changed.
 5. Deprecate and delete the `question` label only after that verification
-   succeeds. Then resume the issue-labeler, run its catch-up, and resume stale
-   in the order required by the rollout safety protocol.
+   succeeds. Then complete the rollout safety protocol's issue-labeler resume,
+   bounded post-resume replay, catch-up, verification, and stale-resume
+   sequence.
 
 ## Stale issues
 
