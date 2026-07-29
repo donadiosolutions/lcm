@@ -191,6 +191,24 @@ type InstructionCacheFixtureRow = {
   readonly updatedAt: string | Uint8Array;
 };
 
+function makeInstructionDatabase(
+  path: string,
+  table: "session_instruction_cache" | "session_instructions",
+  id: number,
+  row: InstructionCacheFixtureRow | null,
+): void {
+  mkdirSync(join(path, ".."), { recursive: true });
+  const db = new DatabaseSync(path);
+  runLcmMigrations(db);
+  if (row !== null) {
+    db.prepare(
+      `INSERT INTO ${table}(id, content, content_hash, updated_at)
+       VALUES(?, ?, ?, ?)`,
+    ).run(id, row.content, row.contentHash, row.updatedAt);
+  }
+  db.close();
+}
+
 function makeInstructionCacheReconciliation(
   root: string,
   targetRow: InstructionCacheFixtureRow,
@@ -212,18 +230,11 @@ function makeInstructionCacheReconciliation(
   clearProjectMapCache();
   const targetPath = join(root, ".lcm", "projects", targetHash, "db.sqlite");
   const sourcePath = join(root, ".lcm", "projects", sourceHash, "db.sqlite");
-  makeDatabase(targetPath, "instruction-target", "target", targetHash);
-  makeDatabase(sourcePath, "instruction-source", "source", sourceHash);
   for (const [path, cacheRow] of [
     [targetPath, targetRow],
     [sourcePath, sourceRow],
   ] as const) {
-    const db = new DatabaseSync(path);
-    db.prepare(
-      `INSERT INTO session_instruction_cache(id, content, content_hash, updated_at)
-       VALUES(2, ?, ?, ?)`,
-    ).run(cacheRow.content, cacheRow.contentHash, cacheRow.updatedAt);
-    db.close();
+    makeInstructionDatabase(path, "session_instruction_cache", 2, cacheRow);
   }
   return { main, linked, targetPath, sourcePath };
 }
@@ -247,19 +258,11 @@ function makeLegacyInstructionReconciliation(
   clearProjectMapCache();
   const targetPath = join(root, ".lcm", "projects", targetHash, "db.sqlite");
   const sourcePath = join(root, ".lcm", "projects", sourceHash, "db.sqlite");
-  makeDatabase(targetPath, "instruction-target", "target", targetHash);
-  makeDatabase(sourcePath, "instruction-source", "source", sourceHash);
   for (const [path, instructionRow] of [
     [targetPath, targetRow],
     [sourcePath, sourceRow],
   ] as const) {
-    if (instructionRow === null) continue;
-    const db = new DatabaseSync(path);
-    db.prepare(
-      `INSERT INTO session_instructions(id, content, content_hash, updated_at)
-       VALUES(1, ?, ?, ?)`,
-    ).run(instructionRow.content, instructionRow.contentHash, instructionRow.updatedAt);
-    db.close();
+    makeInstructionDatabase(path, "session_instructions", 1, instructionRow);
   }
   return { main, targetPath };
 }

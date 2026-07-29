@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const sqliteRouteTests = ["test/daemon/routes/**/*.test.ts"];
+const worktreeReconciliationTests = ["test/worktree-reconciliation.test.ts"];
+const serialSqliteTests = [...sqliteRouteTests, ...worktreeReconciliationTests];
 const e2eTests = ["test/e2e/**/*.test.ts"];
 const runtimeHomeSetup = ["test/setup/isolate-runtime-home.ts"];
 
@@ -28,7 +30,7 @@ export default defineConfig({
           name: "unit-parallel",
           setupFiles: runtimeHomeSetup,
           include: ["test/**/*.test.ts"],
-          exclude: [...sqliteRouteTests, ...e2eTests, "node_modules/**", ".claude/**"],
+          exclude: [...serialSqliteTests, ...e2eTests, "node_modules/**", ".claude/**"],
           sequence: {
             groupOrder: 0,
           },
@@ -38,10 +40,11 @@ export default defineConfig({
         test: {
           name: "unit-sqlite-routes",
           setupFiles: runtimeHomeSetup,
-          include: sqliteRouteTests,
+          include: serialSqliteTests,
           exclude: ["node_modules/**", ".claude/**"],
-          // Route handler tests repeatedly open and migrate project SQLite DBs.
-          // Keep this narrow group serial while the rest of the unit suite stays parallel.
+          // Route handler and worktree reconciliation tests repeatedly open and migrate
+          // project SQLite DBs. Keep this group serial and ordered after the parallel
+          // unit pool so their real timeout assertions are not distorted by I/O contention.
           sequence: {
             groupOrder: 1,
           },
