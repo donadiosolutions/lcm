@@ -6,8 +6,19 @@ import { ensureCore } from "../src/bootstrap.js";
 import { lcmHomeDir } from "../src/runtime-paths.js";
 import { atomicWritePrivateFile } from "../src/security-files.js";
 import { packageExecutable, packageRootFor } from "../src/runtime-root.js";
-import { mergeClaudeSettings } from "../src/installer/settings.js";
-export { REQUIRED_HOOKS, canonicalHookCommand, hasManagedClaudeSettings, mergeClaudeSettings } from "../src/installer/settings.js";
+import {
+  hasCanonicalClaudeMcpEntry,
+  mergeClaudeMcpEntry,
+  mergeClaudeSettings,
+} from "../src/installer/settings.js";
+export {
+  REQUIRED_HOOKS,
+  canonicalHookCommand,
+  hasCanonicalClaudeMcpEntry,
+  hasManagedClaudeSettings,
+  mergeClaudeMcpEntry,
+  mergeClaudeSettings,
+} from "../src/installer/settings.js";
 
 export interface ServiceDeps {
   spawnSync: (cmd: string, args: string[], opts?: SpawnSyncOptionsWithStringEncoding) => SpawnSyncReturns<string>;
@@ -256,6 +267,35 @@ function readMergedClaudeSettings(
   return mergeClaudeSettings(parsed, lcmBin);
 }
 
+function persistVerifiedNativeClaudeSettings(
+  deps: Pick<ServiceDeps, "existsSync" | "readFileSync" | "writeFileSync" | "mkdirSync" | "dryRun">,
+  settingsPath: string,
+  lcmBin: string,
+): void {
+  const merged = readMergedClaudeSettings(deps, settingsPath, lcmBin);
+  const mcpServers = merged.mcpServers as Record<string, unknown>;
+  mcpServers.lcm = mergeClaudeMcpEntry(mcpServers.lcm, lcmBin);
+  merged.mcpServers = mcpServers;
+
+  deps.mkdirSync(dirname(settingsPath), { recursive: true });
+  deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
+  if (deps.dryRun) return;
+
+  let persisted: unknown;
+  try {
+    persisted = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
+  } catch {
+    throw new Error(`Could not verify native Claude settings after writing: ${settingsPath}`);
+  }
+  const verified = mergeClaudeSettings(persisted, lcmBin);
+  const persistedRecord = persisted as Record<string, unknown>;
+  const persistedMcpEntry = (verified.mcpServers as Record<string, unknown>).lcm;
+  if (JSON.stringify(persistedRecord.hooks) !== JSON.stringify(verified.hooks)
+      || !hasCanonicalClaudeMcpEntry(persistedMcpEntry, lcmBin)) {
+    throw new Error(`Native Claude settings did not persist correctly: ${settingsPath}`);
+  }
+}
+
 export interface ResolveBinaryDeps {
   spawnSync: (cmd: string, args: string[], opts?: SpawnSyncOptionsWithStringEncoding) => { status: number | null; stdout: string | Buffer };
   existsSync: (path: string) => boolean;
@@ -454,8 +494,6 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     console.log(`Created ${configPath}`);
   }
 
-  migrateClaudeMarketplacePlugins(deps, deps.cwd ?? process.cwd());
-
   // ensureCore will:
   // - Skip config creation (already exists or just created above)
   // - Merge settings.json hooks (remove duplicates, clean old commands)
@@ -474,15 +512,17 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     }),
   });
 
-  // Register the npm-owned MCP server directly in Claude settings.
-  const merged: any = readMergedClaudeSettings(deps, settingsPath, lcmBin);
-  const mcpServers = merged.mcpServers;
-  mcpServers["lcm"] = { command: process.execPath, args: [lcmBin, "mcp"] };
-  (merged as any).mcpServers = mcpServers;
-
-  deps.mkdirSync(dirname(settingsPath), { recursive: true });
-  deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
+  // Establish and read back the native hook and MCP settings before removing a
+  // working Marketplace plugin. If the settings write is not durable, the
+  // legacy integration remains untouched.
+  persistVerifiedNativeClaudeSettings(deps, settingsPath, lcmBin);
   console.log(`Updated ${settingsPath}`);
+
+  migrateClaudeMarketplacePlugins(deps, deps.cwd ?? process.cwd());
+
+  // Claude's plugin uninstaller may rewrite settings. Re-read that result,
+  // preserve its unrelated mutations, and restore only LCM-owned fields.
+  persistVerifiedNativeClaudeSettings(deps, settingsPath, lcmBin);
 
   // 4. Install slash commands to ~/.claude/commands/
   const claudeTemplates = join(packageRootFor(import.meta.url, 2), "dist", "src", "connectors", "templates", "claude");

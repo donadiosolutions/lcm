@@ -21,7 +21,20 @@ describe("package.json", () => {
     );
   });
   it("has anthropic sdk as optional peer dep", () => expect(pkg.peerDependencies).toHaveProperty("@anthropic-ai/sdk"));
-  it("has mcp sdk", () => expect(pkg.dependencies).toHaveProperty("@modelcontextprotocol/sdk"));
+  it("keeps the bundled MCP build graph out of published consumer dependencies", () => {
+    expect(pkg.dependencies).not.toHaveProperty("@modelcontextprotocol/sdk");
+    expect(pkg.dependencies).not.toHaveProperty("body-parser");
+    expect(pkg.dependencies).not.toHaveProperty("fast-uri");
+    expect(pkg.devDependencies).toHaveProperty("@modelcontextprotocol/sdk", "1.30.0");
+    expect(pkg.devDependencies).toHaveProperty("body-parser", "2.3.0");
+    expect(pkg.devDependencies).toHaveProperty("fast-uri", "3.1.4");
+    expect(pkg.dependencies).toHaveProperty("@hono/node-server", "2.0.12");
+    expect(pkg.scripts).toHaveProperty(
+      "verify:consumer-topology",
+      "node scripts/verify-consumer-topology.mjs",
+    );
+    expect(pkg.scripts["release:verify"]).toContain("npm run verify:consumer-topology");
+  });
   it("does not have pi-ai", () => expect(pkg.dependencies).not.toHaveProperty("@mariozechner/pi-ai"));
   it("does not have pi-agent-core", () => expect(pkg.dependencies).not.toHaveProperty("@mariozechner/pi-agent-core"));
 
@@ -52,6 +65,8 @@ describe("package.json", () => {
     expect(source).toContain('join(root, "dist", "lcm.mjs")');
     expect(source).not.toContain('join(root, "lcm.mjs")');
     expect(source).not.toContain("mcp.mjs");
+    expect(source).toContain("bundle: true");
+    expect(source).not.toMatch(/\bexternal\s*:/u);
     expect(source).toContain('startsWith("#!/usr/bin/env node\\n")');
     expect(source).toContain("chmod(output, 0o755)");
   });

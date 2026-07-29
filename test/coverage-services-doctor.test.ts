@@ -110,6 +110,7 @@ function makeDeps(options: {
   managedDaemonPath?: string;
   procEnviron?: string;
   readPaths?: string[];
+  writes?: string[];
 } = {}): DoctorDeps {
   const health = [...(options.health ?? [{ ok: false }])];
   return {
@@ -126,7 +127,10 @@ function makeDeps(options: {
       if (path.startsWith("/proc/")) return options.procEnviron ?? "";
       return "{}";
     },
-    writeFileSync: () => { if (options.writeError) throw options.writeError; },
+    writeFileSync: (_path, content) => {
+      if (options.writeError) throw options.writeError;
+      options.writes?.push(content);
+    },
     mkdirSync: vi.fn(),
     spawnSync: (...args) => mocks.spawnSync(...args),
     fetch: vi.fn().mockImplementation(async () => health.shift() ?? { ok: false }) as typeof fetch,
@@ -1016,6 +1020,72 @@ describe("doctor service coverage", () => {
     }));
     expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
     expect(results.find((result) => result.name === "lcm-md")?.status).toBe("fail");
+  });
+
+  it("repairs only MCP fields owned by LCM", async () => {
+    const writes: string[] = [];
+    const results = await runDoctor(makeDeps({
+      settings: {
+        theme: "dark",
+        mcpServers: {
+          other: { command: "other" },
+          lcm: {
+            command: "/stale/node",
+            args: ["/stale/lcm", "mcp"],
+            env: { LCM_POSTGRES_URL: "postgresql://configured" },
+            futureOption: { enabled: true },
+          },
+        },
+      },
+      writes,
+    }));
+
+    expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
+    const repaired = writes
+      .map((content) => JSON.parse(content))
+      .find((settings) => settings.mcpServers?.lcm?.command === process.execPath);
+    expect(repaired).toEqual(expect.objectContaining({
+      theme: "dark",
+      mcpServers: {
+        other: { command: "other" },
+        lcm: expect.objectContaining({
+          command: process.execPath,
+          env: { LCM_POSTGRES_URL: "postgresql://configured" },
+          futureOption: { enabled: true },
+        }),
+      },
+    }));
+
+    const rerunWrites: string[] = [];
+    const rerun = await runDoctor(makeDeps({ settings: repaired, writes: rerunWrites }));
+    expect(rerun.find((result) => result.name === "mcp-lcm")?.status).toBe("pass");
+    expect(rerunWrites).toEqual([]);
+  });
+
+  it("replaces a malformed managed MCP entry without disturbing its siblings", async () => {
+    const writes: string[] = [];
+    const results = await runDoctor(makeDeps({
+      settings: {
+        mcpServers: {
+          other: { command: "other", env: { KEEP: "true" } },
+          lcm: ["malformed"],
+        },
+      },
+      writes,
+    }));
+
+    expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
+    const repaired = writes
+      .map((content) => JSON.parse(content))
+      .find((settings) => settings.mcpServers?.lcm?.command === process.execPath);
+    expect(repaired).toBeDefined();
+    expect(repaired!.mcpServers).toEqual({
+      other: { command: "other", env: { KEEP: "true" } },
+      lcm: {
+        command: process.execPath,
+        args: [expect.stringContaining("/dist/lcm.mjs"), "mcp"],
+      },
+    });
   });
 
   it("covers passive-learning detailed boundaries", async () => {
