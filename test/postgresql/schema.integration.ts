@@ -291,7 +291,7 @@ describe("PostgreSQL schema baseline", () => {
       const normalizedConstraints = constraints.rows
         .map((row) => `${row.table_name}|${row.constraint_type}|${row.definition}`)
         .join("\n");
-      expect(constraints.rowCount).toBe(170);
+      expect(constraints.rowCount).toBe(174);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
         .toBe("c52caa7c786d4fa4bd039a770976266a32c54628943599337cbff102ac2c53a0");
 

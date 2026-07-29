@@ -426,12 +426,12 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
   const baseline: PostgreSqlSchemaSnapshot = {
     ...expectedBaselineDefinitionInventory(),
     definitionHashes: {
-      columnAcl: "8d4254224cc473b408fb087264254b009d29e6228cb0ac6e74aa0f5e5be7671a",
+      columnAcl: "e2581c7c70cbec57d64bb02ac1520fe27336efb326618b36add668cb1431e98c",
       constraint: "ea03d07488ccd0cc51023463169b71f78c23336374545856d506e2df52483207",
       generatedColumn: "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
       identitySequence: "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
-      index: "16e10e2a4fc080f52b11315ee2b03d5df258d216f293bb0051b56beb16035374",
-      ordinaryColumn: "2cd3bcb84fbd6557dd2e2d26b0ce2bae15ee1c9899bfef1a17ea4e7ad41f4907",
+      index: "6d95eda805e9cd5d0b246daaa763a6919262f64e1129dc93f0ee95291276a7fd",
+      ordinaryColumn: "e0daf9a1d97b62f6baf491c35d3b45d5082336538e44da8651afaa1180e11e8a",
       relationAcl: "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
       table: "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
       trigger: "229e8dd0e6a1c953dd18b4220da95be28121db72f4fbba199e1d6808c4b7afcc",
@@ -466,7 +466,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       ...baseline,
       definitionHashes: {
         ...baseline.definitionHashes,
-        constraint: "eeb6605a8e1c078d2ee34a83c7e80539226a9f8e4d6a278f5286d9889dc47256",
+        constraint: "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
       },
       migrationId: "0004_machine_display_name",
     },

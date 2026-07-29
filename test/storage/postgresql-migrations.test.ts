@@ -435,6 +435,26 @@ describe("PostgreSQL migration runner", () => {
       .toThrowError(expect.objectContaining({ operation: "verifyMigrationArtifact" }));
   });
 
+  it("pins the complete latest PostgreSQL 18 definition inventory", () => {
+    const snapshot = loadPostgreSqlSchemaSnapshots().at(-1)!;
+
+    expect(getPostgreSqlSchemaSnapshotExpectations(snapshot)).toMatchObject({
+      definitionGroupCounts: [52, 3, 174, 15, 225, 6, 24, 30, 210],
+      definitionGroupHashes: [
+        "6d95eda805e9cd5d0b246daaa763a6919262f64e1129dc93f0ee95291276a7fd",
+        "229e8dd0e6a1c953dd18b4220da95be28121db72f4fbba199e1d6808c4b7afcc",
+        "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
+        "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
+        "e2581c7c70cbec57d64bb02ac1520fe27336efb326618b36add668cb1431e98c",
+        "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
+        "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
+        "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
+        "e0daf9a1d97b62f6baf491c35d3b45d5082336538e44da8651afaa1180e11e8a",
+      ],
+      definitionObjectCount: 739,
+    });
+  });
+
   it.each([
     { migrations: [migration("bad")] },
     { migrations: [migration("0001_valid"), migration("0001_valid")] },
@@ -1357,7 +1377,7 @@ describe("PostgreSQL migration runner", () => {
     expect(inventorySql).toContain("pg_catalog.unnest");
     expect(inventorySql).toContain("WHEN 'S' THEN 's'::pg_catalog.\"char\"");
     for (const hardcodedGroupCount of [
-      52, 3, 169, 15, 221, 6, 24, 30, 206,
+      52, 3, 174, 15, 225, 6, 24, 30, 210,
     ]) {
       expect(inventorySql).not.toMatch(
         new RegExp(`\\b${hardcodedGroupCount}::pg_catalog\\.int4`, "u"),

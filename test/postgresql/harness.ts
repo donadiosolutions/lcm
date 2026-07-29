@@ -342,13 +342,7 @@ export async function assertHarnessReady(): Promise<void> {
     try {
       await runPostgreSqlMigrations(migrator);
     } catch (error) {
-      if (error instanceof PostgreSqlBaselineDefinitionPreflightError) {
-        process.stderr.write(
-          `PostgreSQL baseline definition fingerprints: ${
-            JSON.stringify(error.actualDefinitionGroups)
-          }\n`,
-        );
-      }
+      writePostgreSqlBaselineDefinitionFingerprints(error);
       throw error;
     }
     const [migratorHealth, runtimeHealth] = await Promise.all([migrator.health(), runtime.health()]);
@@ -361,6 +355,18 @@ export async function assertHarnessReady(): Promise<void> {
   } finally {
     await Promise.allSettled([migrator.close(), runtime.close()]);
   }
+}
+
+export function writePostgreSqlBaselineDefinitionFingerprints(
+  error: unknown,
+): boolean {
+  if (!(error instanceof PostgreSqlBaselineDefinitionPreflightError)) return false;
+  process.stderr.write(
+    `PostgreSQL baseline definition fingerprints: ${
+      JSON.stringify(error.actualDefinitionGroups)
+    }\n`,
+  );
+  return true;
 }
 
 export interface PostgreSqlTestDatabase extends PostgreSqlTestDatabaseLease {
