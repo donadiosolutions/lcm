@@ -904,12 +904,12 @@ describe("runDoctor configuration validation", () => {
       });
       const results = await runDoctor(minimalDeps({
         fetch,
-        readFileSync: (path: string) => {
-          if (path.endsWith("config.json")) {
-            return JSON.stringify({ storage: { backend: "postgresql" } });
-          }
-          return minimalDeps().readFileSync(path);
-        },
+          readFileSync: (path: string) => {
+            if (path.endsWith("config.json")) {
+              return JSON.stringify({ storage: { backend: "postgresql" } });
+            }
+            return minimalDeps().readFileSync(path);
+          },
       }));
 
       expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
@@ -1021,6 +1021,7 @@ describe("runDoctor configuration validation", () => {
           if (path.endsWith("config.json")) {
             return JSON.stringify({ storage: { backend: "postgresql" } });
           }
+          if (path.endsWith("daemon.token")) return "doctor-token";
           return minimalDeps().readFileSync(path);
         },
       }));
@@ -1030,6 +1031,19 @@ describe("runDoctor configuration validation", () => {
         expectedVersion: "0.5.0",
       }));
       expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenNthCalledWith(
+        1,
+        "http://127.0.0.1:3737/health",
+        { signal: expect.any(AbortSignal) },
+      );
+      expect(fetch).toHaveBeenNthCalledWith(
+        2,
+        "http://127.0.0.1:3737/health",
+        {
+          headers: { Authorization: "Bearer doctor-token" },
+          signal: expect.any(AbortSignal),
+        },
+      );
       expect(results.find((result) => result.name === "daemon")).toMatchObject({
         status: "pass",
         message: "localhost:3737 (up)",
@@ -1049,6 +1063,80 @@ describe("runDoctor configuration validation", () => {
       else process.env.LCM_POSTGRES_CA_FILE = previousCaFile;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("does not send an authenticated health request when the daemon token is unreadable", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        status: "ok",
+        version: "0.5.0",
+        storageBackend: "sqlite",
+        uptime: 10,
+        pid: 4242,
+      }),
+    });
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 3737,
+      spawned: false,
+      pid: 4242,
+      startMethod: "existing",
+    });
+
+    const results = await runDoctor(minimalDeps({
+      fetch,
+      readFileSync: (path: string) => {
+        if (path.endsWith("daemon.token")) throw new Error("permission denied");
+        return minimalDeps().readFileSync(path);
+      },
+    }));
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:3737/health",
+      { signal: expect.any(AbortSignal) },
+    );
+    expect(results.find((result) => result.name === "daemon")).toMatchObject({
+      status: "pass",
+      message: "localhost:3737 (up)",
+    });
+  });
+
+  it("does not send an authenticated health request when the daemon token is empty", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        status: "ok",
+        version: "0.5.0",
+        storageBackend: "sqlite",
+        uptime: 10,
+        pid: 4242,
+      }),
+    });
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 3737,
+      spawned: false,
+      pid: 4242,
+      startMethod: "existing",
+    });
+
+    await runDoctor(minimalDeps({
+      fetch,
+      readFileSync: (path: string) => {
+        if (path.endsWith("daemon.token")) return " \n";
+        return minimalDeps().readFileSync(path);
+      },
+    }));
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:3737/health",
+      { signal: expect.any(AbortSignal) },
+    );
   });
 
   it.each([0, 65536, 4545.5, "4545"])(

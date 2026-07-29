@@ -113,6 +113,7 @@ describe("mocked systemd credential boundaries", () => {
     const fetch = vi.fn()
       .mockRejectedValueOnce(new Error("initially down"))
       .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1", pid: 20 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1", pid: 20 }) })
       .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
     const result = await ensureDaemon({
       ...base(), _skipHealthWait: false, _fetchOverride: fetch,

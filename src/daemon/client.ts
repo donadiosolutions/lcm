@@ -54,8 +54,14 @@ export class DaemonClient {
 
   async health(): Promise<DaemonHealth | null> {
     try {
+      const token = this.getToken();
+      const headers: Record<string, string> = {};
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
       const response = await daemonJsonResponse<DaemonHealthResponse>(this.port, "/health", {
         method: "GET",
+        headers,
       });
       const health = response.data;
       if (
