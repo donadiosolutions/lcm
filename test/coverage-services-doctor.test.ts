@@ -1044,8 +1044,10 @@ describe("doctor service coverage", () => {
         mcpServers: {
           other: { command: "other" },
           lcm: {
-            command: "/stale/node",
-            args: ["/stale/lcm", "mcp"],
+            type: "sse",
+            url: "https://example.invalid/lcm",
+            headers: { Authorization: "Bearer secret" },
+            transport: "sse",
             env: { LCM_POSTGRES_URL: "postgresql://configured" },
             futureOption: { enabled: true },
           },
@@ -1062,11 +1064,13 @@ describe("doctor service coverage", () => {
       theme: "dark",
       mcpServers: {
         other: { command: "other" },
-        lcm: expect.objectContaining({
+        lcm: {
+          type: "stdio",
           command: process.execPath,
+          args: [expect.stringContaining("/dist/lcm.mjs"), "mcp"],
           env: { LCM_POSTGRES_URL: "postgresql://configured" },
           futureOption: { enabled: true },
-        }),
+        },
       },
     }));
 
@@ -1096,6 +1100,7 @@ describe("doctor service coverage", () => {
     expect(repaired!.mcpServers).toEqual({
       other: { command: "other", env: { KEEP: "true" } },
       lcm: {
+        type: "stdio",
         command: process.execPath,
         args: [expect.stringContaining("/dist/lcm.mjs"), "mcp"],
       },

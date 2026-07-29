@@ -67,7 +67,7 @@ function canonicalClaudeMcpFields(
   runtimePath: string,
   nodePath: string,
   platform: NodeJS.Platform,
-): { command: string; args: [string, "mcp"] } {
+): { type: "stdio"; command: string; args: [string, "mcp"] } {
   const pathIsAbsolute = platform === "win32" ? win32.isAbsolute : isAbsolute;
   if (!pathIsAbsolute(runtimePath)) {
     throw new Error(`LCM runtime path must be absolute: ${runtimePath}`);
@@ -75,15 +75,18 @@ function canonicalClaudeMcpFields(
   if (!pathIsAbsolute(nodePath)) {
     throw new Error(`Node executable path must be absolute: ${nodePath}`);
   }
-  return { command: nodePath, args: [runtimePath, "mcp"] };
+  return { type: "stdio", command: nodePath, args: [runtimePath, "mcp"] };
 }
+
+const CLAUDE_REMOTE_MCP_FIELDS = ["url", "headers", "transport"] as const;
 
 /**
  * Merge the fields owned by LCM into a Claude MCP server entry.
  *
- * Unknown fields belong to Claude or the user and must survive repairs. A
- * malformed entry cannot be merged safely, so it is replaced with the minimal
- * canonical entry.
+ * Unknown fields belong to Claude or the user and must survive repairs. Known
+ * remote-transport fields cannot coexist with a stdio command, so they are
+ * removed while type, command, and args are normalized. A malformed entry
+ * cannot be merged safely, so it is replaced with the minimal canonical entry.
  */
 export function mergeClaudeMcpEntry(
   existing: unknown,
@@ -95,7 +98,9 @@ export function mergeClaudeMcpEntry(
   if (existing === null || typeof existing !== "object" || Array.isArray(existing)) {
     return canonical;
   }
-  return { ...structuredClone(existing), ...canonical };
+  const preserved = structuredClone(existing) as Record<string, unknown>;
+  for (const field of CLAUDE_REMOTE_MCP_FIELDS) delete preserved[field];
+  return { ...preserved, ...canonical };
 }
 
 export function hasCanonicalClaudeMcpEntry(
@@ -109,7 +114,9 @@ export function hasCanonicalClaudeMcpEntry(
   }
   const canonical = canonicalClaudeMcpFields(runtimePath, nodePath, platform);
   const entry = existing as Record<string, unknown>;
-  return entry.command === canonical.command
+  return entry.type === canonical.type
+    && CLAUDE_REMOTE_MCP_FIELDS.every((field) => !(field in entry))
+    && entry.command === canonical.command
     && Array.isArray(entry.args)
     && entry.args.length === canonical.args.length
     && entry.args.every((value, index) => value === canonical.args[index]);

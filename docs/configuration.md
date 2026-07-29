@@ -39,11 +39,12 @@ lcm doctor
 ```
 
 The hook commands and MCP server use absolute paths into the installed npm
-package. LCM owns only the MCP entry's `command` and `args`; `env` and any
-other user- or Claude-managed options, sibling MCP servers, and unrelated
-settings are preserved across installation and doctor repair. `lcm doctor`
-validates the native configuration and managed daemon; repair or reinstall
-with `lcm install`.
+package. LCM owns the MCP entry's `type`, `command`, and `args`; `env` and any
+other compatible user- or Claude-managed options, sibling MCP servers, and
+unrelated settings are preserved across installation and doctor repair. When
+normalizing an HTTP or SSE entry to `stdio`, LCM removes the incompatible
+`url`, `headers`, and `transport` fields. `lcm doctor` validates the native
+configuration and managed daemon; repair or reinstall with `lcm install`.
 
 The published CLI contains its MCP SDK build graph in `dist/lcm.mjs`. Consumer
 installations therefore do not receive a second external SDK, Express, or AJV

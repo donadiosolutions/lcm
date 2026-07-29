@@ -45,7 +45,7 @@ describe("doctor hook validation", () => {
   it("reports pass when native hooks and mcpServers.lcm use the installed binary", async () => {
     const settings = JSON.stringify({
       ...mergeClaudeSettings({}, BINARY),
-      mcpServers: { lcm: { command: process.execPath, args: [BINARY, "mcp"] } },
+      mcpServers: { lcm: { type: "stdio", command: process.execPath, args: [BINARY, "mcp"] } },
     });
     const results = await runDoctor({
       existsSync: () => true,

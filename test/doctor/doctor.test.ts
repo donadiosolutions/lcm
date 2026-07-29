@@ -139,7 +139,7 @@ describe("runDoctor Claude integration ownership", () => {
     const runtimePath = join(process.cwd(), "dist", "lcm.mjs");
     const settings = mergeClaudeSettings({}, runtimePath);
     settings.mcpServers = {
-      lcm: { command: process.execPath, args: [runtimePath, "mcp"] },
+      lcm: { type: "stdio", command: process.execPath, args: [runtimePath, "mcp"] },
       [legacyLcmMcpServerName()]: { command: "legacy" },
       unrelated: { command: "preserved" },
     };
@@ -157,7 +157,7 @@ describe("runDoctor Claude integration ownership", () => {
     expect(settingsWrite).toBeDefined();
     const persisted = JSON.parse(settingsWrite![1]);
     expect(persisted.mcpServers).toEqual({
-      lcm: { command: process.execPath, args: [runtimePath, "mcp"] },
+      lcm: { type: "stdio", command: process.execPath, args: [runtimePath, "mcp"] },
       unrelated: { command: "preserved" },
     });
     expect(results.find((result) => result.name === "hooks")?.status).toBe("pass");

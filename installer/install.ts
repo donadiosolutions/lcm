@@ -37,6 +37,7 @@ export interface ServiceDeps {
   cwd?: string;
   binaryPath?: string;
   dryRun?: boolean;
+  previewWriteFile?: (path: string, data: string) => void;
   promptUser: (question: string) => Promise<string>;
   ensureDaemon?: (opts: { port: number; pidFilePath: string; spawnTimeoutMs: number }) => Promise<{ connected: boolean }>;
   runDoctor?: () => Promise<Array<{ name: string; status: string; category?: string; message?: string }>>;
@@ -268,19 +269,24 @@ function readMergedClaudeSettings(
 }
 
 function persistVerifiedNativeClaudeSettings(
-  deps: Pick<ServiceDeps, "existsSync" | "readFileSync" | "writeFileSync" | "mkdirSync" | "dryRun">,
+  deps: Pick<ServiceDeps, "existsSync" | "readFileSync" | "writeFileSync" | "mkdirSync" | "dryRun" | "previewWriteFile">,
   settingsPath: string,
   lcmBin: string,
+  previewDryRun = false,
 ): void {
   const merged = readMergedClaudeSettings(deps, settingsPath, lcmBin);
   const mcpServers = merged.mcpServers as Record<string, unknown>;
   mcpServers.lcm = mergeClaudeMcpEntry(mcpServers.lcm, lcmBin);
   merged.mcpServers = mcpServers;
 
-  if (deps.dryRun) return;
+  const serialized = JSON.stringify(merged, null, 2);
+  if (deps.dryRun) {
+    if (previewDryRun) deps.previewWriteFile?.(settingsPath, serialized);
+    return;
+  }
 
   deps.mkdirSync(dirname(settingsPath), { recursive: true });
-  deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
+  deps.writeFileSync(settingsPath, serialized);
 
   let persisted: unknown;
   try {
@@ -516,7 +522,7 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   // Establish and read back the native hook and MCP settings before removing a
   // working Marketplace plugin. If the settings write is not durable, the
   // legacy integration remains untouched.
-  persistVerifiedNativeClaudeSettings(deps, settingsPath, lcmBin);
+  persistVerifiedNativeClaudeSettings(deps, settingsPath, lcmBin, true);
   console.log(`Updated ${settingsPath}`);
 
   migrateClaudeMarketplacePlugins(deps, deps.cwd ?? process.cwd());

@@ -287,50 +287,93 @@ describe("Claude MCP entry ownership", () => {
       command: "/old/node",
       args: ["/old/lcm", "mcp"],
       env: { LCM_POSTGRES_URL: "configured-elsewhere" },
-      transport: "stdio",
       nested: { future: true },
     };
 
     const merged = mergeClaudeMcpEntry(existing, binary, node);
 
     expect(merged).toEqual({
+      type: "stdio",
       command: node,
       args: [binary, "mcp"],
       env: existing.env,
-      transport: "stdio",
       nested: { future: true },
     });
     expect(existing.command).toBe("/old/node");
     expect(hasCanonicalClaudeMcpEntry(merged, binary, node)).toBe(true);
   });
 
+  it("normalizes HTTP and SSE entries to usable stdio without losing safe options", () => {
+    for (const remoteType of ["http", "sse"]) {
+      const existing = {
+        type: remoteType,
+        url: "https://example.invalid/lcm",
+        headers: { Authorization: "Bearer secret" },
+        transport: remoteType,
+        env: { LCM_POSTGRES_URL: "postgresql://configured" },
+        futureOption: { enabled: true },
+      };
+
+      const merged = mergeClaudeMcpEntry(existing, binary, node);
+
+      expect(merged).toEqual({
+        type: "stdio",
+        command: node,
+        args: [binary, "mcp"],
+        env: existing.env,
+        futureOption: { enabled: true },
+      });
+      expect(existing).toEqual(expect.objectContaining({
+        type: remoteType,
+        url: "https://example.invalid/lcm",
+        headers: { Authorization: "Bearer secret" },
+        transport: remoteType,
+      }));
+      expect(hasCanonicalClaudeMcpEntry(merged, binary, node)).toBe(true);
+      expect(hasCanonicalClaudeMcpEntry({
+        ...merged,
+        type: remoteType,
+      }, binary, node)).toBe(false);
+      for (const field of ["url", "headers", "transport"]) {
+        expect(hasCanonicalClaudeMcpEntry({
+          ...merged,
+          [field]: "incompatible",
+        }, binary, node)).toBe(false);
+      }
+    }
+  });
+
   it("replaces malformed entries and rejects stale owned fields", () => {
     expect(mergeClaudeMcpEntry(null, binary, node)).toEqual({
+      type: "stdio",
       command: node,
       args: [binary, "mcp"],
     });
     expect(mergeClaudeMcpEntry([], binary, node)).toEqual({
+      type: "stdio",
       command: node,
       args: [binary, "mcp"],
     });
     expect(mergeClaudeMcpEntry("invalid", binary, node)).toEqual({
+      type: "stdio",
       command: node,
       args: [binary, "mcp"],
     });
     expect(hasCanonicalClaudeMcpEntry(null, binary, node)).toBe(false);
     expect(hasCanonicalClaudeMcpEntry([], binary, node)).toBe(false);
     expect(hasCanonicalClaudeMcpEntry("invalid", binary, node)).toBe(false);
-    expect(hasCanonicalClaudeMcpEntry({ command: node, args: "invalid" }, binary, node)).toBe(false);
-    expect(hasCanonicalClaudeMcpEntry({ command: node, args: [binary] }, binary, node)).toBe(false);
-    expect(hasCanonicalClaudeMcpEntry({ command: "/stale", args: [binary, "mcp"] }, binary, node)).toBe(false);
-    expect(hasCanonicalClaudeMcpEntry({ command: node, args: [binary, "other"] }, binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry({ type: "stdio", command: node, args: "invalid" }, binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry({ type: "stdio", command: node, args: [binary] }, binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry({ type: "stdio", command: "/stale", args: [binary, "mcp"] }, binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry({ type: "stdio", command: node, args: [binary, "other"] }, binary, node)).toBe(false);
+    expect(hasCanonicalClaudeMcpEntry({ command: node, args: [binary, "mcp"] }, binary, node)).toBe(false);
   });
 
   it("requires absolute runtime and Node paths", () => {
     expect(() => mergeClaudeMcpEntry({}, "lcm", node)).toThrow("runtime path must be absolute");
     expect(() => hasCanonicalClaudeMcpEntry({}, binary, "node")).toThrow("Node executable path must be absolute");
     expect(hasCanonicalClaudeMcpEntry(
-      { command: "C:\\node\\node.exe", args: ["C:\\npm\\lcm.mjs", "mcp"], env: {} },
+      { type: "stdio", command: "C:\\node\\node.exe", args: ["C:\\npm\\lcm.mjs", "mcp"], env: {} },
       "C:\\npm\\lcm.mjs",
       "C:\\node\\node.exe",
       "win32",
@@ -753,6 +796,7 @@ describe("install", () => {
     const settingsPath = join(homedir(), ".claude", "settings.json");
     const nativeSettings = JSON.stringify(mergeClaudeSettings({}, "/opt/npm/bin/lcm"));
     const events: string[] = [];
+    let previewedSettings: Record<string, any> | undefined;
     const plugin = JSON.stringify([{ id: "lcm@legacy", scope: "user" }]);
     const marketplaces = JSON.stringify([{ name: "legacy", repo: "lossless-claude/lcm" }]);
     const spawnSync = vi.fn((_cmd: string, args: string[]) => {
@@ -782,6 +826,12 @@ describe("install", () => {
       writeFileSync: vi.fn((path: string) => {
         if (path === settingsPath) events.push("settings-write");
       }),
+      previewWriteFile: vi.fn((path: string, data: string) => {
+        if (path === settingsPath) {
+          events.push("settings-preview");
+          previewedSettings = JSON.parse(data);
+        }
+      }),
       mkdirSync: vi.fn((path: string) => {
         if (path === dirname(settingsPath)) events.push("settings-directory");
       }),
@@ -790,10 +840,18 @@ describe("install", () => {
     await install(deps);
 
     expect(events.filter((event) => event === "settings-read")).toHaveLength(4);
+    expect(events.filter((event) => event === "settings-preview")).toHaveLength(1);
     expect(events).not.toContain("settings-write");
     expect(events).not.toContain("marketplace-uninstall");
+    expect(previewedSettings?.mcpServers).toEqual({
+      lcm: {
+        type: "stdio",
+        command: process.execPath,
+        args: ["/opt/npm/bin/lcm", "mcp"],
+      },
+    });
     expect(events.indexOf("marketplace-scan")).toBeGreaterThan(
-      events.indexOf("settings-read"),
+      events.indexOf("settings-preview"),
     );
     expect(events.indexOf("marketplace-verification")).toBeGreaterThan(
       events.indexOf("marketplace-scan"),
@@ -909,15 +967,17 @@ describe("install", () => {
     }));
   });
 
-  it("preserves MCP entry options across installation and post-migration reconciliation", async () => {
+  it("normalizes a remote MCP entry while preserving settings across installation", async () => {
     const settingsPath = join(homedir(), ".claude", "settings.json");
     let settings = JSON.stringify({
       theme: "dark",
       mcpServers: {
         other: { command: "other" },
         lcm: {
-          command: "/old/node",
-          args: ["/old/lcm", "mcp"],
+          type: "http",
+          url: "https://example.invalid/lcm",
+          headers: { Authorization: "Bearer secret" },
+          transport: "http",
           env: { LCM_POSTGRES_URL: "postgresql://configured" },
           futureOption: { enabled: true },
         },
@@ -938,6 +998,7 @@ describe("install", () => {
       mcpServers: {
         other: { command: "other" },
         lcm: {
+          type: "stdio",
           command: process.execPath,
           args: ["/opt/npm/bin/lcm", "mcp"],
           env: { LCM_POSTGRES_URL: "postgresql://configured" },
@@ -1032,7 +1093,7 @@ describe("install with DryRunServiceDeps", () => {
       .filter((s: any) => typeof s === "string" && s.includes("[dry-run]"));
 
     expect(dryRunLines.some((l: string) => l.includes("would write:"))).toBe(true);
-    expect(dryRunLines.some((l: string) => l.includes("settings.json"))).toBe(false);
+    expect(dryRunLines.some((l: string) => l.includes("settings.json"))).toBe(true);
 
     logSpy.mockRestore();
     warnSpy.mockRestore();
