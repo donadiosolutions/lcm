@@ -62,6 +62,11 @@ interface PublishWorkflow {
 const versionSource = readFileSync(new URL("../.github/workflows/version-pr.yml", import.meta.url), "utf8");
 const publishSource = readFileSync(new URL("../.github/workflows/publish.yml", import.meta.url), "utf8");
 const releasingSource = readFileSync(new URL("../RELEASING.md", import.meta.url), "utf8");
+const docsReleasingSource = readFileSync(new URL("../docs/releasing.md", import.meta.url), "utf8");
+const releasePolicySource = readFileSync(
+  new URL("../.github/scripts/release-policy.mjs", import.meta.url),
+  "utf8",
+);
 const releaseTagPolicySource = readFileSync(
   new URL("../.github/scripts/release-tag-policy.mjs", import.meta.url),
   "utf8",
@@ -218,38 +223,59 @@ describe("release workflows", () => {
     expect(publishWorkflow.jobs["recover-publish"].environment).toBe("npm-publish");
     expect(publishWorkflow.jobs["recover-publish"].needs).toBe("recover-preflight");
     expect(publishWorkflow.jobs.publish.concurrency).toBeUndefined();
-    const publicationQueue = publishWorkflow.jobs.preflight.steps.find(
-      (step: WorkflowStep): boolean => step.name === "Enforce earlier publication success",
+    const trustedPolicy = publishWorkflow.jobs.preflight.steps.find(
+      (step: WorkflowStep): boolean =>
+        step.name === "Checkout trusted default-branch release policy",
     );
-    expect(publicationQueue?.uses).toBe(
+    expect(trustedPolicy?.uses).toBe(
+      "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    );
+    expect(trustedPolicy?.with).toMatchObject({
+      ref: "${{ github.workflow_sha }}",
+      path: "trusted",
+      "persist-credentials": false,
+      "sparse-checkout": ".github/scripts",
+    });
+    const publicationPolicy = publishWorkflow.jobs.preflight.steps.find(
+      (step: WorkflowStep): boolean => step.name === "Validate trusted release provenance",
+    );
+    expect(publicationPolicy?.uses).toBe(
       "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
     );
-    expect(publicationQueue?.with?.script).toContain('workflow_id: "publish.yml"');
-    expect(publicationQueue?.with?.script).toContain('event: "release"');
-    expect(publicationQueue?.with?.script).toContain('event: "workflow_dispatch"');
-    expect(publicationQueue?.with?.script).toContain('status: "completed"');
-    expect(publicationQueue?.with?.script).toContain(
-      "const failedRuns = releaseRuns",
+    expect(publicationPolicy?.with?.script).toMatch(
+      /join\(\s*process\.env\.GITHUB_WORKSPACE,\s*"trusted"/u,
     );
-    expect(publicationQueue?.with?.script).toContain(
+    expect(publicationPolicy?.with?.script).toContain("assertActionCreatedReleaseBody");
+    expect(publicationPolicy?.with?.script).toContain("enforceEarlierPublicationSuccess");
+    expect(publicationPolicy?.with?.script).toContain("parseReleaseTag");
+    expect(publicationPolicy?.with?.script).not.toContain("run.display_title");
+    expect(releasePolicySource).toContain('workflow_id: "publish.yml"');
+    expect(releasePolicySource).toContain('event: "release"');
+    expect(releasePolicySource).toContain('event: "workflow_dispatch"');
+    expect(releasePolicySource).toContain('status: "completed"');
+    expect(releasePolicySource).toContain("const failedRuns = releaseRuns");
+    expect(releasePolicySource).toContain(
       "const successfulRuns = [...releaseRuns, ...recoveryRuns]",
     );
-    expect(publicationQueue?.with?.script).toContain("run.conclusion !== \"success\"");
-    expect(publicationQueue?.with?.script).toContain('run.conclusion === "success"');
-    expect(publicationQueue?.with?.script).toContain("run.display_title");
-    expect(publicationQueue?.with?.script).toContain("^release-tag:");
-    expect(publicationQueue?.with?.script).toContain("has no canonical tag in its stored run name");
-    expect(publicationQueue?.with?.script).toContain(
+    expect(releasePolicySource).toContain("run.conclusion !== \"success\"");
+    expect(releasePolicySource).toContain('run.conclusion === "success"');
+    expect(releasePolicySource).toContain("run.display_title");
+    expect(releasePolicySource).toContain("RELEASE_RUN_NAME_PREFIX");
+    expect(releasePolicySource).toContain("preflight-impossible noncanonical publication run");
+    expect(releasePolicySource).toContain("missing or malformed release-tag provenance");
+    expect(releasePolicySource).toContain(
       "candidate.releaseTag === run.releaseTag && candidate.id > run.id",
     );
-    expect(publicationQueue?.with?.script).toContain("later run ${supersedingRun.id} succeeded");
-    expect(publicationQueue?.with?.script).toContain("run.releaseTag === currentTag");
-    expect(publicationQueue?.with?.script).toContain("tag: run.releaseTag");
-    expect(publicationQueue?.with?.script).not.toContain("head_branch");
-    expect(publicationQueue?.with?.script).toContain("for retry tag");
-    expect(publicationQueue?.with?.script).toContain("if (release.draft)");
-    expect(publicationQueue?.with?.script).toContain("for other tags failed");
-    expect(publicationQueue?.with?.script).not.toContain("setTimeout");
+    expect(releasePolicySource).toContain("later run ${supersedingRun.id}");
+    expect(releasePolicySource).toContain("run.releaseTag === currentTag");
+    expect(releasePolicySource).toContain("tag: run.releaseTag");
+    expect(releasePolicySource).not.toContain("head_branch");
+    expect(releasePolicySource).toContain("current tag");
+    expect(releasePolicySource).toContain("if (release.draft)");
+    expect(releasePolicySource).toContain("for other tags failed");
+    expect(releasePolicySource).not.toContain("setTimeout");
+    expect(publishWorkflow.jobs.preflight.steps.indexOf(trustedPolicy!)).toBe(0);
+    expect(publishWorkflow.jobs.preflight.steps.indexOf(publicationPolicy!)).toBe(1);
 
     const restore = publishWorkflow.jobs["restore-draft"];
     expect(restore.if).toContain("needs.preflight.result == 'failure'");
@@ -343,6 +369,9 @@ describe("release workflows", () => {
 
   it("filters drafts, fetches canonical published bases, and verifies tags before code execution", () => {
     expect(releaseTagPolicySource).not.toMatch(/^\s*import\s/mu);
+    expect(releasePolicySource).not.toMatch(/from "js-yaml"/u);
+    expect(releasePolicySource).toContain('createRequire(import.meta.url)');
+    expect(releasePolicySource).toContain('require("js-yaml")');
     const collect = publishWorkflow.jobs.draft.steps.find(
       (step: WorkflowStep): boolean => step.name === "Collect release pull requests",
     );
@@ -375,16 +404,31 @@ describe("release workflows", () => {
       expect(tagCheck?.with?.script).toContain("annotatedTag.verification?.verified !== true");
       expect(tagCheck?.with?.script).toContain('ref.object.type !== "tag"');
     }
-    for (const job of [publishWorkflow.jobs.draft, publishWorkflow.jobs.preflight]) {
-      const checkoutIndex = job.steps.findIndex(
-        (step: WorkflowStep): boolean => step.name?.startsWith("Checkout ") === true,
-      );
-      const tagCheckIndex = job.steps.findIndex(
-        (step: WorkflowStep): boolean => step.name === "Verify signed annotated release tag",
-      );
-      expect(tagCheckIndex).toBeGreaterThanOrEqual(0);
-      expect(tagCheckIndex).toBeLessThan(checkoutIndex);
-    }
+    const draftTagCheckIndex = publishWorkflow.jobs.draft.steps.findIndex(
+      (step: WorkflowStep): boolean => step.name === "Verify signed annotated release tag",
+    );
+    const draftCheckoutIndex = publishWorkflow.jobs.draft.steps.findIndex(
+      (step: WorkflowStep): boolean => step.name === "Checkout release tag",
+    );
+    expect(draftTagCheckIndex).toBeGreaterThanOrEqual(0);
+    expect(draftTagCheckIndex).toBeLessThan(draftCheckoutIndex);
+    const preflightSteps = publishWorkflow.jobs.preflight.steps;
+    const trustedPolicyIndex = preflightSteps.findIndex(
+      (step) => step.name === "Checkout trusted default-branch release policy",
+    );
+    const trustedProvenanceIndex = preflightSteps.findIndex(
+      (step) => step.name === "Validate trusted release provenance",
+    );
+    const preflightTagCheckIndex = preflightSteps.findIndex(
+      (step) => step.name === "Verify signed annotated release tag",
+    );
+    const releaseCheckoutIndex = preflightSteps.findIndex(
+      (step) => step.name === "Checkout verified release commit",
+    );
+    expect(trustedPolicyIndex).toBe(0);
+    expect(trustedProvenanceIndex).toBe(1);
+    expect(trustedProvenanceIndex).toBeLessThan(preflightTagCheckIndex);
+    expect(preflightTagCheckIndex).toBeLessThan(releaseCheckoutIndex);
     const trustedCheckout = publishWorkflow.jobs.publish.steps.find(
       (step) => step.name === "Checkout trusted release tools",
     );
@@ -457,21 +501,39 @@ describe("release workflows", () => {
       recoveryPublish.steps.find((step) => step.name === "Checkout trusted recovery tools")?.with
         ?.ref,
     ).toBe("${{ github.workflow_sha }}");
-    expect(
-      recoveryPreflight.steps.find((step) => step.name === "Checkout trusted recovery tools")?.with
-        ?.ref,
-    ).toBe("${{ github.workflow_sha }}");
+    const trustedRecoveryPolicy = recoveryPreflight.steps.find(
+      (step) => step.name === "Checkout trusted default-branch recovery policy",
+    );
+    expect(trustedRecoveryPolicy?.with?.ref).toBe("${{ github.workflow_sha }}");
+    const trustedReleasePolicy = publishWorkflow.jobs.preflight.steps.find(
+      (step) => step.name === "Checkout trusted default-branch release policy",
+    );
+    const trustedPolicyRefs = [trustedReleasePolicy, trustedRecoveryPolicy].map(
+      (step) => step?.with?.ref,
+    );
+    expect(trustedPolicyRefs).toEqual([
+      "${{ github.workflow_sha }}",
+      "${{ github.workflow_sha }}",
+    ]);
+    expect(trustedPolicyRefs.some((ref) => String(ref).includes("default_branch"))).toBe(false);
+    expect(trustedRecoveryPolicy?.with?.path).toBe("trusted");
+    expect(recoveryPreflight.steps.indexOf(trustedRecoveryPolicy!)).toBe(0);
     const recoveryHistory = recoveryPreflight.steps.find(
-      (step) => step.name === "Enforce earlier publication success",
+      (step) => step.name === "Verify recovery request and immutable release tag",
     );
-    expect(recoveryHistory?.with?.script).toContain('event: "release"');
-    expect(recoveryHistory?.with?.script).toContain('event: "workflow_dispatch"');
-    expect(recoveryHistory?.with?.script).toContain("const failedRuns = releaseRuns");
-    expect(recoveryHistory?.with?.script).toContain(
-      "const successfulRuns = [...releaseRuns, ...recoveryRuns]",
+    expect(recoveryPreflight.steps.indexOf(recoveryHistory!)).toBe(1);
+    expect(recoveryHistory?.with?.script).toMatch(
+      /join\(\s*process\.env\.GITHUB_WORKSPACE,\s*"trusted"/u,
     );
-    expect(recoveryHistory?.with?.script).toContain("run.releaseTag === currentTag");
-    expect(recoveryHistory?.with?.script).toContain("for recovery tag");
+    expect(recoveryHistory?.with?.script).toContain("assertActionCreatedReleaseBody");
+    expect(recoveryHistory?.with?.script).toContain("enforceEarlierPublicationSuccess");
+    expect(recoveryHistory?.with?.script).toContain("parseReleaseTag(tag)");
+    expect(recoveryHistory?.with?.script).not.toContain("run.display_title");
+    expect(recoveryPreflight.steps.indexOf(recoveryHistory!)).toBeLessThan(
+      recoveryPreflight.steps.findIndex(
+        (step) => step.name === "Checkout verified release commit",
+      ),
+    );
     expect(recoveryPreflight.outputs?.artifact_name).toBe("${{ steps.artifact.outputs.name }}");
     expect(recoveryPreflight.outputs?.already_published).toBe(
       "${{ steps.npm.outputs.already_published }}",
@@ -533,15 +595,18 @@ describe("release workflows", () => {
   });
 
   it("documents immutable published-release recovery without weakening the trust boundary", () => {
-    expect(releasingSource).toContain("Use the manual immutable-release recovery path only");
-    expect(releasingSource).toContain("gh workflow run publish.yml");
-    expect(releasingSource).toContain("--ref main");
-    expect(releasingSource).toContain("-f tag=v1.4.2");
-    expect(releasingSource).toContain("protected commit that defines the workflow");
-    expect(releasingSource).toContain("checks out or executes tagged package code");
-    expect(releasingSource).toContain("Recovery is idempotent");
-    expect(releasingSource).toContain("without rebuilding, repacking, downloading");
-    expect(releasingSource).toContain("does not create, edit, withdraw, replace, or delete");
+    for (const guide of [releasingSource, docsReleasingSource]) {
+      expect(guide).toContain("Use the manual immutable-release recovery path only");
+      expect(guide).toContain("gh workflow run publish.yml");
+      expect(guide).toContain("--ref main");
+      expect(guide).toContain("-f tag=v1.4.2");
+      expect(guide).toMatch(/trusted\s+default-branch\s+release\s+policy/u);
+      expect(guide).toMatch(/before\s+checking out tagged code/u);
+      expect(guide).toContain("Recovery is idempotent");
+      expect(guide).toContain("does not create, edit, withdraw, replace, or delete");
+      expect(guide).toContain("explicitly noncanonical");
+      expect(guide).toMatch(/missing or\s+malformed/iu);
+    }
   });
 
   it("binds the draft marker to the exact release tag", () => {
@@ -550,11 +615,12 @@ describe("release workflows", () => {
     );
     expect(draft?.with?.script).toContain("targetTag: tag_name");
     const marker = publishWorkflow.jobs.preflight.steps.find(
-      (step) => step.name === "Verify draft workflow marker and Highlights",
+      (step) => step.name === "Validate trusted release provenance",
     );
-    expect(marker?.run).toContain(
-      "assertActionCreatedReleaseBody(process.env.RELEASE_BODY, process.env.RELEASE_TAG)",
+    expect(marker?.with?.script).toContain(
+      "assertActionCreatedReleaseBody(release.body, currentTag)",
     );
+    expect(publishWorkflow.jobs.preflight.steps.indexOf(marker!)).toBe(1);
   });
 
   it("records prerelease support as a minor package change", () => {
