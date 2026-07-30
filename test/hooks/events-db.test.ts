@@ -17,6 +17,10 @@ import {
   isLcmConnectionOpen,
 } from "../../src/db/connection.js";
 
+// Full-suite coverage contention has stretched this 501-transaction stress case
+// to 12.7 seconds. Keep a bounded budget above twice that observed tail.
+const DURABLE_SEQUENCE_STRESS_TIMEOUT_MS = 30_000;
+
 const machineIdentityState = vi.hoisted(() => ({ fail: false }));
 
 vi.mock("../../src/machine-identity.js", () => ({
@@ -151,7 +155,7 @@ describe("EventsDb", () => {
       "SELECT next_sequence FROM local_hook_sequence WHERE singleton = 1",
     ).get()).toEqual({ next_sequence: "501" });
     checkpoint.close();
-  });
+  }, DURABLE_SEQUENCE_STRESS_TIMEOUT_MS);
 
   it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
     "ignores a non-finite busy timeout (%s)",
