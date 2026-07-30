@@ -828,6 +828,38 @@ function makeVersionedPredecessorCollision(
   return fixture;
 }
 
+function withEventsSqlite<T>(
+  path: string,
+  readOnly: boolean,
+  operation: (db: DatabaseSync) => T,
+): T {
+  const db = new DatabaseSync(path, { readOnly });
+  let operationFailed = false;
+  try {
+    return operation(db);
+  } catch (error) {
+    operationFailed = true;
+    throw error;
+  } finally {
+    try {
+      db.close();
+    } catch (closeError) {
+      if (!operationFailed) throw closeError;
+    }
+  }
+}
+
+function pruneVersionedPredecessor(
+  fixture: ReturnType<typeof makeEventsReconciliation>,
+  eventId = 1,
+): void {
+  for (const path of [fixture.targetEvents, fixture.sourceEvents]) {
+    withEventsSqlite(path, false, (db) => {
+      db.prepare("DELETE FROM events WHERE event_id = ?").run(eventId);
+    });
+  }
+}
+
 describe("worktree reconciliation", () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
@@ -3016,6 +3048,185 @@ describe("worktree reconciliation", () => {
     );
     expect(existsSync(fixture.sourceEvents)).toBe(true);
   });
+
+  it("preserves an identical delivered predecessor that is dangling in both copies", () => {
+    const fixture = makeVersionedPredecessorCollision(home, 1, 1);
+    setPassiveEventTransportState(fixture.targetEvents, 2, "replicated");
+    setPassiveEventTransportState(fixture.sourceEvents, 2, "replicated");
+    pruneVersionedPredecessor(fixture);
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const expected = {
+      prev_event_id: 1,
+      delivery_state: "replicated",
+      delivery_generation: 1,
+      remote_inbox_id: "42",
+    };
+    withEventsSqlite(fixture.targetEvents, true, (target) => {
+      expect(target.prepare(`
+        SELECT prev_event_id, delivery_state, delivery_generation, remote_inbox_id
+        FROM events
+        WHERE event_uuid = '22222222-2222-4222-8222-222222222222'
+      `).get()).toEqual(expected);
+      expect(target.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({
+        count: 1,
+      });
+    });
+
+    clearWorktreeReconciliationCache();
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    withEventsSqlite(fixture.targetEvents, true, (target) => {
+      expect(target.prepare(`
+        SELECT prev_event_id, delivery_state, delivery_generation, remote_inbox_id
+        FROM events
+        WHERE event_uuid = '22222222-2222-4222-8222-222222222222'
+      `).get()).toEqual(expected);
+      expect(target.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({
+        count: 1,
+      });
+    });
+  });
+
+  it.each([
+    { label: "source", progressed: "sourceEvents" },
+    { label: "destination", progressed: "targetEvents" },
+  ] as const)(
+    "preserves the dangling predecessor when only the $label copy has delivery progress",
+    ({ progressed }) => {
+      const fixture = makeVersionedPredecessorCollision(home, 1, 1);
+      setPassiveEventTransportState(fixture[progressed], 2, "replicated");
+      pruneVersionedPredecessor(fixture);
+
+      expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+      withEventsSqlite(fixture.targetEvents, true, (target) => {
+        expect(target.prepare(`
+          SELECT prev_event_id, delivery_state, delivery_generation, remote_inbox_id
+          FROM events
+          WHERE event_uuid = '22222222-2222-4222-8222-222222222222'
+        `).get()).toEqual({
+          prev_event_id: 1,
+          delivery_state: "replicated",
+          delivery_generation: 1,
+          remote_inbox_id: "42",
+        });
+      });
+    },
+  );
+
+  it("preserves an identical dangling predecessor while both copies are pristine", () => {
+    const fixture = makeVersionedPredecessorCollision(home, 1, 1);
+    pruneVersionedPredecessor(fixture);
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    withEventsSqlite(fixture.targetEvents, true, (target) => {
+      expect(target.prepare(`
+        SELECT prev_event_id, delivery_state, delivery_generation, remote_inbox_id
+        FROM events
+        WHERE event_uuid = '22222222-2222-4222-8222-222222222222'
+      `).get()).toEqual({
+        prev_event_id: 1,
+        delivery_state: "pending",
+        delivery_generation: 0,
+        remote_inbox_id: null,
+      });
+    });
+  });
+
+  it("fails closed when delivered duplicates retain different dangling predecessors", () => {
+    const fixture = makeVersionedPredecessorCollision(home, 1, 999);
+    setPassiveEventTransportState(fixture.targetEvents, 2, "replicated");
+    setPassiveEventTransportState(fixture.sourceEvents, 2, "replicated");
+    pruneVersionedPredecessor(fixture);
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "cannot remap delivered passive event predecessor",
+    );
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it("fails closed when the dangling predecessor ID is occupied in the destination", () => {
+    const fixture = makeVersionedPredecessorCollision(home, 1, 1);
+    setPassiveEventTransportState(fixture.targetEvents, 2, "replicated");
+    setPassiveEventTransportState(fixture.sourceEvents, 2, "replicated");
+    withEventsSqlite(fixture.sourceEvents, false, (source) => {
+      source.prepare("DELETE FROM events WHERE event_id = 1").run();
+    });
+    const expectedTarget = withEventsSqlite(
+      fixture.targetEvents,
+      false,
+      (targetBefore) => {
+        targetBefore.prepare(`
+          UPDATE events
+          SET event_uuid = '99999999-9999-4999-8999-999999999999',
+              data = 'unrelated occupant'
+          WHERE event_id = 1
+        `).run();
+        return targetBefore.prepare(
+          "SELECT * FROM events ORDER BY event_id",
+        ).all();
+      },
+    );
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "cannot remap delivered passive event predecessor",
+    );
+    withEventsSqlite(fixture.targetEvents, true, (targetAfter) => {
+      expect(targetAfter.prepare(
+        "SELECT * FROM events ORDER BY event_id",
+      ).all()).toEqual(expectedTarget);
+      expect(targetAfter.prepare(
+        "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources",
+      ).get()).toEqual({ count: 0 });
+    });
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it.each([
+    {
+      label: "payload",
+      sql: "UPDATE events SET data = 'divergent' WHERE event_id = 2",
+    },
+    {
+      label: "machine identity",
+      sql: `UPDATE events
+            SET machine_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+            WHERE event_id = 2`,
+    },
+    {
+      label: "machine sequence",
+      sql: "UPDATE events SET machine_sequence = '0000000000000000999' WHERE event_id = 2",
+    },
+  ])(
+    "fails closed before preserving a dangling predecessor with divergent $label",
+    ({ sql }) => {
+      const fixture = makeVersionedPredecessorCollision(home, 1, 1);
+      setPassiveEventTransportState(fixture.sourceEvents, 2, "replicated");
+      pruneVersionedPredecessor(fixture);
+      const expectedTarget = withEventsSqlite(
+        fixture.targetEvents,
+        false,
+        (targetBefore) => {
+          targetBefore.exec(sql);
+          return targetBefore.prepare(
+            "SELECT * FROM events ORDER BY event_id",
+          ).all();
+        },
+      );
+
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "cannot remap delivered passive event predecessor",
+      );
+      withEventsSqlite(fixture.targetEvents, true, (targetAfter) => {
+        expect(targetAfter.prepare(
+          "SELECT * FROM events ORDER BY event_id",
+        ).all()).toEqual(expectedTarget);
+        expect(targetAfter.prepare(
+          "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources",
+        ).get()).toEqual({ count: 0 });
+      });
+      expect(existsSync(fixture.sourceEvents)).toBe(true);
+    },
+  );
 
   it("keeps an unchanged delivered v4 predecessor", () => {
     const fixture = makeVersionedPredecessorRemap(home, false);
