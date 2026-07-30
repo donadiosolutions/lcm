@@ -8,6 +8,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -201,8 +202,12 @@ describe("daemon lifecycle test-scope validation", () => {
       fixture.scope,
       join(fixture.root, "foreign"),
     )).toThrow("not current owned state");
-    rmSync(fixture.scope.entrypoint);
-    writeFileSync(fixture.scope.entrypoint, "replacement entrypoint\n");
+    const replacementEntrypoint = join(
+      fixture.root,
+      "replacement-entrypoint.mjs",
+    );
+    writeFileSync(replacementEntrypoint, "replacement entrypoint\n");
+    renameSync(replacementEntrypoint, fixture.scope.entrypoint);
     expect(() => assertLifecycleScopeOwnsCurrentCleanupRoot(
       fixture.scope,
       fixture.scope.runtimeDir,
@@ -925,6 +930,32 @@ describe("run-owned lifecycle resources", () => {
     expect(existsSync(fixture.scope.stateDir)).toBe(false);
   });
 
+  it("rechecks interruption after the initial probe before token or startup effects", async () => {
+    const controller = new AbortController();
+    const fetch = vi.fn(async () => {
+      controller.abort();
+      throw new Error("initial probe interrupted");
+    });
+    const fixture = createFixture("owned-probe-interrupt", {
+      fetch: fetch as never,
+    });
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      _abortSignal: controller.signal,
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      warning: "daemon lifecycle was interrupted before startup",
+    });
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(existsSync(fixture.pidPath)).toBe(false);
+    expect(existsSync(fixture.tokenPath)).toBe(false);
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+  });
+
   it("observes abort cleanup rejection until finish awaits it", async () => {
     const controller = new AbortController();
     const fetch = vi.fn()
@@ -1029,6 +1060,73 @@ describe("run-owned lifecycle resources", () => {
     expect(fetch).toHaveBeenCalledOnce();
     expect(fixture.killProcess).not.toHaveBeenCalled();
     expect(fixture.stopUnit).not.toHaveBeenCalled();
+  });
+
+  it("blocks an unauthenticated foreign retry before parent repair can signal it", async () => {
+    const fixture = createFixture("retry-foreign-owner");
+    const foreign = createFixture("retry-foreign-scope");
+    const daemonPid = 5252;
+    const managerPid = 6262;
+    writeFileSync(fixture.pidPath, String(daemonPid));
+    ensureAuthToken(fixture.tokenPath);
+    const procRoot = join(fixture.root, "proc");
+    mkdirSync(join(procRoot, String(daemonPid)), { recursive: true });
+    mkdirSync(join(procRoot, String(managerPid)), { recursive: true });
+    writeFileSync(
+      join(procRoot, String(daemonPid), "status"),
+      `Name:\tlcm\nUid:\t1000\t1000\t1000\t1000\nPPid:\t${managerPid}\n`,
+    );
+    writeFileSync(
+      join(procRoot, String(daemonPid), "cmdline"),
+      "node\0lcm\0daemon\0start\0",
+    );
+    writeFileSync(
+      join(procRoot, String(managerPid), "status"),
+      "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
+    );
+    writeFileSync(
+      join(procRoot, String(managerPid), "cmdline"),
+      "systemd\0--user\0",
+    );
+    const fetch = vi.fn()
+      .mockRejectedValueOnce(new Error("initially down"))
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          status: "ok",
+          version: "1.4.2",
+          storageBackend: "sqlite",
+          pid: daemonPid,
+          ownerId: foreign.scope.ownerId,
+          entrypoint: foreign.scope.entrypoint,
+        }),
+      });
+    const scope = createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        fetch: fetch as never,
+        isProcessAlive: () => true,
+      },
+    });
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      _testScope: scope,
+      _procRoot: procRoot,
+      _uid: 1000,
+      _listeningPortsOverride: () => [48_321],
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      warning: expect.stringContaining("could not be authenticated"),
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(existsSync(fixture.pidPath)).toBe(false);
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
   });
 
   it("treats an empty owned token as unavailable without leaving its scope", async () => {

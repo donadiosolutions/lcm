@@ -1744,6 +1744,15 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
             expectedRuntimeDigest,
           );
           const retryHasAccess = authenticatedRetry !== null;
+          if (testScope && authenticatedRetry === null) {
+            cleanOwnedPid();
+            return {
+              connected: false,
+              port: opts.port,
+              spawned: false,
+              warning: mismatchAuthWarning(retryStorageBackendMatches),
+            };
+          }
           const mismatchRepair = await repairMismatchedDaemon(
             authenticatedRetry ?? retry,
             retryIdentityMatches,
@@ -1810,6 +1819,14 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       port: opts.port,
       spawned: false,
       warning: "refusing to register a Vitest worker as a daemon entrypoint",
+    };
+  }
+  if (opts._abortSignal?.aborted) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "daemon lifecycle was interrupted before startup",
     };
   }
 
