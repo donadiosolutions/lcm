@@ -311,6 +311,17 @@ function planText(value: unknown): string {
 describe("PostgreSQL 18 lexical search", () => {
   it("requires and admits only the reviewed read-only search grants", async () => {
     await withPostgreSqlTestDatabase("search-grants", async (database) => {
+      await database.migrator.query(
+        {
+          text: `REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+                 REVOKE EXECUTE ON FUNCTION public.similarity(text, text)
+                 FROM PUBLIC`,
+        },
+        {
+          domain: "lexical-search",
+          operation: "hardenSearchExtensionPrivileges",
+        }
+      );
       const projectId = await createProject(database, "Search grants");
       const conversationId = await createConversation(
         database,
@@ -349,6 +360,9 @@ describe("PostgreSQL 18 lexical search", () => {
       const privileges = await database.migrator.query<{
         schema_usage: boolean;
         schema_create: boolean;
+        public_schema_usage: boolean;
+        public_schema_create: boolean;
+        public_schema_grant_option: boolean;
         messages_select: boolean;
         messages_insert: boolean;
         summaries_select: boolean;
@@ -360,6 +374,8 @@ describe("PostgreSQL 18 lexical search", () => {
         conversations_select: boolean;
         normalize_execute: boolean;
         normalize_grant_option: boolean;
+        similarity_execute: boolean;
+        similarity_grant_option: boolean;
       }>(
         {
           text: `SELECT
@@ -369,6 +385,26 @@ describe("PostgreSQL 18 lexical search", () => {
                  has_schema_privilege(
                    'lcm_test_runtime', 'lcm', 'CREATE'
                  ) AS schema_create,
+                 has_schema_privilege(
+                   'lcm_test_runtime', 'public', 'USAGE'
+                 ) AS public_schema_usage,
+                 has_schema_privilege(
+                   'lcm_test_runtime', 'public', 'CREATE'
+                 ) AS public_schema_create,
+                 EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_namespace AS namespace
+                   CROSS JOIN LATERAL pg_catalog.aclexplode(
+                     namespace.nspacl
+                   ) AS privilege
+                   WHERE namespace.oid
+                     = 'public'::pg_catalog.regnamespace
+                     AND privilege.grantee
+                       = 'lcm_test_runtime'::pg_catalog.regrole
+                     AND privilege.privilege_type
+                       OPERATOR(pg_catalog.=) 'USAGE'
+                     AND privilege.is_grantable
+                 ) AS public_schema_grant_option,
                  has_table_privilege(
                    'lcm_test_runtime', 'lcm.messages', 'SELECT'
                  ) AS messages_select,
@@ -412,7 +448,26 @@ describe("PostgreSQL 18 lexical search", () => {
                      AND privilege.grantee
                        = 'lcm_test_runtime'::pg_catalog.regrole
                      AND privilege.is_grantable
-                 ) AS normalize_grant_option`,
+                 ) AS normalize_grant_option,
+                 has_function_privilege(
+                   'lcm_test_runtime',
+                   'public.similarity(text,text)',
+                   'EXECUTE'
+                 ) AS similarity_execute,
+                 EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_proc AS procedure
+                   CROSS JOIN LATERAL pg_catalog.aclexplode(
+                     procedure.proacl
+                   ) AS privilege
+                   WHERE procedure.oid
+                     = 'public.similarity(text,text)'::pg_catalog.regprocedure
+                     AND privilege.grantee
+                       = 'lcm_test_runtime'::pg_catalog.regrole
+                     AND privilege.privilege_type
+                       OPERATOR(pg_catalog.=) 'EXECUTE'
+                     AND privilege.is_grantable
+                 ) AS similarity_grant_option`,
         },
         {
           domain: "lexical-search",
@@ -422,6 +477,9 @@ describe("PostgreSQL 18 lexical search", () => {
       expect(privileges.rows[0]).toEqual({
         schema_usage: true,
         schema_create: false,
+        public_schema_usage: true,
+        public_schema_create: false,
+        public_schema_grant_option: false,
         messages_select: true,
         messages_insert: false,
         summaries_select: true,
@@ -433,6 +491,8 @@ describe("PostgreSQL 18 lexical search", () => {
         conversations_select: false,
         normalize_execute: true,
         normalize_grant_option: false,
+        similarity_execute: true,
+        similarity_grant_option: false,
       });
     });
   });
@@ -608,6 +668,18 @@ describe("PostgreSQL 18 lexical search", () => {
         projectId
       );
       try {
+        const originalBackend = await lowTimeoutRuntime.query<{
+          backend_pid: number;
+        }>(
+          {
+            text: `SELECT
+                   pg_catalog.pg_backend_pid() AS backend_pid`,
+          },
+          {
+            domain: "lexical-search",
+            operation: "capturePooledSearchBackend",
+          }
+        );
         await lowTimeoutRuntime.query(
           {
             text: "SET statement_timeout = '1ms'",
@@ -626,18 +698,52 @@ describe("PostgreSQL 18 lexical search", () => {
           sqlState: "57014",
           retryable: false,
         });
-        const pooled = await lowTimeoutRuntime.query<{
-          timeout: string;
-          usable: number;
-        }>(
-          {
-            text: `SELECT
-                   pg_catalog.current_setting('statement_timeout') AS timeout,
-                   1::pg_catalog.int4 AS usable`,
-          },
-          { domain: "lexical-search", operation: "verifyPoolAfterTimeout" }
-        );
-        expect(pooled.rows[0]).toEqual({ timeout: "1ms", usable: 1 });
+        await lowTimeoutRuntime.transaction(async (transaction) => {
+          const restored = await transaction.query<{
+            statement_timeout: string;
+          }>(
+            {
+              text: "SHOW statement_timeout",
+            },
+            {
+              domain: "lexical-search",
+              operation: "verifyRestoredPooledSearchTimeout",
+            }
+          );
+          expect(restored.rows[0]).toEqual({ statement_timeout: "1ms" });
+          await transaction.query(
+            {
+              text: "SET statement_timeout = '5s'",
+            },
+            {
+              domain: "lexical-search",
+              operation: "raisePooledSearchTimeout",
+            }
+          );
+          const healthy = await transaction.query<{
+            timeout: string;
+            backend_pid: number;
+            usable: number;
+          }>(
+            {
+              text: `SELECT
+                     pg_catalog.current_setting(
+                       'statement_timeout'
+                     ) AS timeout,
+                     pg_catalog.pg_backend_pid() AS backend_pid,
+                     1::pg_catalog.int4 AS usable`,
+            },
+            {
+              domain: "lexical-search",
+              operation: "verifyPoolAfterTimeout",
+            }
+          );
+          expect(healthy.rows[0]).toEqual({
+            timeout: "5s",
+            backend_pid: originalBackend.rows[0].backend_pid,
+            usable: 1,
+          });
+        });
       } finally {
         await lowTimeoutRuntime.close();
       }

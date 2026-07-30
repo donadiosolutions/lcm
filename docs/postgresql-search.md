@@ -112,12 +112,16 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
   --file=docs/postgresql-runtime-search-grants.sql
 ```
 
-Replace `lcm_runtime` with the existing runtime role. The script grants schema
-`USAGE`, exact execution of the normalization function, and `SELECT` on only
-messages, summaries, promoted memories, and promoted tags. It grants no schema
-creation, conversation access, DML, sequence access, `TRUNCATE`, ownership,
-grant option, or unrelated-domain access. Applying it does not activate
-PostgreSQL daemon or CLI routing.
+Replace `lcm_runtime` with the existing runtime role. The script grants `USAGE`
+on only the `lcm` and `public` schemas, exact execution of
+`lcm.normalize_search_text(text)` and `public.similarity(text,text)`, and
+`SELECT` on only messages, summaries, promoted memories, and promoted tags.
+The explicit `public` grants keep search functional when an administrator has
+revoked the extension namespace and similarity-function defaults from
+`PUBLIC`. The script grants no schema creation, conversation access, DML,
+sequence access, `TRUNCATE`, ownership, grant option, blanket function access,
+or unrelated-domain access. Applying it does not activate PostgreSQL daemon or
+CLI routing.
 
 ## Indexes, plans, and benchmark evidence
 

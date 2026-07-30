@@ -363,19 +363,26 @@ describe("PostgreSQL lexical-search repository", () => {
         mode: "regex",
       })
     ).resolves.toMatchObject([{ summaryId: "summary-a", rank: 0 }]);
+    await expect(
+      repository.searchMessages({
+        query: "\u0301 \t \u20dd",
+        mode: "regex",
+      })
+    ).resolves.toMatchObject([{ messageId: 11, rank: 0 }]);
 
     const regexQueries = database.query.mock.calls
       .map(([config]) => config as QueryConfig<unknown[]>)
       .filter((config) => text(config).includes("pg_catalog.regexp_substr"));
-    expect(regexQueries).toHaveLength(2);
+    expect(regexQueries).toHaveLength(3);
     expect(regexQueries[0].values?.[1]).toBe("needle-[0-9]+");
+    expect(regexQueries[2].values?.[1]).toBe("\u0301 \t \u20dd");
     expect(
       database.query.mock.calls
         .filter(([config]) =>
           text(config as QueryConfig<unknown[]>).includes("set_config")
         )
         .map(([config]) => (config as QueryConfig<unknown[]>).values?.[0])
-    ).toEqual(["5000ms", "0", "5000ms", "0"]);
+    ).toEqual(["5000ms", "0", "5000ms", "0", "5000ms", "0"]);
   });
 
   it("validates and snapshots every input before database I/O", async () => {
@@ -449,7 +456,7 @@ describe("PostgreSQL lexical-search repository", () => {
     ).resolves.toEqual([]);
     await expect(
       repository.searchMessages({
-        query: " \u0301\u20dd ",
+        query: " \u0301 \t \u20dd ",
         mode: "full_text",
       })
     ).resolves.toEqual([]);
@@ -468,7 +475,7 @@ describe("PostgreSQL lexical-search repository", () => {
     ).resolves.toEqual([]);
     await expect(
       repository.searchSummaries({
-        query: "\u20de\u20e4",
+        query: "\u20de\n\u20e4",
         mode: "full_text",
       })
     ).resolves.toEqual([]);
@@ -480,9 +487,9 @@ describe("PostgreSQL lexical-search repository", () => {
       })
     ).resolves.toEqual([]);
     await expect(repository.searchPromoted(" ", 5)).resolves.toEqual([]);
-    await expect(repository.searchPromoted("\u0362\u20e0", 5)).resolves.toEqual(
-      []
-    );
+    await expect(
+      repository.searchPromoted("\u0362 \r\n \u20e0", 5)
+    ).resolves.toEqual([]);
     await expect(repository.searchPromoted("needle", 0)).resolves.toEqual([]);
     expect(database.transaction).not.toHaveBeenCalled();
     expect(database.query).not.toHaveBeenCalled();

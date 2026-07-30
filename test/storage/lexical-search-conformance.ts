@@ -166,7 +166,7 @@ export async function exerciseLexicalSearchRepositoryConformance(
   ).toEqual([]);
   expect(
     await repository.searchMessages({
-      query: "\u20dd",
+      query: "\u20dd \t \u0301",
       mode: "full_text",
     })
   ).toEqual([]);
@@ -252,7 +252,7 @@ export async function exerciseLexicalSearchRepositoryConformance(
   ).toEqual([]);
   expect(
     await repository.searchSummaries({
-      query: "\u0301\u20de",
+      query: "\u0301\n\u20de",
       mode: "full_text",
     })
   ).toEqual([]);
@@ -305,7 +305,7 @@ export async function exerciseLexicalSearchRepositoryConformance(
   ).toMatchObject([{ id: memoryIds.isolated }]);
   expect(await repository.searchPromoted("durable", 1)).toHaveLength(1);
   expect(await repository.searchPromoted("", 10)).toEqual([]);
-  expect(await repository.searchPromoted("\u20e0\u0362", 10)).toEqual([]);
+  expect(await repository.searchPromoted("\u20e0 \r\n \u0362", 10)).toEqual([]);
   expect(
     (await repository.searchPromoted("_%; DROP TABLE memories; --", 10)).length
   ).toBeLessThanOrEqual(2);

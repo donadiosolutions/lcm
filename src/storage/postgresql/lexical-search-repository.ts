@@ -23,11 +23,14 @@ const MAX_SEARCH_LIMIT = 1_000;
 const DEFAULT_SEARCH_LIMIT = 50;
 const SEARCH_TIMEOUT_CAP_MS = 5_000;
 const MIN_TRIGRAM_QUERY_BYTES = 3;
-// Exact empty replacements from migration 0002's pinned unaccent-derived map.
-// Rejecting these locally prevents an empty normalized trigram pattern (`%%`)
-// without requiring a database normalization probe.
-const NORMALIZATION_REMOVALS_ONLY =
-  /^[\u0300-\u0362\u20dd-\u20e0\u20e2-\u20e4]+$/u;
+// Exact empty replacements from migration 0002's pinned unaccent-derived map,
+// plus Unicode whitespace. PostgreSQL preserves the whitespace while removing
+// the mapped characters, leaving no full-text lexeme and an unsafe broad
+// trigram pattern. U+FEFF is included because the repository's String.trim()
+// boundary already treats it as whitespace even though Unicode White_Space
+// does not. Punctuation and all other text remain searchable.
+const NORMALIZATION_EMPTY_INPUT =
+  /^[\p{White_Space}\uFEFF\u0300-\u0362\u20dd-\u20e0\u20e2-\u20e4]+$/u;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const UUIDV7_PATTERN =
@@ -484,7 +487,7 @@ function hasTrigrams(query: string): boolean {
 }
 
 function normalizesToEmpty(query: string): boolean {
-  return NORMALIZATION_REMOVALS_ONLY.test(query.trim());
+  return NORMALIZATION_EMPTY_INPUT.test(query);
 }
 
 function boundedStatementTimeoutMs(
