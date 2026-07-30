@@ -29,6 +29,11 @@ import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { PKG_VERSION, RUNTIME_DIGEST } from "./version.js";
 import { normalizeDaemonPort, normalizeIdleTimeoutMs } from "./http-url.js";
+import {
+  type DaemonLifecycleTestIdentity,
+  isDaemonLifecycleTestIdentity,
+  isVitestWorkerEntrypoint,
+} from "./lifecycle-scope.js";
 import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
 import { createStorageBackendFactory } from "../storage/index.js";
@@ -48,6 +53,10 @@ export type DaemonOptions = {
   _scanForTranscripts?: () => Promise<void>;
   /** @internal Deterministic packaged-runtime identity seam for health tests. */
   _runtimeDigest?: string;
+  /** @internal Explicit owned daemon identity for lifecycle isolation tests. */
+  _testIdentity?: DaemonLifecycleTestIdentity;
+  /** @internal Deterministic auth-token read seam for preflight ordering tests. */
+  _readAuthToken?: typeof readAuthToken;
 };
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -132,8 +141,19 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const clearIdleTimeout = options?._clearTimeout ?? clearTimeout;
   const listenPort = normalizeDaemonPort(config.daemon.port, { allowZero: true });
   const idleTimeoutMs = normalizeIdleTimeoutMs(config.daemon.idleTimeoutMs);
-  const serverToken = options?.tokenPath ? readAuthToken(options.tokenPath) : null;
   const runtimeDigest = options?._runtimeDigest ?? RUNTIME_DIGEST;
+  const hasTestIdentity = Object.prototype.hasOwnProperty.call(options ?? {}, "_testIdentity");
+  if (hasTestIdentity && !isDaemonLifecycleTestIdentity(options?._testIdentity)) {
+    throw new Error("Daemon test identity is incomplete or malformed");
+  }
+  const daemonEntrypoint = options?._testIdentity?.entrypoint ?? process.argv[1];
+  const daemonOwnerId = options?._testIdentity?.ownerId;
+  if (options?.tokenPath && isVitestWorkerEntrypoint(daemonEntrypoint)) {
+    throw new Error("Refusing to authenticate a Vitest worker as a daemon entrypoint");
+  }
+  const serverToken = options?.tokenPath
+    ? (options._readAuthToken ?? readAuthToken)(options.tokenPath)
+    : null;
   if (options?.tokenPath && serverToken === null) {
     throw new Error(`Auth token file specified but could not be read: ${options.tokenPath}`);
   }
@@ -171,6 +191,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         storageBackend: config.storage.backend,
         uptime: Math.floor((Date.now() - startTime) / 1000),
         pid: process.pid,
+        ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
       });
       return;
     }
@@ -182,7 +203,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       storageBackend: config.storage.backend,
       uptime: Math.floor((Date.now() - startTime) / 1000),
       pid: process.pid,
-      entrypoint: process.argv[1],
+      entrypoint: daemonEntrypoint,
+      ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
       ...(serverToken && req.headers.authorization !== undefined && runtimeDigest
         ? { runtimeDigest }
         : {}),

@@ -69,6 +69,12 @@ const state = vi.hoisted(() => ({
     canonical: path,
   })),
   daemonClientInstances: 0,
+  runtimeHome: "/lcm",
+  runtimePidPath: "/lcm/daemon.pid",
+  runtimeTokenPath: "/lcm/daemon.token",
+  migrateLegacyHome: vi.fn(),
+  ensureAuthToken: vi.fn(),
+  createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })),
 }));
 
 const fakeStdin = vi.hoisted(() => ({
@@ -95,9 +101,12 @@ vi.mock("node:fs", async importOriginal => ({
 }));
 vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/runtime-paths.js")>()),
-  configPath: () => "/lcm/config.json", daemonPidPath: () => "/lcm/daemon.pid",
-  daemonTokenPath: () => "/lcm/daemon.token", lcmHomeDir: () => "/lcm",
-  migrateLegacyHomeIfNeeded: vi.fn(), projectsDir: () => "/lcm/projects",
+  configPath: () => `${state.runtimeHome}/config.json`,
+  daemonPidPath: () => state.runtimePidPath,
+  daemonTokenPath: () => state.runtimeTokenPath,
+  lcmHomeDir: () => state.runtimeHome,
+  migrateLegacyHomeIfNeeded: state.migrateLegacyHome,
+  projectsDir: () => `${state.runtimeHome}/projects`,
 }));
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: class {
@@ -131,8 +140,8 @@ vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((va
 vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
   start = vi.fn(); stop = vi.fn(); sessionDone = vi.fn(); printSummary = vi.fn();
 } }));
-vi.mock("../../src/daemon/server.js", () => ({ createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })) }));
-vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn() }));
+vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
+vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: state.ensureAuthToken }));
 vi.mock("../../src/stats.js", () => ({ collectStats: vi.fn(() => ({ ok: true })), printStats: vi.fn() }));
 vi.mock("../../src/doctor/doctor.js", () => ({ runDoctor: vi.fn(async () => state.doctorResults), printResults: vi.fn() }));
 vi.mock("../../src/diagnose.js", () => ({ diagnose: vi.fn(async () => ({ ok: true })), formatDiagnoseResult: vi.fn(() => "diagnosed") }));
@@ -180,9 +189,12 @@ vi.mock("../../src/storage/postgresql/provisioning.js", () => ({
 }));
 
 const {
-  handleCliError, resolveCompactRequestPolicyOverride, runCli, runMainIfInvoked, shouldRunMain,
+  assertParsedInternalDaemonTestIdentity, handleCliError, isStrictContainedRelativePath,
+  resolveCompactRequestPolicyOverride,
+  runCli, runMainIfInvoked, shouldRunMain,
   withHookOverrides, writeCliError, writeCliOutput,
 } = await import("../../bin/lcm.js");
+const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
 const { batchCompact } = await import("../../src/batch-compact.js");
 const { isDaemonTransportFailure } = await import("../../src/daemon/http-url.js");
 
@@ -221,6 +233,9 @@ beforeEach(() => {
   state.importProgressLast = true;
   state.sensitiveStdout = "sensitive";
   state.packageVersion = "1.4.0";
+  state.runtimeHome = "/lcm";
+  state.runtimePidPath = "/lcm/daemon.pid";
+  state.runtimeTokenPath = "/lcm/daemon.token";
   state.storageBackend = "sqlite";
   state.provisionResult = {
     applied: ["0001_migration_ledger"],
@@ -745,6 +760,331 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(() => handlers.get("SIGTERM")?.()).toThrow("exit:0");
     expect(() => handlers.get("SIGINT")?.()).toThrow("exit:0");
     on.mockRestore();
+  });
+
+  it("rejects partial and fabricated internal daemon identities before side effects", async () => {
+    const ownerOption = "--internal-lcm-test-daemon-owner";
+    const entrypointOption = "--internal-lcm-test-daemon-entrypoint";
+    expect((await invoke([
+      "daemon",
+      "start",
+      "--foreground",
+      ownerOption,
+      "partial",
+    ]))?.message).toContain("complete owner and entrypoint pair");
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    expect(state.ensureAuthToken).not.toHaveBeenCalled();
+    expect(state.createDaemon).not.toHaveBeenCalled();
+
+    expect((await invoke([
+      "daemon",
+      "start",
+      "--foreground",
+      ownerOption,
+      "fabricated",
+      entrypointOption,
+      "/tmp/fabricated-daemon.mjs",
+    ]))?.message).toContain("not confined to an isolated lifecycle environment");
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    expect(state.ensureAuthToken).not.toHaveBeenCalled();
+    expect(state.createDaemon).not.toHaveBeenCalled();
+  });
+
+  it("rejects missing, duplicate, misplaced, and malformed internal identity options", async () => {
+    const ownerOption = "--internal-lcm-test-daemon-owner";
+    const entrypointOption = "--internal-lcm-test-daemon-entrypoint";
+    const cases: Array<{ args: string[]; expected: string }> = [
+      {
+        args: ["daemon", "start", "--foreground", ownerOption],
+        expected: "requires a value",
+      },
+      {
+        args: ["daemon", "start", ownerOption, "--foreground", entrypointOption, "/tmp/owned.mjs"],
+        expected: "requires a value",
+      },
+      {
+        args: ["daemon", "start", "--foreground", `${ownerOption}=owned`, `${entrypointOption}=`],
+        expected: "requires a value",
+      },
+      {
+        args: [
+          "daemon",
+          "start",
+          "--foreground",
+          ownerOption,
+          "owned",
+          ownerOption,
+          "duplicate",
+          entrypointOption,
+          "/tmp/owned.mjs",
+        ],
+        expected: "one complete owner and entrypoint pair",
+      },
+      {
+        args: ["status", "--foreground", `${ownerOption}=owned`, `${entrypointOption}=/tmp/owned.mjs`],
+        expected: "restricted to foreground daemon startup",
+      },
+      {
+        args: [
+          "daemon",
+          "start",
+          `${ownerOption}=owned`,
+          `${entrypointOption}=/tmp/owned.mjs`,
+          "--",
+          "--foreground",
+        ],
+        expected: "restricted to foreground daemon startup",
+      },
+      {
+        args: [
+          "daemon",
+          "start",
+          "--foreground",
+          "--",
+          `${ownerOption}=owned`,
+          `${entrypointOption}=/tmp/owned.mjs`,
+        ],
+        expected: "restricted to foreground daemon startup",
+      },
+      {
+        args: ["daemon", "start", "--foreground", `${ownerOption}=bad owner`, `${entrypointOption}=/tmp/owned.mjs`],
+        expected: "identity is malformed",
+      },
+      {
+        args: [
+          "daemon",
+          "start",
+          "--foreground",
+          `${ownerOption}=owned`,
+          `${entrypointOption}=/repo/node_modules/vitest/dist/workers/forks.js`,
+        ],
+        expected: "identity is malformed",
+      },
+    ];
+
+    for (const { args, expected } of cases) {
+      expect((await invoke(args))?.message).toContain(expected);
+    }
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    expect(state.ensureAuthToken).not.toHaveBeenCalled();
+    expect(state.createDaemon).not.toHaveBeenCalled();
+    expect(isStrictContainedRelativePath("child/file")).toBe(true);
+    expect(isStrictContainedRelativePath("")).toBe(false);
+    expect(isStrictContainedRelativePath("../outside")).toBe(false);
+    expect(isStrictContainedRelativePath("/absolute")).toBe(false);
+    expect(() => assertParsedInternalDaemonTestIdentity(
+      {
+        internalLcmTestDaemonOwner: "changed",
+        internalLcmTestDaemonEntrypoint: "/tmp/owned.mjs",
+      },
+      { ownerId: "owned", entrypoint: "/tmp/owned.mjs" },
+    )).toThrow("did not survive CLI parsing intact");
+    expect(() => assertParsedInternalDaemonTestIdentity(
+      {
+        internalLcmTestDaemonOwner: "owned",
+        internalLcmTestDaemonEntrypoint: "/tmp/changed.mjs",
+      },
+      { ownerId: "owned", entrypoint: "/tmp/owned.mjs" },
+    )).toThrow("did not survive CLI parsing intact");
+  });
+
+  it("rejects every unconfined environment and state root before side effects", async () => {
+    const previous = {
+      home: process.env.HOME,
+      runtime: process.env.XDG_RUNTIME_DIR,
+      owner: process.env.LCM_DAEMON_OWNER_ID,
+    };
+    const ownerOption = "--internal-lcm-test-daemon-owner=owned";
+    const entrypointOption = "--internal-lcm-test-daemon-entrypoint=/tmp/lcm-owned/runtime/owned.mjs";
+    const invokeIdentity = (): Promise<Error | undefined> => invoke([
+      "daemon",
+      "start",
+      "--foreground",
+      ownerOption,
+      entrypointOption,
+    ]);
+    const setValidEnvironment = (): void => {
+      process.env.HOME = "/tmp/lcm-owned";
+      process.env.XDG_RUNTIME_DIR = "/tmp/lcm-owned/runtime";
+      process.env.LCM_DAEMON_OWNER_ID = "owned";
+      state.runtimeHome = "/tmp/lcm-owned/.lcm";
+      state.runtimePidPath = "/tmp/lcm-owned/.lcm/daemon.pid";
+      state.runtimeTokenPath = "/tmp/lcm-owned/.lcm/daemon.token";
+    };
+
+    try {
+      setValidEnvironment();
+      process.env.LCM_DAEMON_OWNER_ID = "foreign";
+      expect((await invokeIdentity())?.message).toContain("not confined");
+      setValidEnvironment();
+      delete process.env.HOME;
+      expect((await invokeIdentity())?.message).toContain("not confined");
+      setValidEnvironment();
+      delete process.env.XDG_RUNTIME_DIR;
+      expect((await invokeIdentity())?.message).toContain("not confined");
+      setValidEnvironment();
+      process.env.HOME = "/";
+      expect((await invokeIdentity())?.message).toContain("not confined");
+      setValidEnvironment();
+      process.env.HOME = "relative";
+      expect((await invokeIdentity())?.message).toContain("not confined");
+      setValidEnvironment();
+      process.env.XDG_RUNTIME_DIR = "relative";
+      expect((await invokeIdentity())?.message).toContain("not confined");
+      setValidEnvironment();
+      process.env.XDG_RUNTIME_DIR = "/tmp/foreign-runtime";
+      expect((await invokeIdentity())?.message).toContain("not confined");
+      setValidEnvironment();
+      const outsideEntrypoint = entrypointOption.replace(
+        "/tmp/lcm-owned/runtime/owned.mjs",
+        "/tmp/foreign-entrypoint.mjs",
+      );
+      expect((await invoke([
+        "daemon",
+        "start",
+        "--foreground",
+        ownerOption,
+        outsideEntrypoint,
+      ]))?.message).toContain("not confined");
+
+      setValidEnvironment();
+      state.runtimeHome = "/tmp/foreign-state";
+      expect((await invokeIdentity())?.message).toContain("state is not confined");
+      setValidEnvironment();
+      state.runtimePidPath = "/tmp/lcm-owned/foreign.pid";
+      expect((await invokeIdentity())?.message).toContain("state is not confined");
+      setValidEnvironment();
+      state.runtimeTokenPath = "/tmp/lcm-owned/foreign.token";
+      expect((await invokeIdentity())?.message).toContain("state is not confined");
+    } finally {
+      if (previous.home === undefined) delete process.env.HOME;
+      else process.env.HOME = previous.home;
+      if (previous.runtime === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = previous.runtime;
+      if (previous.owner === undefined) delete process.env.LCM_DAEMON_OWNER_ID;
+      else process.env.LCM_DAEMON_OWNER_ID = previous.owner;
+    }
+
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    expect(state.ensureAuthToken).not.toHaveBeenCalled();
+    expect(state.createDaemon).not.toHaveBeenCalled();
+  });
+
+  it("passes one confined internal daemon identity explicitly to the server", async () => {
+    const previous = {
+      home: process.env.HOME,
+      runtime: process.env.XDG_RUNTIME_DIR,
+      owner: process.env.LCM_DAEMON_OWNER_ID,
+    };
+    const homeDir = actualFs.mkdtempSync("/tmp/lcm-cli-owned-home-");
+    const runtimeDir = `${homeDir}/runtime`;
+    const entrypoint = `${runtimeDir}/owned-lcm.mjs`;
+    actualFs.mkdirSync(runtimeDir, { recursive: true });
+    actualFs.mkdirSync(`${homeDir}/.lcm`, { recursive: true });
+    actualFs.writeFileSync(entrypoint, "export {};\n");
+    state.runtimeHome = `${homeDir}/.lcm`;
+    state.runtimePidPath = `${state.runtimeHome}/daemon.pid`;
+    state.runtimeTokenPath = `${state.runtimeHome}/daemon.token`;
+    process.env.HOME = homeDir;
+    process.env.XDG_RUNTIME_DIR = runtimeDir;
+    process.env.LCM_DAEMON_OWNER_ID = "cli-owned";
+    try {
+      expect(await invoke([
+        "daemon",
+        "start",
+        "--foreground",
+        "--internal-lcm-test-daemon-owner=cli-owned",
+        `--internal-lcm-test-daemon-entrypoint=${entrypoint}`,
+      ])).toBeUndefined();
+      expect(state.createDaemon).toHaveBeenCalledWith(
+        expect.any(Object),
+        {
+          tokenPath: `${state.runtimeHome}/daemon.token`,
+          _testIdentity: {
+            ownerId: "cli-owned",
+            entrypoint,
+          },
+        },
+      );
+      expect(state.ensureAuthToken).toHaveBeenCalledWith(
+        `${state.runtimeHome}/daemon.token`,
+      );
+    } finally {
+      if (previous.home === undefined) delete process.env.HOME;
+      else process.env.HOME = previous.home;
+      if (previous.runtime === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = previous.runtime;
+      if (previous.owner === undefined) delete process.env.LCM_DAEMON_OWNER_ID;
+      else process.env.LCM_DAEMON_OWNER_ID = previous.owner;
+      actualFs.rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects linked hidden-pair state and entrypoints before side effects", async () => {
+    const previous = {
+      home: process.env.HOME,
+      runtime: process.env.XDG_RUNTIME_DIR,
+      owner: process.env.LCM_DAEMON_OWNER_ID,
+    };
+    const root = actualFs.mkdtempSync("/tmp/lcm-cli-symlink-");
+    const homeDir = `${root}/home`;
+    const runtimeDir = `${homeDir}/runtime`;
+    const stateTarget = `${root}/canonical-target-state`;
+    const entrypointTarget = `${root}/canonical-target-entrypoint.mjs`;
+    const entrypoint = `${runtimeDir}/owned-lcm.mjs`;
+    actualFs.mkdirSync(runtimeDir, { recursive: true });
+    actualFs.mkdirSync(stateTarget, { recursive: true });
+    actualFs.writeFileSync(`${stateTarget}/sentinel`, "untouched");
+    actualFs.writeFileSync(entrypoint, "export {};\n");
+    actualFs.writeFileSync(entrypointTarget, "export const target = true;\n");
+    actualFs.symlinkSync(stateTarget, `${homeDir}/.lcm`, "dir");
+    state.runtimeHome = `${homeDir}/.lcm`;
+    state.runtimePidPath = `${state.runtimeHome}/daemon.pid`;
+    state.runtimeTokenPath = `${state.runtimeHome}/daemon.token`;
+    process.env.HOME = homeDir;
+    process.env.XDG_RUNTIME_DIR = runtimeDir;
+    process.env.LCM_DAEMON_OWNER_ID = "cli-symlink";
+    const invokeOwned = (): Promise<Error | undefined> => invoke([
+      "daemon",
+      "start",
+      "--foreground",
+      "--internal-lcm-test-daemon-owner=cli-symlink",
+      `--internal-lcm-test-daemon-entrypoint=${entrypoint}`,
+    ]);
+    try {
+      expect((await invokeOwned())?.message).toContain("filesystem is not canonical");
+      actualFs.unlinkSync(`${homeDir}/.lcm`);
+      actualFs.mkdirSync(`${homeDir}/.lcm`);
+      actualFs.unlinkSync(entrypoint);
+      actualFs.symlinkSync(entrypointTarget, entrypoint, "file");
+      expect((await invokeOwned())?.message).toContain("filesystem is not canonical");
+      actualFs.unlinkSync(entrypoint);
+      actualFs.writeFileSync(entrypoint, "export const owned = true;\n", {
+        mode: 0o640,
+      });
+      const hardlinkTarget = `${root}/hardlinked-entrypoint.mjs`;
+      actualFs.linkSync(entrypoint, hardlinkTarget);
+      const hardlinkContent = actualFs.readFileSync(hardlinkTarget, "utf-8");
+      const hardlinkMode = actualFs.statSync(hardlinkTarget).mode & 0o777;
+      expect((await invokeOwned())?.message).toContain("filesystem is not canonical");
+      expect(actualFs.readFileSync(`${stateTarget}/sentinel`, "utf-8")).toBe("untouched");
+      expect(actualFs.readFileSync(entrypointTarget, "utf-8")).toContain("target");
+      expect(actualFs.readFileSync(hardlinkTarget, "utf-8")).toBe(hardlinkContent);
+      expect(actualFs.statSync(hardlinkTarget).mode & 0o777).toBe(hardlinkMode);
+      expect(actualFs.existsSync(`${stateTarget}/daemon.pid`)).toBe(false);
+      expect(actualFs.existsSync(`${stateTarget}/daemon.token`)).toBe(false);
+    } finally {
+      if (previous.home === undefined) delete process.env.HOME;
+      else process.env.HOME = previous.home;
+      if (previous.runtime === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = previous.runtime;
+      if (previous.owner === undefined) delete process.env.LCM_DAEMON_OWNER_ID;
+      else process.env.LCM_DAEMON_OWNER_ID = previous.owner;
+      actualFs.rmSync(root, { recursive: true, force: true });
+    }
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    expect(state.ensureAuthToken).not.toHaveBeenCalled();
+    expect(state.createDaemon).not.toHaveBeenCalled();
   });
 
   it("executes restart preflight validation", async () => {

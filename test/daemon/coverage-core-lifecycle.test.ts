@@ -1,12 +1,19 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureAuthToken } from "../../src/daemon/auth.js";
-import { __lifecycleTestUtils, ensureDaemon, findUserSystemdPid, readProcessParentPid, restartDaemon } from "../../src/daemon/lifecycle.js";
+import {
+  __lifecycleTestUtils,
+  ensureDaemon as ensureDaemonProduction,
+  findUserSystemdPid,
+  readProcessParentPid,
+  restartDaemon as restartDaemonProduction,
+} from "../../src/daemon/lifecycle.js";
+import type { DaemonLifecycleHermeticTestSeams } from "../../src/daemon/lifecycle-scope.js";
 
 const dirs: string[] = [];
-type EnsureDaemonOptions = Parameters<typeof ensureDaemon>[0];
+type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
 type MonotonicNowOverride = NonNullable<EnsureDaemonOptions["_monotonicNowOverride"]>;
 type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
 type SpawnChildDouble = Pick<ReturnType<SpawnOverride>, "pid" | "unref"> & {
@@ -24,7 +31,210 @@ const fetchHealthy = (pid?: number) => vi.fn(async (url: string) => url.endsWith
   ? { ok: true, json: async () => ({ status: "ok", version: "1", pid }) }
   : { ok: true, json: async () => ({}) });
 
+function withHermeticLifecycleSeams(options: EnsureDaemonOptions): EnsureDaemonOptions {
+  const stateDir = dirname(options.pidFilePath);
+  const runtimeDir = join(stateDir, ".hermetic-runtime");
+  const credentialDir = join(stateDir, ".hermetic-credentials");
+  const procRoot = options._procRoot === "/proc"
+    ? join(stateDir, ".hermetic-proc")
+    : options._procRoot ?? join(stateDir, ".hermetic-proc");
+  for (const directory of [stateDir, runtimeDir, credentialDir, procRoot]) {
+    mkdirSync(directory, { recursive: true });
+  }
+  const seams: DaemonLifecycleHermeticTestSeams = {
+    homeDir: stateDir,
+    runtimeDir,
+    stateDir,
+    credentialDir,
+    procRoot,
+    platform: options._platform ?? "linux",
+    uid: options._uid ?? 1000,
+    environment: {},
+    fetch: options._fetchOverride
+      ?? (vi.fn().mockRejectedValue(new Error("hermetic offline")) as never),
+    spawn: options._spawnOverride
+      ?? (vi.fn(() => ({ pid: undefined, once: vi.fn().mockReturnThis(), unref: vi.fn() })) as never),
+    spawnSync: options._spawnSyncOverride
+      ?? (vi.fn(() => ({ status: 1, stdout: "", stderr: "hermetic" })) as never),
+    stopUnit: vi.fn(),
+    killProcess: options._killOverride ?? vi.fn(),
+    isProcessAlive: options._isProcessAliveOverride ?? (() => false),
+    sleep: options._sleepOverride ?? (async () => undefined),
+    realpath: options._realpathOverride ?? (path => path),
+  };
+  return { ...options, _hermeticTestSeams: seams };
+}
+
+function ensureDaemon(options: EnsureDaemonOptions): ReturnType<typeof ensureDaemonProduction> {
+  return ensureDaemonProduction(withHermeticLifecycleSeams(options));
+}
+
+function restartDaemon(
+  options: Parameters<typeof restartDaemonProduction>[0],
+): ReturnType<typeof restartDaemonProduction> {
+  return restartDaemonProduction(withHermeticLifecycleSeams(options));
+}
+
 describe("lifecycle procfs and parent warnings", () => {
+  it("attempts every cleanup stage before aggregating multiple failures", async () => {
+    const order: string[] = [];
+    const first = new Error("unit cleanup failed");
+    const second = new Error("state cleanup failed");
+    await expect(__lifecycleTestUtils.runCleanupStages([
+      async () => {
+        order.push("unit");
+        throw first;
+      },
+      () => {
+        order.push("process");
+      },
+      async () => {
+        order.push("state");
+        throw second;
+      },
+    ])).rejects.toMatchObject({
+      errors: [first, second],
+      message: "daemon lifecycle cleanup failed",
+    });
+    expect(order).toEqual(["unit", "process", "state"]);
+    await expect(__lifecycleTestUtils.sleep(0)).resolves.toBeUndefined();
+    expect(__lifecycleTestUtils.isProcessAlive(process.pid)).toBe(true);
+    expect(__lifecycleTestUtils.isProcessAlive(Number.MAX_SAFE_INTEGER)).toBe(false);
+  });
+
+  it("resolves complete scoped, hermetic, override, and production dependency sets", () => {
+    const root = temp();
+    const pidFilePath = join(root, "daemon.pid");
+    const production = __lifecycleTestUtils.resolveLifecycleDependencies({
+      port: 1,
+      pidFilePath,
+      spawnTimeoutMs: 1,
+    });
+    expect(production).toMatchObject({
+      environment: process.env,
+      platform: process.platform,
+      procRoot: "/proc",
+      uid: undefined,
+    });
+    expect(Object.values(production).filter(value => typeof value === "function"))
+      .toHaveLength(7);
+
+    const overrides = {
+      fetch: vi.fn() as never,
+      spawn: vi.fn() as never,
+      spawnSync: vi.fn() as never,
+      killProcess: vi.fn(),
+      isProcessAlive: vi.fn(),
+      sleep: vi.fn(async () => undefined),
+      realpath: vi.fn((path: string) => path),
+    };
+    expect(__lifecycleTestUtils.resolveLifecycleDependencies({
+      port: 1,
+      pidFilePath,
+      spawnTimeoutMs: 1,
+      _fetchOverride: overrides.fetch,
+      _spawnOverride: overrides.spawn,
+      _spawnSyncOverride: overrides.spawnSync,
+      _killOverride: overrides.killProcess,
+      _isProcessAliveOverride: overrides.isProcessAlive,
+      _sleepOverride: overrides.sleep,
+      _realpathOverride: overrides.realpath,
+      _platform: "darwin",
+      _procRoot: join(root, "proc"),
+      _uid: 501,
+    })).toMatchObject({
+      ...overrides,
+      platform: "darwin",
+      procRoot: join(root, "proc"),
+      uid: 501,
+    });
+
+    const hermeticOptions = withHermeticLifecycleSeams({
+      port: 1,
+      pidFilePath,
+      spawnTimeoutMs: 1,
+    });
+    const hermetic = __lifecycleTestUtils.resolveLifecycleDependencies(hermeticOptions);
+    expect(hermetic).toMatchObject({
+      environment: hermeticOptions._hermeticTestSeams!.environment,
+      fetch: hermeticOptions._hermeticTestSeams!.fetch,
+      spawn: hermeticOptions._hermeticTestSeams!.spawn,
+      spawnSync: hermeticOptions._hermeticTestSeams!.spawnSync,
+      killProcess: hermeticOptions._hermeticTestSeams!.killProcess,
+      isProcessAlive: hermeticOptions._hermeticTestSeams!.isProcessAlive,
+      sleep: hermeticOptions._hermeticTestSeams!.sleep,
+      realpath: hermeticOptions._hermeticTestSeams!.realpath,
+      platform: hermeticOptions._hermeticTestSeams!.platform,
+      procRoot: hermeticOptions._hermeticTestSeams!.procRoot,
+      uid: hermeticOptions._hermeticTestSeams!.uid,
+    });
+
+    const scopedDependencies = {
+      fetch: vi.fn() as never,
+      spawn: vi.fn() as never,
+      spawnSync: vi.fn() as never,
+      killProcess: vi.fn(),
+      isProcessAlive: vi.fn(),
+      sleep: vi.fn(async () => undefined),
+    };
+    const scopedOptions = {
+      port: 1,
+      pidFilePath,
+      spawnTimeoutMs: 1,
+      _testScope: {
+        ownerId: "owned",
+        homeDir: join(root, "home"),
+        runtimeDir: join(root, "home", "runtime"),
+        unitPrefix: "lcm-test-daemon-owned-",
+        dependencies: scopedDependencies,
+      } as never,
+    };
+    const scoped = __lifecycleTestUtils.resolveLifecycleDependencies(scopedOptions);
+    expect(scoped).toMatchObject(scopedDependencies);
+    expect(__lifecycleTestUtils.lifecycleSpawnEnvironment(
+      { port: 1, pidFilePath, spawnTimeoutMs: 1 },
+      production,
+    )).toMatchObject(process.env);
+    expect(__lifecycleTestUtils.lifecycleSpawnEnvironment(
+      hermeticOptions,
+      hermetic,
+    )).toMatchObject({
+      HOME: hermeticOptions._hermeticTestSeams!.homeDir,
+      USERPROFILE: hermeticOptions._hermeticTestSeams!.homeDir,
+      XDG_RUNTIME_DIR: hermeticOptions._hermeticTestSeams!.runtimeDir,
+    });
+    expect(__lifecycleTestUtils.lifecycleSpawnEnvironment(
+      scopedOptions,
+      scoped,
+    )).toMatchObject({
+      HOME: scopedOptions._testScope.homeDir,
+      USERPROFILE: scopedOptions._testScope.homeDir,
+      XDG_RUNTIME_DIR: scopedOptions._testScope.runtimeDir,
+      LCM_DAEMON_OWNER_ID: "owned",
+    });
+
+    expect(__lifecycleTestUtils.lifecycleUnitName(
+      { port: 1, pidFilePath, spawnTimeoutMs: 1 },
+      10,
+      20,
+    )).toBe("lcm-daemon-10-20");
+    expect(__lifecycleTestUtils.lifecycleUnitName(
+      hermeticOptions,
+      10,
+      20,
+    )).toBe("lcm-test-daemon-hermetic-10-20");
+    expect(__lifecycleTestUtils.lifecycleUnitName(
+      {
+        port: 1,
+        pidFilePath,
+        spawnTimeoutMs: 1,
+        _testScope: scopedOptions._testScope,
+      },
+      10,
+      20,
+    )).toBe("lcm-test-daemon-owned-10-20");
+  });
+
   it("covers internal platform parsing, parent equality, warning fallback, and environment shaping", () => {
     expect(__lifecycleTestUtils.healthVersionMatches(null, undefined)).toBe(false);
     expect(__lifecycleTestUtils.healthVersionMatches({ status: "ok", version: "" }, "")).toBe(false);
@@ -176,6 +386,7 @@ describe("lifecycle procfs and parent warnings", () => {
       expectedVersion: "1",
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(31) as never,
       _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [1], _skipSpawn: true,
+      _monotonicNowOverride: (): number => 0,
     });
     expect(result.warning).toContain("not an LCM daemon");
   });
@@ -251,27 +462,31 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     }
   });
 
-  it("uses global process.kill and the default ensure override seams", async () => {
+  it("uses an injected restart signal seam and covers the default signal delegate", async () => {
     const dir = temp(); const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "23");
     const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    __lifecycleTestUtils.defaultKillProcess(22, "SIGTERM");
+    expect(kill).toHaveBeenCalledWith(22, "SIGTERM");
+    const injectedKill = vi.fn();
     const alive = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValue(false);
     await restartDaemon({
       port: 5, pidFilePath: pidPath, spawnTimeoutMs: 1, _platform: "darwin", _isProcessAliveOverride: alive,
-      _isManagedProcessOverride: () => true, _sleepOverride: async () => {},
+      _isManagedProcessOverride: () => true, _killOverride: injectedKill, _sleepOverride: async () => {},
       _ensureDaemonOverride: async () => ({ connected: false, port: 5, spawned: true }),
     });
-    expect(kill).toHaveBeenCalledWith(23, "SIGTERM");
+    expect(injectedKill).toHaveBeenCalledWith(23, "SIGTERM");
   });
 
-  it("uses the default ensure kill function for a version mismatch", async () => {
+  it("uses the injected ensure kill function for a version mismatch", async () => {
     const dir = temp(); const procRoot = join(dir, "proc"); mkdirSync(procRoot);
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "33"); ensureAuthToken(join(dir, "daemon.token"));
     proc(procRoot, 33, "Uid:\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
-    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    const kill = vi.fn();
     const alive = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValue(false);
     await ensureDaemon({
       port: 6, pidFilePath: pidPath, spawnTimeoutMs: 1, expectedVersion: "2", _procRoot: procRoot,
-      _fetchOverride: fetchHealthy(33) as never, _isProcessAliveOverride: alive, _listeningPortsOverride: () => [6], _sleepOverride: async () => {}, _skipSpawn: true,
+      _fetchOverride: fetchHealthy(33) as never, _isProcessAliveOverride: alive, _killOverride: kill,
+      _listeningPortsOverride: () => [6], _sleepOverride: async () => {}, _skipSpawn: true,
     });
     expect(kill).toHaveBeenCalledWith(33, "SIGTERM");
   });
@@ -414,7 +629,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     })).resolves.toMatchObject({ connected: true, spawned: false, pid: 20 });
   });
 
-  it("reports systemd credential setup errors when the user runtime directory is unavailable", async () => {
+  it("keeps ambient credentials outside a hermetic systemd invocation", async () => {
     const dir = temp(); const oldKey = process.env.ANTHROPIC_API_KEY; process.env.ANTHROPIC_API_KEY = "secret";
     const getuid = vi.spyOn(process, "getuid").mockReturnValue(999_999);
     try {
@@ -424,7 +639,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
         _spawnOverride: vi.fn(() => ({ pid: undefined, once: vi.fn(), unref: vi.fn() })) as never, _skipHealthWait: true,
         _monotonicNowOverride: (): number => 0,
       });
-      expect(result.warning).toContain("credential setup failed");
+      expect(result.warning).not.toContain("credential setup failed");
     } finally {
       getuid.mockRestore();
       if (oldKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = oldKey;

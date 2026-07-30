@@ -19,6 +19,11 @@ import {
   setRemoteProjectBinding,
 } from "../../src/project-map.js";
 
+const testIdentity = {
+  ownerId: "server-tests",
+  entrypoint: "/lcm-tests/server-daemon.mjs",
+} as const;
+
 describe("daemon server", () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
@@ -489,7 +494,7 @@ describe("daemon auth", () => {
     ensureAuthToken(tokenPath);
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    const daemon = await createDaemon(config, { tokenPath });
+    const daemon = await createDaemon(config, { tokenPath, _testIdentity: testIdentity });
     const port = daemon.address().port;
     try {
       const res = await fetch(`http://127.0.0.1:${port}/store`, {
@@ -511,7 +516,11 @@ describe("daemon auth", () => {
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
     const runtimeDigest = "a".repeat(64);
-    const daemon = await createDaemon(config, { tokenPath, _runtimeDigest: runtimeDigest });
+    const daemon = await createDaemon(config, {
+      tokenPath,
+      _runtimeDigest: runtimeDigest,
+      _testIdentity: testIdentity,
+    });
     const port = daemon.address().port;
     try {
       const publicResponse = await fetch(`http://127.0.0.1:${port}/health`);
@@ -522,6 +531,7 @@ describe("daemon auth", () => {
         storageBackend: "sqlite",
         uptime: expect.any(Number),
         pid: process.pid,
+        ownerId: testIdentity.ownerId,
       });
 
       const invalid = await fetch(`http://127.0.0.1:${port}/health`, {
@@ -567,7 +577,7 @@ describe("daemon auth", () => {
         LCM_POSTGRES_CA_FILE: caPath,
       },
     );
-    const daemon = await createDaemon(config, { tokenPath });
+    const daemon = await createDaemon(config, { tokenPath, _testIdentity: testIdentity });
     const port = daemon.address().port;
     try {
       const publicResponse = await fetch(`http://127.0.0.1:${port}/health`);
@@ -578,6 +588,7 @@ describe("daemon auth", () => {
         storageBackend: "postgresql",
         uptime: expect.any(Number),
         pid: process.pid,
+        ownerId: testIdentity.ownerId,
       });
 
       const authenticated = await fetch(`http://127.0.0.1:${port}/health`, {
@@ -610,7 +621,7 @@ describe("daemon auth", () => {
     const token = readAuthToken(tokenPath)!;
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    const daemon = await createDaemon(config, { tokenPath });
+    const daemon = await createDaemon(config, { tokenPath, _testIdentity: testIdentity });
     const port = daemon.address().port;
     try {
       const res = await fetch(`http://127.0.0.1:${port}/store`, {
