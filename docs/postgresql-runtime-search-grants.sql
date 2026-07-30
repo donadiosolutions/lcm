@@ -10,11 +10,13 @@ BEGIN;
 
 GRANT USAGE ON SCHEMA lcm TO :"lcm_runtime_role";
 
--- Trigram ranking uses the extension's schema-qualified similarity function.
+-- Trigram filtering and ranking use the extension's schema-qualified functions.
 -- Grant the exact extension namespace/function access so the script also works
 -- when hardened installations revoke their defaults from PUBLIC.
 GRANT USAGE ON SCHEMA public TO :"lcm_runtime_role";
-GRANT EXECUTE ON FUNCTION public.similarity(text, text)
+GRANT EXECUTE ON FUNCTION
+  public.similarity(text, text),
+  public.similarity_op(text, text)
 TO :"lcm_runtime_role";
 
 -- Search query normalization is pinned by the released schema baseline.

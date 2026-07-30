@@ -18,7 +18,8 @@ import {
 beforeAll(assertHarnessReady);
 
 async function grantSearchRuntimePrivileges(
-  database: PostgreSqlTestDatabase
+  database: PostgreSqlTestDatabase,
+  grantingRuntime: PostgreSqlRuntime = database.migrator
 ): Promise<void> {
   const template = readFileSync(
     join(process.cwd(), "docs", "postgresql-runtime-search-grants.sql"),
@@ -29,7 +30,7 @@ async function grantSearchRuntimePrivileges(
     .filter((line) => !line.startsWith("\\"))
     .join("\n")
     .replaceAll(':"lcm_runtime_role"', '"lcm_test_runtime"');
-  await database.migrator.query(
+  await grantingRuntime.query(
     { text: sql },
     {
       domain: "lexical-search",
@@ -311,17 +312,6 @@ function planText(value: unknown): string {
 describe("PostgreSQL 18 lexical search", () => {
   it("requires and admits only the reviewed read-only search grants", async () => {
     await withPostgreSqlTestDatabase("search-grants", async (database) => {
-      await database.migrator.query(
-        {
-          text: `REVOKE USAGE ON SCHEMA public FROM PUBLIC;
-                 REVOKE EXECUTE ON FUNCTION public.similarity(text, text)
-                 FROM PUBLIC`,
-        },
-        {
-          domain: "lexical-search",
-          operation: "hardenSearchExtensionPrivileges",
-        }
-      );
       const projectId = await createProject(database, "Search grants");
       const conversationId = await createConversation(
         database,
@@ -333,34 +323,58 @@ describe("PostgreSQL 18 lexical search", () => {
         role: "user",
         content: "granted needle",
       });
+      await seedMessage(database, projectId, conversationId, {
+        seq: 1,
+        role: "assistant",
+        content: "needel",
+      });
       const repository = new PostgreSqlLexicalSearchRepository(
         database.runtime,
         projectId
       );
-      await expect(
-        repository.searchMessages({
-          query: "needle",
-          mode: "full_text",
-        })
-      ).rejects.toMatchObject({
-        backend: "postgresql",
-        domain: "lexical-search",
-        operation: "searchMessages",
-        projectId,
-      });
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      try {
+        await admin.query(
+          {
+            text: `REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+                   REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public
+                   FROM PUBLIC`,
+          },
+          {
+            domain: "lexical-search",
+            operation: "hardenSearchExtensionPrivileges",
+          }
+        );
+        await expect(
+          repository.searchMessages({
+            query: "needle",
+            mode: "full_text",
+          })
+        ).rejects.toMatchObject({
+          backend: "postgresql",
+          domain: "lexical-search",
+          operation: "searchMessages",
+          projectId,
+        });
 
-      await grantSearchRuntimePrivileges(database);
-      await expect(
-        repository.searchMessages({
-          query: "needle",
-          mode: "full_text",
-        })
-      ).resolves.toHaveLength(1);
+        await grantSearchRuntimePrivileges(database, admin);
+      } finally {
+        await admin.close();
+      }
+      const admitted = await repository.searchMessages({
+        query: "needle",
+        mode: "full_text",
+      });
+      expect(admitted).toHaveLength(2);
+      expect(admitted[1]).toMatchObject({ snippet: "needel" });
+      expect(admitted[1].rank).toBeGreaterThan(0);
+      expect(admitted[1].rank).toBeLessThan(1);
 
       const privileges = await database.migrator.query<{
         schema_usage: boolean;
         schema_create: boolean;
         public_schema_usage: boolean;
+        public_schema_direct_usage: boolean;
         public_schema_create: boolean;
         public_schema_grant_option: boolean;
         messages_select: boolean;
@@ -375,7 +389,12 @@ describe("PostgreSQL 18 lexical search", () => {
         normalize_execute: boolean;
         normalize_grant_option: boolean;
         similarity_execute: boolean;
+        similarity_direct_execute: boolean;
         similarity_grant_option: boolean;
+        similarity_op_execute: boolean;
+        similarity_op_direct_execute: boolean;
+        similarity_op_grant_option: boolean;
+        unrelated_trgm_execute: boolean;
       }>(
         {
           text: `SELECT
@@ -388,6 +407,19 @@ describe("PostgreSQL 18 lexical search", () => {
                  has_schema_privilege(
                    'lcm_test_runtime', 'public', 'USAGE'
                  ) AS public_schema_usage,
+                 EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_namespace AS namespace
+                   CROSS JOIN LATERAL pg_catalog.aclexplode(
+                     namespace.nspacl
+                   ) AS privilege
+                   WHERE namespace.oid
+                     = 'public'::pg_catalog.regnamespace
+                     AND privilege.grantee
+                       = 'lcm_test_runtime'::pg_catalog.regrole
+                     AND privilege.privilege_type
+                       OPERATOR(pg_catalog.=) 'USAGE'
+                 ) AS public_schema_direct_usage,
                  has_schema_privilege(
                    'lcm_test_runtime', 'public', 'CREATE'
                  ) AS public_schema_create,
@@ -466,8 +498,58 @@ describe("PostgreSQL 18 lexical search", () => {
                        = 'lcm_test_runtime'::pg_catalog.regrole
                      AND privilege.privilege_type
                        OPERATOR(pg_catalog.=) 'EXECUTE'
+                 ) AS similarity_direct_execute,
+                 EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_proc AS procedure
+                   CROSS JOIN LATERAL pg_catalog.aclexplode(
+                     procedure.proacl
+                   ) AS privilege
+                   WHERE procedure.oid
+                     = 'public.similarity(text,text)'::pg_catalog.regprocedure
+                     AND privilege.grantee
+                       = 'lcm_test_runtime'::pg_catalog.regrole
+                     AND privilege.privilege_type
+                       OPERATOR(pg_catalog.=) 'EXECUTE'
                      AND privilege.is_grantable
-                 ) AS similarity_grant_option`,
+                 ) AS similarity_grant_option,
+                 has_function_privilege(
+                   'lcm_test_runtime',
+                   'public.similarity_op(text,text)',
+                   'EXECUTE'
+                 ) AS similarity_op_execute,
+                 EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_proc AS procedure
+                   CROSS JOIN LATERAL pg_catalog.aclexplode(
+                     procedure.proacl
+                   ) AS privilege
+                   WHERE procedure.oid
+                     = 'public.similarity_op(text,text)'::pg_catalog.regprocedure
+                     AND privilege.grantee
+                       = 'lcm_test_runtime'::pg_catalog.regrole
+                     AND privilege.privilege_type
+                       OPERATOR(pg_catalog.=) 'EXECUTE'
+                 ) AS similarity_op_direct_execute,
+                 EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_proc AS procedure
+                   CROSS JOIN LATERAL pg_catalog.aclexplode(
+                     procedure.proacl
+                   ) AS privilege
+                   WHERE procedure.oid
+                     = 'public.similarity_op(text,text)'::pg_catalog.regprocedure
+                     AND privilege.grantee
+                       = 'lcm_test_runtime'::pg_catalog.regrole
+                     AND privilege.privilege_type
+                       OPERATOR(pg_catalog.=) 'EXECUTE'
+                     AND privilege.is_grantable
+                 ) AS similarity_op_grant_option,
+                 has_function_privilege(
+                   'lcm_test_runtime',
+                   'public.show_trgm(text)',
+                   'EXECUTE'
+                 ) AS unrelated_trgm_execute`,
         },
         {
           domain: "lexical-search",
@@ -478,6 +560,7 @@ describe("PostgreSQL 18 lexical search", () => {
         schema_usage: true,
         schema_create: false,
         public_schema_usage: true,
+        public_schema_direct_usage: true,
         public_schema_create: false,
         public_schema_grant_option: false,
         messages_select: true,
@@ -492,7 +575,12 @@ describe("PostgreSQL 18 lexical search", () => {
         normalize_execute: true,
         normalize_grant_option: false,
         similarity_execute: true,
+        similarity_direct_execute: true,
         similarity_grant_option: false,
+        similarity_op_execute: true,
+        similarity_op_direct_execute: true,
+        similarity_op_grant_option: false,
+        unrelated_trgm_execute: false,
       });
     });
   });

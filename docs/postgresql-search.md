@@ -104,7 +104,9 @@ fallback, or broadens the query.
 
 ## Runtime privileges
 
-Apply the dedicated grant script as the migration/schema owner:
+Apply the dedicated grant script as a database administration role that can
+grant privileges on both the LCM-owned objects and the two `pg_trgm`
+functions:
 
 ```bash
 psql "$LCM_POSTGRES_ADMIN_URL" \
@@ -114,14 +116,15 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 
 Replace `lcm_runtime` with the existing runtime role. The script grants `USAGE`
 on only the `lcm` and `public` schemas, exact execution of
-`lcm.normalize_search_text(text)` and `public.similarity(text,text)`, and
-`SELECT` on only messages, summaries, promoted memories, and promoted tags.
-The explicit `public` grants keep search functional when an administrator has
-revoked the extension namespace and similarity-function defaults from
-`PUBLIC`. The script grants no schema creation, conversation access, DML,
-sequence access, `TRUNCATE`, ownership, grant option, blanket function access,
-or unrelated-domain access. Applying it does not activate PostgreSQL daemon or
-CLI routing.
+`lcm.normalize_search_text(text)`, `public.similarity(text,text)`, and
+`public.similarity_op(text,text)`, and `SELECT` on only messages, summaries,
+promoted memories, and promoted tags. The explicit `public` grants keep search
+functional when an administrator has revoked the extension namespace and
+function defaults from `PUBLIC`: `similarity` ranks fallback rows, while the
+`%` operator invokes `similarity_op`. The script grants no schema creation,
+conversation access, DML, sequence access, `TRUNCATE`, ownership, grant option,
+blanket function access, or unrelated-domain access. Applying it does not
+activate PostgreSQL daemon or CLI routing.
 
 ## Indexes, plans, and benchmark evidence
 
