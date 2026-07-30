@@ -30,10 +30,6 @@ type RequestDeadline = {
   abortSignal?: AbortSignal;
 };
 
-function hasExplicitLifecycleTestSeam(options: object): boolean {
-  return Object.keys(options).some((name) => name.startsWith("_") && name !== "_testScope");
-}
-
 export type EnsureDaemonOptions = {
   port: number;
   pidFilePath: string;
@@ -89,6 +85,34 @@ export type RestartDaemonOptions = EnsureDaemonOptions & {
   _ensureDaemonOverride?: (options: EnsureDaemonOptions) => Promise<EnsureDaemonResult>;
   _isManagedProcessOverride?: (pid: number) => boolean;
 };
+
+const DETERMINISTIC_LIFECYCLE_TEST_SEAMS = [
+  "_skipSpawn",
+  "_spawnOverride",
+  "_spawnSyncOverride",
+  "_skipHealthWait",
+  "_fetchOverride",
+  "_platform",
+  "_procRoot",
+  "_uid",
+  "_killOverride",
+  "_sleepOverride",
+  "_monotonicNowOverride",
+  "_setTimeoutOverride",
+  "_clearTimeoutOverride",
+  "_isProcessAliveOverride",
+  "_realpathOverride",
+  "_packagedEntrypointOverride",
+  "_listeningPortsOverride",
+  "_ensureDaemonOverride",
+  "_isManagedProcessOverride",
+] as const satisfies readonly (keyof RestartDaemonOptions)[];
+
+function hasExplicitLifecycleTestSeam(options: object): boolean {
+  return DETERMINISTIC_LIFECYCLE_TEST_SEAMS.some((name) =>
+    Object.prototype.hasOwnProperty.call(options, name),
+  );
+}
 
 export type RestartDaemonResult = EnsureDaemonResult & {
   restarted: boolean;
@@ -1477,7 +1501,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   let interrupted = false;
   const onAbort = (): void => {
     interrupted = true;
-    void cleanupOwnedLifecycle();
+    void cleanupOwnedLifecycle().catch(() => undefined);
   };
   if (opts._abortSignal?.aborted) onAbort();
   else opts._abortSignal?.addEventListener("abort", onAbort, { once: true });

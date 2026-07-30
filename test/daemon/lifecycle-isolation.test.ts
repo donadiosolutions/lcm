@@ -223,6 +223,34 @@ describe("daemon lifecycle test-scope validation", () => {
     expect(kill).not.toHaveBeenCalled();
   });
 
+  it("does not treat an abort signal alone as an isolation seam", async () => {
+    expect(isVitestWorkerEntrypoint(process.argv[1])).toBe(true);
+    const root = mkdtempSync(join(tmpdir(), "lcm-abort-only-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const pidPath = join(stateDir, "daemon.pid");
+    const tokenPath = join(stateDir, "daemon.token");
+    const controller = new AbortController();
+    const fetch = vi.spyOn(globalThis, "fetch");
+    const kill = vi.spyOn(process, "kill");
+    await expect(ensureDaemon({
+      port: 37_341,
+      pidFilePath: pidPath,
+      spawnTimeoutMs: 10,
+      _abortSignal: controller.signal,
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      warning: expect.stringContaining("unscoped Vitest worker"),
+    });
+    expect(controller.signal.aborted).toBe(false);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+    expect(existsSync(pidPath)).toBe(false);
+    expect(existsSync(tokenPath)).toBe(false);
+    expect(existsSync(stateDir)).toBe(false);
+  });
+
   it("fails closed for interruption, entrypoint mismatch, and worker entrypoints", async () => {
     const fixture = createFixture("scope-preflight");
     const controller = new AbortController();
@@ -359,6 +387,47 @@ describe("run-owned lifecycle resources", () => {
     });
     expect(fixture.stopUnit).toHaveBeenCalledOnce();
     expect(existsSync(fixture.scope.stateDir)).toBe(false);
+  });
+
+  it("observes abort cleanup rejection until finish awaits it", async () => {
+    const controller = new AbortController();
+    const fetch = vi.fn()
+      .mockRejectedValueOnce(new Error("initially offline"))
+      .mockImplementation((_url, init) => new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      }));
+    const fixture = createFixture("owned-rejecting-cleanup", {
+      fetch: fetch as never,
+    });
+    const stopUnit = vi.fn(async () => {
+      throw new Error("stop failed");
+    });
+    const scope = createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        stopUnit,
+      },
+    });
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const operation = ensureDaemon({
+        ...scopedOptions(fixture),
+        _testScope: scope,
+        spawnTimeoutMs: 500,
+        _skipHealthWait: false,
+        _abortSignal: controller.signal,
+      });
+      await vi.waitFor(() => expect(fixture.runSystemd).toHaveBeenCalledOnce());
+      controller.abort();
+      await expect(operation).rejects.toThrow("stop failed");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(stopUnit).toHaveBeenCalledOnce();
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
   });
 
   it("cleans when interrupted during transient-unit startup", async () => {
