@@ -17,6 +17,10 @@ const state = vi.hoisted(() => ({
   createFactory: vi.fn(),
   healthFactory: vi.fn(),
 }));
+const testIdentity = {
+  ownerId: "mocked-server-tests",
+  entrypoint: "/lcm-tests/mocked-server-daemon.mjs",
+} as const;
 
 state.healthFactory.mockImplementation(async () => state.health);
 state.createFactory.mockImplementation(() => ({
@@ -177,7 +181,10 @@ describe("mocked server states unavailable from Node HTTP", () => {
   it("uses the first value of an authorization header array", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-server-array-auth-"));
     const tokenPath = join(dir, "token"); ensureAuthToken(tokenPath);
-    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }), { tokenPath });
+    const daemon = await createDaemon(
+      loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }),
+      { tokenPath, _testIdentity: testIdentity },
+    );
     try {
       let status = 0;
       let body = "";
@@ -207,7 +214,7 @@ describe("mocked server states unavailable from Node HTTP", () => {
     const runtimeDigest = "b".repeat(64);
     const daemon = await createDaemon(
       loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }),
-      { tokenPath, _runtimeDigest: runtimeDigest },
+      { tokenPath, _runtimeDigest: runtimeDigest, _testIdentity: testIdentity },
     );
     const request = async (authorization?: string): Promise<{ status: number; body: Record<string, unknown> }> => {
       let status = 0;
@@ -235,6 +242,7 @@ describe("mocked server states unavailable from Node HTTP", () => {
         storageBackend: "sqlite",
         uptime: expect.any(Number),
         pid: process.pid,
+        ownerId: testIdentity.ownerId,
       });
       expect(secondPublic.body).toEqual({
         status: "ok",
@@ -242,6 +250,7 @@ describe("mocked server states unavailable from Node HTTP", () => {
         storageBackend: "sqlite",
         uptime: expect.any(Number),
         pid: process.pid,
+        ownerId: testIdentity.ownerId,
       });
       expect(state.healthFactory).not.toHaveBeenCalled();
 

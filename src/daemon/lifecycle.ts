@@ -10,16 +10,29 @@ import {
   isStagedPostgreSqlHealth,
   STAGED_POSTGRESQL_ERROR_CODE,
 } from "./staged-postgresql.js";
+import {
+  type DaemonLifecycleTestScope,
+  isDaemonLifecycleTestScope,
+  isVitestWorkerEntrypoint,
+  lifecycleScopeOwnsPath,
+  lifecycleScopeUnitName,
+} from "./lifecycle-scope.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
 type SetTimeoutFn = (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
 type ClearTimeoutFn = (timeout: ReturnType<typeof setTimeout>) => void;
+type CleanupFn = () => void | Promise<void>;
 type RequestDeadline = {
   timeoutMs: number;
   setTimeoutFn: SetTimeoutFn;
   clearTimeoutFn: ClearTimeoutFn;
+  abortSignal?: AbortSignal;
 };
+
+function hasExplicitLifecycleTestSeam(options: object): boolean {
+  return Object.keys(options).some((name) => name.startsWith("_") && name !== "_testScope");
+}
 
 export type EnsureDaemonOptions = {
   port: number;
@@ -52,6 +65,10 @@ export type EnsureDaemonOptions = {
   _packagedEntrypointOverride?: string;
   /** @internal Deterministic listener-ownership seam for lifecycle tests. */
   _listeningPortsOverride?: (pid: number) => number[];
+  /** @internal Complete run-owned lifecycle boundary for systemd integration tests. */
+  _testScope?: DaemonLifecycleTestScope;
+  /** @internal Deterministic interruption seam for lifecycle tests. */
+  _abortSignal?: AbortSignal;
 };
 
 export type EnsureDaemonResult = {
@@ -86,6 +103,7 @@ type HealthResponse = {
   pid?: number;
   entrypoint?: string;
   runtimeDigest?: string;
+  ownerId?: string;
   httpStatus?: number;
   storage?: {
     status?: string;
@@ -295,6 +313,7 @@ function processEntrypointMatches(
   procRoot = "/proc",
   realpath: (path: string) => string = realpathSync,
 ): boolean {
+  if (isVitestWorkerEntrypoint(health.entrypoint)) return false;
   if (expectedEntrypoint === undefined) return true;
   const pathApi = platform === "win32" ? win32 : posix;
   const normalize = (path: string): string => {
@@ -614,9 +633,16 @@ async function runWithDeadline<T>(
     controller.abort();
     rejectTimeout(new Error("daemon request timed out"));
   }, deadline.timeoutMs);
+  const abort = (): void => {
+    controller.abort();
+    rejectTimeout(new Error("daemon request interrupted"));
+  };
+  if (deadline.abortSignal?.aborted) abort();
+  else deadline.abortSignal?.addEventListener("abort", abort, { once: true });
   try {
     return await Promise.race([request(controller.signal), timeout]);
   } finally {
+    deadline.abortSignal?.removeEventListener("abort", abort);
     deadline.clearTimeoutFn(timeoutHandle);
   }
 }
@@ -667,7 +693,8 @@ async function checkDaemonAccess(
 function sameHealthIdentity(publicHealth: HealthResponse, authenticatedHealth: HealthResponse): boolean {
   return publicHealth.pid === authenticatedHealth.pid
     && publicHealth.version === authenticatedHealth.version
-    && (publicHealth.storageBackend ?? "sqlite") === (authenticatedHealth.storageBackend ?? "sqlite");
+    && (publicHealth.storageBackend ?? "sqlite") === (authenticatedHealth.storageBackend ?? "sqlite")
+    && publicHealth.ownerId === authenticatedHealth.ownerId;
 }
 
 async function checkDaemonDiagnostics(
@@ -706,15 +733,24 @@ function startViaDetachedSpawn(
   opts: EnsureDaemonOptions,
   spawnCommand: string,
   spawnArgs: string[],
-): { getWarning: () => string | undefined } {
-  const spawnImpl = opts._spawnOverride ?? spawn;
+): { getWarning: () => string | undefined; pid?: number } {
+  const testScope = opts._testScope;
+  const spawnImpl = testScope?.dependencies.spawn ?? opts._spawnOverride ?? spawn;
   let errorMessage: string | undefined;
   let child: ChildProcess;
   try {
     child = spawnImpl(spawnCommand, spawnArgs, {
       detached: true,
       stdio: "ignore",
-      env: { ...process.env },
+      env: testScope
+        ? {
+            ...process.env,
+            HOME: testScope.homeDir,
+            USERPROFILE: testScope.homeDir,
+            XDG_RUNTIME_DIR: testScope.runtimeDir,
+            LCM_DAEMON_OWNER_ID: testScope.ownerId,
+          }
+        : { ...process.env },
     }) as ChildProcess;
   } catch (err) {
     errorMessage = summarizeProcessDiagnostic("detached spawn error", err);
@@ -730,6 +766,7 @@ function startViaDetachedSpawn(
   }
   return {
     getWarning: () => errorMessage ? `detached spawn failed (${errorMessage})` : undefined,
+    ...(child.pid === undefined ? {} : { pid: child.pid }),
   };
 }
 
@@ -769,6 +806,7 @@ function systemdDaemonSetenvArgs(
   env: NodeJS.ProcessEnv,
   credentialNames: string[],
   executablePath = SYSTEMD_DAEMON_PATH,
+  testScope?: DaemonLifecycleTestScope,
 ): string[] {
   const args = Object.entries(env)
     .filter(([name, value]) => (
@@ -778,6 +816,14 @@ function systemdDaemonSetenvArgs(
     ))
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, value]) => `--setenv=${name}=${value}`);
+  if (testScope) {
+    args.push(
+      `--setenv=HOME=${testScope.homeDir}`,
+      `--setenv=LCM_DAEMON_OWNER_ID=${testScope.ownerId}`,
+      `--setenv=USERPROFILE=${testScope.homeDir}`,
+      `--setenv=XDG_RUNTIME_DIR=${testScope.runtimeDir}`,
+    );
+  }
   args.push(`--setenv=PATH=${executablePath}`);
   if (credentialNames.length > 0) {
     args.push(`--setenv=LCM_SYSTEMD_CRED_IDS=${credentialNames.join(",")}`);
@@ -803,16 +849,17 @@ function systemdCredentialCleanup(credentialDir: string): () => void {
   };
 }
 
-function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv): { args: string[]; names: string[]; cleanup?: () => void } {
+function systemdDaemonCredentialArgs(
+  env: NodeJS.ProcessEnv,
+  testScope?: DaemonLifecycleTestScope,
+): { args: string[]; names: string[]; cleanup?: CleanupFn } {
   const secrets = Object.entries(env)
     .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && isSecretDaemonEnvName(name))
     .sort(([left], [right]) => left.localeCompare(right));
   if (secrets.length === 0) return { args: [], names: [] };
   const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  if (uid === undefined) {
-    throw new Error("current user id is unavailable");
-  }
-  const baseDir = `/run/user/${uid}`;
+  if (!testScope && uid === undefined) throw new Error("current user id is unavailable");
+  const baseDir = testScope?.credentialDir ?? `/run/user/${uid!}`;
   const baseStats = statSync(baseDir);
   if (!baseStats.isDirectory()) {
     throw new Error(`${baseDir} is not a directory`);
@@ -841,23 +888,34 @@ function systemdDaemonCredentialArgs(env: NodeJS.ProcessEnv): { args: string[]; 
   }
 }
 
-function startViaUserSystemd(
+async function startViaUserSystemd(
   opts: EnsureDaemonOptions,
   spawnCommand: string,
   spawnArgs: string[],
-): { ok: boolean; warning?: string; cleanup?: () => void } {
-  const spawnSyncImpl = opts._spawnSyncOverride ?? spawnSync;
-  const unit = `lcm-daemon-${process.pid}-${Date.now()}`;
-  let credentials: { args: string[]; names: string[]; cleanup?: () => void };
+): Promise<{ ok: boolean; warning?: string; cleanup?: CleanupFn; unitName: string }> {
+  const testScope = opts._testScope;
+  const spawnSyncImpl = testScope?.dependencies.spawnSync ?? opts._spawnSyncOverride ?? spawnSync;
+  const unit = testScope
+    ? lifecycleScopeUnitName(testScope, process.pid, Date.now())
+    : `lcm-daemon-${process.pid}-${Date.now()}`;
+  let credentials: { args: string[]; names: string[]; cleanup?: CleanupFn };
   try {
-    credentials = systemdDaemonCredentialArgs(process.env);
+    credentials = systemdDaemonCredentialArgs(process.env, testScope);
   } catch (err) {
     const detail = summarizeProcessDiagnostic("credential setup error", err);
     return {
       ok: false,
       warning: `user systemd credential setup failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
+      unitName: unit,
     };
   }
+  let cleaned = false;
+  const cleanup = async (): Promise<void> => {
+    if (cleaned) return;
+    cleaned = true;
+    if (testScope) await testScope.dependencies.stopUnit(unit);
+    await credentials.cleanup?.();
+  };
   let result: ReturnType<typeof spawnSyncImpl>;
   try {
     result = spawnSyncImpl("systemd-run", [
@@ -866,21 +924,32 @@ function startViaUserSystemd(
       "--no-block",
       "--quiet",
       `--unit=${unit}`,
-      ...systemdDaemonSetenvArgs(process.env, credentials.names, managedDaemonPath(spawnCommand, spawnArgs)),
+      ...systemdDaemonSetenvArgs(
+        process.env,
+        credentials.names,
+        managedDaemonPath(spawnCommand, spawnArgs),
+        testScope,
+      ),
       ...credentials.args,
       spawnCommand,
       ...spawnArgs,
-    ], { encoding: "utf-8", env: systemdRunProcessEnv(process.env), timeout: Math.max(1, opts.spawnTimeoutMs) });
+    ], {
+      encoding: "utf-8",
+      env: systemdRunProcessEnv(process.env),
+      timeout: Math.max(1, opts.spawnTimeoutMs),
+    });
   } catch (err) {
-    credentials.cleanup?.();
+    await cleanup();
     const detail = summarizeProcessDiagnostic("systemd start exception", err);
     return {
       ok: false,
       warning: `user systemd start failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
+      cleanup,
+      unitName: unit,
     };
   }
 
-  if (result.status === 0) return { ok: true, cleanup: credentials.cleanup };
+  if (result.status === 0) return { ok: true, cleanup, unitName: unit };
   const stderr = typeof result.stderr === "string" && result.stderr.length > 0
     ? summarizeProcessDiagnostic("systemd stderr", result.stderr)
     : "";
@@ -894,35 +963,95 @@ function startViaUserSystemd(
   return {
     ok: false,
     warning: `user systemd start failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
-    cleanup: credentials.cleanup,
+    cleanup,
+    unitName: unit,
   };
 }
 
 export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDaemonResult> {
   validateSpawnTimeout(opts.spawnTimeoutMs);
 
-  const fetchFn = opts._fetchOverride ?? globalThis.fetch;
+  const hasTestScopeProperty = Object.prototype.hasOwnProperty.call(opts, "_testScope");
+  if (hasTestScopeProperty && !isDaemonLifecycleTestScope(opts._testScope)) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "daemon lifecycle test scope is incomplete or malformed",
+    };
+  }
+  const testScope = opts._testScope;
+  if (testScope && !lifecycleScopeOwnsPath(testScope, opts.pidFilePath)) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "daemon lifecycle test PID state is outside the owned test scope",
+    };
+  }
+  const unscopedVitestWorker = testScope === undefined
+    && isVitestWorkerEntrypoint(process.argv[1])
+    && !hasExplicitLifecycleTestSeam(opts);
+  if (unscopedVitestWorker && opts._fetchOverride === undefined) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "daemon lifecycle is disabled for an unscoped Vitest worker",
+    };
+  }
+  if (opts._abortSignal?.aborted) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "daemon lifecycle was interrupted before startup",
+    };
+  }
+
+  const fetchFn = testScope?.dependencies.fetch ?? opts._fetchOverride ?? globalThis.fetch;
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
   const platform = opts._platform ?? osPlatform();
   const procRoot = opts._procRoot ?? "/proc";
-  const sleepFn = opts._sleepOverride ?? sleep;
+  const sleepFn = testScope?.dependencies.sleep ?? opts._sleepOverride ?? sleep;
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
   const realpath = opts._realpathOverride ?? realpathSync;
   const deadline = monotonicNow() + opts.spawnTimeoutMs;
-  const isAlive = opts._isProcessAliveOverride ?? isProcessAlive;
-  const killProcess = opts._killOverride ?? ((pid, signal) => {
+  const isAlive = testScope?.dependencies.isProcessAlive
+    ?? opts._isProcessAliveOverride
+    ?? isProcessAlive;
+  const killProcess = testScope?.dependencies.killProcess ?? opts._killOverride ?? ((pid, signal) => {
     process.kill(pid, signal);
   });
   const enforceParent = opts.enforceUserManagerParent === true && platform === "linux";
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   const expectedStorageBackend = opts.expectedStorageBackend ?? "sqlite";
-  const expectedEntrypoint = opts.expectedEntrypoint
+  const expectedEntrypoint = testScope?.entrypoint
+    ?? opts.expectedEntrypoint
     ?? opts._packagedEntrypointOverride
     ?? PACKAGED_RUNTIME_ENTRYPOINT;
   const expectedRuntimeDigest = opts.expectedRuntimeDigest ?? RUNTIME_DIGEST;
+  const expectedOwnerId = testScope?.ownerId;
   let restartedForParent = false;
+
+  if (testScope && opts.expectedEntrypoint !== undefined && opts.expectedEntrypoint !== testScope.entrypoint) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "daemon lifecycle test entrypoint does not match the owned test scope",
+    };
+  }
+  if (isVitestWorkerEntrypoint(expectedEntrypoint)) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "refusing to use a Vitest worker as a daemon entrypoint",
+    };
+  }
 
   if (typeof expectedVersion !== "string" || expectedVersion.length === 0) {
     return {
@@ -935,17 +1064,26 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
 
   function endpointIdentityMatches(health: HealthResponse | null): boolean {
     if (!isRecognizedDaemonHealth(health) || health?.pid === undefined) return false;
+    if (expectedOwnerId !== undefined && health.ownerId !== expectedOwnerId) return false;
     const pid = readPidFile(opts.pidFilePath);
     if (pid === null || health.pid !== pid || !isAlive(pid)) return false;
     const listenerPorts = opts._listeningPortsOverride
       ? opts._listeningPortsOverride(pid)
-      : findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync, procRoot, opts.port);
+      : findListeningTcpPorts(
+          pid,
+          platform,
+          testScope?.dependencies.spawnSync ?? opts._spawnSyncOverride ?? spawnSync,
+          procRoot,
+          opts.port,
+        );
     return listenerPorts.includes(opts.port);
   }
 
   function remainingRequestDeadline(): RequestDeadline | null {
     const timeoutMs = deadline - monotonicNow();
-    return timeoutMs <= 0 ? null : { timeoutMs, setTimeoutFn, clearTimeoutFn };
+    return timeoutMs <= 0
+      ? null
+      : { timeoutMs, setTimeoutFn, clearTimeoutFn, abortSignal: opts._abortSignal };
   }
 
   function inspectParent(): ParentInspection {
@@ -1030,7 +1168,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         fetchFn,
         (): RequestDeadline | null => {
           const timeoutMs = access.deadline - monotonicNow();
-          return timeoutMs <= 0 ? null : { timeoutMs, setTimeoutFn, clearTimeoutFn };
+          return timeoutMs <= 0
+            ? null
+            : { timeoutMs, setTimeoutFn, clearTimeoutFn, abortSignal: opts._abortSignal };
         },
         health,
         expectedStorageBackend,
@@ -1274,15 +1414,28 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   ensureAuthToken(tokenPath);
 
   const spawnCommand = opts.spawnCommand ?? process.execPath;
-  const spawnArgs = opts.spawnArgs ?? [process.argv[1], "daemon", "start", "--foreground"];
+  const spawnArgs = opts.spawnArgs
+    ?? [testScope?.entrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
+  if (
+    isVitestWorkerEntrypoint(spawnArgs[0])
+    && opts._spawnOverride === undefined
+    && opts._spawnSyncOverride === undefined
+  ) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "refusing to register a Vitest worker as a daemon entrypoint",
+    };
+  }
   let startMethod: EnsureDaemonResult["startMethod"] = "detached-spawn";
   let warning: string | undefined;
-  let detachedStart: { getWarning: () => string | undefined } | undefined;
-  let cleanupSystemdCredentials: (() => void) | undefined;
+  let detachedStart: { getWarning: () => string | undefined; pid?: number } | undefined;
+  let cleanupSystemdResources: CleanupFn | undefined;
 
   if (enforceParent) {
-    const systemdStart = startViaUserSystemd(opts, spawnCommand, spawnArgs);
-    cleanupSystemdCredentials = systemdStart.cleanup;
+    const systemdStart = await startViaUserSystemd(opts, spawnCommand, spawnArgs);
+    cleanupSystemdResources = systemdStart.cleanup;
     if (systemdStart.ok) {
       startMethod = "systemd-user";
     } else {
@@ -1293,21 +1446,77 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     detachedStart = startViaDetachedSpawn(opts, spawnCommand, spawnArgs);
   }
 
+  let cleanupPromise: Promise<void> | undefined;
+  const cleanupOwnedLifecycle = (): Promise<void> => {
+    if (cleanupPromise) return cleanupPromise;
+    cleanupPromise = (async (): Promise<void> => {
+      await cleanupSystemdResources?.();
+      if (testScope && detachedStart?.pid !== undefined) {
+        await terminatePid(detachedStart.pid, {
+          isAlive,
+          killProcess,
+          sleepFn,
+        });
+      }
+      if (testScope) {
+        const ownedPaths = new Set([
+          opts.pidFilePath,
+          tokenPath,
+          testScope.runtimeDir,
+          testScope.credentialDir,
+          testScope.stateDir,
+        ]);
+        for (const path of ownedPaths) {
+          rmSync(path, { recursive: true, force: true });
+        }
+      }
+    })();
+    return cleanupPromise;
+  };
+  let interrupted = false;
+  const onAbort = (): void => {
+    interrupted = true;
+    void cleanupOwnedLifecycle();
+  };
+  if (opts._abortSignal?.aborted) onAbort();
+  else opts._abortSignal?.addEventListener("abort", onAbort, { once: true });
+  const finish = async (result: EnsureDaemonResult): Promise<EnsureDaemonResult> => {
+    opts._abortSignal?.removeEventListener("abort", onAbort);
+    await cleanupOwnedLifecycle();
+    return interrupted
+      ? {
+          connected: false,
+          port: opts.port,
+          spawned: result.spawned,
+          startMethod: result.startMethod,
+          warning: "daemon lifecycle was interrupted",
+        }
+      : result;
+  };
+
   if (opts._skipHealthWait) {
     const detachedWarning = detachedStart?.getWarning();
     const combinedWarning = warning && detachedWarning ? `${warning}; ${detachedWarning}` : warning ?? detachedWarning;
-    cleanupSystemdCredentials?.();
-    return { connected: false, port: opts.port, spawned: true, startMethod, warning: combinedWarning, restartedForParent };
+    return finish({
+      connected: false,
+      port: opts.port,
+      spawned: true,
+      startMethod,
+      warning: combinedWarning,
+      restartedForParent,
+    });
   }
 
   // Step 4: Wait for health — only connect if version matches (if expected)
   while (true) {
+    if (interrupted) break;
     const attemptTimeoutMs = deadline - monotonicNow();
     if (attemptTimeoutMs <= 0) break;
     const h = await checkDaemonHealth(opts.port, fetchFn, {
       timeoutMs: attemptTimeoutMs,
       setTimeoutFn,
       clearTimeoutFn,
+      abortSignal: opts._abortSignal,
     });
     const accepted = await daemonResult(
       h,
@@ -1318,8 +1527,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       warning !== undefined,
     );
     if (accepted) {
-      cleanupSystemdCredentials?.();
-      return accepted;
+      return finish(accepted);
     }
     const remainingMs = deadline - monotonicNow();
     if (remainingMs <= 0) break;
@@ -1328,8 +1536,14 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
 
   const detachedWarning = detachedStart?.getWarning();
   const combinedWarning = warning && detachedWarning ? `${warning}; ${detachedWarning}` : warning ?? detachedWarning;
-  cleanupSystemdCredentials?.();
-  return { connected: false, port: opts.port, spawned: true, startMethod, warning: combinedWarning, restartedForParent };
+  return finish({
+    connected: false,
+    port: opts.port,
+    spawned: true,
+    startMethod,
+    warning: combinedWarning,
+    restartedForParent,
+  });
 }
 
 /**
@@ -1340,6 +1554,38 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
  */
 export async function restartDaemon(opts: RestartDaemonOptions): Promise<RestartDaemonResult> {
   validateSpawnTimeout(opts.spawnTimeoutMs);
+  const hasTestScopeProperty = Object.prototype.hasOwnProperty.call(opts, "_testScope");
+  if (hasTestScopeProperty && !isDaemonLifecycleTestScope(opts._testScope)) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      restarted: false,
+      warning: "daemon lifecycle test scope is incomplete or malformed",
+    };
+  }
+  const testScope = opts._testScope;
+  if (testScope && !lifecycleScopeOwnsPath(testScope, opts.pidFilePath)) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      restarted: false,
+      warning: "daemon lifecycle test PID state is outside the owned test scope",
+    };
+  }
+  const unscopedVitestWorker = testScope === undefined
+    && isVitestWorkerEntrypoint(process.argv[1])
+    && !hasExplicitLifecycleTestSeam(opts);
+  if (unscopedVitestWorker && opts._fetchOverride === undefined) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      restarted: false,
+      warning: "daemon lifecycle is disabled for an unscoped Vitest worker",
+    };
+  }
   const {
     validateBeforeRestart,
     _ensureDaemonOverride,
@@ -1348,9 +1594,11 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   } = opts;
   await validateBeforeRestart?.();
 
-  const isAlive = opts._isProcessAliveOverride ?? isProcessAlive;
+  const isAlive = testScope?.dependencies.isProcessAlive
+    ?? opts._isProcessAliveOverride
+    ?? isProcessAlive;
   const platform = opts._platform ?? osPlatform();
-  const fetchFn = opts._fetchOverride ?? globalThis.fetch;
+  const fetchFn = testScope?.dependencies.fetch ?? opts._fetchOverride ?? globalThis.fetch;
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
@@ -1359,13 +1607,16 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   const verificationDeadline = monotonicNow() + opts.spawnTimeoutMs;
   function remainingVerificationDeadline(): RequestDeadline | null {
     const timeoutMs = verificationDeadline - monotonicNow();
-    return timeoutMs <= 0 ? null : { timeoutMs, setTimeoutFn, clearTimeoutFn };
+    return timeoutMs <= 0
+      ? null
+      : { timeoutMs, setTimeoutFn, clearTimeoutFn, abortSignal: opts._abortSignal };
   }
   async function isAuthenticatedDaemonAtPort(port: number, pid: number): Promise<boolean> {
     const healthDeadline = remainingVerificationDeadline();
     if (!healthDeadline) return false;
     const health = await checkDaemonHealth(port, fetchFn, healthDeadline);
     if (!isRecognizedDaemonHealth(health) || health.pid !== pid) return false;
+    if (testScope && health.ownerId !== testScope.ownerId) return false;
     if (!healthVersionMatches(health, expectedVersion)) return false;
     // The current daemon may legitimately use a different backend during a
     // configured transition. Authenticate it independently; ensureOptions
@@ -1383,7 +1634,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     return authenticatedHealth !== null
       && processEntrypointMatches(
         authenticatedHealth,
-        opts.expectedEntrypoint,
+        testScope?.entrypoint ?? opts.expectedEntrypoint,
         platform,
         opts._procRoot ?? "/proc",
         opts._realpathOverride ?? realpathSync,
@@ -1394,14 +1645,22 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     if (platform === "linux" && !isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc")) return false;
     const listenerPorts = opts._listeningPortsOverride
       ? opts._listeningPortsOverride(pid)
-      : findListeningTcpPorts(pid, platform, opts._spawnSyncOverride ?? spawnSync, opts._procRoot ?? "/proc", opts.port);
+      : findListeningTcpPorts(
+          pid,
+          platform,
+          testScope?.dependencies.spawnSync ?? opts._spawnSyncOverride ?? spawnSync,
+          opts._procRoot ?? "/proc",
+          opts.port,
+        );
     if (!listenerPorts.includes(opts.port)) return false;
     return await isAuthenticatedDaemonAtPort(opts.port, pid);
   }
-  const killProcess = opts._killOverride ?? ((pid: number, signal?: NodeJS.Signals | number) => {
+  const killProcess = testScope?.dependencies.killProcess
+    ?? opts._killOverride
+    ?? ((pid: number, signal?: NodeJS.Signals | number) => {
     process.kill(pid, signal);
   });
-  const sleepFn = opts._sleepOverride ?? sleep;
+  const sleepFn = testScope?.dependencies.sleep ?? opts._sleepOverride ?? sleep;
   let restarted = false;
   let stoppedPid: number | undefined;
 

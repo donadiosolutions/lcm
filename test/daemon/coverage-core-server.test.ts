@@ -11,6 +11,10 @@ import { clearProjectMapCache } from "../../src/project-map.js";
 let home: string;
 let daemon: DaemonInstance | undefined;
 const originalHome = process.env.HOME;
+const testIdentity = {
+  ownerId: "core-server-tests",
+  entrypoint: "/lcm-tests/core-server-daemon.mjs",
+} as const;
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "lcm-core-server-"));
@@ -87,7 +91,7 @@ describe("daemon route and lifecycle boundaries", () => {
   it("accepts the first authorization value when Node exposes an array", async () => {
     const tokenPath = join(home, "token"); ensureAuthToken(tokenPath);
     const token = readAuthToken(tokenPath)!;
-    daemon = await createDaemon(config(), { tokenPath });
+    daemon = await createDaemon(config(), { tokenPath, _testIdentity: testIdentity });
     daemon.registerRoute("POST", "/custom", async (_req, res) => sendJson(res, 200, { ok: true }));
     const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
       const req = request({

@@ -8,6 +8,11 @@ import { DaemonClient } from "../../src/daemon/client.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { ensureAuthToken } from "../../src/daemon/auth.js";
 
+const testIdentity = {
+  ownerId: "client-tests",
+  entrypoint: "/lcm-tests/client-daemon.mjs",
+} as const;
+
 describe("DaemonClient", () => {
   let daemon: DaemonInstance | undefined;
   afterEach(async () => { if (daemon) { await daemon.stop(); daemon = undefined; } });
@@ -115,7 +120,10 @@ describe("DaemonClient", () => {
     ensureAuthToken(tokenPath);
 
     try {
-      daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0 } }), { tokenPath });
+      daemon = await createDaemon(
+        loadDaemonConfig("/x", { daemon: { port: 0 } }),
+        { tokenPath, _testIdentity: testIdentity },
+      );
       const client = new DaemonClient(`http://127.0.0.1:${daemon.address().port}`, tokenPath);
       await expect(client.health()).resolves.toMatchObject({
         status: "ok",

@@ -17,6 +17,10 @@ type SpawnChildMock = {
   unref: ReturnType<typeof vi.fn>;
   once: ReturnType<typeof vi.fn>;
 };
+const testIdentity = {
+  ownerId: "lifecycle-tests",
+  entrypoint: "/lcm-tests/lifecycle-daemon.mjs",
+} as const;
 
 function makeSpawnChild(pid: number | undefined): SpawnChildMock {
   const child: SpawnChildMock = {
@@ -112,7 +116,10 @@ describe("ensureDaemon", () => {
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
     config.daemon.idleTimeoutMs = 0;
-    const daemon = await createDaemon(config, { tokenPath: tokenFile });
+    const daemon = await createDaemon(config, {
+      tokenPath: tokenFile,
+      _testIdentity: testIdentity,
+    });
     const port = daemon.address().port;
     writeFileSync(pidFile, String(process.pid));
 
