@@ -779,7 +779,7 @@ describe("ensureDaemon", () => {
     expect(result).toMatchObject({
       connected: false,
       spawned: false,
-      warning: expect.stringContaining("packaged-runtime digest mismatch"),
+      warning: "daemon reuse or replacement was blocked because the runtime-identity mismatch (entrypoint or packaged-runtime digest) could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry",
     });
     expect(killMock).not.toHaveBeenCalled();
     expect(readFileSync(pidFile, "utf-8")).toBe("200");
@@ -834,7 +834,7 @@ describe("ensureDaemon", () => {
     expect(result).toMatchObject({
       connected: false,
       spawned: false,
-      warning: expect.stringContaining("packaged-runtime digest mismatch"),
+      warning: "daemon reuse or replacement was blocked because the runtime-identity mismatch (entrypoint or packaged-runtime digest) could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry",
     });
     expect(killMock).not.toHaveBeenCalled();
     expect(readFileSync(pidFile, "utf-8")).toBe("200");
@@ -1031,7 +1031,11 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: (): number[] => [19999],
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: false, warning: expect.any(String) });
+    expect(result).toMatchObject({
+      connected: false,
+      spawned: false,
+      warning: "daemon reuse or replacement was blocked because the runtime-identity mismatch (entrypoint or packaged-runtime digest) could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry",
+    });
   });
 
   it("does not terminate an unauthenticated daemon when version and backend both mismatch", async (): Promise<void> => {

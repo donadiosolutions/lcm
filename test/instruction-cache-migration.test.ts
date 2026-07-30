@@ -533,7 +533,7 @@ describe("instruction-cache migration", () => {
     let db = new DatabaseSync(dbPath);
     db.exec("CREATE TABLE sentinel (value TEXT NOT NULL); INSERT INTO sentinel VALUES ('kept')");
     db.exec(CURRENT_CACHE_SCHEMA_SQL
-      .replace("'*[^a-f0-9]*'", "'*[^A-F0-9]*'")
+      .replace(/'\*\[\^a-f0-9\]\*'/u, "'*[^A-F0-9]*'")
       .replace("'claude', 'codex'", "'CLAUDE', 'CODEX'"));
     db.exec(LEGACY_SOURCE_SCHEMA_SQL);
     db.prepare(

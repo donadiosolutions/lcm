@@ -137,12 +137,12 @@ function recognizedHealthStorageBackend(health: HealthResponse): StorageBackend 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const STORAGE_BACKEND_AUTH_WARNING = "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
-const RUNTIME_DIGEST_AUTH_WARNING = "daemon reuse or replacement was blocked because the packaged-runtime digest mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
+const RUNTIME_IDENTITY_AUTH_WARNING = "daemon reuse or replacement was blocked because the runtime-identity mismatch (entrypoint or packaged-runtime digest) could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
 
 function mismatchAuthWarning(storageBackendMatches: boolean): string {
   return storageBackendMatches
-    ? RUNTIME_DIGEST_AUTH_WARNING
+    ? RUNTIME_IDENTITY_AUTH_WARNING
     : STORAGE_BACKEND_AUTH_WARNING;
 }
 
