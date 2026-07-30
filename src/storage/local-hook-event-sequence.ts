@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { closeLcmConnection, getLcmConnection } from "../db/connection.js";
 import { eventSequenceDbPath } from "../db/events-path.js";
+import { ensurePrivateDirectory } from "../security-files.js";
 
 const MAX_POSTGRESQL_BIGINT = 9_223_372_036_854_775_807n;
 const EXHAUSTED_SEQUENCE_CHECKPOINT = MAX_POSTGRESQL_BIGINT + 1n;
@@ -74,7 +74,7 @@ export function allocateLocalHookEventSequences(
   }
   if (count === 0) return [];
 
-  mkdirSync(dirname(sequencePath), { recursive: true, mode: 0o700 });
+  ensurePrivateDirectory(dirname(sequencePath));
   const db = getLcmConnection(sequencePath);
   try {
     db.exec(`

@@ -545,12 +545,14 @@ export class EventsDb {
       SELECT COUNT(*) AS retained
       FROM events
       WHERE processed_at IS NULL
-        AND event_id NOT IN (
-          SELECT event_id FROM age_candidates
-          UNION ALL
-          SELECT event_id FROM remaining
+        AND (
+          event_id NOT IN (
+            SELECT event_id FROM age_candidates
+            UNION ALL
+            SELECT event_id FROM remaining
+          )
+          OR event_id IN (SELECT event_id FROM age_candidates)
         )
-      OR event_id IN (SELECT event_id FROM age_candidates)
     `).get(maxAgeDays, normalizedMaxRows) as { retained: number };
     if (candidates.retained > 0) {
       this.db.prepare(

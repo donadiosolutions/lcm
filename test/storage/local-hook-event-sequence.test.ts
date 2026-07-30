@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -42,12 +48,16 @@ describe("local hook event sequence", () => {
     raw.close();
   });
 
-  it("creates the private parent directory for a standalone allocator", () => {
+  it("creates and tightens the private parent directory for a standalone allocator", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-event-sequence-parent-"));
     directories.push(directory);
-    const path = join(directory, "nested", "events", "sequence.sqlite");
+    const parent = join(directory, "nested", "events");
+    mkdirSync(parent, { recursive: true, mode: 0o755 });
+    chmodSync(parent, 0o755);
+    const path = join(parent, "sequence.sqlite");
 
     expect(allocateLocalHookEventSequence(path)).toBe(0n);
+    expect(statSync(parent).mode & 0o777).toBe(0o700);
     const raw = new DatabaseSync(path);
     expect(raw.prepare(
       "SELECT next_sequence FROM local_hook_sequence WHERE singleton = 1",

@@ -1022,6 +1022,18 @@ describe("EventsDb", () => {
       db.close();
     });
 
+    it("excludes processed rows from the unprocessed retention guard", () => {
+      const db = new EventsDb(dbPath);
+      db.insertEvent("s1", { type: "a", category: "file", data: "processed", priority: 3 }, "PostToolUse");
+      const [event] = db.getUnprocessed();
+      db.markProcessed([event.event_id]);
+      withSqlite(dbPath, (raw) => raw.exec("UPDATE events SET created_at = datetime('now', '-31 days')"));
+
+      expect(db.pruneUnprocessed(0, 30)).toEqual({ pruned: 0 });
+      expect(db.getRecentErrors({ includeMaintenance: true })).toEqual([]);
+      db.close();
+    });
+
     it("retains old unprocessed rows and reports each observed guard breach", () => {
       const db = new EventsDb(dbPath);
       db.insertEvent("s1", { type: "a", category: "file", data: "old", priority: 3 }, "PostToolUse");
