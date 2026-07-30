@@ -704,7 +704,7 @@ function setPassiveEventTransportState(
   }
 }
 
-function readSourceEventsAfterFailure(
+function readSourceEventIdentities(
   path: string,
 ): Array<{ event_id: number; event_uuid: string }> {
   const db = new DatabaseSync(path, { readOnly: true });
@@ -763,7 +763,7 @@ function makeVersionedPredecessorRemap(
   );
   source.setPrevEventId(childId, parentId);
   source.close();
-  const events = readSourceEventsAfterFailure(fixture.sourceEvents);
+  const events = readSourceEventIdentities(fixture.sourceEvents);
   return {
     ...fixture,
     parentId,
@@ -2940,6 +2940,8 @@ describe("worktree reconciliation", () => {
       prepareSpy.mockRestore();
     }
 
+    expect(DatabaseSync.prototype.prepare).toBe(originalPrepare);
+    expect(DatabaseSync.prototype.close).toBe(originalClose);
     expect(caught).toBe(queryFailure);
     expect(closeAttempts).toBe(1);
   });
