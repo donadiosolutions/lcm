@@ -38,7 +38,7 @@ import {
   isDaemonLifecycleTestScope,
   isVitestWorkerEntrypoint,
   assertLifecycleScopeOwnsCurrentCleanupRoot,
-  lifecycleHermeticSeamsOwnsStatePath,
+  lifecycleHermeticSeamsOwnsExactStatePaths,
   lifecycleScopeFilesystemIsCurrent,
   lifecycleScopeOwnsExactStatePaths,
   lifecycleScopeUnitName,
@@ -397,8 +397,11 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-type ScopedStateAccess = Readonly<{
+type ScopedStateAccess = Readonly<({
   scope: DaemonLifecycleTestScope;
+} | {
+  hermeticSeams: DaemonLifecycleHermeticTestSeams;
+}) & {
   pidPath: string;
   tokenPath: string;
 }>;
@@ -406,11 +409,14 @@ type ScopedStateAccess = Readonly<{
 class LifecycleTestScopeStateError extends Error {}
 
 function assertScopedStateAccess(access: ScopedStateAccess): void {
-  if (!lifecycleScopeOwnsExactStatePaths(
-    access.scope,
-    access.pidPath,
-    access.tokenPath,
-  )) {
+  const ownsState = "scope" in access
+    ? lifecycleScopeOwnsExactStatePaths(access.scope, access.pidPath, access.tokenPath)
+    : lifecycleHermeticSeamsOwnsExactStatePaths(
+        access.hermeticSeams,
+        access.pidPath,
+        access.tokenPath,
+      );
+  if (!ownsState) {
     throw new LifecycleTestScopeStateError(
       "daemon lifecycle test state paths changed or escaped their canonical scope",
     );
@@ -442,7 +448,7 @@ function readPidFile(
 ): number | null {
   try {
     if (scopedState) assertScopedStateAccess(scopedState);
-    const content = scopedState
+    const content = scopedState && "scope" in scopedState
       ? readRegularFileNoFollow(pidFilePath)
       : readFileSync(pidFilePath, "utf-8");
     if (scopedState) assertScopedStateAccess(scopedState);
@@ -451,8 +457,11 @@ function readPidFile(
   } catch (error) {
     if (
       scopedState
-      && (error instanceof LifecycleTestScopeStateError
-        || (error as NodeJS.ErrnoException).code !== "ENOENT")
+      && (
+        error instanceof LifecycleTestScopeStateError
+        || ("scope" in scopedState
+          && (error as NodeJS.ErrnoException).code !== "ENOENT")
+      )
     ) {
       throw new LifecycleTestScopeStateError(
         "daemon lifecycle test PID state is not a canonical owned file",
@@ -468,7 +477,15 @@ function cleanStalePid(
 ): void {
   if (scopedState) {
     assertScopedStateAccess(scopedState);
-    rmSync(pidFilePath, { force: true });
+    if ("scope" in scopedState) {
+      rmSync(pidFilePath, { force: true });
+    } else {
+      try {
+        if (existsSync(pidFilePath)) unlinkSync(pidFilePath);
+      } catch {
+        // Preserve production best-effort stale PID cleanup.
+      }
+    }
     assertScopedStateAccess(scopedState);
     return;
   }
@@ -478,6 +495,12 @@ function cleanStalePid(
 }
 
 function readScopedAuthToken(access: ScopedStateAccess): string | null {
+  if ("hermeticSeams" in access) {
+    assertScopedStateAccess(access);
+    const token = readAuthToken(access.tokenPath);
+    assertScopedStateAccess(access);
+    return token;
+  }
   try {
     assertScopedStateAccess(access);
     const token = readRegularFileNoFollow(access.tokenPath).trim();
@@ -492,6 +515,12 @@ function readScopedAuthToken(access: ScopedStateAccess): string | null {
 }
 
 function ensureScopedAuthToken(access: ScopedStateAccess): void {
+  if ("hermeticSeams" in access) {
+    assertScopedStateAccess(access);
+    ensureAuthToken(access.tokenPath);
+    assertScopedStateAccess(access);
+    return;
+  }
   try {
     assertScopedStateAccess(access);
     const existing = openSync(
@@ -553,6 +582,11 @@ function ensureScopedAuthToken(access: ScopedStateAccess): void {
 
 function writeScopedPidFile(access: ScopedStateAccess, pid: number): void {
   assertScopedStateAccess(access);
+  if ("hermeticSeams" in access) {
+    writeFileSync(access.pidPath, String(pid));
+    assertScopedStateAccess(access);
+    return;
+  }
   const descriptor = openSync(
     access.pidPath,
     constants.O_WRONLY
@@ -1348,9 +1382,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
   if (
     hermeticSeams
-    && (
-      !lifecycleHermeticSeamsOwnsStatePath(hermeticSeams, opts.pidFilePath)
-      || !lifecycleHermeticSeamsOwnsStatePath(hermeticSeams, tokenPath)
+    && !lifecycleHermeticSeamsOwnsExactStatePaths(
+      hermeticSeams,
+      opts.pidFilePath,
+      tokenPath,
     )
   ) {
     return {
@@ -1383,7 +1418,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const dependencies = resolveLifecycleDependencies(opts);
   const scopedState = testScope
     ? { scope: testScope, pidPath: opts.pidFilePath, tokenPath }
-    : undefined;
+    : hermeticSeams
+      ? { hermeticSeams, pidPath: opts.pidFilePath, tokenPath }
+      : undefined;
   const readOwnedPid = (): number | null => readPidFile(opts.pidFilePath, scopedState);
   const cleanOwnedPid = (): void => cleanStalePid(opts.pidFilePath, scopedState);
   const readOwnedToken = (path: string): string | null => scopedState
@@ -1699,7 +1736,11 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   if (concurrentReplacementPid !== undefined) {
     return waitForConcurrentReplacement(concurrentReplacementPid);
   }
-  const pidFilePid = scopedState || existsSync(opts.pidFilePath)
+  const pidFilePid = (
+    scopedState && "scope" in scopedState
+      ? true
+      : existsSync(opts.pidFilePath)
+  )
     ? readOwnedPid()
     : null;
   if (pidFilePid !== null) {
@@ -2039,9 +2080,10 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   }
   if (
     hermeticSeams
-    && (
-      !lifecycleHermeticSeamsOwnsStatePath(hermeticSeams, opts.pidFilePath)
-      || !lifecycleHermeticSeamsOwnsStatePath(hermeticSeams, tokenPath)
+    && !lifecycleHermeticSeamsOwnsExactStatePaths(
+      hermeticSeams,
+      opts.pidFilePath,
+      tokenPath,
     )
   ) {
     return {
@@ -2083,11 +2125,29 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       warning: "daemon lifecycle test state changed during restart validation",
     };
   }
+  if (
+    hermeticSeams
+    && !lifecycleHermeticSeamsOwnsExactStatePaths(
+      hermeticSeams,
+      opts.pidFilePath,
+      tokenPath,
+    )
+  ) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      restarted: false,
+      warning: "daemon lifecycle hermetic state changed during restart validation",
+    };
+  }
 
   const dependencies = resolveLifecycleDependencies(opts);
   const scopedState = testScope
     ? { scope: testScope, pidPath: opts.pidFilePath, tokenPath }
-    : undefined;
+    : hermeticSeams
+      ? { hermeticSeams, pidPath: opts.pidFilePath, tokenPath }
+      : undefined;
   const readOwnedPid = (): number | null => readPidFile(opts.pidFilePath, scopedState);
   const cleanOwnedPid = (): void => cleanStalePid(opts.pidFilePath, scopedState);
   const readOwnedToken = (path: string): string | null => scopedState

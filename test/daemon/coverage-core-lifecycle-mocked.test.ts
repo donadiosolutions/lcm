@@ -1,13 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const fs = vi.hoisted(() => ({
-  chmod: vi.fn(), exists: vi.fn(), mkdtemp: vi.fn(), read: vi.fn(), readdir: vi.fn(),
-  rm: vi.fn(), stat: vi.fn(), unlink: vi.fn(), write: vi.fn(),
+  chmod: vi.fn(), exists: vi.fn(), lstat: vi.fn(), mkdtemp: vi.fn(), read: vi.fn(),
+  readdir: vi.fn(), realpath: vi.fn(), rm: vi.fn(), stat: vi.fn(), unlink: vi.fn(),
+  write: vi.fn(),
 }));
 vi.mock("node:fs", async importOriginal => ({
   ...(await importOriginal<typeof import("node:fs")>()),
-  chmodSync: fs.chmod, existsSync: fs.exists, mkdtempSync: fs.mkdtemp, readFileSync: fs.read,
-  readdirSync: fs.readdir, rmSync: fs.rm, statSync: fs.stat, unlinkSync: fs.unlink, writeFileSync: fs.write,
+  chmodSync: fs.chmod, existsSync: fs.exists, lstatSync: fs.lstat,
+  mkdtempSync: fs.mkdtemp, readFileSync: fs.read, readdirSync: fs.readdir,
+  realpathSync: fs.realpath, rmSync: fs.rm, statSync: fs.stat,
+  unlinkSync: fs.unlink, writeFileSync: fs.write,
 }));
 
 import {
@@ -24,6 +27,15 @@ const originalGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
 beforeEach(() => {
   Object.defineProperty(process, "getuid", { configurable: true, value: vi.fn(() => 1000) });
   vi.clearAllMocks(); fs.exists.mockImplementation((path: string) => path.endsWith("daemon.token")); fs.mkdtemp.mockReturnValue("/runtime/.hermetic-credentials/lcm-systemd-credentials-test");
+  fs.lstat.mockReturnValue({
+    dev: 1,
+    ino: 1,
+    isDirectory: () => true,
+    isFile: () => false,
+    isSymbolicLink: () => false,
+    nlink: 1,
+  });
+  fs.realpath.mockImplementation((path: string) => path);
   fs.stat.mockReturnValue({ isDirectory: () => true, mtimeMs: 0 }); fs.readdir.mockReturnValue([]);
   delete process.env.ANTHROPIC_API_KEY; delete process.env.OPENAI_API_KEY; delete process.env.LCM_SUMMARY_API_KEY;
 });

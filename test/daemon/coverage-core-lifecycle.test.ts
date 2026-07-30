@@ -33,14 +33,20 @@ const fetchHealthy = (pid?: number) => vi.fn(async (url: string) => url.endsWith
 
 function withHermeticLifecycleSeams(options: EnsureDaemonOptions): EnsureDaemonOptions {
   const stateDir = dirname(options.pidFilePath);
+  const runtimeDir = join(stateDir, ".hermetic-runtime");
+  const credentialDir = join(stateDir, ".hermetic-credentials");
+  const procRoot = options._procRoot === "/proc"
+    ? join(stateDir, ".hermetic-proc")
+    : options._procRoot ?? join(stateDir, ".hermetic-proc");
+  for (const directory of [stateDir, runtimeDir, credentialDir, procRoot]) {
+    mkdirSync(directory, { recursive: true });
+  }
   const seams: DaemonLifecycleHermeticTestSeams = {
     homeDir: stateDir,
-    runtimeDir: join(stateDir, ".hermetic-runtime"),
+    runtimeDir,
     stateDir,
-    credentialDir: join(stateDir, ".hermetic-credentials"),
-    procRoot: options._procRoot === "/proc"
-      ? join(stateDir, ".hermetic-proc")
-      : options._procRoot ?? join(stateDir, ".hermetic-proc"),
+    credentialDir,
+    procRoot,
     platform: options._platform ?? "linux",
     uid: options._uid ?? 1000,
     environment: {},
@@ -380,6 +386,7 @@ describe("lifecycle procfs and parent warnings", () => {
       expectedVersion: "1",
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(31) as never,
       _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [1], _skipSpawn: true,
+      _monotonicNowOverride: (): number => 0,
     });
     expect(result.warning).toContain("not an LCM daemon");
   });

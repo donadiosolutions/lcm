@@ -43,6 +43,7 @@ import {
 import { ensureAuthToken } from "../../src/daemon/auth.js";
 import { createDaemon } from "../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
+import { RUNTIME_DIGEST } from "../../src/daemon/version.js";
 
 type ScopeFixture = {
   root: string;
@@ -142,12 +143,18 @@ function withHermeticLifecycleSeams(
   root: string,
 ): Parameters<typeof ensureDaemon>[0] {
   const stateDir = dirname(options.pidFilePath);
+  const runtimeDir = join(root, "hermetic-runtime");
+  const credentialDir = join(root, "hermetic-credentials");
+  const procRoot = join(root, "hermetic-proc");
+  for (const directory of [runtimeDir, stateDir, credentialDir, procRoot]) {
+    mkdirSync(directory, { recursive: true });
+  }
   const seams: DaemonLifecycleHermeticTestSeams = {
     homeDir: root,
-    runtimeDir: join(root, "hermetic-runtime"),
+    runtimeDir,
     stateDir,
-    credentialDir: join(root, "hermetic-credentials"),
-    procRoot: join(root, "hermetic-proc"),
+    credentialDir,
+    procRoot,
     platform: options._platform ?? "linux",
     uid: options._uid ?? 1000,
     environment: {},
@@ -506,10 +513,17 @@ describe("daemon lifecycle test-scope validation", () => {
     }, fixture.scope.homeDir);
     const seams = options._hermeticTestSeams!;
     expect(isDaemonLifecycleHermeticTestSeams(seams)).toBe(true);
+    expect(isDaemonLifecycleHermeticTestSeams(seams)).toBe(true);
     expect(isDaemonLifecycleHermeticTestSeams(null)).toBe(false);
     expect(isDaemonLifecycleHermeticTestSeams({ ...seams, homeDir: "/" })).toBe(false);
     expect(isDaemonLifecycleHermeticTestSeams({ ...seams, homeDir: "relative" })).toBe(false);
     expect(isDaemonLifecycleHermeticTestSeams({ ...seams, runtimeDir: "/outside" })).toBe(false);
+    const outsideRoot = mkdtempSync(join(tmpdir(), "lcm-hermetic-outside-"));
+    roots.push(outsideRoot);
+    expect(isDaemonLifecycleHermeticTestSeams({
+      ...seams,
+      runtimeDir: outsideRoot,
+    })).toBe(false);
     expect(isDaemonLifecycleHermeticTestSeams({ ...seams, uid: -1 })).toBe(false);
     expect(isDaemonLifecycleHermeticTestSeams({ ...seams, platform: "" })).toBe(false);
     expect(isDaemonLifecycleHermeticTestSeams({ ...seams, environment: null })).toBe(false);
@@ -552,6 +566,7 @@ describe("daemon lifecycle test-scope validation", () => {
       ...options._hermeticTestSeams!,
       stateDir: join(fixture.scope.homeDir, "foreign-state"),
     };
+    mkdirSync(foreignSeams.stateDir);
     await expect(ensureDaemon({
       ...options,
       _hermeticTestSeams: foreignSeams,
@@ -567,6 +582,211 @@ describe("daemon lifecycle test-scope validation", () => {
       warning: expect.stringContaining("outside its state root"),
     });
     expect(fixture.scope.dependencies.fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects symlinked hermetic roots and ancestors before external state access", async () => {
+    const externalRoot = mkdtempSync(join(tmpdir(), "lcm-hermetic-external-"));
+    roots.push(externalRoot);
+    const externalState = join(externalRoot, "state");
+    mkdirSync(externalState);
+
+    async function expectBlocked(
+      label: string,
+      prepare: (
+        root: string,
+        seams: DaemonLifecycleHermeticTestSeams,
+      ) => DaemonLifecycleHermeticTestSeams,
+    ): Promise<void> {
+      const root = mkdtempSync(join(tmpdir(), `lcm-hermetic-${label}-`));
+      roots.push(root);
+      const stateDir = join(root, "state");
+      const pidPath = join(stateDir, "daemon.pid");
+      const options = withHermeticLifecycleSeams({
+        port: 37_347,
+        pidFilePath: pidPath,
+        spawnTimeoutMs: 10,
+      }, root);
+      const originalSeams = options._hermeticTestSeams!;
+      expect(isDaemonLifecycleHermeticTestSeams(originalSeams)).toBe(true);
+      const seams = prepare(root, originalSeams);
+      const ownedPidPath = join(seams.stateDir, "daemon.pid");
+      const ownedTokenPath = join(seams.stateDir, "daemon.token");
+      mkdirSync(seams.stateDir, { recursive: true });
+      writeFileSync(ownedPidPath, "8282");
+      writeFileSync(ownedTokenPath, "seam-token", { mode: 0o640 });
+      const ownedPidBefore = readFileSync(ownedPidPath, "utf8");
+      const ownedTokenBefore = readFileSync(ownedTokenPath, "utf8");
+      const ownedTokenModeBefore = statSync(ownedTokenPath).mode & 0o777;
+      const validateBeforeRestart = vi.fn();
+
+      expect(isDaemonLifecycleHermeticTestSeams(seams)).toBe(false);
+      await expect(ensureDaemon({
+        ...options,
+        pidFilePath: ownedPidPath,
+        _hermeticTestSeams: seams,
+      })).resolves.toMatchObject({
+        connected: false,
+        spawned: false,
+        warning: expect.stringContaining("incomplete or malformed"),
+      });
+      await expect(restartDaemon({
+        ...options,
+        pidFilePath: ownedPidPath,
+        _hermeticTestSeams: seams,
+        validateBeforeRestart,
+      })).resolves.toMatchObject({
+        connected: false,
+        spawned: false,
+        restarted: false,
+        warning: expect.stringContaining("incomplete or malformed"),
+      });
+      expect(validateBeforeRestart).not.toHaveBeenCalled();
+      expect(seams.fetch).not.toHaveBeenCalled();
+      expect(seams.spawn).not.toHaveBeenCalled();
+      expect(seams.spawnSync).not.toHaveBeenCalled();
+      expect(seams.killProcess).not.toHaveBeenCalled();
+      expect(readFileSync(ownedPidPath, "utf8")).toBe(ownedPidBefore);
+      expect(readFileSync(ownedTokenPath, "utf8")).toBe(ownedTokenBefore);
+      expect(statSync(ownedTokenPath).mode & 0o777).toBe(ownedTokenModeBefore);
+    }
+
+    await expectBlocked("state-link", (_root, seams) => {
+      rmSync(seams.stateDir, { recursive: true });
+      symlinkSync(externalState, seams.stateDir, "dir");
+      return seams;
+    });
+    await expectBlocked("state-replacement", (_root, seams) => {
+      renameSync(seams.stateDir, `${seams.stateDir}-original`);
+      mkdirSync(seams.stateDir);
+      return seams;
+    });
+    await expectBlocked("runtime-link", (_root, seams) => {
+      rmSync(seams.runtimeDir, { recursive: true });
+      symlinkSync(externalRoot, seams.runtimeDir, "dir");
+      return seams;
+    });
+    await expectBlocked("credential-link", (_root, seams) => {
+      rmSync(seams.credentialDir, { recursive: true });
+      symlinkSync(externalRoot, seams.credentialDir, "dir");
+      return seams;
+    });
+    await expectBlocked("proc-link", (_root, seams) => {
+      rmSync(seams.procRoot, { recursive: true });
+      symlinkSync(externalRoot, seams.procRoot, "dir");
+      return seams;
+    });
+    await expectBlocked("home-link", (root, seams) => {
+      const externalHome = join(externalRoot, "home");
+      mkdirSync(join(externalHome, "hermetic-runtime"), { recursive: true });
+      mkdirSync(join(externalHome, "state"), { recursive: true });
+      mkdirSync(join(externalHome, "hermetic-credentials"), { recursive: true });
+      mkdirSync(join(externalHome, "hermetic-proc"), { recursive: true });
+      rmSync(root, { recursive: true });
+      symlinkSync(externalHome, root, "dir");
+      return seams;
+    });
+    await expectBlocked("ancestor-swap", (root) => {
+      const home = join(root, "owned", "home");
+      mkdirSync(home, { recursive: true });
+      const nestedOptions = withHermeticLifecycleSeams({
+        port: 37_348,
+        pidFilePath: join(home, "state", "daemon.pid"),
+        spawnTimeoutMs: 10,
+      }, home);
+      const originalParent = join(root, "owned-original");
+      renameSync(join(root, "owned"), originalParent);
+      const externalParent = join(externalRoot, "owned");
+      mkdirSync(join(externalParent, "home", "hermetic-runtime"), { recursive: true });
+      mkdirSync(join(externalParent, "home", "state"), { recursive: true });
+      mkdirSync(join(externalParent, "home", "hermetic-credentials"), { recursive: true });
+      mkdirSync(join(externalParent, "home", "hermetic-proc"), { recursive: true });
+      symlinkSync(externalParent, join(root, "owned"), "dir");
+      return nestedOptions._hermeticTestSeams!;
+    });
+  });
+
+  it("revalidates hermetic root snapshots after injected callbacks", async () => {
+    function createAncestorSwap(
+      label: string,
+    ): {
+      options: Parameters<typeof ensureDaemon>[0];
+      seams: DaemonLifecycleHermeticTestSeams;
+      swap: ReturnType<typeof vi.fn>;
+      externalPid: string;
+      externalToken: string;
+    } {
+      const root = mkdtempSync(join(tmpdir(), `lcm-hermetic-swap-${label}-`));
+      roots.push(root);
+      const home = join(root, "owned", "home");
+      mkdirSync(home, { recursive: true });
+      const options = withHermeticLifecycleSeams({
+        port: 37_349,
+        pidFilePath: join(home, "state", "daemon.pid"),
+        spawnTimeoutMs: 10,
+      }, home);
+      const seams = options._hermeticTestSeams!;
+      expect(isDaemonLifecycleHermeticTestSeams(seams)).toBe(true);
+      const externalParent = join(root, "external-owned");
+      const externalHome = join(externalParent, "home");
+      for (const directory of [
+        join(externalHome, "hermetic-runtime"),
+        join(externalHome, "state"),
+        join(externalHome, "hermetic-credentials"),
+        join(externalHome, "hermetic-proc"),
+      ]) {
+        mkdirSync(directory, { recursive: true });
+      }
+      const externalPid = join(externalHome, "state", "daemon.pid");
+      const externalToken = join(externalHome, "state", "daemon.token");
+      writeFileSync(externalPid, "8383");
+      writeFileSync(externalToken, "external-swap-token", { mode: 0o640 });
+      const swap = vi.fn(() => {
+        renameSync(join(root, "owned"), join(root, "owned-original"));
+        symlinkSync(externalParent, join(root, "owned"), "dir");
+      });
+      return { options, seams, swap, externalPid, externalToken };
+    }
+
+    const restartCase = createAncestorSwap("restart");
+    const validateBeforeRestart = vi.fn(async () => restartCase.swap());
+    await expect(restartDaemon({
+      ...restartCase.options,
+      _hermeticTestSeams: restartCase.seams,
+      validateBeforeRestart,
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      restarted: false,
+      warning: expect.stringContaining("state changed during restart validation"),
+    });
+    expect(validateBeforeRestart).toHaveBeenCalledOnce();
+    expect(restartCase.seams.fetch).not.toHaveBeenCalled();
+    expect(restartCase.seams.killProcess).not.toHaveBeenCalled();
+    expect(readFileSync(restartCase.externalPid, "utf8")).toBe("8383");
+    expect(readFileSync(restartCase.externalToken, "utf8")).toBe("external-swap-token");
+    expect(statSync(restartCase.externalToken).mode & 0o777).toBe(0o640);
+
+    const ensureCase = createAncestorSwap("ensure");
+    const fetch = vi.fn(async () => {
+      ensureCase.swap();
+      return { ok: false, status: 503 };
+    });
+    const seams = {
+      ...ensureCase.seams,
+      fetch: fetch as never,
+    };
+    expect(isDaemonLifecycleHermeticTestSeams(seams)).toBe(true);
+    await expect(ensureDaemon({
+      ...ensureCase.options,
+      _hermeticTestSeams: seams,
+    })).rejects.toThrow("PID state is not a canonical owned file");
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(seams.spawn).not.toHaveBeenCalled();
+    expect(seams.spawnSync).not.toHaveBeenCalled();
+    expect(seams.killProcess).not.toHaveBeenCalled();
+    expect(readFileSync(ensureCase.externalPid, "utf8")).toBe("8383");
+    expect(readFileSync(ensureCase.externalToken, "utf8")).toBe("external-swap-token");
+    expect(statSync(ensureCase.externalToken).mode & 0o777).toBe(0o640);
   });
 
   it("preserves best-effort stale PID recovery for a hermetic production-shaped error", async () => {
@@ -785,6 +1005,142 @@ describe("daemon lifecycle test-scope validation", () => {
     expect(systemdArgs.find(arg => arg.startsWith("--setenv=LCM_DAEMON_OWNER_ID=")))
       .toBeUndefined();
     expect(fixture.stopUnit).not.toHaveBeenCalled();
+  });
+
+  it("preserves no-scope production PID cleanup and detached PID writes", async () => {
+    const fixture = createFixture("production-state-defaults");
+    const previousEntrypoint = process.argv[1];
+    process.argv[1] = fixture.scope.entrypoint;
+    const pidPath = join(fixture.root, "production.pid");
+    const missingPidPath = join(fixture.root, "missing-production.pid");
+    const detachedPidPath = join(fixture.root, "detached-production.pid");
+    const ensureReplacement = vi.fn(async () => ({
+      connected: false,
+      port: 37_350,
+      spawned: false,
+    }));
+    try {
+      writeFileSync(pidPath, "8484");
+      await expect(restartDaemon({
+        port: 37_350,
+        pidFilePath: pidPath,
+        spawnTimeoutMs: 10,
+        _isProcessAliveOverride: () => false,
+        _ensureDaemonOverride: ensureReplacement,
+      })).resolves.toMatchObject({
+        connected: false,
+        restarted: false,
+      });
+      expect(existsSync(pidPath)).toBe(false);
+      await expect(restartDaemon({
+        port: 37_350,
+        pidFilePath: missingPidPath,
+        spawnTimeoutMs: 10,
+        _ensureDaemonOverride: ensureReplacement,
+      })).resolves.toMatchObject({
+        connected: false,
+        restarted: false,
+      });
+
+      const child = {
+        pid: 8585,
+        once: vi.fn().mockReturnThis(),
+        unref: vi.fn(),
+      };
+      await expect(ensureDaemon({
+        port: 37_350,
+        pidFilePath: detachedPidPath,
+        spawnTimeoutMs: 10,
+        spawnArgs: [fixture.scope.entrypoint],
+        _platform: "darwin",
+        _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as never,
+        _spawnOverride: vi.fn(() => child) as never,
+        _skipHealthWait: true,
+      })).resolves.toMatchObject({
+        connected: false,
+        spawned: true,
+        startMethod: "detached-spawn",
+      });
+      expect(readFileSync(detachedPidPath, "utf8")).toBe("8585");
+
+      const health = {
+        status: "ok",
+        version: "1",
+        storageBackend: "sqlite",
+        pid: 8686,
+        entrypoint: fixture.scope.entrypoint,
+        runtimeDigest: RUNTIME_DIGEST,
+      };
+      const fetchHealthy = vi.fn(async (url: string) => (
+        url.endsWith("/health")
+          ? { ok: true, status: 200, json: async () => health }
+          : { ok: true, status: 200, json: async () => ({}) }
+      ));
+      const connectedRoot = join(fixture.root, "connected");
+      mkdirSync(connectedRoot);
+      const connectedPidPath = join(connectedRoot, "daemon.pid");
+      writeFileSync(connectedPidPath, "8686");
+      ensureAuthToken(join(connectedRoot, "daemon.token"));
+      await expect(ensureDaemon({
+        port: 37_351,
+        pidFilePath: connectedPidPath,
+        spawnTimeoutMs: 10,
+        expectedVersion: "1",
+        expectedEntrypoint: fixture.scope.entrypoint,
+        _platform: "darwin",
+        _fetchOverride: fetchHealthy as never,
+        _isProcessAliveOverride: () => true,
+        _listeningPortsOverride: () => [37_351],
+        _monotonicNowOverride: () => 0,
+        _skipSpawn: true,
+      })).resolves.toMatchObject({
+        connected: true,
+        spawned: false,
+      });
+
+      const restartRoot = join(fixture.root, "restart");
+      mkdirSync(restartRoot);
+      const restartPidPath = join(restartRoot, "daemon.pid");
+      writeFileSync(restartPidPath, "8787");
+      ensureAuthToken(join(restartRoot, "daemon.token"));
+      let alive = true;
+      const kill = vi.fn(() => {
+        alive = false;
+      });
+      const restartHealth = {
+        ...health,
+        pid: 8787,
+      };
+      const fetchRestart = vi.fn(async (url: string) => (
+        url.endsWith("/health")
+          ? { ok: true, status: 200, json: async () => restartHealth }
+          : { ok: true, status: 200, json: async () => ({}) }
+      ));
+      await expect(restartDaemon({
+        port: 37_352,
+        pidFilePath: restartPidPath,
+        spawnTimeoutMs: 10,
+        expectedVersion: "1",
+        expectedEntrypoint: fixture.scope.entrypoint,
+        _platform: "darwin",
+        _fetchOverride: fetchRestart as never,
+        _isProcessAliveOverride: () => alive,
+        _killOverride: kill,
+        _sleepOverride: async () => undefined,
+        _listeningPortsOverride: () => [37_352],
+        _monotonicNowOverride: () => 0,
+        _ensureDaemonOverride: async () => ({
+          connected: false,
+          port: 37_352,
+          spawned: false,
+        }),
+      })).resolves.toMatchObject({
+        restarted: true,
+        stoppedPid: 8787,
+      });
+    } finally {
+      process.argv[1] = previousEntrypoint;
+    }
   });
 });
 

@@ -79,6 +79,22 @@ type DaemonLifecycleTestFilesystem = Readonly<{
   entrypoint: CanonicalLifecycleTestResource;
 }>;
 
+const HERMETIC_FILESYSTEM_ROOTS = [
+  "homeDir",
+  "runtimeDir",
+  "stateDir",
+  "credentialDir",
+  "procRoot",
+] as const satisfies readonly (keyof DaemonLifecycleHermeticTestSeams)[];
+type HermeticFilesystemRoot = typeof HERMETIC_FILESYSTEM_ROOTS[number];
+type DaemonLifecycleHermeticTestFilesystem = Readonly<
+  Record<HermeticFilesystemRoot, CanonicalLifecycleTestResource>
+>;
+const hermeticFilesystemSnapshots = new WeakMap<
+  object,
+  DaemonLifecycleHermeticTestFilesystem
+>();
+
 type ScopeInput = Omit<DaemonLifecycleTestScope, "unitPrefix" | "filesystem">;
 
 function requireAbsoluteDirectory(label: string, path: string): string {
@@ -276,25 +292,38 @@ export function isDaemonLifecycleHermeticTestSeams(
 ): value is DaemonLifecycleHermeticTestSeams {
   if (typeof value !== "object" || value === null) return false;
   const seams = value as DaemonLifecycleHermeticTestSeams;
+  let filesystem: DaemonLifecycleHermeticTestFilesystem;
   try {
     const homeDir = requireAbsoluteDirectory("hermetic test homeDir", seams.homeDir);
     if (homeDir === resolve("/")) return false;
-    for (const [label, path] of [
-      ["runtimeDir", seams.runtimeDir],
-      ["stateDir", seams.stateDir],
-      ["credentialDir", seams.credentialDir],
-      ["procRoot", seams.procRoot],
-    ] as const) {
-      const absolute = requireAbsoluteDirectory(`hermetic test ${label}`, path);
+    filesystem = Object.freeze(Object.fromEntries(
+      HERMETIC_FILESYSTEM_ROOTS.map((label) => {
+        const absolute = requireAbsoluteDirectory(`hermetic test ${label}`, seams[label]);
+        return [
+          label,
+          captureCanonicalResource(`hermetic test ${label}`, absolute, "directory"),
+        ];
+      }),
+    ) as unknown as DaemonLifecycleHermeticTestFilesystem);
+    for (const label of HERMETIC_FILESYSTEM_ROOTS.slice(1)) {
+      const absolute = filesystem[label].path;
       if (!isWithin(absolute, homeDir)) return false;
     }
+    const expected = hermeticFilesystemSnapshots.get(value);
+    if (
+      expected
+      && !HERMETIC_FILESYSTEM_ROOTS.every(label => (
+        expected[label].path === filesystem[label].path
+        && resourceMatchesSnapshot(expected[label])
+      ))
+    ) return false;
   } catch {
     return false;
   }
   if (!Number.isSafeInteger(seams.uid) || seams.uid < 0) return false;
   if (typeof seams.platform !== "string" || seams.platform.length === 0) return false;
   if (typeof seams.environment !== "object" || seams.environment === null) return false;
-  return [
+  const dependenciesAreComplete = [
     seams.fetch,
     seams.spawn,
     seams.spawnSync,
@@ -304,13 +333,23 @@ export function isDaemonLifecycleHermeticTestSeams(
     seams.sleep,
     seams.realpath,
   ].every(dependency => typeof dependency === "function");
+  if (!dependenciesAreComplete) return false;
+  if (!hermeticFilesystemSnapshots.has(value)) {
+    hermeticFilesystemSnapshots.set(value, filesystem);
+  }
+  return true;
 }
 
-export function lifecycleHermeticSeamsOwnsStatePath(
+export function lifecycleHermeticSeamsOwnsExactStatePaths(
   seams: DaemonLifecycleHermeticTestSeams,
-  path: string,
+  pidPath: string,
+  tokenPath: string,
 ): boolean {
-  return isWithin(path, seams.stateDir);
+  return isDaemonLifecycleHermeticTestSeams(seams)
+    && pidPath === resolve(pidPath)
+    && tokenPath === resolve(tokenPath)
+    && isWithin(pidPath, seams.stateDir)
+    && isWithin(tokenPath, seams.stateDir);
 }
 
 export function isDaemonLifecycleTestScope(value: unknown): value is DaemonLifecycleTestScope {

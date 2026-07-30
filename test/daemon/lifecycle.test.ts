@@ -38,6 +38,12 @@ function makeSpawnChild(pid: number | undefined): SpawnChildMock {
   return child;
 }
 
+function makeHermeticPidFile(prefix: string): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  tempDirs.push(root);
+  return join(root, "daemon.pid");
+}
+
 function withHermeticLifecycleSeams(
   options: EnsureDaemonOptions,
   overrides: Partial<DaemonLifecycleHermeticTestSeams> = {},
@@ -67,6 +73,15 @@ function withHermeticLifecycleSeams(
     realpath: options._realpathOverride ?? (path => path),
     ...overrides,
   };
+  for (const directory of [
+    seams.homeDir,
+    seams.runtimeDir,
+    seams.stateDir,
+    seams.credentialDir,
+    seams.procRoot,
+  ]) {
+    mkdirSync(directory, { recursive: true });
+  }
   return { ...options, _hermeticTestSeams: seams };
 }
 
@@ -2506,7 +2521,7 @@ describe("ensureDaemon", () => {
       const sleepMock = vi.fn(async (_durationMs: number): Promise<void> => {});
       await expect(ensureDaemon({
         port: 19999,
-        pidFilePath: "/unused/daemon.pid",
+        pidFilePath: makeHermeticPidFile("lcm-invalid-timeout-"),
         spawnTimeoutMs,
         _fetchOverride: fetchMock as FetchOverride,
         _spawnOverride: spawnMock as unknown as SpawnOverride,
@@ -2529,7 +2544,7 @@ describe("ensureDaemon", () => {
 
     const result = await ensureDaemon({
       port: 19999,
-      pidFilePath: "/unused/daemon.pid",
+      pidFilePath: makeHermeticPidFile("lcm-zero-timeout-"),
       spawnTimeoutMs: 0,
       _fetchOverride: fetchMock as FetchOverride,
       _spawnOverride: spawnMock as unknown as SpawnOverride,
@@ -2548,7 +2563,7 @@ describe("ensureDaemon", () => {
     const spawnMock = vi.fn();
     await expect(ensureDaemon({
       port: 19999,
-      pidFilePath: "/unused/daemon.pid",
+      pidFilePath: makeHermeticPidFile("lcm-negative-timeout-"),
       spawnTimeoutMs: -1,
       _fetchOverride: fetchMock as FetchOverride,
       _spawnOverride: spawnMock as unknown as SpawnOverride,
@@ -2954,7 +2969,7 @@ describe("restartDaemon", () => {
 
       await expect(restartDaemon({
         port: 19999,
-        pidFilePath: "/unused/daemon.pid",
+        pidFilePath: makeHermeticPidFile("lcm-invalid-restart-timeout-"),
         spawnTimeoutMs,
         validateBeforeRestart,
         _fetchOverride: fetchMock as FetchOverride,
