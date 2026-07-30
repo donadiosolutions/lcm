@@ -34,15 +34,17 @@ Exact duplicates are retained once. Per-source merge markers make retries and
 later-discovered generations idempotent, so each source generation is applied
 exactly once.
 
-Exact same-UUID passive events with the same immutable envelope and predecessor
-identity—the same numeric ID or null—also reconcile idempotently. If that
-numeric predecessor row was pruned from both stores, LCM preserves the recorded
-predecessor identity instead of remapping it. Once delivery is observable,
-different predecessors, inconsistent predecessor presence, and any actual
-remap fail closed to protect the immutable PostgreSQL envelope. Divergent
-mapped numeric predecessors also fail closed, while compatible pristine
-null-versus-numeric copies may coalesce before delivery. LCM neither guesses a
-replacement nor discards either copy, so repeated reconciliation remains safe.
+Exact same-UUID passive events with the same immutable envelope, compatible
+delivery state and checkpoints, and the same predecessor identity—the same
+numeric ID or null—also reconcile idempotently. For such a compatible pair, if
+the numeric predecessor row was pruned from both stores, LCM preserves the
+recorded predecessor identity instead of remapping it. Once delivery is
+observable, different predecessors, inconsistent predecessor presence, and any
+actual remap fail closed to protect the immutable PostgreSQL envelope.
+Divergent mapped numeric predecessors also fail closed, while compatible
+pristine null-versus-numeric copies may coalesce before delivery. LCM neither
+guesses a replacement nor discards either copy, so repeated reconciliation
+remains safe.
 
 Each operation has an atomically replaced journal under
 `~/.lcm/reconciliations/`. The journal records discovery evidence, completed
