@@ -189,7 +189,8 @@ vi.mock("../../src/storage/postgresql/provisioning.js", () => ({
 }));
 
 const {
-  assertParsedInternalDaemonTestIdentity, handleCliError, resolveCompactRequestPolicyOverride,
+  assertParsedInternalDaemonTestIdentity, handleCliError, isStrictContainedRelativePath,
+  resolveCompactRequestPolicyOverride,
   runCli, runMainIfInvoked, shouldRunMain,
   withHookOverrides, writeCliError, writeCliOutput,
 } = await import("../../bin/lcm.js");
@@ -823,6 +824,28 @@ describe("runCli failure and alternate presentation branches", () => {
         expected: "restricted to foreground daemon startup",
       },
       {
+        args: [
+          "daemon",
+          "start",
+          `${ownerOption}=owned`,
+          `${entrypointOption}=/tmp/owned.mjs`,
+          "--",
+          "--foreground",
+        ],
+        expected: "restricted to foreground daemon startup",
+      },
+      {
+        args: [
+          "daemon",
+          "start",
+          "--foreground",
+          "--",
+          `${ownerOption}=owned`,
+          `${entrypointOption}=/tmp/owned.mjs`,
+        ],
+        expected: "restricted to foreground daemon startup",
+      },
+      {
         args: ["daemon", "start", "--foreground", `${ownerOption}=bad owner`, `${entrypointOption}=/tmp/owned.mjs`],
         expected: "identity is malformed",
       },
@@ -844,6 +867,10 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(state.migrateLegacyHome).not.toHaveBeenCalled();
     expect(state.ensureAuthToken).not.toHaveBeenCalled();
     expect(state.createDaemon).not.toHaveBeenCalled();
+    expect(isStrictContainedRelativePath("child/file")).toBe(true);
+    expect(isStrictContainedRelativePath("")).toBe(false);
+    expect(isStrictContainedRelativePath("../outside")).toBe(false);
+    expect(isStrictContainedRelativePath("/absolute")).toBe(false);
     expect(() => assertParsedInternalDaemonTestIdentity(
       {
         internalLcmTestDaemonOwner: "changed",

@@ -58,7 +58,10 @@ describe("daemon route and lifecycle boundaries", () => {
   });
 
   it("rejects a missing token file", async () => {
-    await expect(createDaemon(config(), { tokenPath: join(home, "missing-token") })).rejects.toThrow("could not be read");
+    await expect(createDaemon(config(), {
+      tokenPath: join(home, "missing-token"),
+      _testIdentity: testIdentity,
+    })).rejects.toThrow("could not be read");
   });
 
   it("uses the default idle callback", async () => {

@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createDaemonLifecycleTestScope,
@@ -58,7 +59,7 @@ function createFixture(
   roots.push(root);
   const homeDir = join(root, "home");
   const runtimeDir = join(homeDir, "runtime");
-  const stateDir = join(homeDir, "state");
+  const stateDir = join(homeDir, ".lcm");
   const credentialDir = join(homeDir, "credentials");
   const entrypoint = join(runtimeDir, "owned-daemon.mjs");
   mkdirSync(runtimeDir, { recursive: true });
@@ -118,7 +119,6 @@ function scopedOptions(fixture: ScopeFixture): Parameters<typeof ensureDaemon>[0
     expectedVersion: "1.4.2",
     enforceUserManagerParent: true,
     spawnCommand: process.execPath,
-    spawnArgs: [fixture.scope.entrypoint],
     _platform: "linux",
     _testScope: fixture.scope,
     _skipHealthWait: true,
@@ -183,6 +183,7 @@ describe("daemon lifecycle test-scope validation", () => {
     [{ ownerId: "bad owner" }, "ownerId"],
     [{ homeDir: "relative" }, "homeDir"],
     [{ runtimeDir: "/outside" }, "runtimeDir"],
+    [{ stateDir: "/outside" }, "stateDir must equal"],
     [{ entrypoint: "/repo/node_modules/vitest/dist/workers/forks.js" }, "entrypoint"],
     [{ dependencies: undefined }, "dependencies"],
   ])("rejects malformed scope component %#", (change, expected) => {
@@ -540,7 +541,9 @@ describe("run-owned lifecycle resources", () => {
   it("uses only the scoped unit, paths, credentials, environment, and entrypoint", async () => {
     const fixture = createFixture("owned-success");
     const previousSecret = process.env.LCM_SUMMARY_API_KEY;
+    const previousDatabasePath = process.env.LCM_DATABASE_PATH;
     process.env.LCM_SUMMARY_API_KEY = "scope-secret";
+    process.env.LCM_DATABASE_PATH = "/canonical/.lcm/lcm.db";
     try {
       const result = await ensureDaemon(scopedOptions(fixture));
       expect(result).toMatchObject({
@@ -551,6 +554,8 @@ describe("run-owned lifecycle resources", () => {
     } finally {
       if (previousSecret === undefined) delete process.env.LCM_SUMMARY_API_KEY;
       else process.env.LCM_SUMMARY_API_KEY = previousSecret;
+      if (previousDatabasePath === undefined) delete process.env.LCM_DATABASE_PATH;
+      else process.env.LCM_DATABASE_PATH = previousDatabasePath;
     }
     expect(fixture.runSystemd).toHaveBeenCalledOnce();
     const [, args, options] = fixture.runSystemd.mock.calls[0]!;
@@ -561,6 +566,9 @@ describe("run-owned lifecycle resources", () => {
     expect(args).toContain(`--setenv=LCM_DAEMON_OWNER_ID=${fixture.scope.ownerId}`);
     expect(args).toContain(`--setenv=XDG_RUNTIME_DIR=${fixture.scope.runtimeDir}`);
     expect(args).toContain(fixture.scope.entrypoint);
+    expect(args).toContain("daemon");
+    expect(args).toContain("start");
+    expect(args).toContain("--foreground");
     expect(args.slice(-4)).toEqual([
       DAEMON_TEST_OWNER_OPTION,
       fixture.scope.ownerId,
@@ -568,9 +576,12 @@ describe("run-owned lifecycle resources", () => {
       fixture.scope.entrypoint,
     ]);
     expect(JSON.stringify(args)).not.toContain("scope-secret");
-    expect(options.env.HOME).toBe(process.env.HOME);
-    expect(options.env.XDG_RUNTIME_DIR).toBe(process.env.XDG_RUNTIME_DIR);
-    expect(options.env.LCM_DAEMON_OWNER_ID).toBe(process.env.LCM_DAEMON_OWNER_ID);
+    expect(JSON.stringify(args)).not.toContain("LCM_DATABASE_PATH");
+    expect(options.env.HOME).toBe(fixture.scope.homeDir);
+    expect(options.env.USERPROFILE).toBe(fixture.scope.homeDir);
+    expect(options.env.XDG_RUNTIME_DIR).toBe(fixture.scope.runtimeDir);
+    expect(options.env.LCM_DAEMON_OWNER_ID).toBe(fixture.scope.ownerId);
+    expect(options.env.LCM_DATABASE_PATH).toBeUndefined();
     expect(options.env.LCM_SUMMARY_API_KEY).toBeUndefined();
     expect(fixture.stopUnit).toHaveBeenCalledExactlyOnceWith(unitArg!.slice("--unit=".length));
     expect(existsSync(fixture.scope.stateDir)).toBe(false);
@@ -962,13 +973,29 @@ describe("authenticated daemon identity", () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-worker-auth-"));
     roots.push(dir);
     const tokenPath = join(dir, "daemon.token");
-    ensureAuthToken(tokenPath);
     const config = loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } });
-    await expect(createDaemon(config, { tokenPath })).rejects.toThrow("Vitest worker");
+    const readAuthToken = vi.fn((): string | null => "token");
+    await expect(createDaemon(config, {
+      tokenPath,
+      _readAuthToken: readAuthToken,
+    })).rejects.toThrow("Vitest worker");
+    expect(readAuthToken).not.toHaveBeenCalled();
     await expect(createDaemon(config, {
       tokenPath,
       _testIdentity: { ownerId: "partial" } as never,
+      _readAuthToken: readAuthToken,
     })).rejects.toThrow("incomplete or malformed");
+    expect(readAuthToken).not.toHaveBeenCalled();
+    readAuthToken.mockReturnValueOnce(null);
+    await expect(createDaemon(config, {
+      tokenPath,
+      _testIdentity: {
+        ownerId: "server-auth-order",
+        entrypoint: join(dir, "owned-daemon.mjs"),
+      },
+      _readAuthToken: readAuthToken,
+    })).rejects.toThrow("could not be read");
+    expect(readAuthToken).toHaveBeenCalledExactlyOnceWith(tokenPath);
   });
 
   it("preserves the production public-health shape without a scoped owner", async () => {
@@ -1015,13 +1042,27 @@ describe("same-user-systemd integration", () => {
     roots.push(root);
     const homeDir = join(root, "home");
     const runtimeDir = join(homeDir, "runtime");
-    const stateDir = join(homeDir, "state");
+    const stateDir = join(homeDir, ".lcm");
     const credentialDir = join(homeDir, "credentials");
     const entrypoint = join(runtimeDir, "owned-daemon.mjs");
     mkdirSync(runtimeDir, { recursive: true });
     mkdirSync(stateDir, { recursive: true });
     mkdirSync(credentialDir, { recursive: true });
-    writeFileSync(entrypoint, "setTimeout(() => {}, 60_000);\n");
+    const builtCliUrl = pathToFileURL(join(process.cwd(), "dist", "bin", "lcm.js")).href;
+    writeFileSync(
+      entrypoint,
+      `import { runCli } from ${JSON.stringify(builtCliUrl)};\nawait runCli(process.argv);\n`,
+    );
+    const daemonPort = Number(
+      process.env.LCM_LIFECYCLE_DAEMON_PORT
+      ?? String(40_000 + (process.pid % 20_000)),
+    );
+    expect(daemonPort).toBeGreaterThan(0);
+    expect(daemonPort).toBeLessThanOrEqual(65_535);
+    writeFileSync(join(stateDir, "config.json"), JSON.stringify({
+      daemon: { port: daemonPort, idleTimeoutMs: 0 },
+      llm: { provider: "disabled" },
+    }));
     let unitName = "";
     const stopUnit = async (unit: string): Promise<void> => {
       expect(unit).toBe(unitName);
@@ -1044,11 +1085,49 @@ describe("same-user-systemd integration", () => {
       const expectedScopes = Number(process.env.LCM_LIFECYCLE_EXPECTED_SCOPES ?? "1");
       if (result.status !== 0 || barrierDir === undefined || expectedScopes <= 1) return result;
 
-      mkdirSync(barrierDir, { recursive: true });
-      writeFileSync(join(barrierDir, `${ownerId}.ready`), `${unitName}\n`);
       const pause = (): void => {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
       };
+      let daemonPid = 0;
+      let token = "";
+      let execStart = "";
+      for (let attempt = 0; attempt < 500; attempt++) {
+        const status = spawnSync(
+          "systemctl",
+          ["--user", "show", unitName, "--property=ActiveState,MainPID,ExecStart"],
+          { encoding: "utf-8", timeout: 10_000 },
+        );
+        const details = String(status.stdout);
+        const pidMatch = /^MainPID=([0-9]+)$/mu.exec(details);
+        if (
+          status.status === 0
+          && details.includes("ActiveState=active")
+          && pidMatch
+          && Number(pidMatch[1]) > 0
+          && existsSync(join(stateDir, "daemon.pid"))
+          && existsSync(join(stateDir, "daemon.token"))
+        ) {
+          daemonPid = Number(pidMatch[1]);
+          token = readFileSync(join(stateDir, "daemon.token"), "utf-8").trim();
+          execStart = /^ExecStart=(.*)$/mu.exec(details)?.[1] ?? "";
+          break;
+        }
+        pause();
+      }
+      expect(daemonPid).toBeGreaterThan(0);
+      expect(readFileSync(join(stateDir, "daemon.pid"), "utf-8").trim()).toBe(String(daemonPid));
+      expect(token.length).toBeGreaterThan(0);
+      expect(execStart).toContain(entrypoint);
+      mkdirSync(barrierDir, { recursive: true });
+      writeFileSync(join(barrierDir, `${ownerId}.ready`), JSON.stringify({
+        unitName,
+        homeDir,
+        runtimeDir,
+        stateDir,
+        credentialDir,
+        entrypoint,
+        daemonPid,
+      }));
       const waitForMarkers = (suffix: string): string[] => {
         for (let attempt = 0; attempt < 500; attempt++) {
           const markers = readdirSync(barrierDir)
@@ -1060,24 +1139,31 @@ describe("same-user-systemd integration", () => {
         throw new Error(`timed out waiting for ${expectedScopes} lifecycle ${suffix} markers`);
       };
       const ready = waitForMarkers(".ready");
-      const units = ready.map(marker => readFileSync(join(barrierDir, marker), "utf-8").trim());
-      expect(new Set(units).size).toBe(expectedScopes);
-      for (const ownedUnit of units) {
-        expect(ownedUnit).toMatch(/^lcm-test-daemon-/u);
-        let active = false;
-        for (let attempt = 0; attempt < 250; attempt++) {
-          const status = spawnSync(
-            "systemctl",
-            ["--user", "show", ownedUnit, "--property=ActiveState", "--value"],
-            { encoding: "utf-8", timeout: 10_000 },
-          );
-          if (status.status === 0 && String(status.stdout).trim() === "active") {
-            active = true;
-            break;
-          }
-          pause();
-        }
-        expect(active).toBe(true);
+      const ownership = ready.map(marker => JSON.parse(
+        readFileSync(join(barrierDir, marker), "utf-8"),
+      ) as {
+        unitName: string;
+        homeDir: string;
+        runtimeDir: string;
+        stateDir: string;
+        credentialDir: string;
+        entrypoint: string;
+        daemonPid: number;
+      });
+      for (const key of [
+        "unitName",
+        "homeDir",
+        "runtimeDir",
+        "stateDir",
+        "credentialDir",
+        "entrypoint",
+        "daemonPid",
+      ] as const) {
+        expect(new Set(ownership.map(resource => resource[key])).size).toBe(expectedScopes);
+      }
+      for (const resource of ownership) {
+        expect(resource.unitName).toMatch(/^lcm-test-daemon-/u);
+        expect(resource.stateDir).toBe(join(resource.homeDir, ".lcm"));
       }
       writeFileSync(join(barrierDir, `${ownerId}.checked`), `${unitName}\n`);
       waitForMarkers(".checked");
@@ -1107,7 +1193,6 @@ describe("same-user-systemd integration", () => {
       expectedVersion: "1.4.2",
       enforceUserManagerParent: true,
       spawnCommand: process.execPath,
-      spawnArgs: [entrypoint],
       _platform: "linux",
       _testScope: scope,
       _skipHealthWait: true,

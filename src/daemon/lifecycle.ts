@@ -125,13 +125,29 @@ type ResolvedLifecycleDependencies = Readonly<{
   uid: number | undefined;
 }>;
 
+function scopedLifecycleEnvironment(
+  scope: DaemonLifecycleTestScope,
+): NodeJS.ProcessEnv {
+  const environment = { ...process.env };
+  delete environment.LCM_DATABASE_PATH;
+  return {
+    ...environment,
+    HOME: scope.homeDir,
+    USERPROFILE: scope.homeDir,
+    XDG_RUNTIME_DIR: scope.runtimeDir,
+    LCM_DAEMON_OWNER_ID: scope.ownerId,
+  };
+}
+
 function resolveLifecycleDependencies(
   opts: EnsureDaemonOptions,
 ): ResolvedLifecycleDependencies {
   const testDependencies = opts._testScope?.dependencies;
   const hermeticSeams = opts._hermeticTestSeams;
   return {
-    environment: hermeticSeams?.environment ?? process.env,
+    environment: opts._testScope
+      ? scopedLifecycleEnvironment(opts._testScope)
+      : hermeticSeams?.environment ?? process.env,
     fetch: testDependencies?.fetch
       ?? hermeticSeams?.fetch
       ?? opts._fetchOverride
@@ -177,15 +193,7 @@ function lifecycleSpawnEnvironment(
   opts: EnsureDaemonOptions,
   dependencies: ResolvedLifecycleDependencies,
 ): NodeJS.ProcessEnv {
-  if (opts._testScope) {
-    return {
-      ...process.env,
-      HOME: opts._testScope.homeDir,
-      USERPROFILE: opts._testScope.homeDir,
-      XDG_RUNTIME_DIR: opts._testScope.runtimeDir,
-      LCM_DAEMON_OWNER_ID: opts._testScope.ownerId,
-    };
-  }
+  if (opts._testScope) return { ...dependencies.environment };
   if (opts._hermeticTestSeams) {
     return {
       ...dependencies.environment,

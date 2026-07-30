@@ -55,6 +55,8 @@ export type DaemonOptions = {
   _runtimeDigest?: string;
   /** @internal Explicit owned daemon identity for lifecycle isolation tests. */
   _testIdentity?: DaemonLifecycleTestIdentity;
+  /** @internal Deterministic auth-token read seam for preflight ordering tests. */
+  _readAuthToken?: typeof readAuthToken;
 };
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -139,7 +141,6 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const clearIdleTimeout = options?._clearTimeout ?? clearTimeout;
   const listenPort = normalizeDaemonPort(config.daemon.port, { allowZero: true });
   const idleTimeoutMs = normalizeIdleTimeoutMs(config.daemon.idleTimeoutMs);
-  const serverToken = options?.tokenPath ? readAuthToken(options.tokenPath) : null;
   const runtimeDigest = options?._runtimeDigest ?? RUNTIME_DIGEST;
   const hasTestIdentity = Object.prototype.hasOwnProperty.call(options ?? {}, "_testIdentity");
   if (hasTestIdentity && !isDaemonLifecycleTestIdentity(options?._testIdentity)) {
@@ -147,9 +148,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   }
   const daemonEntrypoint = options?._testIdentity?.entrypoint ?? process.argv[1];
   const daemonOwnerId = options?._testIdentity?.ownerId;
-  if (serverToken && isVitestWorkerEntrypoint(daemonEntrypoint)) {
+  if (options?.tokenPath && isVitestWorkerEntrypoint(daemonEntrypoint)) {
     throw new Error("Refusing to authenticate a Vitest worker as a daemon entrypoint");
   }
+  const serverToken = options?.tokenPath
+    ? (options._readAuthToken ?? readAuthToken)(options.tokenPath)
+    : null;
   if (options?.tokenPath && serverToken === null) {
     throw new Error(`Auth token file specified but could not be read: ${options.tokenPath}`);
   }

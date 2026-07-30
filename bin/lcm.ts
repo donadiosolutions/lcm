@@ -222,7 +222,14 @@ type CustomHelpRequest = {
 function strictlyContainsPath(parent: string, candidate: string): boolean {
   if (!isAbsolute(parent) || !isAbsolute(candidate)) return false;
   const rel = relative(resolve(parent), resolve(candidate));
-  return rel.length > 0 && !rel.startsWith("..");
+  return isStrictContainedRelativePath(rel);
+}
+
+/** @internal Cross-platform guard for path.relative containment results. */
+export function isStrictContainedRelativePath(relativePath: string): boolean {
+  return relativePath.length > 0
+    && !relativePath.startsWith("..")
+    && !isAbsolute(relativePath);
 }
 
 function internalOptionValues(args: readonly string[], option: string): string[] {
@@ -251,6 +258,10 @@ function resolveInternalDaemonTestIdentity(
   cliArgv: readonly string[],
 ): DaemonLifecycleTestIdentity | undefined {
   const args = cliArgv.slice(2);
+  const terminatorIndex = args.indexOf("--");
+  const effectiveArgs = terminatorIndex === -1
+    ? args
+    : args.slice(0, terminatorIndex);
   const owners = internalOptionValues(args, DAEMON_TEST_OWNER_OPTION);
   const entrypoints = internalOptionValues(args, DAEMON_TEST_ENTRYPOINT_OPTION);
   if (owners.length === 0 && entrypoints.length === 0) return undefined;
@@ -258,9 +269,11 @@ function resolveInternalDaemonTestIdentity(
     throw new Error("Internal daemon test identity must provide one complete owner and entrypoint pair");
   }
   if (
-    args[0] !== "daemon"
-    || args[1] !== "start"
-    || !args.includes("--foreground")
+    internalOptionValues(effectiveArgs, DAEMON_TEST_OWNER_OPTION).length !== owners.length
+    || internalOptionValues(effectiveArgs, DAEMON_TEST_ENTRYPOINT_OPTION).length !== entrypoints.length
+    || effectiveArgs[0] !== "daemon"
+    || effectiveArgs[1] !== "start"
+    || !effectiveArgs.includes("--foreground")
   ) {
     throw new Error("Internal daemon test identity is restricted to foreground daemon startup");
   }

@@ -1,5 +1,6 @@
 import type { spawn, spawnSync } from "node:child_process";
 import { isAbsolute, relative, resolve } from "node:path";
+import { LCM_HOME_DIRNAME } from "../runtime-paths.js";
 
 const TEST_UNIT_PREFIX = "lcm-test-daemon-";
 export const DAEMON_TEST_OWNER_OPTION = "--internal-lcm-test-daemon-owner";
@@ -94,11 +95,13 @@ export function createDaemonLifecycleTestScope(input: ScopeInput): DaemonLifecyc
   const entrypoint = requireAbsoluteDirectory("lifecycle test entrypoint", input.entrypoint);
   for (const [label, path] of [
     ["runtimeDir", runtimeDir],
-    ["stateDir", stateDir],
     ["credentialDir", credentialDir],
     ["entrypoint", entrypoint],
   ] as const) {
     if (!isWithin(path, homeDir)) throw new Error(`lifecycle test ${label} must be inside homeDir`);
+  }
+  if (stateDir !== resolve(homeDir, LCM_HOME_DIRNAME)) {
+    throw new Error(`lifecycle test stateDir must equal homeDir/${LCM_HOME_DIRNAME}`);
   }
   if (isVitestWorkerEntrypoint(entrypoint)) {
     throw new Error("lifecycle test entrypoint must not be a Vitest worker");
