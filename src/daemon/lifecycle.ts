@@ -6,6 +6,7 @@ import {
   existsSync,
   fchmodSync,
   fstatSync,
+  ftruncateSync,
   mkdtempSync,
   openSync,
   readFileSync,
@@ -423,6 +424,10 @@ function assertScopedStateAccess(access: ScopedStateAccess): void {
   }
 }
 
+function scopedStateDir(access: ScopedStateAccess): string {
+  return "scope" in access ? access.scope.stateDir : access.hermeticSeams.stateDir;
+}
+
 function requireRegularFileDescriptor(descriptor: number): void {
   const stats = fstatSync(descriptor);
   if (!stats.isFile() || stats.nlink !== 1) {
@@ -448,7 +453,7 @@ function readPidFile(
 ): number | null {
   try {
     if (scopedState) assertScopedStateAccess(scopedState);
-    const content = scopedState && "scope" in scopedState
+    const content = scopedState
       ? readRegularFileNoFollow(pidFilePath)
       : readFileSync(pidFilePath, "utf-8");
     if (scopedState) assertScopedStateAccess(scopedState);
@@ -459,8 +464,7 @@ function readPidFile(
       scopedState
       && (
         error instanceof LifecycleTestScopeStateError
-        || ("scope" in scopedState
-          && (error as NodeJS.ErrnoException).code !== "ENOENT")
+        || (error as NodeJS.ErrnoException).code !== "ENOENT"
       )
     ) {
       throw new LifecycleTestScopeStateError(
@@ -495,12 +499,6 @@ function cleanStalePid(
 }
 
 function readScopedAuthToken(access: ScopedStateAccess): string | null {
-  if ("hermeticSeams" in access) {
-    assertScopedStateAccess(access);
-    const token = readAuthToken(access.tokenPath);
-    assertScopedStateAccess(access);
-    return token;
-  }
   try {
     assertScopedStateAccess(access);
     const token = readRegularFileNoFollow(access.tokenPath).trim();
@@ -515,12 +513,6 @@ function readScopedAuthToken(access: ScopedStateAccess): string | null {
 }
 
 function ensureScopedAuthToken(access: ScopedStateAccess): void {
-  if ("hermeticSeams" in access) {
-    assertScopedStateAccess(access);
-    ensureAuthToken(access.tokenPath);
-    assertScopedStateAccess(access);
-    return;
-  }
   try {
     assertScopedStateAccess(access);
     const existing = openSync(
@@ -544,7 +536,7 @@ function ensureScopedAuthToken(access: ScopedStateAccess): void {
   }
 
   const temporaryPath = join(
-    access.scope.stateDir,
+    scopedStateDir(access),
     `.lcm-token-${randomBytes(8).toString("hex")}.tmp`,
   );
   const descriptor = openSync(
@@ -582,21 +574,16 @@ function ensureScopedAuthToken(access: ScopedStateAccess): void {
 
 function writeScopedPidFile(access: ScopedStateAccess, pid: number): void {
   assertScopedStateAccess(access);
-  if ("hermeticSeams" in access) {
-    writeFileSync(access.pidPath, String(pid));
-    assertScopedStateAccess(access);
-    return;
-  }
   const descriptor = openSync(
     access.pidPath,
     constants.O_WRONLY
       | constants.O_CREAT
-      | constants.O_TRUNC
       | constants.O_NOFOLLOW,
     0o600,
   );
   try {
     requireRegularFileDescriptor(descriptor);
+    ftruncateSync(descriptor, 0);
     writeSync(descriptor, String(pid));
     fchmodSync(descriptor, 0o600);
   } finally {

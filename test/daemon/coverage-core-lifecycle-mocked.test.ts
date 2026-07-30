@@ -1,17 +1,40 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { closeSync, openSync, writeSync } from "node:fs";
+import {
+  mkdir,
+  mkdtemp,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const fs = vi.hoisted(() => ({
   chmod: vi.fn(), exists: vi.fn(), lstat: vi.fn(), mkdtemp: vi.fn(), read: vi.fn(),
   readdir: vi.fn(), realpath: vi.fn(), rm: vi.fn(), stat: vi.fn(), unlink: vi.fn(),
   write: vi.fn(),
 }));
-vi.mock("node:fs", async importOriginal => ({
-  ...(await importOriginal<typeof import("node:fs")>()),
-  chmodSync: fs.chmod, existsSync: fs.exists, lstatSync: fs.lstat,
-  mkdtempSync: fs.mkdtemp, readFileSync: fs.read, readdirSync: fs.readdir,
-  realpathSync: fs.realpath, rmSync: fs.rm, statSync: fs.stat,
-  unlinkSync: fs.unlink, writeFileSync: fs.write,
-}));
+vi.mock("node:fs", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...original,
+    chmodSync: fs.chmod,
+    existsSync: fs.exists,
+    lstatSync: fs.lstat,
+    mkdtempSync: fs.mkdtemp,
+    readFileSync: (path: unknown, ...args: unknown[]) => (
+      typeof path === "number"
+        ? Reflect.apply(original.readFileSync, original, [path, ...args])
+        : Reflect.apply(fs.read, fs, [path, ...args])
+    ),
+    readdirSync: fs.readdir,
+    realpathSync: fs.realpath,
+    rmSync: fs.rm,
+    statSync: fs.stat,
+    unlinkSync: fs.unlink,
+    writeFileSync: fs.write,
+  };
+});
 
 import {
   __lifecycleTestUtils,
@@ -24,45 +47,82 @@ type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
 
 const saved = { anthropic: process.env.ANTHROPIC_API_KEY, openai: process.env.OPENAI_API_KEY, lcm: process.env.LCM_SUMMARY_API_KEY };
 const originalGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
-beforeEach(() => {
+let runtimeRoot: string;
+beforeEach(async () => {
+  runtimeRoot = await mkdtemp(join(tmpdir(), "lcm-mocked-lifecycle-"));
+  await mkdir(join(runtimeRoot, ".hermetic-runtime"));
+  await mkdir(join(runtimeRoot, ".hermetic-credentials"));
+  await mkdir(join(runtimeRoot, ".hermetic-proc"));
+  await writeFile(join(runtimeRoot, "daemon.token"), "token", { mode: 0o600 });
   Object.defineProperty(process, "getuid", { configurable: true, value: vi.fn(() => 1000) });
-  vi.clearAllMocks(); fs.exists.mockImplementation((path: string) => path.endsWith("daemon.token")); fs.mkdtemp.mockReturnValue("/runtime/.hermetic-credentials/lcm-systemd-credentials-test");
-  fs.lstat.mockReturnValue({
-    dev: 1,
-    ino: 1,
-    isDirectory: () => true,
-    isFile: () => false,
-    isSymbolicLink: () => false,
-    nlink: 1,
+  vi.clearAllMocks();
+  fs.exists.mockImplementation((path: string) => path.endsWith("daemon.token"));
+  fs.lstat.mockImplementation((path: string) => {
+    if (path.endsWith("daemon.pid") || path.endsWith("daemon.token")) {
+      if (!fs.exists(path)) {
+        const error = new Error("missing") as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
+      }
+      return {
+        dev: 1,
+        ino: 2,
+        isDirectory: () => false,
+        isFile: () => true,
+        isSymbolicLink: () => false,
+        nlink: 1,
+      };
+    }
+    return {
+      dev: 1,
+      ino: 1,
+      isDirectory: () => true,
+      isFile: () => false,
+      isSymbolicLink: () => false,
+      nlink: 1,
+    };
   });
+  fs.mkdtemp.mockReturnValue(
+    join(runtimeRoot, ".hermetic-credentials", "lcm-systemd-credentials-test"),
+  );
   fs.realpath.mockImplementation((path: string) => path);
   fs.stat.mockReturnValue({ isDirectory: () => true, mtimeMs: 0 }); fs.readdir.mockReturnValue([]);
   delete process.env.ANTHROPIC_API_KEY; delete process.env.OPENAI_API_KEY; delete process.env.LCM_SUMMARY_API_KEY;
 });
-afterEach(() => {
+afterEach(async () => {
   if (originalGetuid) Object.defineProperty(process, "getuid", originalGetuid);
   else Reflect.deleteProperty(process, "getuid");
   vi.restoreAllMocks();
   if (saved.anthropic === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = saved.anthropic;
   if (saved.openai === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = saved.openai;
   if (saved.lcm === undefined) delete process.env.LCM_SUMMARY_API_KEY; else process.env.LCM_SUMMARY_API_KEY = saved.lcm;
+  await rm(runtimeRoot, { recursive: true, force: true });
 });
 
 const base = (): EnsureDaemonOptions => ({
-  port: 1, pidFilePath: "/runtime/daemon.pid", spawnTimeoutMs: 1, expectedVersion: "1", _platform: "linux" as const,
+  port: 1, pidFilePath: join(runtimeRoot, "daemon.pid"), spawnTimeoutMs: 1, expectedVersion: "1", _platform: "linux" as const,
   enforceUserManagerParent: true, _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
   _spawnOverride: vi.fn(() => ({ pid: undefined, once: vi.fn(), unref: vi.fn() })) as unknown as SpawnOverride,
   _monotonicNowOverride: (): number => 0,
   _skipHealthWait: true,
 });
 
+const writePidLeaf = (pid: number): void => {
+  const descriptor = openSync(join(runtimeRoot, "daemon.pid"), "w", 0o600);
+  try {
+    writeSync(descriptor, String(pid));
+  } finally {
+    closeSync(descriptor);
+  }
+};
+
 function ensureDaemon(options: EnsureDaemonOptions): ReturnType<typeof ensureDaemonProduction> {
   const seams: DaemonLifecycleHermeticTestSeams = {
-    homeDir: "/runtime",
-    runtimeDir: "/runtime/.hermetic-runtime",
-    stateDir: "/runtime",
-    credentialDir: "/runtime/.hermetic-credentials",
-    procRoot: "/runtime/.hermetic-proc",
+    homeDir: runtimeRoot,
+    runtimeDir: join(runtimeRoot, ".hermetic-runtime"),
+    stateDir: runtimeRoot,
+    credentialDir: join(runtimeRoot, ".hermetic-credentials"),
+    procRoot: join(runtimeRoot, ".hermetic-proc"),
     platform: options._platform ?? "linux",
     uid: options._uid ?? 1000,
     environment: { ...process.env },
@@ -106,11 +166,13 @@ describe("mocked systemd credential boundaries", () => {
     const credentials = __lifecycleTestUtils.systemdDaemonCredentialArgs(process.env);
     expect(fs.stat).toHaveBeenCalledWith("/run/user/1000");
     expect(credentials.args).toEqual([
-      expect.stringContaining("ANTHROPIC_API_KEY:/runtime/.hermetic-credentials/"),
+      expect.stringContaining(
+        `ANTHROPIC_API_KEY:${join(runtimeRoot, ".hermetic-credentials")}/`,
+      ),
     ]);
     credentials.cleanup?.();
     expect(fs.rm).toHaveBeenCalledWith(
-      "/runtime/.hermetic-credentials/lcm-systemd-credentials-test",
+      join(runtimeRoot, ".hermetic-credentials", "lcm-systemd-credentials-test"),
       { recursive: true, force: true },
     );
   });
@@ -134,7 +196,10 @@ describe("mocked systemd credential boundaries", () => {
     });
     const result = await ensureDaemon(base());
     expect(result.warning).toContain("credential setup error: process reported a failure");
-    expect(fs.rm).toHaveBeenCalledWith("/runtime/.hermetic-credentials/lcm-systemd-credentials-test", { recursive: true, force: true });
+    expect(fs.rm).toHaveBeenCalledWith(
+      join(runtimeRoot, ".hermetic-credentials", "lcm-systemd-credentials-test"),
+      { recursive: true, force: true },
+    );
   });
 
   it("does not attempt partial cleanup when credential directory creation fails", async () => {
@@ -142,19 +207,25 @@ describe("mocked systemd credential boundaries", () => {
     fs.mkdtemp.mockImplementation(() => { throw new Error("mkdir failed"); });
     const result = await ensureDaemon(base());
     expect(result.warning).toContain("credential setup error: process reported a failure");
-    expect(fs.rm).not.toHaveBeenCalledWith("/runtime/.hermetic-credentials/lcm-systemd-credentials-test", expect.anything());
+    expect(fs.rm).not.toHaveBeenCalledWith(
+      join(runtimeRoot, ".hermetic-credentials", "lcm-systemd-credentials-test"),
+      expect.anything(),
+    );
   });
 
   it("tolerates cleanup scan stat/removal failures", async () => {
     process.env.ANTHROPIC_API_KEY = "secret";
     fs.readdir.mockReturnValue([{ isDirectory: () => true, name: "lcm-systemd-credentials-old" }]);
-    fs.stat.mockImplementation((path: string) => path === "/runtime/.hermetic-credentials"
+    fs.stat.mockImplementation((path: string) => path === join(runtimeRoot, ".hermetic-credentials")
       ? { isDirectory: () => true, mtimeMs: 0 }
       : (() => { throw new Error("stat"); })());
     fs.write.mockImplementation(() => {});
     const result = await ensureDaemon({ ...base(), _spawnSyncOverride: vi.fn(() => ({ status: 0 })) as never });
     expect(result.startMethod).toBe("systemd-user");
-    expect(fs.rm).toHaveBeenCalledWith("/runtime/.hermetic-credentials/lcm-systemd-credentials-test", { recursive: true, force: true });
+    expect(fs.rm).toHaveBeenCalledWith(
+      join(runtimeRoot, ".hermetic-credentials", "lcm-systemd-credentials-test"),
+      { recursive: true, force: true },
+    );
   });
 
   it("cleans credentials after a systemd-started daemon becomes healthy", async () => {
@@ -172,11 +243,19 @@ describe("mocked systemd credential boundaries", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
     const result = await ensureDaemon({
       ...base(), _skipHealthWait: false, _fetchOverride: fetch,
-      _spawnSyncOverride: vi.fn(() => ({ status: 0 })) as never, _sleepOverride: async () => {},
+      _spawnSyncOverride: vi.fn(() => {
+        writePidLeaf(20);
+        fs.exists.mockReturnValue(true);
+        return { status: 0 };
+      }) as never,
+      _sleepOverride: async () => {},
       expectedVersion: "1", _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [1],
     });
     expect(result).toMatchObject({ connected: true, startMethod: "systemd-user" });
-    expect(fs.rm).toHaveBeenCalledWith("/runtime/.hermetic-credentials/lcm-systemd-credentials-test", { recursive: true, force: true });
+    expect(fs.rm).toHaveBeenCalledWith(
+      join(runtimeRoot, ".hermetic-credentials", "lcm-systemd-credentials-test"),
+      { recursive: true, force: true },
+    );
   });
 
   it("tolerates credential cleanup removal failures and Error-valued systemd throws", async () => {
@@ -191,6 +270,7 @@ describe("mocked systemd credential boundaries", () => {
 
   it("does not terminate when a verified retry PID changes identity before signaling", async () => {
     let daemonCommandReads = 0;
+    writePidLeaf(20);
     fs.exists.mockReturnValue(true);
     fs.readdir.mockReturnValue([{ isDirectory: () => true, name: "11" }]);
     fs.read.mockImplementation((path: string) => {
@@ -216,6 +296,7 @@ describe("mocked systemd credential boundaries", () => {
 
   it("does not terminate when an existing healthy PID changes identity before signaling", async () => {
     let daemonCommandReads = 0;
+    writePidLeaf(20);
     fs.exists.mockImplementation((path: string) => path.endsWith("daemon.token"));
     fs.readdir.mockReturnValue([{ isDirectory: () => true, name: "10" }]);
     fs.read.mockImplementation((path: string) => {
@@ -240,19 +321,18 @@ describe("mocked systemd credential boundaries", () => {
   });
 
   it("does not signal when a wrong-parent first inspection becomes unavailable on reinspection", async () => {
-    let pidReads = 0;
+    writePidLeaf(20);
     fs.exists.mockImplementation((path: string) => path.endsWith("daemon.token"));
     fs.readdir.mockReturnValue([{ isDirectory: () => true, name: "11" }]);
     fs.read.mockImplementation((path: string) => {
-      if (path.endsWith("daemon.pid")) {
-        pidReads++;
-        if (pidReads === 1) return "20";
-        throw new Error("pid disappeared");
-      }
+      if (path.endsWith("daemon.pid")) return "20";
       if (path.endsWith("/11/status")) return "Uid:\t1000\nPPid:\t1\n";
       if (path.endsWith("/11/cmdline")) return "systemd\0--user";
       if (path.endsWith("/20/status")) return "Uid:\t1000\nPPid:\t10\n";
-      if (path.endsWith("/20/cmdline")) return "node\0lcm\0daemon\0start";
+      if (path.endsWith("/20/cmdline")) {
+        writePidLeaf(Number.NaN);
+        return "node\0lcm\0daemon\0start";
+      }
       if (path.endsWith("daemon.token")) return "token";
       throw new Error(`unexpected read ${path}`);
     });

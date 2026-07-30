@@ -705,6 +705,59 @@ describe("daemon lifecycle test-scope validation", () => {
     });
   });
 
+  it("rejects hermetic PID and token symlinks or hardlinks before ensure and restart", async () => {
+    for (const linkKind of ["symlink", "hardlink"] as const) {
+      for (const leaf of ["daemon.pid", "daemon.token"] as const) {
+        const root = mkdtempSync(join(tmpdir(), `lcm-hermetic-${linkKind}-${leaf}-`));
+        roots.push(root);
+        const stateDir = join(root, "state");
+        const pidPath = join(stateDir, "daemon.pid");
+        const tokenPath = join(stateDir, "daemon.token");
+        const options = withHermeticLifecycleSeams({
+          port: 37_353,
+          pidFilePath: pidPath,
+          spawnTimeoutMs: 10,
+        }, root);
+        const seams = options._hermeticTestSeams!;
+        const external = join(root, `external-${leaf}`);
+        writeFileSync(external, `external-${linkKind}-${leaf}`, { mode: 0o640 });
+        const linkedPath = join(stateDir, leaf);
+        if (linkKind === "symlink") symlinkSync(external, linkedPath, "file");
+        else linkSync(external, linkedPath);
+        const contentBefore = readFileSync(external, "utf8");
+        const modeBefore = statSync(external).mode & 0o777;
+        const validateBeforeRestart = vi.fn();
+
+        expect(isDaemonLifecycleHermeticTestSeams(seams)).toBe(true);
+        await expect(ensureDaemon({
+          ...options,
+          _hermeticTestSeams: seams,
+        })).resolves.toMatchObject({
+          connected: false,
+          spawned: false,
+          warning: expect.stringContaining("outside its state root"),
+        });
+        await expect(restartDaemon({
+          ...options,
+          _hermeticTestSeams: seams,
+          validateBeforeRestart,
+        })).resolves.toMatchObject({
+          connected: false,
+          spawned: false,
+          restarted: false,
+          warning: expect.stringContaining("outside its state root"),
+        });
+        expect(validateBeforeRestart).not.toHaveBeenCalled();
+        expect(seams.fetch).not.toHaveBeenCalled();
+        expect(seams.spawn).not.toHaveBeenCalled();
+        expect(seams.spawnSync).not.toHaveBeenCalled();
+        expect(seams.killProcess).not.toHaveBeenCalled();
+        expect(readFileSync(external, "utf8")).toBe(contentBefore);
+        expect(statSync(external).mode & 0o777).toBe(modeBefore);
+      }
+    }
+  });
+
   it("revalidates hermetic root snapshots after injected callbacks", async () => {
     function createAncestorSwap(
       label: string,

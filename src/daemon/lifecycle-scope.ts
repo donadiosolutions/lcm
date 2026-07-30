@@ -349,7 +349,9 @@ export function lifecycleHermeticSeamsOwnsExactStatePaths(
     && pidPath === resolve(pidPath)
     && tokenPath === resolve(tokenPath)
     && isWithin(pidPath, seams.stateDir)
-    && isWithin(tokenPath, seams.stateDir);
+    && isWithin(tokenPath, seams.stateDir)
+    && isCanonicalOrMissingLifecycleTestStateFile(pidPath, pidPath)
+    && isCanonicalOrMissingLifecycleTestStateFile(tokenPath, tokenPath);
 }
 
 export function isDaemonLifecycleTestScope(value: unknown): value is DaemonLifecycleTestScope {
