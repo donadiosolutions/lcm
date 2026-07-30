@@ -27,7 +27,7 @@ import {
 import { createStatsHandler } from "./routes/stats.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
-import { PKG_VERSION } from "./version.js";
+import { PKG_VERSION, RUNTIME_DIGEST } from "./version.js";
 import { normalizeDaemonPort, normalizeIdleTimeoutMs } from "./http-url.js";
 import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
@@ -46,6 +46,8 @@ export type DaemonOptions = {
   _clearTimeout?: typeof clearTimeout;
   /** @internal Deterministic periodic-ingest seam for lifecycle tests. */
   _scanForTranscripts?: () => Promise<void>;
+  /** @internal Deterministic packaged-runtime identity seam for health tests. */
+  _runtimeDigest?: string;
 };
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -131,6 +133,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const listenPort = normalizeDaemonPort(config.daemon.port, { allowZero: true });
   const idleTimeoutMs = normalizeIdleTimeoutMs(config.daemon.idleTimeoutMs);
   const serverToken = options?.tokenPath ? readAuthToken(options.tokenPath) : null;
+  const runtimeDigest = options?._runtimeDigest ?? RUNTIME_DIGEST;
   if (options?.tokenPath && serverToken === null) {
     throw new Error(`Auth token file specified but could not be read: ${options.tokenPath}`);
   }
@@ -180,6 +183,9 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       uptime: Math.floor((Date.now() - startTime) / 1000),
       pid: process.pid,
       entrypoint: process.argv[1],
+      ...(serverToken && req.headers.authorization !== undefined && runtimeDigest
+        ? { runtimeDigest }
+        : {}),
       ...(healthy ? {} : {
         storage: {
           status: storageHealth.status,

@@ -24,19 +24,23 @@ const LEGACY_CACHE_FIXTURE_SQL = `
   VALUES (1, 'private legacy cache', 'legacy-hash', '2026-07-29 00:00:00');
 `;
 
-const LEGACY_SOURCE_FIXTURE_SQL = `
+const LEGACY_SOURCE_SCHEMA_SQL = `
   CREATE TABLE session_instructions (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     content TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+`;
+
+const LEGACY_SOURCE_FIXTURE_SQL = `
+  ${LEGACY_SOURCE_SCHEMA_SQL}
   INSERT INTO session_instructions
     (id, content, content_hash, updated_at)
   VALUES (1, 'private legacy source', 'source-hash', '2026-07-29 00:00:00');
 `;
 
-const CURRENT_CACHE_FIXTURE_SQL = `
+const CURRENT_CACHE_SCHEMA_SQL = `
   CREATE TABLE session_instruction_cache (
     project_id TEXT NOT NULL,
     scope_hash TEXT NOT NULL CHECK (
@@ -52,6 +56,10 @@ const CURRENT_CACHE_FIXTURE_SQL = `
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (project_id, scope_hash)
   );
+`;
+
+const CURRENT_CACHE_FIXTURE_SQL = `
+  ${CURRENT_CACHE_SCHEMA_SQL}
   INSERT INTO session_instruction_cache (
     project_id, scope_hash, client_name, session_id, worktree_path,
     cwd_path, content, content_hash, updated_at
@@ -145,6 +153,90 @@ describe("instruction-cache migration", () => {
   it("accepts the oldest source-only schema and discards its unscoped row", () => {
     const db = database();
     db.exec(LEGACY_SOURCE_FIXTURE_SQL);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    expect(db.prepare(
+      "SELECT 1 FROM sqlite_schema WHERE name = 'session_instructions'",
+    ).get()).toBeUndefined();
+    expect(db.prepare(
+      "SELECT COUNT(*) AS count FROM session_instruction_cache",
+    ).get()).toEqual({ count: 0 });
+  });
+
+  it("repairs the empty legacy table left by the exact stale-daemon SQL sequence", () => {
+    const db = database();
+    db.exec(CURRENT_CACHE_SCHEMA_SQL);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS session_instructions (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS session_instruction_cache (
+        id INTEGER PRIMARY KEY,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    expect(() => db.exec(`
+      INSERT OR IGNORE INTO session_instruction_cache
+        (id, content, content_hash, updated_at)
+      SELECT id, content, content_hash, updated_at
+      FROM session_instructions
+      WHERE id = 1
+    `)).toThrow(/session_instruction_cache has no column named id/u);
+    expect(db.prepare(
+      "SELECT COUNT(*) AS count FROM session_instructions",
+    ).get()).toEqual({ count: 0 });
+    expect(db.prepare(
+      "SELECT COUNT(*) AS count FROM session_instruction_cache",
+    ).get()).toEqual({ count: 0 });
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    expect(db.prepare(
+      "SELECT 1 FROM sqlite_schema WHERE name = 'session_instructions'",
+    ).get()).toBeUndefined();
+    expect(db.prepare(
+      "SELECT COUNT(*) AS count FROM session_instruction_cache",
+    ).get()).toEqual({ count: 0 });
+  });
+
+  it("retains current scoped rows while removing an exact empty legacy table", () => {
+    const db = database();
+    db.exec(CURRENT_CACHE_FIXTURE_SQL);
+    db.exec(LEGACY_SOURCE_SCHEMA_SQL);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    expect(db.prepare(
+      "SELECT 1 FROM sqlite_schema WHERE name = 'session_instructions'",
+    ).get()).toBeUndefined();
+    expect(db.prepare(
+      "SELECT content, content_hash FROM session_instruction_cache",
+    ).all()).toEqual([{
+      content: "private current cache",
+      content_hash: "current-hash",
+    }]);
+  });
+
+  it("accepts harmless SQL keyword casing while preserving quoted literals", () => {
+    const db = database();
+    const lowerCaseKeywords = /\b(?:CREATE|TABLE|TEXT|NOT|NULL|CHECK|LENGTH|AND|GLOB|IN|DEFAULT|DATETIME|PRIMARY|KEY)\b/gu;
+    db.exec(CURRENT_CACHE_SCHEMA_SQL.replace(
+      lowerCaseKeywords,
+      (keyword) => keyword.toLowerCase(),
+    ));
+    db.exec(LEGACY_SOURCE_SCHEMA_SQL.replace(
+      lowerCaseKeywords,
+      (keyword) => keyword.toLowerCase(),
+    ));
 
     runLcmMigrations(db, { fts5Available: false });
 
@@ -432,6 +524,108 @@ describe("instruction-cache migration", () => {
     db.close();
 
     expect(readFileSync(dbPath)).toEqual(beforeBytes);
+  });
+
+  it("rejects changed quoted CHECK literals without changing bytes, schema, or rows", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-cache-literals-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "cache.db");
+    let db = new DatabaseSync(dbPath);
+    db.exec("CREATE TABLE sentinel (value TEXT NOT NULL); INSERT INTO sentinel VALUES ('kept')");
+    db.exec(CURRENT_CACHE_SCHEMA_SQL
+      .replace(/'\*\[\^a-f0-9\]\*'/u, "'*[^A-F0-9]*'")
+      .replace("'claude', 'codex'", "'CLAUDE', 'CODEX'"));
+    db.exec(LEGACY_SOURCE_SCHEMA_SQL);
+    db.prepare(
+      `INSERT INTO session_instruction_cache (
+         project_id, scope_hash, client_name, session_id, worktree_path,
+         cwd_path, content, content_hash, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "project",
+      "A".repeat(64),
+      "CLAUDE",
+      "session",
+      "/repo",
+      "/repo/src",
+      "private malformed cache",
+      "malformed-hash",
+      "2026-07-29 00:00:00",
+    );
+    const beforeSchema = schemaSnapshot(db);
+    const beforeRows = db.prepare(
+      "SELECT * FROM session_instruction_cache",
+    ).all();
+    db.close();
+    const beforeBytes = readFileSync(dbPath);
+
+    db = new DatabaseSync(dbPath);
+    expect(() => runLcmMigrations(db, { fts5Available: false }))
+      .toThrow("unsupported session_instruction_cache schema");
+    expect(schemaSnapshot(db)).toEqual(beforeSchema);
+    expect(db.prepare("SELECT * FROM session_instruction_cache").all())
+      .toEqual(beforeRows);
+    expect(db.prepare(
+      "SELECT COUNT(*) AS count FROM session_instructions",
+    ).get()).toEqual({ count: 0 });
+    expect(db.prepare("SELECT value FROM sentinel").get()).toEqual({ value: "kept" });
+    db.close();
+
+    expect(readFileSync(dbPath)).toEqual(beforeBytes);
+  });
+
+  it("rolls back rather than dropping a legacy source populated after preflight", () => {
+    const db = database();
+    db.exec(CURRENT_CACHE_FIXTURE_SQL);
+    db.exec(LEGACY_SOURCE_SCHEMA_SQL);
+    const before = schemaSnapshot(db);
+
+    expect(() => runLcmMigrations(db, {
+      fts5Available: false,
+      _instructionCacheMigrationObserver: (stage) => {
+        if (stage === "after-begin") {
+          db.prepare(
+            `INSERT INTO session_instructions
+               (id, content, content_hash, updated_at)
+             VALUES (1, 'late source', 'late-hash', '2026-07-29 00:00:00')`,
+          ).run();
+        }
+      },
+    })).toThrow("unsupported ambiguous instruction-cache schema");
+
+    expect(schemaSnapshot(db)).toEqual(before);
+    expect(db.prepare(
+      "SELECT COUNT(*) AS count FROM session_instructions",
+    ).get()).toEqual({ count: 0 });
+    expect(db.prepare(
+      "SELECT content FROM session_instruction_cache",
+    ).get()).toEqual({ content: "private current cache" });
+  });
+
+  it.each([
+    "after-begin",
+    "after-drop",
+    "after-create",
+  ] as const)("rolls back empty stale-daemon recovery at %s", (injectedStage) => {
+    const db = database();
+    db.exec(CURRENT_CACHE_FIXTURE_SQL);
+    db.exec(LEGACY_SOURCE_SCHEMA_SQL);
+    const before = schemaSnapshot(db);
+
+    expect(() => runLcmMigrations(db, {
+      fts5Available: false,
+      _instructionCacheMigrationObserver: (stage) => {
+        if (stage === injectedStage) throw new Error(`injected ${stage}`);
+      },
+    })).toThrow(`injected ${injectedStage}`);
+
+    expect(schemaSnapshot(db)).toEqual(before);
+    expect(db.prepare(
+      "SELECT COUNT(*) AS count FROM session_instructions",
+    ).get()).toEqual({ count: 0 });
+    expect(db.prepare(
+      "SELECT content FROM session_instruction_cache",
+    ).get()).toEqual({ content: "private current cache" });
   });
 
   it.each([

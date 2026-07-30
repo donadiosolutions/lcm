@@ -510,7 +510,8 @@ describe("daemon auth", () => {
     ensureAuthToken(tokenPath);
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    const daemon = await createDaemon(config, { tokenPath });
+    const runtimeDigest = "a".repeat(64);
+    const daemon = await createDaemon(config, { tokenPath, _runtimeDigest: runtimeDigest });
     const port = daemon.address().port;
     try {
       const publicResponse = await fetch(`http://127.0.0.1:${port}/health`);
@@ -537,6 +538,7 @@ describe("daemon auth", () => {
         status: "ok",
         storageBackend: "sqlite",
         entrypoint: expect.any(String),
+        runtimeDigest,
       });
     } finally {
       await daemon.stop();

@@ -176,6 +176,199 @@ describe("batch compaction discovery", () => {
     expect(progress.at(-1)).toMatchObject({ completed: 1, current: undefined });
   });
 
+  it("retains SQLite scan failures while compacting readable projects", async () => {
+    const healthyCwd = makeDir("compact-readable-project");
+    const healthyPaths = projectPaths(healthyCwd);
+    ensureProjectDir(healthyCwd);
+    writeFileSync(healthyPaths.metaPath, JSON.stringify({ cwd: healthyPaths.canonical }));
+    seedConversation(healthyPaths.dbPath);
+
+    const corruptCwd = makeDir("compact-unreadable-project");
+    const corruptProjectDir = join(homedir(), ".lcm", "projects", "corrupt-project");
+    mkdirSync(corruptProjectDir, { recursive: true });
+    writeFileSync(join(corruptProjectDir, "meta.json"), JSON.stringify({ cwd: corruptCwd }));
+    writeFileSync(join(corruptProjectDir, "db.sqlite"), "not sqlite");
+
+    const post = vi.spyOn(DaemonClient.prototype, "post")
+      .mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      onProgress: patch => progress.push(patch),
+    });
+
+    expect(result).toEqual({
+      compacted: 1,
+      unchanged: 0,
+      skipped: 0,
+      failures: 1,
+      compactedProjects: [healthyPaths.canonical],
+    });
+    expect(post).toHaveBeenCalledOnce();
+    expect(progress[0]).toEqual({
+      total: 1,
+      phaseErrors: [{
+        phase: "Compact",
+        target: corruptCwd,
+        message: expect.stringContaining("not a database"),
+      }],
+    });
+    expect(progress.at(-1)).toMatchObject({ completed: 1 });
+    expect(error).toHaveBeenCalledWith(expect.stringContaining(`compact scan failed for ${corruptCwd}`));
+    expect(log).not.toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
+  });
+
+  it("fails an all-unreadable scan without claiming there is nothing to compact", async () => {
+    const corruptCwd = makeDir("compact-only-unreadable-project");
+    const corruptProjectDir = join(homedir(), ".lcm", "projects", "only-corrupt-project");
+    mkdirSync(corruptProjectDir, { recursive: true });
+    writeFileSync(join(corruptProjectDir, "meta.json"), JSON.stringify({ cwd: corruptCwd }));
+    writeFileSync(join(corruptProjectDir, "db.sqlite"), "not sqlite");
+
+    const post = vi.spyOn(DaemonClient.prototype, "post");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      onProgress: patch => progress.push(patch),
+    })).toEqual({
+      compacted: 0,
+      unchanged: 0,
+      skipped: 0,
+      failures: 1,
+      compactedProjects: [],
+    });
+    expect(post).not.toHaveBeenCalled();
+    expect(progress).toEqual([{
+      total: 0,
+      phaseErrors: [{
+        phase: "Compact",
+        target: corruptCwd,
+        message: expect.stringContaining("not a database"),
+      }],
+    }]);
+    expect(log).not.toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
+    expect(error).toHaveBeenCalledWith("No sessions were compacted because project discovery failed.");
+  });
+
+  it("reports missing, malformed, and empty project metadata as scan failures", async () => {
+    const projectsDir = join(homedir(), ".lcm", "projects");
+    const fixtures: Array<{ name: string; metadata?: string }> = [
+      { name: "missing-metadata" },
+      { name: "malformed-metadata", metadata: "{" },
+      { name: "empty-metadata", metadata: "{}" },
+    ];
+    for (const fixture of fixtures) {
+      const projectDir = join(projectsDir, fixture.name);
+      mkdirSync(projectDir, { recursive: true });
+      seedConversation(join(projectDir, "db.sqlite"));
+      if (fixture.metadata !== undefined) {
+        writeFileSync(join(projectDir, "meta.json"), fixture.metadata);
+      }
+    }
+
+    const post = vi.spyOn(DaemonClient.prototype, "post");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    expect(findUncompacted(100, false)).toEqual([]);
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      onProgress: patch => progress.push(patch),
+    })).toEqual({
+      compacted: 0,
+      unchanged: 0,
+      skipped: 0,
+      failures: 3,
+      compactedProjects: [],
+    });
+    expect(post).not.toHaveBeenCalled();
+    expect(progress).toHaveLength(1);
+    expect(progress[0]?.total).toBe(0);
+    expect(progress[0]?.phaseErrors).toEqual(expect.arrayContaining([
+      { phase: "Compact", target: "missing-metadata", message: "project metadata is missing" },
+      { phase: "Compact", target: "malformed-metadata", message: "project metadata is unreadable or malformed" },
+      { phase: "Compact", target: "empty-metadata", message: "project metadata cwd must be a non-empty string" },
+    ]));
+    expect(log).not.toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
+  });
+
+  it("reports mapped metadata failures for a cwd-filtered scan", async () => {
+    const cwd = makeDir("compact-filtered-missing-metadata");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    rmSync(paths.metaPath);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    })).toEqual({
+      compacted: 0,
+      unchanged: 0,
+      skipped: 0,
+      failures: 1,
+      compactedProjects: [],
+    });
+    expect(progress[0]?.phaseErrors).toEqual([
+      { phase: "Compact", target: paths.id, message: "project metadata is missing" },
+    ]);
+    expect(log).not.toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
+  });
+
+  it("does not attribute unrelated metadata failures to a cwd-filtered scan", async () => {
+    const cwd = makeDir("compact-filtered-readable");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+
+    const unrelatedProject = join(homedir(), ".lcm", "projects", "unrelated-metadata");
+    mkdirSync(unrelatedProject, { recursive: true });
+    seedConversation(join(unrelatedProject, "db.sqlite"));
+    writeFileSync(join(unrelatedProject, "meta.json"), "{");
+    writeFileSync(projectMapPath(), "{");
+    clearProjectMapCache();
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: true,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    })).toEqual({
+      compacted: 0,
+      unchanged: 0,
+      skipped: 0,
+      failures: 0,
+      compactedProjects: [],
+    });
+    expect(progress).toEqual([{ total: 1 }, { completed: 1 }]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("Found 1 uncompacted conversation"));
+  });
+
   it("counts each successful session once and falls back to discovered input tokens", async () => {
     const cwd = makeDir("compact-aggregate-totals");
     const paths = projectPaths(cwd);
