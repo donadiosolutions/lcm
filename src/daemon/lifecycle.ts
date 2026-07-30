@@ -1,4 +1,24 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  existsSync,
+  fchmodSync,
+  fstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
 import { join, dirname, posix, win32 } from "node:path";
@@ -17,8 +37,10 @@ import {
   isDaemonLifecycleHermeticTestSeams,
   isDaemonLifecycleTestScope,
   isVitestWorkerEntrypoint,
+  assertLifecycleScopeOwnsCurrentCleanupRoot,
   lifecycleHermeticSeamsOwnsStatePath,
-  lifecycleScopeOwnsPath,
+  lifecycleScopeFilesystemIsCurrent,
+  lifecycleScopeOwnsExactStatePaths,
   lifecycleScopeUnitName,
 } from "./lifecycle-scope.js";
 
@@ -375,19 +397,178 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function readPidFile(pidFilePath: string): number | null {
+type ScopedStateAccess = Readonly<{
+  scope: DaemonLifecycleTestScope;
+  pidPath: string;
+  tokenPath: string;
+}>;
+
+class LifecycleTestScopeStateError extends Error {}
+
+function assertScopedStateAccess(access: ScopedStateAccess): void {
+  if (!lifecycleScopeOwnsExactStatePaths(
+    access.scope,
+    access.pidPath,
+    access.tokenPath,
+  )) {
+    throw new LifecycleTestScopeStateError(
+      "daemon lifecycle test state paths changed or escaped their canonical scope",
+    );
+  }
+}
+
+function requireRegularFileDescriptor(descriptor: number): void {
+  const stats = fstatSync(descriptor);
+  if (!stats.isFile() || stats.nlink !== 1) {
+    throw new LifecycleTestScopeStateError(
+      "daemon lifecycle test state leaf is not a single-link regular file",
+    );
+  }
+}
+
+function readRegularFileNoFollow(path: string): string {
+  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const pid = Number.parseInt(readFileSync(pidFilePath, "utf-8").trim(), 10);
+    requireRegularFileDescriptor(descriptor);
+    return readFileSync(descriptor, "utf-8");
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function readPidFile(
+  pidFilePath: string,
+  scopedState?: ScopedStateAccess,
+): number | null {
+  try {
+    if (scopedState) assertScopedStateAccess(scopedState);
+    const content = scopedState
+      ? readRegularFileNoFollow(pidFilePath)
+      : readFileSync(pidFilePath, "utf-8");
+    if (scopedState) assertScopedStateAccess(scopedState);
+    const pid = Number.parseInt(content.trim(), 10);
     return Number.isInteger(pid) && pid > 0 ? pid : null;
-  } catch {
+  } catch (error) {
+    if (
+      scopedState
+      && (error instanceof LifecycleTestScopeStateError
+        || (error as NodeJS.ErrnoException).code !== "ENOENT")
+    ) {
+      throw new LifecycleTestScopeStateError(
+        "daemon lifecycle test PID state is not a canonical owned file",
+      );
+    }
     return null;
   }
 }
 
-function cleanStalePid(pidFilePath: string): void {
+function cleanStalePid(
+  pidFilePath: string,
+  scopedState?: ScopedStateAccess,
+): void {
+  if (scopedState) {
+    assertScopedStateAccess(scopedState);
+    rmSync(pidFilePath, { force: true });
+    assertScopedStateAccess(scopedState);
+    return;
+  }
   try {
     if (existsSync(pidFilePath)) unlinkSync(pidFilePath);
-  } catch { /* ignore */ }
+  } catch { /* Preserve production best-effort stale PID cleanup. */ }
+}
+
+function readScopedAuthToken(access: ScopedStateAccess): string | null {
+  try {
+    assertScopedStateAccess(access);
+    const token = readRegularFileNoFollow(access.tokenPath).trim();
+    assertScopedStateAccess(access);
+    return token || null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new LifecycleTestScopeStateError(
+      `refusing unsafe daemon lifecycle token read: ${String(error)}`,
+    );
+  }
+}
+
+function ensureScopedAuthToken(access: ScopedStateAccess): void {
+  try {
+    assertScopedStateAccess(access);
+    const existing = openSync(
+      access.tokenPath,
+      constants.O_RDWR | constants.O_NOFOLLOW,
+    );
+    try {
+      requireRegularFileDescriptor(existing);
+      fchmodSync(existing, 0o600);
+    } finally {
+      closeSync(existing);
+    }
+    assertScopedStateAccess(access);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new LifecycleTestScopeStateError(
+        `refusing unsafe daemon lifecycle token access: ${String(error)}`,
+      );
+    }
+  }
+
+  const temporaryPath = join(
+    access.scope.stateDir,
+    `.lcm-token-${randomBytes(8).toString("hex")}.tmp`,
+  );
+  const descriptor = openSync(
+    temporaryPath,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    writeSync(descriptor, randomBytes(32).toString("hex"));
+  } finally {
+    closeSync(descriptor);
+  }
+  try {
+    assertScopedStateAccess(access);
+    renameSync(temporaryPath, access.tokenPath);
+    const installed = openSync(
+      access.tokenPath,
+      constants.O_RDWR | constants.O_NOFOLLOW,
+    );
+    try {
+      requireRegularFileDescriptor(installed);
+      fchmodSync(installed, 0o600);
+    } finally {
+      closeSync(installed);
+    }
+    assertScopedStateAccess(access);
+  } finally {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // The atomic rename consumes the temporary path on success.
+    }
+  }
+}
+
+function writeScopedPidFile(access: ScopedStateAccess, pid: number): void {
+  assertScopedStateAccess(access);
+  const descriptor = openSync(
+    access.pidPath,
+    constants.O_WRONLY
+      | constants.O_CREAT
+      | constants.O_TRUNC
+      | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    requireRegularFileDescriptor(descriptor);
+    writeSync(descriptor, String(pid));
+    fchmodSync(descriptor, 0o600);
+  } finally {
+    closeSync(descriptor);
+  }
+  assertScopedStateAccess(access);
 }
 
 function statusField(status: string, name: string): string | null {
@@ -640,8 +821,9 @@ function inspectDaemonParent(
     uid?: number;
     isAlive: (pid: number) => boolean;
   },
+  readPid: (path: string) => number | null = readPidFile,
 ): ParentInspection {
-  const pid = readPidFile(pidFilePath);
+  const pid = readPid(pidFilePath);
   if (pid === null) return { satisfies: false, available: false, reason: "missing-pid" };
   if (!options.isAlive(pid)) return { satisfies: false, available: false, pid, reason: "dead-pid" };
   if (!isLikelyLcmDaemonProcess(pid, options.procRoot)) {
@@ -819,8 +1001,9 @@ async function checkDaemonDiagnostics(
   remainingDeadline: () => RequestDeadline | null,
   publicHealth: HealthResponse,
   expectedStorageBackend: StorageBackend,
+  readToken: (path: string) => string | null = readAuthToken,
 ): Promise<HealthResponse | null> {
-  const token = readAuthToken(tokenPath);
+  const token = readToken(tokenPath);
   if (!token) return null;
   const healthDeadline = remainingDeadline();
   if (!healthDeadline) return null;
@@ -849,6 +1032,7 @@ function startViaDetachedSpawn(
   spawnCommand: string,
   spawnArgs: string[],
   dependencies: ResolvedLifecycleDependencies,
+  scopedState?: ScopedStateAccess,
 ): { getWarning: () => string | undefined; pid?: number } {
   let errorMessage: string | undefined;
   let child: ChildProcess;
@@ -868,7 +1052,8 @@ function startViaDetachedSpawn(
   child.unref();
 
   if (child.pid) {
-    writeFileSync(opts.pidFilePath, String(child.pid));
+    if (scopedState) writeScopedPidFile(scopedState, child.pid);
+    else writeFileSync(opts.pidFilePath, String(child.pid));
   }
   return {
     getWarning: () => errorMessage ? `detached spawn failed (${errorMessage})` : undefined,
@@ -964,11 +1149,20 @@ function systemdManagerProcessEnv(
   });
 }
 
-function systemdCredentialCleanup(credentialDir: string): () => void {
+function systemdCredentialCleanup(
+  credentialDir: string,
+  testScope?: DaemonLifecycleTestScope,
+): () => void {
   return () => {
     try {
+      if (testScope && !lifecycleScopeFilesystemIsCurrent(testScope)) {
+        throw new LifecycleTestScopeStateError(
+          "refusing cleanup through a changed lifecycle test credential root",
+        );
+      }
       rmSync(credentialDir, { recursive: true, force: true });
-    } catch {
+    } catch (error) {
+      if (error instanceof LifecycleTestScopeStateError) throw error;
       // Best-effort cleanup only; the age-based cleanup handles leftovers.
     }
   };
@@ -1010,10 +1204,10 @@ function systemdDaemonCredentialArgs(
     return {
       args,
       names,
-      cleanup: systemdCredentialCleanup(createdCredentialDir),
+      cleanup: systemdCredentialCleanup(createdCredentialDir, testScope),
     };
   } catch (err) {
-    if (credentialDir) systemdCredentialCleanup(credentialDir)();
+    if (credentialDir) systemdCredentialCleanup(credentialDir, testScope)();
     throw err;
   }
 }
@@ -1143,16 +1337,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
   if (
     testScope
-    && (
-      !lifecycleScopeOwnsPath(testScope, opts.pidFilePath)
-      || !lifecycleScopeOwnsPath(testScope, tokenPath)
-    )
+    && !lifecycleScopeOwnsExactStatePaths(testScope, opts.pidFilePath, tokenPath)
   ) {
     return {
       connected: false,
       port: opts.port,
       spawned: false,
-      warning: "daemon lifecycle test PID or token state is outside the owned test scope",
+      warning: "daemon lifecycle test PID or token state is not exact canonical owned state",
     };
   }
   if (
@@ -1190,6 +1381,14 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   const dependencies = resolveLifecycleDependencies(opts);
+  const scopedState = testScope
+    ? { scope: testScope, pidPath: opts.pidFilePath, tokenPath }
+    : undefined;
+  const readOwnedPid = (): number | null => readPidFile(opts.pidFilePath, scopedState);
+  const cleanOwnedPid = (): void => cleanStalePid(opts.pidFilePath, scopedState);
+  const readOwnedToken = (path: string): string | null => scopedState
+    ? readScopedAuthToken(scopedState)
+    : readAuthToken(path);
   const fetchFn = dependencies.fetch;
   const platform = dependencies.platform;
   const procRoot = dependencies.procRoot;
@@ -1241,7 +1440,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   function endpointIdentityMatches(health: HealthResponse | null): boolean {
     if (!isRecognizedDaemonHealth(health) || health?.pid === undefined) return false;
     if (expectedOwnerId !== undefined && health.ownerId !== expectedOwnerId) return false;
-    const pid = readPidFile(opts.pidFilePath);
+    const pid = readOwnedPid();
     if (pid === null || health.pid !== pid || !isAlive(pid)) return false;
     const listenerPorts = opts._listeningPortsOverride
       ? opts._listeningPortsOverride(pid)
@@ -1267,15 +1466,15 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       procRoot,
       uid: dependencies.uid,
       isAlive,
-    });
+    }, () => readOwnedPid());
   }
 
   async function terminatePidFileProcess(): Promise<void> {
-    const pid = readPidFile(opts.pidFilePath);
+    const pid = readOwnedPid();
     if (pid !== null && isLikelyLcmDaemonProcess(pid, procRoot)) {
       await terminatePid(pid, { isAlive, killProcess, sleepFn });
     }
-    cleanStalePid(opts.pidFilePath);
+    cleanOwnedPid();
   }
 
   type MismatchRepair =
@@ -1292,9 +1491,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     }
     await terminatePid(authenticatedPid, { isAlive, killProcess, sleepFn });
     if (isAlive(authenticatedPid)) return { outcome: "blocked" };
-    const currentPid = readPidFile(opts.pidFilePath);
+    const currentPid = readOwnedPid();
     if (currentPid === authenticatedPid) {
-      cleanStalePid(opts.pidFilePath);
+      cleanOwnedPid();
       return { outcome: "terminated" };
     }
     return currentPid === null
@@ -1350,6 +1549,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         },
         health,
         expectedStorageBackend,
+        readOwnedToken,
       );
       if (!authenticated) return null;
       verifiedHealth = authenticated;
@@ -1363,7 +1563,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       if (!parent.satisfies) {
         if (!parent.available || allowParentWarning) {
           if (parent.reason === "dead-pid" || parent.reason === "pid-not-lcm-daemon") {
-            cleanStalePid(opts.pidFilePath);
+            cleanOwnedPid();
           }
           return {
             connected: true,
@@ -1397,7 +1597,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   async function waitForConcurrentReplacement(pid: number): Promise<EnsureDaemonResult> {
-    while (readPidFile(opts.pidFilePath) === pid && isAlive(pid)) {
+    while (readOwnedPid() === pid && isAlive(pid)) {
       const healthDeadline = remainingRequestDeadline();
       if (!healthDeadline) break;
       const replacementHealth = await checkDaemonHealth(opts.port, fetchFn, healthDeadline);
@@ -1435,6 +1635,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           remainingRequestDeadline,
           health,
           publicStorageBackend,
+          readOwnedToken,
         )
       : null;
     const entrypointMatches = authenticatedHealth !== null
@@ -1490,7 +1691,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           restartedForParent = true;
         }
       }
-      cleanStalePid(opts.pidFilePath);
+      cleanOwnedPid();
     }
   }
 
@@ -1498,11 +1699,14 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   if (concurrentReplacementPid !== undefined) {
     return waitForConcurrentReplacement(concurrentReplacementPid);
   }
-  if (existsSync(opts.pidFilePath)) {
+  const pidFilePid = scopedState || existsSync(opts.pidFilePath)
+    ? readOwnedPid()
+    : null;
+  if (pidFilePid !== null) {
     let repairedMismatch = false;
     try {
-      const pid = parseInt(readFileSync(opts.pidFilePath, "utf-8").trim(), 10);
-      if (!isNaN(pid) && isAlive(pid)) {
+      const pid = pidFilePid;
+      if (isAlive(pid)) {
         const sleepRemainingMs = deadline - monotonicNow();
         if (sleepRemainingMs > 0) await sleepFn(Math.min(1000, sleepRemainingMs));
         const retryHealthDeadline = remainingRequestDeadline();
@@ -1524,6 +1728,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
                 remainingRequestDeadline,
                 retry,
                 retryPublicStorageBackend,
+                readOwnedToken,
               )
             : null;
           const retryEntrypointMatches = authenticatedRetry !== null
@@ -1577,8 +1782,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           }
         }
       }
-    } catch { /* ignore */ }
-    if (!repairedMismatch) cleanStalePid(opts.pidFilePath);
+    } catch (error) {
+      if (error instanceof LifecycleTestScopeStateError) throw error;
+    }
+    if (!repairedMismatch) cleanOwnedPid();
   }
 
   // Step 3: Spawn daemon (unless skipped for testing)
@@ -1607,7 +1814,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   // Ensure auth token exists only after the daemon entrypoint is trusted.
-  ensureAuthToken(tokenPath);
+  if (scopedState) ensureScopedAuthToken(scopedState);
+  else ensureAuthToken(tokenPath);
 
   let startMethod: EnsureDaemonResult["startMethod"] = "detached-spawn";
   let warning: string | undefined;
@@ -1631,6 +1839,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         spawnCommand,
         spawnArgs,
         dependencies,
+        scopedState,
       );
     }
   } else {
@@ -1639,6 +1848,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       spawnCommand,
       spawnArgs,
       dependencies,
+      scopedState,
     );
   }
 
@@ -1656,15 +1866,23 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         }));
       }
       if (testScope) {
-        const ownedPaths = new Set([
-          opts.pidFilePath,
-          tokenPath,
+        stages.push(
+          () => cleanStalePid(opts.pidFilePath, scopedState),
+          () => {
+            assertScopedStateAccess(scopedState!);
+            rmSync(tokenPath, { force: true });
+            assertScopedStateAccess(scopedState!);
+          },
+        );
+        for (const path of [
           testScope.runtimeDir,
           testScope.credentialDir,
           testScope.stateDir,
-        ]);
-        for (const path of ownedPaths) {
-          stages.push(() => rmSync(path, { recursive: true, force: true }));
+        ]) {
+          stages.push(() => {
+            assertLifecycleScopeOwnsCurrentCleanupRoot(testScope, path);
+            rmSync(path, { recursive: true, force: true });
+          });
         }
       }
       await runCleanupStages(stages);
@@ -1792,17 +2010,14 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
   if (
     testScope
-    && (
-      !lifecycleScopeOwnsPath(testScope, opts.pidFilePath)
-      || !lifecycleScopeOwnsPath(testScope, tokenPath)
-    )
+    && !lifecycleScopeOwnsExactStatePaths(testScope, opts.pidFilePath, tokenPath)
   ) {
     return {
       connected: false,
       port: opts.port,
       spawned: false,
       restarted: false,
-      warning: "daemon lifecycle test PID or token state is outside the owned test scope",
+      warning: "daemon lifecycle test PID or token state is not exact canonical owned state",
     };
   }
   if (
@@ -1839,8 +2054,28 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     ...ensureOptions
   } = opts;
   await validateBeforeRestart?.();
+  if (
+    testScope
+    && !lifecycleScopeOwnsExactStatePaths(testScope, opts.pidFilePath, tokenPath)
+  ) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      restarted: false,
+      warning: "daemon lifecycle test state changed during restart validation",
+    };
+  }
 
   const dependencies = resolveLifecycleDependencies(opts);
+  const scopedState = testScope
+    ? { scope: testScope, pidPath: opts.pidFilePath, tokenPath }
+    : undefined;
+  const readOwnedPid = (): number | null => readPidFile(opts.pidFilePath, scopedState);
+  const cleanOwnedPid = (): void => cleanStalePid(opts.pidFilePath, scopedState);
+  const readOwnedToken = (path: string): string | null => scopedState
+    ? readScopedAuthToken(scopedState)
+    : readAuthToken(path);
   const isAlive = dependencies.isProcessAlive;
   const platform = dependencies.platform;
   const fetchFn = dependencies.fetch;
@@ -1876,6 +2111,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       remainingVerificationDeadline,
       health,
       currentStorageBackend,
+      readOwnedToken,
     );
     return authenticatedHealth !== null
       && processEntrypointMatches(
@@ -1906,24 +2142,30 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   let restarted = false;
   let stoppedPid: number | undefined;
 
-  const pid = readPidFile(opts.pidFilePath);
+  const pid = readOwnedPid();
   if (pid === null) {
-    cleanStalePid(opts.pidFilePath);
+    cleanOwnedPid();
   } else if (!isAlive(pid)) {
-    cleanStalePid(opts.pidFilePath);
+    cleanOwnedPid();
   } else {
     if (!await isManaged(pid)) {
       throw new Error(`Refusing to restart: PID ${pid} is running but is not a verified LCM daemon.`);
+    }
+    if (readOwnedPid() !== pid) {
+      throw new LifecycleTestScopeStateError(
+        "daemon lifecycle test PID changed before restart signaling",
+      );
     }
     await terminatePid(pid, { isAlive, killProcess, sleepFn });
     if (isAlive(pid)) {
       throw new Error(`Unable to stop verified LCM daemon PID ${pid}; restart aborted.`);
     }
-    cleanStalePid(opts.pidFilePath);
+    cleanOwnedPid();
     restarted = true;
     stoppedPid = pid;
   }
 
+  if (scopedState) assertScopedStateAccess(scopedState);
   const ensure = _ensureDaemonOverride ?? ensureDaemon;
   const result = await ensure(ensureOptions);
   if (!restarted && result.connected && !result.spawned) {
@@ -1943,6 +2185,7 @@ export const __lifecycleTestUtils = {
   inspectDaemonParent,
   isProcessAlive,
   parentInvariantWarning,
+  requireRegularFileDescriptor,
   resolveWindowsNetstatPath,
   resolveLifecycleDependencies,
   lifecycleUnitName,

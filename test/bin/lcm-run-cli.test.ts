@@ -194,6 +194,7 @@ const {
   runCli, runMainIfInvoked, shouldRunMain,
   withHookOverrides, writeCliError, writeCliOutput,
 } = await import("../../bin/lcm.js");
+const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
 const { batchCompact } = await import("../../src/batch-compact.js");
 const { isDaemonTransportFailure } = await import("../../src/daemon/http-url.js");
 
@@ -975,9 +976,12 @@ describe("runCli failure and alternate presentation branches", () => {
       runtime: process.env.XDG_RUNTIME_DIR,
       owner: process.env.LCM_DAEMON_OWNER_ID,
     };
-    const homeDir = "/tmp/lcm-cli-owned-home";
+    const homeDir = actualFs.mkdtempSync("/tmp/lcm-cli-owned-home-");
     const runtimeDir = `${homeDir}/runtime`;
     const entrypoint = `${runtimeDir}/owned-lcm.mjs`;
+    actualFs.mkdirSync(runtimeDir, { recursive: true });
+    actualFs.mkdirSync(`${homeDir}/.lcm`, { recursive: true });
+    actualFs.writeFileSync(entrypoint, "export {};\n");
     state.runtimeHome = `${homeDir}/.lcm`;
     state.runtimePidPath = `${state.runtimeHome}/daemon.pid`;
     state.runtimeTokenPath = `${state.runtimeHome}/daemon.token`;
@@ -1012,7 +1016,75 @@ describe("runCli failure and alternate presentation branches", () => {
       else process.env.XDG_RUNTIME_DIR = previous.runtime;
       if (previous.owner === undefined) delete process.env.LCM_DAEMON_OWNER_ID;
       else process.env.LCM_DAEMON_OWNER_ID = previous.owner;
+      actualFs.rmSync(homeDir, { recursive: true, force: true });
     }
+  });
+
+  it("rejects linked hidden-pair state and entrypoints before side effects", async () => {
+    const previous = {
+      home: process.env.HOME,
+      runtime: process.env.XDG_RUNTIME_DIR,
+      owner: process.env.LCM_DAEMON_OWNER_ID,
+    };
+    const root = actualFs.mkdtempSync("/tmp/lcm-cli-symlink-");
+    const homeDir = `${root}/home`;
+    const runtimeDir = `${homeDir}/runtime`;
+    const stateTarget = `${root}/canonical-target-state`;
+    const entrypointTarget = `${root}/canonical-target-entrypoint.mjs`;
+    const entrypoint = `${runtimeDir}/owned-lcm.mjs`;
+    actualFs.mkdirSync(runtimeDir, { recursive: true });
+    actualFs.mkdirSync(stateTarget, { recursive: true });
+    actualFs.writeFileSync(`${stateTarget}/sentinel`, "untouched");
+    actualFs.writeFileSync(entrypoint, "export {};\n");
+    actualFs.writeFileSync(entrypointTarget, "export const target = true;\n");
+    actualFs.symlinkSync(stateTarget, `${homeDir}/.lcm`, "dir");
+    state.runtimeHome = `${homeDir}/.lcm`;
+    state.runtimePidPath = `${state.runtimeHome}/daemon.pid`;
+    state.runtimeTokenPath = `${state.runtimeHome}/daemon.token`;
+    process.env.HOME = homeDir;
+    process.env.XDG_RUNTIME_DIR = runtimeDir;
+    process.env.LCM_DAEMON_OWNER_ID = "cli-symlink";
+    const invokeOwned = (): Promise<Error | undefined> => invoke([
+      "daemon",
+      "start",
+      "--foreground",
+      "--internal-lcm-test-daemon-owner=cli-symlink",
+      `--internal-lcm-test-daemon-entrypoint=${entrypoint}`,
+    ]);
+    try {
+      expect((await invokeOwned())?.message).toContain("filesystem is not canonical");
+      actualFs.unlinkSync(`${homeDir}/.lcm`);
+      actualFs.mkdirSync(`${homeDir}/.lcm`);
+      actualFs.unlinkSync(entrypoint);
+      actualFs.symlinkSync(entrypointTarget, entrypoint, "file");
+      expect((await invokeOwned())?.message).toContain("filesystem is not canonical");
+      actualFs.unlinkSync(entrypoint);
+      actualFs.writeFileSync(entrypoint, "export const owned = true;\n", {
+        mode: 0o640,
+      });
+      const hardlinkTarget = `${root}/hardlinked-entrypoint.mjs`;
+      actualFs.linkSync(entrypoint, hardlinkTarget);
+      const hardlinkContent = actualFs.readFileSync(hardlinkTarget, "utf-8");
+      const hardlinkMode = actualFs.statSync(hardlinkTarget).mode & 0o777;
+      expect((await invokeOwned())?.message).toContain("filesystem is not canonical");
+      expect(actualFs.readFileSync(`${stateTarget}/sentinel`, "utf-8")).toBe("untouched");
+      expect(actualFs.readFileSync(entrypointTarget, "utf-8")).toContain("target");
+      expect(actualFs.readFileSync(hardlinkTarget, "utf-8")).toBe(hardlinkContent);
+      expect(actualFs.statSync(hardlinkTarget).mode & 0o777).toBe(hardlinkMode);
+      expect(actualFs.existsSync(`${stateTarget}/daemon.pid`)).toBe(false);
+      expect(actualFs.existsSync(`${stateTarget}/daemon.token`)).toBe(false);
+    } finally {
+      if (previous.home === undefined) delete process.env.HOME;
+      else process.env.HOME = previous.home;
+      if (previous.runtime === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = previous.runtime;
+      if (previous.owner === undefined) delete process.env.LCM_DAEMON_OWNER_ID;
+      else process.env.LCM_DAEMON_OWNER_ID = previous.owner;
+      actualFs.rmSync(root, { recursive: true, force: true });
+    }
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    expect(state.ensureAuthToken).not.toHaveBeenCalled();
+    expect(state.createDaemon).not.toHaveBeenCalled();
   });
 
   it("executes restart preflight validation", async () => {

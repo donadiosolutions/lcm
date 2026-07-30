@@ -35,6 +35,9 @@ import {
   DAEMON_TEST_ENTRYPOINT_OPTION,
   DAEMON_TEST_OWNER_OPTION,
   type DaemonLifecycleTestIdentity,
+  isCanonicalLifecycleTestDirectory,
+  isCanonicalLifecycleTestRegularFile,
+  isCanonicalOrMissingLifecycleTestStateFile,
   isDaemonLifecycleTestIdentity,
 } from "../src/daemon/lifecycle-scope.js";
 
@@ -294,12 +297,30 @@ function resolveInternalDaemonTestIdentity(
     throw new Error("Internal daemon test identity is not confined to an isolated lifecycle environment");
   }
   const lcDir = lcmHomeDir();
+  const pidPath = daemonPidPath();
+  const tokenPath = daemonTokenPath();
   if (
     !strictlyContainsPath(homeDir, lcDir)
-    || !strictlyContainsPath(lcDir, daemonPidPath())
-    || !strictlyContainsPath(lcDir, daemonTokenPath())
+    || !strictlyContainsPath(lcDir, pidPath)
+    || !strictlyContainsPath(lcDir, tokenPath)
   ) {
     throw new Error("Internal daemon test state is not confined to the isolated lifecycle home");
+  }
+  if (
+    !isCanonicalLifecycleTestDirectory(homeDir)
+    || !isCanonicalLifecycleTestDirectory(runtimeDir)
+    || !isCanonicalLifecycleTestDirectory(lcDir)
+    || !isCanonicalLifecycleTestRegularFile(identity.entrypoint)
+    || !isCanonicalOrMissingLifecycleTestStateFile(
+      pidPath,
+      join(lcDir, "daemon.pid"),
+    )
+    || !isCanonicalOrMissingLifecycleTestStateFile(
+      tokenPath,
+      join(lcDir, "daemon.token"),
+    )
+  ) {
+    throw new Error("Internal daemon test filesystem is not canonical owned state");
   }
   return identity;
 }

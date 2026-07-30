@@ -1,5 +1,6 @@
 import type { spawn, spawnSync } from "node:child_process";
-import { isAbsolute, relative, resolve } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { LCM_HOME_DIRNAME } from "../runtime-paths.js";
 
 const TEST_UNIT_PREFIX = "lcm-test-daemon-";
@@ -59,14 +60,109 @@ export type DaemonLifecycleTestScope = Readonly<{
   credentialDir: string;
   entrypoint: string;
   unitPrefix: string;
+  filesystem: DaemonLifecycleTestFilesystem;
   dependencies: DaemonLifecycleTestDependencies;
 }>;
 
-type ScopeInput = Omit<DaemonLifecycleTestScope, "unitPrefix">;
+type CanonicalLifecycleTestResource = Readonly<{
+  path: string;
+  device: number;
+  inode: number;
+  kind: "directory" | "file";
+}>;
+
+type DaemonLifecycleTestFilesystem = Readonly<{
+  homeDir: CanonicalLifecycleTestResource;
+  runtimeDir: CanonicalLifecycleTestResource;
+  stateDir: CanonicalLifecycleTestResource;
+  credentialDir: CanonicalLifecycleTestResource;
+  entrypoint: CanonicalLifecycleTestResource;
+}>;
+
+type ScopeInput = Omit<DaemonLifecycleTestScope, "unitPrefix" | "filesystem">;
 
 function requireAbsoluteDirectory(label: string, path: string): string {
   if (!isAbsolute(path)) throw new Error(`${label} must be absolute`);
   return resolve(path);
+}
+
+function captureCanonicalResource(
+  label: string,
+  path: string,
+  kind: CanonicalLifecycleTestResource["kind"],
+): CanonicalLifecycleTestResource {
+  let stats: ReturnType<typeof lstatSync>;
+  try {
+    stats = lstatSync(path);
+  } catch {
+    throw new Error(`${label} must be an existing canonical ${kind}`);
+  }
+  const expectedKind = kind === "directory" ? stats.isDirectory() : stats.isFile();
+  if (
+    stats.isSymbolicLink()
+    || !expectedKind
+    || (kind === "file" && stats.nlink !== 1)
+    || realpathSync(path) !== path
+  ) {
+    throw new Error(`${label} must be an existing canonical ${kind}`);
+  }
+  return Object.freeze({
+    path,
+    device: stats.dev,
+    inode: stats.ino,
+    kind,
+  });
+}
+
+function resourceMatchesSnapshot(resource: CanonicalLifecycleTestResource): boolean {
+  try {
+    const current = captureCanonicalResource(
+      "lifecycle test resource",
+      resource.path,
+      resource.kind,
+    );
+    return current.device === resource.device && current.inode === resource.inode;
+  } catch {
+    return false;
+  }
+}
+
+export function isCanonicalLifecycleTestDirectory(path: string): boolean {
+  if (!isAbsolute(path)) return false;
+  try {
+    captureCanonicalResource("lifecycle test directory", resolve(path), "directory");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isCanonicalLifecycleTestRegularFile(path: string): boolean {
+  if (!isAbsolute(path)) return false;
+  try {
+    captureCanonicalResource("lifecycle test file", resolve(path), "file");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isCanonicalOrMissingLifecycleTestStateFile(
+  path: string,
+  expectedPath: string,
+): boolean {
+  if (resolve(path) !== resolve(expectedPath) || path !== resolve(path)) return false;
+  try {
+    captureCanonicalResource("lifecycle test state file", path, "file");
+    return true;
+  } catch {
+    try {
+      lstatSync(path);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT";
+    }
+  }
 }
 
 function isWithin(candidate: string, parent: string): boolean {
@@ -78,6 +174,22 @@ function isWithin(candidate: string, parent: string): boolean {
 
 function isSafeOwnerId(ownerId: unknown): ownerId is string {
   return typeof ownerId === "string" && OWNER_ID_PATTERN.test(ownerId);
+}
+
+function hasOnlyDataProperties(
+  value: unknown,
+  required: readonly PropertyKey[],
+): value is Record<PropertyKey, unknown> {
+  if (typeof value !== "object" || value === null) return false;
+  if (Object.getOwnPropertySymbols(value).length > 0) return false;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (!Reflect.ownKeys(descriptors).every(
+    key => Object.hasOwn(descriptors[key as keyof typeof descriptors], "value"),
+  )) return false;
+  return required.every((key) => {
+    const descriptor = descriptors[key as keyof typeof descriptors];
+    return descriptor !== undefined && Object.hasOwn(descriptor, "value");
+  });
 }
 
 export function isVitestWorkerEntrypoint(entrypoint: string | undefined): boolean {
@@ -115,6 +227,17 @@ export function createDaemonLifecycleTestScope(input: ScopeInput): DaemonLifecyc
       throw new Error(`lifecycle test dependency ${label} must be a function`);
     }
   }
+  const filesystem = Object.freeze({
+    homeDir: captureCanonicalResource("lifecycle test homeDir", homeDir, "directory"),
+    runtimeDir: captureCanonicalResource("lifecycle test runtimeDir", runtimeDir, "directory"),
+    stateDir: captureCanonicalResource("lifecycle test stateDir", stateDir, "directory"),
+    credentialDir: captureCanonicalResource(
+      "lifecycle test credentialDir",
+      credentialDir,
+      "directory",
+    ),
+    entrypoint: captureCanonicalResource("lifecycle test entrypoint", entrypoint, "file"),
+  });
   return Object.freeze({
     ownerId: input.ownerId,
     homeDir,
@@ -123,6 +246,7 @@ export function createDaemonLifecycleTestScope(input: ScopeInput): DaemonLifecyc
     credentialDir,
     entrypoint,
     unitPrefix: `${TEST_UNIT_PREFIX}${input.ownerId}-`,
+    filesystem,
     dependencies: Object.freeze({ ...input.dependencies }),
   });
 }
@@ -190,9 +314,34 @@ export function lifecycleHermeticSeamsOwnsStatePath(
 }
 
 export function isDaemonLifecycleTestScope(value: unknown): value is DaemonLifecycleTestScope {
-  if (typeof value !== "object" || value === null) return false;
+  if (!hasOnlyDataProperties(value, [
+    "ownerId",
+    "homeDir",
+    "runtimeDir",
+    "stateDir",
+    "credentialDir",
+    "entrypoint",
+    "unitPrefix",
+    "filesystem",
+    "dependencies",
+  ])) return false;
   try {
     const scope = value as DaemonLifecycleTestScope;
+    if (!hasOnlyDataProperties(scope.dependencies, REQUIRED_DEPENDENCIES)) return false;
+    if (!hasOnlyDataProperties(scope.filesystem, [
+      "homeDir",
+      "runtimeDir",
+      "stateDir",
+      "credentialDir",
+      "entrypoint",
+    ])) return false;
+    if (!(Object.keys(scope.filesystem) as Array<keyof DaemonLifecycleTestFilesystem>)
+      .every(key => hasOnlyDataProperties(scope.filesystem[key], [
+        "path",
+        "device",
+        "inode",
+        "kind",
+      ]))) return false;
     const recreated = createDaemonLifecycleTestScope({
       ownerId: scope.ownerId,
       homeDir: scope.homeDir,
@@ -202,7 +351,14 @@ export function isDaemonLifecycleTestScope(value: unknown): value is DaemonLifec
       entrypoint: scope.entrypoint,
       dependencies: scope.dependencies,
     });
-    return recreated.unitPrefix === scope.unitPrefix;
+    return recreated.unitPrefix === scope.unitPrefix
+      && (Object.keys(recreated.filesystem) as Array<keyof DaemonLifecycleTestFilesystem>)
+        .every((key) => (
+          recreated.filesystem[key].path === scope.filesystem?.[key]?.path
+          && recreated.filesystem[key].device === scope.filesystem?.[key]?.device
+          && recreated.filesystem[key].inode === scope.filesystem?.[key]?.inode
+          && recreated.filesystem[key].kind === scope.filesystem?.[key]?.kind
+        ));
   } catch {
     return false;
   }
@@ -212,6 +368,48 @@ export function lifecycleScopeOwnsPath(scope: DaemonLifecycleTestScope, path: st
   return isWithin(path, scope.stateDir)
     || isWithin(path, scope.runtimeDir)
     || isWithin(path, scope.credentialDir);
+}
+
+export function lifecycleScopeFilesystemIsCurrent(
+  scope: DaemonLifecycleTestScope,
+): boolean {
+  return (Object.values(scope.filesystem) as CanonicalLifecycleTestResource[])
+    .every(resourceMatchesSnapshot);
+}
+
+export function assertLifecycleScopeOwnsCurrentCleanupRoot(
+  scope: DaemonLifecycleTestScope,
+  path: string,
+): void {
+  if (path === scope.runtimeDir) {
+    if (
+      resourceMatchesSnapshot(scope.filesystem.runtimeDir)
+      && resourceMatchesSnapshot(scope.filesystem.entrypoint)
+    ) return;
+  } else if (
+    path === scope.credentialDir
+    && resourceMatchesSnapshot(scope.filesystem.credentialDir)
+  ) {
+    return;
+  } else if (
+    path === scope.stateDir
+    && resourceMatchesSnapshot(scope.filesystem.stateDir)
+  ) {
+    return;
+  }
+  throw new Error(`lifecycle test cleanup root is not current owned state: ${path}`);
+}
+
+export function lifecycleScopeOwnsExactStatePaths(
+  scope: DaemonLifecycleTestScope,
+  pidPath: string,
+  tokenPath: string,
+): boolean {
+  const expectedPidPath = join(scope.stateDir, "daemon.pid");
+  const expectedTokenPath = join(scope.stateDir, "daemon.token");
+  return lifecycleScopeFilesystemIsCurrent(scope)
+    && isCanonicalOrMissingLifecycleTestStateFile(pidPath, expectedPidPath)
+    && isCanonicalOrMissingLifecycleTestStateFile(tokenPath, expectedTokenPath);
 }
 
 export function lifecycleScopeUnitName(

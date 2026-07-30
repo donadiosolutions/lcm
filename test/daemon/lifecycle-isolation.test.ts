@@ -1,12 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
 import {
+  closeSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,12 +18,15 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  assertLifecycleScopeOwnsCurrentCleanupRoot,
   createDaemonLifecycleTestScope,
   DAEMON_TEST_ENTRYPOINT_OPTION,
   DAEMON_TEST_OWNER_OPTION,
   isDaemonLifecycleHermeticTestSeams,
   isDaemonLifecycleTestIdentity,
   isDaemonLifecycleTestScope,
+  isCanonicalLifecycleTestDirectory,
+  isCanonicalLifecycleTestRegularFile,
   isVitestWorkerEntrypoint,
   lifecycleScopeOwnsPath,
   lifecycleScopeUnitName,
@@ -27,7 +34,11 @@ import {
   type DaemonLifecycleHermeticTestSeams,
   type DaemonLifecycleTestScope,
 } from "../../src/daemon/lifecycle-scope.js";
-import { ensureDaemon, restartDaemon } from "../../src/daemon/lifecycle.js";
+import {
+  __lifecycleTestUtils,
+  ensureDaemon,
+  restartDaemon,
+} from "../../src/daemon/lifecycle.js";
 import { ensureAuthToken } from "../../src/daemon/auth.js";
 import { createDaemon } from "../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
@@ -174,9 +185,171 @@ describe("daemon lifecycle test-scope validation", () => {
     expect(isVitestWorkerEntrypoint("/repo/lcm.mjs")).toBe(false);
     expect(lifecycleScopeOwnsPath(fixture.scope, fixture.pidPath)).toBe(true);
     expect(lifecycleScopeOwnsPath(fixture.scope, join(fixture.root, "foreign"))).toBe(false);
+    expect(() => assertLifecycleScopeOwnsCurrentCleanupRoot(
+      fixture.scope,
+      fixture.scope.runtimeDir,
+    )).not.toThrow();
+    expect(() => assertLifecycleScopeOwnsCurrentCleanupRoot(
+      fixture.scope,
+      fixture.scope.credentialDir,
+    )).not.toThrow();
+    expect(() => assertLifecycleScopeOwnsCurrentCleanupRoot(
+      fixture.scope,
+      fixture.scope.stateDir,
+    )).not.toThrow();
+    expect(() => assertLifecycleScopeOwnsCurrentCleanupRoot(
+      fixture.scope,
+      join(fixture.root, "foreign"),
+    )).toThrow("not current owned state");
+    rmSync(fixture.scope.entrypoint);
+    writeFileSync(fixture.scope.entrypoint, "replacement entrypoint\n");
+    expect(() => assertLifecycleScopeOwnsCurrentCleanupRoot(
+      fixture.scope,
+      fixture.scope.runtimeDir,
+    )).toThrow("not current owned state");
     expect(lifecycleScopeUnitName(fixture.scope, 12, 34)).toBe(
       "lcm-test-daemon-scope-valid-12-34",
     );
+  });
+
+  it("validates canonical resource kinds and rejects symbol-bearing nested scope data", () => {
+    const fixture = createFixture("scope-descriptors");
+    expect(isCanonicalLifecycleTestDirectory(fixture.scope.homeDir)).toBe(true);
+    expect(isCanonicalLifecycleTestDirectory("relative")).toBe(false);
+    expect(isCanonicalLifecycleTestDirectory(fixture.scope.entrypoint)).toBe(false);
+    expect(isCanonicalLifecycleTestRegularFile(fixture.scope.entrypoint)).toBe(true);
+    expect(isCanonicalLifecycleTestRegularFile("relative")).toBe(false);
+    expect(isCanonicalLifecycleTestRegularFile(fixture.scope.homeDir)).toBe(false);
+
+    expect(isDaemonLifecycleTestScope({
+      ...fixture.scope,
+      [Symbol("foreign")]: true,
+    })).toBe(false);
+    expect(isDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        [Symbol("foreign")]: vi.fn(),
+      },
+    })).toBe(false);
+    expect(isDaemonLifecycleTestScope({
+      ...fixture.scope,
+      filesystem: {
+        ...fixture.scope.filesystem,
+        [Symbol("foreign")]: true,
+      },
+    })).toBe(false);
+    const pathGetter = vi.fn(() => fixture.scope.filesystem.stateDir.path);
+    const stateSnapshot = { ...fixture.scope.filesystem.stateDir };
+    Object.defineProperty(stateSnapshot, "path", {
+      configurable: true,
+      enumerable: true,
+      get: pathGetter,
+    });
+    expect(isDaemonLifecycleTestScope({
+      ...fixture.scope,
+      filesystem: {
+        ...fixture.scope.filesystem,
+        stateDir: stateSnapshot,
+      },
+    })).toBe(false);
+    expect(pathGetter).not.toHaveBeenCalled();
+  });
+
+  it("rejects symlinked leaves and ancestors while accepting real resources", () => {
+    const fixture = createFixture("scope-canonical");
+    const linkedEntrypoint = join(fixture.scope.runtimeDir, "linked-daemon.mjs");
+    symlinkSync(fixture.scope.entrypoint, linkedEntrypoint, "file");
+    expect(() => createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      entrypoint: linkedEntrypoint,
+    })).toThrow("canonical file");
+
+    const aliasRoot = mkdtempSync(join(tmpdir(), "lcm-lifecycle-alias-"));
+    roots.push(aliasRoot);
+    const homeDir = join(aliasRoot, "home");
+    const runtimeDir = join(homeDir, "runtime");
+    const credentialDir = join(homeDir, "credentials");
+    const targetStateDir = join(aliasRoot, "canonical-state-target");
+    const entrypoint = join(runtimeDir, "owned-daemon.mjs");
+    mkdirSync(runtimeDir, { recursive: true });
+    mkdirSync(credentialDir, { recursive: true });
+    mkdirSync(targetStateDir, { recursive: true });
+    writeFileSync(entrypoint, "export {};\n");
+    writeFileSync(join(targetStateDir, "sentinel"), "untouched");
+    symlinkSync(targetStateDir, join(homeDir, ".lcm"), "dir");
+    expect(() => createDaemonLifecycleTestScope({
+      ownerId: "scope-state-alias",
+      homeDir,
+      runtimeDir,
+      stateDir: join(homeDir, ".lcm"),
+      credentialDir,
+      entrypoint,
+      dependencies: fixture.scope.dependencies,
+    })).toThrow("canonical directory");
+    expect(readFileSync(join(targetStateDir, "sentinel"), "utf-8")).toBe("untouched");
+
+    const realHome = join(aliasRoot, "real-home");
+    const linkedHome = join(aliasRoot, "linked-home");
+    mkdirSync(join(realHome, "runtime"), { recursive: true });
+    mkdirSync(join(realHome, ".lcm"), { recursive: true });
+    mkdirSync(join(realHome, "credentials"), { recursive: true });
+    writeFileSync(join(realHome, "runtime", "owned-daemon.mjs"), "export {};\n");
+    symlinkSync(realHome, linkedHome, "dir");
+    expect(() => createDaemonLifecycleTestScope({
+      ownerId: "scope-home-alias",
+      homeDir: linkedHome,
+      runtimeDir: join(linkedHome, "runtime"),
+      stateDir: join(linkedHome, ".lcm"),
+      credentialDir: join(linkedHome, "credentials"),
+      entrypoint: join(linkedHome, "runtime", "owned-daemon.mjs"),
+      dependencies: fixture.scope.dependencies,
+    })).toThrow("canonical directory");
+  });
+
+  it("rejects a hardlinked entrypoint without mutating its inode", async () => {
+    const fixture = createFixture("scope-entrypoint-hardlink");
+    const targetRoot = mkdtempSync(join(tmpdir(), "lcm-lifecycle-entrypoint-hardlink-"));
+    roots.push(targetRoot);
+    const secondLink = join(targetRoot, "owned-daemon.mjs");
+    linkSync(fixture.scope.entrypoint, secondLink);
+    const contentBefore = readFileSync(secondLink, "utf-8");
+    const modeBefore = statSync(secondLink).mode & 0o777;
+    await expect(ensureDaemon(scopedOptions(fixture))).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      warning: expect.stringContaining("incomplete or malformed"),
+    });
+    expect(readFileSync(secondLink, "utf-8")).toBe(contentBefore);
+    expect(statSync(secondLink).mode & 0o777).toBe(modeBefore);
+    expect(fixture.scope.dependencies.fetch).not.toHaveBeenCalled();
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+  });
+
+  it("rejects accessor-bearing scope objects without invoking getters", async () => {
+    const fixture = createFixture("scope-accessor");
+    const getter = vi.fn(() => fixture.scope.stateDir);
+    const malformed = { ...fixture.scope };
+    Object.defineProperty(malformed, "stateDir", {
+      configurable: true,
+      enumerable: true,
+      get: getter,
+    });
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      _testScope: malformed as never,
+    })).resolves.toMatchObject({
+      connected: false,
+      warning: expect.stringContaining("incomplete or malformed"),
+    });
+    expect(getter).not.toHaveBeenCalled();
+    expect(fixture.scope.dependencies.fetch).not.toHaveBeenCalled();
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
+    expect(fixture.killProcess).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -234,7 +407,7 @@ describe("daemon lifecycle test-scope validation", () => {
       pidFilePath: join(fixture.root, "foreign", "daemon.pid"),
     })).resolves.toMatchObject({
       connected: false,
-      warning: expect.stringContaining("outside the owned test scope"),
+      warning: expect.stringContaining("canonical owned state"),
     });
     expect(fixture.runSystemd).not.toHaveBeenCalled();
     expect(fixture.spawnProcess).not.toHaveBeenCalled();
@@ -254,7 +427,7 @@ describe("daemon lifecycle test-scope validation", () => {
     })).resolves.toMatchObject({
       connected: false,
       spawned: false,
-      warning: expect.stringContaining("PID or token state is outside"),
+      warning: expect.stringContaining("canonical owned state"),
     });
     expect(readFileSync(escapedTokenPath, "utf8")).toBe(tokenBefore);
     expect(statSync(escapedTokenPath).mode & 0o777).toBe(tokenModeBefore);
@@ -264,6 +437,60 @@ describe("daemon lifecycle test-scope validation", () => {
     expect(fixture.runSystemd).not.toHaveBeenCalled();
     expect(fixture.spawnProcess).not.toHaveBeenCalled();
   });
+
+  it.each(["daemon.pid", "daemon.token"] as const)(
+    "rejects a symlinked %s leaf before target or lifecycle access",
+    async (leaf) => {
+      const fixture = createFixture(`scope-leaf-${leaf.replace(".", "-")}`);
+      const targetRoot = mkdtempSync(join(tmpdir(), "lcm-lifecycle-leaf-target-"));
+      roots.push(targetRoot);
+      const target = join(targetRoot, leaf);
+      writeFileSync(target, `target-${leaf}`, { mode: 0o640 });
+      symlinkSync(target, join(fixture.scope.stateDir, leaf), "file");
+      const contentBefore = readFileSync(target, "utf-8");
+      const modeBefore = statSync(target).mode & 0o777;
+      await expect(ensureDaemon(scopedOptions(fixture))).resolves.toMatchObject({
+        connected: false,
+        spawned: false,
+        warning: expect.stringContaining("canonical owned state"),
+      });
+      expect(readFileSync(target, "utf-8")).toBe(contentBefore);
+      expect(statSync(target).mode & 0o777).toBe(modeBefore);
+      expect(fixture.scope.dependencies.fetch).not.toHaveBeenCalled();
+      expect(fixture.runSystemd).not.toHaveBeenCalled();
+      expect(fixture.spawnProcess).not.toHaveBeenCalled();
+      expect(fixture.killProcess).not.toHaveBeenCalled();
+      expect(fixture.stopUnit).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["daemon.pid", "daemon.token"] as const)(
+    "rejects a hardlinked %s leaf without mutating its target",
+    async (leaf) => {
+      const fixture = createFixture(`scope-hardlink-${leaf.replace(".", "-")}`);
+      const targetRoot = mkdtempSync(join(tmpdir(), "lcm-lifecycle-hardlink-target-"));
+      roots.push(targetRoot);
+      const target = join(targetRoot, leaf);
+      writeFileSync(target, leaf === "daemon.pid" ? "8181" : "target-secret", {
+        mode: 0o640,
+      });
+      linkSync(target, join(fixture.scope.stateDir, leaf));
+      const contentBefore = readFileSync(target, "utf-8");
+      const modeBefore = statSync(target).mode & 0o777;
+      await expect(ensureDaemon(scopedOptions(fixture))).resolves.toMatchObject({
+        connected: false,
+        spawned: false,
+        warning: expect.stringContaining("canonical owned state"),
+      });
+      expect(readFileSync(target, "utf-8")).toBe(contentBefore);
+      expect(statSync(target).mode & 0o777).toBe(modeBefore);
+      expect(fixture.scope.dependencies.fetch).not.toHaveBeenCalled();
+      expect(fixture.runSystemd).not.toHaveBeenCalled();
+      expect(fixture.spawnProcess).not.toHaveBeenCalled();
+      expect(fixture.killProcess).not.toHaveBeenCalled();
+      expect(fixture.stopUnit).not.toHaveBeenCalled();
+    },
+  );
 
   it("fails closed for malformed, conflicting, or out-of-root hermetic seams", async () => {
     const fixture = createFixture("hermetic-preflight");
@@ -335,6 +562,25 @@ describe("daemon lifecycle test-scope validation", () => {
       warning: expect.stringContaining("outside its state root"),
     });
     expect(fixture.scope.dependencies.fetch).not.toHaveBeenCalled();
+  });
+
+  it("preserves best-effort stale PID recovery for a hermetic production-shaped error", async () => {
+    const fixture = createFixture("hermetic-stale-error");
+    writeFileSync(fixture.pidPath, "9195");
+    const options = withHermeticLifecycleSeams({
+      port: 37_346,
+      pidFilePath: fixture.pidPath,
+      spawnTimeoutMs: 10,
+      _skipSpawn: true,
+      _isProcessAliveOverride: () => {
+        throw new Error("process inspection unavailable");
+      },
+    }, fixture.scope.homeDir);
+    await expect(ensureDaemon(options)).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+    });
+    expect(existsSync(fixture.pidPath)).toBe(false);
   });
 
   it("blocks an unscoped Vitest worker before host discovery or mutation", async () => {
@@ -538,6 +784,32 @@ describe("daemon lifecycle test-scope validation", () => {
 });
 
 describe("run-owned lifecycle resources", () => {
+  it("rejects non-regular no-follow state descriptors", () => {
+    const fixture = createFixture("owned-descriptor");
+    const descriptor = openSync(fixture.scope.stateDir, "r");
+    try {
+      expect(() => __lifecycleTestUtils.requireRegularFileDescriptor(descriptor))
+        .toThrow("state leaf is not a single-link regular file");
+    } finally {
+      closeSync(descriptor);
+    }
+
+    const stateFile = join(fixture.scope.stateDir, "descriptor-target");
+    const secondLink = join(fixture.root, "descriptor-second-link");
+    writeFileSync(stateFile, "unchanged", { mode: 0o640 });
+    linkSync(stateFile, secondLink);
+    const hardlinkedDescriptor = openSync(stateFile, "r");
+    try {
+      expect(() => __lifecycleTestUtils.requireRegularFileDescriptor(
+        hardlinkedDescriptor,
+      )).toThrow("state leaf is not a single-link regular file");
+    } finally {
+      closeSync(hardlinkedDescriptor);
+    }
+    expect(readFileSync(secondLink, "utf-8")).toBe("unchanged");
+    expect(statSync(secondLink).mode & 0o777).toBe(0o640);
+  });
+
   it("uses only the scoped unit, paths, credentials, environment, and entrypoint", async () => {
     const fixture = createFixture("owned-success");
     const previousSecret = process.env.LCM_SUMMARY_API_KEY;
@@ -588,6 +860,19 @@ describe("run-owned lifecycle resources", () => {
     expect(existsSync(fixture.scope.stateDir)).toBe(false);
     expect(existsSync(fixture.scope.runtimeDir)).toBe(false);
     expect(existsSync(fixture.scope.credentialDir)).toBe(false);
+  });
+
+  it("revalidates and preserves an existing owned token before startup", async () => {
+    const fixture = createFixture("owned-existing-token");
+    writeFileSync(fixture.tokenPath, "existing-token", { mode: 0o640 });
+    await expect(ensureDaemon(scopedOptions(fixture))).resolves.toMatchObject({
+      connected: false,
+      spawned: true,
+      startMethod: "systemd-user",
+    });
+    expect(fixture.runSystemd).toHaveBeenCalledOnce();
+    expect(fixture.stopUnit).toHaveBeenCalledOnce();
+    expect(existsSync(fixture.scope.stateDir)).toBe(false);
   });
 
   it("cleans the exact unit and fallback process after systemd failure", async () => {
@@ -746,6 +1031,336 @@ describe("run-owned lifecycle resources", () => {
     expect(fixture.stopUnit).not.toHaveBeenCalled();
   });
 
+  it("treats an empty owned token as unavailable without leaving its scope", async () => {
+    const fixture = createFixture("owned-empty-token");
+    writeFileSync(fixture.pidPath, "5152");
+    writeFileSync(fixture.tokenPath, "");
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        status: "ok",
+        version: "1.4.2",
+        storageBackend: "sqlite",
+        pid: 5152,
+        ownerId: fixture.scope.ownerId,
+      }),
+    }));
+    const scope = createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        fetch: fetch as never,
+        isProcessAlive: () => true,
+      },
+    });
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      _testScope: scope,
+      _skipSpawn: true,
+      _listeningPortsOverride: () => [48_321],
+    })).resolves.toMatchObject({ connected: false, spawned: false });
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+  });
+
+  it("treats a missing owned token as unavailable without leaving its scope", async () => {
+    const fixture = createFixture("owned-missing-token");
+    writeFileSync(fixture.pidPath, "5155");
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        status: "ok",
+        version: "1.4.2",
+        storageBackend: "sqlite",
+        pid: 5155,
+        ownerId: fixture.scope.ownerId,
+      }),
+    }));
+    const scope = createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        fetch: fetch as never,
+        isProcessAlive: () => true,
+      },
+    });
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      _testScope: scope,
+      _skipSpawn: true,
+      _listeningPortsOverride: () => [48_321],
+    })).resolves.toMatchObject({ connected: false, spawned: false });
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+  });
+
+  it("rejects a token leaf swap immediately before startup token access", async () => {
+    const fixture = createFixture("swap-token-startup");
+    const spawnArgs = [fixture.scope.entrypoint, "daemon", "start", "--foreground"];
+    Object.defineProperty(spawnArgs, "0", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        mkdirSync(fixture.tokenPath);
+        return fixture.scope.entrypoint;
+      },
+    });
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      spawnArgs,
+    })).rejects.toThrow("unsafe daemon lifecycle token access");
+    expect(readdirSync(fixture.tokenPath)).toEqual([]);
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+  });
+
+  it("rejects a token leaf swap after PID identity without accessing the replacement", async () => {
+    const fixture = createFixture("swap-token-after-pid");
+    writeFileSync(fixture.pidPath, "5153");
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        status: "ok",
+        version: "1.4.2",
+        storageBackend: "sqlite",
+        pid: 5153,
+        ownerId: fixture.scope.ownerId,
+      }),
+    }));
+    const scope = createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        fetch: fetch as never,
+        isProcessAlive: () => true,
+      },
+    });
+    const listeningPorts = vi.fn(() => {
+      mkdirSync(fixture.tokenPath);
+      return [48_321];
+    });
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      _testScope: scope,
+      _skipSpawn: true,
+      _listeningPortsOverride: listeningPorts,
+    })).rejects.toThrow("unsafe daemon lifecycle token read");
+    expect(listeningPorts).toHaveBeenCalledOnce();
+    expect(readdirSync(fixture.tokenPath)).toEqual([]);
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+  });
+
+  it("propagates a scoped state swap discovered during stale-PID inspection", async () => {
+    const fixture = createFixture("swap-stale-pid");
+    writeFileSync(fixture.pidPath, "5154");
+    const targetRoot = mkdtempSync(join(tmpdir(), "lcm-lifecycle-stale-target-"));
+    roots.push(targetRoot);
+    writeFileSync(join(targetRoot, "daemon.pid"), "9194", { mode: 0o640 });
+    let swapped = false;
+    const scope = createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        isProcessAlive: () => true,
+        sleep: async () => {
+          if (swapped) return;
+          swapped = true;
+          rmSync(fixture.scope.stateDir, { recursive: true, force: true });
+          symlinkSync(targetRoot, fixture.scope.stateDir, "dir");
+        },
+      },
+    });
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      _testScope: scope,
+      _skipSpawn: true,
+    })).rejects.toThrow("canonical owned file");
+    expect(readFileSync(join(targetRoot, "daemon.pid"), "utf-8")).toBe("9194");
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+  });
+
+  it("rejects a state-root swap during health discovery before PID or token access", async () => {
+    const fixture = createFixture("swap-health");
+    writeFileSync(fixture.pidPath, "5151");
+    ensureAuthToken(fixture.tokenPath);
+    const targetRoot = mkdtempSync(join(tmpdir(), "lcm-lifecycle-health-target-"));
+    roots.push(targetRoot);
+    writeFileSync(join(targetRoot, "daemon.pid"), "9191", { mode: 0o640 });
+    writeFileSync(join(targetRoot, "daemon.token"), "target-secret", { mode: 0o640 });
+    const swapState = (): void => {
+      rmSync(fixture.scope.stateDir, { recursive: true, force: true });
+      symlinkSync(targetRoot, fixture.scope.stateDir, "dir");
+    };
+    const fetch = vi.fn(async () => {
+      swapState();
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          status: "ok",
+          version: "1.4.2",
+          storageBackend: "sqlite",
+          pid: 5151,
+          ownerId: fixture.scope.ownerId,
+        }),
+      };
+    });
+    const scope = createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        fetch: fetch as never,
+        isProcessAlive: () => true,
+      },
+    });
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      _testScope: scope,
+      _skipSpawn: true,
+      _listeningPortsOverride: () => [48_321],
+    })).rejects.toThrow("canonical owned file");
+    expect(readFileSync(join(targetRoot, "daemon.pid"), "utf-8")).toBe("9191");
+    expect(readFileSync(join(targetRoot, "daemon.token"), "utf-8")).toBe("target-secret");
+    expect(statSync(join(targetRoot, "daemon.pid")).mode & 0o777).toBe(0o640);
+    expect(statSync(join(targetRoot, "daemon.token")).mode & 0o777).toBe(0o640);
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+  });
+
+  it("revalidates state after restart validation before access or replacement", async () => {
+    const fixture = createFixture("swap-restart-validator");
+    const targetRoot = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-target-"));
+    roots.push(targetRoot);
+    writeFileSync(join(targetRoot, "daemon.pid"), "9292", { mode: 0o640 });
+    writeFileSync(join(targetRoot, "daemon.token"), "target-secret", { mode: 0o640 });
+    const replacement = vi.fn();
+    const validateBeforeRestart = vi.fn(() => {
+      rmSync(fixture.scope.stateDir, { recursive: true, force: true });
+      symlinkSync(targetRoot, fixture.scope.stateDir, "dir");
+    });
+    await expect(restartDaemon({
+      ...scopedOptions(fixture),
+      validateBeforeRestart,
+      _ensureDaemonOverride: replacement,
+    })).resolves.toMatchObject({
+      connected: false,
+      restarted: false,
+      warning: expect.stringContaining("changed during restart validation"),
+    });
+    expect(validateBeforeRestart).toHaveBeenCalledOnce();
+    expect(replacement).not.toHaveBeenCalled();
+    expect(readFileSync(join(targetRoot, "daemon.pid"), "utf-8")).toBe("9292");
+    expect(readFileSync(join(targetRoot, "daemon.token"), "utf-8")).toBe("target-secret");
+    expect(fixture.scope.dependencies.fetch).not.toHaveBeenCalled();
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+  });
+
+  it("refuses cleanup after an owned root is replaced with a symlink", async () => {
+    const fixture = createFixture("swap-cleanup");
+    const targetRoot = mkdtempSync(join(tmpdir(), "lcm-lifecycle-cleanup-target-"));
+    roots.push(targetRoot);
+    writeFileSync(join(targetRoot, "daemon.pid"), "9393", { mode: 0o640 });
+    writeFileSync(join(targetRoot, "daemon.token"), "target-secret", { mode: 0o640 });
+    const stopUnit = vi.fn(async () => {
+      rmSync(fixture.scope.stateDir, { recursive: true, force: true });
+      symlinkSync(targetRoot, fixture.scope.stateDir, "dir");
+    });
+    const scope = createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        stopUnit,
+      },
+    });
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      _testScope: scope,
+    })).rejects.toThrow("daemon lifecycle cleanup failed");
+    expect(stopUnit).toHaveBeenCalledOnce();
+    expect(readFileSync(join(targetRoot, "daemon.pid"), "utf-8")).toBe("9393");
+    expect(readFileSync(join(targetRoot, "daemon.token"), "utf-8")).toBe("target-secret");
+    expect(statSync(join(targetRoot, "daemon.pid")).mode & 0o777).toBe(0o640);
+    expect(statSync(join(targetRoot, "daemon.token")).mode & 0o777).toBe(0o640);
+  });
+
+  it("attempts every later exact cleanup stage after independent earlier failures", async () => {
+    const fixture = createFixture("cleanup-all-stages");
+    const targetRoot = mkdtempSync(join(tmpdir(), "lcm-lifecycle-stage-target-"));
+    roots.push(targetRoot);
+    const pidTarget = join(targetRoot, "host.pid");
+    const tokenTarget = join(targetRoot, "host.token");
+    const entrypointLink = join(targetRoot, "host-entrypoint.mjs");
+    const credentialTarget = join(targetRoot, "host-credentials");
+    writeFileSync(pidTarget, "8282", { mode: 0o640 });
+    mkdirSync(credentialTarget);
+    writeFileSync(join(credentialTarget, "sentinel"), "credential-target", {
+      mode: 0o640,
+    });
+
+    const stopUnit = vi.fn(async () => {
+      linkSync(pidTarget, fixture.pidPath);
+      linkSync(fixture.tokenPath, tokenTarget);
+      linkSync(fixture.scope.entrypoint, entrypointLink);
+      rmSync(fixture.scope.credentialDir, { recursive: true, force: true });
+      symlinkSync(credentialTarget, fixture.scope.credentialDir, "dir");
+    });
+    const scope = createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        stopUnit,
+      },
+    });
+
+    let failure: unknown;
+    try {
+      await ensureDaemon({
+        ...scopedOptions(fixture),
+        _testScope: scope,
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(AggregateError);
+    const flattenMessages = (error: unknown): string[] => error instanceof AggregateError
+      ? error.errors.flatMap(flattenMessages)
+      : [error instanceof Error ? error.message : String(error)];
+    const messages = flattenMessages(failure);
+    expect(messages.filter(message => message.includes(
+      "state paths changed or escaped",
+    ))).toHaveLength(2);
+    expect(messages).toContain(
+      `lifecycle test cleanup root is not current owned state: ${fixture.scope.runtimeDir}`,
+    );
+    expect(messages).toContain(
+      `lifecycle test cleanup root is not current owned state: ${fixture.scope.credentialDir}`,
+    );
+
+    expect(stopUnit).toHaveBeenCalledOnce();
+    expect(existsSync(fixture.scope.stateDir)).toBe(false);
+    expect(existsSync(fixture.scope.runtimeDir)).toBe(true);
+    expect(existsSync(fixture.scope.credentialDir)).toBe(true);
+    expect(readFileSync(pidTarget, "utf-8")).toBe("8282");
+    expect(statSync(pidTarget).mode & 0o777).toBe(0o640);
+    expect(readFileSync(tokenTarget, "utf-8").trim()).not.toBe("");
+    expect(statSync(tokenTarget).mode & 0o777).toBe(0o600);
+    expect(readFileSync(entrypointLink, "utf-8")).toContain("setTimeout");
+    expect(readFileSync(join(credentialTarget, "sentinel"), "utf-8"))
+      .toBe("credential-target");
+    expect(statSync(join(credentialTarget, "sentinel")).mode & 0o777).toBe(0o640);
+  });
+
   it("keeps two independent scopes from discovering or cleaning each other", async () => {
     const left = createFixture("parallel-left");
     const right = createFixture("parallel-right");
@@ -786,7 +1401,7 @@ describe("run-owned lifecycle resources", () => {
       pidFilePath: join(fixture.root, "foreign", "daemon.pid"),
     })).resolves.toMatchObject({
       restarted: false,
-      warning: expect.stringContaining("outside the owned test scope"),
+      warning: expect.stringContaining("canonical owned state"),
     });
     await expect(restartDaemon({
       port: 37_340,
@@ -816,7 +1431,7 @@ describe("run-owned lifecycle resources", () => {
       connected: false,
       spawned: false,
       restarted: false,
-      warning: expect.stringContaining("PID or token state is outside"),
+      warning: expect.stringContaining("canonical owned state"),
     });
     expect(readFileSync(escapedTokenPath, "utf8")).toBe(tokenBefore);
     expect(statSync(escapedTokenPath).mode & 0o777).toBe(tokenModeBefore);
@@ -904,6 +1519,22 @@ describe("run-owned lifecycle resources", () => {
     });
     expect(fixture.killProcess).toHaveBeenCalledWith(7373, "SIGTERM");
     expect(replacement).toHaveBeenCalledOnce();
+  });
+
+  it("revalidates the owned PID immediately before restart signaling", async () => {
+    const fixture = createFixture("restart-pid-swap");
+    writeFileSync(fixture.pidPath, "7374");
+    const isManaged = vi.fn(async () => {
+      writeFileSync(fixture.pidPath, "8374");
+      return true;
+    });
+    await expect(restartDaemon({
+      ...scopedOptions(fixture),
+      _isManagedProcessOverride: isManaged,
+    })).rejects.toThrow("PID changed before restart signaling");
+    expect(isManaged).toHaveBeenCalledExactlyOnceWith(7374);
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(readFileSync(fixture.pidPath, "utf-8")).toBe("8374");
   });
 
   it("rejects worker authentication and an already-interrupted restart", async () => {
