@@ -19,6 +19,14 @@ function sidecar(overrides: Partial<EventSidecarSummary>): EventSidecarSummary {
     unprocessed: 0,
     errors: 0,
     lastCapture: null,
+    deliveryPending: 0,
+    deliveryClaimed: 0,
+    deliveryRetry: 0,
+    deliveryReplicated: 0,
+    deliveryAcknowledged: 0,
+    deliveryAwaitingRemotePrune: 0,
+    deliveryQuarantined: 0,
+    oldestDeliveryAt: null,
     ...overrides,
   };
 }
@@ -46,6 +54,14 @@ describe("event stats aggregation boundaries", () => {
       sidecars: 5,
       sidecarsWithUnprocessed: 2,
       orphanedSidecarsWithUnprocessed: 1,
+      deliveryPending: 0,
+      deliveryClaimed: 0,
+      deliveryRetry: 0,
+      deliveryReplicated: 0,
+      deliveryAcknowledged: 0,
+      deliveryAwaitingRemotePrune: 0,
+      deliveryQuarantined: 0,
+      oldestDeliveryAt: null,
     });
     expect(sidecarMock).toHaveBeenCalledWith({ timeoutMs: 123 });
   });
@@ -83,5 +99,52 @@ describe("event stats aggregation boundaries", () => {
       "2026-01-07", "2026-01-06", "2026-01-05", "2026-01-04", "2026-01-03",
     ]);
     expect(sidecarMock).toHaveBeenCalledWith({ maxDbs: 9, includeRecentErrors: true });
+  });
+
+  it("defaults delivery fields from legacy summaries and retains the oldest backlog", async () => {
+    const legacy = sidecar({ file: "legacy.db" });
+    for (const field of [
+      "deliveryPending",
+      "deliveryClaimed",
+      "deliveryRetry",
+      "deliveryReplicated",
+      "deliveryAcknowledged",
+      "deliveryAwaitingRemotePrune",
+      "deliveryQuarantined",
+      "oldestDeliveryAt",
+    ] as const) {
+      Reflect.deleteProperty(legacy, field);
+    }
+    const summaries = [
+      sidecar({ file: "oldest.db", oldestDeliveryAt: "2026-01-01" }),
+      sidecar({ file: "newer.db", oldestDeliveryAt: "2026-02-01" }),
+      legacy,
+    ];
+    sidecarMock.mockResolvedValue(summaries);
+
+    await expect(collectEventStats()).resolves.toMatchObject({
+      deliveryPending: 0,
+      deliveryClaimed: 0,
+      deliveryRetry: 0,
+      deliveryReplicated: 0,
+      deliveryAcknowledged: 0,
+      deliveryAwaitingRemotePrune: 0,
+      deliveryQuarantined: 0,
+      oldestDeliveryAt: "2026-01-01",
+    });
+
+    sidecarMock.mockResolvedValue(summaries);
+    const detailed = await collectDetailedEventStats();
+    expect(detailed.oldestDeliveryAt).toBe("2026-01-01");
+    expect(detailed.projects.find(({ file }) => file === "legacy.db")).toMatchObject({
+      deliveryPending: 0,
+      deliveryClaimed: 0,
+      deliveryRetry: 0,
+      deliveryReplicated: 0,
+      deliveryAcknowledged: 0,
+      deliveryAwaitingRemotePrune: 0,
+      deliveryQuarantined: 0,
+      oldestDeliveryAt: null,
+    });
   });
 });

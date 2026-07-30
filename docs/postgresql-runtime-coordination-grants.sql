@@ -35,14 +35,29 @@ ON TABLE lcm.fenced_leases TO :"lcm_runtime_role";
 GRANT USAGE ON SEQUENCE lcm.fenced_leases_fencing_token_seq
 TO :"lcm_runtime_role";
 
-GRANT SELECT ON TABLE lcm.passive_event_inbox
+GRANT SELECT, DELETE ON TABLE lcm.passive_event_inbox
 TO :"lcm_runtime_role";
-GRANT UPDATE (
-  status,
-  attempt_count,
-  claimed_at,
-  claimed_by
-)
+GRANT INSERT (
+  project_id,
+  machine_id,
+  event_id,
+  event_version,
+  machine_sequence,
+  event_type,
+  payload
+),
+      UPDATE (
+        status,
+        attempt_count,
+        next_attempt_at,
+        claimed_at,
+        claimed_by,
+        applied_at,
+        quarantined_at,
+        quarantine_reason
+      )
 ON TABLE lcm.passive_event_inbox TO :"lcm_runtime_role";
+GRANT USAGE ON SEQUENCE lcm.passive_event_inbox_inbox_id_seq
+TO :"lcm_runtime_role";
 
 COMMIT;

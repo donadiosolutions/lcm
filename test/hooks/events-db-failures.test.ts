@@ -22,6 +22,7 @@ vi.mock("../../src/db/connection.js", () => ({
           throw "plain schema-version failure";
         }
       }),
+      all: vi.fn(() => []),
     })),
     exec: vi.fn((sql: string) => {
       state.execSql.push(sql);

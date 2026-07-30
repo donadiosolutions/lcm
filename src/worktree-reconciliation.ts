@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { runLcmMigrations } from "./db/migration.js";
 import { getLcmDbFeatures } from "./db/features.js";
+import { EventsDb } from "./hooks/events-db.js";
 import {
   closeLcmConnection,
   getExistingLcmConnection,
@@ -43,6 +44,11 @@ import {
   withPrivateMutationLock,
 } from "./private-mutation-lock.js";
 import { historicalWorktreeEntriesForProject } from "./codex-project-resolution.js";
+import {
+  allocateLocalHookEventSequences,
+  deriveLegacyLocalHookEventUuid,
+  formatLocalHookMachineSequence,
+} from "./storage/local-hook-event-sequence.js";
 
 const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_PATTERN_BYTES = 1024 * 1024;
@@ -931,26 +937,11 @@ function mergeEventsDatabase(
     source,
     commitFence,
   ) => {
+    const migratedTarget = new EventsDb(targetPath);
+    migratedTarget.close();
     const target = getLcmConnection(targetPath);
     try {
       target.exec(`
-        CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS events (
-          event_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-          seq INTEGER NOT NULL DEFAULT 0, type TEXT NOT NULL, category TEXT NOT NULL,
-          data TEXT NOT NULL, priority INTEGER DEFAULT 3, source_hook TEXT NOT NULL,
-          prev_event_id INTEGER, processed_at TEXT, created_at TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS error_log (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, hook TEXT NOT NULL, error TEXT NOT NULL,
-          session_id TEXT, created_at TEXT DEFAULT (datetime('now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_events_unprocessed ON events(processed_at)
-          WHERE processed_at IS NULL;
-        CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_events_pattern_lookup
-          ON events(type, category, data, created_at);
-        CREATE INDEX IF NOT EXISTS idx_error_log_created ON error_log(created_at);
         CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
           source_hash TEXT PRIMARY KEY,
           merged_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -970,11 +961,27 @@ function mergeEventsDatabase(
           target.exec("COMMIT");
           return;
         }
+        const sourceSchemaVersion = legacyEventsSchemaVersion(source);
+        if (sourceSchemaVersion > 4) {
+          throw new Error(
+            `unsupported legacy events database schema: ${String(sourceSchemaVersion)}`,
+          );
+        }
         const sourceEvents = rows(source, "SELECT * FROM events ORDER BY event_id");
+        const legacySequences = sourceSchemaVersion < 4
+          ? allocateLocalHookEventSequences(
+            sourceEvents.length,
+            join(dirname(targetPath), ".machine-sequence.sqlite"),
+          )
+          : [];
         const sourceEventIds = new Set(sourceEvents.map((event) => Number(event.event_id)));
         const eventMap = new Map<number, number>();
-        for (const sourceEvent of sourceEvents) {
+        for (let sourceIndex = 0; sourceIndex < sourceEvents.length; sourceIndex++) {
+          const sourceEvent = sourceEvents[sourceIndex]!;
           const sourceId = Number(sourceEvent.event_id);
+          const legacyCreatedAt = typeof sourceEvent.created_at === "string"
+            ? sourceEvent.created_at
+            : "1970-01-01 00:00:00";
           const previousSourceId = sourceEvent.prev_event_id === null
             ? null
             : Number(sourceEvent.prev_event_id);
@@ -987,7 +994,46 @@ function mergeEventsDatabase(
               `event ${sourceId} references an unmapped predecessor ${previousSourceId}`,
             );
           }
-          const value: SqlRow = {
+          const value: SqlRow = sourceSchemaVersion < 4 ? {
+            event_uuid: deriveLegacyLocalHookEventUuid({
+              event_id: sourceId,
+              session_id: String(sourceEvent.session_id),
+              seq: Number(sourceEvent.seq),
+              type: String(sourceEvent.type),
+              category: String(sourceEvent.category),
+              data: String(sourceEvent.data),
+              priority: Number(sourceEvent.priority),
+              source_hook: String(sourceEvent.source_hook),
+              created_at: legacyCreatedAt,
+            }),
+            event_version: 1,
+            machine_id: null,
+            machine_sequence: formatLocalHookMachineSequence(legacySequences[sourceIndex]!),
+            session_id: sourceEvent.session_id,
+            seq: sourceEvent.seq,
+            type: sourceEvent.type,
+            category: sourceEvent.category,
+            data: sourceEvent.data,
+            priority: sourceEvent.priority,
+            source_hook: sourceEvent.source_hook,
+            prev_event_id: previousSourceId === null
+              ? null
+              : eventMap.get(previousSourceId) ?? null,
+            processed_at: sourceEvent.processed_at,
+            created_at: legacyCreatedAt,
+            delivery_state: "pending",
+            delivery_generation: 0,
+            delivery_attempts: 0,
+            delivery_owner: null,
+            delivery_claimed_at: null,
+            delivery_next_attempt_at: legacyCreatedAt,
+            delivery_last_error: null,
+            remote_inbox_id: null,
+            quarantine_reason: null,
+            acknowledged_at: null,
+            remote_pruned_at: null,
+            delivery_updated_at: legacyCreatedAt,
+          } : {
             ...sourceEvent,
             prev_event_id: previousSourceId === null
               ? null
@@ -996,28 +1042,126 @@ function mergeEventsDatabase(
           delete value.event_id;
           const existing = row(
             target,
-            `SELECT * FROM events
-             WHERE session_id IS ? AND seq IS ? AND type IS ? AND category IS ?
-               AND data IS ? AND priority IS ? AND source_hook IS ?
-               AND prev_event_id IS ? AND processed_at IS ? AND created_at IS ?
-             ORDER BY event_id LIMIT 1`,
-            value.session_id,
-            value.seq,
-            value.type,
-            value.category,
-            value.data,
-            value.priority,
-            value.source_hook,
-            value.prev_event_id,
-            value.processed_at,
-            value.created_at,
+            "SELECT * FROM events WHERE event_uuid = ?",
+            value.event_uuid,
           );
-          const targetId = existing
-            ? Number(existing.event_id)
-            : Number(insertRow(target, "events", value));
+          let targetId: number;
+          if (!existing) {
+            targetId = Number(insertRow(target, "events", value));
+          } else {
+            targetId = Number(existing.event_id);
+            const immutableColumns = [
+              "event_uuid",
+              "event_version",
+              "session_id",
+              "seq",
+              "type",
+              "category",
+              "data",
+              "priority",
+              "source_hook",
+              "created_at",
+            ] as const;
+            if (
+              immutableColumns.some((column) =>
+                comparable(existing[column]) !== comparable(value[column]))
+              || (
+                sourceSchemaVersion >= 4
+                && (
+                  comparable(existing.machine_sequence)
+                    !== comparable(value.machine_sequence)
+                  || (
+                    existing.machine_id !== null
+                    && value.machine_id !== null
+                    && comparable(existing.machine_id) !== comparable(value.machine_id)
+                  )
+                )
+              )
+            ) {
+              throw new Error(`divergent passive event UUID collision: ${String(value.event_uuid)}`);
+            }
+            const existingGeneration = Number(existing.delivery_generation);
+            const sourceGeneration = Number(value.delivery_generation);
+            if (
+              !Number.isSafeInteger(existingGeneration)
+              || !Number.isSafeInteger(sourceGeneration)
+              || existingGeneration < 0
+              || sourceGeneration < 0
+            ) {
+              throw new Error(`invalid passive event delivery generation: ${String(value.event_uuid)}`);
+            }
+            if (
+              existing.prev_event_id !== null
+              && value.prev_event_id !== null
+              && comparable(existing.prev_event_id) !== comparable(value.prev_event_id)
+            ) {
+              throw new Error(`divergent passive event predecessor: ${String(value.event_uuid)}`);
+            }
+            const deliveryColumns = [
+              "delivery_state",
+              "delivery_generation",
+              "delivery_attempts",
+              "delivery_owner",
+              "delivery_claimed_at",
+              "delivery_next_attempt_at",
+              "delivery_last_error",
+              "remote_inbox_id",
+              "quarantine_reason",
+              "acknowledged_at",
+              "remote_pruned_at",
+            ] as const;
+            if (
+              sourceGeneration === existingGeneration
+              && deliveryColumns.some((column) =>
+                comparable(existing[column]) !== comparable(value[column]))
+            ) {
+              throw new Error(`divergent passive event delivery state: ${String(value.event_uuid)}`);
+            }
+            const earliest = (
+              left: SQLInputValue,
+              right: SQLInputValue,
+            ): SQLInputValue => {
+              if (left === null) return right;
+              if (right === null) return left;
+              return comparable(left) <= comparable(right) ? left : right;
+            };
+            const latest = (
+              left: SQLInputValue,
+              right: SQLInputValue,
+            ): SQLInputValue => comparable(left) >= comparable(right) ? left : right;
+            const sourceWins = sourceGeneration > existingGeneration;
+            const merged: SqlRow = {
+              machine_id: existing.machine_id ?? value.machine_id,
+              prev_event_id: existing.prev_event_id ?? value.prev_event_id,
+              processed_at: earliest(existing.processed_at, value.processed_at),
+              ...Object.fromEntries(deliveryColumns.map((column) => [
+                column,
+                sourceWins ? value[column] : existing[column],
+              ])),
+              delivery_updated_at: sourceGeneration === existingGeneration
+                ? latest(existing.delivery_updated_at, value.delivery_updated_at)
+                : sourceWins
+                  ? value.delivery_updated_at
+                  : existing.delivery_updated_at,
+            };
+            const mutableColumns = [
+              "machine_id",
+              "prev_event_id",
+              "processed_at",
+              ...deliveryColumns,
+              "delivery_updated_at",
+            ] as const;
+            if (mutableColumns.some((column) =>
+              comparable(existing[column]) !== comparable(merged[column]))) {
+              target.prepare(`
+                UPDATE events
+                SET ${mutableColumns.map((column) => `${column} = ?`).join(", ")}
+                WHERE event_id = ?
+              `).run(...mutableColumns.map((column) => merged[column]), targetId);
+            }
+          }
           eventMap.set(sourceId, targetId);
         }
-        const sourceSchemaVersion = legacyEventsSchemaVersion(source);
         const sourceHasErrorLog = tableExists(source, "error_log");
         if (!sourceHasErrorLog && sourceSchemaVersion !== 1) {
           throw new Error(

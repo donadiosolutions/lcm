@@ -40,6 +40,14 @@ import {
   isCanonicalOrMissingLifecycleTestStateFile,
   isDaemonLifecycleTestIdentity,
 } from "../src/daemon/lifecycle-scope.js";
+import type {
+  LocalHookEventRow,
+  LocalHookOutboxRepository,
+} from "../src/storage/local-hook-outbox.js";
+import type {
+  PostgreSqlPassiveEventRecord,
+  PostgreSqlPassiveEventRepository,
+} from "../src/storage/postgresql/passive-event-repository.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -461,6 +469,127 @@ export function registerMemoryCommands(program: Command): void {
 async function loadIdentityStorageConfig() {
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
   return loadDaemonConfig(defaultConfigPath()).storage;
+}
+
+interface PassiveEventOperatorSession {
+  readonly local: LocalHookOutboxRepository;
+  readonly remote: PostgreSqlPassiveEventRepository;
+  close(): Promise<void>;
+}
+
+async function openPassiveEventOperatorSession(): Promise<PassiveEventOperatorSession> {
+  const storage = await loadIdentityStorageConfig();
+  if (storage.backend !== "postgresql") {
+    throw new Error(
+      "remote passive-event commands require storage.backend \"postgresql\"",
+    );
+  }
+  const [{ resolveProjectIdentity }, { requireMachineIdentity }, runtimeModule, repositoryModule, outboxModule, pathModule] =
+    await Promise.all([
+      import("../src/project-map.js"),
+      import("../src/machine-identity.js"),
+      import("../src/storage/postgresql/runtime.js"),
+      import("../src/storage/postgresql/passive-event-repository.js"),
+      import("../src/storage/local-hook-outbox.js"),
+      import("../src/db/events-path.js"),
+    ]);
+  const project = resolveProjectIdentity(process.cwd());
+  if (!project.remoteProjectId) {
+    throw new Error(
+      "local project has no PostgreSQL binding; run `lcm project create` or `lcm project link <project-id>`",
+    );
+  }
+  const machine = requireMachineIdentity();
+  const runtime = new runtimeModule.PostgreSqlRuntime(storage.postgresql);
+  const outboxFactory = new outboxModule.SQLiteLocalHookOutboxFactory();
+  let local: LocalHookOutboxRepository | undefined;
+  try {
+    const health = await runtime.health();
+    if (health.status !== "healthy") {
+      throw health.error ?? new Error("PostgreSQL passive-event storage is unavailable");
+    }
+    local = await outboxFactory.open(pathModule.eventsDbPath(process.cwd()));
+    return {
+      local,
+      remote: new repositoryModule.PostgreSqlPassiveEventRepository(
+        runtime,
+        project.remoteProjectId,
+        machine.machineId,
+      ),
+      close: async () => {
+        await Promise.all([
+          outboxFactory.close(),
+          runtime.close(),
+        ]);
+      },
+    };
+  } catch (error) {
+    await Promise.allSettled([
+      outboxFactory.close(),
+      runtime.close(),
+    ]);
+    throw error;
+  }
+}
+
+async function withPassiveEventOperatorSession<T>(
+  operation: (session: PassiveEventOperatorSession) => Promise<T>,
+): Promise<T> {
+  const session = await openPassiveEventOperatorSession();
+  try {
+    return await operation(session);
+  } finally {
+    await session.close();
+  }
+}
+
+function passiveEventReadbackMatches(
+  local: LocalHookEventRow,
+  remote: PostgreSqlPassiveEventRecord,
+): boolean {
+  const payload = remote.payload as Record<string, unknown>;
+  return local.machine_id === remote.machineId
+    && local.event_uuid === remote.eventId
+    && local.event_version === remote.eventVersion
+    && BigInt(local.machine_sequence) === remote.machineSequence
+    && local.type === remote.eventType
+    && payload.sessionId === local.session_id
+    && payload.sessionSequence === local.seq
+    && payload.category === local.category
+    && payload.data === local.data
+    && payload.priority === local.priority
+    && payload.sourceHook === local.source_hook
+    && payload.previousEventId === local.prev_event_id
+    && payload.createdAt === local.created_at;
+}
+
+function serializablePassiveEvent(record: PostgreSqlPassiveEventRecord): Record<string, unknown> {
+  return {
+    ...record,
+    inboxId: record.inboxId.toString(),
+    machineSequence: record.machineSequence.toString(),
+  };
+}
+
+function serializableCoordinationDiagnostics(
+  diagnostics: Awaited<ReturnType<PostgreSqlPassiveEventRepository["getDiagnostics"]>>,
+): Record<string, unknown> {
+  return {
+    leases: {
+      ...diagnostics.leases,
+      active: diagnostics.leases.active.toString(),
+      expired: diagnostics.leases.expired.toString(),
+      released: diagnostics.leases.released.toString(),
+    },
+    queue: {
+      ...diagnostics.queue,
+      pending: diagnostics.queue.pending.toString(),
+      claimed: diagnostics.queue.claimed.toString(),
+      retry: diagnostics.queue.retry.toString(),
+      applied: diagnostics.queue.applied.toString(),
+      quarantined: diagnostics.queue.quarantined.toString(),
+    },
+  };
 }
 
 export function registerProjectCommand(program: Command): void {
@@ -1669,7 +1798,9 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       const { printHelp } = await import("../src/cli-help.js");
       printHelp("events"); exit(0);
     }
-    console.error("Usage: lcm events promote [--all] [--json]");
+    console.error(
+      "Usage: lcm events <promote|status|validate|quarantine|replay> [options]",
+    );
     exit(1);
   });
 
@@ -1715,6 +1846,211 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         if (result.message) console.log(result.message);
       }
       if (failed) exit(1);
+    });
+
+  const passiveOperatorError = (error: unknown, json: boolean): never => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (json) printJson({ error: message });
+    else console.error(`Error: ${message}`);
+    return exit(1);
+  };
+
+  eventsCmd
+    .command("status")
+    .description("Show staged local and PostgreSQL passive-event delivery status")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (opts) => {
+      if (opts.help || cliArgv.includes("-h") || cliArgv.includes("--help")) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("events"); exit(0);
+      }
+      const jsonFlag: boolean = opts.json ?? false;
+      try {
+        const output = await withPassiveEventOperatorSession(async ({ local, remote }) => ({
+          local: await local.getDeliveryDiagnostics(),
+          remote: serializableCoordinationDiagnostics(await remote.getDiagnostics()),
+        }));
+        if (jsonFlag) {
+          printJson(output);
+          return;
+        }
+        const local = output.local;
+        const queue = output.remote.queue as Record<string, string | null>;
+        console.log(
+          `Local: ${local.pending} pending, ${local.claimed} claimed, ${local.retry} retry, `
+          + `${local.replicated} replicated, ${local.acknowledged} acknowledged, `
+          + `${local.awaitingRemotePrune} awaiting remote prune, `
+          + `${local.quarantined} quarantined.`,
+        );
+        console.log(
+          `PostgreSQL: ${queue.pending} pending, ${queue.claimed} claimed, `
+          + `${queue.retry} retry, ${queue.applied} applied, `
+          + `${queue.quarantined} quarantined.`,
+        );
+      } catch (error) {
+        passiveOperatorError(error, jsonFlag);
+      }
+    });
+
+  eventsCmd
+    .command("validate")
+    .description("Validate staged local-to-PostgreSQL passive-event readback")
+    .option("--limit <n>", "Maximum replicated or quarantined events to validate", "100")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (opts) => {
+      if (opts.help || cliArgv.includes("-h") || cliArgv.includes("--help")) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("events"); exit(0);
+      }
+      const jsonFlag: boolean = opts.json ?? false;
+      try {
+        const limit = parsePositiveInteger(String(opts.limit), "--limit");
+        if (limit > 500) throw new Error("--limit must not exceed 500");
+        const output = await withPassiveEventOperatorSession(async ({ local, remote }) => {
+          const events = await local.listAwaitingRemote(limit, true);
+          const records = events.length === 0
+            ? []
+            : await remote.readEvents(events.map((event) => ({
+              machineId: event.machine_id!,
+              eventId: event.event_uuid,
+            })));
+          const byId = new Map(records.map((record) => [record.eventId, record]));
+          const missing: string[] = [];
+          const mismatched: string[] = [];
+          let matched = 0;
+          for (const event of events) {
+            const record = byId.get(event.event_uuid);
+            if (!record) missing.push(event.event_uuid);
+            else if (!passiveEventReadbackMatches(event, record)) {
+              mismatched.push(event.event_uuid);
+            } else {
+              matched += 1;
+            }
+          }
+          return { checked: events.length, matched, missing, mismatched };
+        });
+        if (jsonFlag) {
+          printJson(output);
+        } else {
+          console.log(
+            `Validated ${output.checked} event${output.checked === 1 ? "" : "s"}: `
+            + `${output.matched} matched, ${output.missing.length} missing, `
+            + `${output.mismatched.length} mismatched.`,
+          );
+        }
+        if (output.missing.length > 0 || output.mismatched.length > 0) {
+          process.exitCode = 1;
+        }
+      } catch (error) {
+        passiveOperatorError(error, jsonFlag);
+      }
+    });
+
+  eventsCmd
+    .command("quarantine")
+    .description("Inspect quarantined local and PostgreSQL passive events")
+    .option("--limit <n>", "Maximum quarantined events to list", "100")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (opts) => {
+      if (opts.help || cliArgv.includes("-h") || cliArgv.includes("--help")) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("events"); exit(0);
+      }
+      const jsonFlag: boolean = opts.json ?? false;
+      try {
+        const limit = parsePositiveInteger(String(opts.limit), "--limit");
+        if (limit > 500) throw new Error("--limit must not exceed 500");
+        const output = await withPassiveEventOperatorSession(async ({ local, remote }) => ({
+          local: await local.listQuarantined(limit),
+          remote: (await remote.listQuarantined(limit)).map(serializablePassiveEvent),
+        }));
+        if (jsonFlag) {
+          printJson(output);
+          return;
+        }
+        if (output.local.length === 0 && output.remote.length === 0) {
+          console.log("No quarantined local or PostgreSQL passive events.");
+          return;
+        }
+        for (const record of output.local) {
+          console.log(
+            `${record.event_uuid}  source=local  machine=${record.machine_id ?? "unassigned"}  `
+            + `sequence=${BigInt(record.machine_sequence).toString()}  `
+            + `reason=${sanitizeTerminalText(record.quarantine_reason ?? "unknown")}`,
+          );
+        }
+        for (const record of output.remote) {
+          console.log(
+            `${String(record.eventId)}  source=postgresql  machine=${String(record.machineId)}  `
+            + `sequence=${String(record.machineSequence)}  `
+            + `reason=${sanitizeTerminalText(String(record.quarantineReason ?? "unknown"))}`,
+          );
+        }
+      } catch (error) {
+        passiveOperatorError(error, jsonFlag);
+      }
+    });
+
+  eventsCmd
+    .command("replay <event-id>")
+    .description("Replay one exact quarantined local or PostgreSQL passive event")
+    .option("--machine <machine-id>", "Owning machine UUID; defaults to this machine")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (eventId: string, opts) => {
+      if (opts.help || cliArgv.includes("-h") || cliArgv.includes("--help")) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("events"); exit(0);
+      }
+      const jsonFlag: boolean = opts.json ?? false;
+      try {
+        const output = await withPassiveEventOperatorSession(async ({ local, remote }) => {
+          const key = {
+            machineId: typeof opts.machine === "string" ? opts.machine : remote.machineId,
+            eventId,
+          };
+          const existing = await remote.readEvent(key);
+          if (existing?.status !== "quarantined") {
+            const localReplayed = await local.replayQuarantined(eventId);
+            return {
+              replayed: localReplayed,
+              localReplayed,
+              event: localReplayed && existing
+                ? serializablePassiveEvent(existing)
+                : null,
+            };
+          }
+          // Move the local checkpoint first. If the process dies before or
+          // during the remote transition, normal readback reconciliation can
+          // restore quarantine or observe the completed remote replay.
+          const localReplayed = await local.replayQuarantined(existing.eventId);
+          const transitioned = await remote.replayQuarantined(key);
+          const record = transitioned ?? await remote.readEvent(key);
+          const replayed = record?.status === "pending";
+          return {
+            replayed,
+            localReplayed,
+            event: replayed ? serializablePassiveEvent(record) : null,
+          };
+        });
+        if (jsonFlag) {
+          printJson(output);
+        } else if (output.replayed) {
+          console.log(`Replayed passive event ${eventId}.`);
+        } else {
+          console.log(`Passive event ${eventId} is not quarantined.`);
+        }
+        if (!output.replayed) process.exitCode = 1;
+      } catch (error) {
+        passiveOperatorError(error, jsonFlag);
+      }
     });
 
   program.addCommand(eventsCmd);
