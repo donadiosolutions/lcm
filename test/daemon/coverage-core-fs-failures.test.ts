@@ -1,4 +1,8 @@
 import * as realFs from "node:fs";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 afterEach(() => {
@@ -66,5 +70,33 @@ describe("daemon filesystem failure boundaries", () => {
     vi.doMock("node:fs", () => ({ ...realFs, readFileSync }));
     const { PKG_VERSION } = await import("../../src/daemon/version.js");
     expect(PKG_VERSION).toBe("9.8.7");
+  });
+
+  it("captures the executing lcm.mjs entrypoint and only hashes a readable packaged runtime", async () => {
+    vi.resetModules();
+    const runtimeDir = realFs.mkdtempSync(join(tmpdir(), "lcm-runtime-digest-"));
+    const runtimePath = join(runtimeDir, "lcm.mjs");
+    const runtime = "packaged runtime bytes";
+    realFs.writeFileSync(runtimePath, runtime);
+    try {
+      const {
+        PACKAGED_RUNTIME_ENTRYPOINT,
+        RUNTIME_DIGEST,
+        packagedRuntimeDigest,
+        packagedRuntimeEntrypoint,
+      } = await import("../../src/daemon/version.js");
+      expect(PACKAGED_RUNTIME_ENTRYPOINT).toBeUndefined();
+      expect(RUNTIME_DIGEST).toBeUndefined();
+      expect(packagedRuntimeEntrypoint("https://example.test/lcm.mjs")).toBeUndefined();
+      expect(packagedRuntimeEntrypoint(pathToFileURL(join(runtimeDir, "version.js")).href)).toBeUndefined();
+      expect(packagedRuntimeEntrypoint(pathToFileURL(runtimePath).href)).toBe(runtimePath);
+      expect(packagedRuntimeDigest(pathToFileURL(join(runtimeDir, "version.js")).href)).toBeUndefined();
+      expect(packagedRuntimeDigest(pathToFileURL(join(runtimeDir, "missing", "lcm.mjs")).href)).toBeUndefined();
+      expect(packagedRuntimeDigest(pathToFileURL(runtimePath).href)).toBe(
+        createHash("sha256").update(runtime).digest("hex"),
+      );
+    } finally {
+      realFs.rmSync(runtimeDir, { recursive: true, force: true });
+    }
   });
 });

@@ -204,9 +204,10 @@ describe("mocked server states unavailable from Node HTTP", () => {
     ensureAuthToken(tokenPath);
     const token = readAuthToken(tokenPath)!;
     state.health = { status: "unavailable", backend: "sqlite" };
+    const runtimeDigest = "b".repeat(64);
     const daemon = await createDaemon(
       loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }),
-      { tokenPath },
+      { tokenPath, _runtimeDigest: runtimeDigest },
     );
     const request = async (authorization?: string): Promise<{ status: number; body: Record<string, unknown> }> => {
       let status = 0;
@@ -256,6 +257,7 @@ describe("mocked server states unavailable from Node HTTP", () => {
         status: "unavailable",
         storageBackend: "sqlite",
         entrypoint: expect.any(String),
+        runtimeDigest,
         storage: { status: "unavailable" },
       });
       expect(state.healthFactory).toHaveBeenCalledOnce();

@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { basename, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { packageRootFor } from "../runtime-root.js";
 
@@ -28,3 +29,38 @@ export const PKG_VERSION: string | undefined = (() => {
   }
   return undefined;
 })();
+
+/**
+ * Resolve the packaged single-file runtime identified by a module URL.
+ *
+ * Source and separately compiled modules intentionally return `undefined`;
+ * only the executing `lcm.mjs` bundle is a stable packaged entrypoint.
+ */
+export function packagedRuntimeEntrypoint(moduleUrl: string): string | undefined {
+  try {
+    const runtimePath = fileURLToPath(moduleUrl);
+    return basename(runtimePath) === "lcm.mjs" ? runtimePath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Hash the packaged single-file runtime identified by a module URL.
+ *
+ * The exported entrypoint and digest below are captured once when the process
+ * loads this module, so a later in-place rebuild cannot make a stale daemon
+ * claim either part of the new runtime identity.
+ */
+export function packagedRuntimeDigest(moduleUrl: string): string | undefined {
+  const runtimePath = packagedRuntimeEntrypoint(moduleUrl);
+  if (runtimePath === undefined) return undefined;
+  try {
+    return createHash("sha256").update(readFileSync(runtimePath)).digest("hex");
+  } catch {
+    return undefined;
+  }
+}
+
+export const PACKAGED_RUNTIME_ENTRYPOINT: string | undefined = packagedRuntimeEntrypoint(import.meta.url);
+export const RUNTIME_DIGEST: string | undefined = packagedRuntimeDigest(import.meta.url);

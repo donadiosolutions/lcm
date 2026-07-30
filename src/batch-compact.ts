@@ -1,9 +1,8 @@
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { homedir } from "node:os";
 import { runLcmMigrations } from "./db/migration.js";
 import { closeLcmConnection, getLcmConnection } from "./db/connection.js";
-import type { ProgressState } from "./cli/progress-state.js";
+import type { ProgressPhaseError, ProgressState } from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
 import { projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
@@ -32,6 +31,16 @@ type ReplayContextRow = {
   item_type: "message" | "summary";
   depth: number | null;
   token_count: number;
+};
+
+type ProjectScanFailure = {
+  target: string;
+  message: string;
+};
+
+type UncompactedDiscovery = {
+  conversations: UncompactedConversation[];
+  failures: ProjectScanFailure[];
 };
 
 const MANUAL_COMPACT_LEAF_MIN_FANOUT = 3;
@@ -79,6 +88,15 @@ function projectMatchesCwdFilter(projectHash: string, cwd: string, cwdFilter?: s
   const normalizedFilter = normalizeProjectPath(cwdFilter);
   if (normalizeProjectPath(cwd) === normalizedFilter) return true;
   return false;
+}
+
+function metadataFailureMatchesCwdFilter(projectHash: string, cwdFilter?: string): boolean {
+  if (!cwdFilter) return true;
+  try {
+    return projectMapPathsForHash(projectHash).includes(resolve(cwdFilter));
+  } catch {
+    return false;
+  }
 }
 
 function hasReplayCondensationCandidate(db: ReturnType<typeof getLcmConnection>, conversationId: number): boolean {
@@ -131,11 +149,12 @@ function hasReplayCondensationCandidate(db: ReturnType<typeof getLcmConnection>,
   return false;
 }
 
-export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedConversation[] {
+function discoverUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedDiscovery {
   const baseDir = lcmProjectsDir();
-  if (!existsSync(baseDir)) return [];
+  if (!existsSync(baseDir)) return { conversations: [], failures: [] };
 
-  const results: UncompactedConversation[] = [];
+  const conversations: UncompactedConversation[] = [];
+  const failures: ProjectScanFailure[] = [];
 
   for (const entry of readdirSync(baseDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
@@ -144,13 +163,28 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
     if (!existsSync(dbPath)) continue;
 
     const metaPath = join(projDir, "meta.json");
-    let cwd = "";
-    if (existsSync(metaPath)) {
-      try {
-        cwd = JSON.parse(readFileSync(metaPath, "utf-8")).cwd ?? "";
-      } catch { /* skip corrupt meta */ }
+    if (!existsSync(metaPath)) {
+      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter)) {
+        failures.push({ target: entry.name, message: "project metadata is missing" });
+      }
+      continue;
     }
-    if (!cwd) continue;
+    let metadata: unknown;
+    try {
+      metadata = JSON.parse(readFileSync(metaPath, "utf-8")) as unknown;
+    } catch {
+      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter)) {
+        failures.push({ target: entry.name, message: "project metadata is unreadable or malformed" });
+      }
+      continue;
+    }
+    const cwd = Object(metadata).cwd as unknown;
+    if (typeof cwd !== "string" || cwd.trim().length === 0) {
+      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter)) {
+        failures.push({ target: entry.name, message: "project metadata cwd must be a non-empty string" });
+      }
+      continue;
+    }
     if (!projectMatchesCwdFilter(entry.name, cwd, cwdFilter)) continue;
 
     try {
@@ -187,7 +221,7 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
         for (const row of rows) {
           const hasRawWork = row.raw_context_messages > MANUAL_COMPACT_FRESH_TAIL_COUNT;
           if (!hasRawWork && !(replay && hasReplayCondensationCandidate(db, row.conversation_id))) continue;
-          results.push({
+          conversations.push({
             projectDir: projDir,
             cwd,
             conversationId: row.conversation_id,
@@ -199,10 +233,19 @@ export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?:
       } finally {
         closeLcmConnection(dbPath, db);
       }
-    } catch { /* skip corrupt databases */ }
+    } catch (error) {
+      failures.push({
+        target: cwd,
+        message: String(error).replace(/^Error:\s*/, ""),
+      });
+    }
   }
 
-  return results;
+  return { conversations, failures };
+}
+
+export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedConversation[] {
+  return discoverUncompacted(minTokens, readOnly, cwdFilter, replay).conversations;
 }
 
 /** Compact all uncompacted conversations above threshold via the daemon. */
@@ -220,19 +263,43 @@ export async function batchCompact(opts: {
   /** Called with state patches as each session is processed — used by the ninja renderer */
   onProgress?: (patch: Partial<ProgressState>) => void;
 }): Promise<BatchCompactResult> {
-  const conversations = findUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay);
+  const discovery = discoverUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay);
+  const conversations = discovery.conversations;
   const onProgress = opts.onProgress;
+  const phaseErrors: ProgressPhaseError[] = discovery.failures.map(failure => ({
+    phase: "Compact",
+    target: failure.target,
+    message: failure.message,
+  }));
 
-  if (conversations.length === 0) {
+  if (phaseErrors.length > 0) {
+    for (const failure of phaseErrors) {
+      console.error(`  compact scan failed for ${failure.target}: ${failure.message}`);
+    }
+  }
+
+  if (conversations.length === 0 && phaseErrors.length === 0) {
     console.log("Nothing to compact — no sessions are currently eligible.");
     return { compacted: 0, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [] };
   }
 
+  onProgress?.(phaseErrors.length > 0
+    ? { total: conversations.length, phaseErrors }
+    : { total: conversations.length });
+
+  if (conversations.length === 0) {
+    console.error("No sessions were compacted because project discovery failed.");
+    return {
+      compacted: 0,
+      unchanged: 0,
+      skipped: 0,
+      failures: phaseErrors.length,
+      compactedProjects: [],
+    };
+  }
+
   const totalTokens = conversations.reduce((s, c) => s + c.tokens, 0);
   console.log(`Found ${conversations.length} uncompacted conversation${conversations.length > 1 ? "s" : ""} (${(totalTokens / 1000).toFixed(1)}k tokens)\n`);
-
-  // Notify renderer of total so it can show accurate progress
-  onProgress?.({ total: conversations.length });
 
   let compacted = 0;
   let unchanged = 0;
@@ -362,5 +429,11 @@ export async function batchCompact(opts: {
     }
   }
 
-  return { compacted, unchanged, skipped, failures: progressErrors.length, compactedProjects: [...compactedProjects] };
+  return {
+    compacted,
+    unchanged,
+    skipped,
+    failures: phaseErrors.length + progressErrors.length,
+    compactedProjects: [...compactedProjects],
+  };
 }

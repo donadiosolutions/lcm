@@ -151,7 +151,25 @@ function instructionTableColumns(
 }
 
 function normalizedSql(sql: string): string {
-  return sql.replace(/\s+/gu, " ").trim().toLowerCase();
+  // SQL keywords and unquoted identifiers are case-insensitive, but CHECK
+  // literals are data. Protect every SQLite quoting form before normalizing.
+  const quotedSegments: string[] = [];
+  const unquotedSql = sql.replace(
+    /'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[(?:[^\]]|\]\])*\]/gu,
+    (segment) => {
+      const placeholder = `\0${quotedSegments.length}\0`;
+      quotedSegments.push(segment);
+      return placeholder;
+    },
+  );
+  return unquotedSql
+    .replace(/\s+/gu, " ")
+    .trim()
+    .toLowerCase()
+    .replace(
+      /\0(\d+)\0/gu,
+      (_placeholder, index: string) => quotedSegments[Number(index)]!,
+    );
 }
 
 function hasNoAuxiliaryInstructionObjects(
@@ -169,6 +187,12 @@ function hasOnlyCurrentInstructionAutoindex(
     tbl_name: "session_instruction_cache",
     sql: null,
   }]);
+}
+
+function legacyInstructionSourceIsEmpty(db: DatabaseSync): boolean {
+  return db.prepare(
+    "SELECT 1 FROM session_instructions LIMIT 1",
+  ).get() === undefined;
 }
 
 function unexpectedInstructionSchemaReferences(
@@ -227,12 +251,12 @@ function inspectInstructionCacheSchema(db: DatabaseSync): {
     && normalizedSql(cache.sql) === normalizedSql(CURRENT_INSTRUCTION_CACHE_SQL)
     && hasOnlyCurrentInstructionAutoindex(cache.auxiliaryObjects)
   ) {
-    if (legacySource) {
+    if (legacySource && !legacyInstructionSourceIsEmpty(db)) {
       throw new Error(
         "unsupported ambiguous instruction-cache schema; database was not modified",
       );
     }
-    return { cache: "current", hasLegacySource: false };
+    return { cache: "current", hasLegacySource: legacySource !== null };
   }
   throw new Error("unsupported session_instruction_cache schema; database was not modified");
 }
@@ -243,11 +267,14 @@ function migrateInstructionCache(
 ): void {
   // Preflight runs before any other migration statement so unknown, partial,
   // or ambiguous cache schemas leave the complete original database intact.
-  const schema = inspectInstructionCacheSchema(db);
+  let schema = inspectInstructionCacheSchema(db);
   if (schema.cache === "current" && !schema.hasLegacySource) return;
   db.exec("BEGIN IMMEDIATE");
   try {
     observer?.("after-begin");
+    // Revalidate after acquiring the write lock. In particular, never drop the
+    // stale-daemon artifact if another writer populated it after preflight.
+    schema = inspectInstructionCacheSchema(db);
     if (schema.cache === "legacy") {
       db.exec("DROP TABLE session_instruction_cache");
     }

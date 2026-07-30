@@ -4,7 +4,7 @@ import { platform as osPlatform } from "node:os";
 import { join, dirname, posix, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { managedDaemonPath, SYSTEMD_DAEMON_PATH } from "./managed-path.js";
-import { PKG_VERSION } from "./version.js";
+import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "./version.js";
 import type { StorageBackend } from "./config.js";
 import {
   isStagedPostgreSqlHealth,
@@ -28,6 +28,7 @@ export type EnsureDaemonOptions = {
   expectedVersion?: string;
   expectedStorageBackend?: StorageBackend;
   expectedEntrypoint?: string;
+  expectedRuntimeDigest?: string;
   enforceUserManagerParent?: boolean;
   spawnCommand?: string;
   spawnArgs?: string[];
@@ -47,6 +48,8 @@ export type EnsureDaemonOptions = {
   _isProcessAliveOverride?: (pid: number) => boolean;
   /** @internal Deterministic executable-canonicalization seam for lifecycle tests. */
   _realpathOverride?: (path: string) => string;
+  /** @internal Deterministic packaged-entrypoint seam for lifecycle tests. */
+  _packagedEntrypointOverride?: string;
   /** @internal Deterministic listener-ownership seam for lifecycle tests. */
   _listeningPortsOverride?: (pid: number) => number[];
 };
@@ -82,6 +85,7 @@ type HealthResponse = {
   uptime?: number;
   pid?: number;
   entrypoint?: string;
+  runtimeDigest?: string;
   httpStatus?: number;
   storage?: {
     status?: string;
@@ -114,6 +118,17 @@ function healthStorageBackendMatches(
   return (health?.storageBackend ?? "sqlite") === expectedStorageBackend;
 }
 
+function healthRuntimeDigestMatches(
+  health: HealthResponse | null,
+  expectedRuntimeDigest: string | undefined,
+): boolean {
+  // Source-only development has no packaged single-file runtime to hash. Every
+  // packaged invocation has a digest and therefore takes the strict branch.
+  if (expectedRuntimeDigest === undefined) return true;
+  return typeof health?.runtimeDigest === "string"
+    && health.runtimeDigest === expectedRuntimeDigest;
+}
+
 function recognizedHealthStorageBackend(health: HealthResponse): StorageBackend | null {
   const backend = health.storageBackend ?? "sqlite";
   return backend === "sqlite" || backend === "postgresql" ? backend : null;
@@ -122,7 +137,14 @@ function recognizedHealthStorageBackend(health: HealthResponse): StorageBackend 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const STORAGE_BACKEND_AUTH_WARNING = "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
+const RUNTIME_DIGEST_AUTH_WARNING = "daemon reuse or replacement was blocked because the packaged-runtime digest mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
+
+function mismatchAuthWarning(storageBackendMatches: boolean): string {
+  return storageBackendMatches
+    ? RUNTIME_DIGEST_AUTH_WARNING
+    : STORAGE_BACKEND_AUTH_WARNING;
+}
 
 type ProcessDiagnosticSource =
   | "credential setup error"
@@ -896,7 +918,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const enforceParent = opts.enforceUserManagerParent === true && platform === "linux";
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   const expectedStorageBackend = opts.expectedStorageBackend ?? "sqlite";
-  const expectedEntrypoint = opts.expectedEntrypoint;
+  const expectedEntrypoint = opts.expectedEntrypoint
+    ?? opts._packagedEntrypointOverride
+    ?? PACKAGED_RUNTIME_ENTRYPOINT;
+  const expectedRuntimeDigest = opts.expectedRuntimeDigest ?? RUNTIME_DIGEST;
   let restartedForParent = false;
 
   if (typeof expectedVersion !== "string" || expectedVersion.length === 0) {
@@ -970,6 +995,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     versionMatches: boolean,
     storageBackendMatches: boolean,
     entrypointMatches: boolean,
+    runtimeDigestMatches: boolean,
     hasAccess: boolean,
   ): Promise<MismatchRepair> {
     if (!identityMatches) return { outcome: "none" };
@@ -978,7 +1004,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       await terminatePidFileProcess();
       return { outcome: "terminated" };
     }
-    if (!storageBackendMatches || !entrypointMatches) {
+    if (!storageBackendMatches || !entrypointMatches || !runtimeDigestMatches) {
       if (!hasAccess) return { outcome: "blocked" };
       return terminateAuthenticatedDaemon(health);
     }
@@ -1013,6 +1039,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       verifiedHealth = authenticated;
     }
     if (!processEntrypointMatches(verifiedHealth, expectedEntrypoint, platform, procRoot, realpath)) return null;
+    if (!healthRuntimeDigestMatches(verifiedHealth, expectedRuntimeDigest)) return null;
 
     let parent: ParentInspection | undefined;
     if (enforceParent) {
@@ -1102,6 +1129,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         procRoot,
         realpath,
       );
+    const runtimeDigestMatches = healthRuntimeDigestMatches(
+      authenticatedHealth,
+      expectedRuntimeDigest,
+    );
     const hasAccess = authenticatedHealth !== null;
     const mismatchRepair = await repairMismatchedDaemon(
       authenticatedHealth ?? health,
@@ -1109,10 +1140,16 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       versionMatches,
       storageBackendMatches,
       entrypointMatches,
+      runtimeDigestMatches,
       hasAccess,
     );
     if (mismatchRepair.outcome === "blocked") {
-      return { connected: false, port: opts.port, spawned: false, warning: STORAGE_BACKEND_AUTH_WARNING };
+      return {
+        connected: false,
+        port: opts.port,
+        spawned: false,
+        warning: mismatchAuthWarning(storageBackendMatches),
+      };
     }
     if (mismatchRepair.outcome === "replacement") {
       concurrentReplacementPid = mismatchRepair.pid;
@@ -1181,6 +1218,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
               procRoot,
               realpath,
             );
+          const retryRuntimeDigestMatches = healthRuntimeDigestMatches(
+            authenticatedRetry,
+            expectedRuntimeDigest,
+          );
           const retryHasAccess = authenticatedRetry !== null;
           const mismatchRepair = await repairMismatchedDaemon(
             authenticatedRetry ?? retry,
@@ -1188,10 +1229,16 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
             retryVersionMatches,
             retryStorageBackendMatches,
             retryEntrypointMatches,
+            retryRuntimeDigestMatches,
             retryHasAccess,
           );
           if (mismatchRepair.outcome === "blocked") {
-            return { connected: false, port: opts.port, spawned: false, warning: STORAGE_BACKEND_AUTH_WARNING };
+            return {
+              connected: false,
+              port: opts.port,
+              spawned: false,
+              warning: mismatchAuthWarning(retryStorageBackendMatches),
+            };
           }
           if (mismatchRepair.outcome === "replacement") {
             return waitForConcurrentReplacement(mismatchRepair.pid);
