@@ -428,9 +428,9 @@ describe("Passive Learning E2E", { timeout: 30_000 }, () => {
     }
   });
 
-  // ── Test I: Pruning caps unprocessed events ──────────────────────────
+  // ── Test I: Retention never discards an offline outbox backlog ───────
 
-  it("pruneUnprocessed caps events at maxRows", async () => {
+  it("pruneUnprocessed retains events beyond maxRows for later replication", async () => {
     const dbPath = eventsDbPath(projectDir);
     const db = new EventsDb(dbPath);
     try {
@@ -442,8 +442,9 @@ describe("Passive Learning E2E", { timeout: 30_000 }, () => {
       expect(db.getHealthStats().unprocessed).toBe(20);
 
       const result = db.pruneUnprocessed(10, 30);
-      expect(result.pruned).toBe(10);
-      expect(db.getHealthStats().unprocessed).toBe(10);
+      expect(result.pruned).toBe(0);
+      expect(db.getHealthStats().unprocessed).toBe(20);
+      expect(db.getHealthStats().deliveryPending).toBe(20);
 
       const pruneLogs = db.getRecentErrors({ includeMaintenance: true, limit: 100 })
         .filter((entry) => entry.hook === "maintenance:pruneUnprocessed");

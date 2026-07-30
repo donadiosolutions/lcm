@@ -51,6 +51,9 @@ describe("collectEventStats", () => {
     expect(stats.unprocessed).toBe(0);
     expect(stats.errors).toBe(0);
     expect(stats.lastCapture).toBeNull();
+    expect(stats.deliveryPending).toBe(0);
+    expect(stats.deliveryQuarantined).toBe(0);
+    expect(stats.oldestDeliveryAt).toBeNull();
   });
 
   it("aggregates across multiple sidecar DBs", async () => {
@@ -68,6 +71,8 @@ describe("collectEventStats", () => {
     expect(stats.captured).toBe(3);
     expect(stats.unprocessed).toBe(3);
     expect(stats.errors).toBe(1);
+    expect(stats.deliveryPending).toBe(3);
+    expect(stats.oldestDeliveryAt).not.toBeNull();
   });
 
   it("skips non-.db files in events directory", async () => {
@@ -127,13 +132,21 @@ describe("collectEventStats", () => {
     for (const [file, createdAt] of [
       ["fresh.db", "datetime('now')"],
       ["invalid-date.db", "'invalid'"],
-      ["null-date.db", "NULL"],
     ] as const) {
       const path = join(tempDir, file);
       const db = new EventsDb(path);
       db.insertEvent("s", { type: "decision", category: "decision", data: file, priority: 1 }, "PostToolUse");
       const events = db.getUnprocessed();
       db.markProcessed(events.map((event) => event.event_id));
+      const [claim] = db.claimDeliveries({
+        machineId: "0195d250-0000-7000-8000-000000000091",
+        claimOwner: `terminal-${file}`,
+        limit: 1,
+        staleClaimMs: 1_000,
+      });
+      expect(db.markReplicated(claim.event_uuid, `terminal-${file}`, 41n)).toBe(true);
+      expect(db.markAcknowledged(claim.event_uuid, 41n)).toBe(true);
+      expect(db.markRemotePruned(claim.event_uuid)).toBe(true);
       db.close();
       const raw = new DatabaseSync(path);
       raw.exec("PRAGMA journal_mode = WAL");
@@ -145,7 +158,6 @@ describe("collectEventStats", () => {
     const sidecars = await collectEventSidecars({ pruneOrphanSidecars: true });
     expect(sidecars.find((entry) => entry.file === "fresh.db")?.pruned).toBeUndefined();
     expect(sidecars.find((entry) => entry.file === "invalid-date.db")?.pruned).toBeUndefined();
-    expect(sidecars.find((entry) => entry.file === "null-date.db")?.pruned).toBeUndefined();
   });
 
   it("normalizes non-Error sidecar scan failures", async () => {
@@ -208,7 +220,7 @@ describe("collectEventStats", () => {
     expect(existsSync(sidecarPath)).toBe(false);
   });
 
-  it("prunes stale processed orphan sidecars but preserves queued orphan sidecars", async () => {
+  it("preserves stale processed sidecars until remote delivery and queued sidecars", async () => {
     const stalePath = join(tempDir, `orphan-stale-${Date.now()}.db`);
     const staleDb = new EventsDb(stalePath);
     staleDb.insertEvent("s1", { type: "decision", category: "decision", data: "old", priority: 1 }, "PostToolUse");
@@ -227,15 +239,53 @@ describe("collectEventStats", () => {
     queuedDb.close();
 
     const sidecars = await collectEventSidecars({ pruneOrphanSidecars: true });
-    const pruned = sidecars.find((sidecar) => sidecar.path === stalePath);
+    const retained = sidecars.find((sidecar) => sidecar.path === stalePath);
     const queued = sidecars.find((sidecar) => sidecar.path === queuedPath);
 
-    expect(pruned?.pruned).toBe(true);
-    expect(pruned?.pruneReason).toContain("stale orphan");
-    expect(existsSync(stalePath)).toBe(false);
+    expect(retained?.pruned).toBeUndefined();
+    expect(retained?.deliveryPending).toBe(1);
+    expect(existsSync(stalePath)).toBe(true);
     expect(queued?.pruned).toBeUndefined();
     expect(queued?.unprocessed).toBe(1);
     expect(existsSync(queuedPath)).toBe(true);
+  });
+
+  it("retains an acknowledged orphan until exact remote pruning is checkpointed", async () => {
+    const sidecarPath = join(tempDir, `orphan-awaiting-prune-${Date.now()}.db`);
+    const db = new EventsDb(sidecarPath);
+    db.insertEvent(
+      "s1",
+      { type: "decision", category: "decision", data: "applied", priority: 1 },
+      "PostToolUse",
+    );
+    const [event] = db.getUnprocessed();
+    db.markProcessed([event.event_id]);
+    const [claim] = db.claimDeliveries({
+      machineId: "0195d250-0000-7000-8000-000000000091",
+      claimOwner: "retention-test",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+    expect(db.markReplicated(claim.event_uuid, "retention-test", 41n)).toBe(true);
+    expect(db.markAcknowledged(claim.event_uuid, 41n)).toBe(true);
+    db.close();
+    const raw = new DatabaseSync(sidecarPath);
+    raw.exec("UPDATE events SET created_at = datetime('now', '-31 days')");
+    raw.close();
+
+    const retained = (await collectEventSidecars({ pruneOrphanSidecars: true }))
+      .find((sidecar) => sidecar.path === sidecarPath);
+    expect(retained?.deliveryAwaitingRemotePrune).toBe(1);
+    expect(retained?.pruned).toBeUndefined();
+    expect(existsSync(sidecarPath)).toBe(true);
+
+    const checkpoint = new EventsDb(sidecarPath);
+    expect(checkpoint.markRemotePruned(event.event_uuid)).toBe(true);
+    checkpoint.close();
+    const pruned = (await collectEventSidecars({ pruneOrphanSidecars: true }))
+      .find((sidecar) => sidecar.path === sidecarPath);
+    expect(pruned?.pruned).toBe(true);
+    expect(existsSync(sidecarPath)).toBe(false);
   });
 
   it("preserves orphan sidecars with recent hook errors", async () => {

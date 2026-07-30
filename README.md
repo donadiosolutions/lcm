@@ -388,7 +388,12 @@ passive-inbox claims, cleanup, and diagnostics, but normal daemon/CLI
 activation stays staged until #92/#224. Issue #87 adds independently usable
 summary-DAG, context-item, and large-file repositories with transactional
 graph integrity, deterministic recursive expansion, and optional final-write
-fence validation under the same conversation lock namespace. Selecting `postgresql`
+fence validation under the same conversation lock namespace. Issue #91 adds
+durable versioned local hook envelopes, idempotent passive-inbox delivery, and
+a bounded crash-recoverable replication worker. Its status, validation,
+quarantine, and exact-event replay commands are operator-invoked and staged;
+hooks remain offline-only and no PostgreSQL worker starts automatically.
+Selecting `postgresql`
 therefore starts the daemon with an explicitly unavailable storage factory
 instead of falling back to SQLite. The health endpoint reports `503` and
 unavailable storage; status and statistics routes return fixed `503` responses, and SQLite
@@ -406,6 +411,9 @@ that repository is used, and the
 for the #88 adapters. Direct distributed-coordination callers also apply the
 separate
 [coordination](docs/postgresql-runtime-coordination-grants.sql) grants. The
+same grant script supplies only the additional column-scoped inbox writes,
+applied-row deletion, and identity-sequence usage required by staged #91
+delivery; it does not grant table-wide writes or sequence inspection. The
 staged summary, context, and large-file adapters use their dedicated
 [summary/context](docs/postgresql-runtime-summary-context-grants.sql) grants.
 See
@@ -421,7 +429,8 @@ defines metadata, tag, recall, counter, coordination, and scoped-purge
 semantics.
 The [PostgreSQL cross-machine coordination guide](docs/postgresql-coordination.md)
 defines transaction-lock, fenced-lease, final-write fence, queue-claim,
-cleanup, diagnostic, and crash-recovery semantics.
+delivery, acknowledgement, replay, quarantine, cleanup, diagnostic, and
+crash-recovery semantics.
 The [PostgreSQL summary, context, and large-file guide](docs/postgresql-summary-context.md)
 defines graph, coverage, context-range, ordering, lock/fence, grant, query-plan,
 diagnostic, and recovery semantics.

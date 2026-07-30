@@ -77,6 +77,13 @@ same-transaction final fence validation, fair durable inbox claims, bounded clea
 and diagnostics. Long-running model or network work stays outside transactions;
 only the final fence check and protected write share a short transaction. See
 [PostgreSQL cross-machine coordination](postgresql-coordination.md).
+Issue #91 adds a separate staged `PostgreSqlPassiveEventRepository` and drain
+worker around that exact coordination contract. It inserts and reads the
+existing inbox idempotently, completes an event effect and its `applied`
+transition in one fenced transaction, schedules retry or quarantine, supports
+exact replay, and prunes only exact applied rows after durable local
+acknowledgement. It does not add a migration, queue, lock namespace, or normal
+application routing.
 
 ### PostgreSQL runtime and migrations
 
@@ -281,14 +288,48 @@ permission for new application code to bypass repositories.
 it to capture passive events quickly even when the daemon or authoritative
 project backend is unavailable. A later daemon pass reads the outbox, promotes
 eligible events through the selected project's repositories, and marks local
-entries processed only according to the existing retry rules.
+entries processed only according to the existing retry rules. Each event also
+has a versioned transport UUID, durable machine identity, installation-global
+exact-`bigint` sequence, and local delivery checkpoint. Sequence reservation is
+transactional and gap-safe.
 
 The outbox is not a project-memory cache, a dual-write target, an offline read
 replica, or a fallback source for repository reads. PostgreSQL outages must
 remain visible to authoritative workflows; they do not authorize reads or
 writes against a hidden SQLite copy of project memory. The outbox owns only
-local event capture, retry, pruning, health, and error-log operations, and it
-does not expose its SQLite handle to callers.
+local event capture, local promotion state, delivery retry/checkpoints,
+retention guards, health, and error-log operations, and it does not expose its
+SQLite handle to callers.
+
+Local promotion and remote delivery are independent state machines.
+`processed_at` records local passive-learning consumption. Remote
+`acknowledged_at` advances only after the PostgreSQL inbox proves `applied`.
+Consequently, local promotion never suppresses replication, including for
+processed rows upgraded from a legacy sidecar, and local retention never
+discards an outage backlog. Processed rows are removable only after delivery
+acknowledgement and exact remote-prune proof.
+
+The staged drain performs network work outside hooks. A fenced lease admits one
+local drain owner, but #90 `SKIP LOCKED` claims allow independent machines to
+progress concurrently. A ready local sequence prefix prevents an unavailable
+earlier event from being skipped before insertion. PostgreSQL then enforces the
+authoritative per-machine claim order. Durable states—not process memory—form
+the crash checkpoints:
+
+```text
+local pending/claimed/retry
+  -> remote pending/claimed/retry
+  -> remote applied or quarantined
+  -> local acknowledged or quarantined
+  -> exact remote applied-row prune
+  -> local remote-pruned checkpoint
+```
+
+Uncertain insertion and applied commits require immutable readback. Remote
+prune completion requires either a successful exact delete or missing-row
+readback. A present nonterminal, mismatched, or quarantined row is never treated
+as pruned. The worker and its operator CLI remain staged; #92 and #224 retain
+normal PostgreSQL activation and application routing.
 
 ## Data model
 

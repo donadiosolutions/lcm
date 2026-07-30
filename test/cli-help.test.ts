@@ -195,6 +195,11 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("promote --all");
     expect(text).toContain("--json");
     expect(text).toContain("metadata-backed");
+    expect(text).toContain("status");
+    expect(text).toContain("validate");
+    expect(text).toContain("quarantine");
+    expect(text).toContain("replay <event-id>");
+    expect(text).toContain("operator commands are staged");
   });
 
   it("prints connector help with global scope option", () => {

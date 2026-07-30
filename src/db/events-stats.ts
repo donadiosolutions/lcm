@@ -12,6 +12,14 @@ export interface EventStats {
   sidecars?: number;
   sidecarsWithUnprocessed?: number;
   orphanedSidecarsWithUnprocessed?: number;
+  deliveryPending: number;
+  deliveryClaimed: number;
+  deliveryRetry: number;
+  deliveryReplicated: number;
+  deliveryAcknowledged: number;
+  deliveryAwaitingRemotePrune: number;
+  deliveryQuarantined: number;
+  oldestDeliveryAt: string | null;
 }
 
 export interface DetailedEventStats extends EventStats {
@@ -22,6 +30,14 @@ export interface DetailedEventStats extends EventStats {
     metadataMissing: boolean;
     captured: number;
     unprocessed: number;
+    deliveryPending: number;
+    deliveryClaimed: number;
+    deliveryRetry: number;
+    deliveryReplicated: number;
+    deliveryAcknowledged: number;
+    deliveryAwaitingRemotePrune: number;
+    deliveryQuarantined: number;
+    oldestDeliveryAt: string | null;
     lastCapture: string | null;
     path: string;
     scanError?: string;
@@ -57,6 +73,14 @@ export async function collectEventStats(options: EventStatsOptions = {}): Promis
     sidecars: 0,
     sidecarsWithUnprocessed: 0,
     orphanedSidecarsWithUnprocessed: 0,
+    deliveryPending: 0,
+    deliveryClaimed: 0,
+    deliveryRetry: 0,
+    deliveryReplicated: 0,
+    deliveryAcknowledged: 0,
+    deliveryAwaitingRemotePrune: 0,
+    deliveryQuarantined: 0,
+    oldestDeliveryAt: null,
   };
 
   for (const sidecar of await collectEventSidecars(scanOptions)) {
@@ -71,6 +95,19 @@ export async function collectEventStats(options: EventStatsOptions = {}): Promis
     }
     result.captured += sidecar.captured;
     result.unprocessed += sidecar.unprocessed;
+    result.deliveryPending += sidecar.deliveryPending ?? 0;
+    result.deliveryClaimed += sidecar.deliveryClaimed ?? 0;
+    result.deliveryRetry += sidecar.deliveryRetry ?? 0;
+    result.deliveryReplicated += sidecar.deliveryReplicated ?? 0;
+    result.deliveryAcknowledged += sidecar.deliveryAcknowledged ?? 0;
+    result.deliveryAwaitingRemotePrune += sidecar.deliveryAwaitingRemotePrune ?? 0;
+    result.deliveryQuarantined += sidecar.deliveryQuarantined ?? 0;
+    if (
+      sidecar.oldestDeliveryAt
+      && (!result.oldestDeliveryAt || sidecar.oldestDeliveryAt < result.oldestDeliveryAt)
+    ) {
+      result.oldestDeliveryAt = sidecar.oldestDeliveryAt;
+    }
     if (sidecar.scanError) {
       result.scanErrors = result.scanErrors! + 1;
     } else {
@@ -98,6 +135,10 @@ export async function collectDetailedEventStats(options: EventStatsOptions = {})
   const result: DetailedEventStats = {
     captured: 0, unprocessed: 0, errors: 0, scanErrors: 0, scanSkipped: 0, prunedSidecars: 0, lastCapture: null,
     sidecars: 0, sidecarsWithUnprocessed: 0, orphanedSidecarsWithUnprocessed: 0,
+    deliveryPending: 0, deliveryClaimed: 0, deliveryRetry: 0,
+    deliveryReplicated: 0, deliveryAcknowledged: 0, deliveryAwaitingRemotePrune: 0,
+    deliveryQuarantined: 0,
+    oldestDeliveryAt: null,
     projects: [], recentErrors: [],
   };
 
@@ -110,6 +151,19 @@ export async function collectDetailedEventStats(options: EventStatsOptions = {})
     } else {
       result.captured += sidecar.captured;
       result.unprocessed += sidecar.unprocessed;
+      result.deliveryPending += sidecar.deliveryPending ?? 0;
+      result.deliveryClaimed += sidecar.deliveryClaimed ?? 0;
+      result.deliveryRetry += sidecar.deliveryRetry ?? 0;
+      result.deliveryReplicated += sidecar.deliveryReplicated ?? 0;
+      result.deliveryAcknowledged += sidecar.deliveryAcknowledged ?? 0;
+      result.deliveryAwaitingRemotePrune += sidecar.deliveryAwaitingRemotePrune ?? 0;
+      result.deliveryQuarantined += sidecar.deliveryQuarantined ?? 0;
+      if (
+        sidecar.oldestDeliveryAt
+        && (!result.oldestDeliveryAt || sidecar.oldestDeliveryAt < result.oldestDeliveryAt)
+      ) {
+        result.oldestDeliveryAt = sidecar.oldestDeliveryAt;
+      }
       if (sidecar.scanError) {
         result.scanErrors = result.scanErrors! + 1;
       } else {
@@ -132,6 +186,14 @@ export async function collectDetailedEventStats(options: EventStatsOptions = {})
       metadataMissing: sidecar.metadataMissing,
       captured: sidecar.captured,
       unprocessed: sidecar.unprocessed,
+      deliveryPending: sidecar.deliveryPending ?? 0,
+      deliveryClaimed: sidecar.deliveryClaimed ?? 0,
+      deliveryRetry: sidecar.deliveryRetry ?? 0,
+      deliveryReplicated: sidecar.deliveryReplicated ?? 0,
+      deliveryAcknowledged: sidecar.deliveryAcknowledged ?? 0,
+      deliveryAwaitingRemotePrune: sidecar.deliveryAwaitingRemotePrune ?? 0,
+      deliveryQuarantined: sidecar.deliveryQuarantined ?? 0,
+      oldestDeliveryAt: sidecar.oldestDeliveryAt ?? null,
       lastCapture: sidecar.lastCapture,
       path: sidecar.path,
       scanError: sidecar.scanError,

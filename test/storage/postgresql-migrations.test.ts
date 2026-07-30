@@ -1484,6 +1484,44 @@ describe("PostgreSQL migration runner", () => {
     ]) {
       expect(inventorySql).toContain(summaryContextGrantIdentity);
     }
+    expect(inventorySql).toMatch(
+      /'table\|passive_event_inbox'[\s\S]*?ARRAY\['SELECT', 'DELETE'\]/u,
+    );
+    expect(inventorySql).toContain(
+      "'sequence|passive_event_inbox_inbox_id_seq'",
+    );
+    const passiveColumnAclSql = inventorySql.slice(
+      inventorySql.lastIndexOf("'passive_event_inbox'"),
+    );
+    for (const passiveInsertColumn of [
+      "project_id",
+      "machine_id",
+      "event_id",
+      "event_version",
+      "machine_sequence",
+      "event_type",
+      "payload",
+    ]) {
+      expect(passiveColumnAclSql).toContain(`'${passiveInsertColumn}'`);
+    }
+    for (const passiveUpdateColumn of [
+      "status",
+      "attempt_count",
+      "next_attempt_at",
+      "claimed_at",
+      "claimed_by",
+      "applied_at",
+      "quarantined_at",
+      "quarantine_reason",
+    ]) {
+      expect(passiveColumnAclSql).toContain(`'${passiveUpdateColumn}'`);
+    }
+    expect(passiveColumnAclSql).toContain(
+      "OPERATOR(pg_catalog.=) 'INSERT'",
+    );
+    expect(passiveColumnAclSql).toContain(
+      "OPERATOR(pg_catalog.=) 'UPDATE'",
+    );
     for (const hardcodedGroupCount of [
       52, 3, 174, 15, 225, 6, 24, 30, 210,
     ]) {

@@ -8,6 +8,54 @@ All hooks receive a JSON object via stdin. lcm hooks are invoked as shell comman
 lcm <hook-command> < <stdin-json>
 ```
 
+## Local passive-event durability
+
+Passive-event capture is an explicit offline boundary. `PostToolUse` and
+`UserPromptSubmit` commit only to the per-project SQLite sidecar under
+`~/.lcm/events/`; they never open PostgreSQL, resolve PostgreSQL credentials, or
+wait for a network request. Daemon notification remains best-effort and is not
+part of the hook commit.
+
+Every captured row has a versioned local delivery envelope:
+
+| Envelope field | Purpose |
+|-------|-------------|
+| `event_uuid` | Stable UUID used for idempotent remote insertion and exact replay |
+| `event_version` | Compatibility version for decoding the event |
+| `machine_id` | Durable registered machine UUID, or assigned before first delivery when capture occurred before registration |
+| `machine_sequence` | Installation-global, 19-digit exact-`bigint` sequence used for per-machine ordering |
+| `type` and payload columns | Scrubbed event type plus session sequence, category, data, priority, source hook, predecessor, and capture time |
+| delivery state and timestamps | Durable claim, retry, replication, acknowledgement, quarantine, and remote-prune checkpoints |
+
+Local promotion may add predecessor correlation while an envelope is still
+pending. That metadata is frozen atomically when the first delivery claim
+begins, so a later local correlation pass cannot change an envelope that may
+already exist in PostgreSQL.
+
+The sequence allocator is a separate local SQLite file,
+`~/.lcm/events/.machine-sequence.sqlite`. Reservation and checkpoint update are
+one transaction. A crash between reservation and sidecar insertion can leave a
+gap, but no committed event can reuse a sequence.
+
+Legacy sidecars upgrade transactionally. Immutable legacy content derives a
+deterministic compatibility UUID, existing local `processed_at` metadata is
+preserved, and delivery starts independently. Local passive-learning
+processing does not imply PostgreSQL acknowledgement and cannot prevent later
+delivery.
+
+This release decodes envelope version `1`. A positive but unsupported version
+is quarantined locally before any network insertion, remains visible through
+`lcm events quarantine`, and can be replayed by exact UUID after compatible
+software is installed. Later machine-sequence events may continue because the
+quarantine is an explicit terminal checkpoint, not a retryable outage. A drain
+that encounters an already-remote unsupported claim applies the same
+quarantine policy instead of invoking an incompatible effect decoder.
+
+The staged replication worker owns all PostgreSQL I/O. It resolves uncertain
+insertion, application, and pruning through exact readback before advancing the
+local checkpoint. Hooks are therefore unchanged by PostgreSQL outages: they
+commit locally and return successfully while the durable backlog waits.
+
 ## PreCompact Hook
 
 **Command:** `lcm compact --hook`

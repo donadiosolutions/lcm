@@ -299,19 +299,27 @@ const HELP: Record<string, CommandHelp> = {
   },
 
   events: {
-    summary: "Manually remediate passive-learning sidecar queues.",
-    usage: "lcm events promote [--all] [--json]",
+    summary: "Promote local events and operate staged PostgreSQL replication.",
+    usage: "lcm events <promote|status|validate|quarantine|replay> [options]",
     options: [
       ["promote", "Manually drain queued passive-learning events for the current project"],
       ["promote --all", "Manually drain queued events from all metadata-backed project sidecars"],
+      ["status", "Show local delivery and PostgreSQL coordination diagnostics"],
+      ["validate [--limit N]", "Compare replicated local envelopes with PostgreSQL readback"],
+      ["quarantine [--limit N]", "Inspect quarantined local and PostgreSQL events"],
+      ["replay <event-id>", "Replay one exact local or PostgreSQL quarantine"],
+      ["--machine <machine-id>", "Select the owning machine for exact replay"],
       ["--json", "Output structured JSON"],
     ],
     examples: [
       ["lcm events promote", "Remediate queued passive events for the current project"],
       ["lcm events promote --all", "Remediate stale passive-event sidecars across all known projects"],
-      ["lcm events promote --all --json", "Show per-sidecar promotion results"],
+      ["lcm events status --json", "Inspect local and remote queue state"],
+      ["lcm events validate", "Validate idempotent PostgreSQL readback"],
+      ["lcm events quarantine", "List local and PostgreSQL poison events without discarding them"],
+      ["lcm events replay <event-id>", "Replay one quarantined event for this machine"],
     ],
-    notes: "Passive events are normally processed by the daemon automatically. Sidecars without project metadata are reported but cannot be mapped back to a cwd automatically.",
+    notes: "Hooks always write local SQLite only. PostgreSQL operator commands are staged and require a registered machine plus a linked project; they do not activate automatic backend routing.",
   },
 
   diagnose: {
@@ -507,7 +515,7 @@ const GROUPS = [
       { name: "import [--provider ...] [--all] [--verbose] [--dry-run] [--replay]", summary: "Import Claude Code and Codex session transcripts" },
       { name: "promote [--all] [--verbose] [--dry-run]", summary: "Promote insights to long-term memory" },
       { name: "stats [-v]", summary: "Memory inventory and compression ratios" },
-      { name: "events promote [--all] [--json]", summary: "Manually remediate passive-learning sidecar queues" },
+      { name: "events <promote|status|validate|quarantine|replay>", summary: "Promote local events or operate staged PostgreSQL replication" },
       { name: "diagnose [--all] [--days N] [--verbose] [--json]", summary: "Scan sessions for hook failures and issues" },
     ],
   },

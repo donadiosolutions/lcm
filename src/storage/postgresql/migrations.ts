@@ -1765,7 +1765,7 @@ export async function runPostgreSqlMigrations(
                          acl_relations.object_identity OPERATOR(pg_catalog.=)
                            'table|passive_event_inbox'
                          AND privilege.privilege_type OPERATOR(pg_catalog.=)
-                           'SELECT'
+                           ANY (ARRAY['SELECT', 'DELETE']::pg_catalog.text[])
                        )
                        OR (
                          acl_relations.object_identity OPERATOR(pg_catalog.=)
@@ -1799,6 +1799,7 @@ export async function runPostgreSqlMigrations(
                                'sequence|conversations_conversation_id_seq',
                                'sequence|messages_message_id_seq',
                                'sequence|fenced_leases_fencing_token_seq',
+                               'sequence|passive_event_inbox_inbox_id_seq',
                                'sequence|recall_surfacing_surfacing_id_seq',
                                'sequence|session_instructions_instruction_id_seq'
                              ]::pg_catalog.text[]
@@ -2384,17 +2385,41 @@ export async function runPostgreSqlMigrations(
                             OR (
                               relation.relname OPERATOR(pg_catalog.=)
                                 'passive_event_inbox'
-                              AND attribute.attname OPERATOR(pg_catalog.=)
-                                ANY (
-                                  ARRAY[
-                                    'status',
-                                    'attempt_count',
-                                    'claimed_at',
-                                    'claimed_by'
-                                  ]::pg_catalog.text[]
+                              AND (
+                                (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'project_id',
+                                        'machine_id',
+                                        'event_id',
+                                        'event_version',
+                                        'machine_sequence',
+                                        'event_type',
+                                        'payload'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'INSERT'
                                 )
-                              AND privilege.privilege_type
-                                OPERATOR(pg_catalog.=) 'UPDATE'
+                                OR (
+                                  attribute.attname OPERATOR(pg_catalog.=)
+                                    ANY (
+                                      ARRAY[
+                                        'status',
+                                        'attempt_count',
+                                        'next_attempt_at',
+                                        'claimed_at',
+                                        'claimed_by',
+                                        'applied_at',
+                                        'quarantined_at',
+                                        'quarantine_reason'
+                                      ]::pg_catalog.text[]
+                                    )
+                                  AND privilege.privilege_type
+                                    OPERATOR(pg_catalog.=) 'UPDATE'
+                                )
+                              )
                             )
                           ),
                           false

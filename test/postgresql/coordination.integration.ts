@@ -296,10 +296,11 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
         inbox_delete: boolean;
         inbox_insert: boolean;
         inbox_update: boolean;
-        inbox_status_update: boolean;
-        inbox_payload_update: boolean;
+        inbox_insert_columns: string[];
+        inbox_update_columns: string[];
         inbox_truncate: boolean;
         inbox_sequence_usage: boolean;
+        inbox_sequence_select: boolean;
       }>({
         text: `SELECT
                  has_schema_privilege(
@@ -361,14 +362,32 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
                  has_table_privilege(
                    'lcm_test_runtime', 'lcm.passive_event_inbox', 'UPDATE'
                  ) AS inbox_update,
-                 has_column_privilege(
-                   'lcm_test_runtime', 'lcm.passive_event_inbox',
-                   'status', 'UPDATE'
-                 ) AS inbox_status_update,
-                 has_column_privilege(
-                   'lcm_test_runtime', 'lcm.passive_event_inbox',
-                   'payload', 'UPDATE'
-                 ) AS inbox_payload_update,
+                 ARRAY(
+                   SELECT column_name::pg_catalog.text
+                   FROM information_schema.columns
+                   WHERE table_schema = 'lcm'
+                     AND table_name = 'passive_event_inbox'
+                     AND has_column_privilege(
+                       'lcm_test_runtime',
+                       'lcm.passive_event_inbox',
+                       column_name,
+                       'INSERT'
+                     )
+                   ORDER BY ordinal_position
+                 ) AS inbox_insert_columns,
+                 ARRAY(
+                   SELECT column_name::pg_catalog.text
+                   FROM information_schema.columns
+                   WHERE table_schema = 'lcm'
+                     AND table_name = 'passive_event_inbox'
+                     AND has_column_privilege(
+                       'lcm_test_runtime',
+                       'lcm.passive_event_inbox',
+                       column_name,
+                       'UPDATE'
+                     )
+                   ORDER BY ordinal_position
+                 ) AS inbox_update_columns,
                  has_table_privilege(
                    'lcm_test_runtime', 'lcm.passive_event_inbox', 'TRUNCATE'
                  ) AS inbox_truncate,
@@ -376,7 +395,12 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
                    'lcm_test_runtime',
                    'lcm.passive_event_inbox_inbox_id_seq',
                    'USAGE'
-                 ) AS inbox_sequence_usage`,
+                 ) AS inbox_sequence_usage,
+                 has_sequence_privilege(
+                   'lcm_test_runtime',
+                   'lcm.passive_event_inbox_inbox_id_seq',
+                   'SELECT'
+                 ) AS inbox_sequence_select`,
       }, { domain: "coordination", operation: "inspectCoordinationGrants" });
       expect(privileges.rows[0]).toEqual({
         schema_usage: true,
@@ -393,13 +417,31 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
         lease_sequence_usage: true,
         lease_sequence_select: false,
         inbox_select: true,
-        inbox_delete: false,
+        inbox_delete: true,
         inbox_insert: false,
         inbox_update: false,
-        inbox_status_update: true,
-        inbox_payload_update: false,
+        inbox_insert_columns: [
+          "project_id",
+          "machine_id",
+          "event_id",
+          "event_version",
+          "machine_sequence",
+          "event_type",
+          "payload",
+        ],
+        inbox_update_columns: [
+          "status",
+          "attempt_count",
+          "next_attempt_at",
+          "claimed_at",
+          "claimed_by",
+          "applied_at",
+          "quarantined_at",
+          "quarantine_reason",
+        ],
         inbox_truncate: false,
-        inbox_sequence_usage: false,
+        inbox_sequence_usage: true,
+        inbox_sequence_select: false,
       });
       await expect(runPostgreSqlMigrations(database.migrator)).resolves
         .toMatchObject({ applied: [] });

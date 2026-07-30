@@ -10,6 +10,8 @@ import {
 } from "../../src/storage/local-hook-outbox.js";
 
 describe("SQLiteLocalHookOutboxFactory", () => {
+  const machineId = "0195d250-0000-7000-8000-000000000091";
+  const eventUuid = "0195d250-0000-7000-8000-000000000092";
   const directories: string[] = [];
 
   afterEach(() => {
@@ -52,6 +54,62 @@ describe("SQLiteLocalHookOutboxFactory", () => {
       { operation: "getRecentErrors", run: () => repository.getRecentErrors() },
       { operation: "pruneUnprocessed", run: () => repository.pruneUnprocessed() },
       { operation: "pruneErrorLog", run: () => repository.pruneErrorLog() },
+      {
+        operation: "claimDeliveries",
+        run: () => repository.claimDeliveries({
+          machineId,
+          claimOwner: "closed-owner",
+          limit: 1,
+          staleClaimMs: 1,
+        }),
+      },
+      {
+        operation: "markReplicated",
+        run: () => repository.markReplicated(eventUuid, "closed-owner", 1n),
+      },
+      {
+        operation: "markDeliveryRetry",
+        run: () => repository.markDeliveryRetry(
+          eventUuid,
+          "closed-owner",
+          "closed",
+          "2026-01-01T00:00:00.000Z",
+        ),
+      },
+      {
+        operation: "markDeliveryQuarantined",
+        run: () => repository.markDeliveryQuarantined(
+          eventUuid,
+          "closed-owner",
+          "unsupported",
+        ),
+      },
+      { operation: "listAwaitingRemote", run: () => repository.listAwaitingRemote() },
+      { operation: "listQuarantined", run: () => repository.listQuarantined() },
+      {
+        operation: "markAcknowledged",
+        run: () => repository.markAcknowledged(eventUuid, 1n),
+      },
+      {
+        operation: "markQuarantined",
+        run: () => repository.markQuarantined(eventUuid, 1n, "closed"),
+      },
+      {
+        operation: "replayQuarantined",
+        run: () => repository.replayQuarantined(eventUuid),
+      },
+      {
+        operation: "listAcknowledgedForRemotePrune",
+        run: () => repository.listAcknowledgedForRemotePrune(),
+      },
+      {
+        operation: "markRemotePruned",
+        run: () => repository.markRemotePruned(eventUuid),
+      },
+      {
+        operation: "getDeliveryDiagnostics",
+        run: () => repository.getDeliveryDiagnostics(),
+      },
     ];
   }
 
@@ -113,10 +171,35 @@ describe("SQLiteLocalHookOutboxFactory", () => {
       totalEvents: 3,
       unprocessed: 3,
       errors: 1,
+      deliveryPending: 3,
+      deliveryAcknowledged: 0,
+      deliveryAwaitingRemotePrune: 0,
     });
 
     await repository.markProcessed([]);
     await repository.markProcessed([secondSession]);
+    const activeMachineId = (await repository.getUnprocessed())[0]?.machine_id
+      ?? machineId;
+    const claimed = await repository.claimDeliveries({
+      machineId: activeMachineId,
+      claimOwner: "test-owner",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0].event_id).toBe(secondSession);
+    expect(await repository.markReplicated(
+      claimed[0].event_uuid,
+      "wrong-owner",
+      9n,
+    )).toBe(false);
+    expect(await repository.markReplicated(
+      claimed[0].event_uuid,
+      "test-owner",
+      9n,
+    )).toBe(true);
+    expect(await repository.markAcknowledged(claimed[0].event_uuid, 9n)).toBe(true);
+    expect(await repository.markRemotePruned(claimed[0].event_uuid)).toBe(true);
     const raw = new DatabaseSync(path);
     raw.exec("PRAGMA journal_mode = WAL");
     raw.exec("PRAGMA foreign_keys = ON");
@@ -128,7 +211,8 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     raw.close();
 
     expect(await repository.pruneProcessed(7)).toBe(1);
-    expect(await repository.pruneUnprocessed(10, 30)).toEqual({ pruned: 1 });
+    expect(await repository.pruneUnprocessed(10, 30)).toEqual({ pruned: 0 });
+    expect(await repository.getUnprocessed()).toHaveLength(2);
     expect(await repository.pruneErrorLog()).toBe(2);
 
     await repository.close();

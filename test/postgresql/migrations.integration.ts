@@ -85,6 +85,28 @@ async function applySummaryContextRuntimeGrant(
   });
 }
 
+async function applyCoordinationRuntimeGrant(
+  database: PostgreSqlTestDatabase,
+): Promise<void> {
+  const template = readFileSync(
+    join(
+      process.cwd(),
+      "docs",
+      "postgresql-runtime-coordination-grants.sql",
+    ),
+    "utf8",
+  );
+  const sql = template
+    .split("\n")
+    .filter((line) => !line.startsWith("\\"))
+    .join("\n")
+    .replaceAll(':"lcm_runtime_role"', '"lcm_test_runtime"');
+  await database.migrator.query({ text: sql }, {
+    domain: "factory",
+    operation: "applyCoordinationRuntimeGrantBeforeMigration",
+  });
+}
+
 async function executeRawMigrationExpectingFailure(
   database: PostgreSqlTestDatabase,
   pending: PostgreSqlMigration,
@@ -1551,6 +1573,28 @@ describe("PostgreSQL migrations and database isolation", () => {
       await database.migrator.query({
         text: "GRANT TRUNCATE ON lcm.projects TO lcm_test_runtime",
       }, { domain: "factory", operation: "grantUnexpectedRuntimePrivilege" });
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toMatchObject({
+          baselineApplied: true,
+          driftedDefinitionGroupCount: 1,
+          expectedObjectCount: 740,
+          existingObjectCount: 740,
+          missingObjectCount: 0,
+          operation: "preflightBaselineDefinitions",
+        });
+    });
+  });
+
+  it("normalizes passive replication grants but rejects broader inbox writes", async () => {
+    await withPostgreSqlTestDatabase("runtime-passive-event-grants", async (database) => {
+      await applyCoordinationRuntimeGrant(database);
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .resolves.toMatchObject({ applied: [] });
+
+      await database.migrator.query({
+        text: `GRANT UPDATE (payload)
+               ON lcm.passive_event_inbox TO lcm_test_runtime`,
+      }, { domain: "factory", operation: "grantUnexpectedInboxPayloadUpdate" });
       await expect(runPostgreSqlMigrations(database.migrator))
         .rejects.toMatchObject({
           baselineApplied: true,

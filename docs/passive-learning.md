@@ -11,7 +11,26 @@ Two hooks capture events during your session:
 - **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output.
 - **UserPromptSubmit** — fires on each user prompt. Detects decisions ("always use X"), role statements ("I'm a data scientist"), and intent patterns.
 
-Events are written to a **sidecar SQLite database** (`~/.lcm/events/<project-hash>.db`) at <10ms cost. This is separate from the main LCM database — if the daemon is unavailable, events are safely queued.
+Events are written to a **sidecar SQLite database**
+(`~/.lcm/events/<project-hash>.db`) at <10ms cost. This is separate from the
+main LCM database—if the daemon or PostgreSQL is unavailable, events are safely
+queued. Hooks never wait for PostgreSQL and never send captured data over the
+network.
+
+Each captured row also carries a backward-compatible delivery envelope:
+
+- a stable event UUID and envelope version;
+- the registered machine UUID when it is available;
+- an installation-global, exact-`bigint`, monotonically allocated machine
+  sequence;
+- the event type and structured payload fields;
+- capture, retry, claim, acknowledgement, quarantine, and pruning timestamps.
+
+The global sequence checkpoint is stored at
+`~/.lcm/events/.machine-sequence.sqlite`. Sequence reservation commits before
+the sidecar insert, so a crash may leave a harmless gap but can never reuse a
+committed value. Legacy sidecars receive deterministic compatibility UUIDs and
+new global sequences during their transactional schema upgrade.
 
 ### What Gets Captured
 
@@ -70,6 +89,43 @@ lcm events promote --all
 
 Sidecars that are missing project metadata are reported separately because their hash cannot be reversed back to a project path automatically.
 
+### Staged PostgreSQL Replication
+
+When PostgreSQL storage is configured, issue #91 provides a staged drain worker
+for explicit composition. It is not started automatically and does not activate
+normal PostgreSQL daemon routing. The worker:
+
+1. acquires and renews the existing #90 fenced drain lease;
+2. claims a ready local sequence prefix in a bounded batch;
+3. inserts envelopes idempotently into the existing
+   `lcm.passive_event_inbox`;
+4. applies remotely claimed events and their `applied` transition in one short
+   PostgreSQL transaction;
+5. resolves uncertain commits by exact inbox readback;
+6. durably acknowledges the local row after remote `applied` proof; and
+7. prunes only the exact applied inbox row, recording local prune completion
+   after deletion or missing-row proof.
+
+Per-machine ordering is preserved. Independent machines can progress
+concurrently. Retry delay uses bounded exponential backoff with deterministic
+jitter, stale claims are recoverable, and poison events remain inspectable
+until exact replay.
+
+The staged operator commands are:
+
+```bash
+lcm events status [--json]
+lcm events validate [--limit 100] [--json]
+lcm events quarantine [--limit 100] [--json]
+lcm events replay <event-id> [--machine <machine-id>] [--json]
+```
+
+They require PostgreSQL configuration, a registered machine, and a linked
+remote project. `status` and `validate` expose the durable checkpoints;
+`quarantine` lists local compatibility failures and remote poison rows; and
+`replay` retries one exact local or remote event. These commands do not start
+replication.
+
 ### Learned Insights
 
 On SessionStart, recently promoted passive insights are surfaced in a `<learned-insights>` block. This closes the feedback loop — the system learns from your sessions and applies those learnings in future ones.
@@ -103,9 +159,23 @@ When a pattern crosses the reinforcement threshold, `reinforcementBoost` is adde
 
 - **Sidecar DB**: `~/.lcm/events/<sha256-of-project-path>.db`
   - Per-project SQLite database in WAL mode
-  - Processed events pruned after 7 days
-  - Unprocessed events capped at 10,000 rows (oldest pruned first)
-  - Schema versioned for future migrations (currently v3)
+  - Local promotion state and remote delivery state are independent
+  - Processed events are pruned after 7 days only when remote delivery is
+    acknowledged and any remote applied row is proven pruned
+  - Unprocessed and replayable events are never discarded by age or row-count
+    retention guards; a maintenance diagnostic records guard breaches
+  - Schema versioned for future migrations (currently v4)
+
+- **Machine sequence DB**: `~/.lcm/events/.machine-sequence.sqlite`
+  - Shared by every local project sidecar
+  - Reserves exact PostgreSQL-`bigint` sequence values transactionally
+  - Allows gaps after a crash, but never reuse
+
+- **Remote inbox**: `lcm.passive_event_inbox`
+  - Existing #90 project-scoped queue with machine/event and machine/sequence
+    uniqueness
+  - `pending`, `claimed`, `retry`, `applied`, and `quarantined` states
+  - Not an offline read replica or a dual-write project-memory cache
 
 - **Error log**: `error_log` table in each sidecar DB
   - Records hook errors with timestamp and session ID
@@ -130,9 +200,14 @@ The UserPromptSubmit extractor includes guards against false-positive decisions.
 | Pre-compact | Events promoted before context is compacted |
 | Daemon available during capture | Hooks notify `/promote-events/notify`; daemon processes queued events in the background |
 | Daemon unavailable | Events queued in sidecar, processed by startup/session lifecycle drains or manual remediation later |
+| PostgreSQL unavailable | Hooks continue local commits; staged replication retries with bounded backoff and does not bypass an earlier local sequence blocker |
 | Hard kill (SIGKILL) | Events survive in sidecar, scavenged on next SessionStart |
 | Stale sidecars in other projects | `lcm events promote --all` drains all metadata-backed sidecars |
-| Unprocessed cap exceeded | Oldest events pruned when > 10,000 rows or > 30 days |
+| Unprocessed cap or age guard exceeded | Events remain durable; a maintenance diagnostic reports the retained backlog |
+| Worker crashes after inbox insert | Exact immutable readback proves whether insertion committed |
+| Worker crashes during apply | PostgreSQL transaction rollback or exact `applied` readback resolves the outcome |
+| Worker crashes after local acknowledgement | The next drain retries exact applied-row pruning |
+| Poison event | Event remains quarantined and inspectable until exact-ID replay |
 | Error log pruning | Entries older than 30 days removed on SessionStart |
 
 ## Observability
@@ -150,6 +225,12 @@ When passive learning hooks are installed, `lcm doctor` includes a "Passive Lear
 | `events-sidecar-scan-skipped` | Sidecar DBs intentionally skipped by the scan count or timeout budget |
 | `events-staleness` | Time since last event capture |
 
+`lcm events status` adds delivery-specific local counts (`pending`, `claimed`,
+`retry`, `replicated`, `acknowledged`, `awaiting remote prune`, and
+`quarantined`) plus the existing #90 PostgreSQL queue and lease counts. Use
+`lcm events validate` when a crash or outage makes a local/remote checkpoint
+uncertain.
+
 Run `lcm doctor --verbose` to see the per-project breakdown and recent error details.
 
 By default, doctor scans up to 50 passive-learning sidecar DBs. Use `lcm doctor --events-max-dbs <n>` to set another count limit, or `lcm doctor --events-max-dbs all` / `lcm doctor --events-max-dbs unlimited` to remove the count limit. Sidecars skipped because of the count or timeout budget are reported as skipped, not warnings.
@@ -162,7 +243,14 @@ daemon and storage are healthy but 200 or more queued events remain across
 project sidecars, `lcm doctor` warns and suggests `lcm events promote --all`
 instead of asking you to restart the daemon.
 
-During the sidecar scan, lcm also prunes orphan sidecars that are safe to remove. A sidecar is pruned only when its project metadata is missing and it has no unprocessed events. Empty orphan sidecars are removed immediately; processed-only orphan sidecars are removed after the 30-day stale retention window.
+During the sidecar scan, lcm also prunes orphan sidecars that are safe to
+remove. A sidecar is pruned only when its project metadata is missing, it has
+no unprocessed events, and it has no pending, claimed, retryable, replicated,
+or quarantined delivery. Empty orphan sidecars are removed immediately;
+acknowledged-only orphan sidecars are removed after the 30-day stale retention
+window, but only after every acknowledged row has a durable
+`remote_pruned_at` checkpoint. An acknowledged row still awaiting exact remote
+pruning retains the sidecar.
 
 ### `lcm stats`
 

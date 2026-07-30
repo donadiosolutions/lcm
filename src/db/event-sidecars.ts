@@ -14,6 +14,14 @@ export interface EventSidecarSummary {
   unprocessed: number;
   errors: number;
   lastCapture: string | null;
+  deliveryPending: number;
+  deliveryClaimed: number;
+  deliveryRetry: number;
+  deliveryReplicated: number;
+  deliveryAcknowledged: number;
+  deliveryAwaitingRemotePrune: number;
+  deliveryQuarantined: number;
+  oldestDeliveryAt: string | null;
   recentErrors?: Array<{ created_at: string; hook: string; error: string }>;
   scanError?: string;
   scanSkipped?: string;
@@ -63,6 +71,14 @@ function failedSidecarSummary(
     unprocessed: 0,
     errors: 0,
     lastCapture: null,
+    deliveryPending: 0,
+    deliveryClaimed: 0,
+    deliveryRetry: 0,
+    deliveryReplicated: 0,
+    deliveryAcknowledged: 0,
+    deliveryAwaitingRemotePrune: 0,
+    deliveryQuarantined: 0,
+    oldestDeliveryAt: null,
     scanError,
   };
 }
@@ -78,12 +94,19 @@ function skippedSidecarSummary(file: string, path: string, scanSkipped: string):
     unprocessed: 0,
     errors: 0,
     lastCapture: null,
+    deliveryPending: 0,
+    deliveryClaimed: 0,
+    deliveryRetry: 0,
+    deliveryReplicated: 0,
+    deliveryAcknowledged: 0,
+    deliveryAwaitingRemotePrune: 0,
+    deliveryQuarantined: 0,
+    oldestDeliveryAt: null,
     scanSkipped,
   };
 }
 
-function parseSqliteDate(value: string | null): number | undefined {
-  if (value === null) return undefined;
+function parseSqliteDate(value: string): number | undefined {
   const parsed = Date.parse(`${value.replace(" ", "T")}Z`);
   return Number.isNaN(parsed) ? undefined : parsed;
 }
@@ -93,6 +116,12 @@ function orphanPruneReason(summary: EventSidecarSummary, olderThanDays: number):
     !summary.metadataMissing
     || summary.unprocessed > 0
     || summary.errors > 0
+    || summary.deliveryPending > 0
+    || summary.deliveryClaimed > 0
+    || summary.deliveryRetry > 0
+    || summary.deliveryReplicated > 0
+    || summary.deliveryAwaitingRemotePrune > 0
+    || summary.deliveryQuarantined > 0
     || summary.scanError
     || summary.scanSkipped
   ) {
@@ -100,7 +129,9 @@ function orphanPruneReason(summary: EventSidecarSummary, olderThanDays: number):
   }
   if (summary.captured === 0) return "empty orphan sidecar";
 
-  const lastCaptureMs = parseSqliteDate(summary.lastCapture);
+  // A non-empty sidecar is backed by a NOT NULL created_at column, so the
+  // aggregate MAX is non-null after the captured === 0 case above.
+  const lastCaptureMs = parseSqliteDate(summary.lastCapture!);
   if (lastCaptureMs === undefined) return undefined;
   const ageMs = olderThanDays * 24 * 60 * 60 * 1000;
   if (Date.now() - lastCaptureMs >= ageMs) {
@@ -181,6 +212,14 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
           unprocessed: stats.unprocessed,
           errors: stats.errors,
           lastCapture: stats.lastCapture,
+          deliveryPending: stats.deliveryPending,
+          deliveryClaimed: stats.deliveryClaimed,
+          deliveryRetry: stats.deliveryRetry,
+          deliveryReplicated: stats.deliveryReplicated,
+          deliveryAcknowledged: stats.deliveryAcknowledged,
+          deliveryAwaitingRemotePrune: stats.deliveryAwaitingRemotePrune,
+          deliveryQuarantined: stats.deliveryQuarantined,
+          oldestDeliveryAt: stats.oldestDeliveryAt,
           recentErrors,
         };
       } finally {

@@ -39,6 +39,7 @@ import {
 import { projectDbPath, projectIdentity } from "../src/daemon/project.js";
 import { recoverMachineIdentity } from "../src/machine-identity.js";
 import type { ResolvedStorageConfig } from "../src/daemon/config.js";
+import { EventsDb } from "../src/hooks/events-db.js";
 
 const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
   backend: "postgresql",
@@ -437,6 +438,162 @@ function makeLegacyEvents(
      ) VALUES(?, 1, 'decision', 'legacy', '{}', 1, 'PostToolUse', '2026-01-01')`,
   ).run(sessionId);
   db.close();
+}
+
+function makeVersionedEvents(
+  path: string,
+  overrides: {
+    readonly eventUuid?: string;
+    readonly machineSequence?: string;
+    readonly data?: string;
+    readonly deliveryState?: "pending" | "retry" | "replicated" | "acknowledged" | "quarantined";
+    readonly deliveryGeneration?: number;
+    readonly deliveryAttempts?: number;
+    readonly remoteInboxId?: string | null;
+    readonly quarantineReason?: string | null;
+  } = {},
+): void {
+  const events = new EventsDb(path);
+  events.insertEvent(
+    "shared-versioned-session",
+    {
+      type: "choice",
+      category: "decision",
+      data: overrides.data ?? "SQLite",
+      priority: 1,
+    },
+    "PostToolUse",
+  );
+  events.close();
+  const state = overrides.deliveryState ?? "pending";
+  const db = new DatabaseSync(path);
+  db.prepare(`
+    UPDATE events
+    SET event_uuid = ?,
+        machine_id = ?,
+        machine_sequence = ?,
+        delivery_state = ?,
+        delivery_generation = ?,
+        delivery_attempts = ?,
+        delivery_owner = NULL,
+        delivery_claimed_at = NULL,
+        delivery_next_attempt_at = '2026-07-29 12:00:00',
+        remote_inbox_id = ?,
+        quarantine_reason = ?,
+        acknowledged_at = ?,
+        created_at = '2026-07-29 12:00:00',
+        delivery_updated_at = '2026-07-29 12:00:01'
+  `).run(
+    overrides.eventUuid ?? "12345678-1234-4abc-8def-123456789abc",
+    MACHINE_ID,
+    overrides.machineSequence ?? "0000000000000000007",
+    state,
+    overrides.deliveryGeneration ?? 0,
+    overrides.deliveryAttempts ?? 0,
+    overrides.remoteInboxId ?? null,
+    state === "quarantined"
+      ? overrides.quarantineReason ?? "poison"
+      : null,
+    state === "acknowledged" ? "2026-07-29 12:00:01" : null,
+  );
+  db.close();
+}
+
+function makeEventsReconciliation(root: string): {
+  readonly main: string;
+  readonly targetEvents: string;
+  readonly sourceEvents: string;
+} {
+  const { main, linked } = makeRepository(root);
+  const canonical = resolveGitProjectAnchor(main)!.canonical;
+  const targetHash = hashProjectPath(canonical);
+  const sourceHash = hashProjectPath(linked);
+  writeFileSync(projectMapPath(), `${JSON.stringify({
+    [targetHash]: { canonical, aliases: [] },
+    [sourceHash]: { canonical: linked, aliases: [] },
+  }, null, 2)}\n`);
+  clearProjectMapCache();
+  return {
+    main,
+    targetEvents: join(root, ".lcm", "events", `${targetHash}.db`),
+    sourceEvents: join(root, ".lcm", "events", `${sourceHash}.db`),
+  };
+}
+
+function makeSeparatelyMigratedLegacyCopies(
+  root: string,
+  firstMigration: "target" | "source",
+): ReturnType<typeof makeEventsReconciliation> {
+  const fixture = makeEventsReconciliation(root);
+  recoverMachineIdentity({
+    version: 1,
+    identityKey: `machine:${"a".repeat(64)}`,
+    machineId: MACHINE_ID,
+    displayName: "Test machine",
+  }, { homeDir: root });
+  makeEventsV1(fixture.targetEvents, "shared-legacy-session");
+  cpSync(fixture.targetEvents, fixture.sourceEvents);
+  const first = firstMigration === "target"
+    ? fixture.targetEvents
+    : fixture.sourceEvents;
+  const second = firstMigration === "target"
+    ? fixture.sourceEvents
+    : fixture.targetEvents;
+  new EventsDb(first).close();
+  new EventsDb(second).close();
+  return fixture;
+}
+
+function migratedLegacyEvent(path: string): {
+  readonly event_id: number;
+  readonly event_uuid: string;
+  readonly machine_sequence: string;
+  readonly delivery_state: string;
+  readonly delivery_generation: number;
+  readonly delivery_attempts: number;
+  readonly delivery_next_attempt_at: string;
+  readonly remote_inbox_id: string | null;
+  readonly acknowledged_at: string | null;
+  readonly quarantine_reason: string | null;
+  readonly remote_pruned_at: string | null;
+  readonly delivery_updated_at: string;
+} {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    return db.prepare(`
+      SELECT event_id, event_uuid, machine_sequence, delivery_state,
+             delivery_generation, delivery_attempts, delivery_next_attempt_at,
+             remote_inbox_id, acknowledged_at, quarantine_reason,
+             remote_pruned_at, delivery_updated_at
+      FROM events
+      WHERE session_id = 'shared-legacy-session'
+    `).get() as ReturnType<typeof migratedLegacyEvent>;
+  } finally {
+    db.close();
+  }
+}
+
+function progressMigratedLegacyEvent(path: string, remoteInboxId: string): void {
+  const db = new DatabaseSync(path);
+  try {
+    db.prepare(`
+      UPDATE events
+      SET delivery_state = 'replicated',
+          delivery_generation = 3,
+          delivery_attempts = 2,
+          delivery_owner = NULL,
+          delivery_claimed_at = NULL,
+          delivery_last_error = NULL,
+          remote_inbox_id = ?,
+          quarantine_reason = NULL,
+          acknowledged_at = NULL,
+          remote_pruned_at = NULL,
+          delivery_updated_at = '2026-07-30 08:00:00'
+      WHERE session_id = 'shared-legacy-session'
+    `).run(remoteInboxId);
+  } finally {
+    db.close();
+  }
 }
 
 describe("worktree reconciliation", () => {
@@ -2009,6 +2166,13 @@ describe("worktree reconciliation", () => {
     clearProjectMapCache();
     const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
     makeEventsV1(sourceEvents, "legacy-v1");
+    const nullableLegacy = new DatabaseSync(sourceEvents);
+    nullableLegacy.exec(`
+      UPDATE events
+      SET created_at = NULL,
+          processed_at = '2026-07-29 12:00:00'
+    `);
+    nullableLegacy.close();
 
     const result = reconcileWorktrees(main);
     expect(result.status).toBe("completed");
@@ -2016,8 +2180,19 @@ describe("worktree reconciliation", () => {
       join(home, ".lcm", "events", `${targetHash}.db`),
       { readOnly: true },
     );
-    expect(target.prepare("SELECT session_id FROM events").all())
-      .toEqual([{ session_id: "legacy-v1" }]);
+    expect(target.prepare(`
+      SELECT session_id, processed_at, created_at, delivery_state,
+             acknowledged_at, remote_inbox_id
+      FROM events
+    `).all())
+      .toEqual([{
+        session_id: "legacy-v1",
+        processed_at: "2026-07-29 12:00:00",
+        created_at: "1970-01-01 00:00:00",
+        delivery_state: "pending",
+        acknowledged_at: null,
+        remote_inbox_id: null,
+      }]);
     expect(target.prepare("SELECT COUNT(*) AS count FROM error_log").get())
       .toEqual({ count: 0 });
     target.close();
@@ -2028,8 +2203,14 @@ describe("worktree reconciliation", () => {
     expect(evidence.prepare(
       "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'error_log'",
     ).get()).toBeUndefined();
-    expect(evidence.prepare("SELECT session_id FROM events").all())
-      .toEqual([{ session_id: "legacy-v1" }]);
+    expect(evidence.prepare(`
+      SELECT session_id, processed_at, created_at
+      FROM events
+    `).all()).toEqual([{
+      session_id: "legacy-v1",
+      processed_at: "2026-07-29 12:00:00",
+      created_at: null,
+    }]);
     evidence.close();
   });
 
@@ -2106,6 +2287,461 @@ describe("worktree reconciliation", () => {
     const journal = listWorktreeReconciliationJournals()[0];
     expect(journal).toMatchObject({ phase: "blocked" });
     expect(journal.reason).not.toContain("NaN");
+  });
+
+  it.each(["target", "source"] as const)(
+    "converges copied legacy sidecars when the %s copy migrates first",
+    (firstMigration) => {
+      const fixture = makeSeparatelyMigratedLegacyCopies(home, firstMigration);
+      const targetBefore = migratedLegacyEvent(fixture.targetEvents);
+      const sourceBefore = migratedLegacyEvent(fixture.sourceEvents);
+      expect(targetBefore.event_uuid).toBe(sourceBefore.event_uuid);
+      expect(targetBefore.machine_sequence).not.toBe(sourceBefore.machine_sequence);
+      const expectedSequence = [
+        targetBefore.machine_sequence,
+        sourceBefore.machine_sequence,
+      ].sort()[0]!;
+
+      expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+      expect(migratedLegacyEvent(fixture.targetEvents).machine_sequence)
+        .toBe(expectedSequence);
+
+      expect(() => reconcileWorktrees(fixture.main)).not.toThrow();
+      const merged = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+      expect(merged.prepare(`
+        SELECT COUNT(*) AS count
+        FROM events
+        WHERE event_uuid = ?
+      `).get(targetBefore.event_uuid)).toEqual({ count: 1 });
+      expect(merged.prepare(`
+        SELECT machine_sequence
+        FROM events
+        WHERE event_uuid = ?
+      `).get(targetBefore.event_uuid)).toEqual({ machine_sequence: expectedSequence });
+      merged.close();
+    },
+  );
+
+  it.each([
+    { progressed: "target" as const, firstMigration: "source" as const },
+    { progressed: "source" as const, firstMigration: "target" as const },
+  ])("preserves the sole progressed $progressed legacy copy and its sequence", ({
+    progressed,
+    firstMigration,
+  }) => {
+    const fixture = makeSeparatelyMigratedLegacyCopies(home, firstMigration);
+    const progressedPath = progressed === "target"
+      ? fixture.targetEvents
+      : fixture.sourceEvents;
+    progressMigratedLegacyEvent(progressedPath, "41");
+    const expected = migratedLegacyEvent(progressedPath);
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    expect(migratedLegacyEvent(fixture.targetEvents)).toMatchObject({
+      event_uuid: expected.event_uuid,
+      machine_sequence: expected.machine_sequence,
+      delivery_state: "replicated",
+      delivery_generation: 3,
+      delivery_attempts: 2,
+      delivery_next_attempt_at: expected.delivery_next_attempt_at,
+      remote_inbox_id: "41",
+      acknowledged_at: null,
+      quarantine_reason: null,
+      remote_pruned_at: null,
+      delivery_updated_at: "2026-07-30 08:00:00",
+    });
+  });
+
+  it("fails closed when both separately migrated copies made remote progress", () => {
+    const fixture = makeSeparatelyMigratedLegacyCopies(home, "target");
+    progressMigratedLegacyEvent(fixture.targetEvents, "41");
+    progressMigratedLegacyEvent(fixture.sourceEvents, "42");
+    const targetBefore = migratedLegacyEvent(fixture.targetEvents);
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "divergent passive event UUID collision",
+    );
+    expect(migratedLegacyEvent(fixture.targetEvents)).toEqual(targetBefore);
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it.each(["target", "source"] as const)(
+    "accepts a copied legacy pair when only the %s local event id was remapped",
+    (remapped) => {
+      const fixture = makeSeparatelyMigratedLegacyCopies(home, "target");
+      const path = remapped === "target"
+        ? fixture.targetEvents
+        : fixture.sourceEvents;
+      const db = new DatabaseSync(path);
+      db.prepare(`
+        UPDATE events
+        SET event_id = 17
+        WHERE session_id = 'shared-legacy-session'
+      `).run();
+      db.close();
+      const expectedSequence = [
+        migratedLegacyEvent(fixture.targetEvents).machine_sequence,
+        migratedLegacyEvent(fixture.sourceEvents).machine_sequence,
+      ].sort()[0]!;
+
+      expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+      expect(migratedLegacyEvent(fixture.targetEvents).machine_sequence)
+        .toBe(expectedSequence);
+    },
+  );
+
+  it("fails closed when neither remapped event id proves legacy derivation", () => {
+    const fixture = makeSeparatelyMigratedLegacyCopies(home, "target");
+    for (const [path, eventId] of [
+      [fixture.targetEvents, 17],
+      [fixture.sourceEvents, 18],
+    ] as const) {
+      const db = new DatabaseSync(path);
+      db.prepare(`
+        UPDATE events
+        SET event_id = ?
+        WHERE session_id = 'shared-legacy-session'
+      `).run(eventId);
+      db.close();
+    }
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "divergent passive event UUID collision",
+    );
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it("rolls back when canonical sequence selection collides with another event", () => {
+    const fixture = makeSeparatelyMigratedLegacyCopies(home, "target");
+    progressMigratedLegacyEvent(fixture.sourceEvents, "41");
+    const sourceSequence = migratedLegacyEvent(fixture.sourceEvents).machine_sequence;
+    const targetEvents = new EventsDb(fixture.targetEvents);
+    const otherEventId = targetEvents.insertEvent(
+      "other-session",
+      { type: "choice", category: "decision", data: "other", priority: 1 },
+      "PostToolUse",
+    );
+    targetEvents.close();
+    const target = new DatabaseSync(fixture.targetEvents);
+    target.prepare("UPDATE events SET machine_sequence = ? WHERE event_id = ?")
+      .run(sourceSequence, otherEventId);
+    const targetBefore = target.prepare(
+      "SELECT event_id, event_uuid, machine_sequence FROM events ORDER BY event_id",
+    ).all();
+    target.close();
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "divergent passive event machine sequence collision",
+    );
+    const after = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    expect(after.prepare(
+      "SELECT event_id, event_uuid, machine_sequence FROM events ORDER BY event_id",
+    ).all()).toEqual(targetBefore);
+    after.close();
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it.each([1, 2])(
+    "does not collapse arbitrary v4 rows at event version %i that only share a UUID",
+    (eventVersion) => {
+      const fixture = makeEventsReconciliation(home);
+      makeVersionedEvents(fixture.targetEvents, {
+        machineSequence: "0000000000000000007",
+      });
+      makeVersionedEvents(fixture.sourceEvents, {
+        machineSequence: "0000000000000000008",
+      });
+      if (eventVersion !== 1) {
+        for (const path of [fixture.targetEvents, fixture.sourceEvents]) {
+          const db = new DatabaseSync(path);
+          db.prepare("UPDATE events SET event_version = ?").run(eventVersion);
+          db.close();
+        }
+      }
+
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "divergent passive event UUID collision",
+      );
+      expect(existsSync(fixture.sourceEvents)).toBe(true);
+    },
+  );
+
+  it("preserves the newest versioned passive-event delivery checkpoint", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.targetEvents, {
+      deliveryState: "replicated",
+      deliveryGeneration: 1,
+      deliveryAttempts: 1,
+      remoteInboxId: "41",
+    });
+    makeVersionedEvents(fixture.sourceEvents, {
+      deliveryState: "quarantined",
+      deliveryGeneration: 2,
+      deliveryAttempts: 5,
+      remoteInboxId: "41",
+      quarantineReason: "poison payload",
+    });
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    expect(target.prepare(`
+      SELECT event_uuid, event_version, machine_id, machine_sequence,
+             delivery_state, delivery_generation, delivery_attempts,
+             remote_inbox_id, quarantine_reason
+      FROM events
+    `).get()).toEqual({
+      event_uuid: "12345678-1234-4abc-8def-123456789abc",
+      event_version: 1,
+      machine_id: MACHINE_ID,
+      machine_sequence: "0000000000000000007",
+      delivery_state: "quarantined",
+      delivery_generation: 2,
+      delivery_attempts: 5,
+      remote_inbox_id: "41",
+      quarantine_reason: "poison payload",
+    });
+    target.close();
+  });
+
+  it("preserves a newer target passive-event delivery checkpoint", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.targetEvents, {
+      deliveryState: "replicated",
+      deliveryGeneration: 2,
+      deliveryAttempts: 5,
+      remoteInboxId: "41",
+    });
+    makeVersionedEvents(fixture.sourceEvents, {
+      deliveryState: "replicated",
+      deliveryGeneration: 1,
+      deliveryAttempts: 1,
+      remoteInboxId: "41",
+    });
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    expect(target.prepare(`
+      SELECT delivery_state, delivery_generation, delivery_attempts,
+             remote_inbox_id, delivery_updated_at
+      FROM events
+    `).get()).toEqual({
+      delivery_state: "replicated",
+      delivery_generation: 2,
+      delivery_attempts: 5,
+      remote_inbox_id: "41",
+      delivery_updated_at: "2026-07-29 12:00:01",
+    });
+    target.close();
+  });
+
+  it("deduplicates an exact versioned passive-event envelope", () => {
+    const fixture = makeEventsReconciliation(home);
+    const checkpoint = {
+      deliveryState: "replicated" as const,
+      deliveryGeneration: 2,
+      deliveryAttempts: 1,
+      remoteInboxId: "41",
+    };
+    makeVersionedEvents(fixture.targetEvents, checkpoint);
+    makeVersionedEvents(fixture.sourceEvents, checkpoint);
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    expect(target.prepare("SELECT COUNT(*) AS count FROM events").get())
+      .toEqual({ count: 1 });
+    target.close();
+  });
+
+  it("merges independent processing metadata without erasing machine identity", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.targetEvents);
+    makeVersionedEvents(fixture.sourceEvents);
+    const source = new DatabaseSync(fixture.sourceEvents);
+    source.exec(`
+      UPDATE events
+      SET machine_id = NULL,
+          processed_at = '2026-07-29 12:00:02',
+          delivery_updated_at = '2026-07-29 12:00:02'
+    `);
+    source.close();
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    expect(target.prepare(`
+      SELECT machine_id, processed_at, delivery_generation, delivery_updated_at
+      FROM events
+    `).get()).toEqual({
+      machine_id: MACHINE_ID,
+      processed_at: "2026-07-29 12:00:02",
+      delivery_generation: 0,
+      delivery_updated_at: "2026-07-29 12:00:02",
+    });
+    target.close();
+  });
+
+  it.each([
+    ["target-only", "2026-07-29 12:00:01", null, "2026-07-29 12:00:01"],
+    ["target-earlier", "2026-07-29 12:00:01", "2026-07-29 12:00:02", "2026-07-29 12:00:01"],
+    ["source-earlier", "2026-07-29 12:00:03", "2026-07-29 12:00:02", "2026-07-29 12:00:02"],
+  ] as const)("keeps the earliest %s processed checkpoint", (
+    _label,
+    targetProcessedAt,
+    sourceProcessedAt,
+    expected,
+  ) => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.targetEvents);
+    makeVersionedEvents(fixture.sourceEvents);
+    for (const [path, processedAt] of [
+      [fixture.targetEvents, targetProcessedAt],
+      [fixture.sourceEvents, sourceProcessedAt],
+    ] as const) {
+      const db = new DatabaseSync(path);
+      db.prepare("UPDATE events SET processed_at = ?").run(processedAt);
+      db.close();
+    }
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    expect(target.prepare("SELECT processed_at FROM events").get())
+      .toEqual({ processed_at: expected });
+    target.close();
+  });
+
+  it("maps present and pruned predecessors for versioned passive events", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.sourceEvents);
+    const sourceEvents = new EventsDb(fixture.sourceEvents);
+    sourceEvents.insertEvent(
+      "shared-versioned-session",
+      { type: "choice", category: "decision", data: "child", priority: 1 },
+      "PostToolUse",
+    );
+    sourceEvents.close();
+    const source = new DatabaseSync(fixture.sourceEvents);
+    source.exec(`
+      UPDATE events SET prev_event_id = 999 WHERE event_id = 1;
+      UPDATE events SET prev_event_id = 1 WHERE event_id = 2;
+    `);
+    source.close();
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    const rows = target.prepare(
+      "SELECT event_id, prev_event_id FROM events ORDER BY event_id",
+    ).all() as Array<{ event_id: number; prev_event_id: number | null }>;
+    expect(rows[0].prev_event_id).toBeNull();
+    expect(rows[1].prev_event_id).toBe(rows[0].event_id);
+    target.close();
+  });
+
+  it("fails closed on an invalid passive-event delivery generation", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.targetEvents);
+    makeVersionedEvents(fixture.sourceEvents);
+    const source = new DatabaseSync(fixture.sourceEvents);
+    source.exec(`
+      PRAGMA ignore_check_constraints = ON;
+      UPDATE events SET delivery_generation = -1;
+    `);
+    source.close();
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "invalid passive event delivery generation",
+    );
+  });
+
+  it("fails closed on a divergent mapped passive-event predecessor", () => {
+    const fixture = makeEventsReconciliation(home);
+    const configure = (
+      path: string,
+      parentUuid: string,
+      parentSequence: string,
+    ): void => {
+      makeVersionedEvents(path, {
+        eventUuid: parentUuid,
+        machineSequence: parentSequence,
+      });
+      const events = new EventsDb(path);
+      events.insertEvent(
+        "shared-versioned-session",
+        { type: "choice", category: "decision", data: "child", priority: 1 },
+        "PostToolUse",
+      );
+      events.close();
+      const db = new DatabaseSync(path);
+      db.prepare(`
+        UPDATE events
+        SET event_uuid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+            machine_id = ?,
+            machine_sequence = '0000000000000000009',
+            prev_event_id = 1,
+            created_at = '2026-07-29 12:00:02',
+            delivery_updated_at = '2026-07-29 12:00:02'
+        WHERE event_id = 2
+      `).run(MACHINE_ID);
+      db.close();
+    };
+    configure(
+      fixture.targetEvents,
+      "11111111-1111-4111-8111-111111111111",
+      "0000000000000000007",
+    );
+    configure(
+      fixture.sourceEvents,
+      "22222222-2222-4222-8222-222222222222",
+      "0000000000000000008",
+    );
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "divergent passive event predecessor",
+    );
+  });
+
+  it("fails closed on equal-generation divergent passive-event delivery state", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.targetEvents, {
+      deliveryState: "replicated",
+      deliveryGeneration: 2,
+      deliveryAttempts: 1,
+      remoteInboxId: "41",
+    });
+    makeVersionedEvents(fixture.sourceEvents, {
+      deliveryState: "quarantined",
+      deliveryGeneration: 2,
+      deliveryAttempts: 1,
+      remoteInboxId: "41",
+      quarantineReason: "poison",
+    });
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "divergent passive event delivery state",
+    );
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it("fails closed on a divergent immutable passive-event UUID collision", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.targetEvents, { data: "SQLite" });
+    makeVersionedEvents(fixture.sourceEvents, { data: "PostgreSQL" });
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "divergent passive event UUID collision",
+    );
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it("rejects a future passive-event sidecar schema before importing rows", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.sourceEvents);
+    const source = new DatabaseSync(fixture.sourceEvents);
+    source.exec("UPDATE schema_version SET version = 5");
+    source.close();
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "unsupported legacy events database schema: 5",
+    );
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
   });
 
   it("preserves surviving events whose pruned predecessor is no longer present", () => {

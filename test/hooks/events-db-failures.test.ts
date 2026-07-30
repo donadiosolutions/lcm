@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
-  mode: "constructor" as "constructor" | "migration" | "bootstrap",
+  mode: "constructor" as "constructor" | "migration" | "bootstrap" | "stale-migrator",
   execSql: [] as string[],
+  selectedSql: [] as string[],
+  versionReads: 0,
 }));
 const closeLcmConnection = vi.hoisted(() => vi.fn());
 
@@ -14,13 +16,22 @@ vi.mock("../../src/db/connection.js", () => ({
         if (sql.includes("sqlite_master")) {
           return state.mode === "bootstrap" ? undefined : { name: "schema_version" };
         }
-        if (sql.includes("SELECT version")) return { version: 1 };
+        if (sql.includes("SELECT version")) {
+          state.versionReads += 1;
+          return {
+            version: state.mode === "stale-migrator" && state.versionReads > 1 ? 4 : 1,
+          };
+        }
         return undefined;
       }),
       run: vi.fn(() => {
         if (state.mode === "bootstrap" && sql.includes("INSERT INTO schema_version")) {
           throw "plain schema-version failure";
         }
+      }),
+      all: vi.fn(() => {
+        state.selectedSql.push(sql);
+        return [];
       }),
     })),
     exec: vi.fn((sql: string) => {
@@ -38,6 +49,8 @@ import { EventsDb, _resetMigratedPathsForTesting } from "../../src/hooks/events-
 describe("EventsDb non-Error migration failures", () => {
   beforeEach(() => {
     state.execSql = [];
+    state.selectedSql = [];
+    state.versionReads = 0;
     closeLcmConnection.mockClear();
     _resetMigratedPathsForTesting();
   });
@@ -64,5 +77,18 @@ describe("EventsDb non-Error migration failures", () => {
     expect(state.execSql.at(-1)).toBe("ROLLBACK");
     expect(state.execSql).not.toContain("COMMIT");
     expect(closeLcmConnection).toHaveBeenCalledOnce();
+  });
+
+  it("rechecks a stale migration under the lock and preserves the current schema", () => {
+    state.mode = "stale-migrator";
+    const db = new EventsDb("/tmp/lcm-events-stale-migrator/test.db");
+
+    expect(state.versionReads).toBe(2);
+    expect(state.execSql[0]).toBe("BEGIN EXCLUSIVE");
+    expect(state.selectedSql).toEqual([]);
+    expect(state.execSql).not.toContain("DROP TABLE IF EXISTS events_v4");
+    expect(state.execSql.at(-1)).toBe("COMMIT");
+
+    db.close();
   });
 });
