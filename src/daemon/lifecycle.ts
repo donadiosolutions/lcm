@@ -2220,6 +2220,15 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         "daemon lifecycle test PID changed before restart signaling",
       );
     }
+    if (opts._abortSignal?.aborted) {
+      return {
+        connected: false,
+        port: opts.port,
+        spawned: false,
+        restarted: false,
+        warning: "daemon lifecycle was interrupted before startup",
+      };
+    }
     await terminatePid(pid, { isAlive, killProcess, sleepFn });
     if (isAlive(pid)) {
       throw new Error(`Unable to stop verified LCM daemon PID ${pid}; restart aborted.`);

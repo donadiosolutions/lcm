@@ -2052,6 +2052,46 @@ describe("run-owned lifecycle resources", () => {
     expect(readFileSync(fixture.pidPath, "utf-8")).toBe("8374");
   });
 
+  it("does not signal or replace after managed verification is interrupted", async () => {
+    const fixture = createFixture("restart-managed-abort");
+    writeFileSync(fixture.pidPath, "7473", { mode: 0o640 });
+    const stateBefore = readdirSync(fixture.scope.stateDir);
+    const pidBefore = readFileSync(fixture.pidPath, "utf-8");
+    const modeBefore = statSync(fixture.pidPath).mode & 0o777;
+    const controller = new AbortController();
+    const isManaged = vi.fn(async () => {
+      controller.abort();
+      return true;
+    });
+    const replacement = vi.fn(async () => ({
+      connected: false,
+      port: 48_321,
+      spawned: true,
+      startMethod: "systemd-user" as const,
+    }));
+
+    await expect(restartDaemon({
+      ...scopedOptions(fixture),
+      _abortSignal: controller.signal,
+      _isManagedProcessOverride: isManaged,
+      _ensureDaemonOverride: replacement,
+    })).resolves.toEqual({
+      connected: false,
+      port: 48_321,
+      spawned: false,
+      restarted: false,
+      warning: "daemon lifecycle was interrupted before startup",
+    });
+    expect(isManaged).toHaveBeenCalledExactlyOnceWith(7473);
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(replacement).not.toHaveBeenCalled();
+    expect(readdirSync(fixture.scope.stateDir)).toEqual(stateBefore);
+    expect(readFileSync(fixture.pidPath, "utf-8")).toBe(pidBefore);
+    expect(statSync(fixture.pidPath).mode & 0o777).toBe(modeBefore);
+  });
+
   it("rejects worker authentication and an already-interrupted restart", async () => {
     const workerFixture = createFixture("restart-worker");
     writeFileSync(workerFixture.pidPath, "7474");
