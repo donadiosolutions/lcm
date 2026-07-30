@@ -601,13 +601,19 @@ describe("PostgreSQL 18 lexical search", () => {
       );
 
       const lowTimeoutRuntime = new PostgreSqlRuntime(
-        settings(database.runtimeUrl, { poolMax: 1, statementTimeoutMs: 1 })
+        settings(database.runtimeUrl, { poolMax: 1 })
       );
       const lowTimeoutRepository = new PostgreSqlLexicalSearchRepository(
         lowTimeoutRuntime,
         projectId
       );
       try {
+        await lowTimeoutRuntime.query(
+          {
+            text: "SET statement_timeout = '1ms'",
+          },
+          { domain: "lexical-search", operation: "setPooledSearchTimeout" }
+        );
         await expect(
           lowTimeoutRepository.searchMessages({
             query: "z$",
