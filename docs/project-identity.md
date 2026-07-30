@@ -37,11 +37,12 @@ exactly once.
 Exact same-UUID passive events with the same immutable envelope and predecessor
 identity—the same numeric ID or null—also reconcile idempotently. If that
 numeric predecessor row was pruned from both stores, LCM preserves the recorded
-predecessor identity instead of remapping it. Different predecessors, presence
-of that predecessor in only one store, or any actual remap after delivery has
-begun fail closed to protect the immutable PostgreSQL envelope. LCM neither
-guesses a replacement nor discards either copy, so repeated reconciliation
-remains safe.
+predecessor identity instead of remapping it. Once delivery is observable,
+different predecessors, inconsistent predecessor presence, and any actual
+remap fail closed to protect the immutable PostgreSQL envelope. Divergent
+mapped numeric predecessors also fail closed, while compatible pristine
+null-versus-numeric copies may coalesce before delivery. LCM neither guesses a
+replacement nor discards either copy, so repeated reconciliation remains safe.
 
 Each operation has an atomically replaced journal under
 `~/.lcm/reconciliations/`. The journal records discovery evidence, completed
