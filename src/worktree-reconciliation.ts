@@ -48,6 +48,7 @@ import {
   allocateLocalHookEventSequences,
   deriveLegacyLocalHookEventUuid,
   formatLocalHookMachineSequence,
+  parseLocalHookMachineSequence,
 } from "./storage/local-hook-event-sequence.js";
 
 const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
@@ -474,6 +475,86 @@ function comparable(value: unknown): string {
 
 function rowsEqual(left: SqlRow[], right: SqlRow[]): boolean {
   return comparable(left) === comparable(right);
+}
+
+const PASSIVE_EVENT_IMMUTABLE_COLUMNS = [
+  "event_uuid",
+  "event_version",
+  "session_id",
+  "seq",
+  "type",
+  "category",
+  "data",
+  "priority",
+  "source_hook",
+  "created_at",
+] as const;
+
+const PASSIVE_EVENT_DELIVERY_COLUMNS = [
+  "delivery_state",
+  "delivery_generation",
+  "delivery_attempts",
+  "delivery_owner",
+  "delivery_claimed_at",
+  "delivery_next_attempt_at",
+  "delivery_last_error",
+  "remote_inbox_id",
+  "quarantine_reason",
+  "acknowledged_at",
+  "remote_pruned_at",
+] as const;
+
+function legacyEventUuidForCandidate(
+  value: SqlRow,
+  candidateEventId: number,
+): string {
+  return deriveLegacyLocalHookEventUuid({
+    event_id: candidateEventId,
+    session_id: String(value.session_id),
+    seq: Number(value.seq),
+    type: String(value.type),
+    category: String(value.category),
+    data: String(value.data),
+    priority: Number(value.priority),
+    source_hook: String(value.source_hook),
+    created_at: String(value.created_at),
+  });
+}
+
+function isProvablyMigratedLegacyEventPair(
+  existing: SqlRow,
+  incoming: SqlRow,
+  incomingSourceId: number,
+): boolean {
+  if (
+    existing.event_version !== 1
+    || incoming.event_version !== 1
+    || typeof existing.event_uuid !== "string"
+    || existing.event_uuid !== incoming.event_uuid
+    || PASSIVE_EVENT_IMMUTABLE_COLUMNS.some((column) =>
+      comparable(existing[column]) !== comparable(incoming[column]))
+  ) {
+    return false;
+  }
+  const existingId = Number(existing.event_id);
+  return [existingId, incomingSourceId].some((candidateEventId) =>
+    legacyEventUuidForCandidate(existing, candidateEventId) === existing.event_uuid
+    && legacyEventUuidForCandidate(incoming, candidateEventId) === incoming.event_uuid);
+}
+
+function isPristineMigratedLegacyDelivery(value: SqlRow): boolean {
+  return value.delivery_state === "pending"
+    && value.delivery_generation === 0
+    && value.delivery_attempts === 0
+    && value.delivery_owner === null
+    && value.delivery_claimed_at === null
+    && value.delivery_last_error === null
+    && value.remote_inbox_id === null
+    && value.quarantine_reason === null
+    && value.acknowledged_at === null
+    && value.remote_pruned_at === null
+    && value.delivery_next_attempt_at === value.created_at
+    && value.delivery_updated_at === value.created_at;
 }
 
 function insertRow(
@@ -1050,35 +1131,65 @@ function mergeEventsDatabase(
             targetId = Number(insertRow(target, "events", value));
           } else {
             targetId = Number(existing.event_id);
-            const immutableColumns = [
-              "event_uuid",
-              "event_version",
-              "session_id",
-              "seq",
-              "type",
-              "category",
-              "data",
-              "priority",
-              "source_hook",
-              "created_at",
-            ] as const;
             if (
-              immutableColumns.some((column) =>
+              PASSIVE_EVENT_IMMUTABLE_COLUMNS.some((column) =>
                 comparable(existing[column]) !== comparable(value[column]))
               || (
                 sourceSchemaVersion >= 4
-                && (
-                  comparable(existing.machine_sequence)
-                    !== comparable(value.machine_sequence)
-                  || (
-                    existing.machine_id !== null
-                    && value.machine_id !== null
-                    && comparable(existing.machine_id) !== comparable(value.machine_id)
-                  )
-                )
+                && existing.machine_id !== null
+                && value.machine_id !== null
+                && comparable(existing.machine_id) !== comparable(value.machine_id)
               )
             ) {
               throw new Error(`divergent passive event UUID collision: ${String(value.event_uuid)}`);
+            }
+            const sequenceDiffers = sourceSchemaVersion >= 4
+              && comparable(existing.machine_sequence)
+                !== comparable(value.machine_sequence);
+            let reconciledSequence = existing.machine_sequence;
+            let preferredDelivery: SqlRow | undefined;
+            if (sequenceDiffers) {
+              if (
+                !isProvablyMigratedLegacyEventPair(existing, value, sourceId)
+                || typeof existing.machine_sequence !== "string"
+                || typeof value.machine_sequence !== "string"
+              ) {
+                throw new Error(`divergent passive event UUID collision: ${String(value.event_uuid)}`);
+              }
+              const existingPristine = isPristineMigratedLegacyDelivery(existing);
+              const incomingPristine = isPristineMigratedLegacyDelivery(value);
+              if (!existingPristine && !incomingPristine) {
+                throw new Error(`divergent passive event UUID collision: ${String(value.event_uuid)}`);
+              }
+              if (existingPristine && incomingPristine) {
+                const existingSequence = parseLocalHookMachineSequence(
+                  existing.machine_sequence,
+                );
+                const incomingSequence = parseLocalHookMachineSequence(
+                  value.machine_sequence,
+                );
+                reconciledSequence = incomingSequence < existingSequence
+                  ? value.machine_sequence
+                  : existing.machine_sequence;
+                preferredDelivery = existing;
+              } else {
+                preferredDelivery = existingPristine ? value : existing;
+                reconciledSequence = preferredDelivery.machine_sequence;
+              }
+              if (
+                reconciledSequence !== existing.machine_sequence
+                && row(
+                  target,
+                  `SELECT event_uuid FROM events
+                   WHERE machine_sequence = ? AND event_uuid <> ?`,
+                  reconciledSequence,
+                  value.event_uuid,
+                )
+              ) {
+                throw new Error(
+                  `divergent passive event machine sequence collision: ${String(value.event_uuid)}`,
+                );
+              }
             }
             const existingGeneration = Number(existing.delivery_generation);
             const sourceGeneration = Number(value.delivery_generation);
@@ -1097,22 +1208,10 @@ function mergeEventsDatabase(
             ) {
               throw new Error(`divergent passive event predecessor: ${String(value.event_uuid)}`);
             }
-            const deliveryColumns = [
-              "delivery_state",
-              "delivery_generation",
-              "delivery_attempts",
-              "delivery_owner",
-              "delivery_claimed_at",
-              "delivery_next_attempt_at",
-              "delivery_last_error",
-              "remote_inbox_id",
-              "quarantine_reason",
-              "acknowledged_at",
-              "remote_pruned_at",
-            ] as const;
             if (
-              sourceGeneration === existingGeneration
-              && deliveryColumns.some((column) =>
+              preferredDelivery === undefined
+              && sourceGeneration === existingGeneration
+              && PASSIVE_EVENT_DELIVERY_COLUMNS.some((column) =>
                 comparable(existing[column]) !== comparable(value[column]))
             ) {
               throw new Error(`divergent passive event delivery state: ${String(value.event_uuid)}`);
@@ -1130,15 +1229,20 @@ function mergeEventsDatabase(
               right: SQLInputValue,
             ): SQLInputValue => comparable(left) >= comparable(right) ? left : right;
             const sourceWins = sourceGeneration > existingGeneration;
+            const deliverySource = preferredDelivery
+              ?? (sourceWins ? value : existing);
             const merged: SqlRow = {
               machine_id: existing.machine_id ?? value.machine_id,
+              machine_sequence: reconciledSequence,
               prev_event_id: existing.prev_event_id ?? value.prev_event_id,
               processed_at: earliest(existing.processed_at, value.processed_at),
-              ...Object.fromEntries(deliveryColumns.map((column) => [
+              ...Object.fromEntries(PASSIVE_EVENT_DELIVERY_COLUMNS.map((column) => [
                 column,
-                sourceWins ? value[column] : existing[column],
+                deliverySource[column],
               ])),
-              delivery_updated_at: sourceGeneration === existingGeneration
+              delivery_updated_at: preferredDelivery !== undefined
+                ? preferredDelivery.delivery_updated_at
+                : sourceGeneration === existingGeneration
                 ? latest(existing.delivery_updated_at, value.delivery_updated_at)
                 : sourceWins
                   ? value.delivery_updated_at
@@ -1146,9 +1250,10 @@ function mergeEventsDatabase(
             };
             const mutableColumns = [
               "machine_id",
+              "machine_sequence",
               "prev_event_id",
               "processed_at",
-              ...deliveryColumns,
+              ...PASSIVE_EVENT_DELIVERY_COLUMNS,
               "delivery_updated_at",
             ] as const;
             if (mutableColumns.some((column) =>

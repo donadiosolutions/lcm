@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { DatabaseSync, StatementSync } from "node:sqlite";
 import { dirname } from "node:path";
 import { closeLcmConnection, getLcmConnection } from "../db/connection.js";
 import { eventSequenceDbPath } from "../db/events-path.js";
@@ -9,6 +10,17 @@ const EXHAUSTED_SEQUENCE_CHECKPOINT = MAX_POSTGRESQL_BIGINT + 1n;
 const PADDED_SEQUENCE_LENGTH = MAX_POSTGRESQL_BIGINT.toString().length;
 const MAX_SEQUENCE_ALLOCATION_BATCH = 1_000_000;
 const DECIMAL_SEQUENCE = /^\d+$/u;
+
+function validateSequenceAllocationCount(count: number): void {
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new Error("local hook sequence count must be a non-negative safe integer");
+  }
+  if (count > MAX_SEQUENCE_ALLOCATION_BATCH) {
+    throw new Error(
+      `local hook sequence count must not exceed ${MAX_SEQUENCE_ALLOCATION_BATCH}`,
+    );
+  }
+}
 
 export interface LegacyLocalHookEventIdentity {
   readonly event_id: number;
@@ -55,63 +67,113 @@ export function parseLocalHookMachineSequence(sequence: string): bigint {
 }
 
 /**
- * Reserves installation-global sequence values in one SQLite transaction.
+ * Keeps one initialized checkpoint connection alive for a caller-owned
+ * lifecycle while committing every reservation independently.
  *
  * The sidecar insert happens after this reservation. A crash may therefore
  * leave a gap, which is safe; a committed event can never reuse a value.
+ */
+export class LocalHookEventSequenceAllocator {
+  private readonly db: DatabaseSync;
+  private readonly readCheckpoint: StatementSync;
+  private readonly writeCheckpoint: StatementSync;
+  private closed = false;
+
+  constructor(private readonly sequencePath = eventSequenceDbPath()) {
+    ensurePrivateDirectory(dirname(sequencePath));
+    const db = getLcmConnection(sequencePath);
+    this.db = db;
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS local_hook_sequence (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          next_sequence TEXT NOT NULL
+            CHECK (next_sequence <> '' AND next_sequence NOT GLOB '*[^0-9]*')
+        );
+        INSERT INTO local_hook_sequence(singleton, next_sequence)
+        VALUES(1, '0')
+        ON CONFLICT(singleton) DO NOTHING;
+      `);
+      this.readCheckpoint = db.prepare(
+        "SELECT next_sequence FROM local_hook_sequence WHERE singleton = 1",
+      );
+      this.writeCheckpoint = db.prepare(
+        "UPDATE local_hook_sequence SET next_sequence = ? WHERE singleton = 1",
+      );
+    } catch (error) {
+      closeLcmConnection(sequencePath, db);
+      throw error;
+    }
+  }
+
+  allocateSequences(count: number): bigint[] {
+    if (this.closed) {
+      throw new Error("local hook sequence allocator is closed");
+    }
+    validateSequenceAllocationCount(count);
+    if (count === 0) return [];
+
+    // Revalidate the persistent path before every reservation. A pooled handle
+    // can remain usable after its file is unlinked or replaced; acquiring a
+    // temporary lease makes the shared connection guard reject that rotation
+    // before this allocator can advance the stale checkpoint.
+    const validationLease = getLcmConnection(this.sequencePath);
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const row = this.readCheckpoint.get() as
+          { next_sequence?: unknown } | undefined;
+        const start = parseSequence(
+          row?.next_sequence,
+          "sequence checkpoint",
+          EXHAUSTED_SEQUENCE_CHECKPOINT,
+        );
+        const next = start + BigInt(count);
+        if (start > MAX_POSTGRESQL_BIGINT || next - 1n > MAX_POSTGRESQL_BIGINT) {
+          throw new Error("local hook machine sequence is exhausted");
+        }
+        this.writeCheckpoint.run(next.toString());
+        this.db.exec("COMMIT");
+        return Array.from({ length: count }, (_, index) => start + BigInt(index));
+      } catch (error) {
+        try { this.db.exec("ROLLBACK"); } catch { /* preserve allocation failure */ }
+        throw error;
+      }
+    } finally {
+      closeLcmConnection(this.sequencePath, validationLease);
+    }
+  }
+
+  allocateSequence(): bigint {
+    return this.allocateSequences(1)[0]!;
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    closeLcmConnection(this.sequencePath, this.db);
+  }
+}
+
+/**
+ * Reserves installation-global sequence values in one SQLite transaction.
+ *
+ * Callers that allocate repeatedly should own a
+ * LocalHookEventSequenceAllocator for their lifecycle so the connection,
+ * schema, and prepared statements are reused.
  */
 export function allocateLocalHookEventSequences(
   count: number,
   sequencePath = eventSequenceDbPath(),
 ): bigint[] {
-  if (!Number.isSafeInteger(count) || count < 0) {
-    throw new Error("local hook sequence count must be a non-negative safe integer");
-  }
-  if (count > MAX_SEQUENCE_ALLOCATION_BATCH) {
-    throw new Error(
-      `local hook sequence count must not exceed ${MAX_SEQUENCE_ALLOCATION_BATCH}`,
-    );
-  }
+  validateSequenceAllocationCount(count);
   if (count === 0) return [];
 
-  ensurePrivateDirectory(dirname(sequencePath));
-  const db = getLcmConnection(sequencePath);
+  const allocator = new LocalHookEventSequenceAllocator(sequencePath);
   try {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS local_hook_sequence (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        next_sequence TEXT NOT NULL
-          CHECK (next_sequence <> '' AND next_sequence NOT GLOB '*[^0-9]*')
-      );
-      INSERT INTO local_hook_sequence(singleton, next_sequence)
-      VALUES(1, '0')
-      ON CONFLICT(singleton) DO NOTHING;
-    `);
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      const row = db.prepare(
-        "SELECT next_sequence FROM local_hook_sequence WHERE singleton = 1",
-      ).get() as { next_sequence?: unknown } | undefined;
-      const start = parseSequence(
-        row?.next_sequence,
-        "sequence checkpoint",
-        EXHAUSTED_SEQUENCE_CHECKPOINT,
-      );
-      const next = start + BigInt(count);
-      if (start > MAX_POSTGRESQL_BIGINT || next - 1n > MAX_POSTGRESQL_BIGINT) {
-        throw new Error("local hook machine sequence is exhausted");
-      }
-      db.prepare(
-        "UPDATE local_hook_sequence SET next_sequence = ? WHERE singleton = 1",
-      ).run(next.toString());
-      db.exec("COMMIT");
-      return Array.from({ length: count }, (_, index) => start + BigInt(index));
-    } catch (error) {
-      try { db.exec("ROLLBACK"); } catch { /* preserve allocation failure */ }
-      throw error;
-    }
+    return allocator.allocateSequences(count);
   } finally {
-    closeLcmConnection(sequencePath, db);
+    allocator.close();
   }
 }
 

@@ -7,7 +7,7 @@ import {
   type EventRow,
   type HealthStats,
 } from "../../src/hooks/events-db.js";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -82,6 +82,75 @@ describe("EventsDb", () => {
     )).toBeTypeOf("number");
     expect(db.getUnprocessed()[0].machine_id).toBeNull();
     db.close();
+  });
+
+  it("does not initialize a sequence allocator after closing before the first insert", () => {
+    const sequencePath = join(dir, ".machine-sequence.sqlite");
+    const db = new EventsDb(dbPath);
+    db.close();
+
+    expect(existsSync(sequencePath)).toBe(false);
+    expect(isLcmConnectionOpen(sequencePath)).toBe(false);
+    expect(() => db.insertEvent("after-close", {
+      type: "choice",
+      category: "decision",
+      data: "must not reserve",
+      priority: 1,
+    }, "PostToolUse")).toThrow("events database is closed");
+    expect(existsSync(sequencePath)).toBe(false);
+    expect(isLcmConnectionOpen(sequencePath)).toBe(false);
+
+    db.close();
+  });
+
+  it("reuses one durable sequence allocator across 501 event inserts", () => {
+    const sequencePath = join(dir, ".machine-sequence.sqlite");
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
+    const db = new EventsDb(dbPath);
+    expect(existsSync(sequencePath)).toBe(false);
+    expect(isLcmConnectionOpen(sequencePath)).toBe(false);
+
+    try {
+      for (let index = 0; index < 501; index++) {
+        db.insertEvent("backlog", {
+          type: "choice",
+          category: "decision",
+          data: `event ${index}`,
+          priority: 1,
+        }, "PostToolUse");
+      }
+
+      expect(isLcmConnectionOpen(sequencePath)).toBe(true);
+      const rows = db.getUnprocessed(501);
+      expect(rows).toHaveLength(501);
+      expect(rows.map(({ machine_sequence: sequence }) => BigInt(sequence)))
+        .toEqual(Array.from({ length: 501 }, (_, index) => BigInt(index)));
+
+      const sql = execSpy.mock.calls.map(([statement]) => statement);
+      expect(sql.filter((statement) =>
+        statement.includes("CREATE TABLE IF NOT EXISTS local_hook_sequence")
+      )).toHaveLength(1);
+      expect(sql.filter((statement) => statement === "BEGIN IMMEDIATE"))
+        .toHaveLength(501);
+      expect(sql.filter((statement) => statement === "COMMIT")).toHaveLength(502);
+    } finally {
+      db.close();
+      db.close();
+      execSpy.mockRestore();
+    }
+
+    expect(isLcmConnectionOpen(sequencePath)).toBe(false);
+    expect(() => db.insertEvent("after-close", {
+      type: "choice",
+      category: "decision",
+      data: "must not reserve",
+      priority: 1,
+    }, "PostToolUse")).toThrow("events database is closed");
+    const checkpoint = new DatabaseSync(sequencePath, { readOnly: true });
+    expect(checkpoint.prepare(
+      "SELECT next_sequence FROM local_hook_sequence WHERE singleton = 1",
+    ).get()).toEqual({ next_sequence: "501" });
+    checkpoint.close();
   });
 
   it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
@@ -675,15 +744,24 @@ describe("EventsDb", () => {
   });
 
   it("handles concurrent opens (WAL mode)", () => {
+    const sequencePath = join(dir, ".machine-sequence.sqlite");
     const db1 = new EventsDb(dbPath);
     const db2 = new EventsDb(dbPath);
-    db1.insertEvent("s1", { type: "a", category: "file", data: "x", priority: 3 }, "PostToolUse");
-    db2.insertEvent("s2", { type: "b", category: "file", data: "y", priority: 3 }, "PostToolUse");
+    try {
+      db1.insertEvent("s1", { type: "a", category: "file", data: "x", priority: 3 }, "PostToolUse");
+      db2.insertEvent("s2", { type: "b", category: "file", data: "y", priority: 3 }, "PostToolUse");
 
-    const events = db1.getUnprocessed();
-    expect(events).toHaveLength(2);
-    db1.close();
-    db2.close();
+      const events = db1.getUnprocessed();
+      expect(events.map(({ machine_sequence: sequence }) => BigInt(sequence)))
+        .toEqual([0n, 1n]);
+      expect(isLcmConnectionOpen(sequencePath)).toBe(true);
+      db1.close();
+      expect(isLcmConnectionOpen(sequencePath)).toBe(true);
+    } finally {
+      db1.close();
+      db2.close();
+    }
+    expect(isLcmConnectionOpen(sequencePath)).toBe(false);
   });
 
   describe("Schema migrations — error_log + pattern lookup index", () => {
@@ -803,6 +881,63 @@ describe("EventsDb", () => {
       db.close();
     });
 
+    it("takes the legacy snapshot only after acquiring the migration lock", () => {
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec(`
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version VALUES (2);
+        CREATE TABLE events (
+          event_id INTEGER PRIMARY KEY, session_id TEXT, seq INTEGER, type TEXT,
+          category TEXT, data TEXT, priority INTEGER, source_hook TEXT,
+          prev_event_id INTEGER, processed_at TEXT, created_at TEXT
+        );
+        INSERT INTO events(
+          event_id, session_id, seq, type, category, data, priority,
+          source_hook, prev_event_id, processed_at, created_at
+        ) VALUES(
+          7, 'first-session', 1, 'observation', 'fact', 'first', 2,
+          'PostToolUse', NULL, NULL, '2026-07-29 11:59:00'
+        );
+      `);
+      rawDb.close();
+
+      const competingWriter = new DatabaseSync(dbPath);
+      const originalExec = DatabaseSync.prototype.exec;
+      let competingRowCommitted = false;
+      const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+        this: DatabaseSync,
+        sql: string,
+      ) {
+        if (!competingRowCommitted && sql === "BEGIN EXCLUSIVE") {
+          competingWriter.prepare(`
+            INSERT INTO events(
+              event_id, session_id, seq, type, category, data, priority,
+              source_hook, prev_event_id, processed_at, created_at
+            ) VALUES(
+              8, 'competing-session', 1, 'observation', 'fact', 'second', 2,
+              'PostToolUse', NULL, NULL, '2026-07-29 12:00:00'
+            )
+          `).run();
+          competingRowCommitted = true;
+        }
+        return originalExec.call(this, sql);
+      });
+
+      let db: EventsDb | undefined;
+      try {
+        db = new EventsDb(dbPath);
+        expect(competingRowCommitted).toBe(true);
+        expect(db.getUnprocessed()
+          .map(({ event_id: eventId }) => eventId)
+          .sort((left, right) => left - right))
+          .toEqual([7, 8]);
+      } finally {
+        db?.close();
+        execSpy.mockRestore();
+        competingWriter.close();
+      }
+    });
+
     it("leaves an already-current schema version unchanged", () => {
       const rawDb = new DatabaseSync(dbPath);
       rawDb.exec(`
@@ -815,9 +950,16 @@ describe("EventsDb", () => {
       expect(withSqlite(dbPath, (raw) => (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version))
         .toBe(4);
       db.close();
-      const reopened = new EventsDb(dbPath);
-      expect(reopened.getUnprocessed()).toEqual([]);
-      reopened.close();
+      const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
+      let reopened: EventsDb | undefined;
+      try {
+        reopened = new EventsDb(dbPath);
+        expect(reopened.getUnprocessed()).toEqual([]);
+        expect(execSpy).not.toHaveBeenCalledWith("BEGIN EXCLUSIVE");
+      } finally {
+        reopened?.close();
+        execSpy.mockRestore();
+      }
     });
 
     it.each([

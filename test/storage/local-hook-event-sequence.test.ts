@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   chmodSync,
   mkdirSync,
@@ -14,8 +14,10 @@ import {
   allocateLocalHookEventSequences,
   deriveLegacyLocalHookEventUuid,
   formatLocalHookMachineSequence,
+  LocalHookEventSequenceAllocator,
   parseLocalHookMachineSequence,
 } from "../../src/storage/local-hook-event-sequence.js";
+import { isLcmConnectionOpen } from "../../src/db/connection.js";
 
 const MAX_POSTGRESQL_BIGINT = 9_223_372_036_854_775_807n;
 
@@ -46,6 +48,55 @@ describe("local hook event sequence", () => {
       "SELECT next_sequence FROM local_hook_sequence WHERE singleton = 1",
     ).get()).toEqual({ next_sequence: "5" });
     raw.close();
+  });
+
+  it("reuses one initialized allocator while committing every exact allocation", () => {
+    const path = sequencePath();
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
+    const allocator = new LocalHookEventSequenceAllocator(path);
+    try {
+      expect(allocator.allocateSequences(0)).toEqual([]);
+      expect(Array.from(
+        { length: 5 },
+        () => allocator.allocateSequence(),
+      )).toEqual([0n, 1n, 2n, 3n, 4n]);
+      expect(isLcmConnectionOpen(path)).toBe(true);
+
+      const sql = execSpy.mock.calls.map(([statement]) => statement);
+      expect(sql.filter((statement) =>
+        statement.includes("CREATE TABLE IF NOT EXISTS local_hook_sequence")
+      )).toHaveLength(1);
+      expect(sql.filter((statement) => statement === "BEGIN IMMEDIATE"))
+        .toHaveLength(5);
+      expect(sql.filter((statement) => statement === "COMMIT")).toHaveLength(5);
+    } finally {
+      allocator.close();
+      allocator.close();
+      execSpy.mockRestore();
+    }
+
+    expect(isLcmConnectionOpen(path)).toBe(false);
+    expect(() => allocator.allocateSequence()).toThrow("allocator is closed");
+  });
+
+  it("releases its connection when checkpoint initialization fails", () => {
+    const path = sequencePath();
+    const originalExec = DatabaseSync.prototype.exec;
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(
+      function (this: DatabaseSync, sql: string) {
+        if (sql.includes("CREATE TABLE IF NOT EXISTS local_hook_sequence")) {
+          throw new Error("injected checkpoint initialization failure");
+        }
+        return originalExec.call(this, sql);
+      },
+    );
+    try {
+      expect(() => new LocalHookEventSequenceAllocator(path))
+        .toThrow("injected checkpoint initialization failure");
+      expect(isLcmConnectionOpen(path)).toBe(false);
+    } finally {
+      execSpy.mockRestore();
+    }
   });
 
   it("creates and tightens the private parent directory for a standalone allocator", () => {
@@ -92,9 +143,23 @@ describe("local hook event sequence", () => {
     ).run(MAX_POSTGRESQL_BIGINT.toString());
     raw.close();
 
-    expect(allocateLocalHookEventSequence(path)).toBe(MAX_POSTGRESQL_BIGINT);
-    expect(() => allocateLocalHookEventSequence(path))
-      .toThrow("machine sequence is exhausted");
+    const allocator = new LocalHookEventSequenceAllocator(path);
+    try {
+      expect(allocator.allocateSequence()).toBe(MAX_POSTGRESQL_BIGINT);
+      expect(() => allocator.allocateSequence())
+        .toThrow("machine sequence is exhausted");
+      expect(() => allocator.allocateSequence())
+        .toThrow("machine sequence is exhausted");
+    } finally {
+      allocator.close();
+    }
+    const reopened = new DatabaseSync(path);
+    expect(reopened.prepare(
+      "SELECT next_sequence FROM local_hook_sequence WHERE singleton = 1",
+    ).get()).toEqual({
+      next_sequence: (MAX_POSTGRESQL_BIGINT + 1n).toString(),
+    });
+    reopened.close();
   });
 
   it("fails closed for a malformed durable checkpoint without changing it", () => {
@@ -110,8 +175,10 @@ describe("local hook event sequence", () => {
     `);
     raw.close();
 
-    expect(() => allocateLocalHookEventSequence(path))
+    const allocator = new LocalHookEventSequenceAllocator(path);
+    expect(() => allocator.allocateSequence())
       .toThrow("invalid local hook sequence checkpoint");
+    allocator.close();
     const reopened = new DatabaseSync(path);
     expect(reopened.prepare(
       "SELECT next_sequence FROM local_hook_sequence WHERE singleton = 1",

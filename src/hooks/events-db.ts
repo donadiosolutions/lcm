@@ -8,10 +8,10 @@ import { sanitizeError } from "../daemon/safe-error.js";
 import { readMachineIdentity } from "../machine-identity.js";
 import { sanitizeHookErrorDiagnostic } from "./hook-error-diagnostic.js";
 import {
-  allocateLocalHookEventSequence,
   allocateLocalHookEventSequences,
   deriveLegacyLocalHookEventUuid,
   formatLocalHookMachineSequence,
+  LocalHookEventSequenceAllocator,
 } from "../storage/local-hook-event-sequence.js";
 import type {
   LocalHookDeliveryClaimInput,
@@ -190,6 +190,7 @@ export class EventsDb {
   private dbPath: string;
   private closed = false;
   private busyTimeoutOverrideId: symbol | undefined;
+  private sequenceAllocator: LocalHookEventSequenceAllocator | undefined;
 
   constructor(dbPath: string, options: LocalHookOutboxOpenOptions = {}) {
     mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
@@ -258,19 +259,15 @@ export class EventsDb {
     }
   }
 
-  private migrate(): void {
-    // Check if schema_version table exists
+  private readSchemaVersion(): {
+    currentVersion: number;
+    versionRow: { version: number } | undefined;
+  } | undefined {
     const row = this.db.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
     ).get() as { name: string } | undefined;
 
-    if (!row) {
-      this.runMigrationTransaction(() => {
-        this.db.exec(SCHEMA_SQL);
-        this.db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(SCHEMA_VERSION);
-      });
-      return;
-    }
+    if (!row) return undefined;
 
     const versionRow = this.db.prepare("SELECT version FROM schema_version").get() as { version: number } | undefined;
 
@@ -281,14 +278,42 @@ export class EventsDb {
     if (currentVersion > SCHEMA_VERSION) {
       throw new Error(`unsupported events schema version: ${String(currentVersion)}`);
     }
+
+    return { currentVersion, versionRow };
+  }
+
+  private migrate(): void {
+    const schema = this.readSchemaVersion();
+    if (schema?.currentVersion === SCHEMA_VERSION) {
+      const eventsTable = this.db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='events'",
+      ).get();
+      if (eventsTable) {
+        this.db.exec(`${EVENT_INDEX_SQL}${ERROR_LOG_SQL}`);
+        return;
+      }
+    }
+
+    this.runMigrationTransaction(() => {
+      this.migrateUnderExclusiveLock();
+    });
+  }
+
+  private migrateUnderExclusiveLock(): void {
+    const schema = this.readSchemaVersion();
+    if (!schema) {
+      this.db.exec(SCHEMA_SQL);
+      this.db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(SCHEMA_VERSION);
+      return;
+    }
+
+    const { currentVersion, versionRow } = schema;
     if (currentVersion === SCHEMA_VERSION) {
       const eventsTable = this.db.prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='events'",
       ).get();
       if (!eventsTable) {
-        this.runMigrationTransaction(() => {
-          this.db.exec(`${EVENTS_TABLE_SQL}${EVENT_INDEX_SQL}${ERROR_LOG_SQL}`);
-        });
+        this.db.exec(`${EVENTS_TABLE_SQL}${EVENT_INDEX_SQL}${ERROR_LOG_SQL}`);
       } else {
         this.db.exec(`${EVENT_INDEX_SQL}${ERROR_LOG_SQL}`);
       }
@@ -318,58 +343,56 @@ export class EventsDb {
       join(dirname(this.dbPath), ".machine-sequence.sqlite"),
     );
     const machineId = currentRegisteredMachineId();
-    this.runMigrationTransaction(() => {
-      this.db.exec(ERROR_LOG_SQL);
-      this.db.exec("DROP TABLE IF EXISTS events_v4");
-      this.db.exec(EVENTS_TABLE_SQL.replace("CREATE TABLE events", "CREATE TABLE events_v4"));
-      const insert = this.db.prepare(`
-        INSERT INTO events_v4 (
-          event_id, event_uuid, event_version, machine_id, machine_sequence,
-          session_id, seq, type, category, data, priority, source_hook,
-          prev_event_id, processed_at, created_at, delivery_state,
-          delivery_generation, delivery_attempts, delivery_owner,
-          delivery_claimed_at, delivery_next_attempt_at, delivery_last_error,
-          remote_inbox_id, quarantine_reason, acknowledged_at,
-          remote_pruned_at, delivery_updated_at
-        ) VALUES (
-          ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, 0, 0, NULL, NULL, ?, NULL, NULL, NULL, ?, NULL, ?
-        )
-      `);
-      legacyRows.forEach((legacy, index) => {
-        const createdAt = legacy.created_at ?? LEGACY_EVENT_CREATED_AT_FALLBACK;
-        insert.run(
-          legacy.event_id,
-          deriveLegacyLocalHookEventUuid({ ...legacy, created_at: createdAt }),
-          machineId,
-          formatLocalHookMachineSequence(allocated[index]!),
-          legacy.session_id,
-          legacy.seq,
-          legacy.type,
-          legacy.category,
-          legacy.data,
-          legacy.priority,
-          legacy.source_hook,
-          legacy.prev_event_id,
-          legacy.processed_at,
-          createdAt,
-          "pending",
-          createdAt,
-          null,
-          createdAt,
-        );
-      });
-      this.db.exec(`
-        DROP TABLE events;
-        ALTER TABLE events_v4 RENAME TO events;
-        ${EVENT_INDEX_SQL}
-      `);
-      if (versionRow) {
-        this.db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
-      } else {
-        this.db.prepare("INSERT INTO schema_version(version) VALUES(?)").run(SCHEMA_VERSION);
-      }
+    this.db.exec(ERROR_LOG_SQL);
+    this.db.exec("DROP TABLE IF EXISTS events_v4");
+    this.db.exec(EVENTS_TABLE_SQL.replace("CREATE TABLE events", "CREATE TABLE events_v4"));
+    const insert = this.db.prepare(`
+      INSERT INTO events_v4 (
+        event_id, event_uuid, event_version, machine_id, machine_sequence,
+        session_id, seq, type, category, data, priority, source_hook,
+        prev_event_id, processed_at, created_at, delivery_state,
+        delivery_generation, delivery_attempts, delivery_owner,
+        delivery_claimed_at, delivery_next_attempt_at, delivery_last_error,
+        remote_inbox_id, quarantine_reason, acknowledged_at,
+        remote_pruned_at, delivery_updated_at
+      ) VALUES (
+        ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, 0, 0, NULL, NULL, ?, NULL, NULL, NULL, ?, NULL, ?
+      )
+    `);
+    legacyRows.forEach((legacy, index) => {
+      const createdAt = legacy.created_at ?? LEGACY_EVENT_CREATED_AT_FALLBACK;
+      insert.run(
+        legacy.event_id,
+        deriveLegacyLocalHookEventUuid({ ...legacy, created_at: createdAt }),
+        machineId,
+        formatLocalHookMachineSequence(allocated[index]!),
+        legacy.session_id,
+        legacy.seq,
+        legacy.type,
+        legacy.category,
+        legacy.data,
+        legacy.priority,
+        legacy.source_hook,
+        legacy.prev_event_id,
+        legacy.processed_at,
+        createdAt,
+        "pending",
+        createdAt,
+        null,
+        createdAt,
+      );
     });
+    this.db.exec(`
+      DROP TABLE events;
+      ALTER TABLE events_v4 RENAME TO events;
+      ${EVENT_INDEX_SQL}
+    `);
+    if (versionRow) {
+      this.db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
+    } else {
+      this.db.prepare("INSERT INTO schema_version(version) VALUES(?)").run(SCHEMA_VERSION);
+    }
   }
 
   private runMigrationTransaction(migration: () => void): void {
@@ -384,11 +407,19 @@ export class EventsDb {
     }
   }
 
+  private localHookEventSequenceAllocator(): LocalHookEventSequenceAllocator {
+    if (this.closed) {
+      throw new Error("events database is closed");
+    }
+    this.sequenceAllocator ??= new LocalHookEventSequenceAllocator(
+      join(dirname(this.dbPath), ".machine-sequence.sqlite"),
+    );
+    return this.sequenceAllocator;
+  }
+
   insertEvent(sessionId: string, event: LocalHookEvent, sourceHook: string): number {
     const sequence = formatLocalHookMachineSequence(
-      allocateLocalHookEventSequence(
-        join(dirname(this.dbPath), ".machine-sequence.sqlite"),
-      ),
+      this.localHookEventSequenceAllocator().allocateSequence(),
     );
     const stmt = this.db.prepare(`
       INSERT INTO events (
@@ -910,12 +941,16 @@ export class EventsDb {
     // other callers hold a reference — it is only closed when refs reach 0.
     try { this.removeBusyTimeoutOverride(); } catch { /* timeout restoration is best-effort */ }
     try {
-      closeLcmConnection(this.dbPath, this.db);
+      this.sequenceAllocator?.close();
     } finally {
-      // If the connection was fully evicted from the pool, invalidate the
-      // migration cache so the next open re-runs migrations on a fresh handle.
-      if (!isLcmConnectionOpen(this.dbPath)) {
-        _migratedPaths.delete(this.dbPath);
+      try {
+        closeLcmConnection(this.dbPath, this.db);
+      } finally {
+        // If the connection was fully evicted from the pool, invalidate the
+        // migration cache so the next open re-runs migrations on a fresh handle.
+        if (!isLcmConnectionOpen(this.dbPath)) {
+          _migratedPaths.delete(this.dbPath);
+        }
       }
     }
   }
