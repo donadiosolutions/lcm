@@ -579,7 +579,8 @@ describe("run-owned lifecycle resources", () => {
     expect(JSON.stringify(args)).not.toContain("LCM_DATABASE_PATH");
     expect(options.env.HOME).toBe(fixture.scope.homeDir);
     expect(options.env.USERPROFILE).toBe(fixture.scope.homeDir);
-    expect(options.env.XDG_RUNTIME_DIR).toBe(fixture.scope.runtimeDir);
+    expect(options.env.XDG_RUNTIME_DIR).toBe(process.env.XDG_RUNTIME_DIR);
+    expect(options.env.DBUS_SESSION_BUS_ADDRESS).toBe(process.env.DBUS_SESSION_BUS_ADDRESS);
     expect(options.env.LCM_DAEMON_OWNER_ID).toBe(fixture.scope.ownerId);
     expect(options.env.LCM_DATABASE_PATH).toBeUndefined();
     expect(options.env.LCM_SUMMARY_API_KEY).toBeUndefined();
@@ -1081,6 +1082,15 @@ describe("same-user-systemd integration", () => {
     const runSystemd = ((command: string, args: readonly string[], options: object) => {
       unitName = args.find(arg => arg.startsWith("--unit="))!.slice(7);
       const result = spawnSync(command, args, options);
+      if (result.status !== 0) {
+        console.info("[lcm lifecycle systemd failure]", JSON.stringify({
+          unitName,
+          status: result.status,
+          stdout: String(result.stdout),
+          stderr: String(result.stderr),
+          args,
+        }));
+      }
       const barrierDir = process.env.LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR;
       const expectedScopes = Number(process.env.LCM_LIFECYCLE_EXPECTED_SCOPES ?? "1");
       if (result.status !== 0 || barrierDir === undefined || expectedScopes <= 1) return result;
@@ -1197,7 +1207,10 @@ describe("same-user-systemd integration", () => {
       _testScope: scope,
       _skipHealthWait: true,
     });
-    expect(result.startMethod).toBe("systemd-user");
+    expect(result).toMatchObject({
+      startMethod: "systemd-user",
+      warning: undefined,
+    });
     expect(unitName).toMatch(new RegExp(`^${scope.unitPrefix}[0-9]+-[0-9]+$`, "u"));
     expect(unitName).not.toMatch(/^lcm-daemon-/u);
     expect(existsSync(stateDir)).toBe(false);

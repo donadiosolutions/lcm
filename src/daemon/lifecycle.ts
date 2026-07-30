@@ -952,6 +952,18 @@ function systemdRunProcessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return result;
 }
 
+function systemdManagerProcessEnv(
+  lifecycleEnv: NodeJS.ProcessEnv,
+  testScope?: DaemonLifecycleTestScope,
+): NodeJS.ProcessEnv {
+  if (!testScope) return systemdRunProcessEnv(lifecycleEnv);
+  return systemdRunProcessEnv({
+    ...lifecycleEnv,
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
+    DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS,
+  });
+}
+
 function systemdCredentialCleanup(credentialDir: string): () => void {
   return () => {
     try {
@@ -1058,7 +1070,7 @@ async function startViaUserSystemd(
       ...spawnArgs,
     ], {
       encoding: "utf-8",
-      env: systemdRunProcessEnv(lifecycleEnv),
+      env: systemdManagerProcessEnv(lifecycleEnv, testScope),
       timeout: Math.max(1, opts.spawnTimeoutMs),
     });
   } catch (err) {
@@ -1939,5 +1951,6 @@ export const __lifecycleTestUtils = {
   sleep,
   systemdDaemonSetenvArgs,
   systemdDaemonCredentialArgs,
+  systemdManagerProcessEnv,
   systemdRunProcessEnv,
 };
