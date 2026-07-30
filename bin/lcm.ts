@@ -2,7 +2,7 @@
 import { realpathSync } from "node:fs";
 import { argv, exit, stdin, stdout } from "node:process";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command, Option } from "commander";
 import { packageRootFor } from "../src/runtime-root.js";
@@ -31,6 +31,12 @@ import type { ProgressState } from "../src/cli/progress-state.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
 import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
+import {
+  DAEMON_TEST_ENTRYPOINT_OPTION,
+  DAEMON_TEST_OWNER_OPTION,
+  type DaemonLifecycleTestIdentity,
+  isDaemonLifecycleTestIdentity,
+} from "../src/daemon/lifecycle-scope.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -175,11 +181,29 @@ type DaemonStartOptions = {
   help?: boolean;
   detach?: boolean;
   foreground?: boolean;
+  internalLcmTestDaemonOwner?: string;
+  internalLcmTestDaemonEntrypoint?: string;
 };
 
 type DaemonRootOptions = {
   help?: boolean;
 };
+
+/** @internal Verifies that Commander preserved the preflighted hidden identity. */
+export function assertParsedInternalDaemonTestIdentity(
+  opts: Pick<
+    DaemonStartOptions,
+    "internalLcmTestDaemonOwner" | "internalLcmTestDaemonEntrypoint"
+  >,
+  identity: DaemonLifecycleTestIdentity | undefined,
+): void {
+  if (
+    opts.internalLcmTestDaemonOwner !== identity?.ownerId
+    || opts.internalLcmTestDaemonEntrypoint !== identity?.entrypoint
+  ) {
+    throw new Error("Internal daemon test identity did not survive CLI parsing intact");
+  }
+}
 
 export function shouldRunMain(invokedPath: string | undefined, currentFilePath: string): boolean {
   if (!invokedPath) return false;
@@ -194,6 +218,78 @@ export function shouldRunMain(invokedPath: string | undefined, currentFilePath: 
 type CustomHelpRequest = {
   command?: string;
 };
+
+function strictlyContainsPath(parent: string, candidate: string): boolean {
+  if (!isAbsolute(parent) || !isAbsolute(candidate)) return false;
+  const rel = relative(resolve(parent), resolve(candidate));
+  return rel.length > 0 && !rel.startsWith("..");
+}
+
+function internalOptionValues(args: readonly string[], option: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === option) {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith("-")) {
+        throw new Error(`Incomplete internal daemon test identity: ${option} requires a value`);
+      }
+      values.push(value);
+      index++;
+    } else if (arg.startsWith(`${option}=`)) {
+      const value = arg.slice(option.length + 1);
+      if (value.length === 0) {
+        throw new Error(`Incomplete internal daemon test identity: ${option} requires a value`);
+      }
+      values.push(value);
+    }
+  }
+  return values;
+}
+
+function resolveInternalDaemonTestIdentity(
+  cliArgv: readonly string[],
+): DaemonLifecycleTestIdentity | undefined {
+  const args = cliArgv.slice(2);
+  const owners = internalOptionValues(args, DAEMON_TEST_OWNER_OPTION);
+  const entrypoints = internalOptionValues(args, DAEMON_TEST_ENTRYPOINT_OPTION);
+  if (owners.length === 0 && entrypoints.length === 0) return undefined;
+  if (owners.length !== 1 || entrypoints.length !== 1) {
+    throw new Error("Internal daemon test identity must provide one complete owner and entrypoint pair");
+  }
+  if (
+    args[0] !== "daemon"
+    || args[1] !== "start"
+    || !args.includes("--foreground")
+  ) {
+    throw new Error("Internal daemon test identity is restricted to foreground daemon startup");
+  }
+  const identity = { ownerId: owners[0]!, entrypoint: entrypoints[0]! };
+  if (!isDaemonLifecycleTestIdentity(identity)) {
+    throw new Error("Internal daemon test identity is malformed");
+  }
+  const homeDir = process.env.HOME;
+  const runtimeDir = process.env.XDG_RUNTIME_DIR;
+  if (
+    process.env.LCM_DAEMON_OWNER_ID !== identity.ownerId
+    || homeDir === undefined
+    || runtimeDir === undefined
+    || resolve(homeDir) === resolve("/")
+    || !strictlyContainsPath(homeDir, runtimeDir)
+    || !strictlyContainsPath(homeDir, identity.entrypoint)
+  ) {
+    throw new Error("Internal daemon test identity is not confined to an isolated lifecycle environment");
+  }
+  const lcDir = lcmHomeDir();
+  if (
+    !strictlyContainsPath(homeDir, lcDir)
+    || !strictlyContainsPath(lcDir, daemonPidPath())
+    || !strictlyContainsPath(lcDir, daemonTokenPath())
+  ) {
+    throw new Error("Internal daemon test state is not confined to the isolated lifecycle home");
+  }
+  return identity;
+}
 
 /** Resolve custom help before Commander can dispatch a nested command action. */
 function resolveCustomHelpRequest(cliArgv: string[]): CustomHelpRequest | undefined {
@@ -853,6 +949,7 @@ async function createDaemonClientOrExit(
 
 /** @internal CLI entry seam; defaults preserve the published executable behavior. */
 export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
+  const internalDaemonTestIdentity = resolveInternalDaemonTestIdentity(cliArgv);
   migrateLegacyHomeIfNeeded();
   const { readFileSync } = await import("node:fs");
   const { join } = await import("node:path");
@@ -891,9 +988,12 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
     .description("Start the context daemon")
     .option("--detach", "Run in the background (compatibility alias)")
     .option("--foreground", "Run in the foreground for debugging")
+    .addOption(new Option(`${DAEMON_TEST_OWNER_OPTION} <owner>`).hideHelp())
+    .addOption(new Option(`${DAEMON_TEST_ENTRYPOINT_OPTION} <path>`).hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts: DaemonStartOptions) => {
       if (opts.help) await withCustomHelp(daemonCmd, "daemon");
+      assertParsedInternalDaemonTestIdentity(opts, internalDaemonTestIdentity);
       if (!opts.foreground) {
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
         const { loadDaemonConfig } = await import("../src/daemon/config.js");
@@ -940,7 +1040,12 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
           // Best-effort cleanup; stale PID files are handled by ensureDaemon.
         }
       };
-      const daemon = await createDaemon(config, { tokenPath });
+      const daemon = await createDaemon(config, {
+        tokenPath,
+        ...(internalDaemonTestIdentity
+          ? { _testIdentity: internalDaemonTestIdentity }
+          : {}),
+      });
       mkdirSync(lcDir, { recursive: true });
       writeFileSync(pidFilePath, String(process.pid));
       process.on("exit", cleanupPidFile);

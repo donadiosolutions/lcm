@@ -14,12 +14,16 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createDaemonLifecycleTestScope,
+  DAEMON_TEST_ENTRYPOINT_OPTION,
+  DAEMON_TEST_OWNER_OPTION,
+  isDaemonLifecycleHermeticTestSeams,
   isDaemonLifecycleTestIdentity,
   isDaemonLifecycleTestScope,
   isVitestWorkerEntrypoint,
   lifecycleScopeOwnsPath,
   lifecycleScopeUnitName,
   type DaemonLifecycleTestDependencies,
+  type DaemonLifecycleHermeticTestSeams,
   type DaemonLifecycleTestScope,
 } from "../../src/daemon/lifecycle-scope.js";
 import { ensureDaemon, restartDaemon } from "../../src/daemon/lifecycle.js";
@@ -119,6 +123,35 @@ function scopedOptions(fixture: ScopeFixture): Parameters<typeof ensureDaemon>[0
     _testScope: fixture.scope,
     _skipHealthWait: true,
   };
+}
+
+function withHermeticLifecycleSeams(
+  options: Parameters<typeof ensureDaemon>[0],
+  root: string,
+): Parameters<typeof ensureDaemon>[0] {
+  const stateDir = dirname(options.pidFilePath);
+  const seams: DaemonLifecycleHermeticTestSeams = {
+    homeDir: root,
+    runtimeDir: join(root, "hermetic-runtime"),
+    stateDir,
+    credentialDir: join(root, "hermetic-credentials"),
+    procRoot: join(root, "hermetic-proc"),
+    platform: options._platform ?? "linux",
+    uid: options._uid ?? 1000,
+    environment: {},
+    fetch: options._fetchOverride
+      ?? (vi.fn().mockRejectedValue(new Error("hermetic offline")) as never),
+    spawn: options._spawnOverride
+      ?? (vi.fn(() => ({ pid: undefined, once: vi.fn().mockReturnThis(), unref: vi.fn() })) as never),
+    spawnSync: options._spawnSyncOverride
+      ?? (vi.fn(() => ({ status: 1, stdout: "", stderr: "hermetic" })) as never),
+    stopUnit: vi.fn(),
+    killProcess: options._killOverride ?? vi.fn(),
+    isProcessAlive: options._isProcessAliveOverride ?? (() => false),
+    sleep: options._sleepOverride ?? (async () => undefined),
+    realpath: options._realpathOverride ?? (path => path),
+  };
+  return { ...options, _hermeticTestSeams: seams };
 }
 
 describe("daemon lifecycle test-scope validation", () => {
@@ -231,6 +264,78 @@ describe("daemon lifecycle test-scope validation", () => {
     expect(fixture.spawnProcess).not.toHaveBeenCalled();
   });
 
+  it("fails closed for malformed, conflicting, or out-of-root hermetic seams", async () => {
+    const fixture = createFixture("hermetic-preflight");
+    const options = withHermeticLifecycleSeams({
+      port: 37_343,
+      pidFilePath: fixture.pidPath,
+      spawnTimeoutMs: 10,
+    }, fixture.scope.homeDir);
+    const seams = options._hermeticTestSeams!;
+    expect(isDaemonLifecycleHermeticTestSeams(seams)).toBe(true);
+    expect(isDaemonLifecycleHermeticTestSeams(null)).toBe(false);
+    expect(isDaemonLifecycleHermeticTestSeams({ ...seams, homeDir: "/" })).toBe(false);
+    expect(isDaemonLifecycleHermeticTestSeams({ ...seams, homeDir: "relative" })).toBe(false);
+    expect(isDaemonLifecycleHermeticTestSeams({ ...seams, runtimeDir: "/outside" })).toBe(false);
+    expect(isDaemonLifecycleHermeticTestSeams({ ...seams, uid: -1 })).toBe(false);
+    expect(isDaemonLifecycleHermeticTestSeams({ ...seams, platform: "" })).toBe(false);
+    expect(isDaemonLifecycleHermeticTestSeams({ ...seams, environment: null })).toBe(false);
+    expect(isDaemonLifecycleHermeticTestSeams({ ...seams, spawn: undefined })).toBe(false);
+    await expect(ensureDaemon({
+      ...options,
+      _hermeticTestSeams: {
+        ...options._hermeticTestSeams!,
+        fetch: undefined,
+      } as never,
+    })).resolves.toMatchObject({
+      connected: false,
+      warning: expect.stringContaining("incomplete or malformed"),
+    });
+    await expect(restartDaemon({
+      ...options,
+      _hermeticTestSeams: {
+        ...options._hermeticTestSeams!,
+        uid: -1,
+      } as never,
+    })).resolves.toMatchObject({
+      restarted: false,
+      warning: expect.stringContaining("incomplete or malformed"),
+    });
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      _hermeticTestSeams: options._hermeticTestSeams,
+    })).resolves.toMatchObject({
+      connected: false,
+      warning: expect.stringContaining("conflicts"),
+    });
+    await expect(restartDaemon({
+      ...scopedOptions(fixture),
+      _hermeticTestSeams: options._hermeticTestSeams,
+    })).resolves.toMatchObject({
+      restarted: false,
+      warning: expect.stringContaining("conflicts"),
+    });
+    const foreignSeams = {
+      ...options._hermeticTestSeams!,
+      stateDir: join(fixture.scope.homeDir, "foreign-state"),
+    };
+    await expect(ensureDaemon({
+      ...options,
+      _hermeticTestSeams: foreignSeams,
+    })).resolves.toMatchObject({
+      connected: false,
+      warning: expect.stringContaining("outside its state root"),
+    });
+    await expect(restartDaemon({
+      ...options,
+      _hermeticTestSeams: foreignSeams,
+    })).resolves.toMatchObject({
+      restarted: false,
+      warning: expect.stringContaining("outside its state root"),
+    });
+    expect(fixture.scope.dependencies.fetch).not.toHaveBeenCalled();
+  });
+
   it("blocks an unscoped Vitest worker before host discovery or mutation", async () => {
     expect(isVitestWorkerEntrypoint(process.argv[1])).toBe(true);
     const fetch = vi.spyOn(globalThis, "fetch");
@@ -276,6 +381,48 @@ describe("daemon lifecycle test-scope validation", () => {
     expect(existsSync(stateDir)).toBe(false);
   });
 
+  it("rejects no-op partial seams for ensure and restart before side effects", async () => {
+    expect(isVitestWorkerEntrypoint(process.argv[1])).toBe(true);
+    const root = mkdtempSync(join(tmpdir(), "lcm-partial-seams-"));
+    roots.push(root);
+    const stateDir = join(root, "state");
+    const pidPath = join(stateDir, "daemon.pid");
+    const tokenPath = join(stateDir, "daemon.token");
+    const fetch = vi.spyOn(globalThis, "fetch");
+    const kill = vi.spyOn(process, "kill");
+    const validateBeforeRestart = vi.fn();
+    await expect(ensureDaemon({
+      port: 37_342,
+      pidFilePath: pidPath,
+      spawnTimeoutMs: 10,
+      _skipHealthWait: false,
+      _platform: process.platform,
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      warning: expect.stringContaining("unscoped Vitest worker"),
+    });
+    await expect(restartDaemon({
+      port: 37_342,
+      pidFilePath: pidPath,
+      spawnTimeoutMs: 10,
+      _skipHealthWait: false,
+      _platform: process.platform,
+      validateBeforeRestart,
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      restarted: false,
+      warning: expect.stringContaining("unscoped Vitest worker"),
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+    expect(validateBeforeRestart).not.toHaveBeenCalled();
+    expect(existsSync(pidPath)).toBe(false);
+    expect(existsSync(tokenPath)).toBe(false);
+    expect(existsSync(stateDir)).toBe(false);
+  });
+
   it("fails closed for interruption, entrypoint mismatch, and worker entrypoints", async () => {
     const fixture = createFixture("scope-preflight");
     const controller = new AbortController();
@@ -294,16 +441,37 @@ describe("daemon lifecycle test-scope validation", () => {
       connected: false,
       warning: expect.stringContaining("does not match the owned test scope"),
     });
-    await expect(ensureDaemon({
+    await expect(ensureDaemon(withHermeticLifecycleSeams({
       port: 37_338,
       pidFilePath: join(fixture.root, "worker-entrypoint", "daemon.pid"),
       spawnTimeoutMs: 10,
       expectedEntrypoint: process.argv[1],
       _fetchOverride: vi.fn() as never,
-    })).resolves.toMatchObject({
+    }, fixture.root))).resolves.toMatchObject({
       connected: false,
       warning: expect.stringContaining("Vitest worker as a daemon entrypoint"),
     });
+
+    const ambientWorkerEntrypoint = process.argv[1];
+    process.argv[1] = fixture.scope.entrypoint;
+    const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("offline"));
+    try {
+      await expect(ensureDaemon({
+        port: 37_344,
+        pidFilePath: join(fixture.scope.stateDir, "worker-spawn.pid"),
+        spawnTimeoutMs: 100,
+        expectedEntrypoint: fixture.scope.entrypoint,
+        spawnArgs: [ambientWorkerEntrypoint],
+        _skipHealthWait: true,
+      })).resolves.toMatchObject({
+        connected: false,
+        warning: expect.stringContaining("register a Vitest worker"),
+      });
+      expect(existsSync(join(fixture.scope.stateDir, "worker-spawn.pid"))).toBe(false);
+      expect(existsSync(join(fixture.scope.stateDir, "daemon.token"))).toBe(false);
+    } finally {
+      process.argv[1] = ambientWorkerEntrypoint;
+    }
   });
 
   it("refuses to register the ambient Vitest worker during default startup", async () => {
@@ -320,11 +488,51 @@ describe("daemon lifecycle test-scope validation", () => {
       _skipHealthWait: true,
     })).resolves.toMatchObject({
       connected: false,
-      warning: expect.stringContaining("register a Vitest worker"),
+      warning: expect.stringContaining("unscoped Vitest worker"),
     });
     expect(existsSync(fixture.pidPath)).toBe(false);
     expect(existsSync(fixture.tokenPath)).toBe(false);
     expect(readdirSync(fixture.scope.stateDir)).toEqual(stateBefore);
+  });
+
+  it("preserves canonical unit naming for a fully mocked no-scope production invocation", async () => {
+    const fixture = createFixture("production-default");
+    const previousEntrypoint = process.argv[1];
+    process.argv[1] = fixture.scope.entrypoint;
+    const runSystemd = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+    try {
+      await expect(ensureDaemon({
+        port: 37_345,
+        pidFilePath: fixture.pidPath,
+        spawnTimeoutMs: 100,
+        expectedEntrypoint: fixture.scope.entrypoint,
+        enforceUserManagerParent: true,
+        spawnArgs: [fixture.scope.entrypoint],
+        _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as never,
+        _spawnOverride: fixture.spawnProcess as never,
+        _spawnSyncOverride: runSystemd as never,
+        _killOverride: fixture.killProcess,
+        _isProcessAliveOverride: (): boolean => false,
+        _sleepOverride: async () => undefined,
+        _realpathOverride: path => path,
+        _platform: "linux",
+        _procRoot: join(fixture.root, "proc"),
+        _uid: 1000,
+        _skipHealthWait: true,
+      })).resolves.toMatchObject({
+        connected: false,
+        spawned: true,
+        startMethod: "systemd-user",
+      });
+    } finally {
+      process.argv[1] = previousEntrypoint;
+    }
+    const systemdArgs = runSystemd.mock.calls[0]![1] as string[];
+    expect(systemdArgs.find(arg => arg.startsWith("--unit=")))
+      .toMatch(/^--unit=lcm-daemon-[0-9]+-[0-9]+$/u);
+    expect(systemdArgs.find(arg => arg.startsWith("--setenv=LCM_DAEMON_OWNER_ID=")))
+      .toBeUndefined();
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
   });
 });
 
@@ -353,6 +561,12 @@ describe("run-owned lifecycle resources", () => {
     expect(args).toContain(`--setenv=LCM_DAEMON_OWNER_ID=${fixture.scope.ownerId}`);
     expect(args).toContain(`--setenv=XDG_RUNTIME_DIR=${fixture.scope.runtimeDir}`);
     expect(args).toContain(fixture.scope.entrypoint);
+    expect(args.slice(-4)).toEqual([
+      DAEMON_TEST_OWNER_OPTION,
+      fixture.scope.ownerId,
+      DAEMON_TEST_ENTRYPOINT_OPTION,
+      fixture.scope.entrypoint,
+    ]);
     expect(JSON.stringify(args)).not.toContain("scope-secret");
     expect(options.env.HOME).toBe(process.env.HOME);
     expect(options.env.XDG_RUNTIME_DIR).toBe(process.env.XDG_RUNTIME_DIR);
@@ -424,6 +638,7 @@ describe("run-owned lifecycle resources", () => {
     const fixture = createFixture("owned-rejecting-cleanup", {
       fetch: fetch as never,
     });
+    fixture.runSystemd.mockReturnValue({ status: 1, stdout: "", stderr: "fallback" });
     const stopUnit = vi.fn(async () => {
       throw new Error("stop failed");
     });
@@ -449,6 +664,10 @@ describe("run-owned lifecycle resources", () => {
       await expect(operation).rejects.toThrow("stop failed");
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(stopUnit).toHaveBeenCalledOnce();
+      expect(fixture.killProcess).toHaveBeenCalledWith(42_424, "SIGTERM");
+      expect(existsSync(fixture.scope.stateDir)).toBe(false);
+      expect(existsSync(fixture.scope.runtimeDir)).toBe(false);
+      expect(existsSync(fixture.scope.credentialDir)).toBe(false);
       expect(unhandled).not.toHaveBeenCalled();
     } finally {
       process.off("unhandledRejection", unhandled);

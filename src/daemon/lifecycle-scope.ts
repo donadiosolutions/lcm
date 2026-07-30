@@ -2,6 +2,8 @@ import type { spawn, spawnSync } from "node:child_process";
 import { isAbsolute, relative, resolve } from "node:path";
 
 const TEST_UNIT_PREFIX = "lcm-test-daemon-";
+export const DAEMON_TEST_OWNER_OPTION = "--internal-lcm-test-daemon-owner";
+export const DAEMON_TEST_ENTRYPOINT_OPTION = "--internal-lcm-test-daemon-entrypoint";
 const OWNER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u;
 const VITEST_WORKER_PATTERN = /(?:^|[/\\])node_modules[/\\]vitest[/\\]dist[/\\]workers[/\\][^/\\]+\.js$/u;
 const REQUIRED_DEPENDENCIES = [
@@ -27,6 +29,25 @@ export type DaemonLifecycleTestDependencies = Readonly<{
 export type DaemonLifecycleTestIdentity = Readonly<{
   ownerId: string;
   entrypoint: string;
+}>;
+
+export type DaemonLifecycleHermeticTestSeams = Readonly<{
+  homeDir: string;
+  runtimeDir: string;
+  stateDir: string;
+  credentialDir: string;
+  procRoot: string;
+  platform: NodeJS.Platform;
+  uid: number;
+  environment: NodeJS.ProcessEnv;
+  fetch: typeof globalThis.fetch;
+  spawn: typeof spawn;
+  spawnSync: typeof spawnSync;
+  stopUnit: (unitName: string) => void | Promise<void>;
+  killProcess: (pid: number, signal?: NodeJS.Signals | number) => void;
+  isProcessAlive: (pid: number) => boolean;
+  sleep: (ms: number) => Promise<void>;
+  realpath: (path: string) => string;
 }>;
 
 export type DaemonLifecycleTestScope = Readonly<{
@@ -110,6 +131,59 @@ export function isDaemonLifecycleTestIdentity(value: unknown): value is DaemonLi
     && typeof identity.entrypoint === "string"
     && isAbsolute(identity.entrypoint)
     && !isVitestWorkerEntrypoint(identity.entrypoint);
+}
+
+export function daemonLifecycleTestIdentityArgs(
+  scope: DaemonLifecycleTestScope,
+): [string, string, string, string] {
+  return [
+    DAEMON_TEST_OWNER_OPTION,
+    scope.ownerId,
+    DAEMON_TEST_ENTRYPOINT_OPTION,
+    scope.entrypoint,
+  ];
+}
+
+export function isDaemonLifecycleHermeticTestSeams(
+  value: unknown,
+): value is DaemonLifecycleHermeticTestSeams {
+  if (typeof value !== "object" || value === null) return false;
+  const seams = value as DaemonLifecycleHermeticTestSeams;
+  try {
+    const homeDir = requireAbsoluteDirectory("hermetic test homeDir", seams.homeDir);
+    if (homeDir === resolve("/")) return false;
+    for (const [label, path] of [
+      ["runtimeDir", seams.runtimeDir],
+      ["stateDir", seams.stateDir],
+      ["credentialDir", seams.credentialDir],
+      ["procRoot", seams.procRoot],
+    ] as const) {
+      const absolute = requireAbsoluteDirectory(`hermetic test ${label}`, path);
+      if (!isWithin(absolute, homeDir)) return false;
+    }
+  } catch {
+    return false;
+  }
+  if (!Number.isSafeInteger(seams.uid) || seams.uid < 0) return false;
+  if (typeof seams.platform !== "string" || seams.platform.length === 0) return false;
+  if (typeof seams.environment !== "object" || seams.environment === null) return false;
+  return [
+    seams.fetch,
+    seams.spawn,
+    seams.spawnSync,
+    seams.stopUnit,
+    seams.killProcess,
+    seams.isProcessAlive,
+    seams.sleep,
+    seams.realpath,
+  ].every(dependency => typeof dependency === "function");
+}
+
+export function lifecycleHermeticSeamsOwnsStatePath(
+  seams: DaemonLifecycleHermeticTestSeams,
+  path: string,
+): boolean {
+  return isWithin(path, seams.stateDir);
 }
 
 export function isDaemonLifecycleTestScope(value: unknown): value is DaemonLifecycleTestScope {

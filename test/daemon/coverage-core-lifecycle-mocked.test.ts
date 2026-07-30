@@ -10,16 +10,20 @@ vi.mock("node:fs", async importOriginal => ({
   readdirSync: fs.readdir, rmSync: fs.rm, statSync: fs.stat, unlinkSync: fs.unlink, writeFileSync: fs.write,
 }));
 
-import { ensureDaemon } from "../../src/daemon/lifecycle.js";
+import {
+  __lifecycleTestUtils,
+  ensureDaemon as ensureDaemonProduction,
+} from "../../src/daemon/lifecycle.js";
+import type { DaemonLifecycleHermeticTestSeams } from "../../src/daemon/lifecycle-scope.js";
 
-type EnsureDaemonOptions = Parameters<typeof ensureDaemon>[0];
+type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
 type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
 
 const saved = { anthropic: process.env.ANTHROPIC_API_KEY, openai: process.env.OPENAI_API_KEY, lcm: process.env.LCM_SUMMARY_API_KEY };
 const originalGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
 beforeEach(() => {
   Object.defineProperty(process, "getuid", { configurable: true, value: vi.fn(() => 1000) });
-  vi.clearAllMocks(); fs.exists.mockImplementation((path: string) => path.endsWith("daemon.token")); fs.mkdtemp.mockReturnValue("/run/user/1000/lcm-systemd-credentials-test");
+  vi.clearAllMocks(); fs.exists.mockImplementation((path: string) => path.endsWith("daemon.token")); fs.mkdtemp.mockReturnValue("/runtime/.hermetic-credentials/lcm-systemd-credentials-test");
   fs.stat.mockReturnValue({ isDirectory: () => true, mtimeMs: 0 }); fs.readdir.mockReturnValue([]);
   delete process.env.ANTHROPIC_API_KEY; delete process.env.OPENAI_API_KEY; delete process.env.LCM_SUMMARY_API_KEY;
 });
@@ -40,6 +44,31 @@ const base = (): EnsureDaemonOptions => ({
   _skipHealthWait: true,
 });
 
+function ensureDaemon(options: EnsureDaemonOptions): ReturnType<typeof ensureDaemonProduction> {
+  const seams: DaemonLifecycleHermeticTestSeams = {
+    homeDir: "/runtime",
+    runtimeDir: "/runtime/.hermetic-runtime",
+    stateDir: "/runtime",
+    credentialDir: "/runtime/.hermetic-credentials",
+    procRoot: "/runtime/.hermetic-proc",
+    platform: options._platform ?? "linux",
+    uid: options._uid ?? 1000,
+    environment: { ...process.env },
+    fetch: options._fetchOverride
+      ?? (vi.fn().mockRejectedValue(new Error("hermetic offline")) as never),
+    spawn: options._spawnOverride
+      ?? (vi.fn(() => ({ pid: undefined, once: vi.fn().mockReturnThis(), unref: vi.fn() })) as never),
+    spawnSync: options._spawnSyncOverride
+      ?? (vi.fn(() => ({ status: 1, stdout: "", stderr: "hermetic" })) as never),
+    stopUnit: vi.fn(),
+    killProcess: options._killOverride ?? vi.fn(),
+    isProcessAlive: options._isProcessAliveOverride ?? (() => false),
+    sleep: options._sleepOverride ?? (async () => undefined),
+    realpath: options._realpathOverride ?? (path => path),
+  };
+  return ensureDaemonProduction({ ...options, _hermeticTestSeams: seams });
+}
+
 describe("mocked systemd credential boundaries", () => {
   it("starts with no secret credentials", async () => {
     const spawnSync = vi.fn(() => ({ status: 0 }));
@@ -53,11 +82,25 @@ describe("mocked systemd credential boundaries", () => {
     const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
     Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
     try {
-      const result = await ensureDaemon(base());
-      expect(result.warning).toContain("credential setup error: process reported a failure");
+      expect(() => __lifecycleTestUtils.systemdDaemonCredentialArgs(process.env))
+        .toThrow("current user id is unavailable");
     } finally {
       if (descriptor) Object.defineProperty(process, "getuid", descriptor);
     }
+  });
+
+  it("uses only the current user's production credential root without a test scope", () => {
+    process.env.ANTHROPIC_API_KEY = "secret";
+    const credentials = __lifecycleTestUtils.systemdDaemonCredentialArgs(process.env);
+    expect(fs.stat).toHaveBeenCalledWith("/run/user/1000");
+    expect(credentials.args).toEqual([
+      expect.stringContaining("ANTHROPIC_API_KEY:/runtime/.hermetic-credentials/"),
+    ]);
+    credentials.cleanup?.();
+    expect(fs.rm).toHaveBeenCalledWith(
+      "/runtime/.hermetic-credentials/lcm-systemd-credentials-test",
+      { recursive: true, force: true },
+    );
   });
 
   it("reports a non-directory runtime path", async () => {
@@ -79,7 +122,7 @@ describe("mocked systemd credential boundaries", () => {
     });
     const result = await ensureDaemon(base());
     expect(result.warning).toContain("credential setup error: process reported a failure");
-    expect(fs.rm).toHaveBeenCalledWith("/run/user/1000/lcm-systemd-credentials-test", { recursive: true, force: true });
+    expect(fs.rm).toHaveBeenCalledWith("/runtime/.hermetic-credentials/lcm-systemd-credentials-test", { recursive: true, force: true });
   });
 
   it("does not attempt partial cleanup when credential directory creation fails", async () => {
@@ -87,19 +130,19 @@ describe("mocked systemd credential boundaries", () => {
     fs.mkdtemp.mockImplementation(() => { throw new Error("mkdir failed"); });
     const result = await ensureDaemon(base());
     expect(result.warning).toContain("credential setup error: process reported a failure");
-    expect(fs.rm).not.toHaveBeenCalledWith("/run/user/1000/lcm-systemd-credentials-test", expect.anything());
+    expect(fs.rm).not.toHaveBeenCalledWith("/runtime/.hermetic-credentials/lcm-systemd-credentials-test", expect.anything());
   });
 
   it("tolerates cleanup scan stat/removal failures", async () => {
     process.env.ANTHROPIC_API_KEY = "secret";
     fs.readdir.mockReturnValue([{ isDirectory: () => true, name: "lcm-systemd-credentials-old" }]);
-    fs.stat.mockImplementation((path: string) => path === "/run/user/1000"
+    fs.stat.mockImplementation((path: string) => path === "/runtime/.hermetic-credentials"
       ? { isDirectory: () => true, mtimeMs: 0 }
       : (() => { throw new Error("stat"); })());
     fs.write.mockImplementation(() => {});
     const result = await ensureDaemon({ ...base(), _spawnSyncOverride: vi.fn(() => ({ status: 0 })) as never });
     expect(result.startMethod).toBe("systemd-user");
-    expect(fs.rm).toHaveBeenCalledWith("/run/user/1000/lcm-systemd-credentials-test", { recursive: true, force: true });
+    expect(fs.rm).toHaveBeenCalledWith("/runtime/.hermetic-credentials/lcm-systemd-credentials-test", { recursive: true, force: true });
   });
 
   it("cleans credentials after a systemd-started daemon becomes healthy", async () => {
@@ -121,7 +164,7 @@ describe("mocked systemd credential boundaries", () => {
       expectedVersion: "1", _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [1],
     });
     expect(result).toMatchObject({ connected: true, startMethod: "systemd-user" });
-    expect(fs.rm).toHaveBeenCalledWith("/run/user/1000/lcm-systemd-credentials-test", { recursive: true, force: true });
+    expect(fs.rm).toHaveBeenCalledWith("/runtime/.hermetic-credentials/lcm-systemd-credentials-test", { recursive: true, force: true });
   });
 
   it("tolerates credential cleanup removal failures and Error-valued systemd throws", async () => {

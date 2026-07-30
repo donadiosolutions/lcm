@@ -1,14 +1,20 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureAuthToken } from "../../src/daemon/auth.js";
 import { loadDaemonConfig, parseDaemonConfig } from "../../src/daemon/config.js";
-import { ensureDaemon, findUserSystemdPid, readProcessParentPid, restartDaemon } from "../../src/daemon/lifecycle.js";
+import {
+  ensureDaemon as ensureDaemonProduction,
+  findUserSystemdPid,
+  readProcessParentPid,
+  restartDaemon as restartDaemonProduction,
+} from "../../src/daemon/lifecycle.js";
+import type { DaemonLifecycleHermeticTestSeams } from "../../src/daemon/lifecycle-scope.js";
 import { createDaemon } from "../../src/daemon/server.js";
 
 const tempDirs: string[] = [];
-type EnsureDaemonOptions = Parameters<typeof ensureDaemon>[0];
+type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
 type FetchOverride = NonNullable<EnsureDaemonOptions["_fetchOverride"]>;
 type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
 type SpawnSyncOverride = NonNullable<EnsureDaemonOptions["_spawnSyncOverride"]>;
@@ -32,17 +38,46 @@ function makeSpawnChild(pid: number | undefined): SpawnChildMock {
   return child;
 }
 
-function userRuntimeBaseDir(): string | undefined {
-  if (typeof process.getuid !== "function") return undefined;
-  const baseDir = `/run/user/${process.getuid()}`;
-  try {
-    if (!existsSync(baseDir)) return undefined;
-    const probeDir = mkdtempSync(join(baseDir, "lcm-lifecycle-probe-"));
-    rmSync(probeDir, { recursive: true, force: true });
-    return baseDir;
-  } catch {
-    return undefined;
-  }
+function withHermeticLifecycleSeams(
+  options: EnsureDaemonOptions,
+  overrides: Partial<DaemonLifecycleHermeticTestSeams> = {},
+): EnsureDaemonOptions {
+  const stateDir = dirname(options.pidFilePath);
+  const seams: DaemonLifecycleHermeticTestSeams = {
+    homeDir: stateDir,
+    runtimeDir: join(stateDir, ".hermetic-runtime"),
+    stateDir,
+    credentialDir: join(stateDir, ".hermetic-credentials"),
+    procRoot: options._procRoot === "/proc"
+      ? join(stateDir, ".hermetic-proc")
+      : options._procRoot ?? join(stateDir, ".hermetic-proc"),
+    platform: options._platform ?? "linux",
+    uid: options._uid ?? 1000,
+    environment: {},
+    fetch: options._fetchOverride
+      ?? (vi.fn().mockRejectedValue(new Error("hermetic offline")) as FetchOverride),
+    spawn: options._spawnOverride
+      ?? (vi.fn(() => makeSpawnChild(undefined)) as unknown as SpawnOverride),
+    spawnSync: options._spawnSyncOverride
+      ?? (vi.fn(() => ({ status: 1, stdout: "", stderr: "hermetic" })) as unknown as SpawnSyncOverride),
+    stopUnit: vi.fn(),
+    killProcess: options._killOverride ?? vi.fn(),
+    isProcessAlive: options._isProcessAliveOverride ?? (() => false),
+    sleep: options._sleepOverride ?? (async () => undefined),
+    realpath: options._realpathOverride ?? (path => path),
+    ...overrides,
+  };
+  return { ...options, _hermeticTestSeams: seams };
+}
+
+function ensureDaemon(options: EnsureDaemonOptions): ReturnType<typeof ensureDaemonProduction> {
+  return ensureDaemonProduction(withHermeticLifecycleSeams(options));
+}
+
+function restartDaemon(
+  options: Parameters<typeof restartDaemonProduction>[0],
+): ReturnType<typeof restartDaemonProduction> {
+  return restartDaemonProduction(withHermeticLifecycleSeams(options));
 }
 
 afterEach(() => {
@@ -112,31 +147,47 @@ describe("ensureDaemon", () => {
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
     const tokenFile = join(tempDir, "daemon.token");
-    ensureAuthToken(tokenFile);
-    const config = loadDaemonConfig("/nonexistent");
-    config.daemon.port = 0;
-    config.daemon.idleTimeoutMs = 0;
-    const daemon = await createDaemon(config, {
-      tokenPath: tokenFile,
-      _testIdentity: testIdentity,
+    writeFileSync(pidFile, "4242");
+    writeFileSync(tokenFile, "local-token");
+    const fetchMock = vi.fn(async (url: string): Promise<Response> => {
+      if (url.endsWith("/health")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            status: "ok",
+            version: "1.2.3",
+            storageBackend: "sqlite",
+            pid: 4242,
+          }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+      } as Response;
     });
-    const port = daemon.address().port;
-    writeFileSync(pidFile, String(process.pid));
 
-    try {
-      const result = await ensureDaemon({
-        port,
-        pidFilePath: pidFile,
-        spawnTimeoutMs: 5000,
-        _skipSpawn: true,
-      });
-      expect(result.connected).toBe(true);
-      expect(result.port).toBe(port);
-      expect(result.spawned).toBe(false);
-    } finally {
-      await daemon.stop();
-    }
-  }, 10_000);
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _skipSpawn: true,
+      _fetchOverride: fetchMock as FetchOverride,
+      _isProcessAliveOverride: (): boolean => true,
+      _listeningPortsOverride: (): number[] => [19999],
+    });
+
+    expect(result).toMatchObject({
+      connected: true,
+      port: 19999,
+      spawned: false,
+      pid: 4242,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
 
   it("accepts an authenticated staged PostgreSQL daemon with sanitized 503 readiness", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-staged-postgresql-"));
@@ -1679,42 +1730,25 @@ describe("ensureDaemon", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-systemd-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
-    const runtimeBaseDir = userRuntimeBaseDir();
-    let oldCredentialDir: string | undefined;
-    if (runtimeBaseDir !== undefined) {
-      oldCredentialDir = mkdtempSync(join(runtimeBaseDir, "lcm-systemd-credentials-old-"));
-      tempDirs.push(oldCredentialDir);
-      writeFileSync(join(oldCredentialDir, "ANTHROPIC_API_KEY"), "old");
-      const oldDate = new Date(Date.now() - 20 * 60 * 1000);
-      utimesSync(oldCredentialDir, oldDate, oldDate);
-    }
+    const runtimeDir = join(tempDir, "runtime");
+    const credentialDir = join(tempDir, "credentials");
+    mkdirSync(runtimeDir, { recursive: true });
+    mkdirSync(credentialDir, { recursive: true });
     const spawnSyncMock = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
     const spawnMock = vi.fn();
-    const originalProvider = process.env.LCM_SUMMARY_PROVIDER;
-    const originalSummaryApiKey = process.env.LCM_SUMMARY_API_KEY;
-    const originalApiKey = process.env.ANTHROPIC_API_KEY;
-    const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
-    const originalPostgresUrl = process.env.LCM_POSTGRES_URL;
-    const originalPostgresCaFile = process.env.LCM_POSTGRES_CA_FILE;
-    const originalUnrelated = process.env.UNRELATED_DAEMON_VALUE;
-    const originalPath = process.env.PATH;
-    process.env.LCM_SUMMARY_PROVIDER = "anthropic";
-    if (runtimeBaseDir === undefined) {
-      delete process.env.LCM_SUMMARY_API_KEY;
-      delete process.env.ANTHROPIC_API_KEY;
-      delete process.env.LCM_POSTGRES_URL;
-    } else {
-      process.env.LCM_SUMMARY_API_KEY = "sk-lcm-test";
-      process.env.ANTHROPIC_API_KEY = "sk-test";
-      process.env.LCM_POSTGRES_URL = "postgresql://user:postgres-secret@db.example.com/lcm";
-    }
-    process.env.LCM_POSTGRES_CA_FILE = "/etc/ssl/certs/postgres-ca.crt";
-    delete process.env.OPENAI_API_KEY;
-    process.env.UNRELATED_DAEMON_VALUE = "ignored";
-    process.env.PATH = "/opt/lcm-test/bin:/usr/bin";
+    const stopUnitMock = vi.fn(async () => undefined);
+    const environment = {
+      ANTHROPIC_API_KEY: "sk-test",
+      LCM_POSTGRES_CA_FILE: "/etc/ssl/certs/postgres-ca.crt",
+      LCM_POSTGRES_URL: "postgresql://user:postgres-secret@db.example.com/lcm",
+      LCM_SUMMARY_API_KEY: "sk-lcm-test",
+      LCM_SUMMARY_PROVIDER: "anthropic",
+      PATH: "/opt/lcm-test/bin:/usr/bin",
+      UNRELATED_DAEMON_VALUE: "ignored",
+    };
 
-    try {
-      const result = await ensureDaemon({
+    const result = await ensureDaemonProduction(withHermeticLifecycleSeams(
+      {
         port: 19999,
         pidFilePath: pidFile,
         spawnTimeoutMs: 100,
@@ -1725,74 +1759,58 @@ describe("ensureDaemon", () => {
         _skipHealthWait: true,
         _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
         _spawnOverride: spawnMock as unknown as SpawnOverride,
-      });
+      },
+      { credentialDir, environment, runtimeDir, stopUnit: stopUnitMock },
+    ));
 
-      expect(result.startMethod).toBe("systemd-user");
-      expect(spawnMock).not.toHaveBeenCalled();
-      const expectedEnvironment = [
+    expect(result.startMethod).toBe("systemd-user");
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(spawnSyncMock).toHaveBeenCalledWith(
+      "systemd-run",
+      expect.arrayContaining([
+        "--user",
+        "--collect",
+        "--no-block",
+        `--setenv=HOME=${tempDir}`,
+        `--setenv=USERPROFILE=${tempDir}`,
+        `--setenv=XDG_RUNTIME_DIR=${runtimeDir}`,
         "--setenv=PATH=/path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "--setenv=LCM_POSTGRES_CA_FILE=/etc/ssl/certs/postgres-ca.crt",
         "--setenv=LCM_SUMMARY_PROVIDER=anthropic",
-      ];
-      if (runtimeBaseDir !== undefined) {
-        expectedEnvironment.push("--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_POSTGRES_URL,LCM_SUMMARY_API_KEY");
-      }
-      expect(spawnSyncMock).toHaveBeenCalledWith(
-        "systemd-run",
-        expect.arrayContaining([
-          "--user",
-          "--collect",
-          "--no-block",
-          ...expectedEnvironment,
-          "node",
-          "/path/lcm.js",
-          "daemon",
-          "start",
-          "--foreground",
-        ]),
-        expect.objectContaining({ encoding: "utf-8", timeout: 100 }),
-      );
-      const systemdArgs = spawnSyncMock.mock.calls[0][1] as string[];
-      if (runtimeBaseDir === undefined) {
-        expect(systemdArgs).not.toContain(
-          "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_POSTGRES_URL,LCM_SUMMARY_API_KEY",
-        );
-      }
-      const joinedArgs = systemdArgs.join("\n");
-      expect(joinedArgs).not.toContain("sk-test");
-      expect(joinedArgs).not.toContain("sk-lcm-test");
-      expect(joinedArgs).not.toContain("postgres-secret");
-      expect(systemdArgs).not.toContain("--setenv=UNRELATED_DAEMON_VALUE=ignored");
-      expect(systemdArgs).not.toContain("--setenv=PATH=/opt/lcm-test/bin:/usr/bin");
-      const credentialArgs = systemdArgs.filter((arg) => arg.startsWith("--property=LoadCredential="));
-      expect(credentialArgs).toEqual(runtimeBaseDir === undefined ? [] : [
-        expect.stringContaining("ANTHROPIC_API_KEY:"),
-        expect.stringContaining("LCM_POSTGRES_URL:"),
-        expect.stringContaining("LCM_SUMMARY_API_KEY:"),
-      ]);
-      for (const arg of credentialArgs) {
-        const [, credentialPath] = arg.split(":", 2);
-        expect(existsSync(credentialPath)).toBe(false);
-        expect(existsSync(dirname(credentialPath))).toBe(false);
-      }
-      if (oldCredentialDir !== undefined) expect(existsSync(oldCredentialDir)).toBe(false);
-    } finally {
-      if (originalProvider === undefined) delete process.env.LCM_SUMMARY_PROVIDER;
-      else process.env.LCM_SUMMARY_PROVIDER = originalProvider;
-      if (originalSummaryApiKey === undefined) delete process.env.LCM_SUMMARY_API_KEY;
-      else process.env.LCM_SUMMARY_API_KEY = originalSummaryApiKey;
-      if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
-      else process.env.ANTHROPIC_API_KEY = originalApiKey;
-      if (originalOpenAiApiKey === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = originalOpenAiApiKey;
-      if (originalPostgresUrl === undefined) delete process.env.LCM_POSTGRES_URL;
-      else process.env.LCM_POSTGRES_URL = originalPostgresUrl;
-      if (originalPostgresCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
-      else process.env.LCM_POSTGRES_CA_FILE = originalPostgresCaFile;
-      if (originalUnrelated === undefined) delete process.env.UNRELATED_DAEMON_VALUE;
-      else process.env.UNRELATED_DAEMON_VALUE = originalUnrelated;
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+        "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_POSTGRES_URL,LCM_SUMMARY_API_KEY",
+        "node",
+        "/path/lcm.js",
+        "daemon",
+        "start",
+        "--foreground",
+      ]),
+      expect.objectContaining({ encoding: "utf-8", timeout: 100 }),
+    );
+    const systemdArgs = spawnSyncMock.mock.calls[0][1] as string[];
+    expect(systemdArgs.find(arg => arg.startsWith("--unit=")))
+      .toMatch(/^--unit=lcm-test-daemon-hermetic-[0-9]+-[0-9]+$/u);
+    expect(systemdArgs.find(arg => arg.startsWith("--unit=")))
+      .not.toContain("--unit=lcm-daemon-");
+    expect(stopUnitMock).toHaveBeenCalledExactlyOnceWith(
+      systemdArgs.find(arg => arg.startsWith("--unit="))!.slice(7),
+    );
+    const joinedArgs = systemdArgs.join("\n");
+    expect(joinedArgs).not.toContain("sk-test");
+    expect(joinedArgs).not.toContain("sk-lcm-test");
+    expect(joinedArgs).not.toContain("postgres-secret");
+    expect(systemdArgs).not.toContain("--setenv=UNRELATED_DAEMON_VALUE=ignored");
+    expect(systemdArgs).not.toContain("--setenv=PATH=/opt/lcm-test/bin:/usr/bin");
+    const credentialArgs = systemdArgs.filter((arg) => arg.startsWith("--property=LoadCredential="));
+    expect(credentialArgs).toEqual([
+      expect.stringContaining("ANTHROPIC_API_KEY:"),
+      expect.stringContaining("LCM_POSTGRES_URL:"),
+      expect.stringContaining("LCM_SUMMARY_API_KEY:"),
+    ]);
+    for (const arg of credentialArgs) {
+      const [, credentialPath] = arg.split(":", 2);
+      expect(credentialPath.startsWith(`${credentialDir}/lcm-systemd-credentials-`)).toBe(true);
+      expect(existsSync(credentialPath)).toBe(false);
+      expect(existsSync(dirname(credentialPath))).toBe(false);
     }
   });
 

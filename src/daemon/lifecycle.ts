@@ -11,9 +11,13 @@ import {
   STAGED_POSTGRESQL_ERROR_CODE,
 } from "./staged-postgresql.js";
 import {
+  daemonLifecycleTestIdentityArgs,
+  type DaemonLifecycleHermeticTestSeams,
   type DaemonLifecycleTestScope,
+  isDaemonLifecycleHermeticTestSeams,
   isDaemonLifecycleTestScope,
   isVitestWorkerEntrypoint,
+  lifecycleHermeticSeamsOwnsStatePath,
   lifecycleScopeOwnsPath,
   lifecycleScopeUnitName,
 } from "./lifecycle-scope.js";
@@ -29,6 +33,25 @@ type RequestDeadline = {
   clearTimeoutFn: ClearTimeoutFn;
   abortSignal?: AbortSignal;
 };
+
+async function runCleanupStages(stages: readonly CleanupFn[]): Promise<void> {
+  const errors: unknown[] = [];
+  for (const stage of stages) {
+    try {
+      await stage();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "daemon lifecycle cleanup failed");
+  }
+}
+
+function defaultKillProcess(pid: number, signal?: NodeJS.Signals | number): void {
+  process.kill(pid, signal);
+}
 
 export type EnsureDaemonOptions = {
   port: number;
@@ -63,6 +86,8 @@ export type EnsureDaemonOptions = {
   _listeningPortsOverride?: (pid: number) => number[];
   /** @internal Complete run-owned lifecycle boundary for systemd integration tests. */
   _testScope?: DaemonLifecycleTestScope;
+  /** @internal Complete hermetic side-effect boundary for production-mode lifecycle tests. */
+  _hermeticTestSeams?: DaemonLifecycleHermeticTestSeams;
   /** @internal Deterministic interruption seam for lifecycle tests. */
   _abortSignal?: AbortSignal;
 };
@@ -86,32 +111,90 @@ export type RestartDaemonOptions = EnsureDaemonOptions & {
   _isManagedProcessOverride?: (pid: number) => boolean;
 };
 
-const DETERMINISTIC_LIFECYCLE_TEST_SEAMS = [
-  "_skipSpawn",
-  "_spawnOverride",
-  "_spawnSyncOverride",
-  "_skipHealthWait",
-  "_fetchOverride",
-  "_platform",
-  "_procRoot",
-  "_uid",
-  "_killOverride",
-  "_sleepOverride",
-  "_monotonicNowOverride",
-  "_setTimeoutOverride",
-  "_clearTimeoutOverride",
-  "_isProcessAliveOverride",
-  "_realpathOverride",
-  "_packagedEntrypointOverride",
-  "_listeningPortsOverride",
-  "_ensureDaemonOverride",
-  "_isManagedProcessOverride",
-] as const satisfies readonly (keyof RestartDaemonOptions)[];
+type ResolvedLifecycleDependencies = Readonly<{
+  environment: NodeJS.ProcessEnv;
+  fetch: typeof globalThis.fetch;
+  spawn: typeof spawn;
+  spawnSync: typeof spawnSync;
+  killProcess: KillProcess;
+  isProcessAlive: (pid: number) => boolean;
+  sleep: SleepFn;
+  realpath: (path: string) => string;
+  platform: NodeJS.Platform;
+  procRoot: string;
+  uid: number | undefined;
+}>;
 
-function hasExplicitLifecycleTestSeam(options: object): boolean {
-  return DETERMINISTIC_LIFECYCLE_TEST_SEAMS.some((name) =>
-    Object.prototype.hasOwnProperty.call(options, name),
-  );
+function resolveLifecycleDependencies(
+  opts: EnsureDaemonOptions,
+): ResolvedLifecycleDependencies {
+  const testDependencies = opts._testScope?.dependencies;
+  const hermeticSeams = opts._hermeticTestSeams;
+  return {
+    environment: hermeticSeams?.environment ?? process.env,
+    fetch: testDependencies?.fetch
+      ?? hermeticSeams?.fetch
+      ?? opts._fetchOverride
+      ?? globalThis.fetch,
+    spawn: testDependencies?.spawn
+      ?? hermeticSeams?.spawn
+      ?? opts._spawnOverride
+      ?? spawn,
+    spawnSync: testDependencies?.spawnSync
+      ?? hermeticSeams?.spawnSync
+      ?? opts._spawnSyncOverride
+      ?? spawnSync,
+    killProcess: testDependencies?.killProcess
+      ?? hermeticSeams?.killProcess
+      ?? opts._killOverride
+      ?? defaultKillProcess,
+    isProcessAlive: testDependencies?.isProcessAlive
+      ?? hermeticSeams?.isProcessAlive
+      ?? opts._isProcessAliveOverride
+      ?? isProcessAlive,
+    sleep: testDependencies?.sleep
+      ?? hermeticSeams?.sleep
+      ?? opts._sleepOverride
+      ?? sleep,
+    realpath: hermeticSeams?.realpath ?? opts._realpathOverride ?? realpathSync,
+    platform: hermeticSeams?.platform ?? opts._platform ?? osPlatform(),
+    procRoot: hermeticSeams?.procRoot ?? opts._procRoot ?? "/proc",
+    uid: hermeticSeams?.uid ?? opts._uid,
+  };
+}
+
+function lifecycleUnitName(
+  opts: EnsureDaemonOptions,
+  pid: number,
+  nonce: number,
+): string {
+  if (opts._testScope) return lifecycleScopeUnitName(opts._testScope, pid, nonce);
+  if (opts._hermeticTestSeams) return `lcm-test-daemon-hermetic-${pid}-${nonce}`;
+  return `lcm-daemon-${pid}-${nonce}`;
+}
+
+function lifecycleSpawnEnvironment(
+  opts: EnsureDaemonOptions,
+  dependencies: ResolvedLifecycleDependencies,
+): NodeJS.ProcessEnv {
+  if (opts._testScope) {
+    return {
+      ...process.env,
+      HOME: opts._testScope.homeDir,
+      USERPROFILE: opts._testScope.homeDir,
+      XDG_RUNTIME_DIR: opts._testScope.runtimeDir,
+      LCM_DAEMON_OWNER_ID: opts._testScope.ownerId,
+    };
+  }
+  if (opts._hermeticTestSeams) {
+    return {
+      ...dependencies.environment,
+      HOME: opts._hermeticTestSeams.homeDir,
+      USERPROFILE: opts._hermeticTestSeams.homeDir,
+      XDG_RUNTIME_DIR: opts._hermeticTestSeams.runtimeDir,
+    };
+  }
+  return { ...process.env };
 }
 
 export type RestartDaemonResult = EnsureDaemonResult & {
@@ -757,24 +840,15 @@ function startViaDetachedSpawn(
   opts: EnsureDaemonOptions,
   spawnCommand: string,
   spawnArgs: string[],
+  dependencies: ResolvedLifecycleDependencies,
 ): { getWarning: () => string | undefined; pid?: number } {
-  const testScope = opts._testScope;
-  const spawnImpl = testScope?.dependencies.spawn ?? opts._spawnOverride ?? spawn;
   let errorMessage: string | undefined;
   let child: ChildProcess;
   try {
-    child = spawnImpl(spawnCommand, spawnArgs, {
+    child = dependencies.spawn(spawnCommand, spawnArgs, {
       detached: true,
       stdio: "ignore",
-      env: testScope
-        ? {
-            ...process.env,
-            HOME: testScope.homeDir,
-            USERPROFILE: testScope.homeDir,
-            XDG_RUNTIME_DIR: testScope.runtimeDir,
-            LCM_DAEMON_OWNER_ID: testScope.ownerId,
-          }
-        : { ...process.env },
+      env: lifecycleSpawnEnvironment(opts, dependencies),
     }) as ChildProcess;
   } catch (err) {
     errorMessage = summarizeProcessDiagnostic("detached spawn error", err);
@@ -831,6 +905,7 @@ function systemdDaemonSetenvArgs(
   credentialNames: string[],
   executablePath = SYSTEMD_DAEMON_PATH,
   testScope?: DaemonLifecycleTestScope,
+  hermeticSeams?: DaemonLifecycleHermeticTestSeams,
 ): string[] {
   const args = Object.entries(env)
     .filter(([name, value]) => (
@@ -846,6 +921,12 @@ function systemdDaemonSetenvArgs(
       `--setenv=LCM_DAEMON_OWNER_ID=${testScope.ownerId}`,
       `--setenv=USERPROFILE=${testScope.homeDir}`,
       `--setenv=XDG_RUNTIME_DIR=${testScope.runtimeDir}`,
+    );
+  } else if (hermeticSeams) {
+    args.push(
+      `--setenv=HOME=${hermeticSeams.homeDir}`,
+      `--setenv=USERPROFILE=${hermeticSeams.homeDir}`,
+      `--setenv=XDG_RUNTIME_DIR=${hermeticSeams.runtimeDir}`,
     );
   }
   args.push(`--setenv=PATH=${executablePath}`);
@@ -876,14 +957,19 @@ function systemdCredentialCleanup(credentialDir: string): () => void {
 function systemdDaemonCredentialArgs(
   env: NodeJS.ProcessEnv,
   testScope?: DaemonLifecycleTestScope,
+  hermeticSeams?: DaemonLifecycleHermeticTestSeams,
 ): { args: string[]; names: string[]; cleanup?: CleanupFn } {
   const secrets = Object.entries(env)
     .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && isSecretDaemonEnvName(name))
     .sort(([left], [right]) => left.localeCompare(right));
   if (secrets.length === 0) return { args: [], names: [] };
   const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  if (!testScope && uid === undefined) throw new Error("current user id is unavailable");
-  const baseDir = testScope?.credentialDir ?? `/run/user/${uid!}`;
+  if (!testScope && !hermeticSeams && uid === undefined) {
+    throw new Error("current user id is unavailable");
+  }
+  const baseDir = testScope?.credentialDir
+    ?? hermeticSeams?.credentialDir
+    ?? `/run/user/${uid!}`;
   const baseStats = statSync(baseDir);
   if (!baseStats.isDirectory()) {
     throw new Error(`${baseDir} is not a directory`);
@@ -916,15 +1002,16 @@ async function startViaUserSystemd(
   opts: EnsureDaemonOptions,
   spawnCommand: string,
   spawnArgs: string[],
+  dependencies: ResolvedLifecycleDependencies,
 ): Promise<{ ok: boolean; warning?: string; cleanup?: CleanupFn; unitName: string }> {
   const testScope = opts._testScope;
-  const spawnSyncImpl = testScope?.dependencies.spawnSync ?? opts._spawnSyncOverride ?? spawnSync;
-  const unit = testScope
-    ? lifecycleScopeUnitName(testScope, process.pid, Date.now())
-    : `lcm-daemon-${process.pid}-${Date.now()}`;
+  const hermeticSeams = opts._hermeticTestSeams;
+  const lifecycleEnv = dependencies.environment;
+  const spawnSyncImpl = dependencies.spawnSync;
+  const unit = lifecycleUnitName(opts, process.pid, Date.now());
   let credentials: { args: string[]; names: string[]; cleanup?: CleanupFn };
   try {
-    credentials = systemdDaemonCredentialArgs(process.env, testScope);
+    credentials = systemdDaemonCredentialArgs(lifecycleEnv, testScope, hermeticSeams);
   } catch (err) {
     const detail = summarizeProcessDiagnostic("credential setup error", err);
     return {
@@ -937,8 +1024,11 @@ async function startViaUserSystemd(
   const cleanup = async (): Promise<void> => {
     if (cleaned) return;
     cleaned = true;
-    if (testScope) await testScope.dependencies.stopUnit(unit);
-    await credentials.cleanup?.();
+    const stopUnit = testScope?.dependencies.stopUnit ?? hermeticSeams?.stopUnit;
+    await runCleanupStages([
+      ...(stopUnit ? [(): void | Promise<void> => stopUnit(unit)] : []),
+      ...(credentials.cleanup ? [credentials.cleanup] : []),
+    ]);
   };
   let result: ReturnType<typeof spawnSyncImpl>;
   try {
@@ -949,17 +1039,18 @@ async function startViaUserSystemd(
       "--quiet",
       `--unit=${unit}`,
       ...systemdDaemonSetenvArgs(
-        process.env,
+        lifecycleEnv,
         credentials.names,
         managedDaemonPath(spawnCommand, spawnArgs),
         testScope,
+        hermeticSeams,
       ),
       ...credentials.args,
       spawnCommand,
       ...spawnArgs,
     ], {
       encoding: "utf-8",
-      env: systemdRunProcessEnv(process.env),
+      env: systemdRunProcessEnv(lifecycleEnv),
       timeout: Math.max(1, opts.spawnTimeoutMs),
     });
   } catch (err) {
@@ -1005,6 +1096,30 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     };
   }
   const testScope = opts._testScope;
+  const hasHermeticSeamsProperty = Object.prototype.hasOwnProperty.call(
+    opts,
+    "_hermeticTestSeams",
+  );
+  if (
+    hasHermeticSeamsProperty
+    && !isDaemonLifecycleHermeticTestSeams(opts._hermeticTestSeams)
+  ) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "daemon lifecycle hermetic test seams are incomplete or malformed",
+    };
+  }
+  const hermeticSeams = opts._hermeticTestSeams;
+  if (testScope && hermeticSeams) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "daemon lifecycle test scope conflicts with hermetic test seams",
+    };
+  }
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
   if (
     testScope
@@ -1020,10 +1135,24 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       warning: "daemon lifecycle test PID or token state is outside the owned test scope",
     };
   }
+  if (
+    hermeticSeams
+    && (
+      !lifecycleHermeticSeamsOwnsStatePath(hermeticSeams, opts.pidFilePath)
+      || !lifecycleHermeticSeamsOwnsStatePath(hermeticSeams, tokenPath)
+    )
+  ) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      warning: "daemon lifecycle hermetic PID or token state is outside its state root",
+    };
+  }
   const unscopedVitestWorker = testScope === undefined
     && isVitestWorkerEntrypoint(process.argv[1])
-    && !hasExplicitLifecycleTestSeam(opts);
-  if (unscopedVitestWorker && opts._fetchOverride === undefined) {
+    && hermeticSeams === undefined;
+  if (unscopedVitestWorker) {
     return {
       connected: false,
       port: opts.port,
@@ -1040,21 +1169,18 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     };
   }
 
-  const fetchFn = testScope?.dependencies.fetch ?? opts._fetchOverride ?? globalThis.fetch;
-  const platform = opts._platform ?? osPlatform();
-  const procRoot = opts._procRoot ?? "/proc";
-  const sleepFn = testScope?.dependencies.sleep ?? opts._sleepOverride ?? sleep;
+  const dependencies = resolveLifecycleDependencies(opts);
+  const fetchFn = dependencies.fetch;
+  const platform = dependencies.platform;
+  const procRoot = dependencies.procRoot;
+  const sleepFn = dependencies.sleep;
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
-  const realpath = opts._realpathOverride ?? realpathSync;
+  const realpath = dependencies.realpath;
   const deadline = monotonicNow() + opts.spawnTimeoutMs;
-  const isAlive = testScope?.dependencies.isProcessAlive
-    ?? opts._isProcessAliveOverride
-    ?? isProcessAlive;
-  const killProcess = testScope?.dependencies.killProcess ?? opts._killOverride ?? ((pid, signal) => {
-    process.kill(pid, signal);
-  });
+  const isAlive = dependencies.isProcessAlive;
+  const killProcess = dependencies.killProcess;
   const enforceParent = opts.enforceUserManagerParent === true && platform === "linux";
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   const expectedStorageBackend = opts.expectedStorageBackend ?? "sqlite";
@@ -1102,7 +1228,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       : findListeningTcpPorts(
           pid,
           platform,
-          testScope?.dependencies.spawnSync ?? opts._spawnSyncOverride ?? spawnSync,
+          dependencies.spawnSync,
           procRoot,
           opts.port,
         );
@@ -1119,7 +1245,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   function inspectParent(): ParentInspection {
     return inspectDaemonParent(opts.pidFilePath, {
       procRoot,
-      uid: opts._uid,
+      uid: dependencies.uid,
       isAlive,
     });
   }
@@ -1441,10 +1567,14 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   const spawnCommand = opts.spawnCommand ?? process.execPath;
-  const spawnArgs = opts.spawnArgs
+  const baseSpawnArgs = opts.spawnArgs
     ?? [testScope?.entrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
+  const spawnArgs = testScope
+    ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
+    : baseSpawnArgs;
   if (
     isVitestWorkerEntrypoint(spawnArgs[0])
+    && hermeticSeams === undefined
     && opts._spawnOverride === undefined
     && opts._spawnSyncOverride === undefined
   ) {
@@ -1465,29 +1595,45 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   let cleanupSystemdResources: CleanupFn | undefined;
 
   if (enforceParent) {
-    const systemdStart = await startViaUserSystemd(opts, spawnCommand, spawnArgs);
+    const systemdStart = await startViaUserSystemd(
+      opts,
+      spawnCommand,
+      spawnArgs,
+      dependencies,
+    );
     cleanupSystemdResources = systemdStart.cleanup;
     if (systemdStart.ok) {
       startMethod = "systemd-user";
     } else {
       warning = systemdStart.warning;
-      detachedStart = startViaDetachedSpawn(opts, spawnCommand, spawnArgs);
+      detachedStart = startViaDetachedSpawn(
+        opts,
+        spawnCommand,
+        spawnArgs,
+        dependencies,
+      );
     }
   } else {
-    detachedStart = startViaDetachedSpawn(opts, spawnCommand, spawnArgs);
+    detachedStart = startViaDetachedSpawn(
+      opts,
+      spawnCommand,
+      spawnArgs,
+      dependencies,
+    );
   }
 
   let cleanupPromise: Promise<void> | undefined;
   const cleanupOwnedLifecycle = (): Promise<void> => {
     if (cleanupPromise) return cleanupPromise;
     cleanupPromise = (async (): Promise<void> => {
-      await cleanupSystemdResources?.();
+      const stages: CleanupFn[] = [];
+      if (cleanupSystemdResources) stages.push(cleanupSystemdResources);
       if (testScope && detachedStart?.pid !== undefined) {
-        await terminatePid(detachedStart.pid, {
+        stages.push(() => terminatePid(detachedStart.pid!, {
           isAlive,
           killProcess,
           sleepFn,
-        });
+        }));
       }
       if (testScope) {
         const ownedPaths = new Set([
@@ -1498,9 +1644,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           testScope.stateDir,
         ]);
         for (const path of ownedPaths) {
-          rmSync(path, { recursive: true, force: true });
+          stages.push(() => rmSync(path, { recursive: true, force: true }));
         }
       }
+      await runCleanupStages(stages);
     })();
     return cleanupPromise;
   };
@@ -1596,6 +1743,32 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     };
   }
   const testScope = opts._testScope;
+  const hasHermeticSeamsProperty = Object.prototype.hasOwnProperty.call(
+    opts,
+    "_hermeticTestSeams",
+  );
+  if (
+    hasHermeticSeamsProperty
+    && !isDaemonLifecycleHermeticTestSeams(opts._hermeticTestSeams)
+  ) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      restarted: false,
+      warning: "daemon lifecycle hermetic test seams are incomplete or malformed",
+    };
+  }
+  const hermeticSeams = opts._hermeticTestSeams;
+  if (testScope && hermeticSeams) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      restarted: false,
+      warning: "daemon lifecycle test scope conflicts with hermetic test seams",
+    };
+  }
   const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
   if (
     testScope
@@ -1612,10 +1785,25 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       warning: "daemon lifecycle test PID or token state is outside the owned test scope",
     };
   }
+  if (
+    hermeticSeams
+    && (
+      !lifecycleHermeticSeamsOwnsStatePath(hermeticSeams, opts.pidFilePath)
+      || !lifecycleHermeticSeamsOwnsStatePath(hermeticSeams, tokenPath)
+    )
+  ) {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      restarted: false,
+      warning: "daemon lifecycle hermetic PID or token state is outside its state root",
+    };
+  }
   const unscopedVitestWorker = testScope === undefined
     && isVitestWorkerEntrypoint(process.argv[1])
-    && !hasExplicitLifecycleTestSeam(opts);
-  if (unscopedVitestWorker && opts._fetchOverride === undefined) {
+    && hermeticSeams === undefined;
+  if (unscopedVitestWorker) {
     return {
       connected: false,
       port: opts.port,
@@ -1632,11 +1820,12 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   } = opts;
   await validateBeforeRestart?.();
 
-  const isAlive = testScope?.dependencies.isProcessAlive
-    ?? opts._isProcessAliveOverride
-    ?? isProcessAlive;
-  const platform = opts._platform ?? osPlatform();
-  const fetchFn = testScope?.dependencies.fetch ?? opts._fetchOverride ?? globalThis.fetch;
+  const dependencies = resolveLifecycleDependencies(opts);
+  const isAlive = dependencies.isProcessAlive;
+  const platform = dependencies.platform;
+  const fetchFn = dependencies.fetch;
+  const procRoot = dependencies.procRoot;
+  const realpath = dependencies.realpath;
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
@@ -1673,31 +1862,27 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         authenticatedHealth,
         testScope?.entrypoint ?? opts.expectedEntrypoint,
         platform,
-        opts._procRoot ?? "/proc",
-        opts._realpathOverride ?? realpathSync,
+        procRoot,
+        realpath,
       );
   }
   async function isManaged(pid: number): Promise<boolean> {
     if (_isManagedProcessOverride) return _isManagedProcessOverride(pid);
-    if (platform === "linux" && !isLikelyLcmDaemonProcess(pid, opts._procRoot ?? "/proc")) return false;
+    if (platform === "linux" && !isLikelyLcmDaemonProcess(pid, procRoot)) return false;
     const listenerPorts = opts._listeningPortsOverride
       ? opts._listeningPortsOverride(pid)
       : findListeningTcpPorts(
           pid,
           platform,
-          testScope?.dependencies.spawnSync ?? opts._spawnSyncOverride ?? spawnSync,
-          opts._procRoot ?? "/proc",
+          dependencies.spawnSync,
+          procRoot,
           opts.port,
         );
     if (!listenerPorts.includes(opts.port)) return false;
     return await isAuthenticatedDaemonAtPort(opts.port, pid);
   }
-  const killProcess = testScope?.dependencies.killProcess
-    ?? opts._killOverride
-    ?? ((pid: number, signal?: NodeJS.Signals | number) => {
-    process.kill(pid, signal);
-  });
-  const sleepFn = testScope?.dependencies.sleep ?? opts._sleepOverride ?? sleep;
+  const killProcess = dependencies.killProcess;
+  const sleepFn = dependencies.sleep;
   let restarted = false;
   let stoppedPid: number | undefined;
 
@@ -1731,12 +1916,20 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
 
 /** Internal branch-level seams used by the daemon lifecycle test suite. */
 export const __lifecycleTestUtils = {
+  defaultKillProcess,
   findListeningTcpPorts,
   healthVersionMatches,
   healthStorageBackendMatches,
   inspectDaemonParent,
+  isProcessAlive,
   parentInvariantWarning,
   resolveWindowsNetstatPath,
+  resolveLifecycleDependencies,
+  lifecycleUnitName,
+  lifecycleSpawnEnvironment,
+  runCleanupStages,
+  sleep,
   systemdDaemonSetenvArgs,
+  systemdDaemonCredentialArgs,
   systemdRunProcessEnv,
 };
