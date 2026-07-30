@@ -1421,6 +1421,8 @@ describe("run-owned lifecycle resources", () => {
       },
     });
 
+    const previousSummaryApiKey = process.env.LCM_SUMMARY_API_KEY;
+    process.env.LCM_SUMMARY_API_KEY = "cleanup-stage-credential";
     let failure: unknown;
     try {
       await ensureDaemon({
@@ -1429,6 +1431,12 @@ describe("run-owned lifecycle resources", () => {
       });
     } catch (error) {
       failure = error;
+    } finally {
+      if (previousSummaryApiKey === undefined) {
+        delete process.env.LCM_SUMMARY_API_KEY;
+      } else {
+        process.env.LCM_SUMMARY_API_KEY = previousSummaryApiKey;
+      }
     }
     expect(failure).toBeInstanceOf(AggregateError);
     const flattenMessages = (error: unknown): string[] => error instanceof AggregateError
