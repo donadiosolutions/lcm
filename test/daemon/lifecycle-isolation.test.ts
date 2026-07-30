@@ -255,6 +255,9 @@ describe("daemon lifecycle test-scope validation", () => {
 
   it("refuses to register the ambient Vitest worker during default startup", async () => {
     const fixture = createFixture("scope-spawn-worker");
+    const stateBefore = readdirSync(fixture.scope.stateDir);
+    expect(existsSync(fixture.pidPath)).toBe(false);
+    expect(existsSync(fixture.tokenPath)).toBe(false);
     await expect(ensureDaemon({
       port: 37_339,
       pidFilePath: fixture.pidPath,
@@ -266,6 +269,9 @@ describe("daemon lifecycle test-scope validation", () => {
       connected: false,
       warning: expect.stringContaining("register a Vitest worker"),
     });
+    expect(existsSync(fixture.pidPath)).toBe(false);
+    expect(existsSync(fixture.tokenPath)).toBe(false);
+    expect(readdirSync(fixture.scope.stateDir)).toEqual(stateBefore);
   });
 });
 
@@ -295,10 +301,8 @@ describe("run-owned lifecycle resources", () => {
     expect(args).toContain(`--setenv=XDG_RUNTIME_DIR=${fixture.scope.runtimeDir}`);
     expect(args).toContain(fixture.scope.entrypoint);
     expect(JSON.stringify(args)).not.toContain("scope-secret");
-    expect(options.env).toMatchObject({
-      HOME: process.env.HOME,
-      XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
-    });
+    expect(options.env.HOME).toBe(process.env.HOME);
+    expect(options.env.XDG_RUNTIME_DIR).toBe(process.env.XDG_RUNTIME_DIR);
     expect(options.env.LCM_DAEMON_OWNER_ID).toBe(process.env.LCM_DAEMON_OWNER_ID);
     expect(options.env.LCM_SUMMARY_API_KEY).toBeUndefined();
     expect(fixture.stopUnit).toHaveBeenCalledExactlyOnceWith(unitArg!.slice("--unit=".length));

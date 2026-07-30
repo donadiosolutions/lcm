@@ -1410,9 +1410,6 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     return { connected: false, port: opts.port, spawned: false };
   }
 
-  // Ensure auth token exists before spawning
-  ensureAuthToken(tokenPath);
-
   const spawnCommand = opts.spawnCommand ?? process.execPath;
   const spawnArgs = opts.spawnArgs
     ?? [testScope?.entrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
@@ -1428,6 +1425,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       warning: "refusing to register a Vitest worker as a daemon entrypoint",
     };
   }
+
+  // Ensure auth token exists only after the daemon entrypoint is trusted.
+  ensureAuthToken(tokenPath);
+
   let startMethod: EnsureDaemonResult["startMethod"] = "detached-spawn";
   let warning: string | undefined;
   let detachedStart: { getWarning: () => string | undefined; pid?: number } | undefined;
