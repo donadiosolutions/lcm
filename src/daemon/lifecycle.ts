@@ -1005,12 +1005,19 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     };
   }
   const testScope = opts._testScope;
-  if (testScope && !lifecycleScopeOwnsPath(testScope, opts.pidFilePath)) {
+  const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
+  if (
+    testScope
+    && (
+      !lifecycleScopeOwnsPath(testScope, opts.pidFilePath)
+      || !lifecycleScopeOwnsPath(testScope, tokenPath)
+    )
+  ) {
     return {
       connected: false,
       port: opts.port,
       spawned: false,
-      warning: "daemon lifecycle test PID state is outside the owned test scope",
+      warning: "daemon lifecycle test PID or token state is outside the owned test scope",
     };
   }
   const unscopedVitestWorker = testScope === undefined
@@ -1034,7 +1041,6 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   const fetchFn = testScope?.dependencies.fetch ?? opts._fetchOverride ?? globalThis.fetch;
-  const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
   const platform = opts._platform ?? osPlatform();
   const procRoot = opts._procRoot ?? "/proc";
   const sleepFn = testScope?.dependencies.sleep ?? opts._sleepOverride ?? sleep;
@@ -1590,13 +1596,20 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     };
   }
   const testScope = opts._testScope;
-  if (testScope && !lifecycleScopeOwnsPath(testScope, opts.pidFilePath)) {
+  const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
+  if (
+    testScope
+    && (
+      !lifecycleScopeOwnsPath(testScope, opts.pidFilePath)
+      || !lifecycleScopeOwnsPath(testScope, tokenPath)
+    )
+  ) {
     return {
       connected: false,
       port: opts.port,
       spawned: false,
       restarted: false,
-      warning: "daemon lifecycle test PID state is outside the owned test scope",
+      warning: "daemon lifecycle test PID or token state is outside the owned test scope",
     };
   }
   const unscopedVitestWorker = testScope === undefined
@@ -1624,7 +1637,6 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     ?? isProcessAlive;
   const platform = opts._platform ?? osPlatform();
   const fetchFn = testScope?.dependencies.fetch ?? opts._fetchOverride ?? globalThis.fetch;
-  const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;

@@ -6,10 +6,11 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createDaemonLifecycleTestScope,
@@ -204,6 +205,30 @@ describe("daemon lifecycle test-scope validation", () => {
     expect(fixture.runSystemd).not.toHaveBeenCalled();
     expect(fixture.spawnProcess).not.toHaveBeenCalled();
     expect(fixture.killProcess).not.toHaveBeenCalled();
+  });
+
+  it("rejects a directory-shaped PID boundary before token or lifecycle access", async () => {
+    const fixture = createFixture("scope-boundary-ensure");
+    const escapedTokenPath = join(dirname(fixture.scope.stateDir), "daemon.token");
+    writeFileSync(escapedTokenPath, "boundary-token", { mode: 0o644 });
+    const tokenBefore = readFileSync(escapedTokenPath, "utf8");
+    const tokenModeBefore = statSync(escapedTokenPath).mode & 0o777;
+    const stateBefore = readdirSync(fixture.scope.stateDir);
+    await expect(ensureDaemon({
+      ...scopedOptions(fixture),
+      pidFilePath: fixture.scope.stateDir,
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      warning: expect.stringContaining("PID or token state is outside"),
+    });
+    expect(readFileSync(escapedTokenPath, "utf8")).toBe(tokenBefore);
+    expect(statSync(escapedTokenPath).mode & 0o777).toBe(tokenModeBefore);
+    expect(readdirSync(fixture.scope.stateDir)).toEqual(stateBefore);
+    expect(fixture.scope.dependencies.fetch).not.toHaveBeenCalled();
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
   });
 
   it("blocks an unscoped Vitest worker before host discovery or mutation", async () => {
@@ -540,6 +565,37 @@ describe("run-owned lifecycle resources", () => {
       restarted: false,
       warning: expect.stringContaining("unscoped Vitest worker"),
     });
+  });
+
+  it("rejects a restart PID boundary before validation, token, or lifecycle access", async () => {
+    const fixture = createFixture("scope-boundary-restart");
+    const escapedTokenPath = join(dirname(fixture.scope.stateDir), "daemon.token");
+    writeFileSync(escapedTokenPath, "boundary-token", { mode: 0o644 });
+    const tokenBefore = readFileSync(escapedTokenPath, "utf8");
+    const tokenModeBefore = statSync(escapedTokenPath).mode & 0o777;
+    const stateBefore = readdirSync(fixture.scope.stateDir);
+    const validateBeforeRestart = vi.fn();
+    const replacement = vi.fn();
+    await expect(restartDaemon({
+      ...scopedOptions(fixture),
+      pidFilePath: fixture.scope.stateDir,
+      validateBeforeRestart,
+      _ensureDaemonOverride: replacement,
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      restarted: false,
+      warning: expect.stringContaining("PID or token state is outside"),
+    });
+    expect(readFileSync(escapedTokenPath, "utf8")).toBe(tokenBefore);
+    expect(statSync(escapedTokenPath).mode & 0o777).toBe(tokenModeBefore);
+    expect(readdirSync(fixture.scope.stateDir)).toEqual(stateBefore);
+    expect(validateBeforeRestart).not.toHaveBeenCalled();
+    expect(replacement).not.toHaveBeenCalled();
+    expect(fixture.scope.dependencies.fetch).not.toHaveBeenCalled();
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
   });
 
   it("never restarts a live daemon owned by another scope", async () => {
