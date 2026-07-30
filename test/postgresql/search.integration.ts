@@ -642,6 +642,10 @@ describe("PostgreSQL 18 lexical search", () => {
         await lowTimeoutRuntime.close();
       }
 
+      let regexDialectError: unknown;
+      let regexDialectState:
+        | { readonly timeout: string; readonly usable: number }
+        | undefined;
       await database.runtime.transaction(async (transaction) => {
         await transaction.query(
           {
@@ -683,7 +687,50 @@ describe("PostgreSQL 18 lexical search", () => {
             { domain: "lexical-search", operation: "verifyCallerUsable" }
           )
         ).resolves.toMatchObject({ rowCount: 1 });
+
+        await transaction.query(
+          {
+            text: "SET LOCAL statement_timeout = '30s'",
+          },
+          {
+            domain: "lexical-search",
+            operation: "setCallerRegexDialectTimeout",
+          }
+        );
+        try {
+          // ECMAScript named captures are valid and pass safe-regex, while
+          // PostgreSQL 18's ARE dialect rejects this syntax with SQLSTATE 2201B.
+          await scoped.searchMessages({
+            query: "(?<name>a)",
+            mode: "regex",
+            limit: 50,
+          });
+        } catch (error) {
+          regexDialectError = error;
+        }
+        const dialectFailure = await transaction.query<{
+          timeout: string;
+          usable: number;
+        }>(
+          {
+            text: `SELECT
+                   pg_catalog.current_setting('statement_timeout') AS timeout,
+                   1::pg_catalog.int4 AS usable`,
+          },
+          {
+            domain: "lexical-search",
+            operation: "verifyCallerAfterRegexDialectFailure",
+          }
+        );
+        regexDialectState = dialectFailure.rows[0];
       });
+      expect(regexDialectError).toMatchObject({
+        domain: "lexical-search",
+        operation: "searchMessages",
+        sqlState: "2201B",
+        retryable: false,
+      });
+      expect(regexDialectState).toEqual({ timeout: "30s", usable: 1 });
 
       const pooled = await database.runtime.query<{
         timeout: string;

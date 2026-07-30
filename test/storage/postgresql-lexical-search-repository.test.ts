@@ -449,6 +449,12 @@ describe("PostgreSQL lexical-search repository", () => {
     ).resolves.toEqual([]);
     await expect(
       repository.searchMessages({
+        query: " \u0301\u20dd ",
+        mode: "full_text",
+      })
+    ).resolves.toEqual([]);
+    await expect(
+      repository.searchMessages({
         query: "needle",
         mode: "full_text",
         limit: 0,
@@ -462,12 +468,21 @@ describe("PostgreSQL lexical-search repository", () => {
     ).resolves.toEqual([]);
     await expect(
       repository.searchSummaries({
+        query: "\u20de\u20e4",
+        mode: "full_text",
+      })
+    ).resolves.toEqual([]);
+    await expect(
+      repository.searchSummaries({
         query: "needle",
         mode: "full_text",
         limit: 0,
       })
     ).resolves.toEqual([]);
     await expect(repository.searchPromoted(" ", 5)).resolves.toEqual([]);
+    await expect(repository.searchPromoted("\u0362\u20e0", 5)).resolves.toEqual(
+      []
+    );
     await expect(repository.searchPromoted("needle", 0)).resolves.toEqual([]);
     expect(database.transaction).not.toHaveBeenCalled();
     expect(database.query).not.toHaveBeenCalled();

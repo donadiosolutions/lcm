@@ -23,6 +23,11 @@ const MAX_SEARCH_LIMIT = 1_000;
 const DEFAULT_SEARCH_LIMIT = 50;
 const SEARCH_TIMEOUT_CAP_MS = 5_000;
 const MIN_TRIGRAM_QUERY_BYTES = 3;
+// Exact empty replacements from migration 0002's pinned unaccent-derived map.
+// Rejecting these locally prevents an empty normalized trigram pattern (`%%`)
+// without requiring a database normalization probe.
+const NORMALIZATION_REMOVALS_ONLY =
+  /^[\u0300-\u0362\u20dd-\u20e0\u20e2-\u20e4]+$/u;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const UUIDV7_PATTERN =
@@ -476,6 +481,10 @@ function appendDeduplicated<Result>(
 
 function hasTrigrams(query: string): boolean {
   return Buffer.byteLength(query.trim(), "utf8") >= MIN_TRIGRAM_QUERY_BYTES;
+}
+
+function normalizesToEmpty(query: string): boolean {
+  return NORMALIZATION_REMOVALS_ONLY.test(query.trim());
 }
 
 function boundedStatementTimeoutMs(
@@ -1155,7 +1164,13 @@ export class PostgreSqlLexicalSearchRepository
   ): Promise<MessageSearchResult[]> {
     const operation = "searchMessages";
     const snapshot = snapshotInput(input, this.access.projectId, operation);
-    if (snapshot.limit === 0 || snapshot.query.trim().length === 0) return [];
+    if (
+      snapshot.limit === 0 ||
+      snapshot.query.trim().length === 0 ||
+      (snapshot.mode === "full_text" && normalizesToEmpty(snapshot.query))
+    ) {
+      return [];
+    }
     return this.access.atomic(operation, async (executor) => {
       const context = this.access.context(operation);
       if (snapshot.mode === "regex") {
@@ -1235,7 +1250,13 @@ export class PostgreSqlLexicalSearchRepository
   ): Promise<SummarySearchResult[]> {
     const operation = "searchSummaries";
     const snapshot = snapshotInput(input, this.access.projectId, operation);
-    if (snapshot.limit === 0 || snapshot.query.trim().length === 0) return [];
+    if (
+      snapshot.limit === 0 ||
+      snapshot.query.trim().length === 0 ||
+      (snapshot.mode === "full_text" && normalizesToEmpty(snapshot.query))
+    ) {
+      return [];
+    }
     return this.access.atomic(operation, async (executor) => {
       const context = this.access.context(operation);
       if (snapshot.mode === "regex") {
@@ -1339,7 +1360,9 @@ export class PostgreSqlLexicalSearchRepository
             operation,
             "source_project_id"
           );
-    if (limit === 0 || query.trim().length === 0) return [];
+    if (limit === 0 || query.trim().length === 0 || normalizesToEmpty(query)) {
+      return [];
+    }
     return this.access.atomic(operation, async (executor) => {
       const context = this.access.context(operation);
       const primary = await executor.query<PromotedSearchRow>(
