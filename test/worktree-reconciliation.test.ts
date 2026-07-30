@@ -596,6 +596,221 @@ function progressMigratedLegacyEvent(path: string, remoteInboxId: string): void 
   }
 }
 
+type PassiveEventTransportState =
+  | "claimed"
+  | "retry"
+  | "replicated"
+  | "acknowledged"
+  | "quarantined"
+  | "remote-pruned";
+
+function setPassiveEventTransportState(
+  path: string,
+  eventId: number,
+  state: PassiveEventTransportState,
+): void {
+  const values = {
+    claimed: {
+      deliveryState: "claimed",
+      owner: "worker",
+      claimedAt: "2026-07-30 08:00:00",
+      lastError: null,
+      remoteInboxId: null,
+      quarantineReason: null,
+      acknowledgedAt: null,
+      remotePrunedAt: null,
+    },
+    retry: {
+      deliveryState: "retry",
+      owner: null,
+      claimedAt: null,
+      lastError: "readback unavailable",
+      remoteInboxId: null,
+      quarantineReason: null,
+      acknowledgedAt: null,
+      remotePrunedAt: null,
+    },
+    replicated: {
+      deliveryState: "replicated",
+      owner: null,
+      claimedAt: null,
+      lastError: null,
+      remoteInboxId: "42",
+      quarantineReason: null,
+      acknowledgedAt: null,
+      remotePrunedAt: null,
+    },
+    acknowledged: {
+      deliveryState: "acknowledged",
+      owner: null,
+      claimedAt: null,
+      lastError: null,
+      remoteInboxId: "42",
+      quarantineReason: null,
+      acknowledgedAt: "2026-07-30 08:01:00",
+      remotePrunedAt: null,
+    },
+    quarantined: {
+      deliveryState: "quarantined",
+      owner: null,
+      claimedAt: null,
+      lastError: null,
+      remoteInboxId: null,
+      quarantineReason: "poison payload",
+      acknowledgedAt: null,
+      remotePrunedAt: null,
+    },
+    "remote-pruned": {
+      deliveryState: "acknowledged",
+      owner: null,
+      claimedAt: null,
+      lastError: null,
+      remoteInboxId: "42",
+      quarantineReason: null,
+      acknowledgedAt: "2026-07-30 08:01:00",
+      remotePrunedAt: "2026-07-30 08:02:00",
+    },
+  } as const;
+  const value = values[state];
+  const db = new DatabaseSync(path);
+  try {
+    db.prepare(`
+      UPDATE events
+      SET delivery_state = ?,
+          delivery_generation = delivery_generation + 1,
+          delivery_attempts = 1,
+          delivery_owner = ?,
+          delivery_claimed_at = ?,
+          delivery_last_error = ?,
+          remote_inbox_id = ?,
+          quarantine_reason = ?,
+          acknowledged_at = ?,
+          remote_pruned_at = ?,
+          delivery_updated_at = '2026-07-30 08:03:00'
+      WHERE event_id = ?
+    `).run(
+      value.deliveryState,
+      value.owner,
+      value.claimedAt,
+      value.lastError,
+      value.remoteInboxId,
+      value.quarantineReason,
+      value.acknowledgedAt,
+      value.remotePrunedAt,
+      eventId,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+function makeVersionedPredecessorRemap(
+  root: string,
+  occupyTarget = true,
+): ReturnType<typeof makeEventsReconciliation> & {
+  readonly parentId: number;
+  readonly childId: number;
+  readonly parentUuid: string;
+  readonly childUuid: string;
+} {
+  const fixture = makeEventsReconciliation(root);
+  recoverMachineIdentity({
+    version: 1,
+    identityKey: `machine:${"a".repeat(64)}`,
+    machineId: MACHINE_ID,
+    displayName: "Test machine",
+  }, { homeDir: root });
+  if (occupyTarget) {
+    const target = new EventsDb(fixture.targetEvents);
+    target.insertEvent(
+      "target",
+      { type: "choice", category: "decision", data: "occupy id 1", priority: 1 },
+      "PostToolUse",
+    );
+    target.close();
+  }
+  const source = new EventsDb(fixture.sourceEvents);
+  const parentId = source.insertEvent(
+    "source",
+    { type: "choice", category: "decision", data: "parent", priority: 1 },
+    "PostToolUse",
+  );
+  const childId = source.insertEvent(
+    "source",
+    { type: "choice", category: "decision", data: "child", priority: 1 },
+    "PostToolUse",
+  );
+  source.setPrevEventId(childId, parentId);
+  source.close();
+  const db = new DatabaseSync(fixture.sourceEvents, { readOnly: true });
+  const events = db.prepare(
+    "SELECT event_id, event_uuid FROM events ORDER BY event_id",
+  ).all() as Array<{ event_id: number; event_uuid: string }>;
+  db.close();
+  return {
+    ...fixture,
+    parentId,
+    childId,
+    parentUuid: events[0]!.event_uuid,
+    childUuid: events[1]!.event_uuid,
+  };
+}
+
+function makeVersionedPredecessorCollision(
+  root: string,
+  targetPreviousId: number | null,
+  sourcePreviousId: number | null,
+): ReturnType<typeof makeEventsReconciliation> {
+  const fixture = makeEventsReconciliation(root);
+  for (const path of [fixture.targetEvents, fixture.sourceEvents]) {
+    const events = new EventsDb(path);
+    events.insertEvent(
+      "shared",
+      { type: "choice", category: "decision", data: "parent", priority: 1 },
+      "PostToolUse",
+    );
+    events.insertEvent(
+      "shared",
+      { type: "choice", category: "decision", data: "child", priority: 1 },
+      "PostToolUse",
+    );
+    events.close();
+  }
+  for (const [path, previousId] of [
+    [fixture.targetEvents, targetPreviousId],
+    [fixture.sourceEvents, sourcePreviousId],
+  ] as const) {
+    const db = new DatabaseSync(path);
+    db.prepare(`
+      UPDATE events
+      SET event_uuid = CASE event_id
+            WHEN 1 THEN '11111111-1111-4111-8111-111111111111'
+            ELSE '22222222-2222-4222-8222-222222222222'
+          END,
+          machine_id = ?,
+          machine_sequence = CASE event_id
+            WHEN 1 THEN '0000000000000000007'
+            ELSE '0000000000000000008'
+          END,
+          prev_event_id = CASE event_id WHEN 2 THEN ? ELSE NULL END,
+          created_at = CASE event_id
+            WHEN 1 THEN '2026-07-30 07:00:00'
+            ELSE '2026-07-30 07:00:01'
+          END,
+          delivery_next_attempt_at = CASE event_id
+            WHEN 1 THEN '2026-07-30 07:00:00'
+            ELSE '2026-07-30 07:00:01'
+          END,
+          delivery_updated_at = CASE event_id
+            WHEN 1 THEN '2026-07-30 07:00:00'
+            ELSE '2026-07-30 07:00:01'
+          END
+    `).run(MACHINE_ID, previousId);
+    db.close();
+  }
+  return fixture;
+}
+
 describe("worktree reconciliation", () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
@@ -2632,6 +2847,205 @@ describe("worktree reconciliation", () => {
     ).all() as Array<{ event_id: number; prev_event_id: number | null }>;
     expect(rows[0].prev_event_id).toBeNull();
     expect(rows[1].prev_event_id).toBe(rows[0].event_id);
+    target.close();
+  });
+
+  it("remaps a v4 predecessor before the first delivery attempt", () => {
+    const fixture = makeVersionedPredecessorRemap(home);
+    const source = new DatabaseSync(fixture.sourceEvents);
+    source.prepare(`
+      UPDATE events
+      SET delivery_next_attempt_at = '2026-07-30 09:00:00',
+          delivery_updated_at = '2026-07-30 09:00:01'
+      WHERE event_id = ?
+    `).run(fixture.childId);
+    source.close();
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    const parent = target.prepare(
+      "SELECT event_id FROM events WHERE event_uuid = ?",
+    ).get(fixture.parentUuid) as { event_id: number };
+    expect(target.prepare(`
+      SELECT prev_event_id, delivery_state, delivery_generation,
+             delivery_attempts, delivery_next_attempt_at,
+             remote_inbox_id, delivery_updated_at
+      FROM events
+      WHERE event_uuid = ?
+    `).get(fixture.childUuid)).toEqual({
+      prev_event_id: parent.event_id,
+      delivery_state: "pending",
+      delivery_generation: 1,
+      delivery_attempts: 0,
+      delivery_next_attempt_at: "2026-07-30 09:00:00",
+      remote_inbox_id: null,
+      delivery_updated_at: "2026-07-30 09:00:01",
+    });
+    target.close();
+  });
+
+  it.each([
+    "claimed",
+    "retry",
+    "replicated",
+    "acknowledged",
+    "quarantined",
+    "remote-pruned",
+  ] as const)(
+    "fails closed before remapping a %s v4 predecessor",
+    (transportState) => {
+      const fixture = makeVersionedPredecessorRemap(home);
+      setPassiveEventTransportState(
+        fixture.sourceEvents,
+        fixture.childId,
+        transportState,
+      );
+      const targetBefore = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+      const expectedTarget = targetBefore.prepare(
+        "SELECT event_id, event_uuid, data FROM events ORDER BY event_id",
+      ).all();
+      targetBefore.close();
+      const sourceBefore = new DatabaseSync(fixture.sourceEvents, { readOnly: true });
+      const expectedSource = sourceBefore.prepare(
+        `SELECT event_id, event_uuid, prev_event_id, delivery_state,
+                delivery_attempts, remote_inbox_id
+         FROM events ORDER BY event_id`,
+      ).all();
+      sourceBefore.close();
+
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "cannot remap delivered passive event predecessor",
+      );
+      const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+      expect(target.prepare(
+        "SELECT event_id, event_uuid, data FROM events ORDER BY event_id",
+      ).all()).toEqual(expectedTarget);
+      expect(target.prepare(
+        "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources",
+      ).get()).toEqual({ count: 0 });
+      target.close();
+      const source = new DatabaseSync(fixture.sourceEvents);
+      expect(source.prepare(
+        `SELECT event_id, event_uuid, prev_event_id, delivery_state,
+                delivery_attempts, remote_inbox_id
+         FROM events ORDER BY event_id`,
+      ).all()).toEqual(expectedSource);
+      expect(() => source.prepare(
+        "UPDATE events SET data = data WHERE event_id = ?",
+      ).run(fixture.childId)).not.toThrow();
+      source.close();
+    },
+  );
+
+  it("fails closed when a delivered v4 predecessor was already pruned locally", () => {
+    const fixture = makeVersionedPredecessorRemap(home, false);
+    const source = new DatabaseSync(fixture.sourceEvents);
+    source.prepare("UPDATE events SET prev_event_id = 999 WHERE event_id = ?")
+      .run(fixture.childId);
+    source.close();
+    setPassiveEventTransportState(
+      fixture.sourceEvents,
+      fixture.childId,
+      "replicated",
+    );
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "cannot remap delivered passive event predecessor",
+    );
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it("keeps an unchanged delivered v4 predecessor", () => {
+    const fixture = makeVersionedPredecessorRemap(home, false);
+    setPassiveEventTransportState(
+      fixture.sourceEvents,
+      fixture.childId,
+      "replicated",
+    );
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    expect(target.prepare(`
+      SELECT prev_event_id, delivery_state, remote_inbox_id
+      FROM events
+      WHERE event_uuid = ?
+    `).get(fixture.childUuid)).toEqual({
+      prev_event_id: fixture.parentId,
+      delivery_state: "replicated",
+      remote_inbox_id: "42",
+    });
+    target.close();
+  });
+
+  it.each([
+    {
+      label: "destination",
+      targetPreviousId: null,
+      sourcePreviousId: 1,
+      lockedPath: "target",
+    },
+    {
+      label: "source",
+      targetPreviousId: 1,
+      sourcePreviousId: null,
+      lockedPath: "source",
+    },
+  ] as const)(
+    "fails closed on null-asymmetric predecessor collision with a locked $label",
+    ({ targetPreviousId, sourcePreviousId, lockedPath }) => {
+      const fixture = makeVersionedPredecessorCollision(
+        home,
+        targetPreviousId,
+        sourcePreviousId,
+      );
+      setPassiveEventTransportState(
+        lockedPath === "target" ? fixture.targetEvents : fixture.sourceEvents,
+        2,
+        "replicated",
+      );
+
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "cannot reconcile delivered passive event predecessor",
+      );
+      expect(existsSync(fixture.sourceEvents)).toBe(true);
+    },
+  );
+
+  it("coalesces a null-asymmetric predecessor while both copies are pre-delivery", () => {
+    const fixture = makeVersionedPredecessorCollision(home, null, 1);
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    expect(target.prepare(`
+      SELECT prev_event_id, delivery_state, delivery_attempts, remote_inbox_id
+      FROM events
+      WHERE event_uuid = '22222222-2222-4222-8222-222222222222'
+    `).get()).toEqual({
+      prev_event_id: 1,
+      delivery_state: "pending",
+      delivery_attempts: 0,
+      remote_inbox_id: null,
+    });
+    target.close();
+  });
+
+  it("merges matching delivered predecessors without weakening checkpoint merge", () => {
+    const fixture = makeVersionedPredecessorCollision(home, 1, 1);
+    setPassiveEventTransportState(fixture.targetEvents, 2, "replicated");
+    setPassiveEventTransportState(fixture.sourceEvents, 2, "replicated");
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    expect(target.prepare(`
+      SELECT prev_event_id, delivery_state, delivery_attempts, remote_inbox_id
+      FROM events
+      WHERE event_uuid = '22222222-2222-4222-8222-222222222222'
+    `).get()).toEqual({
+      prev_event_id: 1,
+      delivery_state: "replicated",
+      delivery_attempts: 1,
+      remote_inbox_id: "42",
+    });
     target.close();
   });
 

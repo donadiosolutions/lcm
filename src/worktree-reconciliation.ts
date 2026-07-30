@@ -557,6 +557,30 @@ function isPristineMigratedLegacyDelivery(value: SqlRow): boolean {
     && value.delivery_updated_at === value.created_at;
 }
 
+function hasPassiveEventTransportProgress(value: SqlRow): boolean {
+  return comparable([
+    value.delivery_state,
+    value.delivery_attempts,
+    value.delivery_owner,
+    value.delivery_claimed_at,
+    value.delivery_last_error,
+    value.remote_inbox_id,
+    value.quarantine_reason,
+    value.acknowledged_at,
+    value.remote_pruned_at,
+  ]) !== comparable([
+    "pending",
+    0,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+  ]);
+}
+
 function insertRow(
   db: DatabaseSync,
   table: string,
@@ -1075,6 +1099,18 @@ function mergeEventsDatabase(
               `event ${sourceId} references an unmapped predecessor ${previousSourceId}`,
             );
           }
+          const mappedPreviousId = previousSourceId === null
+            ? null
+            : eventMap.get(previousSourceId) ?? null;
+          if (
+            sourceSchemaVersion >= 4
+            && comparable(mappedPreviousId) !== comparable(previousSourceId)
+            && hasPassiveEventTransportProgress(sourceEvent)
+          ) {
+            throw new Error(
+              `cannot remap delivered passive event predecessor: ${String(sourceEvent.event_uuid)}`,
+            );
+          }
           const value: SqlRow = sourceSchemaVersion < 4 ? {
             event_uuid: deriveLegacyLocalHookEventUuid({
               event_id: sourceId,
@@ -1097,9 +1133,7 @@ function mergeEventsDatabase(
             data: sourceEvent.data,
             priority: sourceEvent.priority,
             source_hook: sourceEvent.source_hook,
-            prev_event_id: previousSourceId === null
-              ? null
-              : eventMap.get(previousSourceId) ?? null,
+            prev_event_id: mappedPreviousId,
             processed_at: sourceEvent.processed_at,
             created_at: legacyCreatedAt,
             delivery_state: "pending",
@@ -1116,9 +1150,7 @@ function mergeEventsDatabase(
             delivery_updated_at: legacyCreatedAt,
           } : {
             ...sourceEvent,
-            prev_event_id: previousSourceId === null
-              ? null
-              : eventMap.get(previousSourceId) ?? null,
+            prev_event_id: mappedPreviousId,
           };
           delete value.event_id;
           const existing = row(
@@ -1200,6 +1232,17 @@ function mergeEventsDatabase(
               || sourceGeneration < 0
             ) {
               throw new Error(`invalid passive event delivery generation: ${String(value.event_uuid)}`);
+            }
+            if (
+              comparable(existing.prev_event_id) !== comparable(value.prev_event_id)
+              && (
+                hasPassiveEventTransportProgress(existing)
+                || hasPassiveEventTransportProgress(value)
+              )
+            ) {
+              throw new Error(
+                `cannot reconcile delivered passive event predecessor: ${String(value.event_uuid)}`,
+              );
             }
             if (
               existing.prev_event_id !== null
