@@ -43,6 +43,21 @@ function makeRepository(root: string): string {
   return root;
 }
 
+function padGitConfigToBytes(config: string, targetBytes: number): string {
+  const paddingBytes = targetBytes - Buffer.byteLength(config);
+  if (paddingBytes < 2) throw new Error("Git config target is too small");
+  return `${config}#${"x".repeat(paddingBytes - 2)}\n`;
+}
+
+function repeatedBranchMetadataConfig(targetBytes: number): string {
+  const prefix = "[core]\nrepositoryformatversion = 0\n[branch \"main\"]\n";
+  const entry = "github-pr-owner-number = 123\n";
+  const entryCount = Math.floor(
+    (targetBytes - Buffer.byteLength(prefix) - 2) / Buffer.byteLength(entry),
+  );
+  return padGitConfigToBytes(`${prefix}${entry.repeat(entryCount)}`, targetBytes);
+}
+
 function makeLinkedWorktree(primary: string, linked: string, name = "linked"): string {
   const gitDir = makeDirectory(join(primary, ".git", "worktrees", name));
   writeFileSync(join(gitDir, "commondir"), "../..\n");
@@ -339,6 +354,75 @@ describe("Git project identity", () => {
     expect(resolveGitProjectAnchor(primary)?.canonical).toBe(shared);
   });
 
+  it("accepts a 174581-byte valid config with repeated branch metadata", () => {
+    const primary = makeRepository(join(root, "large-config"));
+    const linked = makeLinkedWorktree(primary, join(root, "large-config-linked"));
+    const configPath = join(primary, ".git", "config");
+    const config = repeatedBranchMetadataConfig(174_581);
+    writeFileSync(configPath, config);
+
+    expect(Buffer.byteLength(config)).toBe(174_581);
+    const repeatedValues = git(
+      primary,
+      "config",
+      "--file",
+      configPath,
+      "--get-all",
+      "branch.main.github-pr-owner-number",
+    ).split("\n");
+    expect(repeatedValues.length).toBeGreaterThan(2_494);
+    expect(new Set(repeatedValues)).toEqual(new Set(["123"]));
+    expect(resolveGitProjectAnchor(primary)?.canonical).toBe(primary);
+    expect(resolveGitProjectAnchor(linked)?.canonical).toBe(primary);
+  });
+
+  it("accepts 4 MiB Git configs and rejects either config location above the limit", () => {
+    const primary = makeRepository(join(root, "config-boundary"));
+    const configPath = join(primary, ".git", "config");
+    const configPrefix = [
+      "[core]",
+      "repositoryformatversion = 0",
+      "[extensions]",
+      "worktreeConfig = true",
+      "",
+    ].join("\n");
+    writeFileSync(configPath, padGitConfigToBytes(configPrefix, 4 * 1024 * 1024));
+    expect(resolveGitProjectAnchor(primary)?.canonical).toBe(primary);
+
+    writeFileSync(configPath, padGitConfigToBytes(configPrefix, 4 * 1024 * 1024 + 1));
+    clearGitProjectAnchorCache();
+    expect(() => resolveGitProjectAnchor(primary)).toThrow(
+      "invalid Git config metadata",
+    );
+    expect(() => resolveGitProjectAnchor(primary)).toThrow("size limit");
+
+    writeFileSync(configPath, configPrefix);
+    const metadata = makeDirectory(join(root, "configured-metadata"));
+    makeDirectory(join(metadata, "objects"));
+    writeFileSync(join(metadata, "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(metadata, "config"), configPrefix);
+    const checkout = makeDirectory(join(root, "configured-checkout"));
+    writeFileSync(join(checkout, ".git"), "gitdir: ../configured-metadata\n");
+    const worktreeConfigPath = join(metadata, "config.worktree");
+    const worktreeConfigPrefix = `[core]\nworktree = ${checkout}\n`;
+    writeFileSync(
+      worktreeConfigPath,
+      padGitConfigToBytes(worktreeConfigPrefix, 4 * 1024 * 1024),
+    );
+    clearGitProjectAnchorCache();
+    expect(resolveGitProjectAnchor(checkout)?.canonical).toBe(checkout);
+
+    writeFileSync(
+      worktreeConfigPath,
+      padGitConfigToBytes(worktreeConfigPrefix, 4 * 1024 * 1024 + 1),
+    );
+    clearGitProjectAnchorCache();
+    expect(() => resolveGitProjectAnchor(checkout)).toThrow(
+      "invalid Git worktree config metadata",
+    );
+    expect(() => resolveGitProjectAnchor(checkout)).toThrow("size limit");
+  });
+
   it("rejects malformed, oversized, symlinked, and invalid Git metadata", () => {
     const malformed = makeDirectory(join(root, "malformed"));
     writeFileSync(join(malformed, ".git"), "not-a-gitdir\n");
@@ -412,6 +496,10 @@ describe("Git project identity", () => {
     rmSync(join(linkedHead, ".git", "HEAD"));
     symlinkSync(join(linkedHead, ".git", "config"), join(linkedHead, ".git", "HEAD"));
     expect(() => resolveGitProjectAnchor(linkedHead)).toThrow("invalid Git HEAD");
+
+    const oversizedHead = makeRepository(join(root, "oversized-head"));
+    writeFileSync(join(oversizedHead, ".git", "HEAD"), "x".repeat(64 * 1024 + 1));
+    expect(() => resolveGitProjectAnchor(oversizedHead)).toThrow("size limit");
 
     const linkedConfig = makeRepository(join(root, "linked-config"));
     rmSync(join(linkedConfig, ".git", "config"));

@@ -7,7 +7,12 @@ primary checkout as that canonical path, so linked worktrees share one local
 project. A primary checkout created with `git init --separate-git-dir` and all
 of its linked worktrees instead share that external Git directory as their
 stable local anchor. Git submodules remain independent projects anchored at
-their own checkouts. Non-Git directories continue to use their normalized path directly.
+their own checkouts. Non-Git directories continue to use their normalized path
+directly. LCM reads Git metadata through descriptor-bound, no-follow
+validation. `HEAD`, `gitdir`, `commondir`, and other topology pointers remain
+limited to 64 KiB; `.git/config` and `config.worktree` accept valid files up to
+4 MiB so accumulated branch metadata does not block project identity. Larger,
+symlinked, or non-regular metadata continues to fail closed.
 The database and passive-learning sidecar remain under:
 
 ```text

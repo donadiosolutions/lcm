@@ -15,6 +15,7 @@ import {
 import { readBoundedRegularFile } from "./security-files.js";
 
 const MAX_GIT_POINTER_BYTES = 64 * 1024;
+const MAX_GIT_CONFIG_BYTES = 4 * 1024 * 1024;
 const resolutionCache = new Map<string, GitProjectAnchor>();
 
 export type GitProjectAnchor = {
@@ -34,15 +35,28 @@ function existingRealDirectory(path: string, label: string): string {
   return real;
 }
 
-function readGitPointer(path: string, allowedRoot: string, label: string): string {
+function readGitMetadata(
+  path: string,
+  allowedRoot: string,
+  label: string,
+  maxBytes: number,
+): string {
   try {
     return readBoundedRegularFile(path, {
       allowedRoot,
-      maxBytes: MAX_GIT_POINTER_BYTES,
+      maxBytes,
     });
   } catch (error) {
     throw new Error(`invalid ${label} metadata at ${path}: ${String(error)}`);
   }
+}
+
+function readGitPointer(path: string, allowedRoot: string, label: string): string {
+  return readGitMetadata(path, allowedRoot, label, MAX_GIT_POINTER_BYTES);
+}
+
+function readGitConfig(path: string, allowedRoot: string, label: string): string {
+  return readGitMetadata(path, allowedRoot, label, MAX_GIT_CONFIG_BYTES);
 }
 
 function parseGitDir(
@@ -229,26 +243,26 @@ function configEnablesWorktreeConfig(config: string): boolean {
 }
 
 function hasConfiguredWorktree(gitDir: string): boolean {
-  const config = readGitPointer(join(gitDir, "config"), gitDir, "Git config");
+  const config = readGitConfig(join(gitDir, "config"), gitDir, "Git config");
   if (configHasCoreWorktree(config)) return true;
   if (!configEnablesWorktreeConfig(config)) return false;
   const worktreeConfigPath = join(gitDir, "config.worktree");
   if (!existsSync(worktreeConfigPath)) return false;
   return configHasCoreWorktree(
-    readGitPointer(worktreeConfigPath, gitDir, "Git worktree config"),
+    readGitConfig(worktreeConfigPath, gitDir, "Git worktree config"),
   );
 }
 
 function validateGitDirectory(gitDir: string, commonDir: string): void {
-  for (const [path, label] of [
-    [join(gitDir, "HEAD"), "Git HEAD"],
-    [join(commonDir, "config"), "Git config"],
+  for (const [path, label, read] of [
+    [join(gitDir, "HEAD"), "Git HEAD", readGitPointer],
+    [join(commonDir, "config"), "Git config", readGitConfig],
   ] as const) {
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.isSymbolicLink()) {
       throw new Error(`invalid ${label} metadata at ${path}`);
     }
-    readGitPointer(path, dirname(path), label);
+    read(path, dirname(path), label);
   }
   const objects = lstatSync(join(commonDir, "objects"));
   if (!objects.isDirectory() || objects.isSymbolicLink()) {
