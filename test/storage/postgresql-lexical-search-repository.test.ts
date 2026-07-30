@@ -237,6 +237,70 @@ describe("PostgreSQL lexical-search repository", () => {
     ]);
   });
 
+  it("aligns primary headlines and trigram gates with database normalization", async () => {
+    const database = executor((config) => {
+      const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow();
+      return result([]);
+    });
+    const repository = new PostgreSqlLexicalSearchRepository(
+      database,
+      projectId
+    );
+    const rawMultibyteQuery = "𝐚";
+
+    await repository.searchMessages({
+      query: rawMultibyteQuery,
+      mode: "full_text",
+    });
+    await repository.searchSummaries({
+      query: rawMultibyteQuery,
+      mode: "full_text",
+    });
+    await repository.searchPromoted(rawMultibyteQuery, 5);
+
+    const statements = database.query.mock.calls.map(
+      ([config]) => config as QueryConfig<unknown[]>
+    );
+    const headlineStatements = statements.filter((config) =>
+      text(config).includes("pg_catalog.ts_headline")
+    );
+    expect(headlineStatements).toHaveLength(2);
+    expect(text(headlineStatements[0])).toMatch(
+      /pg_catalog\.ts_headline\(\s*'lcm\.search_v1'::pg_catalog\.regconfig,\s*lcm\.normalize_search_text\(message\.content\),\s*input\.query,/u
+    );
+    expect(text(headlineStatements[1])).toMatch(
+      /pg_catalog\.ts_headline\(\s*'lcm\.search_v1'::pg_catalog\.regconfig,\s*lcm\.normalize_search_text\(summary\.content\),\s*input\.query,/u
+    );
+    for (const config of headlineStatements) {
+      expect(text(config)).toContain(
+        "StartSel=, StopSel=, MaxWords=32, MinWords=8"
+      );
+      expect(text(config)).toContain("pg_catalog.left(");
+    }
+
+    const trigramStatements = statements.filter((config) =>
+      text(config).includes("public.similarity")
+    );
+    expect(trigramStatements).toHaveLength(3);
+    for (const config of trigramStatements) {
+      const sql = text(config);
+      const normalizedGate = sql.indexOf(
+        "pg_catalog.octet_length(input.query)"
+      );
+      expect(config.values?.[1]).toBe(rawMultibyteQuery);
+      expect(sql).toContain(
+        "SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query"
+      );
+      expect(sql).toContain("OPERATOR(pg_catalog.>=) 3");
+      expect(normalizedGate).toBeGreaterThan(-1);
+      expect(normalizedGate).toBeLessThan(sql.indexOf("OPERATOR(public.%)"));
+      expect(normalizedGate).toBeLessThan(
+        sql.indexOf("OPERATOR(pg_catalog.~~)")
+      );
+    }
+  });
+
   it("fills only remaining slots with bounded, deduplicated trigram rows", async () => {
     const database = executor((config) => {
       const sql = text(config);

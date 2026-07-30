@@ -55,9 +55,12 @@ The default message and summary limit is 50. Limits must be safe nonnegative
 integers from 0 through 1,000; zero returns no rows. Promoted-memory callers
 must provide a limit in the same range. Full-text headlines use empty
 highlight markers, at most 32 words, and one fragment. Every message and
-summary snippet is additionally bounded to 512 PostgreSQL characters. Regex
-snippets contain the first matching text, while trigram snippets contain a
-bounded content prefix.
+summary snippet is additionally bounded to 512 PostgreSQL characters.
+PostgreSQL full-text snippets are generated from
+`lcm.normalize_search_text(content)` in the same `lcm.search_v1` domain as the
+indexed document and query, so they expose normalized text rather than the
+canonical source spelling. Regex snippets contain the first matching text,
+while trigram snippets contain a bounded canonical-content prefix.
 
 Invalid dates, identifiers, modes, limits, unsupported Unicode strings,
 malformed result rows, and invalid regex patterns become sanitized
@@ -79,6 +82,13 @@ and does not duplicate or replace:
 Normalization performs PostgreSQL 18 Unicode fast lowercase mapping and the
 pinned PostgreSQL 18.4 `unaccent.rules` substitutions. Canonical source content
 and exact promoted tags remain unchanged.
+
+The runtime first uses raw UTF-8 query length as a conservative trigram
+prefilter. Every PostgreSQL trigram statement then requires the
+database-normalized query to contain at least three UTF-8 octets before
+evaluating substring or similarity predicates. This second gate covers
+multibyte input that the pinned mapping reduces to fewer than three bytes
+without duplicating the mapping in TypeScript.
 
 PostgreSQL omits a parsed full-text lexeme whose normalized UTF-8 length reaches
 2,047 bytes. The harness proves that a 2,046-byte normalized lexeme is accepted

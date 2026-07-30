@@ -720,6 +720,127 @@ describe("PostgreSQL 18 lexical search", () => {
     });
   });
 
+  it("gates normalized trigram queries and headlines normalized late matches", async () => {
+    await withPostgreSqlTestDatabase("search-normalized", async (database) => {
+      await grantSearchRuntimePrivileges(database);
+      const projectId = await createProject(
+        database,
+        "Search normalized domain"
+      );
+      const conversationId = await createConversation(
+        database,
+        projectId,
+        "search-normalized"
+      );
+      await seedMessage(database, projectId, conversationId, {
+        seq: 0,
+        role: "user",
+        content: "cat",
+      });
+      const unrelated = Array.from(
+        { length: 40 },
+        (_, index) => `unrelated${index}`
+      ).join(" ");
+      const lateContent = `${unrelated} Café late`;
+      const lateMessage = await seedMessage(
+        database,
+        projectId,
+        conversationId,
+        {
+          seq: 1,
+          role: "assistant",
+          content: lateContent,
+        }
+      );
+      const lateSummaryId = await seedSummary(
+        database,
+        projectId,
+        conversationId,
+        {
+          id: "normalized-late-summary",
+          kind: "leaf",
+          content: lateContent,
+        }
+      );
+      await seedMemory(database, projectId, {
+        content: "cat",
+        tags: ["cat"],
+        sourceProjectId: "normalized-source",
+        confidence: 1,
+      });
+
+      const normalized = await database.migrator.query<{
+        normalized_query: string;
+        normalized_bytes: number;
+      }>(
+        {
+          text: `SELECT
+                   lcm.normalize_search_text($1) AS normalized_query,
+                   pg_catalog.octet_length(
+                     lcm.normalize_search_text($1)
+                   ) AS normalized_bytes`,
+          values: ["𝐚"],
+        },
+        {
+          domain: "lexical-search",
+          operation: "inspectNormalizedTrigramGate",
+        }
+      );
+      expect(normalized.rows[0]).toEqual({
+        normalized_query: "a",
+        normalized_bytes: 1,
+      });
+
+      const repository = new PostgreSqlLexicalSearchRepository(
+        database.runtime,
+        projectId
+      );
+      expect(
+        await repository.searchMessages({
+          query: "𝐚",
+          mode: "full_text",
+          conversationId,
+        })
+      ).toEqual([]);
+      expect(
+        await repository.searchSummaries({
+          query: "𝐚",
+          mode: "full_text",
+          conversationId,
+        })
+      ).toEqual([]);
+      expect(await repository.searchPromoted("𝐚", 10)).toEqual([]);
+
+      const messageResults = await repository.searchMessages({
+        query: "cafe",
+        mode: "full_text",
+        conversationId,
+        limit: 1,
+      });
+      expect(messageResults).toHaveLength(1);
+      expect(messageResults[0].messageId).toBe(lateMessage.id);
+      expect(messageResults[0].snippet).toContain("cafe");
+      expect(messageResults[0].snippet).not.toContain("Café");
+      expect(messageResults[0].snippet).not.toContain("unrelated0");
+      expect(messageResults[0].snippet).not.toMatch(/<\/?(?:b|mark)>/iu);
+      expect(messageResults[0].snippet.length).toBeLessThanOrEqual(512);
+
+      const summaryResults = await repository.searchSummaries({
+        query: "cafe",
+        mode: "full_text",
+        conversationId,
+        limit: 1,
+      });
+      expect(summaryResults).toHaveLength(1);
+      expect(summaryResults[0].summaryId).toBe(lateSummaryId);
+      expect(summaryResults[0].snippet).toContain("cafe");
+      expect(summaryResults[0].snippet).not.toContain("Café");
+      expect(summaryResults[0].snippet).not.toContain("unrelated0");
+      expect(summaryResults[0].snippet).not.toMatch(/<\/?(?:b|mark)>/iu);
+      expect(summaryResults[0].snippet.length).toBeLessThanOrEqual(512);
+    });
+  });
+
   it("contains cancellation and restores caller and pooled statement timeouts", async () => {
     await withPostgreSqlTestDatabase("search-timeout", async (database) => {
       await grantSearchRuntimePrivileges(database);

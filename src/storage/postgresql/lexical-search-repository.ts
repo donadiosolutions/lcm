@@ -658,7 +658,7 @@ SELECT
   pg_catalog.left(
     pg_catalog.ts_headline(
       'lcm.search_v1'::pg_catalog.regconfig,
-      message.content,
+      lcm.normalize_search_text(message.content),
       input.query,
       'StartSel=, StopSel=, MaxWords=32, MinWords=8, ShortWord=1, MaxFragments=1, FragmentDelimiter= … '
     ),
@@ -716,6 +716,8 @@ candidate AS (
       message.message_id OPERATOR(pg_catalog.=)
       ANY($6::pg_catalog.int8[])
     )
+    AND pg_catalog.octet_length(input.query)
+      OPERATOR(pg_catalog.>=) 3
     AND (
       lcm.normalize_search_text(message.content)
         OPERATOR(public.%) input.query
@@ -809,7 +811,7 @@ SELECT
   pg_catalog.left(
     pg_catalog.ts_headline(
       'lcm.search_v1'::pg_catalog.regconfig,
-      summary.content,
+      lcm.normalize_search_text(summary.content),
       input.query,
       'StartSel=, StopSel=, MaxWords=32, MinWords=8, ShortWord=1, MaxFragments=1, FragmentDelimiter= … '
     ),
@@ -867,6 +869,8 @@ candidate AS (
       summary.summary_id OPERATOR(pg_catalog.=)
       ANY($6::pg_catalog.text[])
     )
+    AND pg_catalog.octet_length(input.query)
+      OPERATOR(pg_catalog.>=) 3
     AND (
       lcm.normalize_search_text(summary.content)
         OPERATOR(public.%) input.query
@@ -1069,6 +1073,8 @@ ranked AS (
       memory.memory_id OPERATOR(pg_catalog.=)
       ANY($3::pg_catalog.uuid[])
     )
+    AND pg_catalog.octet_length(input.query)
+      OPERATOR(pg_catalog.>=) 3
     AND (
       lcm.normalize_search_text(memory.content)
         OPERATOR(public.%) input.query
