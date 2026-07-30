@@ -704,6 +704,27 @@ function setPassiveEventTransportState(
   }
 }
 
+function readSourceEventsAfterFailure(
+  path: string,
+): Array<{ event_id: number; event_uuid: string }> {
+  const db = new DatabaseSync(path, { readOnly: true });
+  let queryFailed = false;
+  try {
+    return db.prepare(
+      "SELECT event_id, event_uuid FROM events ORDER BY event_id",
+    ).all() as Array<{ event_id: number; event_uuid: string }>;
+  } catch (error) {
+    queryFailed = true;
+    throw error;
+  } finally {
+    try {
+      db.close();
+    } catch (closeError) {
+      if (!queryFailed) throw closeError;
+    }
+  }
+}
+
 function makeVersionedPredecessorRemap(
   root: string,
   occupyTarget = true,
@@ -742,11 +763,7 @@ function makeVersionedPredecessorRemap(
   );
   source.setPrevEventId(childId, parentId);
   source.close();
-  const db = new DatabaseSync(fixture.sourceEvents, { readOnly: true });
-  const events = db.prepare(
-    "SELECT event_id, event_uuid FROM events ORDER BY event_id",
-  ).all() as Array<{ event_id: number; event_uuid: string }>;
-  db.close();
+  const events = readSourceEventsAfterFailure(fixture.sourceEvents);
   return {
     ...fixture,
     parentId,
@@ -2882,6 +2899,49 @@ describe("worktree reconciliation", () => {
       delivery_updated_at: "2026-07-30 09:00:01",
     });
     target.close();
+  });
+
+  it("closes the source identity reader without masking its query failure", () => {
+    const queryFailure = new Error("injected source identity query failure");
+    const closeFailure = new Error("injected source identity close failure");
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const originalClose = DatabaseSync.prototype.close;
+    let failedDatabase: DatabaseSync | undefined;
+    let closeAttempts = 0;
+    const prepareSpy = vi.spyOn(
+      DatabaseSync.prototype,
+      "prepare",
+    ).mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (sql === "SELECT event_id, event_uuid FROM events ORDER BY event_id") {
+        failedDatabase = this;
+        throw queryFailure;
+      }
+      return originalPrepare.call(this, sql);
+    });
+    const closeSpy = vi.spyOn(
+      DatabaseSync.prototype,
+      "close",
+    ).mockImplementation(function (this: DatabaseSync) {
+      if (this === failedDatabase) {
+        closeAttempts += 1;
+        originalClose.call(this);
+        throw closeFailure;
+      }
+      return originalClose.call(this);
+    });
+
+    let caught: unknown;
+    try {
+      makeVersionedPredecessorRemap(home);
+    } catch (error) {
+      caught = error;
+    } finally {
+      closeSpy.mockRestore();
+      prepareSpy.mockRestore();
+    }
+
+    expect(caught).toBe(queryFailure);
+    expect(closeAttempts).toBe(1);
   });
 
   it.each([
