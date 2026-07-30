@@ -504,6 +504,19 @@ const PASSIVE_EVENT_DELIVERY_COLUMNS = [
   "remote_pruned_at",
 ] as const;
 
+function hasSamePassiveEventImmutableEnvelope(
+  existing: SqlRow,
+  incoming: SqlRow,
+): boolean {
+  return [
+    ...PASSIVE_EVENT_IMMUTABLE_COLUMNS,
+    "machine_id",
+    "machine_sequence",
+  ].every((column) =>
+    comparable(existing[column]) === comparable(incoming[column])
+  );
+}
+
 function legacyEventUuidForCandidate(
   value: SqlRow,
   candidateEventId: number,
@@ -1102,9 +1115,38 @@ function mergeEventsDatabase(
           const mappedPreviousId = previousSourceId === null
             ? null
             : eventMap.get(previousSourceId) ?? null;
+          const existingVersionedEvent = sourceSchemaVersion >= 4
+            ? row(
+              target,
+              "SELECT * FROM events WHERE event_uuid = ?",
+              sourceEvent.event_uuid,
+            )
+            : undefined;
+          // A predecessor pruned from both copies has no map entry. Preserve
+          // its numeric identity only when the destination proves no remap.
+          const preserveDanglingPreviousId = (
+            previousSourceId !== null
+            && mappedPreviousId === null
+            && !sourceEventIds.has(previousSourceId)
+            && existingVersionedEvent !== undefined
+            && comparable(existingVersionedEvent.prev_event_id)
+              === comparable(previousSourceId)
+            && hasSamePassiveEventImmutableEnvelope(
+              existingVersionedEvent,
+              sourceEvent,
+            )
+            && !row(
+              target,
+              "SELECT event_id FROM events WHERE event_id = ?",
+              previousSourceId,
+            )
+          );
+          const reconciledPreviousId = preserveDanglingPreviousId
+            ? previousSourceId
+            : mappedPreviousId;
           if (
             sourceSchemaVersion >= 4
-            && comparable(mappedPreviousId) !== comparable(previousSourceId)
+            && comparable(reconciledPreviousId) !== comparable(previousSourceId)
             && hasPassiveEventTransportProgress(sourceEvent)
           ) {
             throw new Error(
@@ -1133,7 +1175,7 @@ function mergeEventsDatabase(
             data: sourceEvent.data,
             priority: sourceEvent.priority,
             source_hook: sourceEvent.source_hook,
-            prev_event_id: mappedPreviousId,
+            prev_event_id: reconciledPreviousId,
             processed_at: sourceEvent.processed_at,
             created_at: legacyCreatedAt,
             delivery_state: "pending",
@@ -1150,14 +1192,16 @@ function mergeEventsDatabase(
             delivery_updated_at: legacyCreatedAt,
           } : {
             ...sourceEvent,
-            prev_event_id: mappedPreviousId,
+            prev_event_id: reconciledPreviousId,
           };
           delete value.event_id;
-          const existing = row(
-            target,
-            "SELECT * FROM events WHERE event_uuid = ?",
-            value.event_uuid,
-          );
+          const existing = sourceSchemaVersion >= 4
+            ? existingVersionedEvent
+            : row(
+              target,
+              "SELECT * FROM events WHERE event_uuid = ?",
+              value.event_uuid,
+            );
           let targetId: number;
           if (!existing) {
             targetId = Number(insertRow(target, "events", value));
