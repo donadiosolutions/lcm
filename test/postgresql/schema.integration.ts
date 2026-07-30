@@ -2351,12 +2351,29 @@ describe("PostgreSQL schema baseline", () => {
       }, { domain: "factory", operation: "readInstructionContractHash" }))
         .resolves.toMatchObject({ rows: [{ content_hash: "hash-1" }] });
       const eventId = "6ba7b810-9dad-41d1-80b4-00c04fd430c8";
-      await database.migrator.query({
+      await expect(database.migrator.query<{
+        attempt_count: string;
+        immediate_attempt: boolean;
+        inbox_id: string;
+        status: string;
+      }>({
         text: `INSERT INTO lcm.passive_event_inbox
           (project_id,machine_id,event_id,event_version,machine_sequence,event_type,payload)
-          VALUES($1,$2,$3,1,0,'event','{}')`,
+          VALUES($1,$2,$3,1,0,'event','{}')
+          RETURNING inbox_id::text,
+                    status,
+                    attempt_count::text,
+                    next_attempt_at = received_at AS immediate_attempt`,
         values: [scope.projectId, scope.machineId, eventId],
-      }, { domain: "factory", operation: "seedInboxMatrix" });
+      }, { domain: "factory", operation: "seedInboxMatrix" })).resolves
+        .toMatchObject({
+          rows: [{
+            attempt_count: "0",
+            immediate_attempt: true,
+            inbox_id: expect.stringMatching(/^[1-9][0-9]*$/u),
+            status: "pending",
+          }],
+        });
       const localMessage = await database.migrator.query<{ message_id: string }>({
         text: "INSERT INTO lcm.messages(project_id,conversation_id,seq,role,content,token_count) VALUES($1,$2,0,'user','local',1) RETURNING message_id",
         values: [scope.projectId, scope.conversationId],

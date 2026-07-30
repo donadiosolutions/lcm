@@ -25,6 +25,11 @@ Issue #87 adds staged summary-DAG, context-item, and large-file repositories,
 an always-enabled recursive cycle guard, and least-privilege runtime grants.
 These adapters are available for direct programmatic use and conformance, but
 they likewise do not activate daemon or CLI routing.
+Issue #91 adds a separately exported passive-event repository and a bounded
+replication worker around the existing #90 inbox and fencing primitives. Hooks
+still commit only to local SQLite. Delivery, acknowledgement, quarantine, and
+exact-event replay remain explicitly invoked staged operations; selecting
+PostgreSQL does not start the worker or activate the application backend.
 
 The design is single-user and multi-machine. Project scoping prevents accidental
 cross-project relationships; it is not a tenant or authorization boundary and
@@ -367,9 +372,9 @@ is deleted.
 
 The baseline does not run retention jobs or silently delete records. Identity,
 source, derived, and administrative records are retained until an explicit
-future repository operation removes them. Archived promoted memories remain
-stored. Applied inbox events may be pruned only after the acknowledgement rules
-in #91 are implemented. Released or expired lease rows are short-lived
+repository operation removes them. Archived promoted memories remain stored.
+Applied inbox events may be pruned only under the acknowledgement rules
+implemented by #91. Released or expired lease rows are short-lived
 coordination state, but cleanup must use row deletion without truncating or
 restarting `fenced_leases_fencing_token_seq`. The sequence is durable schema
 state, owned by `fenced_leases.fencing_token`, and is retained for the table's
@@ -430,7 +435,7 @@ baseline. Provider backup retention is independent of live-table deletion.
 
 | Table | Ownership and retention | Enforced invariants and indexes |
 | --- | --- | --- |
-| `passive_event_inbox` | Durable remote copy of a machine's local hook-outbox event. Project and machine deletion are restricted. Retain pending, claimed, retry, and quarantined rows; prune applied rows only after #91's acknowledgement policy. Issue #90 claims only an eligible head per machine, durably records its claimant and attempt, and recovers stale claims without deleting payloads. | Generated `bigint` primary key; unique event ID and sequence per machine; positive version, nonnegative sequence/attempt count; closed status enum; claim, applied, and quarantine columns must agree with status; nonnull claim owners and quarantine reasons must be nonblank after trimming. Claim, next-attempt, applied, and quarantine timestamps cannot precede receipt. Equality is permitted for immediate first attempts and claims. Partial ready, retry-time, and claimed-age B-tree indexes support ordered `FOR UPDATE SKIP LOCKED` claims and recovery; payload uses a JSONB path-ops GIN index. |
+| `passive_event_inbox` | Durable remote copy of a machine's local hook-outbox event. Project and machine deletion are restricted. Retain pending, claimed, retry, and quarantined rows. Issue #90 claims only an eligible head per machine, durably records its claimant and attempt, and recovers stale claims without deleting payloads. Issue #91 inserts idempotently, commits each applied effect and applied transition in one short transaction, durably acknowledges the exact local event, and only then deletes that exact applied remote row. | Generated `bigint` primary key; unique event ID and sequence per machine; positive version, nonnegative sequence/attempt count; closed status enum; claim, applied, and quarantine columns must agree with status; nonnull claim owners and quarantine reasons must be nonblank after trimming. Claim, next-attempt, applied, and quarantine timestamps cannot precede receipt. Equality is permitted for immediate first attempts and claims. Partial ready, retry-time, and claimed-age B-tree indexes support ordered `FOR UPDATE SKIP LOCKED` claims and recovery; payload uses a JSONB path-ops GIN index. |
 | `fenced_leases` | Project resource lease owned operationally by a machine/process. The project and owner-machine foreign keys both use `ON DELETE RESTRICT`. Released or expired rows may be deleted by issue #90's bounded cleanup, but the column-owned token sequence is retained until an explicit schema migration drops the table and must never be restarted by cleanup. | `(project_id, resource_type, resource_key)` primary key permits one current row per scoped resource; resource and owner/process/operation fields are nonblank. `fencing_token` is a generated-always `bigint` identity with a positive check, backed by `fenced_leases_fencing_token_seq`, so delete-and-reacquire cannot reuse a generated token. `renewed_at >= acquired_at`, `expires_at > renewed_at`, and `released_at >= renewed_at` when released. Partial active-owner and active-expiry indexes support diagnostics and takeover; `fenced_leases_owner_machine_idx` covers the complete machine foreign key. Acquisition and expired/released takeover allocate a new identity token from database time. Renewal and release match the exact project, resource, owner, operation, and token. A protected write validates the active fence with `SELECT ... FOR UPDATE` in its own short transaction. |
 
 ## Named index catalog
@@ -749,9 +754,15 @@ Migration privilege hardening is likewise confined to LCM-owned objects: it
 does not change ACLs on unknown objects already present in `lcm`. If an
 administrator has granted schema-level `PUBLIC CREATE`, they must remove that
 privilege outside LCM and rerun migration; LCM fails closed rather than mutating it.
-The issue #90 coordination grant gives the runtime only sequence `USAGE`
-required to consume `fenced_leases_fencing_token_seq`; it does not grant
-sequence inspection, restart, or table-truncate authority. See
+The coordination grant gives the runtime sequence `USAGE`, but not `SELECT` or
+restart authority, on `fenced_leases_fencing_token_seq` and
+`passive_event_inbox_inbox_id_seq`. For the inbox, #91 adds `SELECT`, exact
+column-scoped envelope `INSERT`, exact lifecycle-column `UPDATE`, and `DELETE`
+for the repository's fully qualified applied-row prune. It grants no
+table-wide `INSERT` or `UPDATE`, payload update, immutable identity update,
+generated/default-column insertion, `TRUNCATE`, or grant option. Readiness
+normalizes only this reviewed owner-granted, non-grantable shape and fails
+closed on broader privileges. See
 [PostgreSQL cross-machine coordination](postgresql-coordination.md) for the
 complete runtime grant and operator contract.
 
@@ -782,7 +793,7 @@ for the complete runtime, transaction, diagnostic, and recovery contract.
   `~/.lcm/transcript-quarantine/` is local too. Preserve these separately.
   Recover a lost machine file
   with the explicit PostgreSQL machine UUID via `lcm machine recover`; restore
-  project bindings explicitly via `lcm project link`. Once #91 exists, replay uses
+  project bindings explicitly via `lcm project link`. Replay uses
   `(machine_id, event_id)` and machine sequence uniqueness to avoid duplicate
   remote inbox effects; do not acknowledge a local event solely because a
   restored checkpoint claims it was applied.

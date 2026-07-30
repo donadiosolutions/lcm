@@ -4,6 +4,7 @@ import {
   PostgreSqlContextRepository,
   PostgreSqlCoordinationRepository,
   PostgreSqlLargeFileRepository,
+  PostgreSqlPassiveEventRepository,
   PostgreSqlPromotedMemoryRepository,
   PostgreSqlRecallRepository,
   PostgreSqlRedactionAdminRepository,
@@ -24,6 +25,7 @@ import {
 import {
   POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS,
   POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE,
+  POSTGRESQL_STAGED_REPOSITORY_SUITES,
 } from "./postgresql-conformance-manifest.js";
 
 describe("PostgreSQL project repository conformance manifest", () => {
@@ -72,5 +74,19 @@ describe("PostgreSQL project repository conformance manifest", () => {
       .toBe(PostgreSqlCoordinationRepository);
     expect(POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE.coordination.exercise)
       .toBe(exerciseCoordinationRepositoryConformance);
+  });
+
+  it("registers staged passive-event delivery without activating ProjectRepositories", () => {
+    expect(POSTGRESQL_STAGED_REPOSITORY_SUITES).toEqual({
+      passiveEvents: {
+        implementation: PostgreSqlPassiveEventRepository,
+        integrationSuites: [
+          "test/postgresql/passive-event-repository.integration.ts",
+          "test/postgresql/passive-event-replication.integration.ts",
+        ],
+      },
+    });
+    expect(POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS)
+      .not.toHaveProperty("passiveEvents");
   });
 });

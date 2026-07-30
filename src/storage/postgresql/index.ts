@@ -8,6 +8,7 @@ export * from "./identity-repository.js";
 export * from "./migrations.js";
 export * from "./memory-repositories.js";
 export * from "./native-transcript-repository.js";
+export * from "./passive-event-repository.js";
 export * from "./runtime.js";
 export * from "./search-configuration.js";
 export * from "./summary-context-repositories.js";

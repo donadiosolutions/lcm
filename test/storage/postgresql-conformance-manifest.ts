@@ -117,3 +117,19 @@ export const POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE = {
     exercise: exerciseCoordinationRepositoryConformance,
   },
 } as const satisfies PostgreSqlProjectRepositoryConformanceManifest;
+
+/**
+ * Staged PostgreSQL repositories that are not yet part of ProjectRepositories
+ * still need an explicit adapter and integration-suite inventory. This keeps
+ * new public adapters visible to the PostgreSQL harness without activating
+ * them through the daemon storage factory.
+ */
+export const POSTGRESQL_STAGED_REPOSITORY_SUITES = {
+  passiveEvents: {
+    implementation: PostgreSqlExports.PostgreSqlPassiveEventRepository,
+    integrationSuites: [
+      "test/postgresql/passive-event-repository.integration.ts",
+      "test/postgresql/passive-event-replication.integration.ts",
+    ],
+  },
+} as const;
