@@ -2279,6 +2279,165 @@ describe("ensureDaemon", () => {
     expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
   });
 
+  it.each([
+    {
+      platform: "darwin" as const,
+      executable: "/bin/ps",
+      windowsPowerShellPath: undefined,
+      command: "node /usr/local/bin/lcm daemon start --foreground",
+    },
+    {
+      platform: "win32" as const,
+      executable: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      windowsPowerShellPath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      command: "\"C:\\Program Files\\nodejs\\node.exe\" C:\\lcm\\lcm.mjs daemon start --foreground",
+    },
+  ])("preserves a valid busy daemon on $platform using fail-closed command identity", async ({
+    platform,
+    executable,
+    windowsPowerShellPath,
+    command,
+  }): Promise<void> => {
+    const fixture = createOwnedDaemonFixture(`lcm-lifecycle-busy-${platform}-`);
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
+    const killMock = vi.fn();
+    const spawnMock = vi.fn();
+    const listenerPorts = vi.fn().mockReturnValue([19999]);
+    const processInspector = vi.fn((
+      _executable: string,
+      _args: string[],
+      _options: Record<string, unknown>,
+    ) => ({
+      status: 0,
+      stdout: command,
+      stderr: "",
+    }));
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: fixture.pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _platform: platform,
+      _fetchOverride: fetchMock as FetchOverride,
+      _killOverride: killMock,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _spawnSyncOverride: processInspector as unknown as SpawnSyncOverride,
+      _sleepOverride: async (): Promise<void> => {},
+      _isProcessAliveOverride: (): boolean => true,
+      _listeningPortsOverride: listenerPorts,
+      _windowsPowerShellPathOverride: windowsPowerShellPath,
+    });
+
+    expect(result).toMatchObject({
+      connected: false,
+      spawned: false,
+      pid: fixture.pid,
+      warning: expect.stringContaining("health remained unavailable after bounded retries"),
+    });
+    expect(processInspector).toHaveBeenCalledTimes(4);
+    for (const [actualExecutable, args, options] of processInspector.mock.calls) {
+      expect(actualExecutable).toBe(executable);
+      expect(options).toMatchObject({
+        encoding: "utf-8",
+        timeout: 1000,
+        maxBuffer: 64 * 1024,
+        shell: false,
+        windowsHide: true,
+      });
+      if (platform === "darwin") {
+        expect(args).toEqual(["-p", String(fixture.pid), "-o", "command="]);
+      } else {
+        expect(args).toEqual([
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          expect.stringMatching(new RegExp(`ProcessId = ${fixture.pid}\\b`, "u")),
+        ]);
+      }
+    }
+    expect(listenerPorts).toHaveBeenCalledTimes(2);
+    expect(killMock).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(readFileSync(fixture.pidFile, "utf-8")).toBe(String(fixture.pid));
+    expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
+  });
+
+  it.each([
+    { name: "an unrelated macOS command", platform: "darwin" as const, outcome: "unrelated" as const },
+    { name: "a failed macOS inspection", platform: "darwin" as const, outcome: "throw" as const },
+    { name: "a nonzero macOS inspection", platform: "darwin" as const, outcome: "nonzero" as const },
+    { name: "a non-string macOS inspection", platform: "darwin" as const, outcome: "nonstring" as const },
+    { name: "an empty macOS inspection", platform: "darwin" as const, outcome: "empty" as const },
+    { name: "an unrelated Windows command", platform: "win32" as const, outcome: "unrelated" as const },
+    { name: "a failed Windows inspection", platform: "win32" as const, outcome: "throw" as const },
+    { name: "a missing trusted Windows inspector", platform: "win32" as const, outcome: "missing" as const },
+    { name: "an unsupported platform", platform: "freebsd" as const, outcome: "unsupported" as const },
+  ])("rejects busy preservation for $name", async ({
+    platform,
+    outcome,
+  }): Promise<void> => {
+    const fixture = createOwnedDaemonFixture(`lcm-lifecycle-busy-invalid-${platform}-`);
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
+    const killMock = vi.fn();
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(undefined));
+    const listenerPorts = vi.fn().mockReturnValue([19999]);
+    const processInspector = vi.fn((
+      _executable: string,
+      _args: string[],
+      _options: Record<string, unknown>,
+    ): {
+      status: number;
+      stdout: unknown;
+      stderr: string;
+    } => {
+      switch (outcome) {
+        case "throw":
+          throw new Error("process inspection failed");
+        case "nonzero":
+          return { status: 1, stdout: "", stderr: "failed" };
+        case "nonstring":
+          return { status: 0, stdout: Buffer.from("unexpected"), stderr: "" };
+        case "empty":
+          return { status: 0, stdout: "   ", stderr: "" };
+        default:
+          return { status: 0, stdout: "sleep 1000", stderr: "" };
+      }
+    });
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: fixture.pidFile,
+      spawnTimeoutMs: 1000,
+      expectedVersion: "1.2.3",
+      _platform: platform,
+      _fetchOverride: fetchMock as FetchOverride,
+      _killOverride: killMock,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+      _spawnSyncOverride: processInspector as unknown as SpawnSyncOverride,
+      _sleepOverride: async (): Promise<void> => {},
+      _isProcessAliveOverride: (): boolean => true,
+      _listeningPortsOverride: listenerPorts,
+      _windowsPowerShellPathOverride: platform === "win32" && outcome !== "missing"
+        ? "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+        : undefined,
+      _skipHealthWait: true,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: true });
+    expect(killMock).not.toHaveBeenCalled();
+    expect(spawnMock).toHaveBeenCalledOnce();
+    expect(listenerPorts).not.toHaveBeenCalled();
+    expect(existsSync(fixture.pidFile)).toBe(false);
+    expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
+    if (outcome === "missing" || outcome === "unsupported") {
+      expect(processInspector).not.toHaveBeenCalled();
+    } else {
+      expect(processInspector).toHaveBeenCalledOnce();
+    }
+  });
+
   it("preserves the exact busy daemon after the health deadline is exhausted", async (): Promise<void> => {
     const fixture = createOwnedDaemonFixture("lcm-lifecycle-busy-deadline-");
     let monotonicMs = 0;
