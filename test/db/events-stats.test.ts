@@ -1,6 +1,13 @@
 // test/db/events-stats.test.ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -30,6 +37,9 @@ vi.mock("../../src/hooks/events-db.js", async (importOriginal) => {
 import { collectDetailedEventStats, collectEventStats } from "../../src/db/events-stats.js";
 import { collectEventSidecars } from "../../src/db/event-sidecars.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
+import {
+  serializeWorktreeReconciliationFence,
+} from "../../src/worktree-reconciliation-fence.js";
 
 describe("collectEventStats", () => {
   let tempDir: string;
@@ -198,6 +208,103 @@ describe("collectEventStats", () => {
     expect(sidecars[0].scanSkipped).toBeUndefined();
     expect(sidecars).toHaveLength(2);
     expect(sidecars[1].scanSkipped).toContain("2 sidecars");
+  });
+
+  it("omits exact reconciliation fences before ordering and scan budgets", async () => {
+    const hash = "0".repeat(64);
+    const fencePath = join(tempDir, `${hash}.db`);
+    mkdirSync(fencePath);
+    writeFileSync(
+      join(fencePath, "fence.json"),
+      serializeWorktreeReconciliationFence(hash, "events"),
+    );
+    for (const file of ["a.db", "b.db"]) {
+      const db = new EventsDb(join(tempDir, file));
+      db.insertEvent(
+        "s1",
+        { type: "decision", category: "decision", data: file, priority: 1 },
+        "PostToolUse",
+      );
+      db.close();
+    }
+
+    const sidecars = await collectEventSidecars({
+      maxDbs: 1,
+      startIndex: 1,
+      pruneOrphanSidecars: false,
+    });
+    expect(sidecars[0].file).toBe("b.db");
+    expect(sidecars[1].scanSkipped).toContain("1 sidecar");
+    expect(sidecars.some((sidecar) => sidecar.projectId === hash)).toBe(false);
+    expect(existsSync(join(fencePath, "fence.json"))).toBe(true);
+  });
+
+  it("does not count, open, or prune a lone exact reconciliation fence", async () => {
+    const hash = "a".repeat(64);
+    const fencePath = join(tempDir, `${hash}.db`);
+    mkdirSync(fencePath);
+    writeFileSync(
+      join(fencePath, "fence.json"),
+      serializeWorktreeReconciliationFence(hash, "events"),
+    );
+
+    expect(await collectEventSidecars({ maxDbs: 0 })).toEqual([]);
+    expect(existsSync(join(fencePath, "fence.json"))).toBe(true);
+  });
+
+  it("surfaces every malformed or ambiguous fence candidate as a scan failure", async () => {
+    const candidates = [
+      ["1", "{"],
+      [
+        "2",
+        `${JSON.stringify({ version: 1, hash: "3".repeat(64), kind: "events" })}\n`,
+      ],
+      [
+        "3",
+        `${JSON.stringify({ version: 1, hash: "3".repeat(64), kind: "project" })}\n`,
+      ],
+      [
+        "4",
+        `${JSON.stringify({ version: 2, hash: "4".repeat(64), kind: "events" })}\n`,
+      ],
+      ["5", "x".repeat(1025)],
+    ] as const;
+    for (const [digit, marker] of candidates) {
+      const path = join(tempDir, `${digit.repeat(64)}.db`);
+      mkdirSync(path);
+      writeFileSync(join(path, "fence.json"), marker);
+    }
+
+    const extraHash = "6".repeat(64);
+    const extraPath = join(tempDir, `${extraHash}.db`);
+    mkdirSync(extraPath);
+    writeFileSync(
+      join(extraPath, "fence.json"),
+      serializeWorktreeReconciliationFence(extraHash, "events"),
+    );
+    writeFileSync(join(extraPath, "unexpected"), "entry");
+
+    mkdirSync(join(tempDir, `${"7".repeat(64)}.db`));
+    const symlinkTarget = join(tempDir, "valid-fence-target");
+    mkdirSync(symlinkTarget);
+    writeFileSync(
+      join(symlinkTarget, "fence.json"),
+      serializeWorktreeReconciliationFence("8".repeat(64), "events"),
+    );
+    symlinkSync(symlinkTarget, join(tempDir, `${"8".repeat(64)}.db`), "dir");
+    const nonHashPath = join(tempDir, "not-a-project-hash.db");
+    mkdirSync(nonHashPath);
+    writeFileSync(
+      join(nonHashPath, "fence.json"),
+      serializeWorktreeReconciliationFence("9".repeat(64), "events"),
+    );
+
+    const sidecars = await collectEventSidecars({ pruneOrphanSidecars: true });
+    expect(sidecars).toHaveLength(9);
+    expect(sidecars.every((sidecar) =>
+      sidecar.scanError === "sidecar path is not a regular file"
+    )).toBe(true);
+    expect(sidecars.every((sidecar) => sidecar.pruned === undefined)).toBe(true);
   });
 
   it("bounds truncation reporting to one summary regardless of skipped file count", async () => {

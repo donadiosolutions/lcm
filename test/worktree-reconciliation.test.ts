@@ -5745,13 +5745,35 @@ describe("worktree reconciliation", () => {
 
     rmSync(sourceDir, { force: true });
     const eventsPath = join(home, ".lcm", "events", `${sourceHash}.db`);
-    for (const markerState of ["missing", "unreadable", "malformed"]) {
+    for (const markerState of [
+      "missing",
+      "unreadable",
+      "malformed",
+      "unexpected-entry",
+      "oversized",
+      "symlinked",
+    ]) {
       rmSync(eventsPath, { recursive: true, force: true });
       mkdirSync(eventsPath, { recursive: true });
       if (markerState === "unreadable") {
         mkdirSync(join(eventsPath, "fence.json"));
       } else if (markerState === "malformed") {
         writeFileSync(join(eventsPath, "fence.json"), "{");
+      } else if (markerState === "unexpected-entry") {
+        writeFileSync(
+          join(eventsPath, "fence.json"),
+          `${JSON.stringify({ version: 1, hash: sourceHash, kind: "events" })}\n`,
+        );
+        writeFileSync(join(eventsPath, "unexpected"), "entry");
+      } else if (markerState === "oversized") {
+        writeFileSync(join(eventsPath, "fence.json"), "x".repeat(1025));
+      } else if (markerState === "symlinked") {
+        const markerTarget = join(home, `${sourceHash}-fence-target`);
+        writeFileSync(
+          markerTarget,
+          `${JSON.stringify({ version: 1, hash: sourceHash, kind: "events" })}\n`,
+        );
+        symlinkSync(markerTarget, join(eventsPath, "fence.json"));
       }
       writeFileSync(journalPath, JSON.stringify(journal));
       expect(() => reconcileWorktrees(main)).toThrow("invalid legacy events state path");

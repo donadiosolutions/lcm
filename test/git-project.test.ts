@@ -215,11 +215,57 @@ describe("Git project identity", () => {
 
     for (const line of [
       "worktreeConfig = false # disabled",
+      "worktreeConfig = no;disabled",
       "worktreeConfig = off;disabled",
+      "worktreeConfig = 0 # disabled",
     ]) {
       writeWorktreeConfig(line);
       expect(configuredWorktreeBool()).toBe("false");
       expectMetadataAnchor();
+    }
+
+    for (const [config, expected] of [
+      [
+        [
+          "[core]",
+          "repositoryformatversion = 0",
+          "[extensions]",
+          "worktreeConfig = true # superseded",
+          "worktreeConfig = false;final",
+          "",
+        ].join("\n"),
+        false,
+      ],
+      [
+        [
+          "[extensions]",
+          "worktreeConfig = 0",
+          "[core]",
+          "repositoryformatversion = 0",
+          "[extensions]",
+          "worktreeConfig",
+          "",
+        ].join("\n"),
+        true,
+      ],
+      [
+        [
+          "[extensions]",
+          "worktreeConfig = no",
+          "[extensions]",
+          "worktreeConfig = yes;superseded",
+          "[extensions]",
+          "worktreeConfig = off # final",
+          "",
+        ].join("\n"),
+        false,
+      ],
+    ] as const) {
+      writeFileSync(commonConfigPath, config);
+      clearGitProjectAnchorCache();
+      expect(configuredWorktreeBool()).toBe(expected ? "true" : "false");
+      if (expected) expectSubmoduleAnchor();
+      else expectMetadataAnchor();
     }
 
     for (const line of [
@@ -230,6 +276,21 @@ describe("Git project identity", () => {
       expect(configuredWorktreeBool).toThrow();
       expectMetadataAnchor();
     }
+
+    writeFileSync(
+      commonConfigPath,
+      [
+        "[extensions]",
+        "worktreeConfig = true",
+        "worktreeConfig = unsupported",
+        "[extensions]",
+        "worktreeConfig = true",
+        "",
+      ].join("\n"),
+    );
+    clearGitProjectAnchorCache();
+    expect(configuredWorktreeBool).toThrow();
+    expectMetadataAnchor();
   });
 
   it("revalidates cached anchors when nearer or changed Git metadata appears", () => {

@@ -13,6 +13,13 @@ validation. `HEAD`, `gitdir`, `commondir`, and other topology pointers remain
 limited to 64 KiB; `.git/config` and `config.worktree` accept valid files up to
 4 MiB so accumulated branch metadata does not block project identity. Larger,
 symlinked, or non-regular metadata continues to fail closed.
+When Git's common config repeats `extensions.worktreeConfig`, including across
+multiple `[extensions]` sections, LCM follows Git's final-assignment behavior:
+the last supported true/yes/on/1 or implicit boolean enables per-worktree
+configuration, while the last false/no/off/0 disables it. Inline `#` and `;`
+comments on explicit supported values are preserved. Any malformed or
+unsupported occurrence fails closed instead of allowing an earlier or later
+truthy value to enable `config.worktree`.
 The database and passive-learning sidecar remain under:
 
 ```text
@@ -63,6 +70,16 @@ database sidecars move to timestamped private backups under
 remain at the retired project and event paths so an older LCM process cannot
 recreate a split store. The project map then folds live and deleted worktree
 paths into canonical aliases. Legacy data remains recoverable in the backups.
+An event-path sentinel is recognized only when the hash-named
+`~/.lcm/events/<local-hash>.db` path is a real directory containing exactly one
+bounded, regular `fence.json` marker whose version, hash, kind, JSON bytes, and
+trailing newline match the reconciliation serializer. Exact sentinels are
+removed from passive-event scans before sorting, rotated start indexes, scan
+budgets, database opens, or orphan pruning, so they never appear as a sidecar
+or consume scan capacity. Symlinks, missing or oversized markers, malformed
+JSON, wrong fields, extra directory entries, and other non-regular or
+ambiguous candidates are not hidden; scans report them as failures, and
+reconciliation continues to fail closed on the same shared validation.
 
 Divergent identity collisions, malformed source state, and conflicting
 PostgreSQL UUID bindings fail closed. The journal retains a blocked,
