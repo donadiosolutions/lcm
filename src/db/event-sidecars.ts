@@ -1,8 +1,9 @@
-import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { eventsDir } from "./events-path.js";
 import { projectsDir } from "../runtime-paths.js";
 import { SQLiteLocalHookOutboxFactory } from "../storage/local-hook-outbox.js";
+import { isWorktreeReconciliationFence } from "../worktree-reconciliation-fence.js";
 
 export interface EventSidecarSummary {
   file: string;
@@ -41,6 +42,7 @@ export interface EventSidecarScanOptions {
 const DEFAULT_TIMEOUT_MS = 2000;
 const DEFAULT_MAX_DBS = 50;
 const DEFAULT_PRUNE_ORPHAN_SIDECAR_AGE_DAYS = 30;
+const PROJECT_HASH_SIDECAR_RE = /^([a-f0-9]{64})\.db$/u;
 
 function readCwdForProject(projectId: string): string | undefined {
   const metaPath = join(projectsDir(), projectId, "meta.json");
@@ -158,6 +160,11 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
   try {
     files = readdirSync(dir)
       .filter(f => f.endsWith(".db"))
+      .filter((file) => {
+        const match = PROJECT_HASH_SIDECAR_RE.exec(file);
+        return !match
+          || !isWorktreeReconciliationFence(join(dir, file), match[1]!, "events");
+      })
       .sort((a, b) => a.localeCompare(b));
   } catch {
     return [];
@@ -189,6 +196,10 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
 
     const projectId = file.slice(0, -".db".length);
     try {
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink() || !stat.isFile()) {
+        throw new Error("sidecar path is not a regular file");
+      }
       const outboxFactory = new SQLiteLocalHookOutboxFactory();
       const db = await outboxFactory.open(path, { busyTimeoutMs: 500 });
       let summary: EventSidecarSummary;

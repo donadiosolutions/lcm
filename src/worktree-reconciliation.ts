@@ -50,6 +50,10 @@ import {
   formatLocalHookMachineSequence,
   parseLocalHookMachineSequence,
 } from "./storage/local-hook-event-sequence.js";
+import {
+  isWorktreeReconciliationFence,
+  serializeWorktreeReconciliationFence,
+} from "./worktree-reconciliation-fence.js";
 
 const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_PATTERN_BYTES = 1024 * 1024;
@@ -58,7 +62,6 @@ const RECONCILIATION_VERSION = 1;
 const HASH_RE = /^[a-f0-9]{64}$/u;
 const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const MAX_DISCOVERY_ENTRIES = 50_000;
-const SOURCE_FENCE_VERSION = 1;
 const DEFAULT_SOURCE_BUSY_TIMEOUT_MS = 5_000;
 const RECONCILIATION_CACHE_TTL_MS = 1_000;
 
@@ -1522,33 +1525,12 @@ function backupName(hash: string, now: Date): string {
   return `${hash}-${now.toISOString().replace(/[:.]/gu, "-")}`;
 }
 
-function sourceFenceContent(hash: string, kind: "project" | "events"): string {
-  return `${JSON.stringify({ version: SOURCE_FENCE_VERSION, hash, kind })}\n`;
-}
-
 function isProjectPathFence(path: string, hash: string): boolean {
-  const stat = lstatSync(path);
-  if (stat.isSymbolicLink() || !stat.isFile()) return false;
-  return readBoundedRegularFile(path, {
-    allowedRoot: dirname(path),
-    maxBytes: 1024,
-  }) === sourceFenceContent(hash, "project");
+  return isWorktreeReconciliationFence(path, hash, "project");
 }
 
 function isEventsPathFence(path: string, hash: string): boolean {
-  try {
-    const stat = lstatSync(path);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
-    const marker = join(path, "fence.json");
-    const content = readBoundedRegularFile(marker, {
-      allowedRoot: path,
-      maxBytes: 1024,
-    });
-    JSON.parse(content);
-    return content === sourceFenceContent(hash, "events");
-  } catch {
-    return false;
-  }
+  return isWorktreeReconciliationFence(path, hash, "events");
 }
 
 function installFilesystemFences(
@@ -1559,7 +1541,7 @@ function installFilesystemFences(
     observe("before-project-path-fence", source.projectDir);
     if (!atomicWritePrivateFileExclusive(
       source.projectDir,
-      sourceFenceContent(source.hash, "project"),
+      serializeWorktreeReconciliationFence(source.hash, "project"),
     )) {
       throw new Error(`legacy project path was recreated during reconciliation: ${source.projectDir}`);
     }
@@ -1588,7 +1570,10 @@ function installFilesystemFences(
     observe("after-events-fence-directory-prepared", prepared);
     const marker = join(prepared, "fence.json");
     if (!existsSync(marker)) {
-      atomicWritePrivateFileExclusive(marker, sourceFenceContent(source.hash, "events"));
+      atomicWritePrivateFileExclusive(
+        marker,
+        serializeWorktreeReconciliationFence(source.hash, "events"),
+      );
     } else if (!isEventsPathFence(prepared, source.hash)) {
       throw new Error(`invalid prepared events fence: ${prepared}`);
     }

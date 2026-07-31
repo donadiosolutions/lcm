@@ -33,7 +33,7 @@ Retrieve relevant context across all past sessions using full-text search.
 ```bash
 lcm search "how was auth implemented"
 lcm search "compaction architecture" --tag decision --tag architecture
-lcm search "JWT token" --layers episodic
+lcm search "JWT token" --layer episodic
 ```
 
 ### 2. Grep Memory (exact match)

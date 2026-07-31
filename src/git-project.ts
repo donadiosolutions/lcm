@@ -226,20 +226,25 @@ function configHasCoreWorktree(config: string): boolean {
 
 function configEnablesWorktreeConfig(config: string): boolean {
   let inExtensions = false;
+  let enabled = false;
   for (const line of config.split(/\r?\n/u)) {
     const section = /^\s*\[([^\]]+)\]\s*$/u.exec(line);
     if (section) {
       inExtensions = section[1]!.trim().toLowerCase() === "extensions";
       continue;
     }
-    if (
-      inExtensions
-      && /^\s*worktreeconfig(?:\s*=\s*(?:true|yes|on|1)\s*(?:[#;].*)?)?\s*$/iu.test(line)
-    ) {
-      return true;
+    if (!inExtensions || !/^\s*worktreeconfig(?=$|[\s=])/iu.test(line)) continue;
+    if (/^\s*worktreeconfig\s*$/iu.test(line)) {
+      enabled = true;
+      continue;
     }
+    const assignment =
+      /^\s*worktreeconfig\s*=\s*(true|yes|on|1|false|no|off|0)\s*(?:[#;].*)?\s*$/iu
+        .exec(line);
+    if (!assignment) return false;
+    enabled = /^(?:true|yes|on|1)$/iu.test(assignment[1]!);
   }
-  return false;
+  return enabled;
 }
 
 function hasConfiguredWorktree(gitDir: string): boolean {
