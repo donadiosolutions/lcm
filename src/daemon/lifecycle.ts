@@ -107,6 +107,8 @@ export type EnsureDaemonOptions = {
   _packagedEntrypointOverride?: string;
   /** @internal Deterministic listener-ownership seam for lifecycle tests. */
   _listeningPortsOverride?: (pid: number) => number[];
+  /** @internal Deterministic trusted Windows PowerShell seam for lifecycle tests. */
+  _windowsPowerShellPathOverride?: string | null;
   /** @internal Complete run-owned lifecycle boundary for systemd integration tests. */
   _testScope?: DaemonLifecycleTestScope;
   /** @internal Complete hermetic side-effect boundary for production-mode lifecycle tests. */
@@ -671,7 +673,8 @@ function isLikelyLcmDaemonProcess(pid: number, procRoot = "/proc"): boolean {
   return isLikelyLcmDaemonCommand(readProcessCommand(pid, procRoot));
 }
 
-function resolveWindowsNetstatPath(
+function resolveWindowsSystemExecutable(
+  relativeSegments: readonly string[],
   systemRoot: string | undefined,
   windir: string | undefined,
   fileExists: (path: string) => boolean = existsSync,
@@ -683,10 +686,100 @@ function resolveWindowsNetstatPath(
     // not accept arbitrary absolute directories supplied through the process
     // environment, UNC paths, relative paths, or executable search fallback.
     if (!/^[A-Za-z]:\\Windows$/i.test(normalized)) continue;
-    const executable = win32.join(normalized, "System32", "netstat.exe");
+    const executable = win32.join(normalized, ...relativeSegments);
     if (fileExists(executable)) return executable;
   }
   return null;
+}
+
+function resolveWindowsNetstatPath(
+  systemRoot: string | undefined,
+  windir: string | undefined,
+  fileExists: (path: string) => boolean = existsSync,
+): string | null {
+  return resolveWindowsSystemExecutable(
+    ["System32", "netstat.exe"],
+    systemRoot,
+    windir,
+    fileExists,
+  );
+}
+
+function resolveWindowsPowerShellPath(
+  systemRoot: string | undefined,
+  windir: string | undefined,
+  fileExists: (path: string) => boolean = existsSync,
+): string | null {
+  return resolveWindowsSystemExecutable(
+    ["System32", "WindowsPowerShell", "v1.0", "powershell.exe"],
+    systemRoot,
+    windir,
+    fileExists,
+  );
+}
+
+function readPlatformProcessCommand(
+  pid: number,
+  platform: NodeJS.Platform,
+  spawnSyncImpl: typeof spawnSync,
+  procRoot = "/proc",
+  windowsPowerShellPath: string | null = resolveWindowsPowerShellPath(
+    process.env.SystemRoot,
+    process.env.WINDIR,
+  ),
+): string | null {
+  if (platform === "linux") return readProcessCommand(pid, procRoot);
+
+  let executable: string;
+  let args: string[];
+  if (platform === "darwin") {
+    executable = "/bin/ps";
+    args = ["-p", String(pid), "-o", "command="];
+  } else if (platform === "win32" && windowsPowerShellPath !== null) {
+    executable = windowsPowerShellPath;
+    args = [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `$process = Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = ${String(pid)}'; if ($null -ne $process) { [Console]::Out.Write($process.CommandLine) }`,
+    ];
+  } else {
+    return null;
+  }
+
+  try {
+    const result = spawnSyncImpl(executable, args, {
+      encoding: "utf-8",
+      timeout: 1000,
+      maxBuffer: 64 * 1024,
+      shell: false,
+      windowsHide: true,
+    });
+    if (result.status !== 0 || typeof result.stdout !== "string") return null;
+    const command = result.stdout.trim();
+    return command.length > 0 ? command : null;
+  } catch {
+    return null;
+  }
+}
+
+function isLikelyLcmDaemonProcessForPlatform(
+  pid: number,
+  platform: NodeJS.Platform,
+  spawnSyncImpl: typeof spawnSync,
+  procRoot: string,
+  windowsPowerShellPath: string | null,
+): boolean {
+  return isLikelyLcmDaemonCommand(
+    readPlatformProcessCommand(
+      pid,
+      platform,
+      spawnSyncImpl,
+      procRoot,
+      windowsPowerShellPath,
+    ),
+  );
 }
 
 function findListeningTcpPorts(
@@ -1433,6 +1526,12 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     ?? PACKAGED_RUNTIME_ENTRYPOINT;
   const expectedRuntimeDigest = opts.expectedRuntimeDigest ?? RUNTIME_DIGEST;
   const expectedOwnerId = testScope?.ownerId;
+  const windowsPowerShellPath = opts._windowsPowerShellPathOverride === undefined
+    ? resolveWindowsPowerShellPath(
+        dependencies.environment.SystemRoot,
+        dependencies.environment.WINDIR,
+      )
+    : opts._windowsPowerShellPathOverride;
   let restartedForParent = false;
 
   if (testScope && opts.expectedEntrypoint !== undefined && opts.expectedEntrypoint !== testScope.entrypoint) {
@@ -1476,6 +1575,59 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           opts.port,
         );
     return listenerPorts.includes(opts.port);
+  }
+
+  function ownedPidIsLiveLikelyDaemon(pid: number): boolean {
+    return readOwnedPid() === pid
+      && isAlive(pid)
+      && isLikelyLcmDaemonProcessForPlatform(
+        pid,
+        platform,
+        dependencies.spawnSync,
+        procRoot,
+        windowsPowerShellPath,
+      );
+  }
+
+  function ownedPidConfiguredListenerStateMatches(
+    pid: number,
+    expectedToOwnListener: boolean,
+  ): boolean {
+    if (
+      !ownedPidIsLiveLikelyDaemon(pid)
+    ) {
+      return false;
+    }
+    const listenerPorts = opts._listeningPortsOverride
+      ? opts._listeningPortsOverride(pid)
+      : findListeningTcpPorts(
+          pid,
+          platform,
+          dependencies.spawnSync,
+          procRoot,
+          opts.port,
+        );
+    return listenerPorts.includes(opts.port) === expectedToOwnListener
+      && ownedPidIsLiveLikelyDaemon(pid);
+  }
+
+  function preserveBusyOwnedDaemon(pid: number): EnsureDaemonResult | null {
+    if (!ownedPidConfiguredListenerStateMatches(pid, true)) {
+      return null;
+    }
+    // Revalidate the exact PID, process identity, and listener immediately
+    // before returning. Health may have been unavailable long enough for a
+    // concurrent lifecycle operation to replace any one of them.
+    if (!ownedPidConfiguredListenerStateMatches(pid, true)) {
+      return null;
+    }
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      pid,
+      warning: `daemon PID ${pid} still owns configured port ${opts.port} but health remained unavailable after bounded retries; it may be busy, so it was preserved without signaling or replacement. Retry after the current operation completes; if it remains unavailable, inspect or explicitly stop the daemon before retrying`,
+    };
   }
 
   function remainingRequestDeadline(): RequestDeadline | null {
@@ -1809,20 +1961,41 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
             }
           }
         }
+        if (!isRecognizedDaemonHealth(retry) && !opts._abortSignal?.aborted) {
+          const preserved = preserveBusyOwnedDaemon(pid);
+          if (preserved) return preserved;
+          const replacementPid = readOwnedPid();
+          if (replacementPid !== null && replacementPid !== pid) {
+            return waitForConcurrentReplacement(replacementPid);
+          }
+        }
         if (enforceParent && !repairedMismatch) {
           const parent = inspectParent();
-          if (parent.available && parent.pid !== undefined) {
-            if (isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
-              await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
-              restartedForParent = true;
-            }
+          const signalStateMatches = isRecognizedDaemonHealth(retry)
+            ? ownedPidConfiguredListenerStateMatches(pid, true)
+            : opts._abortSignal?.aborted
+              ? ownedPidIsLiveLikelyDaemon(pid)
+              : ownedPidConfiguredListenerStateMatches(pid, false);
+          if (
+            parent.available
+            && parent.pid === pid
+            && signalStateMatches
+          ) {
+            await terminatePid(pid, { isAlive, killProcess, sleepFn });
+            restartedForParent = true;
           }
         }
       }
     } catch (error) {
       if (error instanceof LifecycleTestScopeStateError) throw error;
     }
-    if (!repairedMismatch) cleanOwnedPid();
+    if (!repairedMismatch) {
+      const currentPid = readOwnedPid();
+      if (currentPid !== null && currentPid !== pidFilePid) {
+        return waitForConcurrentReplacement(currentPid);
+      }
+      cleanOwnedPid();
+    }
   }
 
   // Step 3: Spawn daemon (unless skipped for testing)

@@ -432,6 +432,14 @@ recognized active storage backend, the PID file, process liveness, and exact
 occupied port with missing or unverifiable identity is rejected rather than
 trusted. Daemons that predate backend identity are recognized as SQLite-only,
 so selecting PostgreSQL cannot silently reuse an existing SQLite process.
+If bounded health checks remain unavailable while the exact PID-file process is
+still a live likely-LCM process and still owns the configured listener,
+lifecycle admission reports `connected: false` with a busy/unavailable warning
+and preserves the process, PID file, and token. It revalidates that evidence
+immediately before returning and does not signal, clean, or start a replacement
+daemon. Retry after the current operation finishes. If health remains
+unavailable after the daemon should be idle, inspect it and explicitly stop or
+restart it instead of repeatedly starting competing processes.
 During an explicit restart, the running daemon is authenticated by PID,
 installed version, listener ownership, and its local token without requiring it
 to already use the newly selected backend; the replacement must match the new
