@@ -1,8 +1,17 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { QueryConfig, QueryResultRow } from "pg";
 import { beforeAll, describe, expect, it } from "vitest";
-import { PostgreSqlLexicalSearchRepository } from "../../src/storage/postgresql/lexical-search-repository.js";
+import type {
+  PostgreSqlQueryExecutor,
+  PostgreSqlQueryOptions,
+  PostgreSqlTransactionScopeExecutor,
+} from "../../src/storage/postgresql/contracts.js";
+import {
+  PostgreSqlLexicalSearchRepository,
+  type PostgreSqlLexicalSearchScopedExecutor,
+} from "../../src/storage/postgresql/lexical-search-repository.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import {
   exerciseLexicalSearchRepositoryConformance,
@@ -309,6 +318,344 @@ function planText(value: unknown): string {
   return JSON.stringify(value);
 }
 
+type CapturedSearchQuery = {
+  readonly text: string;
+  readonly values: readonly unknown[];
+};
+
+function captureSearchQueryExecutor(
+  executor: PostgreSqlQueryExecutor,
+  captured: CapturedSearchQuery[]
+): PostgreSqlQueryExecutor {
+  return {
+    async query<
+      R extends QueryResultRow = QueryResultRow,
+      I extends unknown[] = unknown[]
+    >(config: QueryConfig<I>, options: PostgreSqlQueryOptions) {
+      if (config.text.includes("FROM combined")) {
+        captured.push({
+          text: config.text,
+          values: [...(config.values ?? [])],
+        });
+      }
+      return executor.query<R, I>(config, options);
+    },
+  };
+}
+
+function captureSearchScopedExecutor(
+  executor: PostgreSqlTransactionScopeExecutor,
+  captured: CapturedSearchQuery[]
+): PostgreSqlLexicalSearchScopedExecutor {
+  const direct = captureSearchQueryExecutor(executor, captured);
+  return {
+    transactionScope: "active",
+    query: direct.query,
+    savepoint: (callback, options) =>
+      executor.savepoint(
+        (savepoint) =>
+          callback(captureSearchQueryExecutor(savepoint, captured)),
+        options
+      ),
+  };
+}
+
+function planNodes(value: unknown): ReadonlyArray<Record<string, unknown>> {
+  if (Array.isArray(value)) return value.flatMap(planNodes);
+  if (value === null || typeof value !== "object") return [];
+  const node = value as Record<string, unknown>;
+  return [node, ...Object.values(node).flatMap(planNodes)];
+}
+
+function expectFallbackRelationNeverExecuted(
+  plan: unknown,
+  relationName: string
+): void {
+  const fallbackPlans = planNodes(plan).filter(
+    (node) => node["Subplan Name"] === "CTE fallback_rows"
+  );
+  expect(fallbackPlans).toHaveLength(1);
+  const relationNodes = fallbackPlans
+    .flatMap(planNodes)
+    .filter((node) => node["Relation Name"] === relationName);
+  expect(relationNodes.length).toBeGreaterThan(0);
+  expect(relationNodes.map((node) => node["Actual Loops"])).toEqual(
+    relationNodes.map(() => 0)
+  );
+}
+
+type SnapshotDomain = "messages" | "summaries" | "promoted";
+type SnapshotScope = "root" | "caller";
+
+type SnapshotResult = {
+  readonly id: string | number;
+  readonly rank: number;
+  readonly snippet?: string;
+};
+
+const SNAPSHOT_BARRIER_KEYS: Readonly<Record<SnapshotDomain, string>> = {
+  messages: "89001",
+  summaries: "89002",
+  promoted: "89003",
+};
+
+async function installSearchSnapshotBarriers(
+  database: PostgreSqlTestDatabase
+): Promise<void> {
+  await database.migrator.query(
+    {
+      text: `CREATE FUNCTION lcm.test_search_snapshot_barrier(
+               barrier_key pg_catalog.int8
+             )
+             RETURNS pg_catalog.bool
+             LANGUAGE plpgsql
+             VOLATILE
+             PARALLEL UNSAFE
+             SECURITY DEFINER
+             SET search_path = pg_catalog
+             AS $function$
+             BEGIN
+               PERFORM pg_catalog.pg_advisory_xact_lock(barrier_key);
+               RETURN true;
+             END
+             $function$;
+             REVOKE ALL
+             ON FUNCTION lcm.test_search_snapshot_barrier(pg_catalog.int8)
+             FROM PUBLIC;
+             GRANT EXECUTE
+             ON FUNCTION lcm.test_search_snapshot_barrier(pg_catalog.int8)
+             TO lcm_test_runtime;
+
+             ALTER TABLE lcm.messages ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY test_search_snapshot_messages
+             ON lcm.messages
+             FOR SELECT
+             TO lcm_test_runtime
+             USING (
+               lcm.test_search_snapshot_barrier(
+                 89001::pg_catalog.int8
+               )
+             );
+
+             ALTER TABLE lcm.summaries ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY test_search_snapshot_summaries
+             ON lcm.summaries
+             FOR SELECT
+             TO lcm_test_runtime
+             USING (
+               lcm.test_search_snapshot_barrier(
+                 89002::pg_catalog.int8
+               )
+             );
+
+             ALTER TABLE lcm.promoted_memories ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY test_search_snapshot_promoted
+             ON lcm.promoted_memories
+             FOR SELECT
+             TO lcm_test_runtime
+             USING (
+               lcm.test_search_snapshot_barrier(
+                 89003::pg_catalog.int8
+               )
+             )`,
+    },
+    {
+      domain: "lexical-search",
+      operation: "installSearchSnapshotBarriers",
+    }
+  );
+  const installed = await database.migrator.query<{
+    protected_tables: string;
+    policies: string;
+  }>(
+    {
+      text: `SELECT
+               pg_catalog.count(*) FILTER (
+                 WHERE table_state.relrowsecurity
+               )::pg_catalog.text AS protected_tables,
+               (
+                 SELECT pg_catalog.count(*)::pg_catalog.text
+                 FROM pg_catalog.pg_policy AS policy
+                 WHERE policy.polname OPERATOR(pg_catalog.~~)
+                   'test_search_snapshot_%'
+               ) AS policies
+             FROM pg_catalog.pg_class AS table_state
+             INNER JOIN pg_catalog.pg_namespace AS namespace
+               ON namespace.oid OPERATOR(pg_catalog.=)
+                 table_state.relnamespace
+             WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+               AND table_state.relname OPERATOR(pg_catalog.=)
+                 ANY($1::pg_catalog.text[])`,
+      values: [["messages", "summaries", "promoted_memories"]],
+    },
+    {
+      domain: "lexical-search",
+      operation: "verifySearchSnapshotBarriers",
+    }
+  );
+  expect(installed.rows[0]).toEqual({
+    protected_tables: "3",
+    policies: "3",
+  });
+}
+
+async function holdSearchSnapshotBarrier(
+  database: PostgreSqlTestDatabase,
+  barrierKey: string,
+  holder: PostgreSqlRuntime = database.migrator
+): Promise<{
+  readonly backendPid: number;
+  release(): Promise<void>;
+}> {
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => {
+    markHeld = resolve;
+  });
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let backendPid!: number;
+  const transaction = holder.transaction(async (scope) => {
+    const acquired = await scope.query<{ backend_pid: number }>(
+      {
+        text: `SELECT
+                 pg_catalog.pg_advisory_xact_lock(
+                   $1::pg_catalog.int8
+                 ),
+                 pg_catalog.pg_backend_pid() AS backend_pid`,
+        values: [barrierKey],
+      },
+      {
+        domain: "lexical-search",
+        operation: "holdSearchSnapshotBarrier",
+      }
+    );
+    backendPid = acquired.rows[0].backend_pid;
+    markHeld();
+    await released;
+  });
+  await Promise.race([
+    held,
+    transaction.then(
+      () => {
+        throw new Error("search snapshot barrier exited before acquisition");
+      },
+      (error: unknown) => {
+        throw error;
+      }
+    ),
+  ]);
+  return {
+    backendPid,
+    release: async () => {
+      release();
+      await transaction;
+    },
+  };
+}
+
+async function waitForSearchSnapshotWaiter(
+  database: PostgreSqlTestDatabase
+): Promise<void> {
+  const observer = new PostgreSqlRuntime(settings(database.adminUrl));
+  let observed: readonly {
+    readonly waiter_pid: number;
+    readonly blocking_pids: number[];
+  }[] = [];
+  try {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const result = await observer.query<{
+        waiter_pid: number;
+        blocking_pids: number[];
+      }>(
+        {
+          text: `SELECT
+                   activity.pid::pg_catalog.int4 AS waiter_pid,
+                   pg_catalog.pg_blocking_pids(activity.pid)
+                     AS blocking_pids
+                 FROM pg_catalog.pg_stat_activity AS activity
+                 INNER JOIN pg_catalog.pg_locks AS pending
+                   ON pending.pid OPERATOR(pg_catalog.=) activity.pid
+                  AND pending.locktype OPERATOR(pg_catalog.=) 'advisory'
+                  AND NOT pending.granted
+                 WHERE activity.datname OPERATOR(pg_catalog.=)
+                     pg_catalog.current_database()
+                   AND activity.usename OPERATOR(pg_catalog.=)
+                     'lcm_test_runtime'
+                   AND activity.state OPERATOR(pg_catalog.=) 'active'
+                   AND activity.wait_event_type OPERATOR(pg_catalog.=) 'Lock'
+                   AND activity.query OPERATOR(pg_catalog.~~)
+                     'WITH input AS MATERIALIZED (%'
+                 ORDER BY activity.pid`,
+        },
+        {
+          domain: "lexical-search",
+          operation: "waitForSearchSnapshotWaiter",
+        }
+      );
+      observed = result.rows;
+      if (
+        observed.some(
+          (row) =>
+            row.waiter_pid > 0 &&
+            new Set(row.blocking_pids).size === row.blocking_pids.length &&
+            row.blocking_pids.length > 0
+        )
+      ) {
+        return;
+      }
+    }
+  } finally {
+    await observer.close();
+  }
+  throw new Error(
+    `expected a server-observed lexical-search advisory waiter; observed ${JSON.stringify(
+      observed
+    )}`
+  );
+}
+
+async function searchSnapshotDomain(
+  repository: PostgreSqlLexicalSearchRepository,
+  domain: SnapshotDomain,
+  conversationId: number,
+  query: string
+): Promise<SnapshotResult[]> {
+  if (domain === "messages") {
+    return (
+      await repository.searchMessages({
+        query,
+        mode: "full_text",
+        conversationId,
+        limit: 10,
+      })
+    ).map((row) => ({
+      id: row.messageId,
+      rank: row.rank,
+      snippet: row.snippet,
+    }));
+  }
+  if (domain === "summaries") {
+    return (
+      await repository.searchSummaries({
+        query,
+        mode: "full_text",
+        conversationId,
+        limit: 10,
+      })
+    ).map((row) => ({
+      id: row.summaryId,
+      rank: row.rank,
+      snippet: row.snippet,
+    }));
+  }
+  return (await repository.searchPromoted(query, 10)).map((row) => ({
+    id: row.id,
+    rank: row.rank,
+  }));
+}
+
 describe("PostgreSQL 18 lexical search", () => {
   it("requires and admits only the reviewed read-only search grants", async () => {
     await withPostgreSqlTestDatabase("search-grants", async (database) => {
@@ -583,6 +930,350 @@ describe("PostgreSQL 18 lexical search", () => {
         unrelated_trgm_execute: false,
       });
     });
+  });
+
+  it.each(
+    (
+      [
+        ["messages", "root"],
+        ["messages", "caller"],
+        ["summaries", "root"],
+        ["summaries", "caller"],
+        ["promoted", "root"],
+        ["promoted", "caller"],
+      ] as const
+    ).map(([domain, scope]) => ({ domain, scope }))
+  )(
+    "keeps one READ COMMITTED snapshot for $domain in a $scope scope",
+    async ({
+      domain,
+      scope,
+    }: {
+      domain: SnapshotDomain;
+      scope: SnapshotScope;
+    }) => {
+      await withPostgreSqlTestDatabase(
+        `search-snapshot-${domain}-${scope}`,
+        async (database) => {
+          await grantSearchRuntimePrivileges(database);
+          await installSearchSnapshotBarriers(database);
+          const projectId = await createProject(
+            database,
+            `Search snapshot ${domain} ${scope}`
+          );
+          const conversationId = await createConversation(
+            database,
+            projectId,
+            `search-snapshot-${domain}-${scope}`
+          );
+          const query = "atomiccafe snapshotterm";
+          const baselineContent = "atomiccafe snapshotterm baseline";
+          const concurrentContent =
+            "atómiccafe snapshotterm atómiccafe snapshotterm";
+          let baselineId: string | number;
+          let insertConcurrent: () => Promise<string | number>;
+          if (domain === "messages") {
+            baselineId = (
+              await seedMessage(database, projectId, conversationId, {
+                seq: 0,
+                role: "user",
+                content: baselineContent,
+              })
+            ).id;
+            insertConcurrent = async () =>
+              (
+                await seedMessage(database, projectId, conversationId, {
+                  seq: 1,
+                  role: "assistant",
+                  content: concurrentContent,
+                })
+              ).id;
+          } else if (domain === "summaries") {
+            baselineId = await seedSummary(
+              database,
+              projectId,
+              conversationId,
+              {
+                id: `snapshot-${scope}-baseline`,
+                kind: "leaf",
+                content: baselineContent,
+              }
+            );
+            insertConcurrent = () =>
+              seedSummary(database, projectId, conversationId, {
+                id: `snapshot-${scope}-concurrent`,
+                kind: "condensed",
+                content: concurrentContent,
+              });
+          } else {
+            baselineId = await seedMemory(database, projectId, {
+              content: baselineContent,
+              tags: [],
+              sourceProjectId: "snapshot-source",
+              confidence: 0.8,
+            });
+            insertConcurrent = () =>
+              seedMemory(database, projectId, {
+                content: concurrentContent,
+                tags: [],
+                sourceProjectId: "snapshot-source",
+                confidence: 0.9,
+              });
+          }
+
+          const exercise = async (
+            repository: PostgreSqlLexicalSearchRepository
+          ): Promise<void> => {
+            const barrier = await holdSearchSnapshotBarrier(
+              database,
+              SNAPSHOT_BARRIER_KEYS[domain]
+            );
+            const pending = searchSnapshotDomain(
+              repository,
+              domain,
+              conversationId,
+              query
+            );
+            const completion = pending.then(
+              (rows) => ({ state: "completed" as const, rows }),
+              (error: unknown) => ({ state: "failed" as const, error })
+            );
+            let concurrentId!: string | number;
+            try {
+              const observation = await Promise.race([
+                waitForSearchSnapshotWaiter(database).then(() => ({
+                  state: "blocked" as const,
+                })),
+                completion,
+              ]);
+              if (observation.state === "failed") {
+                throw observation.error;
+              }
+              if (observation.state === "completed") {
+                throw new Error(
+                  `lexical ${domain} search completed before its snapshot barrier`
+                );
+              }
+              concurrentId = await insertConcurrent();
+            } finally {
+              await barrier.release();
+            }
+
+            const first = await pending;
+            expect(first.map((row) => row.id)).toEqual([baselineId]);
+            const next = await searchSnapshotDomain(
+              repository,
+              domain,
+              conversationId,
+              query
+            );
+            expect(next.map((row) => row.id)).toEqual([
+              concurrentId,
+              baselineId,
+            ]);
+            if (domain === "promoted") {
+              expect(next.every((row) => row.rank < 0)).toBe(true);
+            } else {
+              expect(next.every((row) => row.rank > 0)).toBe(true);
+              expect(next[0].snippet).toContain("atomiccafe");
+              expect(next[0].snippet).not.toContain("atómiccafe");
+            }
+          };
+
+          if (scope === "root") {
+            await exercise(
+              new PostgreSqlLexicalSearchRepository(database.runtime, projectId)
+            );
+            const healthy = await database.runtime.query<{
+              statement_timeout: string;
+              usable: number;
+            }>(
+              {
+                text: `SELECT
+                         pg_catalog.current_setting(
+                           'statement_timeout'
+                         ) AS statement_timeout,
+                         1::pg_catalog.int4 AS usable`,
+              },
+              {
+                domain: "lexical-search",
+                operation: "verifyRootSnapshotSearchState",
+              }
+            );
+            expect(healthy.rows[0]).toEqual({
+              statement_timeout: "5s",
+              usable: 1,
+            });
+            return;
+          }
+
+          await database.runtime.transaction(async (transaction) => {
+            const prior = await transaction.query<{
+              transaction_isolation: string;
+              statement_timeout: string;
+              prior_io: number;
+            }>(
+              {
+                text: `SELECT
+                         pg_catalog.current_setting(
+                           'transaction_isolation'
+                         ) AS transaction_isolation,
+                         pg_catalog.current_setting(
+                           'statement_timeout'
+                         ) AS statement_timeout,
+                         1::pg_catalog.int4 AS prior_io`,
+              },
+              {
+                domain: "lexical-search",
+                operation: "verifyCallerSnapshotPrerequisites",
+              }
+            );
+            expect(prior.rows[0]).toEqual({
+              transaction_isolation: "read committed",
+              statement_timeout: "5s",
+              prior_io: 1,
+            });
+            await transaction.query(
+              {
+                text: "SET LOCAL statement_timeout = '30s'",
+              },
+              {
+                domain: "lexical-search",
+                operation: "setCallerSnapshotTimeout",
+              }
+            );
+            await exercise(
+              new PostgreSqlLexicalSearchRepository(transaction, projectId)
+            );
+            const healthy = await transaction.query<{
+              statement_timeout: string;
+              usable: number;
+            }>(
+              {
+                text: `SELECT
+                         pg_catalog.current_setting(
+                           'statement_timeout'
+                         ) AS statement_timeout,
+                         1::pg_catalog.int4 AS usable`,
+              },
+              {
+                domain: "lexical-search",
+                operation: "verifyCallerSnapshotSearchState",
+              }
+            );
+            expect(healthy.rows[0]).toEqual({
+              statement_timeout: "30s",
+              usable: 1,
+            });
+          });
+        }
+      );
+    }
+  );
+
+  it("does not execute fallback relations when any fallback gate is closed", async () => {
+    await withPostgreSqlTestDatabase(
+      "search-fallback-gates",
+      async (database) => {
+        await grantSearchRuntimePrivileges(database);
+        const projectId = await createProject(
+          database,
+          "Search fallback gates"
+        );
+        const conversationId = await createConversation(
+          database,
+          projectId,
+          "search-fallback-gates"
+        );
+        await seedMessage(database, projectId, conversationId, {
+          seq: 0,
+          role: "user",
+          content: "a fullprimary message",
+        });
+        await seedSummary(database, projectId, conversationId, {
+          id: "fallback-gate-summary",
+          kind: "leaf",
+          content: "a fullprimary summary",
+        });
+        await seedMemory(database, projectId, {
+          content: "a fullprimary memory",
+          tags: [],
+          sourceProjectId: "fallback-gate-source",
+          confidence: 1,
+        });
+
+        const cases = (
+          [
+            ["messages", "raw", "a", 10, "messages"],
+            ["messages", "normalized", "𝐚", 10, "messages"],
+            ["messages", "budget", "fullprimary", 1, "messages"],
+            ["summaries", "raw", "a", 10, "summaries"],
+            ["summaries", "normalized", "𝐚", 10, "summaries"],
+            ["summaries", "budget", "fullprimary", 1, "summaries"],
+            ["promoted", "raw", "a", 10, "promoted_memories"],
+            ["promoted", "normalized", "𝐚", 10, "promoted_memories"],
+            ["promoted", "budget", "fullprimary", 1, "promoted_memories"],
+          ] as const
+        ).map(([domain, gate, query, limit, relationName]) => ({
+          domain,
+          gate,
+          query,
+          limit,
+          relationName,
+        }));
+
+        await database.runtime.transaction(async (transaction) => {
+          for (const testCase of cases) {
+            const captured: CapturedSearchQuery[] = [];
+            const repository = new PostgreSqlLexicalSearchRepository(
+              captureSearchScopedExecutor(transaction, captured),
+              projectId
+            );
+            const behavior =
+              testCase.domain === "messages"
+                ? await repository.searchMessages({
+                    query: testCase.query,
+                    mode: "full_text",
+                    conversationId,
+                    limit: testCase.limit,
+                  })
+                : testCase.domain === "summaries"
+                ? await repository.searchSummaries({
+                    query: testCase.query,
+                    mode: "full_text",
+                    conversationId,
+                    limit: testCase.limit,
+                  })
+                : await repository.searchPromoted(
+                    testCase.query,
+                    testCase.limit
+                  );
+            expect(
+              behavior,
+              `${testCase.domain}/${testCase.gate} production behavior`
+            ).toHaveLength(1);
+            expect(captured).toHaveLength(1);
+            const explained = await transaction.query<{
+              "QUERY PLAN": unknown;
+            }>(
+              {
+                text: `EXPLAIN (ANALYZE, FORMAT JSON) ${captured[0].text}`,
+                values: [...captured[0].values],
+              },
+              {
+                domain: "lexical-search",
+                operation: `explainFallbackGate-${testCase.domain}-${testCase.gate}`,
+                projectId,
+              }
+            );
+            expectFallbackRelationNeverExecuted(
+              explained.rows[0]["QUERY PLAN"],
+              testCase.relationName
+            );
+          }
+        });
+      }
+    );
   });
 
   it("passes golden parity, project isolation, and 2046/2047-byte routing", async () => {
@@ -923,6 +1614,7 @@ describe("PostgreSQL 18 lexical search", () => {
         projectId,
         "search-timeout"
       );
+      await installSearchSnapshotBarriers(database);
       await database.migrator.query(
         {
           text: `INSERT INTO lcm.messages (
@@ -933,8 +1625,13 @@ describe("PostgreSQL 18 lexical search", () => {
                  $2,
                  source.ordinal,
                  'user',
-                 pg_catalog.repeat('a', 4000)
-                   OPERATOR(pg_catalog.||) source.ordinal::pg_catalog.text,
+                 CASE
+                   WHEN source.ordinal OPERATOR(pg_catalog.=) 1
+                     THEN 'atomiccafe timeoutbarrier'
+                   ELSE pg_catalog.repeat('a', 4000)
+                     OPERATOR(pg_catalog.||)
+                     source.ordinal::pg_catalog.text
+                 END,
                  1
                FROM pg_catalog.generate_series(1, 1000) AS source(ordinal)`,
           values: [projectId, conversationId],
@@ -942,67 +1639,87 @@ describe("PostgreSQL 18 lexical search", () => {
         { domain: "lexical-search", operation: "seedTimeoutCorpus" }
       );
 
-      const lowTimeoutRuntime = new PostgreSqlRuntime(
-        settings(database.runtimeUrl, { poolMax: 1 })
+      const barrierHolderRuntime = new PostgreSqlRuntime(
+        settings(database.migratorUrl, {
+          poolMax: 1,
+          statementTimeoutMs: 30_000,
+        })
       );
-      const lowTimeoutRepository = new PostgreSqlLexicalSearchRepository(
-        lowTimeoutRuntime,
-        projectId
-      );
+      let barrierHolderPid = 0;
       try {
-        const originalBackend = await lowTimeoutRuntime.query<{
-          backend_pid: number;
-        }>(
-          {
-            text: `SELECT
-                   pg_catalog.pg_backend_pid() AS backend_pid`,
-          },
-          {
-            domain: "lexical-search",
-            operation: "capturePooledSearchBackend",
-          }
-        );
-        await lowTimeoutRuntime.query(
-          {
-            text: "SET statement_timeout = '1ms'",
-          },
-          { domain: "lexical-search", operation: "setPooledSearchTimeout" }
-        );
-        await expect(
-          lowTimeoutRepository.searchMessages({
-            query: "z$",
-            mode: "regex",
-            limit: 50,
+        const lowTimeoutRuntime = new PostgreSqlRuntime(
+          settings(database.runtimeUrl, {
+            poolMax: 1,
+            statementTimeoutMs: 30_000,
           })
-        ).rejects.toMatchObject({
-          domain: "lexical-search",
-          operation: "searchMessages",
-          sqlState: "57014",
-          retryable: false,
-        });
-        await lowTimeoutRuntime.transaction(async (transaction) => {
-          const restored = await transaction.query<{
-            statement_timeout: string;
+        );
+        try {
+          const lowTimeoutRepository = new PostgreSqlLexicalSearchRepository(
+            lowTimeoutRuntime,
+            projectId
+          );
+          const originalBackend = await lowTimeoutRuntime.query<{
+            timeout: string;
+            backend_pid: number;
           }>(
             {
-              text: "SHOW statement_timeout",
+              text: `SELECT
+                     pg_catalog.current_setting(
+                       'statement_timeout'
+                     ) AS timeout,
+                     pg_catalog.pg_backend_pid() AS backend_pid`,
             },
             {
               domain: "lexical-search",
-              operation: "verifyRestoredPooledSearchTimeout",
+              operation: "capturePooledSearchBackend",
             }
           );
-          expect(restored.rows[0]).toEqual({ statement_timeout: "1ms" });
-          await transaction.query(
-            {
-              text: "SET statement_timeout = '5s'",
-            },
-            {
+          expect(originalBackend.rows[0]).toMatchObject({ timeout: "30s" });
+
+          const barrier = await holdSearchSnapshotBarrier(
+            database,
+            SNAPSHOT_BARRIER_KEYS.messages,
+            barrierHolderRuntime
+          );
+          barrierHolderPid = barrier.backendPid;
+          const pending = lowTimeoutRepository.searchMessages({
+            query: "atomiccafe timeoutbarrier",
+            mode: "full_text",
+            limit: 50,
+          });
+          const completion = pending.then(
+            (rows) => ({ state: "completed" as const, rows }),
+            (error: unknown) => ({ state: "failed" as const, error })
+          );
+          try {
+            const observation = await Promise.race([
+              waitForSearchSnapshotWaiter(database).then(() => ({
+                state: "blocked" as const,
+              })),
+              completion,
+            ]);
+            if (observation.state === "completed") {
+              throw new Error(
+                "pooled lexical search completed before its timeout barrier"
+              );
+            }
+            if (observation.state === "failed") throw observation.error;
+            const timedOut = await completion;
+            expect(timedOut.state).toBe("failed");
+            if (timedOut.state === "completed") {
+              throw new Error("pooled lexical search did not time out");
+            }
+            expect(timedOut.error).toMatchObject({
               domain: "lexical-search",
-              operation: "raisePooledSearchTimeout",
-            }
-          );
-          const healthy = await transaction.query<{
+              operation: "searchMessages",
+              sqlState: "57014",
+              retryable: false,
+            });
+          } finally {
+            await barrier.release();
+          }
+
+          const healthy = await lowTimeoutRuntime.query<{
             timeout: string;
             backend_pid: number;
             usable: number;
@@ -1021,14 +1738,35 @@ describe("PostgreSQL 18 lexical search", () => {
             }
           );
           expect(healthy.rows[0]).toEqual({
-            timeout: "5s",
+            timeout: "30s",
             backend_pid: originalBackend.rows[0].backend_pid,
             usable: 1,
           });
-        });
+        } finally {
+          await lowTimeoutRuntime.close();
+        }
       } finally {
-        await lowTimeoutRuntime.close();
+        await barrierHolderRuntime.close();
       }
+      expect(barrierHolderPid).toBeGreaterThan(0);
+      const holderClosed = await database.migrator.query<{
+        active: boolean;
+      }>(
+        {
+          text: `SELECT EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_stat_activity AS activity
+                   WHERE activity.pid OPERATOR(pg_catalog.=)
+                     $1::pg_catalog.int4
+                 ) AS active`,
+          values: [barrierHolderPid],
+        },
+        {
+          domain: "lexical-search",
+          operation: "verifySearchBarrierHolderClosed",
+        }
+      );
+      expect(holderClosed.rows[0]).toEqual({ active: false });
 
       let regexDialectError: unknown;
       let regexDialectState:

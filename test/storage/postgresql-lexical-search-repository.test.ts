@@ -98,6 +98,7 @@ const messageRow = {
   snippet: "needle message",
   rank: 0.75,
   created_at: "2026-01-01T00:00:00.000Z",
+  match_phase: 0,
 };
 
 const summaryRow = {
@@ -107,6 +108,7 @@ const summaryRow = {
   snippet: "needle summary",
   rank: 0.5,
   created_at: new Date("2026-01-02T00:00:00.000Z"),
+  match_phase: 0,
 };
 
 const promotedRow = {
@@ -118,14 +120,21 @@ const promotedRow = {
   confidence: 0.8,
   created_at: "2026-01-03T00:00:00.000Z",
   rank: -0.25,
+  match_phase: 0,
 };
 
-const promotedFallbackRow = { ...promotedRow, rank: 0.25 };
+const promotedFallbackRow = {
+  ...promotedRow,
+  rank: 0.25,
+  match_phase: 1,
+};
 
 describe("PostgreSQL lexical-search repository", () => {
   it("maps primary message, summary, and promoted rows with exact scoped SQL", async () => {
     const database = executor((config) => {
       const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow();
+      if (sql.includes("set_config")) return result([]);
       if (sql.includes("FROM lcm.messages")) {
         return result([
           messageRow,
@@ -217,7 +226,11 @@ describe("PostgreSQL lexical-search repository", () => {
     ]);
 
     expect(database.transaction).toHaveBeenCalledTimes(3);
-    for (const [config, options] of database.query.mock.calls) {
+    const dataQueries = database.query.mock.calls.filter(([config]) =>
+      text(config as QueryConfig<unknown[]>).includes("FROM combined")
+    );
+    expect(dataQueries).toHaveLength(3);
+    for (const [config, options] of dataQueries) {
       const query = config as QueryConfig<unknown[]>;
       expect(query.text).toContain("lcm.");
       expect(query.text).not.toContain("needle");
@@ -227,22 +240,24 @@ describe("PostgreSQL lexical-search repository", () => {
       });
       expect(query.values?.[0]).toBe(projectId);
     }
-    expect(database.query.mock.calls[0][0].values).toEqual([
+    expect(dataQueries[0][0].values).toEqual([
       projectId,
       "needle",
       7,
       "2026-01-01T00:00:00.000Z",
       "2026-02-01T00:00:00.000Z",
       2,
+      true,
     ]);
-    expect(database.query.mock.calls[2][0].values).toEqual([
+    expect(dataQueries[2][0].values).toEqual([
       projectId,
       "needle",
       "source-a",
       ["one"],
       2,
+      true,
     ]);
-    const promotedSql = text(database.query.mock.calls[2][0]);
+    const promotedSql = text(dataQueries[2][0]);
     expect(promotedSql).toContain(") AS relevance");
     expect(promotedSql).toContain(
       "OPERATOR(pg_catalog.-) ranked.relevance AS rank"
@@ -250,8 +265,8 @@ describe("PostgreSQL lexical-search repository", () => {
     expect(promotedSql).toContain(
       "WHERE ranked.relevance OPERATOR(pg_catalog.>) 0::pg_catalog.float4"
     );
-    expect(promotedSql).toContain(
-      "ORDER BY\n  ranked.relevance DESC,\n  ranked.created_at DESC,\n  ranked.memory_id DESC"
+    expect(promotedSql).toMatch(
+      /ORDER BY\s+ranked\.relevance DESC,\s+ranked\.created_at DESC,\s+ranked\.memory_id DESC/u
     );
     expect(promotedSql).not.toContain("ORDER BY\n  ranked.rank DESC");
   });
@@ -286,10 +301,10 @@ describe("PostgreSQL lexical-search repository", () => {
     );
     expect(headlineStatements).toHaveLength(2);
     expect(text(headlineStatements[0])).toMatch(
-      /pg_catalog\.ts_headline\(\s*'lcm\.search_v1'::pg_catalog\.regconfig,\s*lcm\.normalize_search_text\(message\.content\),\s*input\.query,/u
+      /pg_catalog\.ts_headline\(\s*'lcm\.search_v1'::pg_catalog\.regconfig,\s*lcm\.normalize_search_text\(message\.content\),\s*input\.full_text_query,/u
     );
     expect(text(headlineStatements[1])).toMatch(
-      /pg_catalog\.ts_headline\(\s*'lcm\.search_v1'::pg_catalog\.regconfig,\s*lcm\.normalize_search_text\(summary\.content\),\s*input\.query,/u
+      /pg_catalog\.ts_headline\(\s*'lcm\.search_v1'::pg_catalog\.regconfig,\s*lcm\.normalize_search_text\(summary\.content\),\s*input\.full_text_query,/u
     );
     for (const config of headlineStatements) {
       expect(text(config)).toContain(
@@ -308,15 +323,36 @@ describe("PostgreSQL lexical-search repository", () => {
         "pg_catalog.octet_length(input.query)"
       );
       expect(config.values?.[1]).toBe(rawMultibyteQuery);
+      expect(config.values?.at(-1)).toBe(true);
       expect(sql).toContain(
         "SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query"
       );
+      expect(sql).toContain("primary_rows AS MATERIALIZED");
+      expect(sql).toContain("fallback_rows AS MATERIALIZED");
+      expect(sql).toContain("fallback_budget AS MATERIALIZED");
+      expect(sql).toContain("CROSS JOIN LATERAL");
+      expect(sql).toContain("FROM primary_rows AS primary_row");
+      expect(sql).toContain("UNION ALL");
+      expect(sql).toContain("combined.match_phase");
+      expect(sql).toContain("combined.match_order DESC");
       expect(sql).toContain("OPERATOR(pg_catalog.>=) 3");
-      expect(normalizedGate).toBeGreaterThan(-1);
-      expect(normalizedGate).toBeLessThan(sql.indexOf("OPERATOR(public.%)"));
-      expect(normalizedGate).toBeLessThan(
-        sql.indexOf("OPERATOR(pg_catalog.~~)")
+      expect(sql).toMatch(
+        /fallback_budget AS MATERIALIZED \(\s*SELECT GREATEST\(\s*\$(?:5|6)::pg_catalog\.int8\s+OPERATOR\(pg_catalog\.-\)\s+pg_catalog\.count\(\*\)::pg_catalog\.int8,\s+0::pg_catalog\.int8\s*\) AS remaining\s+FROM primary_rows\s*\)/u
       );
+      expect(sql).toMatch(
+        /LIMIT CASE\s+WHEN input\.allow_trigram\s+AND pg_catalog\.octet_length\(input\.query\)\s+OPERATOR\(pg_catalog\.>=\) 3\s+AND fallback_budget\.remaining OPERATOR\(pg_catalog\.>\) 0\s+THEN GREATEST\(\s*fallback_budget\.remaining,\s+0::pg_catalog\.int8\s*\)\s+ELSE 0::pg_catalog\.int8\s+END/u
+      );
+      expect(sql.match(/LIMIT CASE/gu)).toHaveLength(1);
+      expect(sql).toMatch(
+        /combined AS \(\s*SELECT \* FROM primary_rows\s+UNION ALL\s+SELECT \* FROM fallback_rows\s*\)/u
+      );
+      expect(sql).toMatch(
+        /FROM combined\s+ORDER BY\s+combined\.match_phase,\s+combined\.match_order DESC,\s+combined\.created_at DESC,\s+combined\.(?:message_id|summary_id|memory_id) DESC\s+LIMIT \$(?:5|6)::pg_catalog\.int8$/u
+      );
+      expect(normalizedGate).toBeGreaterThan(-1);
+      const guardedFallback = sql.slice(normalizedGate);
+      expect(guardedFallback).toContain("OPERATOR(public.%)");
+      expect(guardedFallback).toContain("OPERATOR(pg_catalog.~~)");
     }
   });
 
@@ -325,7 +361,12 @@ describe("PostgreSQL lexical-search repository", () => {
       ...promotedRow,
       source_project_id: null,
     };
-    const primaryDatabase = executor(() => result([legacyPrimary]));
+    const primaryDatabase = executor((config) => {
+      const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow();
+      if (sql.includes("set_config")) return result([]);
+      return result([legacyPrimary]);
+    });
     const primaryRepository = new PostgreSqlLexicalSearchRepository(
       primaryDatabase,
       projectId
@@ -380,9 +421,25 @@ describe("PostgreSQL lexical-search repository", () => {
       ) {
         return result([
           messageRow,
-          { ...messageRow, message_id: "12", snippet: "fallback two" },
-          { ...messageRow, message_id: "13", snippet: "fallback three" },
-          { ...messageRow, message_id: "14", snippet: "unreachable" },
+          { ...messageRow, match_phase: 1 },
+          {
+            ...messageRow,
+            message_id: "12",
+            snippet: "fallback two",
+            match_phase: 1,
+          },
+          {
+            ...messageRow,
+            message_id: "13",
+            snippet: "fallback three",
+            match_phase: 1,
+          },
+          {
+            ...messageRow,
+            message_id: "14",
+            snippet: "unreachable",
+            match_phase: 1,
+          },
         ]);
       }
       if (
@@ -391,8 +448,9 @@ describe("PostgreSQL lexical-search repository", () => {
       ) {
         return result([
           summaryRow,
-          { ...summaryRow, summary_id: "summary-b" },
-          { ...summaryRow, summary_id: "summary-c" },
+          { ...summaryRow, match_phase: 1 },
+          { ...summaryRow, summary_id: "summary-b", match_phase: 1 },
+          { ...summaryRow, summary_id: "summary-c", match_phase: 1 },
         ]);
       }
       if (
@@ -400,6 +458,7 @@ describe("PostgreSQL lexical-search repository", () => {
         sql.includes("public.similarity")
       ) {
         return result([
+          promotedRow,
           promotedFallbackRow,
           { ...promotedFallbackRow, memory_id: secondMemoryId },
           { ...promotedFallbackRow, memory_id: thirdMemoryId },
@@ -452,20 +511,63 @@ describe("PostgreSQL lexical-search repository", () => {
         ([config]) => (config as QueryConfig<unknown[]>).values?.[0]
       )
     ).toEqual(["5000ms", "37s", "5000ms", "37s", "5000ms", "37s"]);
-    const trigramQueries = database.query.mock.calls
+    const dataQueries = database.query.mock.calls
       .map(([config]) => config as QueryConfig<unknown[]>)
-      .filter((config) => text(config).includes("public.similarity"));
-    expect(trigramQueries[0].values).toEqual([
+      .filter((config) => text(config).includes("FROM combined"));
+    expect(dataQueries).toHaveLength(3);
+    expect(dataQueries[0].values).toEqual([
       projectId,
       "needle",
       null,
       null,
       null,
-      [11],
-      2,
+      3,
+      true,
     ]);
-    expect(trigramQueries[1].values?.at(-1)).toBe(2);
-    expect(trigramQueries[2].values?.at(-1)).toBe(2);
+    expect(dataQueries[1].values).toEqual([
+      projectId,
+      "needle",
+      null,
+      null,
+      null,
+      3,
+      true,
+    ]);
+    expect(dataQueries[2].values).toEqual([
+      projectId,
+      "needle",
+      null,
+      [],
+      3,
+      true,
+    ]);
+  });
+
+  it("truncates malformed over-limit primary output before fallback", async () => {
+    const database = executor((config) => {
+      const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow();
+      if (sql.includes("set_config")) return result([]);
+      return result([
+        messageRow,
+        { ...messageRow, message_id: "12" },
+        { ...messageRow, message_id: "13" },
+        { ...messageRow, message_id: "14", match_phase: 1 },
+      ]);
+    });
+    const repository = new PostgreSqlLexicalSearchRepository(
+      database,
+      projectId
+    );
+
+    const rows = await repository.searchMessages({
+      query: "needle",
+      mode: "full_text",
+      limit: 2,
+    });
+
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.messageId)).toEqual([11, 12]);
   });
 
   it("preserves promotion dedup semantics across primary and fallback rank signs", async () => {
@@ -598,7 +700,10 @@ describe("PostgreSQL lexical-search repository", () => {
     });
     const database = executor(async (config) => {
       await gate;
-      if (text(config).includes("FROM lcm.messages")) {
+      const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow();
+      if (sql.includes("set_config")) return result([]);
+      if (sql.includes("FROM lcm.messages")) {
         return result([messageRow]);
       }
       return result([promotedRow]);
@@ -631,20 +736,32 @@ describe("PostgreSQL lexical-search repository", () => {
     release();
     await Promise.all([messageSearch, promotedSearch]);
 
-    expect(database.query.mock.calls[0][0].values).toEqual([
+    const dataQueries = database.query.mock.calls
+      .map(([config]) => config as QueryConfig<unknown[]>)
+      .filter((config) => text(config).includes("FROM combined"));
+    expect(dataQueries).toHaveLength(2);
+    const messageQuery = dataQueries.find((config) =>
+      text(config).includes("FROM lcm.messages")
+    );
+    const promotedQuery = dataQueries.find((config) =>
+      text(config).includes("FROM lcm.promoted_memories")
+    );
+    expect(messageQuery?.values).toEqual([
       projectId,
       "needle🚀",
       7,
       "2026-01-01T00:00:00.000Z",
       "2026-02-01T00:00:00.000Z",
       1,
+      true,
     ]);
-    expect(database.query.mock.calls[1][0].values).toEqual([
+    expect(promotedQuery?.values).toEqual([
       projectId,
       "needle🚀",
       "source-a",
       ["one"],
       1,
+      true,
     ]);
   });
 
@@ -702,7 +819,11 @@ describe("PostgreSQL lexical-search repository", () => {
   });
 
   it("skips trigram fallback for fewer than three UTF-8 bytes", async () => {
-    const database = executor(() => result([]));
+    const database = executor((config) => {
+      const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow();
+      return result([]);
+    });
     const repository = new PostgreSqlLexicalSearchRepository(
       database,
       projectId
@@ -710,7 +831,15 @@ describe("PostgreSQL lexical-search repository", () => {
     await repository.searchMessages({ query: "a", mode: "full_text" });
     await repository.searchSummaries({ query: "é", mode: "full_text" });
     await repository.searchPromoted("ab", 5);
-    expect(database.query).toHaveBeenCalledTimes(3);
+    const dataQueries = database.query.mock.calls
+      .map(([config]) => config as QueryConfig<unknown[]>)
+      .filter((config) => text(config).includes("FROM combined"));
+    expect(dataQueries).toHaveLength(3);
+    expect(dataQueries.map((config) => config.values?.at(-1))).toEqual([
+      false,
+      false,
+      false,
+    ]);
   });
 
   it.each([
@@ -887,7 +1016,10 @@ describe("PostgreSQL lexical-search repository", () => {
     });
     let invocation = 0;
     const scoped = scopedExecutor(async (config) => {
-      if (!text(config).includes("FROM lcm.messages")) return result([]);
+      const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow();
+      if (sql.includes("set_config")) return result([]);
+      if (!sql.includes("FROM lcm.messages")) return result([]);
       invocation += 1;
       if (invocation === 1) {
         await gate;
@@ -910,7 +1042,11 @@ describe("PostgreSQL lexical-search repository", () => {
     await expect(first).rejects.toThrow("first failure");
     await expect(second).resolves.toMatchObject([{ messageId: 11 }]);
     expect(scoped.savepoint).toHaveBeenCalledTimes(2);
-    expect(scoped.query).toHaveBeenCalledTimes(2);
+    expect(
+      scoped.query.mock.calls.filter(([config]) =>
+        text(config as QueryConfig<unknown[]>).includes("FROM combined")
+      )
+    ).toHaveLength(2);
   });
 
   it("never restores inside a cancelled statement or runs a broader fallback", async () => {
@@ -949,7 +1085,7 @@ describe("PostgreSQL lexical-search repository", () => {
       database.query.mock.calls.filter(([config]) =>
         text(config as QueryConfig<unknown[]>).includes("FROM lcm.messages")
       )
-    ).toHaveLength(2);
+    ).toHaveLength(1);
     expect(timeout.toJSON()).toMatchObject({
       sqlState: "57014",
       retryable: false,
@@ -1070,9 +1206,17 @@ describe("PostgreSQL lexical-search repository", () => {
       { ...messageRow, snippet: null },
       { ...messageRow, created_at: "bad" },
       { ...messageRow, rank: Number.NaN },
+      { ...messageRow, match_phase: null },
+      { ...messageRow, match_phase: -1 },
+      { ...messageRow, match_phase: 2 },
     ];
     for (const row of rows) {
-      const database = executor(() => result([row]));
+      const database = executor((config) => {
+        const sql = text(config);
+        if (sql.includes("previous_timeout")) return timeoutRow();
+        if (sql.includes("set_config")) return result([]);
+        return result([row]);
+      });
       const repository = new PostgreSqlLexicalSearchRepository(
         database,
         projectId
@@ -1098,7 +1242,12 @@ describe("PostgreSQL lexical-search repository", () => {
       { ...summaryRow, rank: "0.5" },
     ];
     for (const row of rows) {
-      const database = executor(() => result([row]));
+      const database = executor((config) => {
+        const sql = text(config);
+        if (sql.includes("previous_timeout")) return timeoutRow();
+        if (sql.includes("set_config")) return result([]);
+        return result([row]);
+      });
       const repository = new PostgreSqlLexicalSearchRepository(
         database,
         projectId
@@ -1129,7 +1278,12 @@ describe("PostgreSQL lexical-search repository", () => {
       { ...promotedRow, rank: 0.25 },
     ];
     for (const row of rows) {
-      const database = executor(() => result([row]));
+      const database = executor((config) => {
+        const sql = text(config);
+        if (sql.includes("previous_timeout")) return timeoutRow();
+        if (sql.includes("set_config")) return result([]);
+        return result([row]);
+      });
       const repository = new PostgreSqlLexicalSearchRepository(
         database,
         projectId
@@ -1145,7 +1299,9 @@ describe("PostgreSQL lexical-search repository", () => {
       const sql = text(config);
       if (sql.includes("previous_timeout")) return timeoutRow();
       if (sql.includes("set_config")) return result([]);
-      if (sql.includes("public.similarity")) return result([promotedRow]);
+      if (sql.includes("public.similarity")) {
+        return result([{ ...promotedRow, match_phase: 1 }]);
+      }
       return result([]);
     });
     const repository = new PostgreSqlLexicalSearchRepository(

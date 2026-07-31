@@ -104,19 +104,27 @@ entry. The repository does not truncate or reject canonical content: the
 
 ## Timeout and transaction behavior
 
-Regex and trigram statements run with the smaller of the connection's current
-finite `statement_timeout` and five seconds. A connection configured with
-unlimited timeout therefore receives the five-second search cap. The
-repository reads the prior setting, changes it with transaction-local
-`set_config`, and restores the exact prior value after successful work.
+Each full-text primary-plus-optional-trigram data statement, and each regex
+statement, runs with the smaller of the connection's current finite
+`statement_timeout` and five seconds. A connection configured with unlimited
+timeout therefore receives the five-second search cap. Primary retrieval and
+optional trigram filling execute in one SQL statement and therefore use one
+PostgreSQL `READ COMMITTED` statement snapshot. A concurrent commit during that
+statement can become visible only to a later search.
+
+The repository reads the prior timeout setting, changes it with
+transaction-local `set_config`, and restores the exact prior value after
+successful work. Those surrounding `SHOW`, `set_config`, and restoration
+statements manage timeout state; they are not part of the search-data
+statement's MVCC snapshot.
 
 Standalone searches run in a repository transaction, so rollback or commit
 removes transaction-local state before the connection returns to its pool.
 When a caller supplies an active PostgreSQL transaction, the repository
 serializes access and opens a savepoint. SQLSTATE `57014` rolls back and
 releases only that savepoint; the caller's prior timeout and usable transaction
-are preserved. A timeout never returns partial primary results, starts another
-fallback, or broadens the query.
+are preserved. A timeout returns neither a partial primary phase nor a partial
+fallback phase, starts no additional fallback, and never broadens the query.
 
 ## Runtime privileges
 

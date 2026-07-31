@@ -100,6 +100,14 @@ type PromotedSearchRow = QueryResultRow & {
   rank: unknown;
 };
 
+type MatchPhaseRow = QueryResultRow & {
+  match_phase: unknown;
+};
+
+type CombinedMessageSearchRow = MessageSearchRow & MatchPhaseRow;
+type CombinedSummarySearchRow = SummarySearchRow & MatchPhaseRow;
+type CombinedPromotedSearchRow = PromotedSearchRow & MatchPhaseRow;
+
 type TimeoutRow = QueryResultRow & {
   previous_timeout: unknown;
 };
@@ -266,6 +274,22 @@ function resultNonnegativeInteger(
 ): number {
   const candidate = resultInteger(value, projectId, operation, field);
   return candidate < 0 ? dataError(projectId, operation, field) : candidate;
+}
+
+function matchPhase(
+  value: unknown,
+  projectId: string,
+  operation: SearchOperation
+): "primary" | "fallback" {
+  const candidate = resultNonnegativeInteger(
+    value,
+    projectId,
+    operation,
+    "match_phase"
+  );
+  if (candidate === 0) return "primary";
+  if (candidate === 1) return "fallback";
+  return dataError(projectId, operation, "match_phase");
 }
 
 function timestamp(
@@ -489,7 +513,8 @@ function appendDeduplicated<Result>(
   id: (result: Result) => string | number,
   limit: number
 ): Result[] {
-  const result = [...primary];
+  const result = primary.slice(0, limit);
+  if (result.length >= limit) return result;
   const seen = new Set(result.map(id));
   for (const candidate of fallback) {
     const candidateId = id(candidate);
@@ -500,6 +525,23 @@ function appendDeduplicated<Result>(
     if (result.length >= limit) break;
   }
   return result;
+}
+
+function decodeCombinedRows<Row extends MatchPhaseRow, Result>(
+  rows: readonly Row[],
+  projectId: string,
+  operation: SearchOperation,
+  decode: (row: Row, phase: "primary" | "fallback") => Result,
+  id: (result: Result) => string | number,
+  limit: number
+): Result[] {
+  const primary: Result[] = [];
+  const fallback: Result[] = [];
+  for (const row of rows) {
+    const phase = matchPhase(row.match_phase, projectId, operation);
+    (phase === "primary" ? primary : fallback).push(decode(row, phase));
+  }
+  return appendDeduplicated(primary, fallback, id, limit);
 }
 
 function hasTrigrams(query: string): boolean {
@@ -665,130 +707,225 @@ async function withBoundedSearch<T>(
   return result;
 }
 
-const MESSAGE_PRIMARY_SQL = `WITH input AS (
-  SELECT pg_catalog.websearch_to_tsquery(
-           'lcm.search_v1'::pg_catalog.regconfig,
-           lcm.normalize_search_text($2::pg_catalog.text)
-         ) AS query
-)
-SELECT
-  message.message_id,
-  message.conversation_id,
-  message.role,
-  pg_catalog.left(
-    pg_catalog.ts_headline(
-      'lcm.search_v1'::pg_catalog.regconfig,
-      lcm.normalize_search_text(message.content),
-      input.query,
-      'StartSel=, StopSel=, MaxWords=32, MinWords=8, ShortWord=1, MaxFragments=1, FragmentDelimiter= … '
-    ),
-    512
-  ) AS snippet,
-  pg_catalog.ts_rank_cd(message.search_document, input.query) AS rank,
-  message.created_at
-FROM lcm.messages AS message
-CROSS JOIN input
-WHERE message.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
-  AND (
-    $3::pg_catalog.int8 IS NULL
-    OR message.conversation_id OPERATOR(pg_catalog.=) $3::pg_catalog.int8
-  )
-  AND (
-    $4::pg_catalog.timestamptz IS NULL
-    OR message.created_at OPERATOR(pg_catalog.>=) $4::pg_catalog.timestamptz
-  )
-  AND (
-    $5::pg_catalog.timestamptz IS NULL
-    OR message.created_at OPERATOR(pg_catalog.<) $5::pg_catalog.timestamptz
-  )
-  AND message.search_document OPERATOR(pg_catalog.@@) input.query
-ORDER BY rank DESC, message.created_at DESC, message.message_id DESC
-LIMIT $6::pg_catalog.int8`;
-
-const MESSAGE_TRIGRAM_SQL = `WITH input AS (
-  SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query
-),
-candidate AS (
+const MESSAGE_FULL_TEXT_SQL = `WITH input AS MATERIALIZED (
   SELECT
-    message.message_id,
-    message.conversation_id,
-    message.role,
-    message.content,
-    message.created_at,
-    lcm.normalize_search_text(message.content) AS normalized_content,
-    input.query
-  FROM lcm.messages AS message
-  CROSS JOIN input
-  WHERE message.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
-    AND (
-      $3::pg_catalog.int8 IS NULL
-      OR message.conversation_id OPERATOR(pg_catalog.=) $3::pg_catalog.int8
-    )
-    AND (
-      $4::pg_catalog.timestamptz IS NULL
-      OR message.created_at OPERATOR(pg_catalog.>=) $4::pg_catalog.timestamptz
-    )
-    AND (
-      $5::pg_catalog.timestamptz IS NULL
-      OR message.created_at OPERATOR(pg_catalog.<) $5::pg_catalog.timestamptz
-    )
-    AND NOT (
-      message.message_id OPERATOR(pg_catalog.=)
-      ANY($6::pg_catalog.int8[])
-    )
-    AND pg_catalog.octet_length(input.query)
-      OPERATOR(pg_catalog.>=) 3
-    AND (
-      lcm.normalize_search_text(message.content)
-        OPERATOR(public.%) input.query
-      OR lcm.normalize_search_text(message.content)
-        OPERATOR(pg_catalog.~~)
-        (
-          '%' OPERATOR(pg_catalog.||)
-          pg_catalog.replace(
+    normalized.query,
+    pg_catalog.websearch_to_tsquery(
+      'lcm.search_v1'::pg_catalog.regconfig,
+      normalized.query
+    ) AS full_text_query,
+    $7::pg_catalog.bool AS allow_trigram
+  FROM (
+    SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query
+  ) AS normalized
+),
+primary_rows AS MATERIALIZED (
+  SELECT
+    ranked.message_id,
+    ranked.conversation_id,
+    ranked.role,
+    ranked.snippet,
+    ranked.rank,
+    ranked.created_at,
+    0::pg_catalog.int2 AS match_phase,
+    ranked.rank AS match_order
+  FROM (
+    SELECT
+      message.message_id,
+      message.conversation_id,
+      message.role,
+      pg_catalog.left(
+        pg_catalog.ts_headline(
+          'lcm.search_v1'::pg_catalog.regconfig,
+          lcm.normalize_search_text(message.content),
+          input.full_text_query,
+          'StartSel=, StopSel=, MaxWords=32, MinWords=8, ShortWord=1, MaxFragments=1, FragmentDelimiter= … '
+        ),
+        512
+      ) AS snippet,
+      pg_catalog.ts_rank_cd(
+        message.search_document,
+        input.full_text_query
+      ) AS rank,
+      message.created_at
+    FROM lcm.messages AS message
+    CROSS JOIN input
+    WHERE message.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+      AND (
+        $3::pg_catalog.int8 IS NULL
+        OR message.conversation_id OPERATOR(pg_catalog.=) $3::pg_catalog.int8
+      )
+      AND (
+        $4::pg_catalog.timestamptz IS NULL
+        OR message.created_at OPERATOR(pg_catalog.>=)
+          $4::pg_catalog.timestamptz
+      )
+      AND (
+        $5::pg_catalog.timestamptz IS NULL
+        OR message.created_at OPERATOR(pg_catalog.<)
+          $5::pg_catalog.timestamptz
+      )
+      AND message.search_document
+        OPERATOR(pg_catalog.@@) input.full_text_query
+  ) AS ranked
+  ORDER BY ranked.rank DESC, ranked.created_at DESC, ranked.message_id DESC
+  LIMIT $6::pg_catalog.int8
+),
+fallback_budget AS MATERIALIZED (
+  SELECT GREATEST(
+           $6::pg_catalog.int8
+             OPERATOR(pg_catalog.-)
+             pg_catalog.count(*)::pg_catalog.int8,
+           0::pg_catalog.int8
+         ) AS remaining
+  FROM primary_rows
+),
+fallback_rows AS MATERIALIZED (
+  SELECT
+    fallback.message_id,
+    fallback.conversation_id,
+    fallback.role,
+    fallback.snippet,
+    fallback.rank,
+    fallback.created_at,
+    1::pg_catalog.int2 AS match_phase,
+    fallback.rank AS match_order
+  FROM input
+  CROSS JOIN fallback_budget
+  CROSS JOIN LATERAL (
+    SELECT
+      scored.message_id,
+      scored.conversation_id,
+      scored.role,
+      scored.snippet,
+      scored.rank,
+      scored.created_at
+    FROM (
+      SELECT
+        candidate.message_id,
+        candidate.conversation_id,
+        candidate.role,
+        pg_catalog.left(candidate.content, 512) AS snippet,
+        GREATEST(
+          public.similarity(
+            candidate.normalized_content,
+            candidate.query
+          ),
+          CASE
+            WHEN candidate.normalized_content
+              OPERATOR(pg_catalog.~~) candidate.substring_pattern
+              THEN 1::pg_catalog.float4
+            ELSE 0::pg_catalog.float4
+          END
+        ) AS rank,
+        candidate.created_at
+      FROM (
+        SELECT
+          message.message_id,
+          message.conversation_id,
+          message.role,
+          message.content,
+          message.created_at,
+          lcm.normalize_search_text(message.content) AS normalized_content,
+          input.query,
+          (
+            '%' OPERATOR(pg_catalog.||)
             pg_catalog.replace(
-              pg_catalog.replace(input.query, E'\\\\', E'\\\\\\\\'),
-              '%',
-              E'\\\\%'
-            ),
-            '_',
-            E'\\\\_'
+              pg_catalog.replace(
+                pg_catalog.replace(input.query, E'\\\\', E'\\\\\\\\'),
+                '%',
+                E'\\\\%'
+              ),
+              '_',
+              E'\\\\_'
+            )
+            OPERATOR(pg_catalog.||) '%'
+          ) AS substring_pattern
+        FROM lcm.messages AS message
+        WHERE input.allow_trigram
+          AND pg_catalog.octet_length(input.query)
+            OPERATOR(pg_catalog.>=) 3
+          AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
+          AND message.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+          AND (
+            $3::pg_catalog.int8 IS NULL
+            OR message.conversation_id
+              OPERATOR(pg_catalog.=) $3::pg_catalog.int8
           )
-          OPERATOR(pg_catalog.||) '%'
+          AND (
+            $4::pg_catalog.timestamptz IS NULL
+            OR message.created_at OPERATOR(pg_catalog.>=)
+              $4::pg_catalog.timestamptz
+          )
+          AND (
+            $5::pg_catalog.timestamptz IS NULL
+            OR message.created_at OPERATOR(pg_catalog.<)
+              $5::pg_catalog.timestamptz
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM primary_rows AS primary_row
+            WHERE primary_row.message_id
+              OPERATOR(pg_catalog.=) message.message_id
+          )
+          AND (
+            lcm.normalize_search_text(message.content)
+              OPERATOR(public.%) input.query
+            OR lcm.normalize_search_text(message.content)
+              OPERATOR(pg_catalog.~~)
+              (
+                '%' OPERATOR(pg_catalog.||)
+                pg_catalog.replace(
+                  pg_catalog.replace(
+                    pg_catalog.replace(input.query, E'\\\\', E'\\\\\\\\'),
+                    '%',
+                    E'\\\\%'
+                  ),
+                  '_',
+                  E'\\\\_'
+                )
+                OPERATOR(pg_catalog.||) '%'
+              )
+          )
+      ) AS candidate
+    ) AS scored
+    ORDER BY
+      scored.rank DESC,
+      scored.created_at DESC,
+      scored.message_id DESC
+    LIMIT CASE
+      WHEN input.allow_trigram
+        AND pg_catalog.octet_length(input.query)
+          OPERATOR(pg_catalog.>=) 3
+        AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
+        THEN GREATEST(
+          fallback_budget.remaining,
+          0::pg_catalog.int8
         )
-    )
+      ELSE 0::pg_catalog.int8
+    END
+  ) AS fallback
+),
+combined AS (
+  SELECT * FROM primary_rows
+  UNION ALL
+  SELECT * FROM fallback_rows
 )
 SELECT
-  candidate.message_id,
-  candidate.conversation_id,
-  candidate.role,
-  pg_catalog.left(candidate.content, 512) AS snippet,
-  GREATEST(
-    public.similarity(candidate.normalized_content, candidate.query),
-    CASE
-      WHEN candidate.normalized_content
-        OPERATOR(pg_catalog.~~)
-        (
-          '%' OPERATOR(pg_catalog.||)
-          pg_catalog.replace(
-            pg_catalog.replace(
-              pg_catalog.replace(candidate.query, E'\\\\', E'\\\\\\\\'),
-              '%',
-              E'\\\\%'
-            ),
-            '_',
-            E'\\\\_'
-          )
-          OPERATOR(pg_catalog.||) '%'
-        )
-        THEN 1::pg_catalog.float4
-      ELSE 0::pg_catalog.float4
-    END
-  ) AS rank,
-  candidate.created_at
-FROM candidate
-ORDER BY rank DESC, candidate.created_at DESC, candidate.message_id DESC
-LIMIT $7::pg_catalog.int8`;
+  combined.message_id,
+  combined.conversation_id,
+  combined.role,
+  combined.snippet,
+  combined.rank,
+  combined.created_at,
+  combined.match_phase
+FROM combined
+ORDER BY
+  combined.match_phase,
+  combined.match_order DESC,
+  combined.created_at DESC,
+  combined.message_id DESC
+LIMIT $6::pg_catalog.int8`;
 
 const MESSAGE_REGEX_SQL = `SELECT
   message.message_id,
@@ -818,130 +955,225 @@ WHERE message.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
 ORDER BY message.created_at DESC, message.message_id DESC
 LIMIT $6::pg_catalog.int8`;
 
-const SUMMARY_PRIMARY_SQL = `WITH input AS (
-  SELECT pg_catalog.websearch_to_tsquery(
-           'lcm.search_v1'::pg_catalog.regconfig,
-           lcm.normalize_search_text($2::pg_catalog.text)
-         ) AS query
-)
-SELECT
-  summary.summary_id,
-  summary.conversation_id,
-  summary.kind,
-  pg_catalog.left(
-    pg_catalog.ts_headline(
-      'lcm.search_v1'::pg_catalog.regconfig,
-      lcm.normalize_search_text(summary.content),
-      input.query,
-      'StartSel=, StopSel=, MaxWords=32, MinWords=8, ShortWord=1, MaxFragments=1, FragmentDelimiter= … '
-    ),
-    512
-  ) AS snippet,
-  pg_catalog.ts_rank_cd(summary.search_document, input.query) AS rank,
-  summary.created_at
-FROM lcm.summaries AS summary
-CROSS JOIN input
-WHERE summary.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
-  AND (
-    $3::pg_catalog.int8 IS NULL
-    OR summary.conversation_id OPERATOR(pg_catalog.=) $3::pg_catalog.int8
-  )
-  AND (
-    $4::pg_catalog.timestamptz IS NULL
-    OR summary.created_at OPERATOR(pg_catalog.>=) $4::pg_catalog.timestamptz
-  )
-  AND (
-    $5::pg_catalog.timestamptz IS NULL
-    OR summary.created_at OPERATOR(pg_catalog.<) $5::pg_catalog.timestamptz
-  )
-  AND summary.search_document OPERATOR(pg_catalog.@@) input.query
-ORDER BY rank DESC, summary.created_at DESC, summary.summary_id DESC
-LIMIT $6::pg_catalog.int8`;
-
-const SUMMARY_TRIGRAM_SQL = `WITH input AS (
-  SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query
-),
-candidate AS (
+const SUMMARY_FULL_TEXT_SQL = `WITH input AS MATERIALIZED (
   SELECT
-    summary.summary_id,
-    summary.conversation_id,
-    summary.kind,
-    summary.content,
-    summary.created_at,
-    lcm.normalize_search_text(summary.content) AS normalized_content,
-    input.query
-  FROM lcm.summaries AS summary
-  CROSS JOIN input
-  WHERE summary.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
-    AND (
-      $3::pg_catalog.int8 IS NULL
-      OR summary.conversation_id OPERATOR(pg_catalog.=) $3::pg_catalog.int8
-    )
-    AND (
-      $4::pg_catalog.timestamptz IS NULL
-      OR summary.created_at OPERATOR(pg_catalog.>=) $4::pg_catalog.timestamptz
-    )
-    AND (
-      $5::pg_catalog.timestamptz IS NULL
-      OR summary.created_at OPERATOR(pg_catalog.<) $5::pg_catalog.timestamptz
-    )
-    AND NOT (
-      summary.summary_id OPERATOR(pg_catalog.=)
-      ANY($6::pg_catalog.text[])
-    )
-    AND pg_catalog.octet_length(input.query)
-      OPERATOR(pg_catalog.>=) 3
-    AND (
-      lcm.normalize_search_text(summary.content)
-        OPERATOR(public.%) input.query
-      OR lcm.normalize_search_text(summary.content)
-        OPERATOR(pg_catalog.~~)
-        (
-          '%' OPERATOR(pg_catalog.||)
-          pg_catalog.replace(
+    normalized.query,
+    pg_catalog.websearch_to_tsquery(
+      'lcm.search_v1'::pg_catalog.regconfig,
+      normalized.query
+    ) AS full_text_query,
+    $7::pg_catalog.bool AS allow_trigram
+  FROM (
+    SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query
+  ) AS normalized
+),
+primary_rows AS MATERIALIZED (
+  SELECT
+    ranked.summary_id,
+    ranked.conversation_id,
+    ranked.kind,
+    ranked.snippet,
+    ranked.rank,
+    ranked.created_at,
+    0::pg_catalog.int2 AS match_phase,
+    ranked.rank AS match_order
+  FROM (
+    SELECT
+      summary.summary_id,
+      summary.conversation_id,
+      summary.kind,
+      pg_catalog.left(
+        pg_catalog.ts_headline(
+          'lcm.search_v1'::pg_catalog.regconfig,
+          lcm.normalize_search_text(summary.content),
+          input.full_text_query,
+          'StartSel=, StopSel=, MaxWords=32, MinWords=8, ShortWord=1, MaxFragments=1, FragmentDelimiter= … '
+        ),
+        512
+      ) AS snippet,
+      pg_catalog.ts_rank_cd(
+        summary.search_document,
+        input.full_text_query
+      ) AS rank,
+      summary.created_at
+    FROM lcm.summaries AS summary
+    CROSS JOIN input
+    WHERE summary.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+      AND (
+        $3::pg_catalog.int8 IS NULL
+        OR summary.conversation_id OPERATOR(pg_catalog.=) $3::pg_catalog.int8
+      )
+      AND (
+        $4::pg_catalog.timestamptz IS NULL
+        OR summary.created_at OPERATOR(pg_catalog.>=)
+          $4::pg_catalog.timestamptz
+      )
+      AND (
+        $5::pg_catalog.timestamptz IS NULL
+        OR summary.created_at OPERATOR(pg_catalog.<)
+          $5::pg_catalog.timestamptz
+      )
+      AND summary.search_document
+        OPERATOR(pg_catalog.@@) input.full_text_query
+  ) AS ranked
+  ORDER BY ranked.rank DESC, ranked.created_at DESC, ranked.summary_id DESC
+  LIMIT $6::pg_catalog.int8
+),
+fallback_budget AS MATERIALIZED (
+  SELECT GREATEST(
+           $6::pg_catalog.int8
+             OPERATOR(pg_catalog.-)
+             pg_catalog.count(*)::pg_catalog.int8,
+           0::pg_catalog.int8
+         ) AS remaining
+  FROM primary_rows
+),
+fallback_rows AS MATERIALIZED (
+  SELECT
+    fallback.summary_id,
+    fallback.conversation_id,
+    fallback.kind,
+    fallback.snippet,
+    fallback.rank,
+    fallback.created_at,
+    1::pg_catalog.int2 AS match_phase,
+    fallback.rank AS match_order
+  FROM input
+  CROSS JOIN fallback_budget
+  CROSS JOIN LATERAL (
+    SELECT
+      scored.summary_id,
+      scored.conversation_id,
+      scored.kind,
+      scored.snippet,
+      scored.rank,
+      scored.created_at
+    FROM (
+      SELECT
+        candidate.summary_id,
+        candidate.conversation_id,
+        candidate.kind,
+        pg_catalog.left(candidate.content, 512) AS snippet,
+        GREATEST(
+          public.similarity(
+            candidate.normalized_content,
+            candidate.query
+          ),
+          CASE
+            WHEN candidate.normalized_content
+              OPERATOR(pg_catalog.~~) candidate.substring_pattern
+              THEN 1::pg_catalog.float4
+            ELSE 0::pg_catalog.float4
+          END
+        ) AS rank,
+        candidate.created_at
+      FROM (
+        SELECT
+          summary.summary_id,
+          summary.conversation_id,
+          summary.kind,
+          summary.content,
+          summary.created_at,
+          lcm.normalize_search_text(summary.content) AS normalized_content,
+          input.query,
+          (
+            '%' OPERATOR(pg_catalog.||)
             pg_catalog.replace(
-              pg_catalog.replace(input.query, E'\\\\', E'\\\\\\\\'),
-              '%',
-              E'\\\\%'
-            ),
-            '_',
-            E'\\\\_'
+              pg_catalog.replace(
+                pg_catalog.replace(input.query, E'\\\\', E'\\\\\\\\'),
+                '%',
+                E'\\\\%'
+              ),
+              '_',
+              E'\\\\_'
+            )
+            OPERATOR(pg_catalog.||) '%'
+          ) AS substring_pattern
+        FROM lcm.summaries AS summary
+        WHERE input.allow_trigram
+          AND pg_catalog.octet_length(input.query)
+            OPERATOR(pg_catalog.>=) 3
+          AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
+          AND summary.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+          AND (
+            $3::pg_catalog.int8 IS NULL
+            OR summary.conversation_id
+              OPERATOR(pg_catalog.=) $3::pg_catalog.int8
           )
-          OPERATOR(pg_catalog.||) '%'
+          AND (
+            $4::pg_catalog.timestamptz IS NULL
+            OR summary.created_at OPERATOR(pg_catalog.>=)
+              $4::pg_catalog.timestamptz
+          )
+          AND (
+            $5::pg_catalog.timestamptz IS NULL
+            OR summary.created_at OPERATOR(pg_catalog.<)
+              $5::pg_catalog.timestamptz
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM primary_rows AS primary_row
+            WHERE primary_row.summary_id
+              OPERATOR(pg_catalog.=) summary.summary_id
+          )
+          AND (
+            lcm.normalize_search_text(summary.content)
+              OPERATOR(public.%) input.query
+            OR lcm.normalize_search_text(summary.content)
+              OPERATOR(pg_catalog.~~)
+              (
+                '%' OPERATOR(pg_catalog.||)
+                pg_catalog.replace(
+                  pg_catalog.replace(
+                    pg_catalog.replace(input.query, E'\\\\', E'\\\\\\\\'),
+                    '%',
+                    E'\\\\%'
+                  ),
+                  '_',
+                  E'\\\\_'
+                )
+                OPERATOR(pg_catalog.||) '%'
+              )
+          )
+      ) AS candidate
+    ) AS scored
+    ORDER BY
+      scored.rank DESC,
+      scored.created_at DESC,
+      scored.summary_id DESC
+    LIMIT CASE
+      WHEN input.allow_trigram
+        AND pg_catalog.octet_length(input.query)
+          OPERATOR(pg_catalog.>=) 3
+        AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
+        THEN GREATEST(
+          fallback_budget.remaining,
+          0::pg_catalog.int8
         )
-    )
+      ELSE 0::pg_catalog.int8
+    END
+  ) AS fallback
+),
+combined AS (
+  SELECT * FROM primary_rows
+  UNION ALL
+  SELECT * FROM fallback_rows
 )
 SELECT
-  candidate.summary_id,
-  candidate.conversation_id,
-  candidate.kind,
-  pg_catalog.left(candidate.content, 512) AS snippet,
-  GREATEST(
-    public.similarity(candidate.normalized_content, candidate.query),
-    CASE
-      WHEN candidate.normalized_content
-        OPERATOR(pg_catalog.~~)
-        (
-          '%' OPERATOR(pg_catalog.||)
-          pg_catalog.replace(
-            pg_catalog.replace(
-              pg_catalog.replace(candidate.query, E'\\\\', E'\\\\\\\\'),
-              '%',
-              E'\\\\%'
-            ),
-            '_',
-            E'\\\\_'
-          )
-          OPERATOR(pg_catalog.||) '%'
-        )
-        THEN 1::pg_catalog.float4
-      ELSE 0::pg_catalog.float4
-    END
-  ) AS rank,
-  candidate.created_at
-FROM candidate
-ORDER BY rank DESC, candidate.created_at DESC, candidate.summary_id DESC
-LIMIT $7::pg_catalog.int8`;
+  combined.summary_id,
+  combined.conversation_id,
+  combined.kind,
+  combined.snippet,
+  combined.rank,
+  combined.created_at,
+  combined.match_phase
+FROM combined
+ORDER BY
+  combined.match_phase,
+  combined.match_order DESC,
+  combined.created_at DESC,
+  combined.summary_id DESC
+LIMIT $6::pg_catalog.int8`;
 
 const SUMMARY_REGEX_SQL = `SELECT
   summary.summary_id,
@@ -971,214 +1203,287 @@ WHERE summary.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
 ORDER BY summary.created_at DESC, summary.summary_id DESC
 LIMIT $6::pg_catalog.int8`;
 
-const PROMOTED_PRIMARY_SQL = `WITH input AS (
-  SELECT pg_catalog.websearch_to_tsquery(
-           'lcm.search_v1'::pg_catalog.regconfig,
-           lcm.normalize_search_text($2::pg_catalog.text)
-         ) AS query
-),
-ranked AS (
+const PROMOTED_FULL_TEXT_SQL = `WITH input AS MATERIALIZED (
   SELECT
-    memory.memory_id,
-    memory.content,
-    memory.source_project_id,
-    memory.session_id,
-    memory.confidence,
-    memory.created_at,
-    GREATEST(
-      pg_catalog.ts_rank_cd(memory.search_document, input.query),
-      COALESCE(
-        (
-          SELECT pg_catalog.max(
-            pg_catalog.ts_rank_cd(tag.search_document, input.query)
-          )
-          FROM lcm.promoted_memory_tags AS tag
-          WHERE tag.project_id OPERATOR(pg_catalog.=) memory.project_id
-            AND tag.memory_id OPERATOR(pg_catalog.=) memory.memory_id
-            AND tag.search_document OPERATOR(pg_catalog.@@) input.query
-        ),
-        0::pg_catalog.float4
-      )
-    ) AS relevance
-  FROM lcm.promoted_memories AS memory
-  CROSS JOIN input
-  WHERE memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
-    AND memory.archived_at IS NULL
-    AND (
-      memory.search_document OPERATOR(pg_catalog.@@) input.query
-      OR EXISTS (
-        SELECT 1
+    normalized.query,
+    pg_catalog.websearch_to_tsquery(
+      'lcm.search_v1'::pg_catalog.regconfig,
+      normalized.query
+    ) AS full_text_query,
+    $6::pg_catalog.bool AS allow_trigram
+  FROM (
+    SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query
+  ) AS normalized
+),
+primary_rows AS MATERIALIZED (
+  SELECT
+    ranked.memory_id,
+    ranked.content,
+    COALESCE(
+      (
+        SELECT pg_catalog.array_agg(tag.tag ORDER BY tag.ordinal)
         FROM lcm.promoted_memory_tags AS tag
-        WHERE tag.project_id OPERATOR(pg_catalog.=) memory.project_id
-          AND tag.memory_id OPERATOR(pg_catalog.=) memory.memory_id
-          AND tag.search_document OPERATOR(pg_catalog.@@) input.query
-      )
-    )
-    AND (
-      $3::pg_catalog.text IS NULL
-      OR memory.source_project_id OPERATOR(pg_catalog.=) $3::pg_catalog.text
-    )
-    AND NOT EXISTS (
-      SELECT 1
-      FROM pg_catalog.unnest($4::pg_catalog.text[]) AS required(tag)
-      WHERE NOT EXISTS (
-        SELECT 1
-        FROM lcm.promoted_memory_tags AS actual
-        WHERE actual.project_id OPERATOR(pg_catalog.=) memory.project_id
-          AND actual.memory_id OPERATOR(pg_catalog.=) memory.memory_id
-          AND actual.tag OPERATOR(pg_catalog.=) required.tag
-      )
-    )
-)
-SELECT
-  ranked.memory_id,
-  ranked.content,
-  COALESCE(
-    (
-      SELECT pg_catalog.array_agg(tag.tag ORDER BY tag.ordinal)
-      FROM lcm.promoted_memory_tags AS tag
-      WHERE tag.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
-        AND tag.memory_id OPERATOR(pg_catalog.=) ranked.memory_id
-    ),
-    '{}'::pg_catalog.text[]
-  ) AS tags,
-  ranked.source_project_id,
-  ranked.session_id,
-  ranked.confidence,
-  ranked.created_at,
-  OPERATOR(pg_catalog.-) ranked.relevance AS rank
-FROM ranked
-WHERE ranked.relevance OPERATOR(pg_catalog.>) 0::pg_catalog.float4
-ORDER BY
-  ranked.relevance DESC,
-  ranked.created_at DESC,
-  ranked.memory_id DESC
-LIMIT $5::pg_catalog.int8`;
-
-const PROMOTED_TRIGRAM_SQL = `WITH input AS (
-  SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query
-),
-ranked AS (
-  SELECT
-    memory.memory_id,
-    memory.content,
-    memory.source_project_id,
-    memory.session_id,
-    memory.confidence,
-    memory.created_at,
-    GREATEST(
-      public.similarity(
-        lcm.normalize_search_text(memory.content),
-        input.query
+        WHERE tag.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+          AND tag.memory_id OPERATOR(pg_catalog.=) ranked.memory_id
       ),
-      COALESCE(
-        (
-          SELECT pg_catalog.max(
-            public.similarity(
-              lcm.normalize_search_text(tag.tag),
-              input.query
+      '{}'::pg_catalog.text[]
+    ) AS tags,
+    ranked.source_project_id,
+    ranked.session_id,
+    ranked.confidence,
+    ranked.created_at,
+    OPERATOR(pg_catalog.-) ranked.relevance AS rank,
+    0::pg_catalog.int2 AS match_phase,
+    ranked.relevance AS match_order
+  FROM (
+    SELECT
+      memory.memory_id,
+      memory.content,
+      memory.source_project_id,
+      memory.session_id,
+      memory.confidence,
+      memory.created_at,
+      GREATEST(
+        pg_catalog.ts_rank_cd(
+          memory.search_document,
+          input.full_text_query
+        ),
+        COALESCE(
+          (
+            SELECT pg_catalog.max(
+              pg_catalog.ts_rank_cd(
+                tag.search_document,
+                input.full_text_query
+              )
             )
-          )
+            FROM lcm.promoted_memory_tags AS tag
+            WHERE tag.project_id OPERATOR(pg_catalog.=) memory.project_id
+              AND tag.memory_id OPERATOR(pg_catalog.=) memory.memory_id
+              AND tag.search_document
+                OPERATOR(pg_catalog.@@) input.full_text_query
+          ),
+          0::pg_catalog.float4
+        )
+      ) AS relevance
+    FROM lcm.promoted_memories AS memory
+    CROSS JOIN input
+    WHERE memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+      AND memory.archived_at IS NULL
+      AND (
+        memory.search_document OPERATOR(pg_catalog.@@) input.full_text_query
+        OR EXISTS (
+          SELECT 1
           FROM lcm.promoted_memory_tags AS tag
           WHERE tag.project_id OPERATOR(pg_catalog.=) memory.project_id
             AND tag.memory_id OPERATOR(pg_catalog.=) memory.memory_id
-        ),
-        0::pg_catalog.float4
-      )
-    ) AS rank
-  FROM lcm.promoted_memories AS memory
-  CROSS JOIN input
-  WHERE memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
-    AND memory.archived_at IS NULL
-    AND NOT (
-      memory.memory_id OPERATOR(pg_catalog.=)
-      ANY($3::pg_catalog.uuid[])
-    )
-    AND pg_catalog.octet_length(input.query)
-      OPERATOR(pg_catalog.>=) 3
-    AND (
-      lcm.normalize_search_text(memory.content)
-        OPERATOR(public.%) input.query
-      OR lcm.normalize_search_text(memory.content)
-        OPERATOR(pg_catalog.~~)
-        (
-          '%' OPERATOR(pg_catalog.||)
-          pg_catalog.replace(
-            pg_catalog.replace(
-              pg_catalog.replace(input.query, E'\\\\', E'\\\\\\\\'),
-              '%',
-              E'\\\\%'
-            ),
-            '_',
-            E'\\\\_'
-          )
-          OPERATOR(pg_catalog.||) '%'
+            AND tag.search_document
+              OPERATOR(pg_catalog.@@) input.full_text_query
         )
-      OR EXISTS (
+      )
+      AND (
+        $3::pg_catalog.text IS NULL
+        OR memory.source_project_id OPERATOR(pg_catalog.=) $3::pg_catalog.text
+      )
+      AND NOT EXISTS (
         SELECT 1
-        FROM lcm.promoted_memory_tags AS tag
-        WHERE tag.project_id OPERATOR(pg_catalog.=) memory.project_id
-          AND tag.memory_id OPERATOR(pg_catalog.=) memory.memory_id
-          AND (
-            lcm.normalize_search_text(tag.tag)
-              OPERATOR(public.%) input.query
-            OR lcm.normalize_search_text(tag.tag)
-              OPERATOR(pg_catalog.~~)
-              (
-                '%' OPERATOR(pg_catalog.||)
-                pg_catalog.replace(
-                  pg_catalog.replace(
-                    pg_catalog.replace(input.query, E'\\\\', E'\\\\\\\\'),
-                    '%',
-                    E'\\\\%'
-                  ),
-                  '_',
-                  E'\\\\_'
+        FROM pg_catalog.unnest($4::pg_catalog.text[]) AS required(tag)
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM lcm.promoted_memory_tags AS actual
+          WHERE actual.project_id OPERATOR(pg_catalog.=) memory.project_id
+            AND actual.memory_id OPERATOR(pg_catalog.=) memory.memory_id
+            AND actual.tag OPERATOR(pg_catalog.=) required.tag
+        )
+      )
+  ) AS ranked
+  WHERE ranked.relevance OPERATOR(pg_catalog.>) 0::pg_catalog.float4
+  ORDER BY
+    ranked.relevance DESC,
+    ranked.created_at DESC,
+    ranked.memory_id DESC
+  LIMIT $5::pg_catalog.int8
+),
+fallback_budget AS MATERIALIZED (
+  SELECT GREATEST(
+           $5::pg_catalog.int8
+             OPERATOR(pg_catalog.-)
+             pg_catalog.count(*)::pg_catalog.int8,
+           0::pg_catalog.int8
+         ) AS remaining
+  FROM primary_rows
+),
+fallback_rows AS MATERIALIZED (
+  SELECT
+    fallback.memory_id,
+    fallback.content,
+    fallback.tags,
+    fallback.source_project_id,
+    fallback.session_id,
+    fallback.confidence,
+    fallback.created_at,
+    fallback.rank,
+    1::pg_catalog.int2 AS match_phase,
+    fallback.rank AS match_order
+  FROM input
+  CROSS JOIN fallback_budget
+  CROSS JOIN LATERAL (
+    SELECT
+      ranked.memory_id,
+      ranked.content,
+      COALESCE(
+        (
+          SELECT pg_catalog.array_agg(tag.tag ORDER BY tag.ordinal)
+          FROM lcm.promoted_memory_tags AS tag
+          WHERE tag.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+            AND tag.memory_id OPERATOR(pg_catalog.=) ranked.memory_id
+        ),
+        '{}'::pg_catalog.text[]
+      ) AS tags,
+      ranked.source_project_id,
+      ranked.session_id,
+      ranked.confidence,
+      ranked.created_at,
+      ranked.rank
+    FROM (
+      SELECT
+        memory.memory_id,
+        memory.content,
+        memory.source_project_id,
+        memory.session_id,
+        memory.confidence,
+        memory.created_at,
+        GREATEST(
+          public.similarity(
+            lcm.normalize_search_text(memory.content),
+            input.query
+          ),
+          COALESCE(
+            (
+              SELECT pg_catalog.max(
+                public.similarity(
+                  lcm.normalize_search_text(tag.tag),
+                  input.query
                 )
-                OPERATOR(pg_catalog.||) '%'
+              )
+              FROM lcm.promoted_memory_tags AS tag
+              WHERE tag.project_id OPERATOR(pg_catalog.=) memory.project_id
+                AND tag.memory_id OPERATOR(pg_catalog.=) memory.memory_id
+            ),
+            0::pg_catalog.float4
+          )
+        ) AS rank
+      FROM lcm.promoted_memories AS memory
+      WHERE input.allow_trigram
+        AND pg_catalog.octet_length(input.query)
+          OPERATOR(pg_catalog.>=) 3
+        AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
+        AND memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+        AND memory.archived_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM primary_rows AS primary_row
+          WHERE primary_row.memory_id OPERATOR(pg_catalog.=) memory.memory_id
+        )
+        AND (
+          lcm.normalize_search_text(memory.content)
+            OPERATOR(public.%) input.query
+          OR lcm.normalize_search_text(memory.content)
+            OPERATOR(pg_catalog.~~)
+            (
+              '%' OPERATOR(pg_catalog.||)
+              pg_catalog.replace(
+                pg_catalog.replace(
+                  pg_catalog.replace(input.query, E'\\\\', E'\\\\\\\\'),
+                  '%',
+                  E'\\\\%'
+                ),
+                '_',
+                E'\\\\_'
+              )
+              OPERATOR(pg_catalog.||) '%'
+            )
+          OR EXISTS (
+            SELECT 1
+            FROM lcm.promoted_memory_tags AS tag
+            WHERE tag.project_id OPERATOR(pg_catalog.=) memory.project_id
+              AND tag.memory_id OPERATOR(pg_catalog.=) memory.memory_id
+              AND (
+                lcm.normalize_search_text(tag.tag)
+                  OPERATOR(public.%) input.query
+                OR lcm.normalize_search_text(tag.tag)
+                  OPERATOR(pg_catalog.~~)
+                  (
+                    '%' OPERATOR(pg_catalog.||)
+                    pg_catalog.replace(
+                      pg_catalog.replace(
+                        pg_catalog.replace(input.query, E'\\\\', E'\\\\\\\\'),
+                        '%',
+                        E'\\\\%'
+                      ),
+                      '_',
+                      E'\\\\_'
+                    )
+                    OPERATOR(pg_catalog.||) '%'
+                  )
               )
           )
-      )
-    )
-    AND (
-      $4::pg_catalog.text IS NULL
-      OR memory.source_project_id OPERATOR(pg_catalog.=) $4::pg_catalog.text
-    )
-    AND NOT EXISTS (
-      SELECT 1
-      FROM pg_catalog.unnest($5::pg_catalog.text[]) AS required(tag)
-      WHERE NOT EXISTS (
-        SELECT 1
-        FROM lcm.promoted_memory_tags AS actual
-        WHERE actual.project_id OPERATOR(pg_catalog.=) memory.project_id
-          AND actual.memory_id OPERATOR(pg_catalog.=) memory.memory_id
-          AND actual.tag OPERATOR(pg_catalog.=) required.tag
-      )
-    )
+        )
+        AND (
+          $3::pg_catalog.text IS NULL
+          OR memory.source_project_id OPERATOR(pg_catalog.=)
+            $3::pg_catalog.text
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM pg_catalog.unnest($4::pg_catalog.text[]) AS required(tag)
+          WHERE NOT EXISTS (
+            SELECT 1
+            FROM lcm.promoted_memory_tags AS actual
+            WHERE actual.project_id OPERATOR(pg_catalog.=) memory.project_id
+              AND actual.memory_id OPERATOR(pg_catalog.=) memory.memory_id
+              AND actual.tag OPERATOR(pg_catalog.=) required.tag
+          )
+        )
+    ) AS ranked
+    ORDER BY
+      ranked.rank DESC,
+      ranked.created_at DESC,
+      ranked.memory_id DESC
+    LIMIT CASE
+      WHEN input.allow_trigram
+        AND pg_catalog.octet_length(input.query)
+          OPERATOR(pg_catalog.>=) 3
+        AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
+        THEN GREATEST(
+          fallback_budget.remaining,
+          0::pg_catalog.int8
+        )
+      ELSE 0::pg_catalog.int8
+    END
+  ) AS fallback
+),
+combined AS (
+  SELECT * FROM primary_rows
+  UNION ALL
+  SELECT * FROM fallback_rows
 )
 SELECT
-  ranked.memory_id,
-  ranked.content,
-  COALESCE(
-    (
-      SELECT pg_catalog.array_agg(tag.tag ORDER BY tag.ordinal)
-      FROM lcm.promoted_memory_tags AS tag
-      WHERE tag.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
-        AND tag.memory_id OPERATOR(pg_catalog.=) ranked.memory_id
-    ),
-    '{}'::pg_catalog.text[]
-  ) AS tags,
-  ranked.source_project_id,
-  ranked.session_id,
-  ranked.confidence,
-  ranked.created_at,
-  ranked.rank
-FROM ranked
+  combined.memory_id,
+  combined.content,
+  combined.tags,
+  combined.source_project_id,
+  combined.session_id,
+  combined.confidence,
+  combined.created_at,
+  combined.rank,
+  combined.match_phase
+FROM combined
 ORDER BY
-  ranked.rank DESC,
-  ranked.created_at DESC,
-  ranked.memory_id DESC
-LIMIT $6::pg_catalog.int8`;
+  combined.match_phase,
+  combined.match_order DESC,
+  combined.created_at DESC,
+  combined.memory_id DESC
+LIMIT $5::pg_catalog.int8`;
 
 export class PostgreSqlLexicalSearchRepository
   implements LexicalSearchRepository
@@ -1224,50 +1529,27 @@ export class PostgreSqlLexicalSearchRepository
           );
         });
       }
-      const primary = await executor.query<MessageSearchRow>(
-        {
-          text: MESSAGE_PRIMARY_SQL,
-          values: [
-            this.access.projectId,
-            snapshot.query,
-            snapshot.conversationId,
-            snapshot.since,
-            snapshot.before,
-            snapshot.limit,
-          ],
-        },
-        context
-      );
-      const primaryResults = primary.rows.map((row) =>
-        messageFromRow(row, this.access.projectId, operation)
-      );
-      if (
-        primaryResults.length >= snapshot.limit ||
-        !hasTrigrams(snapshot.query)
-      ) {
-        return primaryResults;
-      }
       return withBoundedSearch(executor, context, async () => {
-        const fallback = await executor.query<MessageSearchRow>(
+        const result = await executor.query<CombinedMessageSearchRow>(
           {
-            text: MESSAGE_TRIGRAM_SQL,
+            text: MESSAGE_FULL_TEXT_SQL,
             values: [
               this.access.projectId,
               snapshot.query,
               snapshot.conversationId,
               snapshot.since,
               snapshot.before,
-              primaryResults.map((row) => row.messageId),
-              snapshot.limit - primaryResults.length,
+              snapshot.limit,
+              hasTrigrams(snapshot.query),
             ],
           },
           context
         );
-        return appendDeduplicated(
-          primaryResults,
-          fallback.rows.map((row) =>
-            messageFromRow(row, this.access.projectId, operation)
-          ),
+        return decodeCombinedRows(
+          result.rows,
+          this.access.projectId,
+          operation,
+          (row) => messageFromRow(row, this.access.projectId, operation),
           (row) => row.messageId,
           snapshot.limit
         );
@@ -1310,50 +1592,27 @@ export class PostgreSqlLexicalSearchRepository
           );
         });
       }
-      const primary = await executor.query<SummarySearchRow>(
-        {
-          text: SUMMARY_PRIMARY_SQL,
-          values: [
-            this.access.projectId,
-            snapshot.query,
-            snapshot.conversationId,
-            snapshot.since,
-            snapshot.before,
-            snapshot.limit,
-          ],
-        },
-        context
-      );
-      const primaryResults = primary.rows.map((row) =>
-        summaryFromRow(row, this.access.projectId, operation)
-      );
-      if (
-        primaryResults.length >= snapshot.limit ||
-        !hasTrigrams(snapshot.query)
-      ) {
-        return primaryResults;
-      }
       return withBoundedSearch(executor, context, async () => {
-        const fallback = await executor.query<SummarySearchRow>(
+        const result = await executor.query<CombinedSummarySearchRow>(
           {
-            text: SUMMARY_TRIGRAM_SQL,
+            text: SUMMARY_FULL_TEXT_SQL,
             values: [
               this.access.projectId,
               snapshot.query,
               snapshot.conversationId,
               snapshot.since,
               snapshot.before,
-              primaryResults.map((row) => row.summaryId),
-              snapshot.limit - primaryResults.length,
+              snapshot.limit,
+              hasTrigrams(snapshot.query),
             ],
           },
           context
         );
-        return appendDeduplicated(
-          primaryResults,
-          fallback.rows.map((row) =>
-            summaryFromRow(row, this.access.projectId, operation)
-          ),
+        return decodeCombinedRows(
+          result.rows,
+          this.access.projectId,
+          operation,
+          (row) => summaryFromRow(row, this.access.projectId, operation),
           (row) => row.summaryId,
           snapshot.limit
         );
@@ -1395,45 +1654,27 @@ export class PostgreSqlLexicalSearchRepository
     }
     return this.access.atomic(operation, async (executor) => {
       const context = this.access.context(operation);
-      const primary = await executor.query<PromotedSearchRow>(
-        {
-          text: PROMOTED_PRIMARY_SQL,
-          values: [
-            this.access.projectId,
-            query,
-            sourceProjectId,
-            filterTags,
-            limit,
-          ],
-        },
-        context
-      );
-      const primaryResults = primary.rows.map((row) =>
-        promotedFromRow(row, this.access.projectId, operation, "primary")
-      );
-      if (primaryResults.length >= limit || !hasTrigrams(query)) {
-        return primaryResults;
-      }
       return withBoundedSearch(executor, context, async () => {
-        const fallback = await executor.query<PromotedSearchRow>(
+        const result = await executor.query<CombinedPromotedSearchRow>(
           {
-            text: PROMOTED_TRIGRAM_SQL,
+            text: PROMOTED_FULL_TEXT_SQL,
             values: [
               this.access.projectId,
               query,
-              primaryResults.map((row) => row.id),
               sourceProjectId,
               filterTags,
-              limit - primaryResults.length,
+              limit,
+              hasTrigrams(query),
             ],
           },
           context
         );
-        return appendDeduplicated(
-          primaryResults,
-          fallback.rows.map((row) =>
-            promotedFromRow(row, this.access.projectId, operation, "fallback")
-          ),
+        return decodeCombinedRows(
+          result.rows,
+          this.access.projectId,
+          operation,
+          (row, phase) =>
+            promotedFromRow(row, this.access.projectId, operation, phase),
           (row) => row.id,
           limit
         );
