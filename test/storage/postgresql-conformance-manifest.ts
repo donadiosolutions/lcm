@@ -12,6 +12,7 @@ import {
   exerciseLargeFileRepositoryConformance,
   exerciseSummaryRepositoryConformance,
 } from "./summary-context-conformance.js";
+import { exerciseLexicalSearchRepositoryConformance } from "./lexical-search-conformance.js";
 
 type ProjectRepositoryDomain = keyof ProjectRepositories;
 
@@ -34,21 +35,21 @@ const POSTGRESQL_PROJECT_REPOSITORY_EXPORT_NAMES = {
 } as const satisfies Record<ProjectRepositoryDomain, string>;
 
 type PostgreSqlProjectRepositoryExportName<
-  Domain extends ProjectRepositoryDomain,
+  Domain extends ProjectRepositoryDomain
 > = (typeof POSTGRESQL_PROJECT_REPOSITORY_EXPORT_NAMES)[Domain];
 
 type ExportedPostgreSqlProjectRepositoryDomain = {
-  [Domain in ProjectRepositoryDomain]:
-  PostgreSqlProjectRepositoryExportName<Domain> extends keyof typeof PostgreSqlExports
+  [Domain in ProjectRepositoryDomain]: PostgreSqlProjectRepositoryExportName<Domain> extends keyof typeof PostgreSqlExports
     ? Domain
     : never;
 }[ProjectRepositoryDomain];
 
 type ExportedPostgreSqlProjectRepository<
-  Domain extends ExportedPostgreSqlProjectRepositoryDomain,
-> = PostgreSqlProjectRepositoryExportName<Domain> extends keyof typeof PostgreSqlExports
-  ? (typeof PostgreSqlExports)[PostgreSqlProjectRepositoryExportName<Domain>]
-  : never;
+  Domain extends ExportedPostgreSqlProjectRepositoryDomain
+> =
+  PostgreSqlProjectRepositoryExportName<Domain> extends keyof typeof PostgreSqlExports
+    ? (typeof PostgreSqlExports)[PostgreSqlProjectRepositoryExportName<Domain>]
+    : never;
 
 type PostgreSqlProjectRepositoryAdapterManifest = {
   readonly [Domain in ExportedPostgreSqlProjectRepositoryDomain]: {
@@ -59,7 +60,7 @@ type PostgreSqlProjectRepositoryAdapterManifest = {
 type PostgreSqlProjectRepositoryConformanceManifest = {
   readonly [Domain in keyof typeof POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS]: {
     readonly exercise: (
-      repository: ProjectRepositories[Domain],
+      repository: ProjectRepositories[Domain]
     ) => Promise<unknown>;
   };
 };
@@ -85,6 +86,9 @@ export const POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS = {
   },
   redactionAdmin: {
     implementation: PostgreSqlExports.PostgreSqlRedactionAdminRepository,
+  },
+  lexicalSearch: {
+    implementation: PostgreSqlExports.PostgreSqlLexicalSearchRepository,
   },
   coordination: {
     implementation: PostgreSqlExports.PostgreSqlCoordinationRepository,
@@ -112,6 +116,9 @@ export const POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE = {
   },
   redactionAdmin: {
     exercise: exerciseRedactionAdminRepositoryConformance,
+  },
+  lexicalSearch: {
+    exercise: exerciseLexicalSearchRepositoryConformance,
   },
   coordination: {
     exercise: exerciseCoordinationRepositoryConformance,

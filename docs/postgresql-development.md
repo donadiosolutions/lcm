@@ -3,19 +3,20 @@
 LCM's PostgreSQL runtime, migration runner, and complete PostgreSQL 18 schema
 baseline remain staged until the remaining domain adapters satisfy the shared
 storage contracts and #92 enables cutover. Machine/project identity, the
-conversation repository, and the native-transcript repository are implemented,
-but SQLite remains the default domain backend. Native-transcript use is limited
-to explicit programmatic backfill and conformance; daemon/CLI activation remains
-#224. See the
+conversation repository, the native-transcript repository, and lexical search
+are implemented, but SQLite remains the default domain backend.
+Native-transcript and PostgreSQL lexical-search use is limited to explicit
+programmatic calls and conformance; daemon/CLI activation remains #224. See the
 [PostgreSQL schema reference](postgresql-schema.md) for tables, repository
 ordering and atomicity, integrity rules, index families, extension
 prerequisites, retention, and backup implications.
 
-Issue #85 preserves canonical message content but does not implement lexical
-query or oversized-lexeme routing. PostgreSQL 18's source-level safe parsed
-lexeme maximum is 2,046 UTF-8 bytes after normalization and parsing, not a raw
-whitespace-token limit. Issue #89 must pin that matrix in the real harness and
-define lossless handling before #224 enables PostgreSQL daemon/CLI writes.
+Issue #89 provides the staged, read-only search adapter and proves the
+PostgreSQL 18 source-level parsed-lexeme boundary: 2,046 normalized UTF-8 bytes
+use full-text search, while 2,047 bytes route losslessly through bounded
+trigram fill. See
+[PostgreSQL lexical search](postgresql-search.md) for query syntax, ranking,
+normalization, scopes, timeouts, grants, benchmark evidence, and diagnostics.
 
 ## Run the conformance harness
 
@@ -183,14 +184,14 @@ adapter is also rejected. The dedicated
 the existing `npm run typecheck` and CI gate without adding it to the production
 build or public runtime API.
 
-The staged manifest currently registers conversations plus the issue #88
-promoted-memory, recall, redaction-administration, and coordination adapters.
+The staged manifest currently registers conversations; summaries, context, and
+large files; issue #88 promoted-memory, recall, redaction-administration, and
+coordination; and issue #89 lexical search.
 Their PostgreSQL integration tests invoke the same backend-neutral exercises
 used by SQLite, then add PostgreSQL-only least-privilege, project-isolation,
 concurrency, transactional purge, and rollback checks. The native-transcript
 adapter has its own explicit staged contract because it is not a
-`ProjectRepositories` domain. When implementing the remaining adapters tracked
-by #87, #89, and #91:
+`ProjectRepositories` domain. When implementing remaining repository adapters:
 
 1. Put backend-neutral behavior in a shared suite whose input is the matching
    `ProjectRepositories` interface, not a PostgreSQL concrete class.
@@ -408,6 +409,10 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
+  --file=docs/postgresql-runtime-search-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
   --file=docs/postgresql-runtime-coordination-grants.sql
 ```
 
@@ -439,6 +444,13 @@ columns, project reassignment, unrelated domains, `TRUNCATE`, and sequence
 inspection or mutation remain forbidden. Exact execution of
 `lcm.normalize_search_text(text)` is required for promoted-memory and tag
 generated columns.
+
+The search script is read-only. It grants schema `USAGE`, exact normalization
+function execution, and `SELECT` only on messages, summaries, promoted
+memories, and promoted tags. It grants no access to conversations or
+provenance tables, DML, sequence access, `TRUNCATE`, schema creation, grant
+option, or unrelated domains. See
+[PostgreSQL lexical search](postgresql-search.md).
 
 The coordination script grants reads and bounded row deletion on fenced
 leases, column-limited lease acquisition/takeover/renewal/release operations,
