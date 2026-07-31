@@ -1478,6 +1478,56 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     return listenerPorts.includes(opts.port);
   }
 
+  function ownedPidIsLiveLikelyDaemon(pid: number): boolean {
+    return readOwnedPid() === pid
+      && isAlive(pid)
+      && isLikelyLcmDaemonProcess(pid, procRoot)
+      && readOwnedPid() === pid
+      && isAlive(pid)
+      && isLikelyLcmDaemonProcess(pid, procRoot);
+  }
+
+  function ownedPidConfiguredListenerStateMatches(
+    pid: number,
+    expectedToOwnListener: boolean,
+  ): boolean {
+    if (
+      !ownedPidIsLiveLikelyDaemon(pid)
+    ) {
+      return false;
+    }
+    const listenerPorts = opts._listeningPortsOverride
+      ? opts._listeningPortsOverride(pid)
+      : findListeningTcpPorts(
+          pid,
+          platform,
+          dependencies.spawnSync,
+          procRoot,
+          opts.port,
+        );
+    return listenerPorts.includes(opts.port) === expectedToOwnListener
+      && ownedPidIsLiveLikelyDaemon(pid);
+  }
+
+  function preserveBusyOwnedDaemon(pid: number): EnsureDaemonResult | null {
+    if (
+      !ownedPidConfiguredListenerStateMatches(pid, true)
+      // Revalidate the exact PID, process identity, and listener immediately
+      // before returning. Health may have been unavailable long enough for a
+      // concurrent lifecycle operation to replace any one of them.
+      || !ownedPidConfiguredListenerStateMatches(pid, true)
+    ) {
+      return null;
+    }
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      pid,
+      warning: `daemon PID ${pid} still owns configured port ${opts.port} but health remained unavailable after bounded retries; it may be busy, so it was preserved without signaling or replacement. Retry after the current operation completes; if it remains unavailable, inspect or explicitly stop the daemon before retrying`,
+    };
+  }
+
   function remainingRequestDeadline(): RequestDeadline | null {
     const timeoutMs = deadline - monotonicNow();
     return timeoutMs <= 0
@@ -1809,20 +1859,41 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
             }
           }
         }
+        if (!isRecognizedDaemonHealth(retry) && !opts._abortSignal?.aborted) {
+          const preserved = preserveBusyOwnedDaemon(pid);
+          if (preserved) return preserved;
+          const replacementPid = readOwnedPid();
+          if (replacementPid !== null && replacementPid !== pid) {
+            return waitForConcurrentReplacement(replacementPid);
+          }
+        }
         if (enforceParent && !repairedMismatch) {
           const parent = inspectParent();
-          if (parent.available && parent.pid !== undefined) {
-            if (isLikelyLcmDaemonProcess(parent.pid, procRoot)) {
-              await terminatePid(parent.pid, { isAlive, killProcess, sleepFn });
-              restartedForParent = true;
-            }
+          const signalStateMatches = isRecognizedDaemonHealth(retry)
+            ? ownedPidConfiguredListenerStateMatches(pid, true)
+            : opts._abortSignal?.aborted
+              ? ownedPidIsLiveLikelyDaemon(pid)
+              : ownedPidConfiguredListenerStateMatches(pid, false);
+          if (
+            parent.available
+            && parent.pid === pid
+            && signalStateMatches
+          ) {
+            await terminatePid(pid, { isAlive, killProcess, sleepFn });
+            restartedForParent = true;
           }
         }
       }
     } catch (error) {
       if (error instanceof LifecycleTestScopeStateError) throw error;
     }
-    if (!repairedMismatch) cleanOwnedPid();
+    if (!repairedMismatch) {
+      const currentPid = readOwnedPid();
+      if (currentPid !== null && currentPid !== pidFilePid) {
+        return waitForConcurrentReplacement(currentPid);
+      }
+      cleanOwnedPid();
+    }
   }
 
   // Step 3: Spawn daemon (unless skipped for testing)

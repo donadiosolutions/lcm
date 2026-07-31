@@ -63,6 +63,14 @@ The daemon uses bounded triggers so passive learning stays fresh without making 
 - A startup sweep and a 5-minute periodic sweep scan up to 20 metadata-backed sidecars per pass.
 - Active-project background processing promotes at most one batch per pass, then requeues remaining work.
 
+While a larger passive-learning batch is running, the daemon can remain alive
+and own its configured listener even if bounded health checks cannot complete.
+Lifecycle admission preserves that exact likely-LCM process and its PID/token
+state instead of signaling it or starting a replacement, and reports a
+busy/unavailable warning with `connected: false`. Let the current batch finish,
+then retry the command. If health remains unavailable after processing should
+be idle, inspect the backlog and daemon, then stop or restart it explicitly.
+
 `lcm search` stays read-only: it searches already promoted memory and does not process queued sidecar events.
 
 ### Three-Tier Promotion
