@@ -1,4 +1,5 @@
 import {
+  type Dirent,
   mkdirSync,
   mkdtempSync,
   opendirSync,
@@ -113,36 +114,50 @@ describe("worktree reconciliation fences", () => {
     expect(isWorktreeReconciliationFence(path, hash, "events")).toBe(false);
   });
 
-  it("reads at most two entries from a huge contaminated events fence", () => {
+  it("bounds ordered directory reads and closes exact and huge contaminated event fences", () => {
     const path = join(root, `${hash}.db`);
     mkdirSync(path);
     writeFileSync(
       join(path, "fence.json"),
       serializeWorktreeReconciliationFence(hash, "events"),
     );
-    for (let index = 0; index < 4_096; index++) {
-      writeFileSync(join(path, `contaminant-${index.toString().padStart(4, "0")}`), "");
-    }
-    let reads = 0;
-    let closes = 0;
 
-    expect(isWorktreeReconciliationFence(path, hash, "events", {
-      _openDirectory: (directoryPath) => {
-        const directory = opendirSync(directoryPath);
-        return {
-          readSync: () => {
-            reads++;
-            return directory.readSync();
-          },
-          closeSync: () => {
-            closes++;
-            directory.closeSync();
-          },
-        } as ReturnType<typeof opendirSync>;
-      },
-    })).toBe(false);
-    expect(reads).toBeLessThanOrEqual(2);
-    expect(closes).toBe(1);
+    const validateEntries = (entries: readonly (string | null)[]) => {
+      let index = 0;
+      let reads = 0;
+      let closes = 0;
+      const result = isWorktreeReconciliationFence(path, hash, "events", {
+        _openDirectory: (directoryPath) => {
+          expect(directoryPath).toBe(path);
+          return {
+            readSync: () => {
+              reads++;
+              const name = entries[index++] ?? null;
+              return name === null ? null : ({ name } as Dirent);
+            },
+            closeSync: () => {
+              closes++;
+            },
+          } as ReturnType<typeof opendirSync>;
+        },
+      });
+      return { result, reads, closes };
+    };
+
+    expect(validateEntries(["fence.json", null])).toEqual({
+      result: true,
+      reads: 2,
+      closes: 1,
+    });
+    const contaminants = Array.from(
+      { length: 4_096 },
+      (_, index) => `contaminant-${index.toString().padStart(4, "0")}`,
+    );
+    expect(validateEntries(["fence.json", ...contaminants])).toEqual({
+      result: false,
+      reads: 2,
+      closes: 1,
+    });
   });
 
   it("closes the events directory when the deadline expires between bounded reads", () => {
