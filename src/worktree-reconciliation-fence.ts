@@ -36,7 +36,6 @@ export function isWorktreeReconciliationFence(
       allowedRoot: kind === "events" ? path : dirname(path),
       maxBytes: MAX_SOURCE_FENCE_BYTES,
     });
-    JSON.parse(content);
     return content === serializeWorktreeReconciliationFence(hash, kind);
   } catch {
     return false;

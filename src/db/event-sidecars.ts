@@ -158,13 +158,18 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
 
   let files: string[];
   try {
-    files = readdirSync(dir)
-      .filter(f => f.endsWith(".db"))
-      .filter((file) => {
-        const match = PROJECT_HASH_SIDECAR_RE.exec(file);
-        return !match
-          || !isWorktreeReconciliationFence(join(dir, file), match[1]!, "events");
+    files = readdirSync(dir, { withFileTypes: true })
+      .filter(entry => entry.name.endsWith(".db"))
+      .filter((entry) => {
+        const match = PROJECT_HASH_SIDECAR_RE.exec(entry.name);
+        if (!match || entry.isFile() || entry.isSymbolicLink()) return true;
+        return !isWorktreeReconciliationFence(
+          join(dir, entry.name),
+          match[1]!,
+          "events",
+        );
       })
+      .map(entry => entry.name)
       .sort((a, b) => a.localeCompare(b));
   } catch {
     return [];
