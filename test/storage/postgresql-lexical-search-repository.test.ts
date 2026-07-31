@@ -320,6 +320,55 @@ describe("PostgreSQL lexical-search repository", () => {
     }
   });
 
+  it("maps nullable legacy provenance to the owner for primary and trigram rows", async () => {
+    const legacyPrimary = {
+      ...promotedRow,
+      source_project_id: null,
+    };
+    const primaryDatabase = executor(() => result([legacyPrimary]));
+    const primaryRepository = new PostgreSqlLexicalSearchRepository(
+      primaryDatabase,
+      projectId
+    );
+    await expect(
+      primaryRepository.searchPromoted("needle", 1)
+    ).resolves.toMatchObject([
+      {
+        id: memoryId,
+        projectId,
+        rank: -0.25,
+      },
+    ]);
+
+    const fallbackDatabase = executor((config) => {
+      const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow();
+      if (sql.includes("set_config")) return result([]);
+      if (sql.includes("public.similarity")) {
+        return result([
+          {
+            ...promotedFallbackRow,
+            source_project_id: null,
+          },
+        ]);
+      }
+      return result([]);
+    });
+    const fallbackRepository = new PostgreSqlLexicalSearchRepository(
+      fallbackDatabase,
+      projectId
+    );
+    await expect(
+      fallbackRepository.searchPromoted("needle", 1)
+    ).resolves.toMatchObject([
+      {
+        id: memoryId,
+        projectId,
+        rank: 0.25,
+      },
+    ]);
+  });
+
   it("fills only remaining slots with bounded, deduplicated trigram rows", async () => {
     const database = executor((config) => {
       const sql = text(config);
@@ -1070,7 +1119,7 @@ describe("PostgreSQL lexical-search repository", () => {
       { ...promotedRow, content: null },
       { ...promotedRow, tags: {} },
       { ...promotedRow, tags: [1] },
-      { ...promotedRow, source_project_id: null },
+      { ...promotedRow, source_project_id: 1 },
       { ...promotedRow, session_id: 1 },
       { ...promotedRow, confidence: "0.8" },
       { ...promotedRow, created_at: "bad" },

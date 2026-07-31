@@ -150,7 +150,7 @@ async function seedMemory(
   input: {
     readonly content: string;
     readonly tags: readonly string[];
-    readonly sourceProjectId: string;
+    readonly sourceProjectId: string | null;
     readonly confidence: number;
   }
 ): Promise<string> {
@@ -616,6 +616,56 @@ describe("PostgreSQL 18 lexical search", () => {
         projectId
       );
       await exerciseLexicalSearchRepositoryConformance(repository, fixtures);
+      const legacyPrimaryMemory = await seedMemory(database, projectId, {
+        content: "legacyprimaryneedle",
+        tags: [],
+        sourceProjectId: null,
+        confidence: 0.8,
+      });
+      const legacyFallbackMemory = await seedMemory(database, projectId, {
+        content: "legacyfallbackspelling",
+        tags: [],
+        sourceProjectId: null,
+        confidence: 0.8,
+      });
+      const legacyPrimary = await repository.searchPromoted(
+        "legacyprimaryneedle",
+        10
+      );
+      expect(legacyPrimary).toMatchObject([
+        {
+          id: legacyPrimaryMemory,
+          projectId,
+        },
+      ]);
+      expect(legacyPrimary[0].rank).toBeLessThan(0);
+      const legacyFallback = await repository.searchPromoted(
+        "legacyfallbackspeling",
+        10
+      );
+      expect(legacyFallback).toMatchObject([
+        {
+          id: legacyFallbackMemory,
+          projectId,
+        },
+      ]);
+      expect(legacyFallback[0].rank).toBeGreaterThanOrEqual(0);
+      await expect(
+        repository.searchPromoted(
+          "legacyprimaryneedle",
+          10,
+          undefined,
+          projectId
+        )
+      ).resolves.toEqual([]);
+      await expect(
+        repository.searchPromoted(
+          "legacyfallbackspeling",
+          10,
+          undefined,
+          projectId
+        )
+      ).resolves.toEqual([]);
       const rankedContentMemory = await seedMemory(database, projectId, {
         content: "rankprobealpha rankprobebeta",
         tags: [],

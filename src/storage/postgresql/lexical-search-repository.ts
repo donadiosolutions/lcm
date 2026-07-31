@@ -454,12 +454,15 @@ function promotedFromRow(
     id: uuid(row.memory_id, projectId, operation, "memory_id"),
     content: validatedString(row.content, projectId, operation, "content"),
     tags: tags(row.tags, projectId, operation),
-    projectId: validatedString(
-      row.source_project_id,
-      projectId,
-      operation,
-      "source_project_id"
-    ),
+    projectId:
+      row.source_project_id === null
+        ? projectId
+        : validatedString(
+            row.source_project_id,
+            projectId,
+            operation,
+            "source_project_id"
+          ),
     sessionId:
       row.session_id === null
         ? null
