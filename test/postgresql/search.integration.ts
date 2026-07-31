@@ -616,6 +616,29 @@ describe("PostgreSQL 18 lexical search", () => {
         projectId
       );
       await exerciseLexicalSearchRepositoryConformance(repository, fixtures);
+      const rankedContentMemory = await seedMemory(database, projectId, {
+        content: "rankprobealpha rankprobebeta",
+        tags: [],
+        sourceProjectId: fixtures.sourceProjectId,
+        confidence: 0.8,
+      });
+      const rankedTagMemory = await seedMemory(database, projectId, {
+        content: "unrelated rank ordering memory",
+        tags: ["rankprobealpha"],
+        sourceProjectId: fixtures.sourceProjectId,
+        confidence: 0.8,
+      });
+      const promotedRanks = (
+        await repository.searchPromoted("rankprobealpha OR rankprobebeta", 10)
+      ).filter(
+        (row) => row.id === rankedContentMemory || row.id === rankedTagMemory
+      );
+      expect(promotedRanks.map((row) => row.id)).toEqual([
+        rankedContentMemory,
+        rankedTagMemory,
+      ]);
+      expect(promotedRanks.every((row) => row.rank < 0)).toBe(true);
+      expect(promotedRanks[0].rank).toBeLessThan(promotedRanks[1].rank);
       expect(
         await repository.searchMessages({
           query: "cross-project",

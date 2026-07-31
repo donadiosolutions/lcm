@@ -270,17 +270,22 @@ export async function exerciseLexicalSearchRepositoryConformance(
       projectId: sourceProjectId,
     },
   ]);
+  expect(promoted[0].rank).toBeLessThan(0);
+  expect(Object.is(promoted[0].rank, -0)).toBe(false);
   const durable = await repository.searchPromoted("durable", 10);
   const repeatedDurable = await repository.searchPromoted("durable", 10);
   expect(ids(repeatedDurable, (row) => row.id)).toEqual(
     ids(durable, (row) => row.id)
   );
-  expect(await repository.searchPromoted("tagonly", 10)).toMatchObject([
+  const tagOnly = await repository.searchPromoted("tagonly", 10);
+  expect(tagOnly).toMatchObject([
     {
       id: memoryIds.tagOnly,
       tags: expect.arrayContaining(["tagonly", "required"]),
     },
   ]);
+  expect(tagOnly[0].rank).toBeLessThan(0);
+  expect(Object.is(tagOnly[0].rank, -0)).toBe(false);
   expect(
     await repository.searchPromoted("tagonly", 10, ["required"])
   ).toMatchObject([{ id: memoryIds.tagOnly }]);

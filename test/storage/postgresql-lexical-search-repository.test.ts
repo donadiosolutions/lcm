@@ -1,5 +1,10 @@
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import { describe, expect, it, vi } from "vitest";
+import { deduplicateAndInsert } from "../../src/promotion/dedup.js";
+import type {
+  LexicalSearchRepository,
+  PromotedMemoryRepository,
+} from "../../src/storage/contracts.js";
 import type { PostgreSqlQueryOptions } from "../../src/storage/postgresql/contracts.js";
 import {
   PostgreSqlLexicalSearchDataError,
@@ -112,8 +117,10 @@ const promotedRow = {
   session_id: null,
   confidence: 0.8,
   created_at: "2026-01-03T00:00:00.000Z",
-  rank: 0.25,
+  rank: -0.25,
 };
+
+const promotedFallbackRow = { ...promotedRow, rank: 0.25 };
 
 describe("PostgreSQL lexical-search repository", () => {
   it("maps primary message, summary, and promoted rows with exact scoped SQL", async () => {
@@ -235,6 +242,18 @@ describe("PostgreSQL lexical-search repository", () => {
       ["one"],
       2,
     ]);
+    const promotedSql = text(database.query.mock.calls[2][0]);
+    expect(promotedSql).toContain(") AS relevance");
+    expect(promotedSql).toContain(
+      "OPERATOR(pg_catalog.-) ranked.relevance AS rank"
+    );
+    expect(promotedSql).toContain(
+      "WHERE ranked.relevance OPERATOR(pg_catalog.>) 0::pg_catalog.float4"
+    );
+    expect(promotedSql).toContain(
+      "ORDER BY\n  ranked.relevance DESC,\n  ranked.created_at DESC,\n  ranked.memory_id DESC"
+    );
+    expect(promotedSql).not.toContain("ORDER BY\n  ranked.rank DESC");
   });
 
   it("aligns primary headlines and trigram gates with database normalization", async () => {
@@ -332,9 +351,9 @@ describe("PostgreSQL lexical-search repository", () => {
         sql.includes("public.similarity")
       ) {
         return result([
-          promotedRow,
-          { ...promotedRow, memory_id: secondMemoryId },
-          { ...promotedRow, memory_id: thirdMemoryId },
+          promotedFallbackRow,
+          { ...promotedFallbackRow, memory_id: secondMemoryId },
+          { ...promotedFallbackRow, memory_id: thirdMemoryId },
         ]);
       }
       if (sql.includes("FROM lcm.messages")) return result([messageRow]);
@@ -398,6 +417,80 @@ describe("PostgreSQL lexical-search repository", () => {
     ]);
     expect(trigramQueries[1].values?.at(-1)).toBe(2);
     expect(trigramQueries[2].values?.at(-1)).toBe(2);
+  });
+
+  it("preserves promotion dedup semantics across primary and fallback rank signs", async () => {
+    const primaryCandidate = {
+      id: memoryId,
+      content: "semantically related memory",
+      tags: ["existing"],
+      projectId: "source-a",
+      sessionId: null,
+      confidence: 0.8,
+      createdAt: "2026-01-03T00:00:00.000Z",
+      rank: -0.25,
+    };
+    const fallbackCandidate = {
+      ...primaryCandidate,
+      id: secondMemoryId,
+      content: "needle memory fragment",
+      rank: 0.25,
+    };
+    let candidates = [primaryCandidate, fallbackCandidate];
+    const searchPromoted = vi.fn(
+      async (
+        _query: string,
+        _limit: number
+      ): Promise<
+        Awaited<ReturnType<LexicalSearchRepository["searchPromoted"]>>
+      > => candidates
+    );
+    const insert = vi.fn(
+      async (
+        _input: Parameters<PromotedMemoryRepository["insert"]>[0]
+      ): Promise<string> => thirdMemoryId
+    );
+    const update = vi.fn(
+      async (
+        _id: string,
+        _fields: Parameters<PromotedMemoryRepository["update"]>[1]
+      ): Promise<void> => undefined
+    );
+    const archive = vi.fn(async (_id: string): Promise<void> => undefined);
+    const repositories = {
+      lexicalSearch: { searchPromoted },
+      promotedMemory: { insert, update, archive },
+    };
+    const transaction = async <T>(
+      callback: (available: typeof repositories) => Promise<T>
+    ): Promise<T> => callback(repositories);
+    const input = {
+      transaction,
+      content: "needle memory",
+      tags: ["incoming"],
+      sourceProjectId: "source-a",
+      depth: 2,
+      confidence: 0.7,
+      thresholds: { dedupBm25Threshold: 0.2, dedupCandidateLimit: 10 },
+    };
+
+    await expect(deduplicateAndInsert(input)).resolves.toBe(memoryId);
+    expect(update).toHaveBeenLastCalledWith(memoryId, {
+      confidence: 0.8,
+      tags: ["existing", "incoming"],
+    });
+    expect(insert).not.toHaveBeenCalled();
+
+    candidates = [fallbackCandidate];
+    await expect(deduplicateAndInsert(input)).resolves.toBe(thirdMemoryId);
+    expect(insert).toHaveBeenCalledTimes(1);
+
+    candidates = [{ ...fallbackCandidate, content: input.content }];
+    await expect(deduplicateAndInsert(input)).resolves.toBe(secondMemoryId);
+    expect(update).toHaveBeenLastCalledWith(secondMemoryId, {
+      confidence: 0.8,
+      tags: ["existing", "incoming"],
+    });
   });
 
   it("runs validated regex searches under the bounded timeout", async () => {
@@ -982,6 +1075,9 @@ describe("PostgreSQL lexical-search repository", () => {
       { ...promotedRow, confidence: "0.8" },
       { ...promotedRow, created_at: "bad" },
       { ...promotedRow, rank: Number.POSITIVE_INFINITY },
+      { ...promotedRow, rank: 0 },
+      { ...promotedRow, rank: -0 },
+      { ...promotedRow, rank: 0.25 },
     ];
     for (const row of rows) {
       const database = executor(() => result([row]));
@@ -993,5 +1089,23 @@ describe("PostgreSQL lexical-search repository", () => {
         repository.searchPromoted("needle", 1)
       ).rejects.toBeInstanceOf(PostgreSqlLexicalSearchDataError);
     }
+  });
+
+  it("rejects a negative trigram fallback rank as malformed data", async () => {
+    const database = executor((config) => {
+      const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow();
+      if (sql.includes("set_config")) return result([]);
+      if (sql.includes("public.similarity")) return result([promotedRow]);
+      return result([]);
+    });
+    const repository = new PostgreSqlLexicalSearchRepository(
+      database,
+      projectId
+    );
+
+    await expect(repository.searchPromoted("needle", 1)).rejects.toBeInstanceOf(
+      PostgreSqlLexicalSearchDataError
+    );
   });
 });

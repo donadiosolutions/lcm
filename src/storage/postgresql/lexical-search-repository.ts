@@ -242,6 +242,22 @@ function finiteNumber(
   return value;
 }
 
+function promotedRank(
+  value: unknown,
+  projectId: string,
+  operation: "searchPromoted",
+  source: "primary" | "fallback"
+): number {
+  const candidate = finiteNumber(value, projectId, operation, "rank");
+  if (
+    (source === "primary" && candidate >= 0) ||
+    (source === "fallback" && candidate < 0)
+  ) {
+    return dataError(projectId, operation, "rank");
+  }
+  return candidate;
+}
+
 function resultNonnegativeInteger(
   value: unknown,
   projectId: string,
@@ -431,7 +447,8 @@ function summaryFromRow(
 function promotedFromRow(
   row: PromotedSearchRow,
   projectId: string,
-  operation: "searchPromoted"
+  operation: "searchPromoted",
+  source: "primary" | "fallback"
 ): SearchResult {
   return {
     id: uuid(row.memory_id, projectId, operation, "memory_id"),
@@ -459,7 +476,7 @@ function promotedFromRow(
       operation,
       "created_at"
     ).toISOString(),
-    rank: finiteNumber(row.rank, projectId, operation, "rank"),
+    rank: promotedRank(row.rank, projectId, operation, source),
   };
 }
 
@@ -979,7 +996,7 @@ ranked AS (
         ),
         0::pg_catalog.float4
       )
-    ) AS rank
+    ) AS relevance
   FROM lcm.promoted_memories AS memory
   CROSS JOIN input
   WHERE memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
@@ -1026,10 +1043,11 @@ SELECT
   ranked.session_id,
   ranked.confidence,
   ranked.created_at,
-  ranked.rank
+  OPERATOR(pg_catalog.-) ranked.relevance AS rank
 FROM ranked
+WHERE ranked.relevance OPERATOR(pg_catalog.>) 0::pg_catalog.float4
 ORDER BY
-  ranked.rank DESC,
+  ranked.relevance DESC,
   ranked.created_at DESC,
   ranked.memory_id DESC
 LIMIT $5::pg_catalog.int8`;
@@ -1388,7 +1406,7 @@ export class PostgreSqlLexicalSearchRepository
         context
       );
       const primaryResults = primary.rows.map((row) =>
-        promotedFromRow(row, this.access.projectId, operation)
+        promotedFromRow(row, this.access.projectId, operation, "primary")
       );
       if (primaryResults.length >= limit || !hasTrigrams(query)) {
         return primaryResults;
@@ -1411,7 +1429,7 @@ export class PostgreSqlLexicalSearchRepository
         return appendDeduplicated(
           primaryResults,
           fallback.rows.map((row) =>
-            promotedFromRow(row, this.access.projectId, operation)
+            promotedFromRow(row, this.access.projectId, operation, "fallback")
           ),
           (row) => row.id,
           limit

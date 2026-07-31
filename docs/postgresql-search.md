@@ -36,10 +36,16 @@ memory uses full-text search with trigram fill.
   Such text can still contain legitimate searchable words, so zero matches are
   not guaranteed.
 
-PostgreSQL and SQLite do not expose numerically comparable relevance scores.
-Callers may use rank only within one backend response. PostgreSQL orders
-full-text and trigram matches by descending rank, descending creation time,
-and the final public ID. Regex results use descending creation time and ID.
+PostgreSQL and SQLite do not expose numerically comparable relevance
+magnitudes. For promoted memories, a strictly negative rank identifies a
+primary full-text match, while a non-negative rank identifies a trigram
+fallback. PostgreSQL orders primary promoted matches by its positive internal
+relevance before projecting that value as a negative public rank; zero-
+relevance rows are excluded. Callers must not re-sort promoted results by the
+public rank or compare its magnitude across backends.
+
+PostgreSQL orders matches by backend relevance, descending creation time, and
+the final public ID. Regex results use descending creation time and ID.
 Primary full-text results always precede trigram fill results. Repeating a
 query against unchanged data therefore produces the same order.
 
