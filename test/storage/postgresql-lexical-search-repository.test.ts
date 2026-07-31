@@ -247,7 +247,6 @@ describe("PostgreSQL lexical-search repository", () => {
       "2026-01-01T00:00:00.000Z",
       "2026-02-01T00:00:00.000Z",
       2,
-      true,
     ]);
     expect(dataQueries[2][0].values).toEqual([
       projectId,
@@ -255,7 +254,6 @@ describe("PostgreSQL lexical-search repository", () => {
       "source-a",
       ["one"],
       2,
-      true,
     ]);
     const promotedSql = text(dataQueries[2][0]);
     expect(promotedSql).toContain(") AS relevance");
@@ -281,17 +279,17 @@ describe("PostgreSQL lexical-search repository", () => {
       database,
       projectId
     );
-    const rawMultibyteQuery = "𝐚";
+    const normalizedShortQuery = "𝐚";
 
     await repository.searchMessages({
-      query: rawMultibyteQuery,
+      query: normalizedShortQuery,
       mode: "full_text",
     });
     await repository.searchSummaries({
-      query: rawMultibyteQuery,
+      query: normalizedShortQuery,
       mode: "full_text",
     });
-    await repository.searchPromoted(rawMultibyteQuery, 5);
+    await repository.searchPromoted(normalizedShortQuery, 5);
 
     const statements = database.query.mock.calls.map(
       ([config]) => config as QueryConfig<unknown[]>
@@ -322,8 +320,13 @@ describe("PostgreSQL lexical-search repository", () => {
       const normalizedGate = sql.indexOf(
         "pg_catalog.octet_length(input.query)"
       );
-      expect(config.values?.[1]).toBe(rawMultibyteQuery);
-      expect(config.values?.at(-1)).toBe(true);
+      expect(config.values?.[1]).toBe(normalizedShortQuery);
+      expect(config.values).not.toContain(true);
+      expect(config.values).not.toContain(false);
+      expect(config.values).toHaveLength(
+        sql.includes("FROM lcm.promoted_memories") ? 5 : 6
+      );
+      expect(sql).not.toContain("allow_trigram");
       expect(sql).toContain(
         "SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query"
       );
@@ -340,7 +343,7 @@ describe("PostgreSQL lexical-search repository", () => {
         /fallback_budget AS MATERIALIZED \(\s*SELECT GREATEST\(\s*\$(?:5|6)::pg_catalog\.int8\s+OPERATOR\(pg_catalog\.-\)\s+pg_catalog\.count\(\*\)::pg_catalog\.int8,\s+0::pg_catalog\.int8\s*\) AS remaining\s+FROM primary_rows\s*\)/u
       );
       expect(sql).toMatch(
-        /LIMIT CASE\s+WHEN input\.allow_trigram\s+AND pg_catalog\.octet_length\(input\.query\)\s+OPERATOR\(pg_catalog\.>=\) 3\s+AND fallback_budget\.remaining OPERATOR\(pg_catalog\.>\) 0\s+THEN GREATEST\(\s*fallback_budget\.remaining,\s+0::pg_catalog\.int8\s*\)\s+ELSE 0::pg_catalog\.int8\s+END/u
+        /LIMIT CASE\s+WHEN pg_catalog\.octet_length\(input\.query\)\s+OPERATOR\(pg_catalog\.>=\) 3\s+AND fallback_budget\.remaining OPERATOR\(pg_catalog\.>\) 0\s+THEN GREATEST\(\s*fallback_budget\.remaining,\s+0::pg_catalog\.int8\s*\)\s+ELSE 0::pg_catalog\.int8\s+END/u
       );
       expect(sql.match(/LIMIT CASE/gu)).toHaveLength(1);
       expect(sql).toMatch(
@@ -522,7 +525,6 @@ describe("PostgreSQL lexical-search repository", () => {
       null,
       null,
       3,
-      true,
     ]);
     expect(dataQueries[1].values).toEqual([
       projectId,
@@ -531,16 +533,8 @@ describe("PostgreSQL lexical-search repository", () => {
       null,
       null,
       3,
-      true,
     ]);
-    expect(dataQueries[2].values).toEqual([
-      projectId,
-      "needle",
-      null,
-      [],
-      3,
-      true,
-    ]);
+    expect(dataQueries[2].values).toEqual([projectId, "needle", null, [], 3]);
   });
 
   it("truncates malformed over-limit primary output before fallback", async () => {
@@ -753,7 +747,6 @@ describe("PostgreSQL lexical-search repository", () => {
       "2026-01-01T00:00:00.000Z",
       "2026-02-01T00:00:00.000Z",
       1,
-      true,
     ]);
     expect(promotedQuery?.values).toEqual([
       projectId,
@@ -761,7 +754,6 @@ describe("PostgreSQL lexical-search repository", () => {
       "source-a",
       ["one"],
       1,
-      true,
     ]);
   });
 
@@ -818,7 +810,7 @@ describe("PostgreSQL lexical-search repository", () => {
     expect(database.query).not.toHaveBeenCalled();
   });
 
-  it("skips trigram fallback for fewer than three UTF-8 bytes", async () => {
+  it("binds omitted defaults and leaves short-query gating to normalized SQL", async () => {
     const database = executor((config) => {
       const sql = text(config);
       if (sql.includes("previous_timeout")) return timeoutRow();
@@ -835,11 +827,17 @@ describe("PostgreSQL lexical-search repository", () => {
       .map(([config]) => config as QueryConfig<unknown[]>)
       .filter((config) => text(config).includes("FROM combined"));
     expect(dataQueries).toHaveLength(3);
-    expect(dataQueries.map((config) => config.values?.at(-1))).toEqual([
-      false,
-      false,
-      false,
+    expect(dataQueries.map((config) => config.values)).toEqual([
+      [projectId, "a", null, null, null, 50],
+      [projectId, "é", null, null, null, 50],
+      [projectId, "ab", null, [], 5],
     ]);
+    for (const config of dataQueries) {
+      expect(config.values).not.toContain(true);
+      expect(config.values).not.toContain(false);
+      expect(text(config)).not.toContain("allow_trigram");
+      expect(text(config)).toContain("pg_catalog.octet_length(input.query)");
+    }
   });
 
   it.each([
@@ -900,6 +898,14 @@ describe("PostgreSQL lexical-search repository", () => {
       }),
     ],
     [
+      "limit null",
+      () => ({
+        query: "needle",
+        mode: "full_text",
+        limit: null,
+      }),
+    ],
+    [
       "limit fractional",
       () => ({
         query: "needle",
@@ -943,6 +949,24 @@ describe("PostgreSQL lexical-search repository", () => {
       expect(database.query).not.toHaveBeenCalled();
     }
   );
+
+  it("rejects an explicit null summary limit before I/O", async () => {
+    const database = executor(() => result([]));
+    const repository = new PostgreSqlLexicalSearchRepository(
+      database,
+      projectId
+    );
+
+    await expect(
+      repository.searchSummaries({
+        query: "needle",
+        mode: "full_text",
+        limit: null as never,
+      })
+    ).rejects.toBeInstanceOf(PostgreSqlLexicalSearchDataError);
+    expect(database.transaction).not.toHaveBeenCalled();
+    expect(database.query).not.toHaveBeenCalled();
+  });
 
   it("rejects malformed promoted inputs before I/O", async () => {
     const database = executor(() => result([]));

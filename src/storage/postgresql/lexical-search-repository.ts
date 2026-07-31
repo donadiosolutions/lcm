@@ -22,7 +22,6 @@ import type {
 const MAX_SEARCH_LIMIT = 1_000;
 const DEFAULT_SEARCH_LIMIT = 50;
 const SEARCH_TIMEOUT_CAP_MS = 5_000;
-const MIN_TRIGRAM_QUERY_BYTES = 3;
 // Exact empty replacements from migration 0002's pinned unaccent-derived map,
 // plus Unicode whitespace. PostgreSQL preserves the whitespace while removing
 // the mapped characters, leaving no full-text lexeme and an unsafe broad
@@ -379,7 +378,7 @@ function snapshotInput(
         ? null
         : inputTimestamp(input.before, projectId, operation, "before"),
     limit: searchLimit(
-      input.limit ?? DEFAULT_SEARCH_LIMIT,
+      input.limit === undefined ? DEFAULT_SEARCH_LIMIT : input.limit,
       projectId,
       operation
     ),
@@ -542,10 +541,6 @@ function decodeCombinedRows<Row extends MatchPhaseRow, Result>(
     (phase === "primary" ? primary : fallback).push(decode(row, phase));
   }
   return appendDeduplicated(primary, fallback, id, limit);
-}
-
-function hasTrigrams(query: string): boolean {
-  return Buffer.byteLength(query.trim(), "utf8") >= MIN_TRIGRAM_QUERY_BYTES;
 }
 
 function normalizesToEmpty(query: string): boolean {
@@ -713,8 +708,7 @@ const MESSAGE_FULL_TEXT_SQL = `WITH input AS MATERIALIZED (
     pg_catalog.websearch_to_tsquery(
       'lcm.search_v1'::pg_catalog.regconfig,
       normalized.query
-    ) AS full_text_query,
-    $7::pg_catalog.bool AS allow_trigram
+    ) AS full_text_query
   FROM (
     SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query
   ) AS normalized
@@ -842,8 +836,7 @@ fallback_rows AS MATERIALIZED (
             OPERATOR(pg_catalog.||) '%'
           ) AS substring_pattern
         FROM lcm.messages AS message
-        WHERE input.allow_trigram
-          AND pg_catalog.octet_length(input.query)
+        WHERE pg_catalog.octet_length(input.query)
             OPERATOR(pg_catalog.>=) 3
           AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
           AND message.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
@@ -894,8 +887,7 @@ fallback_rows AS MATERIALIZED (
       scored.created_at DESC,
       scored.message_id DESC
     LIMIT CASE
-      WHEN input.allow_trigram
-        AND pg_catalog.octet_length(input.query)
+      WHEN pg_catalog.octet_length(input.query)
           OPERATOR(pg_catalog.>=) 3
         AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
         THEN GREATEST(
@@ -961,8 +953,7 @@ const SUMMARY_FULL_TEXT_SQL = `WITH input AS MATERIALIZED (
     pg_catalog.websearch_to_tsquery(
       'lcm.search_v1'::pg_catalog.regconfig,
       normalized.query
-    ) AS full_text_query,
-    $7::pg_catalog.bool AS allow_trigram
+    ) AS full_text_query
   FROM (
     SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query
   ) AS normalized
@@ -1090,8 +1081,7 @@ fallback_rows AS MATERIALIZED (
             OPERATOR(pg_catalog.||) '%'
           ) AS substring_pattern
         FROM lcm.summaries AS summary
-        WHERE input.allow_trigram
-          AND pg_catalog.octet_length(input.query)
+        WHERE pg_catalog.octet_length(input.query)
             OPERATOR(pg_catalog.>=) 3
           AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
           AND summary.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
@@ -1142,8 +1132,7 @@ fallback_rows AS MATERIALIZED (
       scored.created_at DESC,
       scored.summary_id DESC
     LIMIT CASE
-      WHEN input.allow_trigram
-        AND pg_catalog.octet_length(input.query)
+      WHEN pg_catalog.octet_length(input.query)
           OPERATOR(pg_catalog.>=) 3
         AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
         THEN GREATEST(
@@ -1209,8 +1198,7 @@ const PROMOTED_FULL_TEXT_SQL = `WITH input AS MATERIALIZED (
     pg_catalog.websearch_to_tsquery(
       'lcm.search_v1'::pg_catalog.regconfig,
       normalized.query
-    ) AS full_text_query,
-    $6::pg_catalog.bool AS allow_trigram
+    ) AS full_text_query
   FROM (
     SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query
   ) AS normalized
@@ -1373,8 +1361,7 @@ fallback_rows AS MATERIALIZED (
           )
         ) AS rank
       FROM lcm.promoted_memories AS memory
-      WHERE input.allow_trigram
-        AND pg_catalog.octet_length(input.query)
+      WHERE pg_catalog.octet_length(input.query)
           OPERATOR(pg_catalog.>=) 3
         AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
         AND memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
@@ -1450,8 +1437,7 @@ fallback_rows AS MATERIALIZED (
       ranked.created_at DESC,
       ranked.memory_id DESC
     LIMIT CASE
-      WHEN input.allow_trigram
-        AND pg_catalog.octet_length(input.query)
+      WHEN pg_catalog.octet_length(input.query)
           OPERATOR(pg_catalog.>=) 3
         AND fallback_budget.remaining OPERATOR(pg_catalog.>) 0
         THEN GREATEST(
@@ -1540,7 +1526,6 @@ export class PostgreSqlLexicalSearchRepository
               snapshot.since,
               snapshot.before,
               snapshot.limit,
-              hasTrigrams(snapshot.query),
             ],
           },
           context
@@ -1603,7 +1588,6 @@ export class PostgreSqlLexicalSearchRepository
               snapshot.since,
               snapshot.before,
               snapshot.limit,
-              hasTrigrams(snapshot.query),
             ],
           },
           context
@@ -1664,7 +1648,6 @@ export class PostgreSqlLexicalSearchRepository
               sourceProjectId,
               filterTags,
               limit,
-              hasTrigrams(query),
             ],
           },
           context

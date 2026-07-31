@@ -24,6 +24,10 @@ export interface LexicalSearchConformanceFixtures {
   readonly searchTimestamp: Date;
 }
 
+export interface LexicalSearchConformanceOptions {
+  readonly rejectsExplicitNullObjectLimits?: boolean;
+}
+
 function requireFixtures(
   fixtures: LexicalSearchConformanceFixtures | undefined
 ): LexicalSearchConformanceFixtures {
@@ -56,7 +60,8 @@ function expectBoundedSnippets(
  */
 export async function exerciseLexicalSearchRepositoryConformance(
   repository: LexicalSearchRepository,
-  prepared?: LexicalSearchConformanceFixtures
+  prepared?: LexicalSearchConformanceFixtures,
+  options: LexicalSearchConformanceOptions = {}
 ): Promise<void> {
   const fixtures = requireFixtures(prepared);
   const {
@@ -319,15 +324,29 @@ export async function exerciseLexicalSearchRepositoryConformance(
     await repository.searchMessages({
       query: "needle",
       mode: "full_text",
-      limit: 10,
     })
   ).toHaveLength(3);
   expect(
     await repository.searchSummaries({
       query: "needle",
       mode: "full_text",
-      limit: 10,
     })
   ).toHaveLength(3);
+  if (options.rejectsExplicitNullObjectLimits === true) {
+    await expect(
+      repository.searchMessages({
+        query: "needle",
+        mode: "full_text",
+        limit: null as never,
+      })
+    ).rejects.toBeInstanceOf(Error);
+    await expect(
+      repository.searchSummaries({
+        query: "needle",
+        mode: "full_text",
+        limit: null as never,
+      })
+    ).rejects.toBeInstanceOf(Error);
+  }
   expect(durable).toHaveLength(2);
 }

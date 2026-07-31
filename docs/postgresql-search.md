@@ -24,8 +24,8 @@ memory uses full-text search with trigram fill.
 - If primary matches do not fill the requested limit, a normalized
   `pg_trgm` substring/similarity query fills only the remaining slots.
   Previously selected IDs are excluded in SQL and deduplicated again at the
-  result boundary. Queries shorter than three UTF-8 bytes do not run the
-  trigram path.
+  result boundary. Queries whose database-normalized form is shorter than
+  three UTF-8 bytes do not run the trigram path.
 - Regex input is checked by LCM's safe-regex validator before PostgreSQL I/O.
   Accepted patterns use PostgreSQL's regular-expression operator. Invalid or
   potentially catastrophic patterns fail with a sanitized lexical-search data
@@ -57,11 +57,12 @@ SQL to message and summary searches. Promoted-memory rows must be active and
 can be restricted by exact, case-sensitive required tags and exact
 `source_project_id`; every required tag must exist before ranking and limiting.
 
-The default message and summary limit is 50. Limits must be safe nonnegative
-integers from 0 through 1,000; zero returns no rows. Promoted-memory callers
-must provide a limit in the same range. Full-text headlines use empty
-highlight markers, at most 32 words, and one fragment. Every message and
-summary snippet is additionally bounded to 512 PostgreSQL characters.
+The default message and summary limit is 50 when the field is omitted.
+Explicit runtime values, including `null`, must be safe nonnegative integers
+from 0 through 1,000; zero returns no rows. Promoted-memory callers must
+provide a limit in the same range. Full-text headlines use empty highlight
+markers, at most 32 words, and one fragment. Every message and summary snippet
+is additionally bounded to 512 PostgreSQL characters.
 PostgreSQL full-text snippets are generated from
 `lcm.normalize_search_text(content)` in the same `lcm.search_v1` domain as the
 indexed document and query, so they expose normalized text rather than the
@@ -89,12 +90,12 @@ Normalization performs PostgreSQL 18 Unicode fast lowercase mapping and the
 pinned PostgreSQL 18.4 `unaccent.rules` substitutions. Canonical source content
 and exact promoted tags remain unchanged.
 
-The runtime first uses raw UTF-8 query length as a conservative trigram
-prefilter. Every PostgreSQL trigram statement then requires the
-database-normalized query to contain at least three UTF-8 octets before
-evaluating substring or similarity predicates. This second gate covers
-multibyte input that the pinned mapping reduces to fewer than three bytes
-without duplicating the mapping in TypeScript.
+Every PostgreSQL trigram statement uses the database-normalized query as its
+only length authority and requires at least three UTF-8 octets before
+evaluating substring or similarity predicates. This admits mappings that
+expand across the boundary, such as `±` to `+/-`, while rejecting mappings
+that contract below it, such as `𝐚` to `a`, without duplicating the pinned
+mapping in TypeScript.
 
 PostgreSQL omits a parsed full-text lexeme whose normalized UTF-8 length reaches
 2,047 bytes. The harness proves that a 2,046-byte normalized lexeme is accepted

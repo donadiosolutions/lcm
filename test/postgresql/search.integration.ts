@@ -367,10 +367,10 @@ function planNodes(value: unknown): ReadonlyArray<Record<string, unknown>> {
   return [node, ...Object.values(node).flatMap(planNodes)];
 }
 
-function expectFallbackRelationNeverExecuted(
+function fallbackRelationNodes(
   plan: unknown,
   relationName: string
-): void {
+): ReadonlyArray<Record<string, unknown>> {
   const fallbackPlans = planNodes(plan).filter(
     (node) => node["Subplan Name"] === "CTE fallback_rows"
   );
@@ -379,9 +379,30 @@ function expectFallbackRelationNeverExecuted(
     .flatMap(planNodes)
     .filter((node) => node["Relation Name"] === relationName);
   expect(relationNodes.length).toBeGreaterThan(0);
+  return relationNodes;
+}
+
+function expectFallbackRelationNeverExecuted(
+  plan: unknown,
+  relationName: string
+): void {
+  const relationNodes = fallbackRelationNodes(plan, relationName);
   expect(relationNodes.map((node) => node["Actual Loops"])).toEqual(
     relationNodes.map(() => 0)
   );
+}
+
+function expectFallbackRelationExecuted(
+  plan: unknown,
+  relationName: string
+): void {
+  const relationNodes = fallbackRelationNodes(plan, relationName);
+  expect(
+    relationNodes.some(
+      (node) =>
+        Number(node["Actual Loops"]) > 0 && Number(node["Actual Rows"]) > 0
+    )
+  ).toBe(true);
 }
 
 type SnapshotDomain = "messages" | "summaries" | "promoted";
@@ -1171,7 +1192,7 @@ describe("PostgreSQL 18 lexical search", () => {
     }
   );
 
-  it("does not execute fallback relations when any fallback gate is closed", async () => {
+  it("executes fallback only for database-normalized eligible queries", async () => {
     await withPostgreSqlTestDatabase(
       "search-fallback-gates",
       async (database) => {
@@ -1185,42 +1206,164 @@ describe("PostgreSQL 18 lexical search", () => {
           projectId,
           "search-fallback-gates"
         );
-        await seedMessage(database, projectId, conversationId, {
-          seq: 0,
-          role: "user",
-          content: "a fullprimary message",
+        const normalizedExpansion = await database.migrator.query<{
+          normalized_query: string;
+          normalized_bytes: number;
+        }>(
+          {
+            text: `SELECT
+                     lcm.normalize_search_text($1) AS normalized_query,
+                     pg_catalog.octet_length(
+                       lcm.normalize_search_text($1)
+                     ) AS normalized_bytes`,
+            values: ["±"],
+          },
+          {
+            domain: "lexical-search",
+            operation: "inspectExpandedTrigramGate",
+          }
+        );
+        expect(normalizedExpansion.rows[0]).toEqual({
+          normalized_query: "+/-",
+          normalized_bytes: 3,
         });
-        await seedSummary(database, projectId, conversationId, {
-          id: "fallback-gate-summary",
-          kind: "leaf",
-          content: "a fullprimary summary",
-        });
-        await seedMemory(database, projectId, {
-          content: "a fullprimary memory",
+
+        const primaryMessage = await seedMessage(
+          database,
+          projectId,
+          conversationId,
+          {
+            seq: 0,
+            role: "user",
+            content: "± a fullprimary message",
+          }
+        );
+        const laterMessage = await seedMessage(
+          database,
+          projectId,
+          conversationId,
+          {
+            seq: 1,
+            role: "assistant",
+            content: "± expansion message",
+          }
+        );
+        const primarySummary = await seedSummary(
+          database,
+          projectId,
+          conversationId,
+          {
+            id: "fallback-gate-summary-a",
+            kind: "leaf",
+            content: "± a fullprimary summary",
+          }
+        );
+        const laterSummary = await seedSummary(
+          database,
+          projectId,
+          conversationId,
+          {
+            id: "fallback-gate-summary-z",
+            kind: "condensed",
+            content: "± expansion summary",
+          }
+        );
+        const primaryMemory = await seedMemory(database, projectId, {
+          content: "± a fullprimary memory",
           tags: [],
           sourceProjectId: "fallback-gate-source",
           confidence: 1,
         });
+        const laterMemory = await seedMemory(database, projectId, {
+          content: "± expansion memory",
+          tags: [],
+          sourceProjectId: "fallback-gate-source",
+          confidence: 0.9,
+        });
 
-        const cases = (
-          [
-            ["messages", "raw", "a", 10, "messages"],
-            ["messages", "normalized", "𝐚", 10, "messages"],
-            ["messages", "budget", "fullprimary", 1, "messages"],
-            ["summaries", "raw", "a", 10, "summaries"],
-            ["summaries", "normalized", "𝐚", 10, "summaries"],
-            ["summaries", "budget", "fullprimary", 1, "summaries"],
-            ["promoted", "raw", "a", 10, "promoted_memories"],
-            ["promoted", "normalized", "𝐚", 10, "promoted_memories"],
-            ["promoted", "budget", "fullprimary", 1, "promoted_memories"],
-          ] as const
-        ).map(([domain, gate, query, limit, relationName]) => ({
-          domain,
-          gate,
-          query,
-          limit,
-          relationName,
-        }));
+        const cases = [
+          {
+            domain: "messages",
+            gate: "expansion",
+            query: "±",
+            limit: 10,
+            relationName: "messages",
+            expectedIds: [laterMessage.id, primaryMessage.id],
+            executeFallback: true,
+          },
+          {
+            domain: "messages",
+            gate: "normalized",
+            query: "𝐚",
+            limit: 10,
+            relationName: "messages",
+            expectedIds: [primaryMessage.id],
+            executeFallback: false,
+          },
+          {
+            domain: "messages",
+            gate: "budget",
+            query: "fullprimary",
+            limit: 1,
+            relationName: "messages",
+            expectedIds: [primaryMessage.id],
+            executeFallback: false,
+          },
+          {
+            domain: "summaries",
+            gate: "expansion",
+            query: "±",
+            limit: 10,
+            relationName: "summaries",
+            expectedIds: [laterSummary, primarySummary],
+            executeFallback: true,
+          },
+          {
+            domain: "summaries",
+            gate: "normalized",
+            query: "𝐚",
+            limit: 10,
+            relationName: "summaries",
+            expectedIds: [primarySummary],
+            executeFallback: false,
+          },
+          {
+            domain: "summaries",
+            gate: "budget",
+            query: "fullprimary",
+            limit: 1,
+            relationName: "summaries",
+            expectedIds: [primarySummary],
+            executeFallback: false,
+          },
+          {
+            domain: "promoted",
+            gate: "expansion",
+            query: "±",
+            limit: 10,
+            relationName: "promoted_memories",
+            expectedIds: [laterMemory, primaryMemory],
+            executeFallback: true,
+          },
+          {
+            domain: "promoted",
+            gate: "normalized",
+            query: "𝐚",
+            limit: 10,
+            relationName: "promoted_memories",
+            expectedIds: [primaryMemory],
+            executeFallback: false,
+          },
+          {
+            domain: "promoted",
+            gate: "budget",
+            query: "fullprimary",
+            limit: 1,
+            relationName: "promoted_memories",
+            expectedIds: [primaryMemory],
+            executeFallback: false,
+          },
+        ] as const;
 
         await database.runtime.transaction(async (transaction) => {
           for (const testCase of cases) {
@@ -1248,10 +1391,20 @@ describe("PostgreSQL 18 lexical search", () => {
                     testCase.query,
                     testCase.limit
                   );
+            const observedIds = behavior.map((row) =>
+              "messageId" in row
+                ? row.messageId
+                : "summaryId" in row
+                ? row.summaryId
+                : row.id
+            );
             expect(
-              behavior,
-              `${testCase.domain}/${testCase.gate} production behavior`
-            ).toHaveLength(1);
+              observedIds,
+              `${testCase.domain}/${testCase.gate} production order`
+            ).toEqual(testCase.expectedIds);
+            if (testCase.executeFallback) {
+              expect(behavior.every((row) => row.rank >= 0)).toBe(true);
+            }
             expect(captured).toHaveLength(1);
             const explained = await transaction.query<{
               "QUERY PLAN": unknown;
@@ -1266,10 +1419,12 @@ describe("PostgreSQL 18 lexical search", () => {
                 projectId,
               }
             );
-            expectFallbackRelationNeverExecuted(
-              explained.rows[0]["QUERY PLAN"],
-              testCase.relationName
-            );
+            const plan = explained.rows[0]["QUERY PLAN"];
+            if (testCase.executeFallback) {
+              expectFallbackRelationExecuted(plan, testCase.relationName);
+            } else {
+              expectFallbackRelationNeverExecuted(plan, testCase.relationName);
+            }
           }
         });
       }
@@ -1306,7 +1461,9 @@ describe("PostgreSQL 18 lexical search", () => {
         database.runtime,
         projectId
       );
-      await exerciseLexicalSearchRepositoryConformance(repository, fixtures);
+      await exerciseLexicalSearchRepositoryConformance(repository, fixtures, {
+        rejectsExplicitNullObjectLimits: true,
+      });
       const legacyPrimaryMemory = await seedMemory(database, projectId, {
         content: "legacyprimaryneedle",
         tags: [],
