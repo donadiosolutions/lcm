@@ -1,5 +1,4 @@
 import {
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -114,5 +113,23 @@ describe("event sidecar discovery", () => {
     expect(await collectEventSidecars({ maxDbs: 0 })).toEqual([]);
     expect(scanMocks.open).not.toHaveBeenCalled();
     expect(scanMocks.lstat).toHaveBeenCalledWith(path);
+  });
+
+  it("stops fence authentication after the discovery deadline expires", async () => {
+    const hash = "c".repeat(64);
+    const path = join(scanMocks.eventsDir, `${hash}.db`);
+    mkdirSync(path);
+    writeFileSync(
+      join(path, "fence.json"),
+      serializeWorktreeReconciliationFence(hash, "events"),
+    );
+
+    const sidecars = await collectEventSidecars({ timeoutMs: -1 });
+
+    expect(sidecars).toHaveLength(1);
+    expect(sidecars[0].file).toBe(`${hash}.db`);
+    expect(sidecars[0].scanSkipped).toContain("timeout");
+    expect(scanMocks.lstat).not.toHaveBeenCalled();
+    expect(scanMocks.open).not.toHaveBeenCalled();
   });
 });

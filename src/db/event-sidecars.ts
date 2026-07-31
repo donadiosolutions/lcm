@@ -167,6 +167,7 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
           join(dir, entry.name),
           match[1]!,
           "events",
+          { _deadlineReached: () => Date.now() >= deadline },
         );
       })
       .map(entry => entry.name)

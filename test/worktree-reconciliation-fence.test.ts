@@ -1,6 +1,7 @@
 import {
   mkdirSync,
   mkdtempSync,
+  opendirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -110,5 +111,128 @@ describe("worktree reconciliation fences", () => {
     writeFileSync(target, serializeWorktreeReconciliationFence(hash, "events"));
     symlinkSync(target, marker);
     expect(isWorktreeReconciliationFence(path, hash, "events")).toBe(false);
+  });
+
+  it("reads at most two entries from a huge contaminated events fence", () => {
+    const path = join(root, `${hash}.db`);
+    mkdirSync(path);
+    writeFileSync(
+      join(path, "fence.json"),
+      serializeWorktreeReconciliationFence(hash, "events"),
+    );
+    for (let index = 0; index < 4_096; index++) {
+      writeFileSync(join(path, `contaminant-${index.toString().padStart(4, "0")}`), "");
+    }
+    let reads = 0;
+    let closes = 0;
+
+    expect(isWorktreeReconciliationFence(path, hash, "events", {
+      _openDirectory: (directoryPath) => {
+        const directory = opendirSync(directoryPath);
+        return {
+          readSync: () => {
+            reads++;
+            return directory.readSync();
+          },
+          closeSync: () => {
+            closes++;
+            directory.closeSync();
+          },
+        } as ReturnType<typeof opendirSync>;
+      },
+    })).toBe(false);
+    expect(reads).toBeLessThanOrEqual(2);
+    expect(closes).toBe(1);
+  });
+
+  it("closes the events directory when the deadline expires between bounded reads", () => {
+    const path = join(root, `${hash}.db`);
+    mkdirSync(path);
+    writeFileSync(
+      join(path, "fence.json"),
+      serializeWorktreeReconciliationFence(hash, "events"),
+    );
+    let deadlineChecks = 0;
+    let reads = 0;
+    let closes = 0;
+
+    expect(isWorktreeReconciliationFence(path, hash, "events", {
+      _deadlineReached: () => ++deadlineChecks === 3,
+      _openDirectory: (directoryPath) => {
+        const directory = opendirSync(directoryPath);
+        return {
+          readSync: () => {
+            reads++;
+            return directory.readSync();
+          },
+          closeSync: () => {
+            closes++;
+            directory.closeSync();
+          },
+        } as ReturnType<typeof opendirSync>;
+      },
+    })).toBe(false);
+    expect(reads).toBe(1);
+    expect(closes).toBe(1);
+  });
+
+  it("does not open an events directory after the deadline expires following lstat", () => {
+    const path = join(root, `${hash}.db`);
+    mkdirSync(path);
+    let deadlineChecks = 0;
+    let opens = 0;
+
+    expect(isWorktreeReconciliationFence(path, hash, "events", {
+      _deadlineReached: () => ++deadlineChecks === 2,
+      _openDirectory: (directoryPath) => {
+        opens++;
+        return opendirSync(directoryPath);
+      },
+    })).toBe(false);
+    expect(opens).toBe(0);
+  });
+
+  it("does not inspect an events fence when its deadline is already exhausted", () => {
+    let opens = 0;
+
+    expect(isWorktreeReconciliationFence(join(root, `${hash}.db`), hash, "events", {
+      _deadlineReached: () => true,
+      _openDirectory: (directoryPath) => {
+        opens++;
+        return opendirSync(directoryPath);
+      },
+    })).toBe(false);
+    expect(opens).toBe(0);
+  });
+
+  it("closes the events directory when the deadline expires before marker validation", () => {
+    const path = join(root, `${hash}.db`);
+    mkdirSync(path);
+    writeFileSync(
+      join(path, "fence.json"),
+      serializeWorktreeReconciliationFence(hash, "events"),
+    );
+    let deadlineChecks = 0;
+    let reads = 0;
+    let closes = 0;
+
+    expect(isWorktreeReconciliationFence(path, hash, "events", {
+      _deadlineReached: () => ++deadlineChecks === 4,
+      _openDirectory: (directoryPath) => {
+        const directory = opendirSync(directoryPath);
+        return {
+          readSync: () => {
+            reads++;
+            return directory.readSync();
+          },
+          closeSync: () => {
+            closes++;
+            directory.closeSync();
+          },
+        } as ReturnType<typeof opendirSync>;
+      },
+    })).toBe(false);
+    expect(reads).toBe(2);
+    expect(closes).toBe(1);
   });
 });
