@@ -70,7 +70,7 @@ class MigrationRuntime {
   healthStatus: "healthy" | "unhealthy" = "healthy";
   transactionCalls = 0;
   failTransactionAt: number | null = null;
-  uncertainAfterCommit = false;
+  uncertainTransactionsRemaining = 0;
   relationalViolations = "0";
   sampleMismatch = false;
   schema = loadPostgreSqlMigrations().map(({ id, sha256 }) => ({ migration_id: id, sha256 }));
@@ -141,7 +141,10 @@ class MigrationRuntime {
         this.transactionCalls += 1;
         if (this.failTransactionAt === this.transactionCalls) throw new Error("injected PostgreSQL transaction failure");
         const value = await callback(scope);
-        if (this.uncertainAfterCommit) throw new (await import("../src/storage/postgresql/errors.js")).PostgreSqlCommitOutcomeUnknownError(_options);
+        if (this.uncertainTransactionsRemaining > 0) {
+          this.uncertainTransactionsRemaining -= 1;
+          throw new (await import("../src/storage/postgresql/errors.js")).PostgreSqlCommitOutcomeUnknownError(_options);
+        }
         return value;
       },
     };
@@ -537,7 +540,7 @@ describe("migration safety helpers and blockers", () => {
     const uncertain = fixture();
     const uncertainGeneration = planProjectMigration(uncertain.options).generationId;
     await dryRunProjectMigration(uncertainGeneration, uncertain.options);
-    uncertain.runtime.uncertainAfterCommit = true;
+    uncertain.runtime.uncertainTransactionsRemaining = 1;
     await applyProjectMigration(uncertainGeneration, uncertain.options);
     expect(readMigrationManifest(uncertainGeneration, uncertain.home).projects[0]?.tables[0]?.remoteOutcome).toBe("readback-verified");
 
