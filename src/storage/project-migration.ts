@@ -829,9 +829,8 @@ function assertJournalIdentity(journal: MigrationPublicationJournal, manifest: M
     expectedCanonicalPath,
     expectedAliasesSha256,
   }: MigrationPublicationJournal["projects"][number]) => ({ generationId, localProjectId, remoteProjectId, sourceFingerprintSha256, expectedCanonicalPath, expectedAliasesSha256 });
-  const sort = <T extends { readonly localProjectId: string }>(projects: readonly T[]) => [...projects].sort((left, right) => left.localProjectId.localeCompare(right.localProjectId));
-  const actual = sort(journal.projects.map(fields));
-  const expected = sort(journalProjectIdentities(manifest));
+  const actual = journal.projects.map(fields);
+  const expected = journalProjectIdentities(manifest);
   if (canonicalJson(actual) !== canonicalJson(expected)) throw new Error("publication journal project identity or source fingerprint changed");
 }
 
