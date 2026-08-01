@@ -18,9 +18,10 @@ import { clearProjectMapCache, hashProjectPath, projectMapPath, readProjectMapSn
 import { machineIdentityPath } from "../src/machine-identity.js";
 import { loadPostgreSqlMigrations } from "../src/storage/postgresql/migrations.js";
 import { PostgreSqlWorkCoordinator } from "../src/storage/postgresql/coordination.js";
-import type {
-  PostgreSqlMigrationRuntime,
-  PostgreSqlMigrationIdentity,
+import {
+  PostgreSqlMigrationAdapter,
+  type PostgreSqlMigrationRuntime,
+  type PostgreSqlMigrationIdentity,
 } from "../src/storage/postgresql/migration-adapter.js";
 import type {
   PostgreSqlOperationContext,
@@ -597,5 +598,134 @@ describe("migration safety helpers and blockers", () => {
     expect(blocked.blockers).toContain("live PostgreSQL storage factory did not close cleanly");
     expect(readFileSync(configPath(current.home))).toEqual(beforeConfig);
     expect(readFileSync(projectMapPath(current.home))).toEqual(beforeMap);
+  });
+
+  it("aggregates installation, project, delivery, and factory activation blockers", async () => {
+    const current = fixture();
+    const generationId = await forwardToVerified(current);
+    const manifest = readMigrationManifest(generationId, current.home);
+    writePrivate(join(lcmHomeDir(current.home), "daemon.pid"), `${process.pid}\n`);
+    const orphan = join(projectsDir(current.home), "f".repeat(64), "db.sqlite");
+    mkdirSync(dirname(orphan), { recursive: true, mode: 0o700 });
+    cpSync(current.databasePath, orphan);
+    const eventPath = join(lcmHomeDir(current.home), "events", `${current.localProjectId}.db`);
+    mkdirSync(dirname(eventPath), { recursive: true, mode: 0o700 });
+    const event = new DatabaseSync(eventPath);
+    event.exec("CREATE TABLE events (delivery_state TEXT); INSERT INTO events VALUES ('pending')");
+    event.close();
+    current.factory.projectExists.mockResolvedValue(false);
+    current.factory.close.mockRejectedValueOnce(new Error("close failed"));
+    const degraded = {
+      ...manifest,
+      status: "applied" as const,
+      schemaManifestSha256: "0".repeat(64),
+      coverage: { ...manifest.coverage, inventorySha256: "1".repeat(64) },
+      projects: manifest.projects.map((project) => ({
+        ...project,
+        status: "applied" as const,
+        sourceFingerprint: project.sourceFingerprint === null ? null : {
+          ...project.sourceFingerprint,
+          main: { ...project.sourceFingerprint.main, sha256: "2".repeat(64) },
+        },
+      })),
+    };
+    const blockers = await PROJECT_MIGRATION_TEST_SEAMS.activationBlockers(
+      degraded,
+      current.options,
+      { ...PROJECT_MIGRATION_TEST_SEAMS.dependencies(current.options), processAlive: () => true },
+    );
+    expect(blockers).toEqual(expect.arrayContaining([
+      "generation is not terminal verified",
+      "LCM daemon is not stopped",
+      "schema or manifest checksum changed",
+      "installation coverage contains orphan local storage artifacts",
+      "installation-wide project coverage changed after planning",
+      `project:${current.localProjectId.slice(0, 12)} is not verified`,
+      `project:${current.localProjectId.slice(0, 12)} source fingerprint changed`,
+      `project:${current.localProjectId.slice(0, 12)} local delivery is not quiescent`,
+      `project:${current.localProjectId.slice(0, 12)} is not usable through the live PostgreSQL factory`,
+      "live PostgreSQL storage factory did not close cleanly",
+    ]));
+
+    const failingFactory = fixture();
+    const failingGeneration = await forwardToVerified(failingFactory);
+    const failingManifest = readMigrationManifest(failingGeneration, failingFactory.home);
+    failingFactory.factory.health.mockRejectedValueOnce(new Error("health failed"));
+    failingFactory.factory.close.mockRejectedValueOnce(new Error("close failed"));
+    const factoryBlockers = await PROJECT_MIGRATION_TEST_SEAMS.activationBlockers(
+      failingManifest,
+      failingFactory.options,
+      PROJECT_MIGRATION_TEST_SEAMS.dependencies(failingFactory.options),
+    );
+    expect(factoryBlockers).toContain("live PostgreSQL storage factory behavioral check failed");
+    expect(factoryBlockers).not.toContain("live PostgreSQL storage factory did not close cleanly");
+  }, 20_000);
+
+  it("rejects every independently stale project-map identity field", () => {
+    const current = fixture();
+    const generationId = planProjectMigration(current.options).generationId;
+    const project = readMigrationManifest(generationId, current.home).projects[0]!;
+    const valid = readProjectMapSnapshot(current.home)[current.localProjectId]!;
+    expect(PROJECT_MIGRATION_TEST_SEAMS.expectedMapEntry({ [current.localProjectId]: valid }, project)).toEqual(valid);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.expectedMapEntry({}, project)).toThrow("disappeared from the project map");
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.expectedMapEntry({ [current.localProjectId]: { ...valid, canonical: dirname(current.projectPath) } }, project)).toThrow("project-map identity changed");
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.expectedMapEntry({ [current.localProjectId]: { ...valid, remoteProjectId: machineId } }, project)).toThrow("project-map identity changed");
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.expectedMapEntry({ [current.localProjectId]: { ...valid, aliases: [dirname(current.projectPath)] } }, project)).toThrow("project-map identity changed");
+  });
+
+  it("rejects stale and incompatible activation journals before publication", async () => {
+    const current = fixture();
+    const generationId = await forwardToVerified(current);
+    const manifest = readMigrationManifest(generationId, current.home);
+    const deps = PROJECT_MIGRATION_TEST_SEAMS.dependencies(current.options);
+    const changedSource = {
+      ...manifest,
+      projects: manifest.projects.map((project) => ({ ...project, sourceFingerprint: project.sourceFingerprint === null ? null : { ...project.sourceFingerprint, main: { ...project.sourceFingerprint.main, sha256: "0".repeat(64) } } })),
+    };
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(changedSource, current.options, deps)).toThrow("changed during activation");
+
+    const crashing = { ...deps, crash: (point: MigrationCrashPoint) => { if (point === "after-prepare") throw new Error("stop after prepare"); } };
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(manifest, current.options, crashing)).toThrow("stop after prepare");
+    const prepared = readPublicationJournal(generationId, current.home)!;
+    writePublicationJournal(generationId, { ...prepared, operation: "pre-write-rollback" }, current.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(manifest, current.options, deps)).toThrow("operation does not match activation");
+    writePublicationJournal(generationId, { ...prepared, operation: "activate", phase: "completed" }, current.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(manifest, current.options, deps)).not.toThrow();
+    writePublicationJournal(generationId, { ...prepared, expectedConfigSha256: "0".repeat(64) }, current.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(manifest, current.options, deps)).toThrow("configuration changed during activation publication");
+
+    writePrivate(configPath(current.home), `${JSON.stringify({ storage: { backend: "postgresql" } }, null, 2)}\n`);
+    writePublicationJournal(generationId, {
+      ...prepared,
+      expectedConfigSha256: PROJECT_MIGRATION_TEST_SEAMS.configSha256(current.home),
+      publishedConfigSha256: "1".repeat(64),
+      phase: "recovery",
+    }, current.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(manifest, current.options, deps)).toThrow("published PostgreSQL configuration changed");
+  }, 15_000);
+
+  it("rejects invalid and stale pre-write rollback publications", () => {
+    const current = fixture();
+    const generationId = planProjectMigration(current.options).generationId;
+    const manifest = readMigrationManifest(generationId, current.home);
+    const deps = PROJECT_MIGRATION_TEST_SEAMS.dependencies(current.options);
+    const copied = { ...manifest, projects: manifest.projects.map((project) => ({ ...project, tables: project.tables.map((table, index) => index === 0 ? { ...table, copiedRows: 1 } : table) })) };
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(copied, current.options, deps)).toThrow("unavailable after remote writes");
+    writePrivate(configPath(current.home), `${JSON.stringify({ storage: { backend: "postgresql" } })}\n`);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(manifest, current.options, deps)).toThrow("expected the global SQLite backend");
+    writePrivate(configPath(current.home), `${JSON.stringify({ storage: { backend: "sqlite" } })}\n`);
+
+    const stop = { ...deps, crash: (point: MigrationCrashPoint) => { if (point === "after-prepare") throw new Error("stop after prepare"); } };
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(manifest, current.options, stop)).toThrow("stop after prepare");
+    const prepared = readPublicationJournal(generationId, current.home)!;
+    writePublicationJournal(generationId, { ...prepared, operation: "activate" }, current.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(manifest, current.options, deps)).toThrow("operation does not match pre-write rollback");
+    writePublicationJournal(generationId, { ...prepared, phase: "completed" }, current.home);
+    expect(PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(manifest, current.options, deps).projects[0]?.status).toBe("rolled-back");
+    expect(PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback({ ...manifest, projects: manifest.projects.map((project) => ({ ...project, verifiedAt: now })) }, current.options, deps).projects[0]?.verifiedAt).toBe(now);
+
+    writePublicationJournal(generationId, prepared, current.home);
+    writePrivate(configPath(current.home), `${JSON.stringify({ storage: { backend: "sqlite" }, changed: true })}\n`);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(manifest, current.options, deps)).toThrow("configuration changed during pre-write rollback");
   });
 });
