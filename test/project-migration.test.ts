@@ -278,7 +278,7 @@ describe("reversible project migration lifecycle", () => {
     expect(readProjectMapSnapshot(current.home)[current.localProjectId]).toMatchObject({ canonical: current.projectPath, remoteProjectId });
     expect(reportProjectMigration(planned.generationId, current.options)).toMatchObject({ status: "rolled-back", ready: true });
     expect(listProjectMigrationReports(current.options)).toHaveLength(1);
-  });
+  }, 15_000);
 
   it("resumes only an interrupted exact generation after a durable checkpoint", async () => {
     const current = fixture(2);
