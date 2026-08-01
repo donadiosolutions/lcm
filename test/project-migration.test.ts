@@ -989,7 +989,8 @@ describe("migration safety helpers and blockers", () => {
     writePublicationJournal(generationId, { ...prepared, projects: prepared.projects.map((project) => ({ ...project, stagedSqlitePath: "/private/wrong.sqlite" })) }, current.home);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("filesystem path changed");
     const preWriteProjects = prepared.projects.map(({ stagedSqlitePath: _staged, archivedMainPath: _main, archivedWalPath: _wal, ...project }) => ({ ...project, published: false }));
-    writePublicationJournal(generationId, { ...prepared, operation: "pre-write-rollback", expectedBackend: "sqlite", priorPublicationJournalSha256: undefined, projects: preWriteProjects }, current.home);
+    const { priorPublicationJournalSha256: _priorJournal, ...preWriteJournal } = prepared;
+    writePublicationJournal(generationId, { ...preWriteJournal, operation: "pre-write-rollback", expectedBackend: "sqlite", projects: preWriteProjects }, current.home);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("operation does not match post-write rollback");
     writePublicationJournal(generationId, { ...prepared, phase: "completed" }, current.home);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).not.toThrow();
