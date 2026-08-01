@@ -1,7 +1,10 @@
 import {
-  copyFileSync,
+  closeSync,
+  constants,
   existsSync,
+  fsyncSync,
   lstatSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -311,7 +314,7 @@ function result(operation: MigrationOperation, manifest: MigrationManifest, bloc
     operation,
     generationId: manifest.generationId,
     status: manifest.status,
-    ready: blockers.length === 0 && manifest.status === "verified",
+    ready: blockers.length === 0 && ["verified", "active", "rolled-back"].includes(manifest.status),
     blockers,
     projects: manifest.projects.map(({ identity, status }) => ({
       localProjectId: identity.localProjectId,
@@ -990,12 +993,25 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
       const staged = state.stagedSqlitePath!;
       const incoming = `${canonical}.incoming-${manifest.generationId}`;
       if (!existsSync(incoming)) {
-        copyFileSync(staged, incoming, constantsForCopy());
+        if (!deps.copyPrivate(staged, incoming, { allowedRoot: dirname(staged) })) {
+          throw new Error(`project:${sanitizedId(state.localProjectId)} reverse staging path collided`);
+        }
       }
-      if (existsSync(canonical) && !existsSync(state.archivedMainPath!)) renameSync(canonical, state.archivedMainPath!);
+      const stagedFingerprint = fingerprintMigrationFileSync(staged, dirname(staged));
+      const incomingFingerprint = fingerprintMigrationFileSync(incoming, dirname(incoming));
+      if (stagedFingerprint.size !== incomingFingerprint.size || stagedFingerprint.sha256 !== incomingFingerprint.sha256) {
+        throw new Error(`project:${sanitizedId(state.localProjectId)} reverse incoming database diverged`);
+      }
+      if (existsSync(canonical) && !existsSync(state.archivedMainPath!)) {
+        durableRename(canonical, state.archivedMainPath!);
+      }
       if (existsSync(`${canonical}-wal`) && !existsSync(state.archivedWalPath!)) renameSync(`${canonical}-wal`, state.archivedWalPath!);
-      if (!existsSync(canonical)) renameSync(incoming, canonical);
+      if (!existsSync(canonical)) durableRename(incoming, canonical);
       if (!existsSync(canonical)) throw new Error(`project:${sanitizedId(state.localProjectId)} reverse database publication failed`);
+      const publishedFingerprint = fingerprintMigrationFileSync(canonical, dirname(canonical));
+      if (publishedFingerprint.size !== stagedFingerprint.size || publishedFingerprint.sha256 !== stagedFingerprint.sha256) {
+        throw new Error(`project:${sanitizedId(state.localProjectId)} canonical reverse database diverged`);
+      }
       published[index] = { ...state, published: true };
       journal = { ...journal, phase: "recovery", updatedAt: timestamp(deps), projects: published };
       writePublicationJournal(manifest.generationId, journal, home);
@@ -1019,8 +1035,10 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
   }, home);
 }
 
-function constantsForCopy(): number {
-  return 0;
+function durableRename(source: string, destination: string): void {
+  renameSync(source, destination);
+  const directory = openSync(dirname(destination), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try { fsyncSync(directory); } finally { closeSync(directory); }
 }
 
 export async function rollbackProjectMigration(generationId: string, options: ProjectMigrationOptions = {}): Promise<ProjectMigrationResult> {
