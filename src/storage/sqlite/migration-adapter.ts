@@ -29,7 +29,7 @@ export interface SqliteMigrationSnapshotOptions {
 }
 
 type RawRow = Record<string, unknown>;
-type TableDescriptor = { readonly name: string; readonly select: string; readonly orderBy: string; readonly normalize?: (row: RawRow) => MigrationRow };
+type TableDescriptor = { readonly name: string; readonly select: string; readonly orderBy: string; readonly normalize: (row: RawRow) => MigrationRow };
 
 function text(value: unknown, field: string): string {
   if (typeof value !== "string" || value.includes("\0")) throw new Error(`${field} is not valid text`);
@@ -163,7 +163,7 @@ export async function createSqliteMigrationSnapshot(sourcePath: string, destinat
   options._afterBackupForTesting?.();
   chmodSync(destinationPath, PRIVATE_FILE_MODE);
   const destination = lstatSync(destinationPath);
-  if (!destination.isFile() || destination.isSymbolicLink() || destination.nlink !== 1) throw new Error("SQLite backup destination is not a private single-link file");
+  if (!destination.isFile() || destination.nlink !== 1) throw new Error("SQLite backup destination is not a private single-link file");
   const afterMain = fingerprintMigrationFileSync(sourcePath, dirname(sourcePath));
   const afterWal = optionalFingerprint(`${sourcePath}-wal`);
   assertSourceUnchanged(beforeMain, beforeWal, afterMain, afterWal);
@@ -197,14 +197,14 @@ export class SqliteMigrationReader {
     if (!Number.isSafeInteger(limit) || limit <= 0) throw new RangeError("limit must be positive");
     const entry = descriptor(table);
     const rows = this.db.prepare(`SELECT ${entry.select} FROM ${sourceTable(entry.name)} ORDER BY ${entry.orderBy} LIMIT ? OFFSET ?`).all(limit, offset) as RawRow[];
-    return rows.map((row) => (entry.normalize ?? baseRow)(row));
+    return rows.map((row) => entry.normalize(row));
   }
 
   *iterate(table: string): IterableIterator<MigrationRow> {
     this.assertOpen();
     const entry = descriptor(table);
     const statement = this.db.prepare(`SELECT ${entry.select} FROM ${sourceTable(entry.name)} ORDER BY ${entry.orderBy}`);
-    for (const row of statement.iterate() as IterableIterator<RawRow>) yield (entry.normalize ?? baseRow)(row);
+    for (const row of statement.iterate() as IterableIterator<RawRow>) yield entry.normalize(row);
   }
 
   sample(table: string, count: number): MigrationRow[] { return this.readBatch(table, 0, count); }

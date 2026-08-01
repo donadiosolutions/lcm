@@ -1,6 +1,7 @@
 import {
   chmodSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -72,6 +73,37 @@ function migrationRows(): Readonly<Record<string, readonly MigrationRow[]>> {
       snapshot_hash: "snapshot",
       compaction_auto: false,
       metadata: "{}",
+    }, {
+      part_id: "018f1234-5678-7abc-8def-0123456789ad",
+      message_id: 1,
+      session_id: "session",
+      part_type: "text",
+      ordinal: 1,
+      text_content: null,
+      is_ignored: null,
+      is_synthetic: null,
+      tool_call_id: null,
+      tool_name: null,
+      tool_status: null,
+      tool_input: null,
+      tool_output: null,
+      tool_error: null,
+      tool_title: null,
+      patch_hash: null,
+      patch_files: null,
+      file_mime: null,
+      file_name: null,
+      file_url: null,
+      subtask_prompt: null,
+      subtask_desc: null,
+      subtask_agent: null,
+      step_reason: null,
+      step_cost: null,
+      step_tokens_in: null,
+      step_tokens_out: null,
+      snapshot_hash: null,
+      compaction_auto: null,
+      metadata: null,
     }],
     summaries: [
       { summary_id: "summary-parent", conversation_id: 1, kind: "leaf", depth: 0, content: "parent", token_count: 1, earliest_at: now, latest_at: now, descendant_count: 0, descendant_token_count: 0, source_message_token_count: 1, created_at: now },
@@ -98,6 +130,7 @@ function createPopulatedDatabase(path: string): ReturnType<SqliteMigrationWriter
   const writer = new SqliteMigrationWriter(path);
   for (const { name } of SQLITE_MIGRATION_TABLES) writer.writeBatch(name, migrationRows()[name]!);
   const inventory = writer.verify();
+  writer.checkpointAndClose();
   writer.checkpointAndClose();
   return inventory;
 }
@@ -199,7 +232,7 @@ describe("SQLite migration reader and writer", () => {
     const path = join(root, "reverse.sqlite");
     const expected = createPopulatedDatabase(path);
     expect(expected.map(({ table }) => table)).toEqual(SQLITE_MIGRATION_TABLES.map(({ name }) => name));
-    expect(expected.reduce((sum, table) => sum + table.rows, 0)).toBe(18);
+    expect(expected.reduce((sum, table) => sum + table.rows, 0)).toBe(19);
     expect(lstatSync(path).mode & 0o777).toBe(0o600);
     expect(existsSync(`${path}-wal`)).toBe(false);
 
@@ -329,6 +362,22 @@ describe("online SQLite migration snapshots", () => {
     const unsafe = join(root, "unsafe");
     mkdirSync(unsafe, { mode: 0o755 });
     await expect(createSqliteMigrationSnapshot(source, join(unsafe, "snapshot.sqlite"))).rejects.toThrow("migration generation directory must use mode 0700");
+    const directoryDestination = join(root, "directory-destination.sqlite");
+    await expect(createSqliteMigrationSnapshot(source, directoryDestination, {
+      _afterBackupForTesting: () => {
+        rmSync(directoryDestination);
+        mkdirSync(directoryDestination, { mode: 0o700 });
+      },
+    })).rejects.toThrow("SQLite backup destination is not a private single-link file");
+    const hardLinkDestination = join(root, "hard-link-destination.sqlite");
+    const anchor = join(root, "hard-link-anchor.sqlite");
+    await expect(createSqliteMigrationSnapshot(source, hardLinkDestination, {
+      _afterBackupForTesting: () => {
+        rmSync(hardLinkDestination);
+        writeFileSync(anchor, "unsafe", { mode: 0o600 });
+        linkSync(anchor, hardLinkDestination);
+      },
+    })).rejects.toThrow("SQLite backup destination is not a private single-link file");
     const sourceLink = join(root, "source-link.sqlite");
     symlinkSync(source, sourceLink);
     await expect(createSqliteMigrationSnapshot(sourceLink, join(root, "linked-snapshot.sqlite"))).rejects.toThrow();
