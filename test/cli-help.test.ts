@@ -178,6 +178,20 @@ describe("printHelp — per-command detail", () => {
     expect(postgresText).toContain("does not install extensions or grant runtime privileges");
   });
 
+  it("prints reversible migration help with safety and recovery requirements", () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    printHelp("migration");
+    const text = out.mock.calls.map(c => c[0]).join("");
+    expect(text).toContain("lcm migration <plan|dry-run|apply|resume|verify|report|activate|rollback>");
+    expect(text).toContain("--confirm <generation-id>");
+    expect(text).toContain("--batch-size <rows>");
+    expect(text).toContain("--sample-size <rows>");
+    expect(text).toContain("required read-only destination rehearsal");
+    expect(text).toContain("SQLite sources and WAL files are retained byte-for-byte");
+    expect(text).toContain("crash-recoverable, not cross-file atomic");
+    expect(text).toContain("--json keeps stdout machine-pure");
+  });
+
   it("prints import command help with Codex provider flags", () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     printHelp("import");
