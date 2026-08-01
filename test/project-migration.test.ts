@@ -8,7 +8,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { configPath, lcmHomeDir, projectsDir } from "../src/runtime-paths.js";
 import { clearProjectMapCache, hashProjectPath, projectMapPath, readProjectMapSnapshot } from "../src/project-map.js";
 import { machineIdentityPath } from "../src/machine-identity.js";
+import { loadDaemonConfig } from "../src/daemon/config.js";
 import { loadPostgreSqlMigrations } from "../src/storage/postgresql/migrations.js";
 import { PostgreSqlWorkCoordinator } from "../src/storage/postgresql/coordination.js";
 import {
@@ -356,7 +357,7 @@ describe("publication crash recovery", () => {
 });
 
 describe("migration safety helpers and blockers", () => {
-  it("bounds options and sanitizes progress and failures", () => {
+  it("bounds options and sanitizes progress and failures", async () => {
     const seam = PROJECT_MIGRATION_TEST_SEAMS;
     expect(seam.positiveOption(undefined, 5, "batchSize")).toBe(5);
     expect(seam.positiveOption(1, 5, "batchSize")).toBe(1);
@@ -372,11 +373,21 @@ describe("migration safety helpers and blockers", () => {
     expect(seam.emptyDigest()).toMatch(/^[a-f0-9]{64}$/u);
     expect(seam.schemaContract().migrations).toHaveLength(5);
     expect(seam.actualHome({ homeDir: "." })).toBe(resolve("."));
+    expect(seam.actualHome({})).toBe(resolve(homedir()));
     expect(seam.timestamp({ ...seam.dependencies({}), now: () => new Date(now) })).toBe(now);
     const defaults = seam.dependencies({});
     expect(defaults.now()).toBeInstanceOf(Date);
     expect(defaults.processAlive(process.pid)).toBe(true);
     expect(defaults.processAlive(2_147_483_647)).toBe(false);
+    const current = fixture();
+    const storage = loadDaemonConfig(configPath(current.home), { storage: { backend: "postgresql" } }, current.options.env).storage;
+    expect(storage.backend).toBe("postgresql");
+    if (storage.backend === "postgresql") {
+      const runtime = defaults.createRuntime(storage.postgresql);
+      await runtime.close();
+      const factory = defaults.createFactory(storage);
+      await factory.close();
+    }
   });
 
   it("detects local artifacts, orphan coverage, daemon state, and delivery blockers", () => {
@@ -391,6 +402,9 @@ describe("migration safety helpers and blockers", () => {
 
     const missingEvent = join(lcmHomeDir(current.home), "events", `${current.localProjectId}.db`);
     expect(seam.readDeliveryGate(missingEvent, now)).toEqual({ blockingOutbox: 0, quarantined: 0, checkedAt: now });
+    expect(seam.deliveryGate([{ delivery_state: "pending", count: 2 }], now)).toEqual({ blockingOutbox: 2, quarantined: 0, checkedAt: now });
+    expect(() => seam.deliveryGate([{ delivery_state: "pending", count: "2" }], now)).toThrow("local outbox diagnostics are invalid");
+    expect(() => seam.deliveryGate([{ delivery_state: null, count: 1 }], now)).toThrow("local outbox diagnostics are invalid");
     mkdirSync(dirname(missingEvent), { recursive: true, mode: 0o700 });
     const events = new DatabaseSync(missingEvent);
     events.exec("CREATE TABLE events (delivery_state TEXT NOT NULL); INSERT INTO events VALUES ('pending'), ('claimed'), ('retry'), ('replicated'), ('quarantined'), ('delivered')");
@@ -414,6 +428,10 @@ describe("migration safety helpers and blockers", () => {
     writePrivate(orphanEvent, "orphan");
     const expanded = seam.installationCoverage(current.home, readProjectMapSnapshot(current.home), now);
     expect(expanded.orphanArtifacts).toContain(`events/${"c".repeat(64)}.db`);
+    const emptyHome = mkdtempSync(join(tmpdir(), "lcm-empty-coverage-"));
+    roots.push(emptyHome);
+    mkdirSync(lcmHomeDir(emptyHome), { recursive: true, mode: 0o700 });
+    expect(seam.installationCoverage(emptyHome, {}, now)).toMatchObject({ complete: true, activeLocalProjectIds: [], orphanArtifacts: [] });
   });
 
   it("validates project identity, source state, inventories, and manifest contracts", () => {
@@ -439,8 +457,49 @@ describe("migration safety helpers and blockers", () => {
     expect(seam.sourceFingerprint(manifest.projects[0]!, current.home)).toEqual({ main: null, wal: null });
     expect(seam.currentSourceMatches({ ...manifest.projects[0]!, sourceFingerprint: null }, current.home)).toBe(true);
     expect(seam.archiveOriginal({ ...manifest.projects[0]!, sourceFingerprint: null }, manifest.generationId, current.home, seam.dependencies(current.options))).toMatchObject({ sourceFingerprint: null });
+    expect(seam.updateProject(manifest, "0".repeat(64), manifest.projects[0]!, seam.dependencies(current.options)).projects).toEqual(manifest.projects);
     expect(() => seam.assertManifestContract({ ...manifest, schemaManifestSha256: "0".repeat(64) })).toThrow("migration schema or manifest checksum changed");
     expect(() => seam.assertManifestContract({ ...manifest, coverage: { ...manifest.coverage, complete: false, orphanArtifacts: ["orphan"] } })).toThrow("installation coverage contains orphan local storage artifacts");
+    const missingConfigHome = mkdtempSync(join(tmpdir(), "lcm-missing-config-"));
+    roots.push(missingConfigHome);
+    mkdirSync(lcmHomeDir(missingConfigHome), { recursive: true, mode: 0o700 });
+    expect(seam.configContent(missingConfigHome)).toBe("{}");
+  });
+
+  it("verifies retained main and WAL archives byte-for-byte", () => {
+    const mismatch = fixture();
+    const mismatchGeneration = planProjectMigration(mismatch.options).generationId;
+    const mismatchManifest = readMigrationManifest(mismatchGeneration, mismatch.home);
+    const mismatchProject = { ...mismatchManifest.projects[0]!, sourceFingerprint: PROJECT_MIGRATION_TEST_SEAMS.sourceFingerprint(mismatchManifest.projects[0]!, mismatch.home) as NonNullable<typeof mismatchManifest.projects[0]["sourceFingerprint"]> };
+    const mismatchDeps = {
+      ...PROJECT_MIGRATION_TEST_SEAMS.dependencies(mismatch.options),
+      copyPrivate: ((_from, to) => { writePrivate(to, "wrong bytes"); return true; }) satisfies ProjectMigrationDependencies["copyPrivate"],
+    };
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.archiveOriginal(mismatchProject, mismatchGeneration, mismatch.home, mismatchDeps)).toThrow("does not match the preserved source bytes");
+
+    const wal = fixture();
+    writePrivate(`${wal.databasePath}-wal`, "retained wal bytes");
+    const walGeneration = planProjectMigration(wal.options).generationId;
+    const walManifest = readMigrationManifest(walGeneration, wal.home);
+    const sourceFingerprint = PROJECT_MIGRATION_TEST_SEAMS.sourceFingerprint(walManifest.projects[0]!, wal.home);
+    expect(sourceFingerprint.wal).not.toBeNull();
+    const archived = PROJECT_MIGRATION_TEST_SEAMS.archiveOriginal(
+      { ...walManifest.projects[0]!, sourceFingerprint: sourceFingerprint as NonNullable<typeof walManifest.projects[0]["sourceFingerprint"]> },
+      walGeneration,
+      wal.home,
+      PROJECT_MIGRATION_TEST_SEAMS.dependencies(wal.options),
+    );
+    expect(archived.operationalEvidence.originalWalArchive?.sha256).toBe(sourceFingerprint.wal?.sha256);
+  });
+
+  it("closes an empty snapshot writer when checkpointing fails", () => {
+    const current = fixture();
+    const close = vi.spyOn(SqliteMigrationWriter.prototype, "close");
+    const checkpoint = vi.spyOn(SqliteMigrationWriter.prototype, "checkpointAndClose").mockImplementationOnce(() => { throw new Error("checkpoint failed"); });
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.emptySnapshot(join(lcmHomeDir(current.home), "failed-empty.sqlite"))).toThrow("checkpoint failed");
+    expect(close).toHaveBeenCalled();
+    checkpoint.mockRestore();
+    close.mockRestore();
   });
 
   it("fails planning for empty installations, orphan files, and missing bindings", () => {
@@ -476,6 +535,35 @@ describe("migration safety helpers and blockers", () => {
     const manifest = readMigrationManifest(planned.generationId, current.home);
     expect(manifest.projects[0]?.sourceFingerprint).toBeNull();
     expect(manifest.projects[0]?.snapshot?.logicalRows).toBe(0);
+    await applyProjectMigration(planned.generationId, current.options);
+    await verifyProjectMigration(planned.generationId, current.options);
+    await activateProjectMigration(planned.generationId, current.options);
+    await expect(rollbackProjectMigration(planned.generationId, current.options)).resolves.toMatchObject({ status: "rolled-back" });
+  });
+
+  it("checks the PostgreSQL schema once for multi-project dry-runs", async () => {
+    const current = fixture();
+    const secondPath = join(current.home, "workspace", "second");
+    mkdirSync(secondPath, { recursive: true, mode: 0o700 });
+    const secondLocalProjectId = hashProjectPath(resolve(secondPath));
+    const secondDatabase = join(projectsDir(current.home), secondLocalProjectId, "db.sqlite");
+    mkdirSync(dirname(secondDatabase), { recursive: true, mode: 0o700 });
+    createSource(secondDatabase, 1);
+    writePrivate(projectMapPath(current.home), `${JSON.stringify({
+      [current.localProjectId]: { canonical: current.projectPath, aliases: [], remoteProjectId },
+      [secondLocalProjectId]: { canonical: secondPath, aliases: [], remoteProjectId: "018f1234-5678-7abc-8def-0123456789ad" },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const empty = vi.spyOn(PostgreSqlMigrationAdapter.prototype, "assertEmptyDestination").mockResolvedValue(undefined);
+    const aliases = vi.spyOn(PostgreSqlMigrationAdapter.prototype, "verifyAliases").mockResolvedValue(undefined);
+    const schema = vi.spyOn(PostgreSqlMigrationAdapter.prototype, "schemaHistory");
+    const generationId = planProjectMigration(current.options).generationId;
+    await dryRunProjectMigration(generationId, current.options);
+    expect(readMigrationManifest(generationId, current.home).projects).toHaveLength(2);
+    expect(schema).toHaveBeenCalledTimes(1);
+    empty.mockRestore();
+    aliases.mockRestore();
+    schema.mockRestore();
   });
 
   it("fails dry-run for stale generations, registry drift, aliases, occupied state, and delivery queues", async () => {
@@ -489,6 +577,8 @@ describe("migration safety helpers and blockers", () => {
     const registryGeneration = planProjectMigration(registry.options).generationId;
     await expect(dryRunProjectMigration(registryGeneration, registry.options)).rejects.toThrow("registry or checksum");
     expect(readMigrationManifest(registryGeneration, registry.home).status).toBe("failed");
+    expect(reportProjectMigration(registryGeneration, registry.options).blockers).toHaveLength(1);
+    expect(listProjectMigrationReports(registry.options)[0]?.blockers).toHaveLength(1);
 
     const aliases = fixture();
     aliases.runtime.aliases = ["/wrong"];
