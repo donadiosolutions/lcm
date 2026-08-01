@@ -5,21 +5,48 @@ identified by the SHA-256 hash of its normalized canonical path. For a Git
 repository, LCM first resolves the verified Git common directory and uses the
 primary checkout as that canonical path, so linked worktrees share one local
 project. A primary checkout created with `git init --separate-git-dir` and all
-of its linked worktrees instead share that external Git directory as their
-stable local anchor. Git submodules remain independent projects anchored at
-their own checkouts. Non-Git directories continue to use their normalized path
-directly. LCM reads Git metadata through descriptor-bound, no-follow
-validation. `HEAD`, `gitdir`, `commondir`, and other topology pointers remain
-limited to 64 KiB; `.git/config` and `config.worktree` accept valid files up to
-4 MiB so accumulated branch metadata does not block project identity. Larger,
-symlinked, or non-regular metadata continues to fail closed.
+of its linked worktrees share that external Git directory as their stable local
+anchor only after the external configuration's final `core.worktree` value
+resolves back to the exact authenticated primary checkout. Relative
+`core.worktree` values follow Git's metadata-directory-relative semantics.
+Every standalone `.git` file pointer, whether absolute or relative, must supply
+that proof. Relative pointers retain submodule-style checkout anchoring only
+after verification; they cannot select unrelated metadata by traversal.
+Missing, ambiguous, mismatched, or race-changed backlinks fail before project
+storage opens. Git submodules remain independent projects anchored at their own
+checkouts. Git config `include` and `includeIf` directives are rejected for
+identity proof because their targets fall outside the bounded authenticated
+config snapshot. A repository-local `.git` directory may use only a `commondir` that
+remains inside that authenticated metadata root; local indirection cannot select
+another checkout's administration directory. Non-Git directories continue to
+use their normalized path directly.
+
+LCM reads Git metadata through descriptor-bound, no-follow validation and
+revalidates the marker, directories, topology pointers, and relevant config
+bytes before accepting the identity. `HEAD`, `gitdir`, `commondir`, and other
+topology pointers remain limited to 64 KiB; `.git/config` and
+`config.worktree` accept valid files up to 4 MiB so accumulated branch metadata
+does not block project identity. Larger, symlinked, non-regular, substituted,
+or escaping metadata continues to fail closed.
+
+Git does not always write `core.worktree` when initializing a separate Git
+directory. Make the relationship explicit before LCM first opens project
+storage:
+
+```bash
+git -C /work/project config --local core.worktree /work/project
+```
+
+Use the authenticated checkout's real path. Symlink aliases are not accepted as
+identity evidence.
 When Git's common config repeats `extensions.worktreeConfig`, including across
 multiple `[extensions]` sections, LCM follows Git's final-assignment behavior:
 the last supported true/yes/on/1 or implicit boolean enables per-worktree
 configuration, while the last false/no/off/0 disables it. Inline `#` and `;`
-comments on explicit supported values are preserved. Any malformed or
-unsupported occurrence fails closed instead of allowing an earlier or later
-truthy value to enable `config.worktree`.
+comments, quoted values, supported escapes, continued lines, CRLF input, and
+case-insensitive section and key names are parsed in one bounded linear pass.
+Any malformed or unsupported occurrence fails closed instead of allowing an
+earlier or later truthy value to enable `config.worktree`.
 The database and passive-learning sidecar remain under:
 
 ```text

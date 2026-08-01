@@ -1,6 +1,7 @@
 import {
   mkdirSync,
   mkdtempSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -15,6 +16,50 @@ const pathBoundary = vi.hoisted(() => ({
   redirectTo: "",
 }));
 
+const metadataRace = vi.hoisted((): {
+  afterRead: ((path: string) => void) | undefined;
+} => ({ afterRead: undefined }));
+
+const directoryAuthRace = vi.hoisted(() => ({
+  invalidDirectoryAt: 0,
+  lstatCount: 0,
+  lstatPath: "",
+  mismatchedStatAt: 0,
+  statCount: 0,
+  statPath: "",
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    lstatSync: ((path: Parameters<typeof actual.lstatSync>[0], options?: Parameters<typeof actual.lstatSync>[1]) => {
+      const stat = actual.lstatSync(path, options as never);
+      if (String(path) === directoryAuthRace.lstatPath) {
+        directoryAuthRace.lstatCount += 1;
+        if (directoryAuthRace.lstatCount === directoryAuthRace.invalidDirectoryAt) {
+          const changed = Object.create(stat) as typeof stat;
+          changed.isDirectory = (): boolean => false;
+          return changed;
+        }
+      }
+      return stat;
+    }) as typeof actual.lstatSync,
+    statSync: ((path: Parameters<typeof actual.statSync>[0], options?: Parameters<typeof actual.statSync>[1]) => {
+      const stat = actual.statSync(path, options as never);
+      if (String(path) === directoryAuthRace.statPath) {
+        directoryAuthRace.statCount += 1;
+        if (directoryAuthRace.statCount === directoryAuthRace.mismatchedStatAt) {
+          const changed = Object.create(stat) as typeof stat;
+          Object.defineProperty(changed, "dev", { value: Number(stat.dev) + 1 });
+          return changed;
+        }
+      }
+      return stat;
+    }) as typeof actual.statSync,
+  };
+});
+
 vi.mock("node:path", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:path")>();
   return {
@@ -22,6 +67,18 @@ vi.mock("node:path", async (importOriginal) => {
     dirname: (path: string): string => path === pathBoundary.redirectFrom
       ? pathBoundary.redirectTo
       : actual.dirname(path),
+  };
+});
+
+vi.mock("../src/security-files.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/security-files.js")>();
+  return {
+    ...actual,
+    readBoundedRegularFile: (path: string, options: Parameters<typeof actual.readBoundedRegularFile>[1]): string => {
+      const content = actual.readBoundedRegularFile(path, options);
+      metadataRace.afterRead?.(path);
+      return content;
+    },
   };
 });
 
@@ -68,6 +125,22 @@ function makeLinkedWorktree(primary: string, linked: string, name = "linked"): s
   return linked;
 }
 
+function makeStandaloneMetadata(
+  checkout: string,
+  metadata: string,
+  config: string,
+  absolutePointer = true,
+): void {
+  makeDirectory(checkout);
+  makeDirectory(join(metadata, "objects"));
+  writeFileSync(join(metadata, "HEAD"), "ref: refs/heads/main\n");
+  writeFileSync(join(metadata, "config"), config);
+  writeFileSync(
+    join(checkout, ".git"),
+    `gitdir: ${absolutePointer ? metadata : `../${metadata.split("/").at(-1)!}`}\n`,
+  );
+}
+
 function git(cwd: string, ...args: string[]): string {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr || result.stdout);
@@ -81,12 +154,26 @@ describe("Git project identity", () => {
     root = mkdtempSync(join(tmpdir(), "lcm-git-project-"));
     pathBoundary.redirectFrom = "";
     pathBoundary.redirectTo = "";
+    metadataRace.afterRead = undefined;
+    directoryAuthRace.invalidDirectoryAt = 0;
+    directoryAuthRace.lstatCount = 0;
+    directoryAuthRace.lstatPath = "";
+    directoryAuthRace.mismatchedStatAt = 0;
+    directoryAuthRace.statCount = 0;
+    directoryAuthRace.statPath = "";
     clearGitProjectAnchorCache();
   });
 
   afterEach(() => {
     pathBoundary.redirectFrom = "";
     pathBoundary.redirectTo = "";
+    metadataRace.afterRead = undefined;
+    directoryAuthRace.invalidDirectoryAt = 0;
+    directoryAuthRace.lstatCount = 0;
+    directoryAuthRace.lstatPath = "";
+    directoryAuthRace.mismatchedStatAt = 0;
+    directoryAuthRace.statCount = 0;
+    directoryAuthRace.statPath = "";
     clearGitProjectAnchorCache();
     rmSync(root, { recursive: true, force: true });
   });
@@ -191,11 +278,8 @@ describe("Git project identity", () => {
         worktreeRoot: submodule,
       });
     };
-    const expectMetadataAnchor = (): void => {
-      expect(resolveGitProjectAnchor(join(submodule, "nested"))).toMatchObject({
-        canonical: anchor.commonDir,
-        worktreeRoot: submodule,
-      });
+    const expectRejectedAnchor = (message: string): void => {
+      expect(() => resolveGitProjectAnchor(join(submodule, "nested"))).toThrow(message);
     };
 
     for (const line of [
@@ -221,7 +305,7 @@ describe("Git project identity", () => {
     ]) {
       writeWorktreeConfig(line);
       expect(configuredWorktreeBool()).toBe("false");
-      expectMetadataAnchor();
+      expectRejectedAnchor("expected one core.worktree path");
     }
 
     for (const [config, expected] of [
@@ -265,7 +349,7 @@ describe("Git project identity", () => {
       clearGitProjectAnchorCache();
       expect(configuredWorktreeBool()).toBe(expected ? "true" : "false");
       if (expected) expectSubmoduleAnchor();
-      else expectMetadataAnchor();
+      else expectRejectedAnchor("expected one core.worktree path");
     }
 
     for (const line of [
@@ -274,7 +358,7 @@ describe("Git project identity", () => {
     ]) {
       writeWorktreeConfig(line);
       expect(configuredWorktreeBool).toThrow();
-      expectMetadataAnchor();
+      expectRejectedAnchor("ambiguous worktree configuration");
     }
 
     writeFileSync(
@@ -290,7 +374,7 @@ describe("Git project identity", () => {
     );
     clearGitProjectAnchorCache();
     expect(configuredWorktreeBool).toThrow();
-    expectMetadataAnchor();
+    expectRejectedAnchor("ambiguous worktree configuration");
   });
 
   it("revalidates cached anchors when nearer or changed Git metadata appears", () => {
@@ -368,20 +452,24 @@ describe("Git project identity", () => {
       commonDir: shared,
     });
 
-    const relativeCheckout = makeDirectory(join(root, "relative-checkout"));
-    writeFileSync(join(relativeCheckout, ".git"), "gitdir: ../shared.git\n");
-    expect(resolveGitProjectAnchor(relativeCheckout)).toEqual({
+    const externalCheckout = makeDirectory(join(root, "external-checkout"));
+    writeFileSync(
+      join(shared, "config"),
+      `[core]\nrepositoryformatversion = 0\nworktree = ${externalCheckout}\n`,
+    );
+    writeFileSync(join(externalCheckout, ".git"), `gitdir: ${shared}\n`);
+    expect(resolveGitProjectAnchor(externalCheckout)).toEqual({
       canonical: shared,
-      worktreeRoot: relativeCheckout,
+      worktreeRoot: externalCheckout,
       commonDir: shared,
     });
 
     writeFileSync(
       join(shared, "config"),
-      "[core]\nrepositoryformatversion = 0\n[extensions]\nworktreeConfig = true\n",
+      `[core]\nrepositoryformatversion = 0\nworktree = ${externalCheckout}\n[extensions]\nworktreeConfig = true\n`,
     );
     clearGitProjectAnchorCache();
-    expect(resolveGitProjectAnchor(relativeCheckout)?.canonical).toBe(shared);
+    expect(resolveGitProjectAnchor(externalCheckout)?.canonical).toBe(shared);
   });
 
   it("uses one external anchor for a separate-git-dir primary and its linked worktree", () => {
@@ -413,6 +501,619 @@ describe("Git project identity", () => {
     git(primary, "config", "extensions.worktreeConfig", "true");
     clearGitProjectAnchorCache();
     expect(resolveGitProjectAnchor(primary)?.canonical).toBe(shared);
+  });
+
+  it("requires an exact final core.worktree backlink for standalone external metadata", () => {
+    const checkout = join(root, "verified#checkout");
+    const metadata = join(root, "verified-metadata");
+    makeStandaloneMetadata(
+      checkout,
+      metadata,
+      [
+        "[core]",
+        "worktree = ../wrong",
+        'worktree = "../verified#checkout" # final quoted backlink',
+        "[extensions]",
+        "worktreeConfig = true",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(metadata, "config.worktree"),
+      '[core]\r\nworktree = ../wrong\r\nworktree = "../verified#checkout" ; final\r\n',
+    );
+    expect(resolveGitProjectAnchor(checkout)).toEqual({
+      canonical: metadata,
+      worktreeRoot: checkout,
+      commonDir: metadata,
+    });
+
+    const absentCheckout = join(root, "absent-checkout");
+    const absentMetadata = join(root, "absent-metadata");
+    makeStandaloneMetadata(
+      absentCheckout,
+      absentMetadata,
+      "[core]\nrepositoryformatversion = 0\n",
+    );
+    expect(() => resolveGitProjectAnchor(absentCheckout)).toThrow(
+      "expected one core.worktree path",
+    );
+
+    const relativeAbsentCheckout = join(root, "relative-absent-checkout");
+    const relativeAbsentMetadata = join(root, "relative-absent-metadata");
+    makeStandaloneMetadata(
+      relativeAbsentCheckout,
+      relativeAbsentMetadata,
+      "[core]\nrepositoryformatversion = 0\n",
+      false,
+    );
+    expect(() => resolveGitProjectAnchor(relativeAbsentCheckout)).toThrow(
+      "expected one core.worktree path",
+    );
+
+    const mismatchCheckout = join(root, "mismatch-checkout");
+    const mismatchMetadata = join(root, "mismatch-metadata");
+    makeStandaloneMetadata(
+      mismatchCheckout,
+      mismatchMetadata,
+      `[core]\nworktree = ${absentCheckout}\n`,
+    );
+    expect(() => resolveGitProjectAnchor(mismatchCheckout)).toThrow(
+      "topology does not point",
+    );
+
+    const relativeMismatchCheckout = join(root, "relative-mismatch-checkout");
+    const relativeMismatchMetadata = join(root, "relative-mismatch-metadata");
+    makeStandaloneMetadata(
+      relativeMismatchCheckout,
+      relativeMismatchMetadata,
+      `[core]\nworktree = ${absentCheckout}\n`,
+      false,
+    );
+    expect(() => resolveGitProjectAnchor(relativeMismatchCheckout)).toThrow(
+      "topology does not point",
+    );
+
+    const continuedCheckout = join(root, "continued-checkout");
+    const continuedMetadata = join(root, "continued-metadata");
+    makeStandaloneMetadata(
+      continuedCheckout,
+      continuedMetadata,
+      [
+        "[core]",
+        `worktree = ${continuedCheckout}`,
+        "[other]",
+        'value = "first\\',
+        'second" # comment\\',
+        "[core]",
+        `worktree = ${mismatchCheckout}`,
+        "",
+      ].join("\n"),
+    );
+    expect(git(
+      root,
+      "config",
+      "--file",
+      join(continuedMetadata, "config"),
+      "--get",
+      "core.worktree",
+    )).toBe(mismatchCheckout);
+    expect(() => resolveGitProjectAnchor(continuedCheckout)).toThrow(
+      "topology does not point",
+    );
+
+    const emptyCheckout = join(root, "empty-checkout");
+    const emptyMetadata = join(root, "empty-metadata");
+    makeStandaloneMetadata(emptyCheckout, emptyMetadata, "[core]\nworktree = \n");
+    expect(() => resolveGitProjectAnchor(emptyCheckout)).toThrow(
+      "expected one core.worktree path",
+    );
+
+    const invalidCheckout = join(root, "invalid-checkout");
+    const invalidMetadata = join(root, "invalid-metadata");
+    makeStandaloneMetadata(
+      invalidCheckout,
+      invalidMetadata,
+      `[core]\nworktree = ${invalidCheckout}\n[extensions]\nworktreeConfig = maybe\n`,
+    );
+    expect(() => resolveGitProjectAnchor(invalidCheckout)).toThrow(
+      "ambiguous worktree configuration",
+    );
+
+    const dottedCheckout = join(root, "dotted-checkout");
+    const dottedMetadata = join(root, "dotted-metadata");
+    makeStandaloneMetadata(
+      dottedCheckout,
+      dottedMetadata,
+      `[core]\nworktree = ${dottedCheckout}\n[other.]\nkey = value\n`,
+    );
+    expect(() => resolveGitProjectAnchor(dottedCheckout)).toThrow(
+      "ambiguous worktree configuration",
+    );
+
+    for (const [name, includeSection] of [
+      ["include", "[include]"],
+      ["include-if", '[includeIf "gitdir:/**"]'],
+    ] as const) {
+      const includeCheckout = join(root, `${name}-checkout`);
+      const includeMetadata = join(root, `${name}-metadata`);
+      makeStandaloneMetadata(
+        includeCheckout,
+        includeMetadata,
+        `[core]\nworktree = ${includeCheckout}\n${includeSection}\npath = override.config\n`,
+      );
+      expect(() => resolveGitProjectAnchor(includeCheckout)).toThrow(
+        "ambiguous worktree configuration",
+      );
+    }
+
+    const symlinkCheckout = makeDirectory(join(root, "symlink-checkout"));
+    const symlinkAlias = join(root, "symlink-worktree");
+    symlinkSync(symlinkCheckout, symlinkAlias);
+    const symlinkMetadata = join(root, "symlink-metadata");
+    makeStandaloneMetadata(
+      symlinkCheckout,
+      symlinkMetadata,
+      `[core]\nworktree = ${symlinkAlias}\n`,
+    );
+    expect(() => resolveGitProjectAnchor(symlinkCheckout)).toThrow(
+      "invalid Git core.worktree directory",
+    );
+
+    const parentAliasCheckout = makeDirectory(join(root, "parent-alias-checkout"));
+    const parentAlias = join(root, "parent-alias");
+    symlinkSync(root, parentAlias);
+    const parentAliasMetadata = join(root, "parent-alias-metadata");
+    makeStandaloneMetadata(
+      parentAliasCheckout,
+      parentAliasMetadata,
+      `[core]\nworktree = ${join(parentAlias, "parent-alias-checkout")}\n`,
+    );
+    expect(() => resolveGitProjectAnchor(parentAliasCheckout)).toThrow(
+      "topology does not point",
+    );
+
+    const pointerSymlinkCheckout = makeDirectory(join(root, "pointer-symlink-checkout"));
+    const pointerSymlinkTarget = join(root, "pointer-symlink-target");
+    makeStandaloneMetadata(
+      join(root, "pointer-symlink-source"),
+      pointerSymlinkTarget,
+      `[core]\nworktree = ${pointerSymlinkCheckout}\n`,
+    );
+    symlinkSync(pointerSymlinkTarget, join(root, "pointer-symlink-metadata"));
+    writeFileSync(
+      join(pointerSymlinkCheckout, ".git"),
+      `gitdir: ${join(root, "pointer-symlink-metadata")}\n`,
+    );
+    expect(() => resolveGitProjectAnchor(pointerSymlinkCheckout)).toThrow(
+      "invalid Git directory",
+    );
+
+    const pointerAliasCheckout = makeDirectory(join(root, "pointer-alias-checkout"));
+    const pointerAliasSource = join(root, "pointer-alias-source");
+    const pointerAliasMetadata = join(pointerAliasSource, "metadata");
+    makeStandaloneMetadata(
+      join(root, "pointer-alias-unused"),
+      pointerAliasMetadata,
+      `[core]\nworktree = ${pointerAliasCheckout}\n`,
+    );
+    const pointerAliasParent = join(root, "pointer-alias-parent");
+    symlinkSync(pointerAliasSource, pointerAliasParent);
+    writeFileSync(
+      join(pointerAliasCheckout, ".git"),
+      `gitdir: ${join(pointerAliasParent, "metadata")}\n`,
+    );
+    expect(() => resolveGitProjectAnchor(pointerAliasCheckout)).toThrow(
+      "Git directory path alias",
+    );
+  });
+
+  it("contains repository-local commondir metadata and revalidates it", () => {
+    const local = makeRepository(join(root, "local-common"));
+    const external = makeRepository(join(root, "external-common"));
+    writeFileSync(join(local, ".git", "commondir"), `${join(external, ".git")}\n`);
+    expect(() => resolveGitProjectAnchor(local)).toThrow("escapes");
+
+    const contained = makeRepository(join(root, "contained-common"));
+    const containedMetadata = makeDirectory(join(contained, ".git", "shared"));
+    makeDirectory(join(containedMetadata, "objects"));
+    writeFileSync(
+      join(containedMetadata, "config"),
+      "[core]\nrepositoryformatversion = 0\n",
+    );
+    writeFileSync(join(contained, ".git", "commondir"), "shared\n");
+    expect(resolveGitProjectAnchor(contained)).toEqual({
+      canonical: containedMetadata,
+      worktreeRoot: contained,
+      commonDir: containedMetadata,
+    });
+
+    const symlinked = makeRepository(join(root, "symlinked-common"));
+    symlinkSync(join(external, ".git"), join(symlinked, ".git", "shared"));
+    writeFileSync(join(symlinked, ".git", "commondir"), "shared\n");
+    expect(() => resolveGitProjectAnchor(symlinked)).toThrow(
+      "invalid Git common directory",
+    );
+
+    const commonAlias = makeRepository(join(root, "common-alias"));
+    const commonAliasParent = join(root, "common-alias-parent");
+    symlinkSync(root, commonAliasParent);
+    writeFileSync(
+      join(commonAlias, ".git", "commondir"),
+      `${join(commonAliasParent, "external-common", ".git")}\n`,
+    );
+    expect(() => resolveGitProjectAnchor(commonAlias)).toThrow(
+      "Git common directory path alias",
+    );
+
+    const raced = makeRepository(join(root, "raced-common"));
+    const first = makeDirectory(join(raced, ".git", "first"));
+    makeDirectory(join(first, "objects"));
+    writeFileSync(join(first, "config"), "[core]\nrepositoryformatversion = 0\n");
+    writeFileSync(join(raced, ".git", "commondir"), "first\n");
+    let swapped = false;
+    metadataRace.afterRead = (path): void => {
+      if (!swapped && path === join(raced, ".git", "commondir")) {
+        swapped = true;
+        writeFileSync(join(raced, ".git", "commondir"), `${join(external, ".git")}\n`);
+      }
+    };
+    expect(() => resolveGitProjectAnchor(raced)).toThrow(
+      "common-directory metadata changed",
+    );
+  });
+
+  it("revalidates standalone pointers, config bytes, and directory identity", () => {
+    const makeVerified = (name: string): { checkout: string; metadata: string } => {
+      const checkout = join(root, `${name}-checkout`);
+      const metadata = join(root, `${name}-metadata`);
+      makeStandaloneMetadata(
+        checkout,
+        metadata,
+        `[core]\nworktree = ../${name}-checkout\n`,
+      );
+      return { checkout, metadata };
+    };
+
+    const configRace = makeVerified("config-race");
+    let configSwapped = false;
+    metadataRace.afterRead = (path): void => {
+      if (!configSwapped && path === join(configRace.metadata, "config")) {
+        configSwapped = true;
+        writeFileSync(
+          path,
+          `[core]\nworktree = ${configRace.checkout}\n# changed bytes\n`,
+        );
+      }
+    };
+    expect(() => resolveGitProjectAnchor(configRace.checkout)).toThrow(
+      "core.worktree metadata changed",
+    );
+
+    metadataRace.afterRead = undefined;
+    const markerRace = makeVerified("marker-race");
+    const replacement = makeVerified("marker-replacement");
+    let markerSwapped = false;
+    metadataRace.afterRead = (path): void => {
+      if (!markerSwapped && path === join(markerRace.metadata, "config")) {
+        markerSwapped = true;
+        writeFileSync(
+          join(markerRace.checkout, ".git"),
+          `gitdir: ${replacement.metadata}\n`,
+        );
+      }
+    };
+    expect(() => resolveGitProjectAnchor(markerRace.checkout)).toThrow(
+      "worktree metadata changed",
+    );
+
+    metadataRace.afterRead = undefined;
+    const pointerFormRace = makeVerified("pointer-form-race");
+    let pointerFormSwapped = false;
+    metadataRace.afterRead = (path): void => {
+      if (!pointerFormSwapped && path === join(pointerFormRace.metadata, "config")) {
+        pointerFormSwapped = true;
+        writeFileSync(
+          join(pointerFormRace.checkout, ".git"),
+          "gitdir: ../pointer-form-race-metadata\n",
+        );
+      }
+    };
+    expect(() => resolveGitProjectAnchor(pointerFormRace.checkout)).toThrow(
+      "worktree metadata changed",
+    );
+
+    metadataRace.afterRead = undefined;
+    const directoryRace = makeVerified("directory-race");
+    const retired = join(root, "directory-race-retired");
+    let directorySwapped = false;
+    metadataRace.afterRead = (path): void => {
+      if (!directorySwapped && path === join(directoryRace.metadata, "config")) {
+        directorySwapped = true;
+        renameSync(directoryRace.metadata, retired);
+        makeDirectory(join(directoryRace.metadata, "objects"));
+        writeFileSync(join(directoryRace.metadata, "HEAD"), "ref: refs/heads/main\n");
+        writeFileSync(
+          join(directoryRace.metadata, "config"),
+          `[core]\nworktree = ${directoryRace.checkout}\n`,
+        );
+      }
+    };
+    expect(() => resolveGitProjectAnchor(directoryRace.checkout)).toThrow(
+      "Git directory changed during validation",
+    );
+  });
+
+  it("fails closed when directory authentication observes substituted metadata", () => {
+    const invalid = makeRepository(join(root, "invalid-auth-directory"));
+    directoryAuthRace.lstatPath = join(invalid, ".git");
+    directoryAuthRace.invalidDirectoryAt = 2;
+    expect(() => resolveGitProjectAnchor(invalid)).toThrow("invalid Git directory");
+
+    directoryAuthRace.invalidDirectoryAt = 0;
+    directoryAuthRace.lstatCount = 0;
+    const changed = makeRepository(join(root, "changed-auth-directory"));
+    directoryAuthRace.statPath = join(changed, ".git");
+    directoryAuthRace.mismatchedStatAt = 2;
+    expect(() => resolveGitProjectAnchor(changed)).toThrow(
+      "Git directory changed during validation",
+    );
+  });
+
+  it("rejects malformed and race-changed linked-worktree topology", () => {
+    const malformedPrimary = makeRepository(join(root, "malformed-linked-primary"));
+    const malformedLinked = makeLinkedWorktree(
+      malformedPrimary,
+      join(root, "malformed-linked"),
+      "malformed-linked",
+    );
+    writeFileSync(
+      join(malformedPrimary, ".git", "worktrees", "malformed-linked", "gitdir"),
+      "\n",
+    );
+    expect(() => resolveGitProjectAnchor(malformedLinked)).toThrow("expected one path");
+
+    const directoryPrimary = makeRepository(join(root, "directory-linked-primary"));
+    const directoryLinked = makeLinkedWorktree(
+      directoryPrimary,
+      join(root, "directory-linked"),
+      "directory-linked",
+    );
+    writeFileSync(
+      join(directoryPrimary, ".git", "worktrees", "directory-linked", "gitdir"),
+      `${directoryLinked}\n`,
+    );
+    expect(() => resolveGitProjectAnchor(directoryLinked)).toThrow(
+      "backpointer target or worktree marker is not a regular file",
+    );
+
+    const missingPrimary = makeRepository(join(root, "missing-worktrees-primary"));
+    const missingGitDir = makeDirectory(join(root, "missing-worktrees-entry"));
+    writeFileSync(join(missingGitDir, "commondir"), `${join(missingPrimary, ".git")}\n`);
+    writeFileSync(join(missingGitDir, "HEAD"), "ref: refs/heads/main\n");
+    const missingLinked = makeDirectory(join(root, "missing-worktrees-linked"));
+    writeFileSync(join(missingLinked, ".git"), `gitdir: ${missingGitDir}\n`);
+    writeFileSync(join(missingGitDir, "gitdir"), `${join(missingLinked, ".git")}\n`);
+    expect(() => resolveGitProjectAnchor(missingLinked)).toThrow(
+      "invalid Git worktrees directory",
+    );
+
+    const filePrimary = makeRepository(join(root, "file-worktrees-primary"));
+    writeFileSync(join(filePrimary, ".git", "worktrees"), "not a directory");
+    const fileGitDir = makeDirectory(join(root, "file-worktrees-entry"));
+    writeFileSync(join(fileGitDir, "commondir"), `${join(filePrimary, ".git")}\n`);
+    writeFileSync(join(fileGitDir, "HEAD"), "ref: refs/heads/main\n");
+    const fileLinked = makeDirectory(join(root, "file-worktrees-linked"));
+    writeFileSync(join(fileLinked, ".git"), `gitdir: ${fileGitDir}\n`);
+    writeFileSync(join(fileGitDir, "gitdir"), `${join(fileLinked, ".git")}\n`);
+    expect(() => resolveGitProjectAnchor(fileLinked)).toThrow(
+      "invalid Git worktrees directory",
+    );
+
+    const nestedPrimary = makeRepository(join(root, "nested-worktrees-primary"));
+    const nestedGitDir = makeDirectory(
+      join(nestedPrimary, ".git", "worktrees", "nested", "entry"),
+    );
+    writeFileSync(join(nestedGitDir, "commondir"), "../../..\n");
+    writeFileSync(join(nestedGitDir, "HEAD"), "ref: refs/heads/main\n");
+    const nestedLinked = makeDirectory(join(root, "nested-worktrees-linked"));
+    writeFileSync(join(nestedLinked, ".git"), `gitdir: ${nestedGitDir}\n`);
+    writeFileSync(join(nestedGitDir, "gitdir"), `${join(nestedLinked, ".git")}\n`);
+    expect(() => resolveGitProjectAnchor(nestedLinked)).toThrow(
+      "is not a direct worktree entry",
+    );
+
+    const pointerPrimary = makeRepository(join(root, "pointer-race-primary"));
+    const pointerLinked = makeLinkedWorktree(
+      pointerPrimary,
+      join(root, "pointer-race-linked"),
+      "pointer-race-linked",
+    );
+    const pointerBack = join(
+      pointerPrimary,
+      ".git",
+      "worktrees",
+      "pointer-race-linked",
+      "gitdir",
+    );
+    let pointerChanged = false;
+    metadataRace.afterRead = (path): void => {
+      if (!pointerChanged && path === pointerBack) {
+        pointerChanged = true;
+        writeFileSync(join(pointerLinked, ".git"), `gitdir: ${fileGitDir}\n`);
+      }
+    };
+    expect(() => resolveGitProjectAnchor(pointerLinked)).toThrow(
+      "worktree metadata changed during topology validation",
+    );
+
+    metadataRace.afterRead = undefined;
+    const commonPrimary = makeRepository(join(root, "common-race-primary"));
+    const commonLinked = makeLinkedWorktree(
+      commonPrimary,
+      join(root, "common-race-linked"),
+      "common-race-linked",
+    );
+    const commonPointer = join(
+      commonPrimary,
+      ".git",
+      "worktrees",
+      "common-race-linked",
+      "commondir",
+    );
+    let commonMarkerReads = 0;
+    metadataRace.afterRead = (path): void => {
+      if (path === join(commonLinked, ".git") && ++commonMarkerReads === 2) {
+        writeFileSync(commonPointer, `${join(filePrimary, ".git")}\n`);
+      }
+    };
+    expect(() => resolveGitProjectAnchor(commonLinked)).toThrow(
+      "common-directory metadata changed during topology validation",
+    );
+
+    metadataRace.afterRead = undefined;
+    const backPrimary = makeRepository(join(root, "back-race-primary"));
+    const backLinked = makeLinkedWorktree(
+      backPrimary,
+      join(root, "back-race-linked"),
+      "back-race-linked",
+    );
+    const backpointer = join(
+      backPrimary,
+      ".git",
+      "worktrees",
+      "back-race-linked",
+      "gitdir",
+    );
+    const backCommonPointer = join(
+      backPrimary,
+      ".git",
+      "worktrees",
+      "back-race-linked",
+      "commondir",
+    );
+    let backCommonReads = 0;
+    metadataRace.afterRead = (path): void => {
+      if (path === backCommonPointer && ++backCommonReads === 2) {
+        writeFileSync(backpointer, "missing\n");
+      }
+    };
+    expect(() => resolveGitProjectAnchor(backLinked)).toThrow(
+      "worktree backpointer changed during topology validation",
+    );
+  });
+
+  it("parses supported Git config syntax with linear final-assignment semantics", () => {
+    const checkout = join(root, "syntax-checkout");
+    const metadata = join(root, "syntax-metadata");
+    makeStandaloneMetadata(
+      checkout,
+      metadata,
+      "[core]\nrepositoryformatversion = 0\n",
+      false,
+    );
+    const configPath = join(metadata, "config");
+    writeFileSync(
+      join(metadata, "config.worktree"),
+      `[core]\nworktree = ${checkout}\n`,
+    );
+    const expectAnchor = (config: string): void => {
+      writeFileSync(configPath, config);
+      clearGitProjectAnchorCache();
+      expect(resolveGitProjectAnchor(checkout)?.canonical, config).toBe(checkout);
+    };
+    const expectRejected = (config: string): void => {
+      writeFileSync(configPath, config);
+      clearGitProjectAnchorCache();
+      expect(() => resolveGitProjectAnchor(checkout), config).toThrow();
+    };
+
+    for (const config of [
+      '[Extensions]\r\nWorkTreeConfig = "true" ; quoted\r\n',
+      "globalKey = accepted\n[extensions]\nworktreeConfig = true\n",
+      "[extensions]\nworktreeConfig = tr\\\nue\n",
+      "[extensions]\nworktreeConfig = t\\\nr\\\nue\n",
+      "[extensions]\nworktreeConfig = false\nworktreeConfig\n",
+      "[extensions \"ignored\"]\nworktreeConfig = false\n[extensions]\nworktreeConfig = yes\n",
+      "[extensions.subsection]\nworktreeConfig = false\n[extensions]\nworktreeConfig = on\n",
+      "[extensions.sub.section]\nworktreeConfig = false\n[extensions]\nworktreeConfig = on\n",
+      "[extensions \"escaped\\\" subsection\"]\nworktreeConfig = false\n[extensions]\nworktreeConfig = 1\n",
+      "# leading comment\n; second comment\n[extensions] # section comment\nworktreeConfig = true # comment\\\n",
+    ]) {
+      expectAnchor(config);
+      expect(git(
+        root,
+        "config",
+        "--file",
+        configPath,
+        "--bool",
+        "--get",
+        "extensions.worktreeConfig",
+      )).toBe("true");
+    }
+
+    for (const config of [
+      "[extensions]\nworktreeConfig = false\n",
+      "[extensions]\nworktreeConfig = maybe\n",
+      "[extensions]\nworktreeConfig # invalid implicit comment\n",
+      "[extensions]\nworktreeConfig trailing\n",
+      "[extensions]\nworktreeConfig = \\\n",
+      "[extensions]\nworktreeConfig = \\\\q\n",
+      "[extensions]\nworktreeConfig = \\\\n\n",
+      "[extensions]\nworktreeConfig = \\\\t\n",
+      "[extensions]\nworktreeConfig = \\\\b\n",
+      "[extensions]\nworktreeConfig = \\\\\\\n",
+      "[extensions]\nworktreeConfig = \\\"\n",
+      "[extensions\nworktreeConfig = true\n",
+      "[]\nworktreeConfig = true\n",
+      "[ extensions]\nworktreeConfig = true\n",
+      "[extensions] trailing\nworktreeConfig = true\n",
+      "[extensions.]\nworktreeConfig = true\n",
+      "[extensions nonsense]\nworktreeConfig = true\n",
+      "[extensions \"unterminated]\nworktreeConfig = true\n",
+      "[extensions \"trailing\" junk]\nworktreeConfig = true\n",
+      "[core]\nworktree\n[extensions]\nworktreeConfig = true\n",
+      "[core]\nworktree trailing\n[extensions]\nworktreeConfig = true\n",
+      "[core]\nworktree = \\q\n[extensions]\nworktreeConfig = true\n",
+      "[extensions]\nworktreeConfig = \"unterminated\n",
+      "[extensions]\nworktreeConfig = true\nother value\n",
+      "[extensions]\nworktreeConfig = true\nother = \\q\n",
+    ]) {
+      expectRejected(config);
+    }
+
+    for (const config of [
+      "[extensions]\nworktreeConfig = true\n1bad = value\n",
+      "[extensions]\nworktreeConfig = true\n-bad = value\n",
+      "[other.$]\nkey = value\n[extensions]\nworktreeConfig = true\n",
+      " \t[ext\\\nensions]\nworktreeConfig = true\n",
+      " \\\n[extensions]\nworktreeConfig = true\n",
+      "[extensions]\n\vworktreeConfig = true\n",
+      "[extensions]\n\fworktreeConfig = true\n",
+    ]) {
+      writeFileSync(configPath, config);
+      const gitResult = spawnSync(
+        "git",
+        ["config", "--file", configPath, "--list"],
+        { encoding: "utf8" },
+      );
+      expect(gitResult.status, config).not.toBe(0);
+      expectRejected(config);
+    }
+
+    for (const escaped of ["n", "t", "b", "\\", '"', "q"]) {
+      expectRejected(
+        `[extensions]\nworktreeConfig = tr${"\\"}${escaped}ue\n`,
+      );
+    }
+
+    const prefix = "[extensions]\nworktreeConfig = true";
+    const suffix = "x\n";
+    const adversarial = `${prefix}${" ".repeat(
+      4 * 1024 * 1024 - Buffer.byteLength(prefix) - Buffer.byteLength(suffix),
+    )}${suffix}`;
+    expect(Buffer.byteLength(adversarial)).toBe(4 * 1024 * 1024);
+    expectRejected(adversarial);
   });
 
   it("accepts a 174581-byte valid config with repeated branch metadata", () => {
@@ -448,6 +1149,10 @@ describe("Git project identity", () => {
       "",
     ].join("\n");
     writeFileSync(configPath, padGitConfigToBytes(configPrefix, 4 * 1024 * 1024));
+    expect(resolveGitProjectAnchor(primary)?.canonical).toBe(primary);
+
+    writeFileSync(join(primary, ".git", "HEAD"), "h".repeat(64 * 1024));
+    clearGitProjectAnchorCache();
     expect(resolveGitProjectAnchor(primary)?.canonical).toBe(primary);
 
     writeFileSync(configPath, padGitConfigToBytes(configPrefix, 4 * 1024 * 1024 + 1));
