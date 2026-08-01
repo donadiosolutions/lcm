@@ -63,6 +63,7 @@ import {
   type MigrationStatus,
   type MigrationTableCheckpoint,
   type MigrationVerificationReport,
+  type PublicationOperation,
   type PublicationPhase,
 } from "./migration-manifest.js";
 import {
@@ -797,18 +798,57 @@ async function activationBlockers(manifest: MigrationManifest, options: ProjectM
   return blockers;
 }
 
-function journalProjects(manifest: MigrationManifest) {
-  const digest = manifestSha256(manifest);
+function journalProjectIdentities(manifest: MigrationManifest) {
   return manifest.projects.map((project) => ({
     generationId: manifest.generationId,
     localProjectId: project.identity.localProjectId,
     remoteProjectId: project.identity.remoteProjectId,
     sourceFingerprintSha256: sha256Canonical(project.sourceFingerprint),
-    manifestSha256: digest,
     expectedCanonicalPath: project.identity.canonicalPath,
     expectedAliasesSha256: sha256Canonical(project.identity.aliases),
+  }));
+}
+
+function journalProjects(manifest: MigrationManifest) {
+  const digest = manifestSha256(manifest);
+  return journalProjectIdentities(manifest).map((project) => ({
+    ...project,
+    manifestSha256: digest,
     published: false,
   }));
+}
+
+function assertJournalIdentity(journal: MigrationPublicationJournal, manifest: MigrationManifest): void {
+  const fields = ({
+    generationId,
+    localProjectId,
+    remoteProjectId,
+    sourceFingerprintSha256,
+    expectedCanonicalPath,
+    expectedAliasesSha256,
+  }: MigrationPublicationJournal["projects"][number]) => ({ generationId, localProjectId, remoteProjectId, sourceFingerprintSha256, expectedCanonicalPath, expectedAliasesSha256 });
+  const sort = <T extends { readonly localProjectId: string }>(projects: readonly T[]) => [...projects].sort((left, right) => left.localProjectId.localeCompare(right.localProjectId));
+  const actual = sort(journal.projects.map(fields));
+  const expected = sort(journalProjectIdentities(manifest));
+  if (canonicalJson(actual) !== canonicalJson(expected)) throw new Error("publication journal project identity or source fingerprint changed");
+}
+
+function assertPublicationJournal(journal: MigrationPublicationJournal, manifest: MigrationManifest, operation: PublicationOperation, home: string): void {
+  if (journal.operation !== operation) throw new Error(`publication journal operation does not match ${operation}`);
+  assertJournalIdentity(journal, manifest);
+  const digest = manifestSha256(manifest);
+  if (journal.projects.some((project) => project.manifestSha256 !== digest)) throw new Error("publication journal manifest checksum changed");
+  if (operation === "post-write-rollback") {
+    for (const project of manifest.projects) {
+      const state = journal.projects.find(({ localProjectId }) => localProjectId === project.identity.localProjectId)!;
+      const canonical = projectDatabasePath(home, project.identity.localProjectId);
+      if (state.stagedSqlitePath !== migrationProjectPaths(manifest.generationId, project.identity.localProjectId, home).reverseDatabase
+        || state.archivedMainPath !== retainedCanonicalPath(canonical, manifest.generationId)
+        || state.archivedWalPath !== retainedCanonicalPath(`${canonical}-wal`, manifest.generationId)) {
+        throw new Error(`project:${sanitizedId(project.identity.localProjectId)} publication journal filesystem path changed`);
+      }
+    }
+  }
 }
 
 function crash(deps: ProjectMigrationDependencies, point: MigrationCrashPoint): void {
@@ -830,6 +870,7 @@ function publishActivation(manifest: MigrationManifest, options: ProjectMigratio
     }
     let journal = readPublicationJournal(manifest.generationId, home);
     if (journal && journal.operation !== "activate") throw new Error("publication journal operation does not match activation");
+    if (journal) assertPublicationJournal(journal, manifest, "activate", home);
     if (journal?.phase === "completed") return;
     if (!journal) {
       const now = timestamp(deps);
@@ -882,6 +923,7 @@ export async function activateProjectMigration(generationId: string, options: Pr
   if (manifest.status === "active") {
     const journal = readPublicationJournal(generationId, actualHome(options));
     if (journal?.operation !== "activate" || journal.phase !== "completed") throw new Error("active migration generation has no completed activation journal");
+    assertJournalIdentity(journal, manifest);
     return result("activate", manifest);
   }
   const blockers = await activationBlockers(manifest, options, deps);
@@ -906,6 +948,7 @@ function preWriteRollback(manifest: MigrationManifest, options: ProjectMigration
   if (backendFromConfig(home, options) !== "sqlite") throw new Error("pre-write rollback expected the global SQLite backend");
   let journal = readPublicationJournal(manifest.generationId, home);
   if (journal && journal.operation !== "pre-write-rollback") throw new Error("publication journal operation does not match pre-write rollback");
+  if (journal) assertPublicationJournal(journal, manifest, "pre-write-rollback", home);
   if (!journal) {
     const now = timestamp(deps);
     journal = {
@@ -1029,6 +1072,7 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
     let priorPublicationJournalSha256: string | undefined;
     if (journal?.operation === "activate") {
       if (journal.phase !== "completed") throw new Error("activation publication must complete before post-write rollback");
+      assertJournalIdentity(journal, manifest);
       const generation = migrationGenerationPaths(manifest.generationId, home);
       const archive = join(generation.directory, "activation-publication-journal.json");
       deps.copyPrivate(generation.journal, archive, { allowedRoot: generation.directory });
@@ -1040,6 +1084,7 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
     }
     if (!journal && priorPublicationJournalSha256 === undefined) throw new Error("completed activation publication journal is required before post-write rollback");
     if (journal && journal.operation !== "post-write-rollback") throw new Error("publication journal operation does not match post-write rollback");
+    if (journal) assertPublicationJournal(journal, manifest, "post-write-rollback", home);
     if (journal?.phase === "completed") return;
     if (!journal) {
       const now = timestamp(deps);
@@ -1067,6 +1112,7 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
       writePublicationJournal(manifest.generationId, journal, home);
       crash(deps, "after-prepare");
     }
+    assertPublicationJournal(journal, manifest, "post-write-rollback", home);
     const backend = backendFromConfig(home, options);
     if (backend === "postgresql" && configSha256(home) !== journal.expectedConfigSha256) throw new Error("configuration changed during rollback publication");
     journal = writeJournalPhase(journal, "commit", options, deps);
@@ -1136,6 +1182,7 @@ export async function rollbackProjectMigration(generationId: string, options: Pr
   if (manifest.status === "rolled-back") {
     const completed = readPublicationJournal(generationId, actualHome(options));
     if (completed?.phase !== "completed" || (completed.operation !== "pre-write-rollback" && completed.operation !== "post-write-rollback")) throw new Error("rolled-back migration generation has no completed rollback journal");
+    assertJournalIdentity(completed, manifest);
     return result("rollback", manifest);
   }
   const requiresGlobalRollback = manifest.status === "active"

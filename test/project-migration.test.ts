@@ -816,12 +816,16 @@ describe("migration safety helpers and blockers", () => {
     const crashing = { ...deps, crash: (point: MigrationCrashPoint) => { if (point === "after-prepare") throw new Error("stop after prepare"); } };
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(manifest, current.options, crashing)).toThrow("stop after prepare");
     const prepared = readPublicationJournal(generationId, current.home)!;
-    writePublicationJournal(generationId, { ...prepared, operation: "pre-write-rollback" }, current.home);
+    writePublicationJournal(generationId, { ...prepared, operation: "pre-write-rollback", targetBackend: "sqlite" }, current.home);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(manifest, current.options, deps)).toThrow("operation does not match activation");
     writePublicationJournal(generationId, { ...prepared, operation: "activate", phase: "completed" }, current.home);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(manifest, current.options, deps)).not.toThrow();
     writePublicationJournal(generationId, { ...prepared, expectedConfigSha256: "0".repeat(64) }, current.home);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(manifest, current.options, deps)).toThrow("configuration changed during activation publication");
+    writePublicationJournal(generationId, { ...prepared, projects: prepared.projects.map((project) => ({ ...project, manifestSha256: "0".repeat(64) })) }, current.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(manifest, current.options, deps)).toThrow("manifest checksum changed");
+    writePublicationJournal(generationId, { ...prepared, projects: prepared.projects.map((project) => ({ ...project, expectedAliasesSha256: "0".repeat(64) })) }, current.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(manifest, current.options, deps)).toThrow("identity or source fingerprint changed");
 
     writePrivate(configPath(current.home), `${JSON.stringify({ storage: { backend: "postgresql" } }, null, 2)}\n`);
     writePublicationJournal(generationId, {
@@ -847,7 +851,7 @@ describe("migration safety helpers and blockers", () => {
     const stop = { ...deps, crash: (point: MigrationCrashPoint) => { if (point === "after-prepare") throw new Error("stop after prepare"); } };
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(manifest, current.options, stop)).toThrow("stop after prepare");
     const prepared = readPublicationJournal(generationId, current.home)!;
-    writePublicationJournal(generationId, { ...prepared, operation: "activate" }, current.home);
+    writePublicationJournal(generationId, { ...prepared, operation: "activate", targetBackend: "postgresql" }, current.home);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(manifest, current.options, deps)).toThrow("operation does not match pre-write rollback");
     writePublicationJournal(generationId, { ...prepared, phase: "completed" }, current.home);
     expect(PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(manifest, current.options, deps).projects[0]?.status).toBe("rolled-back");
