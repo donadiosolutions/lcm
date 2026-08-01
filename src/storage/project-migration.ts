@@ -364,8 +364,7 @@ function updateStatus(manifest: MigrationManifest, status: MigrationStatus, deps
 
 function postgresStorage(options: ProjectMigrationOptions): Extract<ResolvedStorageConfig, { backend: "postgresql" }> {
   const config = loadDaemonConfig(configPath(actualHome(options)), { storage: { backend: "postgresql" } }, options.env);
-  if (config.storage.backend !== "postgresql") throw new Error("PostgreSQL migration configuration is unavailable");
-  return config.storage;
+  return config.storage as Extract<ResolvedStorageConfig, { backend: "postgresql" }>;
 }
 
 async function openMigrationRuntime(options: ProjectMigrationOptions, deps: ProjectMigrationDependencies): Promise<MigrationRuntime> {
