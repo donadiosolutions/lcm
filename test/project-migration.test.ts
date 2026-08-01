@@ -799,14 +799,13 @@ describe("migration safety helpers and blockers", () => {
     const mismatch = fixture();
     const mismatchGeneration = await forwardToActive(mismatch);
     const mismatchManifest = readMigrationManifest(mismatchGeneration, mismatch.home);
-    vi.spyOn(SqliteMigrationWriter.prototype, "verify").mockReturnValueOnce([]);
+    const verifySpy = vi.spyOn(SqliteMigrationWriter.prototype, "verify").mockReturnValueOnce([]);
     await expect(PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(
       mismatchManifest,
       mismatch.options,
       PROJECT_MIGRATION_TEST_SEAMS.dependencies(mismatch.options),
     )).rejects.toThrow("reverse SQLite digest mismatch");
-    vi.restoreAllMocks();
-    beforeEach;
+    verifySpy.mockRestore();
 
     const drift = fixture();
     const driftGeneration = await forwardToActive(drift);
