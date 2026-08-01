@@ -23,6 +23,10 @@ export interface SqliteSnapshotResult {
   readonly snapshotFingerprint: MigrationFileFingerprint;
   readonly tables: readonly MigrationTableInventory[];
 }
+export interface SqliteMigrationSnapshotOptions {
+  /** @internal Deterministic concurrent-writer seam for migration protocol tests. */
+  readonly _afterBackupForTesting?: () => void;
+}
 
 type RawRow = Record<string, unknown>;
 type TableDescriptor = { readonly name: string; readonly select: string; readonly orderBy: string; readonly normalize?: (row: RawRow) => MigrationRow };
@@ -131,6 +135,15 @@ function optionalFingerprint(path: string): MigrationFileFingerprint | null {
   return existsSync(path) ? fingerprintMigrationFileSync(path, dirname(path)) : null;
 }
 
+function assertSourceUnchanged(
+  beforeMain: MigrationFileFingerprint,
+  beforeWal: MigrationFileFingerprint | null,
+  afterMain: MigrationFileFingerprint,
+  afterWal: MigrationFileFingerprint | null,
+): void {
+  if (!sameMigrationFingerprint(beforeMain, afterMain) || !sameMigrationFingerprint(beforeWal, afterWal)) throw new Error("SQLite source changed during backup");
+}
+
 function reserveDestination(path: string): void {
   const parent = lstatSync(dirname(path));
   if (!parent.isDirectory() || parent.isSymbolicLink() || (parent.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) throw new Error("migration generation directory must use mode 0700");
@@ -139,7 +152,7 @@ function reserveDestination(path: string): void {
   unlinkSync(path);
 }
 
-export async function createSqliteMigrationSnapshot(sourcePath: string, destinationPath: string): Promise<SqliteSnapshotResult> {
+export async function createSqliteMigrationSnapshot(sourcePath: string, destinationPath: string, options: SqliteMigrationSnapshotOptions = {}): Promise<SqliteSnapshotResult> {
   if (existsSync(destinationPath)) throw new Error("migration backup destination already exists");
   reserveDestination(destinationPath);
   const beforeMain = fingerprintMigrationFileSync(sourcePath, dirname(sourcePath));
@@ -147,12 +160,13 @@ export async function createSqliteMigrationSnapshot(sourcePath: string, destinat
   const source = new DatabaseSync(sourcePath, { readOnly: true, readBigInts: false, timeout: 5_000 });
   let pages: number;
   try { pages = await backup(source, destinationPath); } finally { source.close(); }
+  options._afterBackupForTesting?.();
   chmodSync(destinationPath, PRIVATE_FILE_MODE);
   const destination = lstatSync(destinationPath);
   if (!destination.isFile() || destination.isSymbolicLink() || destination.nlink !== 1) throw new Error("SQLite backup destination is not a private single-link file");
   const afterMain = fingerprintMigrationFileSync(sourcePath, dirname(sourcePath));
   const afterWal = optionalFingerprint(`${sourcePath}-wal`);
-  if (!sameMigrationFingerprint(beforeMain, afterMain) || !sameMigrationFingerprint(beforeWal, afterWal)) throw new Error("SQLite source changed during backup");
+  assertSourceUnchanged(beforeMain, beforeWal, afterMain, afterWal);
   const snapshot = new DatabaseSync(destinationPath, { timeout: 5_000 });
   let schemaSha256: string;
   try { runLcmMigrations(snapshot); assertSqliteIntegrity(snapshot); schemaSha256 = sqliteSchemaSha256(snapshot); } finally { snapshot.close(); }
@@ -271,3 +285,21 @@ export function lastCanonicalKey(row: MigrationRow): readonly CanonicalScalar[] 
   if (last === null || typeof last === "string" || typeof last === "number" || typeof last === "boolean" || (typeof last === "object" && !Array.isArray(last) && "$integer" in last)) return [last as CanonicalScalar];
   return [sha256Canonical(last)];
 }
+
+export const SQLITE_MIGRATION_TEST_SEAMS = {
+  assertSourceUnchanged,
+  assertSqliteIntegrity,
+  baseRow,
+  descriptor,
+  finite,
+  integer,
+  json,
+  nullableBoolean,
+  nullableInteger,
+  nullableText,
+  reserveDestination,
+  sourceTable,
+  sqliteValue,
+  text,
+  timestamp,
+} as const;
