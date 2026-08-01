@@ -548,8 +548,36 @@ describe("Git project identity", () => {
       "worktreeConfig = yes;enabled",
       "worktreeConfig = on # enabled",
       "worktreeConfig = 1;enabled",
+      "worktreeConfig = 2",
+      "worktreeConfig = -1",
+      "worktreeConfig = 01",
+      "worktreeConfig = +1",
+      "worktreeConfig = 1k",
+      "worktreeConfig = 0x1",
+      "worktreeConfig = -2g",
+      "worktreeConfig = 2147483647",
+      "worktreeConfig = -2147483648",
+      "worktreeConfig = 2097151k",
+      "worktreeConfig = 2047m",
+      "worktreeConfig = 1G",
+      "worktreeConfig = +0Xf",
     ]) {
       writeWorktreeConfig(line);
+      expect(configuredWorktreeBool()).toBe("true");
+      expectSubmoduleAnchor();
+    }
+
+    for (const encodedWhitespace of [
+      " ",
+      "\\t",
+      "\\n",
+      "\r",
+      "\f",
+      "\v",
+    ]) {
+      writeWorktreeConfig(
+        `worktreeConfig = "${encodedWhitespace}+01k"`,
+      );
       expect(configuredWorktreeBool()).toBe("true");
       expectSubmoduleAnchor();
     }
@@ -559,6 +587,12 @@ describe("Git project identity", () => {
       "worktreeConfig = no;disabled",
       "worktreeConfig = off;disabled",
       "worktreeConfig = 0 # disabled",
+      "worktreeConfig =",
+      "worktreeConfig = -0",
+      "worktreeConfig = +0",
+      "worktreeConfig = 00",
+      "worktreeConfig = 0k",
+      "worktreeConfig = 00M",
     ]) {
       writeWorktreeConfig(line);
       expect(configuredWorktreeBool()).toBe("false");
@@ -601,6 +635,24 @@ describe("Git project identity", () => {
         ].join("\n"),
         false,
       ],
+      [
+        [
+          "[extensions]",
+          "worktreeConfig = 00M",
+          "worktreeConfig = 0x1",
+          "",
+        ].join("\n"),
+        true,
+      ],
+      [
+        [
+          "[extensions]",
+          "worktreeConfig = -1",
+          "worktreeConfig = +0",
+          "",
+        ].join("\n"),
+        false,
+      ],
     ] as const) {
       writeFileSync(commonConfigPath, config);
       clearGitProjectAnchorCache();
@@ -615,6 +667,46 @@ describe("Git project identity", () => {
     ]) {
       writeWorktreeConfig(line);
       expect(configuredWorktreeBool).toThrow();
+      expectRejectedAnchor("ambiguous worktree configuration");
+    }
+
+    for (const value of [
+      "maybe",
+      "+",
+      "--1",
+      "08",
+      "0x",
+      "0b2",
+      "1t",
+      "2147483648",
+      "-2147483649",
+      "2097152k",
+      "2048m",
+      "2g",
+    ]) {
+      writeWorktreeConfig(`worktreeConfig = ${value}`);
+      expect(configuredWorktreeBool).toThrow();
+      expectRejectedAnchor("ambiguous worktree configuration");
+    }
+
+    for (const line of [
+      `worktreeConfig = " ${"\\t"}${"\\n"}\r\f\v"`,
+      'worktreeConfig = " true"',
+      'worktreeConfig = "1 "',
+      'worktreeConfig = "1 0"',
+    ]) {
+      writeWorktreeConfig(line);
+      expect(configuredWorktreeBool).toThrow();
+      expectRejectedAnchor("ambiguous worktree configuration");
+    }
+
+    writeWorktreeConfig('worktreeConfig = "\u00a0+1"');
+    expectRejectedAnchor("ambiguous worktree configuration");
+
+    for (const value of ["0b1", "0B0"]) {
+      writeWorktreeConfig(`worktreeConfig = ${value}`);
+      // Git delegates base-0 parsing to the host C library, so C23 binary
+      // prefixes are not portable. LCM rejects them regardless of host Git.
       expectRejectedAnchor("ambiguous worktree configuration");
     }
 
@@ -2030,6 +2122,64 @@ describe("Git project identity", () => {
     )}${suffix}`;
     expect(Buffer.byteLength(adversarial)).toBe(4 * 1024 * 1024);
     expectRejected(adversarial);
+
+  });
+
+  it.each([
+    ["zero", "zeros", false],
+    ["nonzero", "zeros-then-one", true],
+    ["overflow", "sevens", undefined],
+  ] as const)("parses an exact-4-MiB %s integer boolean", (
+    name,
+    pattern,
+    expected,
+  ) => {
+    const checkout = join(root, `${name}-integer-checkout`);
+    const metadata = join(root, `${name}-integer-metadata`);
+    makeStandaloneMetadata(
+      checkout,
+      metadata,
+      "[core]\nrepositoryformatversion = 0\n",
+      false,
+    );
+    writeFileSync(
+      join(metadata, "config.worktree"),
+      `[core]\nworktree = ${checkout}\n`,
+    );
+    const configPath = join(metadata, "config");
+    const prefix = "[extensions]\nworktreeConfig = ";
+    const digitCount = 4 * 1024 * 1024 - Buffer.byteLength(prefix) - 1;
+    const digits = pattern === "sevens"
+      ? "7".repeat(digitCount)
+      : `${"0".repeat(digitCount - 1)}${pattern === "zeros" ? "0" : "1"}`;
+    const config = `${prefix}${digits}\n`;
+    expect(Buffer.byteLength(config)).toBe(4 * 1024 * 1024);
+    writeFileSync(configPath, config);
+
+    const configuredWorktreeBool = (): string => git(
+      root,
+      "config",
+      "--file",
+      configPath,
+      "--bool",
+      "--get",
+      "extensions.worktreeConfig",
+    );
+    if (expected === undefined) {
+      expect(configuredWorktreeBool).toThrow("bad boolean config value");
+      expect(() => resolveGitProjectAnchor(checkout)).toThrow(
+        "ambiguous worktree configuration",
+      );
+    } else {
+      expect(configuredWorktreeBool()).toBe(expected ? "true" : "false");
+      if (expected) {
+        expect(resolveGitProjectAnchor(checkout)?.canonical).toBe(checkout);
+      } else {
+        expect(() => resolveGitProjectAnchor(checkout)).toThrow(
+          "expected one core.worktree path",
+        );
+      }
+    }
   });
 
   it("accepts a 174581-byte valid config with repeated branch metadata", () => {

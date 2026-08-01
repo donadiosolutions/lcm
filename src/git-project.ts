@@ -460,6 +460,85 @@ function isAsciiLetter(char: string): boolean {
   return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
 }
 
+function gitBooleanDigit(char: string): number {
+  const code = char.charCodeAt(0);
+  if (code >= 48 && code <= 57) return code - 48;
+  if (code >= 65 && code <= 70) return code - 55;
+  if (code >= 97 && code <= 102) return code - 87;
+  return -1;
+}
+
+function parseGitBooleanInteger(value: string): boolean | undefined {
+  let cursor = 0;
+  while (cursor < value.length) {
+    const code = value.charCodeAt(cursor);
+    if (code !== 32 && (code < 9 || code > 13)) break;
+    cursor += 1;
+  }
+  let negative = false;
+  if (value[cursor] === "+" || value[cursor] === "-") {
+    negative = value[cursor] === "-";
+    cursor += 1;
+  }
+
+  let end = value.length;
+  let scale = 1;
+  const unit = value[end - 1]?.toLowerCase();
+  if (unit === "k") {
+    scale = 1024;
+    end -= 1;
+  } else if (unit === "m") {
+    scale = 1024 * 1024;
+    end -= 1;
+  } else if (unit === "g") {
+    scale = 1024 * 1024 * 1024;
+    end -= 1;
+  }
+  if (cursor >= end) return undefined;
+
+  let base = 10;
+  if (value[cursor] === "0" && cursor + 1 < end) {
+    const prefix = value[cursor + 1]!.toLowerCase();
+    if (prefix === "x") {
+      base = 16;
+      cursor += 2;
+    } else {
+      base = 8;
+    }
+  }
+  if (cursor >= end) return undefined;
+
+  // Git interprets integer booleans as signed 32-bit values after applying an
+  // optional binary unit. Accumulate only up to that limit so even a 4 MiB
+  // repository-controlled value remains linear without arbitrary precision.
+  const signedLimit = negative ? 2_147_483_648 : 2_147_483_647;
+  const magnitudeLimit = Math.floor(signedLimit / scale);
+  let magnitude = 0;
+  for (; cursor < end; cursor += 1) {
+    const digit = gitBooleanDigit(value[cursor]!);
+    if (
+      digit < 0
+      || digit >= base
+      || magnitude > Math.floor((magnitudeLimit - digit) / base)
+    ) {
+      return undefined;
+    }
+    magnitude = magnitude * base + digit;
+  }
+  return magnitude !== 0;
+}
+
+function parseGitBoolean(value: string): boolean | undefined {
+  if (value.length <= 5) {
+    const text = asciiLower(value);
+    if (text === "" || text === "false" || text === "no" || text === "off") {
+      return false;
+    }
+    if (text === "true" || text === "yes" || text === "on") return true;
+  }
+  return parseGitBooleanInteger(value);
+}
+
 function scanPhysicalConfigLine(
   line: string,
   initialQuoted: boolean,
@@ -724,14 +803,12 @@ function parseGitConfig(config: string): GitConfigValues {
       worktreeConfig = true;
       continue;
     }
-    const bool = asciiLower(parsedValue.value);
-    if (bool === "true" || bool === "yes" || bool === "on" || bool === "1") {
-      worktreeConfig = true;
-    } else if (bool === "false" || bool === "no" || bool === "off" || bool === "0") {
-      worktreeConfig = false;
-    } else {
+    const bool = parseGitBoolean(parsedValue.value);
+    if (bool === undefined) {
       worktreeConfigInvalid = true;
       valid = false;
+    } else {
+      worktreeConfig = bool;
     }
   }
 

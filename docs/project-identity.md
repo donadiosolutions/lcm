@@ -45,12 +45,18 @@ or ambiguous aliases, different roots or drives, and unverifiable spellings
 fail closed.
 When Git's common config repeats `extensions.worktreeConfig`, including across
 multiple `[extensions]` sections, LCM follows Git's final-assignment behavior:
-the last supported true/yes/on/1 or implicit boolean enables per-worktree
-configuration, while the last false/no/off/0 disables it. Inline `#` and `;`
-comments, quoted values, supported escapes, continued lines, CRLF input, and
-case-insensitive section and key names are parsed in one bounded linear pass.
-Any malformed or unsupported occurrence fails closed instead of allowing an
-earlier or later truthy value to enable `config.worktree`.
+the last implicit, true/yes/on, or valid nonzero Git integer enables
+per-worktree configuration, while an assigned empty value, false/no/off, or a
+valid zero integer disables it. Integers support Git's decimal, octal,
+and hexadecimal forms with optional `k`, `m`, or `g` scaling. Host-specific
+numeric extensions such as the C23 `0b` binary prefix fail closed so project
+identity does not vary by operating system or C library. Only integer values
+may have leading ASCII C whitespace; trailing or internal whitespace remains
+invalid. Inline `#` and `;` comments, quoted values, supported escapes,
+continued lines, CRLF input, and case-insensitive section and key names are
+parsed in one bounded linear pass.
+Any malformed, overflowing, or unsupported occurrence fails closed instead of
+allowing an earlier or later truthy value to enable `config.worktree`.
 The database and passive-learning sidecar remain under:
 
 ```text
