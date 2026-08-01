@@ -250,6 +250,16 @@ async function forwardToActive(current: Fixture): Promise<string> {
   return generationId;
 }
 
+async function reverseReady(current: Fixture) {
+  const generationId = await forwardToActive(current);
+  const manifest = await PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(
+    readMigrationManifest(generationId, current.home),
+    current.options,
+    PROJECT_MIGRATION_TEST_SEAMS.dependencies(current.options),
+  );
+  return { generationId, manifest };
+}
+
 beforeEach(() => {
   vi.spyOn(PostgreSqlWorkCoordinator.prototype, "acquireLease").mockResolvedValue({ resourceType: "storage-migration", resourceKey: "generation", fencingToken: 7n } as never);
   vi.spyOn(PostgreSqlWorkCoordinator.prototype, "renewLease").mockResolvedValue({} as never);
@@ -818,4 +828,135 @@ describe("migration safety helpers and blockers", () => {
       PROJECT_MIGRATION_TEST_SEAMS.dependencies(drift.options),
     )).rejects.toThrow("PostgreSQL source changed during reverse staging");
   }, 20_000);
+
+  it("requires, retains, and validates activation evidence before reverse publication", async () => {
+    const missing = fixture();
+    const missingReady = await reverseReady(missing);
+    rmSync(migrationGenerationPaths(missingReady.generationId, missing.home).journal);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(
+      missingReady.manifest,
+      missing.options,
+      PROJECT_MIGRATION_TEST_SEAMS.dependencies(missing.options),
+    )).toThrow("completed activation publication journal is required");
+
+    const current = fixture();
+    const { generationId, manifest } = await reverseReady(current);
+    const deps = PROJECT_MIGRATION_TEST_SEAMS.dependencies(current.options);
+    const generationPaths = migrationGenerationPaths(generationId, current.home);
+    const activation = readPublicationJournal(generationId, current.home)!;
+    writePublicationJournal(generationId, { ...activation, phase: "prepare" }, current.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("activation publication must complete");
+    writePublicationJournal(generationId, activation, current.home);
+    const corruptingDeps = {
+      ...deps,
+      copyPrivate: ((from, to, options) => {
+        const created = deps.copyPrivate(from, to, options);
+        writePrivate(to, "corrupt retained journal");
+        return created;
+      }) satisfies ProjectMigrationDependencies["copyPrivate"],
+    };
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, corruptingDeps)).toThrow("retained activation publication journal diverges");
+    rmSync(join(generationPaths.directory, "activation-publication-journal.json"));
+    writePublicationJournal(generationId, activation, current.home);
+    const stop = { ...deps, crash: (point: MigrationCrashPoint) => { if (point === "after-prepare") throw new Error("stop after prepare"); } };
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, stop)).toThrow("stop after prepare");
+    const prepared = readPublicationJournal(generationId, current.home)!;
+    expect(prepared.priorPublicationJournalSha256).toMatch(/^[a-f0-9]{64}$/u);
+    writePublicationJournal(generationId, { ...prepared, operation: "pre-write-rollback" }, current.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("operation does not match post-write rollback");
+    writePublicationJournal(generationId, { ...prepared, phase: "completed" }, current.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).not.toThrow();
+    writePublicationJournal(generationId, prepared, current.home);
+    writePrivate(configPath(current.home), `${JSON.stringify({ storage: { backend: "postgresql" }, changed: true })}\n`);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("configuration changed during rollback publication");
+  }, 20_000);
+
+  it("fails closed at every reverse filesystem publication guard", async () => {
+    const current = fixture();
+    const { generationId, manifest } = await reverseReady(current);
+    const deps = PROJECT_MIGRATION_TEST_SEAMS.dependencies(current.options);
+    const stop = { ...deps, crash: (point: MigrationCrashPoint) => { if (point === "after-prepare") throw new Error("stop after prepare"); } };
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, stop)).toThrow("stop after prepare");
+    const prepared = readPublicationJournal(generationId, current.home)!;
+    const state = prepared.projects[0]!;
+    const canonical = current.databasePath;
+    const incoming = `${canonical}.incoming-${generationId}`;
+
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, { ...deps, copyPrivate: () => false })).toThrow("reverse staging path collided");
+    writePublicationJournal(generationId, prepared, current.home);
+    writePrivate(incoming, "divergent incoming");
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("reverse incoming database diverged");
+    rmSync(incoming);
+
+    writePublicationJournal(generationId, prepared, current.home);
+    rmSync(canonical);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, { ...deps, renameDurably: () => undefined })).toThrow("reverse database publication failed");
+    cpSync(migrationProjectPaths(generationId, current.localProjectId, current.home).originalMainArchive, canonical);
+    rmSync(incoming);
+
+    writePublicationJournal(generationId, prepared, current.home);
+    writePrivate(state.archivedMainPath!, "existing retained canonical");
+    writePrivate(canonical, "divergent canonical");
+    writePrivate(`${canonical}-wal`, "preserved wal");
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("canonical reverse database diverged");
+    expect(existsSync(state.archivedWalPath!)).toBe(true);
+  }, 20_000);
+
+  it("validates backend publication and completed reverse recovery", async () => {
+    const noPublish = fixture();
+    const noPublishReady = await reverseReady(noPublish);
+    const noPublishDeps = PROJECT_MIGRATION_TEST_SEAMS.dependencies(noPublish.options);
+    await expect(Promise.resolve().then(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(
+      noPublishReady.manifest,
+      noPublish.options,
+      { ...noPublishDeps, publishBackend: () => undefined },
+    ))).rejects.toThrow("rollback failed to publish the SQLite backend");
+
+    const staleConfig = fixture();
+    const staleReady = await reverseReady(staleConfig);
+    const staleDeps = PROJECT_MIGRATION_TEST_SEAMS.dependencies(staleConfig.options);
+    const stop = { ...staleDeps, crash: (point: MigrationCrashPoint) => { if (point === "after-prepare") throw new Error("stop after prepare"); } };
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(staleReady.manifest, staleConfig.options, stop)).toThrow("stop after prepare");
+    const prepared = readPublicationJournal(staleReady.generationId, staleConfig.home)!;
+    writePrivate(configPath(staleConfig.home), `${JSON.stringify({ storage: { backend: "sqlite" } })}\n`);
+    writePublicationJournal(staleReady.generationId, {
+      ...prepared,
+      phase: "recovery",
+      publishedConfigSha256: "0".repeat(64),
+      projects: prepared.projects.map((project) => ({ ...project, published: true })),
+    }, staleConfig.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(staleReady.manifest, staleConfig.options, staleDeps)).toThrow("published SQLite configuration changed");
+  }, 20_000);
+
+  it("rejects invalid terminal activation and rollback recovery states", async () => {
+    const active = fixture();
+    const activeGeneration = await forwardToActive(active);
+    const activation = readPublicationJournal(activeGeneration, active.home)!;
+    writePublicationJournal(activeGeneration, { ...activation, phase: "recovery" }, active.home);
+    await expect(activateProjectMigration(activeGeneration, active.options)).rejects.toThrow("no completed activation journal");
+
+    const terminal = fixture();
+    const terminalGeneration = planProjectMigration(terminal.options).generationId;
+    await rollbackProjectMigration(terminalGeneration, terminal.options);
+    const rollbackJournal = readPublicationJournal(terminalGeneration, terminal.home)!;
+    writePublicationJournal(terminalGeneration, { ...rollbackJournal, phase: "recovery" }, terminal.home);
+    await expect(rollbackProjectMigration(terminalGeneration, terminal.options)).rejects.toThrow("no completed rollback journal");
+
+    const wrongBackend = fixture();
+    const wrongBackendGeneration = await forwardToVerified(wrongBackend);
+    writePrivate(configPath(wrongBackend.home), `${JSON.stringify({ storage: { backend: "sqlite" } })}\n`);
+    await expect(rollbackProjectMigration(wrongBackendGeneration, wrongBackend.options)).rejects.toThrow("globally activated PostgreSQL backend");
+
+    const wrongStatus = fixture();
+    const wrongStatusGeneration = await forwardToVerified(wrongStatus);
+    writePrivate(configPath(wrongStatus.home), `${JSON.stringify({ storage: { backend: "postgresql" } })}\n`);
+    await expect(rollbackProjectMigration(wrongStatusGeneration, wrongStatus.options)).rejects.toThrow("active verified generation");
+
+    const coverage = fixture();
+    const coverageGeneration = await forwardToActive(coverage);
+    const orphan = join(projectsDir(coverage.home), "f".repeat(64), "db.sqlite");
+    mkdirSync(dirname(orphan), { recursive: true, mode: 0o700 });
+    cpSync(coverage.databasePath, orphan);
+    await expect(rollbackProjectMigration(coverageGeneration, coverage.options)).rejects.toThrow("installation-wide project coverage changed after activation");
+  }, 30_000);
 });
