@@ -18,6 +18,7 @@ import {
   MIGRATION_ARTIFACT_MAX_BYTES,
   MIGRATION_MANIFEST_TEST_SEAMS,
   MIGRATION_MANIFEST_VERSION,
+  MIGRATION_PROTOCOL_CONTRACT,
   atomicWriteMigrationArtifact,
   canonicalJson,
   createMigrationGeneration,
@@ -37,6 +38,7 @@ import {
   sha256Canonical,
   sha256Text,
   validateMigrationManifest,
+  validatePublicationJournal,
   writeMigrationCheckpoint,
   writeMigrationManifest,
   writeMigrationReport,
@@ -86,14 +88,7 @@ function manifest(overrides: Partial<MigrationManifest> = {}): MigrationManifest
     sourceBackend: "sqlite",
     destinationBackend: "postgresql",
     schemaManifestSha256: digest,
-    protocol: {
-      stableResume: "immutable-snapshot-offset-v1",
-      integerEncoding: "decimal-tagged-v1",
-      idempotentWrites: "exact-readback-v1",
-      deterministicSampling: "sha256-key-v1",
-      uncertainCommit: "authoritative-remote-readback-v1",
-      activationReadiness: "factory-health-existing-projects-v1",
-    },
+    protocol: MIGRATION_PROTOCOL_CONTRACT,
     projects: [{
       identity: {
         localProjectId: projectId,
@@ -131,7 +126,16 @@ function journal(): MigrationPublicationJournal {
     expectedBackend: "sqlite",
     targetBackend: "postgresql",
     expectedConfigSha256: digest,
-    projects: [],
+    projects: [{
+      generationId,
+      localProjectId: projectId,
+      remoteProjectId,
+      sourceFingerprintSha256: digest,
+      manifestSha256: digest,
+      expectedCanonicalPath: "/workspace/project",
+      expectedAliasesSha256: digest,
+      published: false,
+    }],
   };
 }
 
@@ -308,9 +312,10 @@ describe("versioned migration artifacts", () => {
       [{ ...good, batchSize: 0 }, "invalid migration manifest metadata"],
       [{ ...good, sampleSize: 0 }, "invalid migration manifest metadata"],
       [{ ...good, schemaManifestSha256: "bad" }, "invalid migration manifest metadata"],
-      [{ ...good, coverage: null }, "invalid migration manifest coverage"],
-      [{ ...good, projects: [] }, "invalid migration manifest coverage"],
-      [{ ...good, protocol: null }, "invalid migration manifest coverage"],
+      [{ ...good, coverage: null }, "invalid migration manifest coverage or protocol"],
+      [{ ...good, projects: [] }, "invalid migration manifest coverage or protocol"],
+      [{ ...good, protocol: null }, "invalid migration manifest coverage or protocol"],
+      [{ ...good, protocol: { ...good.protocol, deterministicSampling: "unknown" } }, "invalid migration manifest coverage or protocol"],
       [{ ...good, projects: [null] }, "invalid migration project state"],
       [{ ...good, projects: [{ ...good.projects[0], identity: null }] }, "invalid migration project state"],
       [{ ...good, projects: [{ ...good.projects[0], identity: { ...good.projects[0]!.identity, localProjectId: "bad" } }] }, "invalid migration project state"],
@@ -329,6 +334,43 @@ describe("versioned migration artifacts", () => {
       }],
     });
     expect(validateMigrationManifest(withFiles)).toBe(withFiles);
+  });
+
+  it("validates publication phases, immutable evidence, and operation-specific paths", () => {
+    const good = journal();
+    expect(validatePublicationJournal(good, generationId)).toBe(good);
+    const invalid: unknown[] = [
+      null,
+      { ...good, version: 2 },
+      { ...good, operation: "unknown" },
+      { ...good, phase: "unknown" },
+      { ...good, createdAt: "bad" },
+      { ...good, expectedBackend: "postgresql" },
+      { ...good, expectedConfigSha256: "bad" },
+      { ...good, publishedConfigSha256: "bad" },
+      { ...good, projects: [] },
+      { ...good, projects: [null] },
+      { ...good, projects: [good.projects[0], good.projects[0]] },
+      { ...good, projects: [{ ...good.projects[0], published: true }] },
+      { ...good, priorPublicationJournalSha256: digest },
+    ];
+    for (const value of invalid) expect(() => validatePublicationJournal(value, generationId)).toThrow("invalid publication journal");
+    const reverse: MigrationPublicationJournal = {
+      ...good,
+      operation: "post-write-rollback",
+      expectedBackend: "postgresql",
+      targetBackend: "sqlite",
+      priorPublicationJournalSha256: digest,
+      projects: good.projects.map((project) => ({
+        ...project,
+        stagedSqlitePath: "/private/reverse.sqlite",
+        archivedMainPath: "/private/db.sqlite.preserved",
+        archivedWalPath: "/private/db.sqlite-wal.preserved",
+      })),
+    };
+    expect(validatePublicationJournal(reverse, generationId)).toBe(reverse);
+    expect(() => validatePublicationJournal({ ...reverse, priorPublicationJournalSha256: undefined }, generationId)).toThrow("invalid post-write rollback journal evidence");
+    expect(() => validatePublicationJournal({ ...reverse, projects: reverse.projects.map(({ stagedSqlitePath: _ignored, ...project }) => project) }, generationId)).toThrow("invalid post-write rollback journal evidence");
   });
 
   it("rejects malformed persisted JSON, journals, reports, roots, and generation mismatches", () => {

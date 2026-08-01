@@ -35,6 +35,7 @@ import {
   MIGRATION_DEFAULT_BATCH_SIZE,
   MIGRATION_DEFAULT_SAMPLE_SIZE,
   MIGRATION_MANIFEST_VERSION,
+  MIGRATION_PROTOCOL_CONTRACT,
   canonicalJson,
   createMigrationGeneration,
   ensureMigrationProjectDirectory,
@@ -151,14 +152,7 @@ const DEFAULT_DEPENDENCIES: ProjectMigrationDependencies = {
   renameDurably: durableRename,
 };
 
-const PROTOCOL = {
-  stableResume: "immutable-snapshot-offset-v1",
-  integerEncoding: "decimal-tagged-v1",
-  idempotentWrites: "exact-readback-v1",
-  deterministicSampling: "ordered-prefix-v1",
-  uncertainCommit: "authoritative-remote-readback-v1",
-  activationReadiness: "factory-health-existing-projects-v1",
-} as const;
+const PROTOCOL = MIGRATION_PROTOCOL_CONTRACT;
 
 function dependencies(options: ProjectMigrationOptions): ProjectMigrationDependencies {
   return { ...DEFAULT_DEPENDENCIES, ...options._dependenciesForTesting };
