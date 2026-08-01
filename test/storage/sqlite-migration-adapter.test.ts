@@ -74,7 +74,7 @@ function migrationRows(): Readonly<Record<string, readonly MigrationRow[]>> {
       metadata: "{}",
     }],
     summaries: [
-      { summary_id: "summary-parent", conversation_id: 1, kind: "leaf", depth: 0, content: "parent", token_count: 1, earliest_at: null, latest_at: null, descendant_count: 0, descendant_token_count: 0, source_message_token_count: 1, created_at: now },
+      { summary_id: "summary-parent", conversation_id: 1, kind: "leaf", depth: 0, content: "parent", token_count: 1, earliest_at: now, latest_at: now, descendant_count: 0, descendant_token_count: 0, source_message_token_count: 1, created_at: now },
       { summary_id: "summary-child", conversation_id: 1, kind: "condensed", depth: 1, content: "child", token_count: 1, earliest_at: now, latest_at: now, descendant_count: 1, descendant_token_count: 1, source_message_token_count: 1, created_at: now },
     ],
     summary_messages: [{ summary_id: "summary-parent", message_id: 1, ordinal: 0 }],
@@ -199,7 +199,7 @@ describe("SQLite migration reader and writer", () => {
     const path = join(root, "reverse.sqlite");
     const expected = createPopulatedDatabase(path);
     expect(expected.map(({ table }) => table)).toEqual(SQLITE_MIGRATION_TABLES.map(({ name }) => name));
-    expect(expected.reduce((sum, table) => sum + table.rows, 0)).toBe(19);
+    expect(expected.reduce((sum, table) => sum + table.rows, 0)).toBe(18);
     expect(lstatSync(path).mode & 0o777).toBe(0o600);
     expect(existsSync(`${path}-wal`)).toBe(false);
 
@@ -297,7 +297,7 @@ describe("online SQLite migration snapshots", () => {
     const root = privateDirectory();
     const source = join(root, "legacy.sqlite");
     const legacy = new DatabaseSync(source);
-    legacy.exec(`CREATE TABLE session_instructions (id INTEGER PRIMARY KEY CHECK (id = 1), content TEXT NOT NULL, content_hash TEXT NOT NULL, updated_at TEXT NOT NULL); INSERT INTO session_instructions VALUES (1, 'legacy', '${"a".repeat(64)}', '${now}')`);
+    legacy.exec(`CREATE TABLE session_instructions (id INTEGER PRIMARY KEY CHECK (id = 1), content TEXT NOT NULL, content_hash TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now'))); INSERT INTO session_instructions VALUES (1, 'legacy', '${"a".repeat(64)}', '${now}')`);
     legacy.close();
     chmodSync(source, 0o600);
     const before = readFileSync(source);
