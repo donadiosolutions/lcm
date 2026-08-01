@@ -123,6 +123,8 @@ export interface ProjectMigrationDependencies {
   readonly createFactory: (storage: ResolvedStorageConfig) => StorageBackendFactory;
   readonly processAlive: (pid: number) => boolean;
   readonly copyPrivate: typeof copyRegularFilePrivateExclusive;
+  readonly publishBackend: typeof setConfigValue;
+  readonly renameDurably: typeof durableRename;
   readonly crash?: (point: MigrationCrashPoint) => void;
 }
 
@@ -145,6 +147,8 @@ const DEFAULT_DEPENDENCIES: ProjectMigrationDependencies = {
     catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
   },
   copyPrivate: copyRegularFilePrivateExclusive,
+  publishBackend: setConfigValue,
+  renameDurably: durableRename,
 };
 
 const PROTOCOL = {
@@ -864,7 +868,7 @@ function publishActivation(manifest: MigrationManifest, options: ProjectMigratio
     }
     crash(deps, "after-map");
     if (backend === "sqlite") {
-      setConfigValue({ configPath: configPath(home), path: "storage.backend", value: "postgresql", env: options.env });
+      deps.publishBackend({ configPath: configPath(home), path: "storage.backend", value: "postgresql", env: options.env });
     }
     if (backendFromConfig(home, options) !== "postgresql") throw new Error("activation failed to publish the PostgreSQL backend");
     const publishedConfigSha256 = configSha256(home);
@@ -1087,10 +1091,10 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
         throw new Error(`project:${sanitizedId(state.localProjectId)} reverse incoming database diverged`);
       }
       if (existsSync(canonical) && !existsSync(state.archivedMainPath!)) {
-        durableRename(canonical, state.archivedMainPath!);
+        deps.renameDurably(canonical, state.archivedMainPath!);
       }
-      if (existsSync(`${canonical}-wal`) && !existsSync(state.archivedWalPath!)) durableRename(`${canonical}-wal`, state.archivedWalPath!);
-      if (!existsSync(canonical)) durableRename(incoming, canonical);
+      if (existsSync(`${canonical}-wal`) && !existsSync(state.archivedWalPath!)) deps.renameDurably(`${canonical}-wal`, state.archivedWalPath!);
+      if (!existsSync(canonical)) deps.renameDurably(incoming, canonical);
       if (!existsSync(canonical)) throw new Error(`project:${sanitizedId(state.localProjectId)} reverse database publication failed`);
       const publishedFingerprint = fingerprintMigrationFileSync(canonical, dirname(canonical));
       if (publishedFingerprint.size !== stagedFingerprint.size || publishedFingerprint.sha256 !== stagedFingerprint.sha256) {
@@ -1112,7 +1116,7 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
       });
     }
     crash(deps, "after-map");
-    if (backend === "postgresql") setConfigValue({ configPath: configPath(home), path: "storage.backend", value: "sqlite", env: options.env });
+    if (backend === "postgresql") deps.publishBackend({ configPath: configPath(home), path: "storage.backend", value: "sqlite", env: options.env });
     if (backendFromConfig(home, options) !== "sqlite") throw new Error("rollback failed to publish the SQLite backend");
     const publishedConfigSha256 = configSha256(home);
     if (journal.publishedConfigSha256 && journal.publishedConfigSha256 !== publishedConfigSha256) throw new Error("published SQLite configuration changed during rollback recovery");
