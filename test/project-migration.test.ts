@@ -45,6 +45,8 @@ import {
   type ProjectMigrationOptions,
 } from "../src/storage/project-migration.js";
 import {
+  fingerprintMigrationFileSync,
+  migrationGenerationPaths,
   migrationProjectPaths,
   readMigrationManifest,
   readPublicationJournal,
@@ -728,4 +730,93 @@ describe("migration safety helpers and blockers", () => {
     writePrivate(configPath(current.home), `${JSON.stringify({ storage: { backend: "sqlite" }, changed: true })}\n`);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(manifest, current.options, deps)).toThrow("configuration changed during pre-write rollback");
   });
+
+  it("fails closed on reverse staging preconditions and retained archive drift", async () => {
+    const current = fixture();
+    const generationId = await forwardToActive(current);
+    const manifest = readMigrationManifest(generationId, current.home);
+    const deps = PROJECT_MIGRATION_TEST_SEAMS.dependencies(current.options);
+    writePrivate(join(lcmHomeDir(current.home), "daemon.pid"), `${process.pid}\n`);
+    await expect(PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(manifest, current.options, { ...deps, processAlive: () => true })).rejects.toThrow("daemon to be stopped");
+    rmSync(join(lcmHomeDir(current.home), "daemon.pid"));
+
+    const missingMain = {
+      ...manifest,
+      projects: manifest.projects.map((project) => ({ ...project, operationalEvidence: { ...project.operationalEvidence, originalMainArchive: null } })),
+    };
+    await expect(PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(missingMain, current.options, deps)).rejects.toThrow("main archive is unavailable or changed");
+    const unexpectedWal = {
+      ...manifest,
+      projects: manifest.projects.map((project) => ({ ...project, operationalEvidence: { ...project.operationalEvidence, originalWalArchive: project.operationalEvidence.originalMainArchive } })),
+    };
+    await expect(PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(unexpectedWal, current.options, deps)).rejects.toThrow("WAL archive is unavailable or changed");
+
+    const paths = migrationProjectPaths(generationId, current.localProjectId, current.home);
+    cpSync(paths.originalMainArchive, paths.originalWalArchive);
+    const walFingerprint = fingerprintMigrationFileSync(paths.originalWalArchive, paths.directory);
+    const walSource = {
+      ...manifest,
+      projects: manifest.projects.map((project) => ({
+        ...project,
+        sourceFingerprint: project.sourceFingerprint === null ? null : { ...project.sourceFingerprint, wal: walFingerprint },
+        operationalEvidence: { ...project.operationalEvidence, originalWalArchive: null },
+      })),
+    };
+    await expect(PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(walSource, current.options, deps)).rejects.toThrow("WAL archive is unavailable or changed");
+    writePrivate(paths.originalWalArchive, "changed archive");
+    const staleWal = {
+      ...walSource,
+      projects: walSource.projects.map((project) => ({ ...project, operationalEvidence: { ...project.operationalEvidence, originalWalArchive: walFingerprint } })),
+    };
+    await expect(PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(staleWal, current.options, deps)).rejects.toThrow("WAL archive is unavailable or changed");
+
+    vi.mocked(PostgreSqlWorkCoordinator.prototype.acquireLease).mockResolvedValueOnce(null);
+    await expect(PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(manifest, current.options, deps)).rejects.toThrow("migration lease is held by another writer");
+  }, 15_000);
+
+  it("reuses valid reverse databases and replaces interrupted staging safely", async () => {
+    const current = fixture();
+    const generationId = await forwardToActive(current);
+    const manifest = readMigrationManifest(generationId, current.home);
+    const deps = PROJECT_MIGRATION_TEST_SEAMS.dependencies(current.options);
+    const staged = await PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(manifest, current.options, deps);
+    await expect(PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(staged, current.options, deps)).resolves.toMatchObject({ status: "rollback-ready" });
+    const reversePath = migrationProjectPaths(generationId, current.localProjectId, current.home).reverseDatabase;
+    writePrivate(reversePath, "interrupted");
+    await expect(PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(staged, current.options, deps)).resolves.toMatchObject({ status: "rollback-ready" });
+    expect(existsSync(reversePath)).toBe(true);
+    expect(PROJECT_MIGRATION_TEST_SEAMS.preserveInterruptedReverse).toBeTypeOf("function");
+    const direct = join(dirname(reversePath), "direct-reverse.sqlite");
+    writePrivate(direct, "main");
+    writePrivate(`${direct}-wal`, "wal");
+    writePrivate(`${direct}-shm`, "shm");
+    PROJECT_MIGRATION_TEST_SEAMS.preserveInterruptedReverse(direct);
+    expect(existsSync(direct)).toBe(false);
+    PROJECT_MIGRATION_TEST_SEAMS.preserveInterruptedReverse(join(dirname(reversePath), "missing.sqlite"));
+  }, 15_000);
+
+  it("rejects reverse digest mismatches and PostgreSQL source drift", async () => {
+    const mismatch = fixture();
+    const mismatchGeneration = await forwardToActive(mismatch);
+    const mismatchManifest = readMigrationManifest(mismatchGeneration, mismatch.home);
+    vi.spyOn(SqliteMigrationWriter.prototype, "verify").mockReturnValueOnce([]);
+    await expect(PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(
+      mismatchManifest,
+      mismatch.options,
+      PROJECT_MIGRATION_TEST_SEAMS.dependencies(mismatch.options),
+    )).rejects.toThrow("reverse SQLite digest mismatch");
+    vi.restoreAllMocks();
+    beforeEach;
+
+    const drift = fixture();
+    const driftGeneration = await forwardToActive(drift);
+    const driftManifest = readMigrationManifest(driftGeneration, drift.home);
+    const inventory = driftManifest.projects[0]!.tables.map((table) => ({ table: table.table, rows: table.sourceRows, sha256: table.sourceSha256 }));
+    vi.spyOn(PostgreSqlMigrationAdapter.prototype, "inventory").mockResolvedValueOnce(inventory).mockResolvedValueOnce([]);
+    await expect(PROJECT_MIGRATION_TEST_SEAMS.stageReverseDatabases(
+      driftManifest,
+      drift.options,
+      PROJECT_MIGRATION_TEST_SEAMS.dependencies(drift.options),
+    )).rejects.toThrow("PostgreSQL source changed during reverse staging");
+  }, 20_000);
 });
