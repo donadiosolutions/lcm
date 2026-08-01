@@ -45,11 +45,13 @@ import {
   manifestSha256,
   migrationGenerationPaths,
   migrationProjectPaths,
+  readMigrationArtifact,
   readMigrationManifest,
   readPublicationJournal,
   sameMigrationFingerprint,
   sha256Canonical,
   sha256Text,
+  validatePublicationJournal,
   writeMigrationCheckpoint,
   writeMigrationManifest,
   writeMigrationReport,
@@ -851,6 +853,20 @@ function assertPublicationJournal(journal: MigrationPublicationJournal, manifest
   }
 }
 
+function assertRetainedActivationJournal(journal: MigrationPublicationJournal, manifest: MigrationManifest, home: string): void {
+  try {
+    const generation = migrationGenerationPaths(manifest.generationId, home);
+    const archive = join(generation.directory, "activation-publication-journal.json");
+    const fingerprint = fingerprintMigrationFileSync(archive, generation.directory);
+    if (fingerprint.sha256 !== journal.priorPublicationJournalSha256) throw new Error("retained journal checksum changed");
+    const retained = validatePublicationJournal(JSON.parse(readMigrationArtifact(archive, generation.directory)) as unknown, manifest.generationId);
+    if (retained.operation !== "activate" || retained.phase !== "completed") throw new Error("retained journal is not a completed activation");
+    assertJournalIdentity(retained, manifest);
+  } catch (error) {
+    throw new Error("retained activation publication journal is unavailable or changed", { cause: error });
+  }
+}
+
 function crash(deps: ProjectMigrationDependencies, point: MigrationCrashPoint): void {
   deps.crash?.(point);
 }
@@ -1084,7 +1100,10 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
     }
     if (!journal && priorPublicationJournalSha256 === undefined) throw new Error("completed activation publication journal is required before post-write rollback");
     if (journal && journal.operation !== "post-write-rollback") throw new Error("publication journal operation does not match post-write rollback");
-    if (journal) assertPublicationJournal(journal, manifest, "post-write-rollback", home);
+    if (journal) {
+      assertPublicationJournal(journal, manifest, "post-write-rollback", home);
+      assertRetainedActivationJournal(journal, manifest, home);
+    }
     if (journal?.phase === "completed") return;
     if (!journal) {
       const now = timestamp(deps);
@@ -1113,6 +1132,7 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
       crash(deps, "after-prepare");
     }
     assertPublicationJournal(journal, manifest, "post-write-rollback", home);
+    assertRetainedActivationJournal(journal, manifest, home);
     const backend = backendFromConfig(home, options);
     if (backend === "postgresql" && configSha256(home) !== journal.expectedConfigSha256) throw new Error("configuration changed during rollback publication");
     journal = writeJournalPhase(journal, "commit", options, deps);

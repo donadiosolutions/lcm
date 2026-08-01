@@ -986,6 +986,11 @@ describe("migration safety helpers and blockers", () => {
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, stop)).toThrow("stop after prepare");
     const prepared = readPublicationJournal(generationId, current.home)!;
     expect(prepared.priorPublicationJournalSha256).toMatch(/^[a-f0-9]{64}$/u);
+    const retainedActivation = join(generationPaths.directory, "activation-publication-journal.json");
+    const retainedActivationContent = readFileSync(retainedActivation, "utf8");
+    writePrivate(retainedActivation, "corrupt retained activation journal");
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("retained activation publication journal is unavailable or changed");
+    writePrivate(retainedActivation, retainedActivationContent);
     writePublicationJournal(generationId, { ...prepared, projects: prepared.projects.map((project) => ({ ...project, stagedSqlitePath: "/private/wrong.sqlite" })) }, current.home);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("filesystem path changed");
     const preWriteProjects = prepared.projects.map(({ stagedSqlitePath: _staged, archivedMainPath: _main, archivedWalPath: _wal, ...project }) => ({ ...project, published: false }));
