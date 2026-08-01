@@ -1,6 +1,11 @@
 import {
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   lstatSync,
+  openSync,
+  opendirSync,
   realpathSync,
   statSync,
 } from "node:fs";
@@ -11,12 +16,47 @@ import {
   join,
   parse,
   resolve,
+  sep,
 } from "node:path";
 import { readBoundedRegularFile } from "./security-files.js";
 
 const MAX_GIT_POINTER_BYTES = 64 * 1024;
 const MAX_GIT_CONFIG_BYTES = 4 * 1024 * 1024;
+const MAX_CASE_VARIANT_PARENT_ENTRIES = 4_096;
+const MAX_CASE_VARIANT_PARENT_BYTES = 1024 * 1024;
+const WINDOWS_DRIVE_ROOT = /^[A-Za-z]:\\$/u;
 const resolutionCache = new Map<string, GitProjectAnchor>();
+
+type DirectoryIdentity = {
+  readonly dev: number;
+  readonly ino: number;
+  readonly path: string;
+};
+
+type GitConfigValues = {
+  readonly coreWorktree?: string;
+  readonly hasCoreWorktree: boolean;
+  readonly valid: boolean;
+  readonly worktreeConfig: boolean;
+};
+
+type ParsedConfigValue =
+  | { readonly valid: false }
+  | { readonly valid: true; readonly value: string };
+
+type ExternalWorktreeEvidence = {
+  readonly commonConfig: string;
+  readonly resolvedWorktree: string;
+  readonly worktreeConfig?: string;
+};
+
+type GitDirPointer = {
+  readonly caseEvidence?: string;
+  readonly gitDir: string;
+  readonly identity: DirectoryIdentity;
+  readonly isRelative: boolean;
+  readonly requestedGitDir: string;
+};
 
 export type GitProjectAnchor = {
   /** Stable local repository anchor shared by every linked worktree. */
@@ -33,6 +73,196 @@ function existingRealDirectory(path: string, label: string): string {
     throw new Error(`${label} is not a directory: ${path}`);
   }
   return real;
+}
+
+function isContainedPath(root: string, candidate: string): boolean {
+  const prefix = `${root}${sep}`;
+  return candidate === root || candidate.startsWith(prefix);
+}
+
+function pathComponents(path: string): {
+  readonly components: readonly string[];
+  readonly root: string;
+} {
+  const root = parse(path).root;
+  const suffix = path.slice(root.length);
+  return {
+    components: suffix.split(sep),
+    root,
+  };
+}
+
+function isCaseVariantPath(left: string, right: string): boolean {
+  const leftPath = pathComponents(left);
+  const rightPath = pathComponents(right);
+  // A root has no canonical parent that can prove its on-disk spelling.
+  // Only an ASCII Windows drive letter has defined case-insensitive root
+  // semantics; UNC shares and every other root must match exactly.
+  const rootsMatch = leftPath.root === rightPath.root
+    || (
+      WINDOWS_DRIVE_ROOT.test(leftPath.root)
+      && WINDOWS_DRIVE_ROOT.test(rightPath.root)
+      && leftPath.root[0]!.toLowerCase() === rightPath.root[0]!.toLowerCase()
+    );
+  return rootsMatch
+    && leftPath.components.length === rightPath.components.length
+    && leftPath.components.every((component, index) => {
+      const other = rightPath.components[index]!;
+      return component === other || component.toLowerCase() === other.toLowerCase();
+    });
+}
+
+function snapshotCaseVariantComponent(parent: string, component: string): string {
+  const directory = opendirSync(parent, {
+    bufferSize: 32,
+    encoding: "buffer" as BufferEncoding,
+  });
+  let entryCount = 0;
+  let entryBytes = 0;
+  let matchingName: Buffer | undefined;
+  try {
+    for (;;) {
+      const entry = directory.readSync();
+      if (entry === null) break;
+      entryCount += 1;
+      const name = Buffer.from(entry.name);
+      entryBytes += name.length;
+      if (
+        entryCount > MAX_CASE_VARIANT_PARENT_ENTRIES
+        || entryBytes > MAX_CASE_VARIANT_PARENT_BYTES
+      ) {
+        throw new Error("case-variant parent directory exceeds validation bounds");
+      }
+      const decoded = name.toString("utf8");
+      if (!Buffer.from(decoded, "utf8").equals(name)) {
+        throw new Error("case-variant parent directory contains malformed UTF-8");
+      }
+      if (decoded.toLowerCase() !== component.toLowerCase()) continue;
+      if (matchingName !== undefined) {
+        throw new Error("case-variant parent directory is ambiguous");
+      }
+      matchingName = Buffer.from(name);
+    }
+  } finally {
+    directory.closeSync();
+  }
+  if (matchingName === undefined) {
+    throw new Error("case-variant parent directory has no matching entry");
+  }
+  const actualName = matchingName.toString("utf8");
+  const stat = lstatSync(join(parent, actualName));
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error("case-variant parent entry is not a directory");
+  }
+  return `${matchingName.length}:${matchingName.toString("hex")}`;
+}
+
+function snapshotCaseVariantPath(
+  configuredPath: string,
+  canonicalPath: string,
+): string {
+  const configured = pathComponents(configuredPath);
+  const canonical = pathComponents(canonicalPath);
+  let canonicalParent = canonical.root;
+  const snapshots: string[] = [];
+  for (let index = 0; index < canonical.components.length; index += 1) {
+    const configuredComponent = configured.components[index]!;
+    const canonicalComponent = canonical.components[index]!;
+    if (configuredComponent !== canonicalComponent) {
+      snapshots.push(
+        `${index}:${snapshotCaseVariantComponent(canonicalParent, canonicalComponent)}`,
+      );
+    }
+    canonicalParent = join(canonicalParent, canonicalComponent);
+  }
+  return snapshots.join("|");
+}
+
+function authenticateDirectoryWithoutDescriptor(
+  path: string,
+  label: string,
+  expectedRealPath = path,
+  requireNonzeroIdentity = false,
+): DirectoryIdentity {
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`invalid ${label} at ${path}`);
+  }
+  const real = realpathSync(path);
+  const current = statSync(real);
+  const currentPath = lstatSync(path);
+  if (!currentPath.isDirectory() || currentPath.isSymbolicLink()) {
+    throw new Error(`invalid ${label} at ${path}`);
+  }
+  if (
+    real !== expectedRealPath
+    || current.dev !== stat.dev
+    || current.ino !== stat.ino
+    || currentPath.dev !== stat.dev
+    || currentPath.ino !== stat.ino
+    || (requireNonzeroIdentity && (stat.dev === 0 || stat.ino === 0))
+  ) {
+    throw new Error(`${label} changed during validation: ${path}`);
+  }
+  return { dev: stat.dev, ino: stat.ino, path };
+}
+
+function authenticateDirectory(
+  path: string,
+  label: string,
+  expectedRealPath = path,
+  requireNonzeroIdentity = false,
+): DirectoryIdentity {
+  const directoryFlag = constants.O_DIRECTORY;
+  const noFollowFlag = constants.O_NOFOLLOW;
+  if (typeof directoryFlag !== "number" || typeof noFollowFlag !== "number") {
+    // Node only exposes these constants when the host supports them. Windows
+    // does not support O_DIRECTORY, so retain the strict path-based checks
+    // there instead of attempting an unsafe flag-less directory open.
+    return authenticateDirectoryWithoutDescriptor(
+      path,
+      label,
+      expectedRealPath,
+      requireNonzeroIdentity,
+    );
+  }
+
+  const fd = openSync(
+    path,
+    constants.O_RDONLY | directoryFlag | noFollowFlag,
+  );
+  try {
+    const descriptor = fstatSync(fd);
+    if (!descriptor.isDirectory()) {
+      throw new Error(`invalid ${label} at ${path}`);
+    }
+    const real = realpathSync(path);
+    const current = lstatSync(path);
+    if (!current.isDirectory() || current.isSymbolicLink()) {
+      throw new Error(`invalid ${label} at ${path}`);
+    }
+    if (
+      real !== expectedRealPath
+      || current.dev !== descriptor.dev
+      || current.ino !== descriptor.ino
+      || (
+        requireNonzeroIdentity
+        && (descriptor.dev === 0 || descriptor.ino === 0)
+      )
+    ) {
+      throw new Error(`${label} changed during validation: ${path}`);
+    }
+    return { dev: descriptor.dev, ino: descriptor.ino, path };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function revalidateDirectory(identity: DirectoryIdentity, label: string): void {
+  const current = authenticateDirectory(identity.path, label);
+  if (current.dev !== identity.dev || current.ino !== identity.ino) {
+    throw new Error(`${label} changed during validation: ${identity.path}`);
+  }
 }
 
 function readGitMetadata(
@@ -62,7 +292,7 @@ function readGitConfig(path: string, allowedRoot: string, label: string): string
 function parseGitDir(
   pointerPath: string,
   worktreeRoot: string,
-): { readonly gitDir: string; readonly isRelative: boolean } {
+): GitDirPointer {
   const content = readGitPointer(pointerPath, worktreeRoot, "Git worktree");
   const trimmed = content.trim();
   const match = /^gitdir:\s*(.+)$/iu.exec(trimmed);
@@ -70,10 +300,54 @@ function parseGitDir(
     throw new Error(`invalid Git worktree metadata at ${pointerPath}: expected one gitdir line`);
   }
   const target = match[1]!;
+  const targetPath = resolve(worktreeRoot, target);
+  const targetStat = lstatSync(targetPath);
+  if (targetStat.isSymbolicLink()) {
+    throw new Error(`invalid Git directory at ${targetPath}`);
+  }
+  const gitDir = existingRealDirectory(targetPath, "Git directory");
+  let caseEvidence: string | undefined;
+  let identity: DirectoryIdentity;
+  if (gitDir === targetPath) {
+    identity = authenticateDirectory(gitDir, "Git directory");
+  } else {
+    if (!isCaseVariantPath(targetPath, gitDir)) {
+      throw new Error(`invalid Git directory path alias at ${targetPath}`);
+    }
+    caseEvidence = snapshotCaseVariantPath(targetPath, gitDir);
+    const requestedIdentity = authenticateDirectory(
+      targetPath,
+      "Git directory",
+      gitDir,
+      true,
+    );
+    identity = authenticateDirectory(gitDir, "Git directory", gitDir, true);
+    if (
+      requestedIdentity.dev !== identity.dev
+      || requestedIdentity.ino !== identity.ino
+    ) {
+      throw new Error(`Git directory changed during validation: ${targetPath}`);
+    }
+    if (snapshotCaseVariantPath(targetPath, gitDir) !== caseEvidence) {
+      throw new Error("Git directory case evidence changed during validation");
+    }
+  }
   return {
-    gitDir: existingRealDirectory(resolve(worktreeRoot, target), "Git directory"),
+    caseEvidence,
+    gitDir,
+    identity,
     isRelative: !isAbsolute(target),
+    requestedGitDir: targetPath,
   };
+}
+
+function gitDirPointersEqual(left: GitDirPointer, right: GitDirPointer): boolean {
+  return left.caseEvidence === right.caseEvidence
+    && left.gitDir === right.gitDir
+    && left.identity.dev === right.identity.dev
+    && left.identity.ino === right.identity.ino
+    && left.isRelative === right.isRelative
+    && left.requestedGitDir === right.requestedGitDir;
 }
 
 function resolveCommonDir(gitDir: string): string {
@@ -87,7 +361,16 @@ function resolveCommonDir(gitDir: string): string {
   if (!relative || relative.includes("\0") || relative.includes("\n") || relative.includes("\r")) {
     throw new Error(`invalid Git common-directory metadata at ${commonPointer}: expected one path`);
   }
-  return existingRealDirectory(resolve(gitDir, relative), "Git common directory");
+  const target = resolve(gitDir, relative);
+  const targetStat = lstatSync(target);
+  if (targetStat.isSymbolicLink()) {
+    throw new Error(`invalid Git common directory at ${target}`);
+  }
+  const commonDir = existingRealDirectory(target, "Git common directory");
+  if (commonDir !== target) {
+    throw new Error(`invalid Git common directory path alias at ${target}`);
+  }
+  return commonDir;
 }
 
 function parseOnePath(content: string, path: string, label: string): string {
@@ -141,9 +424,10 @@ function validateWorktreeBackpointer(
 function validateLinkedWorktreeTopology(
   marker: string,
   worktreeRoot: string,
-  gitDir: string,
+  gitPointer: GitDirPointer,
   commonDir: string,
 ): void {
+  const { gitDir } = gitPointer;
   const worktreesPath = join(commonDir, "worktrees");
   const worktreesStat = (() => {
     try {
@@ -183,7 +467,7 @@ function validateLinkedWorktreeTopology(
   // is descriptor-bound; comparing the resolved relationship a second time
   // also fails closed when repository-controlled metadata is retargeted
   // between validation steps.
-  if (parseGitDir(marker, worktreeRoot).gitDir !== gitDir) {
+  if (!gitDirPointersEqual(parseGitDir(marker, worktreeRoot), gitPointer)) {
     throw new Error("Git worktree metadata changed during topology validation");
   }
   if (resolveCommonDir(gitDir) !== commonDir) {
@@ -211,51 +495,509 @@ function canonicalForCommonDir(commonDir: string): string {
     : commonDir;
 }
 
-function configHasCoreWorktree(config: string): boolean {
-  let inCore = false;
-  for (const line of config.split(/\r?\n/u)) {
-    const section = /^\s*\[([^\]]+)\]\s*$/u.exec(line);
-    if (section) {
-      inCore = section[1]!.trim().toLowerCase() === "core";
-      continue;
-    }
-    if (inCore && /^\s*worktree\s*=/iu.test(line)) return true;
-  }
-  return false;
+function isConfigWhitespace(char: string): boolean {
+  return char === " " || char === "\t";
 }
 
-function configEnablesWorktreeConfig(config: string): boolean {
-  let inExtensions = false;
-  let enabled = false;
-  for (const line of config.split(/\r?\n/u)) {
-    const section = /^\s*\[([^\]]+)\]\s*$/u.exec(line);
-    if (section) {
-      inExtensions = section[1]!.trim().toLowerCase() === "extensions";
-      continue;
-    }
-    if (!inExtensions || !/^\s*worktreeconfig(?=$|[\s=])/iu.test(line)) continue;
-    if (/^\s*worktreeconfig\s*$/iu.test(line)) {
-      enabled = true;
-      continue;
-    }
-    const assignment =
-      /^\s*worktreeconfig\s*=\s*(true|yes|on|1|false|no|off|0)\s*(?:[#;].*)?\s*$/iu
-        .exec(line);
-    if (!assignment) return false;
-    enabled = /^(?:true|yes|on|1)$/iu.test(assignment[1]!);
+function asciiLower(value: string): string {
+  let lowered = "";
+  for (const char of value) {
+    const code = char.charCodeAt(0);
+    lowered += code >= 65 && code <= 90 ? String.fromCharCode(code + 32) : char;
   }
-  return enabled;
+  return lowered;
 }
 
-function hasConfiguredWorktree(gitDir: string): boolean {
-  const config = readGitConfig(join(gitDir, "config"), gitDir, "Git config");
-  if (configHasCoreWorktree(config)) return true;
-  if (!configEnablesWorktreeConfig(config)) return false;
-  const worktreeConfigPath = join(gitDir, "config.worktree");
-  if (!existsSync(worktreeConfigPath)) return false;
-  return configHasCoreWorktree(
-    readGitConfig(worktreeConfigPath, gitDir, "Git worktree config"),
+function isConfigNameChar(char: string): boolean {
+  const code = char.charCodeAt(0);
+  return (code >= 48 && code <= 57)
+    || (code >= 65 && code <= 90)
+    || (code >= 97 && code <= 122)
+    || char === "-";
+}
+
+function isAsciiLetter(char: string): boolean {
+  const code = char.charCodeAt(0);
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function gitBooleanDigit(char: string): number {
+  const code = char.charCodeAt(0);
+  if (code >= 48 && code <= 57) return code - 48;
+  if (code >= 65 && code <= 70) return code - 55;
+  if (code >= 97 && code <= 102) return code - 87;
+  return -1;
+}
+
+function parseGitBooleanInteger(value: string): boolean | undefined {
+  let cursor = 0;
+  while (cursor < value.length) {
+    const code = value.charCodeAt(cursor);
+    if (code !== 32 && (code < 9 || code > 13)) break;
+    cursor += 1;
+  }
+  if (value[cursor] === "+" || value[cursor] === "-") {
+    cursor += 1;
+  }
+
+  let end = value.length;
+  let scale = 1;
+  const unit = value[end - 1]?.toLowerCase();
+  if (unit === "k") {
+    scale = 1024;
+    end -= 1;
+  } else if (unit === "m") {
+    scale = 1024 * 1024;
+    end -= 1;
+  } else if (unit === "g") {
+    scale = 1024 * 1024 * 1024;
+    end -= 1;
+  }
+  if (cursor >= end) return undefined;
+
+  let base = 10;
+  if (value[cursor] === "0" && cursor + 1 < end) {
+    const prefix = value[cursor + 1]!.toLowerCase();
+    if (prefix === "x") {
+      base = 16;
+      cursor += 2;
+    } else {
+      base = 8;
+    }
+  }
+  if (cursor >= end) return undefined;
+
+  // Git interprets integer booleans as signed 32-bit values after applying an
+  // optional binary unit. Git versions before the upstream INT_MIN off-by-one
+  // fix reject -2147483648, so use the portable cross-version magnitude limit.
+  // Accumulate only up to that limit so even a 4 MiB repository-controlled
+  // value remains linear without arbitrary precision.
+  const signedLimit = 2_147_483_647;
+  const magnitudeLimit = Math.floor(signedLimit / scale);
+  let magnitude = 0;
+  for (; cursor < end; cursor += 1) {
+    const digit = gitBooleanDigit(value[cursor]!);
+    if (
+      digit < 0
+      || digit >= base
+      || magnitude > Math.floor((magnitudeLimit - digit) / base)
+    ) {
+      return undefined;
+    }
+    magnitude = magnitude * base + digit;
+  }
+  return magnitude !== 0;
+}
+
+function parseGitBoolean(value: string): boolean | undefined {
+  if (value.length <= 5) {
+    const text = asciiLower(value);
+    if (text === "" || text === "false" || text === "no" || text === "off") {
+      return false;
+    }
+    if (text === "true" || text === "yes" || text === "on") return true;
+  }
+  return parseGitBooleanInteger(value);
+}
+
+function scanPhysicalConfigLine(
+  line: string,
+  initialQuoted: boolean,
+): { readonly continues: boolean; readonly quoted: boolean } {
+  let quoted = initialQuoted;
+  let escaped = false;
+  for (const char of line) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (!quoted && (char === "#" || char === ";")) {
+      return { continues: false, quoted };
+    }
+  }
+  return { continues: escaped, quoted };
+}
+
+function logicalConfigLines(config: string): { readonly lines: string[]; readonly valid: boolean } {
+  const lines: string[] = [];
+  const continued: string[] = [];
+  let continuedQuote = false;
+  let valid = true;
+  for (const rawLine of config.split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    const scanned = scanPhysicalConfigLine(line, continuedQuote);
+    if (scanned.continues) {
+      continued.push(line.slice(0, -1));
+      continuedQuote = scanned.quoted;
+      continue;
+    }
+    continued.push(line);
+    const logicalLine = continued.join("");
+    if (continued.length > 1) {
+      let cursor = 0;
+      while (
+        cursor < logicalLine.length
+        && isConfigWhitespace(logicalLine[cursor]!)
+      ) {
+        cursor += 1;
+      }
+      if (logicalLine[cursor] === "[") valid = false;
+    }
+    lines.push(logicalLine);
+    continued.length = 0;
+    continuedQuote = false;
+  }
+  return { lines, valid: valid && continued.length === 0 };
+}
+
+function parseSectionName(line: string, start: number): {
+  readonly baseName?: string;
+  readonly name?: string;
+  readonly next?: number;
+  readonly valid: boolean;
+} {
+  let quoted = false;
+  let escaped = false;
+  let close = -1;
+  for (let index = start + 1; index < line.length; index += 1) {
+    const char = line[index]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quoted) {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (char === "]" && !quoted) {
+      close = index;
+      break;
+    }
+  }
+  if (close < 0 || quoted || escaped) return { valid: false };
+
+  const header = line.slice(start + 1, close);
+  let nameEnd = 0;
+  while (nameEnd < header.length && isConfigNameChar(header[nameEnd]!)) nameEnd += 1;
+  if (nameEnd === 0) return { valid: false };
+  const name = asciiLower(header.slice(0, nameEnd));
+  if (nameEnd === header.length) {
+    return { baseName: name, name, next: close + 1, valid: true };
+  }
+  let remainder = nameEnd;
+  if (header[remainder] === ".") {
+    remainder += 1;
+    const subsectionStart = remainder;
+    while (
+      remainder < header.length
+      && (isConfigNameChar(header[remainder]!) || header[remainder] === ".")
+    ) {
+      remainder += 1;
+    }
+    return {
+      baseName: name,
+      name: undefined,
+      next: close + 1,
+      valid: remainder > subsectionStart && remainder === header.length,
+    };
+  }
+  if (!isConfigWhitespace(header[remainder]!)) return { valid: false };
+  while (remainder < header.length && isConfigWhitespace(header[remainder]!)) remainder += 1;
+  if (header[remainder] !== '"') return { valid: false };
+  quoted = true;
+  escaped = false;
+  remainder += 1;
+  for (; remainder < header.length; remainder += 1) {
+    const char = header[remainder]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      quoted = false;
+      remainder += 1;
+      break;
+    }
+  }
+  return {
+    baseName: name,
+    name: undefined,
+    next: close + 1,
+    valid: !quoted && !escaped && remainder === header.length,
+  };
+}
+
+function parseConfigValue(raw: string): ParsedConfigValue {
+  const value: string[] = [];
+  let escaped = false;
+  let quoted = false;
+  let started = false;
+  let trailingWhitespace = 0;
+  for (let index = 0; index < raw.length; index += 1) {
+    const char = raw[index]!;
+    if (escaped) {
+      const decoded = char === "n" ? "\n"
+        : char === "t" ? "\t"
+          : char === "b" ? "\b"
+            : char === "\\" || char === '"' ? char
+              : undefined;
+      if (decoded === undefined) return { valid: false };
+      value.push(decoded);
+      started = true;
+      trailingWhitespace = 0;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      quoted = !quoted;
+      started = true;
+      trailingWhitespace = 0;
+      continue;
+    }
+    if (!quoted && (char === "#" || char === ";")) break;
+    if (!quoted && isConfigWhitespace(char)) {
+      if (!started) continue;
+      value.push(char);
+      trailingWhitespace += 1;
+      continue;
+    }
+    value.push(char);
+    started = true;
+    trailingWhitespace = 0;
+  }
+  if (escaped || quoted) return { valid: false };
+  if (trailingWhitespace > 0) value.splice(value.length - trailingWhitespace);
+  return { valid: true, value: value.join("") };
+}
+
+function parseGitConfig(config: string): GitConfigValues {
+  const logical = logicalConfigLines(
+    config.startsWith("\uFEFF") ? config.slice(1) : config,
   );
+  let section: string | undefined;
+  let sectionBase: string | undefined;
+  let coreWorktree: string | undefined;
+  let hasCoreWorktree = false;
+  let valid = logical.valid;
+  let worktreeConfig = false;
+  let worktreeConfigInvalid = false;
+
+  for (const line of logical.lines) {
+    let cursor = 0;
+    while (cursor < line.length && isConfigWhitespace(line[cursor]!)) cursor += 1;
+    if (cursor === line.length || line[cursor] === "#" || line[cursor] === ";") continue;
+    let malformedSection = false;
+    while (line[cursor] === "[") {
+      const parsedSection = parseSectionName(line, cursor);
+      if (!parsedSection.valid) {
+        valid = false;
+        section = undefined;
+        sectionBase = undefined;
+        malformedSection = true;
+        break;
+      }
+      section = parsedSection.name;
+      sectionBase = parsedSection.baseName;
+      cursor = parsedSection.next!;
+      while (cursor < line.length && isConfigWhitespace(line[cursor]!)) cursor += 1;
+    }
+    if (
+      malformedSection
+      || cursor === line.length
+      || line[cursor] === "#"
+      || line[cursor] === ";"
+    ) continue;
+
+    if (!isAsciiLetter(line[cursor]!)) {
+      valid = false;
+      continue;
+    }
+    const keyStart = cursor;
+    while (cursor < line.length && isConfigNameChar(line[cursor]!)) cursor += 1;
+    const key = asciiLower(line.slice(keyStart, cursor));
+    const relevant = (section === "core" && key === "worktree")
+      || (section === "extensions" && key === "worktreeconfig");
+    if (
+      key === "path"
+      && (sectionBase === "include" || sectionBase === "includeif")
+    ) {
+      valid = false;
+      continue;
+    }
+    while (cursor < line.length && isConfigWhitespace(line[cursor]!)) cursor += 1;
+    const implicit = cursor === line.length;
+    let parsedValue: ParsedConfigValue | undefined;
+    if (!implicit && line[cursor] === "=") {
+      parsedValue = parseConfigValue(line.slice(cursor + 1));
+    } else if (!implicit) {
+      valid = false;
+      if (section === "extensions") worktreeConfigInvalid = true;
+      continue;
+    }
+    if (parsedValue?.valid === false) {
+      valid = false;
+      if (section === "core" && key === "worktree") hasCoreWorktree = true;
+      if (section === "extensions" && key === "worktreeconfig") {
+        worktreeConfigInvalid = true;
+      }
+      continue;
+    }
+    if (!relevant) continue;
+
+    if (section === "core") {
+      hasCoreWorktree = true;
+      if (parsedValue === undefined) {
+        valid = false;
+      } else {
+        coreWorktree = parsedValue.value;
+      }
+      continue;
+    }
+
+    if (parsedValue === undefined) {
+      worktreeConfig = true;
+      continue;
+    }
+    const bool = parseGitBoolean(parsedValue.value);
+    if (bool === undefined) {
+      worktreeConfigInvalid = true;
+      valid = false;
+    } else {
+      worktreeConfig = bool;
+    }
+  }
+
+  return {
+    coreWorktree,
+    hasCoreWorktree,
+    valid,
+    worktreeConfig: !worktreeConfigInvalid && worktreeConfig,
+  };
+}
+
+function readConfigValues(gitDir: string): {
+  readonly commonConfig: string;
+  readonly commonValues: GitConfigValues;
+  readonly worktreeConfig?: string;
+  readonly worktreeValues?: GitConfigValues;
+} {
+  const commonConfig = readGitConfig(join(gitDir, "config"), gitDir, "Git config");
+  const commonValues = parseGitConfig(commonConfig);
+  const worktreeConfigPath = join(gitDir, "config.worktree");
+  if (!commonValues.worktreeConfig || !existsSync(worktreeConfigPath)) {
+    return { commonConfig, commonValues };
+  }
+  const worktreeConfig = readGitConfig(
+    worktreeConfigPath,
+    gitDir,
+    "Git worktree config",
+  );
+  return {
+    commonConfig,
+    commonValues,
+    worktreeConfig,
+    worktreeValues: parseGitConfig(worktreeConfig),
+  };
+}
+
+function readExternalWorktreeEvidence(
+  gitDir: string,
+  worktreeRoot: string,
+): ExternalWorktreeEvidence {
+  const values = readConfigValues(gitDir);
+  if (!values.commonValues.valid || values.worktreeValues?.valid === false) {
+    throw new Error(`invalid Git config metadata at ${join(gitDir, "config")}: ambiguous worktree configuration`);
+  }
+  const configured = values.worktreeValues?.hasCoreWorktree === true
+    ? values.worktreeValues.coreWorktree
+    : values.commonValues.coreWorktree;
+  if (
+    configured === undefined
+    || configured.length === 0
+    || configured.includes("\0")
+    || configured.includes("\n")
+    || configured.includes("\r")
+  ) {
+    throw new Error(`invalid Git config metadata at ${join(gitDir, "config")}: expected one core.worktree path`);
+  }
+  const configuredPath = resolve(gitDir, configured);
+  let caseVariantSnapshot: string | undefined;
+  if (configuredPath !== worktreeRoot) {
+    if (!isCaseVariantPath(configuredPath, worktreeRoot)) {
+      throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: topology does not point to ${worktreeRoot}`);
+    }
+    try {
+      caseVariantSnapshot = snapshotCaseVariantPath(
+        configuredPath,
+        worktreeRoot,
+      );
+    } catch {
+      throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: topology does not point to ${worktreeRoot}`);
+    }
+  }
+  let configuredIdentity: DirectoryIdentity;
+  try {
+    configuredIdentity = authenticateDirectory(
+      configuredPath,
+      "Git core.worktree directory",
+    );
+  } catch (error) {
+    if (configuredPath === worktreeRoot) throw error;
+    throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: topology does not point to ${worktreeRoot}`);
+  }
+  if (configuredPath !== worktreeRoot) {
+    const worktreeIdentity = authenticateDirectory(
+      worktreeRoot,
+      "Git core.worktree directory",
+    );
+    if (
+      configuredIdentity.dev === 0
+      || configuredIdentity.ino === 0
+      || worktreeIdentity.dev === 0
+      || worktreeIdentity.ino === 0
+      || configuredIdentity.dev !== worktreeIdentity.dev
+      || configuredIdentity.ino !== worktreeIdentity.ino
+    ) {
+      throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: topology does not point to ${worktreeRoot}`);
+    }
+    let revalidatedSnapshot: string;
+    try {
+      revalidatedSnapshot = snapshotCaseVariantPath(
+        configuredPath,
+        worktreeRoot,
+      );
+    } catch {
+      throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: topology does not point to ${worktreeRoot}`);
+    }
+    if (revalidatedSnapshot !== caseVariantSnapshot) {
+      throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: component evidence changed during validation`);
+    }
+  }
+  return {
+    commonConfig: values.commonConfig,
+    resolvedWorktree: worktreeRoot,
+    worktreeConfig: values.worktreeConfig,
+  };
 }
 
 function validateGitDirectory(gitDir: string, commonDir: string): void {
@@ -285,21 +1027,65 @@ function inspectGitMarker(worktreeRoot: string): GitProjectAnchor | null {
 
   let gitDir: string;
   let relativeGitPointer = false;
+  let gitPointer: GitDirPointer | undefined;
   if (stat.isDirectory()) {
     gitDir = existingRealDirectory(marker, "Git directory");
   } else if (stat.isFile()) {
-    const parsedPointer = parseGitDir(marker, worktreeRoot);
-    gitDir = parsedPointer.gitDir;
-    relativeGitPointer = parsedPointer.isRelative;
+    gitPointer = parseGitDir(marker, worktreeRoot);
+    gitDir = gitPointer.gitDir;
+    relativeGitPointer = gitPointer.isRelative;
   } else {
     throw new Error(`invalid Git metadata type at ${marker}`);
   }
 
+  const gitDirIdentity = gitPointer?.identity
+    ?? authenticateDirectory(gitDir, "Git directory");
   const commonDir = resolveCommonDir(gitDir);
-  if (stat.isFile() && commonDir !== gitDir) {
-    validateLinkedWorktreeTopology(marker, worktreeRoot, gitDir, commonDir);
+  const commonDirIdentity = commonDir === gitDir
+    ? gitDirIdentity
+    : authenticateDirectory(commonDir, "Git common directory");
+  if (stat.isDirectory() && !isContainedPath(gitDir, commonDir)) {
+    throw new Error(
+      `invalid Git common-directory metadata: ${commonDir} escapes ${gitDir}`,
+    );
   }
+  if (stat.isFile() && commonDir !== gitDir) {
+    validateLinkedWorktreeTopology(
+      marker,
+      worktreeRoot,
+      gitPointer!,
+      commonDir,
+    );
+  }
+  const externalEvidence = stat.isFile() && commonDir === gitDir
+    ? readExternalWorktreeEvidence(gitDir, worktreeRoot)
+    : undefined;
   validateGitDirectory(gitDir, commonDir);
+
+  revalidateDirectory(gitDirIdentity, "Git directory");
+  if (commonDir !== gitDir) {
+    revalidateDirectory(commonDirIdentity, "Git common directory");
+  }
+  if (resolveCommonDir(gitDir) !== commonDir) {
+    throw new Error("Git common-directory metadata changed during validation");
+  }
+  if (stat.isFile()) {
+    const revalidatedPointer = parseGitDir(marker, worktreeRoot);
+    if (!gitDirPointersEqual(revalidatedPointer, gitPointer!)) {
+      throw new Error("Git worktree metadata changed during validation");
+    }
+    revalidateDirectory(gitDirIdentity, "Git directory");
+  }
+  if (externalEvidence !== undefined) {
+    const revalidatedEvidence = readExternalWorktreeEvidence(gitDir, worktreeRoot);
+    if (
+      revalidatedEvidence.commonConfig !== externalEvidence.commonConfig
+      || revalidatedEvidence.worktreeConfig !== externalEvidence.worktreeConfig
+      || revalidatedEvidence.resolvedWorktree !== externalEvidence.resolvedWorktree
+    ) {
+      throw new Error("Git core.worktree metadata changed during validation");
+    }
+  }
   return {
     // A normal submodule has a `.git` pointer into the superproject's
     // `.git/modules/...` directory, no `commondir`, and an explicit core
@@ -307,7 +1093,7 @@ function inspectGitMarker(worktreeRoot: string): GitProjectAnchor | null {
     // no `commondir`, but Git writes its pointer as an absolute path. Keep that
     // external directory as the anchor so linked worktrees resolve identically.
     canonical: stat.isFile() && relativeGitPointer && commonDir === gitDir
-      ? hasConfiguredWorktree(commonDir) ? worktreeRoot : canonicalForCommonDir(commonDir)
+      ? worktreeRoot
       : canonicalForCommonDir(commonDir),
     worktreeRoot,
     commonDir,

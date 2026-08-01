@@ -5,21 +5,73 @@ identified by the SHA-256 hash of its normalized canonical path. For a Git
 repository, LCM first resolves the verified Git common directory and uses the
 primary checkout as that canonical path, so linked worktrees share one local
 project. A primary checkout created with `git init --separate-git-dir` and all
-of its linked worktrees instead share that external Git directory as their
-stable local anchor. Git submodules remain independent projects anchored at
-their own checkouts. Non-Git directories continue to use their normalized path
-directly. LCM reads Git metadata through descriptor-bound, no-follow
-validation. `HEAD`, `gitdir`, `commondir`, and other topology pointers remain
-limited to 64 KiB; `.git/config` and `config.worktree` accept valid files up to
-4 MiB so accumulated branch metadata does not block project identity. Larger,
-symlinked, or non-regular metadata continues to fail closed.
+of its linked worktrees share that external Git directory as their stable local
+anchor only after the external configuration's final `core.worktree` value
+resolves back to the exact authenticated primary checkout. Relative
+`core.worktree` values follow Git's metadata-directory-relative semantics.
+Every standalone `.git` file pointer, whether absolute or relative, must supply
+that proof. Relative pointers retain submodule-style checkout anchoring only
+after verification; they cannot select unrelated metadata by traversal.
+Missing, ambiguous, mismatched, or race-changed backlinks fail before project
+storage opens. Git submodules remain independent projects anchored at their own
+checkouts. Git config `include` and `includeIf` directives are rejected for
+identity proof because their targets fall outside the bounded authenticated
+config snapshot. A repository-local `.git` directory may use only a `commondir` that
+remains inside that authenticated metadata root; local indirection cannot select
+another checkout's administration directory. Non-Git directories continue to
+use their normalized path directly.
+
+LCM reads Git metadata through descriptor-bound, no-follow validation and
+revalidates the marker, directories, topology pointers, and relevant config
+bytes before accepting the identity. `HEAD`, `gitdir`, `commondir`, and other
+topology pointers remain limited to 64 KiB; `.git/config` and
+`config.worktree` accept valid files up to 4 MiB so accumulated branch metadata
+does not block project identity. Larger, symlinked, non-regular, substituted,
+or escaping metadata continues to fail closed.
+
+On case-insensitive filesystems, a `.git` file may spell its target with
+case-only component differences. LCM accepts that spelling only when the
+requested and canonical paths have the same stable, nonzero filesystem
+identity and every different component has one unique, bounded, unchanged
+same-fold directory entry. The canonical Git directory remains the downstream
+identity anchor. Symlinked, bind-equivalent, ambiguous, race-changed, or
+cross-root aliases fail closed.
+
+Git does not always write `core.worktree` when initializing a separate Git
+directory. Make the relationship explicit before LCM first opens project
+storage:
+
+```bash
+git -C /work/project config --local core.worktree /work/project
+```
+
+Use the authenticated checkout's real path. On case-insensitive filesystems,
+LCM accepts a case-only `core.worktree` spelling only when every differently
+spelled component has one stable same-fold directory entry and both spellings
+authenticate to the same nonzero filesystem identity. Symlink, bind-mounted,
+or ambiguous aliases, different roots or drives, and unverifiable spellings
+fail closed.
 When Git's common config repeats `extensions.worktreeConfig`, including across
 multiple `[extensions]` sections, LCM follows Git's final-assignment behavior:
-the last supported true/yes/on/1 or implicit boolean enables per-worktree
-configuration, while the last false/no/off/0 disables it. Inline `#` and `;`
-comments on explicit supported values are preserved. Any malformed or
-unsupported occurrence fails closed instead of allowing an earlier or later
-truthy value to enable `config.worktree`.
+the last implicit, true/yes/on, or valid nonzero Git integer enables
+per-worktree configuration, while an assigned empty value, false/no/off, or a
+valid zero integer disables it. Integers support Git's decimal, octal,
+and hexadecimal forms with optional `k`, `m`, or `g` scaling. Host-specific
+numeric extensions such as the C23 `0b` binary prefix fail closed so project
+identity does not vary by operating system or C library. For compatibility
+across supported Git versions, scaled results use the symmetric portable range
+from `-2147483647` through `2147483647`; older Git versions reject
+`-2147483648` and equivalent scaled forms. Only integer values may have leading
+ASCII C whitespace; trailing or internal whitespace remains invalid. Inline
+`#` and `;` comments, quoted values, supported escapes,
+continued lines, CRLF input, and case-insensitive section and key names are
+parsed in one bounded linear pass. Git-compatible section headers and their
+first assignment may share one physical line. A bare or deprecated dotted
+section name must meet its closing `]` directly. A quoted subsection requires
+one or more spaces or tabs before its opening quote and its closing quote must
+meet `]` directly; whitespace after the completed header remains valid.
+Any malformed, overflowing, or unsupported occurrence fails closed instead of
+allowing an earlier or later truthy value to enable `config.worktree`.
 The database and passive-learning sidecar remain under:
 
 ```text
