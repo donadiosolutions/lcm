@@ -207,7 +207,10 @@ describe("SQLite migration reader and writer", () => {
     expect(reader.inventory()).toEqual(expected);
     expect(reader.readBatch("conversations", 0, 1)).toEqual(migrationRows().conversations);
     expect(reader.sample("messages", 1)).toEqual(migrationRows().messages);
-    expect([...reader.iterate("summary_large_files")]).toEqual(migrationRows().summary_large_files);
+    expect([...reader.iterate("summary_large_files")]).toEqual([
+      { summary_id: "summary-child", file_ids: [] },
+      ...migrationRows().summary_large_files!,
+    ]);
     expect(reader.readBatch("messages", 99, 1)).toEqual([]);
     expect(() => reader.readBatch("messages", -1, 1)).toThrow("offset must be non-negative");
     expect(() => reader.readBatch("messages", 0.5, 1)).toThrow("offset must be non-negative");
@@ -297,7 +300,15 @@ describe("online SQLite migration snapshots", () => {
     const root = privateDirectory();
     const source = join(root, "legacy.sqlite");
     const legacy = new DatabaseSync(source);
-    legacy.exec(`CREATE TABLE session_instructions (id INTEGER PRIMARY KEY CHECK (id = 1), content TEXT NOT NULL, content_hash TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now'))); INSERT INTO session_instructions VALUES (1, 'legacy', '${"a".repeat(64)}', '${now}')`);
+    legacy.exec(`
+      CREATE TABLE session_instructions (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO session_instructions VALUES (1, 'legacy', '${"a".repeat(64)}', '${now}');
+    `);
     legacy.close();
     chmodSync(source, 0o600);
     const before = readFileSync(source);
