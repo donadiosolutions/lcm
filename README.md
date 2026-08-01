@@ -434,6 +434,10 @@ crash-recovery semantics.
 The [PostgreSQL summary, context, and large-file guide](docs/postgresql-summary-context.md)
 defines graph, coverage, context-range, ordering, lock/fence, grant, query-plan,
 diagnostic, and recovery semantics.
+The [reversible PostgreSQL migration runbook](docs/postgresql-migration.md)
+documents installation-wide planning, destination-read-only rehearsal, fenced
+and resumable copying, verification, crash-recoverable activation, retained
+SQLite sources, PITR prerequisites, and both pre-write and post-write rollback.
 
 ## Development
 
