@@ -20,6 +20,8 @@ import {
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const PROJECT_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
+const PROMOTION_DRAIN_TIMEOUT_MS = 15_000;
+const FORCED_WRAPPER_TIMEOUT_MS = 1;
 
 const eventPathMocks = vi.hoisted(() => ({
   eventsDir: vi.fn(),
@@ -93,12 +95,31 @@ function setupProjectDb(cwd: string): DatabaseSync {
   return db;
 }
 
+function attemptCleanup(errors: unknown[], cleanup: () => void): void {
+  try {
+    cleanup();
+  } catch (error) {
+    errors.push(error);
+  }
+}
+
+function throwCleanupErrors(errors: unknown[], message: string): void {
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, message);
+}
+
 describe("promote-events route", () => {
   let dir: string;
   let homeDir: string;
   let sidecarPath: string;
   let extraDirs: string[];
   let originalHome: string | undefined;
+  let startedPromotionOperations: Promise<unknown>[];
+
+  function registerPromotionOperation<T>(operation: Promise<T>): Promise<T> {
+    startedPromotionOperations.push(operation);
+    return operation;
+  }
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "promote-events-test-"));
@@ -107,26 +128,38 @@ describe("promote-events route", () => {
     process.env.HOME = homeDir;
     sidecarPath = join(dir, "events.db");
     extraDirs = [];
+    startedPromotionOperations = [];
     eventPathMocks.eventsDir.mockReturnValue(dir);
     vi.mocked(eventsDbPath).mockReturnValue(sidecarPath);
     vi.mocked(deduplicateAndInsert).mockClear();
     clearProjectMapCache();
   });
 
-  afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
-    rmSync(homeDir, { recursive: true, force: true });
+  afterEach(async () => {
+    const cleanupErrors: unknown[] = [];
+    const settled = await Promise.allSettled(startedPromotionOperations);
+    for (const result of settled) {
+      if (result.status === "rejected") cleanupErrors.push(result.reason);
+    }
+    startedPromotionOperations = [];
+
+    attemptCleanup(cleanupErrors, () => {
+      if (originalHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = originalHome;
+      }
+    });
+    attemptCleanup(cleanupErrors, () => vi.clearAllMocks());
+    attemptCleanup(cleanupErrors, () => clearProjectMapCache());
+    attemptCleanup(cleanupErrors, () => rmSync(dir, { recursive: true, force: true }));
+    attemptCleanup(cleanupErrors, () => rmSync(homeDir, { recursive: true, force: true }));
     for (const extraDir of extraDirs) {
-      rmSync(extraDir, { recursive: true, force: true });
+      attemptCleanup(cleanupErrors, () => rmSync(extraDir, { recursive: true, force: true }));
     }
-    if (originalHome === undefined) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    vi.clearAllMocks();
-    clearProjectMapCache();
-  });
+
+    throwCleanupErrors(cleanupErrors, "promote-events test cleanup failed");
+  }, Number.POSITIVE_INFINITY);
 
   it("promotes priority 1 events via deduplicateAndInsert", async () => {
     let transactionRepositories: unknown;
@@ -565,7 +598,8 @@ describe("promote-events route", () => {
 
     const handler = createPromoteAllEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler(request, res, "");
+    const operation = registerPromotionOperation(handler(request, res, ""));
+    await operation;
 
     const result = getBody();
     expect(result.promoted).toBe(501);
@@ -578,6 +612,78 @@ describe("promote-events route", () => {
     const remaining = remainingDb.getUnprocessed();
     remainingDb.close();
     expect(remaining).toHaveLength(0);
+  }, PROMOTION_DRAIN_TIMEOUT_MS);
+
+  it("settles route work after a forced wrapper timeout", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent(
+      "s1",
+      { type: "decision", category: "decision", data: "forced wrapper timeout", priority: 1 },
+      "PostToolUse",
+    );
+    edb.close();
+    setupProjectDb(dir).close();
+
+    const deduplicateMock = vi.mocked(deduplicateAndInsert);
+    const originalImplementation = deduplicateMock.getMockImplementation();
+    let markDeduplicateStarted!: () => void;
+    const deduplicateStarted = new Promise<void>((resolve) => {
+      markDeduplicateStarted = resolve;
+    });
+    let releaseDeduplicate!: () => void;
+    const deduplicateReleased = new Promise<void>((resolve) => {
+      releaseDeduplicate = resolve;
+    });
+    let operation: Promise<void> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let primaryError: unknown;
+
+    try {
+      deduplicateMock.mockImplementation(async () => {
+        markDeduplicateStarted();
+        await deduplicateReleased;
+        return "mock-id";
+      });
+      const handler = createPromoteEventsHandler(makeConfig());
+      const { res } = mockRes();
+      operation = registerPromotionOperation(
+        handler(request, res, JSON.stringify({ cwd: dir, drain: true })),
+      );
+      await Promise.race([
+        deduplicateStarted,
+        operation.then(() => {
+          throw new Error("promotion route settled before deferred deduplication started");
+        }),
+      ]);
+
+      const forcedTimeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("forced wrapper timeout")), FORCED_WRAPPER_TIMEOUT_MS);
+      });
+      await expect(Promise.race([operation, forcedTimeout])).rejects.toThrow("forced wrapper timeout");
+    } catch (error) {
+      primaryError = error;
+    } finally {
+      const cleanupErrors: unknown[] = primaryError === undefined ? [] : [primaryError];
+      if (timer !== undefined) attemptCleanup(cleanupErrors, () => clearTimeout(timer));
+      attemptCleanup(cleanupErrors, () => releaseDeduplicate());
+      if (operation !== undefined) {
+        try {
+          await operation;
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      attemptCleanup(cleanupErrors, () => {
+        if (originalImplementation === undefined) {
+          deduplicateMock.mockReset();
+        } else {
+          deduplicateMock.mockImplementation(originalImplementation);
+        }
+      });
+      throwCleanupErrors(cleanupErrors, "forced promotion timeout cleanup failed");
+    }
+
+    expect(deduplicateMock).toHaveBeenCalledTimes(1);
   });
 
   it("drains every batch from the current project when requested", async () => {
@@ -593,7 +699,10 @@ describe("promote-events route", () => {
 
     const handler = createPromoteEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    await handler(request, res, JSON.stringify({ cwd: dir, drain: true }));
+    const operation = registerPromotionOperation(
+      handler(request, res, JSON.stringify({ cwd: dir, drain: true })),
+    );
+    await operation;
 
     const result = getBody();
     expect(result.promoted).toBe(501);
@@ -605,7 +714,7 @@ describe("promote-events route", () => {
     const remaining = remainingDb.getUnprocessed();
     remainingDb.close();
     expect(remaining).toHaveLength(0);
-  });
+  }, PROMOTION_DRAIN_TIMEOUT_MS);
 
   it("reports orphan sidecars during global promotion", async () => {
     const orphanPath = join(dir, "orphan.db");

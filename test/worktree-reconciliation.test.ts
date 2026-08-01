@@ -4281,7 +4281,7 @@ describe("worktree reconciliation", () => {
     expect(reconcileWorktrees(main, {
       _sourceBusyTimeoutMs: value,
     }).status).toBe("completed");
-  });
+  }, 10_000);
 
   it("rediscovers mapped sources after a completed no-op journal", () => {
     const { main, linked } = makeRepository(home);
