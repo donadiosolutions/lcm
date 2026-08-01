@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, constants, existsSync, fsyncSync, linkSync, openSync, unlinkSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, fsyncSync, linkSync, openSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import type { QueryResultRow } from "pg";
 import { CanonicalRowDigest, canonicalJson, fingerprintMigrationFileSync, type CanonicalValue, type MigrationFileFingerprint } from "../migration-manifest.js";
@@ -135,14 +135,16 @@ async function writeSidecar(path: string, rows: AsyncIterable<Record<string, unk
     fsyncSync(fd);
   } finally { closeSync(fd); }
   chmodSync(temporary, PRIVATE_FILE_MODE);
+  const candidate = fingerprintMigrationFileSync(temporary, dirname(temporary));
   try {
     try { linkSync(temporary, path); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    const candidate = fingerprintMigrationFileSync(temporary, dirname(temporary));
-    const published = fingerprintMigrationFileSync(path, dirname(path));
-    if (candidate.size !== published.size || candidate.sha256 !== published.sha256) throw new Error("existing PostgreSQL operational sidecar diverges");
-    return published;
   } finally { unlinkSync(temporary); }
+  const directory = openSync(dirname(path), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try { fsyncSync(directory); } finally { closeSync(directory); }
+  const published = fingerprintMigrationFileSync(path, dirname(path));
+  if (candidate.size !== published.size || candidate.sha256 !== published.sha256) throw new Error("existing PostgreSQL operational sidecar diverges");
+  return published;
 }
 
 export class PostgreSqlMigrationAdapter {
