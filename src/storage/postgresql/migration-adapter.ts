@@ -123,23 +123,29 @@ const SIDECARS = [
 ] as const;
 function logical(name: string): LogicalTable { const found = LOGICAL_TABLES.find((table) => table.name === name); if (!found) throw new Error(`unknown PostgreSQL migration table: ${name}`); return found; }
 
+function writeFully(fd: number, line: Buffer, writer: typeof writeSync = writeSync): void {
+  let offset = 0;
+  while (offset < line.length) { const written = writer(fd, line, offset, line.length - offset); if (written === 0) throw new Error("sidecar write made no progress"); offset += written; }
+}
+
+function linkSidecar(temporary: string, path: string, linker: typeof linkSync = linkSync): void {
+  try { linker(temporary, path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+}
+
 async function writeSidecar(path: string, rows: AsyncIterable<Record<string, unknown>>): Promise<MigrationFileFingerprint> {
   const temporary = `${path}.${randomUUID()}.tmp`;
   const fd = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_WRONLY, PRIVATE_FILE_MODE);
   try {
     for await (const row of rows) {
       const line = Buffer.from(`${canonicalJson(row)}\n`, "utf8");
-      let offset = 0;
-      while (offset < line.length) { const written = writeSync(fd, line, offset, line.length - offset); if (written === 0) throw new Error("sidecar write made no progress"); offset += written; }
+      writeFully(fd, line);
     }
     fsyncSync(fd);
   } finally { closeSync(fd); }
   chmodSync(temporary, PRIVATE_FILE_MODE);
   const candidate = fingerprintMigrationFileSync(temporary, dirname(temporary));
-  try {
-    try { linkSync(temporary, path); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-  } finally { unlinkSync(temporary); }
+  try { linkSidecar(temporary, path); } finally { unlinkSync(temporary); }
   const directory = openSync(dirname(path), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   try { fsyncSync(directory); } finally { closeSync(directory); }
   const published = fingerprintMigrationFileSync(path, dirname(path));
@@ -223,6 +229,7 @@ export const POSTGRESQL_MIGRATION_TEST_SEAMS = {
   deterministicUuid,
   finite,
   jsonValue,
+  linkSidecar,
   logical,
   makePlan,
   matches,
@@ -234,5 +241,6 @@ export const POSTGRESQL_MIGRATION_TEST_SEAMS = {
   text,
   timestamp,
   uuid,
+  writeFully,
   writeSidecar,
 } as const;

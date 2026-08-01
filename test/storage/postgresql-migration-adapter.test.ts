@@ -187,6 +187,7 @@ describe("PostgreSQL migration normalization and planning", () => {
       buffer: Buffer.from("ab", "hex"),
       object: { z: 1, a: 2 },
     })).toEqual({ conversation_id: 1, confidence: 1.5, created_at: now, archived_at: null, tags: ["tag"], nil: null, text: "text", boolean: true, number: 3, bigint: { $integer: "4" }, date: now, buffer: "ab", object: { a: 2, z: 1 } });
+    expect(seam.baseRow({ conversation_id: null, confidence: null, tags: null })).toEqual({ conversation_id: null, confidence: null, tags: null });
 
     expect(() => seam.text(1, "field")).toThrow("field is not valid text");
     expect(() => seam.text("bad\0text", "field")).toThrow("field is not valid text");
@@ -207,6 +208,8 @@ describe("PostgreSQL migration normalization and planning", () => {
       expect(plans.length, table).toBeGreaterThan(0);
       expect(plans.every((plan) => plan.table.length > 0), table).toBe(true);
     }
+    const summaryContext = await POSTGRESQL_MIGRATION_TEST_SEAMS.plansForRow(executor, identity, "context_items", { ...allRows().context_items![0]!, message_id: null, summary_id: "summary" });
+    expect(summaryContext[0]?.values).toContain(POSTGRESQL_MIGRATION_TEST_SEAMS.deterministicUuid(remoteProjectId, "summary", "summary"));
     const summaryFiles = await POSTGRESQL_MIGRATION_TEST_SEAMS.plansForRow(executor, identity, "summary_large_files", { summary_id: "summary", file_ids: [] });
     const tags = await POSTGRESQL_MIGRATION_TEST_SEAMS.plansForRow(executor, identity, "promoted_memory_tags", { memory_id: "018f1234-5678-7abc-8def-0123456789ae", tags: [] });
     expect(summaryFiles).toEqual([]);
@@ -264,6 +267,8 @@ describe("PostgreSQL migration destination and writes", () => {
   it("fails closed for missing, duplicate, divergent, occupied, and malformed destinations", async () => {
     const missing = new PostgreSqlMigrationAdapter(fakeRuntime((config) => config.text.includes("FROM lcm.projects") ? [] : [{ count: "0" }]), identity);
     await expect(missing.assertEmptyDestination()).rejects.toThrow("remote project identity is not registered");
+    const absentCounts = new PostgreSqlMigrationAdapter(fakeRuntime(() => []), identity);
+    expect((await absentCounts.destinationState()).stateRows).toBe(0);
     const duplicate = new PostgreSqlMigrationAdapter(fakeRuntime((config) => config.text.includes("FROM lcm.projects") ? [{ identity_key: localProjectId }, { identity_key: localProjectId }] : [{ count: "0" }]), identity);
     await expect(duplicate.destinationState()).rejects.toThrow("duplicate remote project identity");
     const divergent = new PostgreSqlMigrationAdapter(fakeRuntime((config) => config.text.includes("FROM lcm.projects") ? [{ identity_key: "b".repeat(64) }] : [{ count: "0" }]), identity);
@@ -357,6 +362,8 @@ describe("PostgreSQL migration verification and sidecars", () => {
     }), identity);
     expect(await adapter.readBatch("conversations", 0, 1)).toEqual([{ conversation_id: 1, session_id: "session", title: null, bootstrapped_at: null, created_at: now, updated_at: now, extra_bigint: { $integer: "4" }, extra_buffer: "ab", extra_json: { safe: true } }]);
     expect(await adapter.sample("conversations", 1)).toHaveLength(1);
+    const promoted = new PostgreSqlMigrationAdapter(fakeRuntime((_config, options) => options.operation === "migrationReadBatch:promoted_memories" ? [{ memory_id: "018f1234-5678-7abc-8def-0123456789ae", content: "memory", metadata: '{"safe":true}', source_summary_id: null, source_project_id: localProjectId, session_id: null, depth: "0", confidence: "1", created_at: now, archived_at: null }] : []), identity);
+    expect((await promoted.readBatch("promoted_memories", 0, 1))[0]?.metadata).toEqual({ safe: true });
     const inventory = await adapter.inventory();
     expect(inventory).toHaveLength(POSTGRESQL_MIGRATION_TABLE_NAMES.length);
     expect(inventory[0]).toMatchObject({ table: "conversations", rows: 1_001 });
@@ -386,8 +393,12 @@ describe("PostgreSQL migration verification and sidecars", () => {
     const adapter = new PostgreSqlMigrationAdapter(fakeRuntime((config, options) => {
       if (!options.operation.startsWith("migrationSidecar:")) return [];
       const offset = config.values?.[2];
+      if (options.operation.endsWith("nativeTranscriptSidecar")) {
+        if (offset === 0) return Array.from({ length: 1_000 }, (_unused, transcript_id) => ({ transcript_id, native_payload: { scrubbed: true } }));
+        if (offset === 1_000) return [{ transcript_id: 1_000, native_payload: { scrubbed: true } }];
+        return [];
+      }
       if (offset !== 0) return [];
-      if (options.operation.endsWith("nativeTranscriptSidecar")) return [{ transcript_id: 1, native_payload: { scrubbed: true } }];
       if (options.operation.endsWith("passiveEventSidecar")) return [{ inbox_id: 1, payload: { safe: true } }];
       return [{ machine_id: machineId, checkpoint: { ordinal: 1 } }];
     }), identity);
@@ -397,6 +408,16 @@ describe("PostgreSQL migration verification and sidecars", () => {
     await expect(adapter.exportOperationalSidecars(paths)).resolves.toEqual(first);
     writeFileSync(paths.nativeTranscriptSidecar, "divergent\n", { mode: 0o600 });
     await expect(adapter.exportOperationalSidecars(paths)).rejects.toThrow("existing PostgreSQL operational sidecar diverges");
+  });
+
+  it("fails closed when sidecar writes stall or publication links fail", () => {
+    const stalled = vi.fn(() => 0);
+    expect(() => POSTGRESQL_MIGRATION_TEST_SEAMS.writeFully(1, Buffer.from("line"), stalled)).toThrow("sidecar write made no progress");
+    const partial = vi.fn((_fd: number, _buffer: Uint8Array, offset: number, length: number) => Math.min(length, offset === 0 ? 1 : length));
+    expect(() => POSTGRESQL_MIGRATION_TEST_SEAMS.writeFully(1, Buffer.from("line"), partial)).not.toThrow();
+    const failure = Object.assign(new Error("link failed"), { code: "EPERM" });
+    expect(() => POSTGRESQL_MIGRATION_TEST_SEAMS.linkSidecar("temporary", "destination", () => { throw failure; })).toThrow(failure);
+    expect(() => POSTGRESQL_MIGRATION_TEST_SEAMS.linkSidecar("temporary", "destination", () => { throw Object.assign(new Error("exists"), { code: "EEXIST" }); })).not.toThrow();
   });
 
   it("exports stable manifest metadata", () => {
