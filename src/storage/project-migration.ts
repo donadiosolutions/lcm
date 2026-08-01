@@ -919,6 +919,7 @@ async function stageReverseDatabases(manifest: MigrationManifest, options: Proje
       const paths = ensureMigrationProjectDirectory(manifest.generationId, currentProject.identity.localProjectId, home);
       const adapter = new PostgreSqlMigrationAdapter(runtime, pgIdentity(currentProject, machine.machineId));
       const sourceInventory = await adapter.inventory();
+      const sidecars = await adapter.exportOperationalSidecars(paths);
       const writer = new SqliteMigrationWriter(paths.reverseDatabase);
       try {
         for (const table of sourceInventory) {
@@ -930,12 +931,15 @@ async function stageReverseDatabases(manifest: MigrationManifest, options: Proje
         if (canonicalJson(destination) !== canonicalJson(sourceInventory)) throw new Error(`project:${sanitizedId(currentProject.identity.localProjectId)} reverse SQLite digest mismatch`);
         writer.checkpointAndClose();
       } catch (error) { writer.close(); throw error; }
+      const finalSourceInventory = await adapter.inventory();
+      if (canonicalJson(finalSourceInventory) !== canonicalJson(sourceInventory)) throw new Error(`project:${sanitizedId(currentProject.identity.localProjectId)} PostgreSQL source changed during reverse staging`);
       const verifiedAt = timestamp(deps);
       const project: MigrationProjectState = {
         ...currentProject,
         status: "rollback-ready",
         verifiedAt,
         tables: sourceInventory.map(({ table, rows, sha256 }) => ({ table, copiedRows: rows, sourceRows: rows, sourceSha256: sha256, destinationRows: rows, destinationSha256: sha256, verifiedAt })),
+        operationalEvidence: { ...currentProject.operationalEvidence, ...sidecars },
       };
       nextManifest = updateProject(nextManifest, project.identity.localProjectId, project, deps);
       persist(nextManifest, options);

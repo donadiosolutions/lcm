@@ -1,6 +1,9 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, closeSync, constants, existsSync, fsyncSync, linkSync, openSync, unlinkSync, writeSync } from "node:fs";
+import { dirname } from "node:path";
 import type { QueryResultRow } from "pg";
-import { CanonicalRowDigest, canonicalJson, type CanonicalValue } from "../migration-manifest.js";
+import { CanonicalRowDigest, canonicalJson, fingerprintMigrationFileSync, type CanonicalValue, type MigrationFileFingerprint } from "../migration-manifest.js";
+import { PRIVATE_FILE_MODE } from "../../security-files.js";
 import type { MigrationRow, MigrationTableInventory } from "../sqlite/migration-adapter.js";
 import type { PostgreSqlOperationContext, PostgreSqlQueryExecutor, PostgreSqlTransactionScopeExecutor } from "./contracts.js";
 import { PostgreSqlWorkCoordinator, type PostgreSqlLeaseMutationInput } from "./coordination.js";
@@ -17,6 +20,7 @@ export interface PostgreSqlMigrationFence extends Omit<PostgreSqlLeaseMutationIn
 export interface PostgreSqlBatchResult { readonly rows: number; readonly uncertainCommitRecovered: boolean }
 export interface PostgreSqlDestinationState { readonly projectExists: boolean; readonly stateRows: number; readonly tableCounts: Readonly<Record<string, number>> }
 export interface PostgreSqlSchemaHistoryEntry { readonly id: string; readonly sha256: string }
+export interface PostgreSqlOperationalSidecars { readonly nativeTranscriptSidecar: MigrationFileFingerprint; readonly passiveEventSidecar: MigrationFileFingerprint; readonly checkpointSidecar: MigrationFileFingerprint }
 
 type RowPlan = { readonly table: string; readonly columns: readonly string[]; readonly values: readonly unknown[]; readonly keyColumns: readonly string[]; readonly keyValues: readonly unknown[]; readonly timestampColumns?: readonly string[] };
 type LogicalTable = { readonly name: string; readonly sql: (identity: PostgreSqlMigrationIdentity) => string; readonly values: (identity: PostgreSqlMigrationIdentity) => readonly unknown[]; readonly normalize?: (row: Record<string, unknown>) => MigrationRow };
@@ -112,7 +116,34 @@ const SEQUENCES = [
   ["lcm.recall_surfacing_surfacing_id_seq", "lcm.recall_surfacing", "surfacing_id"],
   ["lcm.session_instructions_instruction_id_seq", "lcm.session_instructions", "instruction_id"],
 ] as const;
+const SIDECARS = [
+  { key: "nativeTranscriptSidecar", sql: "SELECT transcript_id, machine_id, client_name, format_name, format_version, native_session_id, source_locator, source_ordinal, observed_at, ingested_at, scrubber_version, content_sha256, ingest_key, native_payload FROM lcm.native_transcripts WHERE project_id = $1 ORDER BY transcript_id" },
+  { key: "passiveEventSidecar", sql: "SELECT inbox_id, machine_id, event_id, event_version, machine_sequence, event_type, payload, status, attempt_count, received_at, next_attempt_at, claimed_at, claimed_by, applied_at, quarantined_at, quarantine_reason FROM lcm.passive_event_inbox WHERE project_id = $1 ORDER BY inbox_id" },
+  { key: "checkpointSidecar", sql: "SELECT machine_id, client_name, source_locator, last_source_ordinal, imported_count, skipped_count, quarantined_count, revision, checkpoint, updated_at FROM lcm.ingest_checkpoints WHERE project_id = $1 ORDER BY machine_id, client_name, source_locator" },
+] as const;
 function logical(name: string): LogicalTable { const found = LOGICAL_TABLES.find((table) => table.name === name); if (!found) throw new Error(`unknown PostgreSQL migration table: ${name}`); return found; }
+
+async function writeSidecar(path: string, rows: AsyncIterable<Record<string, unknown>>): Promise<MigrationFileFingerprint> {
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  const fd = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_WRONLY, PRIVATE_FILE_MODE);
+  try {
+    for await (const row of rows) {
+      const line = Buffer.from(`${canonicalJson(row)}\n`, "utf8");
+      let offset = 0;
+      while (offset < line.length) { const written = writeSync(fd, line, offset, line.length - offset); if (written === 0) throw new Error("sidecar write made no progress"); offset += written; }
+    }
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+  chmodSync(temporary, PRIVATE_FILE_MODE);
+  try {
+    try { linkSync(temporary, path); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    const candidate = fingerprintMigrationFileSync(temporary, dirname(temporary));
+    const published = fingerprintMigrationFileSync(path, dirname(path));
+    if (candidate.size !== published.size || candidate.sha256 !== published.sha256) throw new Error("existing PostgreSQL operational sidecar diverges");
+    return published;
+  } finally { unlinkSync(temporary); }
+}
 
 export class PostgreSqlMigrationAdapter {
   constructor(private readonly runtime: PostgreSqlMigrationRuntime, readonly identity: PostgreSqlMigrationIdentity) {
@@ -161,6 +192,23 @@ export class PostgreSqlMigrationAdapter {
   async inventory(signal?: AbortSignal): Promise<MigrationTableInventory[]> { const result: MigrationTableInventory[] = []; for (const table of LOGICAL_TABLES) { const digest = new CanonicalRowDigest(); let offset = 0; for (;;) { const rows = await this.readBatch(table.name, offset, READ_BATCH, signal); rows.forEach((row) => digest.update(row)); offset += rows.length; if (rows.length < READ_BATCH) break; } result.push({ table: table.name, ...digest.digest() }); } return result; }
   async sample(table: string, count: number, signal?: AbortSignal): Promise<MigrationRow[]> { return this.readBatch(table, 0, count, signal); }
   async verifyRelationalIntegrity(signal?: AbortSignal): Promise<void> { const result = await this.runtime.query<{ violations: unknown }>({ text: `WITH RECURSIVE ancestry(summary_key, parent_summary_key, path, cycle) AS (SELECT summary_key, parent_summary_key, ARRAY[summary_key], false FROM lcm.summary_parents WHERE project_id = $1 UNION ALL SELECT ancestry.summary_key, edge.parent_summary_key, ancestry.path || edge.parent_summary_key, edge.parent_summary_key = ANY(ancestry.path) FROM ancestry JOIN lcm.summary_parents edge ON edge.project_id = $1 AND edge.summary_key = ancestry.parent_summary_key WHERE NOT ancestry.cycle), violations AS (SELECT count(*)::bigint AS count FROM ancestry WHERE cycle UNION ALL SELECT count(*)::bigint FROM lcm.transcript_messages tm LEFT JOIN lcm.messages m ON m.project_id = tm.project_id AND m.conversation_id = tm.conversation_id AND m.message_id = tm.message_id WHERE tm.project_id = $1 AND m.message_id IS NULL) SELECT COALESCE(sum(count), 0)::text AS violations FROM violations`, values: [this.identity.remoteProjectId] }, options(this.identity, "migrationVerifyRelationalIntegrity", signal)); if (safeInteger(result.rows[0]?.violations ?? "0", "violations") !== 0) throw new Error("PostgreSQL FK, DAG, or transcript coverage verification failed"); }
+  async exportOperationalSidecars(paths: { readonly nativeTranscriptSidecar: string; readonly passiveEventSidecar: string; readonly checkpointSidecar: string }, signal?: AbortSignal): Promise<PostgreSqlOperationalSidecars> {
+    const output = {} as Record<string, MigrationFileFingerprint>;
+    for (const sidecar of SIDECARS) {
+      const self = this;
+      async function* rows(): AsyncIterable<Record<string, unknown>> {
+        let offset = 0;
+        for (;;) {
+          const result = await self.runtime.query({ text: `${sidecar.sql} LIMIT $2 OFFSET $3`, values: [self.identity.remoteProjectId, READ_BATCH, offset] }, options(self.identity, `migrationSidecar:${sidecar.key}`, signal));
+          for (const row of result.rows) yield row;
+          offset += result.rows.length;
+          if (result.rows.length < READ_BATCH) break;
+        }
+      }
+      output[sidecar.key] = await writeSidecar(paths[sidecar.key], rows());
+    }
+    return output as unknown as PostgreSqlOperationalSidecars;
+  }
 
   private async assertPlans(plans: readonly RowPlan[], signal?: AbortSignal): Promise<void> { for (const plan of plans) if (!matches(plan, await readPlan(this.runtime, this.identity, plan, `migrationAuthoritativeReadback:${plan.table}`, signal))) throw new Error(`authoritative PostgreSQL readback mismatch in ${plan.table}`); }
 }
