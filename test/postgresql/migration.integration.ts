@@ -212,7 +212,12 @@ describe("PostgreSQL 18 reversible data migration", () => {
       try {
         await expect(adapter.writeBatch("conversations", [conversation(42, "first")], fence)).resolves.toEqual({ rows: 1, uncertainCommitRecovered: false });
         await expect(adapter.writeBatch("conversations", [conversation(42, "first")], fence)).resolves.toEqual({ rows: 1, uncertainCommitRecovered: false });
-        await expect(adapter.writeBatch("conversations", [conversation(42, "divergent")], fence)).rejects.toThrow("divergent stable-ID conflict");
+        await expect(adapter.writeBatch("conversations", [conversation(42, "divergent")], fence)).rejects.toMatchObject({
+          backend: "postgresql",
+          domain: "transaction",
+          operation: "migrationWriteBatch:conversations",
+          projectId: identity.remoteProjectId,
+        });
         await expect(adapter.writeBatch("conversations", [], fence)).resolves.toEqual({ rows: 0, uncertainCommitRecovered: false });
         await adapter.repairSharedSequences(fence);
         let sequence = await database.migrator.query<{ last_value: string }>({
@@ -253,7 +258,7 @@ describe("PostgreSQL 18 reversible data migration", () => {
                  scrubber_version, content_sha256, ingest_key, native_payload
                ) VALUES ($1, $2, 'codex', 'jsonl', '1', 'session', '/scrubbed/source', 0,
                          $3, '1', $4, $5, '{"scrubbed":true}'::jsonb)`,
-        values: [identity.remoteProjectId, identity.machineId, createdAt, "a".repeat(64), "b".repeat(64)],
+        values: [identity.remoteProjectId, identity.machineId, "2020-01-01T00:00:00.000Z", "a".repeat(64), "b".repeat(64)],
       }, { domain: "transaction", operation: "seedMigrationTranscriptSidecar" });
       await database.migrator.query({
         text: `INSERT INTO lcm.passive_event_inbox
