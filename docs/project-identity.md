@@ -29,6 +29,14 @@ topology pointers remain limited to 64 KiB; `.git/config` and
 does not block project identity. Larger, symlinked, non-regular, substituted,
 or escaping metadata continues to fail closed.
 
+On case-insensitive filesystems, a `.git` file may spell its target with
+case-only component differences. LCM accepts that spelling only when the
+requested and canonical paths have the same stable, nonzero filesystem
+identity and every different component has one unique, bounded, unchanged
+same-fold directory entry. The canonical Git directory remains the downstream
+identity anchor. Symlinked, bind-equivalent, ambiguous, race-changed, or
+cross-root aliases fail closed.
+
 Git does not always write `core.worktree` when initializing a separate Git
 directory. Make the relationship explicit before LCM first opens project
 storage:
@@ -50,9 +58,12 @@ per-worktree configuration, while an assigned empty value, false/no/off, or a
 valid zero integer disables it. Integers support Git's decimal, octal,
 and hexadecimal forms with optional `k`, `m`, or `g` scaling. Host-specific
 numeric extensions such as the C23 `0b` binary prefix fail closed so project
-identity does not vary by operating system or C library. Only integer values
-may have leading ASCII C whitespace; trailing or internal whitespace remains
-invalid. Inline `#` and `;` comments, quoted values, supported escapes,
+identity does not vary by operating system or C library. For compatibility
+across supported Git versions, scaled results use the symmetric portable range
+from `-2147483647` through `2147483647`; older Git versions reject
+`-2147483648` and equivalent scaled forms. Only integer values may have leading
+ASCII C whitespace; trailing or internal whitespace remains invalid. Inline
+`#` and `;` comments, quoted values, supported escapes,
 continued lines, CRLF input, and case-insensitive section and key names are
 parsed in one bounded linear pass. Git-compatible section headers and their
 first assignment may share one physical line.

@@ -50,6 +50,14 @@ type ExternalWorktreeEvidence = {
   readonly worktreeConfig?: string;
 };
 
+type GitDirPointer = {
+  readonly caseEvidence?: string;
+  readonly gitDir: string;
+  readonly identity: DirectoryIdentity;
+  readonly isRelative: boolean;
+  readonly requestedGitDir: string;
+};
+
 export type GitProjectAnchor = {
   /** Stable local repository anchor shared by every linked worktree. */
   canonical: string;
@@ -173,6 +181,8 @@ function snapshotCaseVariantPath(
 function authenticateDirectoryWithoutDescriptor(
   path: string,
   label: string,
+  expectedRealPath = path,
+  requireNonzeroIdentity = false,
 ): DirectoryIdentity {
   const stat = lstatSync(path);
   if (!stat.isDirectory() || stat.isSymbolicLink()) {
@@ -185,25 +195,36 @@ function authenticateDirectoryWithoutDescriptor(
     throw new Error(`invalid ${label} at ${path}`);
   }
   if (
-    real !== path
+    real !== expectedRealPath
     || current.dev !== stat.dev
     || current.ino !== stat.ino
     || currentPath.dev !== stat.dev
     || currentPath.ino !== stat.ino
+    || (requireNonzeroIdentity && (stat.dev === 0 || stat.ino === 0))
   ) {
     throw new Error(`${label} changed during validation: ${path}`);
   }
   return { dev: stat.dev, ino: stat.ino, path };
 }
 
-function authenticateDirectory(path: string, label: string): DirectoryIdentity {
+function authenticateDirectory(
+  path: string,
+  label: string,
+  expectedRealPath = path,
+  requireNonzeroIdentity = false,
+): DirectoryIdentity {
   const directoryFlag = constants.O_DIRECTORY;
   const noFollowFlag = constants.O_NOFOLLOW;
   if (typeof directoryFlag !== "number" || typeof noFollowFlag !== "number") {
     // Node only exposes these constants when the host supports them. Windows
     // does not support O_DIRECTORY, so retain the strict path-based checks
     // there instead of attempting an unsafe flag-less directory open.
-    return authenticateDirectoryWithoutDescriptor(path, label);
+    return authenticateDirectoryWithoutDescriptor(
+      path,
+      label,
+      expectedRealPath,
+      requireNonzeroIdentity,
+    );
   }
 
   const fd = openSync(
@@ -221,9 +242,13 @@ function authenticateDirectory(path: string, label: string): DirectoryIdentity {
       throw new Error(`invalid ${label} at ${path}`);
     }
     if (
-      real !== path
+      real !== expectedRealPath
       || current.dev !== descriptor.dev
       || current.ino !== descriptor.ino
+      || (
+        requireNonzeroIdentity
+        && (descriptor.dev === 0 || descriptor.ino === 0)
+      )
     ) {
       throw new Error(`${label} changed during validation: ${path}`);
     }
@@ -267,7 +292,7 @@ function readGitConfig(path: string, allowedRoot: string, label: string): string
 function parseGitDir(
   pointerPath: string,
   worktreeRoot: string,
-): { readonly gitDir: string; readonly isRelative: boolean } {
+): GitDirPointer {
   const content = readGitPointer(pointerPath, worktreeRoot, "Git worktree");
   const trimmed = content.trim();
   const match = /^gitdir:\s*(.+)$/iu.exec(trimmed);
@@ -281,13 +306,48 @@ function parseGitDir(
     throw new Error(`invalid Git directory at ${targetPath}`);
   }
   const gitDir = existingRealDirectory(targetPath, "Git directory");
-  if (gitDir !== targetPath) {
-    throw new Error(`invalid Git directory path alias at ${targetPath}`);
+  let caseEvidence: string | undefined;
+  let identity: DirectoryIdentity;
+  if (gitDir === targetPath) {
+    identity = authenticateDirectory(gitDir, "Git directory");
+  } else {
+    if (!isCaseVariantPath(targetPath, gitDir)) {
+      throw new Error(`invalid Git directory path alias at ${targetPath}`);
+    }
+    caseEvidence = snapshotCaseVariantPath(targetPath, gitDir);
+    const requestedIdentity = authenticateDirectory(
+      targetPath,
+      "Git directory",
+      gitDir,
+      true,
+    );
+    identity = authenticateDirectory(gitDir, "Git directory", gitDir, true);
+    if (
+      requestedIdentity.dev !== identity.dev
+      || requestedIdentity.ino !== identity.ino
+    ) {
+      throw new Error(`Git directory changed during validation: ${targetPath}`);
+    }
+    if (snapshotCaseVariantPath(targetPath, gitDir) !== caseEvidence) {
+      throw new Error("Git directory case evidence changed during validation");
+    }
   }
   return {
+    caseEvidence,
     gitDir,
+    identity,
     isRelative: !isAbsolute(target),
+    requestedGitDir: targetPath,
   };
+}
+
+function gitDirPointersEqual(left: GitDirPointer, right: GitDirPointer): boolean {
+  return left.caseEvidence === right.caseEvidence
+    && left.gitDir === right.gitDir
+    && left.identity.dev === right.identity.dev
+    && left.identity.ino === right.identity.ino
+    && left.isRelative === right.isRelative
+    && left.requestedGitDir === right.requestedGitDir;
 }
 
 function resolveCommonDir(gitDir: string): string {
@@ -364,9 +424,10 @@ function validateWorktreeBackpointer(
 function validateLinkedWorktreeTopology(
   marker: string,
   worktreeRoot: string,
-  gitDir: string,
+  gitPointer: GitDirPointer,
   commonDir: string,
 ): void {
+  const { gitDir } = gitPointer;
   const worktreesPath = join(commonDir, "worktrees");
   const worktreesStat = (() => {
     try {
@@ -406,7 +467,7 @@ function validateLinkedWorktreeTopology(
   // is descriptor-bound; comparing the resolved relationship a second time
   // also fails closed when repository-controlled metadata is retargeted
   // between validation steps.
-  if (parseGitDir(marker, worktreeRoot).gitDir !== gitDir) {
+  if (!gitDirPointersEqual(parseGitDir(marker, worktreeRoot), gitPointer)) {
     throw new Error("Git worktree metadata changed during topology validation");
   }
   if (resolveCommonDir(gitDir) !== commonDir) {
@@ -475,9 +536,7 @@ function parseGitBooleanInteger(value: string): boolean | undefined {
     if (code !== 32 && (code < 9 || code > 13)) break;
     cursor += 1;
   }
-  let negative = false;
   if (value[cursor] === "+" || value[cursor] === "-") {
-    negative = value[cursor] === "-";
     cursor += 1;
   }
 
@@ -509,9 +568,11 @@ function parseGitBooleanInteger(value: string): boolean | undefined {
   if (cursor >= end) return undefined;
 
   // Git interprets integer booleans as signed 32-bit values after applying an
-  // optional binary unit. Accumulate only up to that limit so even a 4 MiB
-  // repository-controlled value remains linear without arbitrary precision.
-  const signedLimit = negative ? 2_147_483_648 : 2_147_483_647;
+  // optional binary unit. Git versions before the upstream INT_MIN off-by-one
+  // fix reject -2147483648, so use the portable cross-version magnitude limit.
+  // Accumulate only up to that limit so even a 4 MiB repository-controlled
+  // value remains linear without arbitrary precision.
+  const signedLimit = 2_147_483_647;
   const magnitudeLimit = Math.floor(signedLimit / scale);
   let magnitude = 0;
   for (; cursor < end; cursor += 1) {
@@ -966,17 +1027,19 @@ function inspectGitMarker(worktreeRoot: string): GitProjectAnchor | null {
 
   let gitDir: string;
   let relativeGitPointer = false;
+  let gitPointer: GitDirPointer | undefined;
   if (stat.isDirectory()) {
     gitDir = existingRealDirectory(marker, "Git directory");
   } else if (stat.isFile()) {
-    const parsedPointer = parseGitDir(marker, worktreeRoot);
-    gitDir = parsedPointer.gitDir;
-    relativeGitPointer = parsedPointer.isRelative;
+    gitPointer = parseGitDir(marker, worktreeRoot);
+    gitDir = gitPointer.gitDir;
+    relativeGitPointer = gitPointer.isRelative;
   } else {
     throw new Error(`invalid Git metadata type at ${marker}`);
   }
 
-  const gitDirIdentity = authenticateDirectory(gitDir, "Git directory");
+  const gitDirIdentity = gitPointer?.identity
+    ?? authenticateDirectory(gitDir, "Git directory");
   const commonDir = resolveCommonDir(gitDir);
   const commonDirIdentity = commonDir === gitDir
     ? gitDirIdentity
@@ -987,7 +1050,12 @@ function inspectGitMarker(worktreeRoot: string): GitProjectAnchor | null {
     );
   }
   if (stat.isFile() && commonDir !== gitDir) {
-    validateLinkedWorktreeTopology(marker, worktreeRoot, gitDir, commonDir);
+    validateLinkedWorktreeTopology(
+      marker,
+      worktreeRoot,
+      gitPointer!,
+      commonDir,
+    );
   }
   const externalEvidence = stat.isFile() && commonDir === gitDir
     ? readExternalWorktreeEvidence(gitDir, worktreeRoot)
@@ -1003,12 +1071,10 @@ function inspectGitMarker(worktreeRoot: string): GitProjectAnchor | null {
   }
   if (stat.isFile()) {
     const revalidatedPointer = parseGitDir(marker, worktreeRoot);
-    if (
-      revalidatedPointer.gitDir !== gitDir
-      || revalidatedPointer.isRelative !== relativeGitPointer
-    ) {
+    if (!gitDirPointersEqual(revalidatedPointer, gitPointer!)) {
       throw new Error("Git worktree metadata changed during validation");
     }
+    revalidateDirectory(gitDirIdentity, "Git directory");
   }
   if (externalEvidence !== undefined) {
     const revalidatedEvidence = readExternalWorktreeEvidence(gitDir, worktreeRoot);

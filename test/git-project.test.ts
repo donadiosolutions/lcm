@@ -28,6 +28,8 @@ const metadataRace = vi.hoisted((): {
 
 const caseInsensitivePath = vi.hoisted(() => ({
   from: "",
+  realpathReturnsMapped: false,
+  realpathTo: "",
   to: "",
   zeroFromField: undefined as "dev" | "ino" | undefined,
   zeroToField: undefined as "dev" | "ino" | undefined,
@@ -247,7 +249,9 @@ vi.mock("node:fs", async (importOriginal) => {
           directoryAuthRace.afterRealpath?.();
         }
       }
-      return String(path) === caseInsensitivePath.from ? path : real;
+      if (String(path) !== caseInsensitivePath.from) return real;
+      if (!caseInsensitivePath.realpathReturnsMapped) return path;
+      return caseInsensitivePath.realpathTo || real;
     }) as typeof actual.realpathSync,
     statSync: ((path: Parameters<typeof actual.statSync>[0], options?: Parameters<typeof actual.statSync>[1]) => {
       const stat = actual.statSync(mappedPath(path), options as never);
@@ -371,6 +375,8 @@ function git(cwd: string, ...args: string[]): string {
 
 function resetDirectoryAuthRace(): void {
   caseInsensitivePath.from = "";
+  caseInsensitivePath.realpathReturnsMapped = false;
+  caseInsensitivePath.realpathTo = "";
   caseInsensitivePath.to = "";
   caseInsensitivePath.zeroFromField = undefined;
   caseInsensitivePath.zeroToField = undefined;
@@ -554,11 +560,15 @@ describe("Git project identity", () => {
       "worktreeConfig = +1",
       "worktreeConfig = 1k",
       "worktreeConfig = 0x1",
-      "worktreeConfig = -2g",
+      "worktreeConfig = -1g",
       "worktreeConfig = 2147483647",
-      "worktreeConfig = -2147483648",
+      "worktreeConfig = -2147483647",
+      "worktreeConfig = -0x7fffffff",
+      "worktreeConfig = -017777777777",
       "worktreeConfig = 2097151k",
+      "worktreeConfig = -2097151k",
       "worktreeConfig = 2047m",
+      "worktreeConfig = -2047m",
       "worktreeConfig = 1G",
       "worktreeConfig = +0Xf",
     ]) {
@@ -667,6 +677,21 @@ describe("Git project identity", () => {
     ]) {
       writeWorktreeConfig(line);
       expect(configuredWorktreeBool).toThrow();
+      expectRejectedAnchor("ambiguous worktree configuration");
+    }
+
+    // Git 2.43 rejects INT_MIN and scaled forms that reach it, while newer
+    // Git releases accept them. LCM uses the portable cross-version range, so
+    // these assertions intentionally do not use the host Git binary as oracle.
+    for (const value of [
+      "-2147483648",
+      "-0x80000000",
+      "-020000000000",
+      "-2097152k",
+      "-2048m",
+      "-2g",
+    ]) {
+      writeWorktreeConfig(`worktreeConfig = ${value}`);
       expectRejectedAnchor("ambiguous worktree configuration");
     }
 
@@ -1216,6 +1241,190 @@ describe("Git project identity", () => {
     );
   });
 
+  it("accepts authenticated case-only Git directory pointer spellings", () => {
+    const acceptCasePointer = (
+      checkout: string,
+      requestedGitDir: string,
+      canonicalGitDir: string,
+      expectedCanonical: string,
+    ): void => {
+      caseInsensitivePath.from = requestedGitDir;
+      caseInsensitivePath.to = canonicalGitDir;
+      caseInsensitivePath.realpathReturnsMapped = true;
+      expect(resolveGitProjectAnchor(checkout)?.canonical).toBe(
+        expectedCanonical,
+      );
+    };
+
+    const absoluteCheckout = join(root, "absolute-pointer-checkout");
+    const absoluteGitDir = join(root, "Absolute-Pointer-Metadata");
+    const requestedAbsoluteGitDir = join(root, "absolute-pointer-metadata");
+    makeStandaloneMetadata(
+      absoluteCheckout,
+      absoluteGitDir,
+      `[core]\nworktree = ${absoluteCheckout}\n`,
+    );
+    writeFileSync(
+      join(absoluteCheckout, ".git"),
+      `gitdir: ${requestedAbsoluteGitDir}\n`,
+    );
+    acceptCasePointer(
+      absoluteCheckout,
+      requestedAbsoluteGitDir,
+      absoluteGitDir,
+      absoluteGitDir,
+    );
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const relativeCheckout = join(root, "relative-pointer-checkout");
+    const relativeGitDir = join(root, "Relative-Pointer-Metadata");
+    const requestedRelativeGitDir = join(root, "relative-pointer-metadata");
+    makeStandaloneMetadata(
+      relativeCheckout,
+      relativeGitDir,
+      `[core]\nworktree = ${relativeCheckout}\n`,
+    );
+    writeFileSync(
+      join(relativeCheckout, ".git"),
+      `gitdir: ${relative(relativeCheckout, requestedRelativeGitDir)}\n`,
+    );
+    acceptCasePointer(
+      relativeCheckout,
+      requestedRelativeGitDir,
+      relativeGitDir,
+      relativeCheckout,
+    );
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const primary = makeRepository(join(root, "pointer-primary"));
+    const linked = makeLinkedWorktree(
+      primary,
+      join(root, "pointer-linked"),
+      "Linked-Entry",
+    );
+    const linkedGitDir = join(
+      primary,
+      ".git",
+      "worktrees",
+      "Linked-Entry",
+    );
+    const requestedLinkedGitDir = join(
+      primary,
+      ".git",
+      "WORKTREES",
+      "linked-entry",
+    );
+    writeFileSync(join(linked, ".git"), `gitdir: ${requestedLinkedGitDir}\n`);
+    acceptCasePointer(linked, requestedLinkedGitDir, linkedGitDir, primary);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const preservingCheckout = join(root, "preserving-pointer-checkout");
+    const preservingGitDir = join(root, "preserving-pointer-metadata");
+    makeStandaloneMetadata(
+      preservingCheckout,
+      preservingGitDir,
+      `[core]\nworktree = ${preservingCheckout}\n`,
+    );
+    caseInsensitivePath.from = preservingGitDir;
+    caseInsensitivePath.to = preservingGitDir;
+    expect(resolveGitProjectAnchor(preservingCheckout)?.canonical).toBe(
+      preservingGitDir,
+    );
+  });
+
+  it("rejects changed case-only Git directory pointer evidence", () => {
+    const checkout = join(root, "changed-pointer-evidence-checkout");
+    const gitDir = join(root, "Changed-Pointer-Evidence-Metadata");
+    const requestedGitDir = join(root, "changed-pointer-evidence-metadata");
+    makeStandaloneMetadata(
+      checkout,
+      gitDir,
+      `[core]\nworktree = ${checkout}\n`,
+    );
+    writeFileSync(join(checkout, ".git"), `gitdir: ${requestedGitDir}\n`);
+    caseInsensitivePath.from = requestedGitDir;
+    caseInsensitivePath.to = gitDir;
+    caseInsensitivePath.realpathReturnsMapped = true;
+    componentDirectory.path = root;
+    componentDirectory.entryPath = requestedGitDir;
+    componentDirectory.entryTarget = gitDir;
+    componentDirectory.plans = [
+      { entries: [Buffer.from("Changed-Pointer-Evidence-Metadata")] },
+      { entries: [Buffer.from("changed-pointer-evidence-metadata")] },
+    ];
+    expect(() => resolveGitProjectAnchor(checkout)).toThrow(
+      "case evidence changed",
+    );
+    expect(componentDirectory.openCount).toBe(2);
+    expect(componentDirectory.closeCount).toBe(2);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const identityCheckout = join(root, "different-pointer-identity-checkout");
+    const canonicalGitDir = join(root, "Different-Pointer-Identity-Metadata");
+    const requestedIdentityGitDir = join(
+      root,
+      "different-pointer-identity-metadata",
+    );
+    const redirectedGitDir = makeDirectory(
+      join(root, "redirected-pointer-identity-metadata"),
+    );
+    makeStandaloneMetadata(
+      identityCheckout,
+      canonicalGitDir,
+      `[core]\nworktree = ${identityCheckout}\n`,
+    );
+    writeFileSync(
+      join(identityCheckout, ".git"),
+      `gitdir: ${requestedIdentityGitDir}\n`,
+    );
+    caseInsensitivePath.from = requestedIdentityGitDir;
+    caseInsensitivePath.to = redirectedGitDir;
+    caseInsensitivePath.realpathReturnsMapped = true;
+    caseInsensitivePath.realpathTo = canonicalGitDir;
+    expect(() => resolveGitProjectAnchor(identityCheckout)).toThrow(
+      "Git directory changed during validation",
+    );
+
+    for (const identityField of ["dev", "ino"] as const) {
+      resetDirectoryAuthRace();
+      clearGitProjectAnchorCache();
+      const zeroCheckout = join(
+        root,
+        `zero-pointer-${identityField}-checkout`,
+      );
+      const zeroGitDir = join(
+        root,
+        `Zero-Pointer-${identityField}-Metadata`,
+      );
+      const requestedZeroGitDir = join(
+        root,
+        `zero-pointer-${identityField}-metadata`,
+      );
+      makeStandaloneMetadata(
+        zeroCheckout,
+        zeroGitDir,
+        `[core]\nworktree = ${zeroCheckout}\n`,
+      );
+      writeFileSync(
+        join(zeroCheckout, ".git"),
+        `gitdir: ${requestedZeroGitDir}\n`,
+      );
+      caseInsensitivePath.from = requestedZeroGitDir;
+      caseInsensitivePath.to = zeroGitDir;
+      caseInsensitivePath.realpathReturnsMapped = true;
+      caseInsensitivePath.zeroFromField = identityField;
+      caseInsensitivePath.zeroToField = identityField;
+      directoryAuthRace.unsupportedFlag = "directory";
+      expect(() => resolveGitProjectAnchor(zeroCheckout)).toThrow(
+        "Git directory changed during validation",
+      );
+    }
+  });
+
   it("bounds and revalidates case-variant component evidence", () => {
     const makeCaseVariant = (
       name: string,
@@ -1590,6 +1799,34 @@ describe("Git project identity", () => {
     );
 
     metadataRace.afterRead = undefined;
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const pointerCaseRace = makeVerified("pointer-case-race");
+    const requestedPointerCase = join(root, "POINTER-CASE-RACE-METADATA");
+    writeFileSync(
+      join(pointerCaseRace.checkout, ".git"),
+      `gitdir: ${requestedPointerCase}\n`,
+    );
+    caseInsensitivePath.from = requestedPointerCase;
+    caseInsensitivePath.to = pointerCaseRace.metadata;
+    caseInsensitivePath.realpathReturnsMapped = true;
+    let pointerCaseSwapped = false;
+    metadataRace.afterRead = (path): void => {
+      if (!pointerCaseSwapped && path === join(pointerCaseRace.metadata, "config")) {
+        pointerCaseSwapped = true;
+        writeFileSync(
+          join(pointerCaseRace.checkout, ".git"),
+          `gitdir: ${pointerCaseRace.metadata}\n`,
+        );
+      }
+    };
+    expect(() => resolveGitProjectAnchor(pointerCaseRace.checkout)).toThrow(
+      "worktree metadata changed",
+    );
+
+    metadataRace.afterRead = undefined;
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
     const directoryRace = makeVerified("directory-race");
     const retired = join(root, "directory-race-retired");
     let directorySwapped = false;
@@ -1914,6 +2151,26 @@ describe("Git project identity", () => {
     expect(() => resolveGitProjectAnchor(fileLinked)).toThrow(
       "invalid Git worktrees directory",
     );
+
+    const aliasPrimary = makeRepository(join(root, "alias-worktrees-primary"));
+    const canonicalWorktrees = makeDirectory(
+      join(aliasPrimary, ".git", "Worktrees"),
+    );
+    const aliasGitDir = makeDirectory(join(canonicalWorktrees, "entry"));
+    writeFileSync(join(aliasGitDir, "commondir"), "../..\n");
+    writeFileSync(join(aliasGitDir, "HEAD"), "ref: refs/heads/main\n");
+    const aliasLinked = makeDirectory(join(root, "alias-worktrees-linked"));
+    writeFileSync(join(aliasLinked, ".git"), `gitdir: ${aliasGitDir}\n`);
+    writeFileSync(join(aliasGitDir, "gitdir"), `${join(aliasLinked, ".git")}\n`);
+    caseInsensitivePath.from = join(aliasPrimary, ".git", "worktrees");
+    caseInsensitivePath.to = canonicalWorktrees;
+    caseInsensitivePath.realpathReturnsMapped = true;
+    expect(() => resolveGitProjectAnchor(aliasLinked)).toThrow(
+      "invalid Git worktrees directory",
+    );
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
 
     const nestedPrimary = makeRepository(join(root, "nested-worktrees-primary"));
     const nestedGitDir = makeDirectory(
@@ -2277,6 +2534,31 @@ describe("Git project identity", () => {
       "invalid Git worktree config metadata",
     );
     expect(() => resolveGitProjectAnchor(checkout)).toThrow("size limit");
+
+    const pointerCheckout = join(root, "pointer-boundary-checkout");
+    const pointerMetadata = join(root, "pointer-boundary-metadata");
+    makeStandaloneMetadata(
+      pointerCheckout,
+      pointerMetadata,
+      `[core]\nworktree = ${pointerCheckout}\n`,
+    );
+    const pointerSuffix = `${pointerMetadata}\n`;
+    const pointerPrefix = "gitdir:";
+    const exactPointer = `${pointerPrefix}${" ".repeat(
+      64 * 1024
+        - Buffer.byteLength(pointerPrefix)
+        - Buffer.byteLength(pointerSuffix),
+    )}${pointerSuffix}`;
+    expect(Buffer.byteLength(exactPointer)).toBe(64 * 1024);
+    writeFileSync(join(pointerCheckout, ".git"), exactPointer);
+    clearGitProjectAnchorCache();
+    expect(resolveGitProjectAnchor(pointerCheckout)?.canonical).toBe(
+      pointerMetadata,
+    );
+
+    writeFileSync(join(pointerCheckout, ".git"), ` ${exactPointer}`);
+    clearGitProjectAnchorCache();
+    expect(() => resolveGitProjectAnchor(pointerCheckout)).toThrow("size limit");
   });
 
   it("rejects malformed, oversized, symlinked, and invalid Git metadata", () => {
