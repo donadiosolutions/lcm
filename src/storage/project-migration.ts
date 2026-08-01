@@ -392,20 +392,23 @@ async function verifySchemaHistory(adapter: PostgreSqlMigrationAdapter): Promise
   if (canonicalJson(actual) !== canonicalJson(expected)) throw new Error("PostgreSQL migration registry or checksum does not match the packaged 0001-0005 history");
 }
 
+function deliveryGate(rows: readonly { readonly delivery_state?: unknown; readonly count?: unknown }[], checkedAt: string): MigrationDeliveryGate {
+  let blockingOutbox = 0;
+  let quarantined = 0;
+  for (const row of rows) {
+    const count = typeof row.count === "number" && Number.isSafeInteger(row.count) ? row.count : -1;
+    if (count < 0 || typeof row.delivery_state !== "string") throw new Error("local outbox diagnostics are invalid");
+    if (["pending", "claimed", "retry", "replicated"].includes(row.delivery_state)) blockingOutbox += count;
+    if (row.delivery_state === "quarantined") quarantined += count;
+  }
+  return { blockingOutbox, quarantined, checkedAt };
+}
+
 function readDeliveryGate(path: string, checkedAt: string): MigrationDeliveryGate {
-  if (!existsSync(path)) return { blockingOutbox: 0, quarantined: 0, checkedAt };
+  if (!existsSync(path)) return deliveryGate([], checkedAt);
   const db = new DatabaseSync(path, { readOnly: true, timeout: 5_000 });
   try {
-    const rows = db.prepare("SELECT delivery_state, count(*) AS count FROM events GROUP BY delivery_state").all() as Array<{ delivery_state?: unknown; count?: unknown }>;
-    let blockingOutbox = 0;
-    let quarantined = 0;
-    for (const row of rows) {
-      const count = typeof row.count === "number" && Number.isSafeInteger(row.count) ? row.count : -1;
-      if (count < 0 || typeof row.delivery_state !== "string") throw new Error("local outbox diagnostics are invalid");
-      if (["pending", "claimed", "retry", "replicated"].includes(row.delivery_state)) blockingOutbox += count;
-      if (row.delivery_state === "quarantined") quarantined += count;
-    }
-    return { blockingOutbox, quarantined, checkedAt };
+    return deliveryGate(db.prepare("SELECT delivery_state, count(*) AS count FROM events GROUP BY delivery_state").all(), checkedAt);
   } finally { db.close(); }
 }
 
@@ -1191,6 +1194,7 @@ export const PROJECT_MIGRATION_TEST_SEAMS = {
   configSha256,
   currentSourceMatches,
   daemonStopped,
+  deliveryGate,
   dependencies,
   durableRename,
   emptyDigest,
