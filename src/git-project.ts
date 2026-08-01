@@ -1,6 +1,10 @@
 import {
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   lstatSync,
+  openSync,
   realpathSync,
   statSync,
 } from "node:fs";
@@ -32,6 +36,10 @@ type GitConfigValues = {
   readonly worktreeConfig: boolean;
 };
 
+type ParsedConfigValue =
+  | { readonly valid: false }
+  | { readonly valid: true; readonly value: string };
+
 type ExternalWorktreeEvidence = {
   readonly commonConfig: string;
   readonly resolvedWorktree: string;
@@ -60,17 +68,70 @@ function isContainedPath(root: string, candidate: string): boolean {
   return candidate === root || candidate.startsWith(prefix);
 }
 
-function authenticateDirectory(path: string, label: string): DirectoryIdentity {
-  const stat = lstatSync(path);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`invalid ${label} at ${path}`);
-  }
+function authenticateDirectoryWithoutDescriptor(
+  path: string,
+  label: string,
+  stat: NonNullable<ReturnType<typeof lstatSync>>,
+): DirectoryIdentity {
   const real = realpathSync(path);
   const current = statSync(real);
-  if (real !== path || current.dev !== stat.dev || current.ino !== stat.ino) {
+  const currentPath = lstatSync(path);
+  if (!currentPath.isDirectory() || currentPath.isSymbolicLink()) {
+    throw new Error(`invalid ${label} at ${path}`);
+  }
+  if (
+    real !== path
+    || current.dev !== stat.dev
+    || current.ino !== stat.ino
+    || currentPath.dev !== stat.dev
+    || currentPath.ino !== stat.ino
+  ) {
     throw new Error(`${label} changed during validation: ${path}`);
   }
   return { dev: stat.dev, ino: stat.ino, path };
+}
+
+function authenticateDirectory(path: string, label: string): DirectoryIdentity {
+  const initial = lstatSync(path);
+  if (!initial.isDirectory() || initial.isSymbolicLink()) {
+    throw new Error(`invalid ${label} at ${path}`);
+  }
+  const directoryFlag = constants.O_DIRECTORY;
+  const noFollowFlag = constants.O_NOFOLLOW;
+  if (typeof directoryFlag !== "number" || typeof noFollowFlag !== "number") {
+    // Node only exposes these constants when the host supports them. Windows
+    // does not support O_DIRECTORY, so retain the strict path-based checks
+    // there instead of attempting an unsafe flag-less directory open.
+    return authenticateDirectoryWithoutDescriptor(path, label, initial);
+  }
+
+  const fd = openSync(
+    path,
+    constants.O_RDONLY | directoryFlag | noFollowFlag,
+  );
+  try {
+    const descriptor = fstatSync(fd);
+    if (!descriptor.isDirectory()) {
+      throw new Error(`invalid ${label} at ${path}`);
+    }
+    const real = realpathSync(path);
+    const current = lstatSync(path);
+    if (!current.isDirectory() || current.isSymbolicLink()) {
+      throw new Error(`invalid ${label} at ${path}`);
+    }
+    if (
+      real !== path
+      || descriptor.dev !== initial.dev
+      || descriptor.ino !== initial.ino
+      || current.dev !== descriptor.dev
+      || current.ino !== descriptor.ino
+    ) {
+      throw new Error(`${label} changed during validation: ${path}`);
+    }
+    return { dev: descriptor.dev, ino: descriptor.ino, path };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function revalidateDirectory(identity: DirectoryIdentity, label: string): void {
@@ -443,7 +504,7 @@ function parseSectionName(line: string, start: number): {
   };
 }
 
-function parseConfigValue(raw: string): { readonly valid: boolean; readonly value?: string } {
+function parseConfigValue(raw: string): ParsedConfigValue {
   const value: string[] = [];
   let escaped = false;
   let quoted = false;
@@ -532,7 +593,7 @@ function parseGitConfig(config: string): GitConfigValues {
     }
     while (cursor < line.length && isConfigWhitespace(line[cursor]!)) cursor += 1;
     const implicit = cursor === line.length;
-    let parsedValue: { readonly valid: boolean; readonly value?: string } | undefined;
+    let parsedValue: ParsedConfigValue | undefined;
     if (!implicit && line[cursor] === "=") {
       parsedValue = parseConfigValue(line.slice(cursor + 1));
     } else if (!implicit) {
@@ -552,19 +613,19 @@ function parseGitConfig(config: string): GitConfigValues {
 
     if (section === "core") {
       hasCoreWorktree = true;
-      if (implicit) {
+      if (parsedValue === undefined) {
         valid = false;
       } else {
-        coreWorktree = parsedValue!.value;
+        coreWorktree = parsedValue.value;
       }
       continue;
     }
 
-    if (implicit) {
+    if (parsedValue === undefined) {
       worktreeConfig = true;
       continue;
     }
-    const bool = asciiLower(parsedValue!.value!);
+    const bool = asciiLower(parsedValue.value);
     if (bool === "true" || bool === "yes" || bool === "on" || bool === "1") {
       worktreeConfig = true;
     } else if (bool === "false" || bool === "no" || bool === "off" || bool === "0") {
@@ -633,13 +694,13 @@ function readExternalWorktreeEvidence(
   if (!configuredStat.isDirectory() || configuredStat.isSymbolicLink()) {
     throw new Error(`invalid Git core.worktree directory at ${configuredPath}`);
   }
-  const resolvedWorktree = existingRealDirectory(configuredPath, "Git core.worktree directory");
-  if (configuredPath !== worktreeRoot || resolvedWorktree !== worktreeRoot) {
+  if (configuredPath !== worktreeRoot) {
     throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: topology does not point to ${worktreeRoot}`);
   }
+  authenticateDirectory(configuredPath, "Git core.worktree directory");
   return {
     commonConfig: values.commonConfig,
-    resolvedWorktree,
+    resolvedWorktree: configuredPath,
     worktreeConfig: values.worktreeConfig,
   };
 }

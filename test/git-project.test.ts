@@ -1,4 +1,5 @@
 import {
+  constants,
   mkdirSync,
   mkdtempSync,
   renameSync,
@@ -7,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -21,18 +22,88 @@ const metadataRace = vi.hoisted((): {
 } => ({ afterRead: undefined }));
 
 const directoryAuthRace = vi.hoisted(() => ({
+  afterOpen: undefined as (() => void) | undefined,
+  afterRealpath: undefined as (() => void) | undefined,
+  afterRealpathAt: 0,
+  beforeOpen: undefined as (() => void) | undefined,
+  closeCount: 0,
+  closeError: undefined as Error | undefined,
+  descriptorMismatchAt: 0,
+  descriptorMismatchField: "dev" as "dev" | "ino",
+  fstatCount: 0,
+  fstatError: undefined as Error | undefined,
+  invalidDescriptorAt: 0,
   invalidDirectoryAt: 0,
   lstatCount: 0,
   lstatPath: "",
   mismatchedStatAt: 0,
+  openCount: 0,
+  openError: undefined as Error | undefined,
+  openFlags: undefined as number | undefined,
+  openPath: "",
+  realpathCount: 0,
   statCount: 0,
   statPath: "",
+  trackedDescriptors: new Set<number>(),
+  unsupportedFlag: undefined as "directory" | "nofollow" | undefined,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
+  const mockedConstants = { ...actual.constants };
+  Object.defineProperties(mockedConstants, {
+    O_DIRECTORY: {
+      configurable: true,
+      enumerable: true,
+      get: () => directoryAuthRace.unsupportedFlag === "directory"
+        ? undefined
+        : actual.constants.O_DIRECTORY,
+    },
+    O_NOFOLLOW: {
+      configurable: true,
+      enumerable: true,
+      get: () => directoryAuthRace.unsupportedFlag === "nofollow"
+        ? undefined
+        : actual.constants.O_NOFOLLOW,
+    },
+  });
   return {
     ...actual,
+    closeSync: ((fd: number) => {
+      const tracked = directoryAuthRace.trackedDescriptors.has(fd);
+      if (tracked) directoryAuthRace.closeCount += 1;
+      actual.closeSync(fd);
+      if (tracked) {
+        directoryAuthRace.trackedDescriptors.delete(fd);
+        if (directoryAuthRace.closeError !== undefined) {
+          throw directoryAuthRace.closeError;
+        }
+      }
+    }) as typeof actual.closeSync,
+    constants: mockedConstants,
+    fstatSync: ((fd: number, options?: Parameters<typeof actual.fstatSync>[1]) => {
+      if (!directoryAuthRace.trackedDescriptors.has(fd)) {
+        return actual.fstatSync(fd, options as never);
+      }
+      directoryAuthRace.fstatCount += 1;
+      if (directoryAuthRace.fstatError !== undefined) {
+        throw directoryAuthRace.fstatError;
+      }
+      const stat = actual.fstatSync(fd, options as never);
+      if (directoryAuthRace.fstatCount === directoryAuthRace.invalidDescriptorAt) {
+        const changed = Object.create(stat) as typeof stat;
+        changed.isDirectory = (): boolean => false;
+        return changed;
+      }
+      if (directoryAuthRace.fstatCount === directoryAuthRace.descriptorMismatchAt) {
+        const changed = Object.create(stat) as typeof stat;
+        Object.defineProperty(changed, directoryAuthRace.descriptorMismatchField, {
+          value: Number(stat[directoryAuthRace.descriptorMismatchField]) + 1,
+        });
+        return changed;
+      }
+      return stat;
+    }) as typeof actual.fstatSync,
     lstatSync: ((path: Parameters<typeof actual.lstatSync>[0], options?: Parameters<typeof actual.lstatSync>[1]) => {
       const stat = actual.lstatSync(path, options as never);
       if (String(path) === directoryAuthRace.lstatPath) {
@@ -45,6 +116,38 @@ vi.mock("node:fs", async (importOriginal) => {
       }
       return stat;
     }) as typeof actual.lstatSync,
+    openSync: ((
+      path: Parameters<typeof actual.openSync>[0],
+      flags: Parameters<typeof actual.openSync>[1],
+      mode?: Parameters<typeof actual.openSync>[2],
+    ) => {
+      if (String(path) !== directoryAuthRace.openPath) {
+        return actual.openSync(path, flags, mode as never);
+      }
+      directoryAuthRace.openCount += 1;
+      directoryAuthRace.openFlags = typeof flags === "number" ? flags : undefined;
+      if (directoryAuthRace.openError !== undefined) {
+        throw directoryAuthRace.openError;
+      }
+      directoryAuthRace.beforeOpen?.();
+      const fd = actual.openSync(path, flags, mode as never);
+      directoryAuthRace.trackedDescriptors.add(fd);
+      directoryAuthRace.afterOpen?.();
+      return fd;
+    }) as typeof actual.openSync,
+    realpathSync: ((
+      path: Parameters<typeof actual.realpathSync>[0],
+      options?: Parameters<typeof actual.realpathSync>[1],
+    ) => {
+      const real = actual.realpathSync(path, options as never);
+      if (String(path) === directoryAuthRace.openPath) {
+        directoryAuthRace.realpathCount += 1;
+        if (directoryAuthRace.realpathCount === directoryAuthRace.afterRealpathAt) {
+          directoryAuthRace.afterRealpath?.();
+        }
+      }
+      return real;
+    }) as typeof actual.realpathSync,
     statSync: ((path: Parameters<typeof actual.statSync>[0], options?: Parameters<typeof actual.statSync>[1]) => {
       const stat = actual.statSync(path, options as never);
       if (String(path) === directoryAuthRace.statPath) {
@@ -137,7 +240,7 @@ function makeStandaloneMetadata(
   writeFileSync(join(metadata, "config"), config);
   writeFileSync(
     join(checkout, ".git"),
-    `gitdir: ${absolutePointer ? metadata : `../${metadata.split("/").at(-1)!}`}\n`,
+    `gitdir: ${absolutePointer ? metadata : relative(checkout, metadata)}\n`,
   );
 }
 
@@ -145,6 +248,33 @@ function git(cwd: string, ...args: string[]): string {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr || result.stdout);
   return result.stdout.trim();
+}
+
+function resetDirectoryAuthRace(): void {
+  directoryAuthRace.afterOpen = undefined;
+  directoryAuthRace.afterRealpath = undefined;
+  directoryAuthRace.afterRealpathAt = 0;
+  directoryAuthRace.beforeOpen = undefined;
+  directoryAuthRace.closeCount = 0;
+  directoryAuthRace.closeError = undefined;
+  directoryAuthRace.descriptorMismatchAt = 0;
+  directoryAuthRace.descriptorMismatchField = "dev";
+  directoryAuthRace.fstatCount = 0;
+  directoryAuthRace.fstatError = undefined;
+  directoryAuthRace.invalidDescriptorAt = 0;
+  directoryAuthRace.invalidDirectoryAt = 0;
+  directoryAuthRace.lstatCount = 0;
+  directoryAuthRace.lstatPath = "";
+  directoryAuthRace.mismatchedStatAt = 0;
+  directoryAuthRace.openCount = 0;
+  directoryAuthRace.openError = undefined;
+  directoryAuthRace.openFlags = undefined;
+  directoryAuthRace.openPath = "";
+  directoryAuthRace.realpathCount = 0;
+  directoryAuthRace.statCount = 0;
+  directoryAuthRace.statPath = "";
+  directoryAuthRace.trackedDescriptors.clear();
+  directoryAuthRace.unsupportedFlag = undefined;
 }
 
 describe("Git project identity", () => {
@@ -155,12 +285,7 @@ describe("Git project identity", () => {
     pathBoundary.redirectFrom = "";
     pathBoundary.redirectTo = "";
     metadataRace.afterRead = undefined;
-    directoryAuthRace.invalidDirectoryAt = 0;
-    directoryAuthRace.lstatCount = 0;
-    directoryAuthRace.lstatPath = "";
-    directoryAuthRace.mismatchedStatAt = 0;
-    directoryAuthRace.statCount = 0;
-    directoryAuthRace.statPath = "";
+    resetDirectoryAuthRace();
     clearGitProjectAnchorCache();
   });
 
@@ -168,12 +293,7 @@ describe("Git project identity", () => {
     pathBoundary.redirectFrom = "";
     pathBoundary.redirectTo = "";
     metadataRace.afterRead = undefined;
-    directoryAuthRace.invalidDirectoryAt = 0;
-    directoryAuthRace.lstatCount = 0;
-    directoryAuthRace.lstatPath = "";
-    directoryAuthRace.mismatchedStatAt = 0;
-    directoryAuthRace.statCount = 0;
-    directoryAuthRace.statPath = "";
+    resetDirectoryAuthRace();
     clearGitProjectAnchorCache();
     rmSync(root, { recursive: true, force: true });
   });
@@ -590,6 +710,18 @@ describe("Git project identity", () => {
       "topology does not point",
     );
 
+    const nestedRelativeCheckout = join(root, "nested", "relative-checkout");
+    const nonSiblingMetadata = join(root, "non-sibling-metadata");
+    makeStandaloneMetadata(
+      nestedRelativeCheckout,
+      nonSiblingMetadata,
+      `[core]\nworktree = ${nestedRelativeCheckout}\n`,
+      false,
+    );
+    expect(resolveGitProjectAnchor(nestedRelativeCheckout)?.canonical).toBe(
+      nestedRelativeCheckout,
+    );
+
     const continuedCheckout = join(root, "continued-checkout");
     const continuedMetadata = join(root, "continued-metadata");
     makeStandaloneMetadata(
@@ -861,14 +993,226 @@ describe("Git project identity", () => {
   });
 
   it("fails closed when directory authentication observes substituted metadata", () => {
-    const invalid = makeRepository(join(root, "invalid-auth-directory"));
-    directoryAuthRace.lstatPath = join(invalid, ".git");
+    const initialInvalid = makeRepository(join(root, "initial-invalid-auth-directory"));
+    directoryAuthRace.openPath = join(initialInvalid, ".git");
+    directoryAuthRace.lstatPath = join(initialInvalid, ".git");
     directoryAuthRace.invalidDirectoryAt = 2;
-    expect(() => resolveGitProjectAnchor(invalid)).toThrow("invalid Git directory");
+    expect(() => resolveGitProjectAnchor(initialInvalid)).toThrow(
+      "invalid Git directory",
+    );
+    expect(directoryAuthRace.closeCount).toBe(0);
 
-    directoryAuthRace.invalidDirectoryAt = 0;
-    directoryAuthRace.lstatCount = 0;
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const invalid = makeRepository(join(root, "invalid-auth-directory"));
+    directoryAuthRace.openPath = join(invalid, ".git");
+    directoryAuthRace.lstatPath = join(invalid, ".git");
+    directoryAuthRace.invalidDirectoryAt = 3;
+    expect(() => resolveGitProjectAnchor(invalid)).toThrow("invalid Git directory");
+    expect(directoryAuthRace.closeCount).toBe(1);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
     const changed = makeRepository(join(root, "changed-auth-directory"));
+    directoryAuthRace.openPath = join(changed, ".git");
+    directoryAuthRace.descriptorMismatchAt = 1;
+    expect(() => resolveGitProjectAnchor(changed)).toThrow(
+      "Git directory changed during validation",
+    );
+    expect(directoryAuthRace.closeCount).toBe(1);
+  });
+
+  it("descriptor-authenticates strict Git directories and exact core.worktree evidence", () => {
+    const primary = makeRepository(join(root, "descriptor-primary"));
+    const primaryAlias = join(root, "descriptor-primary-alias");
+    symlinkSync(primary, primaryAlias);
+    directoryAuthRace.openPath = join(primary, ".git");
+
+    expect(resolveGitProjectAnchor(primaryAlias)).toEqual({
+      canonical: primary,
+      worktreeRoot: primary,
+      commonDir: join(primary, ".git"),
+    });
+    expect(directoryAuthRace.openCount).toBe(2);
+    expect(directoryAuthRace.fstatCount).toBe(2);
+    expect(directoryAuthRace.closeCount).toBe(2);
+    expect(directoryAuthRace.openFlags).toBe(
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const linked = makeLinkedWorktree(
+      primary,
+      join(root, "descriptor-linked"),
+      "descriptor-linked",
+    );
+    directoryAuthRace.openPath = join(primary, ".git");
+    expect(resolveGitProjectAnchor(linked)?.canonical).toBe(primary);
+    expect(directoryAuthRace.openCount).toBe(2);
+    expect(directoryAuthRace.fstatCount).toBe(2);
+    expect(directoryAuthRace.closeCount).toBe(2);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const checkout = join(root, "descriptor-checkout");
+    const metadata = join(root, "descriptor-metadata");
+    makeStandaloneMetadata(
+      checkout,
+      metadata,
+      `[core]\nworktree = ${checkout}\n`,
+    );
+    directoryAuthRace.openPath = checkout;
+    expect(resolveGitProjectAnchor(checkout)?.canonical).toBe(metadata);
+    expect(directoryAuthRace.openCount).toBe(2);
+    expect(directoryAuthRace.fstatCount).toBe(2);
+    expect(directoryAuthRace.closeCount).toBe(2);
+  });
+
+  it("rejects directory substitutions before open and while a descriptor is held", () => {
+    const beforeOpen = makeRepository(join(root, "before-open-substitution"));
+    const beforeOpenGitDir = join(beforeOpen, ".git");
+    const beforeOpenRetired = join(beforeOpen, ".git-retired");
+    directoryAuthRace.openPath = beforeOpenGitDir;
+    directoryAuthRace.beforeOpen = (): void => {
+      renameSync(beforeOpenGitDir, beforeOpenRetired);
+      symlinkSync(beforeOpenRetired, beforeOpenGitDir);
+    };
+    expect(() => resolveGitProjectAnchor(beforeOpen)).toThrow();
+    expect(directoryAuthRace.openCount).toBe(1);
+    expect(directoryAuthRace.fstatCount).toBe(0);
+    expect(directoryAuthRace.closeCount).toBe(0);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const beforeOpenReplacement = makeRepository(
+      join(root, "before-open-directory-replacement"),
+    );
+    const beforeOpenReplacementGitDir = join(beforeOpenReplacement, ".git");
+    const beforeOpenReplacementRetired = join(
+      beforeOpenReplacement,
+      ".git-retired",
+    );
+    directoryAuthRace.openPath = beforeOpenReplacementGitDir;
+    directoryAuthRace.beforeOpen = (): void => {
+      renameSync(beforeOpenReplacementGitDir, beforeOpenReplacementRetired);
+      makeRepository(beforeOpenReplacement);
+    };
+    expect(() => resolveGitProjectAnchor(beforeOpenReplacement)).toThrow(
+      "Git directory changed during validation",
+    );
+    expect(directoryAuthRace.openCount).toBe(1);
+    expect(directoryAuthRace.fstatCount).toBe(1);
+    expect(directoryAuthRace.closeCount).toBe(1);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const afterOpen = makeRepository(join(root, "after-open-substitution"));
+    const afterOpenGitDir = join(afterOpen, ".git");
+    const afterOpenRetired = join(afterOpen, ".git-retired");
+    directoryAuthRace.openPath = afterOpenGitDir;
+    directoryAuthRace.afterOpen = (): void => {
+      renameSync(afterOpenGitDir, afterOpenRetired);
+      makeRepository(afterOpen);
+    };
+    expect(() => resolveGitProjectAnchor(afterOpen)).toThrow(
+      "Git directory changed during validation",
+    );
+    expect(directoryAuthRace.fstatCount).toBe(1);
+    expect(directoryAuthRace.closeCount).toBe(1);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const afterRealpath = makeRepository(join(root, "after-realpath-substitution"));
+    const afterRealpathGitDir = join(afterRealpath, ".git");
+    const afterRealpathRetired = join(afterRealpath, ".git-retired");
+    directoryAuthRace.openPath = afterRealpathGitDir;
+    directoryAuthRace.afterRealpathAt = 2;
+    directoryAuthRace.afterRealpath = (): void => {
+      renameSync(afterRealpathGitDir, afterRealpathRetired);
+      symlinkSync(afterRealpathRetired, afterRealpathGitDir);
+    };
+    expect(() => resolveGitProjectAnchor(afterRealpath)).toThrow(
+      "invalid Git directory",
+    );
+    expect(directoryAuthRace.fstatCount).toBe(1);
+    expect(directoryAuthRace.closeCount).toBe(1);
+  });
+
+  it("closes directory descriptors across fstat, validation, and close failures", () => {
+    const openFailure = makeRepository(join(root, "directory-open-failure"));
+    const openError = new Error("synthetic directory open failure");
+    directoryAuthRace.openPath = join(openFailure, ".git");
+    directoryAuthRace.openError = openError;
+    expect(() => resolveGitProjectAnchor(openFailure)).toThrow(openError);
+    expect(directoryAuthRace.closeCount).toBe(0);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const fstatFailure = makeRepository(join(root, "directory-fstat-failure"));
+    const fstatError = new Error("synthetic directory fstat failure");
+    directoryAuthRace.openPath = join(fstatFailure, ".git");
+    directoryAuthRace.fstatError = fstatError;
+    expect(() => resolveGitProjectAnchor(fstatFailure)).toThrow(fstatError);
+    expect(directoryAuthRace.closeCount).toBe(1);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const invalidDescriptor = makeRepository(join(root, "invalid-directory-descriptor"));
+    directoryAuthRace.openPath = join(invalidDescriptor, ".git");
+    directoryAuthRace.invalidDescriptorAt = 1;
+    expect(() => resolveGitProjectAnchor(invalidDescriptor)).toThrow(
+      "invalid Git directory",
+    );
+    expect(directoryAuthRace.closeCount).toBe(1);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const inodeMismatch = makeRepository(join(root, "inode-mismatch-directory"));
+    directoryAuthRace.openPath = join(inodeMismatch, ".git");
+    directoryAuthRace.descriptorMismatchAt = 1;
+    directoryAuthRace.descriptorMismatchField = "ino";
+    expect(() => resolveGitProjectAnchor(inodeMismatch)).toThrow(
+      "Git directory changed during validation",
+    );
+    expect(directoryAuthRace.closeCount).toBe(1);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const closeFailure = makeRepository(join(root, "directory-close-failure"));
+    const closeError = new Error("synthetic directory close failure");
+    directoryAuthRace.openPath = join(closeFailure, ".git");
+    directoryAuthRace.closeError = closeError;
+    expect(() => resolveGitProjectAnchor(closeFailure)).toThrow(closeError);
+    expect(directoryAuthRace.closeCount).toBe(1);
+  });
+
+  it("uses path authentication only when a directory-open flag is unavailable", () => {
+    for (const unsupportedFlag of ["directory", "nofollow"] as const) {
+      resetDirectoryAuthRace();
+      clearGitProjectAnchorCache();
+      const repository = makeRepository(join(root, `fallback-${unsupportedFlag}`));
+      directoryAuthRace.openPath = join(repository, ".git");
+      directoryAuthRace.unsupportedFlag = unsupportedFlag;
+      expect(resolveGitProjectAnchor(repository)?.canonical).toBe(repository);
+      expect(directoryAuthRace.openCount).toBe(0);
+    }
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const invalid = makeRepository(join(root, "fallback-invalid"));
+    directoryAuthRace.openPath = join(invalid, ".git");
+    directoryAuthRace.unsupportedFlag = "directory";
+    directoryAuthRace.lstatPath = join(invalid, ".git");
+    directoryAuthRace.invalidDirectoryAt = 3;
+    expect(() => resolveGitProjectAnchor(invalid)).toThrow("invalid Git directory");
+    expect(directoryAuthRace.openCount).toBe(0);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const changed = makeRepository(join(root, "fallback-changed"));
+    directoryAuthRace.openPath = join(changed, ".git");
+    directoryAuthRace.unsupportedFlag = "directory";
     directoryAuthRace.statPath = join(changed, ".git");
     directoryAuthRace.mismatchedStatAt = 2;
     expect(() => resolveGitProjectAnchor(changed)).toThrow(
