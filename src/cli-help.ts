@@ -153,6 +153,25 @@ const HELP: Record<string, CommandHelp> = {
     notes: "Configure storage.backend=postgresql and supply the migration role through LCM_POSTGRES_URL plus the verified CA path through LCM_POSTGRES_CA_FILE. The command validates PostgreSQL 18, extensions, ownership, migration checksums, and schema fingerprints. It does not install extensions or grant runtime privileges.",
   },
 
+  migration: {
+    summary: "Run a crash-recoverable, non-destructive SQLite/PostgreSQL storage migration.",
+    usage: "lcm migration <plan|dry-run|apply|resume|verify|report|activate|rollback> [generation-id] [options]",
+    options: [
+      ["plan [--batch-size <rows>] [--sample-size <rows>] [--json]", "Inventory every local project and create a private generation"],
+      ["dry-run <generation-id> [--json]", "Snapshot sources and verify identity, schema, aliases, delivery, and empty destinations without remote writes"],
+      ["apply|resume <generation-id> --confirm <generation-id> [--json]", "Copy exact stable IDs under a fenced lease and durable checkpoints"],
+      ["verify|report <generation-id> [--json]", "Recompute canonical digests, relational checks, and deterministic samples"],
+      ["activate|rollback <generation-id> --confirm <generation-id> [--json]", "Publish the global backend or recover through the checksummed journal"],
+    ],
+    examples: [
+      ["lcm migration plan --json", "Create an installation-wide migration generation"],
+      ["lcm migration dry-run <generation-id> --json", "Run the required read-only destination rehearsal"],
+      ["lcm migration apply <generation-id> --confirm <generation-id>", "Apply only the exact dry-run-verified generation"],
+      ["lcm migration verify <generation-id> --json", "Produce the activation-gating verification report"],
+    ],
+    notes: "Stop the daemon before apply, activation, or post-write rollback. SQLite sources and WAL files are retained byte-for-byte. Publication is crash-recoverable, not cross-file atomic; rerun the same command and generation after interruption. PostgreSQL credentials remain environment-only and --json keeps stdout machine-pure.",
+  },
+
   search: {
     summary: "Search memory across episodic and promoted layers for the current project.",
     usage: "lcm search <query> [--limit N] [--layer episodic|promoted] [--tag <tag>]",
@@ -500,6 +519,7 @@ const GROUPS = [
       { name: "machine <register|show|recover>", summary: "Manage this machine's PostgreSQL identity" },
       { name: "project <create|link|unlink|list|show|reconcile-worktrees>", summary: "Manage local and PostgreSQL project identities" },
       { name: "postgres migrate [--json]", summary: "Apply packaged PostgreSQL schema migrations" },
+      { name: "migration <operation> [generation-id]", summary: "Run reversible SQLite/PostgreSQL data migration" },
       { name: "mcp", summary: "Start the MCP server (stdio transport)" },
     ],
   },

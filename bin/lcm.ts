@@ -1025,6 +1025,90 @@ export function registerPostgreSqlCommand(program: Command): void {
   program.addCommand(postgresCmd);
 }
 
+export function registerMigrationCommand(program: Command): void {
+  type MigrationOptions = {
+    batchSize?: string;
+    confirm?: string;
+    help?: boolean;
+    json?: boolean;
+    sampleSize?: string;
+  };
+  const migration = new Command("migration")
+    .description("Plan, apply, verify, activate, and roll back storage migrations")
+    .helpOption(false)
+    .option("-h, --help", "Show help");
+  const wantsHelp = (opts: MigrationOptions): boolean =>
+    opts.help === true || migration.opts<MigrationOptions>().help === true;
+  const showHelp = async (): Promise<never> => {
+    const { printHelp } = await import("../src/cli-help.js");
+    printHelp("migration");
+    return exit(0);
+  };
+  const safeError = (error: unknown): string => sanitizeTerminalText(
+    (error instanceof Error ? error.message : "migration operation failed")
+      .replaceAll(/postgresql:\/\/[^\s]+/giu, "postgresql://<redacted>")
+      .replaceAll(/(?:\/[\w.@+-]+){2,}/gu, "<path>"),
+  ).slice(0, 512);
+  const requireConfirmation = (generationId: string, opts: MigrationOptions): void => {
+    if (opts.confirm !== generationId) {
+      throw new Error(`refusing mutation: pass --confirm ${generationId} after reviewing the successful dry-run report`);
+    }
+  };
+  const execute = async (
+    operation: string,
+    generationId: string | undefined,
+    opts: MigrationOptions,
+  ): Promise<void> => {
+    if (wantsHelp(opts)) return showHelp();
+    const api = await import("../src/storage/project-migration.js");
+    const common = {
+      ...(opts.batchSize === undefined ? {} : { batchSize: parsePositiveInteger(opts.batchSize, "--batch-size") }),
+      ...(opts.sampleSize === undefined ? {} : { sampleSize: parsePositiveInteger(opts.sampleSize, "--sample-size") }),
+      progress: opts.json ? undefined : (message: string) => console.error(message),
+    };
+    try {
+      let output;
+      switch (operation) {
+        case "plan": output = api.planProjectMigration(common); break;
+        case "dry-run": output = await api.dryRunProjectMigration(generationId!, common); break;
+        case "apply": requireConfirmation(generationId!, opts); output = await api.applyProjectMigration(generationId!, common); break;
+        case "resume": requireConfirmation(generationId!, opts); output = await api.resumeProjectMigration(generationId!, common); break;
+        case "verify": output = await api.verifyProjectMigration(generationId!, common); break;
+        case "report": output = generationId ? api.reportProjectMigration(generationId, common) : api.listProjectMigrationReports(common); break;
+        case "activate": requireConfirmation(generationId!, opts); output = await api.activateProjectMigration(generationId!, common); break;
+        case "rollback": requireConfirmation(generationId!, opts); output = await api.rollbackProjectMigration(generationId!, common); break;
+        default: throw new Error("unknown migration operation");
+      }
+      if (opts.json) printJson(output);
+      else if (Array.isArray(output)) console.log(`Found ${output.length} migration generation(s).`);
+      else {
+        console.log(`${operation} ${output.generationId}: ${output.status}`);
+        for (const blocker of output.blockers) console.error(`blocker: ${blocker}`);
+      }
+      if (!Array.isArray(output) && output.blockers.length > 0 && operation !== "plan" && operation !== "apply" && operation !== "resume") process.exitCode = 1;
+    } catch (error) {
+      const message = safeError(error);
+      if (opts.json) printJson({ ok: false, operation, error: message });
+      else console.error(`migration ${operation} failed: ${message}`);
+      process.exitCode = 1;
+    }
+  };
+
+  migration.action(async (opts: MigrationOptions) => {
+    if (wantsHelp(opts)) return showHelp();
+    console.error("Usage: lcm migration plan|dry-run|apply|resume|verify|report|activate|rollback");
+    process.exitCode = 1;
+  });
+  migration.command("plan").option("--batch-size <rows>").option("--sample-size <rows>").option("--json").option("-h, --help").action((opts: MigrationOptions) => execute("plan", undefined, opts));
+  migration.command("dry-run <generation-id>").option("--json").option("-h, --help").action((id: string, opts: MigrationOptions) => execute("dry-run", id, opts));
+  for (const name of ["apply", "resume", "activate", "rollback"] as const) {
+    migration.command(`${name} <generation-id>`).option("--confirm <generation-id>").option("--json").option("-h, --help").action((id: string, opts: MigrationOptions) => execute(name, id, opts));
+  }
+  migration.command("verify <generation-id>").option("--json").option("-h, --help").action((id: string, opts: MigrationOptions) => execute("verify", id, opts));
+  migration.command("report [generation-id]").option("--json").option("-h, --help").action((id: string | undefined, opts: MigrationOptions) => execute("report", id, opts));
+  program.addCommand(migration);
+}
+
 function collectRepeatedOption(value: string, previous: string[] = []): string[] {
   return [...previous, value];
 }
@@ -2058,6 +2142,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
   registerMachineCommand(program);
   registerProjectCommand(program);
   registerPostgreSqlCommand(program);
+  registerMigrationCommand(program);
   registerMemoryCommands(program);
 
   // ─── diagnose ──────────────────────────────────────────────────────────────
