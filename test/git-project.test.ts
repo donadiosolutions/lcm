@@ -313,6 +313,9 @@ import {
   resolveGitProjectAnchor,
 } from "../src/git-project.js";
 
+// The 5.454s full-coverage tail makes this bounded budget 2.75x.
+const EXACT_GIT_CONFIG_BOOLEAN_TIMEOUT_MS = 15_000;
+
 function makeDirectory(path: string): string {
   mkdirSync(path, { recursive: true });
   return path;
@@ -2465,7 +2468,7 @@ describe("Git project identity", () => {
         "expected one core.worktree path",
       );
     }
-  });
+  }, EXACT_GIT_CONFIG_BOOLEAN_TIMEOUT_MS);
 
   it("accepts a 174581-byte valid config with repeated branch metadata", () => {
     const primary = makeRepository(join(root, "large-config"));

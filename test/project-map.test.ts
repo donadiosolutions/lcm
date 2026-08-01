@@ -42,6 +42,56 @@ function makeDir(name: string): string {
   return path;
 }
 
+function writeLiveProjectMapLock(nonce: string): string {
+  const lockPath = `${projectMapPath()}.lock`;
+  const processStat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
+  const processStartTime = processStat
+    .slice(processStat.lastIndexOf(")") + 2)
+    .trim()
+    .split(" ")[19];
+  writeFileSync(lockPath, `${JSON.stringify({
+    version: 1,
+    pid: process.pid,
+    processStartTime,
+    nonce,
+    createdAtMs: Date.now(),
+  })}\n`, { mode: 0o600 });
+  return lockPath;
+}
+
+function finishFakeTimerWatcherTest(
+  primaryError: { value: unknown } | undefined,
+  watchers: readonly (ReturnType<typeof watchProjectMap> | undefined)[],
+  lockPath: string | undefined,
+): void {
+  const errors = primaryError ? [primaryError.value] : [];
+  for (const watcher of watchers) {
+    if (!watcher) continue;
+    try {
+      watcher.close();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (lockPath) {
+    try {
+      rmSync(lockPath, { force: true });
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  try {
+    vi.useRealTimers();
+  } catch (error) {
+    errors.push(error);
+  }
+
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "project map watcher test and cleanup failed");
+  }
+}
+
 describe("project map", () => {
   const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
   const originalHome = process.env.HOME;
@@ -1959,48 +2009,43 @@ describe("project map", () => {
     expect(resolveProjectIdentity(target)).toEqual({ id, canonical: normalizeProjectPath(other) });
   });
 
-  it("cancels a pending map-watch reload when closed", async () => {
-    const idleWatcher = watchProjectMap();
-    idleWatcher.close();
-
+  it("cancels a pending map-watch reload when closed", () => {
+    let idleWatcher: ReturnType<typeof watchProjectMap> | undefined;
+    let mapWatcher: ReturnType<typeof watchProjectMap> | undefined;
+    let lockPath: string | undefined;
+    let primaryError: { value: unknown } | undefined;
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const mapWatcher = watchProjectMap();
     try {
-      writeFileSync(projectMapPath(), "{}\n");
-      for (let attempt = 0; attempt < 100 && vi.getTimerCount() === 0; attempt += 1) {
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
+      idleWatcher = watchProjectMap();
+      idleWatcher.close();
+      expect(vi.getTimerCount()).toBe(0);
+
+      const canonical = makeDir("watch-cancellation");
+      resolveProjectIdentity(canonical);
+      lockPath = writeLiveProjectMapLock("1".repeat(32));
+      mapWatcher = watchProjectMap();
       expect(vi.getTimerCount()).toBe(1);
 
       mapWatcher.close();
 
       expect(vi.getTimerCount()).toBe(0);
+    } catch (error) {
+      primaryError = { value: error };
     } finally {
-      mapWatcher.close();
-      vi.useRealTimers();
+      finishFakeTimerWatcherTest(primaryError, [mapWatcher, idleWatcher], lockPath);
     }
   });
 
   it("retries map-watch reloads while a live writer owns the map lock", () => {
     const canonical = makeDir("watch-live-writer");
     resolveProjectIdentity(canonical);
-    const lockPath = `${projectMapPath()}.lock`;
-    const processStat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
-    const processStartTime = processStat
-      .slice(processStat.lastIndexOf(")") + 2)
-      .trim()
-      .split(" ")[19];
-    writeFileSync(lockPath, `${JSON.stringify({
-      version: 1,
-      pid: process.pid,
-      processStartTime,
-      nonce: "2".repeat(32),
-      createdAtMs: Date.now(),
-    })}\n`, { mode: 0o600 });
+    const lockPath = writeLiveProjectMapLock("2".repeat(32));
 
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    let primaryError: { value: unknown } | undefined;
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const watcher = watchProjectMap();
     try {
+      watcher = watchProjectMap();
       expect(vi.getTimerCount()).toBe(1);
       vi.advanceTimersByTime(25);
       expect(vi.getTimerCount()).toBe(1);
@@ -2008,9 +2053,10 @@ describe("project map", () => {
       rmSync(lockPath);
       vi.advanceTimersByTime(25);
       expect(vi.getTimerCount()).toBe(0);
+    } catch (error) {
+      primaryError = { value: error };
     } finally {
-      watcher.close();
-      vi.useRealTimers();
+      finishFakeTimerWatcherTest(primaryError, [watcher], lockPath);
     }
   });
 
@@ -2021,28 +2067,20 @@ describe("project map", () => {
     writeFileSync(lockPath, "{broken", { mode: 0o600 });
     expect(() => watchProjectMap()).toThrow("project map lock is malformed");
 
-    const processStat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
-    const processStartTime = processStat
-      .slice(processStat.lastIndexOf(")") + 2)
-      .trim()
-      .split(" ")[19];
-    writeFileSync(lockPath, `${JSON.stringify({
-      version: 1,
-      pid: process.pid,
-      processStartTime,
-      nonce: "3".repeat(32),
-      createdAtMs: Date.now(),
-    })}\n`, { mode: 0o600 });
+    writeLiveProjectMapLock("3".repeat(32));
 
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    let primaryError: { value: unknown } | undefined;
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const watcher = watchProjectMap();
     try {
+      watcher = watchProjectMap();
       writeFileSync(lockPath, "{broken", { mode: 0o600 });
       expect(() => vi.advanceTimersByTime(25)).not.toThrow();
       expect(vi.getTimerCount()).toBe(0);
+    } catch (error) {
+      primaryError = { value: error };
     } finally {
-      watcher.close();
-      vi.useRealTimers();
+      finishFakeTimerWatcherTest(primaryError, [watcher], lockPath);
     }
   });
 
