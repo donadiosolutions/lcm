@@ -47,6 +47,8 @@ import {
   migrationProjectPaths,
   readMigrationManifest,
   readPublicationJournal,
+  writeMigrationManifest,
+  writePublicationJournal,
 } from "../src/storage/migration-manifest.js";
 import { SqliteMigrationReader, SqliteMigrationWriter, type MigrationRow } from "../src/storage/sqlite/migration-adapter.js";
 
@@ -68,6 +70,9 @@ class MigrationRuntime {
   healthStatus: "healthy" | "unhealthy" = "healthy";
   transactionCalls = 0;
   failTransactionAt: number | null = null;
+  uncertainAfterCommit = false;
+  relationalViolations = "0";
+  sampleMismatch = false;
   schema = loadPostgreSqlMigrations().map(({ id, sha256 }) => ({ migration_id: id, sha256 }));
   aliases: string[] = [];
   identityKey = "";
@@ -89,14 +94,14 @@ class MigrationRuntime {
     if (options.operation === "migrationVerifyAliases") return this.aliases.map((path) => ({ path }));
     if (options.operation === "migrationSchemaHistory") return this.schema;
     if (options.operation === "migrationResolveConversation") return [{ conversation_id: "1" }];
-    if (options.operation === "migrationVerifyRelationalIntegrity") return [{ violations: "0" }];
+    if (options.operation === "migrationVerifyRelationalIntegrity") return [{ violations: this.relationalViolations }];
     if (options.operation.startsWith("migrationSidecar:")) return [];
     if (options.operation.startsWith("migrationReadBatch:")) {
       const table = options.operation.split(":")[1]!;
       const limit = Number(config.values?.at(-2));
       const offset = Number(config.values?.at(-1));
       const columns = /^SELECT (.+?) FROM /su.exec(config.text)?.[1]?.split(", ").map((column) => column.trim()) ?? [];
-      return this.tableRows(table).slice(offset, offset + limit).map((row) => Object.fromEntries(columns.map((column) => [column, row[column]])));
+      return this.tableRows(table).slice(offset, offset + limit).map((row) => Object.fromEntries(columns.map((column) => [column, this.sampleMismatch && limit === 2 && column === "session_id" ? "mismatch" : row[column]])));
     }
     const table = options.operation.split(":")[1] ?? "";
     if (options.operation.startsWith("migrationReadExisting:")) {
@@ -135,7 +140,9 @@ class MigrationRuntime {
       transaction: async <T>(callback: (transaction: PostgreSqlTransactionScopeExecutor) => Promise<T>, _options: PostgreSqlOperationContext): Promise<T> => {
         this.transactionCalls += 1;
         if (this.failTransactionAt === this.transactionCalls) throw new Error("injected PostgreSQL transaction failure");
-        return callback(scope);
+        const value = await callback(scope);
+        if (this.uncertainAfterCommit) throw new (await import("../src/storage/postgresql/errors.js")).PostgreSqlCommitOutcomeUnknownError(_options);
+        return value;
       },
     };
   }
@@ -348,6 +355,12 @@ describe("migration safety helpers and blockers", () => {
     expect(progress).toHaveBeenCalledWith("project:abcdefghijkl copy");
     expect(seam.emptyDigest()).toMatch(/^[a-f0-9]{64}$/u);
     expect(seam.schemaContract().migrations).toHaveLength(5);
+    expect(seam.actualHome({ homeDir: "." })).toBe(resolve("."));
+    expect(seam.timestamp({ ...seam.dependencies({}), now: () => new Date(now) })).toBe(now);
+    const defaults = seam.dependencies({});
+    expect(defaults.now()).toBeInstanceOf(Date);
+    expect(defaults.processAlive(process.pid)).toBe(true);
+    expect(defaults.processAlive(2_147_483_647)).toBe(false);
   });
 
   it("detects local artifacts, orphan coverage, daemon state, and delivery blockers", () => {
@@ -375,7 +388,198 @@ describe("migration safety helpers and blockers", () => {
     const coverage = seam.installationCoverage(current.home, readProjectMapSnapshot(current.home), now);
     expect(coverage.complete).toBe(false);
     expect(coverage.orphanArtifacts).toHaveLength(1);
+    const junkDirectory = join(projectsDir(current.home), "not-a-project");
+    mkdirSync(junkDirectory, { mode: 0o700 });
+    mkdirSync(join(projectsDir(current.home), "e".repeat(64)), { mode: 0o700 });
+    const eventsRoot = join(lcmHomeDir(current.home), "events");
+    writePrivate(join(eventsRoot, "not-an-event.txt"), "ignored");
+    mkdirSync(join(eventsRoot, "directory.db"), { mode: 0o700 });
+    const orphanEvent = join(eventsRoot, `${"c".repeat(64)}.db`);
+    writePrivate(orphanEvent, "orphan");
+    const expanded = seam.installationCoverage(current.home, readProjectMapSnapshot(current.home), now);
+    expect(expanded.orphanArtifacts).toContain(`events/${"c".repeat(64)}.db`);
   });
+
+  it("validates project identity, source state, inventories, and manifest contracts", () => {
+    const current = fixture();
+    const seam = PROJECT_MIGRATION_TEST_SEAMS;
+    expect(() => seam.projectIdentity(current.localProjectId, { canonical: current.projectPath, aliases: [] })).toThrow("has no compatible PostgreSQL binding");
+    expect(() => seam.projectIdentity(current.localProjectId, { canonical: current.projectPath, aliases: [], remoteProjectId: "bad" })).toThrow("has no compatible PostgreSQL binding");
+    expect(seam.projectIdentity(current.localProjectId, { canonical: current.projectPath, aliases: [current.projectPath], remoteProjectId: remoteProjectId.toUpperCase() })).toMatchObject({ aliases: [resolve(current.projectPath)], remoteProjectId });
+    const planned = planProjectMigration(current.options);
+    const manifest = readMigrationManifest(planned.generationId, current.home);
+    expect(seam.result("report", { ...manifest, status: "verified" })).toMatchObject({ ready: true });
+    expect(seam.result("report", { ...manifest, status: "active" })).toMatchObject({ ready: true });
+    expect(seam.result("report", { ...manifest, status: "rolled-back" })).toMatchObject({ ready: true });
+    expect(seam.result("report", manifest, ["blocked"])).toMatchObject({ ready: false });
+    expect(seam.reportFor({ ...manifest, status: "verified", projects: manifest.projects.map((project) => ({ ...project, status: "active" })) })).toMatchObject({ ready: true, projects: [{ verified: true }] });
+    expect(seam.reportFor({ ...manifest, status: "active", projects: manifest.projects.map((project) => ({ ...project, status: "rolled-back" })) })).toMatchObject({ ready: false, projects: [{ verified: true }] });
+    expect(seam.inventoriesEqual(manifest.projects[0]!.tables, [])).toBe(false);
+    expect(seam.inventoriesEqual([{ table: "x", copiedRows: 0, sourceRows: 1, sourceSha256: "a".repeat(64) }], [{ table: "x", rows: 1, sha256: "a".repeat(64) }])).toBe(true);
+    expect(seam.inventoriesEqual([{ table: "x", copiedRows: 0, sourceRows: 1, sourceSha256: "a".repeat(64) }], [{ table: "y", rows: 1, sha256: "a".repeat(64) }])).toBe(false);
+    expect(seam.sourceFingerprint({ ...manifest.projects[0]!, sourceFingerprint: null }, current.home).main).not.toBeNull();
+    expect(seam.currentSourceMatches({ ...manifest.projects[0]!, sourceFingerprint: null }, current.home)).toBe(false);
+    rmSync(current.databasePath);
+    expect(seam.sourceFingerprint(manifest.projects[0]!, current.home)).toEqual({ main: null, wal: null });
+    expect(seam.currentSourceMatches({ ...manifest.projects[0]!, sourceFingerprint: null }, current.home)).toBe(true);
+    expect(seam.archiveOriginal({ ...manifest.projects[0]!, sourceFingerprint: null }, manifest.generationId, current.home, seam.dependencies(current.options))).toMatchObject({ sourceFingerprint: null });
+    expect(() => seam.assertManifestContract({ ...manifest, schemaManifestSha256: "0".repeat(64) })).toThrow("migration schema or manifest checksum changed");
+    expect(() => seam.assertManifestContract({ ...manifest, coverage: { ...manifest.coverage, complete: false, orphanArtifacts: ["orphan"] } })).toThrow("installation coverage contains orphan local storage artifacts");
+  });
+
+  it("fails planning for empty installations, orphan files, and missing bindings", () => {
+    const empty = fixture();
+    rmSync(empty.databasePath);
+    clearProjectMapCache();
+    expect(() => planProjectMigration(empty.options)).toThrow("no local project data is available to migrate");
+
+    const orphaned = fixture();
+    const orphan = join(projectsDir(orphaned.home), "f".repeat(64), "db.sqlite");
+    mkdirSync(dirname(orphan), { recursive: true, mode: 0o700 });
+    cpSync(orphaned.databasePath, orphan);
+    clearProjectMapCache();
+    expect(() => planProjectMigration(orphaned.options)).toThrow("orphan local storage artifacts block planning (1)");
+
+    const unbound = fixture();
+    writePrivate(projectMapPath(unbound.home), `${JSON.stringify({ [unbound.localProjectId]: { canonical: unbound.projectPath, aliases: [] } })}\n`);
+    clearProjectMapCache();
+    expect(() => planProjectMigration(unbound.options)).toThrow("has no compatible PostgreSQL binding");
+  });
+
+  it("uses an empty private snapshot for event-only projects", async () => {
+    const current = fixture();
+    rmSync(current.databasePath);
+    const eventPath = join(lcmHomeDir(current.home), "events", `${current.localProjectId}.db`);
+    mkdirSync(dirname(eventPath), { recursive: true, mode: 0o700 });
+    const event = new DatabaseSync(eventPath);
+    event.exec("CREATE TABLE events (delivery_state TEXT NOT NULL)");
+    event.close();
+    clearProjectMapCache();
+    const planned = planProjectMigration(current.options);
+    await dryRunProjectMigration(planned.generationId, current.options);
+    const manifest = readMigrationManifest(planned.generationId, current.home);
+    expect(manifest.projects[0]?.sourceFingerprint).toBeNull();
+    expect(manifest.projects[0]?.snapshot?.logicalRows).toBe(0);
+  });
+
+  it("fails dry-run for stale generations, registry drift, aliases, occupied state, and delivery queues", async () => {
+    const stale = fixture();
+    const staleGeneration = planProjectMigration(stale.options).generationId;
+    await dryRunProjectMigration(staleGeneration, stale.options);
+    await expect(dryRunProjectMigration(staleGeneration, stale.options)).rejects.toThrow("dry-run requires a newly planned generation");
+
+    const registry = fixture();
+    registry.runtime.schema = [];
+    const registryGeneration = planProjectMigration(registry.options).generationId;
+    await expect(dryRunProjectMigration(registryGeneration, registry.options)).rejects.toThrow("registry or checksum");
+    expect(readMigrationManifest(registryGeneration, registry.home).status).toBe("failed");
+
+    const aliases = fixture();
+    aliases.runtime.aliases = ["/wrong"];
+    await expect(dryRunProjectMigration(planProjectMigration(aliases.options).generationId, aliases.options)).rejects.toThrow("remote aliases do not match");
+
+    const occupied = fixture();
+    occupied.runtime.physical.set("messages", new Map([["occupied", { message_id: 1 }]]));
+    await expect(dryRunProjectMigration(planProjectMigration(occupied.options).generationId, occupied.options)).rejects.toThrow("destination is not empty");
+
+    const delivery = fixture();
+    const eventPath = join(lcmHomeDir(delivery.home), "events", `${delivery.localProjectId}.db`);
+    mkdirSync(dirname(eventPath), { recursive: true, mode: 0o700 });
+    const event = new DatabaseSync(eventPath);
+    event.exec("CREATE TABLE events (delivery_state TEXT NOT NULL); INSERT INTO events VALUES ('pending')");
+    event.close();
+    clearProjectMapCache();
+    await expect(dryRunProjectMigration(planProjectMigration(delivery.options).generationId, delivery.options)).rejects.toThrow("blocking local outbox state");
+  }, 20_000);
+
+  it("fails runtime opening safely and preserves the health failure", async () => {
+    const current = fixture();
+    current.runtime.healthStatus = "unhealthy";
+    await expect(dryRunProjectMigration(planProjectMigration(current.options).generationId, current.options)).rejects.toThrow("runtime is not terminal healthy");
+    expect(current.runtime.close).toHaveBeenCalled();
+    const closeFailure = fixture();
+    closeFailure.runtime.healthStatus = "unhealthy";
+    closeFailure.runtime.close.mockRejectedValueOnce(new Error("close failed"));
+    await expect(dryRunProjectMigration(planProjectMigration(closeFailure.options).generationId, closeFailure.options)).rejects.toThrow("runtime is not terminal healthy");
+  });
+
+  it("fails apply for live daemons, drift, unavailable leases, and early snapshots", async () => {
+    const daemon = fixture();
+    const daemonGeneration = planProjectMigration(daemon.options).generationId;
+    await dryRunProjectMigration(daemonGeneration, daemon.options);
+    writePrivate(join(lcmHomeDir(daemon.home), "daemon.pid"), `${process.pid}\n`);
+    const liveOptions = { ...daemon.options, _dependenciesForTesting: { ...daemon.options._dependenciesForTesting, processAlive: () => true } };
+    await expect(applyProjectMigration(daemonGeneration, liveOptions)).rejects.toThrow("daemon to be stopped");
+
+    const drift = fixture();
+    const driftGeneration = planProjectMigration(drift.options).generationId;
+    await dryRunProjectMigration(driftGeneration, drift.options);
+    const db = new DatabaseSync(drift.databasePath);
+    db.exec("UPDATE conversations SET title = 'changed'");
+    db.close();
+    await expect(applyProjectMigration(driftGeneration, drift.options)).rejects.toThrow("source fingerprint changed after dry-run");
+
+    const noLease = fixture();
+    const noLeaseGeneration = planProjectMigration(noLease.options).generationId;
+    await dryRunProjectMigration(noLeaseGeneration, noLease.options);
+    vi.mocked(PostgreSqlWorkCoordinator.prototype.acquireLease).mockResolvedValueOnce(null);
+    await expect(applyProjectMigration(noLeaseGeneration, noLease.options)).rejects.toThrow("migration lease is held by another writer");
+
+    const early = fixture();
+    const earlyGeneration = planProjectMigration(early.options).generationId;
+    await dryRunProjectMigration(earlyGeneration, early.options);
+    const earlyManifest = readMigrationManifest(earlyGeneration, early.home);
+    writeMigrationManifest({ ...earlyManifest, projects: earlyManifest.projects.map((project) => ({ ...project, tables: project.tables.map((table) => table.table === "conversations" ? { ...table, sourceRows: table.sourceRows + 1 } : table) })) }, early.home);
+    await expect(applyProjectMigration(earlyGeneration, early.options)).rejects.toThrow("source snapshot ended early in conversations");
+  }, 20_000);
+
+  it("records authoritative readback checkpoints and handles lease release failures", async () => {
+    const uncertain = fixture();
+    const uncertainGeneration = planProjectMigration(uncertain.options).generationId;
+    await dryRunProjectMigration(uncertainGeneration, uncertain.options);
+    uncertain.runtime.uncertainAfterCommit = true;
+    await applyProjectMigration(uncertainGeneration, uncertain.options);
+    expect(readMigrationManifest(uncertainGeneration, uncertain.home).projects[0]?.tables[0]?.remoteOutcome).toBe("readback-verified");
+
+    const release = fixture();
+    const releaseGeneration = planProjectMigration(release.options).generationId;
+    await dryRunProjectMigration(releaseGeneration, release.options);
+    vi.mocked(PostgreSqlWorkCoordinator.prototype.releaseLease).mockRejectedValueOnce(new Error("release failed"));
+    await expect(applyProjectMigration(releaseGeneration, release.options)).rejects.toThrow("release failed");
+
+    const suppressed = fixture();
+    const suppressedGeneration = planProjectMigration(suppressed.options).generationId;
+    await dryRunProjectMigration(suppressedGeneration, suppressed.options);
+    suppressed.runtime.failTransactionAt = 1;
+    vi.mocked(PostgreSqlWorkCoordinator.prototype.releaseLease).mockRejectedValueOnce(new Error("release failed"));
+    await expect(applyProjectMigration(suppressedGeneration, suppressed.options)).rejects.toThrow("injected PostgreSQL transaction failure");
+  }, 20_000);
+
+  it("fails verification for invalid state, drift, ledger, inventory, relational, and sample mismatches", async () => {
+    const invalid = fixture();
+    await expect(verifyProjectMigration(planProjectMigration(invalid.options).generationId, invalid.options)).rejects.toThrow("verify requires a completed apply generation");
+
+    const cases = ["source", "ledger", "inventory", "relational", "sample"] as const;
+    for (const scenario of cases) {
+      const current = fixture();
+      const generationId = planProjectMigration(current.options).generationId;
+      await dryRunProjectMigration(generationId, current.options);
+      await applyProjectMigration(generationId, current.options);
+      if (scenario === "source") {
+        const db = new DatabaseSync(current.databasePath);
+        db.exec("UPDATE conversations SET title = 'drift'");
+        db.close();
+      } else if (scenario === "ledger") current.runtime.schema = [];
+      else if (scenario === "inventory") current.runtime.physical.get("conversations")!.clear();
+      else if (scenario === "relational") current.runtime.relationalViolations = "1";
+      else current.runtime.sampleMismatch = true;
+      await expect(verifyProjectMigration(generationId, current.options), scenario).rejects.toThrow();
+      expect(readMigrationManifest(generationId, current.home).status).toBe("failed");
+    }
+    const repeat = fixture();
+    const repeatGeneration = await forwardToVerified(repeat);
+    await expect(verifyProjectMigration(repeatGeneration, repeat.options)).resolves.toMatchObject({ status: "verified" });
+  }, 30_000);
 
   it("reports activation blockers without mutating config or map", async () => {
     const current = fixture();
