@@ -144,16 +144,23 @@ function assertSourceUnchanged(
   if (!sameMigrationFingerprint(beforeMain, afterMain) || !sameMigrationFingerprint(beforeWal, afterWal)) throw new Error("SQLite source changed during backup");
 }
 
+function openExclusiveFile(path: string, collisionMessage: string): number {
+  try { return openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_WRONLY, PRIVATE_FILE_MODE); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(collisionMessage, { cause: error });
+    throw error;
+  }
+}
+
 function reserveDestination(path: string): void {
   const parent = lstatSync(dirname(path));
   if (!parent.isDirectory() || parent.isSymbolicLink() || (parent.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) throw new Error("migration generation directory must use mode 0700");
-  const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_WRONLY, PRIVATE_FILE_MODE);
+  const fd = openExclusiveFile(path, "migration backup destination already exists");
   closeSync(fd);
   unlinkSync(path);
 }
 
 export async function createSqliteMigrationSnapshot(sourcePath: string, destinationPath: string, options: SqliteMigrationSnapshotOptions = {}): Promise<SqliteSnapshotResult> {
-  if (existsSync(destinationPath)) throw new Error("migration backup destination already exists");
   reserveDestination(destinationPath);
   const beforeMain = fingerprintMigrationFileSync(sourcePath, dirname(sourcePath));
   const beforeWal = optionalFingerprint(`${sourcePath}-wal`);
@@ -224,10 +231,9 @@ export class SqliteMigrationWriter {
   private closed = false;
 
   constructor(readonly path: string) {
-    if (existsSync(path)) throw new Error("reverse SQLite destination already exists");
     const parent = lstatSync(dirname(path));
     if (!parent.isDirectory() || parent.isSymbolicLink() || (parent.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) throw new Error("reverse SQLite directory must use mode 0700");
-    const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_WRONLY, PRIVATE_FILE_MODE);
+    const fd = openExclusiveFile(path, "reverse SQLite destination already exists");
     closeSync(fd);
     this.db = new DatabaseSync(path, { timeout: 5_000 });
     runLcmMigrations(this.db);
@@ -297,6 +303,7 @@ export const SQLITE_MIGRATION_TEST_SEAMS = {
   nullableBoolean,
   nullableInteger,
   nullableText,
+  openExclusiveFile,
   reserveDestination,
   sourceTable,
   sqliteValue,

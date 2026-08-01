@@ -278,6 +278,7 @@ describe("SQLite migration reader and writer", () => {
     const existing = join(root, "existing.sqlite");
     writeFileSync(existing, "occupied", { mode: 0o600 });
     expect(() => new SqliteMigrationWriter(existing)).toThrow("reverse SQLite destination already exists");
+    expect(() => SQLITE_MIGRATION_TEST_SEAMS.openExclusiveFile(`${root}/invalid\0path`, "collision")).toThrow();
     const unsafe = join(root, "unsafe");
     mkdirSync(unsafe, { mode: 0o755 });
     expect(() => new SqliteMigrationWriter(join(unsafe, "reverse.sqlite"))).toThrow("reverse SQLite directory must use mode 0700");
