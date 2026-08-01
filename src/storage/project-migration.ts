@@ -1042,6 +1042,7 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
       priorPublicationJournalSha256 = retained.sha256;
       journal = null;
     }
+    if (!journal && priorPublicationJournalSha256 === undefined) throw new Error("completed activation publication journal is required before post-write rollback");
     if (journal && journal.operation !== "post-write-rollback") throw new Error("publication journal operation does not match post-write rollback");
     if (journal?.phase === "completed") return;
     if (!journal) {
@@ -1056,7 +1057,7 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
         expectedBackend: "postgresql",
         targetBackend: "sqlite",
         expectedConfigSha256: configSha256(home),
-        ...(priorPublicationJournalSha256 === undefined ? {} : { priorPublicationJournalSha256 }),
+        priorPublicationJournalSha256,
         projects: manifest.projects.map((project) => {
           const canonical = projectDatabasePath(home, project.identity.localProjectId);
           return {
