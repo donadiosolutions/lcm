@@ -437,10 +437,9 @@ function archiveOriginal(project: MigrationProjectState, generationId: string, h
   const source = projectDatabasePath(home, project.identity.localProjectId);
   const paths = ensureMigrationProjectDirectory(generationId, project.identity.localProjectId, home);
   const copyAndVerify = (from: string, to: string, expected: MigrationFileFingerprint): MigrationFileFingerprint => {
-    const created = deps.copyPrivate(from, to, { allowedRoot: dirname(from) });
+    deps.copyPrivate(from, to, { allowedRoot: dirname(from) });
     const actual = fingerprintMigrationFileSync(to, paths.directory);
     if (actual.size !== expected.size || actual.sha256 !== expected.sha256) throw new Error("retained SQLite archive does not match the preserved source bytes");
-    if (!created && (actual.size !== expected.size || actual.sha256 !== expected.sha256)) throw new Error("existing retained SQLite archive diverges");
     return actual;
   };
   const originalMainArchive = copyAndVerify(source, paths.originalMainArchive, project.sourceFingerprint.main);
