@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
+import fastUri from "fast-uri";
 import pkg from "../package.json";
 
 describe("package.json", () => {
@@ -27,13 +28,32 @@ describe("package.json", () => {
     expect(pkg.dependencies).not.toHaveProperty("fast-uri");
     expect(pkg.devDependencies).toHaveProperty("@modelcontextprotocol/sdk", "1.30.0");
     expect(pkg.devDependencies).toHaveProperty("body-parser", "2.3.0");
-    expect(pkg.devDependencies).toHaveProperty("fast-uri", "3.1.4");
+    expect(pkg.devDependencies).toHaveProperty("fast-uri", "3.1.5");
     expect(pkg.dependencies).toHaveProperty("@hono/node-server", "2.0.12");
     expect(pkg.scripts).toHaveProperty(
       "verify:consumer-topology",
       "node scripts/verify-consumer-topology.mjs",
     );
     expect(pkg.scripts["release:verify"]).toContain("npm run verify:consumer-topology");
+  });
+  it("rejects ambiguous URI authorities before Node URL consumers", () => {
+    const base = "https://allowed.example/";
+    const backslash = String.fromCharCode(92);
+    const hostileReferences = [
+      `${backslash}${backslash}evil.example/path`,
+      `/${backslash}evil.example/path`,
+      `${backslash}/evil.example/path`,
+    ];
+    const legitimateReference = "/safe/path";
+
+    for (const hostileReference of hostileReferences) {
+      expect(() => fastUri.resolve(base, hostileReference)).toThrow(
+        "URI authority must not contain a literal backslash.",
+      );
+    }
+    expect(fastUri.resolve(base, legitimateReference)).toBe(
+      new URL(legitimateReference, base).href,
+    );
   });
   it("does not have pi-ai", () => expect(pkg.dependencies).not.toHaveProperty("@mariozechner/pi-ai"));
   it("does not have pi-agent-core", () => expect(pkg.dependencies).not.toHaveProperty("@mariozechner/pi-agent-core"));
