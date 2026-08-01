@@ -47,6 +47,7 @@ import {
 } from "../src/storage/project-migration.js";
 import {
   fingerprintMigrationFileSync,
+  manifestSha256,
   migrationGenerationPaths,
   migrationProjectPaths,
   readMigrationManifest,
@@ -855,7 +856,9 @@ describe("migration safety helpers and blockers", () => {
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(manifest, current.options, deps)).toThrow("operation does not match pre-write rollback");
     writePublicationJournal(generationId, { ...prepared, phase: "completed" }, current.home);
     expect(PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(manifest, current.options, deps).projects[0]?.status).toBe("rolled-back");
-    expect(PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback({ ...manifest, projects: manifest.projects.map((project) => ({ ...project, verifiedAt: now })) }, current.options, deps).projects[0]?.verifiedAt).toBe(now);
+    const alreadyVerified = { ...manifest, projects: manifest.projects.map((project) => ({ ...project, verifiedAt: now })) };
+    writePublicationJournal(generationId, { ...prepared, phase: "completed", projects: prepared.projects.map((project) => ({ ...project, manifestSha256: manifestSha256(alreadyVerified) })) }, current.home);
+    expect(PROJECT_MIGRATION_TEST_SEAMS.preWriteRollback(alreadyVerified, current.options, deps).projects[0]?.verifiedAt).toBe(now);
 
     writePublicationJournal(generationId, prepared, current.home);
     writePrivate(configPath(current.home), `${JSON.stringify({ storage: { backend: "sqlite" }, changed: true })}\n`);
@@ -983,7 +986,10 @@ describe("migration safety helpers and blockers", () => {
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, stop)).toThrow("stop after prepare");
     const prepared = readPublicationJournal(generationId, current.home)!;
     expect(prepared.priorPublicationJournalSha256).toMatch(/^[a-f0-9]{64}$/u);
-    writePublicationJournal(generationId, { ...prepared, operation: "pre-write-rollback" }, current.home);
+    writePublicationJournal(generationId, { ...prepared, projects: prepared.projects.map((project) => ({ ...project, stagedSqlitePath: "/private/wrong.sqlite" })) }, current.home);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("filesystem path changed");
+    const preWriteProjects = prepared.projects.map(({ stagedSqlitePath: _staged, archivedMainPath: _main, archivedWalPath: _wal, ...project }) => ({ ...project, published: false }));
+    writePublicationJournal(generationId, { ...prepared, operation: "pre-write-rollback", expectedBackend: "sqlite", priorPublicationJournalSha256: undefined, projects: preWriteProjects }, current.home);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("operation does not match post-write rollback");
     writePublicationJournal(generationId, { ...prepared, phase: "completed" }, current.home);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).not.toThrow();
