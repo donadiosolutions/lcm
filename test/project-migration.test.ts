@@ -986,10 +986,15 @@ describe("migration safety helpers and blockers", () => {
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, stop)).toThrow("stop after prepare");
     const prepared = readPublicationJournal(generationId, current.home)!;
     expect(prepared.priorPublicationJournalSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.assertPublicationJournal(prepared, manifest, "activate", current.home)).toThrow("operation does not match activate");
     const retainedActivation = join(generationPaths.directory, "activation-publication-journal.json");
     const retainedActivationContent = readFileSync(retainedActivation, "utf8");
     writePrivate(retainedActivation, "corrupt retained activation journal");
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("retained activation publication journal is unavailable or changed");
+    const incompleteActivation = { ...activation, phase: "recovery" as const };
+    writePrivate(retainedActivation, JSON.stringify(incompleteActivation));
+    const incompleteFingerprint = fingerprintMigrationFileSync(retainedActivation, generationPaths.directory);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.assertRetainedActivationJournal({ ...prepared, priorPublicationJournalSha256: incompleteFingerprint.sha256 }, manifest, current.home)).toThrow("retained activation publication journal is unavailable or changed");
     writePrivate(retainedActivation, retainedActivationContent);
     writePublicationJournal(generationId, { ...prepared, projects: prepared.projects.map((project) => ({ ...project, stagedSqlitePath: "/private/wrong.sqlite" })) }, current.home);
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishReverse(manifest, current.options, deps)).toThrow("filesystem path changed");

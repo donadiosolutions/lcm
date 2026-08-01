@@ -1251,6 +1251,8 @@ export const PROJECT_MIGRATION_TEST_SEAMS = {
   actualHome,
   archiveOriginal,
   artifactIdentity,
+  assertPublicationJournal,
+  assertRetainedActivationJournal,
   assertManifestContract,
   backendFromConfig,
   configContent,
