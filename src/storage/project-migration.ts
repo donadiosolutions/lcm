@@ -3,9 +3,7 @@ import {
   constants,
   existsSync,
   fsyncSync,
-  lstatSync,
   openSync,
-  readFileSync,
   readdirSync,
   renameSync,
 } from "node:fs";
@@ -43,7 +41,6 @@ import {
   generationRelativePath,
   listMigrationManifests,
   manifestSha256,
-  migrationGenerationPaths,
   migrationProjectPaths,
   readMigrationManifest,
   readPublicationJournal,
@@ -1005,7 +1002,7 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
       if (existsSync(canonical) && !existsSync(state.archivedMainPath!)) {
         durableRename(canonical, state.archivedMainPath!);
       }
-      if (existsSync(`${canonical}-wal`) && !existsSync(state.archivedWalPath!)) renameSync(`${canonical}-wal`, state.archivedWalPath!);
+      if (existsSync(`${canonical}-wal`) && !existsSync(state.archivedWalPath!)) durableRename(`${canonical}-wal`, state.archivedWalPath!);
       if (!existsSync(canonical)) durableRename(incoming, canonical);
       if (!existsSync(canonical)) throw new Error(`project:${sanitizedId(state.localProjectId)} reverse database publication failed`);
       const publishedFingerprint = fingerprintMigrationFileSync(canonical, dirname(canonical));
