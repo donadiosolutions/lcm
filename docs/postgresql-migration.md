@@ -73,7 +73,7 @@ lcm migration activate GENERATION_ID --confirm GENERATION_ID --json
 
 Activation is all-or-nothing at the global-backend decision. Every current project-map entry with stored local data must still be represented by a terminal verified project in the generation. Local hashes, canonical paths, aliases, remote bindings, source fingerprints, schema/manifest checksums, delivery state, and quiescence must still match. A live PostgreSQL factory must report `healthy` and successfully find every bound project. The candidate factory is always closed in a `finally` path.
 
-Publication writes a prepare journal, enters commit/recovery, revalidates and folds each project-map entry back into its **original canonical local hash**, then changes `storage.backend`. A stale/manual binding is insufficient. If any blocker exists, no map or configuration mutation occurs.
+Publication writes a prepare journal, enters commit/recovery, revalidates and folds each project-map entry back into its **original canonical local hash**, then changes `storage.backend`. A stale/manual binding is insufficient. If any blocker exists, no map or configuration mutation occurs. Keep the completed activation journal: post-write rollback retains a byte-verified private copy and chains its SHA-256 into the rollback journal before replacing the active journal path.
 
 After activation, run #225's production gate, monitoring, failover, and PITR drills. Retain the entire migration generation and the canonical preserved SQLite copies for the rollback window.
 
@@ -81,7 +81,7 @@ After activation, run #225's production gate, monitoring, failover, and PITR dri
 
 ### Before any PostgreSQL data write
 
-When no batch checkpoint has remote rows, rollback selects the untouched SQLite source and completes only generation-owned journal state:
+Before activation, when no batch checkpoint has remote rows and the global backend is still SQLite, rollback selects the untouched SQLite source and completes only generation-owned journal state:
 
 ```bash
 lcm migration rollback GENERATION_ID --confirm GENERATION_ID --json
@@ -93,7 +93,7 @@ The global backend must still be SQLite. Existing project identities and binding
 
 Stop all writers. Post-write rollback reads every project in the globally active set, stages a **new** SQLite database for each one, runs integrity/FK and canonical digest verification, checkpoints and closes it, and only then begins publication. PostgreSQL-only transcript, passive-inbox, and ingest-checkpoint evidence is retained in private checksummed sidecars.
 
-During publication the journal preserves the prior canonical main/WAL under generation-qualified names, copies the verified staged database through an exclusive no-follow incoming path, and publishes it under the existing canonical local project hash. The global backend changes to SQLite only after every project is published. A crash may leave some project files published while the backend remains PostgreSQL; rerunning rollback reads the recovery journal and completes idempotently. It never switches the backend for a subset.
+During publication the rollback journal is created only after the completed activation journal is retained and checksum-chained. It preserves the prior canonical main/WAL under generation-qualified names, copies the verified staged database through an exclusive no-follow incoming path, and publishes it under the existing canonical local project hash. The global backend changes to SQLite only after every project is published. A crash may leave some project files published while the backend remains PostgreSQL; rerunning rollback reads the recovery journal and completes idempotently. It never switches the backend for a subset. An activated generation follows this global rollback path even when every migrated table was empty, because activation already changed the installation-wide backend.
 
 Never delete the original SQLite main/WAL, generation directory, journal, or server backups until the rollback window and #225 evidence requirements are complete. Cleanup is deliberately manual and outside this command.
 
