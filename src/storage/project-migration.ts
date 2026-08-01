@@ -42,6 +42,7 @@ import {
   generationRelativePath,
   listMigrationManifests,
   manifestSha256,
+  migrationGenerationPaths,
   migrationProjectPaths,
   readMigrationManifest,
   readPublicationJournal,
@@ -1026,6 +1027,18 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
   withProjectMapReconciliationLock((map) => {
     for (const project of manifest.projects) expectedMapEntry(map, project);
     let journal = readPublicationJournal(manifest.generationId, home);
+    let priorPublicationJournalSha256: string | undefined;
+    if (journal?.operation === "activate") {
+      if (journal.phase !== "completed") throw new Error("activation publication must complete before post-write rollback");
+      const generation = migrationGenerationPaths(manifest.generationId, home);
+      const archive = join(generation.directory, "activation-publication-journal.json");
+      deps.copyPrivate(generation.journal, archive, { allowedRoot: generation.directory });
+      const current = fingerprintMigrationFileSync(generation.journal, generation.directory);
+      const retained = fingerprintMigrationFileSync(archive, generation.directory);
+      if (current.size !== retained.size || current.sha256 !== retained.sha256) throw new Error("retained activation publication journal diverges");
+      priorPublicationJournalSha256 = retained.sha256;
+      journal = null;
+    }
     if (journal && journal.operation !== "post-write-rollback") throw new Error("publication journal operation does not match post-write rollback");
     if (journal?.phase === "completed") return;
     if (!journal) {
@@ -1040,6 +1053,7 @@ function publishReverse(manifest: MigrationManifest, options: ProjectMigrationOp
         expectedBackend: "postgresql",
         targetBackend: "sqlite",
         expectedConfigSha256: configSha256(home),
+        ...(priorPublicationJournalSha256 === undefined ? {} : { priorPublicationJournalSha256 }),
         projects: manifest.projects.map((project) => {
           const canonical = projectDatabasePath(home, project.identity.localProjectId);
           return {
