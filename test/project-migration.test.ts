@@ -280,6 +280,7 @@ describe("reversible project migration lifecycle", () => {
     const sourceBytes = readFileSync(current.databasePath);
     const planned = planProjectMigration({ ...current.options, progress: vi.fn() });
     expect(planned).toMatchObject({ operation: "plan", status: "planned", ready: false, blockers: ["dry-run required before apply"] });
+    expect(readMigrationManifest(planned.generationId, current.home).protocol.deterministicSampling).toBe("ordered-prefix-v1");
     await expect(applyProjectMigration(planned.generationId, current.options)).rejects.toThrow("apply requires a successful dry-run");
     await expect(dryRunProjectMigration(planned.generationId, current.options)).resolves.toMatchObject({ operation: "dry-run", status: "dry-run-verified" });
     await expect(applyProjectMigration(planned.generationId, current.options)).resolves.toMatchObject({ operation: "apply", status: "applied", blockers: ["verification required before activation"] });

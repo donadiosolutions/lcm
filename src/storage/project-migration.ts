@@ -155,7 +155,7 @@ const PROTOCOL = {
   stableResume: "immutable-snapshot-offset-v1",
   integerEncoding: "decimal-tagged-v1",
   idempotentWrites: "exact-readback-v1",
-  deterministicSampling: "sha256-key-v1",
+  deterministicSampling: "ordered-prefix-v1",
   uncertainCommit: "authoritative-remote-readback-v1",
   activationReadiness: "factory-health-existing-projects-v1",
 } as const;
