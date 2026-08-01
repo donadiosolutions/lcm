@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -281,7 +281,7 @@ describe("PostgreSQL 18 reversible data migration", () => {
       const generationDirectory = join(root, ".lcm", "migrations", "018f1234-5678-7abc-8def-0123456789ab");
       const projectsDirectory = join(generationDirectory, "projects");
       for (const directory of [join(root, ".lcm"), join(root, ".lcm", "migrations"), generationDirectory, projectsDirectory, projectDirectory]) {
-        await import("node:fs").then(({ mkdirSync }) => mkdirSync(directory, { recursive: true, mode: 0o700 }));
+        mkdirSync(directory, { recursive: true, mode: 0o700 });
       }
       const adapter = new PostgreSqlMigrationAdapter(database.runtime, identity);
       const exported = await adapter.exportOperationalSidecars(paths);
