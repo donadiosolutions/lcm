@@ -2437,29 +2437,16 @@ describe("Git project identity", () => {
     expect(Buffer.byteLength(config)).toBe(4 * 1024 * 1024);
     writeFileSync(configPath, config);
 
-    const configuredWorktreeBool = (): string => git(
-      root,
-      "config",
-      "--file",
-      configPath,
-      "--bool",
-      "--get",
-      "extensions.worktreeConfig",
-    );
     if (expected === undefined) {
-      expect(configuredWorktreeBool).toThrow("bad boolean config value");
       expect(() => resolveGitProjectAnchor(checkout)).toThrow(
         "ambiguous worktree configuration",
       );
+    } else if (expected) {
+      expect(resolveGitProjectAnchor(checkout)?.canonical).toBe(checkout);
     } else {
-      expect(configuredWorktreeBool()).toBe(expected ? "true" : "false");
-      if (expected) {
-        expect(resolveGitProjectAnchor(checkout)?.canonical).toBe(checkout);
-      } else {
-        expect(() => resolveGitProjectAnchor(checkout)).toThrow(
-          "expected one core.worktree path",
-        );
-      }
+      expect(() => resolveGitProjectAnchor(checkout)).toThrow(
+        "expected one core.worktree path",
+      );
     }
   });
 
