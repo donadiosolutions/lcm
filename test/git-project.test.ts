@@ -510,7 +510,7 @@ describe("Git project identity", () => {
       checkout,
       metadata,
       [
-        "[core]",
+        "\uFEFF[core]",
         "worktree = ../wrong",
         'worktree = "../verified#checkout" # final quoted backlink',
         "[extensions]",
@@ -520,8 +520,24 @@ describe("Git project identity", () => {
     );
     writeFileSync(
       join(metadata, "config.worktree"),
-      '[core]\r\nworktree = ../wrong\r\nworktree = "../verified#checkout" ; final\r\n',
+      '\uFEFF[core]\r\nworktree = ../wrong\r\nworktree = "../verified#checkout" ; final\r\n',
     );
+    expect(git(
+      root,
+      "config",
+      "--file",
+      join(metadata, "config"),
+      "--get",
+      "core.worktree",
+    )).toBe("../verified#checkout");
+    expect(git(
+      root,
+      "config",
+      "--file",
+      join(metadata, "config.worktree"),
+      "--get",
+      "core.worktree",
+    )).toBe("../verified#checkout");
     expect(resolveGitProjectAnchor(checkout)).toEqual({
       canonical: metadata,
       worktreeRoot: checkout,
@@ -1088,6 +1104,9 @@ describe("Git project identity", () => {
       "[other.$]\nkey = value\n[extensions]\nworktreeConfig = true\n",
       " \t[ext\\\nensions]\nworktreeConfig = true\n",
       " \\\n[extensions]\nworktreeConfig = true\n",
+      " \uFEFF[extensions]\nworktreeConfig = true\n",
+      "\n\uFEFF[extensions]\nworktreeConfig = true\n",
+      "\uFEFF\uFEFF[extensions]\nworktreeConfig = true\n",
       "[extensions]\n\vworktreeConfig = true\n",
       "[extensions]\n\fworktreeConfig = true\n",
     ]) {

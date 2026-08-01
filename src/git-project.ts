@@ -491,7 +491,9 @@ function parseConfigValue(raw: string): { readonly valid: boolean; readonly valu
 }
 
 function parseGitConfig(config: string): GitConfigValues {
-  const logical = logicalConfigLines(config);
+  const logical = logicalConfigLines(
+    config.startsWith("\uFEFF") ? config.slice(1) : config,
+  );
   let section: string | undefined;
   let sectionBase: string | undefined;
   let coreWorktree: string | undefined;
