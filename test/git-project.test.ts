@@ -2044,6 +2044,14 @@ describe("Git project identity", () => {
       "[extensions.sub.section]\nworktreeConfig = false\n[extensions]\nworktreeConfig = on\n",
       "[extensions \"escaped\\\" subsection\"]\nworktreeConfig = false\n[extensions]\nworktreeConfig = 1\n",
       "# leading comment\n; second comment\n[extensions] # section comment\nworktreeConfig = true # comment\\\n",
+      "[extensions]worktreeConfig=2 # same-line numeric\n",
+      "[extensions] worktreeConfig=+01k; same-line scaled integer\n",
+      "[extensions]worktreeConfig\n",
+      "[other][extensions]worktreeConfig=2\n",
+      "[remote \"origin\"][extensions]worktreeConfig=2\n",
+      "[extensions \"ignored\"][extensions]worktreeConfig=2\n",
+      "[extensions] trailing\nworktreeConfig = true\n",
+      "[extensions]worktreeConfig=0\n[extensions]worktreeConfig=2\n",
     ]) {
       expectAnchor(config);
       expect(git(
@@ -2056,6 +2064,17 @@ describe("Git project identity", () => {
         "extensions.worktreeConfig",
       )).toBe("true");
     }
+
+    const sameLineCore = `[remote "origin"][core]worktree="${checkout}" # backlink\n`;
+    expectAnchor(sameLineCore);
+    expect(git(
+      root,
+      "config",
+      "--file",
+      configPath,
+      "--get",
+      "core.worktree",
+    )).toBe(checkout);
 
     for (const config of [
       "[extensions]\nworktreeConfig = false\n",
@@ -2072,7 +2091,6 @@ describe("Git project identity", () => {
       "[extensions\nworktreeConfig = true\n",
       "[]\nworktreeConfig = true\n",
       "[ extensions]\nworktreeConfig = true\n",
-      "[extensions] trailing\nworktreeConfig = true\n",
       "[extensions.]\nworktreeConfig = true\n",
       "[extensions nonsense]\nworktreeConfig = true\n",
       "[extensions \"unterminated]\nworktreeConfig = true\n",
@@ -2083,6 +2101,9 @@ describe("Git project identity", () => {
       "[extensions]\nworktreeConfig = \"unterminated\n",
       "[extensions]\nworktreeConfig = true\nother value\n",
       "[extensions]\nworktreeConfig = true\nother = \\q\n",
+      `[extensions]worktreeConfig=2[core]worktree=${checkout}\n`,
+      "[include]path=override.config\n[extensions]worktreeConfig=2\n",
+      "[includeIf \"gitdir:/**\"]path=override.config\n[extensions]worktreeConfig=2\n",
     ]) {
       expectRejected(config);
     }
@@ -2098,6 +2119,9 @@ describe("Git project identity", () => {
       "\uFEFF\uFEFF[extensions]\nworktreeConfig = true\n",
       "[extensions]\n\vworktreeConfig = true\n",
       "[extensions]\n\fworktreeConfig = true\n",
+      "[extensions]$bad=value\nworktreeConfig = true\n",
+      "[extensions][\nworktreeConfig = true\n",
+      "[remote \"unterminated]url=value\n[extensions]worktreeConfig=2\n",
     ]) {
       writeFileSync(configPath, config);
       const gitResult = spawnSync(
@@ -2147,7 +2171,7 @@ describe("Git project identity", () => {
       `[core]\nworktree = ${checkout}\n`,
     );
     const configPath = join(metadata, "config");
-    const prefix = "[extensions]\nworktreeConfig = ";
+    const prefix = "[extensions]worktreeConfig = ";
     const digitCount = 4 * 1024 * 1024 - Buffer.byteLength(prefix) - 1;
     const digits = pattern === "sevens"
       ? "7".repeat(digitCount)

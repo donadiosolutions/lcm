@@ -600,6 +600,7 @@ function logicalConfigLines(config: string): { readonly lines: string[]; readonl
 function parseSectionName(line: string, start: number): {
   readonly baseName?: string;
   readonly name?: string;
+  readonly next?: number;
   readonly valid: boolean;
 } {
   let quoted = false;
@@ -625,11 +626,6 @@ function parseSectionName(line: string, start: number): {
     }
   }
   if (close < 0 || quoted || escaped) return { valid: false };
-  let tail = close + 1;
-  while (tail < line.length && isConfigWhitespace(line[tail]!)) tail += 1;
-  if (tail < line.length && line[tail] !== "#" && line[tail] !== ";") {
-    return { valid: false };
-  }
 
   const header = line.slice(start + 1, close);
   let nameEnd = 0;
@@ -638,7 +634,9 @@ function parseSectionName(line: string, start: number): {
   const name = asciiLower(header.slice(0, nameEnd));
   let remainder = nameEnd;
   while (remainder < header.length && isConfigWhitespace(header[remainder]!)) remainder += 1;
-  if (remainder === header.length) return { baseName: name, name, valid: true };
+  if (remainder === header.length) {
+    return { baseName: name, name, next: close + 1, valid: true };
+  }
   if (header[remainder] === ".") {
     remainder += 1;
     const subsectionStart = remainder;
@@ -651,6 +649,7 @@ function parseSectionName(line: string, start: number): {
     return {
       baseName: name,
       name: undefined,
+      next: close + 1,
       valid: remainder > subsectionStart && remainder === header.length,
     };
   }
@@ -678,6 +677,7 @@ function parseSectionName(line: string, start: number): {
   return {
     baseName: name,
     name: undefined,
+    next: close + 1,
     valid: !quoted && !escaped && remainder === header.length,
   };
 }
@@ -745,13 +745,27 @@ function parseGitConfig(config: string): GitConfigValues {
     let cursor = 0;
     while (cursor < line.length && isConfigWhitespace(line[cursor]!)) cursor += 1;
     if (cursor === line.length || line[cursor] === "#" || line[cursor] === ";") continue;
-    if (line[cursor] === "[") {
+    let malformedSection = false;
+    while (line[cursor] === "[") {
       const parsedSection = parseSectionName(line, cursor);
-      if (!parsedSection.valid) valid = false;
-      section = parsedSection.valid ? parsedSection.name : undefined;
-      sectionBase = parsedSection.valid ? parsedSection.baseName : undefined;
-      continue;
+      if (!parsedSection.valid) {
+        valid = false;
+        section = undefined;
+        sectionBase = undefined;
+        malformedSection = true;
+        break;
+      }
+      section = parsedSection.name;
+      sectionBase = parsedSection.baseName;
+      cursor = parsedSection.next!;
+      while (cursor < line.length && isConfigWhitespace(line[cursor]!)) cursor += 1;
     }
+    if (
+      malformedSection
+      || cursor === line.length
+      || line[cursor] === "#"
+      || line[cursor] === ";"
+    ) continue;
 
     if (!isAsciiLetter(line[cursor]!)) {
       valid = false;

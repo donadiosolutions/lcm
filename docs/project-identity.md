@@ -54,7 +54,8 @@ identity does not vary by operating system or C library. Only integer values
 may have leading ASCII C whitespace; trailing or internal whitespace remains
 invalid. Inline `#` and `;` comments, quoted values, supported escapes,
 continued lines, CRLF input, and case-insensitive section and key names are
-parsed in one bounded linear pass.
+parsed in one bounded linear pass. Git-compatible section headers and their
+first assignment may share one physical line.
 Any malformed, overflowing, or unsupported occurrence fails closed instead of
 allowing an earlier or later truthy value to enable `config.worktree`.
 The database and passive-learning sidecar remain under:
