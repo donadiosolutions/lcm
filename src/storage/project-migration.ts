@@ -879,6 +879,11 @@ export async function activateProjectMigration(generationId: string, options: Pr
   const deps = dependencies(options);
   let manifest = readMigrationManifest(generationId, actualHome(options));
   assertManifestContract(manifest);
+  if (manifest.status === "active") {
+    const journal = readPublicationJournal(generationId, actualHome(options));
+    if (journal?.operation !== "activate" || journal.phase !== "completed") throw new Error("active migration generation has no completed activation journal");
+    return result("activate", manifest);
+  }
   const blockers = await activationBlockers(manifest, options, deps);
   if (blockers.length > 0) {
     persist(manifest, options, blockers);
@@ -943,6 +948,12 @@ async function stageReverseDatabases(manifest: MigrationManifest, options: Proje
   try {
     for (const currentProject of nextManifest.projects) {
       const paths = ensureMigrationProjectDirectory(manifest.generationId, currentProject.identity.localProjectId, home);
+      if (currentProject.sourceFingerprint !== null) {
+        const mainArchive = currentProject.operationalEvidence.originalMainArchive;
+        if (mainArchive === null || !sameMigrationFingerprint(mainArchive, fingerprintMigrationFileSync(paths.originalMainArchive, paths.directory))) throw new Error(`project:${sanitizedId(currentProject.identity.localProjectId)} retained SQLite main archive is unavailable or changed`);
+        const walArchive = currentProject.operationalEvidence.originalWalArchive;
+        if (currentProject.sourceFingerprint.wal === null ? walArchive !== null : walArchive === null || !sameMigrationFingerprint(walArchive, fingerprintMigrationFileSync(paths.originalWalArchive, paths.directory))) throw new Error(`project:${sanitizedId(currentProject.identity.localProjectId)} retained SQLite WAL archive is unavailable or changed`);
+      }
       const adapter = new PostgreSqlMigrationAdapter(runtime, pgIdentity(currentProject, machine.machineId));
       const coordinator = new PostgreSqlWorkCoordinator(runtime, currentProject.identity.remoteProjectId, machine.machineId);
       const processId = `reverse-migration-${process.pid}-${manifest.generationId}`;
@@ -1108,6 +1119,11 @@ export async function rollbackProjectMigration(generationId: string, options: Pr
   const deps = dependencies(options);
   let manifest = readMigrationManifest(generationId, actualHome(options));
   assertManifestContract(manifest);
+  if (manifest.status === "rolled-back") {
+    const completed = readPublicationJournal(generationId, actualHome(options));
+    if (completed?.phase !== "completed" || (completed.operation !== "pre-write-rollback" && completed.operation !== "post-write-rollback")) throw new Error("rolled-back migration generation has no completed rollback journal");
+    return result("rollback", manifest);
+  }
   const remoteWrites = manifest.projects.some((project) => project.tables.some(({ copiedRows }) => copiedRows > 0));
   if (!remoteWrites) {
     manifest = preWriteRollback(manifest, options, deps);
@@ -1120,6 +1136,11 @@ export async function rollbackProjectMigration(generationId: string, options: Pr
   if (backend !== "postgresql" && !(backend === "sqlite" && recoveringPublication)) throw new Error("post-write rollback requires the globally activated PostgreSQL backend");
   if (!recoveringPublication) {
     if (manifest.status !== "active" && manifest.status !== "rollback-ready") throw new Error("post-write rollback requires the active verified generation");
+    withProjectMapReconciliationLock((map) => {
+      const current = installationCoverage(actualHome(options), map, timestamp(deps));
+      if (!current.complete || current.inventorySha256 !== manifest.coverage.inventorySha256 || current.projectMapSha256 !== manifest.coverage.projectMapSha256 || canonicalJson(current.activeLocalProjectIds) !== canonicalJson(manifest.coverage.activeLocalProjectIds)) throw new Error("installation-wide project coverage changed after activation");
+      for (const project of manifest.projects) expectedMapEntry(map, project);
+    }, actualHome(options));
     manifest = await stageReverseDatabases(manifest, options, deps);
     persist(manifest, options);
   }
