@@ -217,3 +217,22 @@ export class PostgreSqlMigrationAdapter {
 
 export const POSTGRESQL_MIGRATION_SCHEMA_MANIFEST_SHA256 = createHash("sha256").update(canonicalJson({ tables: LOGICAL_TABLES.map(({ name }) => name), stateTables: PROJECT_STATE_TABLES, sequences: SEQUENCES })).digest("hex");
 export const POSTGRESQL_MIGRATION_TABLE_NAMES = LOGICAL_TABLES.map(({ name }) => name);
+export const POSTGRESQL_MIGRATION_TEST_SEAMS = {
+  baseRow,
+  comparable,
+  deterministicUuid,
+  finite,
+  jsonValue,
+  logical,
+  makePlan,
+  matches,
+  plansForRow,
+  readPlan,
+  rowValue,
+  safeInteger,
+  selectPlan,
+  text,
+  timestamp,
+  uuid,
+  writeSidecar,
+} as const;
