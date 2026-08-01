@@ -1,7 +1,9 @@
 import {
   constants,
+  type Dirent,
   mkdirSync,
   mkdtempSync,
+  opendirSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -13,6 +15,9 @@ import { spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const pathBoundary = vi.hoisted(() => ({
+  parseRoot: "",
+  parseRootPath: "",
+  parseRoots: new Map<string, string>(),
   redirectFrom: "",
   redirectTo: "",
 }));
@@ -20,6 +25,41 @@ const pathBoundary = vi.hoisted(() => ({
 const metadataRace = vi.hoisted((): {
   afterRead: ((path: string) => void) | undefined;
 } => ({ afterRead: undefined }));
+
+const caseInsensitivePath = vi.hoisted(() => ({
+  from: "",
+  to: "",
+  zeroFromField: undefined as "dev" | "ino" | undefined,
+  zeroToField: undefined as "dev" | "ino" | undefined,
+}));
+
+const componentDirectory = vi.hoisted((): {
+  closeCount: number;
+  directorySymlinkPath: string;
+  entryPath: string;
+  entryTarget: string;
+  openCount: number;
+  options: unknown[];
+  path: string;
+  plans: Array<{
+    closeError?: Error;
+    entries?: readonly (Buffer | string)[];
+    openError?: Error;
+    readErrorAt?: number;
+    repeat?: { readonly count: number; readonly name: Buffer | string };
+  }>;
+  readCount: number;
+} => ({
+  closeCount: 0,
+  directorySymlinkPath: "",
+  entryPath: "",
+  entryTarget: "",
+  openCount: 0,
+  options: [],
+  path: "",
+  plans: [],
+  readCount: 0,
+}));
 
 const directoryAuthRace = vi.hoisted(() => ({
   afterOpen: undefined as (() => void) | undefined,
@@ -50,6 +90,9 @@ const directoryAuthRace = vi.hoisted(() => ({
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
+  const mappedPath = <T>(path: T): T => String(path) === caseInsensitivePath.from
+    ? caseInsensitivePath.to as T
+    : path;
   const mockedConstants = { ...actual.constants };
   Object.defineProperties(mockedConstants, {
     O_DIRECTORY: {
@@ -105,7 +148,26 @@ vi.mock("node:fs", async (importOriginal) => {
       return stat;
     }) as typeof actual.fstatSync,
     lstatSync: ((path: Parameters<typeof actual.lstatSync>[0], options?: Parameters<typeof actual.lstatSync>[1]) => {
-      const stat = actual.lstatSync(path, options as never);
+      const mapped = String(path) === componentDirectory.entryPath
+        ? componentDirectory.entryTarget
+        : mappedPath(path);
+      const stat = actual.lstatSync(mapped, options as never);
+      if (String(path) === componentDirectory.directorySymlinkPath) {
+        const changed = Object.create(stat) as typeof stat;
+        changed.isDirectory = (): boolean => true;
+        changed.isSymbolicLink = (): boolean => true;
+        return changed;
+      }
+      const zeroField = String(path) === caseInsensitivePath.from
+        ? caseInsensitivePath.zeroFromField
+        : String(path) === caseInsensitivePath.to
+          ? caseInsensitivePath.zeroToField
+          : undefined;
+      if (zeroField !== undefined) {
+        const changed = Object.create(stat) as typeof stat;
+        Object.defineProperty(changed, zeroField, { value: 0 });
+        return changed;
+      }
       if (String(path) === directoryAuthRace.lstatPath) {
         directoryAuthRace.lstatCount += 1;
         if (directoryAuthRace.lstatCount === directoryAuthRace.invalidDirectoryAt) {
@@ -122,7 +184,7 @@ vi.mock("node:fs", async (importOriginal) => {
       mode?: Parameters<typeof actual.openSync>[2],
     ) => {
       if (String(path) !== directoryAuthRace.openPath) {
-        return actual.openSync(path, flags, mode as never);
+        return actual.openSync(mappedPath(path), flags, mode as never);
       }
       directoryAuthRace.openCount += 1;
       directoryAuthRace.openFlags = typeof flags === "number" ? flags : undefined;
@@ -130,26 +192,75 @@ vi.mock("node:fs", async (importOriginal) => {
         throw directoryAuthRace.openError;
       }
       directoryAuthRace.beforeOpen?.();
-      const fd = actual.openSync(path, flags, mode as never);
+      const fd = actual.openSync(mappedPath(path), flags, mode as never);
       directoryAuthRace.trackedDescriptors.add(fd);
       directoryAuthRace.afterOpen?.();
       return fd;
     }) as typeof actual.openSync,
+    opendirSync: ((
+      path: Parameters<typeof actual.opendirSync>[0],
+      options?: Parameters<typeof actual.opendirSync>[1],
+    ) => {
+      if (String(path) !== componentDirectory.path) {
+        return actual.opendirSync(path, options as never);
+      }
+      const plan = componentDirectory.plans[componentDirectory.openCount++];
+      componentDirectory.options.push(options);
+      if (plan?.openError !== undefined) throw plan.openError;
+      let index = 0;
+      let planReads = 0;
+      return {
+        readSync: () => {
+          componentDirectory.readCount += 1;
+          planReads += 1;
+          if (planReads === plan?.readErrorAt) {
+            throw new Error("synthetic component directory read failure");
+          }
+          let name: Buffer | string | undefined;
+          if (plan?.repeat !== undefined && index < plan.repeat.count) {
+            name = plan.repeat.name;
+          } else {
+            name = plan?.entries?.[index - (plan?.repeat?.count ?? 0)];
+          }
+          index += 1;
+          if (name === undefined) return null;
+          return {
+            isDirectory: (): boolean => true,
+            isSymbolicLink: (): boolean => false,
+            name: Buffer.isBuffer(name) ? name : Buffer.from(name),
+          } as Dirent<Buffer>;
+        },
+        closeSync: () => {
+          componentDirectory.closeCount += 1;
+          if (plan?.closeError !== undefined) throw plan.closeError;
+        },
+      } as ReturnType<typeof opendirSync>;
+    }) as typeof actual.opendirSync,
     realpathSync: ((
       path: Parameters<typeof actual.realpathSync>[0],
       options?: Parameters<typeof actual.realpathSync>[1],
     ) => {
-      const real = actual.realpathSync(path, options as never);
+      const real = actual.realpathSync(mappedPath(path), options as never);
       if (String(path) === directoryAuthRace.openPath) {
         directoryAuthRace.realpathCount += 1;
         if (directoryAuthRace.realpathCount === directoryAuthRace.afterRealpathAt) {
           directoryAuthRace.afterRealpath?.();
         }
       }
-      return real;
+      return String(path) === caseInsensitivePath.from ? path : real;
     }) as typeof actual.realpathSync,
     statSync: ((path: Parameters<typeof actual.statSync>[0], options?: Parameters<typeof actual.statSync>[1]) => {
-      const stat = actual.statSync(path, options as never);
+      const stat = actual.statSync(mappedPath(path), options as never);
+      const zeroField = String(path) === caseInsensitivePath.from
+        ? caseInsensitivePath.zeroFromField
+        : String(path) === caseInsensitivePath.to
+          ? caseInsensitivePath.zeroToField
+          : undefined;
+      if (zeroField !== undefined) {
+        const changed = Object.create(stat) as typeof stat;
+        Object.defineProperty(changed, zeroField, { value: 0 });
+        return changed;
+      }
       if (String(path) === directoryAuthRace.statPath) {
         directoryAuthRace.statCount += 1;
         if (directoryAuthRace.statCount === directoryAuthRace.mismatchedStatAt) {
@@ -170,6 +281,14 @@ vi.mock("node:path", async (importOriginal) => {
     dirname: (path: string): string => path === pathBoundary.redirectFrom
       ? pathBoundary.redirectTo
       : actual.dirname(path),
+    parse: (path: string): ReturnType<typeof actual.parse> => {
+      const parsed = actual.parse(path);
+      const mappedRoot = pathBoundary.parseRoots.get(path);
+      if (mappedRoot !== undefined) return { ...parsed, root: mappedRoot };
+      return path === pathBoundary.parseRootPath
+        ? { ...parsed, root: pathBoundary.parseRoot }
+        : parsed;
+    },
   };
 });
 
@@ -251,6 +370,19 @@ function git(cwd: string, ...args: string[]): string {
 }
 
 function resetDirectoryAuthRace(): void {
+  caseInsensitivePath.from = "";
+  caseInsensitivePath.to = "";
+  caseInsensitivePath.zeroFromField = undefined;
+  caseInsensitivePath.zeroToField = undefined;
+  componentDirectory.closeCount = 0;
+  componentDirectory.directorySymlinkPath = "";
+  componentDirectory.entryPath = "";
+  componentDirectory.entryTarget = "";
+  componentDirectory.openCount = 0;
+  componentDirectory.options = [];
+  componentDirectory.path = "";
+  componentDirectory.plans = [];
+  componentDirectory.readCount = 0;
   directoryAuthRace.afterOpen = undefined;
   directoryAuthRace.afterRealpath = undefined;
   directoryAuthRace.afterRealpathAt = 0;
@@ -282,6 +414,9 @@ describe("Git project identity", () => {
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "lcm-git-project-"));
+    pathBoundary.parseRoot = "";
+    pathBoundary.parseRootPath = "";
+    pathBoundary.parseRoots.clear();
     pathBoundary.redirectFrom = "";
     pathBoundary.redirectTo = "";
     metadataRace.afterRead = undefined;
@@ -290,6 +425,8 @@ describe("Git project identity", () => {
   });
 
   afterEach(() => {
+    pathBoundary.parseRoot = "";
+    pathBoundary.parseRootPath = "";
     pathBoundary.redirectFrom = "";
     pathBoundary.redirectTo = "";
     metadataRace.afterRead = undefined;
@@ -664,6 +801,137 @@ describe("Git project identity", () => {
       commonDir: metadata,
     });
 
+    for (const [name, unsupportedFlag] of [
+      ["descriptor", undefined],
+      ["fallback", "directory"],
+    ] as const) {
+      resetDirectoryAuthRace();
+      clearGitProjectAnchorCache();
+      const caseCheckout = join(root, `${name}-case-checkout`);
+      const differentlyCasedCheckout = join(root, `${name}-CASE-CHECKOUT`);
+      const caseMetadata = join(root, `${name}-case-metadata`);
+      makeStandaloneMetadata(
+        caseCheckout,
+        caseMetadata,
+        `[core]\nworktree = ${differentlyCasedCheckout}\n`,
+      );
+      caseInsensitivePath.from = differentlyCasedCheckout;
+      caseInsensitivePath.to = caseCheckout;
+      directoryAuthRace.unsupportedFlag = unsupportedFlag;
+      expect(resolveGitProjectAnchor(caseCheckout)).toEqual({
+        canonical: caseMetadata,
+        worktreeRoot: caseCheckout,
+        commonDir: caseMetadata,
+      });
+    }
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const intermediateCheckout = join(
+      root,
+      "Intermediate-Parent",
+      "case-checkout",
+    );
+    const differentlyCasedIntermediate = join(
+      root,
+      "intermediate-parent",
+      "CASE-CHECKOUT",
+    );
+    const intermediateMetadata = join(root, "intermediate-case-metadata");
+    makeStandaloneMetadata(
+      intermediateCheckout,
+      intermediateMetadata,
+      `[core]\nworktree = ${differentlyCasedIntermediate}\n`,
+    );
+    caseInsensitivePath.from = differentlyCasedIntermediate;
+    caseInsensitivePath.to = intermediateCheckout;
+    expect(resolveGitProjectAnchor(intermediateCheckout)?.canonical).toBe(
+      intermediateMetadata,
+    );
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const aliasCheckout = join(root, "same-identity-checkout");
+    const arbitraryAlias = join(root, "arbitrary-alias");
+    const aliasMetadata = join(root, "same-identity-metadata");
+    makeStandaloneMetadata(
+      aliasCheckout,
+      aliasMetadata,
+      `[core]\nworktree = ${arbitraryAlias}\n`,
+    );
+    caseInsensitivePath.from = arbitraryAlias;
+    caseInsensitivePath.to = aliasCheckout;
+    expect(() => resolveGitProjectAnchor(aliasCheckout)).toThrow(
+      "topology does not point",
+    );
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const unavailableCheckout = join(root, "unavailable-case-checkout");
+    const unavailableCaseVariant = join(root, "unavailable-CASE-CHECKOUT");
+    const unavailableMetadata = join(root, "unavailable-case-metadata");
+    makeStandaloneMetadata(
+      unavailableCheckout,
+      unavailableMetadata,
+      `[core]\nworktree = ${unavailableCaseVariant}\n`,
+    );
+    caseInsensitivePath.from = unavailableCaseVariant;
+    caseInsensitivePath.to = unavailableCheckout;
+    directoryAuthRace.openPath = unavailableCaseVariant;
+    directoryAuthRace.openError = new Error("synthetic case-variant open failure");
+    expect(() => resolveGitProjectAnchor(unavailableCheckout)).toThrow(
+      "topology does not point",
+    );
+
+    for (const [identitySide, identityField] of [
+      ["from", "dev"],
+      ["from", "ino"],
+      ["to", "dev"],
+      ["to", "ino"],
+    ] as const) {
+      resetDirectoryAuthRace();
+      clearGitProjectAnchorCache();
+      const name = `zero-${identitySide}-${identityField}`;
+      const zeroCheckout = join(root, `${name}-case-checkout`);
+      const differentlyCasedCheckout = join(root, `${name}-CASE-CHECKOUT`);
+      const zeroMetadata = join(root, `${name}-case-metadata`);
+      makeStandaloneMetadata(
+        zeroCheckout,
+        zeroMetadata,
+        `[core]\nworktree = ${differentlyCasedCheckout}\n`,
+      );
+      caseInsensitivePath.from = differentlyCasedCheckout;
+      caseInsensitivePath.to = zeroCheckout;
+      caseInsensitivePath[identitySide === "from"
+        ? "zeroFromField"
+        : "zeroToField"] = identityField;
+      directoryAuthRace.unsupportedFlag = "directory";
+      expect(() => resolveGitProjectAnchor(zeroCheckout)).toThrow(
+        "topology does not point",
+      );
+    }
+
+    for (const identityField of ["dev", "ino"] as const) {
+      resetDirectoryAuthRace();
+      clearGitProjectAnchorCache();
+      const exactCheckout = join(root, `zero-exact-${identityField}-checkout`);
+      const exactMetadata = join(root, `zero-exact-${identityField}-metadata`);
+      makeStandaloneMetadata(
+        exactCheckout,
+        exactMetadata,
+        `[core]\nworktree = ${exactCheckout}\n`,
+      );
+      caseInsensitivePath.to = exactCheckout;
+      caseInsensitivePath.zeroToField = identityField;
+      directoryAuthRace.unsupportedFlag = "directory";
+      expect(resolveGitProjectAnchor(exactCheckout)?.canonical).toBe(
+        exactMetadata,
+      );
+    }
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+
     const absentCheckout = join(root, "absent-checkout");
     const absentMetadata = join(root, "absent-metadata");
     makeStandaloneMetadata(
@@ -805,7 +1073,7 @@ describe("Git project identity", () => {
       `[core]\nworktree = ${symlinkAlias}\n`,
     );
     expect(() => resolveGitProjectAnchor(symlinkCheckout)).toThrow(
-      "invalid Git core.worktree directory",
+      "topology does not point",
     );
 
     const parentAliasCheckout = makeDirectory(join(root, "parent-alias-checkout"));
@@ -854,6 +1122,264 @@ describe("Git project identity", () => {
     expect(() => resolveGitProjectAnchor(pointerAliasCheckout)).toThrow(
       "Git directory path alias",
     );
+  });
+
+  it("bounds and revalidates case-variant component evidence", () => {
+    const makeCaseVariant = (
+      name: string,
+      canonicalParentName: string,
+      configuredParentName: string,
+    ): {
+      canonicalParent: string;
+      checkout: string;
+      configuredPath: string;
+      metadata: string;
+    } => {
+      const canonicalParent = join(root, canonicalParentName);
+      const checkout = join(canonicalParent, "checkout");
+      const configuredPath = join(root, configuredParentName, "checkout");
+      const metadata = join(root, `${name}-metadata`);
+      makeStandaloneMetadata(
+        checkout,
+        metadata,
+        `[core]\nworktree = ${configuredPath}\n`,
+      );
+      caseInsensitivePath.from = configuredPath;
+      caseInsensitivePath.to = checkout;
+      return { canonicalParent, checkout, configuredPath, metadata };
+    };
+
+    const bindEquivalent = makeCaseVariant(
+      "bind-equivalent",
+      "Bind-Foo",
+      "bind-foo",
+    );
+    makeDirectory(join(root, "bind-foo"));
+    expect(() => resolveGitProjectAnchor(bindEquivalent.checkout)).toThrow(
+      "topology does not point",
+    );
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const changed = makeCaseVariant(
+      "changed-evidence",
+      "Snapshot-Parent",
+      "snapshot-parent",
+    );
+    makeDirectory(join(root, "snapshot-parent"));
+    componentDirectory.path = root;
+    componentDirectory.plans = [
+      { entries: [Buffer.from("Snapshot-Parent")] },
+      { entries: [Buffer.from("snapshot-parent")] },
+    ];
+    expect(() => resolveGitProjectAnchor(changed.checkout)).toThrow(
+      "component evidence changed",
+    );
+    expect(componentDirectory.openCount).toBe(2);
+    expect(componentDirectory.closeCount).toBe(2);
+    expect(componentDirectory.options).toEqual([
+      { bufferSize: 32, encoding: "buffer" },
+      { bufferSize: 32, encoding: "buffer" },
+    ]);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const revalidationError = makeCaseVariant(
+      "revalidation-error",
+      "Revalidation-Parent",
+      "revalidation-parent",
+    );
+    componentDirectory.path = root;
+    componentDirectory.plans = [
+      { entries: [Buffer.from("Revalidation-Parent")] },
+      { readErrorAt: 1 },
+    ];
+    expect(() => resolveGitProjectAnchor(revalidationError.checkout)).toThrow(
+      "topology does not point",
+    );
+    expect(componentDirectory.openCount).toBe(2);
+    expect(componentDirectory.closeCount).toBe(2);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const symlinked = makeCaseVariant(
+      "symlink-evidence",
+      "Symlink-Parent",
+      "symlink-parent",
+    );
+    const symlinkEntry = join(root, "symlink-parent");
+    symlinkSync(symlinked.canonicalParent, symlinkEntry);
+    componentDirectory.path = root;
+    componentDirectory.directorySymlinkPath = symlinkEntry;
+    componentDirectory.plans = [
+      { entries: [Buffer.from("symlink-parent")] },
+    ];
+    expect(() => resolveGitProjectAnchor(symlinked.checkout)).toThrow(
+      "topology does not point",
+    );
+    expect(componentDirectory.closeCount).toBe(1);
+
+    const expectEnumerationFailure = (
+      name: string,
+      plan: (typeof componentDirectory.plans)[number],
+      expectedCloses = 1,
+    ): void => {
+      resetDirectoryAuthRace();
+      clearGitProjectAnchorCache();
+      const canonicalParentName = `${name}-Parent`;
+      const fixture = makeCaseVariant(
+        name,
+        canonicalParentName,
+        `${name}-parent`,
+      );
+      componentDirectory.path = root;
+      componentDirectory.plans = [plan];
+      expect(() => resolveGitProjectAnchor(fixture.checkout)).toThrow(
+        "topology does not point",
+      );
+      expect(componentDirectory.openCount).toBe(1);
+      expect(componentDirectory.closeCount).toBe(expectedCloses);
+    };
+
+    expectEnumerationFailure("open-error", {
+      openError: new Error("synthetic component directory open failure"),
+    }, 0);
+    expectEnumerationFailure("read-error", { readErrorAt: 1 });
+    expectEnumerationFailure("close-error", {
+      closeError: new Error("synthetic component directory close failure"),
+      entries: [Buffer.from("close-error-Parent")],
+    });
+    expectEnumerationFailure("missing-entry", {
+      entries: [Buffer.from("unrelated")],
+    });
+    expectEnumerationFailure("entry-bound", {
+      repeat: { count: 4_097, name: Buffer.from("unrelated") },
+    });
+    expectEnumerationFailure("byte-bound", {
+      entries: [Buffer.alloc(1024 * 1024 + 1, 0x61)],
+    });
+    expectEnumerationFailure("malformed-name", {
+      entries: [Buffer.from([0xff])],
+    });
+
+    const expectEnumerationSuccess = (
+      name: string,
+      plan: (typeof componentDirectory.plans)[number],
+    ): void => {
+      resetDirectoryAuthRace();
+      clearGitProjectAnchorCache();
+      const fixture = makeCaseVariant(
+        name,
+        `${name}-Parent`,
+        `${name}-parent`,
+      );
+      componentDirectory.path = root;
+      componentDirectory.plans = [plan, plan, plan, plan];
+      expect(resolveGitProjectAnchor(fixture.checkout)?.canonical).toBe(
+        fixture.metadata,
+      );
+      expect(componentDirectory.openCount).toBe(4);
+      expect(componentDirectory.closeCount).toBe(4);
+    };
+
+    const exactEntryName = "entry-exact-Parent";
+    expectEnumerationSuccess("entry-exact", {
+      entries: [Buffer.from(exactEntryName)],
+      repeat: { count: 4_095, name: Buffer.from("unrelated") },
+    });
+    const exactByteName = "byte-exact-Parent";
+    expectEnumerationSuccess("byte-exact", {
+      entries: [Buffer.from(exactByteName)],
+      repeat: {
+        count: 1,
+        name: Buffer.alloc(
+          1024 * 1024 - Buffer.byteLength(exactByteName),
+          0x61,
+        ),
+      },
+    });
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const windowsDrive = makeCaseVariant(
+      "windows-drive-root",
+      "Drive-Parent",
+      "drive-parent",
+    );
+    const configuredDriveRoot = "c:\\";
+    const canonicalDriveRoot = "C:\\";
+    pathBoundary.parseRoots.set(windowsDrive.configuredPath, configuredDriveRoot);
+    pathBoundary.parseRoots.set(windowsDrive.checkout, canonicalDriveRoot);
+    const configuredComponents = windowsDrive.configuredPath
+      .slice(configuredDriveRoot.length)
+      .split("/");
+    const canonicalComponents = windowsDrive.checkout
+      .slice(canonicalDriveRoot.length)
+      .split("/");
+    const variantIndex = configuredComponents.findIndex(
+      (component, index) => component !== canonicalComponents[index],
+    );
+    expect(variantIndex).toBeGreaterThanOrEqual(0);
+    const evidenceParent = canonicalComponents
+      .slice(0, variantIndex)
+      .reduce((parent, component) => join(parent, component), canonicalDriveRoot);
+    const actualComponent = canonicalComponents[variantIndex]!;
+    componentDirectory.path = evidenceParent;
+    componentDirectory.entryPath = join(evidenceParent, actualComponent);
+    componentDirectory.entryTarget = windowsDrive.canonicalParent;
+    componentDirectory.plans = [
+      { entries: [Buffer.from(actualComponent)] },
+      { entries: [Buffer.from(actualComponent)] },
+      { entries: [Buffer.from(actualComponent)] },
+      { entries: [Buffer.from(actualComponent)] },
+    ];
+    expect(resolveGitProjectAnchor(windowsDrive.checkout)?.canonical).toBe(
+      windowsDrive.metadata,
+    );
+    expect(componentDirectory.closeCount).toBe(4);
+
+    const expectRejectedRoots = (
+      name: string,
+      configuredRoot: string,
+      canonicalRoot: string,
+    ): void => {
+      resetDirectoryAuthRace();
+      clearGitProjectAnchorCache();
+      pathBoundary.parseRoots.clear();
+      const fixture = makeCaseVariant(
+        name,
+        `${name}-Parent`,
+        `${name}-parent`,
+      );
+      pathBoundary.parseRoots.set(fixture.configuredPath, configuredRoot);
+      pathBoundary.parseRoots.set(fixture.checkout, canonicalRoot);
+      expect(() => resolveGitProjectAnchor(fixture.checkout)).toThrow(
+        "topology does not point",
+      );
+      expect(componentDirectory.openCount).toBe(0);
+    };
+    expectRejectedRoots("different-drive-root", "D:\\", "C:\\");
+    expectRejectedRoots(
+      "unc-case-root",
+      "\\\\server\\share\\",
+      "\\\\SERVER\\share\\",
+    );
+    expectRejectedRoots("drive-to-unc-root", "c:\\", "\\\\server\\share\\");
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    pathBoundary.parseRoots.clear();
+    const foreignRoot = makeCaseVariant(
+      "foreign-root",
+      "Root-Parent",
+      "root-parent",
+    );
+    pathBoundary.parseRootPath = foreignRoot.configuredPath;
+    pathBoundary.parseRoot = "foreign-root:";
+    expect(() => resolveGitProjectAnchor(foreignRoot.checkout)).toThrow(
+      "topology does not point",
+    );
+    expect(componentDirectory.openCount).toBe(0);
   });
 
   it("contains repository-local commondir metadata and revalidates it", () => {
@@ -997,6 +1523,7 @@ describe("Git project identity", () => {
     directoryAuthRace.openPath = join(initialInvalid, ".git");
     directoryAuthRace.lstatPath = join(initialInvalid, ".git");
     directoryAuthRace.invalidDirectoryAt = 2;
+    directoryAuthRace.unsupportedFlag = "directory";
     expect(() => resolveGitProjectAnchor(initialInvalid)).toThrow(
       "invalid Git directory",
     );
@@ -1007,7 +1534,7 @@ describe("Git project identity", () => {
     const invalid = makeRepository(join(root, "invalid-auth-directory"));
     directoryAuthRace.openPath = join(invalid, ".git");
     directoryAuthRace.lstatPath = join(invalid, ".git");
-    directoryAuthRace.invalidDirectoryAt = 3;
+    directoryAuthRace.invalidDirectoryAt = 2;
     expect(() => resolveGitProjectAnchor(invalid)).toThrow("invalid Git directory");
     expect(directoryAuthRace.closeCount).toBe(1);
 
@@ -1063,10 +1590,33 @@ describe("Git project identity", () => {
       `[core]\nworktree = ${checkout}\n`,
     );
     directoryAuthRace.openPath = checkout;
+    directoryAuthRace.lstatPath = checkout;
+    directoryAuthRace.beforeOpen = (): void => {
+      if (directoryAuthRace.openCount === 1) {
+        expect(directoryAuthRace.lstatCount).toBe(0);
+      }
+    };
     expect(resolveGitProjectAnchor(checkout)?.canonical).toBe(metadata);
     expect(directoryAuthRace.openCount).toBe(2);
     expect(directoryAuthRace.fstatCount).toBe(2);
+    expect(directoryAuthRace.lstatCount).toBe(2);
     expect(directoryAuthRace.closeCount).toBe(2);
+
+    resetDirectoryAuthRace();
+    clearGitProjectAnchorCache();
+    const invalidCheckout = join(root, "invalid-descriptor-checkout");
+    const invalidMetadata = join(root, "invalid-descriptor-metadata");
+    const coreWorktreeError = new Error("synthetic core.worktree open failure");
+    makeStandaloneMetadata(
+      invalidCheckout,
+      invalidMetadata,
+      `[core]\nworktree = ${invalidCheckout}\n`,
+    );
+    directoryAuthRace.openPath = invalidCheckout;
+    directoryAuthRace.openError = coreWorktreeError;
+    expect(() => resolveGitProjectAnchor(invalidCheckout)).toThrow(
+      coreWorktreeError,
+    );
   });
 
   it("rejects directory substitutions before open and while a descriptor is held", () => {
@@ -1094,16 +1644,19 @@ describe("Git project identity", () => {
       ".git-retired",
     );
     directoryAuthRace.openPath = beforeOpenReplacementGitDir;
+    let replacedBeforeOpen = false;
     directoryAuthRace.beforeOpen = (): void => {
+      if (replacedBeforeOpen) return;
+      replacedBeforeOpen = true;
       renameSync(beforeOpenReplacementGitDir, beforeOpenReplacementRetired);
       makeRepository(beforeOpenReplacement);
     };
-    expect(() => resolveGitProjectAnchor(beforeOpenReplacement)).toThrow(
-      "Git directory changed during validation",
+    expect(resolveGitProjectAnchor(beforeOpenReplacement)?.canonical).toBe(
+      beforeOpenReplacement,
     );
-    expect(directoryAuthRace.openCount).toBe(1);
-    expect(directoryAuthRace.fstatCount).toBe(1);
-    expect(directoryAuthRace.closeCount).toBe(1);
+    expect(directoryAuthRace.openCount).toBe(2);
+    expect(directoryAuthRace.fstatCount).toBe(2);
+    expect(directoryAuthRace.closeCount).toBe(2);
 
     resetDirectoryAuthRace();
     clearGitProjectAnchorCache();

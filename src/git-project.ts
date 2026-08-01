@@ -5,6 +5,7 @@ import {
   fstatSync,
   lstatSync,
   openSync,
+  opendirSync,
   realpathSync,
   statSync,
 } from "node:fs";
@@ -21,6 +22,9 @@ import { readBoundedRegularFile } from "./security-files.js";
 
 const MAX_GIT_POINTER_BYTES = 64 * 1024;
 const MAX_GIT_CONFIG_BYTES = 4 * 1024 * 1024;
+const MAX_CASE_VARIANT_PARENT_ENTRIES = 4_096;
+const MAX_CASE_VARIANT_PARENT_BYTES = 1024 * 1024;
+const WINDOWS_DRIVE_ROOT = /^[A-Za-z]:\\$/u;
 const resolutionCache = new Map<string, GitProjectAnchor>();
 
 type DirectoryIdentity = {
@@ -68,11 +72,112 @@ function isContainedPath(root: string, candidate: string): boolean {
   return candidate === root || candidate.startsWith(prefix);
 }
 
+function pathComponents(path: string): {
+  readonly components: readonly string[];
+  readonly root: string;
+} {
+  const root = parse(path).root;
+  const suffix = path.slice(root.length);
+  return {
+    components: suffix.split(sep),
+    root,
+  };
+}
+
+function isCaseVariantPath(left: string, right: string): boolean {
+  const leftPath = pathComponents(left);
+  const rightPath = pathComponents(right);
+  // A root has no canonical parent that can prove its on-disk spelling.
+  // Only an ASCII Windows drive letter has defined case-insensitive root
+  // semantics; UNC shares and every other root must match exactly.
+  const rootsMatch = leftPath.root === rightPath.root
+    || (
+      WINDOWS_DRIVE_ROOT.test(leftPath.root)
+      && WINDOWS_DRIVE_ROOT.test(rightPath.root)
+      && leftPath.root[0]!.toLowerCase() === rightPath.root[0]!.toLowerCase()
+    );
+  return rootsMatch
+    && leftPath.components.length === rightPath.components.length
+    && leftPath.components.every((component, index) => {
+      const other = rightPath.components[index]!;
+      return component === other || component.toLowerCase() === other.toLowerCase();
+    });
+}
+
+function snapshotCaseVariantComponent(parent: string, component: string): string {
+  const directory = opendirSync(parent, {
+    bufferSize: 32,
+    encoding: "buffer" as BufferEncoding,
+  });
+  let entryCount = 0;
+  let entryBytes = 0;
+  let matchingName: Buffer | undefined;
+  try {
+    for (;;) {
+      const entry = directory.readSync();
+      if (entry === null) break;
+      entryCount += 1;
+      const name = Buffer.from(entry.name);
+      entryBytes += name.length;
+      if (
+        entryCount > MAX_CASE_VARIANT_PARENT_ENTRIES
+        || entryBytes > MAX_CASE_VARIANT_PARENT_BYTES
+      ) {
+        throw new Error("case-variant parent directory exceeds validation bounds");
+      }
+      const decoded = name.toString("utf8");
+      if (!Buffer.from(decoded, "utf8").equals(name)) {
+        throw new Error("case-variant parent directory contains malformed UTF-8");
+      }
+      if (decoded.toLowerCase() !== component.toLowerCase()) continue;
+      if (matchingName !== undefined) {
+        throw new Error("case-variant parent directory is ambiguous");
+      }
+      matchingName = Buffer.from(name);
+    }
+  } finally {
+    directory.closeSync();
+  }
+  if (matchingName === undefined) {
+    throw new Error("case-variant parent directory has no matching entry");
+  }
+  const actualName = matchingName.toString("utf8");
+  const stat = lstatSync(join(parent, actualName));
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error("case-variant parent entry is not a directory");
+  }
+  return `${matchingName.length}:${matchingName.toString("hex")}`;
+}
+
+function snapshotCaseVariantPath(
+  configuredPath: string,
+  canonicalPath: string,
+): string {
+  const configured = pathComponents(configuredPath);
+  const canonical = pathComponents(canonicalPath);
+  let canonicalParent = canonical.root;
+  const snapshots: string[] = [];
+  for (let index = 0; index < canonical.components.length; index += 1) {
+    const configuredComponent = configured.components[index]!;
+    const canonicalComponent = canonical.components[index]!;
+    if (configuredComponent !== canonicalComponent) {
+      snapshots.push(
+        `${index}:${snapshotCaseVariantComponent(canonicalParent, canonicalComponent)}`,
+      );
+    }
+    canonicalParent = join(canonicalParent, canonicalComponent);
+  }
+  return snapshots.join("|");
+}
+
 function authenticateDirectoryWithoutDescriptor(
   path: string,
   label: string,
-  stat: NonNullable<ReturnType<typeof lstatSync>>,
 ): DirectoryIdentity {
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`invalid ${label} at ${path}`);
+  }
   const real = realpathSync(path);
   const current = statSync(real);
   const currentPath = lstatSync(path);
@@ -92,17 +197,13 @@ function authenticateDirectoryWithoutDescriptor(
 }
 
 function authenticateDirectory(path: string, label: string): DirectoryIdentity {
-  const initial = lstatSync(path);
-  if (!initial.isDirectory() || initial.isSymbolicLink()) {
-    throw new Error(`invalid ${label} at ${path}`);
-  }
   const directoryFlag = constants.O_DIRECTORY;
   const noFollowFlag = constants.O_NOFOLLOW;
   if (typeof directoryFlag !== "number" || typeof noFollowFlag !== "number") {
     // Node only exposes these constants when the host supports them. Windows
     // does not support O_DIRECTORY, so retain the strict path-based checks
     // there instead of attempting an unsafe flag-less directory open.
-    return authenticateDirectoryWithoutDescriptor(path, label, initial);
+    return authenticateDirectoryWithoutDescriptor(path, label);
   }
 
   const fd = openSync(
@@ -121,8 +222,6 @@ function authenticateDirectory(path: string, label: string): DirectoryIdentity {
     }
     if (
       real !== path
-      || descriptor.dev !== initial.dev
-      || descriptor.ino !== initial.ino
       || current.dev !== descriptor.dev
       || current.ino !== descriptor.ino
     ) {
@@ -690,17 +789,61 @@ function readExternalWorktreeEvidence(
     throw new Error(`invalid Git config metadata at ${join(gitDir, "config")}: expected one core.worktree path`);
   }
   const configuredPath = resolve(gitDir, configured);
-  const configuredStat = lstatSync(configuredPath);
-  if (!configuredStat.isDirectory() || configuredStat.isSymbolicLink()) {
-    throw new Error(`invalid Git core.worktree directory at ${configuredPath}`);
-  }
+  let caseVariantSnapshot: string | undefined;
   if (configuredPath !== worktreeRoot) {
+    if (!isCaseVariantPath(configuredPath, worktreeRoot)) {
+      throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: topology does not point to ${worktreeRoot}`);
+    }
+    try {
+      caseVariantSnapshot = snapshotCaseVariantPath(
+        configuredPath,
+        worktreeRoot,
+      );
+    } catch {
+      throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: topology does not point to ${worktreeRoot}`);
+    }
+  }
+  let configuredIdentity: DirectoryIdentity;
+  try {
+    configuredIdentity = authenticateDirectory(
+      configuredPath,
+      "Git core.worktree directory",
+    );
+  } catch (error) {
+    if (configuredPath === worktreeRoot) throw error;
     throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: topology does not point to ${worktreeRoot}`);
   }
-  authenticateDirectory(configuredPath, "Git core.worktree directory");
+  if (configuredPath !== worktreeRoot) {
+    const worktreeIdentity = authenticateDirectory(
+      worktreeRoot,
+      "Git core.worktree directory",
+    );
+    if (
+      configuredIdentity.dev === 0
+      || configuredIdentity.ino === 0
+      || worktreeIdentity.dev === 0
+      || worktreeIdentity.ino === 0
+      || configuredIdentity.dev !== worktreeIdentity.dev
+      || configuredIdentity.ino !== worktreeIdentity.ino
+    ) {
+      throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: topology does not point to ${worktreeRoot}`);
+    }
+    let revalidatedSnapshot: string;
+    try {
+      revalidatedSnapshot = snapshotCaseVariantPath(
+        configuredPath,
+        worktreeRoot,
+      );
+    } catch {
+      throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: topology does not point to ${worktreeRoot}`);
+    }
+    if (revalidatedSnapshot !== caseVariantSnapshot) {
+      throw new Error(`invalid Git core.worktree metadata at ${join(gitDir, "config")}: component evidence changed during validation`);
+    }
+  }
   return {
     commonConfig: values.commonConfig,
-    resolvedWorktree: configuredPath,
+    resolvedWorktree: worktreeRoot,
     worktreeConfig: values.worktreeConfig,
   };
 }

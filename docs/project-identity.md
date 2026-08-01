@@ -37,8 +37,12 @@ storage:
 git -C /work/project config --local core.worktree /work/project
 ```
 
-Use the authenticated checkout's real path. Symlink aliases are not accepted as
-identity evidence.
+Use the authenticated checkout's real path. On case-insensitive filesystems,
+LCM accepts a case-only `core.worktree` spelling only when every differently
+spelled component has one stable same-fold directory entry and both spellings
+authenticate to the same nonzero filesystem identity. Symlink, bind-mounted,
+or ambiguous aliases, different roots or drives, and unverifiable spellings
+fail closed.
 When Git's common config repeats `extensions.worktreeConfig`, including across
 multiple `[extensions]` sections, LCM follows Git's final-assignment behavior:
 the last supported true/yes/on/1 or implicit boolean enables per-worktree
