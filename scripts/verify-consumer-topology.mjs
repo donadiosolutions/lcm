@@ -117,10 +117,10 @@ try {
     "body-parser",
     "2.3.0",
   );
-  const fastUriManifest = verifyBuildDependencyPath(ajvManifest, "fast-uri", "3.1.4");
+  const fastUriManifest = verifyBuildDependencyPath(ajvManifest, "fast-uri", "3.1.5");
   console.log(
     `build: sdk-express-body-parser=2.3.0 @ ${bodyParserManifest} `
-    + `sdk-ajv-fast-uri=3.1.4 @ ${fastUriManifest}`,
+    + `sdk-ajv-fast-uri=3.1.5 @ ${fastUriManifest}`,
   );
 
   runNpm(["run", "build"], root, false);

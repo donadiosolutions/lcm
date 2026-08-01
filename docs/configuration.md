@@ -50,7 +50,9 @@ The published CLI contains its MCP SDK build graph in `dist/lcm.mjs`. Consumer
 installations therefore do not receive a second external SDK, Express, or AJV
 dependency path from LCM. The exact SDK, `body-parser`, and `fast-uri` versions
 used to build that runtime remain pinned with lockfile integrity in the source
-package.
+package. The `fast-uri` build pin is maintained on the patched 3.x line so it
+continues to satisfy AJV's supported dependency range without exposing a second
+URI parser path in consumer installations.
 
 When the setup wizard's **Custom server** summarizer is selected, both the
 OpenAI-compatible server URL and model name are required. The wizard retries an
