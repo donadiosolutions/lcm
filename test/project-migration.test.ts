@@ -775,6 +775,32 @@ describe("migration safety helpers and blockers", () => {
     expect(() => PROJECT_MIGRATION_TEST_SEAMS.expectedMapEntry({ [current.localProjectId]: { ...valid, aliases: [dirname(current.projectPath)] } }, project)).toThrow("project-map identity changed");
   });
 
+  it("reports project-map identity failures and refuses ineffective activation publication", async () => {
+    const staleMap = fixture();
+    const staleGeneration = await forwardToVerified(staleMap);
+    const staleManifest = readMigrationManifest(staleGeneration, staleMap.home);
+    writePrivate(projectMapPath(staleMap.home), `${JSON.stringify({
+      [staleMap.localProjectId]: { canonical: dirname(staleMap.projectPath), aliases: [], remoteProjectId },
+    })}\n`);
+    clearProjectMapCache();
+    const blockers = await PROJECT_MIGRATION_TEST_SEAMS.activationBlockers(
+      staleManifest,
+      staleMap.options,
+      PROJECT_MIGRATION_TEST_SEAMS.dependencies(staleMap.options),
+    );
+    expect(blockers).toContain(`project:${staleMap.localProjectId.slice(0, 12)} project-map identity changed`);
+
+    const ineffective = fixture();
+    const ineffectiveGeneration = await forwardToVerified(ineffective);
+    const ineffectiveManifest = readMigrationManifest(ineffectiveGeneration, ineffective.home);
+    const ineffectiveDeps = PROJECT_MIGRATION_TEST_SEAMS.dependencies(ineffective.options);
+    expect(() => PROJECT_MIGRATION_TEST_SEAMS.publishActivation(
+      ineffectiveManifest,
+      ineffective.options,
+      { ...ineffectiveDeps, publishBackend: () => undefined },
+    )).toThrow("activation failed to publish the PostgreSQL backend");
+  }, 15_000);
+
   it("rejects stale and incompatible activation journals before publication", async () => {
     const current = fixture();
     const generationId = await forwardToVerified(current);
