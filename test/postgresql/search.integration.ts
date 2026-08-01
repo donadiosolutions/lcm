@@ -577,7 +577,8 @@ async function holdSearchSnapshotBarrier(
 }
 
 async function waitForSearchSnapshotWaiter(
-  database: PostgreSqlTestDatabase
+  database: PostgreSqlTestDatabase,
+  signal?: AbortSignal
 ): Promise<void> {
   const observer = new PostgreSqlRuntime(settings(database.adminUrl));
   let observed: readonly {
@@ -586,6 +587,7 @@ async function waitForSearchSnapshotWaiter(
   }[] = [];
   try {
     for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (signal?.aborted) return;
       const result = await observer.query<{
         waiter_pid: number;
         blocking_pids: number[];
@@ -630,11 +632,103 @@ async function waitForSearchSnapshotWaiter(
   } finally {
     await observer.close();
   }
+  if (signal?.aborted) return;
   throw new Error(
     `expected a server-observed lexical-search advisory waiter; observed ${JSON.stringify(
       observed
     )}`
   );
+}
+
+async function expectMessagesSearchTimeoutAtBarrier(
+  database: PostgreSqlTestDatabase,
+  repository: PostgreSqlLexicalSearchRepository,
+  barrierHolder: PostgreSqlRuntime,
+  scope: "pooled" | "caller"
+): Promise<number> {
+  const barrier = await holdSearchSnapshotBarrier(
+    database,
+    SNAPSHOT_BARRIER_KEYS.messages,
+    barrierHolder
+  );
+  const pending = repository.searchMessages({
+    query: "atomiccafe timeoutbarrier",
+    mode: "full_text",
+    limit: 50,
+  });
+  const completion = pending.then(
+    (rows) => ({ state: "completed" as const, rows }),
+    (error: unknown) => ({ state: "failed" as const, error })
+  );
+  const observerController = new AbortController();
+  const observer = waitForSearchSnapshotWaiter(
+    database,
+    observerController.signal
+  );
+  const observation = observer.then(
+    () => ({ state: "blocked" as const }),
+    (error: unknown) => ({ state: "observer-failed" as const, error })
+  );
+  let failed = false;
+  let failure: unknown;
+  try {
+    const outcome = await Promise.race([observation, completion]);
+    if (outcome.state === "completed") {
+      throw new Error(
+        `${scope} lexical search completed before its timeout barrier`
+      );
+    }
+    if (outcome.state === "failed") throw outcome.error;
+    if (outcome.state === "observer-failed") throw outcome.error;
+    const timedOut = await completion;
+    expect(timedOut.state).toBe("failed");
+    if (timedOut.state === "completed") {
+      throw new Error(`${scope} lexical search did not time out`);
+    }
+    expect(timedOut.error).toMatchObject({
+      domain: "lexical-search",
+      operation: "searchMessages",
+      sqlState: "57014",
+      retryable: false,
+    });
+  } catch (error) {
+    failed = true;
+    failure = error;
+  }
+
+  const cleanupErrors: unknown[] = [];
+  observerController.abort();
+  const [observerResult] = await Promise.allSettled([observer]);
+  if (
+    observerResult.status === "rejected" &&
+    (!failed || observerResult.reason !== failure)
+  ) {
+    cleanupErrors.push(observerResult.reason);
+  }
+  try {
+    await barrier.release();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  await completion;
+
+  if (failed) {
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [failure, ...cleanupErrors],
+        `${scope} lexical search failed and cleanup did not settle cleanly`
+      );
+    }
+    throw failure;
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(
+      cleanupErrors,
+      `${scope} lexical search cleanup did not settle cleanly`
+    );
+  }
+  return barrier.backendPid;
 }
 
 async function searchSnapshotDomain(
@@ -1772,26 +1866,43 @@ describe("PostgreSQL 18 lexical search", () => {
         "search-timeout"
       );
       await installSearchSnapshotBarriers(database);
-      await database.migrator.query(
-        {
-          text: `INSERT INTO lcm.messages (
-                 project_id, conversation_id, seq, role, content, token_count
-               )
-               SELECT
-                 $1,
-                 $2,
-                 source.ordinal,
-                 'user',
-                 CASE
-                   WHEN source.ordinal OPERATOR(pg_catalog.=) 1
-                     THEN 'atomiccafe timeoutbarrier'
-                   ELSE pg_catalog.repeat('a', 4000)
-                     OPERATOR(pg_catalog.||)
-                     source.ordinal::pg_catalog.text
-                 END,
-                 1
-               FROM pg_catalog.generate_series(1, 1000) AS source(ordinal)`,
-          values: [projectId, conversationId],
+      await database.migrator.transaction(
+        async (transaction) => {
+          const context = {
+            domain: "lexical-search",
+            operation: "seedTimeoutCorpus",
+          } as const;
+          await transaction.query(
+            {
+              text: "SET LOCAL statement_timeout = '30s'",
+            },
+            context
+          );
+          await transaction.query(
+            {
+              text: `INSERT INTO lcm.messages (
+                     project_id, conversation_id, seq, role, content,
+                     token_count
+                   )
+                   SELECT
+                     $1,
+                     $2,
+                     source.ordinal,
+                     'user',
+                     CASE
+                       WHEN source.ordinal OPERATOR(pg_catalog.=) 1
+                         THEN 'atomiccafe timeoutbarrier'
+                       ELSE pg_catalog.repeat('a', 4000)
+                         OPERATOR(pg_catalog.||)
+                         source.ordinal::pg_catalog.text
+                     END,
+                     1
+                   FROM pg_catalog.generate_series(1, 1000)
+                     AS source(ordinal)`,
+              values: [projectId, conversationId],
+            },
+            context
+          );
         },
         { domain: "lexical-search", operation: "seedTimeoutCorpus" }
       );
@@ -1802,7 +1913,11 @@ describe("PostgreSQL 18 lexical search", () => {
           statementTimeoutMs: 30_000,
         })
       );
-      let barrierHolderPid = 0;
+      const barrierHolderPids: number[] = [];
+      let regexDialectError: unknown;
+      let regexDialectState:
+        | { readonly timeout: string; readonly usable: number }
+        | undefined;
       try {
         const lowTimeoutRuntime = new PostgreSqlRuntime(
           settings(database.runtimeUrl, {
@@ -1833,48 +1948,14 @@ describe("PostgreSQL 18 lexical search", () => {
           );
           expect(originalBackend.rows[0]).toMatchObject({ timeout: "30s" });
 
-          const barrier = await holdSearchSnapshotBarrier(
-            database,
-            SNAPSHOT_BARRIER_KEYS.messages,
-            barrierHolderRuntime
+          barrierHolderPids.push(
+            await expectMessagesSearchTimeoutAtBarrier(
+              database,
+              lowTimeoutRepository,
+              barrierHolderRuntime,
+              "pooled"
+            )
           );
-          barrierHolderPid = barrier.backendPid;
-          const pending = lowTimeoutRepository.searchMessages({
-            query: "atomiccafe timeoutbarrier",
-            mode: "full_text",
-            limit: 50,
-          });
-          const completion = pending.then(
-            (rows) => ({ state: "completed" as const, rows }),
-            (error: unknown) => ({ state: "failed" as const, error })
-          );
-          try {
-            const observation = await Promise.race([
-              waitForSearchSnapshotWaiter(database).then(() => ({
-                state: "blocked" as const,
-              })),
-              completion,
-            ]);
-            if (observation.state === "completed") {
-              throw new Error(
-                "pooled lexical search completed before its timeout barrier"
-              );
-            }
-            if (observation.state === "failed") throw observation.error;
-            const timedOut = await completion;
-            expect(timedOut.state).toBe("failed");
-            if (timedOut.state === "completed") {
-              throw new Error("pooled lexical search did not time out");
-            }
-            expect(timedOut.error).toMatchObject({
-              domain: "lexical-search",
-              operation: "searchMessages",
-              sqlState: "57014",
-              retryable: false,
-            });
-          } finally {
-            await barrier.release();
-          }
 
           const healthy = await lowTimeoutRuntime.query<{
             timeout: string;
@@ -1902,111 +1983,100 @@ describe("PostgreSQL 18 lexical search", () => {
         } finally {
           await lowTimeoutRuntime.close();
         }
+
+        await database.runtime.transaction(async (transaction) => {
+          await transaction.query(
+            {
+              text: "SET LOCAL statement_timeout = '30s'",
+            },
+            { domain: "lexical-search", operation: "setCallerTimeout" }
+          );
+          const scoped = new PostgreSqlLexicalSearchRepository(
+            transaction,
+            projectId
+          );
+          barrierHolderPids.push(
+            await expectMessagesSearchTimeoutAtBarrier(
+              database,
+              scoped,
+              barrierHolderRuntime,
+              "caller"
+            )
+          );
+
+          const restored = await transaction.query<{
+            timeout: string;
+            usable: number;
+          }>(
+            {
+              text: `SELECT
+                     pg_catalog.current_setting(
+                       'statement_timeout'
+                     ) AS timeout,
+                     1::pg_catalog.int4 AS usable`,
+            },
+            { domain: "lexical-search", operation: "verifyCallerTimeout" }
+          );
+          expect(restored.rows[0]).toEqual({ timeout: "30s", usable: 1 });
+
+          await transaction.query(
+            {
+              text: "SET LOCAL statement_timeout = '30s'",
+            },
+            {
+              domain: "lexical-search",
+              operation: "setCallerRegexDialectTimeout",
+            }
+          );
+          try {
+            // ECMAScript named captures are valid and pass safe-regex, while
+            // PostgreSQL 18's ARE dialect rejects this syntax with SQLSTATE 2201B.
+            await scoped.searchMessages({
+              query: "(?<name>a)",
+              mode: "regex",
+              limit: 50,
+            });
+          } catch (error) {
+            regexDialectError = error;
+          }
+          const dialectFailure = await transaction.query<{
+            timeout: string;
+            usable: number;
+          }>(
+            {
+              text: `SELECT
+                     pg_catalog.current_setting('statement_timeout') AS timeout,
+                     1::pg_catalog.int4 AS usable`,
+            },
+            {
+              domain: "lexical-search",
+              operation: "verifyCallerAfterRegexDialectFailure",
+            }
+          );
+          regexDialectState = dialectFailure.rows[0];
+        });
       } finally {
         await barrierHolderRuntime.close();
       }
-      expect(barrierHolderPid).toBeGreaterThan(0);
+      expect(barrierHolderPids).toHaveLength(2);
+      expect(barrierHolderPids.every((pid) => pid > 0)).toBe(true);
+      const uniqueBarrierHolderPids = [...new Set(barrierHolderPids)];
       const holderClosed = await database.migrator.query<{
-        active: boolean;
+        active_pids: number;
       }>(
         {
-          text: `SELECT EXISTS (
-                   SELECT 1
-                   FROM pg_catalog.pg_stat_activity AS activity
-                   WHERE activity.pid OPERATOR(pg_catalog.=)
-                     $1::pg_catalog.int4
-                 ) AS active`,
-          values: [barrierHolderPid],
+          text: `SELECT pg_catalog.count(*)::pg_catalog.int4 AS active_pids
+                 FROM pg_catalog.pg_stat_activity AS activity
+                 WHERE activity.pid OPERATOR(pg_catalog.=)
+                   ANY($1::pg_catalog.int4[])`,
+          values: [uniqueBarrierHolderPids],
         },
         {
           domain: "lexical-search",
           operation: "verifySearchBarrierHolderClosed",
         }
       );
-      expect(holderClosed.rows[0]).toEqual({ active: false });
-
-      let regexDialectError: unknown;
-      let regexDialectState:
-        | { readonly timeout: string; readonly usable: number }
-        | undefined;
-      await database.runtime.transaction(async (transaction) => {
-        await transaction.query(
-          {
-            text: "SET LOCAL statement_timeout = '1ms'",
-          },
-          { domain: "lexical-search", operation: "setCallerTimeout" }
-        );
-        const scoped = new PostgreSqlLexicalSearchRepository(
-          transaction,
-          projectId
-        );
-        await expect(
-          scoped.searchMessages({
-            query: "z$",
-            mode: "regex",
-            limit: 50,
-          })
-        ).rejects.toMatchObject({ sqlState: "57014" });
-        const restored = await transaction.query<{ timeout: string }>(
-          {
-            text: `SELECT pg_catalog.current_setting(
-                   'statement_timeout'
-                 ) AS timeout`,
-          },
-          { domain: "lexical-search", operation: "verifyCallerTimeout" }
-        );
-        expect(restored.rows[0].timeout).toBe("1ms");
-        await transaction.query(
-          {
-            text: "SET LOCAL statement_timeout = '5s'",
-          },
-          { domain: "lexical-search", operation: "restoreCallerBudget" }
-        );
-        await expect(
-          transaction.query(
-            {
-              text: "SELECT 1",
-            },
-            { domain: "lexical-search", operation: "verifyCallerUsable" }
-          )
-        ).resolves.toMatchObject({ rowCount: 1 });
-
-        await transaction.query(
-          {
-            text: "SET LOCAL statement_timeout = '30s'",
-          },
-          {
-            domain: "lexical-search",
-            operation: "setCallerRegexDialectTimeout",
-          }
-        );
-        try {
-          // ECMAScript named captures are valid and pass safe-regex, while
-          // PostgreSQL 18's ARE dialect rejects this syntax with SQLSTATE 2201B.
-          await scoped.searchMessages({
-            query: "(?<name>a)",
-            mode: "regex",
-            limit: 50,
-          });
-        } catch (error) {
-          regexDialectError = error;
-        }
-        const dialectFailure = await transaction.query<{
-          timeout: string;
-          usable: number;
-        }>(
-          {
-            text: `SELECT
-                   pg_catalog.current_setting('statement_timeout') AS timeout,
-                   1::pg_catalog.int4 AS usable`,
-          },
-          {
-            domain: "lexical-search",
-            operation: "verifyCallerAfterRegexDialectFailure",
-          }
-        );
-        regexDialectState = dialectFailure.rows[0];
-      });
+      expect(holderClosed.rows[0]).toEqual({ active_pids: 0 });
       expect(regexDialectError).toMatchObject({
         domain: "lexical-search",
         operation: "searchMessages",
