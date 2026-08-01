@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   CanonicalRowDigest,
   MIGRATION_ARTIFACT_MAX_BYTES,
+  MIGRATION_MANIFEST_TEST_SEAMS,
   MIGRATION_MANIFEST_VERSION,
   atomicWriteMigrationArtifact,
   canonicalJson,
@@ -220,7 +221,21 @@ describe("private migration artifacts", () => {
     expect(() => readMigrationArtifact(path, paths.directory, -1)).toThrow("maxBytes must be non-negative");
     expect(() => readMigrationArtifact(path, paths.directory, 1.5)).toThrow("maxBytes must be non-negative");
     expect(() => atomicWriteMigrationArtifact(join(home, "outside"), "bad", paths.directory)).toThrow("outside the permitted root");
+    expect(() => readMigrationArtifact(join(home, "outside"), paths.directory)).toThrow("outside the generation root");
     expect(() => fingerprintMigrationFileSync(path, join(paths.directory, "nested"))).toThrow("outside the permitted root");
+  });
+
+  it("detects every source identity change reported by a streaming fingerprint", () => {
+    const identity = { dev: 1, ino: 2, size: 3, mtimeMs: 4 };
+    expect(() => MIGRATION_MANIFEST_TEST_SEAMS.assertFingerprintStable(identity, identity, identity)).not.toThrow();
+    for (const changed of [
+      { ...identity, dev: 9 },
+      { ...identity, ino: 9 },
+      { ...identity, size: 9 },
+      { ...identity, mtimeMs: 9 },
+    ]) expect(() => MIGRATION_MANIFEST_TEST_SEAMS.assertFingerprintStable(identity, changed, identity)).toThrow("changed while hashing");
+    expect(() => MIGRATION_MANIFEST_TEST_SEAMS.assertFingerprintStable(identity, identity, { ...identity, dev: 9 })).toThrow("changed while hashing");
+    expect(() => MIGRATION_MANIFEST_TEST_SEAMS.assertFingerprintStable(identity, identity, { ...identity, ino: 9 })).toThrow("changed while hashing");
   });
 
   it("fails closed for unsafe links, modes, roots, and oversized files", () => {
