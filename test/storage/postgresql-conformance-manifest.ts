@@ -139,4 +139,8 @@ export const POSTGRESQL_STAGED_REPOSITORY_SUITES = {
       "test/postgresql/passive-event-replication.integration.ts",
     ],
   },
+  migrations: {
+    implementation: PostgreSqlExports.PostgreSqlMigrationAdapter,
+    integrationSuites: ["test/postgresql/migration.integration.ts"],
+  },
 } as const;

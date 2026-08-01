@@ -5,6 +5,7 @@ import {
   PostgreSqlCoordinationRepository,
   PostgreSqlLargeFileRepository,
   PostgreSqlLexicalSearchRepository,
+  PostgreSqlMigrationAdapter,
   PostgreSqlPassiveEventRepository,
   PostgreSqlPromotedMemoryRepository,
   PostgreSqlRecallRepository,
@@ -110,6 +111,10 @@ describe("PostgreSQL project repository conformance manifest", () => {
           "test/postgresql/passive-event-repository.integration.ts",
           "test/postgresql/passive-event-replication.integration.ts",
         ],
+      },
+      migrations: {
+        implementation: PostgreSqlMigrationAdapter,
+        integrationSuites: ["test/postgresql/migration.integration.ts"],
       },
     });
     expect(POSTGRESQL_PROJECT_REPOSITORY_ADAPTERS).not.toHaveProperty(
