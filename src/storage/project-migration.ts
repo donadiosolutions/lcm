@@ -1144,8 +1144,10 @@ export async function rollbackProjectMigration(generationId: string, options: Pr
     if (completed?.phase !== "completed" || (completed.operation !== "pre-write-rollback" && completed.operation !== "post-write-rollback")) throw new Error("rolled-back migration generation has no completed rollback journal");
     return result("rollback", manifest);
   }
-  const remoteWrites = manifest.projects.some((project) => project.tables.some(({ copiedRows }) => copiedRows > 0));
-  if (!remoteWrites) {
+  const requiresGlobalRollback = manifest.status === "active"
+    || manifest.status === "rollback-ready"
+    || manifest.projects.some((project) => project.tables.some(({ copiedRows }) => copiedRows > 0));
+  if (!requiresGlobalRollback) {
     manifest = preWriteRollback(manifest, options, deps);
     persist(manifest, options);
     return result("rollback", manifest);
