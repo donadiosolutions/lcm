@@ -66,7 +66,10 @@ ASCII C whitespace; trailing or internal whitespace remains invalid. Inline
 `#` and `;` comments, quoted values, supported escapes,
 continued lines, CRLF input, and case-insensitive section and key names are
 parsed in one bounded linear pass. Git-compatible section headers and their
-first assignment may share one physical line.
+first assignment may share one physical line. A bare or deprecated dotted
+section name must meet its closing `]` directly. A quoted subsection requires
+one or more spaces or tabs before its opening quote and its closing quote must
+meet `]` directly; whitespace after the completed header remains valid.
 Any malformed, overflowing, or unsupported occurrence fails closed instead of
 allowing an earlier or later truthy value to enable `config.worktree`.
 The database and passive-learning sidecar remain under:

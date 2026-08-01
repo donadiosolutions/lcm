@@ -693,11 +693,10 @@ function parseSectionName(line: string, start: number): {
   while (nameEnd < header.length && isConfigNameChar(header[nameEnd]!)) nameEnd += 1;
   if (nameEnd === 0) return { valid: false };
   const name = asciiLower(header.slice(0, nameEnd));
-  let remainder = nameEnd;
-  while (remainder < header.length && isConfigWhitespace(header[remainder]!)) remainder += 1;
-  if (remainder === header.length) {
+  if (nameEnd === header.length) {
     return { baseName: name, name, next: close + 1, valid: true };
   }
+  let remainder = nameEnd;
   if (header[remainder] === ".") {
     remainder += 1;
     const subsectionStart = remainder;
@@ -714,6 +713,8 @@ function parseSectionName(line: string, start: number): {
       valid: remainder > subsectionStart && remainder === header.length,
     };
   }
+  if (!isConfigWhitespace(header[remainder]!)) return { valid: false };
+  while (remainder < header.length && isConfigWhitespace(header[remainder]!)) remainder += 1;
   if (header[remainder] !== '"') return { valid: false };
   quoted = true;
   escaped = false;
@@ -734,7 +735,6 @@ function parseSectionName(line: string, start: number): {
       break;
     }
   }
-  while (remainder < header.length && isConfigWhitespace(header[remainder]!)) remainder += 1;
   return {
     baseName: name,
     name: undefined,
