@@ -1026,6 +1026,7 @@ export function registerPostgreSqlCommand(program: Command): void {
 }
 
 export function registerMigrationCommand(program: Command): void {
+  type MigrationOperation = "plan" | "dry-run" | "apply" | "resume" | "verify" | "report" | "activate" | "rollback";
   type MigrationOptions = {
     batchSize?: string;
     confirm?: string;
@@ -1055,7 +1056,7 @@ export function registerMigrationCommand(program: Command): void {
     }
   };
   const execute = async (
-    operation: string,
+    operation: MigrationOperation,
     generationId: string | undefined,
     opts: MigrationOptions,
   ): Promise<void> => {
@@ -1077,7 +1078,6 @@ export function registerMigrationCommand(program: Command): void {
         case "report": output = generationId ? api.reportProjectMigration(generationId, common) : api.listProjectMigrationReports(common); break;
         case "activate": requireConfirmation(generationId!, opts); output = await api.activateProjectMigration(generationId!, common); break;
         case "rollback": requireConfirmation(generationId!, opts); output = await api.rollbackProjectMigration(generationId!, common); break;
-        default: throw new Error("unknown migration operation");
       }
       if (opts.json) printJson(output);
       else if (Array.isArray(output)) console.log(`Found ${output.length} migration generation(s).`);

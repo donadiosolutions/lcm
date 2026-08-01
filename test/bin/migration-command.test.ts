@@ -173,6 +173,10 @@ describe("lcm migration command", () => {
     await expect(invoke("migration", "--help")).rejects.toThrow("exit:0");
     expect(state.printHelp).toHaveBeenCalledWith("migration");
     state.exit.mockClear();
+    state.printHelp.mockClear();
+    await expect(invoke("migration", "plan", "--help")).rejects.toThrow("exit:0");
+    expect(state.printHelp).toHaveBeenCalledWith("migration");
+    state.exit.mockClear();
     await invoke("migration");
     expect(error).toHaveBeenCalledWith("Usage: lcm migration plan|dry-run|apply|resume|verify|report|activate|rollback");
     expect(process.exitCode).toBe(1);
