@@ -216,9 +216,10 @@ describe("PostgreSQL migration normalization and planning", () => {
 
   it("rejects malformed rows, arrays, tables, and missing dependencies", async () => {
     const executor = fakeRuntime(() => []);
+    const resolved = fakeRuntime((_config, options) => options.operation === "migrationResolveConversation" ? [{ conversation_id: "1" }] : []);
     await expect(POSTGRESQL_MIGRATION_TEST_SEAMS.plansForRow(executor, identity, "summary_messages", allRows().summary_messages![0]!)).rejects.toThrow("missing migration dependency in summaries");
     await expect(POSTGRESQL_MIGRATION_TEST_SEAMS.plansForRow(executor, identity, "message_parts", allRows().message_parts![0]!)).rejects.toThrow("missing migration dependency in messages");
-    await expect(POSTGRESQL_MIGRATION_TEST_SEAMS.plansForRow(executor, identity, "summary_large_files", { summary_id: "summary", file_ids: [1] })).rejects.toThrow("file_ids is not a text array");
+    await expect(POSTGRESQL_MIGRATION_TEST_SEAMS.plansForRow(resolved, identity, "summary_large_files", { summary_id: "summary", file_ids: [1] })).rejects.toThrow("file_ids is not a text array");
     await expect(POSTGRESQL_MIGRATION_TEST_SEAMS.plansForRow(executor, identity, "promoted_memory_tags", { memory_id: "018f1234-5678-7abc-8def-0123456789ae", tags: [1] })).rejects.toThrow("tags is not a text array");
     await expect(POSTGRESQL_MIGRATION_TEST_SEAMS.plansForRow(executor, identity, "unknown", {})).rejects.toThrow("unknown PostgreSQL migration table: unknown");
     expect(() => POSTGRESQL_MIGRATION_TEST_SEAMS.rowValue({}, "missing")).toThrow("migration row is missing missing");
@@ -267,7 +268,7 @@ describe("PostgreSQL migration destination and writes", () => {
     await expect(duplicate.destinationState()).rejects.toThrow("duplicate remote project identity");
     const divergent = new PostgreSqlMigrationAdapter(fakeRuntime((config) => config.text.includes("FROM lcm.projects") ? [{ identity_key: "b".repeat(64) }] : [{ count: "0" }]), identity);
     await expect(divergent.destinationState()).rejects.toThrow("remote project binding does not match the canonical local identity");
-    const occupied = new PostgreSqlMigrationAdapter(fakeRuntime((config) => config.text.includes("FROM lcm.projects") ? [{ identity_key: localProjectId }] : [{ count: config.text.includes("messages") ? "2" : "0" }]), identity);
+    const occupied = new PostgreSqlMigrationAdapter(fakeRuntime((config) => config.text.includes("FROM lcm.projects") ? [{ identity_key: localProjectId }] : [{ count: config.text.includes("FROM lcm.messages ") ? "2" : "0" }]), identity);
     await expect(occupied.assertEmptyDestination()).rejects.toThrow("remote project destination is not empty (messages:2)");
     const malformed = new PostgreSqlMigrationAdapter(fakeRuntime((config) => config.text.includes("FROM lcm.projects") ? [{ identity_key: localProjectId }] : [{ count: "unsafe" }]), identity);
     await expect(malformed.destinationState()).rejects.toThrow("exceeds SQLite's safe integer migration range");
