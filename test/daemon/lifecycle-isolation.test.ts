@@ -1,5 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
-import {
+import { createHash } from "node:crypto";
+import nodeFs, {
+  chmodSync,
   closeSync,
   existsSync,
   linkSync,
@@ -8,12 +10,14 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -23,6 +27,7 @@ import {
   createDaemonLifecycleTestScope,
   DAEMON_TEST_ENTRYPOINT_OPTION,
   DAEMON_TEST_OWNER_OPTION,
+  daemonLifecycleTestIdentityArgs,
   isDaemonLifecycleHermeticTestSeams,
   isDaemonLifecycleTestIdentity,
   isDaemonLifecycleTestScope,
@@ -57,9 +62,115 @@ type ScopeFixture = {
   isAlive: ReturnType<typeof vi.fn>;
 };
 
+type AuthorizedPublicationFault =
+  | "replacement-gone"
+  | "replacement-reused"
+  | "replacement-reused-after-parent"
+  | "replacement-birth-unreadable"
+  | "replacement-status-unreadable"
+  | "replacement-parent-missing"
+  | "replacement-parent-unsafe"
+  | "replacement-wrong-parent"
+  | "replacement-health-unrecognized"
+  | "replacement-entrypoint-missing"
+  | "replacement-entrypoint-unreadable"
+  | "replacement-entrypoint-mismatch"
+  | "direct-parent-field-missing"
+  | "direct-parent-pid-one"
+  | "direct-parent-exe-missing"
+  | "direct-parent-executable-mismatch"
+  | "direct-parent-identity-invalid"
+  | "direct-process-dir-unsafe"
+  | "direct-fd-unsafe"
+  | "direct-fd-entry-invalid"
+  | "direct-fd-no-socket"
+  | "direct-tcp-unsafe"
+  | "direct-tcp-header-invalid"
+  | "direct-tcp-row-invalid"
+  | "direct-listener-missing"
+  | "direct-listener-wrong-inode"
+  | "direct-ipv6-listener"
+  | "user-manager-missing"
+  | "user-manager-hidden-once"
+  | "user-manager-hidden-twice"
+  | "abort-before-readiness-publication"
+  | "proc-scan-unreadable";
+
+const authorizedPublicationFaults: readonly AuthorizedPublicationFault[] = [
+  "replacement-gone",
+  "replacement-reused",
+  "replacement-reused-after-parent",
+  "replacement-birth-unreadable",
+  "replacement-status-unreadable",
+  "replacement-parent-missing",
+  "replacement-parent-unsafe",
+  "replacement-wrong-parent",
+  "replacement-health-unrecognized",
+  "replacement-entrypoint-missing",
+  "replacement-entrypoint-unreadable",
+  "replacement-entrypoint-mismatch",
+  "direct-parent-field-missing",
+  "direct-parent-pid-one",
+  "direct-parent-exe-missing",
+  "direct-parent-executable-mismatch",
+  "direct-parent-identity-invalid",
+  "direct-process-dir-unsafe",
+  "direct-fd-unsafe",
+  "direct-fd-entry-invalid",
+  "direct-fd-no-socket",
+  "direct-tcp-unsafe",
+  "direct-tcp-header-invalid",
+  "direct-tcp-row-invalid",
+  "direct-listener-missing",
+  "direct-listener-wrong-inode",
+  "direct-ipv6-listener",
+  "user-manager-missing",
+  "user-manager-hidden-once",
+  "user-manager-hidden-twice",
+  "abort-before-readiness-publication",
+  "proc-scan-unreadable",
+];
+
+type StoppedTrustFenceFault =
+  | "before-stopped-trust-fence"
+  | "after-original-gone-proof"
+  | "after-final-original-gone-proof"
+  | "before-stopped-fence-publication"
+  | "finalize"
+  | "abort-before-stopped-trust-fence"
+  | "abort-after-original-gone-proof"
+  | "abort-after-final-original-gone-proof"
+  | "abort-before-stopped-fence-publication"
+  | "abort-finalize"
+  | "abort-immediate-before-stopped-trust-fence"
+  | "abort-immediate-after-original-gone-proof"
+  | "abort-immediate-after-final-original-gone-proof"
+  | "abort-immediate-before-stopped-fence-publication"
+  | "abort-immediate-finalize";
+
+const stoppedTrustFenceFaults: readonly StoppedTrustFenceFault[] = [
+  "before-stopped-trust-fence",
+  "after-original-gone-proof",
+  "after-final-original-gone-proof",
+  "before-stopped-fence-publication",
+  "finalize",
+  "abort-before-stopped-trust-fence",
+  "abort-after-original-gone-proof",
+  "abort-after-final-original-gone-proof",
+  "abort-before-stopped-fence-publication",
+  "abort-finalize",
+  "abort-immediate-before-stopped-trust-fence",
+  "abort-immediate-after-original-gone-proof",
+  "abort-immediate-after-final-original-gone-proof",
+  "abort-immediate-before-stopped-fence-publication",
+  "abort-immediate-finalize",
+];
+
 const roots: string[] = [];
+const initialProcessArgv = [...process.argv];
 
 afterEach(() => {
+  process.argv.splice(0, process.argv.length, ...initialProcessArgv);
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -136,6 +247,34 @@ function scopedOptions(fixture: ScopeFixture): Parameters<typeof ensureDaemon>[0
     _testScope: fixture.scope,
     _skipHealthWait: true,
   };
+}
+
+function writeScopedOfflineProcess(
+  fixture: ScopeFixture,
+  pid: number,
+  procRoot: string,
+  scope = fixture.scope,
+): string {
+  const processDir = join(procRoot, String(pid));
+  mkdirSync(processDir, { recursive: true });
+  const uid = process.getuid();
+  const statFields = ["S", ...Array<string>(18).fill("0"), "123456"];
+  const argv = [
+    process.execPath,
+    scope.entrypoint,
+    "daemon",
+    "start",
+    "--foreground",
+    ...daemonLifecycleTestIdentityArgs(scope),
+  ];
+  writeFileSync(join(processDir, "stat"), `${String(pid)} (node main) ${statFields.join(" ")}\n`);
+  writeFileSync(
+    join(processDir, "status"),
+    `Name:\tnode\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\nPPid:\t1\n`,
+  );
+  writeFileSync(join(processDir, "cmdline"), `${argv.join("\0")}\0`);
+  symlinkSync(process.execPath, join(processDir, "exe"));
+  return processDir;
 }
 
 function withHermeticLifecycleSeams(
@@ -1928,6 +2067,38 @@ describe("run-owned lifecycle resources", () => {
     });
   });
 
+  it("refuses an offline root proof owned by a different uid without leaving its scope", async () => {
+    const fixture = createFixture("restart-offline-root-uid");
+    const procRoot = join(fixture.scope.homeDir, "proc");
+    mkdirSync(procRoot);
+    const replacement = vi.fn(async () => ({
+      connected: false,
+      port: 48_321,
+      spawned: false,
+    }));
+    const previousEntrypoint = process.argv[1];
+    process.argv[1] = fixture.scope.entrypoint;
+    try {
+      await expect(restartDaemon({
+        ...scopedOptions(fixture),
+        _procRoot: procRoot,
+        _uid: process.getuid() + 1,
+        _ensureDaemonOverride: replacement,
+      })).resolves.toMatchObject({
+        connected: false,
+        restarted: false,
+        spawned: false,
+      });
+    } finally {
+      process.argv[1] = previousEntrypoint;
+    }
+    expect(replacement).toHaveBeenCalledOnce();
+    expect(fixture.killProcess).not.toHaveBeenCalled();
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
+    expect(readdirSync(procRoot)).toEqual([]);
+  });
+
   it("rejects a restart PID boundary before validation, token, or lifecycle access", async () => {
     const fixture = createFixture("scope-boundary-restart");
     const escapedTokenPath = join(dirname(fixture.scope.stateDir), "daemon.token");
@@ -1990,6 +2161,740 @@ describe("run-owned lifecycle resources", () => {
       _listeningPortsOverride: () => [48_321],
     })).rejects.toThrow("not a verified LCM daemon");
     expect(fixture.killProcess).not.toHaveBeenCalled();
+  });
+
+  it("recovers only a fully proved offline daemon inside the current lifecycle scope", async () => {
+    const fixture = createFixture("restart-offline-owned");
+    const pid = 6868;
+    const replacementPid = 6969;
+    const userManagerPid = 6767;
+    const procRoot = join(fixture.scope.homeDir, "proc");
+    const procNetDir = join(procRoot, "net");
+    const systemdExecutable = join(fixture.scope.runtimeDir, "systemd");
+    const procNetHeader = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode";
+    mkdirSync(procNetDir, { recursive: true });
+    writeFileSync(systemdExecutable, "run-owned fake user manager\n");
+    const managerDir = join(procRoot, String(userManagerPid));
+    mkdirSync(managerDir);
+    const managerStatFields = ["S", ...Array<string>(18).fill("0"), "676767"];
+    const uid = process.getuid();
+    writeFileSync(
+      join(managerDir, "stat"),
+      `${String(userManagerPid)} (systemd) ${managerStatFields.join(" ")}\n`,
+    );
+    writeFileSync(
+      join(managerDir, "status"),
+      `Name:\tsystemd\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\nPPid:\t1\n`,
+    );
+    writeFileSync(join(managerDir, "cmdline"), `${systemdExecutable}\0--user\0`);
+    symlinkSync(systemdExecutable, join(managerDir, "exe"));
+    const writeListener = (inode: string | null): void => {
+      writeFileSync(join(procNetDir, "tcp"), [
+        procNetHeader,
+        ...(inode === null
+          ? []
+          : [`   0: 0100007F:BCC1 00000000:0000 0A 00000000:00000000 00:00000000 00000000 ${String(uid)} 0 ${inode}`]),
+        "",
+      ].join("\n"));
+      writeFileSync(join(procNetDir, "tcp6"), `${procNetHeader}\n`);
+    };
+    const processDir = writeScopedOfflineProcess(fixture, pid, procRoot);
+    writeFileSync(
+      join(processDir, "status"),
+      `Name:\tnode\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\nPPid:\t${String(userManagerPid)}\n`,
+    );
+    const originalFdDir = join(processDir, "fd");
+    mkdirSync(originalFdDir);
+    symlinkSync("socket:[686800]", join(originalFdDir, "7"));
+    writeListener("686800");
+    writeFileSync(fixture.pidPath, String(pid));
+    ensureAuthToken(fixture.tokenPath);
+    const tokenStatBefore = statSync(fixture.tokenPath);
+    let originalAlive = true;
+    let replacementAlive = false;
+    let scope: DaemonLifecycleTestScope;
+    const runtimeDigest = createHash("sha256")
+      .update(readFileSync(fixture.scope.entrypoint))
+      .digest("hex");
+    const fetch = vi.fn(async (
+      input: string | URL | Request,
+      _init?: RequestInit,
+    ): Promise<Response> => {
+      if (!replacementAlive) throw new Error("owned daemon is wedged");
+      const url = String(input);
+      if (url.endsWith("/stats/pool")) {
+        return { ok: true, status: 200, json: async () => ({}) } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          status: "ok",
+          version: "1.4.2",
+          storageBackend: "sqlite",
+          pid: replacementPid,
+          ownerId: scope.ownerId,
+          entrypoint: scope.entrypoint,
+          runtimeDigest,
+        }),
+      } as Response;
+    });
+    const killProcess = vi.fn((signaledPid: number, signal?: NodeJS.Signals | number) => {
+      expect(signaledPid).toBe(pid);
+      expect(signal).toBe("SIGTERM");
+      originalAlive = false;
+      rmSync(processDir, { recursive: true, force: true });
+      rmSync(fixture.pidPath, { force: true });
+      writeListener(null);
+    });
+    scope = createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        fetch: fetch as never,
+        killProcess,
+        isProcessAlive: (candidate: number): boolean => (
+          (candidate === pid && originalAlive)
+          || (candidate === replacementPid && replacementAlive)
+        ),
+      },
+    });
+    const replacement = vi.fn(async () => {
+      writeFileSync(fixture.pidPath, String(replacementPid));
+      const replacementDir = writeScopedOfflineProcess(
+        fixture,
+        replacementPid,
+        procRoot,
+        scope,
+      );
+      const replacementStatFields = ["S", ...Array<string>(18).fill("0"), "654321"];
+      writeFileSync(
+        join(replacementDir, "stat"),
+        `${String(replacementPid)} (node main) ${replacementStatFields.join(" ")}\n`,
+      );
+      writeFileSync(
+        join(replacementDir, "status"),
+        `Name:\tnode\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\nPPid:\t${String(userManagerPid)}\n`,
+      );
+      const fdDir = join(replacementDir, "fd");
+      mkdirSync(fdDir);
+      symlinkSync("socket:[696900]", join(fdDir, "7"));
+      writeListener("696900");
+      replacementAlive = true;
+      return {
+        connected: true,
+        port: 48_321,
+        spawned: true,
+        pid: replacementPid,
+      };
+    });
+    process.argv[1] = scope.entrypoint;
+
+    await expect(restartDaemon({
+      ...scopedOptions(fixture),
+      spawnTimeoutMs: 500,
+      _testScope: scope,
+      _procRoot: procRoot,
+      _uid: process.getuid(),
+      _realpathOverride: realpathSync,
+      _listeningPortsOverride: (candidate?: number): number[] => (
+        (candidate === pid && originalAlive)
+        || (candidate === replacementPid && replacementAlive)
+          ? [48_321]
+          : []
+      ),
+      _offlineScopedListenerStateOverride: (): "absent" | "listening" => (
+        originalAlive || replacementAlive ? "listening" : "absent"
+      ),
+      _ensureDaemonOverride: replacement,
+      expectedRuntimeDigest: runtimeDigest,
+    })).resolves.toMatchObject({
+      connected: true,
+      restarted: true,
+      stoppedPid: pid,
+      pid: replacementPid,
+    });
+
+    expect(fetch.mock.calls.length).toBeGreaterThan(1);
+    expect(fetch.mock.calls[0]![1]).not.toHaveProperty("headers");
+    expect(fetch.mock.calls.slice(1).some(
+      (call): boolean => call[1]?.headers !== undefined,
+    )).toBe(true);
+    expect(killProcess).toHaveBeenCalledExactlyOnceWith(pid, "SIGTERM");
+    expect(replacement).toHaveBeenCalledOnce();
+    expect(existsSync(processDir)).toBe(false);
+    expect(readFileSync(fixture.pidPath, "utf8")).toBe(String(replacementPid));
+    expect(existsSync(join(procRoot, String(replacementPid)))).toBe(true);
+    expect(existsSync(join(fixture.scope.stateDir, ".daemon.pid.restart-recovery.json")))
+      .toBe(false);
+    expect(existsSync(join(fixture.scope.stateDir, ".daemon.pid.restart-quarantine")))
+      .toBe(false);
+    expect(statSync(fixture.tokenPath)).toMatchObject({
+      ino: tokenStatBefore.ino,
+      mode: tokenStatBefore.mode,
+      size: tokenStatBefore.size,
+    });
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
+  });
+
+  it.each(stoppedTrustFenceFaults)(
+    "fails closed for a stopped scoped daemon trust-fence fault at %s",
+    async (fault: StoppedTrustFenceFault) => {
+      const fixture = createFixture(`stopped-trust-${fault}`);
+      const pid = 7474;
+      const procRoot = join(fixture.scope.homeDir, "proc");
+      const procNetDir = join(procRoot, "net");
+      const procNetHeader = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode";
+      const uid = process.getuid();
+      mkdirSync(procNetDir, { recursive: true });
+      const writeListener = (inode: string | null): void => {
+        const rows = inode === null
+          ? []
+          : [`   0: 0100007F:BCC1 00000000:0000 0A 00000000:00000000 00:00000000 00000000 ${String(uid)} 0 ${inode}`];
+        writeFileSync(join(procNetDir, "tcp"), [procNetHeader, ...rows, ""].join("\n"));
+        writeFileSync(join(procNetDir, "tcp6"), `${procNetHeader}\n`);
+      };
+      const processDir = writeScopedOfflineProcess(fixture, pid, procRoot);
+      const fdDir = join(processDir, "fd");
+      mkdirSync(fdDir);
+      symlinkSync("socket:[747400]", join(fdDir, "7"));
+      writeListener("747400");
+      writeFileSync(fixture.pidPath, String(pid));
+      ensureAuthToken(fixture.tokenPath);
+      const tokenBefore = readFileSync(fixture.tokenPath);
+      let originalAlive = true;
+      let stoppedListenerAppeared = false;
+      let abortDuringSnapshot = false;
+      const abortController = new AbortController();
+      const fetch: typeof globalThis.fetch = async (): Promise<Response> => {
+        throw new Error("owned daemon is wedged");
+      };
+      fixture.killProcess.mockImplementation(
+        (signaledPid: number, signal?: number | NodeJS.Signals): void => {
+          expect(signaledPid).toBe(pid);
+          expect(signal).toBe("SIGTERM");
+          originalAlive = false;
+          rmSync(processDir, { recursive: true, force: true });
+          rmSync(fixture.pidPath, { force: true });
+          writeListener(null);
+        },
+      );
+      const scope = createDaemonLifecycleTestScope({
+        ...fixture.scope,
+        dependencies: {
+          ...fixture.scope.dependencies,
+          fetch,
+          isProcessAlive: (candidate: number): boolean => candidate === pid && originalAlive,
+        },
+      });
+      const ensureReplacement = vi.fn(async () => ({
+        connected: true,
+        port: 48_321,
+        spawned: true,
+        pid: 7575,
+      }));
+      const runtimeDigest = createHash("sha256")
+        .update(readFileSync(scope.entrypoint))
+        .digest("hex");
+      const boundary = (phase: string): void => {
+        const targetPhase = fault.startsWith("abort-immediate-")
+          ? fault.slice("abort-immediate-".length)
+          : fault.startsWith("abort-") ? fault.slice(6) : fault;
+        if (targetPhase !== "finalize" && phase === targetPhase) {
+          if (fault.startsWith("abort-immediate-")) abortController.abort();
+          else if (fault.startsWith("abort-")) abortDuringSnapshot = true;
+          else stoppedListenerAppeared = true;
+        }
+      };
+      const finalize = (): void => {
+        if (fault === "finalize") stoppedListenerAppeared = true;
+        if (fault === "abort-finalize") abortDuringSnapshot = true;
+        if (fault === "abort-immediate-finalize") abortController.abort();
+      };
+      const previousEntrypoint = process.argv[1];
+      process.argv[1] = scope.entrypoint;
+      try {
+        const restart = restartDaemon({
+          ...scopedOptions(fixture),
+          _testScope: scope,
+          _procRoot: procRoot,
+          _uid: uid,
+          _realpathOverride: realpathSync,
+          _listeningPortsOverride: (candidate?: number): number[] => (
+            candidate === pid && originalAlive ? [48_321] : []
+          ),
+          _offlineScopedListenerStateOverride: (): "absent" | "listening" => {
+            if (abortDuringSnapshot) {
+              abortDuringSnapshot = false;
+              abortController.abort();
+            }
+            return originalAlive || stoppedListenerAppeared ? "listening" : "absent";
+          },
+          _offlineRecoveryBoundaryOverride: boundary,
+          _offlineTrustFenceFinalizeOverride: finalize,
+          _ensureDaemonOverride: ensureReplacement,
+          _abortSignal: abortController.signal,
+          expectedRuntimeDigest: runtimeDigest,
+        });
+        if (fault.startsWith("abort-")) {
+          await expect(restart).resolves.toMatchObject({
+            connected: false,
+            restarted: false,
+            spawned: false,
+            warning: expect.stringContaining("interrupted"),
+          });
+        } else {
+          await expect(restart).rejects.toThrow(
+            `Offline restart recovery refused for PID ${String(pid)}: stopped daemon trust evidence ${
+              fault === "before-stopped-trust-fence" ? "is incomplete" : "changed"
+            }.`,
+          );
+        }
+      } finally {
+        process.argv[1] = previousEntrypoint;
+      }
+      expect(fixture.killProcess).toHaveBeenCalledExactlyOnceWith(pid, "SIGTERM");
+      expect(ensureReplacement).not.toHaveBeenCalled();
+      expect(fixture.runSystemd).not.toHaveBeenCalled();
+      expect(fixture.spawnProcess).not.toHaveBeenCalled();
+      expect(readFileSync(fixture.tokenPath)).toEqual(tokenBefore);
+      expect(existsSync(fixture.pidPath)).toBe(false);
+      expect(existsSync(processDir)).toBe(false);
+      expect(existsSync(join(fixture.scope.stateDir, ".daemon.pid.restart-recovery.json")))
+        .toBe(true);
+    },
+  );
+
+  it.each(authorizedPublicationFaults)(
+    "fails closed for an authorized replacement fault: %s",
+    async (fault: AuthorizedPublicationFault) => {
+      const fixture = createFixture(`authorized-publication-${fault}`);
+      const pid = 7878;
+      const replacementPid = 7979;
+      const userManagerPid = 7777;
+      const procRoot = join(fixture.scope.homeDir, "proc");
+      const procNetDir = join(procRoot, "net");
+      const systemdExecutable = join(fixture.scope.runtimeDir, "systemd");
+      const procNetHeader = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode";
+      mkdirSync(procNetDir, { recursive: true });
+      writeFileSync(systemdExecutable, "run-owned fake user manager\n");
+      mkdirSync(join(procRoot, "not-a-pid"));
+      mkdirSync(join(procRoot, "999999999999999999999999999999"));
+      const managerDir = join(procRoot, String(userManagerPid));
+      mkdirSync(managerDir);
+      const managerStatFields = ["S", ...Array<string>(18).fill("0"), "777777"];
+      const uid = process.getuid();
+      writeFileSync(
+        join(managerDir, "stat"),
+        `${String(userManagerPid)} (systemd) ${managerStatFields.join(" ")}\n`,
+      );
+      writeFileSync(
+        join(managerDir, "status"),
+        `Name:\tsystemd\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\nPPid:\t1\n`,
+      );
+      writeFileSync(join(managerDir, "cmdline"), `${systemdExecutable}\0--user\0`);
+      symlinkSync(systemdExecutable, join(managerDir, "exe"));
+      const alternateManagerPid = 6666;
+      const alternateManagerDir = join(procRoot, String(alternateManagerPid));
+      if (fault === "replacement-wrong-parent") {
+        mkdirSync(alternateManagerDir);
+        const alternateStatFields = ["S", ...Array<string>(18).fill("0"), "666666"];
+        writeFileSync(
+          join(alternateManagerDir, "stat"),
+          `${String(alternateManagerPid)} (systemd) ${alternateStatFields.join(" ")}\n`,
+        );
+        writeFileSync(
+          join(alternateManagerDir, "status"),
+          `Name:\tsystemd\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\nPPid:\t1\n`,
+        );
+        writeFileSync(
+          join(alternateManagerDir, "cmdline"),
+          `${systemdExecutable}\0--user\0`,
+        );
+        symlinkSync(systemdExecutable, join(alternateManagerDir, "exe"));
+      }
+      const writeListener = (inode: string | null): void => {
+        const rows = inode === null
+          ? []
+          : [`   0: 0100007F:BCC1 00000000:0000 0A 00000000:00000000 00:00000000 00000000 ${String(uid)} 0 ${inode}`];
+        writeFileSync(join(procNetDir, "tcp"), [procNetHeader, ...rows, ""].join("\n"));
+        writeFileSync(join(procNetDir, "tcp6"), `${procNetHeader}\n`);
+      };
+      const processDir = writeScopedOfflineProcess(fixture, pid, procRoot);
+      writeFileSync(
+        join(processDir, "status"),
+        `Name:\tnode\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\nPPid:\t${String(userManagerPid)}\n`,
+      );
+      const originalFdDir = join(processDir, "fd");
+      mkdirSync(originalFdDir);
+      symlinkSync("socket:[787800]", join(originalFdDir, "7"));
+      writeListener("787800");
+      writeFileSync(fixture.pidPath, String(pid));
+      ensureAuthToken(fixture.tokenPath);
+      const tokenBefore = readFileSync(fixture.tokenPath);
+      let originalAlive = true;
+      let replacementAlive = false;
+      let expired = false;
+      let scope = fixture.scope;
+      const mismatchedEntrypoint = join(fixture.scope.runtimeDir, "other-daemon.mjs");
+      writeFileSync(mismatchedEntrypoint, "export {};\n");
+      const runtimeDigest = createHash("sha256")
+        .update(readFileSync(fixture.scope.entrypoint))
+        .digest("hex");
+      let fetchCalls = 0;
+      const fetch: typeof globalThis.fetch = async (input): Promise<Response> => {
+        fetchCalls += 1;
+        if (!replacementAlive) throw new Error("owned daemon is wedged");
+        const url = String(input);
+        if (fault.startsWith("direct-")) expired = true;
+        if (url.endsWith("/stats/pool")) {
+          if (fault.startsWith("replacement-entrypoint-")) {
+            expired = true;
+          }
+          return Response.json({});
+        }
+        if (fault === "replacement-health-unrecognized") {
+          expired = true;
+          return Response.json({ status: "starting" });
+        }
+        const entrypoint = fault === "replacement-entrypoint-missing"
+          ? undefined
+          : fault === "replacement-entrypoint-unreadable"
+            ? join(fixture.scope.runtimeDir, "missing-daemon.mjs")
+            : fault === "replacement-entrypoint-mismatch"
+              ? mismatchedEntrypoint
+              : scope.entrypoint;
+        return Response.json({
+          status: "ok",
+          version: "1.4.2",
+          storageBackend: "sqlite",
+          pid: replacementPid,
+          ownerId: scope.ownerId,
+          entrypoint,
+          runtimeDigest,
+        });
+      };
+      fixture.killProcess.mockImplementation((signaledPid: number, signal?: number | NodeJS.Signals) => {
+        expect(signaledPid).toBe(pid);
+        expect(signal).toBe("SIGTERM");
+        originalAlive = false;
+        rmSync(processDir, { recursive: true, force: true });
+        rmSync(fixture.pidPath, { force: true });
+        writeListener(null);
+      });
+      scope = createDaemonLifecycleTestScope({
+        ...fixture.scope,
+        dependencies: {
+          ...fixture.scope.dependencies,
+          fetch,
+          isProcessAlive: (candidate: number): boolean => (
+            (candidate === pid && originalAlive)
+            || (candidate === replacementPid && replacementAlive)
+          ),
+        },
+      });
+      const replacementDir = join(procRoot, String(replacementPid));
+      const replacementStat = join(replacementDir, "stat");
+      const replacementStatus = join(replacementDir, "status");
+      fixture.runSystemd.mockImplementation(() => {
+        writeFileSync(fixture.pidPath, String(replacementPid));
+        writeScopedOfflineProcess(fixture, replacementPid, procRoot, scope);
+        const replacementStatFields = ["S", ...Array<string>(18).fill("0"), "797979"];
+        writeFileSync(
+          replacementStat,
+          `${String(replacementPid)} (node main) ${replacementStatFields.join(" ")}\n`,
+        );
+        writeFileSync(
+          replacementStatus,
+          `Name:\tnode\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\nPPid:\t${String(userManagerPid)}\n`,
+        );
+        const replacementFdDir = join(replacementDir, "fd");
+        mkdirSync(replacementFdDir);
+        symlinkSync("socket:[797900]", join(replacementFdDir, "7"));
+        writeListener("797900");
+        if (fault === "direct-parent-field-missing") {
+          writeFileSync(
+            replacementStatus,
+            `Name:\tnode\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\n`,
+          );
+        } else if (fault === "direct-parent-pid-one") {
+          writeFileSync(
+            replacementStatus,
+            `Name:\tnode\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\nPPid:\t1\n`,
+          );
+        } else if (fault === "direct-parent-exe-missing") {
+          rmSync(join(managerDir, "exe"));
+        } else if (fault === "direct-parent-executable-mismatch") {
+          const alternateSystemd = join(fixture.scope.runtimeDir, "alternate", "systemd");
+          mkdirSync(dirname(alternateSystemd));
+          writeFileSync(alternateSystemd, "run-owned alternate user manager\n");
+          writeFileSync(join(managerDir, "cmdline"), `${alternateSystemd}\0--user\0`);
+        } else if (fault === "direct-parent-identity-invalid") {
+          writeFileSync(join(managerDir, "cmdline"), `${systemdExecutable}\0--not-user\0`);
+        } else if (fault === "direct-process-dir-unsafe") {
+          chmodSync(replacementDir, 0o777);
+        } else if (fault === "direct-fd-unsafe") {
+          chmodSync(replacementFdDir, 0o777);
+        } else if (fault === "direct-fd-entry-invalid") {
+          writeFileSync(join(replacementFdDir, "owned"), "not a descriptor\n");
+        } else if (fault === "direct-fd-no-socket") {
+          rmSync(join(replacementFdDir, "7"));
+          symlinkSync("pipe:[797900]", join(replacementFdDir, "7"));
+        } else if (fault === "direct-tcp-unsafe") {
+          chmodSync(join(procNetDir, "tcp"), 0o666);
+        } else if (fault === "direct-tcp-header-invalid") {
+          writeFileSync(join(procNetDir, "tcp"), "invalid header\n");
+        } else if (fault === "direct-tcp-row-invalid") {
+          writeFileSync(
+            join(procNetDir, "tcp"),
+            `${procNetHeader}\n0: malformed\n`,
+          );
+        } else if (fault === "direct-listener-missing") {
+          writeListener(null);
+        } else if (fault === "direct-listener-wrong-inode") {
+          writeListener("999900");
+        } else if (fault === "direct-ipv6-listener") {
+          writeFileSync(join(procNetDir, "tcp"), `${procNetHeader}\n`);
+          writeFileSync(join(procNetDir, "tcp6"), [
+            procNetHeader,
+            `   0: 0000000000000000FFFF00000100007F:BCC1 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 ${String(uid)} 0 797900`,
+            "",
+          ].join("\n"));
+        }
+        replacementAlive = true;
+        return { status: 0, stdout: "", stderr: "" };
+      });
+      let parentInspections = 0;
+      let procRootMoved = false;
+      const abortController = new AbortController();
+      const movedProcRoot = join(fixture.scope.homeDir, "proc-unreadable");
+      const hiddenManagerScans = fault === "user-manager-hidden-once"
+        ? 1
+        : fault === "user-manager-hidden-twice" ? 2 : 0;
+      let observedManagerScans = 0;
+      const originalReaddirSync = nodeFs.readdirSync;
+      const scopedReaddirSync = (
+        ...args: Parameters<typeof originalReaddirSync>
+      ): ReturnType<typeof originalReaddirSync> => {
+        const entries = Reflect.apply(originalReaddirSync, nodeFs, args);
+        if (
+          String(args[0]) === procRoot
+          && fault === "replacement-wrong-parent"
+        ) {
+          const visible = parentInspections < 2
+            ? entries.filter(entry => entry.name !== String(alternateManagerPid))
+            : entries;
+          return [...visible].sort((left, right) => left.name.localeCompare(right.name));
+        }
+        if (
+          String(args[0]) === procRoot
+          && observedManagerScans < hiddenManagerScans
+        ) {
+          observedManagerScans += 1;
+          return entries.filter(entry => entry.name !== String(userManagerPid));
+        }
+        return entries;
+      };
+      const boundary = (phase: string): void => {
+        if (phase === "before-authorized-connected-publication") {
+          expired = true;
+          if (fault === "replacement-gone") {
+            rmSync(replacementDir, { recursive: true, force: true });
+          } else if (fault === "replacement-reused") {
+            const fields = ["S", ...Array<string>(18).fill("0"), "797980"];
+            writeFileSync(
+              replacementStat,
+              `${String(replacementPid)} (node main) ${fields.join(" ")}\n`,
+            );
+          } else if (fault === "replacement-birth-unreadable") {
+            chmodSync(replacementStat, 0o666);
+          } else if (fault === "replacement-status-unreadable") {
+            chmodSync(replacementStatus, 0o666);
+          } else if (fault === "replacement-parent-missing") {
+            writeFileSync(
+              replacementStatus,
+              `Name:\tnode\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\n`,
+            );
+          } else if (fault === "replacement-parent-unsafe") {
+            writeFileSync(
+              replacementStatus,
+              `Name:\tnode\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\nPPid:\t999999999999999999999999999999\n`,
+            );
+          } else if (fault === "user-manager-missing") {
+            rmSync(managerDir, { recursive: true, force: true });
+          }
+        }
+        if (phase === "during-authorized-parent-inspection") {
+          parentInspections += 1;
+          if (
+            fault === "replacement-reused-after-parent"
+            && parentInspections === 1
+          ) {
+            expired = true;
+            const fields = ["S", ...Array<string>(18).fill("0"), "797980"];
+            writeFileSync(
+              replacementStat,
+              `${String(replacementPid)} (node main) ${fields.join(" ")}\n`,
+            );
+          }
+          if (fault === "proc-scan-unreadable" && parentInspections === 2) {
+            renameSync(procRoot, movedProcRoot);
+            procRootMoved = true;
+          }
+        }
+        if (
+          fault === "abort-before-readiness-publication"
+          && phase === "after-authorized-cleanup-before-final-publication"
+        ) {
+          abortController.abort();
+        }
+      };
+      const previousEntrypoint = process.argv[1];
+      process.argv[1] = scope.entrypoint;
+      let result: Awaited<ReturnType<typeof restartDaemon>>;
+      try {
+        if (hiddenManagerScans > 0 || fault === "replacement-wrong-parent") {
+          Object.defineProperty(nodeFs, "readdirSync", {
+            configurable: true,
+            value: scopedReaddirSync,
+            writable: true,
+          });
+          syncBuiltinESMExports();
+        }
+        result = await restartDaemon({
+          ...scopedOptions(fixture),
+          spawnTimeoutMs: 500,
+          _testScope: scope,
+          _procRoot: procRoot,
+          _uid: uid,
+          _realpathOverride: realpathSync,
+          _listeningPortsOverride: (candidate?: number): number[] => (
+            (candidate === pid && originalAlive)
+            || (candidate === replacementPid && replacementAlive)
+              ? [48_321]
+              : []
+          ),
+          _offlineScopedListenerStateOverride: (): "absent" | "listening" => (
+            originalAlive || replacementAlive ? "listening" : "absent"
+          ),
+          _offlineRecoveryBoundaryOverride: boundary,
+          _abortSignal: abortController.signal,
+          _monotonicNowOverride: (): number => expired ? 1_000 : 0,
+          _skipHealthWait: false,
+          expectedRuntimeDigest: runtimeDigest,
+        });
+      } finally {
+        if (hiddenManagerScans > 0 || fault === "replacement-wrong-parent") {
+          Object.defineProperty(nodeFs, "readdirSync", {
+            configurable: true,
+            value: originalReaddirSync,
+            writable: true,
+          });
+          syncBuiltinESMExports();
+        }
+        process.argv[1] = previousEntrypoint;
+      }
+      if (fault === "user-manager-hidden-twice") {
+        expect(result).toMatchObject({
+          connected: true,
+          restarted: true,
+          spawned: true,
+          stoppedPid: pid,
+          pid: replacementPid,
+        });
+      } else {
+        expect(result).toMatchObject({
+          connected: false,
+          restarted: false,
+          spawned: true,
+          stoppedPid: pid,
+          warning: expect.stringContaining(
+            fault === "abort-before-readiness-publication"
+              ? "interrupted before restart success publication"
+              : "replacement readiness failed",
+          ),
+        });
+      }
+      expect(fetchCalls).toBeGreaterThan(1);
+      expect(fixture.killProcess).toHaveBeenCalledExactlyOnceWith(pid, "SIGTERM");
+      expect(fixture.runSystemd).toHaveBeenCalledOnce();
+      expect(fixture.spawnProcess).not.toHaveBeenCalled();
+      expect(readFileSync(fixture.tokenPath)).toEqual(tokenBefore);
+      expect(existsSync(join(fixture.scope.stateDir, ".daemon.pid.restart-recovery.json")))
+        .toBe(fault !== "user-manager-hidden-twice");
+      expect(parentInspections).toBe(
+        fault.startsWith("direct-")
+          ? 0
+          : fault === "replacement-health-unrecognized"
+          || fault.startsWith("replacement-entrypoint-")
+          ? 0
+          : fault === "user-manager-missing"
+            || fault === "user-manager-hidden-once"
+            || fault === "user-manager-hidden-twice"
+            || fault === "replacement-wrong-parent"
+            || fault === "proc-scan-unreadable"
+            || fault === "abort-before-readiness-publication"
+            ? 2
+            : 1,
+      );
+      expect(procRootMoved).toBe(fault === "proc-scan-unreadable");
+      expect(observedManagerScans).toBe(hiddenManagerScans);
+    },
+  );
+
+  it("refuses offline recovery when the process identity belongs to another lifecycle scope", async () => {
+    const fixture = createFixture("restart-offline-left");
+    const foreign = createFixture("restart-offline-right");
+    const pid = 6869;
+    const procRoot = join(fixture.root, "proc");
+    const processDir = writeScopedOfflineProcess(fixture, pid, procRoot, foreign.scope);
+    writeFileSync(fixture.pidPath, String(pid));
+    ensureAuthToken(fixture.tokenPath);
+    const pidBefore = readFileSync(fixture.pidPath, "utf8");
+    const tokenStatBefore = statSync(fixture.tokenPath);
+    const fetch = vi.fn().mockRejectedValue(new Error("foreign daemon is wedged"));
+    const killProcess = vi.fn();
+    const scope = createDaemonLifecycleTestScope({
+      ...fixture.scope,
+      dependencies: {
+        ...fixture.scope.dependencies,
+        fetch: fetch as never,
+        killProcess,
+        isProcessAlive: candidate => candidate === pid,
+      },
+    });
+    const replacement = vi.fn();
+    const runtimeDigest = createHash("sha256")
+      .update(readFileSync(scope.entrypoint))
+      .digest("hex");
+
+    await expect(restartDaemon({
+      ...scopedOptions(fixture),
+      _testScope: scope,
+      _procRoot: procRoot,
+      _uid: process.getuid(),
+      _realpathOverride: realpathSync,
+      _listeningPortsOverride: candidate => candidate === pid ? [48_321] : [],
+      _ensureDaemonOverride: replacement,
+      expectedRuntimeDigest: runtimeDigest,
+    })).rejects.toThrow("not a verified LCM daemon");
+
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0]![1]).not.toHaveProperty("headers");
+    expect(killProcess).not.toHaveBeenCalled();
+    expect(replacement).not.toHaveBeenCalled();
+    expect(readFileSync(fixture.pidPath, "utf8")).toBe(pidBefore);
+    expect(statSync(fixture.tokenPath)).toMatchObject({
+      ino: tokenStatBefore.ino,
+      mode: tokenStatBefore.mode,
+      size: tokenStatBefore.size,
+    });
+    expect(existsSync(processDir)).toBe(true);
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+    expect(fixture.runSystemd).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
   });
 
   it("restarts only a matching owned daemon and reports the exact stopped PID", async () => {
@@ -2132,7 +3037,13 @@ describe("run-owned lifecycle resources", () => {
       _platform: "darwin",
       _listeningPortsOverride: () => [48_321],
       _abortSignal: controller.signal,
-    })).rejects.toThrow("not a verified LCM daemon");
+    })).resolves.toEqual({
+      connected: false,
+      port: 48_321,
+      spawned: false,
+      restarted: false,
+      warning: "daemon lifecycle was interrupted before startup",
+    });
     expect(interruptedFixture.scope.dependencies.fetch).toHaveBeenCalledWith(
       expect.any(String),
       expect.objectContaining({ signal: expect.objectContaining({ aborted: true }) }),

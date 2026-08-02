@@ -445,21 +445,127 @@ restart it instead of repeatedly starting competing processes.
 During an explicit restart, the running daemon is authenticated by PID,
 installed version, listener ownership, and its local token without requiring it
 to already use the newly selected backend; the replacement must match the new
-backend. SessionSnapshot skips ingestion when bootstrap cannot verify daemon
-identity. PostToolUse also ignores payload-provided daemon ports and performs no
-network I/O.
+backend. If that explicit restart receives no HTTP response at all on Linux,
+LCM can recover a wedged packaged daemon without reading or sending its token.
+Recovery proceeds only when the owned PID and token files, process user and
+birth identity, exact Node executable and managed foreground arguments,
+packaged entrypoint digest, and configured loopback listener all identify the
+same process. LCM reopens and revalidates that evidence immediately before
+`SIGTERM` and again before any `SIGKILL`; a changed PID, listener, executable,
+entrypoint, argument, digest, or state-file identity stops the restart without
+cleaning state or starting a replacement. Any HTTP response—including an
+authentication failure, malformed response, or identity mismatch—disables this
+offline fallback and is refused. Source/development runtimes and packages that
+lack a trusted runtime digest are also refused. This recovery applies only to
+an operator-requested `lcm daemon restart`; ordinary start, ensure, health, and
+passive-learning paths continue preserving a live likely-LCM daemon whose
+health request is temporarily unavailable. SessionSnapshot skips ingestion when
+bootstrap cannot verify daemon identity. PostToolUse also ignores
+payload-provided daemon ports and performs no network I/O.
+
+Before signaling an offline-verified daemon, LCM first writes and syncs an exact
+recovery-record backup at `.daemon.pid.restart-quarantine`, then writes and
+syncs the primary `.daemon.pid.restart-recovery.json` record beside
+`daemon.pid`. It removes that initial backup only after the primary record is
+durably revalidated, so interruption during record creation always leaves the
+quarantine backup before it can leave a primary record. After the original
+process stops, the same deterministic quarantine path can instead retain the
+original PID leaf until the replacement is independently authenticated. While
+moving that PID evidence, LCM may temporarily retain the same authenticated
+inode under both `daemon.pid` and the deterministic quarantine name. If
+interrupted in this state, both links are intentional recovery evidence; never
+edit, delete, rename, or overwrite either one. A later explicit `lcm daemon
+restart` recognizes and completes the transition. These files make an
+interrupted restart resumable: a later explicit restart reconciles whether the
+original process is still running, already stopped, quarantined, or already
+replaced, and revalidates all recorded evidence before continuing. Ordinary
+start and ensure operations stop without health checks, cleanup, or spawning
+while any recovery-record leaf is present.
+
+Replacement startup receives one retained recovery authorization; it cannot
+fall back to generic PID-file reads, stale-PID cleanup, or legacy parent
+inspection. Before sending the token, LCM proves the candidate's exact process
+birth, executable, raw argument vector, launch and entrypoint digest, owner,
+canonical PID leaf, recovery authority, token metadata, and listener. It
+recaptures that complete evidence after every authenticated request and after
+parent inspection, and retains the first accepted candidate across retries.
+That result is internal readiness evidence only; offline recovery does not
+publish it as `connected: true` until recovery finalization and a separate
+terminal physical proof both succeed. In a test scope, the procfs fixture must
+be a canonical run-owned directory physically below the scope home; host
+`/proc`, escaped roots, substituted roots, symlinks, and incomplete procfs
+evidence are refused. A user-systemd launch performs the same retained
+authorization check after preparing run-owned credentials and immediately
+before invoking `systemd-run`. A failed check, nonzero result, or ambiguous
+launch disposes the credential-source files and directory, preserves lifecycle
+evidence, and does not fall back to a detached spawn. After a successful
+authorized launch, LCM awaits credential-source disposal without stopping the
+running unit or cleaning its PID or recovery state. A disposal failure prevents
+readiness publication and returns a bounded warning instead of silently
+reporting success; preserve the reported recovery and credential-source state
+for inspection.
+
+Do not edit or delete either recovery file manually. If restart reports
+malformed, untrusted, or ambiguous recovery evidence, preserve the reported
+files and correct the conflicting process, listener, permissions, ownership,
+or daemon configuration. Then run `lcm daemon restart` again. LCM removes the
+original PID quarantine only after replacement readiness remains stable. It
+then writes an exact recovery-record backup to the quarantine path, removes the
+primary record, authenticates the replacement again using that backup as the
+sole authority, and finally removes the backup. Each removal is anchored through
+an already-open state-directory descriptor and an already-open exact leaf; LCM
+proves the held inode lost its only link, proves the anchored name is absent,
+and syncs and revalidates the held and canonical parent directory before
+accepting the removal. At least one exact durable authority therefore remains
+throughout finalization. Uncertainty before an unlink is proved committed keeps
+restart unavailable and restores the exact backup when possible. Finalization
+can produce only two success authorities: a clean result, where both the primary
+record and quarantine backup are proved durably absent, or a warning result,
+where the primary record is absent and the quarantine path contains the exact
+authenticated canonical recovery-record bytes. The warning authority keeps
+ordinary lifecycle operations blocked until another explicit restart
+reconciles it. If LCM cannot prove either exact combination, including when
+backup restoration or its durability cannot be proved, restart remains
+unavailable and reports recovery-marker authority or durability as
+indeterminate; it never reports a usable replacement from that state.
+
+After every authenticated health and diagnostic request, candidate recapture,
+credential cleanup, recovery-file operation, anchored unlink, and durability
+check has completed, LCM constructs a new plain success result from already
+captured values. It then performs two consecutive complete callback-free
+synchronous physical proofs directly from local files and Linux procfs. Each
+snapshot reopens the immutable scope and procfs roots, replacement PID and
+token state, process birth/status/raw arguments/executable, candidate-bound
+user-systemd parent, socket-owned loopback listener, launch path and digest,
+owner, disappearance of the original process, abort state, and the exact
+clean-or-warning recovery-authority union.
+The second complete snapshot is the final observable operation before returning
+success, so it detects evidence consumed and then changed while the first
+snapshot was validating later capabilities. Any terminal abort, replacement
+drift, PID reuse, state substitution, malformed or unexpected recovery-file
+combination, or failure of either snapshot refuses public success.
+If cleanup already removed the quarantine backup, LCM attempts to durably
+restore the exact backup; otherwise it reports that authority is indeterminate.
 
 Use `lcm daemon start` to start or validate the managed background daemon. Use
 `lcm daemon restart` after configuration changes; it validates the new
 configuration before stopping the managed process, then starts the daemon with
-the updated settings. Because restart fails closed unless the running daemon
-owns the configured listener, stop the daemon before changing `daemon.port`,
-then start it again after saving the new port. On Linux, lcm prefers the current user's `systemd --user`
-manager so the daemon remains a direct child of the user manager instead of
-being orphaned under PID 1. `lcm daemon start --detach` is kept as a compatibility
-alias for the same managed start behavior. Use `lcm daemon start --foreground`
-only when you want the daemon to stay attached to the current terminal for
-debugging.
+the updated settings. A successful Linux recovery of a non-responsive packaged
+daemon reports the original stopped PID only after the replacement passes
+readiness. The normal graceful-stop path removes `daemon.pid` itself; LCM accepts
+that safely absent leaf. If the path instead contains a replacement inode—even
+with the same PID text—LCM preserves it and refuses replacement startup. If
+recovery is refused, keep the reported PID, token, recovery-record, and
+quarantine state intact, inspect the named process and listener, and retry
+`lcm daemon restart` after correcting the mismatch; do not delete lifecycle
+state or signal the PID blindly. Because restart fails closed
+unless the running daemon owns the configured listener, stop the daemon before
+changing `daemon.port`, then start it again after saving the new port. On Linux,
+lcm prefers the current user's `systemd --user` manager so the daemon remains a
+direct child of the user manager instead of being orphaned under PID 1. `lcm
+daemon start --detach` is kept as a compatibility alias for the same managed
+start behavior. Use `lcm daemon start --foreground` only when you want the daemon
+to stay attached to the current terminal for debugging.
 
 The managed systemd service receives a trusted executable path rather than the
 launching shell's `PATH`. It prepends the exact absolute launcher and runtime

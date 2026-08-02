@@ -1,4 +1,24 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import nodeFs, {
+  chmodSync,
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  readSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,7 +30,10 @@ import {
   readProcessParentPid,
   restartDaemon as restartDaemonProduction,
 } from "../../src/daemon/lifecycle.js";
-import type { DaemonLifecycleHermeticTestSeams } from "../../src/daemon/lifecycle-scope.js";
+import {
+  createDaemonLifecycleTestScope,
+  type DaemonLifecycleHermeticTestSeams,
+} from "../../src/daemon/lifecycle-scope.js";
 
 const dirs: string[] = [];
 type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
@@ -286,19 +309,32 @@ describe("lifecycle procfs and parent warnings", () => {
     mkdirSync(join(linuxRoot, "net"), { recursive: true });
     symlinkSync("socket:[12345]", join(linuxRoot, "42", "fd", "7"));
     symlinkSync("socket:[67890]", join(linuxRoot, "42", "fd", "8"));
-    writeFileSync(join(linuxRoot, "net", "tcp"), [
-      "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+    symlinkSync("pipe:[77777]", join(linuxRoot, "42", "fd", "9"));
+    const linuxTcpPath = join(linuxRoot, "net", "tcp");
+    const linuxTcpHeader = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
+    const linuxTcpRows = [
+      linuxTcpHeader,
       "   0: 0100007F:0AAA 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 99999 1 0000000000000001 100 0 0 10 0",
       "   1: 0200007F:0D05 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000002 100 0 0 10 0",
       "   2: 0100007F:     00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000003 100 0 0 10 0",
       "   3: 0100007F:0E99 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000004 100 0 0 10 0",
       "   4: 0100007F:11C1 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 67890 1 0000000000000005 100 0 0 10 0",
       "",
-    ].join("\n"));
+    ].join("\n");
+    writeFileSync(linuxTcpPath, linuxTcpRows);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot)).toEqual([3737, 4545]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 2730)).toEqual([]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3333)).toEqual([]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3737)).toEqual([3737]);
+    writeFileSync(linuxTcpPath, `${linuxTcpRows}\n   5: 00000000:0E99 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 99999\n`);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3737)).toEqual([3737]);
+    writeFileSync(linuxTcpPath, `${linuxTcpRows}\n   5: 0100007F:0E99 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 99999\n`);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3737)).toEqual([3737]);
+    writeFileSync(linuxTcpPath, linuxTcpRows);
+    writeFileSync(join(linuxRoot, "net", "tcp6"), `${linuxTcpHeader}\n   5: 0000000000000000FFFF00000100007F:11C1 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 67890\n`);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 4545)).toEqual([4545]);
+    writeFileSync(join(linuxRoot, "net", "tcp6"), `${linuxTcpHeader}\n   5: 00000000000000000000000000000000:11C1 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 99999\n`);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 4545)).toEqual([4545]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, join(linuxRoot, "missing"))).toEqual([]);
 
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: false, reason: "missing-pid" })).toContain("PID file missing");
@@ -309,6 +345,490 @@ describe("lifecycle procfs and parent warnings", () => {
     ]);
     expect(__lifecycleTestUtils.systemdDaemonSetenvArgs({ PATH: "/bin" }, ["OPENAI_API_KEY"])).toContain("--setenv=LCM_SYSTEMD_CRED_IDS=OPENAI_API_KEY");
     expect(__lifecycleTestUtils.systemdRunProcessEnv({ PATH: "/bin", TOKEN: "secret", LCM_POSTGRES_URL: "secret", SAFE: "yes" })).toEqual({ PATH: "/bin", SAFE: "yes" });
+  });
+
+  it("covers bounded offline proof parsing and no-follow file failures", (): void => {
+    const root = temp();
+    const uid = process.getuid();
+    const statePath = join(root, "daemon.pid");
+    writeFileSync(statePath, "42");
+    chmodSync(statePath, 0o644);
+    expect(__lifecycleTestUtils.readOfflineStateFileProof(
+      statePath,
+      uid,
+      { readContent: true, requirePrivate: false },
+    )).toMatchObject({ content: "42", uid });
+    expect(__lifecycleTestUtils.readOfflineStateFileProof(
+      statePath,
+      uid,
+      { readContent: true, requirePrivate: false, maxBytes: -1 },
+    )).toBeNull();
+    expect(__lifecycleTestUtils.readOfflineStateFileProof(
+      join(root, "missing.pid"),
+      uid,
+      { readContent: true, requirePrivate: false },
+    )).toBeNull();
+    expect(__lifecycleTestUtils.readOfflineStateDirectoryProof(root, uid))
+      .toMatchObject({ path: root, uid });
+    expect(__lifecycleTestUtils.readOfflineStateDirectoryProof(statePath, uid)).toBeNull();
+    expect(__lifecycleTestUtils.readOfflineStateDirectoryProof(
+      join(root, "missing-directory"),
+      uid,
+    )).toBeNull();
+
+    const large = join(root, "large");
+    writeFileSync(large, Buffer.alloc(65_537));
+    expect(__lifecycleTestUtils.readBoundedProcText(large, 65_536)).toBeNull();
+    expect(__lifecycleTestUtils.readBoundedProcText(join(root, "missing"), 1)).toBeNull();
+    const getuidDescriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+    try {
+      expect(__lifecycleTestUtils.readBoundedProcText(statePath, 2)).toBeNull();
+    } finally {
+      if (getuidDescriptor) Object.defineProperty(process, "getuid", getuidDescriptor);
+      else Reflect.deleteProperty(process, "getuid");
+    }
+
+    const procRoot = join(root, "proc");
+    mkdirSync(join(procRoot, "42"), { recursive: true });
+    writeFileSync(join(procRoot, "42", "stat"), "42 malformed stat\n");
+    expect(__lifecycleTestUtils.readLinuxProcessStartTime(42, procRoot)).toBeNull();
+    writeFileSync(join(procRoot, "42", "cmdline"), "node");
+    expect(__lifecycleTestUtils.readLinuxProcessArgv(42, procRoot)).toBeNull();
+    writeFileSync(join(procRoot, "42", "cmdline"), "node\0\0");
+    expect(__lifecycleTestUtils.readLinuxProcessArgv(42, procRoot)).toBeNull();
+    writeFileSync(join(procRoot, "42", "cmdline"), "");
+    expect(__lifecycleTestUtils.readLinuxProcessArgv(42, procRoot)).toBeNull();
+
+    const runtime = join(root, "runtime.mjs");
+    const runtimeContent = "console.log('descriptor-bound runtime');\n";
+    writeFileSync(runtime, runtimeContent);
+    expect(__lifecycleTestUtils.sha256File(runtime)).toBe(
+      createHash("sha256").update(runtimeContent).digest("hex"),
+    );
+    const runtimeAlias = join(root, "runtime-alias.mjs");
+    symlinkSync(runtime, runtimeAlias);
+    expect(__lifecycleTestUtils.sha256File(runtimeAlias)).toBeNull();
+    expect(__lifecycleTestUtils.sha256File(root)).toBeNull();
+    expect(__lifecycleTestUtils.sha256File(join(root, "missing-runtime"))).toBeNull();
+  });
+
+  it.each(["fstat", "read", "close"] as const)(
+    "fails closed when a bounded offline proof descriptor %s fails",
+    (failure: "fstat" | "read" | "close"): void => {
+      const root = temp();
+      const statePath = join(root, "daemon.pid");
+      writeFileSync(statePath, "42");
+      const originalFstat = nodeFs.fstatSync;
+      const originalRead = nodeFs.readSync;
+      const originalClose = nodeFs.closeSync;
+      try {
+        if (failure === "fstat") {
+          nodeFs.fstatSync = vi.fn((): never => { throw new Error("fstat"); });
+        }
+        if (failure === "read") {
+          nodeFs.readSync = vi.fn((): never => { throw new Error("read"); });
+        }
+        if (failure === "close") {
+          nodeFs.closeSync = vi.fn((): never => { throw new Error("close"); });
+        }
+        syncBuiltinESMExports();
+        expect(__lifecycleTestUtils.readOfflineStateFileProof(
+          statePath,
+          process.getuid(),
+          { readContent: true, requirePrivate: false },
+        )).toBeNull();
+      } finally {
+        nodeFs.fstatSync = originalFstat;
+        nodeFs.readSync = originalRead;
+        nodeFs.closeSync = originalClose;
+        syncBuiltinESMExports();
+      }
+    },
+  );
+
+  it("hashes the opened runtime inode when its pathname is replaced after open", (): void => {
+    const root = temp();
+    const runtime = join(root, "runtime.mjs");
+    const replacement = join(root, "replacement.mjs");
+    const openedContent = "trusted opened inode\n";
+    const replacementContent = "replacement pathname inode\n";
+    writeFileSync(runtime, openedContent);
+    writeFileSync(replacement, replacementContent);
+    const close = vi.fn(closeSync);
+    const open = vi.fn((path: string, flags: number): number => {
+      expect(flags & constants.O_NOFOLLOW).toBe(constants.O_NOFOLLOW);
+      if (typeof constants.O_NONBLOCK === "number") {
+        expect(flags & constants.O_NONBLOCK).toBe(constants.O_NONBLOCK);
+      }
+      const descriptor = openSync(path, flags);
+      renameSync(replacement, runtime);
+      return descriptor;
+    });
+
+    expect(__lifecycleTestUtils.sha256File(runtime, {
+      open,
+      fstat: (descriptor: number): {
+        device: number;
+        inode: number;
+        size: number;
+        modifiedAtMs: number;
+        changedAtMs: number;
+        isFile: () => boolean;
+      } => {
+        const stats = fstatSync(descriptor);
+        return {
+          device: stats.dev,
+          inode: stats.ino,
+          size: stats.size,
+          modifiedAtMs: stats.mtimeMs,
+          changedAtMs: stats.ctimeMs,
+          isFile: (): boolean => stats.isFile(),
+        };
+      },
+      read: (descriptor: number, maximumBytes: number): Buffer => {
+        expect(maximumBytes).toBe(Buffer.byteLength(openedContent) + 1);
+        const content = Buffer.alloc(maximumBytes);
+        const bytesRead = readSync(descriptor, content, 0, maximumBytes, 0);
+        return content.subarray(0, bytesRead);
+      },
+      close,
+      nonblockingFlag: constants.O_NONBLOCK,
+    })).toBe(createHash("sha256").update(openedContent).digest("hex"));
+    expect(readFileSync(runtime, "utf8")).toBe(replacementContent);
+    expect(open).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a nonregular runtime descriptor before reading and still closes it", (): void => {
+    const read = vi.fn((): Buffer => Buffer.from("unreachable"));
+    const close = vi.fn();
+    expect(__lifecycleTestUtils.sha256File("/run-owned/nonregular-runtime", {
+      open: (): number => 71,
+      fstat: (): {
+        device: number;
+        inode: number;
+        size: number;
+        modifiedAtMs: number;
+        changedAtMs: number;
+        isFile: () => boolean;
+      } => ({
+        device: 1,
+        inode: 2,
+        size: 11,
+        modifiedAtMs: 3,
+        changedAtMs: 4,
+        isFile: (): boolean => false,
+      }),
+      read,
+      close,
+    })).toBeNull();
+    expect(read).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledExactlyOnceWith(71);
+  });
+
+  it.each([
+    ["unsafe size", Number.NaN],
+    ["empty file", 0],
+    ["oversized file", 64 * 1024 * 1024],
+  ] as const)("rejects a regular runtime with %s before reading", (_name: string, size: number): void => {
+    const read = vi.fn((): Buffer => Buffer.alloc(0));
+    const close = vi.fn();
+    expect(__lifecycleTestUtils.sha256File("/run-owned/runtime.mjs", {
+      open: (): number => 72,
+      fstat: (): {
+        device: number;
+        inode: number;
+        size: number;
+        modifiedAtMs: number;
+        changedAtMs: number;
+        isFile: () => boolean;
+      } => ({
+        device: 1,
+        inode: 2,
+        size,
+        modifiedAtMs: 3,
+        changedAtMs: 4,
+        isFile: (): boolean => true,
+      }),
+      read,
+      close,
+    })).toBeNull();
+    expect(read).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledExactlyOnceWith(72);
+  });
+
+  it.each([
+    ["nonregular final descriptor", { isFile: (): boolean => false }],
+    ["short read", { read: Buffer.from("sho") }],
+    ["one-byte growth read", { read: Buffer.from("fiver") }],
+    ["device drift", { device: 9 }],
+    ["inode drift", { inode: 9 }],
+    ["size drift", { size: 9 }],
+    ["mtime drift", { modifiedAtMs: 9 }],
+    ["ctime drift", { changedAtMs: 9 }],
+  ] as const)("rejects descriptor-bound runtime %s", (
+    _name: string,
+    change: {
+      read?: Buffer;
+      isFile?: () => boolean;
+      device?: number;
+      inode?: number;
+      size?: number;
+      modifiedAtMs?: number;
+      changedAtMs?: number;
+    },
+  ): void => {
+    const content = "four";
+    const before = {
+      device: 1,
+      inode: 2,
+      size: content.length,
+      modifiedAtMs: 3,
+      changedAtMs: 4,
+      isFile: (): boolean => true,
+    };
+    const after = { ...before, ...change };
+    const read = vi.fn((): Buffer => change.read ?? Buffer.from(content));
+    const fstat = vi.fn()
+      .mockReturnValueOnce(before)
+      .mockReturnValueOnce(after);
+    const close = vi.fn();
+    expect(__lifecycleTestUtils.sha256File("/run-owned/runtime.mjs", {
+      open: (): number => 73,
+      fstat,
+      read,
+      close,
+    })).toBeNull();
+    expect(read).toHaveBeenCalledExactlyOnceWith(73, before.size + 1);
+    expect(fstat).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledExactlyOnceWith(73);
+  });
+
+  it.each(["initial fstat", "read", "final fstat", "close"] as const)(
+    "fails closed on a descriptor-bound runtime %s error",
+    (failure: "initial fstat" | "read" | "final fstat" | "close"): void => {
+      const stats = {
+        device: 1,
+        inode: 2,
+        size: 4,
+        modifiedAtMs: 3,
+        changedAtMs: 4,
+        isFile: (): boolean => true,
+      };
+      const fstat = vi.fn((): typeof stats => stats);
+      if (failure === "initial fstat") fstat.mockImplementationOnce((): never => { throw new Error("fstat"); });
+      if (failure === "final fstat") {
+        fstat.mockImplementationOnce((): typeof stats => stats)
+          .mockImplementationOnce((): never => { throw new Error("fstat"); });
+      }
+      const read = vi.fn((): Buffer => {
+        if (failure === "read") throw new Error("read");
+        return Buffer.from("four");
+      });
+      const close = vi.fn((): void => {
+        if (failure === "close") throw new Error("close");
+      });
+      expect(__lifecycleTestUtils.sha256File("/run-owned/runtime.mjs", {
+        open: (): number => 74,
+        fstat,
+        read,
+        close,
+      })).toBeNull();
+      expect(close).toHaveBeenCalledExactlyOnceWith(74);
+    },
+  );
+
+  it("cleans aged systemd credential sources and fails closed on credential setup faults", () => {
+    const base = temp();
+    const oldCredentialDir = join(base, "lcm-systemd-credentials-old");
+    const freshCredentialDir = join(base, "lcm-systemd-credentials-fresh");
+    mkdirSync(oldCredentialDir);
+    mkdirSync(freshCredentialDir);
+    mkdirSync(join(base, "unrelated"));
+    writeFileSync(join(base, "lcm-systemd-credentials-file"), "not a directory");
+    utimesSync(oldCredentialDir, new Date(0), new Date(0));
+    const credentials = __lifecycleTestUtils.systemdDaemonCredentialArgs(
+      { OPENAI_API_KEY: "secret" },
+      undefined,
+      { credentialDir: base } as never,
+    );
+    expect(existsSync(oldCredentialDir)).toBe(false);
+    expect(existsSync(freshCredentialDir)).toBe(true);
+    expect(credentials.names).toEqual(["OPENAI_API_KEY"]);
+    credentials.cleanup?.();
+    expect(readdirSync(base).filter(
+      (name: string): boolean => name.startsWith("lcm-systemd-credentials-"),
+    ))
+      .toEqual(["lcm-systemd-credentials-file", "lcm-systemd-credentials-fresh"]);
+
+    const baseFile = join(base, "not-a-directory");
+    writeFileSync(baseFile, "x");
+    expect(() => __lifecycleTestUtils.systemdDaemonCredentialArgs(
+      { OPENAI_API_KEY: "secret" },
+      undefined,
+      { credentialDir: baseFile } as never,
+    )).toThrow("is not a directory");
+
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+    try {
+      expect(() => __lifecycleTestUtils.systemdDaemonCredentialArgs({
+        OPENAI_API_KEY: "secret",
+      })).toThrow("current user id is unavailable");
+    } finally {
+      if (descriptor) Object.defineProperty(process, "getuid", descriptor);
+    }
+
+    expect(() => __lifecycleTestUtils.systemdDaemonCredentialArgs(
+      { OPENAI_API_KEY: Symbol("invalid") } as never,
+      undefined,
+      { credentialDir: base } as never,
+    )).toThrow();
+    expect(readdirSync(base).filter(
+      (name: string): boolean => /^lcm-systemd-credentials-[A-Za-z0-9]/.test(name),
+    ))
+      .toEqual(["lcm-systemd-credentials-file", "lcm-systemd-credentials-fresh"]);
+    expect(() => __lifecycleTestUtils.systemdCredentialCleanup("\0")()).not.toThrow();
+    expect(() => __lifecycleTestUtils.systemdDaemonCredentialArgs(
+      { OPENAI_API_KEY: "secret" },
+      undefined,
+      { credentialDir: "/proc/1" } as never,
+    )).toThrow();
+  });
+
+  it("reports systemd credential setup failure before invoking systemd-run", async () => {
+    const root = temp();
+    const credentialFile = join(root, "credential-root-file");
+    writeFileSync(credentialFile, "not a directory");
+    const spawnSync = vi.fn();
+    const result = await __lifecycleTestUtils.startViaUserSystemd({
+      port: 1,
+      pidFilePath: join(root, "daemon.pid"),
+      spawnTimeoutMs: 10,
+      _hermeticTestSeams: { credentialDir: credentialFile } as never,
+    }, process.execPath, [], {
+      environment: { OPENAI_API_KEY: "secret" },
+      spawnSync,
+    } as never);
+    expect(result).toMatchObject({
+      ok: false,
+      warning: expect.stringContaining("credential setup failed"),
+    });
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("preserves authorized recovery when credential setup or validation fails", async () => {
+    const root = temp();
+    const credentialFile = join(root, "credential-root-file");
+    writeFileSync(credentialFile, "not a directory");
+    const spawnSync = vi.fn();
+    const setupFailure = await __lifecycleTestUtils.startViaUserSystemd({
+      port: 1,
+      pidFilePath: join(root, "daemon.pid"),
+      spawnTimeoutMs: 10,
+      _hermeticTestSeams: { credentialDir: credentialFile } as never,
+    }, process.execPath, [], {
+      environment: { OPENAI_API_KEY: "secret" },
+      spawnSync,
+    } as never, (): boolean => true);
+    expect(setupFailure).toMatchObject({
+      ok: false,
+      authorizationRefused: true,
+      warning: expect.stringContaining("authorized recovery preserved without fallback"),
+    });
+
+    const validationFailure = await __lifecycleTestUtils.startViaUserSystemd({
+      port: 1,
+      pidFilePath: join(root, "daemon.pid"),
+      spawnTimeoutMs: 10,
+      _hermeticTestSeams: { credentialDir: root } as never,
+    }, process.execPath, [], {
+      environment: { OPENAI_API_KEY: "secret" },
+      spawnSync,
+    } as never, (): never => { throw new Error("authorization changed"); });
+    expect(validationFailure).toMatchObject({
+      ok: false,
+      authorizationRefused: true,
+      warning: expect.stringContaining("authorization changed before systemd startup"),
+    });
+    await validationFailure.disposeCredentialSources?.();
+    await validationFailure.disposeCredentialSources?.();
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it.each(["remained", "lstat"] as const)(
+    "fails closed when a systemd credential source %s after disposal",
+    (failure: "remained" | "lstat"): void => {
+      const root = temp();
+      const credentials = __lifecycleTestUtils.systemdDaemonCredentialArgs(
+        { OPENAI_API_KEY: "secret" },
+        undefined,
+        { credentialDir: root } as never,
+      );
+      const originalRm = nodeFs.rmSync;
+      const originalLstat = nodeFs.lstatSync;
+      try {
+        if (failure === "remained") nodeFs.rmSync = vi.fn();
+        if (failure === "lstat") {
+          nodeFs.lstatSync = vi.fn((): never => {
+            const error = new Error("lstat") as NodeJS.ErrnoException;
+            error.code = "EACCES";
+            throw error;
+          });
+        }
+        syncBuiltinESMExports();
+        expect(() => credentials.dispose?.()).toThrow(
+          failure === "remained" ? "remained after disposal" : "lstat",
+        );
+      } finally {
+        nodeFs.rmSync = originalRm;
+        nodeFs.lstatSync = originalLstat;
+        syncBuiltinESMExports();
+        credentials.cleanup?.();
+      }
+    },
+  );
+
+  it("refuses credential-source disposal through a substituted lifecycle scope root", (): void => {
+    const homeDir = temp();
+    const runtimeDir = join(homeDir, "runtime");
+    const stateDir = join(homeDir, ".lcm");
+    const credentialDir = join(homeDir, "credentials");
+    const entrypoint = join(homeDir, "lcm.mjs");
+    for (const directory of [runtimeDir, stateDir, credentialDir]) mkdirSync(directory);
+    writeFileSync(entrypoint, "export {};\n");
+    const scope = createDaemonLifecycleTestScope({
+      ownerId: "credential-disposal-scope",
+      homeDir,
+      runtimeDir,
+      stateDir,
+      credentialDir,
+      entrypoint,
+      dependencies: {
+        fetch: vi.fn() as never,
+        spawn: vi.fn() as never,
+        spawnSync: vi.fn() as never,
+        stopUnit: vi.fn(),
+        killProcess: vi.fn(),
+        isProcessAlive: (): boolean => false,
+        sleep: async (): Promise<void> => undefined,
+      },
+    });
+    const credentials = __lifecycleTestUtils.systemdDaemonCredentialArgs(
+      { OPENAI_API_KEY: "secret" },
+      scope,
+    );
+    const movedCredentialDir = `${credentialDir}-original`;
+    renameSync(credentialDir, movedCredentialDir);
+    mkdirSync(credentialDir);
+    try {
+      expect(() => credentials.dispose?.()).toThrow("changed lifecycle test root");
+    } finally {
+      rmSync(credentialDir, { recursive: true, force: true });
+      renameSync(movedCredentialDir, credentialDir);
+      credentials.cleanup?.();
+    }
   });
 
   it("covers malformed status fields, command reads, directory filtering, and cache hits", () => {
@@ -502,6 +1022,38 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     expect(result.connected).toBe(false);
   });
 
+  it("returns a newly spawned daemon after authenticated readiness succeeds", async () => {
+    const dir = temp();
+    const pid = 70;
+    const healthy = {
+      ok: true,
+      status: 200,
+      json: async () => ({ status: "ok", version: "1", pid }),
+    } as Response;
+    const fetch = vi.fn()
+      .mockRejectedValueOnce(new Error("not started"))
+      .mockResolvedValue(healthy);
+    const result = await ensureDaemon({
+      port: 7,
+      pidFilePath: join(dir, "daemon.pid"),
+      spawnTimeoutMs: 10,
+      expectedVersion: "1",
+      enforceUserManagerParent: false,
+      _fetchOverride: fetch,
+      _spawnOverride: vi.fn(() => ({ pid, once: vi.fn(), unref: vi.fn() })) as never,
+      _isProcessAliveOverride: (candidate: number): boolean => candidate === pid,
+      _listeningPortsOverride: (candidate: number): number[] => candidate === pid ? [7] : [],
+      _sleepOverride: async () => {},
+      _monotonicNowOverride: () => 0,
+    });
+    expect(result).toMatchObject({
+      connected: true,
+      spawned: true,
+      pid,
+      startMethod: "detached-spawn",
+    });
+  });
+
   it("covers invalid PID data and the default detached spawn implementation", async () => {
     const dir = temp(); const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "0");
     await expect(ensureDaemon({ port: 7, pidFilePath: pidPath, spawnTimeoutMs: 1, _skipSpawn: true, _fetchOverride: vi.fn().mockRejectedValue(new Error("down")) })).resolves.toMatchObject({ connected: false });
@@ -591,6 +1143,36 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     expect(result.connected).toBe(true); expect(result.warning).toBeUndefined();
   });
 
+  it("discovers endpoint listener ownership from run-owned procfs", async () => {
+    const dir = temp();
+    const root = join(dir, "proc");
+    const pidPath = join(dir, "daemon.pid");
+    writeFileSync(pidPath, "20");
+    ensureAuthToken(join(dir, "daemon.token"));
+    proc(root, 20, "Uid:\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    mkdirSync(join(root, "20", "fd"), { recursive: true });
+    mkdirSync(join(root, "net"), { recursive: true });
+    symlinkSync("socket:[12345]", join(root, "20", "fd", "7"));
+    writeFileSync(join(root, "net", "tcp"), [
+      "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+      "   0: 0100007F:000D 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000001 100 0 0 10 0",
+      "",
+    ].join("\n"));
+    const result = await ensureDaemon({
+      port: 13,
+      pidFilePath: pidPath,
+      spawnTimeoutMs: 1,
+      expectedVersion: "1",
+      _platform: "linux",
+      _procRoot: root,
+      _uid: 1000,
+      _isProcessAliveOverride: (candidate: number): boolean => candidate === 20,
+      _fetchOverride: fetchHealthy(20) as never,
+      _monotonicNowOverride: () => 0,
+    });
+    expect(result).toMatchObject({ connected: true, spawned: false, pid: 20 });
+  });
+
   it("handles retry access rejection and unavailable retry parent metadata", async () => {
     const accessDir = temp(); const accessPid = join(accessDir, "daemon.pid");
     writeFileSync(accessPid, "20"); ensureAuthToken(join(accessDir, "daemon.token"));
@@ -643,6 +1225,102 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     } finally {
       getuid.mockRestore();
       if (oldKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = oldKey;
+    }
+  });
+
+  it("interrupts retained-backup reconciliation immediately after the unlink seam", async () => {
+    const root = temp();
+    const pid = 4242;
+    const port = 19_999;
+    const pidFilePath = join(root, "daemon.pid");
+    const tokenPath = join(root, "daemon.token");
+    const procRoot = join(root, ".hermetic-proc");
+    const entrypoint = join(root, "lcm.mjs");
+    const runtime = "console.log('core retained backup');\n";
+    const runtimeDigest = createHash("sha256").update(runtime).digest("hex");
+    const procPidRoot = join(procRoot, String(pid));
+    const originalLaunchPath = process.argv[1];
+    writeFileSync(entrypoint, runtime);
+    writeFileSync(pidFilePath, String(pid));
+    ensureAuthToken(tokenPath);
+    mkdirSync(procPidRoot, { recursive: true });
+    const statFields = ["S", ...Array<string>(18).fill("0"), "123456"];
+    writeFileSync(join(procPidRoot, "stat"), `${String(pid)} (node main) ${statFields.join(" ")}\n`);
+    const uid = process.getuid();
+    writeFileSync(
+      join(procPidRoot, "status"),
+      `Name:\tnode\nUid:\t${String(uid)}\t${String(uid)}\t${String(uid)}\t${String(uid)}\nPPid:\t1\n`,
+    );
+    process.argv[1] = entrypoint;
+    writeFileSync(
+      join(procPidRoot, "cmdline"),
+      `${[process.execPath, entrypoint, "daemon", "start", "--foreground"].join("\0")}\0`,
+    );
+    symlinkSync(process.execPath, join(procPidRoot, "exe"));
+    const fetch = vi.fn().mockRejectedValue(new Error("offline"));
+    const listenerPorts = vi.fn((): number[] => [port]);
+    const killProcess = vi.fn();
+    const ensureReplacement = vi.fn(async () => ({
+      connected: true,
+      port,
+      spawned: true,
+      pid: 5252,
+    }));
+    const recordPath = join(root, ".daemon.pid.restart-recovery.json");
+    const backupPath = join(root, ".daemon.pid.restart-quarantine");
+    const options: Parameters<typeof restartDaemonProduction>[0] = {
+      port,
+      pidFilePath,
+      spawnTimeoutMs: 100,
+      expectedEntrypoint: entrypoint,
+      expectedRuntimeDigest: runtimeDigest,
+      _packagedEntrypointOverride: entrypoint,
+      _platform: "linux",
+      _procRoot: procRoot,
+      _uid: uid,
+      _realpathOverride: realpathSync,
+      _fetchOverride: fetch,
+      _listeningPortsOverride: listenerPorts,
+      _isProcessAliveOverride: (candidate: number): boolean => candidate === pid,
+      _killOverride: killProcess,
+      _sleepOverride: async (): Promise<void> => undefined,
+      _ensureDaemonOverride: ensureReplacement,
+    };
+    try {
+      await restartDaemon({
+        ...options,
+        _offlineRecoveryBoundaryOverride: (phase: string): void => {
+          if (phase === "after-record-create") throw new Error("retain exact recovery pair");
+        },
+      }).catch(() => undefined);
+      const retainedRecord = readFileSync(recordPath);
+      expect(retainedRecord.toString("utf8")).toContain(`"pid":${String(pid)}`);
+      const retainedBackup = readFileSync(backupPath);
+      const retainedPid = readFileSync(pidFilePath);
+      const retainedToken = readFileSync(tokenPath);
+      killProcess.mockClear();
+      ensureReplacement.mockClear();
+      const controller = new AbortController();
+
+      await expect(restartDaemon({
+        ...options,
+        _abortSignal: controller.signal,
+        _offlineRecoveryBackupUnlinkOverride: (): void => controller.abort(),
+      })).resolves.toMatchObject({
+        connected: false,
+        restarted: false,
+        warning: expect.stringContaining("interrupted"),
+      });
+
+      expect(controller.signal.aborted).toBe(true);
+      expect(killProcess).not.toHaveBeenCalled();
+      expect(ensureReplacement).not.toHaveBeenCalled();
+      expect(readFileSync(recordPath)).toEqual(retainedRecord);
+      expect(readFileSync(backupPath)).toEqual(retainedBackup);
+      expect(readFileSync(pidFilePath)).toEqual(retainedPid);
+      expect(readFileSync(tokenPath)).toEqual(retainedToken);
+    } finally {
+      process.argv[1] = originalLaunchPath;
     }
   });
 
