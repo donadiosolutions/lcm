@@ -10,6 +10,10 @@ BEGIN;
 
 GRANT USAGE ON SCHEMA lcm TO :"lcm_runtime_role";
 
+-- These existing least-privilege lease columns also support LCM's reserved
+-- backend-publication guard. Ordinary runtime APIs cannot operate the reserved
+-- resource type. No schema change, table-wide lock, MAINTAIN, ownership,
+-- ALTER, TRUNCATE, or unrelated relation privilege is required.
 GRANT SELECT, DELETE ON TABLE lcm.fenced_leases
 TO :"lcm_runtime_role";
 GRANT INSERT (

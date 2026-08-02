@@ -424,6 +424,12 @@ describe("PostgreSQL memory repositories", () => {
       .resolves.toBeUndefined();
     await expect(repository.recordSessionIngest("session-new", 1))
       .resolves.toBeUndefined();
+    expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "coordination",
+      operation: "recordSessionIngest",
+      projectId,
+      transactionMode: "read-committed-read-write",
+    });
     await expect(repository.getSessionInstructions(instructionScope)).resolves.toEqual({
       ...instructionScope,
       content: "rules",

@@ -23,16 +23,15 @@ import {
   type PostgreSqlTestDatabase,
   withPostgreSqlTestDatabase,
 } from "./harness.js";
+import { assertFencedLeaseReadOnlyGrant } from "./grant-assertions.js";
 
 beforeAll(assertHarnessReady);
 
-async function grantIdentityRuntimePrivileges(
+async function applyIdentityRuntimeGrant(
   database: PostgreSqlTestDatabase,
+  filename: string,
 ): Promise<void> {
-  const template = readFileSync(
-    join(process.cwd(), "docs", "postgresql-runtime-identity-grants.sql"),
-    "utf8",
-  );
+  const template = readFileSync(join(process.cwd(), "docs", filename), "utf8");
   const sql = template
     .split("\n")
     .filter((line) => !line.startsWith("\\"))
@@ -42,6 +41,13 @@ async function grantIdentityRuntimePrivileges(
     domain: "identity",
     operation: "grantIdentityRuntimePrivileges",
   });
+}
+
+async function grantIdentityRuntimePrivileges(
+  database: PostgreSqlTestDatabase,
+): Promise<void> {
+  await applyIdentityRuntimeGrant(database, "postgresql-runtime-coordination-grants.sql");
+  await applyIdentityRuntimeGrant(database, "postgresql-runtime-identity-grants.sql");
 }
 
 describe("PostgreSQL 18 machine and project identities", () => {
@@ -82,7 +88,9 @@ describe("PostgreSQL 18 machine and project identities", () => {
       });
       expect(JSON.stringify(denied)).not.toContain(identityKey);
 
-      await grantIdentityRuntimePrivileges(database);
+      await applyIdentityRuntimeGrant(database, "postgresql-runtime-identity-grants.sql");
+      await assertFencedLeaseReadOnlyGrant(database, "identity");
+      await applyIdentityRuntimeGrant(database, "postgresql-runtime-coordination-grants.sql");
       const grantedMachine = await repository.registerMachine(identityKey, "Granted");
       expect(grantedMachine).toMatchObject({ displayName: "Granted" });
       const grantedProject = await repository.createProject({
@@ -190,7 +198,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
         projects_delete: true,
         projects_insert_identity_key: true,
         projects_insert_display_name: true,
-        projects_insert_project_id: false,
+        projects_insert_project_id: true,
         projects_update_identity_key: false,
         aliases_select: true,
         aliases_insert: false,
@@ -230,15 +238,6 @@ describe("PostgreSQL 18 machine and project identities", () => {
         {
           text: "UPDATE lcm.machines SET registered_at = statement_timestamp() WHERE machine_id = $1",
           values: [grantedMachine.machineId],
-        },
-        {
-          text: `INSERT INTO lcm.projects (project_id, identity_key, display_name)
-                 VALUES ($1, $2, $3)`,
-          values: [
-            "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9091",
-            "e".repeat(64),
-            "Forbidden",
-          ],
         },
         {
           text: "UPDATE lcm.projects SET display_name = $1 WHERE project_id = $2",
@@ -731,6 +730,57 @@ describe("PostgreSQL 18 machine and project identities", () => {
         .resolves.toBeNull();
       expect((await repository.listProjects()).map(({ projectId }) => projectId))
         .not.toContain(disposable.projectId);
+    });
+  });
+
+  it("serializes inverse alias transfers through one canonical project-lock order", async () => {
+    await withPostgreSqlTestDatabase("identity-inverse-transfer", async (database) => {
+      await grantIdentityRuntimePrivileges(database);
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
+      const machine = await repository.registerMachine(
+        `machine:${"7".repeat(64)}`,
+        "Inverse transfer machine",
+      );
+      const first = await repository.createProject({
+        machineId: machine.machineId,
+        displayName: "Inverse transfer first",
+        path: "/work/inverse-first",
+        normalizedPath: "/work/inverse-first",
+      });
+      const second = await repository.createProject({
+        machineId: machine.machineId,
+        displayName: "Inverse transfer second",
+        path: "/work/inverse-second",
+        normalizedPath: "/work/inverse-second",
+      });
+
+      await expect(Promise.all([
+        repository.replaceProjectAlias({
+          machineId: machine.machineId,
+          expectedPriorProjectId: first.projectId,
+          projectId: second.projectId,
+          path: "/work/inverse-first",
+          normalizedPath: "/work/inverse-first",
+        }),
+        repository.replaceProjectAlias({
+          machineId: machine.machineId,
+          expectedPriorProjectId: second.projectId,
+          projectId: first.projectId,
+          path: "/work/inverse-second",
+          normalizedPath: "/work/inverse-second",
+        }),
+      ])).resolves.toEqual([
+        expect.objectContaining({ normalizedPath: "/work/inverse-first" }),
+        expect.objectContaining({ normalizedPath: "/work/inverse-second" }),
+      ]);
+      await expect(repository.resolveProject(
+        machine.machineId,
+        "/work/inverse-first",
+      )).resolves.toMatchObject({ projectId: second.projectId });
+      await expect(repository.resolveProject(
+        machine.machineId,
+        "/work/inverse-second",
+      )).resolves.toMatchObject({ projectId: first.projectId });
     });
   });
 

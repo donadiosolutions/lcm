@@ -17,6 +17,7 @@ import {
   type PostgreSqlTestDatabase,
   withPostgreSqlTestDatabase,
 } from "./harness.js";
+import { assertFencedLeaseReadOnlyGrant } from "./grant-assertions.js";
 
 beforeAll(assertHarnessReady);
 
@@ -154,6 +155,7 @@ describe("PostgreSQL 18 native transcript repository", () => {
       });
 
       await grantTranscriptRuntimePrivileges(database);
+      await assertFencedLeaseReadOnlyGrant(database, "native-transcripts");
       await expect(repository.ingestBatch(
         input(scope, "grants/session.jsonl", "grants"),
       )).resolves.toMatchObject({ importedCount: 1, skippedCount: 0 });

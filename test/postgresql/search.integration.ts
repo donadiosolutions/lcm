@@ -23,6 +23,7 @@ import {
   settings,
   withPostgreSqlTestDatabase,
 } from "./harness.js";
+import { assertFencedLeaseReadOnlyGrant } from "./grant-assertions.js";
 
 beforeAll(assertHarnessReady);
 
@@ -823,6 +824,7 @@ describe("PostgreSQL 18 lexical search", () => {
       } finally {
         await admin.close();
       }
+      await assertFencedLeaseReadOnlyGrant(database, "lexical-search");
       const admitted = await repository.searchMessages({
         query: "needle",
         mode: "full_text",
@@ -1241,6 +1243,7 @@ describe("PostgreSQL 18 lexical search", () => {
               {
                 domain: "lexical-search",
                 operation: "verifyCallerSnapshotPrerequisites",
+                projectId,
               }
             );
             expect(prior.rows[0]).toEqual({
@@ -1255,6 +1258,7 @@ describe("PostgreSQL 18 lexical search", () => {
               {
                 domain: "lexical-search",
                 operation: "setCallerSnapshotTimeout",
+                projectId,
               }
             );
             await exercise(
@@ -1274,12 +1278,17 @@ describe("PostgreSQL 18 lexical search", () => {
               {
                 domain: "lexical-search",
                 operation: "verifyCallerSnapshotSearchState",
+                projectId,
               }
             );
             expect(healthy.rows[0]).toEqual({
               statement_timeout: "30s",
               usable: 1,
             });
+          }, {
+            domain: "lexical-search",
+            operation: "callerSnapshotTransaction",
+            projectId,
           });
         }
       );
@@ -1520,6 +1529,10 @@ describe("PostgreSQL 18 lexical search", () => {
               expectFallbackRelationNeverExecuted(plan, testCase.relationName);
             }
           }
+        }, {
+          domain: "lexical-search",
+          operation: "explainFallbackGates",
+          projectId,
         });
       }
     );
@@ -1989,7 +2002,11 @@ describe("PostgreSQL 18 lexical search", () => {
             {
               text: "SET LOCAL statement_timeout = '30s'",
             },
-            { domain: "lexical-search", operation: "setCallerTimeout" }
+            {
+              domain: "lexical-search",
+              operation: "setCallerTimeout",
+              projectId,
+            }
           );
           const scoped = new PostgreSqlLexicalSearchRepository(
             transaction,
@@ -2015,7 +2032,11 @@ describe("PostgreSQL 18 lexical search", () => {
                      ) AS timeout,
                      1::pg_catalog.int4 AS usable`,
             },
-            { domain: "lexical-search", operation: "verifyCallerTimeout" }
+            {
+              domain: "lexical-search",
+              operation: "verifyCallerTimeout",
+              projectId,
+            }
           );
           expect(restored.rows[0]).toEqual({ timeout: "30s", usable: 1 });
 
@@ -2026,6 +2047,7 @@ describe("PostgreSQL 18 lexical search", () => {
             {
               domain: "lexical-search",
               operation: "setCallerRegexDialectTimeout",
+              projectId,
             }
           );
           try {
@@ -2051,9 +2073,14 @@ describe("PostgreSQL 18 lexical search", () => {
             {
               domain: "lexical-search",
               operation: "verifyCallerAfterRegexDialectFailure",
+              projectId,
             }
           );
           regexDialectState = dialectFailure.rows[0];
+        }, {
+          domain: "lexical-search",
+          operation: "callerSearchTimeouts",
+          projectId,
         });
       } finally {
         await barrierHolderRuntime.close();

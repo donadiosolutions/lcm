@@ -189,11 +189,13 @@ describe("PostgreSQL conversation repository", () => {
       domain: "conversations",
       operation: "getOrCreateConversation",
       projectId,
+      transactionMode: "read-committed-read-write",
     });
     expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
       domain: "conversations",
       operation: "appendMessages",
       projectId,
+      transactionMode: "read-committed-read-write",
     });
     for (const [config, options] of db.query.mock.calls) {
       expect(options).toMatchObject({ domain: "conversations", projectId });
@@ -229,13 +231,9 @@ describe("PostgreSQL conversation repository", () => {
     expect(paginated).toMatchObject({ values: [projectId, 41, 0, 1] });
   });
 
-  it("creates a missing get-or-create segment after taking the advisory lock", async () => {
+  it("requests read-committed mode before taking the get-or-create lock", async () => {
     const order: string[] = [];
     const db = executor((config) => {
-      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
-        order.push("isolation");
-        return result([]);
-      }
       if (config.text.includes("pg_advisory_xact_lock")) {
         order.push("lock");
         return result([{ pg_advisory_xact_lock: null }]);
@@ -256,11 +254,14 @@ describe("PostgreSQL conversation repository", () => {
       sessionId: "new-session",
       title: null,
     });
-    expect(order).toEqual(["isolation", "lock", "lookup", "insert"]);
-    expect(db.query.mock.calls[0][0]).toEqual({
-      text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    expect(order).toEqual(["lock", "lookup", "insert"]);
+    expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "conversations",
+      operation: "getOrCreateConversation",
+      projectId,
+      transactionMode: "read-committed-read-write",
     });
-    expect(db.query.mock.calls[1][0]).toMatchObject({
+    expect(db.query.mock.calls[0][0]).toMatchObject({
       values: [
         derivePostgreSqlAdvisoryLockName(
           projectId,
@@ -271,31 +272,28 @@ describe("PostgreSQL conversation repository", () => {
     });
   });
 
-  it("fails closed before locking when the isolation fence cannot be established", async () => {
+  it("fails closed before locking when root transaction setup is rejected", async () => {
     const db = executor((config) => {
-      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
-        throw Object.assign(new Error("isolation unavailable"), { code: "0A000" });
-      }
-      throw new Error(`unexpected SQL after isolation failure: ${config.text}`);
+      throw new Error(`unexpected SQL after setup failure: ${config.text}`);
+    });
+    db.transaction.mockImplementationOnce(async (
+      _callback: Parameters<PostgreSqlConversationExecutor["transaction"]>[0],
+      options: Parameters<PostgreSqlConversationExecutor["transaction"]>[1],
+    ) => {
+      expect(options.transactionMode).toBe("read-committed-read-write");
+      throw Object.assign(new Error("isolation unavailable"), { code: "0A000" });
     });
     const repository = new PostgreSqlConversationRepository(db, projectId);
 
     await expect(repository.getOrCreateConversation("session-a"))
       .rejects.toMatchObject({ code: "0A000" });
     expect(db.transaction).toHaveBeenCalledTimes(1);
-    expect(db.query).toHaveBeenCalledOnce();
-    expect(db.query.mock.calls[0][0]).toEqual({
-      text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-    });
+    expect(db.query).not.toHaveBeenCalled();
   });
 
-  it("establishes append isolation before its row lock and snapshot reads", async () => {
+  it("requests read-committed mode before append row locks and snapshot reads", async () => {
     const order: string[] = [];
     const db = executor((config) => {
-      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
-        order.push("isolation");
-        return result([]);
-      }
       if (config.text.includes("FOR UPDATE")) {
         order.push("lock");
         return result([{ conversation_id: "41" }]);
@@ -317,24 +315,30 @@ describe("PostgreSQL conversation repository", () => {
       content: "append",
       tokenCount: 1,
     }])).resolves.toMatchObject([{ seq: 0 }]);
-    expect(order).toEqual(["isolation", "lock", "maximum", "insert"]);
-    expect(db.query.mock.calls[0][0]).toEqual({
-      text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-    });
-    expect(db.query.mock.calls[0][0]).not.toHaveProperty("values");
+    expect(order).toEqual(["lock", "maximum", "insert"]);
     expect(db.query.mock.calls[0][1]).toEqual({
       domain: "conversations",
       operation: "appendMessages",
       projectId,
     });
+    expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "conversations",
+      operation: "appendMessages",
+      projectId,
+      transactionMode: "read-committed-read-write",
+    });
   });
 
-  it("fails append before locking when its isolation fence cannot be established", async () => {
+  it("fails append before locking when root transaction setup is rejected", async () => {
     const db = executor((config) => {
-      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
-        throw Object.assign(new Error("isolation unavailable"), { code: "0A000" });
-      }
-      throw new Error(`unexpected SQL after isolation failure: ${config.text}`);
+      throw new Error(`unexpected SQL after setup failure: ${config.text}`);
+    });
+    db.transaction.mockImplementationOnce(async (
+      _callback: Parameters<PostgreSqlConversationExecutor["transaction"]>[0],
+      options: Parameters<PostgreSqlConversationExecutor["transaction"]>[1],
+    ) => {
+      expect(options.transactionMode).toBe("read-committed-read-write");
+      throw Object.assign(new Error("isolation unavailable"), { code: "0A000" });
     });
     const repository = new PostgreSqlConversationRepository(db, projectId);
 
@@ -344,10 +348,7 @@ describe("PostgreSQL conversation repository", () => {
       tokenCount: 1,
     }])).rejects.toMatchObject({ code: "0A000" });
     expect(db.transaction).toHaveBeenCalledTimes(1);
-    expect(db.query).toHaveBeenCalledOnce();
-    expect(db.query.mock.calls[0][0]).toEqual({
-      text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-    });
+    expect(db.query).not.toHaveBeenCalled();
   });
 
   it("maps missing rows and false existence without exposing a cause", async () => {
@@ -1471,7 +1472,7 @@ describe("PostgreSQL conversation repository", () => {
       { role: "user", content: "overflow", tokenCount: 1 },
       { role: "assistant", content: "also overflow", tokenCount: 1 },
     ])).rejects.toMatchObject({ field: "seq" });
-    expect(db.query).toHaveBeenCalledTimes(3);
+    expect(db.query).toHaveBeenCalledTimes(2);
   });
 
   it("retries only serialization failures and deadlocks, at most three attempts", async () => {
@@ -1499,23 +1500,13 @@ describe("PostgreSQL conversation repository", () => {
     expect(exhausted.transaction).toHaveBeenCalledTimes(3);
   });
 
-  it("re-establishes READ COMMITTED before every retried get-or-create attempt", async () => {
+  it("requests READ COMMITTED before every retried get-or-create attempt", async () => {
     const statements: string[][] = [];
     let attempt = -1;
     const db = executor((config) => {
       statements[attempt].push(
-        config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
-          ? "isolation"
-          : config.text.includes("pg_advisory_xact_lock")
-            ? "lock"
-            : "lookup",
+        config.text.includes("pg_advisory_xact_lock") ? "lock" : "lookup",
       );
-      if (config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED" && attempt < 2) {
-        throw Object.assign(
-          new Error("retry isolation setup"),
-          { code: attempt === 0 ? "40001" : "40P01" },
-        );
-      }
       if (config.text.includes("pg_advisory_xact_lock")) {
         return result([{ pg_advisory_xact_lock: null }]);
       }
@@ -1523,34 +1514,36 @@ describe("PostgreSQL conversation repository", () => {
     });
     db.transaction.mockImplementation(async (
       callback: Parameters<PostgreSqlConversationExecutor["transaction"]>[0],
+      options: Parameters<PostgreSqlConversationExecutor["transaction"]>[1],
     ) => {
       attempt += 1;
       statements.push([]);
+      expect(options.transactionMode).toBe("read-committed-read-write");
+      if (attempt < 2) {
+        throw Object.assign(
+          new Error("retry isolation setup"),
+          { code: attempt === 0 ? "40001" : "40P01" },
+        );
+      }
       return callback(db);
     });
     const repository = new PostgreSqlConversationRepository(db, projectId);
 
     await expect(repository.getOrCreateConversation("session-a"))
       .resolves.toMatchObject({ conversationId: 41 });
-    expect(statements).toEqual([
-      ["isolation"],
-      ["isolation"],
-      ["isolation", "lock", "lookup"],
-    ]);
+    expect(statements).toEqual([[], [], ["lock", "lookup"]]);
   });
 
-  it("re-establishes READ COMMITTED before every retried append attempt", async () => {
+  it("requests READ COMMITTED before every retried append attempt", async () => {
     const statements: string[][] = [];
     let attempt = -1;
     const db = executor((config) => {
       statements[attempt].push(
-        config.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
-          ? "isolation"
-          : config.text.includes("FOR UPDATE")
-            ? "lock"
-            : config.text.includes("MAX(seq)")
-              ? "maximum"
-              : "insert",
+        config.text.includes("FOR UPDATE")
+          ? "lock"
+          : config.text.includes("MAX(seq)")
+            ? "maximum"
+            : "insert",
       );
       if (config.text.includes("FOR UPDATE") && attempt === 0) {
         throw Object.assign(
@@ -1571,9 +1564,11 @@ describe("PostgreSQL conversation repository", () => {
     });
     db.transaction.mockImplementation(async (
       callback: Parameters<PostgreSqlConversationExecutor["transaction"]>[0],
+      options: Parameters<PostgreSqlConversationExecutor["transaction"]>[1],
     ) => {
       attempt += 1;
       statements.push([]);
+      expect(options.transactionMode).toBe("read-committed-read-write");
       return callback(db);
     });
     const repository = new PostgreSqlConversationRepository(db, projectId);
@@ -1584,9 +1579,9 @@ describe("PostgreSQL conversation repository", () => {
       tokenCount: 1,
     }])).resolves.toMatchObject([{ seq: 0 }]);
     expect(statements).toEqual([
-      ["isolation", "lock"],
-      ["isolation", "lock", "maximum"],
-      ["isolation", "lock", "maximum", "insert"],
+      ["lock"],
+      ["lock", "maximum"],
+      ["lock", "maximum", "insert"],
     ]);
   });
 

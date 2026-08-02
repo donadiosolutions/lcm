@@ -10,6 +10,10 @@ BEGIN;
 
 GRANT USAGE ON SCHEMA lcm TO :"lcm_runtime_role";
 
+-- Common project-mutation admission reads the reserved publication guard.
+-- Domain roles do not receive lease INSERT, UPDATE, DELETE, or sequence use.
+GRANT SELECT ON TABLE lcm.fenced_leases TO :"lcm_runtime_role";
+
 -- Trigram filtering and ranking use the extension's schema-qualified functions.
 -- Grant the exact extension namespace/function access so the script also works
 -- when hardened installations revoke their defaults from PUBLIC.

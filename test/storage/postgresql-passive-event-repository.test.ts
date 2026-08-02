@@ -333,7 +333,13 @@ describe("PostgreSqlPassiveEventRepository", () => {
 
     expect(records.map((record) => record.eventId)).toEqual([EVENT_ID, SECOND_EVENT_ID]);
     expect(records[0].machineSequence).toBe(MAX_POSTGRESQL_BIGINT);
-    expect(execution.transaction).toHaveBeenCalledOnce();
+    expect(execution.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "coordination",
+      machineId: MACHINE_ID,
+      operation: "insertEvents",
+      projectId: PROJECT_ID,
+      transactionMode: "read-committed-read-write",
+    });
     const insertCalls = execution.query.mock.calls.filter(
       ([config]) => config.text.includes("INSERT INTO lcm.passive_event_inbox"),
     );

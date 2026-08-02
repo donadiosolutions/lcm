@@ -17,6 +17,7 @@ import {
   type PostgreSqlTestDatabase,
   withPostgreSqlTestDatabase,
 } from "./harness.js";
+import { assertFencedLeaseReadOnlyGrant } from "./grant-assertions.js";
 
 beforeAll(assertHarnessReady);
 
@@ -84,6 +85,7 @@ describe("PostgreSQL 18 memory and administration repositories", () => {
         });
 
       await grantMemoryRuntimePrivileges(database);
+      await assertFencedLeaseReadOnlyGrant(database, "promoted-memory");
       await expect(repository.insert({ content: "granted" }))
         .resolves.toMatch(/^[0-9a-f-]{36}$/u);
 

@@ -6,9 +6,11 @@ import type {
   PostgreSqlOperationContext,
   PostgreSqlQueryExecutor,
   PostgreSqlQueryOptions,
+  PostgreSqlTransactionOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
 import { PostgreSqlStorageOperationError } from "./errors.js";
+import { POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE } from "./publication-guard.js";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -31,11 +33,16 @@ type CoordinationContext = PostgreSqlOperationContext & {
   readonly signal?: AbortSignal;
 };
 
+type CoordinationTransactionContext = CoordinationContext & Pick<
+  PostgreSqlTransactionOptions,
+  "transactionMode"
+>;
+
 export interface PostgreSqlCoordinationExecutor
 extends PostgreSqlQueryExecutor {
   transaction<T>(
     callback: (transaction: PostgreSqlTransactionScopeExecutor) => Promise<T>,
-    options: CoordinationContext,
+    options: CoordinationTransactionContext,
   ): Promise<T>;
 }
 
@@ -561,14 +568,23 @@ function resource(
   operation: string,
   machineId: string,
 ): PostgreSqlCoordinationResource {
-  return {
-    resourceType: nonblankText(
-      value.resourceType,
+  const resourceType = nonblankText(
+    value.resourceType,
+    projectId,
+    operation,
+    "resource_type",
+    machineId,
+  );
+  if (resourceType === POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE) {
+    return coordinationError(
       projectId,
       operation,
       "resource_type",
       machineId,
-    ),
+    );
+  }
+  return {
+    resourceType,
     resourceKey: nonblankText(
       value.resourceKey,
       projectId,
@@ -1277,6 +1293,7 @@ export class PostgreSqlWorkCoordinator {
                     END AS state
              FROM lcm.fenced_leases
              WHERE project_id = $1
+               AND resource_type <> $2
              ORDER BY
                CASE
                  WHEN released_at IS NULL
@@ -1287,8 +1304,12 @@ export class PostgreSqlWorkCoordinator {
                expires_at,
                resource_type,
                resource_key
-             LIMIT $2`,
-      values: [this.projectId, normalizedLimit],
+             LIMIT $3`,
+      values: [
+        this.projectId,
+        POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+        normalizedLimit,
+      ],
     }, this.queryOptions(operation));
     return result.rows.map((row) => {
       const lease = leaseFromRow(row, this.projectId, operation);
@@ -1333,6 +1354,7 @@ export class PostgreSqlWorkCoordinator {
                  SELECT project_id, resource_type, resource_key
                  FROM lcm.fenced_leases
                  WHERE project_id = $1
+                   AND resource_type <> $4
                    AND COALESCE(released_at, expires_at)
                          <= pg_catalog.statement_timestamp()
                            - $2::pg_catalog.float8
@@ -1353,7 +1375,12 @@ export class PostgreSqlWorkCoordinator {
                )
                SELECT COUNT(*)::pg_catalog.text AS count
                FROM deleted`,
-        values: [this.projectId, retentionMs, limit],
+        values: [
+          this.projectId,
+          retentionMs,
+          limit,
+          POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+        ],
       }, this.queryOptions(operation, input.signal));
       return {
         projectId: this.projectId,
@@ -1479,6 +1506,7 @@ export class PostgreSqlWorkCoordinator {
                  SELECT COUNT(*)::pg_catalog.text
                  FROM lcm.fenced_leases
                  WHERE project_id = $1
+                   AND resource_type <> $2
                    AND released_at IS NULL
                    AND expires_at > pg_catalog.statement_timestamp()
                ) AS active_leases,
@@ -1486,6 +1514,7 @@ export class PostgreSqlWorkCoordinator {
                  SELECT COUNT(*)::pg_catalog.text
                  FROM lcm.fenced_leases
                  WHERE project_id = $1
+                   AND resource_type <> $2
                    AND released_at IS NULL
                    AND expires_at <= pg_catalog.statement_timestamp()
                ) AS expired_leases,
@@ -1493,12 +1522,14 @@ export class PostgreSqlWorkCoordinator {
                  SELECT COUNT(*)::pg_catalog.text
                  FROM lcm.fenced_leases
                  WHERE project_id = $1
+                   AND resource_type <> $2
                    AND released_at IS NOT NULL
                ) AS released_leases,
                (
                  SELECT MIN(expires_at)
                  FROM lcm.fenced_leases
                  WHERE project_id = $1
+                   AND resource_type <> $2
                    AND released_at IS NULL
                    AND expires_at > pg_catalog.statement_timestamp()
                ) AS oldest_active_expiry_at,
@@ -1520,7 +1551,10 @@ export class PostgreSqlWorkCoordinator {
                ) AS oldest_claimed_at
              FROM lcm.passive_event_inbox
              WHERE project_id = $1`,
-      values: [this.projectId],
+      values: [
+        this.projectId,
+        POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+      ],
     }, this.queryOptions(operation));
     const row = result.rows[0];
     if (result.rows.length !== 1 || !row) {
@@ -1752,12 +1786,10 @@ export class PostgreSqlWorkCoordinator {
       "transaction" in this.coordinationExecutor
       && typeof this.coordinationExecutor.transaction === "function"
     ) {
-      return this.coordinationExecutor.transaction(async (transaction) => {
-        await transaction.query({
-          text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-        }, this.queryOptions(operation, signal));
-        return callback(transaction);
-      }, this.context(operation, signal));
+      return this.coordinationExecutor.transaction(callback, {
+        ...this.context(operation, signal),
+        transactionMode: "read-committed-read-write",
+      });
     }
     const transaction = await this.transactionScope(operation);
     await this.assertReadCommitted(transaction, operation, signal);

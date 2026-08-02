@@ -12,6 +12,10 @@ import {
 import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import {
+  POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_KEY,
+  POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+} from "../../src/storage/postgresql/publication-guard.js";
+import {
   assertHarnessReady,
   type PostgreSqlTestDatabase,
   settings,
@@ -250,6 +254,29 @@ async function terminateChild(child: ChildProcess): Promise<void> {
       }
     }
   });
+}
+
+async function waitForAdvisoryWaiter(
+  database: PostgreSqlTestDatabase,
+): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const waiting = await database.migrator.query<{ count: string }>({
+      text: `SELECT COUNT(*)::pg_catalog.text AS count
+             FROM pg_catalog.pg_locks AS lock
+             WHERE lock.locktype = 'advisory'
+               AND NOT lock.granted
+               AND lock.database = (
+                 SELECT oid
+                 FROM pg_catalog.pg_database
+                 WHERE datname = pg_catalog.current_database()
+               )`,
+    }, { domain: "coordination", operation: "waitForPublicationLock" });
+    if (waiting.rows[0].count !== "0") return;
+    await database.migrator.query({
+      text: "SELECT pg_catalog.pg_sleep(0.02)",
+    }, { domain: "coordination", operation: "waitForPublicationLock" });
+  }
+  throw new Error("backend-publication guard did not reach advisory lock wait");
 }
 
 describe("PostgreSQL 18 cross-machine coordination", () => {
@@ -662,6 +689,259 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
       } finally {
         await terminateChild(child);
         await contender.close();
+      }
+    });
+  });
+
+  it("guards writers, survives process loss and expiry, and isolates projects", async () => {
+    await withPostgreSqlTestDatabase("backend-publication", async (database) => {
+      await grantCoordinationRuntimePrivileges(database);
+      const first = await createScope(database, "Backend publication first");
+      const secondProjectId = await createProject(
+        database,
+        "Backend publication isolated project",
+      );
+      const writer = runtime(database);
+      const publicationRuntime = runtime(database);
+      let releaseWriter!: () => void;
+      let reportWriterEntered!: () => void;
+      const writerEntered = new Promise<void>((resolve) => {
+        reportWriterEntered = resolve;
+      });
+      const writerHold = new Promise<void>((resolve) => {
+        releaseWriter = resolve;
+      });
+      const activeWriter = writer.transaction(async (transaction) => {
+        await transaction.query({ text: "SELECT 1" }, {
+          domain: "coordination",
+          operation: "holdNormalProjectWriter",
+          projectId: first.projectId,
+        });
+        reportWriterEntered();
+        await writerHold;
+      }, {
+        domain: "coordination",
+        operation: "holdNormalProjectWriter",
+        projectId: first.projectId,
+      });
+      const publicationId = "backend-publication-integration";
+      const evidenceSha256 = createHash("sha256")
+        .update("backend-publication-integration")
+        .digest("hex");
+      try {
+        await writerEntered;
+        const acquisition = publicationRuntime.backendPublicationGuard().acquire({
+          projectId: first.projectId,
+          machineId: first.machineIds[0],
+          publicationId,
+          targetBackend: "postgresql",
+          evidenceSha256,
+          ttlMs: 60_000,
+        });
+        await waitForAdvisoryWaiter(database);
+
+        await expect(writer.query({ text: "SELECT 1" }, {
+          domain: "coordination",
+          operation: "isolatedProjectWriter",
+          projectId: secondProjectId,
+        })).resolves.toMatchObject({ rows: [{ "?column?": 1 }] });
+
+        releaseWriter();
+        await activeWriter;
+        const firstFence = await acquisition;
+        expect(firstFence.databaseExpired).toBe(false);
+
+        await expect(writer.query({ text: "SELECT 1" }, {
+          domain: "coordination",
+          operation: "blockedProjectWriter",
+          projectId: first.projectId,
+        })).rejects.toMatchObject({ reason: "publication-unresolved" });
+
+        await writer.close();
+        const restartedWriter = runtime(database);
+        try {
+          await expect(restartedWriter.query({ text: "SELECT 1" }, {
+            domain: "coordination",
+            operation: "restartedProjectWriter",
+            projectId: first.projectId,
+          })).rejects.toMatchObject({ reason: "publication-unresolved" });
+        } finally {
+          await restartedWriter.close();
+        }
+
+        await database.migrator.query({
+          text: `UPDATE lcm.fenced_leases
+                 SET acquired_at = pg_catalog.statement_timestamp()
+                       - interval '3 seconds',
+                     renewed_at = pg_catalog.statement_timestamp()
+                       - interval '2 seconds',
+                     expires_at = pg_catalog.statement_timestamp()
+                       - interval '1 second'
+                 WHERE project_id = $1::pg_catalog.uuid
+                   AND resource_type = $2::pg_catalog.text
+                   AND resource_key = $3::pg_catalog.text`,
+          values: [
+            first.projectId,
+            POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+            POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_KEY,
+          ],
+        }, { domain: "coordination", operation: "expirePublicationFence" });
+        await expect(publicationRuntime.backendPublicationGuard().acquire({
+          projectId: first.projectId,
+          machineId: first.machineIds[0],
+          publicationId,
+          targetBackend: "postgresql",
+          evidenceSha256,
+          ttlMs: 60_000,
+        })).rejects.toMatchObject({ reason: "fence-expired" });
+
+        const recovered = await publicationRuntime.backendPublicationGuard().acquire({
+          projectId: first.projectId,
+          machineId: first.machineIds[0],
+          publicationId,
+          targetBackend: "postgresql",
+          evidenceSha256,
+          ttlMs: 60_000,
+          expectedFencingToken: firstFence.fencingToken,
+        });
+        expect(recovered.fencingToken).toBeGreaterThan(firstFence.fencingToken);
+        await expect(publicationRuntime.backendPublicationGuard().release({
+          projectId: first.projectId,
+          machineId: first.machineIds[0],
+          publicationId,
+          targetBackend: "postgresql",
+          evidenceSha256,
+          fencingToken: firstFence.fencingToken,
+        })).rejects.toMatchObject({ reason: "fence-mismatch" });
+        await expect(publicationRuntime.backendPublicationGuard().release({
+          projectId: first.projectId,
+          machineId: first.machineIds[0],
+          publicationId,
+          targetBackend: "postgresql",
+          evidenceSha256,
+          fencingToken: recovered.fencingToken,
+        })).resolves.toMatchObject({ releasedAt: expect.any(String) });
+        await expect(publicationRuntime.query({ text: "SELECT 1" }, {
+          domain: "coordination",
+          operation: "releasedProjectWriter",
+          projectId: first.projectId,
+        })).resolves.toMatchObject({ rows: [{ "?column?": 1 }] });
+      } finally {
+        releaseWriter();
+        await Promise.allSettled([
+          activeWriter,
+          writer.close(),
+          publicationRuntime.close(),
+        ]);
+      }
+    });
+  });
+
+  it("pre-acquires complete multi-project scopes and releases partial acquisitions", async () => {
+    await withPostgreSqlTestDatabase("multi-project-admission", async (database) => {
+      await grantCoordinationRuntimePrivileges(database);
+      const scope = await createScope(database, "Multi-project admission");
+      const secondProjectId = await createProject(
+        database,
+        "Multi-project admission second",
+      );
+      const isolatedProjectId = await createProject(
+        database,
+        "Multi-project admission isolated",
+      );
+      const projectIds = [scope.projectId, secondProjectId].sort();
+      const partiallyAcquiredProjectId = projectIds[0]!;
+      const blockedProjectId = projectIds[1]!;
+      const writer = runtime(database);
+      const publisher = runtime(database);
+      const publicationId = "multi-project-partial-acquisition";
+      const evidenceSha256 = createHash("sha256")
+        .update(publicationId)
+        .digest("hex");
+      let releaseHolder!: () => void;
+      let reportHolderEntered!: () => void;
+      const holderEntered = new Promise<void>((resolve) => {
+        reportHolderEntered = resolve;
+      });
+      const holderRelease = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      try {
+        const fence = await publisher.backendPublicationGuard().acquire({
+          projectId: blockedProjectId,
+          machineId: scope.machineIds[0],
+          publicationId,
+          targetBackend: "postgresql",
+          evidenceSha256,
+          ttlMs: 60_000,
+        });
+        let callbackEntered = false;
+        await expect(writer.transaction(async () => {
+          callbackEntered = true;
+        }, {
+          domain: "coordination",
+          operation: "partialMultiProjectAdmission",
+          projectIds,
+        })).rejects.toMatchObject({ reason: "publication-unresolved" });
+        expect(callbackEntered).toBe(false);
+        await expect(writer.query({ text: "SELECT 1" }, {
+          domain: "coordination",
+          operation: "partialAcquisitionReleased",
+          projectId: partiallyAcquiredProjectId,
+        })).resolves.toMatchObject({ rows: [{ "?column?": 1 }] });
+        await publisher.backendPublicationGuard().release({
+          projectId: blockedProjectId,
+          machineId: scope.machineIds[0],
+          publicationId,
+          targetBackend: "postgresql",
+          evidenceSha256,
+          fencingToken: fence.fencingToken,
+        });
+
+        const holder = writer.transaction(async () => {
+          reportHolderEntered();
+          await holderRelease;
+        }, {
+          domain: "coordination",
+          operation: "holdMultiProjectAdmission",
+          projectIds,
+        });
+        await holderEntered;
+        const contendedPublicationId = "multi-project-contended-publication";
+        const contendedEvidenceSha256 = createHash("sha256")
+          .update(contendedPublicationId)
+          .digest("hex");
+        const waiting = publisher.backendPublicationGuard().acquire({
+          projectId: partiallyAcquiredProjectId,
+          machineId: scope.machineIds[0],
+          publicationId: contendedPublicationId,
+          targetBackend: "postgresql",
+          evidenceSha256: contendedEvidenceSha256,
+          ttlMs: 60_000,
+        });
+        await waitForAdvisoryWaiter(database);
+        await expect(writer.query({ text: "SELECT 3" }, {
+          domain: "coordination",
+          operation: "isolatedMultiProjectAdmission",
+          projectId: isolatedProjectId,
+        })).resolves.toMatchObject({ rows: [{ "?column?": 3 }] });
+        releaseHolder();
+        const [, contendedFence] = await Promise.all([holder, waiting]);
+        expect(contendedFence.projectId).toBe(partiallyAcquiredProjectId);
+        await publisher.backendPublicationGuard().release({
+          projectId: partiallyAcquiredProjectId,
+          machineId: scope.machineIds[0],
+          publicationId: contendedPublicationId,
+          targetBackend: "postgresql",
+          evidenceSha256: contendedEvidenceSha256,
+          fencingToken: contendedFence.fencingToken,
+        });
+      } finally {
+        releaseHolder();
+        await Promise.allSettled([
+          writer.close(),
+          publisher.close(),
+        ]);
       }
     });
   });
@@ -1357,14 +1637,26 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
         await transaction.query({
           text: `LOCK TABLE lcm.passive_event_inbox
                  IN ACCESS EXCLUSIVE MODE`,
-        }, { domain: "coordination", operation: "holdInboxTable" });
+        }, {
+          domain: "coordination",
+          operation: "holdInboxTable",
+          projectId: scope.projectId,
+        });
         reportLocked();
         await transaction.query({
           text: "SELECT pg_catalog.pg_sleep(1.25)",
-        }, { domain: "coordination", operation: "holdInboxTable" });
+        }, {
+          domain: "coordination",
+          operation: "holdInboxTable",
+          projectId: scope.projectId,
+        });
         const observed = await transaction.query<{ observed_at: Date }>({
           text: "SELECT pg_catalog.clock_timestamp() AS observed_at",
-        }, { domain: "coordination", operation: "observeInboxUnlock" });
+        }, {
+          domain: "coordination",
+          operation: "observeInboxUnlock",
+          projectId: scope.projectId,
+        });
         return observed.rows[0].observed_at;
       }, {
         domain: "coordination",
@@ -1481,7 +1773,11 @@ describe("PostgreSQL 18 cross-machine coordination", () => {
                    WHERE inbox_id = $1
                    FOR UPDATE`,
             values: [firstA.toString()],
-          }, { domain: "coordination", operation: "holdMachineHead" });
+          }, {
+            domain: "coordination",
+            operation: "holdMachineHead",
+            projectId: scope.projectId,
+          });
           headLocked();
           await held;
         }, {

@@ -9,6 +9,10 @@
 BEGIN;
 
 GRANT USAGE ON SCHEMA lcm TO :"lcm_runtime_role";
+
+-- Common project-mutation admission reads the reserved publication guard.
+-- Domain roles do not receive lease INSERT, UPDATE, DELETE, or sequence use.
+GRANT SELECT ON TABLE lcm.fenced_leases TO :"lcm_runtime_role";
 GRANT EXECUTE ON FUNCTION lcm.normalize_search_text(text)
 TO :"lcm_runtime_role";
 

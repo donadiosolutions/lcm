@@ -13,12 +13,28 @@ export interface PostgreSqlConnectionSettings {
 export interface PostgreSqlOperationContext {
   readonly domain: StorageDomain;
   readonly operation: string;
+  /** Singleton shorthand for a one-project operation scope. */
   readonly projectId?: string;
+  /**
+   * Complete, case-insensitively sorted and unique project scope. Runtime
+   * transactions acquire every project guard before invoking their callback.
+   */
+  readonly projectIds?: readonly string[];
   readonly machineId?: string;
 }
 
 export interface PostgreSqlQueryOptions extends PostgreSqlOperationContext {
   readonly signal?: AbortSignal;
+}
+
+export type PostgreSqlTransactionMode = "read-committed-read-write";
+
+/**
+ * Options accepted only when establishing a root PostgreSQL transaction.
+ * Scoped queries and savepoints cannot request or inherit transaction setup.
+ */
+export interface PostgreSqlTransactionOptions extends PostgreSqlQueryOptions {
+  readonly transactionMode?: PostgreSqlTransactionMode;
 }
 
 export interface PostgreSqlQueryExecutor {

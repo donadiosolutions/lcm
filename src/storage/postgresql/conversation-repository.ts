@@ -15,8 +15,8 @@ import type {
 import type { ConversationRepository } from "../contracts.js";
 import { StorageOperationError } from "../errors.js";
 import type {
-  PostgreSqlOperationContext,
   PostgreSqlQueryExecutor,
+  PostgreSqlTransactionOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
 import {
@@ -38,7 +38,7 @@ const MESSAGE_PART_COLUMNS =
   "part_id, message_id, session_id, part_type, ordinal, text_content, " +
   "tool_call_id, tool_name, tool_input, tool_output, metadata";
 
-type PostgreSqlConversationTransactionContext = PostgreSqlOperationContext & {
+type PostgreSqlConversationTransactionContext = PostgreSqlTransactionOptions & {
   readonly domain: "conversations";
   readonly projectId: string;
   readonly signal?: AbortSignal;
@@ -981,12 +981,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
         return callback(transaction);
       });
     }
-    return this.shortTransaction(root, operation, async (transaction) => {
-      await transaction.query({
-        text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-      }, this.context(operation));
-      return callback(transaction);
-    });
+    return this.shortTransaction(root, operation, callback);
   }
 
   private async assertScopedReadCommitted(
@@ -1069,7 +1064,10 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       try {
         return await root.transaction(
           callback,
-          this.context(operation),
+          {
+            ...this.context(operation),
+            transactionMode: "read-committed-read-write",
+          },
         );
       } catch (error) {
         if (error instanceof PostgreSqlCommitOutcomeUnknownError) throw error;

@@ -269,6 +269,12 @@ describe("PostgreSQL summary repository", () => {
       .resolves.toBeUndefined();
     await expect(repository.linkSummaryToParents("summary-a", []))
       .resolves.toBeUndefined();
+    expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "summaries",
+      operation: "insertSummary",
+      projectId,
+      transactionMode: "read-committed-read-write",
+    });
 
     const lock = db.query.mock.calls.find(
       ([config]) => config.text.includes("pg_advisory_xact_lock"),
@@ -922,7 +928,13 @@ describe("PostgreSQL large-file repository", () => {
       .resolves.toHaveLength(1);
 
     expect(db.query.mock.calls[0]?.[0].text)
-      .toBe("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      .toContain("INSERT INTO lcm.large_files");
+    expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "large-files",
+      operation: "insertLargeFile",
+      projectId,
+      transactionMode: "read-committed-read-write",
+    });
     const lookup = db.query.mock.calls.find(
       ([config]) => config.text.includes("file_id_sha256"),
     )?.[0];

@@ -141,6 +141,9 @@ describe("PostgreSQL identity repository", () => {
       normalized_path: "/work/project-alias",
     };
     const db = executor((config) => {
+      if (config.text.includes("pg_catalog.uuidv7()")) {
+        return result([{ project_id: projectRow.project_id }]);
+      }
       if (config.text.includes("INSERT INTO lcm.projects")) return result([projectRow]);
       if (config.text.includes("SELECT project_id FROM")) return result([{ project_id: projectRow.project_id }]);
       if (config.text.includes("INSERT INTO lcm.project_aliases")) {
@@ -181,15 +184,20 @@ describe("PostgreSQL identity repository", () => {
     expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
       domain: "identity",
       operation: "createProject",
+      projectId: projectRow.project_id,
     });
     const createCall = db.query.mock.calls.find(
       ([query]) => query.text.includes("INSERT INTO lcm.projects"),
     );
     expect(createCall?.[0]).toMatchObject({
-      text: expect.stringContaining("identity_key, display_name"),
-      values: [expect.stringMatching(/^[a-f0-9]{64}$/u), "Project A"],
+      text: expect.stringContaining("project_id, identity_key, display_name"),
+      values: [
+        projectRow.project_id,
+        expect.stringMatching(/^[a-f0-9]{64}$/u),
+        "Project A",
+      ],
     });
-    expect(createCall?.[0].values?.[0]).not.toBe(
+    expect(createCall?.[0].values?.[1]).not.toBe(
       createHash("sha256").update("/work/project").digest("hex"),
     );
     expect(createCall?.[1]).toMatchObject({ operation: "createProject" });
@@ -219,6 +227,9 @@ describe("PostgreSQL identity repository", () => {
   it("trims Unicode project display names at the persistence boundary", async () => {
     const unicodeProjectRow = { ...projectRow, display_name: "Projeto café" };
     const db = executor((config) => {
+      if (config.text.includes("pg_catalog.uuidv7()")) {
+        return result([{ project_id: projectRow.project_id }]);
+      }
       if (config.text.includes("INSERT INTO lcm.projects")) return result([unicodeProjectRow]);
       if (config.text.includes("SELECT project_id FROM")) return result([{ project_id: projectRow.project_id }]);
       if (config.text.includes("INSERT INTO lcm.project_aliases")) return result([aliasRow]);
@@ -232,23 +243,57 @@ describe("PostgreSQL identity repository", () => {
       path: aliasRow.path,
       normalizedPath: aliasRow.normalized_path,
     })).resolves.toMatchObject({ displayName: "Projeto café" });
-    expect(db.query.mock.calls[0][0]).toMatchObject({
-      values: [expect.stringMatching(/^[a-f0-9]{64}$/u), "Projeto café"],
+    const createCall = db.query.mock.calls.find(
+      ([query]) => query.text.includes("INSERT INTO lcm.projects"),
+    );
+    expect(createCall?.[0]).toMatchObject({
+      values: [
+        projectRow.project_id,
+        expect.stringMatching(/^[a-f0-9]{64}$/u),
+        "Projeto café",
+      ],
     });
   });
 
   it("rejects a project insert that returns no identity", async () => {
-    const repository = new PostgreSqlIdentityRepository(executor(() => result([])));
+    const db = executor((config) => config.text.includes("pg_catalog.uuidv7()")
+      ? result([{ project_id: projectRow.project_id }])
+      : result([]));
+    const repository = new PostgreSqlIdentityRepository(db);
     await expect(repository.createProject({
       machineId: machineRow.machine_id,
       displayName: "Project A",
       path: "/work/project",
       normalizedPath: "/work/project",
     })).rejects.toMatchObject({ identityType: "project" });
+    expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "identity",
+      operation: "createProject",
+      projectId: projectRow.project_id,
+    });
+  });
+
+  it("fails closed when the server does not allocate a project UUID", async () => {
+    const db = executor(() => result([]));
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    await expect(repository.createProject({
+      machineId: machineRow.machine_id,
+      displayName: "Project A",
+      path: "/work/project",
+      normalizedPath: "/work/project",
+    })).rejects.toMatchObject({
+      identityType: "project",
+      identityId: "Project A",
+    });
+    expect(db.transaction).not.toHaveBeenCalled();
   });
 
   it("preserves the candidate UUID when a create COMMIT outcome is unknown", async () => {
     const db = executor((config) => {
+      if (config.text.includes("pg_catalog.uuidv7()")) {
+        return result([{ project_id: projectRow.project_id }]);
+      }
       if (config.text.includes("INSERT INTO lcm.projects")) return result([projectRow]);
       if (config.text.includes("SELECT project_id FROM")) {
         return result([{ project_id: projectRow.project_id }]);
@@ -407,7 +452,7 @@ describe("PostgreSQL identity repository", () => {
     expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
       domain: "identity",
       operation: "replaceProjectAlias",
-      projectId: replacementId,
+      projectIds: [projectRow.project_id, replacementId],
     });
     expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
       text: expect.stringContaining("AND project_id = $5"),
@@ -418,13 +463,56 @@ describe("PostgreSQL identity repository", () => {
         aliasRow.normalized_path,
         projectRow.project_id,
       ],
-    }), expect.any(Object));
+    }), {
+      domain: "identity",
+      operation: "replaceProjectAlias",
+      projectIds: [projectRow.project_id, replacementId],
+    });
+    expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("WHERE machine_id = $1 AND path = $2"),
+    }), {
+      domain: "identity",
+      operation: "replaceProjectAlias",
+      projectIds: [projectRow.project_id, replacementId],
+    });
     replaced = false;
     await expect(repository.replaceProjectAlias(input)).resolves.toBeNull();
 
     const missing = new PostgreSqlIdentityRepository(executor(() => result([])));
     await expect(missing.replaceProjectAlias(input))
       .rejects.toBeInstanceOf(PostgreSqlIdentityNotFoundError);
+  });
+
+  it("canonicalizes inverse alias-transfer input into one global guard order", async () => {
+    const targetProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9019";
+    const priorProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021";
+    const priorAlias = { ...aliasRow, project_id: priorProjectId };
+    const db = executor((config) => {
+      if (config.text.includes("SELECT project_id FROM")) {
+        return result([{ project_id: targetProjectId }]);
+      }
+      if (config.text.includes("WHERE machine_id = $1 AND path = $2")) {
+        return result([priorAlias]);
+      }
+      if (config.text.includes("UPDATE lcm.project_aliases")) {
+        return result([{ ...priorAlias, project_id: targetProjectId }]);
+      }
+      throw new Error(`unexpected SQL: ${config.text}`);
+    });
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    await expect(repository.replaceProjectAlias({
+      machineId: machineRow.machine_id,
+      expectedPriorProjectId: priorProjectId,
+      projectId: targetProjectId,
+      path: aliasRow.path,
+      normalizedPath: aliasRow.normalized_path,
+    })).resolves.toMatchObject({ normalizedPath: aliasRow.normalized_path });
+    expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "identity",
+      operation: "replaceProjectAlias",
+      projectIds: [targetProjectId, priorProjectId],
+    });
   });
 
   it("atomically replaces every requested alias only for the expected prior owner", async () => {
@@ -478,6 +566,11 @@ describe("PostgreSQL identity repository", () => {
         prior: [{}, {}],
         inserted: [false, false],
       });
+    expect(db.transaction).toHaveBeenLastCalledWith(expect.any(Function), {
+      domain: "identity",
+      operation: "replaceProjectAliases",
+      projectIds: [projectRow.project_id, replacementId],
+    });
     expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
       text: expect.stringContaining("AND project_id = $5"),
       values: [
@@ -487,7 +580,18 @@ describe("PostgreSQL identity repository", () => {
         aliasRow.normalized_path,
         projectRow.project_id,
       ],
-    }), expect.objectContaining({ operation: "replaceProjectAliases" }));
+    }), {
+      domain: "identity",
+      operation: "replaceProjectAliases",
+      projectIds: [projectRow.project_id, replacementId],
+    });
+    expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("FOR UPDATE"),
+    }), {
+      domain: "identity",
+      operation: "replaceProjectAliases",
+      projectIds: [projectRow.project_id, replacementId],
+    });
 
     currentRows = [aliasRow];
     await expect(repository.replaceProjectAliases(input))
@@ -883,6 +987,31 @@ describe("PostgreSQL identity repository", () => {
       .resolves.toHaveLength(2);
   });
 
+  it("does not unlink a path whose owner changes after read-only discovery", async () => {
+    const db = executor((config) => config.text.includes("DELETE FROM")
+      ? result([])
+      : result([aliasRow]));
+    const repository = new PostgreSqlIdentityRepository(db);
+
+    await expect(repository.unlinkPath(
+      machineRow.machine_id,
+      aliasRow.normalized_path,
+    )).resolves.toBeNull();
+    expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "identity",
+      operation: "unlinkPath",
+      projectId: projectRow.project_id,
+    });
+    expect(db.query).toHaveBeenLastCalledWith(expect.objectContaining({
+      text: expect.stringContaining("AND project_id = $3::pg_catalog.uuid"),
+      values: [
+        machineRow.machine_id,
+        aliasRow.normalized_path,
+        projectRow.project_id,
+      ],
+    }), expect.objectContaining({ projectId: projectRow.project_id }));
+  });
+
   it("preserves unlink snapshots when their COMMIT outcomes are unknown", async () => {
     const db = executor(() => result([aliasRow]));
     const ambiguous = async (
@@ -1140,7 +1269,7 @@ describe("PostgreSQL identity repository", () => {
 
   it("rethrows unlink failures that occur before a candidate snapshot exists", async () => {
     const original = new Error("transaction did not start");
-    const db = executor(() => result([]));
+    const db = executor(() => result([aliasRow]));
     db.transaction.mockRejectedValue(original);
     const repository = new PostgreSqlIdentityRepository(db);
 
@@ -1196,7 +1325,7 @@ describe("PostgreSQL identity repository", () => {
     expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
       domain: "identity",
       operation: "restoreProjectAlias",
-      projectId: projectRow.project_id,
+      projectIds: [projectRow.project_id, priorProjectId],
     });
     expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
       text: expect.stringContaining("AND project_id = $3"),
@@ -1275,6 +1404,11 @@ describe("PostgreSQL identity repository", () => {
       [false, true, false],
       aliases,
     )).resolves.toBe(true);
+    expect(db.transaction).toHaveBeenLastCalledWith(expect.any(Function), {
+      domain: "identity",
+      operation: "restoreProjectAliasBatch",
+      projectIds: [projectRow.project_id, priorProjectId],
+    });
     expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
       text: expect.stringContaining("UPDATE lcm.project_aliases"),
       values: [
@@ -1284,7 +1418,11 @@ describe("PostgreSQL identity repository", () => {
         aliasRow.normalized_path,
         projectRow.project_id,
       ],
-    }), expect.objectContaining({ operation: "restoreProjectAliasBatch" }));
+    }), {
+      domain: "identity",
+      operation: "restoreProjectAliasBatch",
+      projectIds: [projectRow.project_id, priorProjectId],
+    });
     expect(db.query).toHaveBeenCalledWith(expect.objectContaining({
       text: expect.stringContaining("DELETE FROM lcm.project_aliases"),
       values: [

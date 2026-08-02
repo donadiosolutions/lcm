@@ -6,11 +6,13 @@ import type {
   QueryResult,
   QueryResultRow,
 } from "pg";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { StorageOperationError } from "../../src/storage/errors.js";
 import type {
   PostgreSqlConnectionSettings,
+  PostgreSqlQueryOptions,
   PostgreSqlQueryExecutor,
+  PostgreSqlTransactionOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "../../src/storage/postgresql/contracts.js";
 import {
@@ -37,6 +39,10 @@ const SETTINGS: PostgreSqlConnectionSettings = {
   idleTimeoutMs: 200,
   statementTimeoutMs: 300,
 };
+
+const GUARDED_PROJECT = "018f0000-0000-7000-8000-000000000001";
+const OTHER_GUARDED_PROJECT = "018f0000-0000-7000-8000-000000000002";
+const UNDECLARED_GUARDED_PROJECT = "018f0000-0000-7000-8000-000000000003";
 
 interface HealthFixtureRow {
   readonly server_encoding: unknown;
@@ -138,6 +144,8 @@ function fixtures(queryImplementation?: (input: unknown) => unknown) {
     createPool: vi.fn(() => pool),
     createClient: vi.fn(() => cancelClient),
     buildConfig,
+    acquireMutationGuard: vi.fn(async () => undefined),
+    acquirePublicationLock: vi.fn(async () => undefined),
   };
   const runtime = new PostgreSqlRuntime(SETTINGS, dependencies);
   return {
@@ -175,6 +183,633 @@ describe("PostgreSQL runtime", () => {
       host: "db.example", max: 2, idleTimeoutMillis: 200,
     }));
     expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("admits every project-scoped query through one guarded transaction", async () => {
+    const f = fixtures((input) => typeof input === "string"
+      ? result([])
+      : result([{ value: 1 }]));
+    await expect(f.runtime.query<{ value: number }>({ text: "SELECT 1 AS value" }, {
+      projectId: GUARDED_PROJECT,
+      domain: "sessions",
+      operation: "guardedQuery",
+    })).resolves.toMatchObject({ rows: [{ value: 1 }] });
+    expect(f.dependencies.acquireMutationGuard).toHaveBeenCalledTimes(1);
+    expect(f.dependencies.acquireMutationGuard).toHaveBeenCalledWith(
+      expect.any(Object),
+      GUARDED_PROJECT,
+      expect.objectContaining({ projectId: GUARDED_PROJECT }),
+    );
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "SELECT 1 AS value" },
+      "COMMIT",
+    ]);
+  });
+
+  it("acquires the complete sorted project guard set before invoking the callback", async () => {
+    const f = fixtures();
+    const callback = vi.fn(async (transaction: PostgreSqlTransactionScopeExecutor) => {
+      expect(f.dependencies.acquireMutationGuard).toHaveBeenCalledTimes(2);
+      await transaction.query({ text: "SELECT guarded" }, {
+        projectId: GUARDED_PROJECT,
+        domain: "sessions",
+        operation: "firstProject",
+      });
+      await transaction.query({ text: "SELECT other" }, {
+        projectIds: [OTHER_GUARDED_PROJECT],
+        domain: "sessions",
+        operation: "secondProject",
+      });
+    });
+    await expect(f.runtime.transaction(callback, {
+      projectIds: [GUARDED_PROJECT, OTHER_GUARDED_PROJECT],
+      domain: "transaction",
+      operation: "multiProject",
+    })).resolves.toBeUndefined();
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(f.dependencies.acquireMutationGuard.mock.calls.map((call) => call[1]))
+      .toEqual([GUARDED_PROJECT, OTHER_GUARDED_PROJECT]);
+  });
+
+  it("establishes root transaction mode before every guard and callback command", async () => {
+    const f = fixtures();
+    f.dependencies.acquireMutationGuard.mockImplementationOnce(async (
+      executor,
+      _projectId,
+      options,
+    ) => {
+      await executor.query({ text: "SELECT guard" }, options);
+    });
+    const callback = vi.fn(async (transaction: PostgreSqlTransactionScopeExecutor) => {
+      await transaction.query({ text: "SELECT callback" }, {
+        domain: "sessions",
+        machineId: OTHER_GUARDED_PROJECT,
+        operation: "callback",
+        projectId: GUARDED_PROJECT,
+      });
+    });
+
+    await expect(f.runtime.transaction(callback, {
+      domain: "transaction",
+      machineId: OTHER_GUARDED_PROJECT,
+      operation: "orderedSetup",
+      projectId: GUARDED_PROJECT,
+      transactionMode: "read-committed-read-write",
+    })).resolves.toBeUndefined();
+
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      {
+        text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE",
+      },
+      { text: "SELECT guard" },
+      { text: "SELECT callback" },
+      "COMMIT",
+    ]);
+  });
+
+  it("rejects an unsupported root transaction mode before database effects", async () => {
+    const f = fixtures();
+    await expect(f.runtime.transaction(async () => undefined, {
+      domain: "transaction",
+      operation: "invalidMode",
+      transactionMode: "repeatable-read" as never,
+    })).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      operation: "invalidMode",
+    });
+    expect(f.connect).not.toHaveBeenCalled();
+    expect(f.dependencies.acquireMutationGuard).not.toHaveBeenCalled();
+  });
+
+  it("does not admit guards or callbacks until root transaction setup completes", async () => {
+    let completeSetup!: () => void;
+    const setup = new Promise<QueryResult<QueryResultRow>>((resolve) => {
+      completeSetup = () => { resolve(result([])); };
+    });
+    let completeFirstGuard!: () => void;
+    const firstGuard = new Promise<void>((resolve) => {
+      completeFirstGuard = resolve;
+    });
+    let completeSecondGuard!: () => void;
+    const secondGuard = new Promise<void>((resolve) => {
+      completeSecondGuard = resolve;
+    });
+    const f = fixtures((input) => (
+      typeof input === "object"
+      && input !== null
+      && "text" in input
+      && input.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE"
+        ? setup
+        : result([])
+    ));
+    f.dependencies.acquireMutationGuard.mockImplementation(async (
+      _executor,
+      projectId,
+    ) => projectId === GUARDED_PROJECT ? firstGuard : secondGuard);
+    const callback = vi.fn(async () => undefined);
+    const operation = f.runtime.transaction(callback, {
+      domain: "transaction",
+      operation: "deferredSetup",
+      projectIds: [GUARDED_PROJECT, OTHER_GUARDED_PROJECT],
+      transactionMode: "read-committed-read-write",
+    });
+
+    await vi.waitFor(() => expect(f.query).toHaveBeenCalledWith({
+      text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE",
+    }));
+    expect(f.dependencies.acquireMutationGuard).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+    completeSetup();
+    await vi.waitFor(() => {
+      expect(f.dependencies.acquireMutationGuard).toHaveBeenCalledTimes(1);
+    });
+    expect(callback).not.toHaveBeenCalled();
+    completeFirstGuard();
+    await vi.waitFor(() => {
+      expect(f.dependencies.acquireMutationGuard).toHaveBeenCalledTimes(2);
+    });
+    expect(callback).not.toHaveBeenCalled();
+    completeSecondGuard();
+    await expect(operation).resolves.toBeUndefined();
+    expect(callback).toHaveBeenCalledTimes(1);
+  });
+
+  it("rolls back setup failure before guards and without signal preflight SQL", async () => {
+    const signal = new AbortController().signal;
+    const f = fixtures((input) => {
+      if (
+        typeof input === "object"
+        && input !== null
+        && "text" in input
+        && input.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE"
+      ) {
+        throw Object.assign(new Error("setup unavailable"), { code: "0A000" });
+      }
+      return result([]);
+    });
+    const callback = vi.fn(async () => undefined);
+
+    await expect(f.runtime.transaction(callback, {
+      domain: "transaction",
+      operation: "failedSetup",
+      projectId: GUARDED_PROJECT,
+      signal,
+      transactionMode: "read-committed-read-write",
+    })).rejects.toMatchObject({ sqlState: "0A000", operation: "failedSetup" });
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      {
+        text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE",
+      },
+      "ROLLBACK",
+    ]);
+    expect(f.dependencies.acquireMutationGuard).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it("observes cancellation after raw transaction setup without admitting a guard", async () => {
+    let completeSetup!: () => void;
+    const setup = new Promise<QueryResult<QueryResultRow>>((resolve) => {
+      completeSetup = () => { resolve(result([])); };
+    });
+    const f = fixtures((input) => (
+      typeof input === "object"
+      && input !== null
+      && "text" in input
+      && input.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE"
+        ? setup
+        : result([])
+    ));
+    const controller = new AbortController();
+    const callback = vi.fn(async () => undefined);
+    const operation = f.runtime.transaction(callback, {
+      domain: "transaction",
+      operation: "cancelledSetup",
+      projectId: GUARDED_PROJECT,
+      signal: controller.signal,
+      transactionMode: "read-committed-read-write",
+    });
+
+    await vi.waitFor(() => expect(f.query).toHaveBeenCalledWith({
+      text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE",
+    }));
+    controller.abort();
+    await Promise.resolve();
+    expect(f.dependencies.acquireMutationGuard).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+    completeSetup();
+    await expect(operation).rejects.toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      operation: "cancelledSetup",
+    });
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      {
+        text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE",
+      },
+    ]);
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("snapshots root transaction identity and signal before asynchronous acquisition", async () => {
+    let releaseConnect!: (client: PoolClient) => void;
+    const connected = new Promise<PoolClient>((resolve) => {
+      releaseConnect = resolve;
+    });
+    const f = fixtures();
+    f.connect.mockImplementationOnce(async () => connected);
+    const originalSignal = new AbortController().signal;
+    const replacement = new AbortController();
+    replacement.abort();
+    const mutableOptions: {
+      domain: "transaction" | "factory";
+      operation: string;
+      projectId: string;
+      projectIds: string[];
+      signal: AbortSignal;
+    } = {
+      domain: "transaction",
+      operation: "originalOperation",
+      projectId: GUARDED_PROJECT.toUpperCase(),
+      projectIds: [GUARDED_PROJECT.toUpperCase()],
+      signal: originalSignal,
+    };
+    const callback = vi.fn(async () => "done");
+
+    const operation = f.runtime.transaction(callback, mutableOptions);
+    mutableOptions.domain = "factory";
+    mutableOptions.operation = "mutatedOperation";
+    mutableOptions.projectId = OTHER_GUARDED_PROJECT;
+    mutableOptions.projectIds[0] = OTHER_GUARDED_PROJECT;
+    mutableOptions.signal = replacement.signal;
+    releaseConnect(f.poolClient);
+
+    await expect(operation).resolves.toBe("done");
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(f.dependencies.acquireMutationGuard).toHaveBeenCalledWith(
+      expect.any(Object),
+      GUARDED_PROJECT,
+      {
+        domain: "transaction",
+        operation: "originalOperation",
+        projectId: GUARDED_PROJECT,
+        signal: originalSignal,
+      },
+    );
+  });
+
+  it("rejects late project-scope enlargement without acquiring another guard", async () => {
+    const f = fixtures();
+    await expect(f.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "SELECT guarded" }, {
+        projectId: GUARDED_PROJECT,
+        domain: "sessions",
+        operation: "firstProject",
+      });
+      await transaction.query({ text: "SELECT other" }, {
+        projectId: UNDECLARED_GUARDED_PROJECT,
+        domain: "sessions",
+        operation: "secondProject",
+      });
+    }, {
+      projectIds: [GUARDED_PROJECT, OTHER_GUARDED_PROJECT],
+      domain: "transaction",
+      operation: "crossProject",
+    }))
+      .rejects.toMatchObject({
+        code: "STORAGE_TRANSACTION_SCOPE",
+        projectId: UNDECLARED_GUARDED_PROJECT,
+        operation: "secondProject",
+      });
+    expect(f.dependencies.acquireMutationGuard).toHaveBeenCalledTimes(2);
+    expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+  });
+
+  it("rejects an omitted query scope inside a project-scoped transaction before SQL", async () => {
+    let mutatedUndeclaredProject = false;
+    const f = fixtures((input) => {
+      if (
+        typeof input === "object"
+        && input !== null
+        && "text" in input
+        && input.text === "UPDATE undeclared_project"
+      ) {
+        mutatedUndeclaredProject = true;
+      }
+      return result([]);
+    });
+    await expect(f.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "UPDATE undeclared_project" }, {
+        domain: "sessions",
+        operation: "omittedQueryScope",
+      });
+    }, {
+      projectId: GUARDED_PROJECT,
+      domain: "transaction",
+      operation: "scopedQuery",
+    })).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      projectId: GUARDED_PROJECT,
+      operation: "omittedQueryScope",
+    });
+    expect(mutatedUndeclaredProject).toBe(false);
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      "ROLLBACK",
+    ]);
+  });
+
+  it.each([
+    ["unsorted", [OTHER_GUARDED_PROJECT, GUARDED_PROJECT], undefined],
+    ["duplicate", [GUARDED_PROJECT, GUARDED_PROJECT], undefined],
+    ["mismatched singleton", [OTHER_GUARDED_PROJECT], GUARDED_PROJECT],
+  ])("rejects a %s declared project scope before database effects", async (
+    _case,
+    projectIds,
+    projectId,
+  ) => {
+    const f = fixtures();
+    await expect(f.runtime.transaction(async () => undefined, {
+      ...(projectId === undefined ? {} : { projectId }),
+      projectIds,
+      domain: "transaction",
+      operation: "invalidProjectScope",
+    })).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      operation: "invalidProjectScope",
+    });
+    expect(f.connect).not.toHaveBeenCalled();
+    expect(f.dependencies.acquireMutationGuard).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["empty singleton", { projectId: "" }],
+    ["non-string singleton", { projectId: 7 }],
+    ["non-array set", { projectIds: GUARDED_PROJECT }],
+    ["empty set member", { projectIds: [""] }],
+    ["non-string set member", { projectIds: [7] }],
+  ])("sanitizes a malformed %s project scope before database effects", async (
+    _case,
+    malformed,
+  ) => {
+    const f = fixtures();
+    await expect(f.runtime.transaction(async () => undefined, {
+      ...malformed,
+      domain: "transaction",
+      operation: "malformedProjectScope",
+    } as never)).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      operation: "malformedProjectScope",
+    });
+    expect(f.connect).not.toHaveBeenCalled();
+  });
+
+  it("rejects a savepoint scope outside the pre-acquired transaction set", async () => {
+    const f = fixtures();
+    await expect(f.runtime.transaction(async (transaction) => {
+      await transaction.savepoint(async () => undefined, {
+        projectId: UNDECLARED_GUARDED_PROJECT,
+        domain: "sessions",
+        operation: "undeclaredSavepoint",
+      });
+    }, {
+      projectIds: [GUARDED_PROJECT, OTHER_GUARDED_PROJECT],
+      domain: "transaction",
+      operation: "savepointScope",
+    })).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      projectId: UNDECLARED_GUARDED_PROJECT,
+      operation: "undeclaredSavepoint",
+    });
+    expect(f.query).not.toHaveBeenCalledWith(expect.stringContaining("SAVEPOINT"));
+    expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+  });
+
+  it("rejects an omitted savepoint scope inside a project-scoped transaction before SQL", async () => {
+    const f = fixtures();
+    const callback = vi.fn(async (transaction: PostgreSqlQueryExecutor) => {
+      await transaction.query({ text: "UPDATE undeclared_project" }, {
+        domain: "sessions",
+        operation: "savepointMutation",
+      });
+    });
+    await expect(f.runtime.transaction(async (transaction) => {
+      await transaction.savepoint(callback, {
+        domain: "sessions",
+        operation: "omittedSavepointScope",
+      });
+    }, {
+      projectIds: [GUARDED_PROJECT, OTHER_GUARDED_PROJECT],
+      domain: "transaction",
+      operation: "scopedSavepoint",
+    })).rejects.toMatchObject({
+      code: "STORAGE_TRANSACTION_SCOPE",
+      projectId: GUARDED_PROJECT,
+      operation: "omittedSavepointScope",
+    });
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      "ROLLBACK",
+    ]);
+  });
+
+  it.each(["query", "savepoint"] as const)(
+    "rejects nested %s attempts to smuggle root transaction setup",
+    async (kind) => {
+      const f = fixtures();
+      const nestedCallback = vi.fn(async () => undefined);
+      await expect(f.runtime.transaction(async (transaction) => {
+        const options = {
+          domain: "sessions",
+          operation: `nested-${kind}`,
+          projectId: GUARDED_PROJECT,
+          transactionMode: "read-committed-read-write",
+        } as PostgreSqlTransactionOptions;
+        if (kind === "query") {
+          await transaction.query({ text: "UPDATE smuggled" }, options);
+          return;
+        }
+        await transaction.savepoint(nestedCallback, options);
+      }, {
+        domain: "transaction",
+        operation: "nestedSetup",
+        projectId: GUARDED_PROJECT,
+      })).rejects.toMatchObject({
+        code: "STORAGE_TRANSACTION_SCOPE",
+        operation: `nested-${kind}`,
+      });
+      expect(nestedCallback).not.toHaveBeenCalled();
+      expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+        "BEGIN",
+        "ROLLBACK",
+      ]);
+    },
+  );
+
+  it("snapshots queued query, savepoint, and inner-query scopes at admission", async () => {
+    let releaseBlocker!: () => void;
+    const blocker = new Promise<QueryResult<QueryResultRow>>((resolve) => {
+      releaseBlocker = () => { resolve(result([])); };
+    });
+    const f = fixtures((input) => (
+      typeof input === "object"
+      && input !== null
+      && "text" in input
+      && input.text === "SELECT blocker"
+        ? blocker
+        : result([])
+    ));
+    const savepointCallback = vi.fn(async (inner: PostgreSqlQueryExecutor) => {
+      const innerOptions: PostgreSqlQueryOptions & { projectId: string } = {
+        domain: "sessions",
+        operation: "innerOriginal",
+        projectId: GUARDED_PROJECT,
+      };
+      const innerQuery = inner.query({ text: "SELECT inner" }, innerOptions);
+      innerOptions.operation = "innerMutated";
+      innerOptions.projectId = UNDECLARED_GUARDED_PROJECT;
+      await innerQuery;
+    });
+
+    await expect(f.runtime.transaction(async (transaction) => {
+      const blockerQuery = transaction.query({ text: "SELECT blocker" }, {
+        domain: "sessions",
+        operation: "blocker",
+        projectId: GUARDED_PROJECT,
+      });
+      await vi.waitFor(() => expect(f.query).toHaveBeenCalledWith({
+        text: "SELECT blocker",
+      }));
+      const queryOptions: PostgreSqlQueryOptions & { projectId: string } = {
+        domain: "sessions",
+        operation: "queryOriginal",
+        projectId: GUARDED_PROJECT,
+      };
+      const queuedQuery = transaction.query({ text: "SELECT queued" }, queryOptions);
+      queryOptions.operation = "queryMutated";
+      queryOptions.projectId = UNDECLARED_GUARDED_PROJECT;
+      const savepointOptions: PostgreSqlQueryOptions & { projectId: string } = {
+        domain: "sessions",
+        operation: "savepointOriginal",
+        projectId: GUARDED_PROJECT,
+      };
+      const queuedSavepoint = transaction.savepoint(
+        savepointCallback,
+        savepointOptions,
+      );
+      savepointOptions.operation = "savepointMutated";
+      savepointOptions.projectId = UNDECLARED_GUARDED_PROJECT;
+      releaseBlocker();
+      await Promise.all([blockerQuery, queuedQuery, queuedSavepoint]);
+    }, {
+      domain: "transaction",
+      operation: "snapshotNestedScopes",
+      projectId: GUARDED_PROJECT,
+    })).resolves.toBeUndefined();
+    expect(savepointCallback).toHaveBeenCalledTimes(1);
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "SELECT blocker" },
+      { text: "SELECT queued" },
+      "SAVEPOINT lcm_runtime_repository_1",
+      { text: "SELECT inner" },
+      "RELEASE SAVEPOINT lcm_runtime_repository_1",
+      "COMMIT",
+    ]);
+  });
+
+  it("keeps publication control and readback off the ordinary writer seam", async () => {
+    const publicationId = "runtime-publication";
+    const evidence = "a".repeat(64);
+    const publicationRow = {
+      project_id: GUARDED_PROJECT,
+      owner_machine_id: OTHER_GUARDED_PROJECT,
+      owner_process_id: publicationId,
+      operation: `backend-publication:postgresql:${evidence}`,
+      fencing_token: "1",
+      acquired_at: "2026-08-01T00:00:00.000Z",
+      renewed_at: "2026-08-01T00:00:00.000Z",
+      expires_at: "2026-08-01T00:01:00.000Z",
+      released_at: null,
+      expired: false,
+    };
+    const f = fixtures((input) => {
+      if (typeof input === "string") return result([]);
+      if (input.text.includes("FOR UPDATE")) return result([]);
+      if (input.text.includes("INSERT INTO lcm.fenced_leases")) {
+        return result([publicationRow]);
+      }
+      if (input.text.includes("FROM lcm.fenced_leases")) {
+        return result([publicationRow]);
+      }
+      return result([]);
+    });
+    const guard = f.runtime.backendPublicationGuard();
+    await expect(guard.acquire({
+      projectId: GUARDED_PROJECT,
+      machineId: OTHER_GUARDED_PROJECT,
+      publicationId,
+      targetBackend: "postgresql",
+      evidenceSha256: evidence,
+      ttlMs: 60_000,
+    })).resolves.toMatchObject({ fencingToken: 1n });
+    await expect(guard.read({
+      projectId: GUARDED_PROJECT,
+      targetBackend: "postgresql",
+      evidenceSha256: evidence,
+    })).resolves.toMatchObject({ fencingToken: 1n });
+    expect(f.dependencies.acquirePublicationLock).toHaveBeenCalledTimes(1);
+    expect(f.dependencies.acquireMutationGuard).not.toHaveBeenCalled();
+    expectTypeOf<PostgreSqlRuntime>().not.toHaveProperty(
+      "projectPublicationTransaction",
+    );
+    expectTypeOf<PostgreSqlRuntime>().not.toHaveProperty(
+      "projectPublicationReadback",
+    );
+  });
+
+  it("executes every mutation guard query inside the guarded transaction", async () => {
+    const f = fixtures(() => result([]));
+    f.dependencies.acquireMutationGuard.mockImplementationOnce(async (
+      executor,
+      _projectId,
+      options,
+    ) => {
+      await executor.query({ text: "SELECT guard probe" }, options);
+    });
+    await expect(f.runtime.transaction(async () => undefined, {
+      projectId: GUARDED_PROJECT,
+      domain: "transaction",
+      operation: "guardProbe",
+    })).resolves.toBeUndefined();
+    expect(f.query).toHaveBeenCalledWith({ text: "SELECT guard probe" });
+
+    const failed = fixtures((input) => {
+      if (
+        typeof input === "object"
+        && input !== null
+        && "text" in input
+        && input.text === "SELECT failed guard probe"
+      ) throw Object.assign(new Error("guard query failed"), { code: "23505" });
+      return result([]);
+    });
+    failed.dependencies.acquireMutationGuard.mockImplementationOnce(async (
+      executor,
+      _projectId,
+      options,
+    ) => {
+      await executor.query({ text: "SELECT failed guard probe" }, options);
+    });
+    await expect(failed.runtime.transaction(async () => undefined, {
+      projectId: GUARDED_PROJECT,
+      domain: "transaction",
+      operation: "failedGuardProbe",
+    })).rejects.toMatchObject({ operation: "failedGuardProbe" });
+    expect(failed.query).toHaveBeenCalledWith("ROLLBACK");
   });
 
   it("normalizes acquisition and query failures and handles an already-aborted signal", async () => {
@@ -220,7 +855,7 @@ describe("PostgreSQL runtime", () => {
     await expect(f.runtime.transaction(async (transaction) => {
       expect(transaction.transactionScope).toBe("active");
       const selected = await transaction.query<{ value: number }>({ text: "SELECT 2 AS value" }, {
-        domain: "sessions", operation: "inside",
+        projectId: "project", domain: "sessions", operation: "inside",
       });
       return selected.rows[0].value;
     }, { projectId: "project", domain: "transaction", operation: "commit" })).resolves.toBe(2);
@@ -870,7 +1505,7 @@ describe("PostgreSQL runtime", () => {
     });
     await expect(f.runtime.transaction(async (transaction) => {
       await transaction.query({ text: "INSERT INTO values_table VALUES ($1)", values: [1] }, {
-        projectId: "query-project",
+        projectId: "outer-project",
         domain: "sessions",
         operation: "caughtFailure",
       }).catch(() => undefined);
@@ -878,7 +1513,7 @@ describe("PostgreSQL runtime", () => {
     }, { projectId: "outer-project", domain: "transaction", operation: "caughtFailureOuter" }))
       .rejects.toMatchObject({
         code: "STORAGE_OPERATION_FAILED",
-        projectId: "query-project",
+        projectId: "outer-project",
         domain: "sessions",
         operation: "caughtFailure",
         retryable: false,
@@ -914,6 +1549,7 @@ describe("PostgreSQL runtime", () => {
     const pending = f.runtime.transaction(async (transaction) => {
       retained = transaction;
       void transaction.query({ text: "UPDATE values_table SET value = 2" }, {
+        projectId: "outer-project",
         domain: "sessions",
         operation: "unawaitedSuccess",
       });
@@ -972,7 +1608,7 @@ describe("PostgreSQL runtime", () => {
     const f = fixtures((input) => typeof input === "string" ? result([]) : queryResult);
     const pending = f.runtime.transaction(async (transaction) => {
       void transaction.query({ text: "INSERT INTO values_table VALUES (4)" }, {
-        projectId: "query-project",
+        projectId: "outer-project",
         domain: "sessions",
         operation: "unawaitedFailure",
       }).catch(() => undefined);
@@ -985,7 +1621,7 @@ describe("PostgreSQL runtime", () => {
 
     await expect(pending).rejects.toMatchObject({
       code: "STORAGE_OPERATION_FAILED",
-      projectId: "query-project",
+      projectId: "outer-project",
       domain: "sessions",
       operation: "unawaitedFailure",
       retryable: false,
@@ -1211,13 +1847,13 @@ describe("PostgreSQL runtime", () => {
     let withoutProject!: Promise<unknown>;
     await expect(f.runtime.transaction(async (transaction) => {
       const failed = transaction.query({ text: "INSERT INTO first_table VALUES (1)" }, {
-        domain: "transaction", operation: "failed",
+        projectId: "outer-project", domain: "transaction", operation: "failed",
       });
       withProject = transaction.query({ text: "SELECT 1" }, {
-        projectId: "queued-project", domain: "sessions", operation: "queuedWithProject",
+        projectId: "outer-project", domain: "sessions", operation: "queuedWithProject",
       });
       withoutProject = transaction.query({ text: "SELECT 2" }, {
-        domain: "transaction", operation: "queuedWithoutProject",
+        projectIds: ["outer-project"], domain: "transaction", operation: "queuedProjectSet",
       });
       void withProject.catch(() => undefined);
       void withoutProject.catch(() => undefined);
@@ -1226,10 +1862,10 @@ describe("PostgreSQL runtime", () => {
       .rejects.toMatchObject({ operation: "failed" });
 
     await expect(withProject).rejects.toMatchObject({
-      code: "STORAGE_TRANSACTION_SCOPE", projectId: "queued-project", operation: "queuedWithProject",
+      code: "STORAGE_TRANSACTION_SCOPE", projectId: "outer-project", operation: "queuedWithProject",
     });
     await expect(withoutProject).rejects.toMatchObject({
-      code: "STORAGE_TRANSACTION_SCOPE", projectId: "outer-project", operation: "queuedWithoutProject",
+      code: "STORAGE_TRANSACTION_SCOPE", projectId: "outer-project", operation: "queuedProjectSet",
     });
     expect(f.query).not.toHaveBeenCalledWith(expect.objectContaining({ text: "SELECT 1" }));
     expect(f.query).not.toHaveBeenCalledWith(expect.objectContaining({ text: "SELECT 2" }));

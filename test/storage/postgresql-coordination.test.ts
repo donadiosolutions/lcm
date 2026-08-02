@@ -17,6 +17,7 @@ import {
   PostgreSqlWorkCoordinator,
 } from "../../src/storage/postgresql/coordination.js";
 import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
+import { POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE } from "../../src/storage/postgresql/publication-guard.js";
 import { StorageOperationError } from "../../src/storage/errors.js";
 
 const projectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
@@ -432,6 +433,51 @@ describe("PostgreSQL work coordination", () => {
     expect(db.query).not.toHaveBeenCalled();
   });
 
+  it("reserves backend-publication from every caller-selected coordination operation before database effects", async () => {
+    const root = coordinator(() => result([]));
+    const scoped = scopedExecutor(() => result([]));
+    const scopedRepository = new PostgreSqlWorkCoordinator(
+      scoped.executor,
+      projectId,
+      machineId,
+    );
+    const resource = {
+      resourceType: POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+      resourceKey: "selection",
+    };
+    const mutation = {
+      ...resource,
+      processId: "attempted-bypass",
+      operation: "attempted-bypass",
+      fencingToken: 1n,
+    };
+
+    await expect(scopedRepository.acquireTransactionLock({
+      ...resource,
+      operation: "attempted-bypass",
+      timeoutMs: 100,
+    })).rejects.toMatchObject({ field: "resource_type" });
+    await expect(root.repository.acquireLease({
+      ...resource,
+      processId: "attempted-bypass",
+      operation: "attempted-bypass",
+      ttlMs: 100,
+    })).rejects.toMatchObject({ field: "resource_type" });
+    await expect(root.repository.renewLease({
+      ...mutation,
+      ttlMs: 100,
+    })).rejects.toMatchObject({ field: "resource_type" });
+    await expect(root.repository.releaseLease(mutation))
+      .rejects.toMatchObject({ field: "resource_type" });
+    await expect(scopedRepository.assertLeaseFence(mutation))
+      .rejects.toMatchObject({ field: "resource_type" });
+
+    expect(root.transaction).not.toHaveBeenCalled();
+    expect(root.query).not.toHaveBeenCalled();
+    expect(scoped.query).not.toHaveBeenCalled();
+    expect(scoped.savepoint).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["nul\u0000", "resource_key"],
     ["unpaired-high-\ud800", "resource_key"],
@@ -802,13 +848,20 @@ describe("PostgreSQL work coordination", () => {
       operation: "compact",
       ttlMs: 60_000,
     })).resolves.toMatchObject({ fencingToken: 9007199254740993n });
-    expect(db.query.mock.calls[1][0].text).toContain("FOR UPDATE");
-    expect(db.query.mock.calls[2][0].text).toContain(
+    expect(db.query.mock.calls[0][0].text).toContain("FOR UPDATE");
+    expect(db.query.mock.calls[1][0].text).toContain(
       "expires_at <= pg_catalog.statement_timestamp()",
     );
-    expect(db.query.mock.calls[2][0].text).toContain(
+    expect(db.query.mock.calls[1][0].text).toContain(
       "fencing_token = DEFAULT",
     );
+    expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "coordination",
+      machineId,
+      operation: "acquireLease",
+      projectId,
+      transactionMode: "read-committed-read-write",
+    });
   });
 
   it("fails closed for malformed lease acquisition write shapes", async () => {
@@ -1038,6 +1091,7 @@ describe("PostgreSQL work coordination", () => {
   it("lists active, expired, and released lease diagnostics", async () => {
     const db = coordinator((config) => {
       if (config.text.includes("FROM lcm.fenced_leases")) {
+        expect(config.text).toContain("resource_type <> $2");
         return result([
           { ...leaseRow, state: "active" },
           { ...leaseRow, resource_key: "42", state: "expired" },
@@ -1058,7 +1112,11 @@ describe("PostgreSQL work coordination", () => {
       "released",
     ]);
     expect(db.query.mock.calls[0][0]).toMatchObject({
-      values: [projectId, 3],
+      values: [
+        projectId,
+        POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+        3,
+      ],
     });
   });
 
@@ -1080,6 +1138,7 @@ describe("PostgreSQL work coordination", () => {
         return result([]);
       }
       expect(config.text).toContain("FOR UPDATE SKIP LOCKED");
+      expect(config.text).toContain("resource_type <> $4");
       expect(config.text).not.toContain("TRUNCATE");
       return result([{ count: "9007199254740993" }]);
     });
@@ -1090,8 +1149,20 @@ describe("PostgreSQL work coordination", () => {
       projectId,
       deletedCount: 9007199254740993n,
     });
-    expect(db.query.mock.calls[1][0]).toMatchObject({
-      values: [projectId, 30_000, 50],
+    expect(db.query.mock.calls[0][0]).toMatchObject({
+      values: [
+        projectId,
+        30_000,
+        50,
+        POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+      ],
+    });
+    expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "coordination",
+      machineId,
+      operation: "cleanupLeases",
+      projectId,
+      transactionMode: "read-committed-read-write",
     });
   });
 
@@ -1145,8 +1216,16 @@ describe("PostgreSQL work coordination", () => {
       claimedAt: "2026-07-29T10:00:02.000Z",
       claimedBy: "drain-1",
     }]);
-    expect(db.query.mock.calls[1][0]).toMatchObject({
+    expect(db.query.mock.calls[0][0]).toMatchObject({
       values: [projectId, "drain-1", 10, 30_000],
+    });
+    expect(db.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      domain: "coordination",
+      machineId,
+      operation: "claimPassiveEvents",
+      projectId,
+      signal,
+      transactionMode: "read-committed-read-write",
     });
   });
 
@@ -1195,7 +1274,9 @@ describe("PostgreSQL work coordination", () => {
   });
 
   it("returns project-scoped lease and queue diagnostics with exact counts", async () => {
-    const db = coordinator(() => result([{
+    const db = coordinator((config) => {
+      expect(config.text.match(/resource_type <> \$2/gu)).toHaveLength(4);
+      return result([{
       active_leases: "1",
       expired_leases: 2n,
       released_leases: "3",
@@ -1207,7 +1288,8 @@ describe("PostgreSQL work coordination", () => {
       quarantined_events: "8",
       oldest_ready_at: null,
       oldest_claimed_at: "2026-07-29T10:00:00.000Z",
-    }]));
+      }]);
+    });
     await expect(db.repository.getCoordinationDiagnostics()).resolves.toEqual({
       leases: {
         active: 1n,
@@ -1225,7 +1307,9 @@ describe("PostgreSQL work coordination", () => {
         oldestClaimedAt: "2026-07-29T10:00:00.000Z",
       },
     });
-    expect(db.query.mock.calls[0][0]).toMatchObject({ values: [projectId] });
+    expect(db.query.mock.calls[0][0]).toMatchObject({
+      values: [projectId, POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE],
+    });
   });
 
   it("fails closed unless diagnostics return exactly one aggregate row", async () => {

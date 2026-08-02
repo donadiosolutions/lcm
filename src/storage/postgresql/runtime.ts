@@ -7,6 +7,7 @@ import type {
   PostgreSqlQueryExecutor,
   PostgreSqlQueryOptions,
   PostgreSqlRuntimeHealth,
+  PostgreSqlTransactionOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
 import { buildPostgreSqlClientConfig } from "./client-config.js";
@@ -30,17 +31,26 @@ import {
   inspectPostgreSqlSearchConfiguration,
   PostgreSqlSearchConfigurationPreflightError,
 } from "./search-configuration.js";
+import {
+  acquirePostgreSqlProjectMutationGuard,
+  acquirePostgreSqlProjectPublicationLock,
+  PostgreSqlBackendPublicationGuard,
+} from "./publication-guard.js";
 
 export interface PostgreSqlRuntimeDependencies {
   readonly createPool: (config: PoolConfig) => Pool;
   readonly createClient: (config: ClientConfig) => Client;
   readonly buildConfig: typeof buildPostgreSqlClientConfig;
+  readonly acquireMutationGuard: typeof acquirePostgreSqlProjectMutationGuard;
+  readonly acquirePublicationLock: typeof acquirePostgreSqlProjectPublicationLock;
 }
 
 export const POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES: PostgreSqlRuntimeDependencies = {
   createPool: (config) => new Pool(config),
   createClient: (config) => new Client(config),
   buildConfig: buildPostgreSqlClientConfig,
+  acquireMutationGuard: acquirePostgreSqlProjectMutationGuard,
+  acquirePublicationLock: acquirePostgreSqlProjectPublicationLock,
 };
 
 const DEFAULT_POSTGRESQL_TRANSACTION_CONTEXT = {
@@ -67,11 +77,138 @@ function sanitizeServerMajorVersion(value: unknown): number | null {
     : null;
 }
 
+function contextProjectId(
+  context: PostgreSqlOperationContext,
+): string | undefined {
+  return context.projectId ?? context.projectIds?.[0];
+}
+
+function transactionScopeError(
+  context: PostgreSqlOperationContext,
+  fallbackProjectId?: string,
+): StorageOperationError {
+  return new StorageOperationError(
+    "STORAGE_TRANSACTION_SCOPE",
+    "postgresql",
+    contextProjectId(context) ?? fallbackProjectId,
+    context.domain,
+    context.operation,
+  );
+}
+
+function normalizedProjectScope(
+  context: PostgreSqlOperationContext,
+): readonly string[] {
+  let singleton: string | undefined;
+  if (context.projectId !== undefined) {
+    if (typeof context.projectId !== "string" || context.projectId.length === 0) {
+      throw transactionScopeError(context);
+    }
+    singleton = context.projectId.toLowerCase();
+  }
+  if (context.projectIds === undefined) {
+    return singleton === undefined ? [] : [singleton];
+  }
+  if (!Array.isArray(context.projectIds)) {
+    throw transactionScopeError(context);
+  }
+  const projectIds = context.projectIds.map((projectId) => {
+    if (typeof projectId !== "string" || projectId.length === 0) {
+      throw transactionScopeError(context);
+    }
+    return projectId.toLowerCase();
+  });
+  if (
+    projectIds.some((projectId, index) => (
+      index > 0 && projectIds[index - 1]! >= projectId
+    ))
+  ) {
+    throw transactionScopeError(context);
+  }
+  if (
+    singleton !== undefined
+    && (projectIds.length !== 1 || projectIds[0] !== singleton)
+  ) {
+    throw transactionScopeError(context);
+  }
+  return projectIds;
+}
+
+function snapshotScopedQueryOptions(
+  context: PostgreSqlOperationContext,
+  allowedProjectIds: ReadonlySet<string>,
+  fallbackProjectId?: string,
+): PostgreSqlQueryOptions {
+  if ("transactionMode" in context) {
+    throw transactionScopeError(context, fallbackProjectId);
+  }
+  const requestedProjectIds = normalizedProjectScope(context);
+  const projectlessAdminScope = allowedProjectIds.size === 0
+    && requestedProjectIds.length === 0;
+  const admittedProjectSubset = requestedProjectIds.length > 0
+    && requestedProjectIds.every((projectId) => allowedProjectIds.has(projectId));
+  if (!projectlessAdminScope && !admittedProjectSubset) {
+    throw transactionScopeError(context, fallbackProjectId);
+  }
+  return {
+    domain: context.domain,
+    operation: context.operation,
+    ...(context.projectId === undefined
+      ? {}
+      : { projectId: context.projectId.toLowerCase() }),
+    ...(context.projectIds === undefined
+      ? {}
+      : { projectIds: Object.freeze([...requestedProjectIds]) }),
+    ...(context.machineId === undefined ? {} : { machineId: context.machineId }),
+    ...("signal" in context && context.signal !== undefined
+      ? { signal: context.signal as AbortSignal }
+      : {}),
+  };
+}
+
+function transactionSetupSql(
+  options: PostgreSqlTransactionOptions,
+): string | undefined {
+  if (options.transactionMode === undefined) return undefined;
+  if (options.transactionMode !== "read-committed-read-write") {
+    throw transactionScopeError(options);
+  }
+  return "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE";
+}
+
+function snapshotTransactionOptions(
+  context: PostgreSqlTransactionOptions,
+): {
+  readonly options: PostgreSqlTransactionOptions;
+  readonly projectIds: readonly string[];
+  readonly setupSql: string | undefined;
+} {
+  const setupSql = transactionSetupSql(context);
+  const projectIds = Object.freeze([...normalizedProjectScope(context)]);
+  return {
+    options: {
+      domain: context.domain,
+      operation: context.operation,
+      ...(context.projectId === undefined
+        ? {}
+        : { projectId: context.projectId.toLowerCase() }),
+      ...(context.projectIds === undefined ? {} : { projectIds }),
+      ...(context.machineId === undefined ? {} : { machineId: context.machineId }),
+      ...(context.signal === undefined ? {} : { signal: context.signal }),
+      ...(context.transactionMode === undefined
+        ? {}
+        : { transactionMode: context.transactionMode }),
+    },
+    projectIds,
+    setupSql,
+  };
+}
+
 function aborted(context: PostgreSqlOperationContext): StorageOperationError {
   return new StorageOperationError(
     "STORAGE_OPERATION_FAILED",
     "postgresql",
-    context.projectId,
+    contextProjectId(context),
     context.domain,
     context.operation,
   );
@@ -144,6 +281,40 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     config: QueryConfig<I>,
     options: PostgreSqlQueryOptions,
   ): Promise<QueryResult<R>> {
+    if (options.projectId !== undefined || options.projectIds !== undefined) {
+      return this.transaction(
+        (transaction) => transaction.query<R, I>(config, options),
+        options,
+      );
+    }
+    return this.queryDirect(config, options);
+  }
+
+  /** Return the only public capability allowed to bypass normal admission. */
+  backendPublicationGuard(): PostgreSqlBackendPublicationGuard {
+    return new PostgreSqlBackendPublicationGuard({
+      projectPublicationTransaction: this.projectPublicationTransaction.bind(this),
+      projectPublicationReadback: this.projectPublicationReadback.bind(this),
+    });
+  }
+
+  private projectPublicationReadback<
+    R extends QueryResultRow = QueryResultRow,
+    I extends unknown[] = unknown[],
+  >(
+    config: QueryConfig<I>,
+    options: PostgreSqlQueryOptions,
+  ): Promise<QueryResult<R>> {
+    return this.queryDirect(config, options);
+  }
+
+  private async queryDirect<
+    R extends QueryResultRow = QueryResultRow,
+    I extends unknown[] = unknown[],
+  >(
+    config: QueryConfig<I>,
+    options: PostgreSqlQueryOptions,
+  ): Promise<QueryResult<R>> {
     this.assertOpen(options);
     let client: PoolClient | undefined;
     let destroy = false;
@@ -162,8 +333,33 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
 
   async transaction<T>(
     callback: (transaction: PostgreSqlTransactionScopeExecutor) => Promise<T>,
-    options: PostgreSqlOperationContext & { signal?: AbortSignal } = DEFAULT_POSTGRESQL_TRANSACTION_CONTEXT,
+    options: PostgreSqlTransactionOptions = DEFAULT_POSTGRESQL_TRANSACTION_CONTEXT,
   ): Promise<T> {
+    return this.runTransaction(callback, options, false);
+  }
+
+  private projectPublicationTransaction<T>(
+    projectId: string,
+    callback: (transaction: PostgreSqlTransactionScopeExecutor) => Promise<T>,
+    options: PostgreSqlTransactionOptions,
+  ): Promise<T> {
+    return this.runTransaction(
+      callback,
+      { ...options, projectId, projectIds: undefined },
+      true,
+    );
+  }
+
+  private async runTransaction<T>(
+    callback: (transaction: PostgreSqlTransactionScopeExecutor) => Promise<T>,
+    inputOptions: PostgreSqlTransactionOptions,
+    publicationControl: boolean,
+  ): Promise<T> {
+    const snapshot = snapshotTransactionOptions(inputOptions);
+    const options = snapshot.options;
+    const setupSql = snapshot.setupSql;
+    const declaredProjectIds = snapshot.projectIds;
+    const declaredProjectIdSet = new Set(declaredProjectIds);
     this.assertOpen(options);
     let client: PoolClient | undefined;
     let destroy = false;
@@ -175,6 +371,9 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         throw aborted(options);
       }
       await client.query("BEGIN");
+      if (setupSql !== undefined) {
+        await client.query({ text: setupSql });
+      }
       if (options.signal?.aborted) {
         destroy = true;
         throw aborted(options);
@@ -187,12 +386,9 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       const savepointScopeToken = {};
       const scopeError = (
         queryOptions: PostgreSqlOperationContext,
-      ): StorageOperationError => new StorageOperationError(
-        "STORAGE_TRANSACTION_SCOPE",
-        "postgresql",
-        queryOptions.projectId ?? options.projectId,
-        queryOptions.domain,
-        queryOptions.operation,
+      ): StorageOperationError => transactionScopeError(
+        queryOptions,
+        declaredProjectIds[0],
       );
       const recordFatalFailure = (
         error: unknown,
@@ -213,25 +409,85 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         transactionFailure ??= normalized;
         return normalized;
       };
+      const guardExecutor: PostgreSqlQueryExecutor = {
+        query: async <
+          QueryRow extends QueryResultRow = QueryResultRow,
+          QueryInput extends unknown[] = unknown[],
+        >(
+          config: QueryConfig<QueryInput>,
+          queryOptions: PostgreSqlQueryOptions,
+        ): Promise<QueryResult<QueryRow>> => {
+          const combinedSignal = combineAbortSignals(
+            queryOptions.signal,
+            options.signal,
+          );
+          const effectiveOptions = {
+            ...queryOptions,
+            signal: combinedSignal.signal,
+          };
+          try {
+            return await this.queryClient<QueryRow, QueryInput>(
+              client!,
+              config,
+              effectiveOptions,
+            );
+          } catch (error) {
+            throw recordFatalFailure(error, effectiveOptions);
+          } finally {
+            combinedSignal.dispose();
+          }
+        },
+      };
+      const snapshotQueryOptions = (
+        queryOptions: PostgreSqlQueryOptions,
+      ): PostgreSqlQueryOptions => {
+        return snapshotScopedQueryOptions(
+          queryOptions,
+          declaredProjectIdSet,
+          declaredProjectIds[0],
+        );
+      };
+
+      if (publicationControl) {
+        await this.dependencies.acquirePublicationLock(
+          guardExecutor,
+          options.projectId!,
+          { ...options, projectId: options.projectId! },
+        );
+      } else {
+        for (const projectId of declaredProjectIds) {
+          await this.dependencies.acquireMutationGuard(
+            guardExecutor,
+            projectId,
+            {
+              domain: options.domain,
+              operation: options.operation,
+              projectId,
+              ...(options.signal === undefined ? {} : { signal: options.signal }),
+            },
+          );
+        }
+      }
       const transaction: PostgreSqlTransactionScopeExecutor = {
         transactionScope: "active",
         query: async <R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
           config: QueryConfig<I>,
           queryOptions: PostgreSqlQueryOptions,
         ) => {
+          const scopedOptions = snapshotQueryOptions(queryOptions);
           if (
             !acceptingQueries
             || transactionFailed
             || savepointExecutionContext.getStore() === savepointScopeToken
           ) {
-            throw scopeError(queryOptions);
+            throw scopeError(scopedOptions);
           }
           const execute = queryQueue.then(async () => {
             if (transactionFailed) {
-              throw scopeError(queryOptions);
+              throw scopeError(scopedOptions);
             }
-            const combinedSignal = combineAbortSignals(queryOptions.signal, options.signal);
-            const effectiveOptions = { ...queryOptions, signal: combinedSignal.signal };
+            const combinedSignal = combineAbortSignals(scopedOptions.signal, options.signal);
+            const effectiveOptions = { ...scopedOptions, signal: combinedSignal.signal };
             try {
               return await this.queryClient<R, I>(client!, config, effectiveOptions);
             } catch (error) {
@@ -247,23 +503,25 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
           callback: (savepoint: PostgreSqlQueryExecutor) => Promise<R>,
           savepointOptions: PostgreSqlQueryOptions,
         ): Promise<R> => {
+          const scopedSavepointOptions = snapshotQueryOptions(savepointOptions);
           if (
             !acceptingQueries
             || transactionFailed
             || savepointExecutionContext.getStore() === savepointScopeToken
           ) {
-            throw scopeError(savepointOptions);
+            throw scopeError(scopedSavepointOptions);
           }
           const execute = queryQueue.then(async () => {
             if (transactionFailed) {
-              throw scopeError(savepointOptions);
+              throw scopeError(scopedSavepointOptions);
             }
-            if (savepointOptions.signal?.aborted || options.signal?.aborted) {
+            if (scopedSavepointOptions.signal?.aborted || options.signal?.aborted) {
               const failure = aborted({
-                ...savepointOptions,
-                projectId: savepointOptions.projectId ?? options.projectId,
+                ...scopedSavepointOptions,
+                projectId: contextProjectId(scopedSavepointOptions)
+                  ?? declaredProjectIds[0],
               });
-              throw recordFatalFailure(failure, savepointOptions, true);
+              throw recordFatalFailure(failure, scopedSavepointOptions, true);
             }
             savepointOrdinal =
               (savepointOrdinal % Number.MAX_SAFE_INTEGER) + 1;
@@ -273,7 +531,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
               try {
                 await client!.query(`SAVEPOINT ${savepoint}`);
               } catch (error) {
-                throw recordFatalFailure(error, savepointOptions);
+                throw recordFatalFailure(error, scopedSavepointOptions);
               }
 
               let acceptingSavepointQueries = true;
@@ -289,21 +547,22 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
                   config: QueryConfig<QueryInput>,
                   queryOptions: PostgreSqlQueryOptions,
                 ): Promise<QueryResult<QueryRow>> => {
+                  const scopedOptions = snapshotQueryOptions(queryOptions);
                   if (!acceptingSavepointQueries || savepointFailed) {
-                    throw scopeError(queryOptions);
+                    throw scopeError(scopedOptions);
                   }
                   const queryExecute = savepointQueryQueue.then(async () => {
-                    if (savepointFailed) throw scopeError(queryOptions);
+                    if (savepointFailed) throw scopeError(scopedOptions);
                     const savepointCombinedSignal = combineAbortSignals(
-                      queryOptions.signal,
-                      savepointOptions.signal,
+                      scopedOptions.signal,
+                      scopedSavepointOptions.signal,
                     );
                     const combinedSignal = combineAbortSignals(
                       savepointCombinedSignal.signal,
                       options.signal,
                     );
                     const effectiveOptions = {
-                      ...queryOptions,
+                      ...scopedOptions,
                       signal: combinedSignal.signal,
                     };
                     try {
@@ -366,15 +625,15 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
               const rollbackSavepoint = async (
                 original: unknown,
               ): Promise<never> => {
-                if (savepointOptions.signal?.aborted || options.signal?.aborted) {
+                if (scopedSavepointOptions.signal?.aborted || options.signal?.aborted) {
                   const failure = aborted({
-                    ...savepointOptions,
-                    projectId:
-                      savepointOptions.projectId ?? options.projectId,
+                    ...scopedSavepointOptions,
+                    projectId: contextProjectId(scopedSavepointOptions)
+                      ?? declaredProjectIds[0],
                   });
                   throw recordFatalFailure(
                     failure,
-                    savepointOptions,
+                    scopedSavepointOptions,
                     true,
                   );
                 }
@@ -382,7 +641,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
                   await client!.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
                   await client!.query(`RELEASE SAVEPOINT ${savepoint}`);
                 } catch (error) {
-                  recordFatalFailure(error, savepointOptions);
+                  recordFatalFailure(error, scopedSavepointOptions);
                   throw original;
                 }
                 throw original;
@@ -395,18 +654,18 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
                 return rollbackSavepoint(callbackOutcome.error);
               }
 
-              if (savepointOptions.signal?.aborted || options.signal?.aborted) {
+              if (scopedSavepointOptions.signal?.aborted || options.signal?.aborted) {
                 const failure = aborted({
-                  ...savepointOptions,
-                  projectId:
-                    savepointOptions.projectId ?? options.projectId,
+                  ...scopedSavepointOptions,
+                  projectId: contextProjectId(scopedSavepointOptions)
+                    ?? declaredProjectIds[0],
                 });
-                throw recordFatalFailure(failure, savepointOptions, true);
+                throw recordFatalFailure(failure, scopedSavepointOptions, true);
               }
               try {
                 await client!.query(`RELEASE SAVEPOINT ${savepoint}`);
               } catch (error) {
-                throw recordFatalFailure(error, savepointOptions);
+                throw recordFatalFailure(error, scopedSavepointOptions);
               }
               return callbackOutcome.result;
             } catch (error) {
@@ -570,7 +829,13 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
 
   private assertOpen(context: PostgreSqlOperationContext): void {
     if (!this.closed) return;
-    throw new StorageOperationError("STORAGE_CLOSED", "postgresql", context.projectId, context.domain, context.operation);
+    throw new StorageOperationError(
+      "STORAGE_CLOSED",
+      "postgresql",
+      contextProjectId(context),
+      context.domain,
+      context.operation,
+    );
   }
 
   private async acquire(context: PostgreSqlOperationContext & { signal?: AbortSignal }): Promise<PoolClient> {

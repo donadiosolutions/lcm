@@ -33,6 +33,7 @@ import {
   settings,
   withPostgreSqlTestDatabase,
 } from "./harness.js";
+import { assertFencedLeaseReadOnlyGrant } from "./grant-assertions.js";
 
 beforeAll(assertHarnessReady);
 
@@ -395,6 +396,7 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
         });
 
       await grantSummaryContextRuntimePrivileges(database);
+      await assertFencedLeaseReadOnlyGrant(database, "summaries");
 
       const tablePrivileges = await database.migrator.query<{
         grant_key: string;
@@ -1018,7 +1020,11 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
               primary.conversationId.toString(),
             ),
           ],
-        }, { domain: "summaries", operation: "holdCycleRaceBarrier" });
+        }, {
+          domain: "summaries",
+          operation: "holdCycleRaceBarrier",
+          projectId,
+        });
         markBarrierHeld();
         await barrierRelease;
       }, { domain: "summaries", operation: "cycleRaceBarrier", projectId });
@@ -1649,7 +1655,11 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
         async (transaction) => {
           await transaction.query({
             text: "LOCK TABLE lcm.context_items IN ACCESS EXCLUSIVE MODE",
-          }, { domain: "context", operation: "holdPostFenceContextWrite" });
+          }, {
+            domain: "context",
+            operation: "holdPostFenceContextWrite",
+            projectId: firstProjectId,
+          });
           markContextTableLocked();
           await contextTableRelease;
         },
@@ -1760,7 +1770,11 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
         async (transaction) => {
           await transaction.query({
             text: "SET LOCAL enable_seqscan = off",
-          }, { domain: "summaries", operation: "forceSummaryIndexPlans" });
+          }, {
+            domain: "summaries",
+            operation: "forceSummaryIndexPlans",
+            projectId,
+          });
           const identity = await transaction.query<{ "QUERY PLAN": unknown }>({
             text: `EXPLAIN (FORMAT JSON, COSTS OFF)
                    SELECT summary_key
@@ -1771,7 +1785,11 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
                    ORDER BY summary_key
                    LIMIT 2`,
             values: [projectId, "plan-root"],
-          }, { domain: "summaries", operation: "explainSummaryIdentity" });
+          }, {
+            domain: "summaries",
+            operation: "explainSummaryIdentity",
+            projectId,
+          });
           const recursive = await transaction.query<{ "QUERY PLAN": unknown }>({
             text: `EXPLAIN (FORMAT JSON, COSTS OFF)
                    WITH RECURSIVE reachable(summary_key) AS (
@@ -1825,7 +1843,11 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
               conversation.conversationId,
               root.rows[0].summary_key,
             ],
-          }, { domain: "summaries", operation: "explainSummarySubtree" });
+          }, {
+            domain: "summaries",
+            operation: "explainSummarySubtree",
+            projectId,
+          });
           return {
             identity: JSON.stringify(identity.rows[0]["QUERY PLAN"]),
             recursive: JSON.stringify(recursive.rows[0]["QUERY PLAN"]),

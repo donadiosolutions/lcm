@@ -20,8 +20,8 @@ import {
 } from "../contracts.js";
 import { StorageOperationError } from "../errors.js";
 import type {
-  PostgreSqlOperationContext,
   PostgreSqlQueryExecutor,
+  PostgreSqlTransactionOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
 import { PostgreSqlCommitOutcomeUnknownError } from "./errors.js";
@@ -72,7 +72,7 @@ const TRANSCRIPT_LINK_JOIN = `
    AND link.transcript_id = transcript.transcript_id
 `.trim();
 
-type PostgreSqlNativeTranscriptContext = PostgreSqlOperationContext & {
+type PostgreSqlNativeTranscriptContext = PostgreSqlTransactionOptions & {
   readonly domain: "native-transcripts";
   readonly projectId: string;
 };
@@ -1896,12 +1896,10 @@ implements
   ): Promise<T> {
     const root = this.rootExecutor();
     return root
-      ? root.transaction(async (transaction) => {
-          await transaction.query({
-            text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-          }, this.context(operation));
-          return callback(transaction);
-        }, this.context(operation))
+      ? root.transaction(callback, {
+          ...this.context(operation),
+          transactionMode: "read-committed-read-write",
+        })
       : this.scopedSerialized(operation, async (executor) => {
           await this.assertScopedReadCommitted(executor, operation);
           return executor.savepoint(callback, this.context(operation));

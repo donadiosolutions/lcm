@@ -14,6 +14,7 @@ import {
 import {
   POSTGRESQL_PROJECT_REPOSITORY_CONFORMANCE,
 } from "../storage/postgresql-conformance-manifest.js";
+import { assertFencedLeaseReadOnlyGrant } from "./grant-assertions.js";
 
 beforeAll(assertHarnessReady);
 
@@ -62,6 +63,7 @@ describe("PostgreSQL 18 conversation repository", () => {
         });
 
       await grantConversationRuntimePrivileges(database);
+      await assertFencedLeaseReadOnlyGrant(database, "conversations");
       await expect(repository.createConversation({ sessionId: "granted" }))
         .resolves.toMatchObject({ sessionId: "granted" });
 

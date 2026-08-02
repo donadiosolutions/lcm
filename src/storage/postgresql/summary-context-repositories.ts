@@ -18,6 +18,7 @@ import { StorageOperationError } from "../errors.js";
 import type {
   PostgreSqlOperationContext,
   PostgreSqlQueryExecutor,
+  PostgreSqlTransactionOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
 import {
@@ -75,7 +76,7 @@ export interface PostgreSqlSummaryContextRepositoryOptions {
 
 type MutationDomain = "summaries" | "context";
 
-type MutationContext = PostgreSqlOperationContext & {
+type MutationContext = PostgreSqlTransactionOptions & {
   readonly domain: MutationDomain;
   readonly projectId: string;
   readonly signal?: AbortSignal;
@@ -85,7 +86,7 @@ export interface PostgreSqlSummaryContextExecutor
 extends PostgreSqlQueryExecutor {
   transaction<T>(
     callback: (transaction: PostgreSqlTransactionScopeExecutor) => Promise<T>,
-    options: PostgreSqlOperationContext & {
+    options: PostgreSqlTransactionOptions & {
       readonly projectId: string;
       readonly signal?: AbortSignal;
     },
@@ -849,15 +850,10 @@ class RepositoryCore {
         let attempt = 1;
         while (true) {
           try {
-            return await root.transaction(
-              async (transaction) => {
-                await transaction.query({
-                  text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-                }, this.context(domain, operation));
-                return callback(transaction);
-              },
-              this.context(domain, operation),
-            );
+            return await root.transaction(callback, {
+              ...this.context(domain, operation),
+              transactionMode: "read-committed-read-write",
+            });
           } catch (error) {
             if (error instanceof PostgreSqlCommitOutcomeUnknownError) {
               throw error;
@@ -900,10 +896,6 @@ class RepositoryCore {
     ): Promise<T> => {
       if (nested) {
         await this.assertReadCommitted(transaction, domain, operation);
-      } else {
-        await transaction.query({
-          text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-        }, this.context(domain, operation));
       }
       await this.acquireConversationLock(
         transaction,
@@ -941,7 +933,10 @@ class RepositoryCore {
           try {
             return await root.transaction(
               (transaction) => execute(transaction, false),
-              this.context(domain, operation) as MutationContext,
+              {
+                ...this.context(domain, operation),
+                transactionMode: "read-committed-read-write",
+              } as MutationContext,
             );
           } catch (error) {
             if (error instanceof PostgreSqlCommitOutcomeUnknownError) {
