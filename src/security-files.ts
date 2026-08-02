@@ -77,7 +77,7 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
   }
 
   options._beforeOpenForTesting?.();
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(fd);
     if (!stat.isFile()) throw new Error("path is not a regular file");

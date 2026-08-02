@@ -1,3 +1,4 @@
+import { execFileSync, spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -19,7 +20,8 @@ import {
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, parse } from "node:path";
+import { join, parse, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   atomicWritePrivateFile,
@@ -347,6 +349,43 @@ describe("private filesystem primitives", () => {
     expect(() => readBoundedRegularFile(file, { allowedRoot: root, maxBytes: 3 })).toThrow("size limit");
     expect(() => readBoundedRegularFile(file, { allowedRoot: root, maxBytes: -1 })).toThrow(RangeError);
     expect(() => readBoundedRegularFile(file, { allowedRoot: root, maxBytes: 1.5 })).toThrow(RangeError);
+  });
+
+  it("rejects a FIFO without blocking the caller", async () => {
+    const root = makeRoot();
+    const fifo = join(root, "instructions");
+    execFileSync("mkfifo", [fifo]);
+    const helperUrl = pathToFileURL(resolve("src/security-files.ts")).href;
+    const childSource = [
+      `import { readBoundedRegularFileWithStat } from ${JSON.stringify(helperUrl)};`,
+      `const fifo = ${JSON.stringify(fifo)};`,
+      `const root = ${JSON.stringify(root)};`,
+      "try {",
+      "  readBoundedRegularFileWithStat(fifo, { allowedRoot: root, maxBytes: 1 });",
+      "  process.exitCode = 1;",
+      "} catch (error) {",
+      "  process.exitCode = error instanceof Error && error.message === \"path is not a regular file\" ? 0 : 1;",
+      "}",
+    ].join("\n");
+    const child = spawn(process.execPath, [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      childSource,
+    ]);
+    const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveResult, reject) => {
+      const timeout = setTimeout(() => child.kill("SIGKILL"), 1_000);
+      child.once("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once("close", (code, signal) => {
+        clearTimeout(timeout);
+        resolveResult({ code, signal });
+      });
+    });
+
+    expect(result).toEqual({ code: 0, signal: null });
   });
 
   it("deletes only regular files", () => {
