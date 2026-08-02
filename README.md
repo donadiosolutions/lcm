@@ -393,10 +393,18 @@ durable versioned local hook envelopes, idempotent passive-inbox delivery, and
 a bounded crash-recoverable replication worker. Its status, validation,
 quarantine, and exact-event replay commands are operator-invoked and staged;
 hooks remain offline-only and no PostgreSQL worker starts automatically.
-Selecting `postgresql`
-therefore starts the daemon with an explicitly unavailable storage factory
-instead of falling back to SQLite. The health endpoint reports `503` and
-unavailable storage; status and statistics routes return fixed `503` responses, and SQLite
+The common
+[backend-publication guard](docs/postgresql-backend-publication.md) admits
+normal PostgreSQL writers per project and makes backend-selection consumers
+fail closed around a checksummed, crash-recoverable local publication journal.
+An unreleased publication remains blocking after lease expiry until the exact
+generation recovers or aborts; unrelated projects continue independently.
+After a completed publication selects `postgresql`, LCM starts the daemon with
+an explicitly unavailable storage factory instead of falling back to SQLite.
+A direct or legacy PostgreSQL edit with no publication evidence fails earlier
+at backend admission and cannot start storage. For an authenticated completed
+selection, the health endpoint reports `503` and unavailable storage; status
+and statistics routes return fixed `503` responses, and SQLite
 background scans remain disabled. Project routes first validate machine
 registration and the explicit project binding, then fail safely at the
 unavailable repository boundary. Connection credentials stay out of JSON and
@@ -408,14 +416,20 @@ plus the separate
 [native-transcript](docs/postgresql-runtime-transcript-grants.sql) grants when
 that repository is used, and the
 [memory and administration](docs/postgresql-runtime-memory-grants.sql) grants
-for the #88 adapters. Direct distributed-coordination callers also apply the
-separate
+for the #88 adapters, the
+[search](docs/postgresql-runtime-search-grants.sql) grants for PostgreSQL search,
+and the
+[summary/context](docs/postgresql-runtime-summary-context-grants.sql) grants
+for the staged summary, context, and large-file adapters. Direct
+distributed-coordination callers and any process
+that executes backend publication also apply the separate
 [coordination](docs/postgresql-runtime-coordination-grants.sql) grants. The
-same grant script supplies only the additional column-scoped inbox writes,
-applied-row deletion, and identity-sequence usage required by staged #91
-delivery; it does not grant table-wide writes or sequence inspection. The
-staged summary, context, and large-file adapters use their dedicated
-[summary/context](docs/postgresql-runtime-summary-context-grants.sql) grants.
+same grant script supplies the fenced-lease mutation and sequence privileges
+required by the dedicated publication guard, plus only the additional
+column-scoped inbox writes, applied-row deletion, and identity-sequence usage
+required by staged #91 delivery; it does not grant table-wide writes or
+sequence inspection. Ordinary domain writers need only the fenced-lease read
+included in their own grant script.
 See
 [storage backend configuration](docs/configuration.md#storage-backend)
 for operators, the [PostgreSQL schema reference](docs/postgresql-schema.md) for
@@ -431,6 +445,10 @@ The [PostgreSQL cross-machine coordination guide](docs/postgresql-coordination.m
 defines transaction-lock, fenced-lease, final-write fence, queue-claim,
 delivery, acknowledgement, replay, quarantine, cleanup, diagnostic, and
 crash-recovery semantics.
+The [backend-publication guide](docs/postgresql-backend-publication.md) defines
+writer admission, reserved-fence recovery, local publication phases,
+backend-selection consumer behavior, and lock ordering shared by migration and
+routing.
 The [PostgreSQL summary, context, and large-file guide](docs/postgresql-summary-context.md)
 defines graph, coverage, context-range, ordering, lock/fence, grant, query-plan,
 diagnostic, and recovery semantics.

@@ -221,6 +221,27 @@ not contain a `storage` object continue to use the per-project databases under
 }
 ```
 
+Backend selection participates in a crash-recoverable publication protocol.
+If `~/.lcm/backend-publication/journal.json` records any non-terminal phase,
+LCM fails closed before loading daemon or hook configuration, projecting
+effective configuration, creating a storage factory, selecting a backend,
+changing configuration, loading or repairing the project map, or starting a
+project-map watcher. `lcm doctor` reports one sanitized configuration failure,
+continues unrelated diagnostics, and does not repair the configuration,
+project map, journal, recovery material, or remote evidence.
+
+An explicit `storage.backend: "postgresql"` written without publication
+history is accepted as parseable staged configuration, but it is not trusted
+for backend selection, daemon storage, or writes. Once publication history
+exists, deleting the active journal or any required evidence never restores
+legacy compatibility: all consumers continue to fail closed. LCM does not
+infer completion from the current `storage.backend` value or from an expired
+lease. Restart the exact owning migration or routing operation so it can
+authenticate the journal, recovery material, remote fences, and local
+witnesses and then resume or abort safely. Do not delete or edit the private
+journal or recovery material.
+See [Crash-recoverable PostgreSQL backend publication](postgresql-backend-publication.md).
+
 The PostgreSQL configuration, internal PostgreSQL 18 runtime, and schema
 baseline are available for development and adapter conformance. Machine and
 project identity operations are enabled by #84. The conversation adapter from
@@ -228,10 +249,12 @@ project identity operations are enabled by #84. The conversation adapter from
 The native-transcript adapter from #86 is available to explicit programmatic
 backfill and conformance; it does not add a daemon route or CLI command. Normal
 transcript activation remains #224, and the remaining storage/domain
-repositories stay staged until the #92 cutover. A valid `postgresql` selection
-therefore starts the managed daemon, but other
-storage-backed routes remain unavailable and return a sanitized `503` until
-those repositories are activated. Managed start/restart recognizes that authenticated staged response
+repositories stay staged until the #92 cutover. After the publication protocol
+has authenticated and completed a valid `postgresql` selection, the managed
+daemon starts, but other storage-backed routes remain unavailable and return a
+sanitized `503` until those repositories are activated. A direct or legacy
+PostgreSQL edit with no publication evidence is rejected before daemon storage
+starts. Managed start/restart recognizes that authenticated staged response
 as daemon readiness; it does not treat PostgreSQL storage as ready and never
 falls back to SQLite after an explicit PostgreSQL selection. The internal readiness contract also requires
 the parity extensions at their current default versions in the `public` schema;
@@ -250,9 +273,10 @@ still not resolved before fail-open dispatch.
 Manual CLI operations and MCP request admission are not covered by that hook
 exception. They resolve the complete effective configuration and fail closed
 when PostgreSQL credentials, TLS preflight, identity registration, explicit
-project binding, or backend support are unavailable. Daemon startup and
-restart may retain the authenticated staged process described above, but its
-storage routes remain fail-closed. The hook behavior therefore does not provide
+project binding, or backend support are unavailable. After a completed backend
+publication, daemon startup and restart may retain the authenticated staged
+process described above, but its storage routes remain fail-closed. The hook
+behavior therefore does not provide
 SQLite fallback or make the PostgreSQL repository backend available.
 
 Store only non-secret pool and timeout settings in `~/.lcm/config.json`:
@@ -315,9 +339,12 @@ that this runtime role will use:
 [`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql),
 [`postgresql-runtime-conversation-grants.sql`](postgresql-runtime-conversation-grants.sql),
 [`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql),
+[`postgresql-runtime-memory-grants.sql`](postgresql-runtime-memory-grants.sql),
+[`postgresql-runtime-search-grants.sql`](postgresql-runtime-search-grants.sql),
 and
-[`postgresql-runtime-memory-grants.sql`](postgresql-runtime-memory-grants.sql).
-Direct issue #90 coordination callers additionally use
+[`postgresql-runtime-summary-context-grants.sql`](postgresql-runtime-summary-context-grants.sql).
+Direct issue #90 coordination callers and any process that executes backend
+publication additionally use
 [`postgresql-runtime-coordination-grants.sql`](postgresql-runtime-coordination-grants.sql).
 Run them as an administrator, substituting the deployment's restricted runtime
 role:
@@ -341,10 +368,22 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-search-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file docs/postgresql-runtime-summary-context-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
   --file docs/postgresql-runtime-coordination-grants.sql
 ```
 
-The transcript grant permits immutable inserts, provenance reads, and bounded
+Ordinary domain grant scripts provide only the fenced-lease read required for
+shared mutation admission. The coordination script additionally provides the
+column-scoped lease mutations and sequence use required by the dedicated
+backend-publication guard. The transcript grant permits immutable inserts,
+provenance reads, and bounded
 checkpoint updates only; it grants no payload update, deletion, truncation, or
 unrelated table access. Applying it makes the programmatic repository usable,
 not the staged daemon/CLI routes. See

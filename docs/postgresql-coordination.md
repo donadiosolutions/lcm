@@ -13,6 +13,22 @@ coordinate direct programmatic callers that share one PostgreSQL 18 database:
 - atomic apply, retry, quarantine, replay, and applied-row pruning; and
 - bounded lease cleanup and project-scoped diagnostics.
 
+Backend publication reserves one internal lease family from these general
+APIs. See [Crash-recoverable PostgreSQL backend publication](postgresql-backend-publication.md)
+for the shared writer and backend-selection protocol used by migration and
+backend routing.
+
+Every normal runtime mutation declares its complete project scope before the
+transaction callback runs. Callers supply `projectIds` in canonical UUID order
+without duplicates; the existing `projectId` field remains the single-project
+shorthand. The runtime normalizes UUID case, rejects a sequence that is not
+then strictly sorted and unique, and acquires the shared advisory transaction
+guard for each project in that order. Queries and savepoints may use a subset
+of the declared scope but cannot add a project after admission. Operations that transfer or
+restore identity declare both the prior and current project IDs. Only
+machine-global registration/recovery and administrative migration or health
+preflight are projectless exceptions.
+
 This feature does not change SQLite coordination, select PostgreSQL through
 `ProjectStorage`, automatically start the drain worker, or activate PostgreSQL
 for normal daemon data routes. Those routes remain gated by #92 and #224.
@@ -240,6 +256,17 @@ PostgreSQL daemon routing.
 exact `bigint` lease and inbox counts plus the oldest relevant timestamps.
 These are operational snapshots; ownership decisions still occur in the
 mutating transaction.
+
+The internal `backend-publication` resource is deliberately absent from these
+general views and from `cleanupLeases`. General coordination callers cannot
+acquire, renew, release, validate, inspect, or delete it; only
+`PostgreSqlRuntime.backendPublicationGuard()` may operate that crash-recovery
+evidence.
+
+This is a cooperative application boundary. Direct SQL from an administrator
+or an uncooperative client does not pass through runtime admission and must be
+stopped separately during publication. The protocol does not add a schema
+migration, table-wide lock, or broad `MAINTAIN` privilege.
 
 For a read-only operator snapshot, bind the project rather than removing the
 scope predicate:
