@@ -351,7 +351,7 @@ describe("private filesystem primitives", () => {
     expect(() => readBoundedRegularFile(file, { allowedRoot: root, maxBytes: 1.5 })).toThrow(RangeError);
   });
 
-  it("rejects a FIFO without blocking the caller", async () => {
+  it.runIf(process.platform === "linux")("rejects a FIFO without blocking the caller", async () => {
     const root = makeRoot();
     const fifo = join(root, "instructions");
     execFileSync("mkfifo", [fifo]);
@@ -373,19 +373,39 @@ describe("private filesystem primitives", () => {
       "--eval",
       childSource,
     ]);
-    const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveResult, reject) => {
-      const timeout = setTimeout(() => child.kill("SIGKILL"), 1_000);
+    const result = await new Promise<number>((resolveResult, reject) => {
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // The close handler still reports the timeout after an exit race.
+        }
+      }, 1_000);
       child.once("error", (error) => {
         clearTimeout(timeout);
         reject(error);
       });
       child.once("close", (code, signal) => {
         clearTimeout(timeout);
-        resolveResult({ code, signal });
+        if (timedOut) {
+          reject(new Error("FIFO regression child timed out"));
+          return;
+        }
+        if (signal !== null) {
+          reject(new Error(`FIFO regression child exited from signal ${signal}`));
+          return;
+        }
+        if (code === null) {
+          reject(new Error("FIFO regression child exited without a status"));
+          return;
+        }
+        resolveResult(code);
       });
     });
 
-    expect(result).toEqual({ code: 0, signal: null });
+    expect(result).toBe(0);
   });
 
   it("deletes only regular files", () => {

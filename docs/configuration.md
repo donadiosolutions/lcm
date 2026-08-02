@@ -376,7 +376,8 @@ The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,
 TLS configuration and uses the required CA file for certificate verification.
 The CA path must be absolute and resolve to a readable, non-empty regular file
 no larger than 1 MiB (1,048,576 bytes). Directories, FIFOs, device nodes, and
-other non-regular files are rejected before LCM reads certificate contents.
+other non-regular files are opened nonblocking and rejected before LCM reads
+certificate contents, so a writerless FIFO cannot hang the operation.
 The runtime also rejects any URL query parameter or fragment, requires explicit
 username, password, host, and database components, and does not consult `PG*`
 environment variables. The CA and URL are the only TLS and endpoint authority.
