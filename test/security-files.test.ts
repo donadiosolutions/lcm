@@ -1,3 +1,4 @@
+import { execFileSync, spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -19,7 +20,8 @@ import {
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, parse } from "node:path";
+import { join, parse, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   atomicWritePrivateFile,
@@ -347,6 +349,63 @@ describe("private filesystem primitives", () => {
     expect(() => readBoundedRegularFile(file, { allowedRoot: root, maxBytes: 3 })).toThrow("size limit");
     expect(() => readBoundedRegularFile(file, { allowedRoot: root, maxBytes: -1 })).toThrow(RangeError);
     expect(() => readBoundedRegularFile(file, { allowedRoot: root, maxBytes: 1.5 })).toThrow(RangeError);
+  });
+
+  it.runIf(process.platform === "linux")("rejects a FIFO without blocking the caller", async () => {
+    const root = makeRoot();
+    const fifo = join(root, "instructions");
+    execFileSync("mkfifo", [fifo]);
+    const helperUrl = pathToFileURL(resolve("src/security-files.ts")).href;
+    const childSource = [
+      `import { readBoundedRegularFileWithStat } from ${JSON.stringify(helperUrl)};`,
+      `const fifo = ${JSON.stringify(fifo)};`,
+      `const root = ${JSON.stringify(root)};`,
+      "try {",
+      "  readBoundedRegularFileWithStat(fifo, { allowedRoot: root, maxBytes: 1 });",
+      "  process.exitCode = 1;",
+      "} catch (error) {",
+      "  process.exitCode = error instanceof Error && error.message === \"path is not a regular file\" ? 0 : 1;",
+      "}",
+    ].join("\n");
+    const child = spawn(process.execPath, [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      childSource,
+    ]);
+    const result = await new Promise<number>((resolveResult, reject) => {
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // The close handler still reports the timeout after an exit race.
+        }
+      }, 1_000);
+      child.once("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once("close", (code, signal) => {
+        clearTimeout(timeout);
+        if (timedOut) {
+          reject(new Error("FIFO regression child timed out"));
+          return;
+        }
+        if (signal !== null) {
+          reject(new Error(`FIFO regression child exited from signal ${signal}`));
+          return;
+        }
+        if (code === null) {
+          reject(new Error("FIFO regression child exited without a status"));
+          return;
+        }
+        resolveResult(code);
+      });
+    });
+
+    expect(result).toBe(0);
   });
 
   it("deletes only regular files", () => {
