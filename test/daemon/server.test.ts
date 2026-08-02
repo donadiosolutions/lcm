@@ -18,6 +18,16 @@ import {
   resolveProjectIdentity,
   setRemoteProjectBinding,
 } from "../../src/project-map.js";
+import {
+  backendPublicationConfigSha256,
+  backendPublicationProjectMapSha256,
+  prepareBackendPublication,
+} from "../../src/storage/backend-publication.js";
+
+vi.mock("../../src/storage/backend-publication.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/storage/backend-publication.js")>();
+  return { ...actual, assertBackendPublicationConsumerAccess: vi.fn() };
+});
 
 const testIdentity = {
   ownerId: "server-tests",
@@ -386,6 +396,26 @@ describe("daemon server", () => {
     } finally {
       rmSync(canonical, { recursive: true, force: true });
     }
+  });
+
+  it("does not suppress unresolved publication while deriving transcript scan paths", () => {
+    prepareBackendPublication({
+      publicationId: "transcript-scan-publication",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      expectedConfigSha256: backendPublicationConfigSha256(),
+      expectedProjectMapSha256: backendPublicationProjectMapSha256(),
+      intendedConfigSha256: "1".repeat(64),
+      intendedProjectMapSha256: "2".repeat(64),
+      projects: [{
+        localProjectId: "a".repeat(64),
+        remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+        evidenceSha256: "3".repeat(64),
+      }],
+    });
+
+    expect(() => projectTranscriptScanCwds("unknown-hash", tempHome!))
+      .toThrowError(expect.objectContaining({ reason: "unresolved-publication" }));
   });
 
   it("scans alias Claude transcripts into the canonical project database", async () => {

@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -10,55 +10,78 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-describe("setup config leaf security", () => {
-  it.each(["existing", "dangling"])("rejects an %s config symlink without following it", (kind) => {
-    const root = mkdtempSync(join(tmpdir(), "lcm-setup-security-"));
+function setupFakeLcm(root: string): { bin: string; calls: string } {
+  const bin = join(root, "bin");
+  const calls = join(root, "calls.log");
+  const fakeLcm = join(bin, "lcm");
+  spawnSync("mkdir", ["-p", bin], { stdio: "ignore" });
+  writeFileSync(fakeLcm, `#!/usr/bin/env bash
+set -euo pipefail
+{
+  echo CALL
+  for arg in "$@"; do printf 'ARG=%s\\n' "$arg"; done
+} >> "$LCM_CALL_LOG"
+if [ "\${1:-}" = config ] && [ "\${LCM_CONFIG_REJECTION:-}" != "" ]; then
+  echo "$LCM_CONFIG_REJECTION" >&2
+  exit 1
+fi
+exit 0
+`);
+  chmodSync(fakeLcm, 0o755);
+  return { bin, calls };
+}
+
+function runSetup(root: string, rejection?: string) {
+  const home = join(root, "home");
+  const { bin, calls } = setupFakeLcm(root);
+  const result = spawnSync("bash", [join(process.cwd(), "installer", "setup.sh")], {
+    encoding: "utf-8",
+    input: "",
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      LCM_CALL_LOG: calls,
+      ...(rejection === undefined ? {} : { LCM_CONFIG_REJECTION: rejection }),
+    },
+  });
+  return { result, calls: readFileSync(calls, "utf8") };
+}
+
+describe("setup guarded config delegation", () => {
+  it("delegates one complete llm object before install and doctor", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-setup-delegation-"));
     roots.push(root);
-    const home = join(root, "home");
-    const bin = join(root, "bin");
-    const configDir = join(home, ".lcm");
-    mkdirSync(configDir, { recursive: true });
-    mkdirSync(bin);
-    const fakeLcm = join(bin, "lcm");
-    writeFileSync(fakeLcm, "#!/usr/bin/env bash\nexit 0\n");
-    chmodSync(fakeLcm, 0o755);
 
-    const victim = join(root, "victim.json");
-    if (kind === "existing") writeFileSync(victim, '{"preserve":true}\n');
-    symlinkSync(victim, join(configDir, "config.json"));
+    const { result, calls } = runSetup(root);
 
-    const result = spawnSync("bash", [join(process.cwd(), "installer", "setup.sh")], {
-      encoding: "utf-8",
-      input: "",
-      env: { ...process.env, HOME: home, USERPROFILE: home, PATH: `${bin}:${process.env.PATH ?? ""}` },
-    });
-
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain("refusing to use symlink config path");
-    if (kind === "existing") expect(readFileSync(victim, "utf-8")).toBe('{"preserve":true}\n');
+    expect(result.status).toBe(0);
+    expect(calls).toBe([
+      "CALL", "ARG=config", "ARG=set", "ARG=llm", 'ARG={"provider":"auto"}', "ARG=--json",
+      "CALL", "ARG=install",
+      "CALL", "ARG=doctor",
+      "",
+    ].join("\n"));
   });
 
-  it("rejects an oversized existing config before parsing it", () => {
-    const root = mkdtempSync(join(tmpdir(), "lcm-setup-security-"));
+  it.each([
+    "refusing to use a symlink config path",
+    "file exceeds the configured size limit",
+    "PostgreSQL selection has no completed backend publication evidence",
+  ])("propagates common config rejection without reaching install or doctor: %s", (rejection) => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-setup-rejection-"));
     roots.push(root);
-    const home = join(root, "home");
-    const bin = join(root, "bin");
-    const configDir = join(home, ".lcm");
-    mkdirSync(configDir, { recursive: true });
-    mkdirSync(bin);
-    const fakeLcm = join(bin, "lcm");
-    writeFileSync(fakeLcm, "#!/usr/bin/env bash\nexit 0\n");
-    chmodSync(fakeLcm, 0o755);
-    writeFileSync(join(configDir, "config.json"), `{"padding":"${"x".repeat(1024 * 1024)}"}\n`);
+    const victim = join(root, "victim.json");
+    writeFileSync(victim, '{"preserve":true}\n');
 
-    const result = spawnSync("bash", [join(process.cwd(), "installer", "setup.sh")], {
-      encoding: "utf-8",
-      input: "",
-      env: { ...process.env, HOME: home, USERPROFILE: home, PATH: `${bin}:${process.env.PATH ?? ""}` },
-    });
+    const { result, calls } = runSetup(root, rejection);
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("exceeds the 1 MiB safety limit");
-    expect(result.stderr).not.toContain("invalid JSON");
+    expect(result.stderr).toContain(rejection);
+    expect(calls).toBe([
+      "CALL", "ARG=config", "ARG=set", "ARG=llm", 'ARG={"provider":"auto"}', "ARG=--json", "",
+    ].join("\n"));
+    expect(readFileSync(victim, "utf8")).toBe('{"preserve":true}\n');
   });
 });

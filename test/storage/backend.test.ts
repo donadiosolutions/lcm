@@ -1,15 +1,29 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   selectStorageBackend,
-  StorageBackendUnavailableError,
 } from "../../src/storage/backend.js";
+
+let home: string;
+
+beforeEach(() => {
+  home = mkdtempSync(join(tmpdir(), "lcm-storage-backend-"));
+  vi.stubEnv("HOME", home);
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(home, { recursive: true, force: true });
+});
 
 describe("storage backend selection", () => {
   it("selects SQLite", () => {
     expect(selectStorageBackend({ backend: "sqlite" })).toEqual({ backend: "sqlite" });
   });
 
-  it("fails explicitly for PostgreSQL until repository support lands", () => {
+  it("treats legacy no-journal PostgreSQL selection as untrusted", () => {
     const config = {
       backend: "postgresql" as const,
       postgresql: {
@@ -21,12 +35,17 @@ describe("storage backend selection", () => {
         caFile: "/tmp/ca.crt",
       },
     };
-    expect(() => selectStorageBackend(config)).toThrow(StorageBackendUnavailableError);
+    expect(() => selectStorageBackend(config)).toThrowError(
+      expect.objectContaining({ reason: "publication-evidence-missing" }),
+    );
     try {
       selectStorageBackend(config);
     } catch (error) {
-      expect(error).toMatchObject({ name: "StorageBackendUnavailableError" });
-      expect((error as Error).message).toContain("not available in this release");
+      expect(error).toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "publication-evidence-missing",
+      });
+      expect((error as Error).message).toContain("publication evidence");
       expect((error as Error).message).not.toContain("secret");
     }
   });

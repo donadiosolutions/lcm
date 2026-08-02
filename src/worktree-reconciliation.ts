@@ -54,6 +54,10 @@ import {
   isWorktreeReconciliationFence,
   serializeWorktreeReconciliationFence,
 } from "./worktree-reconciliation-fence.js";
+import {
+  assertBackendPublicationConsumerAccess,
+  withBackendPublicationConsumerLock,
+} from "./storage/backend-publication.js";
 
 const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_PATTERN_BYTES = 1024 * 1024;
@@ -2225,7 +2229,7 @@ export function reconcileWorktrees(
   }
 }
 
-export function ensureWorktreeProjectReconciled(
+function ensureWorktreeProjectReconciledUnlocked(
   cwd: string,
   identity?: ProjectIdentity,
   opts: {
@@ -2334,6 +2338,28 @@ export function ensureWorktreeProjectReconciled(
     }
   }
   return result;
+}
+
+export function ensureWorktreeProjectReconciled(
+  cwd: string,
+  identity?: ProjectIdentity,
+  opts: {
+    /** @internal Override the bounded process-cache lifetime for deterministic tests. */
+    readonly _cacheTtlMs?: number;
+    /** @internal Override wall-clock time for deterministic cache tests. */
+    readonly _nowMs?: number;
+    /** @internal Override ~/.codex for deterministic catalogue tests. */
+    readonly _codexDir?: string;
+    /** @internal Bound catalogue walks for deterministic tests. */
+    readonly _maxDiscoveryEntries?: number;
+    /** @internal Observe catalogue walks for deterministic tests. */
+    readonly _discoveryObserver?: (path: string) => void;
+  } = {},
+): WorktreeReconciliationResult {
+  return withBackendPublicationConsumerLock(undefined, () => {
+    assertBackendPublicationConsumerAccess();
+    return ensureWorktreeProjectReconciledUnlocked(cwd, identity, opts);
+  });
 }
 
 export function clearWorktreeReconciliationCache(): void {

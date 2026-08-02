@@ -57,11 +57,44 @@ describe("daemon route and lifecycle boundaries", () => {
     );
   });
 
+  it("rejects malformed test identities and Vitest worker token ownership", async () => {
+    await expect(createDaemon(config(), {
+      _testIdentity: { entrypoint: "/missing-owner.mjs" } as never,
+    })).rejects.toThrow("test identity is incomplete or malformed");
+
+    const originalEntrypoint = process.argv[1];
+    process.argv[1] = "/repo/node_modules/vitest/dist/workers/forks.js";
+    try {
+      await expect(createDaemon(config(), {
+        tokenPath: join(home, "unused-token"),
+      })).rejects.toThrow("Refusing to authenticate a Vitest worker");
+    } finally {
+      process.argv[1] = originalEntrypoint;
+    }
+  });
+
   it("rejects a missing token file", async () => {
     await expect(createDaemon(config(), {
       tokenPath: join(home, "missing-token"),
       _testIdentity: testIdentity,
     })).rejects.toThrow("could not be read");
+  });
+
+  it("preserves public health without a scoped test owner", async () => {
+    const tokenPath = join(home, "production-token");
+    ensureAuthToken(tokenPath);
+    const originalEntrypoint = process.argv[1];
+    process.argv[1] = join(home, "lcm.mjs");
+    let productionDaemon: DaemonInstance | undefined;
+    try {
+      productionDaemon = await createDaemon(config(), { tokenPath });
+      const response = await fetch(`http://127.0.0.1:${productionDaemon.address().port}/health`);
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.not.toHaveProperty("ownerId");
+    } finally {
+      process.argv[1] = originalEntrypoint;
+      await productionDaemon?.stop();
+    }
   });
 
   it("uses the default idle callback", async () => {

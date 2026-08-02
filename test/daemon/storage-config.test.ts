@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   daemonConfigForPersistence,
   loadDaemonConfig,
@@ -12,6 +12,11 @@ import {
 } from "../../src/daemon/config.js";
 import { createDaemon } from "../../src/daemon/server.js";
 import { parsePostgreSqlUrl } from "../../src/storage/postgresql/client-config.js";
+
+vi.mock("../../src/storage/backend-publication.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/storage/backend-publication.js")>();
+  return { ...actual, assertBackendPublicationConsumerAccess: vi.fn() };
+});
 
 const tempDirs: string[] = [];
 

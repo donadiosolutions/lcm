@@ -34,13 +34,15 @@ interface FakeStatement {
 
 const mocks = vi.hoisted(() => ({
   baseExists: true,
-  configFails: false,
+  configError: null as Error | null,
+  configBackend: "sqlite" as "sqlite" | "postgresql",
   eventsFail: false,
   entries: [] as Array<{ name: string; directory: boolean; dbExists: boolean }>,
   close: vi.fn<(project: string) => void>(),
   migrate: vi.fn<(db: FakeDatabaseState) => void>(),
   collectEvents: vi.fn<(maxDbs: number) => void>(),
   loadConfig: vi.fn<(path: string) => void>(),
+  selectBackend: vi.fn<(backend: "sqlite" | "postgresql") => void>(),
   findStale: vi.fn<(args: FakeStaleQuery) => unknown[]>(),
   getRecallStats: vi.fn<() => RecallStats>(),
 }));
@@ -62,10 +64,23 @@ vi.mock("../src/runtime-paths.js", () => ({
   projectsDir: () => "/coverage/projects",
 }));
 vi.mock("../src/daemon/config.js", () => ({
-  loadDaemonConfig: (path: string): { restoration: { staleAfterDays: number; staleSurfacingWithoutUseLimit: number } } => {
+  loadDaemonConfig: (path: string): {
+    storage: { backend: "sqlite" | "postgresql" };
+    restoration: { staleAfterDays: number; staleSurfacingWithoutUseLimit: number };
+  } => {
     mocks.loadConfig(path);
-    if (mocks.configFails) throw new Error("config broken");
-    return { restoration: { staleAfterDays: 12, staleSurfacingWithoutUseLimit: 3 } };
+    if (mocks.configError !== null) throw mocks.configError;
+    return {
+      storage: { backend: mocks.configBackend },
+      restoration: { staleAfterDays: 12, staleSurfacingWithoutUseLimit: 3 },
+    };
+  },
+}));
+vi.mock("../src/storage/backend.js", () => ({
+  selectStorageBackend: ({ backend }: { backend: "sqlite" | "postgresql" }) => {
+    mocks.selectBackend(backend);
+    if (backend === "postgresql") throw new Error("PostgreSQL backend rejected");
+    return { backend: "sqlite" as const };
   },
 }));
 vi.mock("../src/db/migration.js", () => ({
@@ -107,6 +122,7 @@ vi.mock("node:sqlite", () => ({
 }));
 
 import { collectStats, formatNumber, formatRatio, printStats } from "../src/stats.js";
+import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 
 type Stats = Parameters<typeof printStats>[0];
 
@@ -114,7 +130,8 @@ describe("stats service coverage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.baseExists = true;
-    mocks.configFails = false;
+    mocks.configError = null;
+    mocks.configBackend = "sqlite";
     mocks.eventsFail = false;
     mocks.entries = [];
     projects.clear();
@@ -130,6 +147,23 @@ describe("stats service coverage", () => {
   it("returns the empty aggregate when the projects directory is absent", async () => {
     mocks.baseExists = false;
     expect(await collectStats()).toMatchObject({ projects: 0, messages: 0, staleCount: 0 });
+    expect(mocks.collectEvents).not.toHaveBeenCalled();
+    expect(mocks.selectBackend).toHaveBeenCalledWith("sqlite");
+  });
+
+  it("fails closed before the empty-projects return for publication errors and PostgreSQL", async () => {
+    mocks.baseExists = false;
+    mocks.configError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "backend publication is unresolved",
+    );
+    await expect(collectStats()).rejects.toMatchObject({ reason: "unresolved-publication" });
+    expect(mocks.selectBackend).not.toHaveBeenCalled();
+
+    mocks.configError = null;
+    mocks.configBackend = "postgresql";
+    await expect(collectStats()).rejects.toThrow("PostgreSQL backend rejected");
+    expect(mocks.selectBackend).toHaveBeenCalledWith("postgresql");
     expect(mocks.collectEvents).not.toHaveBeenCalled();
   });
 
@@ -183,7 +217,7 @@ describe("stats service coverage", () => {
   });
 
   it("uses config and event fallbacks and produces a null global recall ratio", async () => {
-    mocks.configFails = true;
+    mocks.configError = new Error("config broken");
     mocks.eventsFail = true;
     mocks.entries = [{ name: "one", directory: true, dbExists: true }];
     projects.set("one", {

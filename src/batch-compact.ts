@@ -8,6 +8,7 @@ import { projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
 import type { LlmApiMode, LlmInvocationRequestPolicy, LlmReasoningEffort, LlmRetryPolicy } from "./daemon/config.js";
 import { MANUAL_COMPACT_FRESH_TAIL_COUNT } from "./compaction.js";
+import { BackendPublicationJournalError } from "./storage/backend-publication.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -82,7 +83,8 @@ function projectMatchesCwdFilter(projectHash: string, cwd: string, cwdFilter?: s
   if (resolve(cwd) === lexicalFilter) return true;
   try {
     if (projectMapPathsForHash(projectHash).includes(lexicalFilter)) return true;
-  } catch {
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) throw error;
     // Fall back to the metadata cwd while map.json is being edited.
   }
   const normalizedFilter = normalizeProjectPath(cwdFilter);
@@ -94,7 +96,8 @@ function metadataFailureMatchesCwdFilter(projectHash: string, cwdFilter?: string
   if (!cwdFilter) return true;
   try {
     return projectMapPathsForHash(projectHash).includes(resolve(cwdFilter));
-  } catch {
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) throw error;
     return false;
   }
 }

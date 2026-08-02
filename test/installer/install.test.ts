@@ -13,11 +13,18 @@ import {
   mergeClaudeMcpEntry,
   type ServiceDeps,
 } from "../../installer/install.js";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { legacyLcmCommand, legacyLcmMcpServerName } from "../../src/legacy-names.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../../src/daemon/config.js";
 import { removeManagedClaudeHooks } from "../../src/installer/settings.js";
+import {
+  backendPublicationConfigSha256,
+  backendPublicationJournalPath,
+  backendPublicationProjectMapSha256,
+  prepareBackendPublication,
+} from "../../src/storage/backend-publication.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -611,6 +618,51 @@ describe("Claude Marketplace migration", () => {
 // ─── install ────────────────────────────────────────────────────────────────
 
 describe("install", () => {
+  it("fails before any installer dependency can mutate unresolved publication state", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-install-publication-"));
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    try {
+      const root = join(home, ".lcm");
+      mkdirSync(root, { mode: 0o700 });
+      const configPath = join(root, "config.json");
+      writeFileSync(configPath, "{}\n", { mode: 0o600 });
+      prepareBackendPublication({
+        publicationId: "installer-unresolved",
+        sourceBackend: "sqlite",
+        targetBackend: "postgresql",
+        expectedConfigSha256: backendPublicationConfigSha256(home),
+        expectedProjectMapSha256: backendPublicationProjectMapSha256(home),
+        intendedConfigSha256: "1".repeat(64),
+        intendedProjectMapSha256: "2".repeat(64),
+        projects: [{
+          localProjectId: "a".repeat(64),
+          remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+          evidenceSha256: "3".repeat(64),
+        }],
+        homeDir: home,
+      });
+      const journalPath = backendPublicationJournalPath(home);
+      const journal = readFileSync(journalPath, "utf8");
+      const deps = makeDeps({
+        readFileSync: vi.fn(() => { throw new Error("installer read bypassed admission"); }),
+      });
+
+      await expect(install(deps)).rejects.toMatchObject({
+        reason: "unresolved-publication",
+      });
+      expect(deps.readFileSync).not.toHaveBeenCalled();
+      expect(deps.writeFileSync).not.toHaveBeenCalled();
+      expect(deps.mkdirSync).not.toHaveBeenCalled();
+      expect(deps.ensureDaemon).not.toHaveBeenCalled();
+      expect(readFileSync(configPath, "utf8")).toBe("{}\n");
+      expect(readFileSync(journalPath, "utf8")).toBe(journal);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("core install works with zero external dependencies", async () => {
     const originalApiKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = "test-key";
@@ -638,6 +690,24 @@ describe("install", () => {
     expect(written.llm.provider).toBe("auto");
     expect(written.llm.apiKey).toBe("");
     process.env.ANTHROPIC_API_KEY = originalApiKey;
+  });
+
+  it("does not overwrite a config that appears while the summarizer prompt is pending", async () => {
+    let configChecks = 0;
+    const deps = makeDeps({
+      existsSync: vi.fn((path: string) => {
+        if (!path.endsWith("config.json")) return false;
+        configChecks += 1;
+        return configChecks > 1;
+      }),
+      promptUser: vi.fn().mockResolvedValue("1"),
+    });
+
+    await install(deps);
+
+    expect(configChecks).toBeGreaterThanOrEqual(2);
+    expect(vi.mocked(deps.writeFileSync).mock.calls
+      .filter(([path]) => path.endsWith("config.json"))).toHaveLength(0);
   });
 
   it("calls chmodSync(0o600) on config.json after creation", async () => {
@@ -753,11 +823,12 @@ describe("install", () => {
   });
 
   it("keeps Marketplace plugins when native settings read-back is malformed JSON", async () => {
+    const configPath = join(homedir(), ".lcm", "config.json");
     const spawnSync = vi.fn();
     const deps = makeDeps({
       spawnSync: spawnSync as any,
       existsSync: vi.fn((path: string) => path.endsWith("config.json")),
-      readFileSync: vi.fn(() => "{"),
+      readFileSync: vi.fn((path: string) => path === configPath ? "{}" : "{"),
     });
 
     await expect(install(deps)).rejects.toThrow("Could not verify native Claude settings after writing");
@@ -1015,7 +1086,7 @@ describe("install", () => {
       existsSync: vi.fn((path: string) => path.endsWith("config.json") || path.includes("plugins/cache") || path === settingsPath),
       readFileSync: vi.fn((path: string) => path === settingsPath
         ? settings
-        : "invalid package json"),
+        : path.endsWith("config.json") ? "{}" : "invalid package json"),
       writeFileSync: vi.fn((path: string, data: string) => {
         if (path === settingsPath) settings = data;
       }),

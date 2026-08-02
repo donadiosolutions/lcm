@@ -11,6 +11,7 @@ import { runLcmMigrations } from "../../../src/db/migration.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
 import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
+import { SqliteStorageBackendFactory } from "../../../src/storage/sqlite/factory.js";
 import { recoverMachineIdentity } from "../../../src/machine-identity.js";
 import {
   clearProjectMapCache,
@@ -557,15 +558,17 @@ describe("promote-events route", () => {
     const secondDb = new EventsDb(secondSidecarPath);
     secondDb.close();
 
+    const storageFactory = new SqliteStorageBackendFactory();
+    const handler = createPromoteAllEventsHandler(makeConfig(), storageFactory);
+    const { res, getBody } = mockRes();
     const now = vi.spyOn(Date, "now");
     now.mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(30_001);
 
-    const handler = createPromoteAllEventsHandler(makeConfig());
-    const { res, getBody } = mockRes();
     try {
       await handler(request, res, "");
     } finally {
       now.mockRestore();
+      await storageFactory.close();
     }
 
     const result = getBody();

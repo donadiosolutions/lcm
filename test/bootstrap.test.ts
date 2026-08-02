@@ -1,10 +1,20 @@
 import { describe, it, expect, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EnsureCoreDeps } from "../src/bootstrap.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../src/daemon/config.js";
 import { canonicalHookCommand, mergeClaudeSettings } from "../src/installer/settings.js";
+import {
+  configPath as runtimeConfigPath,
+  legacyLcmHomeDir,
+} from "../src/runtime-paths.js";
+import {
+  backendPublicationConfigSha256,
+  backendPublicationJournalPath,
+  backendPublicationProjectMapSha256,
+  prepareBackendPublication,
+} from "../src/storage/backend-publication.js";
 
 function makeDeps(overrides: Partial<EnsureCoreDeps> = {}): EnsureCoreDeps {
   return {
@@ -21,6 +31,57 @@ function makeDeps(overrides: Partial<EnsureCoreDeps> = {}): EnsureCoreDeps {
 }
 
 describe("ensureCore", () => {
+  it("rejects unresolved publication before legacy migration or config creation", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-bootstrap-publication-"));
+    const legacy = legacyLcmHomeDir(home);
+    const configPath = runtimeConfigPath(home);
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, "config.json"), "legacy-config", { mode: 0o600 });
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    prepareBackendPublication({
+      publicationId: "bootstrap-unresolved",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      expectedConfigSha256: backendPublicationConfigSha256(home),
+      expectedProjectMapSha256: backendPublicationProjectMapSha256(home),
+      intendedConfigSha256: "1".repeat(64),
+      intendedProjectMapSha256: "2".repeat(64),
+      projects: [{
+        localProjectId: "a".repeat(64),
+        remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+        evidenceSha256: "3".repeat(64),
+      }],
+      homeDir: home,
+    });
+    const journalPath = backendPublicationJournalPath(home);
+    const journalBefore = readFileSync(journalPath);
+    const write = vi.fn(writeFileSync);
+    const deps = makeDeps({
+      configPath,
+      settingsPath: join(home, ".claude", "settings.json"),
+      existsSync,
+      readFileSync: (path, encoding) => readFileSync(path, encoding),
+      writeFileSync: write,
+      mkdirSync,
+    });
+
+    try {
+      const { ensureCoreEndpoint } = await import("../src/bootstrap.js");
+      await expect(ensureCoreEndpoint(deps)).rejects.toMatchObject({
+        reason: "unresolved-publication",
+      });
+      expect(readFileSync(join(legacy, "config.json"), "utf8")).toBe("legacy-config");
+      expect(existsSync(configPath)).toBe(false);
+      expect(readFileSync(journalPath)).toEqual(journalBefore);
+      expect(write).not.toHaveBeenCalled();
+      expect(deps.ensureDaemon).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("creates config.json with defaults when missing", async () => {
     const deps = makeDeps();
     const { ensureCore } = await import("../src/bootstrap.js");
@@ -116,7 +177,7 @@ describe("ensureCore", () => {
 
     try {
       const { ensureCoreEndpoint } = await import("../src/bootstrap.js");
-      await expect(ensureCoreEndpoint(deps)).rejects.toThrow("postgresql storage backend is not available");
+      await expect(ensureCoreEndpoint(deps)).rejects.toThrow("publication evidence");
       expect(deps.ensureDaemon).not.toHaveBeenCalled();
     } finally {
       if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;

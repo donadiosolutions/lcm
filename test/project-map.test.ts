@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   addProjectAlias,
+  applyBackendPublicationProjectMapFile,
   clearRemoteProjectBinding,
   clearProjectMapCache,
   foldProjectMapEntries,
@@ -28,10 +29,17 @@ import {
 import { eventsDbPath } from "../src/db/events-path.js";
 import { projectDbPath, projectId, projectMetaPath } from "../src/daemon/project.js";
 import { clearGitProjectAnchorCache } from "../src/git-project.js";
+import {
+  advanceBackendPublication,
+  backendPublicationConfigSha256,
+  backendPublicationProjectMapSha256,
+  prepareBackendPublication,
+} from "../src/storage/backend-publication.js";
+import type { BackendPublicationFileMutationContext } from "../src/storage/backend-publication.js";
 
 function resetLcmHome(): void {
   rmSync(join(homedir(), ".lcm"), { recursive: true, force: true });
-  mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+  mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
   clearProjectMapCache();
   clearGitProjectAnchorCache();
 }
@@ -92,6 +100,46 @@ function finishFakeTimerWatcherTest(
   }
 }
 
+function installAbortedPublication(homeDir: string): void {
+  const expectedConfigSha256 = backendPublicationConfigSha256(homeDir);
+  const expectedProjectMapSha256 = backendPublicationProjectMapSha256(homeDir);
+  let journal = prepareBackendPublication({
+    publicationId: "post-terminal-project-map",
+    sourceBackend: "sqlite",
+    targetBackend: "postgresql",
+    expectedConfigSha256,
+    expectedProjectMapSha256,
+    intendedConfigSha256: "1".repeat(64),
+    intendedProjectMapSha256: "2".repeat(64),
+    projects: [{
+      localProjectId: "a".repeat(64),
+      remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+      evidenceSha256: "3".repeat(64),
+    }],
+    homeDir,
+  });
+  const advance = (
+    phase: Parameters<typeof advanceBackendPublication>[0]["phase"],
+    witnesses: Pick<
+      Parameters<typeof advanceBackendPublication>[0],
+      "publishedConfigSha256" | "publishedProjectMapSha256"
+    > = {},
+  ): void => {
+    journal = advanceBackendPublication({
+      publicationId: journal.publicationId,
+      expectedChecksumSha256: journal.checksumSha256,
+      phase,
+      homeDir,
+      ...witnesses,
+    });
+  };
+  advance("abort-prepared");
+  advance("config-restored", { publishedConfigSha256: expectedConfigSha256 });
+  advance("map-restored", { publishedProjectMapSha256: expectedProjectMapSha256 });
+  advance("abort-releasing");
+  advance("aborted");
+}
+
 describe("project map", () => {
   const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
   const originalHome = process.env.HOME;
@@ -103,6 +151,56 @@ describe("project map", () => {
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
     resetLcmHome();
+  });
+
+  it("rejects non-UTF-8 publication map material before mutation", async () => {
+    const input = {
+      homeDir: homedir(),
+      file: {
+        presence: "present",
+        content: Uint8Array.from([0xff]),
+        mode: 0o600,
+        uid: process.getuid?.() ?? 0,
+        gid: process.getgid?.() ?? 0,
+      },
+    } as unknown as BackendPublicationFileMutationContext;
+
+    await expect(applyBackendPublicationProjectMapFile(input))
+      .rejects.toThrow("project-map material is not UTF-8");
+    expect(existsSync(projectMapPath())).toBe(false);
+  });
+
+  it("applies exact present and absent terminal publication map material", async () => {
+    const path = projectMapPath();
+    installAbortedPublication(homedir());
+    const metadata = {
+      mode: 0o600,
+      uid: process.getuid?.() ?? 0,
+      gid: process.getgid?.() ?? 0,
+    };
+
+    await applyBackendPublicationProjectMapFile({
+      homeDir: homedir(),
+      file: { presence: "absent", ...metadata },
+    } as BackendPublicationFileMutationContext);
+    expect(existsSync(path)).toBe(false);
+
+    await applyBackendPublicationProjectMapFile({
+      homeDir: homedir(),
+      file: { presence: "present", content: Buffer.from("{}\n"), ...metadata },
+    } as BackendPublicationFileMutationContext);
+    expect(readFileSync(path, "utf8")).toBe("{}\n");
+  });
+
+  it("allows ordinary project-map updates after terminal recovery", () => {
+    installAbortedPublication(homedir());
+    const canonical = makeDir("post-terminal-map-project");
+
+    const identity = resolveProjectIdentity(canonical);
+
+    expect(listProjectMapEntries()[identity.id]).toMatchObject({
+      canonical: normalizeProjectPath(canonical),
+    });
   });
 
   afterEach(() => {
@@ -2034,6 +2132,65 @@ describe("project map", () => {
     } finally {
       finishFakeTimerWatcherTest(primaryError, [mapWatcher, idleWatcher], lockPath);
     }
+  });
+
+  it("fails cache reload and watcher startup closed on unresolved publication", () => {
+    expect(reloadProjectMapCache()).toBe(true);
+    prepareBackendPublication({
+      publicationId: "project-map-watcher-publication",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      expectedConfigSha256: backendPublicationConfigSha256(),
+      expectedProjectMapSha256: backendPublicationProjectMapSha256(),
+      intendedConfigSha256: "1".repeat(64),
+      intendedProjectMapSha256: "2".repeat(64),
+      projects: [{
+        localProjectId: "a".repeat(64),
+        remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+        evidenceSha256: "3".repeat(64),
+      }],
+    });
+    const malformed = '{"leak":"secret-publication-value"';
+    writeFileSync(projectMapPath(), malformed, { mode: 0o600 });
+
+    expect(() => reloadProjectMapCache()).toThrowError(expect.objectContaining({
+      reason: "unresolved-publication",
+    }));
+    expect(() => watchProjectMap()).toThrowError(expect.objectContaining({
+      reason: "unresolved-publication",
+    }));
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(malformed);
+  });
+
+  it("fails watcher arming closed if publication becomes unresolved after cache reload", () => {
+    expect(() => watchProjectMap({
+      _beforeInitialArmForTesting: () => {
+        prepareBackendPublication({
+          publicationId: "project-map-watcher-arm-race",
+          sourceBackend: "sqlite",
+          targetBackend: "postgresql",
+          expectedConfigSha256: backendPublicationConfigSha256(),
+          expectedProjectMapSha256: backendPublicationProjectMapSha256(),
+          intendedConfigSha256: "1".repeat(64),
+          intendedProjectMapSha256: "2".repeat(64),
+          projects: [{
+            localProjectId: "a".repeat(64),
+            remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+            evidenceSha256: "3".repeat(64),
+          }],
+        });
+      },
+    })).toThrowError(expect.objectContaining({ reason: "unresolved-publication" }));
+  });
+
+  it("tolerates unavailable filesystem watch support after a trusted startup reload", () => {
+    const unavailableWatch = vi.fn(() => {
+      throw new Error("watch support unavailable");
+    }) as unknown as typeof import("node:fs").watch;
+
+    const watcher = watchProjectMap({ _watchForTesting: unavailableWatch });
+    expect(unavailableWatch).toHaveBeenCalledOnce();
+    expect(() => watcher.close()).not.toThrow();
   });
 
   it("retries map-watch reloads while a live writer owns the map lock", () => {

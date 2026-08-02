@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
@@ -12,6 +12,35 @@ import {
   hashProjectPath,
   normalizeProjectPath,
 } from "../../src/project-map.js";
+import {
+  backendPublicationConfigSha256,
+  backendPublicationJournalPath,
+  backendPublicationProjectMapSha256,
+  prepareBackendPublication,
+} from "../../src/storage/backend-publication.js";
+
+const publicationAdmission = vi.hoisted(() => ({ resolved: false }));
+
+vi.mock("../../src/storage/backend-publication.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/storage/backend-publication.js")>();
+  return {
+    ...actual,
+    assertBackendPublicationConsumerAccess: vi.fn((...args: Parameters<
+      typeof actual.assertBackendPublicationConsumerAccess
+    >) => {
+      if (!publicationAdmission.resolved) {
+        actual.assertBackendPublicationConsumerAccess(...args);
+      }
+    }),
+    assertBackendPublicationConfigAccess: vi.fn((...args: Parameters<
+      typeof actual.assertBackendPublicationConfigAccess
+    >) => {
+      if (!publicationAdmission.resolved) {
+        actual.assertBackendPublicationConfigAccess(...args);
+      }
+    }),
+  };
+});
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn().mockResolvedValue({ connected: false }),
@@ -27,6 +56,7 @@ const mockCollectEventStats = vi.mocked(collectEventStats);
 const mockCollectDetailedEventStats = vi.mocked(collectDetailedEventStats);
 
 beforeEach(() => {
+  publicationAdmission.resolved = false;
   vi.mocked(ensureDaemon).mockReset();
   vi.mocked(ensureDaemon).mockResolvedValue({ connected: false });
   mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null });
@@ -190,6 +220,269 @@ describe("runDoctor Claude integration ownership", () => {
 });
 
 describe("runDoctor project map checks", () => {
+  it("reports one sanitized publication failure without repairing config or map", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-publication-"));
+    try {
+      const root = join(home, ".lcm");
+      mkdirSync(root, { mode: 0o700 });
+      const config = join(root, "config.json");
+      const map = join(root, "map.json");
+      writeFileSync(config, '{}\n', { mode: 0o600 });
+      writeFileSync(map, '{}', { mode: 0o600 });
+      prepareBackendPublication({
+        publicationId: "doctor-publication",
+        sourceBackend: "sqlite",
+        targetBackend: "postgresql",
+        expectedConfigSha256: backendPublicationConfigSha256(home),
+        expectedProjectMapSha256: backendPublicationProjectMapSha256(home),
+        intendedConfigSha256: "1".repeat(64),
+        intendedProjectMapSha256: "2".repeat(64),
+        projects: [{
+          localProjectId: "a".repeat(64),
+          remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+          evidenceSha256: "3".repeat(64),
+        }],
+        homeDir: home,
+      });
+      writeFileSync(config, '{"leak":"secret-publication-value"', { mode: 0o600 });
+      const before = [config, map, backendPublicationJournalPath(home)].map((path) => ({
+        path,
+        content: readFileSync(path),
+        stat: lstatSync(path),
+      }));
+
+      const results = await runDoctor(minimalDeps({ homedir: home }));
+      const publicationFailures = results.filter((result) =>
+        (result.name === "config" || result.name === "project-map")
+        && result.status === "fail");
+      expect(publicationFailures).toEqual([expect.objectContaining({
+        name: "config",
+        message: "Backend publication recovery is unresolved; resume or abort the owning operation",
+      })]);
+      expect(results.find((result) => result.name === "version")).toBeDefined();
+      expect(JSON.stringify(results)).not.toContain("doctor-publication");
+      expect(JSON.stringify(results)).not.toContain("018f0000");
+      expect(JSON.stringify(results)).not.toContain("secret-publication-value");
+      for (const snapshot of before) {
+        const after = lstatSync(snapshot.path);
+        expect(readFileSync(snapshot.path)).toEqual(snapshot.content);
+        expect(after).toMatchObject({
+          dev: snapshot.stat.dev,
+          ino: snapshot.stat.ino,
+          mode: snapshot.stat.mode,
+          size: snapshot.stat.size,
+          mtimeMs: snapshot.stat.mtimeMs,
+          ctimeMs: snapshot.stat.ctimeMs,
+        });
+      }
+    } finally {
+      clearProjectMapCache();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps every repair target unchanged while unresolved publication diagnostics continue read-only", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-publication-repair-fence-"));
+    try {
+      const lcmRoot = join(home, ".lcm");
+      const claudeRoot = join(home, ".claude");
+      mkdirSync(lcmRoot, { mode: 0o700 });
+      mkdirSync(claudeRoot, { mode: 0o700 });
+      const config = join(lcmRoot, "config.json");
+      const map = join(lcmRoot, "map.json");
+      const settings = join(claudeRoot, "settings.json");
+      const lcmMd = join(claudeRoot, "lcm.md");
+      const claudeMd = join(claudeRoot, "CLAUDE.md");
+      writeFileSync(config, '{}\n', { mode: 0o600 });
+      writeFileSync(map, '{"map-secret":"must-not-leak"}\n', { mode: 0o600 });
+      writeFileSync(settings, JSON.stringify({
+        hooks: {
+          Stop: [{ matcher: "", hooks: [{ type: "command", command: "lcm session-snapshot" }] }],
+        },
+        mcpServers: {
+          lcm: { command: "/stale/lcm", args: ["mcp"] },
+          [legacyLcmMcpServerName()]: { command: "legacy-secret-command" },
+        },
+      }, null, 2), { mode: 0o600 });
+      writeFileSync(lcmMd, "stale lcm guidance with lcm-md-secret\n", { mode: 0o600 });
+      writeFileSync(claudeMd, "# User guidance\nclaude-md-secret\n", { mode: 0o600 });
+      prepareBackendPublication({
+        publicationId: "doctor-publication-repair-secret",
+        sourceBackend: "sqlite",
+        targetBackend: "postgresql",
+        expectedConfigSha256: backendPublicationConfigSha256(home),
+        expectedProjectMapSha256: backendPublicationProjectMapSha256(home),
+        intendedConfigSha256: "1".repeat(64),
+        intendedProjectMapSha256: "2".repeat(64),
+        projects: [{
+          localProjectId: "a".repeat(64),
+          remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+          evidenceSha256: "3".repeat(64),
+        }],
+        homeDir: home,
+      });
+      writeFileSync(config, '{"config-secret":"must-not-leak"', { mode: 0o600 });
+
+      const absentRepairTargets = [
+        join(lcmRoot, "oldmaps"),
+        join(claudeRoot, "settings.json.backup"),
+      ];
+      const presentRepairTargets = [
+        config,
+        map,
+        backendPublicationJournalPath(home),
+        settings,
+        lcmMd,
+        claudeMd,
+      ];
+      const before = presentRepairTargets.map((path) => ({
+        path,
+        content: readFileSync(path),
+        stat: lstatSync(path),
+      }));
+      expect(absentRepairTargets.every((path) => !existsSync(path))).toBe(true);
+
+      mockCollectEventStats.mockReturnValue({
+        captured: 2,
+        unprocessed: 0,
+        errors: 0,
+        lastCapture: null,
+        prunedSidecars: 1,
+      });
+      const fetchHealth = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockResolvedValue({
+          status: "ok",
+          version: "0.5.0",
+          storageBackend: "sqlite",
+          pid: 123,
+          entrypoint: "/trusted/lcm.mjs",
+        }),
+      });
+      const handshake = vi.fn().mockResolvedValue({
+        name: "mcp-handshake-lcm",
+        category: "MCP Servers",
+        status: "pass",
+        message: "lcm: 7/7 tools",
+      });
+
+      const results = await runDoctor({
+        homedir: home,
+        cwd: home,
+        fetch: fetchHealth,
+        spawnSync: vi.fn(() => ({ status: 0, stdout: "", stderr: "" })),
+        _testMcpHandshake: handshake,
+      });
+
+      expect(results.filter((result) =>
+        (result.name === "config" || result.name === "project-map")
+        && result.status === "fail"))
+        .toEqual([expect.objectContaining({
+          name: "config",
+          message: "Backend publication recovery is unresolved; resume or abort the owning operation",
+        })]);
+      expect(results.filter((result) => result.fixApplied === true)).toEqual([]);
+      expect(results.find((result) => result.name === "version")).toBeDefined();
+      expect(results.find((result) => result.name === "secret-detection")).toBeDefined();
+      expect(results.find((result) => result.name === "events-capture")).toBeDefined();
+      expect(results.find((result) => result.name === "mcp-handshake-lcm")).toBeDefined();
+      expect(fetchHealth).toHaveBeenCalled();
+      expect(handshake).toHaveBeenCalledOnce();
+      expect(ensureDaemon).not.toHaveBeenCalled();
+      expect(mockCollectEventStats).toHaveBeenCalledWith(expect.objectContaining({
+        pruneOrphanSidecars: false,
+      }));
+      expect(results.find((result) => result.name === "events-sidecar-prune")).toBeUndefined();
+
+      const serialized = JSON.stringify(results);
+      for (const secret of [
+        "doctor-publication-repair-secret",
+        "018f0000",
+        "config-secret",
+        "map-secret",
+        "legacy-secret-command",
+        "lcm-md-secret",
+        "claude-md-secret",
+      ]) {
+        expect(serialized).not.toContain(secret);
+      }
+      for (const snapshot of before) {
+        const after = lstatSync(snapshot.path);
+        expect(readFileSync(snapshot.path)).toEqual(snapshot.content);
+        expect(after).toMatchObject({
+          dev: snapshot.stat.dev,
+          ino: snapshot.stat.ino,
+          mode: snapshot.stat.mode,
+          nlink: snapshot.stat.nlink,
+          uid: snapshot.stat.uid,
+          gid: snapshot.stat.gid,
+          size: snapshot.stat.size,
+          mtimeMs: snapshot.stat.mtimeMs,
+          ctimeMs: snapshot.stat.ctimeMs,
+        });
+      }
+      expect(absentRepairTargets.every((path) => !existsSync(path))).toBe(true);
+    } finally {
+      clearProjectMapCache();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports the same single sanitized failure when unresolved publication has no config", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-publication-no-config-"));
+    try {
+      const root = join(home, ".lcm");
+      mkdirSync(root, { mode: 0o700 });
+      prepareBackendPublication({
+        publicationId: "doctor-publication-without-config",
+        sourceBackend: "sqlite",
+        targetBackend: "postgresql",
+        expectedConfigSha256: backendPublicationConfigSha256(home),
+        expectedProjectMapSha256: backendPublicationProjectMapSha256(home),
+        intendedConfigSha256: "1".repeat(64),
+        intendedProjectMapSha256: "2".repeat(64),
+        projects: [{
+          localProjectId: "a".repeat(64),
+          remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+          evidenceSha256: "3".repeat(64),
+        }],
+        homeDir: home,
+      });
+      const journalPath = backendPublicationJournalPath(home);
+      const journalBefore = {
+        content: readFileSync(journalPath),
+        stat: lstatSync(journalPath),
+      };
+
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        existsSync: (path: string) => !path.endsWith("config.json"),
+      }));
+
+      expect(results.filter((result) =>
+        (result.name === "config" || result.name === "project-map")
+        && result.status === "fail"))
+        .toEqual([expect.objectContaining({
+          name: "config",
+          message: "Backend publication recovery is unresolved; resume or abort the owning operation",
+        })]);
+      expect(JSON.stringify(results)).not.toContain("doctor-publication-without-config");
+      expect(readFileSync(journalPath)).toEqual(journalBefore.content);
+      expect(lstatSync(journalPath)).toMatchObject({
+        dev: journalBefore.stat.dev,
+        ino: journalBefore.stat.ino,
+        mode: journalBefore.stat.mode,
+        size: journalBefore.stat.size,
+        mtimeMs: journalBefore.stat.mtimeMs,
+        ctimeMs: journalBefore.stat.ctimeMs,
+      });
+    } finally {
+      clearProjectMapCache();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("renders blocked reconciliation guidance without retrying through project patterns", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-blocked-reconciliation-"));
     try {
@@ -738,6 +1031,7 @@ describe("runDoctor daemon version mismatch", () => {
   });
 
   it("reports authenticated staged storage after PostgreSQL auto-start", async () => {
+    publicationAdmission.resolved = true;
     const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-autostart-"));
     const caFile = join(dir, "ca.pem");
     writeFileSync(caFile, "test-ca");
@@ -1189,6 +1483,7 @@ describe("runDoctor configuration validation", () => {
   });
 
   it("checks a valid PostgreSQL selection through daemon health and lifecycle", async () => {
+    publicationAdmission.resolved = true;
     const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-"));
     const caFile = join(dir, "ca.pem");
     writeFileSync(caFile, "test-ca");
@@ -1232,6 +1527,7 @@ describe("runDoctor configuration validation", () => {
   });
 
   it("uses authenticated staged PostgreSQL health for an already-running daemon", async () => {
+    publicationAdmission.resolved = true;
     const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-staged-"));
     const caFile = join(dir, "ca.pem");
     writeFileSync(caFile, "test-ca");

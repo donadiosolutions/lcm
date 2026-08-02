@@ -1,11 +1,10 @@
 import {
-  chmodSync,
+  closeSync,
+  constants,
+  fsyncSync,
   mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  renameSync,
+  openSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import {
@@ -22,9 +21,22 @@ import {
 } from "./daemon/config.js";
 import { isSensitiveKey } from "./secret-key.js";
 import { sanitizeUrlValueForDisplay } from "./url-display.js";
+import { lcmHomeDir } from "./runtime-paths.js";
+import { atomicWritePrivateFile, readBoundedRegularFile } from "./security-files.js";
+import {
+  assertBackendPublicationConfigAccess,
+  assertBackendPublicationConfigMutation,
+  assertBackendPublicationConsumerAccess,
+  backendPublicationHomeForConfigPath,
+  captureBackendPublicationState,
+  withBackendPublicationConfigLock,
+  type BackendPublicationFileMutationContext,
+  type BackendPublicationFileWitness,
+} from "./storage/backend-publication.js";
 
 const DENIED_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 const REDACTED = "[REDACTED]";
+const MAX_CONFIG_BYTES = 1024 * 1024;
 const OPENAI_ONLY_LLM_KEYS = [
   "apiMode",
   "retry",
@@ -83,11 +95,22 @@ function canonicalPath(path: string): string {
   return parseConfigPath(path).join(".");
 }
 
-function readConfigContent(configPath: string): string {
+type ConfigFileState = {
+  readonly content: string;
+  readonly observedContent: string | null;
+};
+
+function readConfigContent(configPath: string): ConfigFileState {
   try {
-    return readFileSync(configPath, "utf-8");
+    const content = readBoundedRegularFile(configPath, {
+      allowedRoot: dirname(configPath),
+      maxBytes: MAX_CONFIG_BYTES,
+    });
+    return { content, observedContent: content };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "{}";
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { content: "{}", observedContent: null };
+    }
     throw error;
   }
 }
@@ -128,13 +151,27 @@ export function maskConfigSecrets(value: unknown, path: readonly string[] = []):
 
 /** Get a stored normalized value, or an effective defaults/env-resolved value. */
 export function getConfigValue(options: GetConfigValueOptions): unknown {
-  const segments = parseConfigPath(options.path);
-  const path = segments.join(".");
-  const content = readConfigContent(options.configPath);
-  const config = options.effective
-    ? parseDaemonConfig(content, {}, resolveDaemonConfigEnv(options.env ?? process.env))
-    : parseStoredConfig(content);
-  return maskConfigSecrets(valueAtPath(config, segments, path), segments);
+  return withBackendPublicationConfigLock(options.configPath, () => {
+    const publicationHome = backendPublicationHomeForConfigPath(options.configPath);
+    if (publicationHome !== undefined) {
+      assertBackendPublicationConsumerAccess({ homeDir: publicationHome });
+    }
+    const segments = parseConfigPath(options.path);
+    const path = segments.join(".");
+    const { content, observedContent } = readConfigContent(options.configPath);
+    const config = options.effective
+      ? parseDaemonConfig(content, {}, resolveDaemonConfigEnv(options.env ?? process.env))
+      : parseStoredConfig(content);
+    const backend = (
+      config.storage as { backend?: "sqlite" | "postgresql" } | undefined
+    )?.backend ?? "sqlite";
+    assertBackendPublicationConfigAccess(
+      options.configPath,
+      backend,
+      observedContent,
+    );
+    return maskConfigSecrets(valueAtPath(config, segments, path), segments);
+  });
 }
 
 /** Parse a CLI value as a string by default or as a JSON value when requested. */
@@ -200,39 +237,116 @@ function canonicalizeLlmProviderTransition(
   if (!supportsFastMode(provider)) delete llm.fastMode;
 }
 
+function syncDirectory(path: string): void {
+  const fd = openSync(path, constants.O_RDONLY);
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function writeConfigAtomic(configPath: string, content: string): void {
   const directory = dirname(configPath);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const tempDirectory = mkdtempSync(join(directory, ".lcm-config-"));
-  const tempPath = join(tempDirectory, "config.json");
+  atomicWritePrivateFile(configPath, content);
+  syncDirectory(directory);
+}
+
+function storedBackend(content: string): "sqlite" | "postgresql" {
+  const stored = parseStoredConfig(content);
+  return (
+    stored.storage as { backend?: "sqlite" | "postgresql" } | undefined
+  )?.backend ?? "sqlite";
+}
+
+function recoveryConfigContent(
+  input: BackendPublicationFileMutationContext,
+): string | null {
+  if (input.file.presence === "absent") return null;
   try {
-    writeFileSync(tempPath, content, { encoding: "utf-8", mode: 0o600, flag: "wx" });
-    chmodSync(tempPath, 0o600);
-    renameSync(tempPath, configPath);
-  } finally {
-    rmSync(tempDirectory, { recursive: true, force: true });
+    return new TextDecoder("utf-8", { fatal: true }).decode(input.file.content);
+  } catch (error) {
+    throw new ConfigManagerError("Backend publication config material is not UTF-8.", {
+      cause: error,
+    });
   }
+}
+
+/**
+ * Publish or restore the exact canonical config state supplied by a guarded
+ * BackendPublicationCoordinator callback.
+ */
+export async function applyBackendPublicationConfigFile(
+  input: BackendPublicationFileMutationContext,
+): Promise<BackendPublicationFileWitness> {
+  const configPath = join(lcmHomeDir(input.homeDir), "config.json");
+  return withBackendPublicationConfigLock(configPath, () => {
+    const current = readConfigContent(configPath);
+    const candidateContent = recoveryConfigContent(input);
+    const currentBackend = storedBackend(current.content);
+    const candidateBackend = storedBackend(candidateContent ?? "{}");
+    assertBackendPublicationConfigMutation(
+      configPath,
+      currentBackend,
+      candidateBackend,
+      candidateContent,
+      current.observedContent,
+    );
+    if (input.file.presence === "absent") {
+      rmSync(configPath, { force: true });
+      syncDirectory(dirname(configPath));
+    } else {
+      writeConfigAtomic(configPath, candidateContent!);
+    }
+    return captureBackendPublicationState(input.homeDir).config;
+  });
 }
 
 /** Set, fully validate, normalize, and atomically persist a configuration value. */
 export function setConfigValue(options: SetConfigValueOptions): unknown {
-  const segments = parseConfigPath(options.path);
-  const path = segments.join(".");
-  const content = readConfigContent(options.configPath);
-  const stored = structuredClone(parseStoredConfig(content));
-  const value = parseConfigValue(options.value, options.json);
-  setAtPath(stored, segments, value);
-  canonicalizeLlmProviderTransition(stored, segments, value);
+  return withBackendPublicationConfigLock(options.configPath, () => {
+    const publicationHome = backendPublicationHomeForConfigPath(options.configPath);
+    if (publicationHome !== undefined) {
+      assertBackendPublicationConsumerAccess({ homeDir: publicationHome });
+    }
+    const segments = parseConfigPath(options.path);
+    const path = segments.join(".");
+    const { content, observedContent } = readConfigContent(options.configPath);
+    const stored = structuredClone(parseStoredConfig(content));
+    const selectedBackend = (
+      stored.storage as { backend?: "sqlite" | "postgresql" } | undefined
+    )?.backend ?? "sqlite";
+    assertBackendPublicationConfigAccess(
+      options.configPath,
+      selectedBackend,
+      observedContent,
+    );
+    const value = parseConfigValue(options.value, options.json);
+    setAtPath(stored, segments, value);
+    canonicalizeLlmProviderTransition(stored, segments, value);
 
-  const candidateContent = JSON.stringify(stored);
-  const env = resolveDaemonConfigEnv(options.env ?? process.env);
-  const persistedValidationEnv = { ...env };
-  delete persistedValidationEnv.LCM_SUMMARY_PROVIDER;
-  delete persistedValidationEnv.LCM_SUMMARY_MODEL;
-  parseDaemonConfig(candidateContent, {}, persistedValidationEnv);
-  const canonical = parseStoredConfig(candidateContent);
-  writeConfigAtomic(options.configPath, `${JSON.stringify(canonical, null, 2)}\n`);
-  return maskConfigSecrets(valueAtPath(canonical, segments, path), segments);
+    const candidateContent = JSON.stringify(stored);
+    const env = resolveDaemonConfigEnv(options.env ?? process.env);
+    const persistedValidationEnv = { ...env };
+    delete persistedValidationEnv.LCM_SUMMARY_PROVIDER;
+    delete persistedValidationEnv.LCM_SUMMARY_MODEL;
+    parseDaemonConfig(candidateContent, {}, persistedValidationEnv);
+    const canonical = parseStoredConfig(candidateContent);
+    const candidateBackend = (
+      canonical.storage as { backend?: "sqlite" | "postgresql" } | undefined
+    )?.backend ?? "sqlite";
+    const persistedContent = `${JSON.stringify(canonical, null, 2)}\n`;
+    assertBackendPublicationConfigMutation(
+      options.configPath,
+      selectedBackend,
+      candidateBackend,
+      persistedContent,
+      observedContent,
+    );
+    writeConfigAtomic(options.configPath, persistedContent);
+    return maskConfigSecrets(valueAtPath(canonical, segments, path), segments);
+  });
 }
 
 /** Render a value for CLI output without adding quoting around scalar strings. */

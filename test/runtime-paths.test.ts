@@ -15,6 +15,13 @@ import {
   tmpDir,
 } from "../src/runtime-paths.js";
 import { legacyLcmHomeDirname } from "../src/legacy-names.js";
+import {
+  advanceBackendPublication,
+  backendPublicationConfigSha256,
+  backendPublicationJournalPath,
+  backendPublicationProjectMapSha256,
+  prepareBackendPublication,
+} from "../src/storage/backend-publication.js";
 
 const homes: string[] = [];
 
@@ -26,6 +33,49 @@ function makeHome(): string {
   const home = mkdtempSync(join(tmpdir(), "lcm-runtime-paths-"));
   homes.push(home);
   return home;
+}
+
+function publicationInput(homeDir: string, publicationId: string) {
+  return {
+    publicationId,
+    sourceBackend: "sqlite" as const,
+    targetBackend: "postgresql" as const,
+    expectedConfigSha256: backendPublicationConfigSha256(homeDir),
+    expectedProjectMapSha256: backendPublicationProjectMapSha256(homeDir),
+    intendedConfigSha256: "1".repeat(64),
+    intendedProjectMapSha256: "2".repeat(64),
+    projects: [{
+      localProjectId: "a".repeat(64),
+      remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+      evidenceSha256: "3".repeat(64),
+    }],
+    homeDir,
+  };
+}
+
+function installAbortedPublication(homeDir: string): void {
+  const input = publicationInput(homeDir, "runtime-path-terminal");
+  let journal = prepareBackendPublication(input);
+  const advance = (
+    phase: Parameters<typeof advanceBackendPublication>[0]["phase"],
+    witnesses: Pick<
+      Parameters<typeof advanceBackendPublication>[0],
+      "publishedConfigSha256" | "publishedProjectMapSha256"
+    > = {},
+  ): void => {
+    journal = advanceBackendPublication({
+      publicationId: journal.publicationId,
+      expectedChecksumSha256: journal.checksumSha256,
+      phase,
+      homeDir,
+      ...witnesses,
+    });
+  };
+  advance("abort-prepared");
+  advance("config-restored", { publishedConfigSha256: input.expectedConfigSha256 });
+  advance("map-restored", { publishedProjectMapSha256: input.expectedProjectMapSha256 });
+  advance("abort-releasing");
+  advance("aborted");
 }
 
 describe("runtime paths", () => {
@@ -125,5 +175,50 @@ describe("runtime paths", () => {
 
     expect(migrateLegacyHomeIfNeeded(home).migrated).toBe(true);
     expect(readFileSync(join(next, "shared.txt"), "utf-8")).toBe("current");
+  });
+
+  it("fails closed without moving legacy bytes while publication is unresolved", () => {
+    const home = makeHome();
+    const legacy = legacyLcmHomeDir(home);
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, "config.json"), "legacy");
+    prepareBackendPublication(publicationInput(home, "runtime-path-unresolved"));
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrowError(expect.objectContaining({
+      reason: "unresolved-publication",
+    }));
+    expect(readFileSync(join(legacy, "config.json"), "utf8")).toBe("legacy");
+    expect(existsSync(configPath(home))).toBe(false);
+  });
+
+  it("keeps the active home authoritative after terminal publication evidence", () => {
+    const home = makeHome();
+    const legacy = legacyLcmHomeDir(home);
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, "config.json"), "legacy");
+    installAbortedPublication(home);
+
+    expect(migrateLegacyHomeIfNeeded(home)).toEqual({
+      migrated: false,
+      from: legacy,
+      to: lcmHomeDir(home),
+    });
+    expect(readFileSync(join(legacy, "config.json"), "utf8")).toBe("legacy");
+    expect(existsSync(configPath(home))).toBe(false);
+  });
+
+  it("fails closed when retained publication history loses its active journal", () => {
+    const home = makeHome();
+    const legacy = legacyLcmHomeDir(home);
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, "map.json"), "legacy-map");
+    installAbortedPublication(home);
+    prepareBackendPublication(publicationInput(home, "runtime-path-next"));
+    rmSync(backendPublicationJournalPath(home));
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrowError(expect.objectContaining({
+      reason: "publication-evidence-missing",
+    }));
+    expect(readFileSync(join(legacy, "map.json"), "utf8")).toBe("legacy-map");
   });
 });

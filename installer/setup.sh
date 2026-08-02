@@ -4,8 +4,7 @@ set -euo pipefail
 # lcm setup script
 # Configures the LLM provider for compaction/summarization and installs hooks.
 
-CONFIG_DIR="$HOME/.lcm"
-CONFIG_FILE="$CONFIG_DIR/config.json"
+CONFIG_FILE="$HOME/.lcm/config.json"
 
 # ── Dry-run support (used by installer/dry-run-deps.ts) ──
 
@@ -139,110 +138,22 @@ else
 fi
 
 # ── Write config.json ──
-# Uses node for proper JSON encoding.
-# Merges into any existing config file: parses the JSON, updates the "llm"
-# block, and rewrites the whole file (reformats + normalises key order).
-# Existing non-llm keys are always preserved.
+# Build one complete llm object, then delegate the single read-modify-write to
+# the common guarded CLI config path. That preserves every non-llm key and
+# applies backend-publication admission, validation, private atomic write, and
+# durability in one operation.
 
-mkdir -p -m 700 "$CONFIG_DIR"
-chmod 700 "$CONFIG_DIR"
-
-node - "$PROVIDER" "$MODEL" "$API_KEY" "$BASE_URL" "$CONFIG_FILE" <<'NODE'
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const [provider, model, apiKey, baseUrl, configFile] = process.argv.slice(2);
-
+LLM_JSON="$(node - "$PROVIDER" "$MODEL" "$API_KEY" "$BASE_URL" <<'NODE'
+const [provider, model, apiKey, baseUrl] = process.argv.slice(2);
 const llm = { provider };
-if (model)   llm.model   = model;
-if (apiKey)  llm.apiKey  = apiKey;
+if (model) llm.model = model;
+if (apiKey) llm.apiKey = apiKey;
 if (baseUrl) llm.baseUrl = baseUrl;
-
-function atomicWritePrivateFile(file, content) {
-  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${crypto.randomBytes(12).toString('hex')}.tmp`);
-  let fd;
-  try {
-    fd = fs.openSync(temp, 'wx', 0o600);
-    fs.writeFileSync(fd, content, 'utf8');
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = undefined;
-    fs.renameSync(temp, file);
-    fs.chmodSync(file, 0o600);
-  } finally {
-    if (fd !== undefined) try { fs.closeSync(fd); } catch (_) {}
-    fs.rmSync(temp, { force: true });
-  }
-}
-
-let configExists = false;
-try {
-  const stat = fs.lstatSync(configFile);
-  if (stat.isSymbolicLink()) throw new Error(`refusing to use symlink config path: ${configFile}`);
-  if (!stat.isFile()) throw new Error(`config path is not a regular file: ${configFile}`);
-  configExists = true;
-} catch (err) {
-  if (err.code !== 'ENOENT') {
-    console.error(`Error: ${err.message}`);
-    process.exit(1);
-  }
-}
-
-// If config doesn't exist, atomically write a fresh file.
-if (!configExists) {
-  atomicWritePrivateFile(configFile, JSON.stringify({ llm }, null, 2) + '\n');
-  process.exit(0);
-}
-
-// Load existing config. Fail loudly on parse errors to prevent data loss.
-let raw;
-let configFd;
-try {
-  configFd = fs.openSync(configFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-  if (!fs.fstatSync(configFd).isFile()) throw new Error('config path is not a regular file');
-  const maxConfigBytes = 1024 * 1024;
-  const chunks = [];
-  const buffer = Buffer.allocUnsafe(64 * 1024);
-  let total = 0;
-  while (total <= maxConfigBytes) {
-    const bytesRead = fs.readSync(configFd, buffer, 0, Math.min(buffer.length, maxConfigBytes + 1 - total), null);
-    if (bytesRead === 0) break;
-    chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
-    total += bytesRead;
-  }
-  if (total > maxConfigBytes) throw new Error('config file exceeds 1 MiB');
-  raw = Buffer.concat(chunks, total).toString('utf8');
-  JSON.parse(raw); // validate
-} catch (err) {
-  if (err instanceof SyntaxError) {
-    console.error(`Error: Failed to parse existing config at ${configFile}.`);
-    console.error('The file contains invalid JSON. Fix or remove it, then re-run setup.');
-  } else if (err instanceof Error && err.message === 'config file exceeds 1 MiB') {
-    console.error(`Error: Existing config at ${configFile} exceeds the 1 MiB safety limit.`);
-    console.error('Reduce the config file size, then re-run setup.');
-  } else {
-    console.error(`Error: Failed to read existing config at ${configFile}.`);
-    console.error('Check that it is a readable regular file, then re-run setup.');
-  }
-  process.exit(1);
-} finally {
-  if (configFd !== undefined) fs.closeSync(configFd);
-}
-
-// Parse the existing config, set the llm block, and write back.
-// Using JSON.parse+stringify is the only safe way to update config.json
-// without risking corruption from partial regex matches on nested structures.
-// Key order in the output follows insertion order: existing keys first, llm last.
-let parsed;
-try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
-if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-  console.error('Error: ' + configFile + ' is not a JSON object. Cannot merge llm block.');
-  process.exit(1);
-}
-const config = { ...parsed, llm };
-const newRaw = JSON.stringify(config, null, 2) + '\n';
-atomicWritePrivateFile(configFile, newRaw);
+process.stdout.write(JSON.stringify(llm));
 NODE
+)"
+
+lcm config set llm "$LLM_JSON" --json >/dev/null
 
 if [ -t 0 ]; then
   echo "  ▸ Config written to ${CONFIG_FILE}"

@@ -26,7 +26,7 @@ import { clearWorktreeReconciliationCache } from "../src/worktree-reconciliation
 import { lcmHomeDir } from "../src/runtime-paths.js";
 import { isLcmConnectionOpen } from "../src/db/connection.js";
 import { ScrubEngine } from "../src/scrub.js";
-import { StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 
 const tempDirs: string[] = [];
 const originalHome = process.env.HOME;
@@ -149,9 +149,13 @@ it("fails closed before portable export or import can access SQLite under Postgr
   };
 
   await expect(exportKnowledge(cwd, { output, skipScrub: true, _lcmBaseDir: baseDir }))
-    .rejects.toBeInstanceOf(StorageBackendUnavailableError);
+    .rejects.toMatchObject<Partial<BackendPublicationJournalError>>({
+      reason: "publication-evidence-missing",
+    });
   await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir }))
-    .rejects.toBeInstanceOf(StorageBackendUnavailableError);
+    .rejects.toMatchObject<Partial<BackendPublicationJournalError>>({
+      reason: "publication-evidence-missing",
+    });
 
   expect(existsSync(output)).toBe(false);
   expect(existsSync(projectDir)).toBe(false);

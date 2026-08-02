@@ -3,9 +3,21 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "node:child_process";
 import { ensureCore } from "../src/bootstrap.js";
+import {
+  daemonConfigForPersistence,
+  loadDaemonConfig,
+  parseStoredConfig,
+} from "../src/daemon/config.js";
 import { lcmHomeDir } from "../src/runtime-paths.js";
 import { atomicWritePrivateFile } from "../src/security-files.js";
 import { packageExecutable, packageRootFor } from "../src/runtime-root.js";
+import {
+  assertBackendPublicationConfigAccess,
+  assertBackendPublicationConfigMutation,
+  assertBackendPublicationConsumerAccess,
+  backendPublicationHomeForConfigPath,
+  withBackendPublicationConfigLock,
+} from "../src/storage/backend-publication.js";
 import {
   hasCanonicalClaudeMcpEntry,
   mergeClaudeMcpEntry,
@@ -253,6 +265,22 @@ function safeConfigExists(deps: ServiceDeps, path: string): boolean {
   }
 }
 
+function inspectInstallConfig(deps: ServiceDeps, path: string): boolean {
+  const publicationHome = backendPublicationHomeForConfigPath(path);
+  assertBackendPublicationConsumerAccess({ homeDir: publicationHome });
+  if (!safeConfigExists(deps, path)) {
+    assertBackendPublicationConfigAccess(path, "sqlite", null);
+    return false;
+  }
+  const content = deps.readFileSync(path, "utf-8");
+  const stored = parseStoredConfig(content);
+  const backend = (
+    stored.storage as { backend?: "sqlite" | "postgresql" } | undefined
+  )?.backend ?? "sqlite";
+  assertBackendPublicationConfigAccess(path, backend, content);
+  return true;
+}
+
 function readMergedClaudeSettings(
   deps: Pick<ServiceDeps, "existsSync" | "readFileSync">,
   settingsPath: string,
@@ -472,9 +500,6 @@ export function ensureLcmMd(
 
 export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   const lcDir = lcmHomeDir();
-  deps.mkdirSync(lcDir, { recursive: true, mode: 0o700 });
-  deps.chmodSync?.(lcDir, 0o700);
-
   const configPath = join(lcDir, "config.json");
   const settingsPath = join(homedir(), ".claude", "settings.json");
   const lcmBin = deps.binaryPath ?? packageExecutable(import.meta.url, 2);
@@ -482,23 +507,40 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     throw new Error("Could not resolve an absolute npm-installed lcm executable path");
   }
 
-  // Validate settings before making any migration or installation changes.
-  readMergedClaudeSettings(deps, settingsPath, lcmBin);
-
   // 1-3. Core setup (config + settings cleanup + daemon)
   // ensureCore handles: creating config.json, merging settings.json hooks, and starting daemon
   // For install, we inject summarizer config into the default config if creating fresh
-  if (!safeConfigExists(deps, configPath)) {
+  const configExists = withBackendPublicationConfigLock(
+    configPath,
+    () => inspectInstallConfig(deps, configPath),
+  );
+  deps.mkdirSync(lcDir, { recursive: true, mode: 0o700 });
+  deps.chmodSync?.(lcDir, 0o700);
+
+  // Validate settings only after backend-publication admission, but before
+  // making any Marketplace or native-integration changes.
+  readMergedClaudeSettings(deps, settingsPath, lcmBin);
+  if (!configExists) {
     const summarizerConfig = await pickSummarizer(deps);
-    const { daemonConfigForPersistence, loadDaemonConfig } = await import("../src/daemon/config.js");
-    const defaults = loadDaemonConfig("/nonexistent");
-    defaults.llm = { ...defaults.llm, ...summarizerConfig };
-    deps.mkdirSync(dirname(configPath), { recursive: true });
-    const serialized = JSON.stringify(daemonConfigForPersistence(defaults), null, 2);
-    if (deps.atomicWritePrivateFile) deps.atomicWritePrivateFile(configPath, serialized);
-    else deps.writeFileSync(configPath, serialized);
-    try { deps.chmodSync?.(configPath, 0o600); } catch { /* best-effort */ }
-    console.log(`Created ${configPath}`);
+    const created = withBackendPublicationConfigLock(configPath, () => {
+      if (inspectInstallConfig(deps, configPath)) return false;
+      const defaults = loadDaemonConfig("/nonexistent");
+      defaults.llm = { ...defaults.llm, ...summarizerConfig };
+      const serialized = JSON.stringify(daemonConfigForPersistence(defaults), null, 2);
+      assertBackendPublicationConfigMutation(
+        configPath,
+        "sqlite",
+        "sqlite",
+        serialized,
+        null,
+      );
+      deps.mkdirSync(dirname(configPath), { recursive: true });
+      if (deps.atomicWritePrivateFile) deps.atomicWritePrivateFile(configPath, serialized);
+      else deps.writeFileSync(configPath, serialized);
+      try { deps.chmodSync?.(configPath, 0o600); } catch { /* best-effort */ }
+      return true;
+    });
+    if (created) console.log(`Created ${configPath}`);
   }
 
   // ensureCore will:

@@ -39,7 +39,13 @@ vi.mock("../src/runtime-paths.js", async (): Promise<typeof import("../src/runti
 import { handleSensitive } from "../src/sensitive.js";
 import { NATIVE_PATTERNS } from "../src/scrub.js";
 import { GITLEAKS_PATTERNS } from "../src/generated-patterns.js";
-import { StorageBackendUnavailableError } from "../src/storage/backend.js";
+import {
+  backendPublicationConfigSha256,
+  backendPublicationJournalPath,
+  backendPublicationProjectMapSha256,
+  BackendPublicationJournalError,
+  prepareBackendPublication,
+} from "../src/storage/backend-publication.js";
 import { ConfigValidationError } from "../src/daemon/config.js";
 
 describe("lcm sensitive", () => {
@@ -182,6 +188,18 @@ describe("lcm sensitive", () => {
     expect(repairedConfig.security.sensitivePatterns).toEqual(["SECOND_.*"]);
   });
 
+  it("add --global: rejects canonical PostgreSQL config without publication evidence", async () => {
+    const home = join(tempBase, "postgresql-home");
+    configPath = join(home, ".lcm", "config.json");
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    const content = JSON.stringify({ storage: { backend: "postgresql" } });
+    writeFileSync(configPath, content, { mode: 0o600 });
+
+    await expect(handleSensitive(["add", "--global", "BLOCKED_.*"], cwd, configPath))
+      .rejects.toMatchObject({ reason: "publication-evidence-missing" });
+    expect(readFileSync(configPath, "utf8")).toBe(content);
+  });
+
   it("add: appends and normalizes a missing trailing newline in a project pattern file", async (): Promise<void> => {
     writeFileSync(join(pDir, "sensitive-patterns.txt"), "PAT_A");
     await expect(handleSensitive(["add", "PAT_B"], cwd, configPath)).resolves.toMatchObject({ exitCode: 0 });
@@ -321,7 +339,9 @@ describe("lcm sensitive", () => {
     }
 
     await expect(handleSensitive(["purge", ...extraArgs, "--yes"], cwd, configPath))
-      .rejects.toBeInstanceOf(StorageBackendUnavailableError);
+      .rejects.toMatchObject<Partial<BackendPublicationJournalError>>({
+        reason: "publication-evidence-missing",
+      });
     expect(existsSync(extraArgs.includes("--all") ? allProjects : pDir)).toBe(true);
   });
 
@@ -360,5 +380,41 @@ describe("lcm sensitive", () => {
 
   it("reports usage for unknown subcommands", async (): Promise<void> => {
     await expect(handleSensitive(["unknown"], cwd, configPath)).resolves.toMatchObject({ exitCode: 1 });
+  });
+
+  it.each([
+    ["list", ["list"]],
+    ["test", ["test", "ordinary"]],
+    ["global add", ["add", "--global", "BLOCKED_.*"]],
+  ])("fails %s closed before consuming unresolved global config", async (_label, argv) => {
+    const home = join(tempBase, "publication-home");
+    const root = join(home, ".lcm");
+    configPath = join(root, "config.json");
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const config = '{"security":{"sensitivePatterns":["SECRET_.*"]}}\n';
+    writeFileSync(configPath, config, { mode: 0o600 });
+    prepareBackendPublication({
+      publicationId: `sensitive-${argv[0]}`,
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      expectedConfigSha256: backendPublicationConfigSha256(home),
+      expectedProjectMapSha256: backendPublicationProjectMapSha256(home),
+      intendedConfigSha256: "1".repeat(64),
+      intendedProjectMapSha256: "2".repeat(64),
+      projects: [{
+        localProjectId: "a".repeat(64),
+        remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+        evidenceSha256: "3".repeat(64),
+      }],
+      homeDir: home,
+    });
+    const journalPath = backendPublicationJournalPath(home);
+    const journal = readFileSync(journalPath, "utf8");
+
+    await expect(handleSensitive(argv, cwd, configPath)).rejects.toMatchObject({
+      reason: "unresolved-publication",
+    });
+    expect(readFileSync(configPath, "utf8")).toBe(config);
+    expect(readFileSync(journalPath, "utf8")).toBe(journal);
   });
 });

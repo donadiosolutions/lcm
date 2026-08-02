@@ -1,4 +1,8 @@
 import type { StorageBackend } from "../daemon/config.js";
+import {
+  assertBackendPublicationConsumerAccess,
+  withBackendPublicationConsumerLock,
+} from "./backend-publication.js";
 
 export type StorageBackendSelection = { backend: StorageBackend };
 
@@ -13,6 +17,9 @@ export class StorageBackendUnavailableError extends Error {
 
 /** Select the configured implementation after the caller's required preflight. */
 export function selectStorageBackend(config: StorageBackendSelection): SelectedStorageBackend {
-  if (config.backend === "postgresql") throw new StorageBackendUnavailableError(config.backend);
-  return { backend: "sqlite" };
+  return withBackendPublicationConsumerLock(undefined, () => {
+    assertBackendPublicationConsumerAccess({ backend: config.backend });
+    if (config.backend === "postgresql") throw new StorageBackendUnavailableError(config.backend);
+    return { backend: "sqlite" };
+  });
 }

@@ -10,6 +10,14 @@ import {
   tmpDir as lcmTmpDir,
 } from "./runtime-paths.js";
 import { selectStorageBackend } from "./storage/backend.js";
+import {
+  assertBackendPublicationConfigAccess,
+  assertBackendPublicationConfigMutation,
+  assertBackendPublicationConsumerAccess,
+  backendPublicationHomeForConfigPath,
+  withBackendPublicationConfigLock,
+  withBackendPublicationConsumerLock,
+} from "./storage/backend-publication.js";
 
 export interface EnsureCoreDeps {
   configPath: string;
@@ -33,7 +41,6 @@ export interface EnsureCoreDeps {
 }
 
 function defaultDeps(): EnsureCoreDeps {
-  migrateLegacyHomeIfNeeded();
   return {
     configPath: defaultConfigPath(),
     settingsPath: join(homedir(), ".claude", "settings.json"),
@@ -54,18 +61,35 @@ export type VerifiedCoreEndpoint = { connected: boolean; port: number };
 
 export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): Promise<VerifiedCoreEndpoint> {
   const binaryPath = deps.binaryPath ?? packageExecutable(import.meta.url, 2);
+  const publicationHome = backendPublicationHomeForConfigPath(deps.configPath);
   if (deps.configPath === defaultConfigPath()) {
-    migrateLegacyHomeIfNeeded();
+    withBackendPublicationConsumerLock(publicationHome, () => {
+      assertBackendPublicationConsumerAccess({ homeDir: publicationHome });
+      migrateLegacyHomeIfNeeded(publicationHome);
+    });
   }
   // 1. Create config.json with defaults if missing
-  if (!deps.existsSync(deps.configPath)) {
-    deps.mkdirSync(dirname(deps.configPath), { recursive: true });
+  withBackendPublicationConfigLock(deps.configPath, () => {
+    if (publicationHome !== undefined) {
+      assertBackendPublicationConsumerAccess({ homeDir: publicationHome });
+    }
+    if (deps.existsSync(deps.configPath)) return;
     const defaults = loadDaemonConfig("/nonexistent");
-    deps.writeFileSync(deps.configPath, JSON.stringify(daemonConfigForPersistence(defaults), null, 2));
+    const serialized = JSON.stringify(daemonConfigForPersistence(defaults), null, 2);
+    assertBackendPublicationConfigAccess(deps.configPath, "sqlite", null);
+    assertBackendPublicationConfigMutation(
+      deps.configPath,
+      "sqlite",
+      "sqlite",
+      serialized,
+      null,
+    );
+    deps.mkdirSync(dirname(deps.configPath), { recursive: true });
+    deps.writeFileSync(deps.configPath, serialized);
     try {
       deps.chmodSync?.(deps.configPath, 0o600);
     } catch {}
-  }
+  });
 
   // 2. Clean stale/duplicate hooks from settings.json (fixes #94)
   // Only rewrite settings.json if mergeClaudeSettings actually changed the data

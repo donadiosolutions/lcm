@@ -37,6 +37,7 @@ import {
 import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
 import { createStorageBackendFactory } from "../storage/index.js";
+import { BackendPublicationJournalError } from "../storage/backend-publication.js";
 export { PKG_VERSION };
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
@@ -77,7 +78,8 @@ export function projectTranscriptScanCwds(projectHash: string, metaCwd: string):
     for (const mappedPath of projectMapPathsForHash(projectHash)) {
       candidates.add(mappedPath);
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) throw error;
     // Fall back to meta.cwd if the user is in the middle of editing map.json.
   }
   return [...candidates];

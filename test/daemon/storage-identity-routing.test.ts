@@ -24,6 +24,11 @@ import * as storageFactoryModule from "../../src/storage/factory.js";
 import { UnavailablePostgreSqlStorageBackendFactory } from "../../src/storage/factory.js";
 import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
 
+vi.mock("../../src/storage/backend-publication.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/storage/backend-publication.js")>();
+  return { ...actual, assertBackendPublicationConsumerAccess: vi.fn() };
+});
+
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const PROJECT_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
 const POSTGRESQL_STORAGE: ResolvedStorageConfig = {

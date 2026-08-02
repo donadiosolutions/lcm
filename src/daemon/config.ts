@@ -2,6 +2,12 @@ import { readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
 import { readBoundedRegularFile } from "../security-files.js";
+import {
+  assertBackendPublicationConfigAccess,
+  assertBackendPublicationConsumerAccess,
+  backendPublicationHomeForConfigPath,
+  withBackendPublicationConfigLock,
+} from "../storage/backend-publication.js";
 import { hasUrlQueryComponent, sanitizeUrlForDisplay } from "../url-display.js";
 
 export { sanitizeUrlForDisplay } from "../url-display.js";
@@ -1287,17 +1293,36 @@ export function parseDaemonConfig(
   return merged;
 }
 
-export function loadDaemonConfig(configPath: string, overrides?: unknown, env?: Record<string, string | undefined>): DaemonConfig {
-  const rawEnv = env ?? process.env;
-  const resolvedEnv = resolveDaemonConfigEnv(rawEnv);
-  let content: string;
-  try {
-    content = readFileSync(configPath, "utf-8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    content = "{}";
-  }
-  return parseDaemonConfig(content, overrides, resolvedEnv);
+export function loadDaemonConfig(
+  configPath: string,
+  overrides?: unknown,
+  env?: Record<string, string | undefined>,
+): DaemonConfig {
+  return withBackendPublicationConfigLock(configPath, () => {
+    const publicationHome = backendPublicationHomeForConfigPath(configPath);
+    if (publicationHome !== undefined) {
+      assertBackendPublicationConsumerAccess({ homeDir: publicationHome });
+    }
+    const rawEnv = env ?? process.env;
+    const resolvedEnv = resolveDaemonConfigEnv(rawEnv);
+    let content: string;
+    let observedContent: string | null;
+    try {
+      content = readFileSync(configPath, "utf-8");
+      observedContent = content;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      content = "{}";
+      observedContent = null;
+    }
+    const config = parseDaemonConfig(content, overrides, resolvedEnv);
+    assertBackendPublicationConfigAccess(
+      configPath,
+      config.storage.backend,
+      observedContent,
+    );
+    return config;
+  });
 }
 
 /** Internal pure seams used by configuration boundary tests. */

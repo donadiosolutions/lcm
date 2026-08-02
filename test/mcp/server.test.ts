@@ -137,7 +137,7 @@ describe("startMcpServer", () => {
     } as never);
     const { startMcpServer } = await import("../../src/mcp/server.js");
 
-    await expect(startMcpServer()).rejects.toThrow("postgresql storage backend is not available");
+    await expect(startMcpServer()).rejects.toThrow("publication evidence");
     expect(ensureDaemonMcpMock).not.toHaveBeenCalled();
   });
 
@@ -216,7 +216,7 @@ describe("handleDaemonRequest spawn opts propagation", () => {
     await expect(handleDaemonRequest(client, "/search", { q: "foo" }, optsWithSpawn))
       .resolves.toMatchObject({
         isError: true,
-        content: [{ text: expect.stringContaining("postgresql storage backend is not available") }],
+        content: [{ text: expect.stringContaining("publication evidence") }],
       });
 
     expect(ensureDaemonSpy).not.toHaveBeenCalled();

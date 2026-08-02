@@ -40,6 +40,12 @@ import { projectDbPath, projectIdentity } from "../src/daemon/project.js";
 import { recoverMachineIdentity } from "../src/machine-identity.js";
 import type { ResolvedStorageConfig } from "../src/daemon/config.js";
 import { EventsDb } from "../src/hooks/events-db.js";
+import {
+  backendPublicationConfigSha256,
+  backendPublicationJournalPath,
+  backendPublicationProjectMapSha256,
+  prepareBackendPublication,
+} from "../src/storage/backend-publication.js";
 
 const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
   backend: "postgresql",
@@ -870,7 +876,7 @@ describe("worktree reconciliation", () => {
     home = mkdtempSync(join(tmpdir(), "lcm-worktree-reconcile-"));
     process.env.HOME = home;
     process.env.USERPROFILE = home;
-    mkdirSync(join(home, ".lcm"), { recursive: true });
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
     clearProjectMapCache();
     clearGitProjectAnchorCache();
     clearWorktreeReconciliationCache();
@@ -5342,6 +5348,55 @@ describe("worktree reconciliation", () => {
       _discoveryObserver: discoveryObserver,
     }).status).toBe("not-needed");
     expect(catalogueWalks).toBeGreaterThan(afterIdentityChange);
+  });
+
+  it("rejects unresolved publication before a process-cache fast path", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const identity = { id: targetHash, canonical };
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const first = ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 0,
+      _codexDir: join(home, ".codex"),
+    });
+    expect(ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 1,
+      _codexDir: join(home, ".codex"),
+    }).status).toBe("completed");
+    const reconciliationBefore = first.journalPath === undefined
+      ? null
+      : readFileSync(first.journalPath);
+    prepareBackendPublication({
+      publicationId: "worktree-cache-publication",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      expectedConfigSha256: backendPublicationConfigSha256(),
+      expectedProjectMapSha256: backendPublicationProjectMapSha256(),
+      intendedConfigSha256: "1".repeat(64),
+      intendedProjectMapSha256: "2".repeat(64),
+      projects: [{
+        localProjectId: "a".repeat(64),
+        remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+        evidenceSha256: "3".repeat(64),
+      }],
+    });
+    const publicationBefore = readFileSync(backendPublicationJournalPath());
+
+    expect(() => ensureWorktreeProjectReconciled(main, identity, {
+      _cacheTtlMs: 1_000,
+      _nowMs: 2,
+      _codexDir: join(home, ".codex"),
+    })).toThrowError(expect.objectContaining({ reason: "unresolved-publication" }));
+    expect(readFileSync(backendPublicationJournalPath())).toEqual(publicationBefore);
+    if (first.journalPath !== undefined && reconciliationBefore !== null) {
+      expect(readFileSync(first.journalPath)).toEqual(reconciliationBefore);
+    }
   });
 
   it("observes a late Codex generation after the bounded cache lifetime", () => {

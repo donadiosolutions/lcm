@@ -16,6 +16,7 @@ vi.mock("../src/daemon/project.js", () => ({ projectDir: (cwd: string): string =
 vi.mock("../src/generated-patterns.js", () => ({ GITLEAKS_PATTERNS: [] }));
 vi.mock("../src/runtime-paths.js", () => ({
   configPath: (): string => "/isolated/config.json",
+  lcmPath: (...segments: string[]): string => `/isolated/${segments.join("/")}`,
   projectsDir: (): string => "/isolated/projects",
 }));
 vi.mock("../src/scrub.js", () => ({

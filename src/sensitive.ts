@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { rmSync, existsSync } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 
@@ -7,9 +7,19 @@ import { NATIVE_PATTERNS, ScrubEngine, readGitleaksSyncDate } from "./scrub.js";
 import { GITLEAKS_PATTERNS } from "./generated-patterns.js";
 import { projectDir } from "./daemon/project.js";
 import { loadStoredConfigProjection } from "./config-projection.js";
+import { parseStoredConfig } from "./daemon/config.js";
 import { selectStorageBackend } from "./storage/backend.js";
 import { validateRegex } from "./store/regex-safety.js";
 import { configPath as runtimeConfigPath, projectsDir as runtimeProjectsDir } from "./runtime-paths.js";
+import { atomicWritePrivateFile } from "./security-files.js";
+import {
+  assertBackendPublicationConfigAccess,
+  assertBackendPublicationConfigMutation,
+  assertBackendPublicationConsumerAccess,
+  backendPublicationHomeForConfigPath,
+  BackendPublicationJournalError,
+  withBackendPublicationConfigLock,
+} from "./storage/backend-publication.js";
 
 function defaultConfigPath(): string {
   return runtimeConfigPath();
@@ -18,7 +28,8 @@ function defaultConfigPath(): string {
 function loadGlobalUserPatterns(configPath: string): string[] {
   try {
     return loadStoredConfigProjection(configPath).security.sensitivePatterns;
-  } catch {
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) throw error;
     // Pattern inspection remains available when persisted configuration is invalid.
     return [];
   }
@@ -118,44 +129,70 @@ async function sensitiveAdd(
   }
 
   if (isGlobal) {
-    // Read config.json, add to security.sensitivePatterns
-    let raw: any = {};
-    try {
-      const content = await readFile(configPath, "utf-8");
-      let parsed: unknown;
+    return withBackendPublicationConfigLock(configPath, () => {
+      const publicationHome = backendPublicationHomeForConfigPath(configPath);
+      if (publicationHome !== undefined) {
+        assertBackendPublicationConsumerAccess({ homeDir: publicationHome });
+      }
+      let content: string | null = null;
+      let raw: Record<string, any> = {};
       try {
-        parsed = JSON.parse(content);
-      } catch {
-        // Corrupt JSON — refuse to overwrite and destroy existing settings.
-        return {
-          exitCode: 1,
-          stdout: `Error: ${configPath} contains invalid JSON. Fix the file manually before adding patterns.\n`,
-        };
+        content = readFileSync(configPath, "utf-8");
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(content);
+        } catch {
+          return {
+            exitCode: 1,
+            stdout: `Error: ${configPath} contains invalid JSON. Fix the file manually before adding patterns.\n`,
+          };
+        }
+        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+          raw = parsed as Record<string, any>;
+        } else {
+          return {
+            exitCode: 1,
+            stdout: `Error: ${configPath} is not a JSON object. Fix the file manually before adding patterns.\n`,
+          };
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-      // Guard against non-object JSON values (arrays, primitives).
-      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-        raw = parsed;
-      } else {
-        return {
-          exitCode: 1,
-          stdout: `Error: ${configPath} is not a JSON object. Fix the file manually before adding patterns.\n`,
-        };
+      const configuredBackend = (
+        raw.storage as { backend?: unknown } | undefined
+      )?.backend;
+      const currentBackend = configuredBackend === "postgresql" ? "postgresql" : "sqlite";
+      assertBackendPublicationConfigAccess(configPath, currentBackend, content);
+      if (!raw.security) raw.security = {};
+      if (!Array.isArray(raw.security.sensitivePatterns)) {
+        raw.security.sensitivePatterns = [];
       }
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-      // File doesn't exist yet — start fresh with empty object.
-    }
-    if (!raw.security) raw.security = {};
-    if (!Array.isArray(raw.security.sensitivePatterns)) {
-      raw.security.sensitivePatterns = [];
-    }
-    if (raw.security.sensitivePatterns.includes(pattern)) {
-      return { exitCode: 0, stdout: `Pattern already present (global): ${pattern}\n` };
-    }
-    raw.security.sensitivePatterns.push(pattern);
-    await mkdir(dirname(configPath), { recursive: true });
-    await writeFile(configPath, JSON.stringify(raw, null, 2) + "\n", "utf-8");
-    return { exitCode: 0, stdout: `Added global pattern: ${pattern}\n` };
+      if (raw.security.sensitivePatterns.includes(pattern)) {
+        return { exitCode: 0, stdout: `Pattern already present (global): ${pattern}\n` };
+      }
+      raw.security.sensitivePatterns.push(pattern);
+      const candidateContent = `${JSON.stringify(raw, null, 2)}\n`;
+      parseStoredConfig(candidateContent);
+      assertBackendPublicationConfigMutation(
+        configPath,
+        currentBackend,
+        currentBackend,
+        candidateContent,
+        content,
+      );
+      mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
+      atomicWritePrivateFile(configPath, candidateContent);
+      const directoryFd = openSync(
+        dirname(configPath),
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      try {
+        fsyncSync(directoryFd);
+      } finally {
+        closeSync(directoryFd);
+      }
+      return { exitCode: 0, stdout: `Added global pattern: ${pattern}\n` };
+    });
   }
 
   // Project-local

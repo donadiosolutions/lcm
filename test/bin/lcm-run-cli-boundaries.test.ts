@@ -105,6 +105,16 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   daemonTokenPath: () => "/lcm/daemon.token", lcmHomeDir: () => "/lcm",
   migrateLegacyHomeIfNeeded: vi.fn(), projectsDir: () => "/lcm/projects",
 }));
+vi.mock("../../src/storage/backend-publication.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/storage/backend-publication.js")>()),
+  assertBackendPublicationConfigAccess: vi.fn(),
+  assertBackendPublicationConfigMutation: vi.fn(),
+  assertBackendPublicationConsumerAccess: vi.fn(),
+  assertBackendPublicationProjectMapAccess: vi.fn(),
+  assertBackendPublicationProjectMapMutation: vi.fn(),
+  withBackendPublicationConfigLock: vi.fn((_path: string, callback: () => unknown) => callback()),
+  withBackendPublicationConsumerLock: vi.fn((_home: string | undefined, callback: () => unknown) => callback()),
+}));
 vi.mock("../../src/daemon/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()), loadDaemonConfig: state.loadConfig,
 }));

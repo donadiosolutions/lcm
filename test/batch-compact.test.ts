@@ -9,10 +9,15 @@ import { closeLcmConnection, getLcmConnection, getPoolStats } from "../src/db/co
 import { runLcmMigrations } from "../src/db/migration.js";
 import { addProjectAlias, clearProjectMapCache, projectMapPath } from "../src/project-map.js";
 import { ensureProjectDir, projectPaths } from "../src/daemon/project.js";
+import {
+  backendPublicationConfigSha256,
+  backendPublicationProjectMapSha256,
+  prepareBackendPublication,
+} from "../src/storage/backend-publication.js";
 
 function resetLcmHome(): void {
   rmSync(join(homedir(), ".lcm"), { recursive: true, force: true });
-  mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+  mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
   clearProjectMapCache();
 }
 
@@ -105,6 +110,60 @@ describe("batch compaction discovery", () => {
     symlinkSync(victim, alias, "dir");
     expect(findUncompacted(100, true, alias)).toHaveLength(1);
     expect(findUncompacted(100, true, victim)).toEqual([]);
+  });
+
+  it("does not suppress unresolved publication while evaluating cwd filters", () => {
+    const canonical = makeDir("compact-publication-canonical");
+    const alias = makeDir("compact-publication-alias");
+    const paths = projectPaths(canonical);
+    ensureProjectDir(canonical);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }, null, 2) + "\n");
+    seedConversation(paths.dbPath);
+    addProjectAlias(alias, { canonical });
+    prepareBackendPublication({
+      publicationId: "batch-filter-publication",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      expectedConfigSha256: backendPublicationConfigSha256(),
+      expectedProjectMapSha256: backendPublicationProjectMapSha256(),
+      intendedConfigSha256: "1".repeat(64),
+      intendedProjectMapSha256: "2".repeat(64),
+      projects: [{
+        localProjectId: "a".repeat(64),
+        remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+        evidenceSha256: "3".repeat(64),
+      }],
+    });
+
+    expect(() => findUncompacted(100, true, alias)).toThrowError(expect.objectContaining({
+      reason: "unresolved-publication",
+    }));
+  });
+
+  it("does not suppress unresolved publication while attributing metadata failures", () => {
+    const cwd = makeDir("compact-publication-missing-metadata");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    rmSync(paths.metaPath, { force: true });
+    seedConversation(paths.dbPath);
+    prepareBackendPublication({
+      publicationId: "batch-metadata-publication",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      expectedConfigSha256: backendPublicationConfigSha256(),
+      expectedProjectMapSha256: backendPublicationProjectMapSha256(),
+      intendedConfigSha256: "1".repeat(64),
+      intendedProjectMapSha256: "2".repeat(64),
+      projects: [{
+        localProjectId: "a".repeat(64),
+        remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+        evidenceSha256: "3".repeat(64),
+      }],
+    });
+
+    expect(() => findUncompacted(100, true, cwd)).toThrowError(expect.objectContaining({
+      reason: "unresolved-publication",
+    }));
   });
 
   it("does not match a current-project filter that is unrelated to the map entry", () => {

@@ -65,6 +65,21 @@ vi.mock("../src/runtime-paths.js", () => ({
   configPath: () => "/tmp/config.json",
   daemonPidPath: () => "/tmp/daemon.pid",
 }));
+vi.mock("../src/storage/backend-publication.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/storage/backend-publication.js")>();
+  return {
+    ...actual,
+    assertBackendPublicationConsumerAccess: vi.fn((options: { backend?: string } = {}) => {
+      if (options.backend === "postgresql") {
+        throw new actual.BackendPublicationJournalError(
+          "publication-evidence-missing",
+          "PostgreSQL selection has no completed backend publication evidence",
+        );
+      }
+    }),
+    withBackendPublicationConsumerLock: vi.fn((_home: string | undefined, callback: () => unknown) => callback()),
+  };
+});
 vi.mock("../src/stats.js", () => ({ collectStats: mocks.collectStats, formatNumber: (n: number) => `n${n}` }));
 vi.mock("../src/doctor/doctor.js", () => ({ runDoctor: mocks.runDoctor, formatResultsPlain: mocks.formatResultsPlain }));
 
@@ -133,7 +148,7 @@ describe("MCP service coverage", () => {
     mocks.storageBackend = "postgresql";
     await expect(call("lcm_search", { query: "postgresql" })).resolves.toMatchObject({
       isError: true,
-      content: [{ text: expect.stringContaining("postgresql storage backend is not available") }],
+      content: [{ text: expect.stringContaining("publication evidence") }],
     });
     expect(mocks.post).toHaveBeenCalledOnce();
     expect(mocks.ensureDaemon).toHaveBeenCalledOnce();
@@ -182,7 +197,7 @@ describe("MCP service coverage", () => {
 
     await expect(call("lcm_stats")).resolves.toMatchObject({
       isError: true,
-      content: [{ text: expect.stringContaining("postgresql storage backend is not available") }],
+      content: [{ text: expect.stringContaining("publication evidence") }],
     });
     expect(mocks.collectStats).not.toHaveBeenCalled();
   });

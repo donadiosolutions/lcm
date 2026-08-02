@@ -1,8 +1,9 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  applyBackendPublicationConfigFile,
   ConfigManagerError,
   formatConfigValue,
   getConfigValue,
@@ -12,8 +13,60 @@ import {
   parseConfigValue,
   setConfigValue,
 } from "../src/config-manager.js";
+import {
+  loadStoredConfigProjection,
+  loadStoredLlmRequestPolicyConfig,
+} from "../src/config-projection.js";
+import { loadDaemonConfig } from "../src/daemon/config.js";
+import {
+  advanceBackendPublication,
+  backendPublicationConfigSha256,
+  backendPublicationProjectMapSha256,
+  prepareBackendPublication,
+  type BackendPublicationFileMutationContext,
+} from "../src/storage/backend-publication.js";
 
 const tempDirs: string[] = [];
+
+function installAbortedPublication(homeDir: string): void {
+  const expectedConfigSha256 = backendPublicationConfigSha256(homeDir);
+  const expectedProjectMapSha256 = backendPublicationProjectMapSha256(homeDir);
+  let journal = prepareBackendPublication({
+    publicationId: "post-terminal-config",
+    sourceBackend: "sqlite",
+    targetBackend: "postgresql",
+    expectedConfigSha256,
+    expectedProjectMapSha256,
+    intendedConfigSha256: "1".repeat(64),
+    intendedProjectMapSha256: "2".repeat(64),
+    projects: [{
+      localProjectId: "a".repeat(64),
+      remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+      evidenceSha256: "3".repeat(64),
+    }],
+    homeDir,
+  });
+  const advance = (
+    phase: Parameters<typeof advanceBackendPublication>[0]["phase"],
+    witnesses: Pick<
+      Parameters<typeof advanceBackendPublication>[0],
+      "publishedConfigSha256" | "publishedProjectMapSha256"
+    > = {},
+  ): void => {
+    journal = advanceBackendPublication({
+      publicationId: journal.publicationId,
+      expectedChecksumSha256: journal.checksumSha256,
+      phase,
+      homeDir,
+      ...witnesses,
+    });
+  };
+  advance("abort-prepared");
+  advance("config-restored", { publishedConfigSha256: expectedConfigSha256 });
+  advance("map-restored", { publishedProjectMapSha256: expectedProjectMapSha256 });
+  advance("abort-releasing");
+  advance("aborted");
+}
 
 function makeConfig(content: unknown): { directory: string; configPath: string } {
   const directory = mkdtempSync(join(tmpdir(), "lcm-config-manager-"));
@@ -32,6 +85,146 @@ afterEach(() => {
 });
 
 describe("config manager paths and values", () => {
+  it("does not apply the default-home publication journal to a noncanonical config path", () => {
+    const defaultHome = mkdtempSync(join(tmpdir(), "lcm-config-default-home-publication-"));
+    tempDirs.push(defaultHome);
+    const root = join(defaultHome, ".lcm");
+    mkdirSync(root, { mode: 0o700 });
+    writeFileSync(join(root, "config.json"), "{}\n", { mode: 0o600 });
+    vi.stubEnv("HOME", defaultHome);
+    vi.stubEnv("USERPROFILE", defaultHome);
+    prepareBackendPublication({
+      publicationId: "default-home-publication",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      expectedConfigSha256: backendPublicationConfigSha256(defaultHome),
+      expectedProjectMapSha256: backendPublicationProjectMapSha256(defaultHome),
+      intendedConfigSha256: "1".repeat(64),
+      intendedProjectMapSha256: "2".repeat(64),
+      projects: [{
+        localProjectId: "a".repeat(64),
+        remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+        evidenceSha256: "3".repeat(64),
+      }],
+      homeDir: defaultHome,
+    });
+    const { configPath } = makeConfig({ daemon: { port: 3738 } });
+
+    expect(getConfigValue({ configPath, path: "daemon.port" })).toBe(3738);
+    expect(loadStoredConfigProjection(configPath).daemonPort).toBe(3738);
+    expect(loadDaemonConfig(configPath).daemon.port).toBe(3738);
+  });
+
+  it("allows ordinary same-backend config updates after terminal recovery", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-config-post-terminal-"));
+    tempDirs.push(home);
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    mkdirSync(root, { mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    installAbortedPublication(home);
+
+    expect(setConfigValue({
+      configPath,
+      path: "daemon.port",
+      value: "3738",
+      json: true,
+    })).toBe(3738);
+    expect(getConfigValue({ configPath, path: "daemon.port" })).toBe(3738);
+  });
+
+  it("fails every config reader and writer closed before parsing unresolved bytes", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-config-publication-unresolved-"));
+    tempDirs.push(home);
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    mkdirSync(root, { mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    prepareBackendPublication({
+      publicationId: "config-consumer-publication",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      expectedConfigSha256: backendPublicationConfigSha256(home),
+      expectedProjectMapSha256: backendPublicationProjectMapSha256(home),
+      intendedConfigSha256: "1".repeat(64),
+      intendedProjectMapSha256: "2".repeat(64),
+      projects: [{
+        localProjectId: "a".repeat(64),
+        remoteProjectId: "018f0000-0000-7000-8000-000000000001",
+        evidenceSha256: "3".repeat(64),
+      }],
+      homeDir: home,
+    });
+    const malformed = '{"leak":"secret-publication-value"';
+    writeFileSync(configPath, malformed, { mode: 0o600 });
+
+    const calls = [
+      () => getConfigValue({ configPath, path: "storage.backend" }),
+      () => setConfigValue({ configPath, path: "daemon.port", value: "3738", json: true }),
+      () => loadStoredConfigProjection(configPath),
+      () => loadStoredLlmRequestPolicyConfig(configPath),
+      () => loadDaemonConfig(configPath),
+    ];
+    for (const call of calls) {
+      expect(call).toThrowError(expect.objectContaining({
+        reason: "unresolved-publication",
+      }));
+    }
+    expect(readFileSync(configPath, "utf8")).toBe(malformed);
+  });
+
+  it("rejects non-UTF-8 publication config material before mutation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-config-publication-invalid-"));
+    tempDirs.push(directory);
+    mkdirSync(join(directory, ".lcm"), { mode: 0o700 });
+    const input = {
+      homeDir: directory,
+      file: {
+        presence: "present",
+        content: Uint8Array.from([0xff]),
+        mode: 0o600,
+        uid: process.getuid?.() ?? 0,
+        gid: process.getgid?.() ?? 0,
+      },
+    } as unknown as BackendPublicationFileMutationContext;
+
+    await expect(applyBackendPublicationConfigFile(input))
+      .rejects.toThrow("config material is not UTF-8");
+    expect(existsSync(join(directory, ".lcm", "config.json"))).toBe(false);
+  });
+
+  it("applies exact present and absent terminal publication config material", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-config-publication-driver-"));
+    tempDirs.push(home);
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    mkdirSync(root, { mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    installAbortedPublication(home);
+    const metadata = {
+      mode: 0o600,
+      uid: process.getuid?.() ?? 0,
+      gid: process.getgid?.() ?? 0,
+    };
+
+    await applyBackendPublicationConfigFile({
+      homeDir: home,
+      file: { presence: "absent", ...metadata },
+    } as BackendPublicationFileMutationContext);
+    expect(existsSync(configPath)).toBe(false);
+
+    await applyBackendPublicationConfigFile({
+      homeDir: home,
+      file: {
+        presence: "present",
+        content: Buffer.from('{"daemon":{"port":3739}}\n'),
+        ...metadata,
+      },
+    } as BackendPublicationFileMutationContext);
+    expect(readFileSync(configPath, "utf8")).toBe('{"daemon":{"port":3739}}\n');
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+  });
+
   it("canonicalizes legacy paths and rejects unsafe paths", () => {
     expect(parseConfigPath("llm.baseURL")).toEqual(["llm", "baseUrl"]);
     expect(normalizeConfigPath("llm.baseURL")).toBe("llm.baseUrl");
@@ -161,6 +354,31 @@ describe("config manager paths and values", () => {
 });
 
 describe("getConfigValue", () => {
+  it("rejects config symlinks and oversized leaves before parsing or mutation", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-config-manager-leaf-"));
+    tempDirs.push(directory);
+    const victim = join(directory, "victim.json");
+    const configPath = join(directory, "config.json");
+    writeFileSync(victim, '{"daemon":{"port":3738}}\n');
+    symlinkSync(victim, configPath);
+
+    expect(() => getConfigValue({ configPath, path: "daemon.port" })).toThrow();
+    expect(() => setConfigValue({
+      configPath,
+      path: "daemon.port",
+      value: "3739",
+      json: true,
+    })).toThrow();
+    expect(readFileSync(victim, "utf8")).toBe('{"daemon":{"port":3738}}\n');
+
+    rmSync(configPath);
+    writeFileSync(configPath, `{"padding":"${"x".repeat(1024 * 1024)}"}\n`);
+    expect(() => getConfigValue({ configPath, path: "padding" }))
+      .toThrow("configured size limit");
+    expect(() => setConfigValue({ configPath, path: "daemon.port", value: "3739", json: true }))
+      .toThrow("configured size limit");
+  });
+
   it("rethrows non-missing filesystem failures and rejects traversal through a scalar", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-config-manager-directory-"));
     tempDirs.push(directory);

@@ -1,8 +1,13 @@
 import { createHash } from "node:crypto";
 import {
+  closeSync,
+  constants,
   existsSync,
+  fsyncSync,
+  openSync,
   realpathSync,
   readdirSync,
+  rmSync,
   statSync,
   watch,
   type FSWatcher,
@@ -23,6 +28,17 @@ import {
   type PrivateMutationLockObserver,
 } from "./private-mutation-lock.js";
 import { resolveGitProjectAnchor } from "./git-project.js";
+import {
+  assertBackendPublicationConsumerAccess,
+  assertBackendPublicationProjectMapAccess,
+  assertBackendPublicationProjectMapMutation,
+  BackendPublicationJournalError,
+  captureBackendPublicationState,
+  readBackendPublicationJournal,
+  withBackendPublicationConsumerLock,
+  type BackendPublicationFileMutationContext,
+  type BackendPublicationFileWitness,
+} from "./storage/backend-publication.js";
 
 export type ProjectMapEntry = {
   canonical: string;
@@ -85,14 +101,15 @@ function withProjectMapMutationLock<T>(
   observer?: ProjectMapLockObserver,
 ): T {
   const lockPath = projectMapMutationLockPath(homeDir);
-  return withPrivateMutationLock(lockPath, "project map", () => {
-    activeProjectMapMutationLocks.add(lockPath);
-    try {
-      return callback();
-    } finally {
-      activeProjectMapMutationLocks.delete(lockPath);
-    }
-  }, observer);
+  return withBackendPublicationConsumerLock(homeDir, () =>
+    withPrivateMutationLock(lockPath, "project map", () => {
+      activeProjectMapMutationLocks.add(lockPath);
+      try {
+        return callback();
+      } finally {
+        activeProjectMapMutationLocks.delete(lockPath);
+      }
+    }, observer));
 }
 
 /**
@@ -290,12 +307,14 @@ function writeProjectMap(
     onMapPublished?: () => void;
   } = {},
 ): { path: string; backupPath?: string } {
+  const content = prettyMap(map);
+  assertBackendPublicationProjectMapMutation(map, homeDir, content);
   const path = projectMapPath(homeDir);
   ensurePrivateDirectory(dirname(path));
   assertCurrentMapIsWritable(path);
   const backupPath = createBackupIfNeeded(path, homeDir);
   if (backupPath) opts.onBackupCreated?.(backupPath);
-  atomicWritePrivateFile(path, prettyMap(map));
+  atomicWritePrivateFile(path, content);
   opts.onMapPublished?.();
   cache = {
     path,
@@ -306,24 +325,109 @@ function writeProjectMap(
   return { path, backupPath };
 }
 
-function loadProjectMap(opts: { strict?: boolean; reload?: boolean; homeDir?: string } = {}): ProjectMap {
+function syncProjectMapDirectory(path: string): void {
+  const fd = openSync(path, constants.O_RDONLY);
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function recoveryProjectMapState(
+  input: BackendPublicationFileMutationContext,
+): { readonly content: string | null; readonly map: ProjectMap } {
+  if (input.file.presence === "absent") {
+    return { content: null, map: emptyMap() };
+  }
+  let content: string;
+  try {
+    content = new TextDecoder("utf-8", { fatal: true }).decode(input.file.content);
+  } catch (error) {
+    throw new InvalidProjectMapError(
+      `backend publication project-map material is not UTF-8: ${String(error)}`,
+    );
+  }
+  return { content, map: parseProjectMap(content) };
+}
+
+/**
+ * Publish or restore the exact canonical project-map state supplied by a
+ * guarded BackendPublicationCoordinator callback.
+ */
+export async function applyBackendPublicationProjectMapFile(
+  input: BackendPublicationFileMutationContext,
+): Promise<BackendPublicationFileWitness> {
+  return withProjectMapMutationLock(() => {
+    const state = recoveryProjectMapState(input);
+    assertBackendPublicationProjectMapMutation(
+      state.map,
+      input.homeDir,
+      state.content,
+    );
+    const path = projectMapPath(input.homeDir);
+    if (state.content === null) {
+      rmSync(path, { force: true });
+      syncProjectMapDirectory(dirname(path));
+      cache = {
+        path,
+        mtimeMs: null,
+        map: emptyMap(),
+        metadataPopulated: false,
+      };
+    } else {
+      ensurePrivateDirectory(dirname(path));
+      atomicWritePrivateFile(path, state.content);
+      syncProjectMapDirectory(dirname(path));
+      cache = {
+        path,
+        mtimeMs: statSync(path).mtimeMs,
+        map: cloneMap(state.map),
+        metadataPopulated: false,
+      };
+    }
+    return captureBackendPublicationState(input.homeDir).projectMap;
+  }, input.homeDir);
+}
+
+function loadProjectMapUnlocked(opts: { strict?: boolean; reload?: boolean; homeDir?: string } = {}): ProjectMap {
+  assertBackendPublicationConsumerAccess({ homeDir: opts.homeDir });
   const path = projectMapPath(opts.homeDir);
   const file = readMapFile(path);
   if (!file) {
-    if (!opts.strict && cache?.path === path) {
+    const map = emptyMap();
+    assertBackendPublicationProjectMapAccess({
+      homeDir: opts.homeDir,
+      content: null,
+      map,
+      present: false,
+    });
+    if (!opts.strict && cache?.path === path
+      && readBackendPublicationJournal(opts.homeDir) === null) {
       return cloneMap(cache.map);
     }
-    const map = emptyMap();
     cache = { path, mtimeMs: null, map, metadataPopulated: false };
     return cloneMap(map);
   }
 
   if (!opts.reload && cache?.path === path && cache.mtimeMs === file.mtimeMs) {
+    assertBackendPublicationProjectMapAccess({
+      homeDir: opts.homeDir,
+      content: file.content,
+      map: cache.map,
+      present: true,
+    });
     return cloneMap(cache.map);
   }
 
   try {
     const map = parseProjectMap(file.content);
+    assertBackendPublicationProjectMapAccess({
+      homeDir: opts.homeDir,
+      content: file.content,
+      map,
+      present: true,
+    });
     cache = { path, mtimeMs: file.mtimeMs, map: cloneMap(map), metadataPopulated: false };
     return map;
   } catch (err) {
@@ -332,6 +436,15 @@ function loadProjectMap(opts: { strict?: boolean; reload?: boolean; homeDir?: st
     }
     return cloneMap(cache.map);
   }
+}
+
+function loadProjectMap(
+  opts: { strict?: boolean; reload?: boolean; homeDir?: string } = {},
+): ProjectMap {
+  return withBackendPublicationConsumerLock(
+    opts.homeDir,
+    () => loadProjectMapUnlocked(opts),
+  );
 }
 
 function loadProjectMapWithMetadata(opts: {
@@ -944,15 +1057,28 @@ export function removeProjectAlias(alias: string, opts: {
 }
 
 function validateProjectMapUnlocked(opts: { homeDir?: string; fix?: boolean }): ProjectMapValidation {
+  assertBackendPublicationConsumerAccess({ homeDir: opts.homeDir });
   const path = projectMapPath(opts.homeDir);
   const file = readMapFile(path);
   if (!file) {
+    assertBackendPublicationProjectMapAccess({
+      homeDir: opts.homeDir,
+      content: null,
+      map: emptyMap(),
+      present: false,
+    });
     return { ok: true, map: emptyMap(), path, errors: [], warnings: ["map.json does not exist yet"], fixApplied: false };
   }
 
   let parsed: ProjectMap;
   try {
     parsed = parseProjectMap(file.content);
+    assertBackendPublicationProjectMapAccess({
+      homeDir: opts.homeDir,
+      content: file.content,
+      map: parsed,
+      present: true,
+    });
   } catch (err) {
     return {
       ok: false,
@@ -998,15 +1124,22 @@ function validateProjectMapUnlocked(opts: { homeDir?: string; fix?: boolean }): 
 }
 
 export function validateProjectMap(opts: { homeDir?: string; fix?: boolean } = {}): ProjectMapValidation {
-  return opts.fix
-    ? withProjectMapMutationLock(() => validateProjectMapUnlocked(opts), opts.homeDir)
-    : validateProjectMapUnlocked(opts);
+  return withBackendPublicationConsumerLock(opts.homeDir, () =>
+    opts.fix
+      ? withProjectMapMutationLock(() => validateProjectMapUnlocked(opts), opts.homeDir)
+      : validateProjectMapUnlocked(opts));
 }
 
 function reloadProjectMapCacheUnlocked(opts: { reformat?: boolean }): boolean {
+  assertBackendPublicationConsumerAccess();
   const path = projectMapPath();
   const file = readMapFile(path);
   if (!file) {
+    assertBackendPublicationProjectMapAccess({
+      content: null,
+      map: emptyMap(),
+      present: false,
+    });
     if (cache?.path === path) {
       return true;
     }
@@ -1015,6 +1148,11 @@ function reloadProjectMapCacheUnlocked(opts: { reformat?: boolean }): boolean {
   }
   try {
     const map = parseProjectMap(file.content);
+    assertBackendPublicationProjectMapAccess({
+      content: file.content,
+      map,
+      present: true,
+    });
     cache = { path, mtimeMs: file.mtimeMs, map: cloneMap(map), metadataPopulated: false };
     if (opts.reformat && file.content !== prettyMap(map)) {
       writeProjectMap(map);
@@ -1026,19 +1164,28 @@ function reloadProjectMapCacheUnlocked(opts: { reformat?: boolean }): boolean {
 }
 
 export function reloadProjectMapCache(opts: { reformat?: boolean } = {}): boolean {
-  return opts.reformat
-    ? withProjectMapMutationLock(() => reloadProjectMapCacheUnlocked(opts))
-    : reloadProjectMapCacheUnlocked(opts);
+  return withBackendPublicationConsumerLock(undefined, () =>
+    opts.reformat
+      ? withProjectMapMutationLock(() => reloadProjectMapCacheUnlocked(opts))
+      : reloadProjectMapCacheUnlocked(opts));
 }
 
-export function watchProjectMap(): { close: () => void } {
+export function watchProjectMap(options: {
+  /** @internal Deterministic publication race seam for tests. */
+  readonly _beforeInitialArmForTesting?: () => void;
+  /** @internal Deterministic filesystem-watch seam for tests. */
+  readonly _watchForTesting?: typeof watch;
+} = {}): { close: () => void } {
   const path = projectMapPath();
-  ensurePrivateDirectory(dirname(path));
+  withBackendPublicationConsumerLock(undefined, () => {
+    assertBackendPublicationConsumerAccess();
+    ensurePrivateDirectory(dirname(path));
+  });
   let closed = false;
   let watcher: FSWatcher | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let activeWatchPath: string | undefined;
-  let arm: () => void;
+  let arm: (failClosed?: boolean) => void;
 
   const scheduleReload = (watchPath: string | undefined) => {
     if (timer) clearTimeout(timer);
@@ -1057,17 +1204,21 @@ export function watchProjectMap(): { close: () => void } {
     }, 25);
   };
 
-  arm = () => {
+  arm = (failClosed = false) => {
     try {
-      watcher?.close();
-      const watchPath = existsSync(path) ? path : dirname(path);
-      activeWatchPath = watchPath;
-      watcher = watch(watchPath, (_event, filename) => {
-        if (watchPath !== path && filename && filename.toString() !== "map.json") return;
-        scheduleReload(watchPath);
+      withBackendPublicationConsumerLock(undefined, () => {
+        assertBackendPublicationConsumerAccess();
+        watcher?.close();
+        const watchPath = existsSync(path) ? path : dirname(path);
+        activeWatchPath = watchPath;
+        watcher = (options._watchForTesting ?? watch)(watchPath, (_event, filename) => {
+          if (watchPath !== path && filename && filename.toString() !== "map.json") return;
+          scheduleReload(watchPath);
+        });
+        watcher.unref();
       });
-      watcher.unref();
-    } catch {
+    } catch (error) {
+      if (failClosed && error instanceof BackendPublicationJournalError) throw error;
       // Watch support varies by filesystem; map resolution still reloads by mtime.
     }
   };
@@ -1079,7 +1230,8 @@ export function watchProjectMap(): { close: () => void } {
     if (!(error instanceof PrivateMutationLockContentionError)) throw error;
     startupContended = true;
   }
-  arm();
+  options._beforeInitialArmForTesting?.();
+  arm(true);
   if (startupContended) scheduleReload(activeWatchPath);
 
   return {

@@ -29,6 +29,11 @@ import {
 } from "./memory-conformance.js";
 import { exerciseSummaryContextRepositoryConformance } from "./summary-context-conformance.js";
 
+vi.mock("../../src/storage/backend-publication.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/storage/backend-publication.js")>();
+  return { ...actual, assertBackendPublicationConsumerAccess: vi.fn() };
+});
+
 function harness(): StorageContractHarness {
   const root = createTemporaryDirectory("lcm-storage-contract-");
   const identities = new Map<string, ReturnType<typeof projectIdentity>>();

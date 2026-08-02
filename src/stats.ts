@@ -8,6 +8,8 @@ import { RecallStore, type RecallStats } from "./db/recall.js";
 import { PromotedStore } from "./db/promoted.js";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "./runtime-paths.js";
+import { BackendPublicationJournalError } from "./storage/backend-publication.js";
+import { selectStorageBackend } from "./storage/backend.js";
 import { sanitizeTerminalText } from "./terminal-sanitize.js";
 
 export type { RecallStats };
@@ -341,6 +343,24 @@ export function printStats(stats: OverallStats, verbose: boolean): void {
 }
 
 export async function collectStats(): Promise<OverallStats> {
+  // Resolve the configured backend before any local SQLite read or early return.
+  // In particular, an empty projects directory must not let unresolved or
+  // PostgreSQL-backed publication state silently fall through to SQLite.
+  let staleCfg = { staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5 };
+  let backend: "sqlite" | "postgresql" = "sqlite";
+  try {
+    const cfg = loadDaemonConfig(defaultConfigPath());
+    backend = cfg.storage.backend;
+    staleCfg = {
+      staleAfterDays: cfg.restoration.staleAfterDays,
+      staleSurfacingWithoutUseLimit: cfg.restoration.staleSurfacingWithoutUseLimit,
+    };
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) throw error;
+    // Preserve the historical resilience to an ordinarily malformed config.
+  }
+  selectStorageBackend({ backend });
+
   const baseDir = lcmProjectsDir();
 
   const emptyRecallStats: RecallStats = {
@@ -374,16 +394,6 @@ export async function collectStats(): Promise<OverallStats> {
   let totalMemoriesSurfaced = 0;
   let totalMemoriesActedUpon = 0;
   const allTopRecalled: Array<{ id: string; content: string; actCount: number }> = [];
-
-  // Load stale config once for all projects
-  let staleCfg = { staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5 };
-  try {
-    const cfg = loadDaemonConfig(defaultConfigPath());
-    staleCfg = {
-      staleAfterDays: cfg.restoration.staleAfterDays,
-      staleSurfacingWithoutUseLimit: cfg.restoration.staleSurfacingWithoutUseLimit,
-    };
-  } catch { /* use defaults */ }
 
   for (const entry of readdirSync(baseDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
