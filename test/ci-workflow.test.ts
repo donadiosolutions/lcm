@@ -35,6 +35,11 @@ interface CiWorkflow {
       "runs-on": string;
       strategy: { matrix: { run: number[] } };
     };
+    native: {
+      name: string;
+      "runs-on": string;
+      steps: WorkflowStep[];
+    };
     ci: {
       name: string;
       needs: string[];
@@ -87,9 +92,28 @@ describe("CI workflow", () => {
     expect(workflow.jobs.postgresql.needs).toBe("environment");
     expect(workflow.jobs.postgresql["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
     expect(workflow.jobs.postgresql.strategy.matrix.run).toEqual([1, 2]);
+    expect(workflow.jobs.native).toMatchObject({
+      name: "Native helper toolchain",
+      "runs-on": "blacksmith-4vcpu-ubuntu-2404",
+    });
+    expect(workflow.jobs.native.steps).toEqual([
+      {
+        name: "Checkout",
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        with: { "persist-credentials": false },
+      },
+      {
+        name: "Set up verified Rust toolchain",
+        uses: "./.github/actions/setup-rust-toolchain",
+      },
+      expect.objectContaining({
+        name: "Compile static Linux x64 musl toolchain check",
+        run: expect.stringContaining("rustc --target x86_64-unknown-linux-musl"),
+      }),
+    ]);
     expect(workflow.jobs.ci).toMatchObject({
       name: "ci",
-      needs: ["environment", "core", "postgresql"],
+      needs: ["environment", "core", "postgresql", "native"],
       if: "${{ always() }}",
     });
     const gate = workflow.jobs.ci.steps.find((step) => step.name === "Require every CI suite");
@@ -97,9 +121,10 @@ describe("CI workflow", () => {
       ENVIRONMENT_RESULT: "${{ needs.environment.result }}",
       CORE_RESULT: "${{ needs.core.result }}",
       POSTGRESQL_RESULT: "${{ needs.postgresql.result }}",
+      NATIVE_RESULT: "${{ needs.native.result }}",
     });
     expect(gate?.run).toContain(
-      '[[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success ]]',
+      '[[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success || "$NATIVE_RESULT" != success ]]',
     );
     expect(workflow.jobs.codecov.needs).toBe("ci");
     expect(workflow.jobs["codecov-fork"].needs).toBe("ci");

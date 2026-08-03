@@ -66,7 +66,7 @@ describe("CI environment cache metadata", () => {
     expect(action).toContain("path: node_modules");
     expect(action.match(/node-version:\s*"([^"]+)"/u)?.[1]).toBe(NODE_VERSION);
     expect(workflow).toContain("name: Initialize CI environment");
-    expect(workflow.match(/runs-on: blacksmith-4vcpu-ubuntu-2404/gu)).toHaveLength(3);
+    expect(workflow.match(/runs-on: blacksmith-4vcpu-ubuntu-2404/gu)).toHaveLength(4);
     expect(workflow.match(/uses: \.\/\.github\/actions\/setup-ci/gu)).toHaveLength(3);
     expect(workflow.match(/runs-on: ubuntu-latest/gu)).toHaveLength(3);
   });

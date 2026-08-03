@@ -107,12 +107,32 @@ jobs:
       - name: Run isolated PostgreSQL 18 conformance harness
         run: npm run test:postgresql
 
+  native:
+    name: Native helper toolchain
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up verified Rust toolchain
+        uses: ./.github/actions/setup-rust-toolchain
+
+      - name: Compile static Linux x64 musl toolchain check
+        run: |
+          set -Eeuo pipefail
+          printf '%s\n' 'fn main() {}' \
+            | rustc --target x86_64-unknown-linux-musl -o "$RUNNER_TEMP/lcm-musl-toolchain-check" -
+          test -x "$RUNNER_TEMP/lcm-musl-toolchain-check"
+
   ci:
     name: ci
     needs:
       - environment
       - core
       - postgresql
+      - native
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -121,15 +141,17 @@ jobs:
           ENVIRONMENT_RESULT: ${{ needs.environment.result }}
           CORE_RESULT: ${{ needs.core.result }}
           POSTGRESQL_RESULT: ${{ needs.postgresql.result }}
+          NATIVE_RESULT: ${{ needs.native.result }}
         run: |
           set -Eeuo pipefail
-          if [[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success ]]; then
+          if [[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success || "$NATIVE_RESULT" != success ]]; then
             echo "Environment result: $ENVIRONMENT_RESULT" >&2
             echo "Core CI result: $CORE_RESULT" >&2
             echo "PostgreSQL matrix result: $POSTGRESQL_RESULT" >&2
+            echo "Native toolchain result: $NATIVE_RESULT" >&2
             exit 1
           fi
-          echo "Environment, Core CI, and every PostgreSQL matrix run passed."
+          echo "Environment, Core CI, every PostgreSQL matrix run, and the native toolchain passed."
 
   codecov:
     name: Codecov upload
