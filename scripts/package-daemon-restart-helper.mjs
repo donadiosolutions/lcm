@@ -6,13 +6,13 @@ import {
   fchmodSync,
   fstatSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readSync,
   readdirSync,
-  renameSync,
-  rmSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
@@ -65,6 +65,24 @@ const RUSTC_KEYS = [
   "llvmVersion",
 ];
 const CARGO_KEYS = ["release", "commitHash", "commitDate", "host"];
+const DIRECTORY_OPEN_FLAGS =
+  constants.O_RDONLY |
+  constants.O_DIRECTORY |
+  constants.O_NOFOLLOW |
+  constants.O_NONBLOCK;
+const CARGO_TARGET_DIRECTORY_FD = 3;
+const CARGO_HOME_DIRECTORY_FD = 4;
+const OUTPUT_LEAVES = Object.freeze([
+  NATIVE_HELPER.filename,
+  NATIVE_HELPER.manifestFilename,
+]);
+const OUTPUT_TEMPORARY_LEAVES = Object.freeze(
+  OUTPUT_LEAVES.map((leaf) => "." + leaf + ".new")
+);
+const OUTPUT_ALLOWED_LEAVES = new Set([
+  ...OUTPUT_LEAVES,
+  ...OUTPUT_TEMPORARY_LEAVES,
+]);
 
 export function cargoExecutablePath(
   targetDirectory,
@@ -162,7 +180,7 @@ function executeCapture(command, args, options = {}, spawn = spawnSync) {
 }
 
 function executeBuild(command, args, options = {}, spawn = spawnSync) {
-  const result = spawn(command, args, { ...options, stdio: "inherit" });
+  const result = spawn(command, args, { stdio: "inherit", ...options });
   if (result.error) throw result.error;
   if (result.signal)
     fail(`${command} was terminated by signal ${result.signal}`);
@@ -209,58 +227,218 @@ function assertRealDirectoryChain(root, candidate, label) {
   }
 }
 
-function ensureRealDirectoryChain(root, candidate, label, mode) {
-  const base = resolve(root);
-  const relation = relative(base, resolve(candidate));
-  const segments = relation === "" ? [] : relation.split(sep);
-  let current = base;
-  for (const segment of segments) {
-    current = resolve(current, segment);
-    try {
-      const stat = lstatSync(current);
-      if (!stat.isDirectory() || stat.isSymbolicLink()) {
-        fail(`${label} contains a non-directory or symbolic-link component`);
-      }
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      mkdirSync(current, { mode });
-    }
+function errorCode(error) {
+  return error && typeof error === "object" ? error.code : undefined;
+}
+
+export function directoryEntryPath(descriptor, component) {
+  if (
+    !Number.isSafeInteger(descriptor) ||
+    descriptor < 0 ||
+    typeof component !== "string" ||
+    component === "" ||
+    component === "." ||
+    component === ".." ||
+    !/^[A-Za-z0-9._-]+$/u.test(component)
+  ) {
+    fail("directory entry is not a single safe component");
+  }
+  return "/proc/self/fd/" + descriptor + "/" + component;
+}
+
+function directoryStat(descriptor, label) {
+  const stat = fstatSync(descriptor, { bigint: true });
+  if (!stat.isDirectory()) fail(label + " is not a directory descriptor");
+  return stat;
+}
+
+function directoryIdentity(stat) {
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function sameDirectoryIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function assertDirectoryIdentity(actual, expected, label) {
+  if (!sameDirectoryIdentity(directoryIdentity(actual), expected)) {
+    fail(label + " identity changed");
   }
 }
 
-function recreateOutputDirectory(root, outputDirectory) {
-  const output = assertInside(
-    root,
-    resolve(root, outputDirectory),
-    "output directory"
-  );
-  const segments = relative(root, output).split(sep);
-  let current = resolve(root);
-  for (const segment of segments.slice(0, -1)) {
-    current = resolve(current, segment);
-    try {
-      const stat = lstatSync(current);
-      if (!stat.isDirectory() || stat.isSymbolicLink()) {
-        fail(
-          `output parent ${relative(root, current)} is not a real directory`
-        );
-      }
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      mkdirSync(current, { mode: 0o755 });
+function openDirectoryNoFollow(path, label) {
+  const descriptor = openSync(path, DIRECTORY_OPEN_FLAGS);
+  try {
+    return { descriptor, stat: directoryStat(descriptor, label) };
+  } catch (error) {
+    closeSync(descriptor);
+    throw error;
+  }
+}
+
+function openExistingDirectoryAt(parentDescriptor, component, label) {
+  const path = directoryEntryPath(parentDescriptor, component);
+  try {
+    return openDirectoryNoFollow(path, label);
+  } catch {
+    fail(label + " is not a no-follow directory");
+  }
+}
+
+function openOrCreateDirectoryAt(parentDescriptor, component, label, mode) {
+  const path = directoryEntryPath(parentDescriptor, component);
+  try {
+    return openDirectoryNoFollow(path, label);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") {
+      fail(label + " is not a no-follow directory");
     }
   }
   try {
-    const stat = lstatSync(output);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) {
-      fail("output directory is not a real directory");
-    }
-    rmSync(output, { force: true, recursive: true });
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
+    mkdirSync(path, { mode });
+  } catch {
+    // A concurrent creator may have won. The no-follow open below decides.
   }
-  mkdirSync(output, { mode: 0o755 });
-  return output;
+  return openExistingDirectoryAt(parentDescriptor, component, label);
+}
+
+function directoryAuthorityPaths(root, directory, label) {
+  const rootPath = resolve(root);
+  const directoryPath = assertInside(
+    rootPath,
+    resolve(rootPath, directory),
+    label
+  );
+  const relation = relative(rootPath, directoryPath);
+  if (relation === "") fail(label + " cannot be the root directory");
+  const components = relation.split(sep);
+  for (const component of components) directoryEntryPath(0, component);
+  return { rootPath, directoryPath, components };
+}
+
+function openDirectoryAuthority(
+  root,
+  directory,
+  label,
+  { create = false, mode = 0o755 } = {}
+) {
+  const paths = directoryAuthorityPaths(root, directory, label);
+  let rootDirectory;
+  try {
+    rootDirectory = openDirectoryNoFollow(paths.rootPath, "package root");
+  } catch {
+    fail("package root is not a no-follow directory");
+  }
+  const identities = [directoryIdentity(rootDirectory.stat)];
+  let currentDescriptor = rootDirectory.descriptor;
+  try {
+    for (const component of paths.components) {
+      const child = create
+        ? openOrCreateDirectoryAt(
+            currentDescriptor,
+            component,
+            label + " component " + component,
+            mode
+          )
+        : openExistingDirectoryAt(
+            currentDescriptor,
+            component,
+            label + " component " + component
+          );
+      if (currentDescriptor !== rootDirectory.descriptor) {
+        closeSync(currentDescriptor);
+      }
+      currentDescriptor = child.descriptor;
+      identities.push(directoryIdentity(child.stat));
+    }
+    return {
+      ...paths,
+      rootDescriptor: rootDirectory.descriptor,
+      directoryDescriptor: currentDescriptor,
+      identities,
+    };
+  } catch (error) {
+    if (currentDescriptor !== rootDirectory.descriptor) {
+      closeSync(currentDescriptor);
+    }
+    closeSync(rootDirectory.descriptor);
+    throw error;
+  }
+}
+
+function closeDirectoryAuthority(authority) {
+  if (authority.directoryDescriptor !== authority.rootDescriptor) {
+    closeSync(authority.directoryDescriptor);
+  }
+  closeSync(authority.rootDescriptor);
+}
+
+function assertDirectoryAuthorityIntact(authority, label) {
+  assertDirectoryIdentity(
+    directoryStat(authority.rootDescriptor, label + " root"),
+    authority.identities[0],
+    label + " root"
+  );
+  let currentDescriptor = authority.rootDescriptor;
+  let ownsCurrentDescriptor = false;
+  try {
+    for (const [index, component] of authority.components.entries()) {
+      const child = openExistingDirectoryAt(
+        currentDescriptor,
+        component,
+        label + " component " + component
+      );
+      if (ownsCurrentDescriptor) closeSync(currentDescriptor);
+      currentDescriptor = child.descriptor;
+      ownsCurrentDescriptor = true;
+      assertDirectoryIdentity(
+        child.stat,
+        authority.identities[index + 1],
+        label + " component " + component
+      );
+    }
+    assertDirectoryIdentity(
+      directoryStat(authority.directoryDescriptor, label + " held directory"),
+      authority.identities.at(-1),
+      label + " held directory"
+    );
+  } finally {
+    if (ownsCurrentDescriptor) closeSync(currentDescriptor);
+  }
+}
+
+function outputEntryPath(authority, component) {
+  return directoryEntryPath(authority.directoryDescriptor, component);
+}
+
+function outputTemporaryLeafName(leaf) {
+  return "." + leaf + ".new";
+}
+
+function outputInventory(authority) {
+  const entries = readdirSync(
+    "/proc/self/fd/" + authority.directoryDescriptor
+  ).sort();
+  const unexpected = entries.filter(
+    (entry) => !OUTPUT_ALLOWED_LEAVES.has(entry)
+  );
+  if (unexpected.length !== 0) {
+    fail("output directory contains an unexpected entry");
+  }
+  return entries;
+}
+
+function cleanupExpectedOutput(authority) {
+  const entries = outputInventory(authority);
+  for (const entry of entries) {
+    const path = outputEntryPath(authority, entry);
+    const stat = lstatSync(path, { bigint: true });
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) {
+      fail("output entry " + entry + " is not an owned regular file");
+    }
+    unlinkSync(path);
+  }
+  if (entries.length !== 0) fsyncSync(authority.directoryDescriptor);
 }
 
 function sameStat(before, after) {
@@ -340,10 +518,16 @@ export function readBoundedRegularFile(
   }
 }
 
-function writeExclusiveFile(path, bytes, mode) {
-  const temporary = `${path}.new`;
+function readBoundedRegularFileAt(authority, component, options) {
+  return readBoundedRegularFile(outputEntryPath(authority, component), options);
+}
+
+function writeExclusiveOutputFile(authority, leaf, bytes, mode) {
+  const temporary = outputTemporaryLeafName(leaf);
+  const temporaryPath = outputEntryPath(authority, temporary);
+  const destinationPath = outputEntryPath(authority, leaf);
   const descriptor = openSync(
-    temporary,
+    temporaryPath,
     constants.O_WRONLY |
       constants.O_CREAT |
       constants.O_EXCL |
@@ -351,10 +535,15 @@ function writeExclusiveFile(path, bytes, mode) {
     mode
   );
   try {
+    const stat = fstatSync(descriptor, { bigint: true });
+    if (!stat.isFile() || stat.nlink !== 1n) {
+      fail("output temporary file is not a single-link regular file");
+    }
     let offset = 0;
     while (offset < bytes.length) {
       const count = writeSync(descriptor, bytes, offset);
-      if (count <= 0) fail(`${path} could not be written completely`);
+      if (count <= 0)
+        fail("output temporary file could not be written completely");
       offset += count;
     }
     fchmodSync(descriptor, mode);
@@ -362,16 +551,13 @@ function writeExclusiveFile(path, bytes, mode) {
   } finally {
     closeSync(descriptor);
   }
-  renameSync(temporary, path);
-}
-
-function fsyncDirectory(path) {
-  const descriptor = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY);
   try {
-    fsyncSync(descriptor);
-  } finally {
-    closeSync(descriptor);
+    linkSync(temporaryPath, destinationPath);
+  } catch {
+    fail("output leaf " + leaf + " cannot be published exclusively");
   }
+  unlinkSync(temporaryPath);
+  fsyncSync(authority.directoryDescriptor);
 }
 
 function sha256(bytes) {
@@ -460,31 +646,39 @@ export function canonicalManifest(manifest) {
   return Buffer.from(`${JSON.stringify(manifest)}\n`, "utf8");
 }
 
-export function verifyNativeHelperPackage({ root = SCRIPT_ROOT } = {}) {
-  const output = assertInside(
-    root,
-    resolve(root, NATIVE_HELPER.outputDirectory),
-    "output directory"
-  );
-  const outputStat = lstatSync(output);
-  if (!outputStat.isDirectory() || outputStat.isSymbolicLink()) {
-    fail("output directory is not a real directory");
+function invokeOutputHook(outputHooks, name, authority) {
+  if (outputHooks === undefined) return;
+  const hook = outputHooks[name];
+  if (hook === undefined) return;
+  if (typeof hook !== "function") {
+    fail("output hook " + name + " must be a function");
   }
-  assertRealDirectoryChain(root, output, "output directory");
-  const entries = readdirSync(output).sort();
-  const expected = [
-    NATIVE_HELPER.filename,
-    NATIVE_HELPER.manifestFilename,
-  ].sort();
+  hook({ outputDirectory: authority.directoryPath });
+}
+
+function verifyNativeHelperPackageWithAuthority(
+  authority,
+  { outputHooks } = {}
+) {
+  invokeOutputHook(outputHooks, "afterVerificationAuthorityHeld", authority);
+  assertDirectoryAuthorityIntact(
+    authority,
+    "output directory before verification"
+  );
+  const entries = outputInventory(authority);
+  const expected = [...OUTPUT_LEAVES].sort();
   if (JSON.stringify(entries) !== JSON.stringify(expected))
     fail("output inventory is not exact");
 
-  const manifestPath = resolve(output, NATIVE_HELPER.manifestFilename);
-  const manifestFile = readBoundedRegularFile(manifestPath, {
-    label: "native helper manifest",
-    maxBytes: NATIVE_HELPER.maxManifestBytes,
-    expectedMode: NATIVE_HELPER.manifestMode,
-  });
+  const manifestFile = readBoundedRegularFileAt(
+    authority,
+    NATIVE_HELPER.manifestFilename,
+    {
+      label: "native helper manifest",
+      maxBytes: NATIVE_HELPER.maxManifestBytes,
+      expectedMode: NATIVE_HELPER.manifestMode,
+    }
+  );
   let manifest;
   try {
     manifest = JSON.parse(manifestFile.bytes.toString("utf8"));
@@ -499,8 +693,7 @@ export function verifyNativeHelperPackage({ root = SCRIPT_ROOT } = {}) {
   if (!manifestFile.bytes.equals(canonical))
     fail("manifest bytes are not canonical");
 
-  const helperPath = resolve(output, NATIVE_HELPER.filename);
-  const helper = readBoundedRegularFile(helperPath, {
+  const helper = readBoundedRegularFileAt(authority, NATIVE_HELPER.filename, {
     label: "native helper",
     maxBytes: NATIVE_HELPER.maxBinaryBytes,
     expectedMode: NATIVE_HELPER.binaryMode,
@@ -510,12 +703,35 @@ export function verifyNativeHelperPackage({ root = SCRIPT_ROOT } = {}) {
     fail("native helper size does not match manifest");
   if (sha256(helper.bytes) !== manifest.sha256)
     fail("native helper digest does not match manifest");
+  assertDirectoryAuthorityIntact(
+    authority,
+    "output directory after verification"
+  );
   return {
-    helperPath,
-    manifestPath,
+    helperPath: resolve(authority.directoryPath, NATIVE_HELPER.filename),
+    manifestPath: resolve(
+      authority.directoryPath,
+      NATIVE_HELPER.manifestFilename
+    ),
     manifestSha256: sha256(manifestFile.bytes),
     manifest,
   };
+}
+
+export function verifyNativeHelperPackage({
+  root = SCRIPT_ROOT,
+  outputHooks,
+} = {}) {
+  const authority = openDirectoryAuthority(
+    root,
+    NATIVE_HELPER.outputDirectory,
+    "output directory"
+  );
+  try {
+    return verifyNativeHelperPackageWithAuthority(authority, { outputHooks });
+  } finally {
+    closeDirectoryAuthority(authority);
+  }
 }
 
 export function buildNativeHelperPackage({
@@ -523,6 +739,7 @@ export function buildNativeHelperPackage({
   spawn = spawnSync,
   platform = process.platform,
   arch = process.arch,
+  outputHooks,
 } = {}) {
   if (platform !== "linux" || arch !== "x64") fail("build requires Linux x64");
   const crate = assertInside(
@@ -533,19 +750,6 @@ export function buildNativeHelperPackage({
   assertRealDirectoryChain(root, crate, "crate directory");
   assertRegularLeaf(resolve(crate, "Cargo.toml"), "Cargo.toml");
   assertRegularLeaf(resolve(crate, "Cargo.lock"), "Cargo.lock");
-  const output = recreateOutputDirectory(root, NATIVE_HELPER.outputDirectory);
-
-  const targetDirectory = assertInside(
-    root,
-    resolve(root, "target", "daemon-restart-helper"),
-    "Cargo target directory"
-  );
-  const cargoHome = assertInside(
-    root,
-    resolve(targetDirectory, "cargo-home"),
-    "Cargo home"
-  );
-  ensureRealDirectoryChain(root, cargoHome, "Cargo home", 0o700);
   if (!process.env.PATH)
     fail("PATH is unavailable for the pinned Rust toolchain");
   const rustupHome =
@@ -553,7 +757,7 @@ export function buildNativeHelperPackage({
     (process.env.HOME ? resolve(process.env.HOME, ".rustup") : undefined);
   if (!rustupHome) fail("RUSTUP_HOME cannot be derived without HOME");
   const rustFlags = [
-    `--remap-path-prefix=${resolve(root)}=/usr/src/lcm`,
+    "--remap-path-prefix=" + resolve(root) + "=/usr/src/lcm",
     "-C",
     "link-arg=-Wl,--build-id=none",
     "-C",
@@ -561,10 +765,8 @@ export function buildNativeHelperPackage({
   ];
   const environment = {
     CARGO_ENCODED_RUSTFLAGS: rustFlags.join("\x1f"),
-    CARGO_HOME: cargoHome,
     CARGO_INCREMENTAL: "0",
     CARGO_NET_OFFLINE: "true",
-    CARGO_TARGET_DIR: targetDirectory,
     LANG: "C",
     LC_ALL: "C",
     PATH: process.env.PATH,
@@ -573,64 +775,150 @@ export function buildNativeHelperPackage({
     ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
     TZ: "UTC",
   };
-  const compiler = parseCompilerEvidence(
-    executeCapture(
-      "rustc",
-      ["--version", "--verbose"],
-      { cwd: root, env: environment },
-      spawn
-    ),
-    executeCapture(
-      "cargo",
-      ["--version", "--verbose"],
-      { cwd: root, env: environment },
-      spawn
-    )
+  const outputAuthority = openDirectoryAuthority(
+    root,
+    NATIVE_HELPER.outputDirectory,
+    "output directory",
+    { create: true }
   );
-  executeBuild(
-    "cargo",
-    [
-      "build",
-      "--locked",
-      "--offline",
-      "--release",
-      "--target",
-      NATIVE_HELPER.target,
-      "--manifest-path",
-      resolve(crate, "Cargo.toml"),
-    ],
-    { cwd: crate, env: environment },
-    spawn
-  );
+  let targetAuthority;
+  let cargoHomeDirectory;
+  try {
+    invokeOutputHook(outputHooks, "afterOutputAuthorityHeld", outputAuthority);
+    cleanupExpectedOutput(outputAuthority);
+    assertDirectoryAuthorityIntact(
+      outputAuthority,
+      "output directory after cleanup"
+    );
 
-  const artifactPath = cargoExecutablePath(targetDirectory);
-  const artifact = readBoundedRegularFile(artifactPath, {
-    label: "Cargo native helper artifact",
-    maxBytes: NATIVE_HELPER.maxBinaryBytes,
-    requireExecutable: true,
-    requireSingleLink: false,
-  });
-  writeExclusiveFile(
-    resolve(output, NATIVE_HELPER.filename),
-    artifact.bytes,
-    NATIVE_HELPER.binaryMode
-  );
-  const manifest = {
-    formatVersion: 1,
-    filename: NATIVE_HELPER.filename,
-    target: NATIVE_HELPER.target,
-    compiler,
-    mode: "0755",
-    size: artifact.bytes.length,
-    sha256: sha256(artifact.bytes),
-  };
-  writeExclusiveFile(
-    resolve(output, NATIVE_HELPER.manifestFilename),
-    canonicalManifest(manifest),
-    NATIVE_HELPER.manifestMode
-  );
-  fsyncDirectory(output);
-  return verifyNativeHelperPackage({ root });
+    targetAuthority = openDirectoryAuthority(
+      root,
+      "target/daemon-restart-helper",
+      "Cargo target directory",
+      { create: true }
+    );
+    cargoHomeDirectory = openOrCreateDirectoryAt(
+      targetAuthority.directoryDescriptor,
+      "cargo-home",
+      "Cargo home",
+      0o700
+    );
+    const compiler = parseCompilerEvidence(
+      executeCapture(
+        "rustc",
+        ["--version", "--verbose"],
+        { cwd: root, env: environment },
+        spawn
+      ),
+      executeCapture(
+        "cargo",
+        ["--version", "--verbose"],
+        { cwd: root, env: environment },
+        spawn
+      )
+    );
+    const cargoEnvironment = {
+      ...environment,
+      CARGO_HOME: "/proc/self/fd/" + CARGO_HOME_DIRECTORY_FD,
+      CARGO_TARGET_DIR: "/proc/self/fd/" + CARGO_TARGET_DIRECTORY_FD,
+    };
+    executeBuild(
+      "cargo",
+      [
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "--target",
+        NATIVE_HELPER.target,
+        "--manifest-path",
+        resolve(crate, "Cargo.toml"),
+      ],
+      {
+        cwd: crate,
+        env: cargoEnvironment,
+        stdio: [
+          "ignore",
+          "inherit",
+          "inherit",
+          targetAuthority.directoryDescriptor,
+          cargoHomeDirectory.descriptor,
+        ],
+      },
+      spawn
+    );
+    closeSync(cargoHomeDirectory.descriptor);
+    cargoHomeDirectory = undefined;
+    assertDirectoryAuthorityIntact(
+      targetAuthority,
+      "Cargo target directory after build"
+    );
+
+    const cargoTarget = openExistingDirectoryAt(
+      targetAuthority.directoryDescriptor,
+      NATIVE_HELPER.target,
+      "Cargo target output"
+    );
+    let releaseDirectory;
+    let artifact;
+    try {
+      releaseDirectory = openExistingDirectoryAt(
+        cargoTarget.descriptor,
+        "release",
+        "Cargo release output"
+      );
+      artifact = readBoundedRegularFile(
+        directoryEntryPath(releaseDirectory.descriptor, NATIVE_HELPER.filename),
+        {
+          label: "Cargo native helper artifact",
+          maxBytes: NATIVE_HELPER.maxBinaryBytes,
+          requireExecutable: true,
+          requireSingleLink: false,
+        }
+      );
+    } finally {
+      if (releaseDirectory !== undefined) {
+        closeSync(releaseDirectory.descriptor);
+      }
+      closeSync(cargoTarget.descriptor);
+    }
+
+    invokeOutputHook(outputHooks, "beforeOutputPublication", outputAuthority);
+    writeExclusiveOutputFile(
+      outputAuthority,
+      NATIVE_HELPER.filename,
+      artifact.bytes,
+      NATIVE_HELPER.binaryMode
+    );
+    const manifest = {
+      formatVersion: 1,
+      filename: NATIVE_HELPER.filename,
+      target: NATIVE_HELPER.target,
+      compiler,
+      mode: "0755",
+      size: artifact.bytes.length,
+      sha256: sha256(artifact.bytes),
+    };
+    writeExclusiveOutputFile(
+      outputAuthority,
+      NATIVE_HELPER.manifestFilename,
+      canonicalManifest(manifest),
+      NATIVE_HELPER.manifestMode
+    );
+    assertDirectoryAuthorityIntact(
+      outputAuthority,
+      "output directory after publication"
+    );
+    return verifyNativeHelperPackageWithAuthority(outputAuthority);
+  } finally {
+    if (cargoHomeDirectory !== undefined) {
+      closeSync(cargoHomeDirectory.descriptor);
+    }
+    if (targetAuthority !== undefined) {
+      closeDirectoryAuthority(targetAuthority);
+    }
+    closeDirectoryAuthority(outputAuthority);
+  }
 }
 
 export function runNativeHelperPackageCli(argv = process.argv.slice(2)) {

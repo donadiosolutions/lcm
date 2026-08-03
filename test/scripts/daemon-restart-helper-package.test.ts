@@ -2,6 +2,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -17,6 +19,7 @@ import {
   buildNativeHelperPackage,
   cargoExecutablePath,
   canonicalManifest,
+  directoryEntryPath,
   parseCompilerEvidence,
   runNativeHelperPackageCli,
   verifyNativeHelperPackage,
@@ -99,9 +102,18 @@ function successfulSpawn(binary = staticElf()) {
       expect(environment.SOURCE_DATE_EPOCH).toBe("0");
       expect(environment.CARGO_ENCODED_RUSTFLAGS).toContain("--build-id=none");
       expect(environment).not.toHaveProperty("RUSTFLAGS");
+      expect(environment.CARGO_TARGET_DIR).toBe("/proc/self/fd/3");
+      expect(environment.CARGO_HOME).toBe("/proc/self/fd/4");
+      const stdio = options.stdio as unknown[];
+      expect(stdio).toEqual([
+        "ignore",
+        "inherit",
+        "inherit",
+        expect.any(Number),
+        expect.any(Number),
+      ]);
       const artifact = resolve(
-        environment.CARGO_TARGET_DIR,
-        NATIVE_HELPER.target,
+        directoryEntryPath(stdio[3] as number, NATIVE_HELPER.target),
         "release",
         NATIVE_HELPER.filename
       );
@@ -151,6 +163,121 @@ describe("daemon restart helper package", () => {
     expect(second.manifest.sha256).toMatch(/^[0-9a-f]{64}$/u);
     expect(second.manifestSha256).toMatch(/^[0-9a-f]{64}$/u);
     expect(spawn).toHaveBeenCalledTimes(6);
+  });
+
+  it("uses expected-only cleanup instead of recursively deleting output", () => {
+    const root = fixtureRoot();
+    const output = resolve(root, NATIVE_HELPER.outputDirectory);
+    mkdirSync(output, { recursive: true });
+    const unexpected = resolve(output, "unrelated-output");
+    writeFileSync(unexpected, "must-survive");
+    const spawn = successfulSpawn();
+
+    expect(() => buildNativeHelperPackage({ root, spawn })).toThrow(
+      "output directory contains an unexpected entry"
+    );
+    expect(readFileSync(unexpected, "utf8")).toBe("must-survive");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when an intermediate output parent is replaced by a symlink", () => {
+    const root = fixtureRoot();
+    const replacement = mkdtempSync(join(tmpdir(), "daemon-helper-target-"));
+    cleanup.push(replacement);
+    const sentinel = resolve(replacement, "sentinel");
+    writeFileSync(sentinel, "must-survive");
+    const spawn = successfulSpawn();
+
+    expect(() =>
+      buildNativeHelperPackage({
+        root,
+        spawn,
+        outputHooks: {
+          afterOutputAuthorityHeld: ({ outputDirectory }) => {
+            const replacedParent = dirname(outputDirectory);
+            renameSync(replacedParent, resolve(root, "held-native"));
+            symlinkSync(replacement, replacedParent);
+          },
+        },
+      })
+    ).toThrow("output directory after cleanup component native");
+    expect(spawn).not.toHaveBeenCalled();
+    expect(readdirSync(replacement)).toEqual(["sentinel"]);
+    expect(readFileSync(sentinel, "utf8")).toBe("must-survive");
+  });
+
+  it("fails closed during verification when an output parent is replaced", () => {
+    const root = fixtureRoot();
+    buildNativeHelperPackage({ root, spawn: successfulSpawn() });
+    const replacement = mkdtempSync(join(tmpdir(), "daemon-helper-target-"));
+    cleanup.push(replacement);
+    const sentinel = resolve(replacement, "sentinel");
+    writeFileSync(sentinel, "must-survive");
+
+    expect(() =>
+      verifyNativeHelperPackage({
+        root,
+        outputHooks: {
+          afterVerificationAuthorityHeld: ({ outputDirectory }) => {
+            const replacedParent = dirname(outputDirectory);
+            renameSync(replacedParent, resolve(root, "held-native"));
+            symlinkSync(replacement, replacedParent);
+          },
+        },
+      })
+    ).toThrow("output directory before verification component native");
+    expect(readdirSync(replacement)).toEqual(["sentinel"]);
+    expect(readFileSync(sentinel, "utf8")).toBe("must-survive");
+  });
+
+  it("does not overwrite a leaf created after cleanup", () => {
+    const root = fixtureRoot();
+    const contested = resolve(
+      root,
+      NATIVE_HELPER.outputDirectory,
+      NATIVE_HELPER.filename
+    );
+
+    expect(() =>
+      buildNativeHelperPackage({
+        root,
+        spawn: successfulSpawn(),
+        outputHooks: {
+          beforeOutputPublication: () => {
+            writeFileSync(contested, "attacker-owned");
+          },
+        },
+      })
+    ).toThrow("cannot be published exclusively");
+    expect(readFileSync(contested, "utf8")).toBe("attacker-owned");
+  });
+
+  it("rechecks the held output identity after publication", () => {
+    const root = fixtureRoot();
+    const replacement = resolve(root, "replacement-native");
+    mkdirSync(replacement);
+    const sentinel = resolve(replacement, "sentinel");
+    writeFileSync(sentinel, "must-survive");
+    const replacedParent = resolve(root, "dist", "native");
+
+    expect(() =>
+      buildNativeHelperPackage({
+        root,
+        spawn: successfulSpawn(),
+        outputHooks: {
+          beforeOutputPublication: () => {
+            renameSync(replacedParent, resolve(root, "held-native"));
+            renameSync(replacement, replacedParent);
+          },
+        },
+      })
+    ).toThrow(
+      "output directory after publication component native identity changed"
+    );
+    expect(readdirSync(replacedParent)).toEqual(["sentinel"]);
+    expect(readFileSync(resolve(replacedParent, "sentinel"), "utf8")).toBe(
+      "must-survive"
+    );
   });
 
   it("fails closed for toolchain drift, Cargo failure, and unsupported hosts", () => {
@@ -206,7 +333,7 @@ describe("daemon restart helper package", () => {
     });
     writeFileSync(resolve(output, "unexpected"), "x");
     expect(() => verifyNativeHelperPackage({ root })).toThrow(
-      "output inventory is not exact"
+      "output directory contains an unexpected entry"
     );
     unlinkSync(resolve(output, "unexpected"));
 
@@ -257,6 +384,12 @@ describe("daemon restart helper package", () => {
     );
     expect(() => cargoExecutablePath("/tmp/target", "../host")).toThrow(
       "Cargo target is not a canonical target triple"
+    );
+    expect(directoryEntryPath(0, "component")).toBe(
+      "/proc/self/fd/0/component"
+    );
+    expect(() => directoryEntryPath(0, "../escape")).toThrow(
+      "single safe component"
     );
   });
 });
