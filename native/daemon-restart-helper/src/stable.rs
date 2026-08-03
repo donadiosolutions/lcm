@@ -358,9 +358,10 @@ fn admit_prepared_active_with_final_hook(
         serial.record().identity,
         &token.key,
     )?;
+    let terminal_name = TerminalName::from_index(selector.terminal_slot as usize);
     let terminal = syscall::open_beneath(
         recovery_root.as_fd(),
-        TerminalName::from_index(selector.terminal_slot as usize).component(),
+        terminal_name.component(),
         OpenAccess::ReadOnly { directory: true },
     )
     .map_err(StableAdmissionError::Syscall)?;
@@ -406,6 +407,7 @@ fn admit_prepared_active_with_final_hook(
         recovery_identity,
         terminal: &terminal,
         terminal_identity,
+        terminal_name,
         directory_policy,
         token: &token,
         owner_uid,
@@ -567,6 +569,7 @@ struct PreparedPostcheck<'a> {
     recovery_identity: StableDirectoryIdentity,
     terminal: &'a Descriptor,
     terminal_identity: StableDirectoryIdentity,
+    terminal_name: TerminalName,
     directory_policy: DescriptorPolicy,
     token: &'a HeldToken,
     owner_uid: u32,
@@ -586,8 +589,10 @@ fn revalidate_prepared_held(postcheck: PreparedPostcheck<'_>) -> Result<(), Stab
         postcheck.recovery_identity,
         postcheck.directory_policy,
     )?;
-    revalidate_directory(
+    revalidate_terminal(
+        postcheck.recovery_root,
         postcheck.terminal,
+        postcheck.terminal_name,
         postcheck.terminal_identity,
         postcheck.directory_policy,
     )?;
@@ -598,6 +603,11 @@ fn revalidate_prepared_held(postcheck: PreparedPostcheck<'_>) -> Result<(), Stab
         postcheck.owner_gid,
     )?;
     for (parent, name, record) in [
+        (
+            postcheck.recovery_root,
+            RecordName::LifecycleSerial,
+            postcheck.held.serial,
+        ),
         (
             postcheck.state_root,
             RecordName::DaemonPid,
@@ -766,6 +776,26 @@ fn revalidate_recovery(
     let reopened = syscall::open_beneath(
         state_root.as_fd(),
         c"daemon-recovery.v1",
+        OpenAccess::ReadOnly { directory: true },
+    )
+    .map_err(|_| StableAdmissionError::Replacement)?;
+    revalidate_directory(&reopened, expected, policy)
+}
+
+/// Reopens the selected terminal from the canonical recovery-root namespace after validating the
+/// held descriptor.  The held directory can remain valid after a rename, so descriptor-only
+/// revalidation would otherwise accept a byte-identical replacement at `terminal.N.v1`.
+fn revalidate_terminal(
+    recovery_root: &Descriptor,
+    held: &Descriptor,
+    name: TerminalName,
+    expected: StableDirectoryIdentity,
+    policy: DescriptorPolicy,
+) -> Result<(), StableAdmissionError> {
+    revalidate_directory(held, expected, policy)?;
+    let reopened = syscall::open_beneath(
+        recovery_root.as_fd(),
+        name.component(),
         OpenAccess::ReadOnly { directory: true },
     )
     .map_err(|_| StableAdmissionError::Replacement)?;
@@ -1157,6 +1187,32 @@ mod tests {
         fs::rename(replacement, path).unwrap();
     }
 
+    fn replace_serial_namespace_preserving_displaced(path: &Path) {
+        let bytes = fs::read(path).unwrap();
+        let displaced = path.with_extension(format!(
+            "displaced-{}",
+            NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::rename(path, &displaced).unwrap();
+        write_new(path, &bytes);
+        assert!(displaced.exists());
+    }
+
+    fn replace_terminal_namespace_preserving_displaced(path: &Path) {
+        let displaced = path.with_extension(format!(
+            "displaced-{}",
+            NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::rename(path, &displaced).unwrap();
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        for component in ["lifecycle.exchange", "journal.exchange"] {
+            let bytes = fs::read(displaced.join(component)).unwrap();
+            write_new(&path.join(component), &bytes);
+        }
+        assert!(displaced.exists());
+    }
+
     fn tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         fn visit(root: &Path, path: &Path, output: &mut BTreeMap<PathBuf, Vec<u8>>) {
             let mut entries: Vec<_> = fs::read_dir(path)
@@ -1429,6 +1485,48 @@ mod tests {
             );
             // The replacement is deliberately byte-identical; the helper has not mutated it.
             assert_eq!(tree_bytes(&fixture.root), before, "{relative}");
+        }
+    }
+
+    #[test]
+    fn final_namespace_revalidation_refuses_serial_and_terminal_replacements() {
+        for (relative, replace) in [
+            (
+                "lifecycle.serial.v1",
+                replace_serial_namespace_preserving_displaced as fn(&Path),
+            ),
+            (
+                "terminal.1.v1",
+                replace_terminal_namespace_preserving_displaced as fn(&Path),
+            ),
+        ] {
+            let fixture = Fixture::new();
+            fixture.prepare_active(OperationKind::InitialStart, 1);
+            let target = fixture.recovery().join(relative);
+            let after_replacement = std::cell::RefCell::new(None);
+            let result = admit_prepared_active_with_final_hook(
+                Descriptor::from_file(File::open(&fixture.root).unwrap()),
+                fixture.owner_uid,
+                fixture.owner_gid,
+                PreverifiedHelperDigest::new(HELPER_DIGEST),
+                || Ok(()),
+                || {
+                    replace(&target);
+                    *after_replacement.borrow_mut() = Some(tree_bytes(&fixture.root));
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                result.err(),
+                Some(StableAdmissionError::Replacement),
+                "{target:?}"
+            );
+            // The displaced namespace remains observable and the helper has made no mutation.
+            assert_eq!(
+                tree_bytes(&fixture.root),
+                after_replacement.into_inner().unwrap(),
+                "{target:?}"
+            );
         }
     }
 
