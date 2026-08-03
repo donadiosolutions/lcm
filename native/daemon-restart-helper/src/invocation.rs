@@ -93,6 +93,28 @@ impl StrictIdentity {
     }
 }
 
+/// Every descriptor-owned authority is revalidated after the only allowed descriptor mutation.
+/// The values stay grouped so no identity can be omitted from the replacement boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InvocationDescriptorIdentities {
+    helper: StrictIdentity,
+    home: DescriptorIdentityCommon,
+    state_root: DescriptorIdentityCommon,
+    node: StrictIdentity,
+    script: StrictIdentity,
+    config: StrictIdentity,
+}
+
+fn require_unchanged_identities_after_cloexec(
+    before: InvocationDescriptorIdentities,
+    after: InvocationDescriptorIdentities,
+) -> Result<(), InvocationError> {
+    if after != before {
+        return Err(InvocationError::Replacement);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ParentProof {
     _pidfd: PidFd,
@@ -264,6 +286,14 @@ fn admit_descriptor_lease() -> Result<InvocationDescriptorLease, InvocationError
         let node = validate_node(&inherited.node)?;
         let script = validate_script(&inherited.script, owner_uid, owner_gid)?;
         let config = validate_config(&inherited.config, owner_uid, owner_gid)?;
+        let identities = InvocationDescriptorIdentities {
+            helper,
+            home,
+            state_root: state,
+            node,
+            script,
+            config,
+        };
 
         for descriptor in [
             HELPER_FD,
@@ -293,13 +323,15 @@ fn admit_descriptor_lease() -> Result<InvocationDescriptorLease, InvocationError
         let node_after = validate_node(&inherited.node)?;
         let script_after = validate_script(&inherited.script, owner_uid, owner_gid)?;
         let config_after = validate_config(&inherited.config, owner_uid, owner_gid)?;
-        if helper_after != helper
-            || node_after != node
-            || script_after != script
-            || config_after != config
-        {
-            return Err(InvocationError::Replacement);
-        }
+        let identities_after = InvocationDescriptorIdentities {
+            helper: helper_after,
+            home: home_after,
+            state_root: state_after,
+            node: node_after,
+            script: script_after,
+            config: config_after,
+        };
+        require_unchanged_identities_after_cloexec(identities, identities_after)?;
         let descriptor_set_digest =
             invocation_descriptor_set_digest(helper, home, state, node, script, config);
 
@@ -1338,6 +1370,67 @@ mod tests {
         assert!(captured.issued);
     }
 
+    #[test]
+    fn home_and_state_root_replacement_after_cloexec_refuse_before_lease_or_side_effects() {
+        let helper = strict(1);
+        let home = strict(2).common;
+        let state_root = strict(3).common;
+        let node = strict(4);
+        let script = strict(5);
+        let config = strict(6);
+
+        for (role, home_after, state_root_after) in [
+            ("home", strict(7).common, state_root),
+            ("state-root", home, strict(8).common),
+        ] {
+            let identities = InvocationDescriptorIdentities {
+                helper,
+                home,
+                state_root,
+                node,
+                script,
+                config,
+            };
+            let identities_after = InvocationDescriptorIdentities {
+                home: home_after,
+                state_root: state_root_after,
+                ..identities
+            };
+            assert_eq!(
+                require_unchanged_identities_after_cloexec(identities, identities_after),
+                Err(InvocationError::Replacement),
+                "{role} replacement passed post-CLOEXEC comparison"
+            );
+
+            let mut harness = AdmissionHarness {
+                fault: Some(match role {
+                    "home" => "revalidate-fd4-home",
+                    "state-root" => "revalidate-fd5-state-root",
+                    _ => unreachable!(),
+                }),
+                gates: Vec::new(),
+                lease: false,
+                frame_reads: 0,
+                output_bytes: 0,
+                durable_mutations: 0,
+            };
+            assert_eq!(harness.run(), Err(InvocationError::Replacement), "{role}");
+            assert!(!harness.lease, "{role} replacement issued a lease");
+            assert_eq!(
+                harness.frame_reads, 0,
+                "{role} replacement consumed a frame"
+            );
+            assert_eq!(
+                harness.output_bytes, 0,
+                "{role} replacement wrote helper output"
+            );
+            assert_eq!(
+                harness.durable_mutations, 0,
+                "{role} replacement mutated durable state"
+            );
+        }
+    }
+
     /// A whole-admission harness deliberately has no frame, output, or mutation operation.  Each
     /// gate corresponds to a concrete production admission check and can be failed independently;
     /// this gives deterministic coverage for identities that an unprivileged test process cannot
@@ -1369,7 +1462,7 @@ mod tests {
         }
     }
 
-    const ADMISSION_GATES: [&str; 41] = [
+    const ADMISSION_GATES: [&str; 42] = [
         "inventory-exact-0-8",
         "inventory-cloexec-clear",
         "stdio-0-type-direction-status",
@@ -1397,7 +1490,8 @@ mod tests {
         "fd8-json-object-utf8",
         "cloexec-3-through-8",
         "revalidate-fd3-self",
-        "revalidate-fd4-fd5",
+        "revalidate-fd4-home",
+        "revalidate-fd5-state-root",
         "revalidate-fd6",
         "revalidate-fd7",
         "revalidate-fd8",
