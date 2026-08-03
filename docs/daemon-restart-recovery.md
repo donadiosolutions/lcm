@@ -68,8 +68,9 @@ The helper does not:
 - accept a bearer token, health body, or shared-token proof over IPC; the
   helper's controlled admission child performs the direct bearer exchange;
 - follow symlinks, magic links, mount crossings, or user-supplied recovery
-  paths, except for the two narrowly defined final procfs magic-link captures
-  for the target network namespace and a proven listener FD described below;
+  paths, except for the three narrowly defined final procfs magic-link captures
+  for the target network namespace, a proven listener FD, and the proven direct
+  parent's executable described below;
 - infer ownership from a port alone, process name alone, UID alone, or a
   numeric PID alone; or
 - delete uncertain evidence to make a later retry appear clean.
@@ -112,9 +113,9 @@ count, size, and timestamp fields, as defined below. It never falls back to a
 realpath/stat/pathname sequence. Final
 regular-file leaves are opened relative to their correct retained parent with
 no-follow semantics, bounded reads, and complete descriptor metadata checks.
-The only exceptions to no-magic-link resolution are the two final procfs
-captures explicitly defined in **Authenticated launch evidence**; they do not
-relax descriptor-bound traversal to their fixed parent directories.
+The only exceptions to no-magic-link resolution are the three final procfs
+captures explicitly defined in this contract; they do not relax
+descriptor-bound traversal to their fixed parent directories.
 
 Unknown entries, duplicate records, malformed content, unexpected hard-link
 counts, non-regular files, and directory identity drift are ambiguous. They
@@ -137,7 +138,7 @@ descriptors at entry.
 | 3 | Verified helper image | `O_RDONLY`, regular, one link, permission/special bits exactly `0755`, owner pair exactly either `0:0` or the invoking effective UID:GID, and size 1 through 33,554,432 bytes. The complete descriptor bytes must be an ELF64 little-endian, `EM_X86_64` static image whose ELF type is either `ET_EXEC` or `ET_DYN`; both forms require no `PT_INTERP` program header and no `DT_NEEDED` dynamic entry. `ET_DYN` is admitted only in that structurally validated static-PIE form, never as an arbitrary dynamically linked image. SHA-256 is computed over exactly the recorded size. |
 | 4 | HOME directory | `O_RDONLY` directory, current effective UID, with neither group nor other write permission. Its GID and exact permission bits are recorded. Link count, size, and timestamps are not policy or identity fields. |
 | 5 | Private state root | `O_RDONLY` directory, current effective UID and GID, permission/special bits exactly `0700`, with the stable directory identity required by the descriptor-held stable-state admission slice. Link count, size, and timestamps are excluded. |
-| 6 | Node interpreter | `O_RDONLY`, regular, one link, permission/special bits exactly `0755`, owner pair exactly either `0:0` or the current effective UID:GID, and size 64 through 134,217,728 bytes. The complete bytes must be boundedly parsed as ELF64 little-endian `ET_EXEC`, `EM_X86_64`; bounded program-header structure is required and a dynamic interpreter is allowed. SHA-256 covers exactly the recorded size. |
+| 6 | Node interpreter | `O_RDONLY`, regular, one link, permission/special bits exactly `0755`, and size 64 through 134,217,728 bytes. The complete bytes must be boundedly parsed as ELF64 little-endian `ET_EXEC`, `EM_X86_64`; bounded program-header structure is required and a dynamic interpreter is allowed. SHA-256 covers exactly the recorded size. It is admitted only when its complete strict immutable-leaf identity equals that of the separately opened executable descriptor of the proven live direct parent, as specified below. No FD 6 owner-pair allowlist exists. |
 | 7 | Packaged runtime script | `O_RDONLY`, regular, one link, permission/special bits exactly `0755`, owner pair exactly either `0:0` or the current effective UID:GID, and size 20 through 16,777,216 bytes. Its bytes begin exactly `#!/usr/bin/env node\n`, are strict UTF-8 with no NUL, and are hashed completely. It is never directly executed. |
 | 8 | Canonical configuration snapshot | `O_RDONLY`, regular, one link, current effective UID:GID, permission/special bits exactly `0600`, and size 1 through 1,048,576 bytes. The complete bytes are strict UTF-8 with no NUL, contain exactly one structurally valid JSON object, and are hashed completely. This slice does not admit config field semantics, ports, backends, paths, or recovery eligibility; that later semantic parse must use these same held bytes. |
 
@@ -149,10 +150,11 @@ digest mismatch fail closed. No pathname is reopened to obtain file content.
 
 FD 3 retains the existing package-helper trust chain. The already-running
 compiled Node runtime authenticates the anchored helper manifest and the exact
-helper descriptor before executing `/proc/self/fd/3`. On entry the helper
-requires FD 3's `fstat` identity to equal its own `/proc/self/exe` identity,
-then independently hashes FD 3 and captures that strict identity. It accepts no
-caller-supplied helper or descriptor-set digest.
+helper descriptor before executing the inherited FD 3 through
+`/proc/self/fd/3`. On entry the helper requires FD 3's `fstat` identity to
+equal its own `/proc/self/exe` identity, then independently hashes FD 3 and
+captures that strict identity. It accepts no caller-supplied helper or
+descriptor-set digest.
 
 The FD 3 owner pair is a package-installation boundary, not the image's trust
 anchor. Exact `0:0` admits a system-owned package and the invoking effective
@@ -163,20 +165,76 @@ proof. Likewise, `ET_DYN` does not relax the static-helper requirement: only an
 otherwise identical x86_64 ELF64 static PIE with neither `PT_INTERP` nor
 `DT_NEEDED` is admitted.
 
+#### FD 6 runtime provenance
+
+FD 6's authority is the exact descriptor-held identity of the runtime that
+executed Node, not a class of owner pairs and not a package pathname. The
+strict immutable-leaf identity used here is exactly the regular-file identity
+defined below: device, inode, UID, GID, mode, link count, bounded size, and the
+complete descriptor-read SHA-256. Thus FD 6 still receives the full
+regular/single-link/mode/size/bounded-ELF/hash validation in the role table;
+the parent-executable equality is an additional admission proof and does not
+weaken any of those checks. It deliberately permits a runtime owned by a third
+UID only when that exact running parent runtime is proven. Equality is not a
+general owner grant, a pathname grant, or package authority.
+
+Before it reads a protocol frame or returns an invocation lease, the helper
+performs this one pre-frame parent proof, with no output or state mutation:
+
+1. It records the decimal direct-parent PID from `getppid()`, calls
+   `prctl(PR_SET_PDEATHSIG, SIGKILL)`, and immediately rereads `getppid()`.
+   The value must be nonzero and exactly the recorded parent PID; otherwise it
+   refuses. This parent-death fence remains armed for the helper's lifetime.
+2. It opens a PIDFD for that direct parent with `pidfd_open`; failure is a
+   refusal. It proves that the helper and that parent are in the same PID
+   namespace, captures the parent's bounded proc start-time from the fixed
+   decimal-PID proc entry, and retains the evidence needed to recheck both.
+   A missing, malformed, changing, inaccessible, or different namespace/start
+   observation is ambiguous and refuses.
+3. Only after those PIDFD, PID-namespace, and start-time proofs does it make
+   the third and final supported procfs magic-link capture:
+   `/proc/<decimal-ppid>/exe`. It opens that exact executable descriptor,
+   validates and hashes it by the identical FD 6 regular-file rules, and
+   requires its complete strict immutable-leaf identity to equal FD 6.
+4. Immediately before the lease, it rechecks the direct parent PID, PIDFD-backed
+   parent evidence, same PID namespace, bounded proc start-time, the separately
+   opened parent executable identity, and FD 6's own strict identity. Every
+   equality must still hold. It then closes all temporary parent-proof
+   descriptors before returning the lease.
+
+No pathname is retained as authority, and neither a successful earlier check
+nor a matching UID/GID alone permits FD 6. Parent exit, PID reuse, a procfs
+race, a short or malformed start-time read, a changed FD 6 or parent executable
+identity, an unsupported `prctl` or `pidfd_open`, or any inability to complete
+the proof is a pre-frame refusal. The helper must not clear PDEATHSIG as part of
+this proof; it is cleared only by the separately specified managed-child commit
+protocol.
+
+Integration #419 obtains the runtime descriptor solely by opening
+`/proc/self/exe` in the already-running Node process, retains that descriptor,
+and passes it to the helper as the numeric Node `stdio` index `6`. It must not
+derive FD 6 from `process.execPath`, `PATH`, a mutable package runtime path, or
+any reopened runtime pathname. Node executes the helper only through held FD 3
+at `/proc/self/fd/3`; after admission, the helper-managed child receives the
+runtime only through the authenticated FD duplication defined below. No other
+Node-to-helper runtime handoff is version-1 authority.
+
+This #447 correction leaves the FD 3 policy from #442/#443 unchanged. It does
+not specify or enable the deferred P2 work in #444 or #448.
+
 The FD 6 and FD 7 limits are a source-slice fail-closed envelope, not a claim
 that every Node installation or future LCM bundle has those sizes. The 128 MiB
-Node envelope covers the supported root-owned bundled Codex Node runtime, and
+Node envelope covers the supported bundled Codex Node runtime, and
 the 16 MiB script envelope covers the single `dist/lcm.mjs` artifact produced
-by the package build. The current package policy supports both root-owned and
-user-owned installations, so imposing current-user ownership universally, or
-deriving an unbounded limit from a mutable path, would reject supported
-installs or create mutable authority. This slice therefore captures and binds
-their exact strict identities but does **not** make those captured digests
-package authority. Integration #419 must bind FD 6 and FD 7 to the
-package-authoritative runtime before any helper-managed launch or recovery is
-reachable. An artifact outside either envelope is unsupported until a new
-versioned policy is deliberately specified; it is never accepted by path
-fallback.
+by the package build. FD 7 remains subject to its explicit owner-pair policy.
+FD 6 instead uses the direct-parent proof above, so it can support the actual
+runtime without an unbounded UID grant or a mutable-path fallback. This slice
+captures and binds their exact strict identities but does **not** make their
+captured digests package authority. Integration #419 must provide the FD 6
+parent-runtime proof and bind FD 7 to the package-authoritative runtime before
+any helper-managed launch or recovery is reachable. An artifact outside either
+envelope is unsupported until a new versioned policy is deliberately specified;
+it is never accepted by path fallback.
 
 #### Standard-stream representation and bounds
 
@@ -223,24 +281,28 @@ Admission order is exact:
    `FD_CLOEXEC` clear;
 2. validate the three protocol streams, every access/status flag, every
    per-role metadata policy, pairwise non-aliasing, FD 3/self identity, all
-   bounded content and hashes, and the repeated FD 4/FD 5 relationship;
+   bounded content and hashes, the complete FD 6 direct-parent proof, and the
+   repeated FD 4/FD 5 relationship;
 3. set `FD_CLOEXEC` on FDs 3 through 8 only, without changing any access or
    status flag; and
-4. revalidate the six descriptor identities, the FD 3/self proof, and both
-   sides of the HOME/state comparison before returning the private invocation
-   lease.
+4. revalidate the six descriptor identities, the FD 3/self proof, every FD 6
+   parent-proof fact and equality, and both sides of the HOME/state comparison
+   before returning the private invocation lease.
 
 Only after that lease exists may the helper accept a frame or enter the
 descriptor-held stable-state admission slice. Before it exists, the only
 permitted operations are bounded descriptor enumeration, `fcntl`, metadata and
 socket queries, position-independent reads/hashing, the two read-only fixed
-child opens, and the specified close-on-exec changes. Descriptor admission
+child opens, the one FD 6 parent-proof sequence above (including its PIDFD and
+final parent-executable capture), and the specified close-on-exec changes.
+Descriptor admission
 must not parse configuration semantics; acquire a durable-state lock; read or
 write a protocol frame; write FD 1 or FD 2; create, chmod, chown, truncate,
 fsync, unlink, rename, or exchange a filesystem object; create a socket or make
-network traffic; inspect or signal another process; spawn; or mutate any
-durable state. Rejection does not close, repair, normalize, or clean up an
-unexpected inherited descriptor before process exit.
+network traffic; inspect or signal another process other than the bounded FD 6
+direct-parent proof; spawn; or mutate any durable state. Rejection does not
+close, repair, normalize, or clean up an unexpected inherited descriptor before
+process exit; it closes only temporary descriptors opened for the FD 6 proof.
 
 #### Canonical invocation descriptor-set digest
 
@@ -303,8 +365,8 @@ Descriptor admission precedes trusted framing. Any failure in this subsection
 produces no response and no FD 1 or FD 2 bytes. The helper calls `_exit(69)` only when a
 required platform capability or this ABI version is unsupported. Every other
 pre-frame failure, including malformed type/access/metadata/content,
-replacement, alias, extra FD, identity mismatch, or ambiguous I/O, calls
-`_exit(78)`.
+replacement, alias, extra FD, FD 6 parent-proof failure, identity mismatch, or
+ambiguous I/O, calls `_exit(78)`.
 Neither exit status carries secret detail.
 
 After descriptor admission and one structurally valid frame, later replacement
@@ -337,10 +399,11 @@ close-on-exec. The helper execs the separately verified Node ELF through
     ["/proc/self/fd/12", "/proc/self/fd/13", "daemon", "run-managed"]
 
 The runtime-script descriptor survives solely so Node can reopen that exact
-script through /proc/self/fd/13 after exec. Each inherited capability is
-opened or inherited, no-follow validated, identity-bound into the launch plan,
-and
-deliberately inherited only by the managed child. If any such capability is
+script through /proc/self/fd/13 after exec. Each inherited capability is opened
+or inherited, no-follow validated, identity-bound into the launch plan, and
+deliberately inherited only by the managed child. The FD 12 copy is solely the
+already authenticated FD 6 runtime descriptor duplicated to the managed child;
+no Node, helper, or child path lookup re-resolves it. If any such capability is
 missing, changed, or cannot be duplicated onto its assigned child descriptor,
 the helper does not launch. The child has no PATH, NODE_OPTIONS, shebang,
 shell, ambient executable resolution, or caller-controlled launch argument.
@@ -802,10 +865,10 @@ network namespace descriptor is opened from the held target process descriptor
 and retained across transitions. This one namespace capability is a deliberate
 procfs final-magic-link exception to no-magic-link resolution: it is opened
 only after PIDFD and proc-start-time proof, then compared by descriptor identity
-rather than reused by pathname. The listener capture below is the second and
-only other such exception. A changed version, runtime, namespace, listener
-capability, or launch plan is a mismatch, not an upgrade signal; the old
-process remains untouched.
+rather than reused by pathname. The listener capture below is the second such
+exception, and the FD 6 direct-parent executable capture is the third. A changed
+version, runtime, namespace, listener capability, or launch plan is a mismatch,
+not an upgrade signal; the old process remains untouched.
 
 Recording is best effort for ordinary healthy lifecycle use. If a supported
 managed start cannot record evidence, the healthy daemon continues on the
@@ -1302,6 +1365,18 @@ Before enabling the protocol, implementation must include:
   invoking effective UID:GID, reject mixed or unrelated owner pairs, admit both
   static `ET_EXEC` and static-PIE `ET_DYN`, and reject `ET_DYN` carrying either
   `PT_INTERP` or `DT_NEEDED`;
+- FD 6 provenance tests proving that #419 opens only `/proc/self/exe`, retains
+  that descriptor, and supplies it at numeric `stdio` index 6; that it never
+  uses `process.execPath`, `PATH`, or a package runtime pathname; and that the
+  helper starts only from FD 3 through `/proc/self/fd/3`. They must cover the
+  complete pre-frame sequence: PDEATHSIG plus PPID recheck, direct-parent
+  PIDFD, same PID namespace, bounded/rechecked parent proc start-time, the
+  final `/proc/<decimal-ppid>/exe` capture, identical strict validation/hash,
+  equality, final rechecks, and closure of temporary proof descriptors. They
+  must admit a matching third-UID runtime, reject every owner-only or
+  nonmatching-identity case, parent exit/PID reuse/namespace/start-time/procfs
+  race, and prove no FD 1/FD 2 output, frame consumption, state mutation, or
+  invocation lease on ambiguity;
 - TypeScript coverage for response versus no-response, unchanged result types,
   headers-received/body-timeout handling, legacy refusal, package verification,
   VerifyExisting's no-mutation path, and the normal authenticated path;
