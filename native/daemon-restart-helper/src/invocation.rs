@@ -49,6 +49,16 @@ pub(crate) enum InvocationError {
     Stable(StableAdmissionError),
 }
 
+/// The only externally observable pre-frame classifications.  `Unsupported` is deliberately
+/// reserved for an explicit `ENOSYS` from a syscall required by this ABI; every other failure is
+/// ambiguous and must be silent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreFrameResult {
+    Admitted,
+    Unsupported,
+    Ambiguous,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamClass {
     Pipe,
@@ -146,6 +156,16 @@ impl InheritedAuthorities {
 /// the process exits immediately and must not normalize or close an unexpected caller handle.
 pub(crate) fn admit_with_stable_lease() -> Result<InvocationLease, InvocationError> {
     let invocation = admit_descriptor_lease()?;
+    // Compatibility detection is descriptor-scoped and occurs only after the exact inherited
+    // invocation lease exists.  Null paths make this recognition side-effect free.
+    require_renameat2_flag(
+        invocation.state_root.as_raw_fd(),
+        syscall::PROBE_RENAME_NOREPLACE,
+    )?;
+    require_renameat2_flag(
+        invocation.state_root.as_raw_fd(),
+        syscall::PROBE_RENAME_EXCHANGE,
+    )?;
     let owner_uid = syscall::effective_uid().map_err(InvocationError::Syscall)?;
     let owner_gid = syscall::effective_gid().map_err(InvocationError::Syscall)?;
     let state_root = invocation
@@ -165,10 +185,31 @@ pub(crate) fn admit_with_stable_lease() -> Result<InvocationLease, InvocationErr
     })
 }
 
-/// Attempts the complete read-only invocation admission.  Error details deliberately stay inside
-/// the helper: pre-frame failures have one externally observable outcome, exit status 78.
-pub fn admit() -> bool {
-    admit_with_stable_lease().is_ok()
+/// Attempts the complete read-only invocation admission without exposing diagnostic detail.
+pub fn admit() -> PreFrameResult {
+    match admit_with_stable_lease() {
+        Ok(_) => PreFrameResult::Admitted,
+        Err(error) => classify_pre_frame_error(error),
+    }
+}
+
+fn classify_pre_frame_error(error: InvocationError) -> PreFrameResult {
+    match error {
+        InvocationError::Syscall(Errno::ENOSYS) => PreFrameResult::Unsupported,
+        _ => PreFrameResult::Ambiguous,
+    }
+}
+
+fn require_renameat2_flag(parent: i32, flag: usize) -> Result<(), InvocationError> {
+    classify_renameat2_probe(syscall::probe_rename_flag_on_held_descriptor(parent, flag))
+}
+
+fn classify_renameat2_probe(result: Result<(), Errno>) -> Result<(), InvocationError> {
+    match result {
+        Err(Errno::EFAULT) => Ok(()),
+        Err(error) => Err(InvocationError::Syscall(error)),
+        Ok(()) => Err(InvocationError::Replacement),
+    }
 }
 
 fn admit_descriptor_lease() -> Result<InvocationDescriptorLease, InvocationError> {
@@ -1376,5 +1417,50 @@ mod tests {
         assert_eq!(harness.frame_reads, 0);
         assert_eq!(harness.output_bytes, 0);
         assert_eq!(harness.durable_mutations, 0);
+    }
+
+    #[test]
+    fn only_explicit_enosys_is_unsupported_preframe() {
+        // The same classifier is used for required kcmp, prctl, PIDFD, and procfs syscall paths.
+        assert_eq!(
+            classify_pre_frame_error(InvocationError::Syscall(Errno::ENOSYS)),
+            PreFrameResult::Unsupported
+        );
+        for error in [
+            InvocationError::Syscall(Errno(1)), // EPERM: e.g. kcmp under policy
+            InvocationError::Syscall(Errno(5)), // EIO: procfs observation ambiguity
+            InvocationError::Syscall(Errno(2)), // ENOENT: parent/procfs race
+            InvocationError::ParentProof,       // changed PPID/start-time/namespace/equality
+            InvocationError::Replacement,       // descriptor replacement or invalid null probe
+            InvocationError::InvalidProtocolStream,
+        ] {
+            assert_eq!(classify_pre_frame_error(error), PreFrameResult::Ambiguous);
+        }
+    }
+
+    #[test]
+    fn rename_probe_recognizes_only_efault_and_preserves_enosys_classification() {
+        assert!(classify_renameat2_probe(Err(Errno::EFAULT)).is_ok());
+        assert_eq!(
+            classify_renameat2_probe(Err(Errno::ENOSYS)),
+            Err(InvocationError::Syscall(Errno::ENOSYS))
+        );
+        assert_eq!(
+            classify_renameat2_probe(Err(Errno(1))),
+            Err(InvocationError::Syscall(Errno(1)))
+        );
+        assert_eq!(
+            classify_renameat2_probe(Ok(())),
+            Err(InvocationError::Replacement)
+        );
+    }
+
+    #[test]
+    fn production_syscall_source_has_no_ambient_cwd_probe() {
+        let syscall_source = include_str!("syscall.rs");
+        assert!(!syscall_source.contains(&["AT", "_FDCWD"].concat()));
+        assert!(!syscall_source.contains(&["probe_", "openat2"].concat()));
+        let main_source = include_str!("main.rs");
+        assert!(!main_source.contains(&["capability", "::probe"].concat()));
     }
 }

@@ -16,7 +16,6 @@ const SYS_PIDFD_SEND_SIGNAL: usize = 424;
 const SYS_PIDFD_OPEN: usize = 434;
 const SYS_OPENAT2: usize = 437;
 
-const AT_FDCWD: RawFd = -100;
 const O_DIRECTORY: u64 = 0o200000;
 const O_NOFOLLOW: u64 = 0o400000;
 const O_CLOEXEC: u64 = 0o2000000;
@@ -398,24 +397,26 @@ fn renameat2_with(
     decode_result(value).map(|_| ())
 }
 
-pub(crate) fn probe_openat2(raw: &impl RawSyscalls) -> Result<RawFd, Errno> {
-    let name = c".";
-    let how = OpenHow {
-        flags: O_PATH | O_DIRECTORY | O_CLOEXEC,
-        mode: 0,
-        resolve: RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
-    };
-    openat2_with(raw, AT_FDCWD, name, &how)
+/// Probes a renameat2 flag only relative to an already admitted descriptor. Deliberately invalid
+/// null names distinguish a recognized syscall/flag (EFAULT) without looking up or mutating an
+/// ambient namespace entry.
+pub(crate) fn probe_rename_flag_on_held_descriptor(
+    parent: RawFd,
+    flag: usize,
+) -> Result<(), Errno> {
+    probe_rename_flag_on_held_descriptor_with(&LinuxRaw, parent, flag)
 }
 
-pub(crate) fn probe_rename_flag(raw: &impl RawSyscalls, flag: usize) -> Result<(), Errno> {
-    // Deliberately invalid null paths distinguish a recognized syscall/flag (EFAULT) without
-    // changing any namespace entry. EFAULT is consumed by the capability probe as success.
+pub(crate) fn probe_rename_flag_on_held_descriptor_with(
+    raw: &impl RawSyscalls,
+    parent: RawFd,
+    flag: usize,
+) -> Result<(), Errno> {
     // SAFETY: null paths are intentionally passed to provoke a side-effect-free kernel error.
     let value = unsafe {
         raw.call6(
             SYS_RENAMEAT2,
-            [AT_FDCWD as usize, 0, AT_FDCWD as usize, 0, flag, 0],
+            [parent as usize, 0, parent as usize, 0, flag, 0],
         )
     };
     decode_result(value).map(|_| ())
@@ -809,5 +810,24 @@ mod tests {
         );
         drop(listener);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rename_flag_probe_uses_only_the_admitted_held_descriptor() {
+        let raw = FakeRaw {
+            result: -(Errno::EFAULT.0 as isize),
+            calls: RefCell::new(Vec::new()),
+        };
+        assert_eq!(
+            probe_rename_flag_on_held_descriptor_with(&raw, 57, PROBE_RENAME_EXCHANGE),
+            Err(Errno::EFAULT)
+        );
+        let call = raw.calls.borrow()[0];
+        assert_eq!(call.0, SYS_RENAMEAT2);
+        assert_eq!(call.1[0], 57);
+        assert_eq!(call.1[1], 0);
+        assert_eq!(call.1[2], 57);
+        assert_eq!(call.1[3], 0);
+        assert_eq!(call.1[4], PROBE_RENAME_EXCHANGE);
     }
 }

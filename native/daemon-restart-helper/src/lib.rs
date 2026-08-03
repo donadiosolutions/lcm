@@ -8,7 +8,6 @@
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("lcm-daemon-restart-helper supports only Linux x86_64");
 
-pub mod capability;
 pub mod descriptor;
 pub mod invocation;
 pub mod persistence;
