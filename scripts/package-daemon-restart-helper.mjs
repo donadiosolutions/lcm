@@ -66,6 +66,20 @@ const RUSTC_KEYS = [
 ];
 const CARGO_KEYS = ["release", "commitHash", "commitDate", "host"];
 
+export function cargoExecutablePath(
+  targetDirectory,
+  target = NATIVE_HELPER.target
+) {
+  if (
+    typeof target !== "string" ||
+    !/^[a-z0-9][a-z0-9_-]*$/u.test(target) ||
+    target.includes("..")
+  ) {
+    fail("Cargo target is not a canonical target triple");
+  }
+  return resolve(targetDirectory, target, "release", NATIVE_HELPER.filename);
+}
+
 function fail(message) {
   throw new Error(`daemon-restart-helper package: ${message}`);
 }
@@ -265,7 +279,14 @@ function sameStat(before, after) {
 
 export function readBoundedRegularFile(
   path,
-  { label, maxBytes, expectedMode, expectedUid = process.getuid?.() } = {}
+  {
+    label,
+    maxBytes,
+    expectedMode,
+    expectedUid = process.getuid?.(),
+    requireExecutable = false,
+    requireSingleLink = true,
+  } = {}
 ) {
   const descriptor = openSync(
     path,
@@ -273,8 +294,13 @@ export function readBoundedRegularFile(
   );
   try {
     const before = fstatSync(descriptor, { bigint: true });
-    if (!before.isFile() || before.nlink !== 1n)
-      fail(`${label} is not a single-link regular file`);
+    if (!before.isFile() || (requireSingleLink && before.nlink !== 1n)) {
+      fail(
+        `${label} is not a${
+          requireSingleLink ? " single-link" : ""
+        } regular file`
+      );
+    }
     if (before.size <= 0n || before.size > BigInt(maxBytes)) {
       fail(`${label} size is outside 1..${maxBytes} bytes`);
     }
@@ -286,6 +312,9 @@ export function readBoundedRegularFile(
     }
     if (expectedUid !== undefined && before.uid !== BigInt(expectedUid)) {
       fail(`${label} is not owned by the current user`);
+    }
+    if (requireExecutable && Number(before.mode & 0o111n) === 0) {
+      fail(`${label} is not executable`);
     }
     const bytes = Buffer.alloc(Number(before.size));
     let offset = 0;
@@ -523,8 +552,15 @@ export function buildNativeHelperPackage({
     process.env.RUSTUP_HOME ??
     (process.env.HOME ? resolve(process.env.HOME, ".rustup") : undefined);
   if (!rustupHome) fail("RUSTUP_HOME cannot be derived without HOME");
+  const rustFlags = [
+    `--remap-path-prefix=${resolve(root)}=/usr/src/lcm`,
+    "-C",
+    "link-arg=-Wl,--build-id=none",
+    "-C",
+    "strip=symbols",
+  ];
   const environment = {
-    CARGO_ENCODED_RUSTFLAGS: "",
+    CARGO_ENCODED_RUSTFLAGS: rustFlags.join("\x1f"),
     CARGO_HOME: cargoHome,
     CARGO_INCREMENTAL: "0",
     CARGO_NET_OFFLINE: "true",
@@ -532,9 +568,6 @@ export function buildNativeHelperPackage({
     LANG: "C",
     LC_ALL: "C",
     PATH: process.env.PATH,
-    RUSTFLAGS: `--remap-path-prefix=${resolve(
-      root
-    )}=/usr/src/lcm -C link-arg=-Wl,--build-id=none -C strip=symbols`,
     RUSTUP_HOME: rustupHome,
     SOURCE_DATE_EPOCH: "0",
     ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
@@ -570,16 +603,12 @@ export function buildNativeHelperPackage({
     spawn
   );
 
-  const artifactPath = resolve(
-    targetDirectory,
-    NATIVE_HELPER.target,
-    "release",
-    NATIVE_HELPER.filename
-  );
+  const artifactPath = cargoExecutablePath(targetDirectory);
   const artifact = readBoundedRegularFile(artifactPath, {
     label: "Cargo native helper artifact",
     maxBytes: NATIVE_HELPER.maxBinaryBytes,
-    expectedMode: NATIVE_HELPER.binaryMode,
+    requireExecutable: true,
+    requireSingleLink: false,
   });
   writeExclusiveFile(
     resolve(output, NATIVE_HELPER.filename),

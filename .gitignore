@@ -33,3 +33,7 @@ sensitive-patterns-test.txt
 dist/
 coverage/
 test-report.junit.xml
+
+# Deterministic daemon-restart-helper Cargo output (the packaged dist tree is
+# already ignored above).
+/target/daemon-restart-helper/

@@ -15,6 +15,7 @@ import {
   NATIVE_HELPER,
   assertStaticLinuxX64Elf,
   buildNativeHelperPackage,
+  cargoExecutablePath,
   canonicalManifest,
   parseCompilerEvidence,
   runNativeHelperPackageCli,
@@ -96,7 +97,8 @@ function successfulSpawn(binary = staticElf()) {
       const environment = options.env as Record<string, string>;
       expect(environment.CARGO_INCREMENTAL).toBe("0");
       expect(environment.SOURCE_DATE_EPOCH).toBe("0");
-      expect(environment.RUSTFLAGS).toContain("--build-id=none");
+      expect(environment.CARGO_ENCODED_RUSTFLAGS).toContain("--build-id=none");
+      expect(environment).not.toHaveProperty("RUSTFLAGS");
       const artifact = resolve(
         environment.CARGO_TARGET_DIR,
         NATIVE_HELPER.target,
@@ -249,6 +251,12 @@ describe("daemon restart helper package", () => {
     );
     expect(() => runNativeHelperPackageCli(["other"])).toThrow(
       "expected exactly one command"
+    );
+    expect(cargoExecutablePath("/tmp/target", "x86_64-unknown-linux-gnu")).toBe(
+      "/tmp/target/x86_64-unknown-linux-gnu/release/daemon-restart-helper"
+    );
+    expect(() => cargoExecutablePath("/tmp/target", "../host")).toThrow(
+      "Cargo target is not a canonical target triple"
     );
   });
 });
