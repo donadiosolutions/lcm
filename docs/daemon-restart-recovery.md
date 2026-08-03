@@ -191,24 +191,34 @@ performs this one pre-frame parent proof, with no output or state mutation:
    decimal-PID proc entry, and retains the evidence needed to recheck both.
    A missing, malformed, changing, inaccessible, or different namespace/start
    observation is ambiguous and refuses.
-3. Only after those PIDFD, PID-namespace, and start-time proofs does it make
-   the third and final supported procfs magic-link capture:
-   `/proc/<decimal-ppid>/exe`. It opens that exact executable descriptor,
-   validates and hashes it by the identical FD 6 regular-file rules, and
-   requires its complete strict immutable-leaf identity to equal FD 6.
-4. Immediately before the lease, it rechecks the direct parent PID, PIDFD-backed
-   parent evidence, same PID namespace, bounded proc start-time, the separately
-   opened parent executable identity, and FD 6's own strict identity. Every
-   equality must still hold. It then closes all temporary parent-proof
-   descriptors before returning the lease.
+3. Immediately before the lease, it makes the first final parent recheck: the
+   direct parent PID is still the recorded decimal PID, the held PIDFD still
+   proves that exact parent is live, the PID namespace is still the same, and
+   the bounded proc start-time is still the recorded value. Any failed,
+   missing, malformed, changing, inaccessible, or different observation is
+   ambiguous and refuses.
+4. Between those final rechecks and the lease, it makes a **fresh** third and
+   final supported procfs magic-link capture: `/proc/<decimal-ppid>/exe`. It
+   opens that exact executable descriptor, performs the complete identical FD 6
+   regular-file validation and descriptor-read SHA-256, and requires its
+   complete strict immutable-leaf identity to equal FD 6. An earlier
+   parent-executable descriptor, whether retained or revalidated, is never
+   final evidence for this comparison.
+5. Immediately after that fresh capture and before the lease, it repeats the
+   final direct-parent PID, PIDFD-liveness, same PID-namespace, and bounded
+   proc-start-time rechecks. Those final rechecks bracket the fresh capture. It
+   then revalidates the freshly captured parent-executable and FD 6 strict
+   identities and their equality. Every equality must still hold. It then closes
+   all temporary parent-proof descriptors before returning the lease.
 
 No pathname is retained as authority, and neither a successful earlier check
-nor a matching UID/GID alone permits FD 6. Parent exit, PID reuse, a procfs
-race, a short or malformed start-time read, a changed FD 6 or parent executable
-identity, an unsupported `prctl` or `pidfd_open`, or any inability to complete
-the proof is a pre-frame refusal. The helper must not clear PDEATHSIG as part of
-this proof; it is cleared only by the separately specified managed-child commit
-protocol.
+nor a matching UID/GID alone permits FD 6. Parent exit, PID reuse, a parent
+`execve` race, another procfs race, a short or malformed start-time read, a
+changed FD 6 or parent executable identity, an unsupported `prctl` or
+`pidfd_open`, or any inability to complete the proof is an explicit pre-frame
+refusal with no output and no state mutation. The helper must not clear
+PDEATHSIG as part of this proof; it is cleared only by the separately specified
+managed-child commit protocol.
 
 Integration #419 obtains the runtime descriptor solely by opening
 `/proc/self/exe` in the already-running Node process, retains that descriptor,
@@ -1370,11 +1380,14 @@ Before enabling the protocol, implementation must include:
   uses `process.execPath`, `PATH`, or a package runtime pathname; and that the
   helper starts only from FD 3 through `/proc/self/fd/3`. They must cover the
   complete pre-frame sequence: PDEATHSIG plus PPID recheck, direct-parent
-  PIDFD, same PID namespace, bounded/rechecked parent proc start-time, the
-  final `/proc/<decimal-ppid>/exe` capture, identical strict validation/hash,
-  equality, final rechecks, and closure of temporary proof descriptors. They
-  must admit a matching third-UID runtime, reject every owner-only or
-  nonmatching-identity case, parent exit/PID reuse/namespace/start-time/procfs
+  PIDFD, same PID namespace, bounded/rechecked parent proc start-time, final
+  parent rechecks bracketing a fresh `/proc/<decimal-ppid>/exe` capture,
+  complete identical strict validation/hash, equality, and closure of temporary
+  proof descriptors. They must deterministically induce an intervening parent
+  exec after the first final recheck and assert that the fresh re-capture—not a
+  retained earlier parent-executable descriptor—detects the changed image and
+  refuses. They must admit a matching third-UID runtime, reject every owner-only
+  or nonmatching-identity case, parent exit/PID reuse/namespace/start-time/procfs
   race, and prove no FD 1/FD 2 output, frame consumption, state mutation, or
   invocation lease on ambiguity;
 - TypeScript coverage for response versus no-response, unchanged result types,
