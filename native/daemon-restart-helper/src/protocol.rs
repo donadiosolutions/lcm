@@ -148,6 +148,26 @@ pub fn open_stable_response(
     .encode()
 }
 
+/// Encodes the exact read-only Prepared-only `ResumeActive` handshake response.
+pub fn resume_active_response(
+    request_id: [u8; 32],
+    session_id: [u8; 32],
+) -> Result<Vec<u8>, ProtocolError> {
+    Frame {
+        kind: MessageKind::Response(RequestKind::ResumeActive),
+        session_id,
+        ordinal: 0,
+        request_id,
+        payload: [
+            &0x0003_u16.to_le_bytes()[..],
+            &0x0001_u16.to_le_bytes()[..],
+            &0_u32.to_le_bytes()[..],
+        ]
+        .concat(),
+    }
+    .encode()
+}
+
 impl Frame {
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.len() < HEADER_LEN {
@@ -465,6 +485,21 @@ mod tests {
         assert_eq!(bytes.len(), HEADER_LEN);
         assert_eq!(&bytes[..4], b"LCMR");
         assert_eq!(Frame::decode(&bytes), Ok(frame));
+    }
+
+    #[test]
+    fn resume_active_response_is_exact_prepared_empty_body_frame() {
+        let request_id = [0x71; 32];
+        let session_id = [0x72; 32];
+        let bytes = resume_active_response(request_id, session_id).unwrap();
+        let frame = Frame::decode(&bytes).unwrap();
+        assert_eq!(frame.kind, MessageKind::Response(RequestKind::ResumeActive));
+        assert_eq!(frame.session_id, session_id);
+        assert_eq!(frame.ordinal, 0);
+        assert_eq!(frame.request_id, request_id);
+        assert_eq!(frame.payload, [0x03, 0x00, 0x01, 0x00, 0, 0, 0, 0]);
+        assert_eq!(&bytes[6..8], &0x8004_u16.to_le_bytes());
+        assert_eq!(&bytes[84..88], &8_u32.to_le_bytes());
     }
 
     #[test]
