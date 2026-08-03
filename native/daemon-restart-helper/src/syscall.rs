@@ -15,6 +15,11 @@ const SYS_LSEEK: usize = 8;
 const SYS_PIDFD_SEND_SIGNAL: usize = 424;
 const SYS_PIDFD_OPEN: usize = 434;
 const SYS_OPENAT2: usize = 437;
+const SYS_READ: usize = 0;
+const SYS_WRITE: usize = 1;
+const SYS_POLL: usize = 7;
+const SYS_CLOCK_GETTIME: usize = 228;
+const SYS_GETRANDOM: usize = 318;
 
 const O_DIRECTORY: u64 = 0o200000;
 const O_NOFOLLOW: u64 = 0o400000;
@@ -41,7 +46,27 @@ impl Errno {
     pub const ENOSYS: Self = Self(38);
     pub const EINVAL: Self = Self(22);
     pub const EFAULT: Self = Self(14);
+    pub const EAGAIN: Self = Self(11);
+    pub const EINTR: Self = Self(4);
 }
+
+#[repr(C)]
+struct PollFd {
+    descriptor: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[repr(C)]
+struct Timespec {
+    seconds: i64,
+    nanoseconds: i64,
+}
+
+const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
+const CLOCK_MONOTONIC: usize = 1;
+const GRND_NONBLOCK: usize = 0x0001;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminatingSignal {
@@ -333,6 +358,128 @@ pub(crate) fn decode_result(value: isize) -> Result<usize, Errno> {
     }
 }
 
+pub(crate) fn monotonic_millis() -> Result<u64, Errno> {
+    let mut time = Timespec {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+    // SAFETY: the fixed timespec is writable for clock_gettime.
+    let value = unsafe {
+        LinuxRaw.call6(
+            SYS_CLOCK_GETTIME,
+            [
+                CLOCK_MONOTONIC,
+                core::ptr::from_mut(&mut time) as usize,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    decode_result(value)?;
+    let seconds = u64::try_from(time.seconds).map_err(|_| Errno::EINVAL)?;
+    let nanos = u64::try_from(time.nanoseconds).map_err(|_| Errno::EINVAL)?;
+    seconds
+        .checked_mul(1_000)
+        .and_then(|value| value.checked_add(nanos / 1_000_000))
+        .ok_or(Errno::EINVAL)
+}
+
+pub(crate) fn wait_for_io(
+    descriptor: RawFd,
+    writable: bool,
+    timeout_ms: i32,
+) -> Result<bool, Errno> {
+    let mut pollfd = PollFd {
+        descriptor,
+        events: if writable { POLLOUT } else { POLLIN },
+        revents: 0,
+    };
+    // SAFETY: pollfd is writable for one poll entry and timeout is bounded by the caller.
+    let value = unsafe {
+        LinuxRaw.call6(
+            SYS_POLL,
+            [
+                core::ptr::from_mut(&mut pollfd) as usize,
+                1,
+                timeout_ms as usize,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    Ok(decode_result(value)? != 0)
+}
+
+pub(crate) fn read_some(descriptor: RawFd, bytes: &mut [u8]) -> Result<usize, Errno> {
+    // SAFETY: bytes is writable for the supplied bounded length.
+    let value = unsafe {
+        LinuxRaw.call6(
+            SYS_READ,
+            [
+                descriptor as usize,
+                bytes.as_mut_ptr() as usize,
+                bytes.len(),
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    decode_result(value)
+}
+
+pub(crate) fn write_some(descriptor: RawFd, bytes: &[u8]) -> Result<usize, Errno> {
+    // SAFETY: bytes is readable for the supplied bounded length.
+    let value = unsafe {
+        LinuxRaw.call6(
+            SYS_WRITE,
+            [
+                descriptor as usize,
+                bytes.as_ptr() as usize,
+                bytes.len(),
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    decode_result(value)
+}
+
+pub(crate) fn random_fill(bytes: &mut [u8]) -> Result<(), Errno> {
+    random_fill_with(&LinuxRaw, bytes)
+}
+
+fn random_fill_with(raw: &impl RawSyscalls, bytes: &mut [u8]) -> Result<(), Errno> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        // SAFETY: the remaining byte slice is writable for getrandom. GRND_NONBLOCK is required
+        // so CRNG initialization cannot extend the helper's monotonic operation deadline.
+        let value = unsafe {
+            raw.call6(
+                SYS_GETRANDOM,
+                [
+                    bytes[offset..].as_mut_ptr() as usize,
+                    bytes.len() - offset,
+                    GRND_NONBLOCK,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        let count = decode_result(value)?;
+        if count == 0 {
+            return Err(Errno::EAGAIN);
+        }
+        offset += count;
+    }
+    Ok(())
+}
+
 fn pidfd_open_with(raw: &impl RawSyscalls, pid: u32) -> Result<RawFd, Errno> {
     // SAFETY: pidfd_open has no pointer arguments; flags are fixed to zero.
     let value = unsafe { raw.call6(SYS_PIDFD_OPEN, [pid as usize, 0, 0, 0, 0, 0]) };
@@ -493,7 +640,7 @@ pub(crate) fn release_ofd_lock(descriptor: RawFd) -> Result<(), Errno> {
     ofd_lock_with(&LinuxRaw, descriptor, F_UNLOCK)
 }
 
-/// The only mutable status bit version 1 accepts on protocol streams.
+/// The required and only mutable status bit version 1 accepts on protocol streams.
 pub(crate) const O_NONBLOCK_STATUS: usize = O_NONBLOCK as usize;
 /// Kernel-generated large-file status is not a caller-controlled status flag on x86_64.
 pub(crate) const O_LARGEFILE_STATUS: usize = 0o100000;
@@ -665,12 +812,58 @@ mod tests {
         }
     }
 
+    struct SequenceRaw {
+        results: RefCell<Vec<isize>>,
+        calls: RefCell<Vec<(usize, [usize; 6])>>,
+    }
+
+    impl RawSyscalls for SequenceRaw {
+        unsafe fn call6(&self, number: usize, arguments: [usize; 6]) -> isize {
+            self.calls.borrow_mut().push((number, arguments));
+            self.results.borrow_mut().remove(0)
+        }
+    }
+
     #[test]
     fn preserves_exact_kernel_errno() {
         for errno in [1, 14, 22, 38, 95, 4095] {
             assert_eq!(decode_result(-(errno as isize)), Err(Errno(errno)));
         }
         assert_eq!(decode_result(7), Ok(7));
+    }
+
+    #[test]
+    fn getrandom_is_nonblocking_and_retries_only_partial_success() {
+        let raw = SequenceRaw {
+            results: RefCell::new(vec![7, 25]),
+            calls: RefCell::new(Vec::new()),
+        };
+        let mut bytes = [0_u8; 32];
+        assert_eq!(random_fill_with(&raw, &mut bytes), Ok(()));
+        let calls = raw.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, SYS_GETRANDOM);
+        assert_eq!(calls[0].1[1], 32);
+        assert_eq!(calls[0].1[2], GRND_NONBLOCK);
+        assert_eq!(calls[1].0, SYS_GETRANDOM);
+        assert_eq!(calls[1].1[1], 25);
+        assert_eq!(calls[1].1[2], GRND_NONBLOCK);
+    }
+
+    #[test]
+    fn getrandom_interruption_or_unready_crng_fails_without_retrying() {
+        for (result, expected) in [
+            (-(Errno::EINTR.0 as isize), Errno::EINTR),
+            (-(Errno::EAGAIN.0 as isize), Errno::EAGAIN),
+        ] {
+            let raw = SequenceRaw {
+                results: RefCell::new(vec![result]),
+                calls: RefCell::new(Vec::new()),
+            };
+            let mut bytes = [0_u8; 32];
+            assert_eq!(random_fill_with(&raw, &mut bytes), Err(expected));
+            assert_eq!(raw.calls.borrow().len(), 1);
+        }
     }
 
     #[test]

@@ -103,6 +103,51 @@ pub enum ProtocolError {
     UnknownPhase,
 }
 
+/// Returns the exact bounded frame length after validating the canonical header fields that are
+/// available before the payload has arrived.
+pub fn frame_length_from_header(header: &[u8]) -> Result<usize, ProtocolError> {
+    if header.len() < HEADER_LEN {
+        return Err(ProtocolError::ShortFrame);
+    }
+    if header[0..4] != MAGIC {
+        return Err(ProtocolError::BadMagic);
+    }
+    if read_u16(header, 4) != VERSION {
+        return Err(ProtocolError::UnsupportedVersion);
+    }
+    MessageKind::from_u16(read_u16(header, 6)).ok_or(ProtocolError::UnknownKind)?;
+    if read_u32(header, 8) != 0 {
+        return Err(ProtocolError::NonzeroFlags);
+    }
+    let payload_len = read_u32(header, 84) as usize;
+    if payload_len > MAX_PAYLOAD_LEN {
+        return Err(ProtocolError::PayloadTooLarge);
+    }
+    HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(ProtocolError::PayloadTooLarge)
+}
+
+/// Encodes the only response emitted by the initial non-mutating session slice.
+pub fn open_stable_response(
+    request_id: [u8; 32],
+    session_id: [u8; 32],
+) -> Result<Vec<u8>, ProtocolError> {
+    Frame {
+        kind: MessageKind::Response(RequestKind::OpenStable),
+        session_id,
+        ordinal: 0,
+        request_id,
+        payload: [
+            &0x0002_u16.to_le_bytes()[..],
+            &0_u16.to_le_bytes()[..],
+            &0_u32.to_le_bytes()[..],
+        ]
+        .concat(),
+    }
+    .encode()
+}
+
 impl Frame {
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.len() < HEADER_LEN {
@@ -118,13 +163,8 @@ impl Frame {
         if read_u32(bytes, 8) != 0 {
             return Err(ProtocolError::NonzeroFlags);
         }
-        let payload_len = read_u32(bytes, 84) as usize;
-        if payload_len > MAX_PAYLOAD_LEN {
-            return Err(ProtocolError::PayloadTooLarge);
-        }
-        let frame_len = HEADER_LEN
-            .checked_add(payload_len)
-            .ok_or(ProtocolError::PayloadTooLarge)?;
+        let frame_len = frame_length_from_header(bytes)?;
+        let payload_len = frame_len - HEADER_LEN;
         match bytes.len().cmp(&frame_len) {
             core::cmp::Ordering::Less => return Err(ProtocolError::ShortFrame),
             core::cmp::Ordering::Greater => return Err(ProtocolError::ExcessBytes),

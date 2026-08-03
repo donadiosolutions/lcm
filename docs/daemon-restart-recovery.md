@@ -270,9 +270,17 @@ admits either of these Linux representations after descriptor observation:
   `O_RDWR` on each of FDs 0, 1, and 2.
 
 All three must use the same representation class, must be pairwise distinct,
-and may have `O_NONBLOCK`. `O_APPEND`, `O_ASYNC`, and every other mutable status
-flag are rejected. A named FIFO or socket, a listening or disconnected socket,
-a regular file, character device, terminal, or mixed representation is not a
+and **must** have `O_NONBLOCK` set on entry. The only permitted status bits are
+the role's access mode, `O_NONBLOCK`, and the kernel-generated
+`O_LARGEFILE`; `O_APPEND`, `O_ASYNC`, and every other mutable status flag are
+rejected. `O_NONBLOCK` is a caller-provided version-1 descriptor-ABI property,
+not a helper normalization: the helper checks it with `F_GETFL` and never calls
+`F_SETFL` on an inherited protocol stream, because status flags belong to an
+open file description and changing them could silently alter caller-visible
+descriptor state. This requirement makes the post-`poll` `read` and `write`
+attempts bounded even when an input peer withholds bytes or an output peer does
+not drain them. A named FIFO or socket, a listening or disconnected socket, a
+regular file, character device, terminal, or mixed representation is not a
 protocol stream. The logical directions remain helper-relative: read FD 0,
 write FD 1, and reserve FD 2 for sanitized diagnostics. The exact version-1
 diagnostic budget is zero bytes, so no sanitizer, raw error, token, config,
@@ -283,10 +291,22 @@ that text is not helper output.
 The frame header is 120 bytes and the payload is at most 8,192 bytes, making
 8,312 bytes the maximum encoded frame. The stream reader must tolerate header
 or payload fragmentation, multiple frames coalesced in one read, short writes,
-and `EAGAIN` when nonblocking is set. It reads or writes only the remaining
+and `EAGAIN`/`EINTR` after readiness. It reads or writes only the remaining
 bounded bytes under the operation's monotonic deadline; bytes belonging to a
 coalesced next frame are retained for that frame, never treated as padding for
 the current frame.
+
+The initial OpenStable-only helper slice uses the fixed helper-local version-1
+`OPEN_STABLE_FRAME_DEADLINE_MS = 10,000` monotonic-millisecond budget for one
+post-admission request and its response write. It is not inherited from Node,
+FD 8, or configuration. Before a complete structurally valid OpenStable request,
+EOF, a malformed/oversize/checksum-invalid frame, or deadline expiry is silent.
+After a valid request, failure to obtain entropy or complete the canonical write
+is also silent and never mutates durable state. If a short write has already
+placed bytes in the peer's receive buffer before a later failure or deadline,
+the peer may observe that partial response; it is not a complete protocol
+response, and the helper performs no compensating write, retry beyond its
+deadline, or durable mutation.
 
 #### HOME/state relationship and admission order
 
