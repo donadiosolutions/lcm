@@ -288,6 +288,14 @@ bounded bytes under the operation's monotonic deadline; bytes belonging to a
 coalesced next frame are retained for that frame, never treated as padding for
 the current frame.
 
+The initial OpenStable-only helper slice uses the fixed helper-local version-1
+`OPEN_STABLE_FRAME_DEADLINE_MS = 10,000` monotonic-millisecond budget for one
+post-admission request and its response write. It is not inherited from Node,
+FD 8, or configuration. Before a complete structurally valid OpenStable request,
+EOF, a malformed/oversize/checksum-invalid frame, or deadline expiry is silent.
+After a valid request, failure to obtain entropy or complete the canonical write
+is also silent and never mutates durable state; a partial write is not a response.
+
 #### HOME/state relationship and admission order
 
 FD 4 and FD 5 are never aliases. The helper validates FD 4, opens exactly its

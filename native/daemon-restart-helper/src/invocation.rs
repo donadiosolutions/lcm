@@ -1,7 +1,8 @@
 //! Read-only admission for the fixed version-1 inherited helper descriptor ABI.
 //!
-//! This module deliberately stops at an in-memory lease.  It never consumes a protocol byte,
-//! writes a diagnostic, alters a durable object, or exposes a dispatch/spawn capability.
+//! The admission path deliberately stops at an in-memory lease. After that lease is held,
+//! the fixed OpenStable transport may consume exactly one frame and write its response; neither
+//! path alters a durable object or exposes a dispatch/spawn capability.
 
 use crate::descriptor::{
     Descriptor, DescriptorContent, DescriptorError, DescriptorIdentity, DescriptorIdentityCommon,
@@ -13,6 +14,7 @@ use crate::syscall::{
     self, Errno, O_LARGEFILE_STATUS, O_NONBLOCK_STATUS, O_RDONLY_ACCESS, O_RDWR_ACCESS,
     O_WRONLY_ACCESS, PidFd,
 };
+use crate::transport;
 use std::fs::{self, File};
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -58,6 +60,13 @@ pub enum PreFrameResult {
     Admitted,
     Unsupported,
     Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenStableResult {
+    Completed,
+    Unsupported,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,6 +238,26 @@ pub fn admit() -> PreFrameResult {
     match admit_with_stable_lease() {
         Ok(_) => PreFrameResult::Admitted,
         Err(error) => classify_pre_frame_error(error),
+    }
+}
+
+/// Retains the admitted invocation and stable/OFD lease while serving exactly one non-mutating
+/// OpenStable handshake. Every transport failure remains silent and releases no authority.
+pub fn serve_open_stable() -> OpenStableResult {
+    let lease = match admit_with_stable_lease() {
+        Ok(lease) => lease,
+        Err(error) => {
+            return match classify_pre_frame_error(error) {
+                PreFrameResult::Unsupported => OpenStableResult::Unsupported,
+                PreFrameResult::Admitted | PreFrameResult::Ambiguous => OpenStableResult::Failed,
+            };
+        }
+    };
+    let result = transport::serve_open_stable();
+    drop(lease);
+    match result {
+        Ok(()) => OpenStableResult::Completed,
+        Err(_) => OpenStableResult::Failed,
     }
 }
 

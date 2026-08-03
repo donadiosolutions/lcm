@@ -15,6 +15,11 @@ const SYS_LSEEK: usize = 8;
 const SYS_PIDFD_SEND_SIGNAL: usize = 424;
 const SYS_PIDFD_OPEN: usize = 434;
 const SYS_OPENAT2: usize = 437;
+const SYS_READ: usize = 0;
+const SYS_WRITE: usize = 1;
+const SYS_POLL: usize = 7;
+const SYS_CLOCK_GETTIME: usize = 228;
+const SYS_GETRANDOM: usize = 318;
 
 const O_DIRECTORY: u64 = 0o200000;
 const O_NOFOLLOW: u64 = 0o400000;
@@ -41,7 +46,26 @@ impl Errno {
     pub const ENOSYS: Self = Self(38);
     pub const EINVAL: Self = Self(22);
     pub const EFAULT: Self = Self(14);
+    pub const EAGAIN: Self = Self(11);
+    pub const EINTR: Self = Self(4);
 }
+
+#[repr(C)]
+struct PollFd {
+    descriptor: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[repr(C)]
+struct Timespec {
+    seconds: i64,
+    nanoseconds: i64,
+}
+
+const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
+const CLOCK_MONOTONIC: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminatingSignal {
@@ -331,6 +355,123 @@ pub(crate) fn decode_result(value: isize) -> Result<usize, Errno> {
     } else {
         Ok(value as usize)
     }
+}
+
+pub(crate) fn monotonic_millis() -> Result<u64, Errno> {
+    let mut time = Timespec {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+    // SAFETY: the fixed timespec is writable for clock_gettime.
+    let value = unsafe {
+        LinuxRaw.call6(
+            SYS_CLOCK_GETTIME,
+            [
+                CLOCK_MONOTONIC,
+                core::ptr::from_mut(&mut time) as usize,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    decode_result(value)?;
+    let seconds = u64::try_from(time.seconds).map_err(|_| Errno::EINVAL)?;
+    let nanos = u64::try_from(time.nanoseconds).map_err(|_| Errno::EINVAL)?;
+    seconds
+        .checked_mul(1_000)
+        .and_then(|value| value.checked_add(nanos / 1_000_000))
+        .ok_or(Errno::EINVAL)
+}
+
+pub(crate) fn wait_for_io(
+    descriptor: RawFd,
+    writable: bool,
+    timeout_ms: i32,
+) -> Result<bool, Errno> {
+    let mut pollfd = PollFd {
+        descriptor,
+        events: if writable { POLLOUT } else { POLLIN },
+        revents: 0,
+    };
+    // SAFETY: pollfd is writable for one poll entry and timeout is bounded by the caller.
+    let value = unsafe {
+        LinuxRaw.call6(
+            SYS_POLL,
+            [
+                core::ptr::from_mut(&mut pollfd) as usize,
+                1,
+                timeout_ms as usize,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    Ok(decode_result(value)? != 0)
+}
+
+pub(crate) fn read_some(descriptor: RawFd, bytes: &mut [u8]) -> Result<usize, Errno> {
+    // SAFETY: bytes is writable for the supplied bounded length.
+    let value = unsafe {
+        LinuxRaw.call6(
+            SYS_READ,
+            [
+                descriptor as usize,
+                bytes.as_mut_ptr() as usize,
+                bytes.len(),
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    decode_result(value)
+}
+
+pub(crate) fn write_some(descriptor: RawFd, bytes: &[u8]) -> Result<usize, Errno> {
+    // SAFETY: bytes is readable for the supplied bounded length.
+    let value = unsafe {
+        LinuxRaw.call6(
+            SYS_WRITE,
+            [
+                descriptor as usize,
+                bytes.as_ptr() as usize,
+                bytes.len(),
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    decode_result(value)
+}
+
+pub(crate) fn random_fill(bytes: &mut [u8]) -> Result<(), Errno> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        // SAFETY: the remaining byte slice is writable for getrandom.
+        let value = unsafe {
+            LinuxRaw.call6(
+                SYS_GETRANDOM,
+                [
+                    bytes[offset..].as_mut_ptr() as usize,
+                    bytes.len() - offset,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        let count = decode_result(value)?;
+        if count == 0 {
+            return Err(Errno::EAGAIN);
+        }
+        offset += count;
+    }
+    Ok(())
 }
 
 fn pidfd_open_with(raw: &impl RawSyscalls, pid: u32) -> Result<RawFd, Errno> {
