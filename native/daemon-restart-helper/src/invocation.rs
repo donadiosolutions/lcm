@@ -261,9 +261,25 @@ fn verify_inherited_inventory() -> Result<(), InvocationError> {
     let enumeration_fd = directory.as_raw_fd();
     let entries =
         syscall::list_directory(directory.as_fd(), 64).map_err(InvocationError::Syscall)?;
+    let seen = classify_inventory(entries.iter().map(Vec::as_slice), enumeration_fd)?;
+    if seen.iter().any(|present| !present) {
+        return Err(InvocationError::MissingDescriptor);
+    }
+    for descriptor in 0..=CONFIG_FD {
+        if syscall::descriptor_has_cloexec(descriptor).map_err(InvocationError::Syscall)? {
+            return Err(InvocationError::CloexecSet);
+        }
+    }
+    Ok(())
+}
+
+fn classify_inventory<'a>(
+    entries: impl IntoIterator<Item = &'a [u8]>,
+    enumeration_fd: i32,
+) -> Result<[bool; 9], InvocationError> {
     let mut seen = [false; 9];
     for entry in entries {
-        let text = std::str::from_utf8(&entry).map_err(|_| InvocationError::ExtraDescriptor)?;
+        let text = std::str::from_utf8(entry).map_err(|_| InvocationError::ExtraDescriptor)?;
         let descriptor = text
             .parse::<i32>()
             .map_err(|_| InvocationError::ExtraDescriptor)?;
@@ -276,15 +292,7 @@ fn verify_inherited_inventory() -> Result<(), InvocationError> {
         let index = usize::try_from(descriptor).map_err(|_| InvocationError::ExtraDescriptor)?;
         seen[index] = true;
     }
-    if seen.iter().any(|present| !present) {
-        return Err(InvocationError::MissingDescriptor);
-    }
-    for descriptor in 0..=CONFIG_FD {
-        if syscall::descriptor_has_cloexec(descriptor).map_err(InvocationError::Syscall)? {
-            return Err(InvocationError::CloexecSet);
-        }
-    }
-    Ok(())
+    Ok(seen)
 }
 
 fn validate_streams() -> Result<(), InvocationError> {
@@ -615,6 +623,61 @@ fn final_parent_proof(expected_node: StrictIdentity) -> Result<ParentProof, Invo
         _pidfd: pidfd,
         _executable: executable,
     })
+}
+
+/// The final suffix's observable contract, factored from its Linux descriptor implementation so
+/// every race boundary can be exercised without changing a test runner's parent or namespace.
+#[cfg(test)]
+trait ParentProofBackend {
+    fn direct_parent(&mut self) -> Result<u32, InvocationError>;
+    fn arm_pdeathsig(&mut self) -> Result<(), InvocationError>;
+    fn pidfd_open(&mut self, parent: u32) -> Result<(), InvocationError>;
+    fn start_time(&mut self, parent: u32) -> Result<u64, InvocationError>;
+    fn same_namespace(&mut self, parent: u32) -> Result<bool, InvocationError>;
+    fn pidfd_live(&mut self) -> Result<(), InvocationError>;
+    fn fresh_executable(&mut self, parent: u32) -> Result<StrictIdentity, InvocationError>;
+    fn issued(&mut self);
+}
+
+#[cfg(test)]
+fn final_parent_proof_sequence(
+    backend: &mut impl ParentProofBackend,
+    expected_node: StrictIdentity,
+) -> Result<(), InvocationError> {
+    let parent = backend.direct_parent()?;
+    if parent == 0 {
+        return Err(InvocationError::ParentProof);
+    }
+    backend.arm_pdeathsig()?;
+    if backend.direct_parent()? != parent {
+        return Err(InvocationError::ParentProof);
+    }
+    backend.pidfd_open(parent)?;
+    let start = backend.start_time(parent)?;
+    validate_parent_tuple(backend, parent, start)?;
+    if backend.fresh_executable(parent)? != expected_node {
+        return Err(InvocationError::ParentProof);
+    }
+    validate_parent_tuple(backend, parent, start)?;
+    // This is intentionally the final callback: it represents LeaseIssued, with no cleanup or
+    // externally visible action sequenced between the final tuple and the result.
+    backend.issued();
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_parent_tuple(
+    backend: &mut impl ParentProofBackend,
+    parent: u32,
+    start: u64,
+) -> Result<(), InvocationError> {
+    if backend.direct_parent()? != parent
+        || backend.start_time(parent)? != start
+        || !backend.same_namespace(parent)?
+    {
+        return Err(InvocationError::ParentProof);
+    }
+    backend.pidfd_live()
 }
 
 fn ensure_parent_tuple(
@@ -998,6 +1061,70 @@ impl JsonParser<'_> {
 mod tests {
     use super::*;
 
+    fn strict(seed: u64) -> StrictIdentity {
+        StrictIdentity {
+            common: DescriptorIdentityCommon {
+                device: seed,
+                inode: seed + 1,
+                uid: 99,
+                gid: 77,
+                mode: 0o755,
+            },
+            link_count: 1,
+            size: 64,
+            digest: [seed as u8; 32],
+        }
+    }
+
+    struct FakeParent {
+        calls: usize,
+        fail_at: Option<usize>,
+        executable: StrictIdentity,
+        issued: bool,
+    }
+
+    impl FakeParent {
+        fn touch(&mut self) -> Result<(), InvocationError> {
+            self.calls += 1;
+            if self.fail_at == Some(self.calls) {
+                return Err(InvocationError::ParentProof);
+            }
+            Ok(())
+        }
+    }
+
+    impl ParentProofBackend for FakeParent {
+        fn direct_parent(&mut self) -> Result<u32, InvocationError> {
+            self.touch()?;
+            Ok(4321)
+        }
+        fn arm_pdeathsig(&mut self) -> Result<(), InvocationError> {
+            self.touch()
+        }
+        fn pidfd_open(&mut self, _parent: u32) -> Result<(), InvocationError> {
+            self.touch()
+        }
+        fn start_time(&mut self, _parent: u32) -> Result<u64, InvocationError> {
+            self.touch()?;
+            Ok(123)
+        }
+        fn same_namespace(&mut self, _parent: u32) -> Result<bool, InvocationError> {
+            self.touch()?;
+            Ok(true)
+        }
+        fn pidfd_live(&mut self) -> Result<(), InvocationError> {
+            self.touch()
+        }
+        fn fresh_executable(&mut self, _parent: u32) -> Result<StrictIdentity, InvocationError> {
+            self.touch()?;
+            Ok(self.executable)
+        }
+        fn issued(&mut self) {
+            self.calls += 1;
+            self.issued = true;
+        }
+    }
+
     fn elf(kind: u16) -> Vec<u8> {
         let mut bytes = vec![0_u8; 120];
         bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
@@ -1063,5 +1190,76 @@ mod tests {
             ),
             Some(987)
         );
+    }
+
+    #[test]
+    fn inventory_requires_exactly_the_fixed_nine_descriptors() {
+        let exact: Vec<_> = (0..=8)
+            .map(|number| number.to_string().into_bytes())
+            .collect();
+        assert_eq!(
+            classify_inventory(exact.iter().map(Vec::as_slice), 9).unwrap(),
+            [true; 9]
+        );
+        let missing: Vec<_> = (0..=7)
+            .map(|number| number.to_string().into_bytes())
+            .collect();
+        assert_ne!(
+            classify_inventory(missing.iter().map(Vec::as_slice), 9).unwrap(),
+            [true; 9]
+        );
+        let mut extra = exact;
+        extra.push(b"9".to_vec());
+        assert_eq!(
+            classify_inventory(extra.iter().map(Vec::as_slice), 10),
+            Err(InvocationError::ExtraDescriptor)
+        );
+    }
+
+    #[test]
+    fn parent_proof_refuses_every_prelinearization_fault_without_lease() {
+        // 14 callbacks occur before the fresh capture is bracketed and LeaseIssued is callback 15.
+        for failure in 1..=14 {
+            let expected = strict(7);
+            let mut fake = FakeParent {
+                calls: 0,
+                fail_at: Some(failure),
+                executable: expected,
+                issued: false,
+            };
+            assert!(
+                final_parent_proof_sequence(&mut fake, expected).is_err(),
+                "call {failure}"
+            );
+            assert!(!fake.issued, "call {failure} issued a lease");
+        }
+    }
+
+    #[test]
+    fn parent_exec_before_fresh_capture_refuses_but_later_change_is_not_retroactive() {
+        let expected = strict(7);
+        let mut changed = FakeParent {
+            calls: 0,
+            fail_at: None,
+            executable: strict(8),
+            issued: false,
+        };
+        assert_eq!(
+            final_parent_proof_sequence(&mut changed, expected),
+            Err(InvocationError::ParentProof)
+        );
+        assert!(!changed.issued);
+
+        let mut captured = FakeParent {
+            calls: 0,
+            fail_at: None,
+            executable: expected,
+            issued: false,
+        };
+        assert!(final_parent_proof_sequence(&mut captured, expected).is_ok());
+        // The retained result claims equality at capture; a later parent exec is deliberately
+        // outside the bounded observation and cannot invalidate the already-issued lease.
+        captured.executable = strict(8);
+        assert!(captured.issued);
     }
 }

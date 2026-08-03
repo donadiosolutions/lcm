@@ -648,7 +648,8 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::fs::{self, File};
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FakeRaw {
@@ -779,5 +780,34 @@ mod tests {
         assert_eq!(list_directory(directory.as_fd(), 1), Err(Errno::EINVAL));
         drop(directory);
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn unix_stream_admission_requires_a_connected_unnamed_stream_endpoint() {
+        let (first, second) = UnixStream::pair().unwrap();
+        assert_eq!(
+            is_connected_unnamed_unix_stream(first.as_raw_fd()),
+            Ok(true)
+        );
+        assert_eq!(
+            is_connected_unnamed_unix_stream(second.as_raw_fd()),
+            Ok(true)
+        );
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "lcm-helper-listener-{}-{nonce}",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        assert_eq!(
+            is_connected_unnamed_unix_stream(listener.as_raw_fd()),
+            Ok(false)
+        );
+        drop(listener);
+        fs::remove_file(path).unwrap();
     }
 }
