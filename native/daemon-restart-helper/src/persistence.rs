@@ -18,6 +18,7 @@ pub enum RecordName {
     LifecycleCurrent,
     RestartCurrent,
     LaunchCurrent,
+    DaemonPid,
     LifecycleExchange,
     JournalExchange,
 }
@@ -55,6 +56,7 @@ impl RecordName {
             Self::LifecycleCurrent => c"lifecycle.current.v1",
             Self::RestartCurrent => c"restart.current.v1",
             Self::LaunchCurrent => c"daemon.launch.current.v1",
+            Self::DaemonPid => c"daemon.pid",
             Self::LifecycleExchange => c"lifecycle.exchange",
             Self::JournalExchange => c"journal.exchange",
         }
@@ -71,6 +73,7 @@ impl RecordName {
                 matches!(kind, RecordKind::RestartVacant | RecordKind::Journal)
             }
             Self::LaunchCurrent => matches!(kind, RecordKind::LaunchVacant),
+            Self::DaemonPid => matches!(kind, RecordKind::PidVacant),
         }
     }
 }
@@ -362,11 +365,11 @@ impl RecordStore {
     pub fn load_layout_after_lock(
         &self,
         recovery_root: &Descriptor,
-        serial: &HeldRecord,
-        lock: &SerialLock<'_>,
+        lock: &SerialLock,
         key: &TokenKey,
     ) -> Result<LayoutSnapshot, PersistenceError> {
-        if serial.record.kind != RecordKind::LifecycleSerial || !lock.holds(serial.descriptor()) {
+        let serial = lock.record();
+        if serial.record.kind != RecordKind::LifecycleSerial {
             return Err(PersistenceError::LayoutAmbiguous);
         }
         self.revalidate(serial)
@@ -709,24 +712,25 @@ fn strict_identity(
 }
 
 #[derive(Debug)]
-pub struct SerialLock<'descriptor> {
-    descriptor: &'descriptor Descriptor,
+pub struct SerialLock {
+    serial: HeldRecord,
 }
 
-impl<'descriptor> SerialLock<'descriptor> {
-    pub fn acquire(descriptor: &'descriptor Descriptor) -> Result<Self, PersistenceError> {
-        syscall::acquire_ofd_lock(descriptor.as_raw_fd()).map_err(PersistenceError::Syscall)?;
-        Ok(Self { descriptor })
+impl SerialLock {
+    pub fn acquire(serial: HeldRecord) -> Result<Self, PersistenceError> {
+        syscall::acquire_ofd_lock(serial.descriptor.as_raw_fd())
+            .map_err(PersistenceError::Syscall)?;
+        Ok(Self { serial })
     }
 
-    fn holds(&self, descriptor: &Descriptor) -> bool {
-        self.descriptor.as_raw_fd() == descriptor.as_raw_fd()
+    pub(crate) fn record(&self) -> &HeldRecord {
+        &self.serial
     }
 }
 
-impl Drop for SerialLock<'_> {
+impl Drop for SerialLock {
     fn drop(&mut self) {
-        let _ = syscall::release_ofd_lock(self.descriptor.as_raw_fd());
+        let _ = syscall::release_ofd_lock(self.serial.descriptor.as_raw_fd());
     }
 }
 
@@ -1516,15 +1520,13 @@ mod tests {
                 &token,
             )
             .unwrap();
-        let lock = SerialLock::acquire(serial.descriptor()).unwrap();
-        let snapshot = store
-            .load_layout_after_lock(&root, &serial, &lock, &token)
-            .unwrap();
+        let lock = SerialLock::acquire(serial).unwrap();
+        let snapshot = store.load_layout_after_lock(&root, &lock, &token).unwrap();
         assert_eq!(classify_layout(&snapshot), LayoutState::StableEmpty);
 
         fs::write(temporary.0.join("unknown"), b"").unwrap();
         assert_eq!(
-            store.load_layout_after_lock(&root, &serial, &lock, &token),
+            store.load_layout_after_lock(&root, &lock, &token),
             Err(PersistenceError::LayoutAmbiguous)
         );
         fs::remove_file(temporary.0.join("unknown")).unwrap();
@@ -1543,7 +1545,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            store.load_layout_after_lock(&root, &serial, &lock, &token),
+            store.load_layout_after_lock(&root, &lock, &token),
             Err(PersistenceError::LayoutAmbiguous)
         );
     }
@@ -1616,12 +1618,12 @@ mod tests {
                 .open(&path)
                 .unwrap(),
         );
-        let first_lock = SerialLock::acquire(&first).unwrap();
+        syscall::acquire_ofd_lock(first.as_raw_fd()).unwrap();
         assert!(matches!(
-            SerialLock::acquire(&second),
-            Err(PersistenceError::Syscall(Errno(11) | Errno(13)))
+            syscall::acquire_ofd_lock(second.as_raw_fd()),
+            Err(Errno(11) | Errno(13))
         ));
-        drop(first_lock);
-        assert!(SerialLock::acquire(&second).is_ok());
+        syscall::release_ofd_lock(first.as_raw_fd()).unwrap();
+        assert!(syscall::acquire_ofd_lock(second.as_raw_fd()).is_ok());
     }
 }

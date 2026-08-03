@@ -14,4 +14,6 @@ pub mod persistence;
 pub mod protocol;
 pub mod record;
 mod sha256;
+#[allow(dead_code)] // Intentionally staged and unwired until the protocol engine lands.
+mod stable;
 pub mod syscall;

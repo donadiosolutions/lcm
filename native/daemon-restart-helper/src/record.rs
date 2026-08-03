@@ -18,6 +18,7 @@ pub enum RecordKind {
     LifecycleVacant = 0x0002,
     RestartVacant = 0x0003,
     LaunchVacant = 0x0004,
+    PidVacant = 0x0005,
     LifecycleSelector = 0x0010,
     Journal = 0x0011,
 }
@@ -29,6 +30,7 @@ impl RecordKind {
             0x0002 => Self::LifecycleVacant,
             0x0003 => Self::RestartVacant,
             0x0004 => Self::LaunchVacant,
+            0x0005 => Self::PidVacant,
             0x0010 => Self::LifecycleSelector,
             0x0011 => Self::Journal,
             _ => return None,
@@ -41,6 +43,7 @@ impl RecordKind {
             | Self::LifecycleVacant
             | Self::RestartVacant
             | Self::LaunchVacant => 512,
+            Self::PidVacant => 1024,
             Self::LifecycleSelector | Self::Journal => 16 * 1024,
         }
     }
@@ -189,6 +192,7 @@ impl RecordBody {
                     RecordKind::LifecycleVacant
                         | RecordKind::RestartVacant
                         | RecordKind::LaunchVacant
+                        | RecordKind::PidVacant
                 )
                 | (Self::Selector(_), RecordKind::LifecycleSelector)
                 | (Self::Journal(_), RecordKind::Journal)
@@ -468,12 +472,13 @@ fn decode_body(kind: RecordKind, bytes: &[u8]) -> Result<RecordBody, RecordError
             authority: decoder.authority()?,
             self_identity: decoder.serial_identity()?,
         }),
-        RecordKind::LifecycleVacant | RecordKind::RestartVacant | RecordKind::LaunchVacant => {
-            RecordBody::Vacancy(VacancyRecord {
-                authority: decoder.authority()?,
-                serial: decoder.strict_identity()?,
-            })
-        }
+        RecordKind::LifecycleVacant
+        | RecordKind::RestartVacant
+        | RecordKind::LaunchVacant
+        | RecordKind::PidVacant => RecordBody::Vacancy(VacancyRecord {
+            authority: decoder.authority()?,
+            serial: decoder.strict_identity()?,
+        }),
         RecordKind::LifecycleSelector => {
             let (operation_id, operation_kind, terminal_slot, phase_bitmap) =
                 decoder.operation()?;
@@ -809,6 +814,7 @@ mod tests {
             (RecordKind::LifecycleVacant, vacancy()),
             (RecordKind::RestartVacant, vacancy()),
             (RecordKind::LaunchVacant, vacancy()),
+            (RecordKind::PidVacant, vacancy()),
             (
                 RecordKind::LifecycleSelector,
                 RecordBody::Selector(SelectorRecord {
