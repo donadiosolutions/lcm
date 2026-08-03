@@ -14,6 +14,7 @@ pub enum TransportError {
     Timeout,
     Protocol,
     Entropy,
+    Unsupported,
 }
 
 trait Io {
@@ -51,12 +52,20 @@ impl Io for LinuxIo {
 }
 
 fn remaining<I: Io>(io: &mut I, deadline: u64) -> Result<i32, TransportError> {
-    let now = io.now_millis().map_err(|_| TransportError::Io)?;
+    let now = io.now_millis().map_err(classify_io_error)?;
     let remaining = deadline.checked_sub(now).ok_or(TransportError::Timeout)?;
     if remaining == 0 {
         return Err(TransportError::Timeout);
     }
     i32::try_from(remaining).map_err(|_| TransportError::Io)
+}
+
+fn classify_io_error(error: Errno) -> TransportError {
+    if error == Errno::ENOSYS {
+        TransportError::Unsupported
+    } else {
+        TransportError::Io
+    }
 }
 
 fn read_frame<I: Io>(
@@ -79,8 +88,11 @@ fn read_frame<I: Io>(
             return Err(TransportError::Protocol);
         }
         let timeout = remaining(io, deadline)?;
-        if !io.wait(false, timeout).map_err(|_| TransportError::Io)? {
-            return Err(TransportError::Timeout);
+        match io.wait(false, timeout) {
+            Ok(false) => return Err(TransportError::Timeout),
+            Ok(true) => {}
+            Err(Errno::EINTR) => continue,
+            Err(error) => return Err(classify_io_error(error)),
         }
         let mut chunk = [0_u8; READ_CHUNK];
         match io.read(&mut chunk) {
@@ -88,7 +100,7 @@ fn read_frame<I: Io>(
             Ok(count) if count <= chunk.len() => pending.extend_from_slice(&chunk[..count]),
             Ok(_) => return Err(TransportError::Io),
             Err(Errno::EAGAIN | Errno::EINTR) => continue,
-            Err(_) => return Err(TransportError::Io),
+            Err(error) => return Err(classify_io_error(error)),
         }
     }
 }
@@ -97,22 +109,25 @@ fn write_all<I: Io>(io: &mut I, deadline: u64, bytes: &[u8]) -> Result<(), Trans
     let mut offset = 0;
     while offset < bytes.len() {
         let timeout = remaining(io, deadline)?;
-        if !io.wait(true, timeout).map_err(|_| TransportError::Io)? {
-            return Err(TransportError::Timeout);
+        match io.wait(true, timeout) {
+            Ok(false) => return Err(TransportError::Timeout),
+            Ok(true) => {}
+            Err(Errno::EINTR) => continue,
+            Err(error) => return Err(classify_io_error(error)),
         }
         match io.write(&bytes[offset..]) {
             Ok(0) => return Err(TransportError::Io),
             Ok(count) if count <= bytes.len() - offset => offset += count,
             Ok(_) => return Err(TransportError::Io),
             Err(Errno::EAGAIN | Errno::EINTR) => continue,
-            Err(_) => return Err(TransportError::Io),
+            Err(error) => return Err(classify_io_error(error)),
         }
     }
     Ok(())
 }
 
 fn serve_with<I: Io>(io: &mut I) -> Result<(), TransportError> {
-    let start = io.now_millis().map_err(|_| TransportError::Io)?;
+    let start = io.now_millis().map_err(classify_io_error)?;
     let deadline = start
         .checked_add(OPEN_STABLE_FRAME_DEADLINE_MS)
         .ok_or(TransportError::Io)?;
@@ -126,8 +141,13 @@ fn serve_with<I: Io>(io: &mut I) -> Result<(), TransportError> {
         return Err(TransportError::Protocol);
     }
     let mut session_id = [0_u8; 32];
-    io.random(&mut session_id)
-        .map_err(|_| TransportError::Entropy)?;
+    io.random(&mut session_id).map_err(|error| {
+        if error == Errno::ENOSYS {
+            TransportError::Unsupported
+        } else {
+            TransportError::Entropy
+        }
+    })?;
     if session_id.iter().all(|byte| *byte == 0) {
         return Err(TransportError::Entropy);
     }
@@ -156,6 +176,7 @@ mod tests {
         waits: Vec<bool>,
         wait_result: bool,
         random: [u8; 32],
+        random_error: Option<Errno>,
     }
     impl Io for Fake {
         fn now_millis(&mut self) -> Result<u64, Errno> {
@@ -179,6 +200,9 @@ mod tests {
             Ok(count)
         }
         fn random(&mut self, bytes: &mut [u8]) -> Result<(), Errno> {
+            if let Some(error) = self.random_error {
+                return Err(error);
+            }
             bytes.copy_from_slice(&self.random);
             Ok(())
         }
@@ -205,6 +229,7 @@ mod tests {
             waits: Vec::new(),
             wait_result: true,
             random: [3; 32],
+            random_error: None,
         };
         assert_eq!(serve_with(&mut io), Ok(()));
         let response = Frame::decode(&io.output).unwrap();
@@ -230,6 +255,7 @@ mod tests {
             waits: Vec::new(),
             wait_result: true,
             random: [3; 32],
+            random_error: None,
         };
         assert_eq!(serve_with(&mut io), Err(TransportError::Protocol));
         assert!(io.output.is_empty());
@@ -245,6 +271,7 @@ mod tests {
             waits: Vec::new(),
             wait_result: false,
             random: [3; 32],
+            random_error: None,
         };
         assert_eq!(serve_with(&mut io), Err(TransportError::Timeout));
         assert!(io.output.is_empty());
@@ -260,6 +287,7 @@ mod tests {
             waits: Vec::new(),
             wait_result: true,
             random: [0; 32],
+            random_error: None,
         };
         assert_eq!(serve_with(&mut io), Err(TransportError::Entropy));
         assert!(io.output.is_empty());
@@ -277,6 +305,7 @@ mod tests {
             waits: Vec::new(),
             wait_result: true,
             random: [3; 32],
+            random_error: None,
         };
         let mut pending = Vec::new();
         let deadline = 1 + OPEN_STABLE_FRAME_DEADLINE_MS;
@@ -293,5 +322,39 @@ mod tests {
             [7; 32]
         );
         assert!(pending.is_empty());
+    }
+    #[test]
+    fn entropy_interruption_and_unready_crng_are_silent() {
+        for error in [Errno::EINTR, Errno::EAGAIN] {
+            let mut io = Fake {
+                now: 1,
+                input: request(),
+                read_at: 0,
+                read_limit: 17,
+                output: Vec::new(),
+                waits: Vec::new(),
+                wait_result: true,
+                random: [3; 32],
+                random_error: Some(error),
+            };
+            assert_eq!(serve_with(&mut io), Err(TransportError::Entropy));
+            assert!(io.output.is_empty());
+        }
+    }
+    #[test]
+    fn unavailable_entropy_capability_is_silent_and_classified() {
+        let mut io = Fake {
+            now: 1,
+            input: request(),
+            read_at: 0,
+            read_limit: 17,
+            output: Vec::new(),
+            waits: Vec::new(),
+            wait_result: true,
+            random: [3; 32],
+            random_error: Some(Errno::ENOSYS),
+        };
+        assert_eq!(serve_with(&mut io), Err(TransportError::Unsupported));
+        assert!(io.output.is_empty());
     }
 }

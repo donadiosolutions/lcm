@@ -66,6 +66,7 @@ struct Timespec {
 const POLLIN: i16 = 0x001;
 const POLLOUT: i16 = 0x004;
 const CLOCK_MONOTONIC: usize = 1;
+const GRND_NONBLOCK: usize = 0x0001;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminatingSignal {
@@ -449,16 +450,21 @@ pub(crate) fn write_some(descriptor: RawFd, bytes: &[u8]) -> Result<usize, Errno
 }
 
 pub(crate) fn random_fill(bytes: &mut [u8]) -> Result<(), Errno> {
+    random_fill_with(&LinuxRaw, bytes)
+}
+
+fn random_fill_with(raw: &impl RawSyscalls, bytes: &mut [u8]) -> Result<(), Errno> {
     let mut offset = 0;
     while offset < bytes.len() {
-        // SAFETY: the remaining byte slice is writable for getrandom.
+        // SAFETY: the remaining byte slice is writable for getrandom. GRND_NONBLOCK is required
+        // so CRNG initialization cannot extend the helper's monotonic operation deadline.
         let value = unsafe {
-            LinuxRaw.call6(
+            raw.call6(
                 SYS_GETRANDOM,
                 [
                     bytes[offset..].as_mut_ptr() as usize,
                     bytes.len() - offset,
-                    0,
+                    GRND_NONBLOCK,
                     0,
                     0,
                     0,
@@ -806,12 +812,58 @@ mod tests {
         }
     }
 
+    struct SequenceRaw {
+        results: RefCell<Vec<isize>>,
+        calls: RefCell<Vec<(usize, [usize; 6])>>,
+    }
+
+    impl RawSyscalls for SequenceRaw {
+        unsafe fn call6(&self, number: usize, arguments: [usize; 6]) -> isize {
+            self.calls.borrow_mut().push((number, arguments));
+            self.results.borrow_mut().remove(0)
+        }
+    }
+
     #[test]
     fn preserves_exact_kernel_errno() {
         for errno in [1, 14, 22, 38, 95, 4095] {
             assert_eq!(decode_result(-(errno as isize)), Err(Errno(errno)));
         }
         assert_eq!(decode_result(7), Ok(7));
+    }
+
+    #[test]
+    fn getrandom_is_nonblocking_and_retries_only_partial_success() {
+        let raw = SequenceRaw {
+            results: RefCell::new(vec![7, 25]),
+            calls: RefCell::new(Vec::new()),
+        };
+        let mut bytes = [0_u8; 32];
+        assert_eq!(random_fill_with(&raw, &mut bytes), Ok(()));
+        let calls = raw.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, SYS_GETRANDOM);
+        assert_eq!(calls[0].1[1], 32);
+        assert_eq!(calls[0].1[2], GRND_NONBLOCK);
+        assert_eq!(calls[1].0, SYS_GETRANDOM);
+        assert_eq!(calls[1].1[1], 25);
+        assert_eq!(calls[1].1[2], GRND_NONBLOCK);
+    }
+
+    #[test]
+    fn getrandom_interruption_or_unready_crng_fails_without_retrying() {
+        for (result, expected) in [
+            (-(Errno::EINTR.0 as isize), Errno::EINTR),
+            (-(Errno::EAGAIN.0 as isize), Errno::EAGAIN),
+        ] {
+            let raw = SequenceRaw {
+                results: RefCell::new(vec![result]),
+                calls: RefCell::new(Vec::new()),
+            };
+            let mut bytes = [0_u8; 32];
+            assert_eq!(random_fill_with(&raw, &mut bytes), Err(expected));
+            assert_eq!(raw.calls.borrow().len(), 1);
+        }
     }
 
     #[test]

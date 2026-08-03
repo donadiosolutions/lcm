@@ -257,6 +257,7 @@ pub fn serve_open_stable() -> OpenStableResult {
     drop(lease);
     match result {
         Ok(()) => OpenStableResult::Completed,
+        Err(transport::TransportError::Unsupported) => OpenStableResult::Unsupported,
         Err(_) => OpenStableResult::Failed,
     }
 }
