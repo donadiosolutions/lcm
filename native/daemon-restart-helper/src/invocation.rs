@@ -15,7 +15,7 @@ use crate::syscall::{
 };
 use std::fs::{self, File};
 use std::mem;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 
 const HELPER_FD: i32 = 3;
@@ -64,6 +64,22 @@ pub enum PreFrameResult {
 enum StreamClass {
     Pipe,
     UnixStream,
+}
+
+/// A descriptor-held identity for the kernel object backing a protocol stream.
+///
+/// `KCMP_FILE` distinguishes open file descriptions, but the read and write ends of one
+/// anonymous pipe have different file descriptions while sharing this object identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StreamObjectIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProtocolStream {
+    class: StreamClass,
+    object: StreamObjectIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -403,18 +419,22 @@ fn classify_inventory<'a>(
 }
 
 fn validate_streams() -> Result<(), InvocationError> {
-    let classes = [
+    let streams = [
         validate_stream(0, O_RDONLY_ACCESS)?,
         validate_stream(1, O_WRONLY_ACCESS)?,
         validate_stream(2, O_WRONLY_ACCESS)?,
     ];
-    if classes.windows(2).any(|pair| pair[0] != pair[1]) {
+    if streams
+        .windows(2)
+        .any(|pair| pair[0].class != pair[1].class)
+    {
         return Err(InvocationError::InvalidProtocolStream);
     }
+    require_distinct_stream_objects(streams)?;
     Ok(())
 }
 
-fn validate_stream(descriptor: i32, access: usize) -> Result<StreamClass, InvocationError> {
+fn validate_stream(descriptor: i32, access: usize) -> Result<ProtocolStream, InvocationError> {
     let flags = syscall::descriptor_status_flags(descriptor).map_err(InvocationError::Syscall)?;
     if flags & !(3 | O_NONBLOCK_STATUS | O_LARGEFILE_STATUS) != 0 {
         return Err(InvocationError::InvalidStatusFlags);
@@ -426,7 +446,12 @@ fn validate_stream(descriptor: i32, access: usize) -> Result<StreamClass, Invoca
         if flags & 3 != access {
             return Err(InvocationError::InvalidProtocolStream);
         }
-        return Ok(StreamClass::Pipe);
+        return Ok(ProtocolStream {
+            // The procfs target is only the representation classifier.  Identity is bound below
+            // from the held descriptor, never from this symlink target.
+            class: StreamClass::Pipe,
+            object: stream_object_identity(descriptor)?,
+        });
     }
     if target.starts_with(b"socket:[")
         && target.ends_with(b"]")
@@ -434,9 +459,40 @@ fn validate_stream(descriptor: i32, access: usize) -> Result<StreamClass, Invoca
         && syscall::is_connected_unnamed_unix_stream(descriptor)
             .map_err(InvocationError::Syscall)?
     {
-        return Ok(StreamClass::UnixStream);
+        return Ok(ProtocolStream {
+            class: StreamClass::UnixStream,
+            object: stream_object_identity(descriptor)?,
+        });
     }
     Err(InvocationError::InvalidProtocolStream)
+}
+
+fn stream_object_identity(descriptor: i32) -> Result<StreamObjectIdentity, InvocationError> {
+    // SAFETY: descriptor admission owns the fixed inherited descriptor for this observation.
+    // The owned clone makes `File::metadata` an fstat of that held object, not a pathname lookup.
+    let held = unsafe { BorrowedFd::borrow_raw(descriptor) }
+        .try_clone_to_owned()
+        .map_err(|error| {
+            InvocationError::Descriptor(DescriptorError::Io(error.raw_os_error().unwrap_or(5)))
+        })?;
+    let metadata = File::from(held).metadata().map_err(|error| {
+        InvocationError::Descriptor(DescriptorError::Io(error.raw_os_error().unwrap_or(5)))
+    })?;
+    Ok(StreamObjectIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn require_distinct_stream_objects(streams: [ProtocolStream; 3]) -> Result<(), InvocationError> {
+    for first in 0..streams.len() {
+        for second in first + 1..streams.len() {
+            if streams[first].object == streams[second].object {
+                return Err(InvocationError::InvalidProtocolStream);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_no_aliases() -> Result<(), InvocationError> {
@@ -1324,6 +1380,73 @@ mod tests {
     }
 
     #[test]
+    fn protocol_streams_reject_opposite_ends_of_one_anonymous_pipe() {
+        let (request_reader, response_writer) = std::io::pipe().unwrap();
+        let (_diagnostic_reader, diagnostic_writer) = std::io::pipe().unwrap();
+        let streams = [
+            ProtocolStream {
+                class: StreamClass::Pipe,
+                object: stream_object_identity(request_reader.as_raw_fd()).unwrap(),
+            },
+            ProtocolStream {
+                class: StreamClass::Pipe,
+                object: stream_object_identity(response_writer.as_raw_fd()).unwrap(),
+            },
+            ProtocolStream {
+                class: StreamClass::Pipe,
+                object: stream_object_identity(diagnostic_writer.as_raw_fd()).unwrap(),
+            },
+        ];
+
+        assert_eq!(streams[0].object, streams[1].object);
+        assert_eq!(
+            require_distinct_stream_objects(streams),
+            Err(InvocationError::InvalidProtocolStream)
+        );
+    }
+
+    #[test]
+    fn protocol_streams_accept_distinct_pipe_and_unix_stream_objects() {
+        let (request_reader, _request_writer) = std::io::pipe().unwrap();
+        let (_response_reader, response_writer) = std::io::pipe().unwrap();
+        let (_diagnostic_reader, diagnostic_writer) = std::io::pipe().unwrap();
+        let distinct_pipes = [
+            ProtocolStream {
+                class: StreamClass::Pipe,
+                object: stream_object_identity(request_reader.as_raw_fd()).unwrap(),
+            },
+            ProtocolStream {
+                class: StreamClass::Pipe,
+                object: stream_object_identity(response_writer.as_raw_fd()).unwrap(),
+            },
+            ProtocolStream {
+                class: StreamClass::Pipe,
+                object: stream_object_identity(diagnostic_writer.as_raw_fd()).unwrap(),
+            },
+        ];
+        assert!(require_distinct_stream_objects(distinct_pipes).is_ok());
+
+        let (request, _request_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (response, _response_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (diagnostic, _diagnostic_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let distinct_unix_streams = [
+            ProtocolStream {
+                class: StreamClass::UnixStream,
+                object: stream_object_identity(request.as_raw_fd()).unwrap(),
+            },
+            ProtocolStream {
+                class: StreamClass::UnixStream,
+                object: stream_object_identity(response.as_raw_fd()).unwrap(),
+            },
+            ProtocolStream {
+                class: StreamClass::UnixStream,
+                object: stream_object_identity(diagnostic.as_raw_fd()).unwrap(),
+            },
+        ];
+        assert!(require_distinct_stream_objects(distinct_unix_streams).is_ok());
+    }
+
+    #[test]
     fn parent_proof_refuses_every_prelinearization_fault_without_lease() {
         // 14 callbacks occur before the fresh capture is bracketed and LeaseIssued is callback 15.
         for failure in 1..=14 {
@@ -1462,13 +1585,14 @@ mod tests {
         }
     }
 
-    const ADMISSION_GATES: [&str; 42] = [
+    const ADMISSION_GATES: [&str; 43] = [
         "inventory-exact-0-8",
         "inventory-cloexec-clear",
         "stdio-0-type-direction-status",
         "stdio-1-type-direction-status",
         "stdio-2-type-direction-status",
         "stdio-representation-distinct",
+        "stdio-underlying-object-distinct",
         "aliases-all-roles",
         "fd3-type",
         "fd3-owner",
