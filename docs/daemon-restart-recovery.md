@@ -296,17 +296,84 @@ bounded bytes under the operation's monotonic deadline; bytes belonging to a
 coalesced next frame are retained for that frame, never treated as padding for
 the current frame.
 
-The initial OpenStable-only helper slice uses the fixed helper-local version-1
-`OPEN_STABLE_FRAME_DEADLINE_MS = 10,000` monotonic-millisecond budget for one
-post-admission request and its response write. It is not inherited from Node,
-FD 8, or configuration. Before a complete structurally valid OpenStable request,
-EOF, a malformed/oversize/checksum-invalid frame, or deadline expiry is silent.
-After a valid request, failure to obtain entropy or complete the canonical write
-is also silent and never mutates durable state. If a short write has already
-placed bytes in the peer's receive buffer before a later failure or deadline,
-the peer may observe that partial response; it is not a complete protocol
-response, and the helper performs no compensating write, retry beyond its
-deadline, or durable mutation.
+The initial two-handshake helper slice uses the fixed helper-local version-1
+`OPEN_STABLE_FRAME_DEADLINE_MS = 10,000` monotonic-millisecond budget. The
+deadline begins when the inherited descriptor/provenance gates have completed
+and issued `LeaseIssued`; it covers exactly one bounded zero-session frame
+read, the matching durable-layout admission, entropy acquisition, and the one
+response write. It is not inherited from Node, FD 8, or configuration. The
+helper retains every descriptor/provenance authority from `LeaseIssued` until
+the response write completes or it exits.
+
+After `LeaseIssued`, the entrypoint runs one bounded **pre-frame router**. It
+reads one frame before durable-layout inspection and accepts only a complete
+zero-session `OpenStable` or `ResumeActive` request: the session ID is all zero,
+the ordinal is zero, the request ID is nonzero, and the payload is empty. It
+routes `OpenStable` only to stable admission and `ResumeActive` only to the
+Prepared-only active admission defined below, before it emits any response. It
+does not accept `Bootstrap`, a later-session frame, a second frame, or any
+other request kind at this entrypoint. The router is not a general lifecycle
+dispatcher and cannot turn a frame into permission to spawn, signal, perform
+network/preflight work, use a PID/PIDFD, or mutate durable state.
+
+For either route, the helper opens `lifecycle.serial.v1`, identity-validates it,
+and takes its nonblocking exclusive `F_OFD_SETLK` lock **before** inspecting a
+durable layout. It retains the serial descriptor and lock, as well as the
+inherited descriptor/provenance authorities, through response completion. A
+malformed, oversize, checksum-invalid, unsupported, timed-out, or otherwise
+unapproved request; entropy failure; failure to open, validate, or lock the
+serial; layout, MAC, or identity mismatch; or an incomplete response write is
+silent and performs no durable mutation. If a short write has already placed
+bytes in the peer's receive buffer before a later failure or deadline, the peer
+may observe that partial response; it is not a complete protocol response, and
+the helper performs no compensating write, retry beyond its deadline, or
+durable mutation.
+
+The initial `ResumeActive` route is a deliberately narrow contract for the
+implementation work in #467. It does not make `ResumeActive` user-reachable or
+claim that the route is implemented. It accepts exactly this authenticated
+Prepared shape and refuses every other active layout:
+
+- the held state root and `daemon-recovery.v1` root have their exact stable
+  identities; the token and `lifecycle.serial.v1` have their exact strict
+  identities; every record MAC verifies; and the authenticated record graph
+  binds the held roots, token, serial identity, and helper identity;
+- `lifecycle.current.v1` is one MAC-verified lifecycle selector and
+  `restart.current.v1` is one MAC-verified journal, with equal nonzero
+  operation ID, equal operation kind, equal terminal-slot index, equal strict
+  serial/token identities, equal preflight digest, equal expected PID digest,
+  and equal expected launch digest. The selector's lifecycle predecessor and
+  the journal's lifecycle predecessor are the same strict identity, while the
+  journal also binds the strict restart predecessor;
+- exactly one `terminal.N.v1` is the reserved active slot, where `N` equals the
+  shared terminal-slot index. Its `lifecycle.exchange` and `journal.exchange`
+  are the exact predecessor lifecycle and restart vacancy records exchanged out
+  of the roots. The other two terminal slots are absent: sealed or otherwise
+  occupied neighbors are not admitted by this slice and fail closed; and
+- the canonical state-root `daemon.pid` and recovery-root
+  `daemon.launch.current.v1` are the exact MAC-verified PID-vacant and
+  launch-vacant records bound by the selector and journal. A numeric PID,
+  active launch, missing vacancy, or any cross-record identity/MAC mismatch is
+  not Prepared authority.
+
+The selector and journal each carry a little-endian `u64` `phase_bitmap`. For
+this initial route, both values are exactly `0x0000_0000_0000_0001`: bit zero
+means `PREPARED`, namely that the matching selector and journal have been
+durably published at their roots while their exact predecessor vacancies remain
+in the one reserved terminal slot. It does not represent a spawned candidate,
+PID publication, admission, a signal, or any later recovery phase. The only
+accepted operation kinds are `InitialStart` (`1`) and `Rotation` (`2`). Zero,
+any other bit or combination, unequal selector/journal bitmaps, `Recovery`,
+`RetireDead`, another operation kind, or any later durable phase is silently
+refused by this slice rather than derived or normalized.
+
+A successful `ResumeActive` response is exactly a `ResumeActive` response
+frame with the request ID repeated, a freshly generated nonzero session ID,
+ordinal zero, and the empty-body payload `OK_RESUMED` (`0x0003`), `PREPARED`
+(`0x0001`), and `u32le(0)`. `OpenStable` continues to use its matching
+`OK_OPEN_STABLE`/`STABLE` response. Neither response authorizes a lifecycle
+transition; it only grants the bounded live session described by the admitted
+durable state.
 
 #### HOME/state relationship and admission order
 
@@ -417,12 +484,18 @@ replacement, alias, extra FD, FD 6 parent-proof failure, identity mismatch, or
 ambiguous I/O, calls `_exit(78)`.
 Neither exit status carries secret detail.
 
-After descriptor admission and one structurally valid frame, later replacement
-or descriptor drift maps to `E_IDENTITY`; a genuinely unavailable required
-platform capability maps to `E_UNSUPPORTED`; and an otherwise ambiguous
-bounded I/O failure maps to `E_IO`. Each has an empty body and durable phase
-`STABLE` (`0x0000`). A framing error continues to use `E_PROTOCOL`. These response codes
-never retroactively make a pre-frame failure response-capable.
+After descriptor admission and a request has passed its matching durable
+admission, later replacement or descriptor drift maps to `E_IDENTITY`; a
+genuinely unavailable required platform capability maps to `E_UNSUPPORTED`; and
+an otherwise ambiguous bounded I/O failure maps to `E_IO`. Every
+response-capable post-admission error—those three, `E_PROTOCOL`, `E_PHASE`, or
+any other `E_*` code—has an empty body and the durable phase of the route or
+session already admitted: `STABLE` (`0x0000`) for `OpenStable`, or `PREPARED`
+(`0x0001`) for the initial Prepared-only `ResumeActive` route. A malformed or
+unapproved router frame is not a response-capable `E_PROTOCOL`: the bounded
+zero-session router above remains silent until matching admission succeeds, so
+these response codes never retroactively make a pre-frame or router refusal
+response-capable.
 
 The recovery-root descriptor is helper-derived from descriptor 5 and is
 deliberately neither the HOME nor state-root descriptor. Bootstrap derives it
@@ -859,7 +932,7 @@ direct admission.
 | Durable kind                                                      | Maximum bytes including envelope/digests/MAC | Required bounded facts                                                                                                                                                                                      |
 | ----------------------------------------------------------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Vacancy and lifecycle.serial                                      | 512                                          | Fixed marker/serial kind, stable state-root/recovery-root identities, serial's non-self inode tuple, and helper image digest.                                                                               |
-| Lifecycle selector and journal                                    | 16 KiB                                       | Operation ID, kind including RetireDead, terminal slot, strict serial identity, selector predecessor identities, token identity/digest, preflight digest, expected PID/launch identities, and phase bitmap. |
+| Lifecycle selector and journal                                    | 16 KiB                                       | Operation ID, kind including RetireDead, terminal slot, strict serial identity, selector predecessor identities, token identity/digest, preflight digest, expected PID/launch identities, and phase bitmap; the initial ResumeActive slice accepts only the equal `0x0000_0000_0000_0001` Prepared bitmap. |
 | PID-vacant and PID record                                         | 1 KiB                                        | Operation ID, PID decimal bytes or vacancy marker, strict PID-file identity when referenced by another record, and expected exchange peer identity.                                                         |
 | Launch record                                                     | 64 KiB                                       | Record ID, operation ID, all stable root and strict serial/PID/token/runtime/config identities, process/network facts, listener observations, launch plan, admitted-facts digest, and terminal head.        |
 | Spawn intent, spawned, execed, TERM, KILL, exited, abort receipts | 4 KiB                                        | Operation ID, exact receipt kind/subject, parent and candidate PID/start facts where applicable, launch-plan/prior-phase digests, listener result, commit/exec result, and monotonic deadline/result.       |
@@ -1057,7 +1130,7 @@ through its held capabilities.
 | Bootstrap         | Zero session. Exact fresh state/token-only residue, exact gap-free bootstrap prefix, or exact stable layout with zero through three sealed slots. | Empty.                                                                | For fresh/prefix state, validate config and acquire real bound exclusion sockets; strictly open/create the token before any MAC, resume only the fixed prefix, then predicate-gate absent-only PID vacancy. For stable state, only verify the exact layout.                                                                                                                                                                                |
 | OpenStable        | Zero session. Exact stable selectors, exact serial control record, and zero through three sealed slots.                                           | Empty.                                                                | Acquire serial OFD lock before layout inspection, verify MACs/identities, issue a fresh volatile session ID, and return the stable phase.                                                                                                                                                                                                                                                                                                  |
 | VerifyExisting    | OpenStable session with a non-vacant exact current launch record and matching current helper-managed PID record.                                  | Empty.                                                                | Run direct helper-owned bearer admission against the existing record and return without creating a slot, journal, selector, PID, or launch mutation.                                                                                                                                                                                                                                                                                       |
-| ResumeActive      | Zero session. Exact active selectors, journal, reserved slot, and MAC-verified phase layout.                                                      | Empty.                                                                | Acquire serial OFD lock before layout inspection, derive durable phase, issue a fresh volatile session ID, and retain the lock for exact resumption.                                                                                                                                                                                                                                                                                       |
+| ResumeActive      | Zero session. In the initial slice, only the exact Prepared selector/journal, one reserved slot with predecessor vacancies, canonical PID/launch vacancies, and no sealed neighbor defined above. | Empty.                                                                | Route before durable inspection; open/identity-validate/OFD-lock the serial, verify the exact Prepared-only layout, issue a fresh volatile session ID, and return only `OK_RESUMED`/`PREPARED` with the lock retained through response completion. Every other active phase silently refuses. |
 | PrepareStart      | OpenStable session in stable state with one absent terminal slot and canonical PID vacancy marker.                                                | One u8 kind: 1 initial or 2 normal rotation; remaining payload empty. | Reserve a slot, create/ MAC journal and lifecycle candidates, exchange root selectors, revalidate, and fsync.                                                                                                                                                                                                                                                                                                                              |
 | RetireDead        | OpenStable session with an exact helper-managed PID/launch pair whose recorded subject and listeners satisfy the dead predicate.                  | Empty.                                                                | Without signalling, reserve/activate a RetireDead group, record exit, exchange PID and launch with fresh MACed vacancies, and terminalize the supported no-daemon state; any live, reused-ambiguity, listener, or source mismatch refuses.                                                                                                                                                                                                 |
 | LaunchManaged     | Prepared initial/normal session.                                                                                                                  | Empty.                                                                | MAC/fsync spawn intent; create the PDEATHSIG/parent-checked gated child; MAC/fsync spawned receipt before COMMIT; require exact exec acknowledgement; MAC/fsync candidate.execed; otherwise enter exact abort or remain unresolved.                                                                                                                                                                                                        |
@@ -1067,10 +1140,11 @@ through its held capabilities.
 | AdmitHealthy      | Exact PublishedPid phase with a helper-held candidate PIDFD.                                                                                      | Empty.                                                                | Run direct helper-owned full-bearer admission, create/MAC a launch candidate, exchange it into daemon.launch.current.v1, revalidate, and fsync.                                                                                                                                                                                                                                                                                            |
 | Abort             | Prepared, exact stopped-recovery, or exact recorded-candidate phase.                                                                              | One u16 little-endian reason enum; remaining payload empty.           | Before spawn intent, seal a start abort; a stopped recovery also retires the old launch to vacancy. An intent without a spawned receipt remains unresolved in v1 even if an exact pre-exec child can be safely stopped. For a recorded candidate, terminate it through exact PIDFD receipts, restore PID vacancy if published, and after old-target exit exchange current launch to vacancy; seal only in an exact supported stable state. |
 
-Bootstrap is initialization only. Every operation begins with OpenStable or
-ResumeActive, which acquires the serial OFD lock before it trusts a stable or
-active layout. Ordinary healthy lifecycle checks use VerifyExisting after
-OpenStable and consume no terminal slot. The normal flow is Bootstrap,
+Bootstrap is initialization only. Every operation begins with OpenStable or,
+only when a separately specified ResumeActive slice admits its exact layout,
+ResumeActive; either route acquires the serial OFD lock before it trusts a
+stable or active layout. Ordinary healthy lifecycle checks use VerifyExisting
+after OpenStable and consume no terminal slot. The normal flow is Bootstrap,
 OpenStable, PrepareStart, LaunchManaged, PublishPid, AdmitHealthy, and terminal
 retirement. A later clean death uses OpenStable, RetireDead, and terminal
 retirement before another PrepareStart. The recovery flow is OpenStable,
@@ -1105,14 +1179,16 @@ durable, not merely that fork returned. No other phase value is accepted or
 emitted.
 
 The following persistence table fixes both phase ownership and idempotency
-after a helper crash:
+after a helper crash. It does not broaden the initial zero-session ResumeActive
+slice: until a later phase receives its own versioned admission rule, that slice
+accepts only the exact Prepared row and silently refuses every other row.
 
 | Durable phase                            | Exact persistence proof                                                                                                                                                                           | Repeated or resumed request                                                                                                                                          |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Bootstrap                                | Token is strict/opened or exclusively created and file/parent fsynced before the fixed gap-free sequence of MAC-verified serial, selector, launch, and predicate-gated absent-only PID vacancies. | Bootstrap resumes only the exact next prefix step under the full fresh predicate, or is a no-op for exact stable layout; gaps/extra children refuse.                 |
-| Open stable / resumed active             | The serial OFD lock is held and the root/slot layout plus every MAC is exact.                                                                                                                     | A new zero-session handshake obtains a new volatile session only after the same checks.                                                                              |
+| Open stable / resumed active             | The serial OFD lock is held and the root/slot layout plus every MAC is exact; initial ResumeActive further requires the exact Prepared-only shape above.                                             | A new zero-session handshake obtains a new volatile session only after the matching checks; the initial ResumeActive slice returns only `OK_RESUMED`/`PREPARED`.       |
 | Existing verified                        | VerifyExisting completed direct admission against a MAC-verified existing launch record without writing a record.                                                                                 | A duplicate VerifyExisting returns OK_VERIFIED only while every admitted fact remains exact; otherwise it refuses without consuming a slot.                          |
-| Prepared                                 | Root lifecycle/restart selectors are MAC-verified operation records; chosen slot holds exact predecessor vacancy markers and journal names that slot.                                             | ResumeActive derives this phase; PrepareStart does not allocate another slot.                                                                                        |
+| Prepared                                 | Root lifecycle/restart selectors are MAC-verified operation records; chosen slot holds exact predecessor vacancy markers and journal names that slot. In the initial ResumeActive slice, both kinds are InitialStart or Rotation and both phase bitmaps are exactly `0x0000_0000_0000_0001`. | ResumeActive derives this phase; PrepareStart does not allocate another slot.                                                                                        |
 | Spawn intent                             | candidate.spawn.intent is MAC-verified and slot durable before fork.                                                                                                                              | Resume never forks another candidate. Without replacement.spawned it preserves the unresolved operation; exact non-scanning cleanup cannot make the missing receipt. |
 | Spawn recorded                           | replacement.spawned is MAC-verified and names the exact child PIDFD/start/parent/launch plan while COMMIT was still gated.                                                                        | After a helper crash, Resume proves and aborts that exact candidate; it never reconstructs the private ack, sends a second COMMIT, or forks again.                   |
 | Candidate spawned                        | candidate.execed and replacement.spawned are MAC-verified; exec-error EOF and exact process/executable revalidation succeeded.                                                                    | LaunchManaged or LaunchReplacement returns only that exact candidate; an exec failure enters abort.                                                                  |
@@ -1129,8 +1205,9 @@ contents returns its first bounded response and performs no second transition.
 The same request ID with different bytes, a skipped ordinal, an old ordinal
 outside the cached response window, or a request not allowed by durable phase
 is E_PROTOCOL or E_PHASE. After a crash, volatile response caching is
-discarded and ResumeActive derives the idempotent result solely from
-MAC-verified persistence; it never guesses from process timing.
+discarded and an admitted ResumeActive slice derives the idempotent result
+solely from MAC-verified persistence; the initial slice derives only Prepared
+and never guesses from process timing.
 
 EOF, malformed frames, mismatched session or request IDs, a deadline, or an
 unexpected message never causes a fallback signal, cleanup, or new process
@@ -1264,7 +1341,7 @@ and current kernel facts, not by repeatedly overwriting mutable state.
 | Both daemon.launch.current.v1 and daemon.pid are their exact MAC-verified vacancy markers                                                               | This is the supported stable no-daemon state. A helper-owned start may proceed; no existing process is adopted. A former managed PID requires sealed RetireDead or exact recovery-abort retirement first.                                                     |
 | daemon.launch.current.v1 is vacant while daemon.pid is non-vacant, numeric, malformed, or not exactly bound to an admitted helper-managed launch record | Treat any apparent daemon as legacy. Preserve it, its PID file, token, and all evidence.                                                                                                                                                                      |
 | Launch record or descriptor mismatch                                                                                                                    | Preserve all leaves and refuse.                                                                                                                                                                                                                               |
-| lifecycle.serial.v1 cannot be opened, identity-verified, or exclusively OFD-locked                                                                      | Return E_BUSY, E_LAYOUT, or E_UNSUPPORTED before layout trust, slot selection, process launch, PID publication, quarantine, or signal. Selectors remain the durable fence even when the lock is held.                                                         |
+| lifecycle.serial.v1 cannot be opened, identity-verified, or exclusively OFD-locked                                                                      | A zero-session OpenStable/ResumeActive router silently refuses before layout trust, slot selection, process launch, PID publication, quarantine, or signal. Only an already response-capable live-session operation may return E_BUSY, E_LAYOUT, or E_UNSUPPORTED, with its already-admitted durable phase. Selectors remain the durable fence even when the lock is held. |
 | A received HTTP response exists                                                                                                                         | Use the existing authenticated path; do not invoke the helper.                                                                                                                                                                                                |
 | Syscall, procfs, filesystem, architecture, or helper check is unsupported                                                                               | Preserve state and return the existing fail-closed result.                                                                                                                                                                                                    |
 | VerifyExisting has an exact managed PID/launch record                                                                                                   | Run the direct managed-admission predicate without reserving a slot or changing a selector, PID, launch record, or terminal group. A mismatch refuses rather than falling back to recovery.                                                                   |
