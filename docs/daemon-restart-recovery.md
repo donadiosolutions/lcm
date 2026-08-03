@@ -1274,6 +1274,12 @@ the launch's PID digest equals the held complete PID record. A numeric PID,
 path, port, UID, a matching token alone, or an independently re-created body
 never substitutes for that equality.
 
+The #493 `validate_active_launch_pair` codec helper checks precisely those
+equalities after each record has independently passed canonical parsing and
+MAC verification. It is deliberately a pure comparison: success does not
+open a path, mutate durable state, publish a record, inspect a process or
+listener, or grant recovery/adoption authority.
+
 The future publisher must hold the state and recovery roots, serial, token,
 configuration, runtime, process, and listener descriptors throughout its
 admission proof; capture the complete canonical admitted facts from that same

@@ -369,6 +369,36 @@ pub enum RecordError {
     DigestMismatch,
     ZeroMac,
     MacMismatch,
+    BindingMismatch,
+}
+
+/// Checks only the canonical evidence relationship between already authenticated
+/// records. It performs no persistence, descriptor, process, listener, or
+/// recovery operation, and grants no authority by itself.
+pub fn validate_active_launch_pair(
+    active_pid: &AuthenticatedRecord,
+    launch: &AuthenticatedRecord,
+) -> Result<(), RecordError> {
+    let (RecordKind::ActivePid, RecordBody::ActivePid(active_pid_body)) =
+        (active_pid.kind, active_pid.body)
+    else {
+        return Err(RecordError::KindBodyMismatch);
+    };
+    let (RecordKind::Launch, RecordBody::Launch(launch_body)) = (launch.kind, launch.body) else {
+        return Err(RecordError::KindBodyMismatch);
+    };
+    if active_pid_body.authority != launch_body.authority
+        || active_pid_body.serial != launch_body.serial
+        || active_pid_body.token != launch_body.token
+        || active_pid_body.configuration != launch_body.configuration
+        || active_pid_body.runtime != launch_body.runtime
+        || active_pid_body.listener_digest != launch_body.listener_digest
+        || active_pid_body.admitted_facts_digest != launch_body.admitted_facts_digest
+        || launch_body.active_pid_digest != active_pid.content_digest
+    {
+        return Err(RecordError::BindingMismatch);
+    }
+    Ok(())
 }
 
 fn persistence_mac(key: &TokenKey, kind: RecordKind, envelope_through_digest: &[u8]) -> [u8; 32] {
@@ -1211,5 +1241,50 @@ mod tests {
             AuthenticatedRecord::parse(&tampered, &key),
             Err(RecordError::DigestMismatch)
         );
+    }
+
+    #[test]
+    fn signed_active_launch_pair_requires_every_binding_to_match() {
+        let key = key(b'a');
+        let active = AuthenticatedRecord::encode(
+            RecordKind::ActivePid,
+            RecordBody::ActivePid(active_pid()),
+            &key,
+        )
+        .unwrap();
+        let mut launch_body = launch();
+        launch_body.active_pid_digest = active.content_digest;
+        let launch =
+            AuthenticatedRecord::encode(RecordKind::Launch, RecordBody::Launch(launch_body), &key)
+                .unwrap();
+        let active = AuthenticatedRecord::parse(active.canonical_bytes(), &key).unwrap();
+        let launch = AuthenticatedRecord::parse(launch.canonical_bytes(), &key).unwrap();
+        assert_eq!(validate_active_launch_pair(&active, &launch), Ok(()));
+
+        for mismatch in 0..8 {
+            let RecordBody::Launch(mut changed) = launch.body else {
+                unreachable!();
+            };
+            match mismatch {
+                0 => changed.authority.state_root.inode += 100,
+                1 => changed.serial.inode += 100,
+                2 => changed.token.inode += 100,
+                3 => changed.configuration.inode += 100,
+                4 => changed.runtime.inode += 100,
+                5 => changed.listener_digest[0] ^= 1,
+                6 => changed.admitted_facts_digest[0] ^= 1,
+                7 => changed.active_pid_digest[0] ^= 1,
+                _ => unreachable!(),
+            }
+            let changed =
+                AuthenticatedRecord::encode(RecordKind::Launch, RecordBody::Launch(changed), &key)
+                    .unwrap();
+            let changed = AuthenticatedRecord::parse(changed.canonical_bytes(), &key).unwrap();
+            assert_eq!(
+                validate_active_launch_pair(&active, &changed),
+                Err(RecordError::BindingMismatch),
+                "signed mismatch {mismatch} must not bind"
+            );
+        }
     }
 }

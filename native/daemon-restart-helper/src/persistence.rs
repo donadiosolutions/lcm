@@ -1000,7 +1000,10 @@ pub fn classify_create(evidence: CreateEvidence) -> CreateState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{Authority, OperationKind, StableDirectoryIdentity, VacancyRecord};
+    use crate::record::{
+        ActivePidRecord, Authority, LaunchRecord, OperationKind, StableDirectoryIdentity,
+        VacancyRecord,
+    };
     use std::fs::{self, File, OpenOptions};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::PathBuf;
@@ -1077,6 +1080,68 @@ mod tests {
             &key(),
         )
         .unwrap()
+    }
+
+    fn active_pid_record() -> AuthenticatedRecord {
+        AuthenticatedRecord::encode(
+            RecordKind::ActivePid,
+            RecordBody::ActivePid(ActivePidRecord {
+                authority: authority(),
+                serial: strict(10),
+                token: strict(20),
+                configuration: strict(30),
+                runtime: strict(40),
+                listener_digest: [50; 32],
+                admitted_facts_digest: [60; 32],
+                pid: 1234,
+                process_start_time: 5678,
+                process_digest: [70; 32],
+            }),
+            &key(),
+        )
+        .unwrap()
+    }
+
+    fn launch_record(active_pid_digest: [u8; 32]) -> AuthenticatedRecord {
+        AuthenticatedRecord::encode(
+            RecordKind::Launch,
+            RecordBody::Launch(LaunchRecord {
+                authority: authority(),
+                serial: strict(10),
+                token: strict(20),
+                configuration: strict(30),
+                runtime: strict(40),
+                listener_digest: [50; 32],
+                admitted_facts_digest: [60; 32],
+                active_pid_digest,
+            }),
+            &key(),
+        )
+        .unwrap()
+    }
+
+    fn held_raw(
+        path: &std::path::Path,
+        record: AuthenticatedRecord,
+        store: RecordStore,
+    ) -> HeldRecord {
+        fs::write(path, record.canonical_bytes()).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        let descriptor = Descriptor::from_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap(),
+        );
+        let identity = descriptor
+            .validate(store.policy(record.kind.maximum_bytes() as u64))
+            .unwrap();
+        HeldRecord {
+            descriptor,
+            identity: strict_identity(identity, record.content_digest).unwrap(),
+            record,
+        }
     }
 
     fn selector(slot: u8, operation: u8) -> AuthenticatedRecord {
@@ -1551,6 +1616,174 @@ mod tests {
         assert_eq!(
             store.load_layout_after_lock(&root, &lock, &token),
             Err(PersistenceError::LayoutAmbiguous)
+        );
+    }
+
+    #[test]
+    fn valid_signed_active_evidence_cannot_enter_authoritative_names_or_layout() {
+        let temporary = TestDirectory::create();
+        let root_metadata = fs::metadata(&temporary.0).unwrap();
+        let root_identity = StableDirectoryIdentity {
+            device: root_metadata.dev(),
+            inode: root_metadata.ino(),
+            uid: root_metadata.uid(),
+            gid: root_metadata.gid(),
+            mode: root_metadata.mode() & 0o7777,
+        };
+        let authority = Authority {
+            state_root: StableDirectoryIdentity {
+                inode: root_identity.inode + 1,
+                ..root_identity
+            },
+            recovery_root: root_identity,
+            helper_digest: [4; 32],
+        };
+        let root = Descriptor::from_file(File::open(&temporary.0).unwrap());
+        let store = RecordStore::new(root_metadata.uid(), root_metadata.gid());
+        let token = key();
+        let serial = store
+            .create_serial_exclusive(&root, authority, &token)
+            .unwrap();
+        for (name, kind) in [
+            (RecordName::LifecycleCurrent, RecordKind::LifecycleVacant),
+            (RecordName::RestartCurrent, RecordKind::RestartVacant),
+            (RecordName::LaunchCurrent, RecordKind::LaunchVacant),
+        ] {
+            store
+                .create_exclusive(
+                    &root,
+                    name,
+                    AuthenticatedRecord::encode(
+                        kind,
+                        RecordBody::Vacancy(VacancyRecord {
+                            authority,
+                            serial: serial.identity,
+                        }),
+                        &token,
+                    )
+                    .unwrap(),
+                    &token,
+                )
+                .unwrap();
+        }
+        let lock = SerialLock::acquire(serial).unwrap();
+        assert_eq!(
+            classify_layout(&store.load_layout_after_lock(&root, &lock, &token).unwrap()),
+            LayoutState::StableEmpty
+        );
+
+        let active = active_pid_record();
+        let launch = launch_record(active.content_digest);
+        assert!(matches!(
+            store.create_exclusive(&root, RecordName::DaemonPid, active.clone(), &token),
+            Err(PersistenceError::UnexpectedKind)
+        ));
+        assert!(!temporary.0.join("daemon.pid").exists());
+        assert!(matches!(
+            store.create_exclusive(&root, RecordName::LaunchCurrent, launch.clone(), &token),
+            Err(PersistenceError::UnexpectedKind)
+        ));
+
+        let held_active = held_raw(&temporary.0.join("journal.exchange"), active.clone(), store);
+        assert_eq!(
+            store.publish_noreplace(
+                &root,
+                RecordName::JournalExchange,
+                &held_active,
+                &root,
+                RecordName::DaemonPid,
+                &token,
+            ),
+            Err(PersistenceError::UnexpectedKind)
+        );
+        let held_launch = held_raw(
+            &temporary.0.join("lifecycle.exchange"),
+            launch.clone(),
+            store,
+        );
+        assert_eq!(
+            store.exchange(
+                RecordEndpoint {
+                    parent: &root,
+                    name: RecordName::JournalExchange,
+                    held: &held_active,
+                },
+                RecordEndpoint {
+                    parent: &root,
+                    name: RecordName::LifecycleExchange,
+                    held: &held_launch,
+                },
+                &token,
+            ),
+            Err(PersistenceError::UnexpectedKind)
+        );
+        drop(held_active);
+        drop(held_launch);
+        fs::remove_file(temporary.0.join("journal.exchange")).unwrap();
+        fs::remove_file(temporary.0.join("lifecycle.exchange")).unwrap();
+
+        fs::write(temporary.0.join("evidence.pid"), active.canonical_bytes()).unwrap();
+        fs::set_permissions(
+            temporary.0.join("evidence.pid"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::rename(
+            temporary.0.join("evidence.pid"),
+            temporary.0.join("daemon.pid"),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.open(&root, RecordName::DaemonPid, RecordKind::PidVacant, &token),
+            Err(PersistenceError::UnexpectedKind)
+        ));
+        assert_eq!(
+            store.load_layout_after_lock(&root, &lock, &token),
+            Err(PersistenceError::LayoutAmbiguous)
+        );
+        fs::remove_file(temporary.0.join("daemon.pid")).unwrap();
+
+        fs::write(
+            temporary.0.join("evidence.launch"),
+            launch.canonical_bytes(),
+        )
+        .unwrap();
+        fs::set_permissions(
+            temporary.0.join("evidence.launch"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        syscall::rename_exchange(
+            root.as_fd(),
+            c"daemon.launch.current.v1",
+            root.as_fd(),
+            c"evidence.launch",
+        )
+        .unwrap();
+        assert!(matches!(
+            store.open(
+                &root,
+                RecordName::LaunchCurrent,
+                RecordKind::LaunchVacant,
+                &token
+            ),
+            Err(PersistenceError::UnexpectedKind)
+        ));
+        assert_eq!(
+            store.load_layout_after_lock(&root, &lock, &token),
+            Err(PersistenceError::LayoutAmbiguous)
+        );
+        syscall::rename_exchange(
+            root.as_fd(),
+            c"daemon.launch.current.v1",
+            root.as_fd(),
+            c"evidence.launch",
+        )
+        .unwrap();
+        fs::remove_file(temporary.0.join("evidence.launch")).unwrap();
+        assert_eq!(
+            classify_layout(&store.load_layout_after_lock(&root, &lock, &token).unwrap()),
+            LayoutState::StableEmpty
         );
     }
 
