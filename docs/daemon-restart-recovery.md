@@ -1249,10 +1249,11 @@ All fixed-width integers are little-endian. A stable directory identity is tag
 `1` followed by device `u64`, inode `u64`, UID `u32`, GID `u32`, and mode
 `u32` (29 bytes). A strict immutable leaf identity is tag `2` followed by the
 same fields, link count `u64`, size `u64`, and a complete-content SHA-256 (77
-bytes). Every identity tag must be exact; every device, inode, link count, and
-digest must be nonzero; mode is at most `07777`. A digest means exactly 32
-nonzero bytes. These rules preserve the existing identity format and do not
-reinterpret existing serial, vacancy, selector, or journal records.
+bytes). Every identity tag must be exact; every device, inode, and link count
+must be nonzero; every digest must be a 32-byte value that is not all zero
+(individual zero bytes are permitted); mode is at most `07777`. These rules
+preserve the existing identity format and do not reinterpret existing serial,
+vacancy, selector, or journal records.
 
 Both new bodies begin with this 462-byte binding prefix, in this exact order:
 
