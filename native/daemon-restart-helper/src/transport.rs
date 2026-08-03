@@ -1,4 +1,4 @@
-//! Bounded, descriptor-only transport for the initial OpenStable handshake.
+//! Bounded, descriptor-only transport for the initial zero-session router.
 
 use crate::protocol::{self, Frame, HEADER_LEN, MAX_PAYLOAD_LEN, MessageKind, RequestKind};
 use crate::syscall::{self, Errno};
@@ -15,6 +15,43 @@ pub enum TransportError {
     Protocol,
     Entropy,
     Unsupported,
+}
+
+/// The only two routes the version-1 zero-session router may select.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RouterRoute {
+    OpenStable,
+    ResumeActive,
+}
+
+/// A complete, structurally valid zero-session router request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RouterRequest {
+    pub route: RouterRoute,
+    pub request_id: [u8; 32],
+}
+
+/// Admission owns the point at which fresh session entropy is acquired.  This makes it possible
+/// to obtain entropy after a route's first exact layout check but before its final postcheck.
+pub(crate) trait AdmissionGate {
+    fn check_deadline(&mut self) -> Result<(), TransportError>;
+    fn fresh_session_id(&mut self) -> Result<[u8; 32], TransportError>;
+}
+
+/// A response paired with every authority retained by its selected route.  The lease is held
+/// until the bounded response write has completed or failed.
+pub(crate) struct AdmittedResponse<L> {
+    bytes: Vec<u8>,
+    _lease: L,
+}
+
+impl<L> AdmittedResponse<L> {
+    pub(crate) fn new(bytes: Vec<u8>, lease: L) -> Self {
+        Self {
+            bytes,
+            _lease: lease,
+        }
+    }
 }
 
 trait Io {
@@ -126,40 +163,95 @@ fn write_all<I: Io>(io: &mut I, deadline: u64, bytes: &[u8]) -> Result<(), Trans
     Ok(())
 }
 
-fn serve_with<I: Io>(io: &mut I) -> Result<(), TransportError> {
+fn router_request(frame: Frame) -> Result<RouterRequest, TransportError> {
+    let route = match frame.kind {
+        MessageKind::Request(RequestKind::OpenStable) => RouterRoute::OpenStable,
+        MessageKind::Request(RequestKind::ResumeActive) => RouterRoute::ResumeActive,
+        _ => return Err(TransportError::Protocol),
+    };
+    if frame.session_id.iter().any(|byte| *byte != 0)
+        || frame.ordinal != 0
+        || frame.request_id.iter().all(|byte| *byte == 0)
+        || !frame.payload.is_empty()
+    {
+        return Err(TransportError::Protocol);
+    }
+    Ok(RouterRequest {
+        route,
+        request_id: frame.request_id,
+    })
+}
+
+struct RouterGate<'a, I> {
+    io: &'a mut I,
+    deadline: u64,
+}
+
+impl<I: Io> AdmissionGate for RouterGate<'_, I> {
+    fn check_deadline(&mut self) -> Result<(), TransportError> {
+        remaining(self.io, self.deadline).map(|_| ())
+    }
+
+    fn fresh_session_id(&mut self) -> Result<[u8; 32], TransportError> {
+        self.check_deadline()?;
+        let mut session_id = [0_u8; 32];
+        self.io.random(&mut session_id).map_err(|error| {
+            if error == Errno::ENOSYS {
+                TransportError::Unsupported
+            } else {
+                TransportError::Entropy
+            }
+        })?;
+        if session_id.iter().all(|byte| *byte == 0) {
+            return Err(TransportError::Entropy);
+        }
+        self.check_deadline()?;
+        Ok(session_id)
+    }
+}
+
+fn serve_router_with<I: Io, F, L>(io: &mut I, admit: F) -> Result<(), TransportError>
+where
+    F: FnOnce(RouterRequest, &mut dyn AdmissionGate) -> Result<AdmittedResponse<L>, TransportError>,
+{
     let start = io.now_millis().map_err(classify_io_error)?;
     let deadline = start
         .checked_add(OPEN_STABLE_FRAME_DEADLINE_MS)
         .ok_or(TransportError::Io)?;
     let mut pending = Vec::with_capacity(MAX_FRAME_LEN + READ_CHUNK);
-    let request = read_frame(io, deadline, &mut pending)?;
-    if request.kind != MessageKind::Request(RequestKind::OpenStable)
-        || !request.session_id.iter().all(|byte| *byte == 0)
-        || request.ordinal != 0
-        || !request.payload.is_empty()
-    {
-        return Err(TransportError::Protocol);
-    }
-    let mut session_id = [0_u8; 32];
-    io.random(&mut session_id).map_err(|error| {
-        if error == Errno::ENOSYS {
-            TransportError::Unsupported
-        } else {
-            TransportError::Entropy
-        }
-    })?;
-    if session_id.iter().all(|byte| *byte == 0) {
-        return Err(TransportError::Entropy);
-    }
-    let response = protocol::open_stable_response(request.request_id, session_id)
-        .map_err(|_| TransportError::Protocol)?;
-    write_all(io, deadline, &response)
+    let request = router_request(read_frame(io, deadline, &mut pending)?)?;
+    let mut gate = RouterGate { io, deadline };
+    // Check on both sides of durable admission.  The selected admission performs its final
+    // revalidation only after it obtains entropy through this gate.
+    gate.check_deadline()?;
+    let response = admit(request, &mut gate)?;
+    gate.check_deadline()?;
+    write_all(gate.io, gate.deadline, &response.bytes)
 }
 
-pub(crate) fn serve_open_stable() -> Result<(), TransportError> {
-    serve_with(&mut LinuxIo {
-        input: 0,
-        output: 1,
+pub(crate) fn serve_router<F, L>(admit: F) -> Result<(), TransportError>
+where
+    F: FnOnce(RouterRequest, &mut dyn AdmissionGate) -> Result<AdmittedResponse<L>, TransportError>,
+{
+    serve_router_with(
+        &mut LinuxIo {
+            input: 0,
+            output: 1,
+        },
+        admit,
+    )
+}
+
+#[cfg(test)]
+fn serve_with<I: Io>(io: &mut I) -> Result<(), TransportError> {
+    serve_router_with(io, |request, gate| {
+        if request.route != RouterRoute::OpenStable {
+            return Err(TransportError::Protocol);
+        }
+        let session_id = gate.fresh_session_id()?;
+        let bytes = protocol::open_stable_response(request.request_id, session_id)
+            .map_err(|_| TransportError::Protocol)?;
+        Ok(AdmittedResponse::new(bytes, ()))
     })
 }
 
@@ -213,9 +305,57 @@ mod tests {
             Ok(())
         }
     }
+
+    struct TimedFake {
+        times: Vec<u64>,
+        time_index: usize,
+        input: Vec<u8>,
+        read_at: usize,
+        output: Vec<u8>,
+        random: [u8; 32],
+        events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+
+    impl Io for TimedFake {
+        fn now_millis(&mut self) -> Result<u64, Errno> {
+            let value = self
+                .times
+                .get(self.time_index)
+                .copied()
+                .unwrap_or_else(|| *self.times.last().unwrap());
+            self.time_index += 1;
+            Ok(value)
+        }
+        fn wait(&mut self, writable: bool, _timeout: i32) -> Result<bool, Errno> {
+            if writable {
+                self.events.borrow_mut().push("write-ready");
+            }
+            Ok(true)
+        }
+        fn read(&mut self, bytes: &mut [u8]) -> Result<usize, Errno> {
+            let count = (self.input.len() - self.read_at).min(bytes.len());
+            bytes[..count].copy_from_slice(&self.input[self.read_at..self.read_at + count]);
+            self.read_at += count;
+            Ok(count)
+        }
+        fn write(&mut self, bytes: &[u8]) -> Result<usize, Errno> {
+            self.events.borrow_mut().push("write");
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn random(&mut self, bytes: &mut [u8]) -> Result<(), Errno> {
+            self.events.borrow_mut().push("entropy");
+            bytes.copy_from_slice(&self.random);
+            Ok(())
+        }
+    }
     fn request() -> Vec<u8> {
+        request_for(RequestKind::OpenStable)
+    }
+
+    fn request_for(kind: RequestKind) -> Vec<u8> {
         Frame {
-            kind: MessageKind::Request(RequestKind::OpenStable),
+            kind: MessageKind::Request(kind),
             session_id: [0; 32],
             ordinal: 0,
             request_id: [7; 32],
@@ -249,6 +389,179 @@ mod tests {
         assert_eq!(response.ordinal, 0);
         assert_eq!(response.request_id, [7; 32]);
         assert_eq!(response.payload, vec![2, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn router_selects_resume_active_and_retains_the_route_lease_until_write() {
+        let mut io = Fake {
+            now: 1,
+            input: request_for(RequestKind::ResumeActive),
+            read_at: 0,
+            read_limit: 17,
+            output: Vec::new(),
+            waits: Vec::new(),
+            wait_result: true,
+            write_error_after: None,
+            write_calls: 0,
+            random: [4; 32],
+            random_error: None,
+        };
+        let retained = std::cell::Cell::new(false);
+        assert_eq!(
+            serve_router_with(&mut io, |request, gate| {
+                assert_eq!(request.route, RouterRoute::ResumeActive);
+                let session_id = gate.fresh_session_id()?;
+                let bytes = protocol::resume_active_response(request.request_id, session_id)
+                    .map_err(|_| TransportError::Protocol)?;
+                Ok(AdmittedResponse::new(bytes, &retained))
+            }),
+            Ok(())
+        );
+        retained.set(true);
+        let response = Frame::decode(&io.output).unwrap();
+        assert_eq!(
+            response.kind,
+            MessageKind::Response(RequestKind::ResumeActive)
+        );
+        assert_eq!(response.payload, vec![3, 0, 1, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn malformed_truncated_and_unsupported_router_frames_never_invoke_admission_or_write() {
+        let unsupported = request_for(RequestKind::Bootstrap);
+        let mut malformed = request();
+        malformed[88] ^= 1;
+        let truncated = request()[..HEADER_LEN - 1].to_vec();
+        for input in [unsupported, malformed, truncated] {
+            let mut io = Fake {
+                now: 1,
+                input,
+                read_at: 0,
+                read_limit: READ_CHUNK,
+                output: Vec::new(),
+                waits: Vec::new(),
+                wait_result: true,
+                write_error_after: None,
+                write_calls: 0,
+                random: [3; 32],
+                random_error: None,
+            };
+            let called = std::cell::Cell::new(false);
+            assert_eq!(
+                serve_router_with(&mut io, |_request, _gate| {
+                    called.set(true);
+                    Ok(AdmittedResponse::new(Vec::new(), ()))
+                })
+                .err(),
+                Some(TransportError::Protocol)
+            );
+            assert!(!called.get());
+            assert!(io.output.is_empty());
+        }
+    }
+
+    #[test]
+    fn entropy_precedes_final_postcheck_and_failure_never_writes_or_completes_admission() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut io = TimedFake {
+            times: vec![1; 16],
+            time_index: 0,
+            input: request(),
+            read_at: 0,
+            output: Vec::new(),
+            random: [3; 32],
+            events: events.clone(),
+        };
+        let final_postcheck = std::cell::Cell::new(false);
+        assert_eq!(
+            serve_router_with(&mut io, |_request, gate| {
+                let _ = gate.fresh_session_id()?;
+                events.borrow_mut().push("postcheck");
+                final_postcheck.set(true);
+                Ok(AdmittedResponse::new(vec![1], ()))
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["entropy", "postcheck", "write-ready", "write"]
+        );
+        assert!(final_postcheck.get());
+
+        let mut failed = Fake {
+            now: 1,
+            input: request(),
+            read_at: 0,
+            read_limit: READ_CHUNK,
+            output: Vec::new(),
+            waits: Vec::new(),
+            wait_result: true,
+            write_error_after: None,
+            write_calls: 0,
+            random: [3; 32],
+            random_error: Some(Errno::EAGAIN),
+        };
+        let postcheck_after_entropy = std::cell::Cell::new(false);
+        assert_eq!(
+            serve_router_with(&mut failed, |_request, gate| {
+                let _ = gate.fresh_session_id()?;
+                postcheck_after_entropy.set(true);
+                Ok(AdmittedResponse::new(vec![1], ()))
+            }),
+            Err(TransportError::Entropy)
+        );
+        assert!(!postcheck_after_entropy.get());
+        assert!(failed.output.is_empty());
+    }
+
+    #[test]
+    fn shared_deadline_refuses_before_during_and_after_route_admission_without_writing() {
+        let make = |times: Vec<u64>| TimedFake {
+            times,
+            time_index: 0,
+            input: request(),
+            read_at: 0,
+            output: Vec::new(),
+            random: [3; 32],
+            events: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        };
+
+        let mut before = make(vec![1, 1, 10_001]);
+        let called = std::cell::Cell::new(false);
+        assert_eq!(
+            serve_router_with(&mut before, |_request, _gate| {
+                called.set(true);
+                Ok(AdmittedResponse::new(Vec::new(), ()))
+            }),
+            Err(TransportError::Timeout)
+        );
+        assert!(!called.get());
+        assert!(before.output.is_empty());
+
+        // Start, frame read, pre-admission check, entropy precheck, entropy postcheck.
+        let mut during = make(vec![1, 1, 1, 1, 10_001]);
+        let final_postcheck = std::cell::Cell::new(false);
+        assert_eq!(
+            serve_router_with(&mut during, |_request, gate| {
+                let _ = gate.fresh_session_id()?;
+                final_postcheck.set(true);
+                Ok(AdmittedResponse::new(Vec::new(), ()))
+            }),
+            Err(TransportError::Timeout)
+        );
+        assert!(!final_postcheck.get());
+        assert!(during.output.is_empty());
+
+        // Start, frame read, pre-admission check, then the transport's required post-admission
+        // deadline check. The route may have finalized, but it has no response capability.
+        let mut after = make(vec![1, 1, 1, 10_001]);
+        assert_eq!(
+            serve_router_with(&mut after, |_request, _gate| {
+                Ok(AdmittedResponse::new(vec![1], ()))
+            }),
+            Err(TransportError::Timeout)
+        );
+        assert!(after.output.is_empty());
     }
     #[test]
     fn malformed_or_unapproved_request_is_silent_failure() {

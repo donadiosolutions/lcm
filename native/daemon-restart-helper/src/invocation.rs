@@ -9,7 +9,9 @@ use crate::descriptor::{
     DescriptorKind, DescriptorPolicy,
 };
 use crate::persistence::PersistenceError;
-use crate::stable::{self, PreverifiedHelperDigest, StableAdmissionError, StableVacantLease};
+use crate::stable::{
+    self, PreparedActiveLease, PreverifiedHelperDigest, StableAdmissionError, StableVacantLease,
+};
 use crate::syscall::{
     self, Errno, O_LARGEFILE_STATUS, O_NONBLOCK_STATUS, O_RDONLY_ACCESS, O_RDWR_ACCESS,
     O_WRONLY_ACCESS, PidFd,
@@ -168,6 +170,15 @@ pub(crate) struct InvocationLease {
     _stable: StableVacantLease,
 }
 
+/// The selected route's complete durable authority stays paired with the descriptor provenance
+/// lease until transport has finished its one response write.
+#[derive(Debug)]
+struct RoutedInvocationLease {
+    _invocation: InvocationDescriptorLease,
+    _stable: Option<StableVacantLease>,
+    _prepared: Option<PreparedActiveLease>,
+}
+
 struct InheritedAuthorities {
     helper: Descriptor,
     home: Descriptor,
@@ -204,8 +215,14 @@ impl InheritedAuthorities {
 /// the process exits immediately and must not normalize or close an unexpected caller handle.
 pub(crate) fn admit_with_stable_lease() -> Result<InvocationLease, InvocationError> {
     let invocation = admit_descriptor_lease()?;
+    admit_stable_after_router(invocation, || Ok(()))
+}
+
+fn require_route_capabilities(
+    invocation: &InvocationDescriptorLease,
+) -> Result<(), InvocationError> {
     // Compatibility detection is descriptor-scoped and occurs only after the exact inherited
-    // invocation lease exists.  Null paths make this recognition side-effect free.
+    // invocation lease and router selection exist. Null paths keep it side-effect free.
     require_renameat2_flag(
         invocation.state_root.as_raw_fd(),
         syscall::PROBE_RENAME_NOREPLACE,
@@ -214,22 +231,57 @@ pub(crate) fn admit_with_stable_lease() -> Result<InvocationLease, InvocationErr
         invocation.state_root.as_raw_fd(),
         syscall::PROBE_RENAME_EXCHANGE,
     )?;
+    Ok(())
+}
+
+fn admit_stable_after_router(
+    invocation: InvocationDescriptorLease,
+    before_postcheck: impl FnOnce() -> Result<(), StableAdmissionError>,
+) -> Result<InvocationLease, InvocationError> {
+    require_route_capabilities(&invocation)?;
     let owner_uid = syscall::effective_uid().map_err(InvocationError::Syscall)?;
     let owner_gid = syscall::effective_gid().map_err(InvocationError::Syscall)?;
     let state_root = invocation
         .state_root
         .try_clone()
         .map_err(InvocationError::Descriptor)?;
-    let stable = stable::admit_stable_vacant(
+    let stable = stable::admit_stable_vacant_with_postcheck(
         state_root,
         owner_uid,
         owner_gid,
         PreverifiedHelperDigest::new(invocation.helper_digest),
+        before_postcheck,
     )
     .map_err(InvocationError::Stable)?;
     Ok(InvocationLease {
         _invocation: invocation,
         _stable: stable,
+    })
+}
+
+fn admit_prepared_after_router(
+    invocation: InvocationDescriptorLease,
+    before_postcheck: impl FnOnce() -> Result<(), StableAdmissionError>,
+) -> Result<RoutedInvocationLease, InvocationError> {
+    require_route_capabilities(&invocation)?;
+    let owner_uid = syscall::effective_uid().map_err(InvocationError::Syscall)?;
+    let owner_gid = syscall::effective_gid().map_err(InvocationError::Syscall)?;
+    let state_root = invocation
+        .state_root
+        .try_clone()
+        .map_err(InvocationError::Descriptor)?;
+    let prepared = stable::admit_prepared_active(
+        state_root,
+        owner_uid,
+        owner_gid,
+        PreverifiedHelperDigest::new(invocation.helper_digest),
+        before_postcheck,
+    )
+    .map_err(InvocationError::Stable)?;
+    Ok(RoutedInvocationLease {
+        _invocation: invocation,
+        _stable: None,
+        _prepared: Some(prepared),
     })
 }
 
@@ -241,10 +293,11 @@ pub fn admit() -> PreFrameResult {
     }
 }
 
-/// Retains the admitted invocation and stable/OFD lease while serving exactly one non-mutating
-/// OpenStable handshake. Every transport failure remains silent and releases no authority.
-pub fn serve_open_stable() -> OpenStableResult {
-    let lease = match admit_with_stable_lease() {
+/// Retains descriptor provenance and the selected stable/Prepared lease while serving exactly one
+/// bounded zero-session router handshake. No durable layout is inspected until FD 0 selected the
+/// route, and fresh entropy is acquired only inside its final-admission callback.
+pub fn serve_router() -> OpenStableResult {
+    let invocation = match admit_descriptor_lease() {
         Ok(lease) => lease,
         Err(error) => {
             return match classify_pre_frame_error(error) {
@@ -253,12 +306,55 @@ pub fn serve_open_stable() -> OpenStableResult {
             };
         }
     };
-    let result = transport::serve_open_stable();
-    drop(lease);
+    let result = transport::serve_router(|request, gate| {
+        let mut session_id = None;
+        let entropy_before_final_postcheck = || {
+            let fresh = gate
+                .fresh_session_id()
+                .map_err(StableAdmissionError::Transport)?;
+            session_id = Some(fresh);
+            Ok(())
+        };
+        let (lease, bytes) = match request.route {
+            transport::RouterRoute::OpenStable => {
+                let lease = admit_stable_after_router(invocation, entropy_before_final_postcheck)
+                    .map_err(classify_router_admission_error)?;
+                let session_id = session_id.ok_or(transport::TransportError::Entropy)?;
+                let bytes = crate::protocol::open_stable_response(request.request_id, session_id)
+                    .map_err(|_| transport::TransportError::Protocol)?;
+                (
+                    RoutedInvocationLease {
+                        _invocation: lease._invocation,
+                        _stable: Some(lease._stable),
+                        _prepared: None,
+                    },
+                    bytes,
+                )
+            }
+            transport::RouterRoute::ResumeActive => {
+                let lease = admit_prepared_after_router(invocation, entropy_before_final_postcheck)
+                    .map_err(classify_router_admission_error)?;
+                let session_id = session_id.ok_or(transport::TransportError::Entropy)?;
+                let bytes = crate::protocol::resume_active_response(request.request_id, session_id)
+                    .map_err(|_| transport::TransportError::Protocol)?;
+                (lease, bytes)
+            }
+        };
+        Ok(transport::AdmittedResponse::new(bytes, lease))
+    });
     match result {
         Ok(()) => OpenStableResult::Completed,
         Err(transport::TransportError::Unsupported) => OpenStableResult::Unsupported,
         Err(_) => OpenStableResult::Failed,
+    }
+}
+
+fn classify_router_admission_error(error: InvocationError) -> transport::TransportError {
+    if invocation_error_is_explicit_enosys(error) {
+        transport::TransportError::Unsupported
+    } else {
+        // The router has not completed route admission, so this remains a silent outer refusal.
+        transport::TransportError::Protocol
     }
 }
 
@@ -284,6 +380,7 @@ fn stable_error_is_explicit_enosys(error: StableAdmissionError) -> bool {
         StableAdmissionError::Syscall(errno) => errno == Errno::ENOSYS,
         StableAdmissionError::Descriptor(error) => descriptor_error_is_explicit_enosys(error),
         StableAdmissionError::Persistence(error) => persistence_error_is_explicit_enosys(error),
+        StableAdmissionError::Transport(transport::TransportError::Unsupported) => true,
         _ => false,
     }
 }

@@ -8,10 +8,15 @@ use crate::descriptor::{
     Descriptor, DescriptorError, DescriptorIdentity, DescriptorKind, DescriptorPolicy,
 };
 use crate::persistence::{
-    HeldRecord, LayoutState, PersistenceError, RecordName, RecordStore, SerialLock, classify_layout,
+    HeldRecord, LayoutSnapshot, LayoutState, PersistenceError, RecordName, RecordStore, SerialLock,
+    SlotEvidence, TerminalName, classify_layout,
 };
-use crate::record::{Authority, RecordBody, RecordKind, StableDirectoryIdentity, TokenKey};
+use crate::record::{
+    Authority, OperationKind, RecordBody, RecordKind, StableDirectoryIdentity, StrictLeafIdentity,
+    TokenKey,
+};
 use crate::syscall::{self, Errno, OpenAccess};
+use crate::transport::TransportError;
 use core::fmt;
 
 const TOKEN_BYTES: usize = 64;
@@ -34,6 +39,26 @@ pub(crate) struct StableVacantLease {
     _lifecycle: HeldRecord,
     _restart: HeldRecord,
     _launch: HeldRecord,
+    _serial: SerialLock,
+}
+
+/// The exact, read-only authority for an initial Prepared-only `ResumeActive` response.
+///
+/// This deliberately retains both exchange vacancies as well as the roots, token, selectors,
+/// vacancies, and serial OFD lock.  It therefore cannot degrade into a layout classification
+/// after the response has been emitted.
+#[derive(Debug)]
+pub(crate) struct PreparedActiveLease {
+    _state_root: Descriptor,
+    _recovery_root: Descriptor,
+    _terminal: Descriptor,
+    _token: HeldToken,
+    _pid: HeldRecord,
+    _lifecycle: HeldRecord,
+    _restart: HeldRecord,
+    _launch: HeldRecord,
+    _lifecycle_predecessor: HeldRecord,
+    _restart_predecessor: HeldRecord,
     _serial: SerialLock,
 }
 
@@ -64,24 +89,27 @@ pub(crate) enum StableAdmissionError {
     InvalidToken,
     AuthorityMismatch,
     LayoutNotStable,
+    LayoutNotPrepared,
+    Transport(TransportError),
     Replacement,
 }
 
+#[cfg(test)]
 pub(crate) fn admit_stable_vacant(
     state_root: Descriptor,
     owner_uid: u32,
     owner_gid: u32,
     helper_digest: PreverifiedHelperDigest,
 ) -> Result<StableVacantLease, StableAdmissionError> {
-    admit_stable_vacant_with_postcheck(state_root, owner_uid, owner_gid, helper_digest, || {})
+    admit_stable_vacant_with_postcheck(state_root, owner_uid, owner_gid, helper_digest, || Ok(()))
 }
 
-fn admit_stable_vacant_with_postcheck(
+pub(crate) fn admit_stable_vacant_with_postcheck(
     state_root: Descriptor,
     owner_uid: u32,
     owner_gid: u32,
     helper_digest: PreverifiedHelperDigest,
-    before_postcheck: impl FnOnce(),
+    before_postcheck: impl FnOnce() -> Result<(), StableAdmissionError>,
 ) -> Result<StableVacantLease, StableAdmissionError> {
     let directory_policy = directory_policy(owner_uid, owner_gid);
     let state_identity = stable_identity(
@@ -169,7 +197,7 @@ fn admit_stable_vacant_with_postcheck(
         return Err(StableAdmissionError::AuthorityMismatch);
     }
 
-    before_postcheck();
+    before_postcheck()?;
 
     revalidate_directory(&state_root, state_identity, directory_policy)?;
     revalidate_recovery(
@@ -222,6 +250,395 @@ fn admit_stable_vacant_with_postcheck(
         _launch: launch,
         _serial: serial,
     })
+}
+
+/// Admits only the first durable Prepared phase of an active InitialStart or Rotation.  The
+/// closure is intentionally called after every initial held authority is known but before the
+/// final postcheck, so a fresh-session entropy fault cannot be mistaken for an admission.
+pub(crate) fn admit_prepared_active(
+    state_root: Descriptor,
+    owner_uid: u32,
+    owner_gid: u32,
+    helper_digest: PreverifiedHelperDigest,
+    before_postcheck: impl FnOnce() -> Result<(), StableAdmissionError>,
+) -> Result<PreparedActiveLease, StableAdmissionError> {
+    admit_prepared_active_with_final_hook(
+        state_root,
+        owner_uid,
+        owner_gid,
+        helper_digest,
+        before_postcheck,
+        || Ok(()),
+    )
+}
+
+fn admit_prepared_active_with_final_hook(
+    state_root: Descriptor,
+    owner_uid: u32,
+    owner_gid: u32,
+    helper_digest: PreverifiedHelperDigest,
+    before_postcheck: impl FnOnce() -> Result<(), StableAdmissionError>,
+    after_final_layout_load: impl FnOnce() -> Result<(), StableAdmissionError>,
+) -> Result<PreparedActiveLease, StableAdmissionError> {
+    let directory_policy = directory_policy(owner_uid, owner_gid);
+    let state_identity = stable_identity(
+        state_root
+            .validate(directory_policy)
+            .map_err(StableAdmissionError::Descriptor)?,
+    )?;
+    let token = open_token(&state_root, owner_uid, owner_gid)?;
+    let token_identity = token_strict_identity(&token)?;
+    let recovery_root = syscall::open_beneath(
+        state_root.as_fd(),
+        c"daemon-recovery.v1",
+        OpenAccess::ReadOnly { directory: true },
+    )
+    .map_err(StableAdmissionError::Syscall)?;
+    let recovery_identity = stable_identity(
+        recovery_root
+            .validate(directory_policy)
+            .map_err(StableAdmissionError::Descriptor)?,
+    )?;
+    let authority = Authority {
+        state_root: state_identity,
+        recovery_root: recovery_identity,
+        helper_digest: helper_digest.0,
+    };
+    let store = RecordStore::new(owner_uid, owner_gid);
+
+    // As with OpenStable, this happens before the first recovery-root layout inspection.
+    let serial = store
+        .open(
+            &recovery_root,
+            RecordName::LifecycleSerial,
+            RecordKind::LifecycleSerial,
+            &token.key,
+        )
+        .map_err(StableAdmissionError::Persistence)?;
+    if !serial_has_authority(&serial, authority) {
+        return Err(StableAdmissionError::AuthorityMismatch);
+    }
+    let serial = SerialLock::acquire(serial).map_err(StableAdmissionError::Persistence)?;
+
+    let layout = store
+        .load_layout_after_lock(&recovery_root, &serial, &token.key)
+        .map_err(StableAdmissionError::Persistence)?;
+    let (selector, journal) = prepared_selector_and_journal(&layout)?;
+    let lifecycle = store
+        .open(
+            &recovery_root,
+            RecordName::LifecycleCurrent,
+            RecordKind::LifecycleSelector,
+            &token.key,
+        )
+        .map_err(StableAdmissionError::Persistence)?;
+    let restart = store
+        .open(
+            &recovery_root,
+            RecordName::RestartCurrent,
+            RecordKind::Journal,
+            &token.key,
+        )
+        .map_err(StableAdmissionError::Persistence)?;
+    let launch = open_stable_vacancy(
+        &store,
+        &recovery_root,
+        RecordName::LaunchCurrent,
+        RecordKind::LaunchVacant,
+        authority,
+        serial.record().identity,
+        &token.key,
+    )?;
+    let pid = open_stable_vacancy(
+        &store,
+        &state_root,
+        RecordName::DaemonPid,
+        RecordKind::PidVacant,
+        authority,
+        serial.record().identity,
+        &token.key,
+    )?;
+    let terminal = syscall::open_beneath(
+        recovery_root.as_fd(),
+        TerminalName::from_index(selector.terminal_slot as usize).component(),
+        OpenAccess::ReadOnly { directory: true },
+    )
+    .map_err(StableAdmissionError::Syscall)?;
+    let terminal_identity = stable_identity(
+        terminal
+            .validate(directory_policy)
+            .map_err(StableAdmissionError::Descriptor)?,
+    )?;
+    let lifecycle_predecessor = store
+        .open(
+            &terminal,
+            RecordName::LifecycleExchange,
+            RecordKind::LifecycleVacant,
+            &token.key,
+        )
+        .map_err(StableAdmissionError::Persistence)?;
+    let restart_predecessor = store
+        .open(
+            &terminal,
+            RecordName::JournalExchange,
+            RecordKind::RestartVacant,
+            &token.key,
+        )
+        .map_err(StableAdmissionError::Persistence)?;
+    let held = PreparedHeld {
+        lifecycle: &lifecycle,
+        restart: &restart,
+        launch: &launch,
+        pid: &pid,
+        lifecycle_predecessor: &lifecycle_predecessor,
+        restart_predecessor: &restart_predecessor,
+        serial: serial.record(),
+    };
+    validate_prepared_bindings(&layout, selector, journal, held, authority, token_identity)?;
+
+    before_postcheck()?;
+
+    let postcheck = PreparedPostcheck {
+        store: &store,
+        state_root: &state_root,
+        state_identity,
+        recovery_root: &recovery_root,
+        recovery_identity,
+        terminal: &terminal,
+        terminal_identity,
+        directory_policy,
+        token: &token,
+        owner_uid,
+        owner_gid,
+        held,
+    };
+    revalidate_prepared_held(postcheck)?;
+
+    let post_layout = store
+        .load_layout_after_lock(&recovery_root, &serial, &token.key)
+        .map_err(|_| StableAdmissionError::Replacement)?;
+    after_final_layout_load()?;
+    let (post_selector, post_journal) = prepared_selector_and_journal(&post_layout)?;
+    validate_prepared_bindings(
+        &post_layout,
+        post_selector,
+        post_journal,
+        held,
+        authority,
+        token_identity,
+    )?;
+    // `load_layout_after_lock` validates a fresh authenticated graph, but its snapshot contains
+    // record bytes rather than the held leaf identities. Rechecking every held pathname after
+    // that load rejects a byte-identical, MAC-valid rename that occurred after the first checks.
+    revalidate_prepared_held(postcheck)?;
+    if !serial_has_authority(serial.record(), authority) {
+        return Err(StableAdmissionError::Replacement);
+    }
+    Ok(PreparedActiveLease {
+        _state_root: state_root,
+        _recovery_root: recovery_root,
+        _terminal: terminal,
+        _token: token,
+        _pid: pid,
+        _lifecycle: lifecycle,
+        _restart: restart,
+        _launch: launch,
+        _lifecycle_predecessor: lifecycle_predecessor,
+        _restart_predecessor: restart_predecessor,
+        _serial: serial,
+    })
+}
+
+fn prepared_selector_and_journal(
+    layout: &LayoutSnapshot,
+) -> Result<(crate::record::SelectorRecord, crate::record::JournalRecord), StableAdmissionError> {
+    if !matches!(classify_layout(layout), LayoutState::ActivePrepared { .. }) {
+        return Err(StableAdmissionError::LayoutNotPrepared);
+    }
+    let (RecordBody::Selector(selector), RecordBody::Journal(journal)) =
+        (layout.lifecycle_current.body, layout.restart_current.body)
+    else {
+        return Err(StableAdmissionError::LayoutNotPrepared);
+    };
+    Ok((selector, journal))
+}
+
+#[derive(Clone, Copy)]
+struct PreparedHeld<'a> {
+    lifecycle: &'a HeldRecord,
+    restart: &'a HeldRecord,
+    launch: &'a HeldRecord,
+    pid: &'a HeldRecord,
+    lifecycle_predecessor: &'a HeldRecord,
+    restart_predecessor: &'a HeldRecord,
+    serial: &'a HeldRecord,
+}
+
+fn validate_prepared_bindings(
+    layout: &LayoutSnapshot,
+    selector: crate::record::SelectorRecord,
+    journal: crate::record::JournalRecord,
+    held: PreparedHeld<'_>,
+    authority: Authority,
+    token_identity: StrictLeafIdentity,
+) -> Result<(), StableAdmissionError> {
+    if selector.operation_id.iter().all(|byte| *byte == 0)
+        || !matches!(
+            selector.operation_kind,
+            OperationKind::InitialStart | OperationKind::Rotation
+        )
+        || selector.operation_kind != journal.operation_kind
+        || selector.operation_id != journal.operation_id
+        || selector.terminal_slot != journal.terminal_slot
+        || selector.terminal_slot > 2
+        || selector.phase_bitmap != 1
+        || journal.phase_bitmap != 1
+        || selector.serial != held.serial.identity
+        || journal.serial != held.serial.identity
+        || selector.token != token_identity
+        || journal.token != token_identity
+        || selector.predecessor != journal.lifecycle_predecessor
+        || selector.predecessor != held.lifecycle_predecessor.identity
+        || journal.restart_predecessor != held.restart_predecessor.identity
+        || selector.preflight_digest != journal.preflight_digest
+        || selector.expected_pid_digest != journal.expected_pid_digest
+        || selector.expected_launch_digest != journal.expected_launch_digest
+        || selector.expected_pid_digest != held.pid.record.content_digest
+        || selector.expected_launch_digest != held.launch.record.content_digest
+        || held.lifecycle.record.content_digest != layout.lifecycle_current.content_digest
+        || held.restart.record.content_digest != layout.restart_current.content_digest
+        || held.launch.record.content_digest != layout.launch_current.content_digest
+        || held.lifecycle.record.kind != RecordKind::LifecycleSelector
+        || held.restart.record.kind != RecordKind::Journal
+        || !vacancy_has_authority(held.launch, authority, held.serial.identity)
+        || !vacancy_has_authority(held.pid, authority, held.serial.identity)
+        || !vacancy_has_authority(held.lifecycle_predecessor, authority, held.serial.identity)
+        || !vacancy_has_authority(held.restart_predecessor, authority, held.serial.identity)
+    {
+        return Err(StableAdmissionError::LayoutNotPrepared);
+    }
+
+    for (index, slot) in layout.slots.iter().enumerate() {
+        match (index == selector.terminal_slot as usize, slot) {
+            (
+                true,
+                SlotEvidence::ExchangePair {
+                    lifecycle: slot_lifecycle,
+                    journal: slot_journal,
+                },
+            ) if slot_lifecycle.content_digest
+                == held.lifecycle_predecessor.record.content_digest
+                && slot_journal.content_digest
+                    == held.restart_predecessor.record.content_digest => {}
+            (false, SlotEvidence::Absent) => {}
+            _ => return Err(StableAdmissionError::LayoutNotPrepared),
+        }
+    }
+    Ok(())
+}
+
+fn token_strict_identity(held: &HeldToken) -> Result<StrictLeafIdentity, StableAdmissionError> {
+    let DescriptorIdentity::StrictLeaf {
+        common,
+        link_count,
+        size,
+    } = held.identity
+    else {
+        return Err(StableAdmissionError::Replacement);
+    };
+    Ok(StrictLeafIdentity {
+        device: common.device,
+        inode: common.inode,
+        uid: common.uid,
+        gid: common.gid,
+        mode: common.mode,
+        link_count,
+        size,
+        content_digest: crate::sha256::digest(&held.canonical),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct PreparedPostcheck<'a> {
+    store: &'a RecordStore,
+    state_root: &'a Descriptor,
+    state_identity: StableDirectoryIdentity,
+    recovery_root: &'a Descriptor,
+    recovery_identity: StableDirectoryIdentity,
+    terminal: &'a Descriptor,
+    terminal_identity: StableDirectoryIdentity,
+    directory_policy: DescriptorPolicy,
+    token: &'a HeldToken,
+    owner_uid: u32,
+    owner_gid: u32,
+    held: PreparedHeld<'a>,
+}
+
+fn revalidate_prepared_held(postcheck: PreparedPostcheck<'_>) -> Result<(), StableAdmissionError> {
+    revalidate_directory(
+        postcheck.state_root,
+        postcheck.state_identity,
+        postcheck.directory_policy,
+    )?;
+    revalidate_recovery(
+        postcheck.state_root,
+        postcheck.recovery_root,
+        postcheck.recovery_identity,
+        postcheck.directory_policy,
+    )?;
+    revalidate_directory(
+        postcheck.terminal,
+        postcheck.terminal_identity,
+        postcheck.directory_policy,
+    )?;
+    revalidate_token(
+        postcheck.state_root,
+        postcheck.token,
+        postcheck.owner_uid,
+        postcheck.owner_gid,
+    )?;
+    for (parent, name, record) in [
+        (
+            postcheck.state_root,
+            RecordName::DaemonPid,
+            postcheck.held.pid,
+        ),
+        (
+            postcheck.recovery_root,
+            RecordName::LifecycleCurrent,
+            postcheck.held.lifecycle,
+        ),
+        (
+            postcheck.recovery_root,
+            RecordName::RestartCurrent,
+            postcheck.held.restart,
+        ),
+        (
+            postcheck.recovery_root,
+            RecordName::LaunchCurrent,
+            postcheck.held.launch,
+        ),
+        (
+            postcheck.terminal,
+            RecordName::LifecycleExchange,
+            postcheck.held.lifecycle_predecessor,
+        ),
+        (
+            postcheck.terminal,
+            RecordName::JournalExchange,
+            postcheck.held.restart_predecessor,
+        ),
+    ] {
+        revalidate_record_path(
+            postcheck.store,
+            parent,
+            name,
+            record.record.kind,
+            record,
+            &postcheck.token.key,
+        )?;
+    }
+    Ok(())
 }
 
 fn open_stable_vacancy(
@@ -412,10 +829,12 @@ mod tests {
     use super::*;
     use crate::persistence::RecordStore;
     use crate::record::{
-        AuthenticatedRecord, RecordBody, SerialRecord, StrictLeafIdentity, VacancyRecord,
+        AuthenticatedRecord, JournalRecord, OperationKind, RecordBody, SelectorRecord,
+        SerialRecord, StrictLeafIdentity, VacancyRecord,
     };
     use std::collections::BTreeMap;
     use std::fs::{self, File, OpenOptions};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -521,7 +940,127 @@ mod tests {
                 self.owner_uid,
                 self.owner_gid,
                 PreverifiedHelperDigest::new(HELPER_DIGEST),
-                hook,
+                || {
+                    hook();
+                    Ok(())
+                },
+            )
+        }
+
+        fn prepare_active(&self, operation_kind: OperationKind, phase_bitmap: u64) {
+            let key = TokenKey::parse(&TOKEN).unwrap();
+            let store = RecordStore::new(self.owner_uid, self.owner_gid);
+            let recovery = self.recovery();
+            let terminal = recovery.join("terminal.1.v1");
+            fs::create_dir(&terminal).unwrap();
+            fs::set_permissions(&terminal, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::rename(
+                recovery.join("lifecycle.current.v1"),
+                terminal.join("lifecycle.exchange"),
+            )
+            .unwrap();
+            fs::rename(
+                recovery.join("restart.current.v1"),
+                terminal.join("journal.exchange"),
+            )
+            .unwrap();
+
+            let terminal_descriptor = Descriptor::from_file(File::open(&terminal).unwrap());
+            let lifecycle_predecessor = store
+                .open(
+                    &terminal_descriptor,
+                    RecordName::LifecycleExchange,
+                    RecordKind::LifecycleVacant,
+                    &key,
+                )
+                .unwrap();
+            let restart_predecessor = store
+                .open(
+                    &terminal_descriptor,
+                    RecordName::JournalExchange,
+                    RecordKind::RestartVacant,
+                    &key,
+                )
+                .unwrap();
+            let recovery_descriptor = Descriptor::from_file(File::open(&recovery).unwrap());
+            let launch = store
+                .open(
+                    &recovery_descriptor,
+                    RecordName::LaunchCurrent,
+                    RecordKind::LaunchVacant,
+                    &key,
+                )
+                .unwrap();
+            let state_descriptor = Descriptor::from_file(File::open(&self.root).unwrap());
+            let pid = store
+                .open(
+                    &state_descriptor,
+                    RecordName::DaemonPid,
+                    RecordKind::PidVacant,
+                    &key,
+                )
+                .unwrap();
+            let token = strict_identity_for(&self.root.join("daemon.token"), TOKEN);
+            let selector = SelectorRecord {
+                operation_id: [0x51; 32],
+                operation_kind,
+                terminal_slot: 1,
+                phase_bitmap,
+                serial: self.serial_identity,
+                predecessor: lifecycle_predecessor.identity,
+                token,
+                preflight_digest: [0x52; 32],
+                expected_pid_digest: pid.record.content_digest,
+                expected_launch_digest: launch.record.content_digest,
+            };
+            let journal = JournalRecord {
+                operation_id: selector.operation_id,
+                operation_kind,
+                terminal_slot: selector.terminal_slot,
+                phase_bitmap,
+                serial: self.serial_identity,
+                lifecycle_predecessor: lifecycle_predecessor.identity,
+                restart_predecessor: restart_predecessor.identity,
+                token,
+                preflight_digest: selector.preflight_digest,
+                expected_pid_digest: selector.expected_pid_digest,
+                expected_launch_digest: selector.expected_launch_digest,
+            };
+            store
+                .create_exclusive(
+                    &recovery_descriptor,
+                    RecordName::LifecycleCurrent,
+                    AuthenticatedRecord::encode(
+                        RecordKind::LifecycleSelector,
+                        RecordBody::Selector(selector),
+                        &key,
+                    )
+                    .unwrap(),
+                    &key,
+                )
+                .unwrap();
+            store
+                .create_exclusive(
+                    &recovery_descriptor,
+                    RecordName::RestartCurrent,
+                    AuthenticatedRecord::encode(
+                        RecordKind::Journal,
+                        RecordBody::Journal(journal),
+                        &key,
+                    )
+                    .unwrap(),
+                    &key,
+                )
+                .unwrap();
+        }
+
+        fn admit_prepared(&self) -> Result<PreparedActiveLease, StableAdmissionError> {
+            admit_prepared_active(
+                Descriptor::from_file(File::open(&self.root).unwrap()),
+                self.owner_uid,
+                self.owner_gid,
+                PreverifiedHelperDigest::new(HELPER_DIGEST),
+                || Ok(()),
             )
         }
 
@@ -555,6 +1094,20 @@ mod tests {
             uid: metadata.uid(),
             gid: metadata.gid(),
             mode: metadata.mode() & 0o7777,
+        }
+    }
+
+    fn strict_identity_for(path: &Path, bytes: [u8; TOKEN_BYTES]) -> StrictLeafIdentity {
+        let metadata = fs::metadata(path).unwrap();
+        StrictLeafIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: metadata.mode() & 0o7777,
+            link_count: metadata.nlink(),
+            size: metadata.size(),
+            content_digest: crate::sha256::digest(&bytes),
         }
     }
 
@@ -630,6 +1183,65 @@ mod tests {
         output
     }
 
+    fn rewrite_selector(fixture: &Fixture, alter: impl FnOnce(&mut SelectorRecord)) {
+        let key = TokenKey::parse(&TOKEN).unwrap();
+        let path = fixture.recovery().join("lifecycle.current.v1");
+        let original = AuthenticatedRecord::parse(&fs::read(&path).unwrap(), &key).unwrap();
+        let RecordBody::Selector(mut selector) = original.body else {
+            panic!("prepared fixture must have a lifecycle selector");
+        };
+        alter(&mut selector);
+        let replacement = AuthenticatedRecord::encode(
+            RecordKind::LifecycleSelector,
+            RecordBody::Selector(selector),
+            &key,
+        )
+        .unwrap();
+        overwrite(&path, replacement.canonical_bytes());
+    }
+
+    fn rewrite_journal(fixture: &Fixture, alter: impl FnOnce(&mut JournalRecord)) {
+        let key = TokenKey::parse(&TOKEN).unwrap();
+        let path = fixture.recovery().join("restart.current.v1");
+        let original = AuthenticatedRecord::parse(&fs::read(&path).unwrap(), &key).unwrap();
+        let RecordBody::Journal(mut journal) = original.body else {
+            panic!("prepared fixture must have a restart journal");
+        };
+        alter(&mut journal);
+        let replacement =
+            AuthenticatedRecord::encode(RecordKind::Journal, RecordBody::Journal(journal), &key)
+                .unwrap();
+        overwrite(&path, replacement.canonical_bytes());
+    }
+
+    fn independent_ofd_lock_succeeds(path: &Path) -> bool {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("stable::tests::independent_ofd_lock_child")
+            .arg("--nocapture")
+            .env("LCM_HELPER_OFD_LOCK_PATH", path)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn independent_ofd_lock_child() {
+        let Ok(path) = std::env::var("LCM_HELPER_OFD_LOCK_PATH") else {
+            return;
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let code = if syscall::acquire_ofd_lock(file.as_raw_fd()).is_ok() {
+            0
+        } else {
+            1
+        };
+        std::process::exit(code);
+    }
+
     #[test]
     fn seeded_stable_state_admits_without_durable_mutation_and_retains_lock() {
         let fixture = Fixture::new();
@@ -664,6 +1276,185 @@ mod tests {
             )
             .unwrap();
         assert!(SerialLock::acquire(released_serial).is_ok());
+    }
+
+    #[test]
+    fn exact_prepared_initial_start_admits_without_mutation_and_holds_ofd_lock_across_fork() {
+        let fixture = Fixture::new();
+        fixture.prepare_active(OperationKind::InitialStart, 1);
+        let before = tree_bytes(&fixture.root);
+        let lease = fixture.admit_prepared().unwrap();
+        assert_eq!(tree_bytes(&fixture.root), before);
+
+        // This forks/execs the current test binary. The child opens the serial itself and asks
+        // the same raw `F_OFD_SETLK` wrapper for a new open file description, so success here
+        // would prove that the prepared lease dropped serial authority too early.
+        let serial = fixture.recovery().join("lifecycle.serial.v1");
+        assert!(!independent_ofd_lock_succeeds(&serial));
+        drop(lease);
+        assert!(independent_ofd_lock_succeeds(&serial));
+        assert_eq!(tree_bytes(&fixture.root), before);
+    }
+
+    #[test]
+    fn prepared_admission_requires_exact_phase_kind_bindings_vacancies_and_one_slot() {
+        let invalid_cases: &[fn(&Fixture)] = &[
+            |fixture| {
+                rewrite_selector(fixture, |selector| selector.phase_bitmap = 2);
+                rewrite_journal(fixture, |journal| journal.phase_bitmap = 2);
+            },
+            |fixture| {
+                rewrite_journal(fixture, |journal| journal.phase_bitmap = 2);
+            },
+            |fixture| {
+                rewrite_selector(fixture, |selector| {
+                    selector.operation_kind = OperationKind::Recovery;
+                })
+            },
+            |fixture| {
+                rewrite_journal(fixture, |journal| {
+                    journal.operation_id = [0x61; 32];
+                })
+            },
+            |fixture| {
+                rewrite_selector(fixture, |selector| {
+                    selector.terminal_slot = 0;
+                })
+            },
+            |fixture| {
+                rewrite_selector(fixture, |selector| {
+                    selector.serial.inode += 1;
+                })
+            },
+            |fixture| {
+                rewrite_journal(fixture, |journal| {
+                    journal.token.inode += 1;
+                })
+            },
+            |fixture| {
+                rewrite_selector(fixture, |selector| {
+                    selector.predecessor.inode += 1;
+                })
+            },
+            |fixture| {
+                rewrite_journal(fixture, |journal| {
+                    journal.restart_predecessor.inode += 1;
+                })
+            },
+            |fixture| {
+                rewrite_selector(fixture, |selector| {
+                    selector.expected_pid_digest = [0x62; 32];
+                })
+            },
+            |fixture| {
+                rewrite_journal(fixture, |journal| {
+                    journal.expected_launch_digest = [0x63; 32];
+                })
+            },
+            |fixture| {
+                rewrite_journal(fixture, |journal| {
+                    journal.preflight_digest = [0x64; 32];
+                })
+            },
+            |fixture| {
+                let selector = fixture.recovery().join("lifecycle.current.v1");
+                let mut bytes = fs::read(&selector).unwrap();
+                let last = bytes.len() - 1;
+                bytes[last] ^= 1;
+                overwrite(&selector, &bytes);
+            },
+            |fixture| {
+                fs::create_dir(fixture.recovery().join("terminal.0.v1")).unwrap();
+                fs::set_permissions(
+                    fixture.recovery().join("terminal.0.v1"),
+                    fs::Permissions::from_mode(0o700),
+                )
+                .unwrap();
+            },
+            |fixture| overwrite(&fixture.root.join("daemon.pid"), b"12345\n"),
+            |fixture| {
+                let key = TokenKey::parse(&TOKEN).unwrap();
+                let wrong = vacancy(
+                    RecordKind::RestartVacant,
+                    fixture.authority,
+                    fixture.serial_identity,
+                    &key,
+                );
+                overwrite(
+                    &fixture.recovery().join("daemon.launch.current.v1"),
+                    wrong.canonical_bytes(),
+                );
+            },
+        ];
+        for alter in invalid_cases {
+            let fixture = Fixture::new();
+            fixture.prepare_active(OperationKind::Rotation, 1);
+            alter(&fixture);
+            let before = tree_bytes(&fixture.root);
+            assert!(fixture.admit_prepared().is_err());
+            assert_eq!(tree_bytes(&fixture.root), before);
+        }
+    }
+
+    #[test]
+    fn final_identity_revalidation_refuses_byte_identical_replacements_after_layout_load() {
+        for relative in [
+            "daemon.pid",
+            "daemon-recovery.v1/lifecycle.current.v1",
+            "daemon-recovery.v1/restart.current.v1",
+            "daemon-recovery.v1/daemon.launch.current.v1",
+            "daemon-recovery.v1/terminal.1.v1/lifecycle.exchange",
+            "daemon-recovery.v1/terminal.1.v1/journal.exchange",
+        ] {
+            let fixture = Fixture::new();
+            fixture.prepare_active(OperationKind::InitialStart, 1);
+            let target = fixture.root.join(relative);
+            let identical_bytes = fs::read(&target).unwrap();
+            let before = tree_bytes(&fixture.root);
+            let result = admit_prepared_active_with_final_hook(
+                Descriptor::from_file(File::open(&fixture.root).unwrap()),
+                fixture.owner_uid,
+                fixture.owner_gid,
+                PreverifiedHelperDigest::new(HELPER_DIGEST),
+                || Ok(()),
+                || {
+                    replace_file(&target, &identical_bytes);
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                result.err(),
+                Some(StableAdmissionError::Replacement),
+                "{relative}"
+            );
+            // The replacement is deliberately byte-identical; the helper has not mutated it.
+            assert_eq!(tree_bytes(&fixture.root), before, "{relative}");
+        }
+    }
+
+    #[test]
+    fn prepared_entropy_fault_precedes_and_prevents_final_postcheck_without_mutation() {
+        let fixture = Fixture::new();
+        fixture.prepare_active(OperationKind::InitialStart, 1);
+        let before = tree_bytes(&fixture.root);
+        let final_layout_loaded = std::cell::Cell::new(false);
+        let result = admit_prepared_active_with_final_hook(
+            Descriptor::from_file(File::open(&fixture.root).unwrap()),
+            fixture.owner_uid,
+            fixture.owner_gid,
+            PreverifiedHelperDigest::new(HELPER_DIGEST),
+            || Err(StableAdmissionError::Transport(TransportError::Entropy)),
+            || {
+                final_layout_loaded.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            result.err(),
+            Some(StableAdmissionError::Transport(TransportError::Entropy))
+        );
+        assert!(!final_layout_loaded.get());
+        assert_eq!(tree_bytes(&fixture.root), before);
     }
 
     #[test]

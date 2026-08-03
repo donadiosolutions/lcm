@@ -39,7 +39,7 @@ impl TerminalName {
         }
     }
 
-    const fn from_index(index: usize) -> Self {
+    pub(crate) const fn from_index(index: usize) -> Self {
         match index {
             0 => Self::Slot0,
             1 => Self::Slot1,
