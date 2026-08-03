@@ -54,6 +54,10 @@ pub enum Predecessor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Facts {
     pub supported_kernel: bool,
+    /// True only when all evidence required for this transition was present
+    /// and bound to the held authority. Missing evidence is distinct from an
+    /// invalid authenticator over present evidence.
+    pub evidence_bound: bool,
     pub authenticated: bool,
     pub unambiguous: bool,
     pub fresh: bool,
@@ -67,6 +71,7 @@ impl Facts {
     pub const fn unavailable() -> Self {
         Self {
             supported_kernel: false,
+            evidence_bound: false,
             authenticated: false,
             unambiguous: false,
             fresh: false,
@@ -78,9 +83,11 @@ impl Facts {
     }
 
     const fn valid(self) -> bool {
-        // A later fact cannot exist without the immediately preceding fact.
+        // A later health result cannot exist without an observed PID. A
+        // replacement cannot coexist with a healthy predecessor daemon: that
+        // combination has no safe lifecycle interpretation.
         (!self.healthy_admitted || self.pid_published)
-            && (!self.pid_published || self.replacement_launched)
+            && !(self.existing_healthy && self.replacement_launched)
     }
 }
 
@@ -104,6 +111,7 @@ pub enum Terminal {
 pub enum Refusal {
     UnsupportedVersion,
     UnsupportedKernel,
+    MissingEvidence,
     Unauthenticated,
     Ambiguous,
     Stale,
@@ -156,9 +164,10 @@ impl Output {
     }
 }
 
-/// Evaluates one transition. Any unsupported, unauthenticated, ambiguous,
-/// stale, contradictory, or otherwise illegal input deterministically refuses
-/// and clears this bounded model's single unresolved-operation slot.
+/// Evaluates one transition. Any unsupported, missing-evidence,
+/// unauthenticated, ambiguous, stale, contradictory, or otherwise illegal
+/// input deterministically refuses and clears this bounded model's single
+/// unresolved-operation slot.
 pub const fn evaluate(input: Input) -> Output {
     if input.version != TRANSITION_MODEL_VERSION {
         return Output::refused(Refusal::UnsupportedVersion, input.predecessor);
@@ -168,6 +177,11 @@ pub const fn evaluate(input: Input) -> Output {
     }
     if !input.facts.supported_kernel {
         return Output::refused(Refusal::UnsupportedKernel, input.predecessor);
+    }
+    // Evidence absence/unboundness takes precedence over authentication so a
+    // caller cannot collapse "nothing was authenticated" into "bad MAC".
+    if !input.facts.evidence_bound {
+        return Output::refused(Refusal::MissingEvidence, input.predecessor);
     }
     if !input.facts.authenticated {
         return Output::refused(Refusal::Unauthenticated, input.predecessor);
@@ -268,6 +282,7 @@ mod tests {
 
     const BASE_FACTS: Facts = Facts {
         supported_kernel: true,
+        evidence_bound: true,
         authenticated: true,
         unambiguous: true,
         fresh: true,
@@ -394,7 +409,6 @@ mod tests {
             Action::PublishPid,
             start.next,
             Facts {
-                replacement_launched: true,
                 pid_published: true,
                 ..BASE_FACTS
             },
@@ -410,7 +424,6 @@ mod tests {
             Action::AdmitHealthy,
             published.next,
             Facts {
-                replacement_launched: true,
                 pid_published: true,
                 healthy_admitted: true,
                 ..BASE_FACTS
@@ -447,6 +460,21 @@ mod tests {
                 phase: UnresolvedPhase::PidPublished
             })
         );
+        let recovery_healthy = evaluate(input(
+            Action::AdmitHealthy,
+            replacement_pid.next,
+            Facts {
+                replacement_launched: true,
+                pid_published: true,
+                healthy_admitted: true,
+                ..BASE_FACTS
+            },
+        ));
+        assert_eq!(
+            recovery_healthy.outcome,
+            Outcome::Terminal(Terminal::HealthyAdmitted)
+        );
+        assert_eq!(recovery_healthy.next, Predecessor::Idle);
     }
 
     #[test]
@@ -533,6 +561,13 @@ mod tests {
             ),
             (
                 Facts {
+                    evidence_bound: false,
+                    ..BASE_FACTS
+                },
+                Refusal::MissingEvidence,
+            ),
+            (
+                Facts {
                     authenticated: false,
                     ..BASE_FACTS
                 },
@@ -575,6 +610,18 @@ mod tests {
             }),
             Refusal::UnsupportedVersion,
         );
+        assert_refused(
+            evaluate(input(
+                Action::PublishPid,
+                predecessor,
+                Facts {
+                    evidence_bound: false,
+                    authenticated: false,
+                    ..BASE_FACTS
+                },
+            )),
+            Refusal::MissingEvidence,
+        );
     }
 
     #[test]
@@ -604,12 +651,31 @@ mod tests {
                 Action::AdmitHealthy,
                 published,
                 Facts {
-                    replacement_launched: true,
                     pid_published: true,
                     ..BASE_FACTS
                 },
             )),
             Refusal::HealthNotAdmitted,
+        );
+    }
+
+    #[test]
+    fn contradictory_existing_and_replacement_facts_fail_closed() {
+        let predecessor = Predecessor::Unresolved(UnresolvedOperation {
+            kind: UnresolvedKind::Recovery,
+            phase: UnresolvedPhase::Recovering,
+        });
+        assert_refused(
+            evaluate(input(
+                Action::LaunchReplacement,
+                predecessor,
+                Facts {
+                    existing_healthy: true,
+                    replacement_launched: true,
+                    ..BASE_FACTS
+                },
+            )),
+            Refusal::ContradictoryFacts,
         );
     }
 }
