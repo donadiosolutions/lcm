@@ -134,7 +134,7 @@ descriptors at entry.
 | 0 | Bounded binary request stream | A Node `stdio: "pipe"` child endpoint, used by the helper only for reads. The accepted Linux representations are defined below. |
 | 1 | Bounded binary response stream | A distinct Node `stdio: "pipe"` child endpoint, used by the helper only for writes. The accepted Linux representations are defined below. |
 | 2 | Reserved diagnostic stream | A third distinct Node `stdio: "pipe"` child endpoint with the same write direction as FD 1. Version 1 emits exactly zero diagnostic bytes. |
-| 3 | Verified helper image | `O_RDONLY`, regular, one link, current effective UID, permission/special bits exactly `0755`, and size 1 through 33,554,432 bytes. GID is identity evidence but is not a separate admission predicate. The complete descriptor bytes must be a static ELF64 little-endian `ET_EXEC`, `EM_X86_64` image with no ELF interpreter or dynamic dependency, and SHA-256 is computed over exactly the recorded size. |
+| 3 | Verified helper image | `O_RDONLY`, regular, one link, permission/special bits exactly `0755`, owner pair exactly either `0:0` or the invoking effective UID:GID, and size 1 through 33,554,432 bytes. The complete descriptor bytes must be an ELF64 little-endian, `EM_X86_64` static image whose ELF type is either `ET_EXEC` or `ET_DYN`; both forms require no `PT_INTERP` program header and no `DT_NEEDED` dynamic entry. `ET_DYN` is admitted only in that structurally validated static-PIE form, never as an arbitrary dynamically linked image. SHA-256 is computed over exactly the recorded size. |
 | 4 | HOME directory | `O_RDONLY` directory, current effective UID, with neither group nor other write permission. Its GID and exact permission bits are recorded. Link count, size, and timestamps are not policy or identity fields. |
 | 5 | Private state root | `O_RDONLY` directory, current effective UID and GID, permission/special bits exactly `0700`, with the stable directory identity required by the descriptor-held stable-state admission slice. Link count, size, and timestamps are excluded. |
 | 6 | Node interpreter | `O_RDONLY`, regular, one link, permission/special bits exactly `0755`, owner pair exactly either `0:0` or the current effective UID:GID, and size 64 through 134,217,728 bytes. The complete bytes must be boundedly parsed as ELF64 little-endian `ET_EXEC`, `EM_X86_64`; bounded program-header structure is required and a dynamic interpreter is allowed. SHA-256 covers exactly the recorded size. |
@@ -153,6 +153,15 @@ helper descriptor before executing `/proc/self/fd/3`. On entry the helper
 requires FD 3's `fstat` identity to equal its own `/proc/self/exe` identity,
 then independently hashes FD 3 and captures that strict identity. It accepts no
 caller-supplied helper or descriptor-set digest.
+
+The FD 3 owner pair is a package-installation boundary, not the image's trust
+anchor. Exact `0:0` admits a system-owned package and the invoking effective
+UID:GID admits a user-owned package; every mixed or different owner pair is
+rejected. In both cases authority still comes from the descriptor-held,
+compiled-anchor-authenticated manifest/image chain plus the FD 3/self identity
+proof. Likewise, `ET_DYN` does not relax the static-helper requirement: only an
+otherwise identical x86_64 ELF64 static PIE with neither `PT_INTERP` nor
+`DT_NEEDED` is admitted.
 
 The FD 6 and FD 7 limits are a source-slice fail-closed envelope, not a claim
 that every Node installation or future LCM bundle has those sizes. The 128 MiB
@@ -1172,7 +1181,9 @@ material, paths, descriptor identities, or journal payloads.
 The helper is a statically linked Rust 1.93.0 x86_64-unknown-linux-musl binary
 with no third-party Rust crates. Its canonical version-1 build manifest records
 the exact helper filename, target, compiler evidence, mode, size, and SHA-256
-digest. The manifest is not discovered by directory scanning.
+digest. The packaged static image may use `ET_EXEC` or the structurally static-
+PIE `ET_DYN` form admitted above; neither form may contain `PT_INTERP` or
+`DT_NEEDED`. The manifest is not discovered by directory scanning.
 
 The build also generates a native-helper trust anchor into the already-running
 packaged LCM runtime. That immutable-in-process anchor fixes the manifest
@@ -1197,7 +1208,8 @@ Before execution, Node:
 1. selects only the anchor-named manifest and helper paths under a held,
    no-follow package-root descriptor;
 2. opens each with no-follow descriptor semantics and verifies regular-file
-   type, ownership/mode expectations, bounded size, and expected name;
+   type, the exact `0:0` or invoking-effective-UID:GID owner pair, mode, bounded
+   size, and expected name;
 3. hashes the manifest through its descriptor and compares it first with the
    compiled trust anchor before parsing its strict version-1 fields;
 4. hashes the helper through its already-open descriptor and compares it with
@@ -1286,7 +1298,10 @@ Before enabling the protocol, implementation must include:
   produce the persisted admitted-facts digest;
 - helper-integrity and unsupported-platform tests, including inherited-
   descriptor execution, a swapped helper-and-manifest pair, and a stale
-  compiled-anchor value;
+  compiled-anchor value. They must admit FD 3 owned by exactly `0:0` and by the
+  invoking effective UID:GID, reject mixed or unrelated owner pairs, admit both
+  static `ET_EXEC` and static-PIE `ET_DYN`, and reject `ET_DYN` carrying either
+  `PT_INTERP` or `DT_NEEDED`;
 - TypeScript coverage for response versus no-response, unchanged result types,
   headers-received/body-timeout handling, legacy refusal, package verification,
   VerifyExisting's no-mutation path, and the normal authenticated path;
