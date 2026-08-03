@@ -625,7 +625,7 @@ fn record_binds_serial(
         // #493 defines codec-only evidence. It is deliberately not admitted
         // into a persistence layout until a later publisher/consumer owns the
         // complete descriptor and process proof.
-        RecordBody::ActivePid(_) | RecordBody::Launch(_) => false,
+        RecordBody::ActivePid(_) | RecordBody::ActiveLaunchEvidence(_) => false,
     }
 }
 
@@ -1001,8 +1001,8 @@ pub fn classify_create(evidence: CreateEvidence) -> CreateState {
 mod tests {
     use super::*;
     use crate::record::{
-        ActivePidRecord, Authority, LaunchRecord, OperationKind, StableDirectoryIdentity,
-        VacancyRecord,
+        ActiveLaunchEvidenceRecord, ActivePidRecord, Authority, OperationKind,
+        StableDirectoryIdentity, VacancyRecord,
     };
     use std::fs::{self, File, OpenOptions};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -1104,8 +1104,8 @@ mod tests {
 
     fn launch_record(active_pid_digest: [u8; 32]) -> AuthenticatedRecord {
         AuthenticatedRecord::encode(
-            RecordKind::Launch,
-            RecordBody::Launch(LaunchRecord {
+            RecordKind::ActiveLaunchEvidence,
+            RecordBody::ActiveLaunchEvidence(ActiveLaunchEvidenceRecord {
                 authority: authority(),
                 serial: strict(10),
                 token: strict(20),
@@ -1142,6 +1142,54 @@ mod tests {
             identity: strict_identity(identity, record.content_digest).unwrap(),
             record,
         }
+    }
+
+    #[test]
+    fn legacy_bounded_reads_reject_513_bytes_while_evidence_cap_accepts_exact_records() {
+        let temporary = TestDirectory::create();
+        let metadata = fs::metadata(&temporary.0).unwrap();
+        let root = Descriptor::from_file(File::open(&temporary.0).unwrap());
+        let store = RecordStore::new(metadata.uid(), metadata.gid());
+        let token = key();
+
+        fs::write(temporary.0.join("lifecycle.current.v1"), [0_u8; 513]).unwrap();
+        fs::set_permissions(
+            temporary.0.join("lifecycle.current.v1"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.open(
+                &root,
+                RecordName::LifecycleCurrent,
+                RecordKind::LifecycleVacant,
+                &token,
+            ),
+            Err(PersistenceError::Descriptor(DescriptorError::TooLarge))
+        ));
+
+        let evidence = active_pid_record();
+        assert_eq!(
+            evidence.canonical_bytes().len(),
+            RecordKind::ActivePid.maximum_bytes()
+        );
+        let descriptor = Descriptor::from_file(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(temporary.0.join("active-evidence"))
+                .unwrap(),
+        );
+        descriptor
+            .write_complete_at_start(evidence.canonical_bytes())
+            .unwrap();
+        assert_eq!(
+            descriptor
+                .read_bounded(RecordKind::ActivePid.maximum_bytes())
+                .unwrap(),
+            evidence.canonical_bytes()
+        );
     }
 
     fn selector(slot: u8, operation: u8) -> AuthenticatedRecord {
@@ -1767,7 +1815,7 @@ mod tests {
                 RecordKind::LaunchVacant,
                 &token
             ),
-            Err(PersistenceError::UnexpectedKind)
+            Err(PersistenceError::Descriptor(DescriptorError::TooLarge))
         ));
         assert_eq!(
             store.load_layout_after_lock(&root, &lock, &token),

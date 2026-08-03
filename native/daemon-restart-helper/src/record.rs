@@ -20,7 +20,7 @@ pub enum RecordKind {
     LaunchVacant = 0x0004,
     PidVacant = 0x0005,
     ActivePid = 0x0006,
-    Launch = 0x0007,
+    ActiveLaunchEvidence = 0x0007,
     LifecycleSelector = 0x0010,
     Journal = 0x0011,
 }
@@ -34,7 +34,7 @@ impl RecordKind {
             0x0004 => Self::LaunchVacant,
             0x0005 => Self::PidVacant,
             0x0006 => Self::ActivePid,
-            0x0007 => Self::Launch,
+            0x0007 => Self::ActiveLaunchEvidence,
             0x0010 => Self::LifecycleSelector,
             0x0011 => Self::Journal,
             _ => return None,
@@ -46,11 +46,13 @@ impl RecordKind {
             Self::LifecycleSerial
             | Self::LifecycleVacant
             | Self::RestartVacant
-            | Self::LaunchVacant
-            | Self::PidVacant
-            | Self::ActivePid
-            | Self::Launch => 1024,
+            | Self::LaunchVacant => 512,
+            Self::PidVacant => 1024,
             Self::LifecycleSelector | Self::Journal => 16 * 1024,
+            // The canonical bodies are fixed at 506 and 494 bytes respectively;
+            // including header, envelope digest, and MAC gives these exact caps.
+            Self::ActivePid => 582,
+            Self::ActiveLaunchEvidence => 570,
         }
     }
 }
@@ -200,9 +202,11 @@ pub struct ActivePidRecord {
 
 /// Authenticated facts for an admitted managed launch. `active_pid_digest`
 /// binds this record to the complete canonical ActivePid record, rather than a
-/// numeric PID or a pathname. It grants no adoption or recovery authority.
+/// numeric PID or a pathname. This is active-launch *evidence*, distinct from
+/// the established lifecycle Launch record. It grants no adoption or recovery
+/// authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LaunchRecord {
+pub struct ActiveLaunchEvidenceRecord {
     pub authority: Authority,
     pub serial: StrictLeafIdentity,
     pub token: StrictLeafIdentity,
@@ -231,7 +235,7 @@ pub enum RecordBody {
     Selector(SelectorRecord),
     Journal(JournalRecord),
     ActivePid(ActivePidRecord),
-    Launch(LaunchRecord),
+    ActiveLaunchEvidence(ActiveLaunchEvidenceRecord),
 }
 
 impl RecordBody {
@@ -249,7 +253,10 @@ impl RecordBody {
                 | (Self::Selector(_), RecordKind::LifecycleSelector)
                 | (Self::Journal(_), RecordKind::Journal)
                 | (Self::ActivePid(_), RecordKind::ActivePid)
-                | (Self::Launch(_), RecordKind::Launch)
+                | (
+                    Self::ActiveLaunchEvidence(_),
+                    RecordKind::ActiveLaunchEvidence
+                )
         )
     }
 }
@@ -379,12 +386,14 @@ pub fn validate_active_launch_pair(
     active_pid: &AuthenticatedRecord,
     launch: &AuthenticatedRecord,
 ) -> Result<(), RecordError> {
-    let (RecordKind::ActivePid, RecordBody::ActivePid(active_pid_body)) =
-        (active_pid.kind, active_pid.body)
+    let Some((RecordKind::ActivePid, RecordBody::ActivePid(active_pid_body))) =
+        canonical_record_facts(active_pid)
     else {
         return Err(RecordError::KindBodyMismatch);
     };
-    let (RecordKind::Launch, RecordBody::Launch(launch_body)) = (launch.kind, launch.body) else {
+    let Some((RecordKind::ActiveLaunchEvidence, RecordBody::ActiveLaunchEvidence(launch_body))) =
+        canonical_record_facts(launch)
+    else {
         return Err(RecordError::KindBodyMismatch);
     };
     if active_pid_body.authority != launch_body.authority
@@ -394,11 +403,35 @@ pub fn validate_active_launch_pair(
         || active_pid_body.runtime != launch_body.runtime
         || active_pid_body.listener_digest != launch_body.listener_digest
         || active_pid_body.admitted_facts_digest != launch_body.admitted_facts_digest
-        || launch_body.active_pid_digest != active_pid.content_digest
+        || launch_body.active_pid_digest != sha256::digest(active_pid.canonical_bytes())
     {
         return Err(RecordError::BindingMismatch);
     }
     Ok(())
+}
+
+/// Extracts comparison facts from the authenticated record's immutable
+/// canonical representation. Parsing and MAC verification occurred when the
+/// record was constructed; this deliberately never consults its mutable public
+/// cache fields.
+fn canonical_record_facts(record: &AuthenticatedRecord) -> Option<(RecordKind, RecordBody)> {
+    let canonical = record.canonical_bytes();
+    if canonical.len() < HEADER_LEN + DIGEST_LEN + MAC_LEN || canonical[..4] != MAGIC {
+        return None;
+    }
+    let kind = RecordKind::from_u16(read_u16(canonical, 4))?;
+    if read_u16(canonical, 6) != VERSION || canonical.len() > kind.maximum_bytes() {
+        return None;
+    }
+    let body_len = read_u32(canonical, 8) as usize;
+    let digest_offset = HEADER_LEN.checked_add(body_len)?;
+    let expected_len = digest_offset.checked_add(DIGEST_LEN + MAC_LEN)?;
+    if canonical.len() != expected_len {
+        return None;
+    }
+    let body = decode_body(kind, &canonical[HEADER_LEN..digest_offset]).ok()?;
+    validate_body(body).ok()?;
+    Some((kind, body))
 }
 
 fn persistence_mac(key: &TokenKey, kind: RecordKind, envelope_through_digest: &[u8]) -> [u8; 32] {
@@ -447,7 +480,7 @@ fn validate_body(body: RecordBody) -> Result<(), RecordError> {
             validate_digest(record.expected_launch_digest)
         }
         RecordBody::ActivePid(record) => validate_active_pid_record(record),
-        RecordBody::Launch(record) => validate_launch_record(record),
+        RecordBody::ActiveLaunchEvidence(record) => validate_active_launch_evidence_record(record),
     }
 }
 
@@ -469,7 +502,9 @@ fn validate_active_pid_record(record: ActivePidRecord) -> Result<(), RecordError
     validate_digest(record.process_digest)
 }
 
-fn validate_launch_record(record: LaunchRecord) -> Result<(), RecordError> {
+fn validate_active_launch_evidence_record(
+    record: ActiveLaunchEvidenceRecord,
+) -> Result<(), RecordError> {
     validate_evidence_binding(launch_binding(record))?;
     validate_digest(record.active_pid_digest)
 }
@@ -576,7 +611,7 @@ fn encode_body(body: RecordBody) -> Vec<u8> {
             bytes.extend_from_slice(&record.process_start_time.to_le_bytes());
             bytes.extend_from_slice(&record.process_digest);
         }
-        RecordBody::Launch(record) => {
+        RecordBody::ActiveLaunchEvidence(record) => {
             encode_evidence_binding(&mut bytes, launch_binding(record));
             bytes.extend_from_slice(&record.active_pid_digest);
         }
@@ -646,9 +681,9 @@ fn decode_body(kind: RecordKind, bytes: &[u8]) -> Result<RecordBody, RecordError
                 process_digest: decoder.digest()?,
             })
         }
-        RecordKind::Launch => {
+        RecordKind::ActiveLaunchEvidence => {
             let binding = decoder.evidence_binding()?;
-            RecordBody::Launch(LaunchRecord {
+            RecordBody::ActiveLaunchEvidence(ActiveLaunchEvidenceRecord {
                 authority: binding.authority,
                 serial: binding.serial,
                 token: binding.token,
@@ -694,7 +729,7 @@ fn active_pid_binding(record: ActivePidRecord) -> EvidenceBinding {
     }
 }
 
-fn launch_binding(record: LaunchRecord) -> EvidenceBinding {
+fn launch_binding(record: ActiveLaunchEvidenceRecord) -> EvidenceBinding {
     EvidenceBinding {
         authority: record.authority,
         serial: record.serial,
@@ -984,8 +1019,8 @@ mod tests {
         }
     }
 
-    fn launch() -> LaunchRecord {
-        LaunchRecord {
+    fn active_launch_evidence() -> ActiveLaunchEvidenceRecord {
+        ActiveLaunchEvidenceRecord {
             authority: authority(),
             serial: strict(10),
             token: strict(20),
@@ -1053,7 +1088,10 @@ mod tests {
             ),
             (RecordKind::Journal, journal()),
             (RecordKind::ActivePid, RecordBody::ActivePid(active_pid())),
-            (RecordKind::Launch, RecordBody::Launch(launch())),
+            (
+                RecordKind::ActiveLaunchEvidence,
+                RecordBody::ActiveLaunchEvidence(active_launch_evidence()),
+            ),
         ];
         let key = key(b'a');
         for (kind, body) in bodies {
@@ -1083,8 +1121,8 @@ mod tests {
         );
 
         let launch = AuthenticatedRecord::encode(
-            RecordKind::Launch,
-            RecordBody::Launch(launch()),
+            RecordKind::ActiveLaunchEvidence,
+            RecordBody::ActiveLaunchEvidence(active_launch_evidence()),
             &current_key,
         )
         .unwrap();
@@ -1222,19 +1260,22 @@ mod tests {
             AuthenticatedRecord::encode(RecordKind::ActivePid, RecordBody::ActivePid(pid), &key),
             Err(RecordError::InvalidBody)
         );
-        let mut invalid_launch = launch();
+        let mut invalid_launch = active_launch_evidence();
         invalid_launch.active_pid_digest = [0; 32];
         assert_eq!(
             AuthenticatedRecord::encode(
-                RecordKind::Launch,
-                RecordBody::Launch(invalid_launch),
+                RecordKind::ActiveLaunchEvidence,
+                RecordBody::ActiveLaunchEvidence(invalid_launch),
                 &key
             ),
             Err(RecordError::InvalidBody)
         );
-        let record =
-            AuthenticatedRecord::encode(RecordKind::Launch, RecordBody::Launch(launch()), &key)
-                .unwrap();
+        let record = AuthenticatedRecord::encode(
+            RecordKind::ActiveLaunchEvidence,
+            RecordBody::ActiveLaunchEvidence(active_launch_evidence()),
+            &key,
+        )
+        .unwrap();
         let mut tampered = record.canonical_bytes().to_vec();
         tampered[HEADER_LEN + 398] ^= 1;
         assert_eq!(
@@ -1252,17 +1293,20 @@ mod tests {
             &key,
         )
         .unwrap();
-        let mut launch_body = launch();
+        let mut launch_body = active_launch_evidence();
         launch_body.active_pid_digest = active.content_digest;
-        let launch =
-            AuthenticatedRecord::encode(RecordKind::Launch, RecordBody::Launch(launch_body), &key)
-                .unwrap();
+        let launch = AuthenticatedRecord::encode(
+            RecordKind::ActiveLaunchEvidence,
+            RecordBody::ActiveLaunchEvidence(launch_body),
+            &key,
+        )
+        .unwrap();
         let active = AuthenticatedRecord::parse(active.canonical_bytes(), &key).unwrap();
         let launch = AuthenticatedRecord::parse(launch.canonical_bytes(), &key).unwrap();
         assert_eq!(validate_active_launch_pair(&active, &launch), Ok(()));
 
         for mismatch in 0..8 {
-            let RecordBody::Launch(mut changed) = launch.body else {
+            let RecordBody::ActiveLaunchEvidence(mut changed) = launch.body else {
                 unreachable!();
             };
             match mismatch {
@@ -1276,9 +1320,12 @@ mod tests {
                 7 => changed.active_pid_digest[0] ^= 1,
                 _ => unreachable!(),
             }
-            let changed =
-                AuthenticatedRecord::encode(RecordKind::Launch, RecordBody::Launch(changed), &key)
-                    .unwrap();
+            let changed = AuthenticatedRecord::encode(
+                RecordKind::ActiveLaunchEvidence,
+                RecordBody::ActiveLaunchEvidence(changed),
+                &key,
+            )
+            .unwrap();
             let changed = AuthenticatedRecord::parse(changed.canonical_bytes(), &key).unwrap();
             assert_eq!(
                 validate_active_launch_pair(&active, &changed),
@@ -1286,5 +1333,90 @@ mod tests {
                 "signed mismatch {mismatch} must not bind"
             );
         }
+    }
+
+    #[test]
+    fn active_launch_pair_ignores_mutated_public_caches() {
+        let key = key(b'a');
+        let active = AuthenticatedRecord::encode(
+            RecordKind::ActivePid,
+            RecordBody::ActivePid(active_pid()),
+            &key,
+        )
+        .unwrap();
+        let mut evidence = active_launch_evidence();
+        evidence.active_pid_digest = [99; 32];
+        let launch = AuthenticatedRecord::encode(
+            RecordKind::ActiveLaunchEvidence,
+            RecordBody::ActiveLaunchEvidence(evidence),
+            &key,
+        )
+        .unwrap();
+        let mut active = AuthenticatedRecord::parse(active.canonical_bytes(), &key).unwrap();
+        let mut launch = AuthenticatedRecord::parse(launch.canonical_bytes(), &key).unwrap();
+
+        // An attacker with a parsed value can rewrite the public caches, but
+        // not its private canonical bytes. The immutable bytes still prove the
+        // mismatched pair and must win.
+        launch.kind = RecordKind::ActiveLaunchEvidence;
+        let RecordBody::ActiveLaunchEvidence(mut changed) = launch.body else {
+            unreachable!();
+        };
+        changed.active_pid_digest = active.content_digest;
+        launch.body = RecordBody::ActiveLaunchEvidence(changed);
+        active.content_digest = [1; 32];
+        assert_eq!(
+            validate_active_launch_pair(&active, &launch),
+            Err(RecordError::BindingMismatch)
+        );
+    }
+
+    #[test]
+    fn legacy_records_keep_512_byte_cap_and_evidence_uses_exact_caps() {
+        for kind in [
+            RecordKind::LifecycleSerial,
+            RecordKind::LifecycleVacant,
+            RecordKind::RestartVacant,
+            RecordKind::LaunchVacant,
+        ] {
+            assert_eq!(kind.maximum_bytes(), 512, "{kind:?}");
+        }
+        assert_eq!(RecordKind::PidVacant.maximum_bytes(), 1024);
+        assert_eq!(RecordKind::LifecycleSelector.maximum_bytes(), 16 * 1024);
+        assert_eq!(RecordKind::Journal.maximum_bytes(), 16 * 1024);
+        assert_eq!(RecordKind::ActivePid.maximum_bytes(), 582);
+        assert_eq!(RecordKind::ActiveLaunchEvidence.maximum_bytes(), 570);
+
+        let key = key(b'a');
+        let legacy =
+            AuthenticatedRecord::encode(RecordKind::RestartVacant, vacancy(), &key).unwrap();
+        let mut oversized_legacy = legacy.canonical_bytes().to_vec();
+        oversized_legacy.resize(513, 0);
+        assert_eq!(
+            AuthenticatedRecord::parse(&oversized_legacy, &key),
+            Err(RecordError::TooLarge)
+        );
+        let active = AuthenticatedRecord::encode(
+            RecordKind::ActivePid,
+            RecordBody::ActivePid(active_pid()),
+            &key,
+        )
+        .unwrap();
+        assert_eq!(
+            active.canonical_bytes().len(),
+            RecordKind::ActivePid.maximum_bytes()
+        );
+        let mut evidence = active_launch_evidence();
+        evidence.active_pid_digest = active.content_digest;
+        let evidence = AuthenticatedRecord::encode(
+            RecordKind::ActiveLaunchEvidence,
+            RecordBody::ActiveLaunchEvidence(evidence),
+            &key,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.canonical_bytes().len(),
+            RecordKind::ActiveLaunchEvidence.maximum_bytes()
+        );
     }
 }

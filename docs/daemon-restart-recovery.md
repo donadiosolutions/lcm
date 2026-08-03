@@ -1221,7 +1221,8 @@ This section defines two **codec-only** records for a future managed launch.
 They are authenticated evidence, not a grant of authority. The helper does not
 yet accept either record in the recovery-root layout, publish either name, use
 one to select a route, or infer that a process can be adopted, recovered,
-signalled, or retired. In particular, an `ActivePidRecord` or `LaunchRecord`
+signalled, or retired. In particular, an `ActivePidRecord` or
+`ActiveLaunchEvidenceRecord`
 alone never changes the legacy-daemon rule. That invariant remains in force
 until the separately reviewed publisher work in #489 and consumer/admission
 work in #490 implement every precondition below.
@@ -1231,7 +1232,7 @@ The records retain the existing `LCMR` version-1 authenticated envelope:
 | Envelope field | Canonical encoding |
 | --- | --- |
 | magic | Four ASCII bytes `LCMR` |
-| kind | Exact little-endian `u16`: `0x0006` ActivePid or `0x0007` Launch |
+| kind | Exact little-endian `u16`: `0x0006` ActivePid or `0x0007` ActiveLaunchEvidence |
 | version | Exact little-endian `u16` value `1` |
 | body length | Little-endian `u32`, exactly the fixed body size for its kind |
 | envelope digest | SHA-256 of header plus body |
@@ -1265,10 +1266,13 @@ Both new bodies begin with this 462-byte binding prefix, in this exact order:
 
 `ActivePidRecord` appends `pid` (`u32`, nonzero), `process_start_time` (`u64`,
 nonzero), and `process_digest`; its body is exactly 506 bytes and complete
-record is at most 582 bytes. `LaunchRecord` instead appends
+record is exactly 582 bytes. `ActiveLaunchEvidenceRecord` instead appends
 `active_pid_digest`, the SHA-256 of the complete canonical `ActivePidRecord`;
-its body is exactly 494 bytes and complete record is at most 570 bytes. The
-four leaf identities and both facts digests are duplicated deliberately: a
+its body is exactly 494 bytes and complete record is exactly 570 bytes. This
+new active-launch-evidence record is distinct from the established 64-KiB
+lifecycle `LaunchRecord`; it neither replaces nor widens that lifecycle schema.
+Its fixed evidence bounds also leave every pre-existing record-kind bound
+unchanged. The four leaf identities and both facts digests are duplicated deliberately: a
 consumer must reject a PID/launch pair unless root, serial, token,
 configuration, runtime, listener, and admitted-fact bindings all agree and
 the launch's PID digest equals the held complete PID record. A numeric PID,
