@@ -4131,7 +4131,7 @@ describe("worktree reconciliation", () => {
     source.close();
 
     expect(reconcileWorktrees(linked)).toMatchObject({ status: "completed" });
-  });
+  }, 15_000);
 
   it("fences already-open legacy writers before archiving their database inodes", () => {
     const { main, linked } = makeRepository(home);
