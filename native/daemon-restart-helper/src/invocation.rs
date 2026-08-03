@@ -7,6 +7,7 @@ use crate::descriptor::{
     Descriptor, DescriptorContent, DescriptorError, DescriptorIdentity, DescriptorIdentityCommon,
     DescriptorKind, DescriptorPolicy,
 };
+use crate::persistence::PersistenceError;
 use crate::stable::{self, PreverifiedHelperDigest, StableAdmissionError, StableVacantLease};
 use crate::syscall::{
     self, Errno, O_LARGEFILE_STATUS, O_NONBLOCK_STATUS, O_RDONLY_ACCESS, O_RDWR_ACCESS,
@@ -194,10 +195,43 @@ pub fn admit() -> PreFrameResult {
 }
 
 fn classify_pre_frame_error(error: InvocationError) -> PreFrameResult {
-    match error {
-        InvocationError::Syscall(Errno::ENOSYS) => PreFrameResult::Unsupported,
-        _ => PreFrameResult::Ambiguous,
+    if invocation_error_is_explicit_enosys(error) {
+        PreFrameResult::Unsupported
+    } else {
+        PreFrameResult::Ambiguous
     }
+}
+
+fn invocation_error_is_explicit_enosys(error: InvocationError) -> bool {
+    match error {
+        InvocationError::Syscall(errno) => errno == Errno::ENOSYS,
+        InvocationError::Descriptor(error) => descriptor_error_is_explicit_enosys(error),
+        InvocationError::Stable(error) => stable_error_is_explicit_enosys(error),
+        _ => false,
+    }
+}
+
+fn stable_error_is_explicit_enosys(error: StableAdmissionError) -> bool {
+    match error {
+        StableAdmissionError::Syscall(errno) => errno == Errno::ENOSYS,
+        StableAdmissionError::Descriptor(error) => descriptor_error_is_explicit_enosys(error),
+        StableAdmissionError::Persistence(error) => persistence_error_is_explicit_enosys(error),
+        _ => false,
+    }
+}
+
+fn persistence_error_is_explicit_enosys(error: PersistenceError) -> bool {
+    match error {
+        PersistenceError::Syscall(errno) => errno == Errno::ENOSYS,
+        PersistenceError::Descriptor(error) | PersistenceError::MutationAmbiguous(error) => {
+            descriptor_error_is_explicit_enosys(error)
+        }
+        _ => false,
+    }
+}
+
+fn descriptor_error_is_explicit_enosys(error: DescriptorError) -> bool {
+    matches!(error, DescriptorError::Io(errno) if errno == Errno::ENOSYS.0)
 }
 
 fn require_renameat2_flag(parent: i32, flag: usize) -> Result<(), InvocationError> {
@@ -1421,18 +1455,68 @@ mod tests {
 
     #[test]
     fn only_explicit_enosys_is_unsupported_preframe() {
-        // The same classifier is used for required kcmp, prctl, PIDFD, and procfs syscall paths.
-        assert_eq!(
-            classify_pre_frame_error(InvocationError::Syscall(Errno::ENOSYS)),
-            PreFrameResult::Unsupported
-        );
+        let descriptor_enosys = DescriptorError::Io(Errno::ENOSYS.0);
+        for error in [
+            // Direct required kcmp, prctl, PIDFD, and procfs syscall paths.
+            InvocationError::Syscall(Errno::ENOSYS),
+            InvocationError::Descriptor(descriptor_enosys),
+            // Descriptor-held stable admission retains every reachable explicit nested form.
+            InvocationError::Stable(StableAdmissionError::Syscall(Errno::ENOSYS)),
+            InvocationError::Stable(StableAdmissionError::Descriptor(descriptor_enosys)),
+            InvocationError::Stable(StableAdmissionError::Persistence(
+                PersistenceError::Syscall(Errno::ENOSYS),
+            )),
+            InvocationError::Stable(StableAdmissionError::Persistence(
+                PersistenceError::Descriptor(descriptor_enosys),
+            )),
+            InvocationError::Stable(StableAdmissionError::Persistence(
+                PersistenceError::MutationAmbiguous(descriptor_enosys),
+            )),
+        ] {
+            assert_eq!(classify_pre_frame_error(error), PreFrameResult::Unsupported);
+        }
+    }
+
+    #[test]
+    fn all_non_enosys_top_level_and_nested_failures_are_ambiguous() {
+        let descriptor_io = DescriptorError::Io(5);
         for error in [
             InvocationError::Syscall(Errno(1)), // EPERM: e.g. kcmp under policy
             InvocationError::Syscall(Errno(5)), // EIO: procfs observation ambiguity
             InvocationError::Syscall(Errno(2)), // ENOENT: parent/procfs race
-            InvocationError::ParentProof,       // changed PPID/start-time/namespace/equality
-            InvocationError::Replacement,       // descriptor replacement or invalid null probe
+            InvocationError::Descriptor(descriptor_io),
+            InvocationError::ExtraDescriptor,
+            InvocationError::MissingDescriptor,
+            InvocationError::CloexecSet,
+            InvocationError::InvalidStatusFlags,
             InvocationError::InvalidProtocolStream,
+            InvocationError::AliasedDescriptors,
+            InvocationError::HelperSelfMismatch,
+            InvocationError::InvalidHelperElf,
+            InvocationError::InvalidNodeElf,
+            InvocationError::InvalidRuntimeScript,
+            InvocationError::InvalidConfigSnapshot,
+            InvocationError::InvalidHomeStateRelation,
+            InvocationError::ParentProof, // changed PPID/start-time/namespace/equality
+            InvocationError::Replacement, // descriptor replacement or invalid null probe
+            InvocationError::Stable(StableAdmissionError::Syscall(Errno(1))),
+            InvocationError::Stable(StableAdmissionError::Descriptor(descriptor_io)),
+            InvocationError::Stable(StableAdmissionError::Persistence(
+                PersistenceError::Syscall(Errno(5)),
+            )),
+            InvocationError::Stable(StableAdmissionError::Persistence(
+                PersistenceError::Descriptor(descriptor_io),
+            )),
+            InvocationError::Stable(StableAdmissionError::Persistence(
+                PersistenceError::MutationAmbiguous(descriptor_io),
+            )),
+            InvocationError::Stable(StableAdmissionError::Persistence(PersistenceError::Record(
+                crate::record::RecordError::InvalidToken,
+            ))),
+            InvocationError::Stable(StableAdmissionError::InvalidToken),
+            InvocationError::Stable(StableAdmissionError::AuthorityMismatch),
+            InvocationError::Stable(StableAdmissionError::LayoutNotStable),
+            InvocationError::Stable(StableAdmissionError::Replacement),
         ] {
             assert_eq!(classify_pre_frame_error(error), PreFrameResult::Ambiguous);
         }
