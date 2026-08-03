@@ -622,6 +622,10 @@ fn record_binds_serial(
         }
         RecordBody::Selector(selector) => selector.serial == serial_identity,
         RecordBody::Journal(journal) => journal.serial == serial_identity,
+        // #493 defines codec-only evidence. It is deliberately not admitted
+        // into a persistence layout until a later publisher/consumer owns the
+        // complete descriptor and process proof.
+        RecordBody::ActivePid(_) | RecordBody::Launch(_) => false,
     }
 }
 
