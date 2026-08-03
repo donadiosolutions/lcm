@@ -121,6 +121,10 @@ describe("CI workflow", () => {
         name: "Set up verified Rust toolchain",
         uses: "./.github/actions/setup-rust-toolchain",
       },
+      {
+        name: "Test native helper with verified Rust toolchain",
+        run: "cargo test --locked --offline --target x86_64-unknown-linux-gnu --manifest-path native/daemon-restart-helper/Cargo.toml",
+      },
       expect.objectContaining({
         name: "Build package with verified Rust toolchain",
         run: expect.stringContaining(["set -Eeuo pipefail", "npm ci", "npm run build"].join("\n")),
