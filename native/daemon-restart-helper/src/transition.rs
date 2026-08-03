@@ -198,6 +198,9 @@ pub const fn evaluate(input: Input) -> Output {
             Output::terminal(Terminal::ExistingVerified)
         }
         (Action::VerifyExisting, Predecessor::Idle) => Output::terminal(Terminal::NoExistingDaemon),
+        (Action::PrepareStart, Predecessor::Idle) if input.facts.existing_healthy => {
+            Output::refused(Refusal::ExistingDaemonHealthy, input.predecessor)
+        }
         (Action::PrepareStart, Predecessor::Idle) => Output::continue_with(UnresolvedOperation {
             kind: UnresolvedKind::Start,
             phase: UnresolvedPhase::Prepared,
@@ -242,6 +245,15 @@ pub const fn evaluate(input: Input) -> Output {
                 kind: UnresolvedKind::Recovery,
                 phase: UnresolvedPhase::ReplacementLaunched,
             }),
+        ) if !input.facts.replacement_launched => {
+            Output::refused(Refusal::ReplacementNotLaunched, input.predecessor)
+        }
+        (
+            Action::PublishPid,
+            Predecessor::Unresolved(UnresolvedOperation {
+                kind: UnresolvedKind::Recovery,
+                phase: UnresolvedPhase::ReplacementLaunched,
+            }),
         ) if input.facts.pid_published => Output::continue_with(UnresolvedOperation {
             kind: UnresolvedKind::Recovery,
             phase: UnresolvedPhase::PidPublished,
@@ -251,8 +263,11 @@ pub const fn evaluate(input: Input) -> Output {
             Predecessor::Unresolved(UnresolvedOperation {
                 kind: UnresolvedKind::Start,
                 phase: UnresolvedPhase::Prepared,
-            })
-            | Predecessor::Unresolved(UnresolvedOperation {
+            }),
+        ) => Output::refused(Refusal::PidNotPublished, input.predecessor),
+        (
+            Action::PublishPid,
+            Predecessor::Unresolved(UnresolvedOperation {
                 kind: UnresolvedKind::Recovery,
                 phase: UnresolvedPhase::ReplacementLaunched,
             }),
@@ -546,6 +561,21 @@ mod tests {
     }
 
     #[test]
+    fn prepare_start_refuses_a_healthy_existing_daemon() {
+        assert_refused(
+            evaluate(input(
+                Action::PrepareStart,
+                Predecessor::Idle,
+                Facts {
+                    existing_healthy: true,
+                    ..BASE_FACTS
+                },
+            )),
+            Refusal::ExistingDaemonHealthy,
+        );
+    }
+
+    #[test]
     fn fault_inputs_fail_closed_and_clear_unresolved_state() {
         let predecessor = Predecessor::Unresolved(UnresolvedOperation {
             kind: UnresolvedKind::Start,
@@ -632,6 +662,21 @@ mod tests {
         });
         assert_refused(
             evaluate(input(Action::LaunchReplacement, recovering, BASE_FACTS)),
+            Refusal::ReplacementNotLaunched,
+        );
+        let replacement_launched = Predecessor::Unresolved(UnresolvedOperation {
+            kind: UnresolvedKind::Recovery,
+            phase: UnresolvedPhase::ReplacementLaunched,
+        });
+        assert_refused(
+            evaluate(input(
+                Action::PublishPid,
+                replacement_launched,
+                Facts {
+                    pid_published: true,
+                    ..BASE_FACTS
+                },
+            )),
             Refusal::ReplacementNotLaunched,
         );
         let prepared = Predecessor::Unresolved(UnresolvedOperation {
