@@ -4,8 +4,9 @@ use crate::descriptor::{
     Descriptor, DescriptorError, DescriptorIdentity, DescriptorKind, DescriptorPolicy,
 };
 use crate::record::{
-    AuthenticatedRecord, JournalRecord, RecordBody, RecordError, RecordKind, SelectorRecord,
-    StableDirectoryIdentity, StrictLeafIdentity, TokenKey,
+    AuthenticatedRecord, Authority, JournalRecord, RecordBody, RecordError, RecordKind,
+    SelectorRecord, SerialRecord, SerialSelfIdentity, StableDirectoryIdentity, StrictLeafIdentity,
+    TokenKey,
 };
 use crate::syscall::{self, Errno, OpenAccess};
 use std::ffi::CStr;
@@ -115,7 +116,7 @@ impl RecordStore {
         record: AuthenticatedRecord,
         key: &TokenKey,
     ) -> Result<HeldRecord, PersistenceError> {
-        if !name.allows(record.kind) {
+        if record.kind == RecordKind::LifecycleSerial || !name.allows(record.kind) {
             return Err(PersistenceError::UnexpectedKind);
         }
         let descriptor = syscall::create_exclusive(parent.as_fd(), name.component(), 0o600)
@@ -137,6 +138,66 @@ impl RecordStore {
             .open(parent, name, record.kind, key)
             .map_err(|_| PersistenceError::MutationAmbiguous(DescriptorError::Io(5)))?;
         if reopened.identity != created_identity
+            || reopened.record.content_digest != record.content_digest
+        {
+            return Err(PersistenceError::IdentityMismatch);
+        }
+        Ok(reopened)
+    }
+
+    /// Creates the self-bound serial record from the inode returned by the
+    /// exclusive empty-file creation. A caller cannot precompute or substitute
+    /// the serial identity.
+    pub fn create_serial_exclusive(
+        &self,
+        parent: &Descriptor,
+        authority: Authority,
+        key: &TokenKey,
+    ) -> Result<HeldRecord, PersistenceError> {
+        let descriptor = syscall::create_exclusive(
+            parent.as_fd(),
+            RecordName::LifecycleSerial.component(),
+            0o600,
+        )
+        .map_err(PersistenceError::Syscall)?;
+        let empty_identity = descriptor
+            .validate(self.policy(RecordKind::LifecycleSerial.maximum_bytes() as u64))
+            .map_err(PersistenceError::MutationAmbiguous)?;
+        let self_identity = serial_self_identity(empty_identity)?;
+        let record = AuthenticatedRecord::encode(
+            RecordKind::LifecycleSerial,
+            RecordBody::Serial(SerialRecord {
+                authority,
+                self_identity,
+            }),
+            key,
+        )
+        .map_err(PersistenceError::Record)?;
+        descriptor
+            .write_complete_at_start(record.canonical_bytes())
+            .map_err(PersistenceError::MutationAmbiguous)?;
+        descriptor
+            .sync_all()
+            .map_err(PersistenceError::MutationAmbiguous)?;
+        parent
+            .sync_all()
+            .map_err(PersistenceError::MutationAmbiguous)?;
+        let written_identity = descriptor
+            .validate(self.policy(RecordKind::LifecycleSerial.maximum_bytes() as u64))
+            .map_err(PersistenceError::MutationAmbiguous)?;
+        let written_identity = strict_identity(written_identity, record.content_digest)?;
+        if !serial_record_matches_identity(record.body, written_identity) {
+            return Err(PersistenceError::IdentityMismatch);
+        }
+        let reopened = self
+            .open(
+                parent,
+                RecordName::LifecycleSerial,
+                RecordKind::LifecycleSerial,
+                key,
+            )
+            .map_err(|_| PersistenceError::MutationAmbiguous(DescriptorError::Io(5)))?;
+        if reopened.identity != written_identity
             || reopened.record.content_digest != record.content_digest
         {
             return Err(PersistenceError::IdentityMismatch);
@@ -308,7 +369,9 @@ impl RecordStore {
         if serial.record.kind != RecordKind::LifecycleSerial || !lock.holds(serial.descriptor()) {
             return Err(PersistenceError::LayoutAmbiguous);
         }
-        self.revalidate(serial)?;
+        self.revalidate(serial)
+            .map_err(|_| PersistenceError::LayoutAmbiguous)?;
+        self.reopen_exact_serial(recovery_root, serial, key)?;
         let root_before = recovery_root
             .validate(self.directory_policy())
             .map_err(PersistenceError::Descriptor)?;
@@ -407,7 +470,9 @@ impl RecordStore {
             };
         }
 
-        self.revalidate(serial)?;
+        self.revalidate(serial)
+            .map_err(|_| PersistenceError::LayoutAmbiguous)?;
+        self.reopen_exact_serial(recovery_root, serial, key)?;
         let names_after =
             syscall::list_directory(recovery_root.as_fd(), 7).map_err(PersistenceError::Syscall)?;
         let root_after = recovery_root
@@ -422,6 +487,30 @@ impl RecordStore {
             launch_current: launch_current.record,
             slots,
         })
+    }
+
+    fn reopen_exact_serial(
+        &self,
+        recovery_root: &Descriptor,
+        locked: &HeldRecord,
+        key: &TokenKey,
+    ) -> Result<(), PersistenceError> {
+        let canonical = self
+            .open(
+                recovery_root,
+                RecordName::LifecycleSerial,
+                RecordKind::LifecycleSerial,
+                key,
+            )
+            .map_err(|_| PersistenceError::LayoutAmbiguous)?;
+        if canonical.identity != locked.identity
+            || canonical.record.content_digest != locked.record.content_digest
+            || canonical.record.envelope_digest != locked.record.envelope_digest
+            || canonical.record.body != locked.record.body
+        {
+            return Err(PersistenceError::LayoutAmbiguous);
+        }
+        Ok(())
     }
 
     fn observe(
@@ -474,6 +563,40 @@ fn stable_directory_identity(
         gid: common.gid,
         mode: common.mode,
     })
+}
+
+fn serial_self_identity(
+    identity: DescriptorIdentity,
+) -> Result<SerialSelfIdentity, PersistenceError> {
+    let DescriptorIdentity::StrictLeaf {
+        common, link_count, ..
+    } = identity
+    else {
+        return Err(PersistenceError::IdentityMismatch);
+    };
+    Ok(SerialSelfIdentity {
+        device: common.device,
+        inode: common.inode,
+        uid: common.uid,
+        gid: common.gid,
+        mode: common.mode,
+        link_count,
+    })
+}
+
+fn serial_record_matches_identity(body: RecordBody, identity: StrictLeafIdentity) -> bool {
+    let RecordBody::Serial(serial) = body else {
+        return false;
+    };
+    serial.self_identity
+        == SerialSelfIdentity {
+            device: identity.device,
+            inode: identity.inode,
+            uid: identity.uid,
+            gid: identity.gid,
+            mode: identity.mode,
+            link_count: identity.link_count,
+        }
 }
 
 fn record_binds_serial(
@@ -869,12 +992,8 @@ pub fn classify_create(evidence: CreateEvidence) -> CreateState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{
-        Authority, OperationKind, SerialRecord, SerialSelfIdentity, StableDirectoryIdentity,
-        VacancyRecord,
-    };
+    use crate::record::{Authority, OperationKind, StableDirectoryIdentity, VacancyRecord};
     use std::fs::{self, File, OpenOptions};
-    use std::io::Write;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1356,48 +1475,11 @@ mod tests {
             recovery_root: root_identity,
             helper_digest: [4; 32],
         };
-        let serial_path = temporary.0.join("lifecycle.serial.v1");
-        let mut serial_file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .open(&serial_path)
-            .unwrap();
-        let serial_metadata = serial_file.metadata().unwrap();
-        let serial_record = AuthenticatedRecord::encode(
-            RecordKind::LifecycleSerial,
-            RecordBody::Serial(SerialRecord {
-                authority,
-                self_identity: SerialSelfIdentity {
-                    device: serial_metadata.dev(),
-                    inode: serial_metadata.ino(),
-                    uid: serial_metadata.uid(),
-                    gid: serial_metadata.gid(),
-                    mode: serial_metadata.mode() & 0o7777,
-                    link_count: serial_metadata.nlink(),
-                },
-            }),
-            &key(),
-        )
-        .unwrap();
-        serial_file
-            .write_all(serial_record.canonical_bytes())
-            .unwrap();
-        serial_file.sync_all().unwrap();
-        drop(serial_file);
-
         let root = Descriptor::from_file(File::open(&temporary.0).unwrap());
-        root.sync_all().unwrap();
         let store = RecordStore::new(root_metadata.uid(), root_metadata.gid());
         let token = key();
         let serial = store
-            .open(
-                &root,
-                RecordName::LifecycleSerial,
-                RecordKind::LifecycleSerial,
-                &token,
-            )
+            .create_serial_exclusive(&root, authority, &token)
             .unwrap();
         let vacancy_body = |kind| {
             AuthenticatedRecord::encode(
@@ -1441,6 +1523,25 @@ mod tests {
         assert_eq!(classify_layout(&snapshot), LayoutState::StableEmpty);
 
         fs::write(temporary.0.join("unknown"), b"").unwrap();
+        assert_eq!(
+            store.load_layout_after_lock(&root, &serial, &lock, &token),
+            Err(PersistenceError::LayoutAmbiguous)
+        );
+        fs::remove_file(temporary.0.join("unknown")).unwrap();
+
+        let replacement_directory = TestDirectory::create();
+        let replacement_root = Descriptor::from_file(File::open(&replacement_directory.0).unwrap());
+        let replacement_metadata = fs::metadata(&replacement_directory.0).unwrap();
+        let replacement_store =
+            RecordStore::new(replacement_metadata.uid(), replacement_metadata.gid());
+        replacement_store
+            .create_serial_exclusive(&replacement_root, authority, &token)
+            .unwrap();
+        fs::rename(
+            replacement_directory.0.join("lifecycle.serial.v1"),
+            temporary.0.join("lifecycle.serial.v1"),
+        )
+        .unwrap();
         assert_eq!(
             store.load_layout_after_lock(&root, &serial, &lock, &token),
             Err(PersistenceError::LayoutAmbiguous)
