@@ -1,8 +1,9 @@
 //! RAII descriptor ownership and descriptor-observed identity validation.
 
 use std::fs::File;
+use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 
 const FILE_TYPE_MASK: u32 = 0o170000;
 const FILE_TYPE_REGULAR: u32 = 0o100000;
@@ -50,6 +51,9 @@ impl Descriptor {
         if metadata.uid() != policy.owner_uid {
             return Err(DescriptorError::WrongOwner);
         }
+        if metadata.gid() != policy.owner_gid {
+            return Err(DescriptorError::WrongGroup);
+        }
         if mode & 0o7777 != policy.exact_mode {
             return Err(DescriptorError::WrongMode);
         }
@@ -78,6 +82,60 @@ impl Descriptor {
             },
         })
     }
+
+    pub(crate) fn write_complete_at_start(&self, bytes: &[u8]) -> Result<(), DescriptorError> {
+        let mut written = 0_usize;
+        while written < bytes.len() {
+            let count = self
+                .0
+                .write_at(&bytes[written..], written as u64)
+                .map_err(io_error)?;
+            if count == 0 {
+                return Err(DescriptorError::ShortIo);
+            }
+            written += count;
+        }
+        Ok(())
+    }
+
+    pub fn read_bounded(&self, maximum: usize) -> Result<Vec<u8>, DescriptorError> {
+        let mut output = Vec::new();
+        let mut offset = 0_u64;
+        loop {
+            let remaining = maximum
+                .checked_add(1)
+                .and_then(|limit| limit.checked_sub(output.len()))
+                .ok_or(DescriptorError::TooLarge)?;
+            if remaining == 0 {
+                return Err(DescriptorError::TooLarge);
+            }
+            let mut buffer = [0_u8; 4096];
+            let read_length = remaining.min(buffer.len());
+            let count = self
+                .0
+                .read_at(&mut buffer[..read_length], offset)
+                .map_err(io_error)?;
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..count]);
+            if output.len() > maximum {
+                return Err(DescriptorError::TooLarge);
+            }
+            offset = offset
+                .checked_add(count as u64)
+                .ok_or(DescriptorError::TooLarge)?;
+        }
+        Ok(output)
+    }
+
+    pub fn sync_all(&self) -> Result<(), DescriptorError> {
+        self.0.sync_all().map_err(io_error)
+    }
+}
+
+fn io_error(error: io::Error) -> DescriptorError {
+    DescriptorError::Io(error.raw_os_error().unwrap_or(5))
 }
 
 impl AsRawFd for Descriptor {
@@ -96,6 +154,7 @@ pub enum DescriptorKind {
 pub struct DescriptorPolicy {
     pub kind: DescriptorKind,
     pub owner_uid: u32,
+    pub owner_gid: u32,
     pub exact_mode: u32,
     pub require_single_link: bool,
     pub max_size: Option<u64>,
@@ -127,9 +186,11 @@ pub enum DescriptorError {
     Io(i32),
     WrongKind,
     WrongOwner,
+    WrongGroup,
     WrongMode,
     WrongLinkCount,
     TooLarge,
+    ShortIo,
 }
 
 #[cfg(test)]
@@ -178,6 +239,7 @@ mod tests {
             .validate(DescriptorPolicy {
                 kind: DescriptorKind::Directory,
                 owner_uid: uid,
+                owner_gid: fs::metadata(&temporary.0).unwrap().gid(),
                 exact_mode: 0o700,
                 require_single_link: false,
                 max_size: None,
@@ -197,6 +259,7 @@ mod tests {
             leaf.validate(DescriptorPolicy {
                 kind: DescriptorKind::RegularFile,
                 owner_uid: uid,
+                owner_gid: fs::metadata(&leaf_path).unwrap().gid(),
                 exact_mode: 0o600,
                 require_single_link: true,
                 max_size: Some(0),
@@ -220,6 +283,7 @@ mod tests {
         let base = DescriptorPolicy {
             kind: DescriptorKind::RegularFile,
             owner_uid: uid,
+            owner_gid: fs::metadata(&path).unwrap().gid(),
             exact_mode: 0o600,
             require_single_link: true,
             max_size: Some(7),

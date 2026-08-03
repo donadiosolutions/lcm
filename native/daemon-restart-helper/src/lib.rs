@@ -10,6 +10,8 @@ compile_error!("lcm-daemon-restart-helper supports only Linux x86_64");
 
 pub mod capability;
 pub mod descriptor;
+pub mod persistence;
 pub mod protocol;
+pub mod record;
 mod sha256;
 pub mod syscall;

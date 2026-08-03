@@ -39,6 +39,29 @@ pub(crate) fn digest(input: &[u8]) -> [u8; 32] {
     output
 }
 
+pub(crate) fn hmac(key: &[u8], input: &[u8]) -> [u8; 32] {
+    let mut key_block = [0_u8; 64];
+    if key.len() > key_block.len() {
+        key_block[..32].copy_from_slice(&digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for index in 0..64 {
+        inner_pad[index] ^= key_block[index];
+        outer_pad[index] ^= key_block[index];
+    }
+    let mut inner = Vec::with_capacity(64 + input.len());
+    inner.extend_from_slice(&inner_pad);
+    inner.extend_from_slice(input);
+    let inner_digest = digest(&inner);
+    let mut outer = Vec::with_capacity(96);
+    outer.extend_from_slice(&outer_pad);
+    outer.extend_from_slice(&inner_digest);
+    digest(&outer)
+}
+
 fn compress(state: &mut [u32; 8], block: &[u8]) {
     let mut schedule = [0_u32; 64];
     for (index, bytes) in block.chunks_exact(4).take(16).enumerate() {
@@ -86,7 +109,7 @@ fn compress(state: &mut [u32; 8], block: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::digest;
+    use super::{digest, hmac};
 
     #[test]
     fn matches_sha256_vectors() {
@@ -112,6 +135,18 @@ mod tests {
                 0x24, 0x8d, 0x6a, 0x61, 0xd2, 0x06, 0x38, 0xb8, 0xe5, 0xc0, 0x26, 0x93, 0x0c, 0x3e,
                 0x60, 0x39, 0xa3, 0x3c, 0xe4, 0x59, 0x64, 0xff, 0x21, 0x67, 0xf6, 0xec, 0xed, 0xd4,
                 0x19, 0xdb, 0x06, 0xc1,
+            ]
+        );
+    }
+
+    #[test]
+    fn matches_hmac_sha256_vector() {
+        assert_eq!(
+            hmac(&[0x0b; 20], b"Hi There"),
+            [
+                0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b,
+                0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c,
+                0x2e, 0x32, 0xcf, 0xf7,
             ]
         );
     }

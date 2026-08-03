@@ -9,6 +9,9 @@ use std::ffi::CStr;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
 const SYS_RENAMEAT2: usize = 316;
+const SYS_MKDIRAT: usize = 258;
+const SYS_GETDENTS64: usize = 217;
+const SYS_LSEEK: usize = 8;
 const SYS_PIDFD_SEND_SIGNAL: usize = 424;
 const SYS_PIDFD_OPEN: usize = 434;
 const SYS_OPENAT2: usize = 437;
@@ -19,6 +22,10 @@ const O_NOFOLLOW: u64 = 0o400000;
 const O_CLOEXEC: u64 = 0o2000000;
 const O_PATH: u64 = 0o10000000;
 const O_NONBLOCK: u64 = 0o4000;
+const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
+const O_CREAT: u64 = 0o100;
+const O_EXCL: u64 = 0o200;
 
 const RESOLVE_NO_XDEV: u64 = 0x01;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -78,6 +85,7 @@ impl PidFd {
 pub enum OpenAccess {
     Path { directory: bool },
     ReadOnly { directory: bool },
+    ReadWriteLock,
 }
 
 #[repr(C)]
@@ -97,6 +105,7 @@ pub fn open_beneath<'fd>(
     let (mut flags, directory) = match access {
         OpenAccess::Path { directory } => (O_PATH, directory),
         OpenAccess::ReadOnly { directory } => (O_NONBLOCK, directory),
+        OpenAccess::ReadWriteLock => (O_RDWR | O_NONBLOCK, false),
     };
     flags |= O_CLOEXEC | O_NOFOLLOW;
     if directory {
@@ -110,6 +119,133 @@ pub fn open_beneath<'fd>(
     let fd = openat2_with(&LinuxRaw, parent.as_raw_fd(), component, &how)?;
     // SAFETY: a successful openat2 returns a new owned descriptor.
     Ok(unsafe { Descriptor::from_owned_raw_fd(fd) })
+}
+
+pub fn create_exclusive<'fd>(
+    parent: BorrowedFd<'fd>,
+    component: &CStr,
+    mode: u32,
+) -> Result<Descriptor, Errno> {
+    validate_component(component)?;
+    if mode == 0 || mode > 0o777 {
+        return Err(Errno::EINVAL);
+    }
+    let how = OpenHow {
+        flags: O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        mode: mode as u64,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV,
+    };
+    let fd = openat2_with(&LinuxRaw, parent.as_raw_fd(), component, &how)?;
+    // SAFETY: a successful exclusive openat2 returns a new owned descriptor.
+    Ok(unsafe { Descriptor::from_owned_raw_fd(fd) })
+}
+
+pub fn mkdir_beneath<'fd>(
+    parent: BorrowedFd<'fd>,
+    component: &CStr,
+    mode: u32,
+) -> Result<(), Errno> {
+    validate_component(component)?;
+    if mode == 0 || mode > 0o777 {
+        return Err(Errno::EINVAL);
+    }
+    // SAFETY: component is a valid immutable C string for the syscall duration.
+    let value = unsafe {
+        LinuxRaw.call6(
+            SYS_MKDIRAT,
+            [
+                parent.as_raw_fd() as usize,
+                component.as_ptr() as usize,
+                mode as usize,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    decode_result(value).map(|_| ())
+}
+
+pub fn list_directory<'fd>(
+    directory: BorrowedFd<'fd>,
+    maximum_entries: usize,
+) -> Result<Vec<Vec<u8>>, Errno> {
+    if maximum_entries == 0 || maximum_entries > 64 {
+        return Err(Errno::EINVAL);
+    }
+    seek_directory_start(directory.as_raw_fd())?;
+    let result = list_directory_from_current_offset(directory.as_raw_fd(), maximum_entries);
+    let reset = seek_directory_start(directory.as_raw_fd());
+    match (result, reset) {
+        (Ok(entries), Ok(())) => Ok(entries),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn list_directory_from_current_offset(
+    descriptor: RawFd,
+    maximum_entries: usize,
+) -> Result<Vec<Vec<u8>>, Errno> {
+    let mut entries = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        // SAFETY: buffer is writable for its complete length during getdents64.
+        let value = unsafe {
+            LinuxRaw.call6(
+                SYS_GETDENTS64,
+                [
+                    descriptor as usize,
+                    buffer.as_mut_ptr() as usize,
+                    buffer.len(),
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        };
+        let count = decode_result(value)?;
+        if count == 0 {
+            break;
+        }
+        if count > buffer.len() {
+            return Err(Errno::EINVAL);
+        }
+        let mut offset = 0_usize;
+        while offset < count {
+            if count - offset < 19 {
+                return Err(Errno::EINVAL);
+            }
+            let record_length =
+                u16::from_ne_bytes([buffer[offset + 16], buffer[offset + 17]]) as usize;
+            if record_length < 20 || record_length > count - offset {
+                return Err(Errno::EINVAL);
+            }
+            let name_field = &buffer[offset + 19..offset + record_length];
+            let nul = name_field
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or(Errno::EINVAL)?;
+            let name = &name_field[..nul];
+            if name != b"." && name != b".." {
+                if name.is_empty() || name.contains(&b'/') || entries.len() == maximum_entries {
+                    return Err(Errno::EINVAL);
+                }
+                entries.push(name.to_vec());
+            }
+            offset += record_length;
+        }
+    }
+    entries.sort_unstable();
+    if entries.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(entries)
+}
+
+fn seek_directory_start(descriptor: RawFd) -> Result<(), Errno> {
+    // SAFETY: lseek has no pointer arguments and offset/whence are fixed to the directory start.
+    let value = unsafe { LinuxRaw.call6(SYS_LSEEK, [descriptor as usize, 0, 0, 0, 0, 0]) };
+    decode_result(value).map(|_| ())
 }
 
 pub fn rename_noreplace<'fd>(
@@ -288,10 +424,67 @@ pub(crate) fn probe_rename_flag(raw: &impl RawSyscalls, flag: usize) -> Result<(
 pub(crate) const PROBE_RENAME_NOREPLACE: usize = RENAME_NOREPLACE;
 pub(crate) const PROBE_RENAME_EXCHANGE: usize = RENAME_EXCHANGE;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Flock {
+    lock_type: i16,
+    whence: i16,
+    start: i64,
+    length: i64,
+    pid: i32,
+    padding: i32,
+}
+
+const SYS_FCNTL: usize = 72;
+const F_OFD_SETLK: usize = 37;
+const F_WRITE_LOCK: i16 = 1;
+const F_UNLOCK: i16 = 2;
+
+pub(crate) fn ofd_lock_with(
+    raw: &impl RawSyscalls,
+    descriptor: RawFd,
+    lock_type: i16,
+) -> Result<(), Errno> {
+    let lock = Flock {
+        lock_type,
+        whence: 0,
+        start: 0,
+        length: 0,
+        pid: 0,
+        padding: 0,
+    };
+    // SAFETY: lock is a valid immutable flock structure for this nonblocking fcntl operation.
+    let value = unsafe {
+        raw.call6(
+            SYS_FCNTL,
+            [
+                descriptor as usize,
+                F_OFD_SETLK,
+                core::ptr::from_ref(&lock) as usize,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    decode_result(value).map(|_| ())
+}
+
+pub(crate) fn acquire_ofd_lock(descriptor: RawFd) -> Result<(), Errno> {
+    ofd_lock_with(&LinuxRaw, descriptor, F_WRITE_LOCK)
+}
+
+pub(crate) fn release_ofd_lock(descriptor: RawFd) -> Result<(), Errno> {
+    ofd_lock_with(&LinuxRaw, descriptor, F_UNLOCK)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::fs::{self, File};
+    use std::os::fd::AsFd;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FakeRaw {
         result: isize,
@@ -379,5 +572,47 @@ mod tests {
             PidFd::open((i32::MAX as u32) + 1).unwrap_err(),
             Errno::EINVAL
         );
+    }
+
+    #[test]
+    fn ofd_lock_is_exclusive_nonblocking_and_preserves_errno() {
+        let raw = FakeRaw {
+            result: -11,
+            calls: RefCell::new(Vec::new()),
+        };
+        assert_eq!(ofd_lock_with(&raw, 8, F_WRITE_LOCK), Err(Errno(11)));
+        let call = raw.calls.borrow()[0];
+        assert_eq!(call.0, SYS_FCNTL);
+        assert_eq!(call.1[0], 8);
+        assert_eq!(call.1[1], F_OFD_SETLK);
+        // SAFETY: the pointer remains valid until ofd_lock_with returns; FakeRaw inspected it
+        // synchronously and stored only its address, so do not dereference it here.
+    }
+
+    #[test]
+    fn directory_listing_is_bounded_sorted_and_offset_independent() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "lcm-helper-getdents-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("zeta"), b"").unwrap();
+        fs::write(path.join("alpha"), b"").unwrap();
+        let directory = File::open(&path).unwrap();
+        assert_eq!(
+            list_directory(directory.as_fd(), 2),
+            Ok(vec![b"alpha".to_vec(), b"zeta".to_vec()])
+        );
+        assert_eq!(
+            list_directory(directory.as_fd(), 2),
+            Ok(vec![b"alpha".to_vec(), b"zeta".to_vec()])
+        );
+        assert_eq!(list_directory(directory.as_fd(), 1), Err(Errno::EINVAL));
+        drop(directory);
+        fs::remove_dir_all(path).unwrap();
     }
 }
