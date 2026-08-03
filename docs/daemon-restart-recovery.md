@@ -138,7 +138,7 @@ descriptors at entry.
 | 3 | Verified helper image | `O_RDONLY`, regular, one link, permission/special bits exactly `0755`, owner pair exactly either `0:0` or the invoking effective UID:GID, and size 1 through 33,554,432 bytes. The complete descriptor bytes must be an ELF64 little-endian, `EM_X86_64` static image whose ELF type is either `ET_EXEC` or `ET_DYN`; both forms require no `PT_INTERP` program header and no `DT_NEEDED` dynamic entry. `ET_DYN` is admitted only in that structurally validated static-PIE form, never as an arbitrary dynamically linked image. SHA-256 is computed over exactly the recorded size. |
 | 4 | HOME directory | `O_RDONLY` directory, current effective UID, with neither group nor other write permission. Its GID and exact permission bits are recorded. Link count, size, and timestamps are not policy or identity fields. |
 | 5 | Private state root | `O_RDONLY` directory, current effective UID and GID, permission/special bits exactly `0700`, with the stable directory identity required by the descriptor-held stable-state admission slice. Link count, size, and timestamps are excluded. |
-| 6 | Node interpreter | `O_RDONLY`, regular, one link, permission/special bits exactly `0755`, and size 64 through 134,217,728 bytes. The complete bytes must be boundedly parsed as ELF64 little-endian `ET_EXEC`, `EM_X86_64`; bounded program-header structure is required and a dynamic interpreter is allowed. SHA-256 covers exactly the recorded size. It is admitted only when its complete strict immutable-leaf identity equals that of the separately opened executable descriptor of the proven live direct parent, as specified below. No FD 6 owner-pair allowlist exists. |
+| 6 | Node interpreter | `O_RDONLY`, regular, one link, permission/special bits exactly `0755`, and size 64 through 134,217,728 bytes. The complete bytes must be boundedly parsed as ELF64 little-endian `ET_EXEC`, `EM_X86_64`; bounded program-header structure is required and a dynamic interpreter is allowed. SHA-256 covers exactly the recorded size. Its initial strict identity/hash capture is revalidated before the final parent-proof suffix, and it is admitted only when that revalidated identity equals the fresh direct-parent executable capture at that suffix's linearization point, as specified below. No FD 6 owner-pair allowlist exists. |
 | 7 | Packaged runtime script | `O_RDONLY`, regular, one link, permission/special bits exactly `0755`, owner pair exactly either `0:0` or the current effective UID:GID, and size 20 through 16,777,216 bytes. Its bytes begin exactly `#!/usr/bin/env node\n`, are strict UTF-8 with no NUL, and are hashed completely. It is never directly executed. |
 | 8 | Canonical configuration snapshot | `O_RDONLY`, regular, one link, current effective UID:GID, permission/special bits exactly `0600`, and size 1 through 1,048,576 bytes. The complete bytes are strict UTF-8 with no NUL, contain exactly one structurally valid JSON object, and are hashed completely. This slice does not admit config field semantics, ports, backends, paths, or recovery eligibility; that later semantic parse must use these same held bytes. |
 
@@ -178,38 +178,50 @@ weaken any of those checks. It deliberately permits a runtime owned by a third
 UID only when that exact running parent runtime is proven. Equality is not a
 general owner grant, a pathname grant, or package authority.
 
-Before it reads a protocol frame or returns an invocation lease, the helper
-performs this one pre-frame parent proof, with no output or state mutation:
+An unsuspended parent cannot be proven to remain on an image after an
+observation. Therefore the parent-runtime proof is a **linearizable
+observation**, not a promise about the parent at lease return or during the
+lease lifetime. The helper completes every non-parent-dependent admission
+operation before its final parent-proof suffix: FD inventory, content, and hash
+validation; FD 3/self proof; both FD 4/FD 5 relationship checks; the initial FD
+6 strict identity/hash capture; every `FD_CLOEXEC` mutation; and their required
+post-mutation revalidations. None of those earlier captures, including any
+retained parent-executable descriptor, is authority for the final comparison.
 
-1. It records the decimal direct-parent PID from `getppid()`, calls
-   `prctl(PR_SET_PDEATHSIG, SIGKILL)`, and immediately rereads `getppid()`.
-   The value must be nonzero and exactly the recorded parent PID; otherwise it
-   refuses. This parent-death fence remains armed for the helper's lifetime.
-2. It opens a PIDFD for that direct parent with `pidfd_open`; failure is a
-   refusal. It proves that the helper and that parent are in the same PID
-   namespace, captures the parent's bounded proc start-time from the fixed
-   decimal-PID proc entry, and retains the evidence needed to recheck both.
-   A missing, malformed, changing, inaccessible, or different namespace/start
-   observation is ambiguous and refuses.
-3. Immediately before the lease, it makes the first final parent recheck: the
-   direct parent PID is still the recorded decimal PID, the held PIDFD still
-   proves that exact parent is live, the PID namespace is still the same, and
-   the bounded proc start-time is still the recorded value. Any failed,
-   missing, malformed, changing, inaccessible, or different observation is
-   ambiguous and refuses.
-4. Between those final rechecks and the lease, it makes a **fresh** third and
-   final supported procfs magic-link capture: `/proc/<decimal-ppid>/exe`. It
-   opens that exact executable descriptor, performs the complete identical FD 6
-   regular-file validation and descriptor-read SHA-256, and requires its
-   complete strict immutable-leaf identity to equal FD 6. An earlier
-   parent-executable descriptor, whether retained or revalidated, is never
-   final evidence for this comparison.
-5. Immediately after that fresh capture and before the lease, it repeats the
-   final direct-parent PID, PIDFD-liveness, same PID-namespace, and bounded
-   proc-start-time rechecks. Those final rechecks bracket the fresh capture. It
-   then revalidates the freshly captured parent-executable and FD 6 strict
-   identities and their equality. Every equality must still hold. It then closes
-   all temporary parent-proof descriptors before returning the lease.
+The final parent-proof suffix is the last pre-frame operation sequence, with no
+output or durable state mutation before `LeaseIssued`:
+
+1. Its final tuple **before** capture records the decimal direct-parent PID from
+   `getppid()`, calls `prctl(PR_SET_PDEATHSIG, SIGKILL)`, and immediately
+   rereads `getppid()`. The value must be nonzero and exactly the recorded
+   parent PID. It opens a PIDFD for that direct parent with `pidfd_open`, proves
+   the same PID namespace, and captures the parent's bounded proc start-time
+   from the fixed decimal-PID proc entry. It then confirms the complete tuple:
+   recorded direct-parent PID, PIDFD-backed liveness of that exact parent, same
+   PID namespace, and that recorded bounded start-time. Missing, malformed,
+   changing, inaccessible, or different evidence is ambiguous and refuses. The
+   parent-death fence remains armed for the helper's lifetime.
+2. It makes the **fresh** supported procfs magic-link capture
+   `/proc/<decimal-ppid>/exe`, opens that exact executable descriptor, and
+   performs the complete FD 6-equivalent regular-file validation and
+   descriptor-read SHA-256. The complete strict immutable-leaf identity must
+   equal the already revalidated FD 6 identity. A parent-executable descriptor
+   captured before this suffix, whether retained or revalidated, never has
+   authority for that equality. This fresh executable capture is the proof's
+   linearization point.
+3. Its final tuple **after** capture repeats the direct-parent PID,
+   PIDFD-liveness, same-PID-namespace, and bounded proc-start-time observations.
+   Every member of that tuple must still hold.
+4. It immediately records the in-memory `LeaseIssued` result. There is no frame
+   I/O, output, durable mutation, lock operation, spawn, network operation,
+   `fcntl`, or cleanup between the final tuple and `LeaseIssued`; temporary
+   parent-proof descriptors are disposed only after that result exists.
+
+Successful issuance proves only that the direct parent's executable equalled FD
+6 at this suffix's fresh executable-capture linearization point. It makes no
+claim that the parent remains on that image at lease return or for the lease
+lifetime. An `execve` before that point refuses; an `execve` after it is not
+retroactively observable and cannot invalidate the bounded successful claim.
 
 No pathname is retained as authority, and neither a successful earlier check
 nor a matching UID/GID alone permits FD 6. Parent exit, PID reuse, a parent
@@ -229,8 +241,9 @@ at `/proc/self/fd/3`; after admission, the helper-managed child receives the
 runtime only through the authenticated FD duplication defined below. No other
 Node-to-helper runtime handoff is version-1 authority.
 
-This #447 correction leaves the FD 3 policy from #442/#443 unchanged. It does
-not specify or enable the deferred P2 work in #444 or #448.
+This #450 linearization correction preserves #447's third-UID equality and
+leaves the FD 3 policy from #442/#443 unchanged. It does not specify or enable
+the deferred P2 work in #444 or #448.
 
 The FD 6 and FD 7 limits are a source-slice fail-closed envelope, not a claim
 that every Node installation or future LCM bundle has those sizes. The 128 MiB
@@ -291,21 +304,26 @@ Admission order is exact:
    `FD_CLOEXEC` clear;
 2. validate the three protocol streams, every access/status flag, every
    per-role metadata policy, pairwise non-aliasing, FD 3/self identity, all
-   bounded content and hashes, the complete FD 6 direct-parent proof, and the
-   repeated FD 4/FD 5 relationship;
+   bounded content and hashes including the initial FD 6 strict identity/hash
+   capture, and the repeated FD 4/FD 5 relationship;
 3. set `FD_CLOEXEC` on FDs 3 through 8 only, without changing any access or
-   status flag; and
-4. revalidate the six descriptor identities, the FD 3/self proof, every FD 6
-   parent-proof fact and equality, and both sides of the HOME/state comparison
-   before returning the private invocation lease.
+   status flag;
+4. revalidate the six descriptor identities, the FD 3/self proof, the initial
+   FD 6 strict identity/hash capture, and both sides of the HOME/state
+   comparison; and
+5. run the final parent-proof suffix: final tuple before, fresh
+   `/proc/<decimal-ppid>/exe` capture, complete FD 6-equivalent validation/hash
+   and equality, final tuple after, and immediately in-memory `LeaseIssued`.
 
 Only after that lease exists may the helper accept a frame or enter the
 descriptor-held stable-state admission slice. Before it exists, the only
 permitted operations are bounded descriptor enumeration, `fcntl`, metadata and
 socket queries, position-independent reads/hashing, the two read-only fixed
-child opens, the one FD 6 parent-proof sequence above (including its PIDFD and
-final parent-executable capture), and the specified close-on-exec changes.
-Descriptor admission
+child opens, the one FD 6 parent-proof suffix above (including its PIDFD and
+fresh parent-executable capture), and the specified close-on-exec changes.
+The `fcntl` and cleanup permissions end before the final tuple begins; from
+that tuple through in-memory `LeaseIssued`, only the ordered suffix operations
+are permitted. Descriptor admission
 must not parse configuration semantics; acquire a durable-state lock; read or
 write a protocol frame; write FD 1 or FD 2; create, chmod, chown, truncate,
 fsync, unlink, rename, or exchange a filesystem object; create a socket or make
@@ -1378,18 +1396,21 @@ Before enabling the protocol, implementation must include:
 - FD 6 provenance tests proving that #419 opens only `/proc/self/exe`, retains
   that descriptor, and supplies it at numeric `stdio` index 6; that it never
   uses `process.execPath`, `PATH`, or a package runtime pathname; and that the
-  helper starts only from FD 3 through `/proc/self/fd/3`. They must cover the
-  complete pre-frame sequence: PDEATHSIG plus PPID recheck, direct-parent
-  PIDFD, same PID namespace, bounded/rechecked parent proc start-time, final
-  parent rechecks bracketing a fresh `/proc/<decimal-ppid>/exe` capture,
-  complete identical strict validation/hash, equality, and closure of temporary
-  proof descriptors. They must deterministically induce an intervening parent
-  exec after the first final recheck and assert that the fresh re-capture—not a
-  retained earlier parent-executable descriptor—detects the changed image and
-  refuses. They must admit a matching third-UID runtime, reject every owner-only
-  or nonmatching-identity case, parent exit/PID reuse/namespace/start-time/procfs
-  race, and prove no FD 1/FD 2 output, frame consumption, state mutation, or
-  invocation lease on ambiguity;
+  helper starts only from FD 3 through `/proc/self/fd/3`. They must prove the
+  exact pre-frame order: FD inventory/content/hash validation, FD 3/self,
+  both FD 4/FD 5 checks, initial FD 6 strict identity/hash capture,
+  `FD_CLOEXEC` mutations, and post-mutation revalidation all precede the final
+  parent-proof suffix. They must admit a matching third-UID runtime, reject
+  every owner-only or nonmatching-identity case, parent
+  exit/PID reuse/namespace/start-time/procfs race, and prove no FD 1/FD 2
+  output, frame consumption, durable state mutation, or invocation lease on
+  ambiguity. The required parent-`execve` injection matrix is:
+
+  | Injection point | Required result |
+  | --- | --- |
+  | After every pre-linearization checkpoint, including every non-parent admission checkpoint and every observation in the final tuple before the fresh executable capture | Refuse. No retained earlier parent-executable descriptor may satisfy equality, and no frame consumption, output, durable mutation, or invocation lease is permitted. |
+  | Immediately after the fresh `/proc/<decimal-ppid>/exe` open, or while its complete FD 6-equivalent validation/hash is running | Issuance is allowed only when the fresh capture linearized before the injected `execve`. The test must demonstrate that success claims equality only at that capture point, not at lease return or later. |
+  | After the final tuple after capture, before the caller observes lease return | Issuance is allowed only when that fresh capture already linearized. The test must demonstrate that the immediate in-memory `LeaseIssued` has the same bounded, non-retroactive claim and that no forbidden intervening operation occurred. |
 - TypeScript coverage for response versus no-response, unchanged result types,
   headers-received/body-timeout handling, legacy refusal, package verification,
   VerifyExisting's no-mutation path, and the normal authenticated path;
