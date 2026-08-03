@@ -123,6 +123,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Set up verified Rust toolchain
+        uses: ./.github/actions/setup-rust-toolchain
+
       - name: Check npm release ordering
         env:
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
@@ -487,6 +490,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Set up verified Rust toolchain
+        uses: ./release/.github/actions/setup-rust-toolchain
+
       - name: Verify trusted publishing prerequisites
         run: |
           node --version
@@ -799,6 +805,10 @@ jobs:
       - name: Install dependencies
         if: ${{ steps.npm.outputs.already_published != 'true' }}
         run: npm ci
+
+      - name: Set up verified Rust toolchain
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
+        uses: ./release/.github/actions/setup-rust-toolchain
 
       - name: Verify trusted publishing prerequisites
         if: ${{ steps.npm.outputs.already_published != 'true' }}

@@ -50,6 +50,9 @@ jobs:
       - name: Initialize CI environment
         uses: ./.github/actions/setup-ci
 
+      - name: Set up verified Rust toolchain
+        uses: ./.github/actions/setup-rust-toolchain
+
       - name: Type-check
         run: npm run typecheck
 
@@ -104,6 +107,9 @@ jobs:
         with:
           stage-postgresql: "true"
 
+      - name: Set up verified Rust toolchain
+        uses: ./.github/actions/setup-rust-toolchain
+
       - name: Run isolated PostgreSQL 18 conformance harness
         run: npm run test:postgresql
 
@@ -119,12 +125,11 @@ jobs:
       - name: Set up verified Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
 
-      - name: Compile static Linux x64 musl toolchain check
+      - name: Build package with verified Rust toolchain
         run: |
           set -Eeuo pipefail
-          printf '%s\n' 'fn main() {}' \
-            | rustc --target x86_64-unknown-linux-musl -o "$RUNNER_TEMP/lcm-musl-toolchain-check" -
-          test -x "$RUNNER_TEMP/lcm-musl-toolchain-check"
+          npm ci
+          npm run build
 
   ci:
     name: ci

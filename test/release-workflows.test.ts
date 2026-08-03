@@ -319,10 +319,43 @@ describe("release workflows", () => {
     for (const workflow of [versionWorkflow, publishWorkflow]) {
       for (const job of Object.values(workflow.jobs)) {
         for (const step of job.steps) {
-          if (step.uses) expect(step.uses).toMatch(/^[^@]+@[0-9a-f]{40}$/u);
+          if (step.uses?.startsWith("./")) {
+            expect(["./.github/actions/setup-rust-toolchain", "./release/.github/actions/setup-rust-toolchain"])
+              .toContain(step.uses);
+          } else if (step.uses) {
+            expect(step.uses).toMatch(/^[^@]+@[0-9a-f]{40}$/u);
+          }
         }
       }
     }
+  });
+
+  it("uses the verified Rust toolchain before every release-package build", () => {
+    for (const [jobName, actionPath] of [
+      ["draft", "./.github/actions/setup-rust-toolchain"],
+      ["preflight", "./release/.github/actions/setup-rust-toolchain"],
+      ["recover-preflight", "./release/.github/actions/setup-rust-toolchain"],
+    ] as const) {
+      const steps = publishWorkflow.jobs[jobName].steps;
+      const toolchainIndex = steps.findIndex(
+        (step) => step.name === "Set up verified Rust toolchain",
+      );
+      const buildIndex = steps.findIndex((step) => step.run === "npm run build");
+      expect(steps[toolchainIndex]).toEqual(
+        expect.objectContaining({
+          name: "Set up verified Rust toolchain",
+          uses: actionPath,
+        }),
+      );
+      expect(toolchainIndex).toBeGreaterThanOrEqual(0);
+      expect(buildIndex).toBeGreaterThan(toolchainIndex);
+    }
+
+    expect(
+      publishWorkflow.jobs["recover-preflight"].steps.find(
+        (step) => step.name === "Set up verified Rust toolchain",
+      ),
+    ).toMatchObject({ if: "${{ steps.npm.outputs.already_published != 'true' }}" });
   });
 
   it("publishes beta and stable versions to explicit npm dist-tags", () => {

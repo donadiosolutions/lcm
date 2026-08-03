@@ -53,6 +53,14 @@ describe("verified Rust CI toolchain", () => {
     expect(installer).not.toMatch(/\b(?:curl|wget)\b/u);
   });
 
+  it("verifies both compiler and package-manager provenance after installation", () => {
+    expect(installer).toContain('CARGO_COMMIT = "083ac5135f967fd9dc906ab057a2315861c7a80d"');
+    expect(installer).toContain('for name, executable, commit in (("rustc", rustc, RUST_COMMIT), ("cargo", cargo, CARGO_COMMIT)):');
+    expect(installer).toContain('[str(executable), "--version", "--verbose"]');
+    expect(installer).toContain('f"release: {RUST_VERSION}"');
+    expect(installer).toContain('f"commit-hash: {commit}"');
+  });
+
   it("uses the local verified setup before Rust CodeQL initialization", () => {
     expect(setupAction).toContain("install-verified-rust-toolchain.py");
     expect(setupAction).toContain('"$RUNNER_TEMP/lcm-rust-1.93.0/bin" >> "$GITHUB_PATH"');

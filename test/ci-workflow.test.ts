@@ -34,6 +34,7 @@ interface CiWorkflow {
       needs: string;
       "runs-on": string;
       strategy: { matrix: { run: number[] } };
+      steps: WorkflowStep[];
     };
     native: {
       name: string;
@@ -92,6 +93,20 @@ describe("CI workflow", () => {
     expect(workflow.jobs.postgresql.needs).toBe("environment");
     expect(workflow.jobs.postgresql["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
     expect(workflow.jobs.postgresql.strategy.matrix.run).toEqual([1, 2]);
+    for (const job of [workflow.jobs.core, workflow.jobs.postgresql]) {
+      const toolchainIndex = job.steps.findIndex(
+        (step) => step.name === "Set up verified Rust toolchain",
+      );
+      const buildIndex = job.steps.findIndex(
+        (step) => step.run === "npm run build" || step.run === "npm run test:postgresql",
+      );
+      expect(job.steps[toolchainIndex]).toEqual({
+        name: "Set up verified Rust toolchain",
+        uses: "./.github/actions/setup-rust-toolchain",
+      });
+      expect(toolchainIndex).toBeGreaterThanOrEqual(0);
+      expect(buildIndex).toBeGreaterThan(toolchainIndex);
+    }
     expect(workflow.jobs.native).toMatchObject({
       name: "Native helper toolchain",
       "runs-on": "blacksmith-4vcpu-ubuntu-2404",
@@ -107,8 +122,8 @@ describe("CI workflow", () => {
         uses: "./.github/actions/setup-rust-toolchain",
       },
       expect.objectContaining({
-        name: "Compile static Linux x64 musl toolchain check",
-        run: expect.stringContaining("rustc --target x86_64-unknown-linux-musl"),
+        name: "Build package with verified Rust toolchain",
+        run: expect.stringContaining(["set -Eeuo pipefail", "npm ci", "npm run build"].join("\n")),
       }),
     ]);
     expect(workflow.jobs.ci).toMatchObject({

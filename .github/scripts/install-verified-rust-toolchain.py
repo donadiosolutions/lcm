@@ -17,6 +17,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 RUST_VERSION = "1.93.0"
 RUST_COMMIT = "254b59607d4417e9dffbc307138ae5c86280fe4c"
+CARGO_COMMIT = "083ac5135f967fd9dc906ab057a2315861c7a80d"
 HOST = "x86_64-unknown-linux-gnu"
 TARGET = "x86_64-unknown-linux-musl"
 
@@ -117,14 +118,17 @@ def verify_toolchain(prefix: Path) -> None:
     if not rustc.is_file() or not cargo.is_file() or not target_std.is_dir():
         raise RuntimeError("installed Rust toolchain is incomplete")
 
-    version = subprocess.run(
-        [str(rustc), "--version", "--verbose"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    if f"release: {RUST_VERSION}" not in version or f"commit-hash: {RUST_COMMIT}" not in version:
-        raise RuntimeError("installed rustc does not match the pinned Rust 1.93.0 compiler")
+    for name, executable, commit in (("rustc", rustc, RUST_COMMIT), ("cargo", cargo, CARGO_COMMIT)):
+        version = subprocess.run(
+            [str(executable), "--version", "--verbose"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if f"release: {RUST_VERSION}" not in version or f"commit-hash: {commit}" not in version:
+            raise RuntimeError(
+                f"installed {name} does not match the pinned Rust {RUST_VERSION} toolchain",
+            )
 
 
 def main() -> None:
