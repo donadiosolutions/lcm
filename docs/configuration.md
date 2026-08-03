@@ -462,6 +462,14 @@ alias for the same managed start behavior. Use `lcm daemon start --foreground`
 only when you want the daemon to stay attached to the current terminal for
 debugging.
 
+The planned kernel-backed recovery path does not broaden that rule yet. It is
+being designed for an explicit `lcm daemon restart` on Linux x64 only, after a
+health exchange receives no HTTP response and only when a prior authenticated
+managed-launch record exactly matches the daemon. Any HTTP response remains on
+the existing authenticated path. Older, foreground, unsupported, or ambiguous
+daemons remain untouched. See [Kernel-backed recovery for a wedged managed
+daemon](daemon-restart-recovery.md) for the protocol and security boundaries.
+
 The managed systemd service receives a trusted executable path rather than the
 launching shell's `PATH`. It prepends the exact absolute launcher and runtime
 directories to a fixed set of system directories when those directories are

@@ -50,3 +50,15 @@ These failures produce a nonzero exit status and are not reported as “Nothing 
 compact.” A failed scan does not mark any session as processed. Back up the
 reported project database, resolve the SQLite or schema error, and rerun the
 command; the still-eligible sessions will be discovered again.
+
+### Planned kernel-backed wedged-daemon recovery
+
+LCM currently preserves a managed daemon when its bounded health check produces
+no response, because a PID and pathname alone are not safe authority to stop a
+possibly replaced process. The planned Linux x64 recovery path is limited to an
+explicit `lcm daemon restart`, requires authenticated launch evidence, and uses
+descriptor-bound state transitions and PIDFD-only signalling. It remains
+disabled until its native helper and integration are released; unsupported,
+legacy, or ambiguous cases continue to fail closed. See
+[the protocol contract](daemon-restart-recovery.md) for the exact boundaries
+and recovery-state guarantees.
