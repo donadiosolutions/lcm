@@ -122,6 +122,11 @@ describe("CI workflow", () => {
         uses: "./.github/actions/setup-rust-toolchain",
       },
       {
+        name: "Set up supported Node",
+        uses: "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+        with: { "node-version": "25.9.0" },
+      },
+      {
         name: "Test native helper with verified Rust toolchain",
         run: "cargo test --locked --offline --target x86_64-unknown-linux-gnu --manifest-path native/daemon-restart-helper/Cargo.toml",
       },

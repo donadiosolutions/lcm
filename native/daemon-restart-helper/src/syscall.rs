@@ -16,7 +16,6 @@ const SYS_PIDFD_SEND_SIGNAL: usize = 424;
 const SYS_PIDFD_OPEN: usize = 434;
 const SYS_OPENAT2: usize = 437;
 
-const AT_FDCWD: RawFd = -100;
 const O_DIRECTORY: u64 = 0o200000;
 const O_NOFOLLOW: u64 = 0o400000;
 const O_CLOEXEC: u64 = 0o2000000;
@@ -398,24 +397,26 @@ fn renameat2_with(
     decode_result(value).map(|_| ())
 }
 
-pub(crate) fn probe_openat2(raw: &impl RawSyscalls) -> Result<RawFd, Errno> {
-    let name = c".";
-    let how = OpenHow {
-        flags: O_PATH | O_DIRECTORY | O_CLOEXEC,
-        mode: 0,
-        resolve: RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
-    };
-    openat2_with(raw, AT_FDCWD, name, &how)
+/// Probes a renameat2 flag only relative to an already admitted descriptor. Deliberately invalid
+/// null names distinguish a recognized syscall/flag (EFAULT) without looking up or mutating an
+/// ambient namespace entry.
+pub(crate) fn probe_rename_flag_on_held_descriptor(
+    parent: RawFd,
+    flag: usize,
+) -> Result<(), Errno> {
+    probe_rename_flag_on_held_descriptor_with(&LinuxRaw, parent, flag)
 }
 
-pub(crate) fn probe_rename_flag(raw: &impl RawSyscalls, flag: usize) -> Result<(), Errno> {
-    // Deliberately invalid null paths distinguish a recognized syscall/flag (EFAULT) without
-    // changing any namespace entry. EFAULT is consumed by the capability probe as success.
+pub(crate) fn probe_rename_flag_on_held_descriptor_with(
+    raw: &impl RawSyscalls,
+    parent: RawFd,
+    flag: usize,
+) -> Result<(), Errno> {
     // SAFETY: null paths are intentionally passed to provoke a side-effect-free kernel error.
     let value = unsafe {
         raw.call6(
             SYS_RENAMEAT2,
-            [AT_FDCWD as usize, 0, AT_FDCWD as usize, 0, flag, 0],
+            [parent as usize, 0, parent as usize, 0, flag, 0],
         )
     };
     decode_result(value).map(|_| ())
@@ -436,9 +437,23 @@ struct Flock {
 }
 
 const SYS_FCNTL: usize = 72;
+const SYS_GETPID: usize = 39;
+const SYS_GETPPID: usize = 110;
+const SYS_GETEUID: usize = 107;
+const SYS_GETEGID: usize = 108;
+const SYS_PRCTL: usize = 157;
+const SYS_KCMP: usize = 312;
+const SYS_GETPEERNAME: usize = 52;
+const SYS_GETSOCKOPT: usize = 55;
 const F_OFD_SETLK: usize = 37;
+const F_GETFD: usize = 1;
+const F_SETFD: usize = 2;
+const F_GETFL: usize = 3;
+const FD_CLOEXEC: usize = 1;
 const F_WRITE_LOCK: i16 = 1;
 const F_UNLOCK: i16 = 2;
+const PR_SET_PDEATHSIG: usize = 1;
+const KCMP_FILE: usize = 0;
 
 pub(crate) fn ofd_lock_with(
     raw: &impl RawSyscalls,
@@ -478,12 +493,164 @@ pub(crate) fn release_ofd_lock(descriptor: RawFd) -> Result<(), Errno> {
     ofd_lock_with(&LinuxRaw, descriptor, F_UNLOCK)
 }
 
+/// The only mutable status bit version 1 accepts on protocol streams.
+pub(crate) const O_NONBLOCK_STATUS: usize = O_NONBLOCK as usize;
+/// Kernel-generated large-file status is not a caller-controlled status flag on x86_64.
+pub(crate) const O_LARGEFILE_STATUS: usize = 0o100000;
+pub(crate) const O_RDONLY_ACCESS: usize = 0;
+pub(crate) const O_WRONLY_ACCESS: usize = 1;
+pub(crate) const O_RDWR_ACCESS: usize = 2;
+
+pub(crate) fn descriptor_fd_flags(descriptor: RawFd) -> Result<usize, Errno> {
+    fcntl_with(&LinuxRaw, descriptor, F_GETFD, 0)
+}
+
+pub(crate) fn descriptor_status_flags(descriptor: RawFd) -> Result<usize, Errno> {
+    fcntl_with(&LinuxRaw, descriptor, F_GETFL, 0)
+}
+
+pub(crate) fn set_descriptor_cloexec(descriptor: RawFd) -> Result<(), Errno> {
+    let flags = descriptor_fd_flags(descriptor)?;
+    fcntl_with(&LinuxRaw, descriptor, F_SETFD, flags | FD_CLOEXEC).map(|_| ())
+}
+
+pub(crate) fn descriptor_has_cloexec(descriptor: RawFd) -> Result<bool, Errno> {
+    Ok(descriptor_fd_flags(descriptor)? & FD_CLOEXEC != 0)
+}
+
+/// Compares two descriptors using Linux's file-description identity primitive.  An unavailable or
+/// permission-denied `kcmp` is intentionally an error: inode equality cannot prove non-aliasing.
+pub(crate) fn same_file_description(first: RawFd, second: RawFd) -> Result<bool, Errno> {
+    let pid = current_pid()?;
+    // SAFETY: kcmp has no pointer arguments and compares descriptors only in this process.
+    let value = unsafe {
+        LinuxRaw.call6(
+            SYS_KCMP,
+            [
+                pid as usize,
+                pid as usize,
+                KCMP_FILE,
+                first as usize,
+                second as usize,
+                0,
+            ],
+        )
+    };
+    Ok(decode_result(value)? == 0)
+}
+
+pub(crate) fn current_pid() -> Result<u32, Errno> {
+    value_as_u32(SYS_GETPID)
+}
+
+pub(crate) fn direct_parent_pid() -> Result<u32, Errno> {
+    value_as_u32(SYS_GETPPID)
+}
+
+pub(crate) fn effective_uid() -> Result<u32, Errno> {
+    value_as_u32(SYS_GETEUID)
+}
+
+pub(crate) fn effective_gid() -> Result<u32, Errno> {
+    value_as_u32(SYS_GETEGID)
+}
+
+fn value_as_u32(number: usize) -> Result<u32, Errno> {
+    // SAFETY: these selected syscalls have no pointer arguments.
+    let value = unsafe { LinuxRaw.call6(number, [0; 6]) };
+    u32::try_from(decode_result(value)?).map_err(|_| Errno::EINVAL)
+}
+
+pub(crate) fn arm_parent_death_sigkill() -> Result<(), Errno> {
+    // SAFETY: prctl's scalar arguments are fixed to PR_SET_PDEATHSIG and SIGKILL.
+    let value = unsafe { LinuxRaw.call6(SYS_PRCTL, [PR_SET_PDEATHSIG, 9, 0, 0, 0, 0]) };
+    decode_result(value).map(|_| ())
+}
+
+pub(crate) fn pidfd_is_live(pidfd: RawFd) -> Result<(), Errno> {
+    pidfd_send_signal_with(&LinuxRaw, pidfd, 0)
+}
+
+/// Establishes the complete version-1 socket endpoint representation without consulting a
+/// pathname: anonymous AF_UNIX, SOCK_STREAM, non-listening, and connected to an unnamed peer.
+pub(crate) fn is_connected_unnamed_unix_stream(descriptor: RawFd) -> Result<bool, Errno> {
+    const SOL_SOCKET: usize = 1;
+    const SO_TYPE: usize = 3;
+    const SO_ACCEPTCONN: usize = 30;
+    const SO_DOMAIN: usize = 39;
+    const AF_UNIX: i32 = 1;
+    const SOCK_STREAM: i32 = 1;
+    if getsockopt_i32(descriptor, SOL_SOCKET, SO_DOMAIN)? != AF_UNIX
+        || getsockopt_i32(descriptor, SOL_SOCKET, SO_TYPE)? != SOCK_STREAM
+        || getsockopt_i32(descriptor, SOL_SOCKET, SO_ACCEPTCONN)? != 0
+    {
+        return Ok(false);
+    }
+    let mut address = [0_u8; 128];
+    let mut length = address.len() as u32;
+    // SAFETY: address and length are writable for getpeername's bounded sockaddr output.
+    let value = unsafe {
+        LinuxRaw.call6(
+            SYS_GETPEERNAME,
+            [
+                descriptor as usize,
+                address.as_mut_ptr() as usize,
+                core::ptr::from_mut(&mut length) as usize,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    decode_result(value)?;
+    if length != 2 {
+        return Ok(false);
+    }
+    Ok(u16::from_ne_bytes([address[0], address[1]]) == AF_UNIX as u16)
+}
+
+fn getsockopt_i32(descriptor: RawFd, level: usize, option: usize) -> Result<i32, Errno> {
+    let mut value = 0_i32;
+    let mut length = core::mem::size_of::<i32>() as u32;
+    // SAFETY: value and length are writable and exactly sized for the scalar socket option.
+    let result = unsafe {
+        LinuxRaw.call6(
+            SYS_GETSOCKOPT,
+            [
+                descriptor as usize,
+                level,
+                option,
+                core::ptr::from_mut(&mut value) as usize,
+                core::ptr::from_mut(&mut length) as usize,
+                0,
+            ],
+        )
+    };
+    decode_result(result)?;
+    if length != core::mem::size_of::<i32>() as u32 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(value)
+}
+
+fn fcntl_with(
+    raw: &impl RawSyscalls,
+    descriptor: RawFd,
+    command: usize,
+    argument: usize,
+) -> Result<usize, Errno> {
+    // SAFETY: fcntl's third argument is scalar for each command used here.
+    let value = unsafe { raw.call6(SYS_FCNTL, [descriptor as usize, command, argument, 0, 0, 0]) };
+    decode_result(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::fs::{self, File};
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FakeRaw {
@@ -614,5 +781,53 @@ mod tests {
         assert_eq!(list_directory(directory.as_fd(), 1), Err(Errno::EINVAL));
         drop(directory);
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn unix_stream_admission_requires_a_connected_unnamed_stream_endpoint() {
+        let (first, second) = UnixStream::pair().unwrap();
+        assert_eq!(
+            is_connected_unnamed_unix_stream(first.as_raw_fd()),
+            Ok(true)
+        );
+        assert_eq!(
+            is_connected_unnamed_unix_stream(second.as_raw_fd()),
+            Ok(true)
+        );
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "lcm-helper-listener-{}-{nonce}",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        assert_eq!(
+            is_connected_unnamed_unix_stream(listener.as_raw_fd()),
+            Ok(false)
+        );
+        drop(listener);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rename_flag_probe_uses_only_the_admitted_held_descriptor() {
+        let raw = FakeRaw {
+            result: -(Errno::EFAULT.0 as isize),
+            calls: RefCell::new(Vec::new()),
+        };
+        assert_eq!(
+            probe_rename_flag_on_held_descriptor_with(&raw, 57, PROBE_RENAME_EXCHANGE),
+            Err(Errno::EFAULT)
+        );
+        let call = raw.calls.borrow()[0];
+        assert_eq!(call.0, SYS_RENAMEAT2);
+        assert_eq!(call.1[0], 57);
+        assert_eq!(call.1[1], 0);
+        assert_eq!(call.1[2], 57);
+        assert_eq!(call.1[3], 0);
+        assert_eq!(call.1[4], PROBE_RENAME_EXCHANGE);
     }
 }
