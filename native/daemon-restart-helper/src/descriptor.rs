@@ -5,6 +5,8 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
 
+use crate::sha256;
+
 const FILE_TYPE_MASK: u32 = 0o170000;
 const FILE_TYPE_REGULAR: u32 = 0o100000;
 const FILE_TYPE_DIRECTORY: u32 = 0o040000;
@@ -129,6 +131,40 @@ impl Descriptor {
         Ok(output)
     }
 
+    /// Reads the complete, descriptor-addressed regular-file contents without changing its offset.
+    ///
+    /// The pre-read size is a hard bound, EOF must occur at that boundary, and the immutable leaf
+    /// identity must be unchanged after the read.  This is intentionally stricter than
+    /// [`Self::read_bounded`]: callers use it for inherited invocation authorities where a short
+    /// read or concurrent growth is ambiguity, never an alternate representation.
+    pub(crate) fn read_complete(
+        &self,
+        policy: DescriptorPolicy,
+    ) -> Result<DescriptorContent, DescriptorError> {
+        let identity = self.validate(policy)?;
+        let DescriptorIdentity::StrictLeaf { size, .. } = identity else {
+            return Err(DescriptorError::WrongKind);
+        };
+        let maximum = usize::try_from(size).map_err(|_| DescriptorError::TooLarge)?;
+        let bytes = self.read_bounded(maximum)?;
+        if bytes.len() != maximum {
+            return Err(DescriptorError::ShortIo);
+        }
+        let post_identity = self.validate(policy)?;
+        if post_identity != identity {
+            return Err(DescriptorError::Replacement);
+        }
+        Ok(DescriptorContent {
+            identity,
+            digest: sha256::digest(&bytes),
+            bytes,
+        })
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self, DescriptorError> {
+        self.0.try_clone().map(Self).map_err(io_error)
+    }
+
     pub fn sync_all(&self) -> Result<(), DescriptorError> {
         self.0.sync_all().map_err(io_error)
     }
@@ -181,6 +217,14 @@ pub enum DescriptorIdentity {
     },
 }
 
+/// A complete bounded read coupled to its pre- and post-read immutable identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DescriptorContent {
+    pub(crate) identity: DescriptorIdentity,
+    pub(crate) digest: [u8; 32],
+    pub(crate) bytes: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DescriptorError {
     Io(i32),
@@ -191,6 +235,7 @@ pub enum DescriptorError {
     WrongLinkCount,
     TooLarge,
     ShortIo,
+    Replacement,
 }
 
 #[cfg(test)]

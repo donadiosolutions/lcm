@@ -5,6 +5,7 @@
 //! launches a daemon, or changes recovery state.
 
 use lcm_daemon_restart_helper::capability;
+use lcm_daemon_restart_helper::invocation;
 use std::process::ExitCode;
 
 const EXIT_CAPABILITY_UNAVAILABLE: u8 = 69;
@@ -12,7 +13,12 @@ const EXIT_PROTOCOL_ENGINE_UNAVAILABLE: u8 = 78;
 
 fn main() -> ExitCode {
     match capability::probe() {
-        Ok(_) => ExitCode::from(EXIT_PROTOCOL_ENGINE_UNAVAILABLE),
+        Ok(_) => {
+            // The next protocol slice remains intentionally unwired; this is a successful
+            // descriptor/state admission with no frame dispatch or lifecycle action.
+            let _admitted = invocation::admit();
+            ExitCode::from(EXIT_PROTOCOL_ENGINE_UNAVAILABLE)
+        }
         Err(_) => ExitCode::from(EXIT_CAPABILITY_UNAVAILABLE),
     }
 }

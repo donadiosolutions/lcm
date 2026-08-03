@@ -10,10 +10,10 @@ compile_error!("lcm-daemon-restart-helper supports only Linux x86_64");
 
 pub mod capability;
 pub mod descriptor;
+pub mod invocation;
 pub mod persistence;
 pub mod protocol;
 pub mod record;
 mod sha256;
-#[allow(dead_code)] // Intentionally staged and unwired until the protocol engine lands.
 mod stable;
 pub mod syscall;
