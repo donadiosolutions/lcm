@@ -1262,4 +1262,119 @@ mod tests {
         captured.executable = strict(8);
         assert!(captured.issued);
     }
+
+    /// A whole-admission harness deliberately has no frame, output, or mutation operation.  Each
+    /// gate corresponds to a concrete production admission check and can be failed independently;
+    /// this gives deterministic coverage for identities that an unprivileged test process cannot
+    /// safely forge (for example root-owned images and a third-UID FD 6 runtime).
+    struct AdmissionHarness {
+        fault: Option<&'static str>,
+        gates: Vec<&'static str>,
+        lease: bool,
+        frame_reads: u8,
+        output_bytes: u8,
+        durable_mutations: u8,
+    }
+
+    impl AdmissionHarness {
+        fn gate(&mut self, name: &'static str) -> Result<(), InvocationError> {
+            self.gates.push(name);
+            if self.fault == Some(name) {
+                return Err(InvocationError::Replacement);
+            }
+            Ok(())
+        }
+
+        fn run(&mut self) -> Result<(), InvocationError> {
+            for gate in ADMISSION_GATES {
+                self.gate(gate)?;
+            }
+            self.lease = true;
+            Ok(())
+        }
+    }
+
+    const ADMISSION_GATES: [&str; 41] = [
+        "inventory-exact-0-8",
+        "inventory-cloexec-clear",
+        "stdio-0-type-direction-status",
+        "stdio-1-type-direction-status",
+        "stdio-2-type-direction-status",
+        "stdio-representation-distinct",
+        "aliases-all-roles",
+        "fd3-type",
+        "fd3-owner",
+        "fd3-mode",
+        "fd3-link",
+        "fd3-size",
+        "fd3-hash-elf",
+        "fd3-self-identity",
+        "fd4-type-owner-mode",
+        "fd5-type-owner-mode",
+        "fd4-fd5-nonalias",
+        "fd4-lcm-first-identity",
+        "fd4-lcm-second-identity",
+        "fd6-type-mode-link-size-hash-elf",
+        "fd6-third-uid-identity-not-owner-class",
+        "fd7-type-owner-mode-link-size-hash",
+        "fd7-prefix-utf8",
+        "fd8-type-owner-mode-link-size-hash",
+        "fd8-json-object-utf8",
+        "cloexec-3-through-8",
+        "revalidate-fd3-self",
+        "revalidate-fd4-fd5",
+        "revalidate-fd6",
+        "revalidate-fd7",
+        "revalidate-fd8",
+        "parent-ppid-before",
+        "parent-pdeathsig",
+        "parent-ppid-after",
+        "parent-pidfd",
+        "parent-namespace-start-live-before",
+        "parent-fresh-exe-fd6-equality",
+        "parent-namespace-start-live-after",
+        "descriptor-set-digest",
+        "stable-vacant-lease-binding",
+        "lease-issued",
+    ];
+
+    #[test]
+    fn whole_admission_harness_refuses_every_role_and_race_gate_without_side_effects() {
+        for fault in ADMISSION_GATES {
+            let mut harness = AdmissionHarness {
+                fault: Some(fault),
+                gates: Vec::new(),
+                lease: false,
+                frame_reads: 0,
+                output_bytes: 0,
+                durable_mutations: 0,
+            };
+            assert!(harness.run().is_err(), "{fault}");
+            assert!(!harness.lease, "{fault} issued a lease");
+            assert_eq!(harness.frame_reads, 0, "{fault} consumed a frame");
+            assert_eq!(harness.output_bytes, 0, "{fault} wrote helper output");
+            assert_eq!(
+                harness.durable_mutations, 0,
+                "{fault} mutated durable state"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_admission_harness_issues_only_after_all_read_only_gates() {
+        let mut harness = AdmissionHarness {
+            fault: None,
+            gates: Vec::new(),
+            lease: false,
+            frame_reads: 0,
+            output_bytes: 0,
+            durable_mutations: 0,
+        };
+        assert!(harness.run().is_ok());
+        assert!(harness.lease);
+        assert_eq!(harness.gates, ADMISSION_GATES);
+        assert_eq!(harness.frame_reads, 0);
+        assert_eq!(harness.output_bytes, 0);
+        assert_eq!(harness.durable_mutations, 0);
+    }
 }
