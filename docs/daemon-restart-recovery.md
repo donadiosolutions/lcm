@@ -487,13 +487,15 @@ Neither exit status carries secret detail.
 After descriptor admission and a request has passed its matching durable
 admission, later replacement or descriptor drift maps to `E_IDENTITY`; a
 genuinely unavailable required platform capability maps to `E_UNSUPPORTED`; and
-an otherwise ambiguous bounded I/O failure maps to `E_IO`. Each has an empty
-body and the durable phase of the route already admitted: `STABLE` (`0x0000`)
-for `OpenStable`, or `PREPARED` (`0x0001`) for the initial Prepared-only
-`ResumeActive` route. A framing error continues to use `E_PROTOCOL`. The
-bounded zero-session router above is not response-capable until that matching
-admission succeeds, so these response codes never retroactively make a
-pre-frame or router refusal response-capable.
+an otherwise ambiguous bounded I/O failure maps to `E_IO`. Every
+response-capable post-admission error—those three, `E_PROTOCOL`, `E_PHASE`, or
+any other `E_*` code—has an empty body and the durable phase of the route or
+session already admitted: `STABLE` (`0x0000`) for `OpenStable`, or `PREPARED`
+(`0x0001`) for the initial Prepared-only `ResumeActive` route. A malformed or
+unapproved router frame is not a response-capable `E_PROTOCOL`: the bounded
+zero-session router above remains silent until matching admission succeeds, so
+these response codes never retroactively make a pre-frame or router refusal
+response-capable.
 
 The recovery-root descriptor is helper-derived from descriptor 5 and is
 deliberately neither the HOME nor state-root descriptor. Bootstrap derives it
@@ -1339,7 +1341,7 @@ and current kernel facts, not by repeatedly overwriting mutable state.
 | Both daemon.launch.current.v1 and daemon.pid are their exact MAC-verified vacancy markers                                                               | This is the supported stable no-daemon state. A helper-owned start may proceed; no existing process is adopted. A former managed PID requires sealed RetireDead or exact recovery-abort retirement first.                                                     |
 | daemon.launch.current.v1 is vacant while daemon.pid is non-vacant, numeric, malformed, or not exactly bound to an admitted helper-managed launch record | Treat any apparent daemon as legacy. Preserve it, its PID file, token, and all evidence.                                                                                                                                                                      |
 | Launch record or descriptor mismatch                                                                                                                    | Preserve all leaves and refuse.                                                                                                                                                                                                                               |
-| lifecycle.serial.v1 cannot be opened, identity-verified, or exclusively OFD-locked                                                                      | Return E_BUSY, E_LAYOUT, or E_UNSUPPORTED before layout trust, slot selection, process launch, PID publication, quarantine, or signal. Selectors remain the durable fence even when the lock is held.                                                         |
+| lifecycle.serial.v1 cannot be opened, identity-verified, or exclusively OFD-locked                                                                      | A zero-session OpenStable/ResumeActive router silently refuses before layout trust, slot selection, process launch, PID publication, quarantine, or signal. Only an already response-capable live-session operation may return E_BUSY, E_LAYOUT, or E_UNSUPPORTED, with its already-admitted durable phase. Selectors remain the durable fence even when the lock is held. |
 | A received HTTP response exists                                                                                                                         | Use the existing authenticated path; do not invoke the helper.                                                                                                                                                                                                |
 | Syscall, procfs, filesystem, architecture, or helper check is unsupported                                                                               | Preserve state and return the existing fail-closed result.                                                                                                                                                                                                    |
 | VerifyExisting has an exact managed PID/launch record                                                                                                   | Run the direct managed-admission predicate without reserving a slot or changing a selector, PID, launch record, or terminal group. A mismatch refuses rather than falling back to recovery.                                                                   |
