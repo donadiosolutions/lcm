@@ -488,10 +488,12 @@ After descriptor admission and a request has passed its matching durable
 admission, later replacement or descriptor drift maps to `E_IDENTITY`; a
 genuinely unavailable required platform capability maps to `E_UNSUPPORTED`; and
 an otherwise ambiguous bounded I/O failure maps to `E_IO`. Each has an empty
-body and durable phase `STABLE` (`0x0000`). A framing error continues to use
-`E_PROTOCOL`. The bounded zero-session router above is not response-capable
-until that matching admission succeeds, so these response codes never
-retroactively make a pre-frame or router refusal response-capable.
+body and the durable phase of the route already admitted: `STABLE` (`0x0000`)
+for `OpenStable`, or `PREPARED` (`0x0001`) for the initial Prepared-only
+`ResumeActive` route. A framing error continues to use `E_PROTOCOL`. The
+bounded zero-session router above is not response-capable until that matching
+admission succeeds, so these response codes never retroactively make a
+pre-frame or router refusal response-capable.
 
 The recovery-root descriptor is helper-derived from descriptor 5 and is
 deliberately neither the HOME nor state-root descriptor. Bootstrap derives it
