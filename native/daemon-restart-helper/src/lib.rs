@@ -16,4 +16,5 @@ pub mod record;
 mod sha256;
 mod stable;
 pub mod syscall;
+pub mod transition;
 mod transport;
