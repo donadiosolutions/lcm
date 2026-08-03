@@ -640,7 +640,7 @@ pub(crate) fn release_ofd_lock(descriptor: RawFd) -> Result<(), Errno> {
     ofd_lock_with(&LinuxRaw, descriptor, F_UNLOCK)
 }
 
-/// The only mutable status bit version 1 accepts on protocol streams.
+/// The required and only mutable status bit version 1 accepts on protocol streams.
 pub(crate) const O_NONBLOCK_STATUS: usize = O_NONBLOCK as usize;
 /// Kernel-generated large-file status is not a caller-controlled status flag on x86_64.
 pub(crate) const O_LARGEFILE_STATUS: usize = 0o100000;

@@ -466,9 +466,7 @@ fn validate_streams() -> Result<(), InvocationError> {
 
 fn validate_stream(descriptor: i32, access: usize) -> Result<ProtocolStream, InvocationError> {
     let flags = syscall::descriptor_status_flags(descriptor).map_err(InvocationError::Syscall)?;
-    if flags & !(3 | O_NONBLOCK_STATUS | O_LARGEFILE_STATUS) != 0 {
-        return Err(InvocationError::InvalidStatusFlags);
-    }
+    validate_protocol_stream_status_flags(flags)?;
     let target = fs::read_link(format!("/proc/self/fd/{descriptor}"))
         .map_err(|_| InvocationError::InvalidProtocolStream)?;
     let target = target.as_os_str().as_encoded_bytes();
@@ -495,6 +493,18 @@ fn validate_stream(descriptor: i32, access: usize) -> Result<ProtocolStream, Inv
         });
     }
     Err(InvocationError::InvalidProtocolStream)
+}
+
+/// Protocol I/O is deadline-bounded only when a readiness result cannot be followed by a
+/// blocking operation.  This checks the caller-provided status flags but deliberately does not
+/// normalize them: `O_NONBLOCK` belongs to the inherited open file description, so an `F_SETFL`
+/// here could mutate a caller-visible authority after the ABI inventory was accepted.
+fn validate_protocol_stream_status_flags(flags: usize) -> Result<(), InvocationError> {
+    if flags & O_NONBLOCK_STATUS == 0 || flags & !(3 | O_NONBLOCK_STATUS | O_LARGEFILE_STATUS) != 0
+    {
+        return Err(InvocationError::InvalidStatusFlags);
+    }
+    Ok(())
 }
 
 fn stream_object_identity(descriptor: i32) -> Result<StreamObjectIdentity, InvocationError> {
@@ -1253,6 +1263,28 @@ impl JsonParser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
+
+    unsafe extern "C" {
+        fn pipe2(pipefd: *mut i32, flags: i32) -> i32;
+    }
+
+    fn nonblocking_pipe() -> (File, File) {
+        let mut descriptors = [-1_i32; 2];
+        // SAFETY: `descriptors` is writable for exactly the two file descriptors required by
+        // pipe2, and O_NONBLOCK is the status supplied by the external ABI caller.
+        assert_eq!(
+            unsafe { pipe2(descriptors.as_mut_ptr(), O_NONBLOCK_STATUS as i32) },
+            0
+        );
+        // SAFETY: successful pipe2 returned two fresh owned descriptors.
+        unsafe {
+            (
+                File::from_raw_fd(descriptors[0]),
+                File::from_raw_fd(descriptors[1]),
+            )
+        }
+    }
 
     fn strict(seed: u64) -> StrictIdentity {
         StrictIdentity {
@@ -1474,6 +1506,47 @@ mod tests {
             },
         ];
         assert!(require_distinct_stream_objects(distinct_unix_streams).is_ok());
+    }
+
+    #[test]
+    fn protocol_streams_reject_blocking_status_without_mutating_inherited_fd() {
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let before = syscall::descriptor_status_flags(reader.as_raw_fd()).unwrap();
+        assert_eq!(before & O_NONBLOCK_STATUS, 0);
+        assert_eq!(
+            validate_stream(reader.as_raw_fd(), O_RDONLY_ACCESS),
+            Err(InvocationError::InvalidStatusFlags)
+        );
+        // Admission never silently changes the inherited open file description.
+        assert_eq!(
+            syscall::descriptor_status_flags(reader.as_raw_fd()).unwrap(),
+            before
+        );
+
+        // An anonymous pipe retains its version-1 representation and access mode when its
+        // caller-supplied status is nonblocking.
+        let (nonblocking_reader, _nonblocking_writer) = nonblocking_pipe();
+        assert!(matches!(
+            validate_stream(nonblocking_reader.as_raw_fd(), O_RDONLY_ACCESS),
+            Ok(ProtocolStream {
+                class: StreamClass::Pipe,
+                ..
+            })
+        ));
+        assert_eq!(
+            validate_protocol_stream_status_flags(O_RDONLY_ACCESS | O_NONBLOCK_STATUS | 0o20_000,),
+            Err(InvocationError::InvalidStatusFlags)
+        );
+
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            validate_stream(stream.as_raw_fd(), O_RDWR_ACCESS),
+            Ok(ProtocolStream {
+                class: StreamClass::UnixStream,
+                ..
+            })
+        ));
     }
 
     #[test]

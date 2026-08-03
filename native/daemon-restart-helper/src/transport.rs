@@ -175,6 +175,8 @@ mod tests {
         output: Vec<u8>,
         waits: Vec<bool>,
         wait_result: bool,
+        write_error_after: Option<usize>,
+        write_calls: usize,
         random: [u8; 32],
         random_error: Option<Errno>,
     }
@@ -195,6 +197,10 @@ mod tests {
             Ok(count)
         }
         fn write(&mut self, bytes: &[u8]) -> Result<usize, Errno> {
+            if self.write_error_after == Some(self.write_calls) {
+                return Err(Errno(32));
+            }
+            self.write_calls += 1;
             let count = bytes.len().min(19);
             self.output.extend_from_slice(&bytes[..count]);
             Ok(count)
@@ -228,6 +234,8 @@ mod tests {
             output: Vec::new(),
             waits: Vec::new(),
             wait_result: true,
+            write_error_after: None,
+            write_calls: 0,
             random: [3; 32],
             random_error: None,
         };
@@ -254,6 +262,8 @@ mod tests {
             output: Vec::new(),
             waits: Vec::new(),
             wait_result: true,
+            write_error_after: None,
+            write_calls: 0,
             random: [3; 32],
             random_error: None,
         };
@@ -270,6 +280,8 @@ mod tests {
             output: Vec::new(),
             waits: Vec::new(),
             wait_result: false,
+            write_error_after: None,
+            write_calls: 0,
             random: [3; 32],
             random_error: None,
         };
@@ -286,6 +298,8 @@ mod tests {
             output: Vec::new(),
             waits: Vec::new(),
             wait_result: true,
+            write_error_after: None,
+            write_calls: 0,
             random: [0; 32],
             random_error: None,
         };
@@ -304,6 +318,8 @@ mod tests {
             output: Vec::new(),
             waits: Vec::new(),
             wait_result: true,
+            write_error_after: None,
+            write_calls: 0,
             random: [3; 32],
             random_error: None,
         };
@@ -334,6 +350,8 @@ mod tests {
                 output: Vec::new(),
                 waits: Vec::new(),
                 wait_result: true,
+                write_error_after: None,
+                write_calls: 0,
                 random: [3; 32],
                 random_error: Some(error),
             };
@@ -351,10 +369,32 @@ mod tests {
             output: Vec::new(),
             waits: Vec::new(),
             wait_result: true,
+            write_error_after: None,
+            write_calls: 0,
             random: [3; 32],
             random_error: Some(Errno::ENOSYS),
         };
         assert_eq!(serve_with(&mut io), Err(TransportError::Unsupported));
         assert!(io.output.is_empty());
+    }
+
+    #[test]
+    fn partial_response_bytes_are_not_a_complete_response() {
+        let mut io = Fake {
+            now: 1,
+            input: request(),
+            read_at: 0,
+            read_limit: 17,
+            output: Vec::new(),
+            waits: Vec::new(),
+            wait_result: true,
+            write_error_after: Some(1),
+            write_calls: 0,
+            random: [3; 32],
+            random_error: None,
+        };
+        assert_eq!(serve_with(&mut io), Err(TransportError::Io));
+        assert_eq!(io.output.len(), 19);
+        assert!(Frame::decode(&io.output).is_err());
     }
 }
