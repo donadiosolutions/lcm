@@ -21,6 +21,8 @@ normally after `daemon.idleTimeoutMs` remains registered but does not consume a
 process. The next lifecycle request recreates the registered service through
 the same manager. Idle recreation is therefore safe and quiet, while a
 crashed or wedged process is not silently replaced in the background.
+If launchd reports a spawned service that has crashed, run `lcm doctor` and
+`lcm daemon restart`; do not manually kill or boot out the job.
 
 Use these commands for normal operation:
 

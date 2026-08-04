@@ -381,6 +381,30 @@ describe("systemd-user supervisor", () => {
     expect(runner.calls[2].timeoutMs).toBe(spec.stopTimeoutMs);
   });
 
+  it("accepts a not-loaded stop race only after an exact prior probe and absent poll", async () => {
+    const spec = makeSpec("systemd-user");
+    const race = fakeRunner([
+      { code: 0, stdout: managerText(spec, "active", 515) },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not loaded` },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not found` },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: race.run,
+      platform: "linux",
+    }).stopAndAwaitAbsent(spec)).resolves.toBeUndefined();
+    expect(race.calls[1].args).toEqual(["--user", "stop", spec.systemdUnit]);
+
+    const genericFailure = fakeRunner([
+      { code: 0, stdout: managerText(spec, "active", 515) },
+      { code: 1, stderr: "permission denied" },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not found` },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: genericFailure.run,
+      platform: "linux",
+    }).stopAndAwaitAbsent(spec)).rejects.toThrow("manager command");
+  });
+
   it("parses JSON/key-value variants and all terminal/metadata refusal boundaries", async () => {
     const spec = makeSpec("systemd-user");
     const identity = ` LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)} LCM_SUPERVISOR_CWD=`;
@@ -784,7 +808,7 @@ describe("systemd-user supervisor", () => {
     expect((await hanging.probe(spec)).kind).toBe("unavailable");
     const unsupported = createSupervisor("launchd-user", { run: vi.fn() });
     expect((await unsupported.probe(makeSpec("launchd-user"))).kind).toBe("unavailable");
-    const absentLaunchd = fakeRunner([{ code: 1, stderr: "Could not find service" }]);
+    const absentLaunchd = fakeRunner([{ code: 113, stderr: "Could not find service" }]);
     const noExplicitUid = createSupervisor("launchd-user", { run: absentLaunchd.run, platform: "darwin" });
     expect((await noExplicitUid.probe(makeSpec("launchd-user"))).kind).toBe("absent");
     const unsafeSystemd = makeSpec("systemd-user", makeRoot(), { credentialFiles: [{ name: "EVIL", path: "/tmp/not-private" }] });
@@ -863,10 +887,10 @@ describe("systemd-user supervisor", () => {
       "LCM_SUPERVISOR_CWD =>",
     ].join("\n");
     const launchdCredentialRunner = fakeRunner([
-      { code: 1, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
       { code: 0, stdout: "bootstrapped" },
       { code: 0, stdout: launchdTerminalOutput },
-      { code: 1, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
     ]);
     await expect(createSupervisor("launchd-user", {
       run: launchdCredentialRunner.run,
@@ -879,6 +903,49 @@ describe("systemd-user supervisor", () => {
 });
 
 describe("launchd-user supervisor", () => {
+  it("classifies captured launchctl absence vocabulary without hiding permission or transport failures", async () => {
+    const spec = makeSpec("launchd-user");
+    const exactExitCode = fakeRunner([{ code: 36, stderr: "No such process" }]);
+    await expect(createSupervisor("launchd-user", {
+      run: exactExitCode.run,
+      platform: "darwin",
+      uid: 501,
+    }).probe(spec)).resolves.toMatchObject({ kind: "absent", name: spec.launchdLabel });
+
+    const capturedNotFound = fakeRunner([{
+      code: 113,
+      stderr: `Could not find service "${spec.launchdLabel}" in domain gui/501`,
+    }]);
+    await expect(createSupervisor("launchd-user", {
+      run: capturedNotFound.run,
+      platform: "darwin",
+      uid: 501,
+    }).probe(spec)).resolves.toMatchObject({ kind: "absent", name: spec.launchdLabel });
+
+    for (const stderr of [
+      "Could not find socket in domain gui/501",
+      "Permission denied",
+      "transport failed",
+    ]) {
+      const failure = fakeRunner([{ code: 113, stderr }]);
+      await expect(createSupervisor("launchd-user", {
+        run: failure.run,
+        platform: "darwin",
+        uid: 501,
+      }).probe(spec)).resolves.toMatchObject({ kind: "unavailable", reason: "manager-command-failed" });
+    }
+
+    const wrongExitCode = fakeRunner([{
+      code: 1,
+      stderr: `Could not find service "${spec.launchdLabel}" in domain gui/501`,
+    }]);
+    await expect(createSupervisor("launchd-user", {
+      run: wrongExitCode.run,
+      platform: "darwin",
+      uid: 501,
+    }).probe(spec)).resolves.toMatchObject({ kind: "unavailable", reason: "manager-command-failed" });
+  });
+
   it("writes a private plist without KeepAlive and uses gui UID bootstrap/print/bootout", async () => {
     const root = makeRoot();
     const credentialDirectory = createManagedCredentialDirectory(root, "launch-003");
@@ -893,7 +960,7 @@ describe("launchd-user supervisor", () => {
     });
     const running = `state = running\npid = 543\nenvironment = {\n LCM_SUPERVISOR_MARKER => ${spec.marker}\n LCM_SUPERVISOR_SCOPE => ${spec.scopeDigest}\n LCM_SUPERVISOR_PORT => ${spec.port}\n LCM_SUPERVISOR_NONCE => ${spec.nonce}\n LCM_SUPERVISOR_EXECUTABLE => ${spec.executable}\n LCM_SUPERVISOR_ARGS => ${JSON.stringify(spec.args)}\n LCM_SUPERVISOR_CWD => ${spec.cwd}\n LCM_SUPERVISOR_ENTRYPOINT => ${spec.entrypoint}\n LCM_SUPERVISOR_RUNTIME_DIGEST => ${spec.runtimeDigest}\n LCM_SUPERVISOR_STORAGE_BACKEND => ${spec.storageBackend}\n}`;
     const runner = fakeRunner([
-      { code: 1, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
       { code: 0, stdout: "bootstrap" },
       { code: 0, stdout: running },
     ]);
@@ -909,7 +976,7 @@ describe("launchd-user supervisor", () => {
     const stopRunner = fakeRunner([
       { code: 0, stdout: running },
       { code: 0, stdout: "bootout" },
-      { code: 1, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
     ]);
     await expect(createSupervisor("launchd-user", { run: stopRunner.run, platform: "darwin", uid: 501 }).stopAndAwaitAbsent(spec)).resolves.toBeUndefined();
     expect(stopRunner.calls[1].args).toEqual(["bootout", `gui/501/${spec.launchdLabel}`]);
@@ -920,7 +987,7 @@ describe("launchd-user supervisor", () => {
     const unsupported = createSupervisor("launchd-user", { run: vi.fn(), platform: "linux", uid: 501 });
     await expect(unsupported.start(spec)).rejects.toThrow("unavailable");
     const unsafe = makeSpec("launchd-user", spec.stateRoot, { credentialDirectory: spec.stateRoot, credentialFiles: [{ name: "OPENAI_API_KEY", path: join(spec.stateRoot, "secret") }] });
-    const supervisor = createSupervisor("launchd-user", { run: vi.fn(async () => ({ code: 1, stderr: "Could not find service" })), platform: "darwin", uid: 501 });
+    const supervisor = createSupervisor("launchd-user", { run: vi.fn(async () => ({ code: 113, stderr: "Could not find service" })), platform: "darwin", uid: 501 });
     await expect(supervisor.start(unsafe)).rejects.toThrow("credential");
   });
 
@@ -933,8 +1000,8 @@ describe("launchd-user supervisor", () => {
       { code: 0, stdout: terminal },
       { code: 0, stdout: terminal },
       { code: 0, stdout: "bootout" },
-      { code: 1, stderr: "Could not find service" },
-      { code: 1, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
       { code: 0, stdout: "bootstrapped" },
       { code: 0, stdout: running },
     ]);
@@ -942,21 +1009,21 @@ describe("launchd-user supervisor", () => {
     await expect(supervisor.start(spec)).resolves.toMatchObject({ managerPid: 777 });
 
     const second = fakeRunner([
-      { code: 1, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
       { code: 0, stdout: "bootstrapped" },
-      { code: 1, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
     ]);
     await expect(createSupervisor("launchd-user", { run: second.run, platform: "darwin", uid: 501 }).start(spec)).rejects.toThrow("manager command");
 
     const badPlist = join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
     writeFileSync(badPlist, "foreign", { mode: 0o644 });
-    const collision = fakeRunner([{ code: 1, stderr: "Could not find service" }, { code: 1, stderr: "Could not find service" }]);
+    const collision = fakeRunner([{ code: 113, stderr: "Could not find service" }, { code: 113, stderr: "Could not find service" }]);
     await expect(createSupervisor("launchd-user", { run: collision.run, platform: "darwin", uid: 501 }).start(spec)).rejects.toThrow("manager command");
     rmSync(badPlist, { force: true });
 
     writeFileSync(badPlist, "foreign", { mode: 0o600 });
     chmodSync(badPlist, 0o644);
-    const modeCollision = fakeRunner([{ code: 1, stderr: "Could not find service" }]);
+    const modeCollision = fakeRunner([{ code: 113, stderr: "Could not find service" }]);
     await expect(createSupervisor("launchd-user", { run: modeCollision.run, platform: "darwin", uid: 501 }).start(spec)).rejects.toThrow("manager command");
     rmSync(badPlist, { force: true });
 
@@ -976,7 +1043,7 @@ describe("launchd-user supervisor", () => {
     const refusalSupervisor = createSupervisor("launchd-user", { run: refusal.run, platform: "darwin", uid: 501 });
     await expect(refusalSupervisor.stopAndStart(spec)).rejects.toThrow("manager command");
 
-    const absentStop = fakeRunner([{ code: 1, stderr: "Could not find service" }]);
+    const absentStop = fakeRunner([{ code: 113, stderr: "Could not find service" }]);
     await expect(createSupervisor("launchd-user", { run: absentStop.run, platform: "darwin", uid: 501 }).stopAndAwaitAbsent(spec)).resolves.toBeUndefined();
 
     const unavailableRestart = fakeRunner([{ code: 127, stderr: "launchctl not found" }]);
@@ -1003,7 +1070,7 @@ describe("launchd-user supervisor", () => {
       "LCM_SUPERVISOR_CWD =>",
     ].join("\n");
     const oldRunner = fakeRunner([
-      { code: 1, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
       { code: 0, stdout: "bootstrapped" },
       { code: 0, stdout: running },
     ]);
@@ -1028,8 +1095,8 @@ describe("launchd-user supervisor", () => {
       { code: 0, stdout: stale },
       { code: 0, stdout: stale },
       { code: 0, stdout: "bootout" },
-      { code: 1, stderr: "Could not find service" },
-      { code: 1, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
       { code: 0, stdout: "bootstrapped" },
       { code: 0, stdout: running
         .replaceAll(oldSpec.port.toString(), newSpec.port.toString())

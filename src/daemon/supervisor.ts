@@ -743,10 +743,23 @@ function parsePort(value: string | undefined): number | undefined {
   return Number.isSafeInteger(port) && port >= 0 && port <= 65_535 ? port : undefined;
 }
 
-function isNotFoundOutput(text: string): boolean {
+function isNotFoundOutput(
+  kind: SupervisorKind,
+  code: number | null,
+  text: string,
+): boolean {
   const lower = text.toLowerCase();
   if (/(?:systemctl|launchctl)\s+(?:command )?not found|enoent/u.test(lower)) return false;
-  return /unit .*not[- ]found|could not (?:find|be found)|no such service|unit .* not loaded|unknown service|does not exist/u.test(lower);
+  if (kind === "launchd-user") {
+    // launchctl uses EX_NOINPUT (36) for a missing job on current macOS
+    // releases.  Exit 113 is also used by `print`, but only its bounded,
+    // service-specific diagnostics establish an absent registration; a bare
+    // transport or permission failure must remain unresolved.
+    if (code === 36) return true;
+    if (code !== 113) return false;
+    return /\b(?:no such process|could not find\b[^\r\n]{0,256}\bservice\b|service\b[^\r\n]{0,256}\b(?:not found|does not exist)\b)/u.test(lower);
+  }
+  return /unit\b[^\r\n]{0,256}\b(?:not[- ]found|not loaded)\b|could not (?:find|be found)|(?:unknown|no such|does not exist) service\b|service\b[^\r\n]{0,256}\b(?:not found|does not exist)\b/u.test(lower);
 }
 
 function isRunningState(value: string | undefined): boolean {
@@ -888,7 +901,7 @@ function classifyRegistered(
       }
       return Object.freeze({ kind: "ambiguous", reason: "pid-invalid", ...base });
     }
-    if (commandCode !== null && commandCode !== 0 && !isNotFoundOutput(JSON.stringify([...values]))) {
+    if (commandCode !== null && commandCode !== 0 && !isNotFoundOutput(spec.kind, commandCode, JSON.stringify([...values]))) {
       return Object.freeze({ kind: "ambiguous", reason: "state-conflict", ...base });
     }
     return Object.freeze({ kind: "registered-not-running-valid", terminal, ...base });
@@ -1157,11 +1170,12 @@ function managerPidFrom(values: Map<string, string>): number | undefined {
 }
 
 function isLikelyAbsent(result: {
+  readonly kind: SupervisorKind;
   readonly code: number | null;
   readonly stdout: string;
   readonly stderr: string;
 }): boolean {
-  return isNotFoundOutput(`${result.stdout}\n${result.stderr}`);
+  return isNotFoundOutput(result.kind, result.code, `${result.stdout}\n${result.stderr}`);
 }
 
 function createObservationRunner(
@@ -1224,7 +1238,7 @@ export function createSupervisor(
       : await runner.invoke("launchctl", launchdProbeArgs(spec, runner.uid));
     if (result.timedOut) return Object.freeze({ kind: "unavailable", reason: "manager-timeout", name: spec.name });
     const parsed = parseManagerOutput(`${result.stdout}\n${result.stderr}`);
-    if (result.code !== 0 && isLikelyAbsent(result)) return Object.freeze({ kind: "absent", name: spec.name });
+    if (result.code !== 0 && isLikelyAbsent({ kind, ...result })) return Object.freeze({ kind: "absent", name: spec.name });
     if (result.code !== 0 && parsed.size === 0) {
       return Object.freeze({ kind: "unavailable", reason: unavailableReason(result), name: spec.name });
     }
@@ -1385,6 +1399,22 @@ export function createSupervisor(
       : ["bootout", `${launchdDomain(runner.uid)}/${spec.launchdLabel}`];
     const result = await runner.invoke(kind === "systemd-user" ? "systemctl" : "launchctl", stopArgs, spec.stopTimeoutMs);
     if (result.timedOut) throw commandFailedError();
+    const exactPriorObservation = current.kind === "registered-running-valid"
+      || current.kind === "registered-not-running-valid"
+      || (
+        allowStaleConfig
+        && current.kind === "registered-stale-config"
+        && current.scopeDigest === spec.scopeDigest
+        && current.name === spec.name
+      );
+    const stopResultIsNotFound = result.code !== 0
+      && isNotFoundOutput(kind, result.code, `${result.stdout}\n${result.stderr}`);
+    // A manager may race a registration disappearing between the authenticated
+    // probe and stop.  Treat that specific not-found result as idempotent only
+    // when the exact job was observed first; a permission/transport failure
+    // must not become cleanup authority merely because a later probe is absent.
+    const stopResultAllowsAbsent = result.code === 0
+      || (exactPriorObservation && stopResultIsNotFound);
     if (
       kind === "systemd-user"
       && current.kind === "registered-not-running-valid"
@@ -1400,6 +1430,15 @@ export function createSupervisor(
     for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
       const observed = await probe(spec);
       if (observed.kind === "absent") {
+        if (!stopResultAllowsAbsent) {
+          if (result.code !== 0) {
+            const reason = unavailableReason(result);
+            if (reason === "manager-not-found" || reason === "manager-unavailable") {
+              throw managerUnavailableError(reason);
+            }
+          }
+          throw commandFailedError();
+        }
         if (kind === "launchd-user") {
           if (stalePlistSpec !== undefined) cleanupPrivatePlist(stalePlistSpec);
           else cleanupPrivatePlist(spec);

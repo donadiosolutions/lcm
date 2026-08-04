@@ -1873,6 +1873,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
 
   let managedSupervisorForCleanup: Supervisor | undefined;
   let managedSpecForCleanup: SupervisorSpec | undefined;
+  // Keep the exact one-launch credential directory separate from manager
+  // observations.  Cleanup may use it only after the operation-owned manager
+  // stop has proved that this exact job is absent.
+  let managedCredentialDirectoryForCleanup: string | undefined;
   let managedCleanupAuthorized = opts._managedOperationAuthorized === true;
   let managedOperationOwned = opts._managedOperationAuthorized === true;
   let managedOperationAmbiguous = false;
@@ -1943,8 +1947,25 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     ) return;
     const stages: Array<() => void | Promise<void>> = [];
     if (managedOperationOwned && !managedOperationAmbiguous) {
+      let managerAbsenceProven = false;
       stages.push(
-        () => managedSupervisorForCleanup!.stopAndAwaitAbsent(managedSpecForCleanup!),
+        async () => {
+          await managedSupervisorForCleanup!.stopAndAwaitAbsent(managedSpecForCleanup!);
+          managerAbsenceProven = true;
+        },
+      );
+      if (managedCredentialDirectoryForCleanup !== undefined) {
+        const credentialDirectory = managedCredentialDirectoryForCleanup;
+        const credentialStateRoot = managedSpecForCleanup!.stateRoot;
+        stages.push(() => {
+          if (!managerAbsenceProven) return;
+          // The directory is authenticated at staging time and revalidated by
+          // the descriptor-safe cleanup helper.  Missing consumed files and a
+          // directory already removed by the supervisor are idempotent.
+          cleanupManagedCredentialDirectory(credentialDirectory, credentialStateRoot);
+        });
+      }
+      stages.push(
         () => {
           const currentPid = readOwnedPid();
           if (
@@ -2184,6 +2205,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       const staged = stageManagedCredentials(spec, dependencies.environment);
       launchSpec = staged.spec;
       managedSpecForCleanup = staged.spec;
+      managedCredentialDirectoryForCleanup = staged.credentialDirectory;
     } catch {
       return refusalResult("startup-failure", "managed daemon credentials could not be prepared", { spawned: false });
     }

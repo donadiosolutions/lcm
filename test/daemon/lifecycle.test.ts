@@ -4194,6 +4194,72 @@ describe("restartDaemon", () => {
     ]);
   });
 
+  it("removes staged launchd credentials after a non-admitted health timeout", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-managed-launchd-timeout-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    let registered = false;
+    let staged: ManagedCredentialSnapshot | undefined;
+    const supervisor = {
+      probe: vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => registered
+        ? {
+            kind: "registered-running-valid" as const,
+            managerPid: 201,
+            scopeDigest: candidate.scopeDigest,
+            nonce: candidate.nonce,
+            name: candidate.name,
+          }
+        : { kind: "absent" as const, name: candidate.name }),
+      start: vi.fn(async (candidate: ManagedSupervisorSpec) => {
+        staged = snapshotManagedCredentials(candidate);
+        registered = true;
+        return {
+          kind: "launchd-user" as const,
+          name: candidate.name,
+          scopeDigest: candidate.scopeDigest,
+          port: 19_999,
+          nonce: candidate.nonce,
+          managerPid: 201,
+        };
+      }),
+      stopAndStart: vi.fn(),
+      stopAndAwaitAbsent: vi.fn(async (candidate: ManagedSupervisorSpec) => {
+        expect(candidate.credentialDirectory).toBe(staged?.credentialDirectory);
+        registered = false;
+      }),
+    };
+    const result = await ensureDaemon({
+      port: 19_999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 5,
+      expectedVersion: "1.4.2",
+      enforceUserManagerParent: true,
+      _platform: "darwin",
+      _skipHealthWait: false,
+      _supervisorOverride: supervisor as never,
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+    }, {
+      platform: "darwin",
+      uid: 501,
+      environment: {
+        ANTHROPIC_API_KEY: "anthropic-value",
+        OPENAI_API_KEY: "openai-value",
+        LCM_SUMMARY_API_KEY: "summary-value",
+        LCM_POSTGRES_URL: "postgres-value",
+      },
+    });
+
+    expect(result).toMatchObject({
+      connected: false,
+      spawned: true,
+      refusalReason: "startup-failure",
+      startMethod: "launchd-user",
+    });
+    expect(supervisor.stopAndAwaitAbsent).toHaveBeenCalledOnce();
+    expect(staged?.credentialDirectory).toBeDefined();
+    expect(existsSync(staged!.credentialDirectory!)).toBe(false);
+  });
+
   it.each([
     ["linux", "systemd-user"],
     ["darwin", "launchd-user"],
