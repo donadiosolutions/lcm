@@ -636,6 +636,26 @@ describe("systemd-user supervisor", () => {
     expect(existsSync(loserDirectory)).toBe(false);
   });
 
+  it("keeps the clean-environment digest stable across per-launch credential markers", () => {
+    const root = makeRoot();
+    const directory = createManagedCredentialDirectory(root, "systemd-digest-001");
+    const file = writeManagedCredentialFiles(directory, { OPENAI_API_KEY: "secret" })[0]!;
+    const plain = makeSpec("systemd-user", root, { launchEnvironment: { PATH: "/usr/bin" } });
+    const credentialed = createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: root,
+      port: plain.port,
+      nonce: plain.nonce,
+      executable: plain.executable,
+      args: plain.args,
+      launchEnvironment: plain.launchEnvironment,
+      credentialDirectory: directory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: file }],
+    });
+    expect(managedLaunchEnvironmentDigest(plain, "systemd-user", process.getuid?.() ?? -1, plain.launchEnvironment!))
+      .toBe(managedLaunchEnvironmentDigest(credentialed, "systemd-user", process.getuid?.() ?? -1, credentialed.launchEnvironment!));
+  });
+
   it("derives the canonical user runtime root when XDG_RUNTIME_DIR is absent", async () => {
     const uid = typeof process.getuid === "function" ? process.getuid() : -1;
     const runtimeRoot = uid < 0 ? "" : `/run/user/${uid}`;

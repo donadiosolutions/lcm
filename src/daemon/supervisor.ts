@@ -1621,7 +1621,21 @@ export function managedLaunchEnvironmentDigest(
   uid: number,
   environment: Readonly<Record<string, string>>,
 ): string {
-  const values = managedLaunchEnvironmentValues(spec, kind, uid, environment);
+  // The authenticated digest is deliberately limited to the stable filtered
+  // environment requested by the caller.  Per-launch credential markers
+  // (CREDENTIALS_DIRECTORY, credential IDs, and launchd file paths) are
+  // manager-owned ephemeral state; including them would make every ordinary
+  // probe compare an existing credentialed unit against an unstaged spec.
+  const values = new Map<string, string>();
+  for (const [name, value] of Object.entries(spec.launchEnvironment ?? environment)) {
+    launchEnvironmentValue(values, name, value);
+  }
+  // Keep the runtime-root trust check on an actual credentialed systemd
+  // launch.  A base probe without staged credentials may legitimately omit
+  // XDG_RUNTIME_DIR and use the manager's own stable unit identity.
+  if (kind === "systemd-user" && (spec.credentialFiles?.length ?? 0) > 0) {
+    systemdCredentialDirectory(spec, uid, values);
+  }
   const canonical = [...values.entries()].sort(([left], [right]) => left.localeCompare(right));
   return createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
 }
