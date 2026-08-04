@@ -433,6 +433,100 @@ describe("systemd-user supervisor", () => {
     });
   });
 
+  it("admits serialized argument metadata beyond the legacy 512-byte field cap", async () => {
+    const spec = makeSpec("systemd-user", makeRoot(), {
+      args: ["a".repeat(512), "daemon", "run-managed"],
+    });
+    const serializedArgs = JSON.stringify(spec.args);
+    expect(serializedArgs.length).toBeGreaterThan(512);
+    const runner = fakeRunner([{ code: 0, stdout: managerText(spec, "active", 4343) }]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).probe(spec)).resolves.toMatchObject({
+      kind: "registered-running-valid",
+      managerPid: 4343,
+      args: serializedArgs,
+    });
+  });
+
+  it("keeps raw argument byte/count limits exact for multibyte values", () => {
+    const root = makeRoot();
+    const exact = Array.from({ length: 128 }, () => "é".repeat(256));
+    const over = [...exact.slice(0, -1), "é".repeat(257)];
+    expect(exact.reduce((total, value) => total + Buffer.byteLength(value, "utf8"), 0)).toBe(64 * 1024);
+    expect(over.reduce((total, value) => total + Buffer.byteLength(value, "utf8"), 0)).toBeGreaterThan(64 * 1024);
+    expect(createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: root,
+      port: 3737,
+      executable: "/usr/bin/node",
+      args: exact,
+    }).args).toHaveLength(128);
+    expect(() => createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: root,
+      port: 3737,
+      executable: "/usr/bin/node",
+      args: over,
+    })).toThrow("argument");
+  });
+
+  it("rejects malformed, duplicate, and oversized serialized assignments", async () => {
+    const spec = makeSpec("systemd-user");
+    const identity = `LCM_SUPERVISOR_SCOPE=${spec.scopeDigest} LCM_SUPERVISOR_PORT=${spec.port} LCM_SUPERVISOR_NONCE=${spec.nonce} LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)} LCM_SUPERVISOR_CWD=`;
+    const duplicate = `LoadState=loaded\nActiveState=active\nMainPID=4344\nEnvironment=LCM_SUPERVISOR_MARKER=${spec.marker} LCM_SUPERVISOR_MARKER=${spec.marker} ${identity}`;
+    const oversized = `LoadState=loaded\nActiveState=active\nMainPID=4345\nEnvironment=LCM_SUPERVISOR_MARKER=${spec.marker} ${identity} LCM_PADDING=${"x".repeat(70_000)}`;
+    const runner = fakeRunner([
+      { code: 0, stdout: duplicate },
+      { code: 0, stdout: oversized },
+    ]);
+    const supervisor = createSupervisor("systemd-user", { run: runner.run, platform: "linux" });
+    await expect(supervisor.probe(spec)).resolves.not.toMatchObject({ kind: "registered-running-valid" });
+    await expect(supervisor.probe(spec)).resolves.not.toMatchObject({ kind: "registered-running-valid" });
+  });
+
+  it("bounds path-shaped supervisor metadata by UTF-8 bytes", () => {
+    const root = makeRoot();
+    const pathAtLimit = `/${"p".repeat(4095)}`;
+    const pathOverLimit = `/${"p".repeat(4096)}`;
+    const spec = createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: root,
+      realpath: () => pathAtLimit,
+      port: 3737,
+      executable: pathAtLimit,
+      args: [],
+      cwd: pathAtLimit,
+      entrypoint: pathAtLimit,
+      credentialDirectory: pathAtLimit,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: pathAtLimit }],
+    });
+    expect(spec.stateRoot).toBe(pathAtLimit);
+    expect(spec.executable).toBe(pathAtLimit);
+    expect(spec.cwd).toBe(pathAtLimit);
+    expect(spec.entrypoint).toBe(pathAtLimit);
+    expect(spec.credentialDirectory).toBe(pathAtLimit);
+    expect(spec.credentialFiles?.[0]?.path).toBe(pathAtLimit);
+    expect(() => createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: root,
+      realpath: () => pathOverLimit,
+      port: 3737,
+      executable: "/usr/bin/node",
+    })).toThrow("state root");
+    expect(() => createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: root,
+      port: 3737,
+      executable: pathOverLimit,
+    })).toThrow("executable");
+    expect(() => createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: root,
+      port: 3737,
+      executable: "/usr/bin/node",
+      cwd: pathOverLimit,
+    })).toThrow("working");
+  });
+
   it("parses real launchd not-running and exit-code terminal output", async () => {
     const spec = makeSpec("launchd-user");
     const output = [

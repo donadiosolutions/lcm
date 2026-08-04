@@ -203,10 +203,25 @@ const DEFAULT_POLL_INTERVAL_MS = 50;
 const MAX_POLL_INTERVALS = 100;
 const MAX_NONCE_LENGTH = 128;
 const MAX_METADATA_VALUE_LENGTH = 512;
+/**
+ * Bound path-shaped manager metadata by bytes, not JavaScript code units.  The
+ * service-manager metadata is not a filesystem API, but keeping this aligned
+ * with a conservative platform path budget prevents a manager response from
+ * becoming an unbounded path carrier while still admitting long valid paths.
+ */
+const MAX_PATH_METADATA_BYTES = 4 * 1024;
 const MAX_COMMAND_OUTPUT_LENGTH = 64 * 1024;
 const MAX_PLIST_BYTES = 64 * 1024;
 const MAX_ARGUMENT_COUNT = 128;
 const MAX_ARGUMENT_BYTES = 64 * 1024;
+/**
+ * JSON.stringify may expand each allowed argument code unit to a six-character
+ * escape (for example, a control character).  This is deliberately a bound on
+ * the serialized metadata, separate from the raw argument-byte budget enforced
+ * by createSupervisorSpec.  Array brackets, commas, and string delimiters add
+ * three characters per argument plus one final delimiter.
+ */
+const MAX_ARGUMENT_JSON_BYTES = MAX_ARGUMENT_BYTES * 6 + MAX_ARGUMENT_COUNT * 3 + 1;
 const XML_HEADER = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
 
 type Realpath = (path: string) => string;
@@ -240,6 +255,35 @@ function assertMetadataValue(value: string, label: string): void {
   }
 }
 
+function assertPathMetadataValue(value: string, label: string): void {
+  if (
+    value.length === 0
+    || Buffer.byteLength(value, "utf8") > MAX_PATH_METADATA_BYTES
+    || /[\u0000\r\n]/u.test(value)
+  ) {
+    throw new Error(`${label} is invalid`);
+  }
+}
+
+function validSupervisorArguments(value: unknown): value is readonly string[] {
+  if (!Array.isArray(value) || value.length > MAX_ARGUMENT_COUNT) return false;
+  let bytes = 0;
+  for (const argument of value) {
+    if (
+      typeof argument !== "string"
+      || argument.length > MAX_METADATA_VALUE_LENGTH
+      || /[\u0000\r\n]/u.test(argument)
+    ) return false;
+    bytes += Buffer.byteLength(argument, "utf8");
+    if (bytes > MAX_ARGUMENT_BYTES) return false;
+  }
+  return true;
+}
+
+function assertSupervisorArguments(value: readonly unknown[]): asserts value is readonly string[] {
+  if (!validSupervisorArguments(value)) throw new Error("supervisor argument is invalid");
+}
+
 function digestScope(stateRoot: string): string {
   return createHash("sha256").update(stateRoot, "utf8").digest("hex");
 }
@@ -270,6 +314,7 @@ export function canonicalSupervisorScope(
   }
   if (!isAbsolute(canonical)) throw new Error("supervisor state root is not canonical");
   canonical = resolve(canonical);
+  assertPathMetadataValue(canonical, "supervisor state root");
   const scopeDigest = digestScope(canonical);
   const shortDigest = scopeDigest.slice(0, SCOPE_NAME_HEX_LENGTH);
   return Object.freeze({
@@ -313,18 +358,16 @@ export function createSupervisorSpec(input: SupervisorSpecInput): SupervisorSpec
   if (typeof executable !== "string" || !isAbsolute(executable)) {
     throw new Error("supervisor executable must be absolute");
   }
+  assertPathMetadataValue(executable, "supervisor executable");
   const args = [...(input.args ?? input.argv ?? [])];
-  if (
-    args.length > MAX_ARGUMENT_COUNT
-    || args.reduce((total, arg) => total + (typeof arg === "string" ? Buffer.byteLength(arg, "utf8") : MAX_ARGUMENT_BYTES), 0) > MAX_ARGUMENT_BYTES
-    || args.some((arg) => typeof arg !== "string" || arg.length > MAX_METADATA_VALUE_LENGTH || /[\u0000\r\n]/u.test(arg))
-  ) {
-    throw new Error("supervisor argument is invalid");
+  assertSupervisorArguments(args);
+  if (input.cwd !== undefined) {
+    if (!isAbsolute(input.cwd)) throw new Error("supervisor working directory is invalid");
+    assertPathMetadataValue(input.cwd, "supervisor working directory");
+    assertPathMetadataValue(resolve(input.cwd), "supervisor working directory");
   }
-  if (input.cwd !== undefined && (!isAbsolute(input.cwd) || /[\u0000\r\n]/u.test(input.cwd))) {
-    throw new Error("supervisor working directory is invalid");
-  }
-  for (const value of [input.entrypoint, input.runtimeDigest, input.storageBackend]) {
+  if (input.entrypoint !== undefined) assertPathMetadataValue(input.entrypoint, "supervisor metadata");
+  for (const value of [input.runtimeDigest, input.storageBackend]) {
     if (value !== undefined) assertMetadataValue(value, "supervisor metadata");
   }
   const credentialFiles = input.credentialFiles === undefined
@@ -338,13 +381,23 @@ export function createSupervisorSpec(input: SupervisorSpecInput): SupervisorSpec
         || /[\u0000\r\n]/u.test(credential.path)
       ) throw new Error("supervisor credential reference is invalid");
       assertMetadataValue(credential.name, "supervisor credential name");
-      assertMetadataValue(credential.path, "supervisor credential path");
-      return Object.freeze({ name: credential.name, path: resolve(credential.path) });
+      assertPathMetadataValue(credential.path, "supervisor credential path");
+      const resolvedPath = resolve(credential.path);
+      assertPathMetadataValue(resolvedPath, "supervisor credential path");
+      return Object.freeze({ name: credential.name, path: resolvedPath });
     }));
   const stopTimeoutMs = input.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
   if (!Number.isInteger(stopTimeoutMs) || stopTimeoutMs < 1 || stopTimeoutMs > 60_000) {
     throw new Error("supervisor stop timeout is invalid");
   }
+  const credentialDirectory = input.credentialDirectory === undefined
+    ? undefined
+    : (() => {
+      assertPathMetadataValue(input.credentialDirectory!, "supervisor credential directory");
+      const resolved = resolve(input.credentialDirectory!);
+      assertPathMetadataValue(resolved, "supervisor credential directory");
+      return resolved;
+    })();
   const name = input.kind === "systemd-user" ? scope.systemdUnit : scope.launchdLabel;
   const result: SupervisorSpec = {
     ...scope,
@@ -361,9 +414,8 @@ export function createSupervisorSpec(input: SupervisorSpecInput): SupervisorSpec
     ...(input.runtimeDigest === undefined ? {} : { runtimeDigest: input.runtimeDigest }),
     ...(input.storageBackend === undefined ? {} : { storageBackend: input.storageBackend }),
     ...(credentialFiles === undefined ? {} : { credentialFiles }),
-    ...(input.credentialDirectory === undefined ? {} : { credentialDirectory: resolve(input.credentialDirectory) }),
+    ...(credentialDirectory === undefined ? {} : { credentialDirectory }),
   };
-  assertMetadataValue(result.stateRoot, "supervisor state root");
   return Object.freeze(result);
 }
 
@@ -440,10 +492,32 @@ function parseKeyValues(text: string): Map<string, string> {
     // the tighter bound to each decoded value.
     const maxValueLength = /^environment$/iu.test(key) || /^env$/iu.test(key)
       ? MAX_COMMAND_OUTPUT_LENGTH
-      : MAX_METADATA_VALUE_LENGTH;
-    if (value.length <= maxValueLength) values.set(key, value);
+      : environmentAssignmentValueLimit(key);
+    if (Buffer.byteLength(value, "utf8") <= maxValueLength) values.set(key, value);
   }
   return values;
+}
+
+function environmentAssignmentValueLimit(key: string): number {
+  const upper = key.toUpperCase();
+  if (upper === "LCM_SUPERVISOR_ARGS") return MAX_ARGUMENT_JSON_BYTES;
+  if (
+    upper === "LCM_SUPERVISOR_STATE_ROOT"
+    || upper === "LCM_SUPERVISOR_EXECUTABLE"
+    || upper === "LCM_SUPERVISOR_CWD"
+    || upper === "LCM_SUPERVISOR_ENTRYPOINT"
+    || upper === "LCM_CREDENTIAL_DIRECTORY"
+    || /^LCM_CREDENTIAL_[A-Z0-9_]+_FILE$/u.test(upper)
+  ) return MAX_PATH_METADATA_BYTES;
+  if (upper === "LCM_SUPERVISOR_MARKER") return MARKER.length;
+  if (upper === "LCM_SUPERVISOR_SCOPE" || upper === "LCM_SUPERVISOR_RUNTIME_DIGEST") return SHA256_HEX_LENGTH;
+  if (upper === "LCM_SUPERVISOR_PORT") return 5;
+  if (upper === "LCM_SUPERVISOR_NONCE") return MAX_NONCE_LENGTH;
+  return MAX_METADATA_VALUE_LENGTH;
+}
+
+function isWithinEnvironmentAssignmentLimit(value: string, limit: number): boolean {
+  return Buffer.byteLength(value, "utf8") <= limit;
 }
 
 /** Parse systemd's bounded shell-like Environment= serialization. */
@@ -451,6 +525,7 @@ function parseEnvironmentAssignments(value: string): Map<string, string> | undef
   const assignments = new Map<string, string>();
   let index = 0;
   let count = 0;
+  const maxTokenBytes = MAX_ARGUMENT_JSON_BYTES + MAX_PATH_METADATA_BYTES;
   const decodeEscape = (): string | undefined => {
     if (index >= value.length) return undefined;
     const escaped = value[index]!;
@@ -477,6 +552,7 @@ function parseEnvironmentAssignments(value: string): Map<string, string> | undef
   const readQuoted = (quote: string): string | undefined => {
     index += 1;
     let decoded = "";
+    let decodedBytes = 0;
     while (index < value.length) {
       const character = value[index]!;
       if (character === "\\") {
@@ -484,6 +560,8 @@ function parseEnvironmentAssignments(value: string): Map<string, string> | undef
         const escaped = decodeEscape();
         if (escaped === undefined) return undefined;
         decoded += escaped;
+        decodedBytes += Buffer.byteLength(escaped, "utf8");
+        if (decodedBytes > maxTokenBytes) return undefined;
         continue;
       }
       if (character === quote) {
@@ -492,7 +570,8 @@ function parseEnvironmentAssignments(value: string): Map<string, string> | undef
       }
       decoded += character;
       index += 1;
-      if (decoded.length > MAX_METADATA_VALUE_LENGTH) return undefined;
+      decodedBytes += Buffer.byteLength(character, "utf8");
+      if (decodedBytes > maxTokenBytes) return undefined;
     }
     return undefined;
   };
@@ -501,8 +580,9 @@ function parseEnvironmentAssignments(value: string): Map<string, string> | undef
     if (separator <= 0) return false;
     const key = token.slice(0, separator);
     const decoded = token.slice(separator + 1);
+    const limit = environmentAssignmentValueLimit(key);
     if (!/^[A-Za-z][A-Za-z0-9_.-]*$/u.test(key)
-      || decoded.length > MAX_METADATA_VALUE_LENGTH
+      || !isWithinEnvironmentAssignmentLimit(decoded, limit)
       || assignments.has(key)) return false;
     assignments.set(key, decoded);
     return true;
@@ -529,6 +609,7 @@ function parseEnvironmentAssignments(value: string): Map<string, string> | undef
     if (value[index] !== "=") return undefined;
     index += 1;
     let decoded = "";
+    let decodedBytes = 0;
     const quote = value[index] === "\"" || value[index] === "'" ? value[index] : undefined;
     if (quote !== undefined) index += 1;
     let closedQuote = quote === undefined;
@@ -539,6 +620,8 @@ function parseEnvironmentAssignments(value: string): Map<string, string> | undef
         const escaped = decodeEscape();
         if (escaped === undefined) return undefined;
         decoded += escaped;
+        decodedBytes += Buffer.byteLength(escaped, "utf8");
+        if (decodedBytes > maxTokenBytes) return undefined;
         continue;
       }
       if (quote !== undefined && character === quote) {
@@ -549,11 +632,14 @@ function parseEnvironmentAssignments(value: string): Map<string, string> | undef
       if (quote === undefined && /\s/u.test(character)) break;
       decoded += character;
       index += 1;
-      if (decoded.length > MAX_METADATA_VALUE_LENGTH) return undefined;
+      decodedBytes += Buffer.byteLength(character, "utf8");
+      if (decodedBytes > maxTokenBytes) return undefined;
     }
     if (!closedQuote || assignments.has(key)) return undefined;
     if (quote !== undefined && index < value.length && !/\s/u.test(value[index]!)) return undefined;
     if (!/^[A-Za-z][A-Za-z0-9_.-]*$/u.test(key)) return undefined;
+    const limit = environmentAssignmentValueLimit(key);
+    if (!isWithinEnvironmentAssignmentLimit(decoded, limit)) return undefined;
     assignments.set(key, decoded);
     count += 1;
     if (count > MAX_ARGUMENT_COUNT) return undefined;
@@ -631,6 +717,15 @@ function metadata(values: Map<string, string>, name: string): string | undefined
   return undefined;
 }
 
+function validSerializedSupervisorArguments(value: string | undefined): boolean {
+  if (value === undefined || Buffer.byteLength(value, "utf8") > MAX_ARGUMENT_JSON_BYTES) return false;
+  try {
+    return validSupervisorArguments(JSON.parse(value));
+  } catch {
+    return false;
+  }
+}
+
 function parsePid(value: string | undefined): number | undefined {
   if (value === undefined || !/^\d+$/u.test(value)) return undefined;
   const pid = Number(value);
@@ -674,7 +769,8 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
   const port = parsePort(metadata(values, "LCM_SUPERVISOR_PORT"));
   const nonce = metadata(values, "LCM_SUPERVISOR_NONCE");
   const executable = metadata(values, "LCM_SUPERVISOR_EXECUTABLE");
-  const args = metadata(values, "LCM_SUPERVISOR_ARGS");
+  const serializedArgs = metadata(values, "LCM_SUPERVISOR_ARGS");
+  const args = validSerializedSupervisorArguments(serializedArgs) ? serializedArgs : undefined;
   const cwd = metadata(values, "LCM_SUPERVISOR_CWD");
   const entrypoint = metadata(values, "LCM_SUPERVISOR_ENTRYPOINT");
   const runtimeDigest = metadata(values, "LCM_SUPERVISOR_RUNTIME_DIGEST");
