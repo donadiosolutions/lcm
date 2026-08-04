@@ -1169,7 +1169,6 @@ function normalizeHealthResponse(response: Response): Response {
   return new Proxy(response, {
     get(target, property, receiver) {
       if (property === "status") return inferred;
-      if (property === "ok") return inferred >= 200 && inferred <= 299;
       if (property === "json") return target.json.bind(target);
       return Reflect.get(target, property, receiver);
     },
@@ -1241,7 +1240,7 @@ async function checkDaemonHealth(
 ): Promise<HealthResponse | null> {
   const observation = await observeDaemonHealth(port, fetchFn, deadline, token);
   return observation.kind === "response" && observation.body === "valid"
-    ? observation.parsedBody ?? null
+    ? observation.parsedBody!
     : null;
 }
 
@@ -2336,7 +2335,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     : { kind: "no-response", reason: "header-timeout" };
   const health = initialHealthObservation.kind === "response"
     && initialHealthObservation.body === "valid"
-    ? initialHealthObservation.parsedBody ?? null
+    ? initialHealthObservation.parsedBody!
     : null;
   const detachedCompatibility = managerKind === undefined;
   if ((managerPreflightUnavailable || detachedCompatibility) && initialHealthObservation.kind === "no-response") {
