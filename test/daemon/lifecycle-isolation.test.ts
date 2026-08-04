@@ -1401,15 +1401,33 @@ describe("run-owned lifecycle resources", () => {
   });
 
   it("cleans on a health timeout", async () => {
-    const fixture = createFixture("owned-timeout");
+    let postStartHealthProbe = false;
+    const fetch = vi.fn(async () => {
+      postStartHealthProbe = fetch.mock.calls.length > 1;
+      throw new Error("offline");
+    });
+    const fixture = createFixture("owned-timeout", { fetch: fetch as never });
     const result = await ensureDaemon({
       ...scopedOptions(fixture),
       spawnTimeoutMs: 3,
       _skipHealthWait: false,
+      _monotonicNowOverride: () => postStartHealthProbe ? 3 : 0,
     });
-    expect(result).toMatchObject({ connected: false, spawned: true });
-    expect(fixture.stopUnit).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      connected: false,
+      spawned: true,
+      refusalReason: "startup-failure",
+      startMethod: "systemd-user",
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fixture.supervisor.start).toHaveBeenCalledOnce();
+    const startedUnit = (fixture.supervisor.start.mock.calls[0]?.[0] as { name?: unknown } | undefined)?.name;
+    expect(startedUnit).toEqual(expect.stringMatching(/^lcm-daemon-[a-f0-9]{20}\.service$/u));
+    expect(fixture.supervisor.stopAndAwaitAbsent).toHaveBeenCalledOnce();
+    expect(fixture.stopUnit).toHaveBeenCalledExactlyOnceWith(startedUnit);
     expect(existsSync(fixture.scope.stateDir)).toBe(false);
+    expect(existsSync(fixture.scope.runtimeDir)).toBe(false);
+    expect(existsSync(fixture.scope.credentialDir)).toBe(false);
   });
 
   it("cleans immediately and reports interruption once", async () => {
