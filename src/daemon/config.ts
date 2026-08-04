@@ -445,6 +445,9 @@ function readLaunchdCredentialEnv(env: Record<string, string | undefined>): Reco
       credentialEnv[name] = consumeBoundedRegularFile(configured, {
         allowedRoot: directory,
         maxBytes: CREDENTIAL_MAX_BYTES,
+        expectedUid: typeof process.getuid === "function" && Number.isSafeInteger(uid) ? uid : undefined,
+        allowedModes: [0o600],
+        requireSingleLink: true,
       }).replace(/\n+$/u, "");
     } catch {
       // Missing, stale, tampered, and oversized launch credentials remain

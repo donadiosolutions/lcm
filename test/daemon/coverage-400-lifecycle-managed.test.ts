@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -85,6 +86,32 @@ function observation(
     name: spec.name,
     scopeDigest: spec.scopeDigest,
     nonce: spec.nonce,
+    ...extra,
+  } as SupervisorObservation;
+}
+
+function staleObservation(
+  spec: SupervisorSpec,
+  extra: Record<string, unknown> = {},
+): SupervisorObservation {
+  return {
+    kind: "registered-stale-config",
+    reason: "metadata-mismatch",
+    marker: spec.marker,
+    scopeDigest: spec.scopeDigest,
+    stateRoot: spec.stateRoot,
+    name: spec.name,
+    port: spec.port,
+    nonce: spec.nonce,
+    executable: spec.executable,
+    args: JSON.stringify(spec.args),
+    cwd: spec.cwd ?? "",
+    entrypoint: spec.entrypoint,
+    runtimeDigest: spec.runtimeDigest,
+    storageBackend: spec.storageBackend,
+    credentialDirectory: spec.credentialDirectory,
+    credentialFiles: spec.credentialFiles,
+    managerPid: 4242,
     ...extra,
   } as SupervisorObservation;
 }
@@ -227,6 +254,11 @@ function optionsFor(
   };
 }
 
+function deadlineClock(limit = 8, end = 1_000): () => number {
+  let calls = 0;
+  return () => calls++ < limit ? 0 : end;
+}
+
 function setRunningProbe(fixture: Fixture, pid = 4242): void {
   fixture.probe.mockImplementation(async (spec: SupervisorSpec) => observation(
     spec,
@@ -287,7 +319,7 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
     });
     fixture.probe
       .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
     fixture.start.mockImplementationOnce(async (spec: SupervisorSpec) => ({
       kind: spec.kind,
       name: spec.name,
@@ -563,6 +595,185 @@ describe("issue 400 managed ensure admission matrix", () => {
     });
   });
 
+  it("adopts an existing no-credential running job through its observed nonce", async () => {
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([healthy(4242), healthy(4242), response({}, 200)]),
+    });
+    let calls = 0;
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          kind: "registered-stale-config",
+          reason: "metadata-mismatch",
+          marker: spec.marker,
+          scopeDigest: spec.scopeDigest,
+          stateRoot: spec.stateRoot,
+          name: spec.name,
+          port: spec.port,
+          nonce: "existing-launch-nonce",
+          executable: spec.executable,
+          args: JSON.stringify(spec.args),
+          cwd: "",
+          entrypoint: spec.entrypoint,
+          runtimeDigest: spec.runtimeDigest,
+          storageBackend: spec.storageBackend,
+          managerPid: 4242,
+        };
+      }
+      return observation(spec, "registered-running-valid", { managerPid: 4242 });
+    });
+    writeFileSync(fixture.pidPath, "4242");
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+
+    const adoptionResult = await ensureDaemon(optionsFor(fixture, {
+      _supervisorNonceOverride: () => "new-launch-nonce",
+    }));
+    expect(adoptionResult).toMatchObject({ connected: true, spawned: false, pid: 4242 });
+    expect(calls).toBe(4);
+  });
+
+  it("rejects malformed observed launch metadata and unreconstructable specs", async () => {
+    for (const args of ["{", "{}", "[1]"]) {
+      const fixture = createFixture();
+      fixture.probe.mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec, { args }));
+      await expect(ensureDaemon(optionsFor(fixture, { _skipSpawn: true }))).resolves.toMatchObject({
+        refusalReason: "stale-config",
+      });
+    }
+
+    const invalidPort = createFixture();
+    invalidPort.probe.mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec, { port: 65_536 }));
+    await expect(ensureDaemon(optionsFor(invalidPort, { _skipSpawn: true }))).resolves.toMatchObject({
+      refusalReason: "stale-config",
+    });
+
+    const reprobeStale = createFixture();
+    reprobeStale.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec));
+    await expect(ensureDaemon(optionsFor(reprobeStale, { _skipSpawn: true }))).resolves.toMatchObject({
+      refusalReason: "stale-config",
+    });
+  });
+
+  it("covers credential-bearing observed identity matching and fail-closed mismatches", async () => {
+    const matching = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([healthy(4242), healthy(4242), response({}, 200)]),
+    });
+    const credentialDirectory = join(matching.root, "credentials", "launch");
+    const credentialFile = { name: "api-key", path: join(credentialDirectory, "api-key") };
+    matching.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(matching.pidPath, "4242");
+    writeFileSync(matching.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(matching, {
+      _skipSpawn: true,
+      _supervisorCredentialDirectoryOverride: credentialDirectory,
+      _supervisorCredentialFilesOverride: [credentialFile],
+    }))).resolves.toMatchObject({ connected: true, spawned: false, pid: 4242 });
+
+    const directoryOnly = createFixture({ isAlive: () => true, fetch: sequenceFetch([new Error("offline")]) });
+    directoryOnly.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(directoryOnly.pidPath, "4242");
+    await expect(ensureDaemon(optionsFor(directoryOnly, {
+      _skipSpawn: true,
+      _supervisorCredentialDirectoryOverride: join(directoryOnly.root, "credentials", "launch"),
+    }))).resolves.toMatchObject({ refusalReason: "live-no-response" });
+
+    const mismatches: readonly Record<string, unknown>[] = [
+      { credentialDirectory: join(matching.root, "credentials", "foreign") },
+      { credentialFiles: [] },
+      { credentialFiles: [{ name: "other", path: credentialFile.path }] },
+      { credentialFiles: [{ name: credentialFile.name, path: join(matching.root, "credentials", "other") }] },
+      { credentialFiles: [undefined] },
+    ];
+    for (const mismatch of mismatches) {
+      const fixture = createFixture();
+      fixture.probe.mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec, mismatch));
+      await expect(ensureDaemon(optionsFor(fixture, {
+        _skipSpawn: true,
+        _supervisorCredentialDirectoryOverride: join(fixture.root, "credentials", "launch"),
+        _supervisorCredentialFilesOverride: [{ name: "api-key", path: join(fixture.root, "credentials", "launch", "api-key") }],
+      }))).resolves.toMatchObject({ refusalReason: "stale-config" });
+    }
+  });
+
+  it("covers optional metadata omission, explicit runtime identity, and stale reprobe refusal", async () => {
+    const runtimeDigest = "a".repeat(64);
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest }),
+        response({}, 200),
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.pidPath, "4242");
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedEntrypoint: undefined,
+      expectedRuntimeDigest: runtimeDigest,
+      _skipSpawn: true,
+    }))).resolves.toMatchObject({ connected: true, spawned: false, pid: 4242 });
+  });
+
+  it("re-probes the exact staged launch spec after manager start", async () => {
+    const fixture = createFixture({
+      environment: { OPENAI_API_KEY: "staged-secret" },
+      fetch: sequenceFetch([new Error("offline")]),
+    });
+    const observed: SupervisorSpec[] = [];
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      observed.push(spec);
+      return observed.length === 1
+        ? observation(spec, "absent")
+        : observation(spec, "registered-running-valid", { managerPid: 4242 });
+    });
+    const result = await ensureDaemon(optionsFor(fixture, {
+      _skipHealthWait: true,
+      _supervisorNonceOverride: () => "deterministic-launch-nonce",
+    }));
+    expect(result).toMatchObject({ connected: false, spawned: true, pid: 4242 });
+    expect(observed).toHaveLength(2);
+    expect(observed[0]?.credentialDirectory).toBeUndefined();
+    expect(observed[1]?.credentialDirectory).toBeDefined();
+    expect(fixture.start).toHaveBeenCalledWith(expect.objectContaining({
+      nonce: "deterministic-launch-nonce",
+      credentialDirectory: observed[1]?.credentialDirectory,
+      credentialFiles: observed[1]?.credentialFiles,
+    }));
+  });
+
+  it("erases operation-owned staged credentials only after authenticated admission", async () => {
+    const fixture = createFixture({
+      environment: { OPENAI_API_KEY: "admitted-secret" },
+      isAlive: () => true,
+      fetch: sequenceFetch([new Error("pre-start offline"), healthy(4242), healthy(4242), response({}, 200)]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+
+    await expect(ensureDaemon(optionsFor(fixture))).resolves.toMatchObject({
+      connected: true,
+      spawned: true,
+      startMethod: "systemd-user",
+    });
+    const stagedDirectory = (fixture.start.mock.calls[0]?.[0] as SupervisorSpec).credentialDirectory;
+    expect(stagedDirectory).toBeDefined();
+    expect(existsSync(stagedDirectory!)).toBe(false);
+  });
+
   it("refuses running managers on no response, probe races, invalid responses, or failed auth", async () => {
     const noResponse = createFixture({ fetch: sequenceFetch([new Error("offline")]), isAlive: () => true });
     setRunningProbe(noResponse);
@@ -606,6 +817,55 @@ describe("issue 400 managed ensure admission matrix", () => {
     const unknownStorage = createFixture({ fetch: sequenceFetch([healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { storageBackend: "unknown" })]), isAlive: () => true });
     setRunningProbe(unknownStorage);
     await expect(ensureDaemon(optionsFor(unknownStorage))).resolves.toMatchObject({ refusalReason: "response-invalid" });
+
+    const afterAuthentication = createFixture({
+      fetch: sequenceFetch([healthy(4242), healthy(4242), response({}, 200)]),
+      isAlive: () => true,
+    });
+    let admissionProbes = 0;
+    afterAuthentication.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      admissionProbes += 1;
+      return admissionProbes === 3
+        ? observation(spec, "registered-running-valid", { managerPid: 4242, scopeDigest: "foreign-after-auth" })
+        : observation(spec, "registered-running-valid", { managerPid: 4242 });
+    });
+    writeFileSync(afterAuthentication.pidPath, "4242");
+    writeFileSync(afterAuthentication.tokenPath, "managed-token", { mode: 0o600 });
+    const afterAuthenticationResult = await ensureDaemon(optionsFor(afterAuthentication));
+    expect(afterAuthenticationResult).toMatchObject({ refusalReason: "ambiguous" });
+    expect(admissionProbes).toBe(3);
+  });
+
+  it("covers authenticated manager final-probe failure and null daemon admission", async () => {
+    const finalProbeFailure = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([healthy(4242), healthy(4242), response({}, 200)]),
+    });
+    finalProbeFailure.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }))
+      .mockRejectedValueOnce(new Error("final manager probe failed"));
+    writeFileSync(finalProbeFailure.pidPath, "4242");
+    writeFileSync(finalProbeFailure.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(finalProbeFailure))).resolves.toMatchObject({
+      refusalReason: "ambiguous",
+      pid: 4242,
+    });
+
+    const nullAdmission = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        healthy(4242),
+        healthy(4242, "/foreign-entrypoint.mjs"),
+        response({}, 200),
+      ]),
+    });
+    setRunningProbe(nullAdmission);
+    writeFileSync(nullAdmission.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(nullAdmission))).resolves.toMatchObject({
+      refusalReason: "response-invalid",
+      pid: 4242,
+    });
   });
 
   it("rejects manager endpoint metadata and owner identity mismatches", async () => {
@@ -830,7 +1090,7 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     ]) });
     fixture.probe
       .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
     writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(fixture))).resolves.toMatchObject({
       connected: true,
@@ -838,6 +1098,80 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       pid: 4242,
       startMethod: "systemd-user",
     });
+  });
+
+  it("covers post-start authenticated reprobe races, rejected admission, and cleanup failure", async () => {
+    const finalProbeFailure = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([new Error("pre-start offline"), healthy(4242), healthy(4242), response({}, 200)]),
+    });
+    finalProbeFailure.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }))
+      .mockRejectedValueOnce(new Error("post-admission probe failed"));
+    writeFileSync(finalProbeFailure.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(finalProbeFailure, {
+      _skipHealthWait: false,
+      _monotonicNowOverride: () => 0,
+    }))).resolves.toMatchObject({ refusalReason: "ambiguous", spawned: true, pid: 4242 });
+
+    const identityRace = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([new Error("pre-start offline"), healthy(4242), healthy(4242), response({}, 200)]),
+    });
+    identityRace.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242, scopeDigest: "foreign-after-auth" }));
+    writeFileSync(identityRace.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(identityRace, {
+      _skipHealthWait: false,
+      _monotonicNowOverride: () => 0,
+    }))).resolves.toMatchObject({ refusalReason: "ambiguous", spawned: true, pid: 4242 });
+
+    const rejectedAdmission = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242),
+        healthy(4242, "/foreign-entrypoint.mjs"),
+        response({}, 200),
+      ]),
+    });
+    rejectedAdmission.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(rejectedAdmission.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(rejectedAdmission, {
+      _skipHealthWait: false,
+      _monotonicNowOverride: deadlineClock(),
+    }))).resolves.toMatchObject({ refusalReason: "startup-failure", spawned: true, pid: 4242 });
+
+    const cleanupFailure = createFixture({
+      environment: { OPENAI_API_KEY: "cleanup-secret" },
+      isAlive: () => true,
+      fetch: sequenceFetch([new Error("pre-start offline"), healthy(4242), healthy(4242), response({}, 200)]),
+    });
+    cleanupFailure.start.mockImplementation(async (spec: SupervisorSpec) => {
+      writeFileSync(cleanupFailure.pidPath, "4242");
+      mkdirSync(join(spec.credentialDirectory!, "LCM_SUMMARY_API_KEY"));
+      return {
+        kind: spec.kind,
+        name: spec.name,
+        scopeDigest: spec.scopeDigest,
+        port: spec.port,
+        nonce: spec.nonce,
+        managerPid: 4242,
+      };
+    });
+    cleanupFailure.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(cleanupFailure.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(cleanupFailure, {
+      _skipHealthWait: false,
+      _monotonicNowOverride: () => 0,
+    }))).rejects.toThrow("managed credential file failed validation");
   });
 
   it("bounds authenticated diagnostics on timeout and caller abort", async () => {

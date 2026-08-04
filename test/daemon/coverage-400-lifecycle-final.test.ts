@@ -226,7 +226,7 @@ describe("Epic 400 lifecycle final branch closure", () => {
       _skipSpawn: true,
       _listeningPortsOverride: () => (++listenerCalls === 1 ? [f.port] : []),
     });
-    expect(result.refusalReason).toBe("response-invalid");
+    expect(result.refusalReason).toBe("ambiguous");
     const restartRoot = offlineFixture({ isAlive: () => true }, { listener: true });
     const restartManager = manager((spec) => managerObservation(spec, "registered-running-valid", { managerPid: 42 }));
     const ensured = vi.fn(async () => ({ connected: false, port: restartRoot.port, spawned: false }));
@@ -323,14 +323,12 @@ describe("Epic 400 lifecycle final branch closure", () => {
         return health(42);
       }) as never,
     });
-    writeFileSync(startRace.tokenPath, "token", { mode: 0o600 });
     const startSupervisor = startingManager(startRace);
-    let startListeners = 0;
     const startResult = await ensureDaemon(baseOptions(startRace, {
       enforceUserManagerParent: true,
       _supervisorOverride: startSupervisor.supervisor,
       _skipSpawn: false,
-      _listeningPortsOverride: () => (++startListeners === 1 ? [startRace.port] : []),
+      _listeningPortsOverride: () => [startRace.port],
       _monotonicNowOverride: deadlineClock(),
     }));
     expect(startResult.refusalReason).toBe("startup-failure");

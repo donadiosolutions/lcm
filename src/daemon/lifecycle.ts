@@ -157,6 +157,12 @@ export type EnsureDaemonOptions = {
   _hermeticTestSeams?: DaemonLifecycleHermeticTestSeams;
   /** @internal Inject only the manager transport environment for lifecycle tests. */
   _managerTransportEnvironmentOverride?: NodeJS.ProcessEnv;
+  /** @internal Deterministic per-start nonce seam for lifecycle tests. */
+  _supervisorNonceOverride?: () => string;
+  /** @internal Exact credential metadata seam for post-manager restart admission. */
+  _supervisorCredentialDirectoryOverride?: string;
+  /** @internal Exact credential metadata seam for post-manager restart admission. */
+  _supervisorCredentialFilesOverride?: SupervisorSpec["credentialFiles"];
   /** @internal Deterministic interruption seam for lifecycle tests. */
   _abortSignal?: AbortSignal;
 };
@@ -329,12 +335,10 @@ function managedSupervisorKind(
   return undefined;
 }
 
-function supervisorNonce(scopeDigest: string, port: number): string {
-  // A stable nonce lets every lifecycle invocation probe the same registered
-  // job without writing another authority file.  The canonical state-root
-  // digest remains the manager scope; port is launch metadata and therefore
-  // deliberately included only in the nonce.
-  return `${scopeDigest.slice(0, 32)}-${port.toString(16)}`;
+function supervisorNonce(): string {
+  // The manager name is the stable state-root mutex; the nonce identifies one
+  // concrete launch and must never be reused across starts or restarts.
+  return randomBytes(16).toString("hex");
 }
 
 function supervisorCommandRunner(
@@ -1840,6 +1844,70 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     return listenerPorts.includes(opts.port);
   }
 
+  function observedSupervisorSpec(
+    requested: SupervisorSpec,
+    observation: SupervisorObservation,
+  ): SupervisorSpec | undefined {
+    if (
+      observation.kind !== "registered-stale-config"
+      || observation.marker !== requested.marker
+      || observation.scopeDigest !== requested.scopeDigest
+      || observation.stateRoot !== requested.stateRoot
+      || observation.name !== requested.name
+      || observation.port === undefined
+      || observation.nonce === undefined
+      || observation.executable === undefined
+      || observation.args === undefined
+      || observation.managerPid === undefined
+      || observation.managerPid < 1
+    ) return undefined;
+    let args: readonly string[];
+    try {
+      const parsed: unknown = JSON.parse(observation.args);
+      if (!Array.isArray(parsed) || parsed.some((value) => typeof value !== "string")) return undefined;
+      args = Object.freeze([...parsed]);
+    } catch {
+      return undefined;
+    }
+    const optionalMetadataMatches = (observed: string | undefined, expected: string | undefined): boolean =>
+      (observed ?? "") === (expected ?? "");
+    const sameCredentials = requested.credentialDirectory === undefined
+      ? observation.credentialDirectory === undefined && (observation.credentialFiles?.length ?? 0) === 0
+      : observation.credentialDirectory === requested.credentialDirectory
+        && (requested.credentialFiles ?? []).length === (observation.credentialFiles ?? []).length
+        && (requested.credentialFiles ?? []).every((credential, index) => {
+          const observed = observation.credentialFiles?.[index];
+          return observed?.name === credential.name && observed.path === credential.path;
+        });
+    if (!sameCredentials
+      || observation.executable !== requested.executable
+      || observation.args !== JSON.stringify(requested.args)
+      || observation.cwd !== (requested.cwd ?? "")
+      || !optionalMetadataMatches(observation.entrypoint, requested.entrypoint)
+      || !optionalMetadataMatches(observation.runtimeDigest, requested.runtimeDigest)
+      || !optionalMetadataMatches(observation.storageBackend, requested.storageBackend)
+    ) return undefined;
+    try {
+      return createSupervisorSpec({
+        kind: requested.kind,
+        stateRoot: requested.stateRoot,
+        port: observation.port,
+        nonce: observation.nonce,
+        executable: observation.executable,
+        args,
+        ...(observation.entrypoint === undefined ? {} : { entrypoint: observation.entrypoint }),
+        ...(observation.runtimeDigest === undefined ? {} : { runtimeDigest: observation.runtimeDigest }),
+        storageBackend: requested.storageBackend!,
+        ...(observation.credentialDirectory === undefined ? {} : { credentialDirectory: observation.credentialDirectory }),
+        ...(observation.credentialFiles === undefined ? {} : { credentialFiles: observation.credentialFiles }),
+        stopTimeoutMs: requested.stopTimeoutMs,
+        realpath,
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
   function exactNoLivePidProof(): boolean {
     try {
       const first = readOwnedPid();
@@ -1891,7 +1959,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         kind,
         stateRoot: scope.stateRoot,
         port: opts.port,
-        nonce: supervisorNonce(scope.scopeDigest, opts.port),
+        nonce: opts._supervisorNonceOverride?.() ?? supervisorNonce(),
         executable,
         args,
         entrypoint: expectedEntrypoint,
@@ -1899,6 +1967,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         storageBackend: expectedStorageBackend,
         stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
         realpath,
+        ...(opts._supervisorCredentialDirectoryOverride === undefined ? {} : { credentialDirectory: opts._supervisorCredentialDirectoryOverride }),
+        ...(opts._supervisorCredentialFilesOverride === undefined ? {} : { credentialFiles: opts._supervisorCredentialFilesOverride }),
       });
     } catch {
       return null;
@@ -1985,6 +2055,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       "managed daemon supervisor could not be constructed; inspect the daemon configuration and retry",
     );
     const { spec, supervisor } = managed;
+    let requestedSpec = spec;
     let observation: SupervisorObservation;
     try {
       observation = await supervisor.probe(spec);
@@ -1993,6 +2064,25 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         "ambiguous",
         "managed daemon supervisor probe failed; inspect the daemon manager and retry",
       );
+    }
+
+    // A fresh per-start nonce is not part of the stable manager name.  When a
+    // running no-credential job is already registered, authenticate its
+    // exact observed nonce and adopt that launch identity.  Credential-bearing
+    // jobs are deliberately not adopted without the exact requested paths.
+    if (observation.kind === "registered-stale-config") {
+      const observedSpec = observedSupervisorSpec(spec, observation);
+      if (observedSpec !== undefined) {
+        try {
+          const observed = await supervisor.probe(observedSpec);
+          if (observed.kind === "registered-running-valid") {
+            requestedSpec = observedSpec;
+            observation = observed;
+          }
+        } catch {
+          // Preserve the stale/ambiguous refusal below.
+        }
+      }
     }
 
     // The only compatibility downgrade is an unavailable manager during the
@@ -2092,11 +2182,11 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (healthObservation.kind === "no-response") {
       let secondProbe: SupervisorObservation;
       try {
-        secondProbe = await supervisor.probe(spec);
+        secondProbe = await supervisor.probe(requestedSpec);
       } catch {
         return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed after the no-response observation", { pid: observation.managerPid });
       }
-      const sameManager = supervisorMetadataMatches(secondProbe, spec)
+      const sameManager = supervisorMetadataMatches(secondProbe, requestedSpec)
         && secondProbe.managerPid === observation.managerPid;
       const sameEndpoint = observation.managerPid !== undefined
         && readOwnedPid() === observation.managerPid
@@ -2123,14 +2213,14 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const health = healthObservation.parsedBody;
     let secondProbe: SupervisorObservation;
     try {
-      secondProbe = await supervisor.probe(spec);
+      secondProbe = await supervisor.probe(requestedSpec);
     } catch {
       return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed before endpoint admission", { pid: observation.managerPid });
     }
     if (!isRecognizedDaemonHealth(health)
-      || !supervisorMetadataMatches(secondProbe, spec)
+      || !supervisorMetadataMatches(secondProbe, requestedSpec)
       || secondProbe.managerPid !== observation.managerPid
-      || !managerEndpointIdentityMatches(secondProbe, health, spec)) {
+      || !managerEndpointIdentityMatches(secondProbe, health, requestedSpec)) {
       return refusalResult(
         "invalid-collision",
         "managed daemon endpoint identity did not match its supervisor job; refusing reuse",
@@ -2152,6 +2242,16 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     );
     if (authenticated === null) {
       return refusalResult("response-auth-failure", "managed daemon health could not be authenticated", { pid: observation.managerPid });
+    }
+    let finalProbe: SupervisorObservation;
+    try {
+      finalProbe = await supervisor.probe(requestedSpec);
+    } catch {
+      return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed after authenticated admission", { pid: observation.managerPid });
+    }
+    if (!managerEndpointIdentityMatches(finalProbe, authenticated, requestedSpec)
+      || finalProbe.managerPid !== observation.managerPid) {
+      return refusalResult("ambiguous", "managed daemon manager identity changed after authenticated admission", { pid: observation.managerPid });
     }
     const accepted = await daemonResult(
       authenticated,
@@ -2207,7 +2307,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     }
     let second: SupervisorObservation;
     try {
-      second = await supervisor.probe(spec);
+      second = await supervisor.probe(launchSpec);
     } catch {
       // A post-start re-probe is part of the ownership proof.  If it cannot
       // settle, the manager mutation may have raced a concurrent winner; do
@@ -2216,7 +2316,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       managedOperationAmbiguous = true;
       return refusalResult("startup-failure", "managed daemon supervisor could not be re-probed after start", { spawned: true, startMethod: managerKind });
     }
-    if (!supervisorMetadataMatches(second, spec)
+    if (!supervisorMetadataMatches(second, launchSpec)
       || (started.managerPid !== undefined && second.managerPid !== started.managerPid)) {
       managedOperationOwned = false;
       managedOperationAmbiguous = true;
@@ -2259,7 +2359,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       const healthObservation = await observeDaemonHealth(opts.port, fetchFn, healthDeadline);
       if (healthObservation.kind === "response" && healthObservation.body === "valid" && healthObservation.parsedBody !== undefined) {
         const health = healthObservation.parsedBody;
-        if (isRecognizedDaemonHealth(health) && managerEndpointIdentityMatches(second, health, spec)) {
+        if (isRecognizedDaemonHealth(health) && managerEndpointIdentityMatches(second, health, launchSpec)) {
           const storage = recognizedHealthStorageBackend(health);
           if (storage !== null) {
             const authenticated = await checkDaemonDiagnostics(
@@ -2272,6 +2372,28 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
               readOwnedToken,
             );
             if (authenticated !== null) {
+              let finalProbe: SupervisorObservation;
+              try {
+                finalProbe = await supervisor.probe(launchSpec);
+              } catch {
+                managedOperationOwned = false;
+                managedOperationAmbiguous = true;
+                return refusalResult(
+                  "ambiguous",
+                  "managed daemon supervisor could not be re-probed after authenticated admission",
+                  { spawned: true, pid: managerPid, startMethod: managerKind },
+                );
+              }
+              if (!managerEndpointIdentityMatches(finalProbe, authenticated, launchSpec)
+                || finalProbe.managerPid !== managerPid) {
+                managedOperationOwned = false;
+                managedOperationAmbiguous = true;
+                return refusalResult(
+                  "ambiguous",
+                  "managed daemon manager identity changed after authenticated admission",
+                  { spawned: true, pid: managerPid, startMethod: managerKind },
+                );
+              }
               const accepted = await daemonResult(
                 authenticated,
                 true,
@@ -2280,7 +2402,24 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
                 undefined,
                 true,
               );
-              if (accepted) return accepted;
+              if (accepted) {
+                if (managedCredentialDirectoryForCleanup !== undefined) {
+                  try {
+                    cleanupManagedCredentialDirectory(
+                      managedCredentialDirectoryForCleanup,
+                      launchSpec.stateRoot,
+                    );
+                    managedCredentialDirectoryForCleanup = undefined;
+                  } catch {
+                    return refusalResult(
+                      "startup-failure",
+                      "managed daemon was admitted but its staged credentials could not be erased",
+                      { spawned: true, pid: managerPid, startMethod: managerKind },
+                    );
+                  }
+                }
+                return accepted;
+              }
             }
           }
         }
@@ -2992,7 +3131,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         kind: managerKind,
         stateRoot: scope.stateRoot,
         port: opts.port,
-        nonce: supervisorNonce(scope.scopeDigest, opts.port),
+        nonce: opts._supervisorNonceOverride?.() ?? supervisorNonce(),
         executable,
         args,
         entrypoint: testScope?.entrypoint ?? opts.expectedEntrypoint,
@@ -3041,12 +3180,20 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       return restartRefusal("ambiguous", "managed daemon supervisor returned ambiguous state; refusing restart");
     }
     const ensure = _ensureDaemonOverride ?? ensureDaemon;
-    const ensureAfterManagerOperation = async (managerPid?: number): Promise<RestartDaemonResult> => {
+    const ensureAfterManagerOperation = async (
+      managerPid?: number,
+      admittedSpec?: SupervisorSpec,
+    ): Promise<RestartDaemonResult> => {
       const ensured = await ensure({
         ...ensureOptions,
         _suppressDetachedFallback: true,
         _managedOperationAuthorized: true,
         ...(managerPid === undefined ? {} : { _managedOperationManagerPid: managerPid }),
+        ...(admittedSpec === undefined ? {} : {
+          _supervisorNonceOverride: () => admittedSpec.nonce,
+          _supervisorCredentialDirectoryOverride: admittedSpec.credentialDirectory,
+          _supervisorCredentialFilesOverride: admittedSpec.credentialFiles,
+        }),
       });
       return {
         ...ensured,
@@ -3058,7 +3205,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       const staged = stageManagedCredentials(spec, dependencies.environment);
       try {
         const started = await supervisor.stopAndStart(staged.spec);
-        return await ensureAfterManagerOperation(started.managerPid);
+        return await ensureAfterManagerOperation(started.managerPid, staged.spec);
       } finally {
         if (staged.credentialDirectory !== undefined) {
           try { cleanupManagedCredentialDirectory(staged.credentialDirectory, spec.stateRoot); } catch { /* preserve unresolved evidence */ }

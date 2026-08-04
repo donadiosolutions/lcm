@@ -29,6 +29,8 @@ const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const MAX_CREDENTIAL_COUNT = MANAGED_CREDENTIAL_NAMES.length;
 const MAX_CREDENTIAL_BYTES = 1024 * 1024;
+const MANAGED_CREDENTIAL_NONCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
+const STALE_CREDENTIAL_DIRECTORY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}-[a-f0-9]{16}$/u;
 
 function currentUid(): number {
   return typeof process.getuid === "function" ? process.getuid() : -1;
@@ -73,6 +75,12 @@ function validateName(name: string): asserts name is ManagedCredentialName {
   }
 }
 
+function validateNonce(nonce: string): void {
+  if (!MANAGED_CREDENTIAL_NONCE_PATTERN.test(nonce)) {
+    throw new Error("managed credential nonce is invalid");
+  }
+}
+
 /**
  * Create a private, canonical directory for one launch's credentials.
  *
@@ -85,9 +93,7 @@ export function createManagedCredentialDirectory(
   uid = currentUid(),
 ): string {
   const canonicalRoot = safeCanonicalDirectory(stateRoot, "managed credential state root");
-  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(nonce)) {
-    throw new Error("managed credential nonce is invalid");
-  }
+  validateNonce(nonce);
   const base = resolve(canonicalRoot, "credentials");
   try {
     ensurePrivateDirectory(base);
@@ -111,6 +117,47 @@ export function createManagedCredentialDirectory(
     throw new Error("managed credential directory escapes state root");
   }
   return canonicalDirectory;
+}
+
+/**
+ * Remove only abandoned lifecycle-created credential directories after an
+ * exact stable manager absence proof.  The manager name is state-root scoped,
+ * so an absent observation for the supplied nonce proves that no launch for
+ * this scope can still consume any older nonce directory.  Unsafe, foreign,
+ * or tampered children are preserved as evidence.
+ */
+export function scavengeStaleManagedCredentialDirectories(
+  stateRoot: string,
+  managerNonce: string,
+  preserveDirectory?: string,
+  uid = currentUid(),
+): void {
+  validateNonce(managerNonce);
+  let canonicalRoot: string;
+  let canonicalBase: string;
+  try {
+    canonicalRoot = safeCanonicalDirectory(stateRoot, "managed credential state root", uid);
+    canonicalBase = safeCanonicalDirectory(resolve(canonicalRoot, "credentials"), "managed credential base directory", uid);
+  } catch {
+    return;
+  }
+  const preserved = preserveDirectory === undefined ? undefined : resolve(preserveDirectory);
+  let names: string[];
+  try {
+    names = readdirSync(canonicalBase);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!STALE_CREDENTIAL_DIRECTORY_PATTERN.test(name)) continue;
+    const candidate = resolve(canonicalBase, name);
+    if (candidate === preserved) continue;
+    try {
+      cleanupManagedCredentialDirectory(candidate, canonicalRoot, uid);
+    } catch {
+      // Never broaden scavenging authority when one child is unresolved.
+    }
+  }
 }
 
 /** Write the allow-listed credential values without following a pre-existing leaf. */

@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -15,6 +16,7 @@ const fsMocks = vi.hoisted(() => ({
   fstatSync: vi.fn(),
   lstatSync: vi.fn(),
   mkdirSync: vi.fn(),
+  readdirSync: vi.fn(),
   realpathSync: vi.fn(),
   rmdirSync: vi.fn(),
   unlinkSync: vi.fn(),
@@ -32,6 +34,7 @@ vi.mock("node:fs", async importOriginal => {
   fsMocks.fstatSync.mockImplementation(forward(original.fstatSync as (...args: any[]) => any));
   fsMocks.lstatSync.mockImplementation(forward(original.lstatSync as (...args: any[]) => any));
   fsMocks.mkdirSync.mockImplementation(forward(original.mkdirSync as (...args: any[]) => any));
+  fsMocks.readdirSync.mockImplementation(forward(original.readdirSync as (...args: any[]) => any));
   fsMocks.realpathSync.mockImplementation(forward(original.realpathSync as (...args: any[]) => any));
   fsMocks.rmdirSync.mockImplementation(forward(original.rmdirSync as (...args: any[]) => any));
   fsMocks.unlinkSync.mockImplementation(forward(original.unlinkSync as (...args: any[]) => any));
@@ -40,6 +43,7 @@ vi.mock("node:fs", async importOriginal => {
     fstatSync: fsMocks.fstatSync,
     lstatSync: fsMocks.lstatSync,
     mkdirSync: fsMocks.mkdirSync,
+    readdirSync: fsMocks.readdirSync,
     realpathSync: fsMocks.realpathSync,
     rmdirSync: fsMocks.rmdirSync,
     unlinkSync: fsMocks.unlinkSync,
@@ -58,6 +62,7 @@ import {
   cleanupManagedCredentialDirectory,
   createManagedCredentialDirectory,
   managedCredentialPath,
+  scavengeStaleManagedCredentialDirectories,
   validateManagedCredentialDirectory,
   writeManagedCredentialFiles,
 } from "../../src/daemon/managed-credentials.js";
@@ -71,6 +76,7 @@ function restoreFsForwarders(): void {
   fsMocks.fstatSync.mockImplementation(forward(original.fstatSync as (...args: any[]) => any));
   fsMocks.lstatSync.mockImplementation(forward(original.lstatSync as (...args: any[]) => any));
   fsMocks.mkdirSync.mockImplementation(forward(original.mkdirSync as (...args: any[]) => any));
+  fsMocks.readdirSync.mockImplementation(forward(original.readdirSync as (...args: any[]) => any));
   fsMocks.realpathSync.mockImplementation(forward(original.realpathSync as (...args: any[]) => any));
   fsMocks.rmdirSync.mockImplementation(forward(original.rmdirSync as (...args: any[]) => any));
   fsMocks.unlinkSync.mockImplementation(forward(original.unlinkSync as (...args: any[]) => any));
@@ -283,6 +289,41 @@ describe("Epic 400 managed credential coverage", () => {
       restoreFsForwarders();
       cleanupManagedCredentialDirectory(rmdirMissing, root);
     } finally {
+      removeRoot(root);
+    }
+  });
+
+  it("fails closed for missing or unreadable bases and handles optional preservation", () => {
+    const root = makeRoot();
+    try {
+      expect(() => scavengeStaleManagedCredentialDirectories(root, "missing-base")).not.toThrow();
+
+      const base = join(root, "credentials");
+      mkdirSync(base, { mode: 0o700 });
+      chmodSync(base, 0o700);
+
+      const withoutPreserve = createManagedCredentialDirectory(root, "stale-without-abcdef0123456789");
+      writeManagedCredentialFiles(withoutPreserve, { OPENAI_API_KEY: "stale" });
+      scavengeStaleManagedCredentialDirectories(root, "manager-without-preserve");
+      expect(existsSync(withoutPreserve)).toBe(false);
+
+      const stale = createManagedCredentialDirectory(root, "stale-with-preserve-fedcba9876543210");
+      const preserved = createManagedCredentialDirectory(root, "current-with-preserve-0123456789abcdef");
+      writeManagedCredentialFiles(stale, { OPENAI_API_KEY: "stale" });
+      writeManagedCredentialFiles(preserved, { OPENAI_API_KEY: "current" });
+
+      fsMocks.readdirSync.mockImplementationOnce(() => { throw errorWithCode("EACCES"); });
+      expect(() => scavengeStaleManagedCredentialDirectories(root, "manager-unreadable", preserved)).not.toThrow();
+      expect(existsSync(stale)).toBe(true);
+      expect(existsSync(preserved)).toBe(true);
+      restoreFsForwarders();
+
+      scavengeStaleManagedCredentialDirectories(root, "manager-with-preserve", preserved);
+      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(preserved)).toBe(true);
+      cleanupManagedCredentialDirectory(preserved, root);
+    } finally {
+      restoreFsForwarders();
       removeRoot(root);
     }
   });

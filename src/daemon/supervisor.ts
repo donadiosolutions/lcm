@@ -17,6 +17,7 @@ import {
   cleanupManagedCredentialDirectory,
   managedCredentialPath,
   MANAGED_CREDENTIAL_NAMES,
+  scavengeStaleManagedCredentialDirectories,
   validateManagedCredentialDirectory,
 } from "./managed-credentials.js";
 
@@ -771,6 +772,30 @@ function isRunningState(value: string | undefined): boolean {
   return value !== undefined && /^(active|running|started|launching)$/iu.test(value);
 }
 
+type SupervisorProbeCapture = {
+  parsed?: Map<string, string>;
+  code?: number | null;
+};
+
+/**
+ * Recognize only the manager state that can legitimately race a successful
+ * systemd-run --no-block submission.  Ordinary classification remains
+ * fail-closed until the unit reaches active/running.
+ */
+function isOwnedSystemdActivation(
+  spec: SupervisorSpec,
+  capture: SupervisorProbeCapture,
+): boolean {
+  if (spec.kind !== "systemd-user" || capture.code !== 0 || capture.parsed === undefined) return false;
+  const loadState = lookup(capture.parsed, "LoadState", "loadState");
+  const activeState = lookup(capture.parsed, "ActiveState", "state", "State", "status");
+  const subState = lookup(capture.parsed, "SubState", "subState", "substate");
+  if (!/^loaded$/iu.test(loadState ?? "") || !/^activating$/iu.test(activeState ?? "")) return false;
+  if (!/^(?:start-pre|start|start-post)$/iu.test(subState ?? "")) return false;
+  const classified = classifyRegistered(spec, capture.parsed, capture.code);
+  return classified.kind === "ambiguous" && classified.reason === "metadata-malformed";
+}
+
 function isTerminalState(value: string | undefined): "inactive" | "failed" | "last-exit" | undefined {
   if (value === undefined) return undefined;
   if (/^(inactive|stopped|dead|exited|not[ -]running)$/iu.test(value)) return "inactive";
@@ -798,6 +823,7 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
   const entrypoint = metadata(values, "LCM_SUPERVISOR_ENTRYPOINT");
   const runtimeDigest = metadata(values, "LCM_SUPERVISOR_RUNTIME_DIGEST");
   const storageBackend = metadata(values, "LCM_SUPERVISOR_STORAGE_BACKEND");
+  const managerPid = parsePid(lookup(values, "MainPID", "pid", "PID", "process.pid", "ProcessID"));
   const credentialDirectory = metadata(values, "LCM_CREDENTIAL_DIRECTORY");
   const credentialFiles = MANAGED_CREDENTIAL_NAMES.flatMap((name) => {
     const path = metadata(values, `LCM_CREDENTIAL_${name}_FILE`);
@@ -817,8 +843,22 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
     ...(storageBackend === undefined ? {} : { storageBackend }),
     ...(credentialDirectory === undefined ? {} : { credentialDirectory }),
     ...(credentialFiles.length === 0 ? {} : { credentialFiles: Object.freeze(credentialFiles) }),
+    ...(managerPid === undefined ? {} : { managerPid }),
     name: spec.name,
   };
+}
+
+function credentialFilesMatch(
+  expected: readonly CredentialFileReference[] | undefined,
+  observed: readonly CredentialFileReference[] | undefined,
+): boolean {
+  const expectedFiles = expected ?? [];
+  const observedFiles = observed ?? [];
+  return expectedFiles.length === observedFiles.length
+    && expectedFiles.every((credential, index) => {
+      const candidate = observedFiles[index];
+      return candidate?.name === credential.name && candidate.path === credential.path;
+    });
 }
 
 function staleReason(
@@ -838,6 +878,13 @@ function staleReason(
   if (base.entrypoint !== undefined && base.entrypoint !== (spec.entrypoint ?? "")) return "metadata-mismatch";
   if (base.runtimeDigest !== undefined && base.runtimeDigest !== (spec.runtimeDigest ?? "")) return "metadata-mismatch";
   if (base.storageBackend !== undefined && base.storageBackend !== (spec.storageBackend ?? "")) return "metadata-mismatch";
+  if (base.credentialDirectory !== undefined && base.credentialDirectory !== (spec.credentialDirectory ?? "")) return "metadata-mismatch";
+  if (spec.credentialDirectory !== undefined && base.credentialDirectory === undefined) return "metadata-missing";
+  if (!credentialFilesMatch(spec.credentialFiles, base.credentialFiles)) {
+    return spec.credentialFiles !== undefined && base.credentialFiles === undefined
+      ? "metadata-missing"
+      : "metadata-mismatch";
+  }
   if (base.executable === undefined || base.args === undefined || base.cwd === undefined) return "metadata-missing";
   if (spec.entrypoint !== undefined && base.entrypoint === undefined) return "metadata-missing";
   if (spec.runtimeDigest !== undefined && base.runtimeDigest === undefined) return "metadata-missing";
@@ -872,6 +919,8 @@ function classifyRegistered(
     || (spec.entrypoint !== undefined && base.entrypoint === undefined)
     || (spec.runtimeDigest !== undefined && base.runtimeDigest === undefined)
     || (spec.storageBackend !== undefined && base.storageBackend === undefined)
+    || (spec.credentialDirectory !== undefined && base.credentialDirectory === undefined)
+    || !credentialFilesMatch(spec.credentialFiles, base.credentialFiles)
   ) {
     return Object.freeze({ kind: "registered-stale-config", reason: "metadata-missing", ...base });
   }
@@ -1092,7 +1141,7 @@ function cleanupPrivatePlist(spec: SupervisorSpec, plistRaceFault?: PlistRaceFau
   }
 }
 
-function plistSpecFromObservation(
+function supervisorSpecFromObservation(
   spec: SupervisorSpec,
   observation: SupervisorObservation,
 ): SupervisorSpec | undefined {
@@ -1104,6 +1153,7 @@ function plistSpecFromObservation(
     || observation.port === undefined
     || observation.executable === undefined
     || observation.args === undefined
+    || (observation.stateRoot !== undefined && observation.stateRoot !== spec.stateRoot)
   ) return undefined;
   let args: readonly string[];
   try {
@@ -1114,32 +1164,70 @@ function plistSpecFromObservation(
     return undefined;
   }
   try {
-    assertNonce(observation.nonce);
-    const candidate: SupervisorSpec = {
-      ...spec,
-      nonce: observation.nonce,
+    return createSupervisorSpec({
+      kind: spec.kind,
+      stateRoot: spec.stateRoot,
       port: observation.port,
+      nonce: observation.nonce,
       executable: observation.executable,
       args,
-      ...(observation.cwd === undefined || observation.cwd === "" ? { cwd: undefined } : { cwd: observation.cwd }),
-      ...(observation.entrypoint === undefined ? { entrypoint: undefined } : { entrypoint: observation.entrypoint }),
-      ...(observation.runtimeDigest === undefined ? { runtimeDigest: undefined } : { runtimeDigest: observation.runtimeDigest }),
-      ...(observation.storageBackend === undefined ? { storageBackend: undefined } : { storageBackend: observation.storageBackend }),
+      ...(observation.cwd === undefined || observation.cwd === "" ? {} : { cwd: observation.cwd }),
+      ...(observation.entrypoint === undefined ? {} : { entrypoint: observation.entrypoint }),
+      ...(observation.runtimeDigest === undefined ? {} : { runtimeDigest: observation.runtimeDigest }),
+      ...(observation.storageBackend === undefined ? {} : { storageBackend: observation.storageBackend }),
       ...(observation.credentialDirectory === undefined ? {} : { credentialDirectory: observation.credentialDirectory }),
       ...(observation.credentialFiles === undefined ? {} : { credentialFiles: observation.credentialFiles }),
-    };
-    if (
-      (spec.cwd !== undefined && candidate.cwd === undefined)
-      || (spec.entrypoint !== undefined && candidate.entrypoint === undefined)
-      || (spec.runtimeDigest !== undefined && candidate.runtimeDigest === undefined)
-      || (spec.storageBackend !== undefined && candidate.storageBackend === undefined)
-      || (spec.credentialDirectory !== undefined && candidate.credentialDirectory === undefined)
-      || (spec.credentialFiles !== undefined && candidate.credentialFiles === undefined)
-    ) return undefined;
-    return Object.freeze(candidate);
+      stopTimeoutMs: spec.stopTimeoutMs,
+    });
   } catch {
     return undefined;
   }
+}
+
+function plistSpecFromObservation(
+  spec: SupervisorSpec,
+  observation: SupervisorObservation,
+): SupervisorSpec | undefined {
+  const candidate = supervisorSpecFromObservation(spec, observation);
+  if (candidate === undefined) return undefined;
+  if (
+    (spec.cwd !== undefined && candidate.cwd === undefined)
+    || (spec.entrypoint !== undefined && candidate.entrypoint === undefined)
+    || (spec.runtimeDigest !== undefined && candidate.runtimeDigest === undefined)
+    || (spec.storageBackend !== undefined && candidate.storageBackend === undefined)
+    || (spec.credentialDirectory !== undefined && candidate.credentialDirectory === undefined)
+    || (spec.credentialFiles !== undefined && candidate.credentialFiles === undefined)
+  ) return undefined;
+  return candidate;
+}
+
+function differentRunningWinnerSpec(
+  spec: SupervisorSpec,
+  observation: SupervisorObservation,
+): SupervisorSpec | undefined {
+  const optionalMetadataMatches = (observed: string | undefined, expected: string | undefined): boolean =>
+    expected === undefined ? observed === undefined || observed === "" : observed === expected;
+  if (
+    observation.kind !== "registered-stale-config"
+    || observation.marker !== spec.marker
+    || observation.scopeDigest !== spec.scopeDigest
+    || observation.stateRoot !== spec.stateRoot
+    || observation.name !== spec.name
+    || observation.port !== spec.port
+    || observation.nonce === undefined
+    || observation.nonce === spec.nonce
+    || observation.executable !== spec.executable
+    || observation.args !== JSON.stringify(spec.args)
+    || observation.cwd !== (spec.cwd ?? "")
+    || !optionalMetadataMatches(observation.entrypoint, spec.entrypoint)
+    || !optionalMetadataMatches(observation.runtimeDigest, spec.runtimeDigest)
+    || !optionalMetadataMatches(observation.storageBackend, spec.storageBackend)
+    || observation.managerPid === undefined
+    || observation.managerPid < 1
+  ) return undefined;
+  const candidate = supervisorSpecFromObservation(spec, observation);
+  if (candidate === undefined || candidate.credentialDirectory === spec.credentialDirectory) return undefined;
+  return candidate;
 }
 
 function credentialsAreSafe(spec: SupervisorSpec): boolean {
@@ -1279,7 +1367,7 @@ export function createSupervisor(
   if (typeof dependencies.run !== "function") throw new Error("supervisor command runner is required");
   const runner = createObservationRunner(kind, dependencies);
 
-  const probe = async (spec: SupervisorSpec): Promise<SupervisorObservation> => {
+  const probeInternal = async (spec: SupervisorSpec, capture?: SupervisorProbeCapture): Promise<SupervisorObservation> => {
     if (spec.kind !== kind) return Object.freeze({ kind: "ambiguous", reason: "metadata-mismatch", name: spec.name });
     if (dependencies.platform === undefined && hostPlatform() !== managerPlatform(kind)) {
       return Object.freeze({ kind: "unavailable", reason: "unsupported-platform", name: spec.name });
@@ -1292,6 +1380,10 @@ export function createSupervisor(
       : await runner.invoke("launchctl", launchdProbeArgs(spec, runner.uid));
     if (result.timedOut) return Object.freeze({ kind: "unavailable", reason: "manager-timeout", name: spec.name });
     const parsed = parseManagerOutput(`${result.stdout}\n${result.stderr}`);
+    if (capture !== undefined) {
+      capture.parsed = parsed;
+      capture.code = result.code;
+    }
     if (result.code !== 0 && isLikelyAbsent({ kind, ...result })) return Object.freeze({ kind: "absent", name: spec.name });
     if (result.code !== 0 && parsed.size === 0) {
       return Object.freeze({ kind: "unavailable", reason: unavailableReason(result), name: spec.name });
@@ -1311,8 +1403,10 @@ export function createSupervisor(
     return classified;
   };
 
+  const probe = (spec: SupervisorSpec): Promise<SupervisorObservation> => probeInternal(spec);
+
   const start = async (spec: SupervisorSpec, terminalRecreated = false): Promise<SupervisorStartResult> => {
-    const current = await probe(spec);
+    const current = await probeInternal(spec);
     if (current.kind === "unavailable") throw managerUnavailableError(current.reason);
     if (current.kind === "registered-running-valid") {
       return Object.freeze({
@@ -1344,6 +1438,7 @@ export function createSupervisor(
     if (!credentialsAreSafe(spec)) {
       throw new Error("supervisor credential validation failed");
     }
+    scavengeStaleManagedCredentialDirectories(spec.stateRoot, spec.nonce, spec.credentialDirectory);
     let launchPath: string | undefined;
     try {
       if (kind === "launchd-user") launchPath = writePrivatePlist(spec, dependencies._plistRaceForTesting);
@@ -1366,12 +1461,19 @@ export function createSupervisor(
         ),
       );
       let after: SupervisorObservation = Object.freeze({ kind: "absent", name: spec.name });
+      const now = dependencies.now ?? performance.now.bind(performance);
+      const pollDeadline = now() + (dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
       for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
-        after = await probe(spec);
-        if (after.kind !== "absent") break;
+        const capture: SupervisorProbeCapture = {};
+        after = await probeInternal(spec, capture);
+        const activation = isOwnedSystemdActivation(spec, capture);
+        if (after.kind !== "absent" && !activation) break;
         if (attempt + 1 < maxPollIntervals) {
-          if (dependencies.sleep !== undefined) await dependencies.sleep(DEFAULT_POLL_INTERVAL_MS);
-          else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, DEFAULT_POLL_INTERVAL_MS));
+          const remaining = pollDeadline - now();
+          if (remaining <= 0) break;
+          const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
+          if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
+          else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
         }
       }
       if (after.kind === "registered-running-valid") {
@@ -1389,21 +1491,38 @@ export function createSupervisor(
         if (after.kind === "absent") {
           if (kind === "launchd-user") cleanupPrivatePlist(spec, dependencies._plistRaceForTesting);
           safeCredentialCleanup(spec);
-        } else if (
-          after.kind === "registered-not-running-valid"
-          && after.scopeDigest === spec.scopeDigest
-          && after.name === spec.name
-          && after.nonce === spec.nonce
-        ) {
-          // A transient service may acknowledge submission and then exit
-          // immediately.  This terminal state is still owned by the exact
-          // nonce, so retire it through the manager and prove absence before
-          // deleting its one-launch credentials or private launch plist.
-          try {
-            await stopAndAwaitAbsent(spec);
-          } catch {
-            // Preserve terminal evidence when stop/absence cannot be proven.
-            throw error;
+        } else {
+          if (spec.credentialDirectory !== undefined) {
+            const winnerSpec = differentRunningWinnerSpec(spec, after);
+            if (winnerSpec !== undefined) {
+              const winner = await probe(winnerSpec);
+              if (
+                winner.kind === "registered-running-valid"
+                && winner.scopeDigest === winnerSpec.scopeDigest
+                && winner.nonce === winnerSpec.nonce
+                && winner.name === winnerSpec.name
+                && winner.managerPid === after.managerPid
+              ) {
+                safeCredentialCleanup(spec);
+              }
+            }
+          }
+          if (
+            after.kind === "registered-not-running-valid"
+            && after.scopeDigest === spec.scopeDigest
+            && after.name === spec.name
+            && after.nonce === spec.nonce
+          ) {
+            // A transient service may acknowledge submission and then exit
+            // immediately.  This terminal state is still owned by the exact
+            // nonce, so retire it through the manager and prove absence before
+            // deleting its one-launch credentials or private launch plist.
+            try {
+              await stopAndAwaitAbsent(spec);
+            } catch {
+              // Preserve terminal evidence when stop/absence cannot be proven.
+              throw error;
+            }
           }
         }
       } catch {
@@ -1427,10 +1546,10 @@ export function createSupervisor(
     const staleSource = staleObservation?.kind === "registered-stale-config"
       ? staleObservation
       : current.kind === "registered-stale-config" ? current : undefined;
-    const stalePlistSpec = allowStaleConfig && staleSource !== undefined
+    const stalePlistSpec = kind === "launchd-user" && allowStaleConfig && staleSource !== undefined
       ? plistSpecFromObservation(spec, staleSource)
       : undefined;
-    if (allowStaleConfig && staleSource !== undefined && stalePlistSpec === undefined) {
+    if (kind === "launchd-user" && allowStaleConfig && staleSource !== undefined && stalePlistSpec === undefined) {
       throw commandFailedError();
     }
     if (current.kind === "absent") {

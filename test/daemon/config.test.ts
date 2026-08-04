@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, type TestContext } from "vitest";
@@ -782,6 +782,10 @@ describe("launchd one-launch credential projection", () => {
     chmodSync(file, 0o644);
     expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
     chmodSync(file, 0o600);
+    const hardlink = join(directory, "OPENAI_API_KEY_HARDLINK");
+    linkSync(file, hardlink);
+    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
+    rmSync(hardlink);
     writeFileSync(file, "x".repeat(1024 * 1024 + 1), { mode: 0o600 });
     chmodSync(file, 0o600);
     expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();

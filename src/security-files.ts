@@ -200,9 +200,10 @@ export function consumeBoundedRegularFile(path: string, options: BoundedFileOpti
       throw new Error("file parent changed during consume");
     }
     const current = lstatSync(path);
-    if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1 || current.dev !== result.dev || current.ino !== result.ino) {
+    if (current.isSymbolicLink() || current.nlink !== 1 || current.dev !== result.dev || current.ino !== result.ino) {
       throw new Error("file changed during consume");
     }
+    validateBoundedFileMetadata(current, options);
     unlinkSync(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return result.content;

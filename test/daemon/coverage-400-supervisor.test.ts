@@ -500,9 +500,116 @@ describe("supervisor coverage: manager states and lifecycle boundaries", () => {
     const rejected = createSupervisor("systemd-user", { run: async () => { throw new Error("runner"); }, platform: "linux" });
     await expect(rejected.probe(value)).resolves.toMatchObject({ kind: "unavailable" });
   });
+
+  it("covers activation metadata fences and the monotonic start deadline", async () => {
+    const rejectAfterPoll = async (value: SupervisorSpec, after: string): Promise<void> => {
+      const runner = runQueue([
+        { code: 1, stderr: "Unit is not-found" },
+        { code: 0, stdout: "started" },
+        { code: 0, stdout: after },
+        { code: 1, stderr: "Unit is not-found" },
+      ]);
+      await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(value)).rejects.toThrow("manager command");
+    };
+
+    const missingLoad = spec("systemd-user");
+    await rejectAfterPoll(
+      missingLoad,
+      systemdText(missingLoad, "activating", 0)
+        .replace("LoadState=loaded", "LoadState=unknown")
+        .replace("SubState=activating", "SubState=start"),
+    );
+    const wrongActive = spec("systemd-user");
+    const wrongActiveRunner = runQueue([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: systemdText(wrongActive, "active", 44) },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: wrongActiveRunner.run, platform: "linux" }).start(wrongActive)).resolves.toMatchObject({ managerPid: 44 });
+    const wrongSubState = spec("systemd-user");
+    await rejectAfterPoll(
+      wrongSubState,
+      systemdText(wrongSubState, "activating", 0).replace("SubState=activating", "SubState=verify"),
+    );
+    const missingLoadState = spec("systemd-user");
+    await rejectAfterPoll(
+      missingLoadState,
+      systemdText(missingLoadState, "activating", 0)
+        .replace("LoadState=loaded\n", "")
+        .replace("SubState=activating", "SubState=start"),
+    );
+    const missingActiveState = spec("systemd-user");
+    await rejectAfterPoll(
+      missingActiveState,
+      systemdText(missingActiveState, "activating", 0)
+        .replace("ActiveState=activating\n", "")
+        .replace("SubState=activating", "SubState=start"),
+    );
+    const missingSubState = spec("systemd-user");
+    await rejectAfterPoll(
+      missingSubState,
+      systemdText(missingSubState, "activating", 0).replace("SubState=activating\n", ""),
+    );
+
+    const deadlineSpec = spec("systemd-user");
+    const deadlineRunner = runQueue([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 1, stderr: "Unit is not-found" },
+    ]);
+    const now = vi.fn().mockReturnValueOnce(0).mockReturnValue(7);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("systemd-user", {
+      run: deadlineRunner.run,
+      platform: "linux",
+      commandTimeoutMs: 6,
+      now,
+      sleep,
+    }).start(deadlineSpec)).rejects.toThrow("manager command");
+    expect(sleep).not.toHaveBeenCalled();
+  });
 });
 
 describe("supervisor coverage: credentials and private launch files", () => {
+  it("classifies credential-directory and allow-list metadata mismatches", async () => {
+    const stateRoot = root();
+    const expectedDirectory = join(stateRoot, "expected-credentials");
+    const expectedFile = join(expectedDirectory, "OPENAI_API_KEY");
+    const expected = spec("systemd-user", stateRoot, {
+      credentialDirectory: expectedDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: expectedFile }],
+    });
+    const differentDirectory = join(stateRoot, "different-credentials");
+    const directoryMismatch = runQueue([{
+      code: 0,
+      stdout: systemdText(expected, "inactive", 0, ` LCM_CREDENTIAL_DIRECTORY=${differentDirectory} LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${join(differentDirectory, "OPENAI_API_KEY")}`),
+    }]);
+    await expect(createSupervisor("systemd-user", { run: directoryMismatch.run, platform: "linux" }).probe(expected)).resolves.toMatchObject({
+      kind: "registered-stale-config",
+      reason: "metadata-mismatch",
+    });
+
+    const filesOnly = spec("systemd-user", stateRoot, {
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: expectedFile }],
+    });
+    const missingFiles = runQueue([{ code: 0, stdout: systemdText(filesOnly, "inactive") }]);
+    await expect(createSupervisor("systemd-user", { run: missingFiles.run, platform: "linux" }).probe(filesOnly)).resolves.toMatchObject({
+      kind: "registered-stale-config",
+      reason: "metadata-missing",
+    });
+
+    const noFiles = spec("systemd-user", stateRoot);
+    const unexpectedFile = runQueue([{
+      code: 0,
+      stdout: systemdText(noFiles, "inactive", 0, ` LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${expectedFile}`),
+    }]);
+    await expect(createSupervisor("systemd-user", { run: unexpectedFile.run, platform: "linux" }).probe(noFiles)).resolves.toMatchObject({
+      kind: "registered-stale-config",
+      reason: "metadata-mismatch",
+    });
+  });
+
   it("checks credential path, mode, symlink, and cleanup races", async () => {
     const stateRoot = root();
     const directory = createManagedCredentialDirectory(stateRoot, "credential-coverage");
@@ -796,6 +903,45 @@ describe("supervisor coverage: credentials and private launch files", () => {
       if (cleanupDescriptor !== undefined) Object.defineProperty(process, "getuid", cleanupDescriptor);
     }
   });
+
+  it("reconstructs complete stale launchd metadata before restarting", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot, {
+      cwd: "/tmp",
+      entrypoint: "entry",
+      runtimeDigest: DIGEST_A,
+      storageBackend: "sqlite",
+    });
+    const directory = createManagedCredentialDirectory(stateRoot, "launchd-stale-credentials");
+    const file = writeManagedCredentialFiles(directory, { OPENAI_API_KEY: "secret" })[0]!;
+    const stale = {
+      ...value,
+      nonce: "stale-nonce",
+      port: 4747,
+      credentialDirectory: directory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: file }],
+    };
+    const stalePlist = join(stateRoot, `daemon.${value.shortDigest}.${stale.nonce}.plist`);
+    const credentials = `LCM_CREDENTIAL_DIRECTORY => ${directory}\nLCM_CREDENTIAL_OPENAI_API_KEY_FILE => ${file}`;
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(stale, "running", 77, credentials) },
+      { code: 0, stdout: launchdText(stale, "not running", 0, credentials) },
+      { code: 0, stdout: launchdText(stale, "not running", 0, credentials) },
+      { code: 0, stdout: "bootout" },
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 88) },
+    ]);
+    await expect(createSupervisor("launchd-user", { run: runner.run, platform: "darwin", uid: 501 }).start(stale)).resolves.toMatchObject({ managerPid: 77 });
+    await expect(createSupervisor("launchd-user", { run: runner.run, platform: "darwin", uid: 501 }).stopAndStart(value)).resolves.toMatchObject({
+      managerPid: 88,
+    });
+    expect(existsSync(stalePlist)).toBe(false);
+  });
 });
 
 describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
@@ -847,6 +993,23 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     await expect(createSupervisor("systemd-user", { run: defaultSleep.run, platform: "linux", now: () => 0 }).stopAndAwaitAbsent(value)).rejects.toThrow("manager command");
     const onePoll = runQueue([{ code: 1, stderr: "Unit is not-found" }, { code: 0, stdout: "started" }, { code: 1, stderr: "Unit is not-found" }]);
     await expect(createSupervisor("systemd-user", { run: onePoll.run, platform: "linux", commandTimeoutMs: 1 }).start(value)).rejects.toThrow("manager command");
+    const expiredStartNow = vi.fn().mockReturnValueOnce(0).mockReturnValue(1_000);
+    const expiredStartSleep = vi.fn(async () => undefined);
+    const activating = systemdText(value, "activating", 0).replace("SubState=activating", "SubState=start");
+    const expiredStart = runQueue([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: activating },
+      { code: 1, stderr: "Unit is not-found" },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: expiredStart.run,
+      platform: "linux",
+      commandTimeoutMs: 100,
+      now: expiredStartNow,
+      sleep: expiredStartSleep,
+    }).start(value)).rejects.toThrow("manager command");
+    expect(expiredStartSleep).not.toHaveBeenCalled();
     const unavailableStop = runQueue([
       { code: 0, stdout: systemdText(value, "active", 12) },
       { code: 127, stderr: "systemctl not found" },
@@ -876,5 +1039,146 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     await expect(createSupervisor("launchd-user", { run: noCandidateRunner.run, platform: "darwin", uid: 501 }).stopAndStart(value)).rejects.toThrow("manager command");
     const staleThenAbsent = runQueue([{ code: 0, stdout: stale }, { code: 113, stderr: "Could not find service" }]);
     await expect(createSupervisor("launchd-user", { run: staleThenAbsent.run, platform: "darwin", uid: 501 }).stopAndStart(value)).rejects.toThrow("manager command");
+  });
+
+  it("covers credential-directory mismatch and incomplete stale launchd candidates", async () => {
+    const stateRoot = root();
+    const expectedDirectory = createManagedCredentialDirectory(stateRoot, "expected-credentials");
+    const observedDirectory = join(stateRoot, "observed-credentials");
+    const value = spec("systemd-user", stateRoot, { cwd: "/tmp", credentialDirectory: expectedDirectory });
+    const mismatch = runQueue([{
+      code: 0,
+      stdout: systemdText(value, "active", 44, ` LCM_CREDENTIAL_DIRECTORY=${observedDirectory}`),
+    }]);
+    await expect(createSupervisor("systemd-user", { run: mismatch.run, platform: "linux" }).probe(value)).resolves.toMatchObject({
+      kind: "registered-stale-config",
+      reason: "metadata-mismatch",
+      credentialDirectory: observedDirectory,
+    });
+    const noCredentialRoot = root();
+    const noCredentialValue = spec("systemd-user", noCredentialRoot, { cwd: "/tmp" });
+    const unexpectedCredential = join(noCredentialRoot, "unexpected-credentials");
+    const unexpected = runQueue([{
+      code: 0,
+      stdout: systemdText(noCredentialValue, "active", 46, ` LCM_CREDENTIAL_DIRECTORY=${unexpectedCredential}`),
+    }]);
+    await expect(createSupervisor("systemd-user", { run: unexpected.run, platform: "linux" }).probe(noCredentialValue)).resolves.toMatchObject({
+      kind: "registered-stale-config",
+      reason: "metadata-mismatch",
+    });
+    const matching = runQueue([{
+      code: 0,
+      stdout: systemdText(value, "active", 45, ` LCM_CREDENTIAL_DIRECTORY=${expectedDirectory}`),
+    }]);
+    await expect(createSupervisor("systemd-user", { run: matching.run, platform: "linux" }).probe(value)).resolves.toMatchObject({
+      kind: "registered-running-valid",
+      credentialDirectory: expectedDirectory,
+    });
+
+    const directoryCandidateRoot = root();
+    const directoryCandidate = spec("launchd-user", directoryCandidateRoot, {
+      credentialDirectory: createManagedCredentialDirectory(directoryCandidateRoot, "candidate-credentials"),
+    });
+    const fileCandidate = spec("launchd-user", root(), { credentialFiles: [] });
+    for (const candidate of [directoryCandidate, fileCandidate]) {
+      const stale = launchdText({ ...candidate, nonce: "old", port: 8 }, "not running", 0);
+      const runner = runQueue([{ code: 0, stdout: stale }]);
+      await expect(createSupervisor("launchd-user", { run: runner.run, platform: "darwin", uid: 501 }).stopAndStart(candidate)).rejects.toThrow("manager command");
+    }
+  });
+
+  it("cleans loser credentials only after reconstructing an exact concurrent winner", async () => {
+    const stateRoot = root();
+    for (const secondWinnerPid of [555, 556]) {
+      const loserDirectory = createManagedCredentialDirectory(stateRoot, `winner-loser-${secondWinnerPid}`);
+      const loserFile = writeManagedCredentialFiles(loserDirectory, { OPENAI_API_KEY: "loser" })[0]!;
+      const winnerDirectory = join(stateRoot, `winner-${secondWinnerPid}`);
+      const winnerFile = join(winnerDirectory, "OPENAI_API_KEY");
+      const loser = spec("systemd-user", stateRoot, {
+        nonce: "loser-nonce",
+        cwd: "/tmp",
+        entrypoint: "entry",
+        runtimeDigest: DIGEST_A,
+        storageBackend: "sqlite",
+        credentialDirectory: loserDirectory,
+        credentialFiles: [{ name: "OPENAI_API_KEY", path: loserFile }],
+      });
+      const winner = spec("systemd-user", stateRoot, {
+        nonce: "winner-nonce",
+        cwd: "/tmp",
+        entrypoint: "entry",
+        runtimeDigest: DIGEST_A,
+        storageBackend: "sqlite",
+        credentialDirectory: winnerDirectory,
+        credentialFiles: [{ name: "OPENAI_API_KEY", path: winnerFile }],
+      });
+      const winnerOutput = (pid: number): string => systemdText(
+        winner,
+        "active",
+        pid,
+        ` LCM_SUPERVISOR_STATE_ROOT=${stateRoot} LCM_SUPERVISOR_ENTRYPOINT=entry LCM_SUPERVISOR_RUNTIME_DIGEST=${DIGEST_A} LCM_SUPERVISOR_STORAGE_BACKEND=sqlite LCM_CREDENTIAL_DIRECTORY=${winnerDirectory} LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${winnerFile}`,
+      );
+      const runner = runQueue([
+        { code: 1, stderr: "Unit is not-found" },
+        { code: 0, stdout: "started" },
+        { code: 0, stdout: winnerOutput(555) },
+        { code: 0, stdout: winnerOutput(555) },
+        { code: 0, stdout: winnerOutput(secondWinnerPid) },
+      ]);
+      await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(loser)).rejects.toThrow("manager command");
+      expect(existsSync(loserDirectory)).toBe(secondWinnerPid === 556);
+    }
+  });
+
+  it("keeps a winner unresolved when optional metadata is explicitly empty", async () => {
+    const stateRoot = root();
+    const loserDirectory = createManagedCredentialDirectory(stateRoot, "empty-winner-loser");
+    const loserFile = writeManagedCredentialFiles(loserDirectory, { OPENAI_API_KEY: "loser" })[0]!;
+    const loser = spec("systemd-user", stateRoot, {
+      nonce: "loser-nonce",
+      credentialDirectory: loserDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: loserFile }],
+    });
+    const winner = spec("systemd-user", stateRoot, { nonce: "winner-nonce" });
+    const winnerOutput = systemdText(
+      winner,
+      "active",
+      556,
+      ` LCM_SUPERVISOR_STATE_ROOT=${stateRoot} LCM_SUPERVISOR_ENTRYPOINT= LCM_SUPERVISOR_RUNTIME_DIGEST= LCM_SUPERVISOR_STORAGE_BACKEND=`,
+    );
+    const runner = runQueue([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: winnerOutput },
+      { code: 0, stdout: winnerOutput },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(loser)).rejects.toThrow("manager command");
+    expect(existsSync(loserDirectory)).toBe(true);
+  });
+
+  it("rejects a winner observation from a different state root before reconstruction", async () => {
+    const stateRoot = root();
+    const loserDirectory = createManagedCredentialDirectory(stateRoot, "foreign-winner-loser");
+    const loserFile = writeManagedCredentialFiles(loserDirectory, { OPENAI_API_KEY: "loser" })[0]!;
+    const loser = spec("systemd-user", stateRoot, {
+      nonce: "loser-nonce",
+      credentialDirectory: loserDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: loserFile }],
+    });
+    const winner = spec("systemd-user", stateRoot, { nonce: "winner-nonce" });
+    const winnerOutput = systemdText(
+      winner,
+      "active",
+      557,
+      ` LCM_SUPERVISOR_STATE_ROOT=/foreign-state-root`,
+    );
+    const runner = runQueue([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: winnerOutput },
+      { code: 0, stdout: winnerOutput },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(loser)).rejects.toThrow("manager command");
+    expect(existsSync(loserDirectory)).toBe(true);
   });
 });

@@ -91,6 +91,30 @@ describe("private filesystem primitives", () => {
     expect(existsSync(hardlink)).toBe(true);
   });
 
+  it("revalidates expected ownership and exact mode across the consume unlink race", () => {
+    const root = makeRoot();
+    const path = join(root, "credential-metadata-race");
+    writeFileSync(path, "secret", { mode: 0o600 });
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    expect(() => consumeBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 1024,
+      expectedUid,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+      _beforeUnlinkForTesting: () => chmodSync(path, 0o644),
+    })).toThrow("mode");
+    expect(existsSync(path)).toBe(true);
+    chmodSync(path, 0o600);
+    expect(consumeBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 1024,
+      expectedUid,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+    })).toBe("secret");
+  });
+
   it("creates and tightens private directories", () => {
     const path = join(makeRoot(), "private");
     mkdirSync(path, { mode: 0o755 });

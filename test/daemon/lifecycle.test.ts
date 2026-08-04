@@ -4059,7 +4059,7 @@ describe("restartDaemon", () => {
     });
 
     expect(result).toMatchObject({ connected: true, spawned: false, startMethod: "systemd-user", pid: 200 });
-    expect(probe).toHaveBeenCalledTimes(2);
+    expect(probe).toHaveBeenCalledTimes(3);
     expect(spec).toBeDefined();
     expect(supervisor.start).not.toHaveBeenCalled();
   });
