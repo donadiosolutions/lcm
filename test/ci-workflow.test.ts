@@ -171,11 +171,19 @@ describe("CI workflow", () => {
       /systemd_state="\$\(systemctl --user is-system-running \|\| true\)"[\s\S]*case "\$systemd_state" in[\s\S]*running\|degraded\)\s*;;[\s\S]*\*\)[\s\S]*exit 1/u,
     );
     expect(integration?.run).toContain("test/daemon/lifecycle-isolation.test.ts");
-    expect(integration?.run).toContain("uses and removes one exact run-owned transient unit");
+    expect(integration?.run).toContain("test/daemon/lifecycle-systemd.integration.test.ts");
     expect(integration?.run).toContain("test/daemon/systemd-credential-loader.test.ts");
-    expect(integration?.run).toContain(
-      '--testNamePattern "observes the real user-systemd LoadCredential modes"',
-    );
+    for (const pattern of [
+      "uses and removes one exact run-owned transient unit",
+      "starts and admits a healthy managed unit with exact identity and cleanup",
+      "restarts a wedged registered unit through systemd without legacy signal fallback",
+      "recreates a terminal clean-exit unit after a registered-not-running observation",
+      "refuses stale manager identity before mutation and never falls back to legacy signals",
+      "observes the real user-systemd LoadCredential modes",
+    ]) {
+      expect(integration?.run).toContain(pattern);
+    }
+    expect(integration?.run).toContain("|starts and admits a healthy managed unit");
     expect(integration?.run).toContain("systemctl --user stop \"$unit_name\"");
     expect(integration?.run).toContain(
       'if [[ "$unit_name" =~ ^lcm-daemon-[0-9a-f]{20}\\.service$ ]]; then',

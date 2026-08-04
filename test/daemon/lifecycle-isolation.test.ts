@@ -2579,7 +2579,7 @@ describe("same-user-systemd integration", () => {
     let result: Awaited<ReturnType<typeof ensureDaemon>>;
     try {
       result = await ensureDaemon({
-        port: 48_322,
+        port: daemonPort,
         pidFilePath: join(stateDir, "daemon.pid"),
         spawnTimeoutMs: 10_000,
         expectedVersion: "1.4.2",
