@@ -136,6 +136,7 @@ describe("CI workflow", () => {
     const checkout = job.steps.find((step) => step.name === "Checkout");
     const node = job.steps.find((step) => step.name === "Set up Node.js 25.9.0");
     const install = job.steps.find((step) => step.name === "Install dependencies");
+    const build = job.steps.find((step) => step.name === "Build package");
     const integration = job.steps.find((step) => step.name === "Run real user-systemd integration");
 
     expect(checkout).toEqual({
@@ -149,6 +150,7 @@ describe("CI workflow", () => {
       with: { "node-version": "25.9.0", cache: "npm" },
     });
     expect(install?.run).toBe("npm ci");
+    expect(build?.run).toBe("npm run build");
     expect(integration?.env).toEqual({
       LCM_LIFECYCLE_SYSTEMD_INTEGRATION: "1",
       LCM_LIFECYCLE_SCOPE_ID: "ci-${{ github.run_id }}-${{ github.run_attempt }}",
