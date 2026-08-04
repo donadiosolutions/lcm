@@ -755,7 +755,7 @@ describe("launchd one-launch credential projection", () => {
       OPENAI_API_KEY: "direct-value",
     };
     expect(resolveDaemonConfigEnv(env)).toMatchObject({
-      OPENAI_API_KEY: "direct-value",
+      OPENAI_API_KEY: "launchd-secret",
       LCM_CREDENTIAL_DIRECTORY: directory,
     });
     expect(existsSync(file)).toBe(false);
@@ -764,6 +764,28 @@ describe("launchd one-launch credential projection", () => {
     const envWithoutDirect = { ...env };
     delete envWithoutDirect.OPENAI_API_KEY;
     expect(resolveDaemonConfigEnv(envWithoutDirect).OPENAI_API_KEY).toBe("launchd-secret");
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("preserves detached direct-environment semantics when launchd markers are malformed", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-launchd-credentials-"));
+    const directory = join(root, "credentials");
+    mkdirSync(directory, { mode: 0o700 });
+    chmodSync(directory, 0o700);
+    const file = join(directory, "OPENAI_API_KEY");
+    writeFileSync(file, "launchd-secret\n", { mode: 0o600 });
+    chmodSync(file, 0o600);
+    expect(resolveDaemonConfigEnv({
+      LCM_CREDENTIAL_DIRECTORY: directory,
+      LCM_CREDENTIAL_OPENAI_API_KEY_FILE: "relative",
+      OPENAI_API_KEY: "direct-value",
+    }).OPENAI_API_KEY).toBe("direct-value");
+    expect(resolveDaemonConfigEnv({
+      LCM_CREDENTIAL_DIRECTORY: directory,
+      LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file,
+      LCM_CREDENTIAL_ANTHROPIC_API_KEY_FILE: "relative",
+      OPENAI_API_KEY: "direct-value",
+    }).OPENAI_API_KEY).toBe("direct-value");
     rmSync(root, { recursive: true, force: true });
   });
 

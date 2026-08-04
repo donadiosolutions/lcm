@@ -280,7 +280,21 @@ type TrustedSystemdCredentialsDir = SystemdCredentialPrefix & {
   path: string;
   dev: number;
   ino: number;
+  runtimeRoot?: string;
 };
+
+type CredentialProjection = Readonly<{
+  authenticated: boolean;
+  /** Credential names are masked from ambient env once markers authenticate. */
+  names: readonly string[];
+  values: Readonly<Record<string, string>>;
+}>;
+
+const EMPTY_CREDENTIAL_PROJECTION: CredentialProjection = Object.freeze({
+  authenticated: false,
+  names: Object.freeze([]),
+  values: Object.freeze({}),
+});
 
 function systemdCredentialDirPrefixes(): SystemdCredentialPrefix[] {
   const prefixes: SystemdCredentialPrefix[] = [{ path: "/run/credentials/" }];
@@ -302,7 +316,29 @@ function systemdCredentialDirectoryPrefix(path: string): SystemdCredentialPrefix
   });
 }
 
-function trustedSystemdCredentialsDir(credentialsDir: string | undefined): TrustedSystemdCredentialsDir | undefined {
+function trustedSystemdRuntimeDirectory(path: string | undefined): string | undefined {
+  if (!path || !isAbsolute(path) || resolve(path) !== path || /[\u0000\r\n]/u.test(path)) return undefined;
+  try {
+    const stats = lstatSync(path);
+    const canonical = realpathSync(path);
+    const uid = typeof process.getuid === "function" ? process.getuid() : stats.uid;
+    if (
+      stats.isSymbolicLink()
+      || !stats.isDirectory()
+      || canonical !== path
+      || stats.uid !== uid
+      || (stats.mode & 0o777) !== 0o700
+    ) return undefined;
+    return canonical;
+  } catch {
+    return undefined;
+  }
+}
+
+function trustedSystemdCredentialsDir(
+  credentialsDir: string | undefined,
+  runtimeDirectory?: string,
+): TrustedSystemdCredentialsDir | undefined {
   if (!credentialsDir || !isAbsolute(credentialsDir)) return undefined;
   const requested = resolve(credentialsDir);
   let stats: ReturnType<typeof lstatSync>;
@@ -313,7 +349,20 @@ function trustedSystemdCredentialsDir(credentialsDir: string | undefined): Trust
   } catch {
     return undefined;
   }
-  const prefix = systemdCredentialDirectoryPrefix(realDir);
+  const standardPrefix = systemdCredentialDirectoryPrefix(realDir);
+  const trustedRuntimeRoot = standardPrefix === undefined
+    ? trustedSystemdRuntimeDirectory(runtimeDirectory)
+    : undefined;
+  const runtimePrefix = trustedRuntimeRoot === undefined ? undefined : `${trustedRuntimeRoot}/credentials/`;
+  const runtimeSuffix = runtimePrefix === undefined || !realDir.startsWith(runtimePrefix)
+    ? undefined
+    : realDir.slice(runtimePrefix.length);
+  const prefix = standardPrefix ?? (runtimePrefix !== undefined
+    && runtimeSuffix !== undefined
+    && runtimeSuffix.length > 0
+    && !runtimeSuffix.includes("/")
+    ? { path: runtimePrefix, expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined }
+    : undefined);
   if (
     stats.isSymbolicLink()
     || !stats.isDirectory()
@@ -322,7 +371,13 @@ function trustedSystemdCredentialsDir(credentialsDir: string | undefined): Trust
     || !SYSTEMD_CREDENTIAL_DIRECTORY_MODES.includes(stats.mode & 0o7777)
     || (prefix.expectedUid !== undefined && stats.uid !== prefix.expectedUid)
   ) return undefined;
-  return { ...prefix, path: realDir, dev: stats.dev, ino: stats.ino };
+  return {
+    ...prefix,
+    path: realDir,
+    dev: stats.dev,
+    ino: stats.ino,
+    ...(trustedRuntimeRoot === undefined ? {} : { runtimeRoot: trustedRuntimeRoot }),
+  };
 }
 
 function isSystemdCredentialEnvName(name: string): name is SystemdCredentialEnvName {
@@ -360,7 +415,18 @@ function credentialFileName(name: SystemdCredentialEnvName): string {
 function trustedSystemdCredentialsDirStillValid(directory: TrustedSystemdCredentialsDir): boolean {
   try {
     const stats = lstatSync(directory.path);
-    const prefix = systemdCredentialDirectoryPrefix(directory.path);
+    const prefix = directory.runtimeRoot === undefined
+      ? systemdCredentialDirectoryPrefix(directory.path)
+      : (() => {
+        const runtimeRoot = trustedSystemdRuntimeDirectory(directory.runtimeRoot);
+        const runtimePrefix = runtimeRoot === undefined ? undefined : `${runtimeRoot}/credentials/`;
+        const suffix = runtimePrefix === undefined || !directory.path.startsWith(runtimePrefix)
+          ? undefined
+          : directory.path.slice(runtimePrefix.length);
+        return runtimePrefix !== undefined && suffix !== undefined && suffix.length > 0 && !suffix.includes("/")
+          ? { path: runtimePrefix, expectedUid: directory.expectedUid }
+          : undefined;
+      })();
     return !stats.isSymbolicLink()
       && stats.isDirectory()
       && prefix !== undefined
@@ -374,13 +440,13 @@ function trustedSystemdCredentialsDirStillValid(directory: TrustedSystemdCredent
   }
 }
 
-function readSystemdCredentialEnv(env: Record<string, string | undefined>): Record<string, string> {
-  const credentialsDir = trustedSystemdCredentialsDir(env.CREDENTIALS_DIRECTORY);
+function readSystemdCredentialEnv(env: Record<string, string | undefined>): CredentialProjection {
+  const credentialsDir = trustedSystemdCredentialsDir(env.CREDENTIALS_DIRECTORY, env.XDG_RUNTIME_DIR);
   const names = credentialNamesFromEnv(env);
-  if (!credentialsDir || names === undefined || names.length === 0) return {};
+  if (!credentialsDir || names === undefined || names.length === 0) return EMPTY_CREDENTIAL_PROJECTION;
   const credentialEnv: Record<string, string> = {};
   for (const name of names) {
-    if (!trustedSystemdCredentialsDirStillValid(credentialsDir)) return {};
+    if (!trustedSystemdCredentialsDirStillValid(credentialsDir)) return EMPTY_CREDENTIAL_PROJECTION;
     const credentialFile = resolve(credentialsDir.path, credentialFileName(name));
     try {
       if (realpathSync(credentialFile) !== credentialFile) continue;
@@ -399,13 +465,17 @@ function readSystemdCredentialEnv(env: Record<string, string | undefined>): Reco
       // A unit credential directory is immutable for this read.  If its
       // canonical inode or security metadata changed while reading, discard
       // every projected value rather than returning a mixed snapshot.
-      if (!trustedSystemdCredentialsDirStillValid(credentialsDir)) return {};
+      if (!trustedSystemdCredentialsDirStillValid(credentialsDir)) return EMPTY_CREDENTIAL_PROJECTION;
       credentialEnv[name] = value;
     } catch {
       // Ignore missing credentials; normal env/config validation will report required keys.
     }
   }
-  return credentialEnv;
+  return Object.freeze({
+    authenticated: true,
+    names: Object.freeze([...names]),
+    values: Object.freeze(credentialEnv),
+  });
 }
 
 function trustedLaunchdCredentialsDir(path: string | undefined): string | undefined {
@@ -428,15 +498,18 @@ function trustedLaunchdCredentialsDir(path: string | undefined): string | undefi
 }
 
 /** Resolve allow-listed private one-launch credential files used by launchd. */
-function readLaunchdCredentialEnv(env: Record<string, string | undefined>): Record<string, string> {
+function readLaunchdCredentialEnv(env: Record<string, string | undefined>): CredentialProjection {
   const directory = trustedLaunchdCredentialsDir(env[LAUNCHD_CREDENTIAL_DIRECTORY_ENV]);
-  if (!directory) return {};
+  if (!directory) return EMPTY_CREDENTIAL_PROJECTION;
   const credentialEnv: Record<string, string> = {};
+  const names: string[] = [];
   for (const name of MANAGED_CREDENTIAL_NAMES) {
     const configured = env[`${LAUNCHD_CREDENTIAL_FILE_PREFIX}${name}${LAUNCHD_CREDENTIAL_FILE_SUFFIX}`];
-    if (!configured || !isAbsolute(configured)) continue;
+    if (configured === undefined) continue;
+    if (!isAbsolute(configured)) return EMPTY_CREDENTIAL_PROJECTION;
     const expected = resolve(directory, name);
-    if (resolve(configured) !== expected) continue;
+    if (resolve(configured) !== expected) return EMPTY_CREDENTIAL_PROJECTION;
+    names.push(name);
     try {
       const stats = lstatSync(configured);
       const uid = typeof process.getuid === "function" ? process.getuid() : stats.uid;
@@ -451,14 +524,25 @@ function readLaunchdCredentialEnv(env: Record<string, string | undefined>): Reco
       // unavailable; ordinary configuration validation reports the key.
     }
   }
-  return credentialEnv;
+  if (names.length === 0) return EMPTY_CREDENTIAL_PROJECTION;
+  return Object.freeze({
+    authenticated: true,
+    names: Object.freeze(names),
+    values: Object.freeze(credentialEnv),
+  });
 }
 
 /** Resolve the environment used for daemon configuration, including trusted systemd credentials. */
 export function resolveDaemonConfigEnv(
   env: Record<string, string | undefined> = process.env,
 ): Record<string, string | undefined> {
-  return { ...readSystemdCredentialEnv(env), ...readLaunchdCredentialEnv(env), ...env };
+  const resolved: Record<string, string | undefined> = { ...env };
+  for (const projection of [readSystemdCredentialEnv(env), readLaunchdCredentialEnv(env)]) {
+    if (!projection.authenticated) continue;
+    for (const name of projection.names) delete resolved[name];
+    Object.assign(resolved, projection.values);
+  }
+  return resolved;
 }
 
 export function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {

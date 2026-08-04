@@ -37,6 +37,7 @@ import {
   createSupervisor,
   createSupervisorSpec,
   isSupervisorPreflightUnavailableReason,
+  managedLaunchEnvironment,
   type Supervisor,
   type SupervisorKind,
   type SupervisorObservation,
@@ -1869,6 +1870,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     spec: SupervisorSpec;
     supervisor: Supervisor;
   } | null> {
+    const launchEnvironment = managedLaunchEnvironment(dependencies.environment);
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
@@ -1897,6 +1899,11 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         entrypoint: expectedEntrypoint,
         runtimeDigest: expectedRuntimeDigest,
         storageBackend: expectedStorageBackend,
+        // Manager transport is deliberately narrower than the managed child
+        // environment. Filter the full lifecycle source independently so
+        // non-secret configuration/runtime values such as HOME and the
+        // PostgreSQL CA pathname are not lost while credentials remain out.
+        launchEnvironment,
         stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
         realpath,
       });
@@ -1907,6 +1914,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       ?? opts._supervisor
       ?? createSupervisor(kind, {
           run: supervisorCommandRunner(dependencies, opts),
+          environment: launchEnvironment,
           platform,
           uid: dependencies.uid,
           commandTimeoutMs: Math.max(1, opts.spawnTimeoutMs || 1_000),
@@ -2970,6 +2978,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   }
 
   async function runManagedRestart(managerKind: SupervisorKind): Promise<RestartDaemonResult> {
+    const launchEnvironment = managedLaunchEnvironment(dependencies.environment);
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
@@ -2998,6 +3007,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         entrypoint: testScope?.entrypoint ?? opts.expectedEntrypoint,
         runtimeDigest: opts.expectedRuntimeDigest ?? RUNTIME_DIGEST,
         storageBackend: opts.expectedStorageBackend ?? "sqlite",
+        launchEnvironment,
         stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
         realpath,
       });
@@ -3008,6 +3018,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       ?? opts._supervisor
       ?? createSupervisor(managerKind, {
           run: supervisorCommandRunner(dependencies, opts),
+          environment: launchEnvironment,
           platform,
           uid: dependencies.uid,
           commandTimeoutMs: Math.max(1, opts.spawnTimeoutMs || 1_000),

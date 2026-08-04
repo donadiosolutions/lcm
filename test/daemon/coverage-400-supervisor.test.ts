@@ -646,6 +646,49 @@ describe("supervisor coverage: credentials and private launch files", () => {
       if (cleanupDescriptor !== undefined) Object.defineProperty(process, "getuid", cleanupDescriptor);
     }
   });
+
+  it("preserves authenticated launchd evidence when old credential cleanup or plist unlink fails", async () => {
+    const stateRoot = root();
+    const oldDirectory = createManagedCredentialDirectory(stateRoot, "old-cleanup");
+    const oldFile = writeManagedCredentialFiles(oldDirectory, { OPENAI_API_KEY: "old" })[0]!;
+    const oldSpec = spec("launchd-user", stateRoot, {
+      nonce: "cleanup-nonce",
+      credentialDirectory: oldDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: oldFile }],
+    });
+    const absent = { code: 113, stderr: "Could not find service" };
+    const oldStart = runQueue([absent, { code: 0, stdout: "bootstrapped" }, { code: 0, stdout: launchdText(oldSpec, "running", 88) }]);
+    await expect(createSupervisor("launchd-user", { run: oldStart.run, platform: "darwin", uid: 501 }).start(oldSpec)).resolves.toMatchObject({ managerPid: 88 });
+
+    const replacementDirectory = createManagedCredentialDirectory(stateRoot, "replacement-cleanup");
+    const replacementFile = writeManagedCredentialFiles(replacementDirectory, { OPENAI_API_KEY: "replacement" })[0]!;
+    const replacement = spec("launchd-user", stateRoot, {
+      nonce: oldSpec.nonce,
+      credentialDirectory: replacementDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: replacementFile }],
+    });
+    chmodSync(oldFile, 0o644);
+    try {
+      const cleanupFailure = runQueue([absent, absent]);
+      await expect(createSupervisor("launchd-user", { run: cleanupFailure.run, platform: "darwin", uid: 501 }).start(replacement)).rejects.toThrow("manager command");
+      expect(existsSync(oldDirectory)).toBe(true);
+    } finally {
+      chmodSync(oldFile, 0o600);
+    }
+
+    rmSync(oldDirectory, { recursive: true, force: true });
+    fsFaults.unlink = true;
+    try {
+      const unlinkFailure = runQueue([absent, absent]);
+      await expect(createSupervisor("launchd-user", { run: unlinkFailure.run, platform: "darwin", uid: 501 }).start(replacement)).rejects.toThrow("manager command");
+    } finally {
+      fsFaults.unlink = false;
+    }
+
+    const cleanup = runQueue([absent]);
+    await expect(createSupervisor("launchd-user", { run: cleanup.run, platform: "darwin", uid: 501 }).stopAndAwaitAbsent(replacement)).resolves.toBeUndefined();
+    expect(existsSync(replacementDirectory)).toBe(false);
+  });
 });
 
 describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
