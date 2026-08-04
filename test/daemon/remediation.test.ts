@@ -614,6 +614,20 @@ describe("bounded remediation marker persistence", () => {
       writeFileSync(markerPath, `${exact} `, { encoding: "utf8", mode: 0o600 });
       expect(recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", () => 2)))
         .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const clockPath = join(root, "clock.json");
+      expect(recordDaemonRemediation(input(
+        clockPath,
+        "scope-a",
+        "ambiguous",
+        () => DAEMON_REMEDIATION_MARKER_MAX_TIME_MS,
+      ))).toMatchObject({ emit: true, markerStatus: "created", markerIoError: false });
+      expect(recordDaemonRemediation(input(
+        clockPath,
+        "scope-a",
+        "ambiguous",
+        () => DAEMON_REMEDIATION_MARKER_MAX_TIME_MS + 1,
+      ))).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

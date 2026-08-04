@@ -445,7 +445,9 @@ function fullDigest(input: Pick<DaemonRemediationInput, "scope" | "scopeDigest">
 function clockNow(clock: DaemonRemediationClock | undefined): number {
   const source = clock ?? DEFAULT_CLOCK;
   const now = typeof source === "function" ? source() : source.now();
-  if (!Number.isFinite(now) || now < 0) throw new Error("invalid remediation clock");
+  if (!Number.isFinite(now) || now < 0 || now > DAEMON_REMEDIATION_MARKER_MAX_TIME_MS) {
+    throw new Error("invalid remediation clock");
+  }
   return now;
 }
 
