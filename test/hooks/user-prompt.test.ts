@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
 import type { EventsDb as EventsDbType } from "../../src/hooks/events-db.js";
@@ -505,5 +508,48 @@ describe("handleUserPromptSubmit", () => {
 
     expect(result.stdout).toContain("<!-- surfaced-memory-ids: memory-1 -->");
     expect(result.stdout).not.toContain("memory-2");
+  });
+
+  it("emits sanitized remediation for a refused daemon under a missing state root", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-user-prompt-remediation-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      expect(homedir()).toBe(home);
+      rmSync(join(home, ".lcm"), { recursive: true, force: true });
+      expect(existsSync(join(home, ".lcm"))).toBe(false);
+      mockEnsureDaemon.mockResolvedValueOnce({
+        connected: false,
+        port: 3737,
+        spawned: false,
+        refusalReason: "live-no-response",
+      } as never);
+      const result = await handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        asDaemonClient({ health: vi.fn(), post: vi.fn() }),
+      );
+      expect(result.stdout).toContain("<learning-instruction>");
+
+      mockEnsureDaemon.mockResolvedValueOnce({
+        connected: false,
+        port: 3737,
+        spawned: false,
+        refusalReason: "attacker supplied reason",
+      } as never);
+      await handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        asDaemonClient({ health: vi.fn(), post: vi.fn() }),
+      );
+
+      mockEnsureDaemon.mockRejectedValueOnce(new Error("admission failed"));
+      await handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        asDaemonClient({ health: vi.fn(), post: vi.fn() }),
+      );
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

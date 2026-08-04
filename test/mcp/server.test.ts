@@ -87,16 +87,18 @@ describe("handleDaemonRequest", () => {
     expect(res.isError).toBe(true);
   });
 
-  it("retries after network crash (TypeError) and returns result on successful retry", async () => {
+  it("does not force-recover after a network failure", async () => {
     const client = {
       post: vi.fn()
         .mockRejectedValueOnce(new TypeError("fetch failed"))
         .mockResolvedValueOnce({ result: "recovered" }),
     };
     const res = await handleDaemonRequest(client, "/search", { q: "foo" }, opts);
-    expect(ensureDaemonMock).toHaveBeenCalled();
-    expect(res.isError).toBeUndefined();
-    expect(res.content[0].text).toContain('"recovered"');
+    expect(ensureDaemonMock).not.toHaveBeenCalled();
+    expect(client.post).toHaveBeenCalledTimes(1);
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toBe("lcm daemon unavailable (live-no-response); run 'lcm daemon restart' or 'lcm doctor'.");
+    expect(res.content[0].text).not.toContain("fetch failed");
   });
 
   it("returns isError:true when both network attempts fail", async () => {
@@ -108,17 +110,17 @@ describe("handleDaemonRequest", () => {
     expect(res.content[0].text).toContain("daemon unavailable");
   });
 
-  it("retry proceeds despite ensureDaemon throwing (non-fatal spawn failure)", async () => {
+  it("does not invoke lifecycle when the transport fails", async () => {
     ensureDaemonMock.mockRejectedValueOnce(new Error("spawn failed"));
     const client = {
       post: vi.fn()
         .mockRejectedValueOnce(new TypeError("fetch failed"))
         .mockResolvedValueOnce({ result: "ok" }),
     };
-    // ensureDaemon throws but retry still proceeds (non-fatal)
     const res = await handleDaemonRequest(client, "/search", { q: "foo" }, opts);
-    expect(res.isError).toBeUndefined(); // retry succeeded despite ensureDaemon throwing
-    expect(res.content[0].text).toContain('"ok"');
+    expect(ensureDaemonMock).not.toHaveBeenCalled();
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).not.toContain("spawn failed");
   });
 });
 
@@ -185,7 +187,7 @@ describe("startMcpServer", () => {
 });
 
 describe("handleDaemonRequest spawn opts propagation", () => {
-  it("rejects PostgreSQL before auto-restart lifecycle and network activity", async () => {
+  it("rejects PostgreSQL before lifecycle and network activity", async () => {
     const ensureDaemonSpy = vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: true });
     const optsWithSpawn = {
       port: 9999,
@@ -223,7 +225,7 @@ describe("handleDaemonRequest spawn opts propagation", () => {
     expect(client.post).not.toHaveBeenCalled();
   });
 
-  it("passes undefined spawn opts when not provided (backwards compat)", async () => {
+  it("does not consume spawn opts when the transport fails", async () => {
     const ensureDaemonSpy = vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: true });
     const optsMinimal = {
       port: 9999,
@@ -240,9 +242,7 @@ describe("handleDaemonRequest spawn opts propagation", () => {
 
     await handleDaemonRequest(client, "/search", { q: "foo" }, optsMinimal);
 
-    const callArgs = ensureDaemonSpy.mock.calls[0][0];
-    expect(callArgs.spawnCommand).toBeUndefined();
-    expect(callArgs.spawnArgs).toBeUndefined();
-    expect(callArgs.enforceUserManagerParent).toBe(true);
+    expect(ensureDaemonSpy).not.toHaveBeenCalled();
+    expect(client.post).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,12 +1,43 @@
 import type { DaemonClient } from "../daemon/client.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
-import { join } from "node:path";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
-import { daemonPidPath } from "../runtime-paths.js";
+import { daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { fenceContent } from "../daemon/content-fence.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
 import { selectStorageBackend } from "../storage/backend.js";
+import {
+  clearDaemonNotice,
+  maybeEmitDaemonNotice,
+  sanitizeDaemonRefusalReason,
+} from "./daemon-notice.js";
+import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remediation.js";
+
+type EnsureResultWithRefusal = Readonly<{ connected: boolean; refusalReason?: unknown }>;
+
+function canonicalRemediationScope(): Readonly<{ scope: string; stateRoot: string }> {
+  const root = lcmHomeDir(homedir());
+  try {
+    const canonical = realpathSync(root);
+    return { scope: canonical, stateRoot: canonical };
+  } catch {
+    const lexical = resolve(root);
+    return { scope: lexical, stateRoot: lexical };
+  }
+}
+
+function emitAdmissionNotice(result: EnsureResultWithRefusal | undefined, fallback: DaemonRefusalReason): void {
+  const reason = isDaemonRefusalReason(result?.refusalReason)
+    ? result.refusalReason
+    : sanitizeDaemonRefusalReason(fallback);
+  maybeEmitDaemonNotice({ ...canonicalRemediationScope(), reason });
+}
+
+function clearAdmissionNotice(): void {
+  clearDaemonNotice(canonicalRemediationScope());
+}
 
 export async function handlePreCompact(
   stdin: string,
@@ -16,20 +47,25 @@ export async function handlePreCompact(
 ): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
-  let connected: boolean;
+  let ensureResult: EnsureResultWithRefusal;
   try {
     selectStorageBackend(storage);
-    ({ connected } = await ensureDaemon({
+    ensureResult = await ensureDaemon({
       port: daemonPort,
       pidFilePath,
       spawnTimeoutMs: 5000,
       expectedStorageBackend: storage.backend,
       enforceUserManagerParent: true,
-    }));
+    });
   } catch {
+    emitAdmissionNotice(undefined, "ambiguous");
     return { exitCode: 0, stdout: "" };
   }
-  if (!connected) return { exitCode: 0, stdout: "" };
+  if (!ensureResult.connected) {
+    emitAdmissionNotice(ensureResult, "not-running");
+    return { exitCode: 0, stdout: "" };
+  }
+  clearAdmissionNotice();
 
   try {
     const input = JSON.parse(stdin || "{}");

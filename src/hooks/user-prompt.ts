@@ -1,11 +1,18 @@
 import type { DaemonClient } from "../daemon/client.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
-import { join } from "node:path";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { safeLogError } from "./hook-errors.js";
 import { buildMemoryContext } from "./memory-context.js";
-import { daemonPidPath } from "../runtime-paths.js";
+import { daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { firePromoteEventsNotifyRequest } from "./session-end.js";
+import {
+  clearDaemonNotice,
+  maybeEmitDaemonNotice,
+  sanitizeDaemonRefusalReason,
+} from "./daemon-notice.js";
+import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remediation.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
 import { selectStorageBackend } from "../storage/backend.js";
 
@@ -20,6 +27,37 @@ type PromoteEventsNotification = {
   pendingCount: number;
   sourceHook: "UserPromptSubmit";
 };
+
+type EnsureResultWithRefusal = Readonly<{ connected: boolean; refusalReason?: unknown }>;
+
+function canonicalRemediationScope(): Readonly<{ scope: string; stateRoot: string }> {
+  const root = lcmHomeDir(homedir());
+  try {
+    const canonical = realpathSync(root);
+    return { scope: canonical, stateRoot: canonical };
+  } catch {
+    const lexical = resolve(root);
+    return { scope: lexical, stateRoot: lexical };
+  }
+}
+
+function refusalReason(
+  result: EnsureResultWithRefusal | undefined,
+  fallback: DaemonRefusalReason,
+): DaemonRefusalReason {
+  return isDaemonRefusalReason(result?.refusalReason)
+    ? result.refusalReason
+    : sanitizeDaemonRefusalReason(fallback);
+}
+
+function emitAdmissionNotice(result: EnsureResultWithRefusal | undefined, fallback: DaemonRefusalReason): void {
+  const scope = canonicalRemediationScope();
+  maybeEmitDaemonNotice({ ...scope, reason: refusalReason(result, fallback) });
+}
+
+function clearAdmissionNotice(): void {
+  clearDaemonNotice(canonicalRemediationScope());
+}
 
 function resolveHookCwd(inputCwd: unknown): string {
   const cwd = typeof inputCwd === "string" ? inputCwd : "";
@@ -102,14 +140,24 @@ export async function handleUserPromptSubmit(
     }
 
     selectStorageBackend(storage);
-    const { connected } = await ensureDaemon({
+    let ensureResult: EnsureResultWithRefusal;
+    try {
+      ensureResult = await ensureDaemon({
       port: daemonPort,
       pidFilePath: daemonPidPath(),
       spawnTimeoutMs: 5000,
       expectedStorageBackend: storage.backend,
       enforceUserManagerParent: true,
-    });
-    if (!connected) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+      });
+    } catch {
+      emitAdmissionNotice(undefined, "ambiguous");
+      return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+    }
+    if (!ensureResult.connected) {
+      emitAdmissionNotice(ensureResult, "not-running");
+      return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+    }
+    clearAdmissionNotice();
 
     if (notification) {
       try {

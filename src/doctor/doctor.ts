@@ -1,6 +1,6 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir, platform } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { spawnSync, spawn } from "node:child_process";
 import type { CheckResult, DoctorDeps } from "./types.js";
 import {
@@ -19,6 +19,7 @@ import {
   configPath,
   daemonPidPath,
   daemonTokenPath,
+  lcmHomeDir,
   projectsDir,
 } from "../runtime-paths.js";
 import {
@@ -46,6 +47,15 @@ import {
   type StagedPostgreSqlHealthResponse,
 } from "../daemon/staged-postgresql.js";
 import { listWorktreeReconciliationJournals } from "../worktree-reconciliation.js";
+import {
+  clearDaemonNotice,
+  sanitizeDaemonRefusalReason,
+} from "../hooks/daemon-notice.js";
+import {
+  isDaemonRefusalReason,
+  mapDaemonRefusalToRemediation,
+  type DaemonRefusalReason,
+} from "../daemon/remediation.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -86,7 +96,6 @@ interface DoctorConfig {
   validationError?: ConfigValidationError;
 }
 
-const MANUAL_DAEMON_RESTART_FIX = "stop the stale daemon process, then run: lcm daemon start";
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
 const DAEMON_HEALTH_DEADLINE_MS = 2000;
 
@@ -95,6 +104,39 @@ type DaemonStorageReadiness = "ready" | "unavailable" | "unverified";
 type DoctorDaemonHealth = StagedPostgreSqlHealthResponse & {
   readonly status?: string;
 };
+
+type LifecycleResultWithRefusal = Readonly<{
+  refusalReason?: unknown;
+  warning?: unknown;
+}>;
+
+/**
+ * Resolve one canonical state root for remediation marker operations.  The
+ * marker is only a hint, so a missing root remains a safe, lexical fallback;
+ * no lifecycle decision depends on this helper succeeding.
+ */
+function daemonRemediationScope(homeDir: string): Readonly<{ scope: string; stateRoot: string }> {
+  const root = lcmHomeDir(homeDir);
+  try {
+    const canonical = realpathSync(root);
+    return { scope: canonical, stateRoot: canonical };
+  } catch {
+    const lexical = resolve(root);
+    return { scope: lexical, stateRoot: lexical };
+  }
+}
+
+function refusalReasonFrom(
+  value: unknown,
+  fallback: DaemonRefusalReason = "ambiguous",
+): DaemonRefusalReason {
+  const candidate = (value as LifecycleResultWithRefusal | null | undefined)?.refusalReason;
+  return isDaemonRefusalReason(candidate) ? candidate : fallback;
+}
+
+function remediationGuidance(reason: DaemonRefusalReason): string {
+  return mapDaemonRefusalToRemediation(sanitizeDaemonRefusalReason(reason)).message;
+}
 
 async function readRecognizedDaemonHealth(
   fetchFn: typeof globalThis.fetch,
@@ -606,7 +648,10 @@ async function checkPassiveLearning(
         results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — daemon is up — run: lcm events promote --all` });
       }
     } else {
-      results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon may be offline — run: lcm daemon start` });
+      results.push({
+        name: "events-capture", category: "Passive Learning", status: "warn",
+        message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon may be offline — ${remediationGuidance("not-running")}`,
+      });
     }
   } else {
     const pending = stats.unprocessed > 0
@@ -687,6 +732,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   const options = normalizeDoctorOptions(doctorOptions);
   const results: CheckResult[] = [];
   const config = loadConfig(deps);
+  const remediationScope = daemonRemediationScope(deps.homedir);
 
   // ── Stack info ──
   results.push({
@@ -736,6 +782,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   let daemonPid: number | undefined;
   const runtimePath = packagedRuntimePath();
   const daemonSpawnArgs = [runtimePath, "daemon", "start", "--foreground"];
+  const clearRemediationMarker = (): void => {
+    clearDaemonNotice(remediationScope);
+  };
   let initialHealthPid: number | undefined;
   try {
     const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
@@ -747,6 +796,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   } catch {}
 
   if (config.validationError || config.storageBackend === "unavailable") {
+    if (daemonHealthy) clearRemediationMarker();
     results.push(daemonHealthy
       ? {
           name: "daemon", category: "Daemon", status: "warn",
@@ -755,7 +805,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         }
       : {
           name: "daemon", category: "Daemon", status: "fail",
-          message: `localhost:${config.port} not responding — automatic start skipped because config is invalid\n     Fix: correct config.json, then run: lcm daemon start`,
+          message: `localhost:${config.port} not responding — automatic start skipped because config is invalid\n     Fix: correct config.json; ${remediationGuidance("stale-config")}`,
           fixApplied: false,
         });
   } else if (daemonHealthy) {
@@ -795,6 +845,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       if (versionMismatch) {
         const fixApplied = ensureResult.connected && postRestartOk && postRestartVersion === pkgVersion;
         if (fixApplied) {
+          clearRemediationMarker();
           const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
           results.push({
             name: "daemon", category: "Daemon", status: "warn",
@@ -807,7 +858,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
           const runningVersionLabel = postRestartVersion ? `v${postRestartVersion}` : daemonVersionLabel;
           results.push({
             name: "daemon", category: "Daemon", status: "warn",
-            message: `localhost:${config.port} — version mismatch (${runningVersionLabel} running, v${pkgVersion} installed); restart did not fix mismatch\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
+            message: `localhost:${config.port} — version mismatch (${runningVersionLabel} running, v${pkgVersion} installed); restart did not fix mismatch\n     Fix: ${remediationGuidance(refusalReasonFrom(ensureResult, "not-running"))}`,
             fixApplied: false,
           });
           daemonHealthy = false;
@@ -815,7 +866,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         } else {
           results.push({
             name: "daemon", category: "Daemon", status: "fail",
-            message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed); restart failed\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
+            message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed); restart failed\n     Fix: ${remediationGuidance(refusalReasonFrom(ensureResult, "not-running"))}`,
             fixApplied: false,
           });
           daemonHealthy = false;
@@ -824,12 +875,13 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       } else if (!ensureResult.connected) {
         results.push({
           name: "daemon", category: "Daemon", status: "fail",
-          message: `localhost:${config.port} — running daemon could not be validated or restarted\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}`,
+          message: `localhost:${config.port} — running daemon could not be validated or restarted\n     Fix: ${remediationGuidance(refusalReasonFrom(ensureResult, "not-running"))}`,
           fixApplied: false,
         });
         daemonHealthy = false;
         daemonStorageReadiness = "unverified";
       } else if (ensureResult.restartedForParent) {
+        clearRemediationMarker();
         const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
         results.push({
           name: "daemon", category: "Daemon", status: "warn",
@@ -839,6 +891,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         daemonHealthy = true;
         daemonStorageReadiness = postRestartStorageReadiness;
       } else if (ensureResult.warning) {
+        clearRemediationMarker();
         results.push({
           name: "daemon", category: "Daemon", status: "warn",
           message: `localhost:${config.port} (up)\n     Warning: ${ensureResult.warning}`,
@@ -846,6 +899,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         });
         daemonHealthy = true;
       } else {
+        clearRemediationMarker();
         results.push({ name: "daemon", category: "Daemon", status: "pass", message: `localhost:${config.port} (up)` });
         daemonHealthy = true;
       }
@@ -854,10 +908,10 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       daemonStorageReadiness = "unverified";
       if (versionMismatch) {
         results.push({ name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed)\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}` });
+          message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed)\n     Fix: ${remediationGuidance("not-running")}` });
       } else {
         results.push({ name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} — daemon validation failed\n     Fix: ${MANUAL_DAEMON_RESTART_FIX}` });
+          message: `localhost:${config.port} — daemon validation failed\n     Fix: ${remediationGuidance("not-running")}` });
       }
     }
   } else {
@@ -876,6 +930,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         enforceUserManagerParent: true,
       });
       if (ensureResult.connected) {
+        clearRemediationMarker();
         daemonPid = ensureResult.pid;
         const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
         results.push({ name: "daemon", category: "Daemon", status: "warn", message: `localhost:${config.port} — started${warning}`, fixApplied: true });
@@ -885,10 +940,16 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
           if (h) daemonStorageReadiness = storageReadinessFromHealth(h);
         } catch { /* non-fatal */ }
       } else {
-        results.push({ name: "daemon", category: "Daemon", status: "fail", message: `localhost:${config.port} not responding\n     Fix: lcm daemon start` });
+        results.push({
+          name: "daemon", category: "Daemon", status: "fail",
+          message: `localhost:${config.port} not responding\n     Fix: ${remediationGuidance(refusalReasonFrom(ensureResult, "not-running"))}`,
+        });
       }
     } catch {
-      results.push({ name: "daemon", category: "Daemon", status: "fail", message: `localhost:${config.port} not responding\n     Fix: lcm daemon start` });
+      results.push({
+        name: "daemon", category: "Daemon", status: "fail",
+        message: `localhost:${config.port} not responding\n     Fix: ${remediationGuidance("not-running")}`,
+      });
     }
   }
 

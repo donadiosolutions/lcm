@@ -8,6 +8,7 @@ import { loadDaemonConfig, type ResolvedStorageConfig } from "../daemon/config.j
 import { ensureDaemon } from "../daemon/lifecycle.js";
 import { configPath as defaultConfigPath, daemonPidPath } from "../runtime-paths.js";
 import { PKG_VERSION } from "../daemon/version.js";
+import { mapDaemonRefusalToRemediation } from "../daemon/remediation.js";
 import { packageExecutable } from "../runtime-root.js";
 import { lcmGrepTool } from "./tools/lcm-grep.js";
 import { lcmExpandTool } from "./tools/lcm-expand.js";
@@ -151,21 +152,7 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/**
- * One restart attempt per port at a time — concurrent network failures share the same
- * restart promise instead of each spawning a separate daemon process.
- */
-const restartInFlight = new Map<number, Promise<unknown>>();
-
-function foregroundDaemonStartArgs(spawnArgs: string[] | undefined): string[] | undefined {
-  if (!spawnArgs) return undefined;
-  if (spawnArgs.includes("--foreground")) return spawnArgs;
-  const daemonStartIndex = spawnArgs.findIndex((arg, index) => arg === "daemon" && spawnArgs[index + 1] === "start");
-  if (daemonStartIndex === -1) return spawnArgs;
-  return [...spawnArgs, "--foreground"];
-}
-
-/** Exported for testing. Calls a daemon route with auto-restart + retry on network failure. */
+/** Exported for testing. Calls a daemon route without lifecycle recovery. */
 export async function handleDaemonRequest(
   client: Pick<DaemonClient, "post">,
   route: string,
@@ -185,29 +172,13 @@ export async function handleDaemonRequest(
     if (!isNetworkError(err)) {
       return { content: [{ type: "text", text: `lcm error: ${errorMessage(err)}` }], isError: true };
     }
-    // Daemon crashed — attempt auto-restart then retry once.
-    // Coalesce concurrent restart attempts so only one ensureDaemon() runs per port.
-    const ensure = opts._ensureDaemon ?? ensureDaemon;
-    if (!restartInFlight.has(opts.port)) {
-      const p = ensure({
-        port: opts.port, pidFilePath: opts.pidFilePath, spawnTimeoutMs: 10000,
-        expectedVersion: opts.expectedVersion,
-        expectedStorageBackend: opts.storage.backend,
-        spawnCommand: opts.spawnCommand,
-        spawnArgs: foregroundDaemonStartArgs(opts.spawnArgs),
-        expectedEntrypoint: opts.expectedEntrypoint,
-        enforceUserManagerParent: true,
-      })
-        .catch(() => { /* non-fatal */ })
-        .finally(() => { restartInFlight.delete(opts.port); });
-      restartInFlight.set(opts.port, p);
-    }
-    await restartInFlight.get(opts.port)!;
-    try {
-      result = await client.post(route, body);
-    } catch (retryErr) {
-      return { content: [{ type: "text", text: `lcm daemon unavailable: ${errorMessage(retryErr)}` }], isError: true };
-    }
+    // An MCP request must not signal, restart, or spawn a daemon based only on
+    // a transport failure.  Lifecycle recovery belongs to explicit CLI/hooks;
+    // return the bounded remediation message without exposing transport text.
+    return {
+      content: [{ type: "text", text: mapDaemonRefusalToRemediation("live-no-response").message }],
+      isError: true,
+    };
   }
   return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 }

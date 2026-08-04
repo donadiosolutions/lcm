@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { handleSessionEnd } from "../../src/hooks/session-end.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { loadDaemonConfig, type DaemonConfig } from "../../src/daemon/config.js";
@@ -343,6 +346,29 @@ describe("handleSessionEnd", () => {
     });
     await expect(handleSessionEnd("{}", createRejectingClient(new Error("failed"))))
       .resolves.toEqual({ exitCode: 0, stdout: "" });
+  });
+
+  it("emits bounded remediation when the canonical state root is absent", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-session-end-remediation-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+      vi.mocked(ensureDaemon).mockResolvedValueOnce({
+        connected: false,
+        port: 3737,
+        spawned: false,
+        refusalReason: "detached-no-response",
+      } as never);
+      await expect(handleSessionEnd("{}", createMockClient({ ingested: 0 }))).resolves.toEqual({
+        exitCode: 0,
+        stdout: "",
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

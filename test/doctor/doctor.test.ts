@@ -430,6 +430,41 @@ describe("runDoctor project map checks", () => {
 });
 
 describe("runDoctor daemon version mismatch", () => {
+  it("uses a lexical remediation scope when the state root is absent", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-remediation-"));
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        cwd: "/tmp/nonexistent-project-xyz",
+      }));
+      expect(results.find((result) => result.name === "daemon")?.message).toContain(
+        "lcm daemon unavailable (not-running)",
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uses an authoritative refusal reason for live daemon evidence", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: false,
+      port: 3737,
+      spawned: false,
+      refusalReason: "live-no-response",
+    } as never);
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: "ok", version: "0.5.0" }),
+      }),
+    }));
+    expect(results.find((result) => result.name === "daemon")?.message).toContain(
+      "lcm daemon unavailable (live-no-response)",
+    );
+  });
+
   it.each(["fetch", "json"] as const)(
     "bounds the complete daemon health %s phase to two seconds",
     async (phase) => {

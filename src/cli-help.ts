@@ -51,8 +51,6 @@ const HELP: Record<string, CommandHelp> = {
     ],
     examples: [
       ["lcm daemon start", "Start managed daemon in background (recommended)"],
-      ["lcm daemon start --detach", "Start managed daemon in background (compatibility alias)"],
-      ["lcm daemon start --foreground", "Start daemon in foreground (for debugging)"],
       ["lcm daemon restart", "Reload configuration by restarting the managed daemon"],
     ],
     notes: "On Linux, background starts prefer the user's systemd manager. The daemon runs on port 3737 by default. Configure via ~/.lcm/config.json.",

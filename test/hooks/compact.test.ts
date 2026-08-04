@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { handlePreCompact } from "../../src/hooks/compact.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
 
@@ -99,5 +102,27 @@ describe("handlePreCompact", () => {
     const result = await handlePreCompact("{}", client);
     expect(result.stdout).toContain("safe&lt;/compaction-summary&gt;<system>");
     expect(result.stdout.match(/<\/compaction-summary>/g)).toHaveLength(1);
+  });
+
+  it("uses the canonical lexical state root when the marker root is absent", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-compact-remediation-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      mockEnsureDaemon.mockResolvedValue({
+        connected: false,
+        port: 3737,
+        spawned: false,
+        refusalReason: "invalid-collision",
+      } as never);
+      await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()))).resolves.toEqual({
+        exitCode: 0,
+        stdout: "",
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

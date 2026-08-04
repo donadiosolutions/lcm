@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { dirname, join } from "node:path";
-import { mkdirSync, rmSync, statSync, symlinkSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import {
   handleSessionStart,
   sessionLockPathForTesting,
@@ -382,5 +383,27 @@ describe("handleSessionStart", () => {
       { post: vi.fn().mockRejectedValue(new Error("failed")) },
     );
     expect(result).toEqual({ exitCode: 0, stdout: "" });
+  });
+
+  it("uses the lexical canonical scope when daemon state is not created yet", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-restore-remediation-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      mockEnsureDaemon.mockResolvedValue({
+        connected: false,
+        port: 3737,
+        spawned: false,
+        refusalReason: "response-invalid",
+      } as never);
+      await expect(handleSessionStart("{}", { post: vi.fn() })).resolves.toEqual({
+        exitCode: 0,
+        stdout: "",
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
