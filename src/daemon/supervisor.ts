@@ -31,6 +31,8 @@ export type SupervisorKind = "systemd-user" | "launchd-user";
  * variables (including credentials) that must not reach the daemon.
  */
 export const MANAGED_LAUNCH_ENV_ALLOWLIST = Object.freeze([
+  "CODEX_HOME",
+  "CLAUDE_CONFIG_DIR",
   "HOME",
   "PATH",
   "USER",
@@ -58,6 +60,7 @@ export const MANAGED_LAUNCH_ENV_ALLOWLIST = Object.freeze([
 ] as const);
 const MANAGED_LAUNCH_ENV_VALUE_MAX_BYTES = 4096;
 const MANAGED_ENV_EXECUTABLE = "/usr/bin/env";
+const MANAGED_LAUNCH_ENV_DIGEST_LENGTH = 64;
 
 /** Stable, bounded reasons used by observations and diagnostics. */
 export type SupervisorReason =
@@ -147,6 +150,7 @@ type SupervisorObservationBase = Readonly<{
   runtimeDigest?: string;
   storageBackend?: string;
   postgresCaFile?: string;
+  launchEnvironmentDigest?: string;
   credentialDirectory?: string;
   credentialFiles?: readonly CredentialFileReference[];
   managerPid?: number;
@@ -337,6 +341,22 @@ function assertSupervisorArguments(value: readonly unknown[]): asserts value is 
   if (!validSupervisorArguments(value)) throw new Error("supervisor argument is invalid");
 }
 
+function isPrivateProviderConfigDirectory(value: string): boolean {
+  if (!isAbsolute(value) || resolve(value) !== value || /[\u0000\r\n=]/u.test(value)) return false;
+  try {
+    const stats = lstatSync(value);
+    const canonical = realpathSync(value);
+    const uid = typeof process.getuid === "function" ? process.getuid() : stats.uid;
+    return !stats.isSymbolicLink()
+      && stats.isDirectory()
+      && canonical === value
+      && stats.uid === uid
+      && (stats.mode & 0o777) === 0o700;
+  } catch {
+    return false;
+  }
+}
+
 function digestScope(stateRoot: string): string {
   return createHash("sha256").update(stateRoot, "utf8").digest("hex");
 }
@@ -424,6 +444,9 @@ export function managedLaunchEnvironment(
       } catch {
         continue;
       }
+    }
+    if ((name === "CODEX_HOME" || name === "CLAUDE_CONFIG_DIR") && !isPrivateProviderConfigDirectory(value)) {
+      continue;
     }
     if (name === "DBUS_SESSION_BUS_ADDRESS" && !/^(?:unix|tcp|unixexec):/u.test(value)) continue;
     result[name] = value;
@@ -606,6 +629,7 @@ function environmentAssignmentValueLimit(key: string): number {
   ) return MAX_PATH_METADATA_BYTES;
   if (upper === "LCM_SUPERVISOR_MARKER") return MARKER.length;
   if (upper === "LCM_SUPERVISOR_SCOPE" || upper === "LCM_SUPERVISOR_RUNTIME_DIGEST") return SHA256_HEX_LENGTH;
+  if (upper === "LCM_SUPERVISOR_ENV_DIGEST") return MANAGED_LAUNCH_ENV_DIGEST_LENGTH;
   if (upper === "LCM_SUPERVISOR_PORT") return 5;
   if (upper === "LCM_SUPERVISOR_NONCE") return MAX_NONCE_LENGTH;
   return MAX_METADATA_VALUE_LENGTH;
@@ -796,6 +820,7 @@ function metadata(values: Map<string, string>, name: string): string | undefined
     LCM_SUPERVISOR_CWD: ["cwd", "Cwd"],
     LCM_SUPERVISOR_ENTRYPOINT: ["entrypoint", "Entrypoint"],
     LCM_SUPERVISOR_RUNTIME_DIGEST: ["runtimeDigest", "RuntimeDigest"],
+    LCM_SUPERVISOR_ENV_DIGEST: ["launchEnvironmentDigest", "environmentDigest", "EnvironmentDigest"],
     LCM_SUPERVISOR_STORAGE_BACKEND: ["storageBackend", "StorageBackend"],
   };
   const direct = lookup(values, name, ...(aliases[name] ?? []), `environment.${name}`, `environment[${name}]`, `env.${name}`);
@@ -856,30 +881,6 @@ function isRunningState(value: string | undefined): boolean {
   return value !== undefined && /^(active|running|started|launching)$/iu.test(value);
 }
 
-type SupervisorProbeCapture = {
-  parsed?: Map<string, string>;
-  code?: number | null;
-};
-
-/**
- * Recognize only the manager state that can legitimately race a successful
- * systemd-run --no-block submission.  Ordinary classification remains
- * fail-closed until the unit reaches active/running.
- */
-function isOwnedSystemdActivation(
-  spec: SupervisorSpec,
-  capture: SupervisorProbeCapture,
-): boolean {
-  if (spec.kind !== "systemd-user" || capture.code !== 0 || capture.parsed === undefined) return false;
-  const loadState = lookup(capture.parsed, "LoadState", "loadState");
-  const activeState = lookup(capture.parsed, "ActiveState", "state", "State", "status");
-  const subState = lookup(capture.parsed, "SubState", "subState", "substate");
-  if (!/^loaded$/iu.test(loadState ?? "") || !/^activating$/iu.test(activeState ?? "")) return false;
-  if (!/^(?:start-pre|start|start-post)$/iu.test(subState ?? "")) return false;
-  const classified = classifyRegistered(spec, capture.parsed, capture.code);
-  return classified.kind === "ambiguous" && classified.reason === "metadata-malformed";
-}
-
 function isTerminalState(value: string | undefined): "inactive" | "failed" | "last-exit" | undefined {
   if (value === undefined) return undefined;
   if (/^(inactive|stopped|dead|exited|not[ -]running)$/iu.test(value)) return "inactive";
@@ -909,6 +910,7 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
   const storageBackend = metadata(values, "LCM_SUPERVISOR_STORAGE_BACKEND");
   const postgresCaFile = metadata(values, "LCM_POSTGRES_CA_FILE");
   const managerPid = parsePid(lookup(values, "MainPID", "pid", "PID", "process.pid", "ProcessID"));
+  const launchEnvironmentDigest = metadata(values, "LCM_SUPERVISOR_ENV_DIGEST");
   const credentialDirectory = metadata(values, "LCM_CREDENTIAL_DIRECTORY");
   const credentialFiles = MANAGED_CREDENTIAL_NAMES.flatMap((name) => {
     const path = metadata(values, `LCM_CREDENTIAL_${name}_FILE`);
@@ -927,6 +929,7 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
     ...(runtimeDigest === undefined ? {} : { runtimeDigest }),
     ...(storageBackend === undefined ? {} : { storageBackend }),
     ...(postgresCaFile === undefined ? {} : { postgresCaFile }),
+    ...(launchEnvironmentDigest === undefined ? {} : { launchEnvironmentDigest }),
     ...(credentialDirectory === undefined ? {} : { credentialDirectory }),
     ...(credentialFiles.length === 0 ? {} : { credentialFiles: Object.freeze(credentialFiles) }),
     ...(managerPid === undefined ? {} : { managerPid }),
@@ -950,6 +953,7 @@ function credentialFilesMatch(
 function staleReason(
   spec: SupervisorSpec,
   base: SupervisorObservationBase,
+  expectedLaunchEnvironmentDigest?: string,
 ): SupervisorReason | "foreign" {
   if (base.marker === undefined && base.scopeDigest === undefined) return "foreign";
   if (base.marker !== undefined && base.marker !== spec.marker) return "foreign";
@@ -971,6 +975,10 @@ function staleReason(
       ? "metadata-missing"
       : "metadata-mismatch";
   }
+  if (spec.kind === "systemd-user") {
+    if (base.launchEnvironmentDigest === undefined) return "metadata-missing";
+    if (expectedLaunchEnvironmentDigest === undefined || base.launchEnvironmentDigest !== expectedLaunchEnvironmentDigest) return "metadata-mismatch";
+  }
   if (base.executable === undefined || base.args === undefined || base.cwd === undefined) return "metadata-missing";
   if (spec.entrypoint !== undefined && base.entrypoint === undefined) return "metadata-missing";
   if (spec.runtimeDigest !== undefined && base.runtimeDigest === undefined) return "metadata-missing";
@@ -985,9 +993,10 @@ function classifyRegistered(
   spec: SupervisorSpec,
   values: Map<string, string>,
   commandCode: number | null,
+  expectedLaunchEnvironmentDigest?: string,
 ): SupervisorObservation {
   const base = observationBase(spec, values);
-  const reason = staleReason(spec, base);
+  const reason = staleReason(spec, base, expectedLaunchEnvironmentDigest);
   if (reason === "foreign") {
     return Object.freeze({ kind: "registered-invalid-collision", reason: "foreign-job", ...base });
   }
@@ -1009,6 +1018,7 @@ function classifyRegistered(
     || (base.postgresCaFile ?? "") !== (spec.postgresCaFile ?? "")
     || (spec.credentialDirectory !== undefined && base.credentialDirectory === undefined)
     || !credentialFilesMatch(spec.credentialFiles, base.credentialFiles)
+    || (spec.kind === "systemd-user" && base.launchEnvironmentDigest === undefined)
   ) {
     return Object.freeze({ kind: "registered-stale-config", reason: "metadata-missing", ...base });
   }
@@ -1535,26 +1545,27 @@ function validatedSystemdRuntimeRoot(
   value: string | undefined,
   uid: number,
 ): string {
+  const requested = value ?? (Number.isSafeInteger(uid) && uid >= 0 ? `/run/user/${uid}` : undefined);
   if (
-    typeof value !== "string"
-    || !isAbsolute(value)
-    || resolve(value) !== value
-    || /[\u0000\r\n=]/u.test(value)
+    typeof requested !== "string"
+    || !isAbsolute(requested)
+    || resolve(requested) !== requested
+    || /[\u0000\r\n=]/u.test(requested)
     || !Number.isSafeInteger(uid)
     || uid < 0
   ) throw new Error("systemd runtime directory is invalid");
   let stats: ReturnType<typeof lstatSync>;
   let canonical: string;
   try {
-    stats = lstatSync(value);
-    canonical = realpathSync(value);
+    stats = lstatSync(requested);
+    canonical = realpathSync(requested);
   } catch {
     throw new Error("systemd runtime directory is unavailable");
   }
   if (
     stats.isSymbolicLink()
     || !stats.isDirectory()
-    || canonical !== value
+    || canonical !== requested
     || stats.uid !== uid
     || (stats.mode & 0o777) !== 0o700
   ) throw new Error("systemd runtime directory is untrusted");
@@ -1574,26 +1585,56 @@ function systemdCredentialDirectory(
   return resolve(runtimeRoot, "credentials", spec.systemdUnit);
 }
 
+function managedLaunchEnvironmentValues(
+  spec: SupervisorSpec,
+  kind: SupervisorKind,
+  uid: number,
+  environment: Readonly<Record<string, string>>,
+): Map<string, string> {
+  const values = new Map<string, string>();
+  const credentialFiles = spec.credentialFiles === undefined ? [] : spec.credentialFiles;
+  for (const [name, value] of Object.entries(spec.launchEnvironment ?? environment)) {
+    launchEnvironmentValue(values, name, value);
+  }
+  // launchd persists the plist across manager probes.  The caller supplies
+  // the already-filtered values in the spec/runner environment.  Running
+  // identity remains bound to these exact values; absence-only cleanup may
+  // authenticate bounded prior values without ever executing that plist.
+  if (kind === "systemd-user") {
+    const names = credentialFiles.map(({ name }) => name);
+    if (names.length > 0) {
+      launchEnvironmentValue(values, "CREDENTIALS_DIRECTORY", systemdCredentialDirectory(spec, uid, values));
+      launchEnvironmentValue(values, "LCM_SYSTEMD_CRED_IDS", names.join(","));
+    }
+  } else if (spec.credentialDirectory !== undefined && credentialFiles.length > 0) {
+    launchEnvironmentValue(values, "LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory);
+    for (const credential of credentialFiles) {
+      launchEnvironmentValue(values, `LCM_CREDENTIAL_${credential.name}_FILE`, credential.path);
+    }
+  }
+  return values;
+}
+
+export function managedLaunchEnvironmentDigest(
+  spec: SupervisorSpec,
+  kind: SupervisorKind,
+  uid: number,
+  environment: Readonly<Record<string, string>>,
+): string {
+  const values = managedLaunchEnvironmentValues(spec, kind, uid, environment);
+  const canonical = [...values.entries()].sort(([left], [right]) => left.localeCompare(right));
+  return createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
+}
+
 function managedLaunchAssignments(
   spec: SupervisorSpec,
   kind: SupervisorKind,
   uid: number,
   environment: Readonly<Record<string, string>>,
 ): readonly string[] {
-  const values = new Map<string, string>();
-  const credentialFiles = spec.credentialFiles === undefined ? [] : spec.credentialFiles;
+  const values = managedLaunchEnvironmentValues(spec, kind, uid, environment);
   if (kind === "systemd-user") {
-    for (const [name, value] of Object.entries(spec.launchEnvironment ?? environment)) {
-      launchEnvironmentValue(values, name, value);
-    }
-  } else {
-    // launchd persists the plist across manager probes.  The caller supplies
-    // the already-filtered values in the spec/runner environment.  Running
-    // identity remains bound to these exact values; absence-only cleanup may
-    // authenticate bounded prior values without ever executing that plist.
-    for (const [name, value] of Object.entries(spec.launchEnvironment ?? environment)) {
-      launchEnvironmentValue(values, name, value);
-    }
+    launchEnvironmentValue(values, "LCM_SUPERVISOR_ENV_DIGEST", managedLaunchEnvironmentDigest(spec, kind, uid, environment));
   }
   // Metadata is intentionally duplicated into the child environment. The
   // manager's own metadata remains authoritative for identity probes, while
@@ -1609,18 +1650,6 @@ function managedLaunchAssignments(
   if (spec.entrypoint !== undefined) launchEnvironmentValue(values, "LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint);
   if (spec.runtimeDigest !== undefined) launchEnvironmentValue(values, "LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest);
   if (spec.storageBackend !== undefined) launchEnvironmentValue(values, "LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend);
-  if (kind === "systemd-user") {
-    const names = credentialFiles.map(({ name }) => name);
-    if (names.length > 0) {
-      launchEnvironmentValue(values, "CREDENTIALS_DIRECTORY", systemdCredentialDirectory(spec, uid, values));
-      launchEnvironmentValue(values, "LCM_SYSTEMD_CRED_IDS", names.join(","));
-    }
-  } else if (spec.credentialDirectory !== undefined && credentialFiles.length > 0) {
-    launchEnvironmentValue(values, "LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory);
-    for (const credential of credentialFiles) {
-      launchEnvironmentValue(values, `LCM_CREDENTIAL_${credential.name}_FILE`, credential.path);
-    }
-  }
   return Object.freeze([...values].map(([name, value]) => `${name}=${value}`));
 }
 
@@ -1776,6 +1805,33 @@ function systemdProbeArgs(spec: SupervisorSpec): readonly string[] {
   ];
 }
 
+type SupervisorProbeCapture = {
+  parsed?: Map<string, string>;
+  code?: number | null;
+};
+
+/**
+ * Recognize only the manager state that can legitimately race a successful
+ * systemd-run --no-block submission.  The ordinary observation classifier
+ * deliberately treats this state as ambiguous because it is not a running
+ * service yet; start() may continue only when the raw observation proves the
+ * exact unit, metadata, and known service activation substate.
+ */
+function isOwnedSystemdActivation(
+  spec: SupervisorSpec,
+  capture: SupervisorProbeCapture,
+  expectedLaunchEnvironmentDigest?: string,
+): boolean {
+  if (spec.kind !== "systemd-user" || capture.code !== 0 || capture.parsed === undefined) return false;
+  const loadState = lookup(capture.parsed, "LoadState", "loadState");
+  const activeState = lookup(capture.parsed, "ActiveState", "state", "State", "status");
+  const subState = lookup(capture.parsed, "SubState", "subState", "substate");
+  if (!/^loaded$/iu.test(loadState ?? "") || !/^activating$/iu.test(activeState ?? "")) return false;
+  if (!/^(?:start-pre|start|start-post)$/iu.test(subState ?? "")) return false;
+  const classified = classifyRegistered(spec, capture.parsed, capture.code, expectedLaunchEnvironmentDigest);
+  return classified.kind === "ambiguous" && classified.reason === "metadata-malformed";
+}
+
 function launchdProbeArgs(spec: SupervisorSpec, uid: number): readonly string[] {
   return ["print", `${launchdDomain(uid)}/${spec.launchdLabel}`];
 }
@@ -1862,6 +1918,9 @@ export function createSupervisor(
     if (kind === "launchd-user" && runner.uid < 0) {
       return Object.freeze({ kind: "unavailable", reason: "manager-unavailable", name: spec.name });
     }
+    const expectedLaunchEnvironmentDigest = kind === "systemd-user"
+      ? managedLaunchEnvironmentDigest(spec, kind, runner.uid, runner.environment)
+      : undefined;
     const result = kind === "systemd-user"
       ? await runner.invoke("systemctl", systemdProbeArgs(spec))
       : await runner.invoke("launchctl", launchdProbeArgs(spec, runner.uid));
@@ -1882,8 +1941,8 @@ export function createSupervisor(
     if (loadState !== undefined && /^(not-found|notloaded)$/iu.test(loadState)) {
       return Object.freeze({ kind: "absent", name: spec.name });
     }
-    if (!validMetadata(spec, parsed)) return classifyRegistered(spec, parsed, result.code);
-    const classified = classifyRegistered(spec, parsed, result.code);
+    if (!validMetadata(spec, parsed)) return classifyRegistered(spec, parsed, result.code, expectedLaunchEnvironmentDigest);
+    const classified = classifyRegistered(spec, parsed, result.code, expectedLaunchEnvironmentDigest);
     if (classified.kind === "registered-running-valid") {
       return Object.freeze({ ...classified, managerPid: managerPidFrom(parsed)! });
     }
@@ -1926,6 +1985,9 @@ export function createSupervisor(
       throw new Error("supervisor credential validation failed");
     }
     scavengeStaleManagedCredentialDirectories(spec.stateRoot, spec.nonce, spec.credentialDirectory);
+    const expectedLaunchEnvironmentDigest = kind === "systemd-user"
+      ? managedLaunchEnvironmentDigest(spec, kind, runner.uid, runner.environment)
+      : undefined;
     let launchPath: string | undefined;
     try {
       if (kind === "launchd-user") launchPath = writePrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
@@ -1953,7 +2015,7 @@ export function createSupervisor(
       for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
         const capture: SupervisorProbeCapture = {};
         after = await probeInternal(spec, capture);
-        const activation = isOwnedSystemdActivation(spec, capture);
+        const activation = isOwnedSystemdActivation(spec, capture, expectedLaunchEnvironmentDigest);
         if (after.kind !== "absent" && !activation) break;
         if (attempt + 1 < maxPollIntervals) {
           const remaining = pollDeadline - now();
@@ -2132,7 +2194,11 @@ export function createSupervisor(
   return Object.freeze({ probe, start, stopAndStart, stopAndAwaitAbsent });
 }
 
-function metadataEnvironmentArgs(spec: SupervisorSpec): string[] {
+function metadataEnvironmentArgs(
+  spec: SupervisorSpec,
+  uid: number,
+  environment: Readonly<Record<string, string>>,
+): string[] {
   const values = [
     ["LCM_SUPERVISOR_MARKER", spec.marker],
     ["LCM_SUPERVISOR_SCOPE", spec.scopeDigest],
@@ -2147,6 +2213,7 @@ function metadataEnvironmentArgs(spec: SupervisorSpec): string[] {
   if (spec.runtimeDigest !== undefined) values.push(["LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest]);
   if (spec.storageBackend !== undefined) values.push(["LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend]);
   if (spec.postgresCaFile !== undefined) values.push(["LCM_POSTGRES_CA_FILE", spec.postgresCaFile]);
+  values.push(["LCM_SUPERVISOR_ENV_DIGEST", managedLaunchEnvironmentDigest(spec, "systemd-user", uid, environment)]);
   if (spec.credentialDirectory !== undefined) values.push(["LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory]);
   if (spec.credentialFiles !== undefined && spec.credentialFiles.length > 0) {
     values.push(["LCM_SYSTEMD_CRED_IDS", spec.credentialFiles.map(({ name }) => name).join(",")]);
@@ -2173,7 +2240,7 @@ function systemdStartArgs(
     "--property=KillMode=control-group",
     `--property=TimeoutStopSec=${spec.stopTimeoutMs}ms`,
     ...loadCredentials,
-    ...metadataEnvironmentArgs(spec),
+    ...metadataEnvironmentArgs(spec, uid, environment),
     ...(spec.cwd === undefined ? [] : [`--working-directory=${spec.cwd}`]),
     MANAGED_ENV_EXECUTABLE,
     "-i",

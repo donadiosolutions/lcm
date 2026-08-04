@@ -17,6 +17,7 @@ import { ensurePrivateDirectory } from "../security-files.js";
 /** Names that may be projected into a managed one-launch credential directory. */
 export const MANAGED_CREDENTIAL_NAMES = Object.freeze([
   "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
   "OPENAI_API_KEY",
   "LCM_SUMMARY_API_KEY",
   "LCM_POSTGRES_URL",

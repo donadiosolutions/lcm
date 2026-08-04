@@ -68,6 +68,8 @@ import {
 import {
   createSupervisor,
   createSupervisorSpec,
+  managedLaunchEnvironment,
+  managedLaunchEnvironmentDigest,
   type SupervisorKind,
   type SupervisorSpec,
 } from "../../src/daemon/supervisor.js";
@@ -125,12 +127,19 @@ function systemdText(
   pid = 123,
   extra = "",
 ): string {
+  const environment = value.launchEnvironment ?? managedLaunchEnvironment(process.env);
+  const environmentDigest = managedLaunchEnvironmentDigest(
+    value,
+    "systemd-user",
+    typeof process.getuid === "function" ? process.getuid() : -1,
+    environment,
+  );
   return [
     "LoadState=loaded",
     `ActiveState=${state}`,
     `SubState=${state === "active" ? "running" : state}`,
     `MainPID=${state === "active" ? pid : 0}`,
-    `Environment=LCM_SUPERVISOR_MARKER=${value.marker} LCM_SUPERVISOR_SCOPE=${value.scopeDigest} LCM_SUPERVISOR_PORT=${value.port} LCM_SUPERVISOR_NONCE=${value.nonce} LCM_SUPERVISOR_EXECUTABLE=${value.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(value.args)} LCM_SUPERVISOR_CWD=${value.cwd ?? ""}${extra}`,
+    `Environment=LCM_SUPERVISOR_MARKER=${value.marker} LCM_SUPERVISOR_SCOPE=${value.scopeDigest} LCM_SUPERVISOR_PORT=${value.port} LCM_SUPERVISOR_NONCE=${value.nonce} LCM_SUPERVISOR_EXECUTABLE=${value.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(value.args)} LCM_SUPERVISOR_CWD=${value.cwd ?? ""} LCM_SUPERVISOR_ENV_DIGEST=${environmentDigest}${extra}`,
   ].join("\n");
 }
 
@@ -235,7 +244,7 @@ describe("supervisor coverage: validation and bounded parsing", () => {
   it("decodes quoted assignment escapes and rejects malformed assignment tokens", async () => {
     const value = spec("systemd-user");
     const escaped = ["a", "b", "e", "f", "n", "r", "s", "t", "v", "x41"].map((item) => `LCM_PADDING_${item}=\\${item}`).join(" ");
-    const environment = `LCM_SUPERVISOR_MARKER=${value.marker} LCM_SUPERVISOR_SCOPE=${value.scopeDigest} LCM_SUPERVISOR_PORT=${value.port} LCM_SUPERVISOR_NONCE=${value.nonce} LCM_SUPERVISOR_EXECUTABLE=${value.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(value.args)} LCM_SUPERVISOR_CWD= ${escaped}`;
+    const environment = `LCM_SUPERVISOR_MARKER=${value.marker} LCM_SUPERVISOR_SCOPE=${value.scopeDigest} LCM_SUPERVISOR_PORT=${value.port} LCM_SUPERVISOR_NONCE=${value.nonce} LCM_SUPERVISOR_EXECUTABLE=${value.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(value.args)} LCM_SUPERVISOR_CWD= LCM_SUPERVISOR_ENV_DIGEST=${managedLaunchEnvironmentDigest(value, "systemd-user", typeof process.getuid === "function" ? process.getuid() : -1, value.launchEnvironment ?? managedLaunchEnvironment(process.env))} ${escaped}`;
     const malformed = [
       `Environment="LCM_SUPERVISOR_MARKER=${value.marker}unterminated`,
       "Environment=LCM_SUPERVISOR_MARKER=bad\\x",

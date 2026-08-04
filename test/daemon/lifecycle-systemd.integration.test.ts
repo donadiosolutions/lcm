@@ -360,4 +360,37 @@ describe("real user-systemd daemon lifecycle", () => {
       await cleanupFixture(fixture);
     }
   });
+
+  linuxSystemd("refuses clean-environment drift before admitting an existing unit", { timeout: 60_000 }, async () => {
+    const fixture = await createFixture();
+    try {
+      const started = await fixture.supervisor.start(fixture.spec);
+      await waitForHealth(fixture, started.managerPid!);
+      const launchEnvironment = {
+        ...fixture.spec.launchEnvironment,
+        PATH: `${fixture.spec.launchEnvironment?.PATH ?? "/usr/bin"}:/lcm-drift`,
+      };
+      const drifted = createSupervisorSpec({
+        kind: "systemd-user",
+        stateRoot: fixture.spec.stateRoot,
+        port: fixture.spec.port,
+        nonce: fixture.spec.nonce,
+        executable: fixture.spec.executable,
+        args: fixture.spec.args,
+        cwd: fixture.spec.cwd,
+        entrypoint: fixture.spec.entrypoint,
+        runtimeDigest: fixture.spec.runtimeDigest,
+        storageBackend: fixture.spec.storageBackend,
+        launchEnvironment,
+        stopTimeoutMs: fixture.spec.stopTimeoutMs,
+      });
+      expect(await fixture.supervisor.probe(drifted)).toMatchObject({
+        kind: "registered-stale-config",
+        reason: "metadata-mismatch",
+      });
+      expect(fixture.calls.filter((call) => call.command === "systemd-run")).toHaveLength(1);
+    } finally {
+      await cleanupFixture(fixture);
+    }
+  });
 });

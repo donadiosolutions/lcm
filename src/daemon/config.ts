@@ -250,6 +250,7 @@ const DEFAULTS: DaemonConfigDefaults = {
 const DENIED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const SYSTEMD_CREDENTIAL_ENV_NAMES = [
   "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
   "OPENAI_API_KEY",
   "LCM_SUMMARY_API_KEY",
   "LCM_POSTGRES_URL",
@@ -403,6 +404,8 @@ function credentialFileName(name: SystemdCredentialEnvName): string {
   switch (name) {
     case "ANTHROPIC_API_KEY":
       return "ANTHROPIC_API_KEY";
+    case "CLAUDE_CODE_OAUTH_TOKEN":
+      return "CLAUDE_CODE_OAUTH_TOKEN";
     case "OPENAI_API_KEY":
       return "OPENAI_API_KEY";
     case "LCM_SUMMARY_API_KEY":

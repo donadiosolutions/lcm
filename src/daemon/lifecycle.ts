@@ -3465,7 +3465,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
 
   if (scopedState) assertScopedStateAccess(scopedState);
   const ensure = _ensureDaemonOverride ?? ensureDaemon;
-  const result = await ensure(ensureOptions);
+  const result = await ensure(ensureOptionsWithEntrypoint);
   if (!restarted && result.connected && !result.spawned) {
     throw new Error(
       "Refusing to report a restart: a daemon is reachable but no verified daemon PID was available to stop.",

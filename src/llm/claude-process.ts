@@ -1,6 +1,6 @@
 import { spawn as defaultSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
-import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, type ClaudeProcessReasoningEffort } from "../daemon/config.js";
+import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, resolveDaemonConfigEnv, type ClaudeProcessReasoningEffort } from "../daemon/config.js";
 import { createProcessCompatibilityError } from "./process-utils.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
@@ -15,6 +15,7 @@ type ClaudeProcessDeps = {
   reasoningEffort?: ClaudeProcessReasoningEffort;
   fastMode?: boolean;
   spawn?: typeof defaultSpawn;
+  environment?: NodeJS.ProcessEnv;
   timeoutMs?: number;
 };
 
@@ -37,6 +38,7 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
   const reasoningEffort = opts.reasoningEffort;
   const fastMode = opts.fastMode;
   const spawn = opts.spawn ?? defaultSpawn;
+  const environment = opts.environment ?? process.env;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS;
 
   return async function summarize(text: string, aggressive?: boolean, ctx: SummarizeContext = {}): Promise<string> {
@@ -73,7 +75,10 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
 
       let proc: ChildProcessWithoutNullStreams;
       try {
-        proc = spawn("claude", args, { stdio: ["pipe", "pipe", "pipe"] });
+        proc = spawn("claude", args, {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: resolveDaemonConfigEnv(environment),
+        });
       } catch (error) {
         reject(normalizeSpawnError(error));
         return;

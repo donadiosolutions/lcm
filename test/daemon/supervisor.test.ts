@@ -29,6 +29,7 @@ import {
   isSupervisorPreflightUnavailableReason,
   MANAGED_LAUNCH_ENV_ALLOWLIST,
   managedLaunchEnvironment,
+  managedLaunchEnvironmentDigest,
   type SupervisorKind,
   type SupervisorSpec,
 } from "../../src/daemon/supervisor.js";
@@ -66,12 +67,26 @@ function makeSpec(kind: SupervisorKind, stateRoot = makeRoot(), overrides: Parti
   });
 }
 
+function systemdEnvironmentDigest(
+  spec: SupervisorSpec,
+  environmentOverride?: Readonly<Record<string, string>>,
+): string {
+  return managedLaunchEnvironmentDigest(
+    spec,
+    "systemd-user",
+    typeof process.getuid === "function" ? process.getuid() : -1,
+    environmentOverride ?? spec.launchEnvironment ?? managedLaunchEnvironment(process.env),
+  );
+}
+
 function managerText(
   spec: SupervisorSpec,
   state = "active",
   pid = 1234,
   subState = state === "active" ? "running" : state,
+  environmentOverride?: Readonly<Record<string, string>>,
 ): string {
+  const environmentDigest = systemdEnvironmentDigest(spec, environmentOverride);
   const credentialMetadata = spec.credentialDirectory === undefined
     ? ""
     : ` LCM_CREDENTIAL_DIRECTORY=${spec.credentialDirectory}${(spec.credentialFiles ?? []).map(({ name, path }) => ` LCM_CREDENTIAL_${name}_FILE=${path}`).join("")}`;
@@ -80,7 +95,7 @@ function managerText(
     `ActiveState=${state}`,
     `SubState=${subState}`,
     `MainPID=${state === "active" ? pid : 0}`,
-    `Environment=LCM_SUPERVISOR_MARKER=${spec.marker} LCM_SUPERVISOR_SCOPE=${spec.scopeDigest} LCM_SUPERVISOR_STATE_ROOT=${spec.stateRoot} LCM_SUPERVISOR_PORT=${spec.port} LCM_SUPERVISOR_NONCE=${spec.nonce} LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)} LCM_SUPERVISOR_CWD=${spec.cwd ?? ""}${spec.entrypoint === undefined ? "" : ` LCM_SUPERVISOR_ENTRYPOINT=${spec.entrypoint}`}${spec.runtimeDigest === undefined ? "" : ` LCM_SUPERVISOR_RUNTIME_DIGEST=${spec.runtimeDigest}`}${spec.storageBackend === undefined ? "" : ` LCM_SUPERVISOR_STORAGE_BACKEND=${spec.storageBackend}`}${spec.postgresCaFile === undefined ? "" : ` LCM_POSTGRES_CA_FILE=${spec.postgresCaFile}`}${credentialMetadata}`,
+    `Environment=LCM_SUPERVISOR_MARKER=${spec.marker} LCM_SUPERVISOR_SCOPE=${spec.scopeDigest} LCM_SUPERVISOR_STATE_ROOT=${spec.stateRoot} LCM_SUPERVISOR_PORT=${spec.port} LCM_SUPERVISOR_NONCE=${spec.nonce} LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)} LCM_SUPERVISOR_CWD=${spec.cwd ?? ""}${spec.entrypoint === undefined ? "" : ` LCM_SUPERVISOR_ENTRYPOINT=${spec.entrypoint}`}${spec.runtimeDigest === undefined ? "" : ` LCM_SUPERVISOR_RUNTIME_DIGEST=${spec.runtimeDigest}`}${spec.storageBackend === undefined ? "" : ` LCM_SUPERVISOR_STORAGE_BACKEND=${spec.storageBackend}`}${spec.postgresCaFile === undefined ? "" : ` LCM_POSTGRES_CA_FILE=${spec.postgresCaFile}`}${spec.kind === "systemd-user" ? ` LCM_SUPERVISOR_ENV_DIGEST=${environmentDigest}` : ""}${credentialMetadata}`,
   ].join("\n");
 }
 
@@ -104,6 +119,8 @@ describe("canonical supervisor identity", () => {
     const runtimeLink = join(linkRoot, "runtime");
     symlinkSync(runtimeRoot, runtimeLink, "dir");
     const environment = managedLaunchEnvironment({
+      CODEX_HOME: runtimeRoot,
+      CLAUDE_CONFIG_DIR: runtimeLink,
       HOME: "/home/test",
       PATH: "/usr/bin",
       XDG_RUNTIME_DIR: runtimeLink,
@@ -116,18 +133,28 @@ describe("canonical supervisor identity", () => {
       BAD_NUL: "bad\u0000value",
       TOO_LARGE: "x".repeat(4097),
     });
-    expect(environment).toEqual({ HOME: "/home/test", PATH: "/usr/bin" });
+    expect(environment).toEqual({ CODEX_HOME: runtimeRoot, HOME: "/home/test", PATH: "/usr/bin" });
     expect(managedLaunchEnvironment({
+      CLAUDE_CONFIG_DIR: runtimeRoot,
       HOME: "/home/test",
       PATH: "/usr/bin",
       XDG_RUNTIME_DIR: runtimeRoot,
       DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
     })).toEqual({
+      CLAUDE_CONFIG_DIR: runtimeRoot,
       HOME: "/home/test",
       PATH: "/usr/bin",
       XDG_RUNTIME_DIR: runtimeRoot,
       DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
     });
+    const wrongMode = makeRoot();
+    chmodSync(wrongMode, 0o755);
+    expect(managedLaunchEnvironment({ CODEX_HOME: wrongMode })).toEqual({});
+    const regularFile = join(makeRoot(), "config");
+    writeFileSync(regularFile, "not-a-directory");
+    expect(managedLaunchEnvironment({ CLAUDE_CONFIG_DIR: regularFile })).toEqual({});
+    expect(managedLaunchEnvironment({ CODEX_HOME: join(makeRoot(), "missing") })).toEqual({});
+    expect(managedLaunchEnvironment({ CODEX_HOME: "relative" })).toEqual({});
   });
 
   it("allows detached compatibility only for read-only manager absence reasons", () => {
@@ -272,6 +299,7 @@ describe("managed one-launch credentials", () => {
     expect(() => writeManagedCredentialFiles(directory, { OPENAI_API_KEY: 1 as unknown as string })).toThrow("value");
     expect(() => writeManagedCredentialFiles(directory, {
       ANTHROPIC_API_KEY: "a",
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth",
       OPENAI_API_KEY: "b",
       LCM_SUMMARY_API_KEY: "c",
       LCM_POSTGRES_URL: "d",
@@ -300,6 +328,31 @@ describe("managed one-launch credentials", () => {
 });
 
 describe("systemd-user supervisor", () => {
+  it("rejects clean-environment drift before admitting a registered unit", async () => {
+    const root = makeRoot();
+    const original = makeSpec("systemd-user", root, { launchEnvironment: { PATH: "/usr/bin" } });
+    const drifted = createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: root,
+      port: original.port,
+      nonce: original.nonce,
+      executable: original.executable,
+      args: original.args,
+      launchEnvironment: { PATH: "/opt/bin" },
+    });
+    const runner = fakeRunner([{ code: 0, stdout: managerText(original, "active", 4321) }]);
+    const supervisor = createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      environment: original.launchEnvironment,
+    });
+    await expect(supervisor.probe(drifted)).resolves.toMatchObject({
+      kind: "registered-stale-config",
+      reason: "metadata-mismatch",
+    });
+    expect(runner.calls).toHaveLength(1);
+  });
+
   it("probes unavailable, absent, valid running, terminal, stale, collision, and ambiguous states", async () => {
     const spec = makeSpec("systemd-user");
     const responses: SupervisorCommandResult[] = [
@@ -583,6 +636,37 @@ describe("systemd-user supervisor", () => {
     expect(existsSync(loserDirectory)).toBe(false);
   });
 
+  it("derives the canonical user runtime root when XDG_RUNTIME_DIR is absent", async () => {
+    const uid = typeof process.getuid === "function" ? process.getuid() : -1;
+    const runtimeRoot = uid < 0 ? "" : `/run/user/${uid}`;
+    if (uid < 0 || !existsSync(runtimeRoot) || (lstatSync(runtimeRoot).mode & 0o777) !== 0o700) return;
+    const root = makeRoot();
+    const directory = createManagedCredentialDirectory(root, "systemd-runtime-fallback");
+    const file = writeManagedCredentialFiles(directory, { OPENAI_API_KEY: "secret" })[0]!;
+    const spec = makeSpec("systemd-user", root, {
+      credentialDirectory: directory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: file }],
+    });
+    const runner = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: managerText(spec, "active", 445, "running", {}) },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      environment: {},
+      platform: "linux",
+      uid,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 445 });
+    expect(runner.calls[1]!.args).toContain(`CREDENTIALS_DIRECTORY=${runtimeRoot}/credentials/${spec.systemdUnit}`);
+    await expect(createSupervisor("systemd-user", {
+      run: fakeRunner([]).run,
+      environment: {},
+      platform: "linux",
+      uid: -1,
+    }).start(spec)).rejects.toThrow("systemd runtime directory");
+  });
+
   it("fails closed when the systemd runtime root for credentials is missing or untrusted", async () => {
     const root = makeRoot();
     let attemptIndex = 0;
@@ -610,7 +694,7 @@ describe("systemd-user supervisor", () => {
         run: runner.run,
         platform: "linux",
         ...(uid === undefined ? {} : { uid }),
-      }).start(spec)).rejects.toThrow("manager command");
+      }).start(spec)).rejects.toThrow(/manager command|systemd runtime directory/u);
     };
     await attempt(join(root, "missing"));
     const deleted = join(root, "deleted-runtime");
@@ -677,7 +761,7 @@ describe("systemd-user supervisor", () => {
 
   it("parses JSON/key-value variants and all terminal/metadata refusal boundaries", async () => {
     const spec = makeSpec("systemd-user");
-    const identity = ` LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)} LCM_SUPERVISOR_CWD=`;
+    const identity = ` LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)} LCM_SUPERVISOR_CWD= LCM_SUPERVISOR_ENV_DIGEST=${systemdEnvironmentDigest(spec)}`;
     const outputs: SupervisorCommandResult[] = [
       { status: 0, stdout: JSON.stringify({
         loadState: "loaded",
@@ -691,6 +775,7 @@ describe("systemd-user supervisor", () => {
           LCM_SUPERVISOR_EXECUTABLE: spec.executable,
           LCM_SUPERVISOR_ARGS: JSON.stringify(spec.args),
           LCM_SUPERVISOR_CWD: "",
+          LCM_SUPERVISOR_ENV_DIGEST: systemdEnvironmentDigest(spec),
         },
         list: [null, true, 3],
       }) },
@@ -724,7 +809,7 @@ describe("systemd-user supervisor", () => {
       "ActiveState=active",
       "SubState=running",
       "MainPID=4242",
-      `Environment=LCM_SUPERVISOR_MARKER=${spec.marker} LCM_SUPERVISOR_SCOPE=${spec.scopeDigest} LCM_SUPERVISOR_PORT=${spec.port} LCM_SUPERVISOR_NONCE=${spec.nonce} LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_CWD= \"LCM_SUPERVISOR_ARGS=[\\\"20\\\"]\"`,
+      `Environment=LCM_SUPERVISOR_MARKER=${spec.marker} LCM_SUPERVISOR_SCOPE=${spec.scopeDigest} LCM_SUPERVISOR_PORT=${spec.port} LCM_SUPERVISOR_NONCE=${spec.nonce} LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_CWD= LCM_SUPERVISOR_ENV_DIGEST=${systemdEnvironmentDigest(spec)} \"LCM_SUPERVISOR_ARGS=[\\\"20\\\"]\"`,
     ].join("\n");
     const runner = fakeRunner([{ code: 0, stdout: output }]);
     await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).probe(spec)).resolves.toMatchObject({
@@ -859,14 +944,14 @@ describe("systemd-user supervisor", () => {
 
   it("handles quoted/oversized metadata, suffix keys, invalid numeric identities, and stale fields", async () => {
     const spec = makeSpec("systemd-user");
-    const quoted = `LoadState=loaded\nActiveState=active\npid='123'\nfoo.LCM_SUPERVISOR_MARKER='${spec.marker}'\nfoo.LCM_SUPERVISOR_SCOPE='${spec.scopeDigest}'\nfoo.LCM_SUPERVISOR_PORT='${spec.port}'\nfoo.LCM_SUPERVISOR_NONCE='${spec.nonce}'\nLCM_SUPERVISOR_EXECUTABLE='${spec.executable}'\nLCM_SUPERVISOR_ARGS='${JSON.stringify(spec.args)}'\nLCM_SUPERVISOR_CWD=''`;
+    const quoted = `LoadState=loaded\nActiveState=active\npid='123'\nfoo.LCM_SUPERVISOR_MARKER='${spec.marker}'\nfoo.LCM_SUPERVISOR_SCOPE='${spec.scopeDigest}'\nfoo.LCM_SUPERVISOR_PORT='${spec.port}'\nfoo.LCM_SUPERVISOR_NONCE='${spec.nonce}'\nLCM_SUPERVISOR_EXECUTABLE='${spec.executable}'\nLCM_SUPERVISOR_ARGS='${JSON.stringify(spec.args)}'\nLCM_SUPERVISOR_CWD=''\nLCM_SUPERVISOR_ENV_DIGEST='${systemdEnvironmentDigest(spec)}'`;
     const oversized = `LoadState=loaded\nActiveState=active\nMainPID=999999999999999999999\nLCM_SUPERVISOR_MARKER=${spec.marker}\nLCM_SUPERVISOR_SCOPE=${spec.scopeDigest}\nLCM_SUPERVISOR_PORT=999999999999999999999\nLCM_SUPERVISOR_NONCE=${spec.nonce}\nBig=${"x".repeat(70_000)}`;
     const staleScope = managerText({ ...spec, scopeDigest: "0".repeat(64) }, "inactive");
     const staleRoot = `${managerText(spec, "inactive")}\nLCM_SUPERVISOR_STATE_ROOT=/other/root`;
     const staleNonce = managerText({ ...spec, nonce: "other" }, "inactive");
     const stalePort = managerText({ ...spec, port: 9 }, "inactive");
     const unknownState = managerText(spec, "mystery", 0);
-    const directKeys = `LoadState=loaded\nActiveState=active\npid=123\nmarker=${spec.marker}\nscopeDigest=${spec.scopeDigest}\nport=${spec.port}\nnonce=${spec.nonce}\nexecutable=${spec.executable}\nargs=${JSON.stringify(spec.args)}\ncwd=`;
+    const directKeys = `LoadState=loaded\nActiveState=active\npid=123\nmarker=${spec.marker}\nscopeDigest=${spec.scopeDigest}\nport=${spec.port}\nnonce=${spec.nonce}\nexecutable=${spec.executable}\nargs=${JSON.stringify(spec.args)}\ncwd=\nLCM_SUPERVISOR_ENV_DIGEST=${systemdEnvironmentDigest(spec)}`;
     const noMetadata = "LoadState=loaded\nActiveState=active\nMainPID=123";
     const activeError = { code: 1, stdout: managerText(spec, "active", 4), stderr: "unexpected" };
     const terminalError = { code: 1, stdout: managerText(spec, "inactive"), stderr: "unexpected" };
@@ -912,6 +997,7 @@ describe("systemd-user supervisor", () => {
       `LCM_SUPERVISOR_EXECUTABLE="${escaped(spec.executable)}"`,
       `LCM_SUPERVISOR_ARGS="${escaped(JSON.stringify(spec.args))}"`,
       "LCM_SUPERVISOR_CWD=\"\"",
+      `LCM_SUPERVISOR_ENV_DIGEST="${systemdEnvironmentDigest(spec)}"`,
     ].join(" ");
     const runner = fakeRunner([{
       code: 0,
@@ -938,6 +1024,7 @@ describe("systemd-user supervisor", () => {
       `LCM_SUPERVISOR_EXECUTABLE=${spec.executable}`,
       `LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)}`,
       "LCM_SUPERVISOR_CWD=",
+      `LCM_SUPERVISOR_ENV_DIGEST=${systemdEnvironmentDigest(spec)}`,
       `LCM_CREDENTIAL_DIRECTORY=${credentialDirectory}`,
       padding,
     ].join(" ");

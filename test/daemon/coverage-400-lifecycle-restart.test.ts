@@ -1070,6 +1070,27 @@ describe("managed restart refusal and repair coverage", () => {
     expect(refused.refusalReason).toBe("ambiguous");
   });
 
+  it("passes the packaged entrypoint default through managed restart", async () => {
+    const dir = root();
+    writePid(dir, 200);
+    writeFileSync(join(dir, "daemon.token"), "token", { mode: 0o600 });
+    const managed = managedSupervisor((spec) => ({ kind: "registered-running-valid", managerPid: 200, scopeDigest: spec.scopeDigest, nonce: spec.nonce, name: spec.name }));
+    const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: true }));
+    const { expectedEntrypoint: _ignoredEntrypoint, ...withoutExplicitEntrypoint } = baseOptions(dir);
+    const result = await restart({
+      ...withoutExplicitEntrypoint,
+      enforceUserManagerParent: true,
+      _packagedEntrypointOverride: "/packaged/lcm.mjs",
+      _supervisorOverride: managed.supervisor,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19_999],
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as unknown as FetchOverride,
+      _ensureDaemonOverride: ensureMock,
+    });
+    expect(result.restarted).toBe(true);
+    expect(ensureMock).toHaveBeenCalledWith(expect.objectContaining({ expectedEntrypoint: "/packaged/lcm.mjs" }));
+  });
+
   it("covers manager health deadline, endpoint collision, and stop/start failure", async () => {
     const expiredDir = root();
     writePid(expiredDir, 200);

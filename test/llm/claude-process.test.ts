@@ -1,4 +1,7 @@
 import { EventEmitter } from "node:events";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { createClaudeProcessSummarizer } from "../../src/llm/claude-process.js";
@@ -49,6 +52,37 @@ function makeErrorChild(error: unknown): FakeChild {
 describe("createClaudeProcessSummarizer", () => {
   it("constructs with default process dependencies", () => {
     expect(createClaudeProcessSummarizer()).toBeTypeOf("function");
+  });
+  it("projects a staged OAuth token into the Claude child environment without argv exposure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-claude-credentials-"));
+    const runtimeRoot = join(root, "runtime");
+    const credentialsParent = join(runtimeRoot, "credentials");
+    const directory = join(credentialsParent, "lcm-claude.service");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    chmodSync(runtimeRoot, 0o700);
+    const tokenPath = join(directory, "CLAUDE_CODE_OAUTH_TOKEN");
+    writeFileSync(tokenPath, "staged-token\n", { mode: 0o400 });
+    chmodSync(tokenPath, 0o400);
+    chmodSync(directory, 0o500);
+    const spawn = vi.fn().mockReturnValue(makeChild());
+    try {
+      const summarizer = createClaudeProcessSummarizer({
+        spawn: spawn as unknown as SpawnFn,
+        environment: {
+          CREDENTIALS_DIRECTORY: directory,
+          XDG_RUNTIME_DIR: runtimeRoot,
+          LCM_SYSTEMD_CRED_IDS: "CLAUDE_CODE_OAUTH_TOKEN",
+          CLAUDE_CODE_OAUTH_TOKEN: "ambient-token",
+        },
+      });
+      await expect(summarizer("Conversation text", false)).resolves.toBe("summary text");
+      const options = spawn.mock.calls[0][2] as { env?: NodeJS.ProcessEnv };
+      expect(options.env?.CLAUDE_CODE_OAUTH_TOKEN).toBe("staged-token");
+      expect((spawn.mock.calls[0][1] as string[]).join(" ")).not.toContain("staged-token");
+    } finally {
+      chmodSync(directory, 0o700);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
   it("passes the configured model to the Claude CLI", async () => {
     const spawn = vi.fn().mockReturnValue(makeChild());

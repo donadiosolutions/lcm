@@ -410,7 +410,9 @@ systemd or launchd manager may have inherited arbitrary variables from the
 interactive session, but the daemon is launched through the trusted
 `/usr/bin/env -i` executable with a bounded set of non-secret runtime values
 (such as `HOME`, `PATH`, locale, timezone, and validated runtime socket
-addresses). Service identity metadata and credential-file markers are passed as
+addresses). Process-based Claude and Codex providers also receive
+`CLAUDE_CONFIG_DIR` and `CODEX_HOME` only when each is an absolute, canonical,
+user-owned private directory. Service identity metadata and credential-file markers are passed as
 names and paths only. API keys and database URLs are never copied into argv,
 unit properties, plist contents, or logs; the daemon reads them from the
 private one-launch credential files after the manager has authenticated their
@@ -428,6 +430,11 @@ allow-listed values solely to remove its canonical plist and owned credential
 directory before writing a new descriptor with the current values. Malformed,
 out-of-scope, or uncontrolled descriptors still fail closed and remain as
 collision evidence.
+
+When the Claude process provider is used, `CLAUDE_CODE_OAUTH_TOKEN` is staged
+through the same private one-launch credential mechanism. It is restored only
+inside the authenticated Claude child environment; it is never placed in
+systemd properties, launchd plist contents, command arguments, or diagnostics.
 
 PostgreSQL is remote-primary: once repository support is enabled, an outage is
 reported rather than silently switching the authoritative store to SQLite.

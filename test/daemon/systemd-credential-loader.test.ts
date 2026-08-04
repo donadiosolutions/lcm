@@ -152,6 +152,20 @@ describe("systemd credential loader hardening", () => {
     }
   });
 
+  it("projects the staged Claude OAuth token without trusting the ambient value", () => {
+    const fixture = makeCredentialDir();
+    try {
+      writeFileSync(join(fixture.directory, "CLAUDE_CODE_OAUTH_TOKEN"), "staged-oauth\n", { mode: 0o400 });
+      sealCredentialDir(fixture.directory);
+      expect(resolveDaemonConfigEnv({
+        ...credentialEnv(fixture, "CLAUDE_CODE_OAUTH_TOKEN"),
+        CLAUDE_CODE_OAUTH_TOKEN: "ambient-oauth",
+      }).CLAUDE_CODE_OAUTH_TOKEN).toBe("staged-oauth");
+    } finally {
+      removeCredentialDir(fixture);
+    }
+  });
+
   it("accepts staged credentials beneath a validated XDG runtime root and rejects a mismatched root", () => {
     const runtimeRoot = mkdtempSync(join(tmpdir(), "lcm-loader-runtime-"));
     const outsideRoot = mkdtempSync(join(tmpdir(), "lcm-loader-outside-runtime-"));
