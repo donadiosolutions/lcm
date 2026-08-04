@@ -87,6 +87,7 @@ const compatibilityFiles = [
 const staleRecoveryPatterns: readonly [RegExp, string][] = [
   [/^[ \t]*(?:[$>#][ \t]*)?(?:sudo[ \t]+)?(?:pkill|killall)\b[^\n]*$/imu, "broad process-kill command"],
   [/^[ \t]*(?:[$>#][ \t]*)?(?:sudo[ \t]+)?kill(?:[ \t]+-[A-Z0-9]+)?[ \t]+(?:["']?\$?\{?[A-Za-z_]*PID[A-Za-z0-9_]*\}?["']?|\d+)\b[^\n]*$/imu, "manual PID kill command"],
+  [/\blcm\s+start(?:\s+--(?:detach|foreground))?\b/iu, "bare daemon-start alias used as recovery"],
   [/\blcm daemon start --(?:detach|foreground)\b/iu, "compatibility launch used as recovery"],
   [/(?:run|use|try|execute|start)\s+`?(?:pkill|killall|kill)\b[^\n]*/iu, "imperative process kill guidance"],
   [/(?:run|use|try|execute)\s+[^\n]*(?:--detach|--foreground)\b/iu, "compatibility launch used as recovery"],
