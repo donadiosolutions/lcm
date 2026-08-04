@@ -492,13 +492,6 @@ const PROCESS_TEXT_CLASSIFICATIONS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\b(?:timed out|timeout)\b/i, "operation timed out"],
   [/\b(?:connection refused|unreachable)\b/i, "service unavailable"],
 ];
-const PROCESS_SIGNALS = new Set([
-  "SIGABRT", "SIGALRM", "SIGBUS", "SIGCHLD", "SIGCONT", "SIGFPE", "SIGHUP",
-  "SIGILL", "SIGINT", "SIGKILL", "SIGPIPE", "SIGQUIT", "SIGSEGV", "SIGSTOP",
-  "SIGTERM", "SIGTRAP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGUSR1",
-  "SIGUSR2", "SIGXCPU", "SIGXFSZ",
-]);
-
 /** Summarize untrusted process output without reproducing any of its text. */
 function summarizeProcessDiagnostic(source: ProcessDiagnosticSource, value: unknown): string {
   let text = "";
@@ -529,14 +522,6 @@ function summarizeProcessDiagnostic(source: ProcessDiagnosticSource, value: unkn
       ?? "process reported a failure";
 
   return `${source}: ${classification}${code ? `; code ${code}` : ""}`;
-}
-
-function summarizeProcessExit(status: unknown, signal: unknown): string {
-  if (typeof signal === "string" && PROCESS_SIGNALS.has(signal)) return `signal ${signal}`;
-  if (typeof status === "number" && Number.isInteger(status) && status >= 0 && status <= 255) {
-    return `exit status ${status}`;
-  }
-  return "process exit unavailable";
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1818,9 +1803,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   }
 
   function observationRefusalReason(
-    observation: HealthObservation<HealthResponse>,
+    observation: Extract<HealthObservation<HealthResponse>, { kind: "response" }>,
   ): DaemonLifecycleRefusalReason {
-    if (observation.kind === "no-response") return "live-no-response";
     if (observation.body === "timeout") return "response-timeout";
     return "response-invalid";
   }
@@ -1882,11 +1866,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   let managedOperationAmbiguous = false;
   let managedOperationManagerPid: number | undefined = opts._managedOperationManagerPid;
 
-  async function createManagedSupervisor(): Promise<{
+  async function createManagedSupervisor(kind: SupervisorKind): Promise<{
     spec: SupervisorSpec;
     supervisor: Supervisor;
   } | null> {
-    if (managerKind === undefined) return null;
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
@@ -1906,7 +1889,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     let spec: SupervisorSpec;
     try {
       spec = createSupervisorSpec({
-        kind: managerKind,
+        kind,
         stateRoot: scope.stateRoot,
         port: opts.port,
         nonce: supervisorNonce(scope.scopeDigest, opts.port),
@@ -1923,7 +1906,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     }
     const supervisor = opts._supervisorOverride
       ?? opts._supervisor
-      ?? createSupervisor(managerKind, {
+      ?? createSupervisor(kind, {
           run: supervisorCommandRunner(dependencies, opts),
           platform,
           uid: dependencies.uid,
@@ -1996,8 +1979,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     await runCleanupStages(stages);
   }
 
-  async function runManagedEnsure(): Promise<EnsureDaemonResult | null> {
-    const managed = await createManagedSupervisor();
+  async function runManagedEnsure(kind: SupervisorKind): Promise<EnsureDaemonResult | null> {
+    const managed = await createManagedSupervisor(kind);
     if (managed === null) return refusalResult(
       "ambiguous",
       "managed daemon supervisor could not be constructed; inspect the daemon configuration and retry",
@@ -2318,7 +2301,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   let managerPreflightUnavailable = false;
 
   if (managerKind !== undefined) {
-    const managedResult = await runManagedEnsure();
+    const managedResult = await runManagedEnsure(managerKind);
     if (managedResult !== null) {
       const failedManagedOperation = managedCleanupAuthorized
         && managedOperationOwned
