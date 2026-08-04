@@ -2987,8 +2987,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     }
   }
 
-  async function runManagedRestart(): Promise<RestartDaemonResult | null> {
-    if (managerKind === undefined) return null;
+  async function runManagedRestart(managerKind: SupervisorKind): Promise<RestartDaemonResult | null> {
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
@@ -3182,7 +3181,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   }
 
   if (managerKind !== undefined) {
-    const managedResult = await runManagedRestart();
+    const managedResult = await runManagedRestart(managerKind);
     if (managedResult !== null) return managedResult;
   }
 
