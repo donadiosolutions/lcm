@@ -529,7 +529,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
     const emptyStart = runQueue([
       { code: 1, stderr: "Unit is not-found" },
       { code: 0, stdout: "started" },
-      { code: 0, stdout: systemdText(emptySpec, "active", 78) },
+      { code: 0, stdout: systemdText(emptySpec, "active", 78, ` LCM_CREDENTIAL_DIRECTORY=${emptyDirectory}`) },
     ]);
     await expect(createSupervisor("systemd-user", { run: emptyStart.run, platform: "linux" }).start(emptySpec)).resolves.toMatchObject({ managerPid: 78 });
     const running = systemdText(value, "active", 7, ` LCM_CREDENTIAL_DIRECTORY=${directory} LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${file}`);
