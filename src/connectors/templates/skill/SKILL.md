@@ -69,6 +69,7 @@ lcm stats
 ## Error Handling
 
 - If `lcm` is not found: run `npm install -g @donadiosolutions/lcm`
-- If daemon is down: run `lcm daemon start --detach`
+- If daemon is unavailable: run `lcm doctor`, then `lcm daemon restart`
+- If a connector is stale after an upgrade: rerun `lcm connectors install <agent>`, then `lcm connectors doctor <agent>`
 - If search returns nothing: memory may be empty — proceed normally
 - Check status: `lcm doctor`

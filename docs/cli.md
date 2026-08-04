@@ -51,14 +51,52 @@ compact.” A failed scan does not mark any session as processed. Back up the
 reported project database, resolve the SQLite or schema error, and rerun the
 command; the still-eligible sessions will be discovered again.
 
-### Planned kernel-backed wedged-daemon recovery
+### Managed-daemon recovery
 
-LCM currently preserves a managed daemon when its bounded health check produces
-no response, because a PID and pathname alone are not safe authority to stop a
-possibly replaced process. The planned Linux x64 recovery path is limited to an
-explicit `lcm daemon restart`, requires authenticated launch evidence, and uses
-descriptor-bound state transitions and PIDFD-only signalling. It remains
-disabled until its native helper and integration are released; unsupported,
-legacy, or ambiguous cases continue to fail closed. See
-[the protocol contract](daemon-restart-recovery.md) for the exact boundaries
-and recovery-state guarantees.
+Use the public commands for daemon recovery:
+
+```bash
+lcm doctor
+lcm daemon restart
+```
+
+`lcm doctor` checks the daemon, hooks, connector registration, MCP server, and
+summarizer without asking an unknown process to stop. `lcm daemon restart`
+validates the effective configuration, asks the host service manager to replace
+the exact LCM service, and waits for authenticated health before returning.
+After changing configuration, run the restart command once; do not start a
+second daemon to work around a health failure.
+
+Linux uses the current user's `systemd --user` manager and macOS uses the
+current user's `launchd` agent. Both integrations are deliberately one-shot:
+LCM does not request automatic restart (`Restart=`) or a launchd `KeepAlive`
+policy. If a daemon reaches its idle timeout and exits normally, the next LCM
+request recreates the registered service. This keeps idle terminals quiet while
+retaining a single, authenticated service owner.
+
+Health observation has three outcomes. An HTTP response (including an error
+status, malformed body, or a body timeout after headers) stays on the normal
+authenticated path. A transport failure or deadline before any response is a
+**no-response** outcome and may be handed to the service manager only when the
+exact managed service is still identifiable. An unknown or ambiguous outcome
+is refused. LCM never turns an uncertain result into permission to signal a
+numeric PID or delete state files.
+
+Detached and foreground launches are compatibility/debug modes, not managed
+recovery authorities. Windows, containers without a user service manager, and
+any unsupported or ambiguous launch are refused rather than force-recovered.
+Run `lcm doctor`, restore the host service manager, and retry `lcm daemon
+restart`.
+
+If a connector was removed or its installed paths are stale after an upgrade,
+repair it through the connector manager and then re-run doctor:
+
+```bash
+lcm connectors install <agent>
+lcm connectors doctor <agent>
+lcm doctor
+```
+
+Do not edit hook files or use process-kill commands as a recovery procedure.
+See [Managed daemon recovery](daemon-restart-recovery.md) for the platform
+boundaries and the user-facing failure cases.

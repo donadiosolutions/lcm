@@ -1,7 +1,45 @@
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 import fastUri from "fast-uri";
 import pkg from "../package.json";
+
+const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
+
+function npmPackInventory(): string[] {
+  const transcriptRuntime = resolve(
+    repositoryRoot,
+    "dist/src/storage/native-transcripts.js",
+  );
+  if (!existsSync(transcriptRuntime)) {
+    execFileSync("npm", ["run", "build"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      stdio: "pipe",
+      maxBuffer: 32 * 1024 * 1024,
+    });
+  }
+
+  const output = execFileSync(
+    "npm",
+    ["pack", "--dry-run", "--json", "--ignore-scripts"],
+    {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      stdio: "pipe",
+      maxBuffer: 32 * 1024 * 1024,
+    },
+  );
+  const metadata = JSON.parse(output) as Array<{
+    files?: Array<{ path?: unknown }>;
+  }>;
+  expect(metadata).toHaveLength(1);
+  return (metadata[0]?.files ?? []).flatMap((entry) =>
+    typeof entry.path === "string" ? [entry.path] : [],
+  );
+}
 
 describe("package.json", () => {
   it("has correct name", () => expect(pkg.name).toBe("@donadiosolutions/lcm"));
@@ -78,6 +116,24 @@ describe("package.json", () => {
     expect(pkg.files).not.toContain("lcm.mjs");
     expect(pkg.files).not.toContain("mcp.mjs");
     expect(pkg.files).not.toContain(".claude-plugin/");
+  });
+
+  it("packs native transcript exports without Rust or restart-helper artifacts", () => {
+    const paths = npmPackInventory();
+    expect(paths).toEqual(
+      expect.arrayContaining([
+        "dist/src/storage/native-transcripts.d.ts",
+        "dist/src/storage/native-transcripts.js",
+        "docs/postgresql-native-transcripts.md",
+      ]),
+    );
+
+    const forbiddenArtifacts = paths.filter((path) =>
+      /(^|\/)(?:native|target|rust)(?:\/|$)/iu.test(path)
+      || /(?:cargo|rustc|daemon-restart-helper|native-helper)/iu.test(path)
+      || /\.(?:rs|rlib|a|dylib|so|exe)$/iu.test(path),
+    );
+    expect(forbiddenArtifacts).toEqual([]);
   });
 
   it("generates only the dist runtime bundle", () => {

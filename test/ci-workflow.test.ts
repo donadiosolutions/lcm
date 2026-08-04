@@ -10,6 +10,16 @@ interface WorkflowStep {
   with?: Record<string, unknown>;
 }
 
+interface IntegrationJob {
+  name: string;
+  needs: string;
+  "runs-on": string;
+  "timeout-minutes"?: number;
+  if?: string;
+  "continue-on-error"?: boolean;
+  steps: WorkflowStep[];
+}
+
 interface CodecovJob {
   needs: string;
   if: string;
@@ -35,6 +45,8 @@ interface CiWorkflow {
       "runs-on": string;
       strategy: { matrix: { run: number[] } };
     };
+    "linux-systemd": IntegrationJob;
+    "macos-launchd": IntegrationJob;
     ci: {
       name: string;
       needs: string[];
@@ -87,9 +99,21 @@ describe("CI workflow", () => {
     expect(workflow.jobs.postgresql.needs).toBe("environment");
     expect(workflow.jobs.postgresql["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
     expect(workflow.jobs.postgresql.strategy.matrix.run).toEqual([1, 2]);
+    expect(workflow.jobs["linux-systemd"]).toMatchObject({
+      name: "Linux Ubuntu 24.04 user-systemd integration",
+      needs: "environment",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 15,
+    });
+    expect(workflow.jobs["macos-launchd"]).toMatchObject({
+      name: "macOS 15 launchd feasibility",
+      needs: "environment",
+      "runs-on": "macos-15",
+      "timeout-minutes": 15,
+    });
     expect(workflow.jobs.ci).toMatchObject({
       name: "ci",
-      needs: ["environment", "core", "postgresql"],
+      needs: ["environment", "core", "postgresql", "linux-systemd"],
       if: "${{ always() }}",
     });
     const gate = workflow.jobs.ci.steps.find((step) => step.name === "Require every CI suite");
@@ -97,12 +121,82 @@ describe("CI workflow", () => {
       ENVIRONMENT_RESULT: "${{ needs.environment.result }}",
       CORE_RESULT: "${{ needs.core.result }}",
       POSTGRESQL_RESULT: "${{ needs.postgresql.result }}",
+      LINUX_SYSTEMD_RESULT: "${{ needs.linux-systemd.result }}",
     });
     expect(gate?.run).toContain(
-      '[[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success ]]',
+      '[[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success || "$LINUX_SYSTEMD_RESULT" != success ]]',
     );
+    expect(gate?.run).toContain("Linux user-systemd result: $LINUX_SYSTEMD_RESULT");
     expect(workflow.jobs.codecov.needs).toBe("ci");
     expect(workflow.jobs["codecov-fork"].needs).toBe("ci");
+  });
+
+  it("runs the pinned Linux user-systemd integration with exact scoped cleanup", () => {
+    const job = workflow.jobs["linux-systemd"];
+    const checkout = job.steps.find((step) => step.name === "Checkout");
+    const node = job.steps.find((step) => step.name === "Set up Node.js 25.9.0");
+    const install = job.steps.find((step) => step.name === "Install dependencies");
+    const integration = job.steps.find((step) => step.name === "Run real user-systemd integration");
+
+    expect(checkout).toEqual({
+      name: "Checkout",
+      uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+      with: { "persist-credentials": false },
+    });
+    expect(node).toEqual({
+      name: "Set up Node.js 25.9.0",
+      uses: "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+      with: { "node-version": "25.9.0", cache: "npm" },
+    });
+    expect(install?.run).toBe("npm ci");
+    expect(integration?.env).toEqual({
+      LCM_LIFECYCLE_SYSTEMD_INTEGRATION: "1",
+      LCM_LIFECYCLE_SCOPE_ID: "ci-${{ github.run_id }}-${{ github.run_attempt }}",
+      LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR:
+        "${{ runner.temp }}/lcm-systemd-${{ github.run_id }}-${{ github.run_attempt }}",
+      LCM_LIFECYCLE_DAEMON_PORT: "48322",
+      LCM_LIFECYCLE_EXPECTED_SCOPES: "1",
+    });
+    expect(integration?.run).toContain("systemctl --user is-system-running");
+    expect(integration?.run).toContain("test/daemon/lifecycle-isolation.test.ts");
+    expect(integration?.run).toContain("uses and removes one exact run-owned transient unit");
+    expect(integration?.run).toContain("systemctl --user stop \"$unit_name\"");
+    expect(integration?.run).toContain('rm -rf -- "$barrier_dir"');
+    expect(integration?.run).not.toMatch(/\b(?:pkill|killall)\b/u);
+  });
+
+  it("keeps the macOS launchd feasibility job active while exposing its integration dependency", () => {
+    const job = workflow.jobs["macos-launchd"];
+    const checkout = job.steps.find((step) => step.name === "Checkout");
+    const node = job.steps.find((step) => step.name === "Set up Node.js 25.9.0");
+    const install = job.steps.find((step) => step.name === "Install dependencies");
+    const integration = job.steps.find((step) => step.name === "Run launchd integration path");
+
+    expect(job.if).toBeUndefined();
+    expect(job["continue-on-error"]).toBeUndefined();
+    expect(checkout?.uses).toBe(
+      "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    );
+    expect(node).toEqual({
+      name: "Set up Node.js 25.9.0",
+      uses: "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+      with: { "node-version": "25.9.0", cache: "npm" },
+    });
+    expect(install?.run).toBe("npm ci");
+    expect(integration?.env).toEqual({
+      LCM_LAUNCHD_INTEGRATION: "1",
+      LCM_LAUNCHD_SCOPE_ID: "ci-${{ github.run_id }}-${{ github.run_attempt }}",
+      LCM_LAUNCHD_RESOURCE_ROOT:
+        "${{ runner.temp }}/lcm-launchd-${{ github.run_id }}-${{ github.run_attempt }}",
+      LCM_LAUNCHD_LABEL:
+        "com.donadiosolutions.lcm.ci.${{ github.run_id }}.${{ github.run_attempt }}",
+    });
+    expect(integration?.run).toContain("test/daemon/lifecycle-launchd.integration.test.ts");
+    expect(integration?.run).toContain("Launchd integration dependency");
+    expect(integration?.run).toContain('launchctl bootout "gui/$(id -u)/$ready_label"');
+    expect(integration?.run).toContain('rm -rf -- "$resource_root"');
+    expect(integration?.run).not.toMatch(/\b(?:pkill|killall)\b/u);
+    expect(workflow.jobs.ci.needs).not.toContain("macos-launchd");
   });
 
   it("separates trusted OIDC uploads from tokenless fork uploads", () => {

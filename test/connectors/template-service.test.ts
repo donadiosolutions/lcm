@@ -163,6 +163,17 @@ describe('generateSkillContent', () => {
     expect(content).toContain('lcm store');
   });
 
+  it('uses canonical daemon and connector recovery guidance', () => {
+    const content = generateSkillContent(mockAgent);
+    expect(content).toContain('lcm doctor');
+    expect(content).toContain('lcm daemon restart');
+    expect(content).toContain('lcm connectors install <agent>');
+    expect(content).toContain('lcm connectors doctor <agent>');
+    expect(content).not.toContain('lcm daemon start --detach');
+    expect(content).not.toContain('lcm daemon start --foreground');
+    expect(content).not.toContain('pkill');
+  });
+
   it('contains a describe example with a node id', () => {
     const content = generateSkillContent(mockAgent);
     expect(content).toContain('lcm describe sum_abc123def456');
