@@ -638,6 +638,9 @@ export function recordDaemonRemediation(
     return unavailableRemediationDecision(remediation, scopeDigest);
   }
   const lock = acquireRemediationLock(path, now, lockOperations);
+  // Lock timeout, stale-owner ambiguity, or any lock I/O failure follows the
+  // existing marker-failure contract: emit visibly and report unavailable;
+  // never suppress a notice based on untrusted persistence state.
   if (lock === null) return unavailableRemediationDecision(remediation, scopeDigest);
   try {
     return recordDaemonRemediationUnderLock(path, fs, scopeDigest, reason, remediation, now);
