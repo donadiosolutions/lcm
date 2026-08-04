@@ -163,6 +163,26 @@ describe("CI workflow", () => {
     expect(integration?.run).toContain("test/daemon/lifecycle-isolation.test.ts");
     expect(integration?.run).toContain("uses and removes one exact run-owned transient unit");
     expect(integration?.run).toContain("systemctl --user stop \"$unit_name\"");
+    expect(integration?.run).toContain(
+      'if [[ "$unit_name" =~ ^lcm-daemon-[0-9a-f]{20}\\.service$ ]]; then',
+    );
+    expect(integration?.run).toContain('systemctl --user reset-failed "$unit_name"');
+    expect(integration?.run).not.toContain("lcm-test-daemon-${scope_id}");
+    const ownedUnit = /^lcm-daemon-[0-9a-f]{20}\.service$/u;
+    for (const value of [
+      "lcm-daemon-0123456789abcdef0123.service",
+    ]) {
+      expect(ownedUnit.test(value)).toBe(true);
+    }
+    for (const value of [
+      "lcm-test-daemon-ci-123-1-12-34",
+      "lcm-daemon-0123456789ABCDEF0123.service",
+      "lcm-daemon-0123456789abcdef0123.service.extra",
+      "lcm-daemon-0123456789abcdef0123.service; touch /tmp/pwned",
+      "other.service",
+    ]) {
+      expect(ownedUnit.test(value)).toBe(false);
+    }
     expect(integration?.run).toContain('rm -rf -- "$barrier_dir"');
     expect(integration?.run).not.toMatch(/\b(?:pkill|killall)\b/u);
   });

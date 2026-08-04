@@ -140,15 +140,15 @@ jobs:
         run: |
           set -Eeuo pipefail
           barrier_dir="$LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR"
-          scope_id="$LCM_LIFECYCLE_SCOPE_ID"
           cleanup() {
             set +e
             if [[ -d "$barrier_dir" ]]; then
               while IFS= read -r marker; do
                 [[ -f "$marker" ]] || continue
                 unit_name="$(node -e 'const fs = require("node:fs"); const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(value.unitName ?? "");' "$marker" 2>/dev/null)"
-                if [[ "$unit_name" =~ ^lcm-test-daemon-${scope_id}-[0-9]+-[0-9]+$ ]]; then
+                if [[ "$unit_name" =~ ^lcm-daemon-[0-9a-f]{20}\.service$ ]]; then
                   systemctl --user stop "$unit_name" || true
+                  systemctl --user reset-failed "$unit_name" || true
                 else
                   echo "Refusing cleanup for unexpected systemd unit: $unit_name" >&2
                 fi
