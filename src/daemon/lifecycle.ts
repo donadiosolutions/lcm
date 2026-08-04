@@ -2970,7 +2970,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     }
   }
 
-  async function runManagedRestart(managerKind: SupervisorKind): Promise<RestartDaemonResult | null> {
+  async function runManagedRestart(managerKind: SupervisorKind): Promise<RestartDaemonResult> {
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
@@ -3030,7 +3030,10 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
           `managed daemon supervisor preflight failed (${observation.reason}); refusing detached fallback`,
         );
       }
-      return null;
+      return restartRefusal(
+        "manager-unavailable",
+        "managed daemon supervisor is unavailable; refusing restart",
+      );
     }
     if (observation.kind === "registered-invalid-collision") {
       return restartRefusal("invalid-collision", "managed daemon supervisor found a foreign job for this state root; refusing restart");
@@ -3165,7 +3168,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
 
   if (managerKind !== undefined) {
     const managedResult = await runManagedRestart(managerKind);
-    if (managedResult !== null) return managedResult;
+    return managedResult;
   }
 
   async function isManaged(pid: number): Promise<boolean> {

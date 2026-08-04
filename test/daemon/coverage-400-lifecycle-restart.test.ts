@@ -2,6 +2,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -746,6 +747,105 @@ describe("managed restart refusal and repair coverage", () => {
     });
     expect(result.refusalReason).toBe("ambiguous");
     expect(probe).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["linux", "manager-unavailable"],
+    ["linux", "manager-not-found"],
+    ["darwin", "manager-unavailable"],
+    ["darwin", "manager-not-found"],
+  ] as const)("refuses %s restart when the selected manager preflight is %s", async (platform, reason) => {
+    const dir = root(`issue-515-${platform}-${reason}-`);
+    const pidPath = writePid(dir, 4242);
+    const tokenPath = join(dir, "daemon.token");
+    writeFileSync(tokenPath, "local-token", { mode: 0o600 });
+    let alive = true;
+    const kill = vi.fn(() => { alive = false; });
+    const ensureMock = vi.fn(async () => ({ connected: false, port: 19_999, spawned: false }));
+    const supervisor = {
+      probe: vi.fn(async (spec: SupervisorSpec) => ({ kind: "unavailable" as const, reason, name: spec.name })),
+      start: vi.fn(),
+      stopAndStart: vi.fn(),
+      stopAndAwaitAbsent: vi.fn(),
+    } as unknown as Supervisor;
+
+    const result = await restart({
+      ...baseOptions(dir),
+      _platform: platform,
+      enforceUserManagerParent: true,
+      _isProcessAliveOverride: () => alive,
+      _isManagedProcessOverride: () => true,
+      _killOverride: kill,
+      _ensureDaemonOverride: ensureMock,
+      _supervisorOverride: supervisor,
+    });
+
+    expect(result).toMatchObject({
+      connected: false,
+      spawned: false,
+      restarted: false,
+      refusalReason: "manager-unavailable",
+    });
+    expect(kill).not.toHaveBeenCalled();
+    expect(ensureMock).not.toHaveBeenCalled();
+    expect(supervisor.start).not.toHaveBeenCalled();
+    expect(supervisor.stopAndStart).not.toHaveBeenCalled();
+    expect(supervisor.stopAndAwaitAbsent).not.toHaveBeenCalled();
+    expect(readFileSync(pidPath, "utf8")).toBe("4242");
+    expect(readFileSync(tokenPath, "utf8")).toBe("local-token");
+  });
+
+  it("refuses a selected-manager ambiguous preflight before legacy recovery", async () => {
+    const dir = root("issue-515-ambiguous-");
+    const pidPath = writePid(dir, 4242);
+    const kill = vi.fn();
+    const ensureMock = vi.fn();
+    const supervisor = {
+      probe: vi.fn(async (spec: SupervisorSpec) => ({ kind: "ambiguous" as const, reason: "state-conflict" as const, name: spec.name })),
+      start: vi.fn(),
+      stopAndStart: vi.fn(),
+      stopAndAwaitAbsent: vi.fn(),
+    } as unknown as Supervisor;
+
+    const result = await restart({
+      ...baseOptions(dir),
+      enforceUserManagerParent: true,
+      _isProcessAliveOverride: () => true,
+      _isManagedProcessOverride: () => true,
+      _killOverride: kill,
+      _ensureDaemonOverride: ensureMock,
+      _supervisorOverride: supervisor,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false, restarted: false, refusalReason: "ambiguous" });
+    expect(kill).not.toHaveBeenCalled();
+    expect(ensureMock).not.toHaveBeenCalled();
+    expect(supervisor.start).not.toHaveBeenCalled();
+    expect(supervisor.stopAndStart).not.toHaveBeenCalled();
+    expect(supervisor.stopAndAwaitAbsent).not.toHaveBeenCalled();
+    expect(readFileSync(pidPath, "utf8")).toBe("4242");
+  });
+
+  it("retains legacy detached restart compatibility when no manager is selected", async () => {
+    const dir = root("issue-515-detached-compatibility-");
+    writePid(dir, 4242);
+    let alive = true;
+    const kill = vi.fn(() => { alive = false; });
+    const ensureMock = vi.fn(async () => ({ connected: false, port: 19_999, spawned: false }));
+
+    const result = await restart({
+      ...baseOptions(dir),
+      enforceUserManagerParent: false,
+      _isProcessAliveOverride: () => alive,
+      _isManagedProcessOverride: () => true,
+      _killOverride: kill,
+      _ensureDaemonOverride: ensureMock,
+    });
+
+    expect(result).toMatchObject({ restarted: true, stoppedPid: 4242 });
+    expect(kill).toHaveBeenCalledWith(4242, "SIGTERM");
+    expect(ensureMock).toHaveBeenCalledOnce();
+    expect(existsSync(join(dir, "daemon.pid"))).toBe(false);
   });
 
   it("maps probe failures, collisions, ambiguous state, and unavailable manager reasons", async () => {
