@@ -1810,9 +1810,8 @@ describe("ensureDaemon", () => {
       _spawnOverride: spawnMock as unknown as SpawnOverride,
     });
 
-    expect(result.startMethod).toBe("detached-spawn");
-    expect(result.warning).toContain("daemon parent invariant is not verified");
-    expect(spawnMock).toHaveBeenCalled();
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "manager-unavailable" });
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 
   it("sanitizes a detached-spawn error before displaying it", async () => {
@@ -1990,6 +1989,7 @@ describe("ensureDaemon", () => {
       .mockReturnValueOnce([19999])
       .mockReturnValue([]);
     const killMock = vi.fn();
+    const managerUnavailable = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" });
 
     const result = await ensureDaemon({
       port: 19999,
@@ -2007,6 +2007,7 @@ describe("ensureDaemon", () => {
       _killOverride: killMock,
       _isProcessAliveOverride: () => true,
       _listeningPortsOverride: listenerPorts,
+      _spawnSyncOverride: managerUnavailable as unknown as SpawnSyncOverride,
       _skipSpawn: true,
     });
 
@@ -2031,6 +2032,7 @@ describe("ensureDaemon", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 200 }) } as Response)
       .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response)
       .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
+    const managerUnavailable = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" });
 
     const result = await ensureDaemon({
       port: 19999,
@@ -2044,6 +2046,7 @@ describe("ensureDaemon", () => {
       _fetchOverride: fetchMock as FetchOverride,
       _isProcessAliveOverride: () => true,
       _listeningPortsOverride: (): number[] => [19999],
+      _spawnSyncOverride: managerUnavailable as unknown as SpawnSyncOverride,
       _skipSpawn: true,
     });
 
@@ -2106,6 +2109,7 @@ describe("ensureDaemon", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response)
       .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
     const killMock = vi.fn();
+    const managerUnavailable = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" });
     const spawnSyncMock = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
 
     const result = await ensureDaemon({
@@ -2136,6 +2140,7 @@ describe("ensureDaemon", () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
     const killMock = vi.fn();
     const spawnMock = vi.fn();
+    const managerUnavailable = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" });
     const listenerPorts = vi.fn().mockReturnValue([19999]);
 
     const result = await ensureDaemon({
@@ -2379,6 +2384,7 @@ describe("ensureDaemon", () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
     const killMock = vi.fn();
     const spawnMock = vi.fn();
+    const managerUnavailable = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" });
     const listenerPorts = vi.fn()
       .mockReturnValueOnce([19999])
       .mockImplementationOnce((): number[] => {
@@ -2457,6 +2463,7 @@ describe("ensureDaemon", () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
     const killMock = vi.fn();
     const spawnMock = vi.fn();
+    const managerUnavailable = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" });
     const listenerPorts = vi.fn()
       .mockReturnValueOnce([19999])
       .mockReturnValue([]);
@@ -2481,6 +2488,7 @@ describe("ensureDaemon", () => {
       _platform: "linux",
       _procRoot: fixture.procRoot,
       _uid: 1000,
+      _spawnSyncOverride: managerUnavailable as unknown as SpawnSyncOverride,
       _listeningPortsOverride: listenerPorts,
       _skipSpawn: true,
     });
@@ -2513,6 +2521,7 @@ describe("ensureDaemon", () => {
     killMock.mockImplementation((): void => {
       alive = false;
     });
+    const managerUnavailable = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" });
 
     const result = await ensureDaemon({
       port: 19999,
@@ -2528,6 +2537,7 @@ describe("ensureDaemon", () => {
       _platform: "linux",
       _procRoot: fixture.procRoot,
       _uid: 1000,
+      _spawnSyncOverride: managerUnavailable as unknown as SpawnSyncOverride,
       _skipSpawn: true,
     });
 
@@ -2558,6 +2568,7 @@ describe("ensureDaemon", () => {
         writeFileSync(fixture.pidFile, "201");
         return [];
       });
+    const managerUnavailable = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" });
 
     const result = await ensureDaemon({
       port: 19999,
@@ -2576,6 +2587,7 @@ describe("ensureDaemon", () => {
       _platform: "linux",
       _procRoot: fixture.procRoot,
       _uid: 1000,
+      _spawnSyncOverride: managerUnavailable as unknown as SpawnSyncOverride,
       _listeningPortsOverride: listenerPorts,
     });
 
@@ -2713,7 +2725,8 @@ describe("ensureDaemon", () => {
 
     expect(result.connected).toBe(false);
     expect(killMock).not.toHaveBeenCalled();
-    expect(existsSync(pidFile)).toBe(false);
+    expect(existsSync(pidFile)).toBe(true);
+    expect(readFileSync(pidFile, "utf-8")).toBe("200");
   });
 
   it("treats access check failures as unavailable", async () => {
@@ -4054,6 +4067,44 @@ describe("restartDaemon", () => {
     expect(supervisor.stopAndStart).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "manager-timeout",
+    "manager-command-failed",
+    "unsupported-platform",
+    "metadata-missing",
+    "metadata-mismatch",
+    "foreign-job",
+    "pid-missing",
+    "pid-invalid",
+    "state-conflict",
+    "credential-invalid",
+    "cleanup-failed",
+  ] as const)("refuses detached fallback for unresolved manager preflight reason %s", async (reason) => {
+    const tempDir = mkdtempSync(join(tmpdir(), `lcm-lifecycle-manager-${reason}-`));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
+    const supervisor = {
+      probe: vi.fn(async () => ({ kind: "unavailable" as const, reason, name: "job" })),
+      start: vi.fn(),
+      stopAndStart: vi.fn(),
+      stopAndAwaitAbsent: vi.fn(),
+    };
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _skipHealthWait: true,
+      _supervisorOverride: supervisor as never,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+    });
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "manager-unavailable" });
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(supervisor.start).not.toHaveBeenCalled();
+  });
+
   it("starts an absent managed macOS job and reports launchd-user", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-managed-launchd-"));
     tempDirs.push(tempDir);
@@ -4159,5 +4210,113 @@ describe("restartDaemon", () => {
     expect(supervisor.stopAndStart).toHaveBeenCalledOnce();
     expect(calls).toBe(2);
     expect(ensureMock).toHaveBeenCalledOnce();
+  });
+
+  it("repairs an exact stale manager registration through explicit stop/start only", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-managed-stale-restart-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const stopAndStart = vi.fn(async () => ({
+      kind: "systemd-user" as const,
+      name: "job",
+      scopeDigest: "scope",
+      port: 19999,
+      nonce: "nonce",
+      managerPid: 404,
+    }));
+    let observedSpec: { scopeDigest: string; nonce: string; name: string } | undefined;
+    const supervisor = {
+      probe: vi.fn(async (candidate: typeof observedSpec) => {
+        observedSpec = candidate!;
+        return {
+          kind: "registered-stale-config" as const,
+          reason: "metadata-mismatch" as const,
+          scopeDigest: candidate!.scopeDigest,
+          nonce: candidate!.nonce,
+          name: candidate!.name,
+          port: 19998,
+          executable: process.execPath,
+          args: JSON.stringify(["/path/lcm.js", "daemon", "start", "--foreground"]),
+          cwd: "",
+        };
+      }),
+      start: vi.fn(),
+      stopAndStart,
+      stopAndAwaitAbsent: vi.fn(),
+    };
+    const killMock = vi.fn();
+    const ensureMock = vi.fn(async () => ({
+      connected: true,
+      port: 19999,
+      spawned: false,
+      startMethod: "systemd-user" as const,
+    }));
+    const result = await restartDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      spawnArgs: ["/path/lcm.js", "daemon", "start", "--foreground"],
+      _supervisorOverride: supervisor as never,
+      _ensureDaemonOverride: ensureMock,
+      _killOverride: killMock,
+      _isProcessAliveOverride: () => true,
+    });
+    expect(result).toMatchObject({ restarted: true, stoppedPid: undefined });
+    expect(observedSpec).toBeDefined();
+    expect(stopAndStart).toHaveBeenCalledOnce();
+    expect(killMock).not.toHaveBeenCalled();
+    expect(ensureMock).toHaveBeenCalledOnce();
+  });
+
+  it("repairs an authenticated responsive version mismatch through the manager only", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-managed-version-restart-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "202");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    let spec: { scopeDigest: string; nonce: string; name: string } | undefined;
+    const supervisor = {
+      probe: vi.fn(async (candidate: typeof spec) => {
+        spec = candidate!;
+        return {
+          kind: "registered-running-valid" as const,
+          managerPid: 202,
+          scopeDigest: candidate!.scopeDigest,
+          nonce: candidate!.nonce,
+          name: candidate!.name,
+        };
+      }),
+      start: vi.fn(),
+      stopAndStart: vi.fn(async () => ({ kind: "systemd-user" as const, name: "job", scopeDigest: "scope", port: 19999, nonce: "nonce", managerPid: 203 })),
+      stopAndAwaitAbsent: vi.fn(),
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: "ok", version: "1.0.0", pid: 202, storageBackend: "sqlite", entrypoint: "/bin/lcm" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: "ok", version: "1.0.0", pid: 202, storageBackend: "sqlite", entrypoint: "/bin/lcm" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ totalConnections: 0 }), { status: 200 }));
+    const killMock = vi.fn();
+    const ensureMock = vi.fn(async () => ({ connected: true, port: 19999, spawned: false, startMethod: "systemd-user" as const }));
+    const result = await restartDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "2.0.0",
+      expectedEntrypoint: "/bin/lcm",
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _fetchOverride: fetchMock as FetchOverride,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19999],
+      _killOverride: killMock,
+      _supervisorOverride: supervisor as never,
+      _ensureDaemonOverride: ensureMock,
+    });
+    expect(result).toMatchObject({ restarted: true });
+    expect(supervisor.stopAndStart).toHaveBeenCalledOnce();
+    expect(killMock).not.toHaveBeenCalled();
+    expect(ensureMock).toHaveBeenCalledOnce();
+    expect(spec).toBeDefined();
   });
 });

@@ -330,7 +330,6 @@ describe("real launchd daemon lifecycle", () => {
         expect(bootoutCalls).toHaveLength(1);
         expect(bootoutCalls[0]?.args).toEqual([
           "bootout",
-          guiDomain,
           `${guiDomain}/${spec.launchdLabel}`,
         ]);
       } finally {

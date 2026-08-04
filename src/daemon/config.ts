@@ -1,7 +1,7 @@
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
-import { readBoundedRegularFile } from "../security-files.js";
+import { consumeBoundedRegularFile, readBoundedRegularFile } from "../security-files.js";
 import { hasUrlQueryComponent, sanitizeUrlForDisplay } from "../url-display.js";
 import { MANAGED_CREDENTIAL_NAMES } from "./managed-credentials.js";
 
@@ -365,7 +365,7 @@ function readLaunchdCredentialEnv(env: Record<string, string | undefined>): Reco
       const uid = typeof process.getuid === "function" ? process.getuid() : stats.uid;
       if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1 || stats.uid !== uid || (stats.mode & 0o777) !== 0o600) continue;
       if (realpathSync(configured) !== expected) continue;
-      credentialEnv[name] = readBoundedRegularFile(configured, {
+      credentialEnv[name] = consumeBoundedRegularFile(configured, {
         allowedRoot: directory,
         maxBytes: LAUNCHD_CREDENTIAL_MAX_BYTES,
       }).replace(/\n+$/u, "");

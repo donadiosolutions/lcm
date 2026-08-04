@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   linkSync,
@@ -84,6 +85,8 @@ function createFixture(
   mkdirSync(runtimeDir, { recursive: true });
   mkdirSync(stateDir, { recursive: true });
   mkdirSync(credentialDir, { recursive: true });
+  chmodSync(stateDir, 0o700);
+  chmodSync(credentialDir, 0o700);
   writeFileSync(entrypoint, "setTimeout(() => {}, 60_000);\n");
 
   let alive = true;
@@ -1383,7 +1386,10 @@ describe("run-owned lifecycle resources", () => {
     fixture.runSystemd.mockReturnValue({ status: 1, stdout: "", stderr: "failed" });
     const result = await ensureDaemon(scopedOptions(fixture));
     expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "startup-failure" });
-    expect(fixture.stopUnit).toHaveBeenCalledOnce();
+    // A manager mutation that throws has unresolved ownership.  The lifecycle
+    // must not issue a second stop, even though the hermetic test scope can
+    // still be removed by its exact-root cleanup fence.
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
     expect(fixture.spawnProcess).not.toHaveBeenCalled();
     expect(existsSync(fixture.scope.stateDir)).toBe(false);
   });
@@ -1961,7 +1967,7 @@ describe("run-owned lifecycle resources", () => {
     const messages = flattenMessages(failure);
     expect(messages.filter(message => message.includes(
       "state paths changed or escaped",
-    ))).toHaveLength(2);
+    ))).toHaveLength(1);
     expect(messages).toContain(
       `lifecycle test cleanup root is not current owned state: ${fixture.scope.runtimeDir}`,
     );

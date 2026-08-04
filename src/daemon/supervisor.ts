@@ -16,6 +16,7 @@ import { platform as hostPlatform } from "node:os";
 import {
   cleanupManagedCredentialDirectory,
   managedCredentialPath,
+  MANAGED_CREDENTIAL_NAMES,
   validateManagedCredentialDirectory,
 } from "./managed-credentials.js";
 
@@ -38,6 +39,33 @@ export type SupervisorReason =
   | "credential-invalid"
   | "cleanup-failed"
   | "unsupported-platform";
+
+/**
+ * Return whether a read-only manager preflight proved that compatibility
+ * detached launch is safe.  A timeout, command failure, or any identity/state
+ * concern is deliberately not a compatibility signal: those observations
+ * mean that a manager was selected but its authority is unresolved.
+ */
+export function isSupervisorPreflightUnavailableReason(reason: SupervisorReason): boolean {
+  switch (reason) {
+    case "manager-unavailable":
+    case "manager-not-found":
+      return true;
+    case "unsupported-platform":
+    case "manager-timeout":
+    case "manager-command-failed":
+    case "metadata-missing":
+    case "metadata-mismatch":
+    case "foreign-job":
+    case "pid-missing":
+    case "pid-invalid":
+    case "state-conflict":
+    case "credential-invalid":
+    case "cleanup-failed":
+      return false;
+  }
+  return false;
+}
 
 type CredentialFileReference = Readonly<{
   name: string;
@@ -79,6 +107,8 @@ type SupervisorObservationBase = Readonly<{
   entrypoint?: string;
   runtimeDigest?: string;
   storageBackend?: string;
+  credentialDirectory?: string;
+  credentialFiles?: readonly CredentialFileReference[];
   managerPid?: number;
   name?: string;
 }>;
@@ -369,10 +399,12 @@ function unavailableReason(result: {
   readonly timedOut: boolean;
 }): SupervisorReason {
   const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
-  if (
-    result.code === 127
-    || /enoent|not found|failed to connect|connection refused|no such file|permission denied|not running/u.test(text)
-  ) return "manager-unavailable";
+  if (result.code === 127 || /enoent|command not found|systemctl not found|launchctl not found|no such file/u.test(text)) {
+    return "manager-not-found";
+  }
+  if (/failed to connect|connection refused|not running|no session|no user manager|no medium/u.test(text)) {
+    return "manager-unavailable";
+  }
   return "manager-command-failed";
 }
 
@@ -398,13 +430,67 @@ function parseScalar(value: string): string {
 function parseKeyValues(text: string): Map<string, string> {
   const values = new Map<string, string>();
   for (const line of text.split(/\r?\n/u)) {
-    const match = /^\s*([A-Za-z][A-Za-z0-9_.-]*)\s*(?:=>|=|:)\s*(.*?)\s*$/u.exec(line);
+    const match = /^\s*([A-Za-z][A-Za-z0-9_.-]*(?:\s+[A-Za-z][A-Za-z0-9_.-]*){0,3})\s*(?:=>|=|:)\s*(.*?)\s*$/u.exec(line);
     if (!match) continue;
     const key = match[1];
     const value = parseScalar(match[2]);
-    if (value.length <= MAX_METADATA_VALUE_LENGTH) values.set(key, value);
+    // systemd serializes all assignments into one Environment= line.  It can
+    // legitimately exceed the per-field metadata cap once credential paths
+    // and launch arguments are included; the assignment parser below applies
+    // the tighter bound to each decoded value.
+    const maxValueLength = /^environment$/iu.test(key) || /^env$/iu.test(key)
+      ? MAX_COMMAND_OUTPUT_LENGTH
+      : MAX_METADATA_VALUE_LENGTH;
+    if (value.length <= maxValueLength) values.set(key, value);
   }
   return values;
+}
+
+/** Parse systemd's bounded shell-like Environment= serialization. */
+function parseEnvironmentAssignments(value: string): Map<string, string> | undefined {
+  const assignments = new Map<string, string>();
+  let index = 0;
+  let count = 0;
+  while (index < value.length) {
+    while (index < value.length && /\s/u.test(value[index]!)) index += 1;
+    if (index >= value.length) break;
+    const keyStart = index;
+    if (!/[A-Za-z]/u.test(value[index]!)) return undefined;
+    index += 1;
+    while (index < value.length && /[A-Za-z0-9_.-]/u.test(value[index]!)) index += 1;
+    const key = value.slice(keyStart, index);
+    if (value[index] !== "=") return undefined;
+    index += 1;
+    let decoded = "";
+    const quote = value[index] === "\"" || value[index] === "'" ? value[index] : undefined;
+    if (quote !== undefined) index += 1;
+    let closedQuote = quote === undefined;
+    while (index < value.length) {
+      const character = value[index]!;
+      if (character === "\\") {
+        index += 1;
+        if (index >= value.length) return undefined;
+        decoded += value[index]!;
+        index += 1;
+        continue;
+      }
+      if (quote !== undefined && character === quote) {
+        index += 1;
+        closedQuote = true;
+        break;
+      }
+      if (quote === undefined && /\s/u.test(character)) break;
+      decoded += character;
+      index += 1;
+      if (decoded.length > MAX_METADATA_VALUE_LENGTH) return undefined;
+    }
+    if (!closedQuote || assignments.has(key)) return undefined;
+    if (quote !== undefined && index < value.length && !/\s/u.test(value[index]!)) return undefined;
+    assignments.set(key, decoded);
+    count += 1;
+    if (count > MAX_ARGUMENT_COUNT) return undefined;
+  }
+  return assignments;
 }
 
 function flattenJsonValues(value: unknown, output: Map<string, string>, prefix = ""): void {
@@ -463,14 +549,15 @@ function metadata(values: Map<string, string>, name: string): string | undefined
     LCM_SUPERVISOR_RUNTIME_DIGEST: ["runtimeDigest", "RuntimeDigest"],
     LCM_SUPERVISOR_STORAGE_BACKEND: ["storageBackend", "StorageBackend"],
   };
-  const direct = lookup(values, name, ...aliases[name], `environment.${name}`, `environment[${name}]`, `env.${name}`);
+  const direct = lookup(values, name, ...(aliases[name] ?? []), `environment.${name}`, `environment[${name}]`, `env.${name}`);
   if (direct !== undefined) return direct;
   for (const [key, value] of values) {
     // systemd's Environment= field is a space-separated list of assignments;
     // launchctl print uses `KEY => VALUE` entries under environment = { ... }.
     if (key.toLowerCase() === "environment" || key.toLowerCase() === "env") {
-      const assignment = new RegExp(`(?:^|\\s)${name}=((?:"[^"\\n]*")|(?:[^\\s]*))`, "u").exec(value);
-      if (assignment) return parseScalar(assignment[1]);
+      const assignments = parseEnvironmentAssignments(value);
+      const assignment = assignments?.get(name);
+      if (assignment !== undefined) return assignment;
     }
   }
   return undefined;
@@ -500,10 +587,16 @@ function isRunningState(value: string | undefined): boolean {
 
 function isTerminalState(value: string | undefined): "inactive" | "failed" | "last-exit" | undefined {
   if (value === undefined) return undefined;
-  if (/^(inactive|stopped|dead|exited|not-running)$/iu.test(value)) return "inactive";
+  if (/^(inactive|stopped|dead|exited|not[ -]running)$/iu.test(value)) return "inactive";
   if (/^(failed|crashed)$/iu.test(value)) return "failed";
   if (/^(last-exit|terminated|exit)$/iu.test(value)) return "last-exit";
   return undefined;
+}
+
+function isLaunchdTerminalExitCode(value: string | undefined): boolean {
+  // launchctl print reports the terminal bootstrap state as an exit code of
+  // 36 on supported macOS releases, sometimes without a separate state line.
+  return value !== undefined && /^36$/u.test(value.trim());
 }
 
 function observationBase(spec: SupervisorSpec, values: Map<string, string>): SupervisorObservationBase {
@@ -518,6 +611,11 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
   const entrypoint = metadata(values, "LCM_SUPERVISOR_ENTRYPOINT");
   const runtimeDigest = metadata(values, "LCM_SUPERVISOR_RUNTIME_DIGEST");
   const storageBackend = metadata(values, "LCM_SUPERVISOR_STORAGE_BACKEND");
+  const credentialDirectory = metadata(values, "LCM_CREDENTIAL_DIRECTORY");
+  const credentialFiles = MANAGED_CREDENTIAL_NAMES.flatMap((name) => {
+    const path = metadata(values, `LCM_CREDENTIAL_${name}_FILE`);
+    return path === undefined ? [] : [{ name, path }];
+  });
   return {
     ...(scopeDigest === undefined ? {} : { scopeDigest }),
     ...(marker === undefined ? {} : { marker }),
@@ -530,6 +628,8 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
     ...(entrypoint === undefined ? {} : { entrypoint }),
     ...(runtimeDigest === undefined ? {} : { runtimeDigest }),
     ...(storageBackend === undefined ? {} : { storageBackend }),
+    ...(credentialDirectory === undefined ? {} : { credentialDirectory }),
+    ...(credentialFiles.length === 0 ? {} : { credentialFiles: Object.freeze(credentialFiles) }),
     name: spec.name,
   };
 }
@@ -588,9 +688,23 @@ function classifyRegistered(
   ) {
     return Object.freeze({ kind: "registered-stale-config", reason: "metadata-missing", ...base });
   }
-  const state = lookup(values, "ActiveState", "SubState", "state", "State", "status");
-  const active = isRunningState(state) || isRunningState(lookup(values, "ActiveState", "state"));
-  const terminal = isTerminalState(state) ?? isTerminalState(lookup(values, "ActiveState", "SubState"));
+  const activeState = lookup(values, "ActiveState", "state", "State", "status");
+  const subState = lookup(values, "SubState", "subState", "substate");
+  const active = isRunningState(activeState);
+  const activeStateTerminal = isTerminalState(activeState);
+  const subStateTerminal = isTerminalState(subState);
+  if (
+    (active && subState !== undefined && !isRunningState(subState))
+    || (activeStateTerminal !== undefined && subState !== undefined && subStateTerminal === undefined)
+    || (subStateTerminal !== undefined && isRunningState(activeState))
+  ) {
+    return Object.freeze({ kind: "ambiguous", reason: "state-conflict", ...base });
+  }
+  const terminal = activeStateTerminal
+    ?? subStateTerminal
+    ?? (spec.kind === "launchd-user" && isLaunchdTerminalExitCode(lookup(values, "last exit code", "lastExitCode", "exit code", "ExitCode"))
+      ? "last-exit"
+      : undefined);
   const pidValue = lookup(values, "MainPID", "pid", "PID", "process.pid", "ProcessID");
   if (active) {
     const managerPid = parsePid(pidValue);
@@ -599,8 +713,11 @@ function classifyRegistered(
     return Object.freeze({ kind: "registered-running-valid", managerPid, ...base });
   }
   if (terminal !== undefined) {
-    if (pidValue !== undefined && pidValue !== "0" && parsePid(pidValue) !== undefined) {
-      return Object.freeze({ kind: "ambiguous", reason: "state-conflict", ...base });
+    if (pidValue !== undefined && pidValue !== "0") {
+      if (parsePid(pidValue) !== undefined) {
+        return Object.freeze({ kind: "ambiguous", reason: "state-conflict", ...base });
+      }
+      return Object.freeze({ kind: "ambiguous", reason: "pid-invalid", ...base });
     }
     if (commandCode !== null && commandCode !== 0 && !isNotFoundOutput(JSON.stringify([...values]))) {
       return Object.freeze({ kind: "ambiguous", reason: "state-conflict", ...base });
@@ -720,10 +837,72 @@ function cleanupPrivatePlist(spec: SupervisorSpec): void {
   const path = plistPath(spec);
   try {
     const stats = lstatSync(path);
-    if (stats.isSymbolicLink() || !stats.isFile() || (stats.mode & 0o777) !== 0o600) return;
+    const uid = typeof process.getuid === "function" ? process.getuid() : stats.uid;
+    if (
+      stats.isSymbolicLink()
+      || !stats.isFile()
+      || stats.nlink !== 1
+      || stats.uid !== uid
+      || stats.size > MAX_PLIST_BYTES
+      || (stats.mode & 0o777) !== 0o600
+      || readFileSync(path, "utf8") !== plistDocument(spec)
+    ) throw new Error("supervisor plist collision");
     unlinkSync(path);
+  } catch (error) {
+    // Idempotent cleanup: an absent plist is already clean. Any present but
+    // changed, linked, or otherwise unsafe file is preserved as evidence.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function plistSpecFromObservation(
+  spec: SupervisorSpec,
+  observation: SupervisorObservation,
+): SupervisorSpec | undefined {
+  if (
+    observation.kind !== "registered-stale-config"
+    || observation.scopeDigest !== spec.scopeDigest
+    || observation.name !== spec.name
+    || observation.nonce === undefined
+    || observation.port === undefined
+    || observation.executable === undefined
+    || observation.args === undefined
+  ) return undefined;
+  let args: readonly string[];
+  try {
+    const parsed: unknown = JSON.parse(observation.args);
+    if (!Array.isArray(parsed) || parsed.some((value) => typeof value !== "string")) return undefined;
+    args = Object.freeze([...parsed]);
   } catch {
-    // Idempotent cleanup: an absent plist is already clean.
+    return undefined;
+  }
+  try {
+    assertNonce(observation.nonce);
+    const candidate: SupervisorSpec = {
+      ...spec,
+      nonce: observation.nonce,
+      port: observation.port,
+      executable: observation.executable,
+      args,
+      ...(observation.cwd === undefined || observation.cwd === "" ? { cwd: undefined } : { cwd: observation.cwd }),
+      ...(observation.entrypoint === undefined ? { entrypoint: undefined } : { entrypoint: observation.entrypoint }),
+      ...(observation.runtimeDigest === undefined ? { runtimeDigest: undefined } : { runtimeDigest: observation.runtimeDigest }),
+      ...(observation.storageBackend === undefined ? { storageBackend: undefined } : { storageBackend: observation.storageBackend }),
+      ...(observation.credentialDirectory === undefined ? {} : { credentialDirectory: observation.credentialDirectory }),
+      ...(observation.credentialFiles === undefined ? {} : { credentialFiles: observation.credentialFiles }),
+    };
+    if (
+      (spec.cwd !== undefined && candidate.cwd === undefined)
+      || (spec.entrypoint !== undefined && candidate.entrypoint === undefined)
+      || (spec.runtimeDigest !== undefined && candidate.runtimeDigest === undefined)
+      || (spec.storageBackend !== undefined && candidate.storageBackend === undefined)
+      || (spec.credentialDirectory !== undefined && candidate.credentialDirectory === undefined)
+      || (spec.credentialFiles !== undefined && candidate.credentialFiles === undefined)
+    ) return undefined;
+    return Object.freeze(candidate);
+  } catch {
+    return undefined;
   }
 }
 
@@ -749,6 +928,32 @@ function safeCredentialCleanup(spec: SupervisorSpec): void {
   } catch {
     // A credential validation failure is preserved by the caller's manager
     // observation; cleanup never broadens its deletion scope.
+  }
+}
+
+/**
+ * Remove credentials authenticated by an earlier manager observation only
+ * after the manager has proved that its registration is absent.  The
+ * observation is not allowed to broaden cleanup outside the requested scope:
+ * the stable scope identity must match and the managed-credential validator
+ * re-checks the canonical directory, ownership, modes, link counts, and
+ * allow-listed leaves before removing anything.
+ */
+function safeObservedCredentialCleanup(
+  observation: SupervisorObservation | undefined,
+  spec: SupervisorSpec,
+): void {
+  if (
+    observation === undefined
+    || observation.scopeDigest !== spec.scopeDigest
+    || observation.name !== spec.name
+    || observation.credentialDirectory === undefined
+  ) return;
+  if (observation.stateRoot !== undefined && observation.stateRoot !== spec.stateRoot) return;
+  try {
+    cleanupManagedCredentialDirectory(observation.credentialDirectory, spec.stateRoot);
+  } catch {
+    // Preserve tampered or otherwise unresolved credential evidence.
   }
 }
 
@@ -869,7 +1074,7 @@ export function createSupervisor(
     return classified;
   };
 
-  const start = async (spec: SupervisorSpec): Promise<SupervisorStartResult> => {
+  const start = async (spec: SupervisorSpec, terminalRecreated = false): Promise<SupervisorStartResult> => {
     const current = await probe(spec);
     if (current.kind === "unavailable") throw managerUnavailableError(current.reason);
     if (current.kind === "registered-running-valid") {
@@ -883,12 +1088,18 @@ export function createSupervisor(
       });
     }
     if (current.kind === "registered-not-running-valid") {
+      if (terminalRecreated) {
+        // A replacement that immediately exits must not recurse indefinitely;
+        // preserve the terminal evidence for the caller and bound this API to
+        // one manager recreation attempt.
+        throw commandFailedError();
+      }
       // A terminal manager registration is retained intentionally (there is no
       // --collect/KeepAlive policy). Recreate it only after an exact manager
       // stop and an observed absent state; never race systemd-run/bootstrap
       // against the old terminal unit.
       await stopAndAwaitAbsent(spec);
-      return start(spec);
+      return start(spec, true);
     }
     if (current.kind === "registered-stale-config" || current.kind === "registered-invalid-collision" || current.kind === "ambiguous") {
       throw commandFailedError();
@@ -903,16 +1114,35 @@ export function createSupervisor(
         ? systemdStartArgs(spec)
         : ["bootstrap", launchdDomain(runner.uid), launchPath!];
       const result = await runner.invoke(kind === "systemd-user" ? "systemd-run" : "launchctl", args);
-      const after = await probe(spec);
+      if (result.timedOut || result.code !== 0) throw commandFailedError();
+
+      // systemd-run --no-block acknowledges the job submission before the
+      // transient unit is active.  Poll the exact stable unit for a bounded
+      // interval so a legitimate activation race cannot become a spurious
+      // startup failure, while terminal/ambiguous observations remain
+      // authoritative and fail closed.
+      const maxPollIntervals = Math.max(
+        1,
+        Math.min(
+          MAX_POLL_INTERVALS,
+          Math.ceil((dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS) / DEFAULT_POLL_INTERVAL_MS),
+        ),
+      );
+      let after: SupervisorObservation = Object.freeze({ kind: "absent", name: spec.name });
+      for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
+        after = await probe(spec);
+        if (after.kind !== "absent") break;
+        if (attempt + 1 < maxPollIntervals) {
+          if (dependencies.sleep !== undefined) await dependencies.sleep(DEFAULT_POLL_INTERVAL_MS);
+          else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, DEFAULT_POLL_INTERVAL_MS));
+        }
+      }
       if (after.kind === "registered-running-valid") {
         return Object.freeze({ kind, name: spec.name, scopeDigest: spec.scopeDigest, port: spec.port, nonce: spec.nonce, managerPid: after.managerPid });
       }
-      if (after.kind === "registered-not-running-valid") {
-        // A successful manager mutation that exited immediately is not an
-        // authenticated running daemon; preserve exact evidence for caller.
-        throw commandFailedError();
-      }
-      if (result.timedOut || after.kind === "unavailable") throw commandFailedError();
+      // A successful manager mutation that is still absent, terminal, stale,
+      // colliding, unavailable, or ambiguous is not an authenticated running
+      // daemon; preserve exact evidence for caller.
       throw commandFailedError();
     } catch (error) {
       // Never clean a concurrent winner. Only remove this nonce's private
@@ -930,11 +1160,33 @@ export function createSupervisor(
     }
   };
 
-  const stopAndAwaitAbsentInternal = async (spec: SupervisorSpec, allowStaleConfig = false): Promise<void> => {
+  const stopAndAwaitAbsentInternal = async (
+    spec: SupervisorSpec,
+    allowStaleConfig = false,
+    staleObservation?: SupervisorObservation,
+    cleanupCredentials = true,
+  ): Promise<void> => {
     const current = await probe(spec);
+    // Keep the first authenticated stale observation as the source of the old
+    // launchd nonce.  A registration may disappear between the initial probe
+    // and this fresh probe; cleanup still needs to remove that exact old plist
+    // after an absent proof, never only the replacement's plist.
+    const staleSource = staleObservation?.kind === "registered-stale-config"
+      ? staleObservation
+      : current.kind === "registered-stale-config" ? current : undefined;
+    const stalePlistSpec = allowStaleConfig && staleSource !== undefined
+      ? plistSpecFromObservation(spec, staleSource)
+      : undefined;
+    if (allowStaleConfig && staleSource !== undefined && stalePlistSpec === undefined) {
+      throw commandFailedError();
+    }
     if (current.kind === "absent") {
-      if (kind === "launchd-user") cleanupPrivatePlist(spec);
-      safeCredentialCleanup(spec);
+      if (kind === "launchd-user") {
+        if (stalePlistSpec !== undefined) cleanupPrivatePlist(stalePlistSpec);
+        else cleanupPrivatePlist(spec);
+      }
+      safeObservedCredentialCleanup(staleSource ?? current, spec);
+      if (cleanupCredentials) safeCredentialCleanup(spec);
       return;
     }
     if (current.kind === "unavailable") throw managerUnavailableError(current.reason);
@@ -958,18 +1210,27 @@ export function createSupervisor(
       if (resetFailed.timedOut || resetFailed.code !== 0) throw commandFailedError();
     }
     const maxPollIntervals = Math.max(1, Math.ceil(spec.stopTimeoutMs / DEFAULT_POLL_INTERVAL_MS));
-    for (let attempt = 0; attempt < Math.min(MAX_POLL_INTERVALS, maxPollIntervals); attempt += 1) {
+    const now = dependencies.now ?? Date.now;
+    const stopDeadline = now() + spec.stopTimeoutMs;
+    for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
       const observed = await probe(spec);
       if (observed.kind === "absent") {
-        if (kind === "launchd-user") cleanupPrivatePlist(spec);
-        safeCredentialCleanup(spec);
+        if (kind === "launchd-user") {
+          if (stalePlistSpec !== undefined) cleanupPrivatePlist(stalePlistSpec);
+          else cleanupPrivatePlist(spec);
+        }
+        safeObservedCredentialCleanup(staleSource ?? current, spec);
+        if (cleanupCredentials) safeCredentialCleanup(spec);
         return;
       }
       if (observed.kind === "unavailable") throw managerUnavailableError(observed.reason);
       if (observed.kind === "registered-invalid-collision" || observed.kind === "ambiguous") throw commandFailedError();
       if (result.code !== 0 && attempt === 0) throw commandFailedError();
-      if (dependencies.sleep !== undefined) await dependencies.sleep(DEFAULT_POLL_INTERVAL_MS);
-      else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, DEFAULT_POLL_INTERVAL_MS));
+      const remaining = stopDeadline - now();
+      if (remaining <= 0) break;
+      const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
+      if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
+      else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
     }
     throw commandFailedError();
   };
@@ -981,8 +1242,8 @@ export function createSupervisor(
     const observed = await probe(spec);
     if (observed.kind === "unavailable") throw managerUnavailableError(observed.reason);
     if (observed.kind === "registered-invalid-collision" || observed.kind === "ambiguous") throw commandFailedError();
-    if (observed.kind === "registered-stale-config") await stopAndAwaitAbsentInternal(spec, true);
-    else if (observed.kind !== "absent") await stopAndAwaitAbsent(spec);
+    if (observed.kind === "registered-stale-config") await stopAndAwaitAbsentInternal(spec, true, observed, false);
+    else if (observed.kind !== "absent") await stopAndAwaitAbsentInternal(spec, false, undefined, false);
     return start(spec);
   };
 
@@ -1003,6 +1264,7 @@ function metadataEnvironmentArgs(spec: SupervisorSpec): string[] {
   if (spec.entrypoint !== undefined) values.push(["LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint]);
   if (spec.runtimeDigest !== undefined) values.push(["LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest]);
   if (spec.storageBackend !== undefined) values.push(["LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend]);
+  if (spec.credentialDirectory !== undefined) values.push(["LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory]);
   if (spec.credentialFiles !== undefined && spec.credentialFiles.length > 0) {
     values.push(["LCM_SYSTEMD_CRED_IDS", spec.credentialFiles.map(({ name }) => name).join(",")]);
   }
@@ -1013,8 +1275,9 @@ function systemdStartArgs(spec: SupervisorSpec): readonly string[] {
   const loadCredentials = (spec.credentialFiles ?? []).map((credential) => `--property=LoadCredential=${credential.name}:${credential.path}`);
   return [
     "--user",
-    "--unit",
-    spec.systemdUnit,
+    "--no-block",
+    "--quiet",
+    `--unit=${spec.systemdUnit}`,
     "--property=KillMode=control-group",
     `--property=TimeoutStopSec=${spec.stopTimeoutMs}ms`,
     ...loadCredentials,

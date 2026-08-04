@@ -13,6 +13,7 @@ import {
   closeSync,
   fchmodSync,
   openSync,
+  linkSync,
   realpathSync,
   statSync as fsStatSync,
   unlinkSync,
@@ -27,6 +28,7 @@ import {
   atomicWritePrivateFile,
   atomicWritePrivateFileExclusive,
   copyRegularFilePrivateExclusive,
+  consumeBoundedRegularFile,
   deleteRegularFile,
   ensurePrivateDirectory,
   readBoundedRegularFile,
@@ -47,6 +49,48 @@ function makeRoot(): string {
 }
 
 describe("private filesystem primitives", () => {
+  it("consumes a bounded regular file only after descriptor and inode revalidation", () => {
+    const root = makeRoot();
+    const path = join(root, "credential");
+    writeFileSync(path, "secret\n", { mode: 0o600 });
+    expect(consumeBoundedRegularFile(path, { allowedRoot: root, maxBytes: 1024 })).toBe("secret\n");
+    expect(existsSync(path)).toBe(false);
+
+    const idempotent = join(root, "idempotent");
+    writeFileSync(idempotent, "value", { mode: 0o600 });
+    expect(consumeBoundedRegularFile(idempotent, {
+      allowedRoot: root,
+      maxBytes: 1024,
+      _beforeUnlinkForTesting: () => unlinkSync(idempotent),
+    })).toBe("value");
+    expect(existsSync(idempotent)).toBe(false);
+  });
+
+  it("preserves a replaced or linked leaf instead of consuming an ambiguous path", () => {
+    const root = makeRoot();
+    const path = join(root, "credential");
+    const replacement = join(root, "replacement");
+    writeFileSync(path, "secret", { mode: 0o600 });
+    writeFileSync(replacement, "replacement", { mode: 0o600 });
+    expect(() => consumeBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 1024,
+      _beforeUnlinkForTesting: () => {
+        rmSync(path);
+        symlinkSync(replacement, path);
+      },
+    })).toThrow("changed");
+    expect(readFileSync(path)).toEqual(readFileSync(replacement));
+
+    rmSync(path);
+    writeFileSync(path, "secret", { mode: 0o600 });
+    const hardlink = join(root, "hardlink");
+    linkSync(path, hardlink);
+    expect(() => consumeBoundedRegularFile(path, { allowedRoot: root, maxBytes: 1024 })).toThrow("changed");
+    expect(existsSync(path)).toBe(true);
+    expect(existsSync(hardlink)).toBe(true);
+  });
+
   it("creates and tightens private directories", () => {
     const path = join(makeRoot(), "private");
     mkdirSync(path, { mode: 0o755 });

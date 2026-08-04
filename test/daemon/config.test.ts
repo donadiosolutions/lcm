@@ -743,6 +743,9 @@ describe("launchd one-launch credential projection", () => {
       OPENAI_API_KEY: "direct-value",
       LCM_CREDENTIAL_DIRECTORY: directory,
     });
+    expect(existsSync(file)).toBe(false);
+    writeFileSync(file, "launchd-secret\n", { mode: 0o600 });
+    chmodSync(file, 0o600);
     const envWithoutDirect = { ...env };
     delete envWithoutDirect.OPENAI_API_KEY;
     expect(resolveDaemonConfigEnv(envWithoutDirect).OPENAI_API_KEY).toBe("launchd-secret");

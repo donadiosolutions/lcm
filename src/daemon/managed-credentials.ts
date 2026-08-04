@@ -196,6 +196,7 @@ export function validateManagedCredentialDirectory(
       stats.isSymbolicLink()
       || !stats.isFile()
       || stats.nlink !== 1
+      || stats.size > MAX_CREDENTIAL_BYTES
       || (stats.mode & 0o777) !== FILE_MODE
       || (uid !== -1 && stats.uid !== uid)
     ) {

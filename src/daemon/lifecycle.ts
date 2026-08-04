@@ -35,11 +35,18 @@ import {
   canonicalSupervisorScope,
   createSupervisor,
   createSupervisorSpec,
+  isSupervisorPreflightUnavailableReason,
   type Supervisor,
   type SupervisorKind,
   type SupervisorObservation,
   type SupervisorSpec,
 } from "./supervisor.js";
+import {
+  cleanupManagedCredentialDirectory,
+  createManagedCredentialDirectory,
+  writeManagedCredentialFiles,
+  MANAGED_CREDENTIAL_NAMES,
+} from "./managed-credentials.js";
 import {
   daemonLifecycleTestIdentityArgs,
   type DaemonLifecycleHermeticTestSeams,
@@ -119,6 +126,8 @@ export type EnsureDaemonOptions = {
   _suppressDetachedFallback?: boolean;
   /** @internal Authorize cleanup of one run-owned manager operation. */
   _managedOperationAuthorized?: boolean;
+  /** @internal Expected PID for cleanup after an explicit manager restart. */
+  _managedOperationManagerPid?: number;
   _fetchOverride?: typeof globalThis.fetch;
   _platform?: NodeJS.Platform;
   _procRoot?: string;
@@ -1335,7 +1344,8 @@ function startViaDetachedSpawn(
 function sanitizedManagerEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = { ...env };
   for (const name of Object.keys(result)) {
-    if (/(?:API_)?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i.test(name)) delete result[name];
+    if (MANAGED_CREDENTIAL_NAMES.includes(name as typeof MANAGED_CREDENTIAL_NAMES[number])
+      || /(?:API_)?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i.test(name)) delete result[name];
   }
   return result;
 }
@@ -1595,6 +1605,19 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (platform === "linux" && !isLikelyLcmDaemonProcess(authenticatedPid, procRoot)) {
       return { outcome: "blocked" };
     }
+    // Health/authentication may have completed well before signaling. Re-read
+    // the exact PID-file binding, liveness, executable identity, and listener
+    // ownership immediately before the signal, then repeat the proof once to
+    // close the replacement/reused-PID window.
+    if (!endpointIdentityMatches(health)
+      || readOwnedPid() !== authenticatedPid
+      || !isAlive(authenticatedPid)
+      || (platform === "linux" && !isLikelyLcmDaemonProcess(authenticatedPid, procRoot))) {
+      return { outcome: "blocked" };
+    }
+    if (!endpointIdentityMatches(health) || readOwnedPid() !== authenticatedPid) {
+      return { outcome: "blocked" };
+    }
     await terminatePid(authenticatedPid, { isAlive, killProcess, sleepFn });
     if (isAlive(authenticatedPid)) return { outcome: "blocked" };
     const currentPid = readOwnedPid();
@@ -1793,6 +1816,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   let managedSupervisorForCleanup: Supervisor | undefined;
   let managedSpecForCleanup: SupervisorSpec | undefined;
   let managedCleanupAuthorized = opts._managedOperationAuthorized === true;
+  let managedOperationOwned = opts._managedOperationAuthorized === true;
+  let managedOperationAmbiguous = false;
+  let managedOperationManagerPid: number | undefined = opts._managedOperationManagerPid;
 
   async function createManagedSupervisor(): Promise<{
     spec: SupervisorSpec;
@@ -1848,26 +1874,78 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     return { spec, supervisor };
   }
 
+  function managedCredentialValues(): Record<string, string> {
+    const values: Record<string, string> = {};
+    for (const name of MANAGED_CREDENTIAL_NAMES) {
+      const value = dependencies.environment[name];
+      if (typeof value === "string" && value.length > 0) values[name] = value;
+    }
+    return values;
+  }
+
+  function specWithManagedCredentials(spec: SupervisorSpec): SupervisorSpec {
+    const values = managedCredentialValues();
+    if (Object.keys(values).length === 0) return spec;
+    // Credential directories are per manager mutation, not stable scope
+    // identity.  A fresh suffix prevents a terminal registration's old
+    // systemd files from colliding with its replacement.
+    const credentialNonce = `${spec.nonce}-${randomBytes(8).toString("hex")}`;
+    const directory = createManagedCredentialDirectory(spec.stateRoot, credentialNonce);
+    let paths: readonly string[];
+    try {
+      paths = writeManagedCredentialFiles(directory, values);
+    } catch (error) {
+      try { cleanupManagedCredentialDirectory(directory, spec.stateRoot); } catch { /* preserve cleanup evidence */ }
+      throw error;
+    }
+    const credentialFiles = Object.freeze(paths.map((path) => ({
+      name: path.slice(path.lastIndexOf("/") + 1),
+      path,
+    })));
+    return Object.freeze({ ...spec, credentialDirectory: directory, credentialFiles });
+  }
+
   async function cleanupManagedScopeResources(): Promise<void> {
-    if (!testScope || !managedCleanupAuthorized
-      || managedSupervisorForCleanup === undefined || managedSpecForCleanup === undefined) return;
-    await runCleanupStages([
-      () => managedSupervisorForCleanup!.stopAndAwaitAbsent(managedSpecForCleanup!),
-      () => cleanOwnedPid(),
-      () => {
-        assertScopedStateAccess(scopedState!);
-        rmSync(tokenPath, { force: true });
-        assertScopedStateAccess(scopedState!);
-      },
-      ...[
+    if (
+      (managedOperationAmbiguous && testScope === undefined)
+      || (!testScope && (!managedCleanupAuthorized || !managedOperationOwned))
+      || (managedOperationOwned && !managedOperationAmbiguous && (
+        managedSupervisorForCleanup === undefined
+        || managedSpecForCleanup === undefined
+      ))
+    ) return;
+    const stages: Array<() => void | Promise<void>> = [];
+    if (managedOperationOwned && !managedOperationAmbiguous) {
+      stages.push(
+        () => managedSupervisorForCleanup!.stopAndAwaitAbsent(managedSpecForCleanup!),
+        () => {
+          const currentPid = readOwnedPid();
+          if (
+            managedOperationManagerPid === undefined
+            || currentPid !== managedOperationManagerPid
+          ) return;
+          cleanOwnedPid();
+        },
+      );
+      if (scopedState !== undefined) {
+        stages.push(() => {
+          assertScopedStateAccess(scopedState!);
+          rmSync(tokenPath, { force: true });
+          assertScopedStateAccess(scopedState!);
+        });
+      }
+    }
+    if (testScope !== undefined) {
+      stages.push(...[
         testScope.runtimeDir,
         testScope.credentialDir,
         testScope.stateDir,
       ].map((path) => () => {
-        assertLifecycleScopeOwnsCurrentCleanupRoot(testScope, path);
+        assertLifecycleScopeOwnsCurrentCleanupRoot(testScope!, path);
         rmSync(path, { recursive: true, force: true });
-      }),
-    ]);
+      }));
+    }
+    await runCleanupStages(stages);
   }
 
   async function runManagedEnsure(): Promise<EnsureDaemonResult | null> {
@@ -1890,6 +1968,12 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     // The only compatibility downgrade is an unavailable manager during the
     // initial preflight. Every other manager observation remains authoritative.
     if (observation.kind === "unavailable") {
+      if (!isSupervisorPreflightUnavailableReason(observation.reason)) {
+        return refusalResult(
+          "manager-unavailable",
+          `managed daemon supervisor preflight failed (${observation.reason}); refusing detached fallback`,
+        );
+      }
       managerPreflightUnavailable = true;
       return null;
     }
@@ -2064,25 +2148,50 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       };
     }
     managedCleanupAuthorized = true;
+    // Credential staging is preparation, not manager ownership.  Do not let a
+    // staging failure trigger cleanup against a registration that may have
+    // appeared concurrently while no mutation was attempted.
+    managedOperationOwned = false;
+    let launchSpec: SupervisorSpec;
+    try {
+      launchSpec = specWithManagedCredentials(spec);
+      managedSpecForCleanup = launchSpec;
+    } catch {
+      return refusalResult("startup-failure", "managed daemon credentials could not be prepared", { spawned: false });
+    }
+    managedOperationOwned = true;
     let started: { managerPid?: number };
     try {
       started = recreateRegisteredJob
-        ? await supervisor.stopAndStart(spec)
-        : await supervisor.start(spec);
+        ? await supervisor.stopAndStart(launchSpec)
+        : await supervisor.start(launchSpec);
     } catch {
+      // A settled manager mutation that throws may have raced a concurrent
+      // winner.  The supervisor owns its own absent-proof cleanup; lifecycle
+      // must not issue a second stop against unresolved manager state.
+      managedOperationOwned = false;
+      managedOperationAmbiguous = true;
       return refusalResult("startup-failure", "managed daemon supervisor start failed", { spawned: false });
     }
     let second: SupervisorObservation;
     try {
       second = await supervisor.probe(spec);
     } catch {
+      // A post-start re-probe is part of the ownership proof.  If it cannot
+      // settle, the manager mutation may have raced a concurrent winner; do
+      // not issue lifecycle cleanup against unresolved manager state.
+      managedOperationOwned = false;
+      managedOperationAmbiguous = true;
       return refusalResult("startup-failure", "managed daemon supervisor could not be re-probed after start", { spawned: true, startMethod: managerKind });
     }
     if (!supervisorMetadataMatches(second, spec)
       || (started.managerPid !== undefined && second.managerPid !== started.managerPid)) {
+      managedOperationOwned = false;
+      managedOperationAmbiguous = true;
       return refusalResult("ambiguous", "managed daemon supervisor identity changed during start", { spawned: true, startMethod: managerKind });
     }
     const managerPid = second.managerPid;
+    managedOperationManagerPid = managerPid;
     if (opts._abortSignal?.aborted) {
       return {
         connected: false,
@@ -2161,7 +2270,22 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   if (managerKind !== undefined) {
     const managedResult = await runManagedEnsure();
     if (managedResult !== null) {
-      await cleanupManagedScopeResources();
+      const failedManagedOperation = managedCleanupAuthorized
+        && managedOperationOwned
+        && !managedOperationAmbiguous
+        && !managedResult.connected
+        && (managedResult.refusalReason !== undefined || opts._abortSignal?.aborted === true);
+      const ownedTestStart = testScope
+        && managedResult.spawned
+        && managedOperationOwned
+        && !managedOperationAmbiguous;
+      // Hermetic test roots remain independently fenced even when manager
+      // ownership is ambiguous; production manager/PID cleanup stays
+      // suppressed by cleanupManagedScopeResources in that case.
+      const failedTestOperation = testScope !== undefined
+        && managedCleanupAuthorized
+        && !managedResult.connected;
+      if (ownedTestStart || failedManagedOperation || failedTestOperation) await cleanupManagedScopeResources();
       return managedResult;
     }
     if (managerPreflightUnavailable && opts._suppressDetachedFallback) {
@@ -2844,9 +2968,14 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     } catch {
       return restartRefusal("ambiguous", "managed daemon supervisor probe failed; inspect the manager and retry");
     }
-    if (observation.kind === "unavailable") return null;
-    if (observation.kind === "registered-stale-config") {
-      return restartRefusal("stale-config", "managed daemon supervisor has stale configuration; retry after an explicit manager repair");
+    if (observation.kind === "unavailable") {
+      if (!isSupervisorPreflightUnavailableReason(observation.reason)) {
+        return restartRefusal(
+          "manager-unavailable",
+          `managed daemon supervisor preflight failed (${observation.reason}); refusing detached fallback`,
+        );
+      }
+      return null;
     }
     if (observation.kind === "registered-invalid-collision") {
       return restartRefusal("invalid-collision", "managed daemon supervisor found a foreign job for this state root; refusing restart");
@@ -2855,11 +2984,12 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       return restartRefusal("ambiguous", "managed daemon supervisor returned ambiguous state; refusing restart");
     }
     const ensure = _ensureDaemonOverride ?? ensureDaemon;
-    const ensureAfterManagerOperation = async (): Promise<RestartDaemonResult> => {
+    const ensureAfterManagerOperation = async (managerPid?: number): Promise<RestartDaemonResult> => {
       const ensured = await ensure({
         ...ensureOptions,
         _suppressDetachedFallback: true,
         _managedOperationAuthorized: true,
+        ...(managerPid === undefined ? {} : { _managedOperationManagerPid: managerPid }),
       });
       return {
         ...ensured,
@@ -2867,6 +2997,61 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         stoppedPid: observation.kind === "registered-running-valid" ? observation.managerPid : undefined,
       };
     };
+    const restartSpecWithManagedCredentials = (): {
+      readonly spec: SupervisorSpec;
+      readonly credentialDirectory?: string;
+    } => {
+      const values: Record<string, string> = {};
+      for (const name of MANAGED_CREDENTIAL_NAMES) {
+        const value = dependencies.environment[name];
+        if (typeof value === "string" && value.length > 0) values[name] = value;
+      }
+      if (Object.keys(values).length === 0) return { spec };
+      const credentialNonce = `${spec.nonce}-${randomBytes(8).toString("hex")}`;
+      const directory = createManagedCredentialDirectory(spec.stateRoot, credentialNonce);
+      try {
+        const paths = writeManagedCredentialFiles(directory, values);
+        return {
+          spec: Object.freeze({
+            ...spec,
+            credentialDirectory: directory,
+            credentialFiles: Object.freeze(paths.map((path) => ({
+              name: path.slice(path.lastIndexOf("/") + 1),
+              path,
+            }))),
+          }),
+          credentialDirectory: directory,
+        };
+      } catch (error) {
+        try { cleanupManagedCredentialDirectory(directory, spec.stateRoot); } catch { /* preserve cleanup evidence */ }
+        throw error;
+      }
+    };
+    const stopStartAndEnsure = async (): Promise<RestartDaemonResult> => {
+      const staged = restartSpecWithManagedCredentials();
+      try {
+        const started = await supervisor.stopAndStart(staged.spec);
+        return await ensureAfterManagerOperation(started.managerPid);
+      } finally {
+        if (staged.credentialDirectory !== undefined) {
+          try { cleanupManagedCredentialDirectory(staged.credentialDirectory, spec.stateRoot); } catch { /* preserve unresolved evidence */ }
+        }
+      }
+    };
+    if (observation.kind === "registered-stale-config") {
+      // Explicit restart is the sole operation authorized to replace stale
+      // manager configuration.  Require the old registration to carry the
+      // exact stable scope identity before mutating it; ensure/doctor remain
+      // read-only refusal paths for the same observation.
+      if (observation.scopeDigest !== spec.scopeDigest || observation.name !== spec.name) {
+        return restartRefusal("invalid-collision", "managed daemon supervisor stale registration did not match the requested scope; refusing restart");
+      }
+      try {
+        return await stopStartAndEnsure();
+      } catch {
+        return restartRefusal("startup-failure", "managed daemon supervisor stale configuration repair failed");
+      }
+    }
     if (observation.kind === "absent" || observation.kind === "registered-not-running-valid") {
       if (!exactNoLivePidProof()) {
         return restartRefusal(
@@ -2935,19 +3120,22 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         readOwnedToken,
       );
       if (authenticated === null) return restartRefusal("response-auth-failure", "managed daemon health could not be authenticated; refusing restart", { pid: managerPid });
-      if (!healthVersionMatches(authenticated, expectedVersion)
-        || !processEntrypointMatches(authenticated, testScope?.entrypoint ?? opts.expectedEntrypoint, platform, procRoot, realpath)) {
+      if (!processEntrypointMatches(authenticated, testScope?.entrypoint ?? opts.expectedEntrypoint, platform, procRoot, realpath)
+        || !healthRuntimeDigestMatches(authenticated, opts.expectedRuntimeDigest)) {
         return restartRefusal("response-invalid", "managed daemon identity did not match the requested runtime; refusing restart", { pid: managerPid });
       }
+      // An authenticated, responsive version mismatch is an explicit manager
+      // repair case.  It must never fall through to bare-PID signaling or
+      // detached spawn; the exact scoped registration is stopped and
+      // recreated below after the final identity re-probe.
       if (!(await secondProbeMatches())) return restartRefusal("ambiguous", "managed daemon supervisor identity changed before restart", { pid: managerPid });
     }
 
     try {
-      await supervisor.stopAndStart(spec);
+      return await stopStartAndEnsure();
     } catch {
       return restartRefusal("startup-failure", "managed daemon supervisor stop/start failed", { pid: managerPid });
     }
-    return ensureAfterManagerOperation();
   }
 
   if (managerKind !== undefined) {

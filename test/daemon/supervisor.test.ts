@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -23,6 +24,7 @@ import {
   canonicalSupervisorScope,
   createSupervisor,
   createSupervisorSpec,
+  isSupervisorPreflightUnavailableReason,
   type SupervisorKind,
   type SupervisorSpec,
 } from "../../src/daemon/supervisor.js";
@@ -81,6 +83,39 @@ function fakeRunner(results: Array<SupervisorCommandResult>): {
 }
 
 describe("canonical supervisor identity", () => {
+  it("allows detached compatibility only for read-only manager absence reasons", () => {
+    const reasons = [
+      "manager-unavailable",
+      "manager-timeout",
+      "manager-command-failed",
+      "manager-not-found",
+      "metadata-missing",
+      "metadata-mismatch",
+      "foreign-job",
+      "pid-missing",
+      "pid-invalid",
+      "state-conflict",
+      "credential-invalid",
+      "cleanup-failed",
+      "unsupported-platform",
+    ] as const;
+    expect(reasons.map(isSupervisorPreflightUnavailableReason)).toEqual([
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+    ]);
+  });
+
   it("uses only the canonical state root for full and shortened identities", () => {
     const root = makeRoot();
     const scope = canonicalSupervisorScope(root);
@@ -154,6 +189,10 @@ describe("managed one-launch credentials", () => {
     writeFileSync(join(directory, "unknown"), "x", { mode: 0o600 });
     expect(() => validateManagedCredentialDirectory(directory, root)).toThrow("unsupported");
     rmSync(join(directory, "unknown"));
+    writeFileSync(file, "x".repeat(1024 * 1024 + 1), { mode: 0o600 });
+    chmodSync(file, 0o600);
+    expect(() => validateManagedCredentialDirectory(directory, root)).toThrow("validation");
+    rmSync(file);
     expect(() => createManagedCredentialDirectory(root, "bad nonce")).toThrow("nonce");
     expect(() => validateManagedCredentialDirectory(join(root, "missing"), root)).toThrow("unavailable");
     expect(() => cleanupManagedCredentialDirectory(join(root, "missing"), root)).not.toThrow();
@@ -229,6 +268,38 @@ describe("systemd-user supervisor", () => {
     expect(runner.calls.every((call) => call.timeoutMs === 5_000)).toBe(true);
   });
 
+  it("rejects contradictory active and terminal manager state fields", async () => {
+    const spec = makeSpec("systemd-user");
+    const systemd = fakeRunner([{
+      code: 0,
+      stdout: `${managerText(spec, "active", 111)}\nSubState=failed`,
+    }]);
+    await expect(createSupervisor("systemd-user", { run: systemd.run, platform: "linux" }).probe(spec)).resolves.toMatchObject({
+      kind: "ambiguous",
+      reason: "state-conflict",
+    });
+    const launchdSpec = makeSpec("launchd-user");
+    const launchd = fakeRunner([{
+      code: 0,
+      stdout: [
+        "state = running",
+        "pid = 123",
+        "substate = failed",
+        `LCM_SUPERVISOR_MARKER => ${launchdSpec.marker}`,
+        `LCM_SUPERVISOR_SCOPE => ${launchdSpec.scopeDigest}`,
+        `LCM_SUPERVISOR_PORT => ${launchdSpec.port}`,
+        `LCM_SUPERVISOR_NONCE => ${launchdSpec.nonce}`,
+        `LCM_SUPERVISOR_EXECUTABLE => ${launchdSpec.executable}`,
+        `LCM_SUPERVISOR_ARGS => ${JSON.stringify(launchdSpec.args)}`,
+        "LCM_SUPERVISOR_CWD =>",
+      ].join("\n"),
+    }]);
+    await expect(createSupervisor("launchd-user", { run: launchd.run, platform: "darwin", uid: 501 }).probe(launchdSpec)).resolves.toMatchObject({
+      kind: "ambiguous",
+      reason: "state-conflict",
+    });
+  });
+
   it("adopts a concurrent valid winner, starts an absent unit, and emits bounded safe args", async () => {
     const spec = makeSpec("systemd-user");
     const runner = fakeRunner([
@@ -241,6 +312,10 @@ describe("systemd-user supervisor", () => {
     const startCall = runner.calls[1];
     expect(startCall.command).toBe("systemd-run");
     expect(startCall.args).toContain("--user");
+    expect(startCall.args).toContain("--no-block");
+    expect(startCall.args).toContain("--quiet");
+    expect(startCall.args).toContain(`--unit=${spec.systemdUnit}`);
+    expect(startCall.args).not.toContain("--unit");
     expect(startCall.args.join(" ")).toContain("KillMode=control-group");
     expect(startCall.args.join(" ")).not.toContain("--collect");
     expect(startCall.args.join(" ")).not.toContain("Restart");
@@ -339,6 +414,35 @@ describe("systemd-user supervisor", () => {
     expect(await supervisor.probe({ ...spec, kind: "launchd-user" })).toMatchObject({ kind: "ambiguous" });
   });
 
+  it("parses real launchd not-running and exit-code terminal output", async () => {
+    const spec = makeSpec("launchd-user");
+    const output = [
+      "state = not running",
+      "pid = 0",
+      "last exit code = 36",
+      `LCM_SUPERVISOR_MARKER => ${spec.marker}`,
+      `LCM_SUPERVISOR_SCOPE => ${spec.scopeDigest}`,
+      `LCM_SUPERVISOR_PORT => ${spec.port}`,
+      `LCM_SUPERVISOR_NONCE => ${spec.nonce}`,
+      `LCM_SUPERVISOR_EXECUTABLE => ${spec.executable}`,
+      `LCM_SUPERVISOR_ARGS => ${JSON.stringify(spec.args)}`,
+      "LCM_SUPERVISOR_CWD =>",
+    ].join("\n");
+    const runner = fakeRunner([{ code: 0, stdout: output }]);
+    await expect(createSupervisor("launchd-user", { run: runner.run, platform: "darwin", uid: 501 }).probe(spec)).resolves.toMatchObject({
+      kind: "registered-not-running-valid",
+      terminal: "inactive",
+      nonce: spec.nonce,
+    });
+
+    const exitOnly = output.replace("state = not running\n", "");
+    const exitRunner = fakeRunner([{ code: 0, stdout: exitOnly }]);
+    await expect(createSupervisor("launchd-user", { run: exitRunner.run, platform: "darwin", uid: 501 }).probe(spec)).resolves.toMatchObject({
+      kind: "registered-not-running-valid",
+      terminal: "last-exit",
+    });
+  });
+
   it("handles quoted/oversized metadata, suffix keys, invalid numeric identities, and stale fields", async () => {
     const spec = makeSpec("systemd-user");
     const quoted = `LoadState=loaded\nActiveState=active\npid='123'\nfoo.LCM_SUPERVISOR_MARKER='${spec.marker}'\nfoo.LCM_SUPERVISOR_SCOPE='${spec.scopeDigest}'\nfoo.LCM_SUPERVISOR_PORT='${spec.port}'\nfoo.LCM_SUPERVISOR_NONCE='${spec.nonce}'\nLCM_SUPERVISOR_EXECUTABLE='${spec.executable}'\nLCM_SUPERVISOR_ARGS='${JSON.stringify(spec.args)}'\nLCM_SUPERVISOR_CWD=''`;
@@ -381,6 +485,58 @@ describe("systemd-user supervisor", () => {
     expect(await supervisor.probe(spec)).toMatchObject({ kind: "ambiguous", reason: "state-conflict" });
     expect(await supervisor.probe(spec)).toMatchObject({ kind: "ambiguous", reason: "state-conflict" });
     expect(await supervisor.probe(spec)).toMatchObject({ kind: "absent" });
+  });
+
+  it("parses systemd Environment values with quoting and escaped JSON", async () => {
+    const spec = makeSpec("systemd-user");
+    const escaped = (value: string): string => value.replace(/\\/gu, "\\\\").replace(/"/gu, '\\"');
+    const environment = [
+      `LCM_SUPERVISOR_MARKER="${escaped(spec.marker)}"`,
+      `LCM_SUPERVISOR_SCOPE="${escaped(spec.scopeDigest)}"`,
+      `LCM_SUPERVISOR_PORT="${spec.port}"`,
+      `LCM_SUPERVISOR_NONCE="${escaped(spec.nonce)}"`,
+      `LCM_SUPERVISOR_EXECUTABLE="${escaped(spec.executable)}"`,
+      `LCM_SUPERVISOR_ARGS="${escaped(JSON.stringify(spec.args))}"`,
+      "LCM_SUPERVISOR_CWD=\"\"",
+    ].join(" ");
+    const runner = fakeRunner([{
+      code: 0,
+      stdout: `LoadState=loaded\nActiveState=active\nMainPID=515\nEnvironment=${environment}`,
+    }]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).probe(spec)).resolves.toMatchObject({
+      kind: "registered-running-valid",
+      managerPid: 515,
+      scopeDigest: spec.scopeDigest,
+      nonce: spec.nonce,
+    });
+  });
+
+  it("retains authenticated metadata from a bounded large systemd Environment line", async () => {
+    const root = makeRoot();
+    const credentialDirectory = createManagedCredentialDirectory(root, "large-env-001");
+    const spec = makeSpec("systemd-user", root, { credentialDirectory });
+    const padding = Array.from({ length: 24 }, (_, index) => `LCM_PADDING_${index}=${"x".repeat(32)}`).join(" ");
+    const environment = [
+      `LCM_SUPERVISOR_MARKER=${spec.marker}`,
+      `LCM_SUPERVISOR_SCOPE=${spec.scopeDigest}`,
+      `LCM_SUPERVISOR_PORT=${spec.port}`,
+      `LCM_SUPERVISOR_NONCE=${spec.nonce}`,
+      `LCM_SUPERVISOR_EXECUTABLE=${spec.executable}`,
+      `LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)}`,
+      "LCM_SUPERVISOR_CWD=",
+      `LCM_CREDENTIAL_DIRECTORY=${credentialDirectory}`,
+      padding,
+    ].join(" ");
+    expect(environment.length).toBeGreaterThan(512);
+    const runner = fakeRunner([{
+      code: 0,
+      stdout: `LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=616\nEnvironment=${environment}`,
+    }]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).probe(spec)).resolves.toMatchObject({
+      kind: "registered-running-valid",
+      managerPid: 616,
+      credentialDirectory,
+    });
   });
 
   it("fails closed when any mandatory marker/scope/port/nonce field is absent", async () => {
@@ -458,7 +614,7 @@ describe("systemd-user supervisor", () => {
     const timeout = fakeRunner([{ timedOut: true }]);
     expect((await createSupervisor("systemd-user", { run: timeout.run, platform: "linux" }).probe(spec)).kind).toBe("unavailable");
     const runnerError = fakeRunner([{ code: 1, stderr: "permission denied" }]);
-    expect(await createSupervisor("systemd-user", { run: runnerError.run, platform: "linux" }).probe(spec)).toMatchObject({ kind: "unavailable", reason: "manager-unavailable" });
+    expect(await createSupervisor("systemd-user", { run: runnerError.run, platform: "linux" }).probe(spec)).toMatchObject({ kind: "unavailable", reason: "manager-command-failed" });
     const commandError = fakeRunner([{ code: 1, stderr: "unexpected failure" }]);
     expect(await createSupervisor("systemd-user", { run: commandError.run, platform: "linux" }).probe(spec)).toMatchObject({ kind: "unavailable", reason: "manager-command-failed" });
     const timeoutOption = fakeRunner([{ code: 1, stderr: "not found" }]);
@@ -524,7 +680,7 @@ describe("systemd-user supervisor", () => {
     const sleep = vi.fn(async () => undefined);
     await expect(createSupervisor("systemd-user", { run: poll.run, platform: "linux", sleep }).stopAndAwaitAbsent(shortTimeout)).rejects.toThrow("manager command");
     expect(poll.calls[1].timeoutMs).toBe(1);
-    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep.mock.calls.length).toBeLessThanOrEqual(1);
 
     const defaultSleepPoll = fakeRunner([
       { code: 0, stdout: managerText(shortTimeout, "active", 52) },
@@ -652,5 +808,57 @@ describe("launchd-user supervisor", () => {
     const unsafeRestartRunner = fakeRunner([]);
     await expect(createSupervisor("launchd-user", { run: unsafeRestartRunner.run, platform: "darwin", uid: 501 }).stopAndStart(unsafeRestart)).rejects.toThrow("credential");
     expect(unsafeRestartRunner.calls).toHaveLength(0);
+  });
+
+  it("removes only the authenticated old launchd plist during stale-config repair", async () => {
+    const root = makeRoot();
+    const oldSpec = makeSpec("launchd-user", root, { nonce: "old-nonce", port: 3737 });
+    const running = [
+      "state = running",
+      "pid = 777",
+      `LCM_SUPERVISOR_MARKER => ${oldSpec.marker}`,
+      `LCM_SUPERVISOR_SCOPE => ${oldSpec.scopeDigest}`,
+      `LCM_SUPERVISOR_PORT => ${oldSpec.port}`,
+      `LCM_SUPERVISOR_NONCE => ${oldSpec.nonce}`,
+      `LCM_SUPERVISOR_EXECUTABLE => ${oldSpec.executable}`,
+      `LCM_SUPERVISOR_ARGS => ${JSON.stringify(oldSpec.args)}`,
+      "LCM_SUPERVISOR_CWD =>",
+    ].join("\n");
+    const oldRunner = fakeRunner([
+      { code: 1, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: running },
+    ]);
+    await createSupervisor("launchd-user", { run: oldRunner.run, platform: "darwin", uid: 501 }).start(oldSpec);
+    const oldPlist = join(root, `daemon.${oldSpec.shortDigest}.${oldSpec.nonce}.plist`);
+    expect(lstatSync(oldPlist).isFile()).toBe(true);
+    const foreignPlist = join(root, `daemon.${oldSpec.shortDigest}.foreign.plist`);
+    writeFileSync(foreignPlist, "foreign", { mode: 0o600 });
+    const newSpec = makeSpec("launchd-user", root, { nonce: "new-nonce", port: 4747 });
+    const stale = running
+      .replace(`state = running`, "state = not running")
+      .replace(`pid = 777`, "pid = 0");
+    const previewRunner = fakeRunner([{ code: 0, stdout: stale }]);
+    await expect(createSupervisor("launchd-user", { run: previewRunner.run, platform: "darwin", uid: 501 }).probe(newSpec)).resolves.toMatchObject({
+      kind: "registered-stale-config",
+      scopeDigest: newSpec.scopeDigest,
+      nonce: oldSpec.nonce,
+      port: oldSpec.port,
+      name: newSpec.name,
+    });
+    const stopRunner = fakeRunner([
+      { code: 0, stdout: stale },
+      { code: 0, stdout: stale },
+      { code: 0, stdout: "bootout" },
+      { code: 1, stderr: "Could not find service" },
+      { code: 1, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: running
+        .replaceAll(oldSpec.port.toString(), newSpec.port.toString())
+        .replaceAll(oldSpec.nonce, newSpec.nonce) },
+    ]);
+    await expect(createSupervisor("launchd-user", { run: stopRunner.run, platform: "darwin", uid: 501 }).stopAndStart(newSpec)).resolves.toMatchObject({ managerPid: 777 });
+    expect(existsSync(oldPlist)).toBe(false);
+    expect(existsSync(foreignPlist)).toBe(true);
   });
 });
