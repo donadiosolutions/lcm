@@ -26,8 +26,8 @@ All subsequent commands are run with `--cwd $LCME2E_DIR` or `cd $LCME2E_DIR &&` 
 | Step | Command | Expected |
 |------|---------|----------|
 | 1.1 | `lcm --version` | Prints version string (e.g. `lcm 0.x.y`) |
-| 1.2 | `lcm status --json` | JSON with `daemon: "running"` or attempt start |
-| 1.3 | `lcm daemon start --detach` (if 1.2 failed) | Daemon starts, PID file created |
+| 1.2 | `lcm status --json` | JSON with `daemon: "running"` or run diagnostics |
+| 1.3 | `lcm doctor` then `lcm daemon restart` (if 1.2 failed) | Managed daemon starts or returns an actionable refusal |
 | 1.4 | `lcm status --json` | JSON with `daemon: "running"` |
 
 **Pass criteria:** lcm binary found, daemon running after step 1.4.
@@ -309,19 +309,23 @@ FIXTURE
 
 ---
 
-## Flow 18 — Daemon-down Resilience
+## Flow 18 — Managed Daemon Resilience
 
-**Goal:** Hooks fail gracefully when daemon is not running.
+**Goal:** Verify service-manager restart, diagnostics, and hook continuity
+without killing or replacing an unverified process.
 
 | Step | Command | Expected |
 |------|---------|----------|
-| 18.1 | `lcm daemon stop` | Daemon stops (or already stopped) |
-| 18.2 | `lcm hook session-start --cwd $LCME2E_DIR` | Exits non-zero OR exits 0 with empty/fallback context (no crash/hang) |
-| 18.3 | `lcm hook user-prompt-submit --prompt "test" --cwd $LCME2E_DIR` | Exits non-zero OR exits 0 with empty hint (no crash/hang) |
-| 18.4 | `lcm daemon start --detach` | Daemon restarts successfully |
-| 18.5 | `lcm status --json` | Daemon running again |
+| 18.1 | `lcm daemon restart` | Managed daemon restarts or returns an actionable refusal |
+| 18.2 | `lcm doctor` | Diagnostic report completes without a crash or hang |
+| 18.3 | `lcm hook session-start --cwd $LCME2E_DIR` | Hook completes without a crash or hang after the managed transition |
+| 18.4 | `lcm hook user-prompt-submit --prompt "test" --cwd $LCME2E_DIR` | Hook completes without a crash or hang |
+| 18.5 | `lcm status --json` | JSON reports the daemon state and does not identify an unverified process |
 
-**Pass criteria:** Hooks do not crash or hang when daemon is down; daemon restarts cleanly.
+**Pass criteria:** Managed restart and doctor are actionable, and hooks remain
+responsive after the transition. If a connector is stale, run
+`lcm connectors install <agent>`, `lcm connectors doctor <agent>`, and
+`lcm doctor` before retrying.
 
 ---
 

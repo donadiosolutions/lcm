@@ -194,28 +194,29 @@ Pass if: returns metadata. ⚠️ SKIP if no node.
 
 ## Phase 9: Resilience — 3 checks
 
-### 9.1 Kill daemon
+### 9.1 Managed restart
 ```bash
-pkill -f "lcm.*daemon" || true
+lcm daemon restart
 sleep 1
 lcm status
 ```
-Pass if: reports daemon down (no crash/hang).
+Pass if: the managed service restarts successfully, or LCM returns an
+actionable refusal without touching an unverified process.
 
-### 9.2 Auto-recovery
+### 9.2 Diagnostics after restart
 ```bash
-lcm daemon start --detach
-sleep 2
-lcm status
+lcm doctor
 ```
-Pass if: daemon back up.
+Pass if: diagnostics complete and report the daemon, service-manager, hook,
+connector, MCP, and summarizer state.
 
-### 9.3 Graceful degradation
-Kill daemon, then:
+### 9.3 Hook continuity
 ```bash
 timeout 10 sh -c 'node -e "console.log(JSON.stringify({prompt:\"test\",cwd:process.cwd()}))" | lcm user-prompt'
 ```
-Pass if: returns within 10s, no crash. Restart daemon after.
+Pass if: the request returns within 10 seconds without a crash or hang after
+the managed transition. If a connector is involved, run
+`lcm connectors doctor <agent>` and repeat `lcm doctor` before retrying.
 
 ## Phase 10: Debug Diagnostics — 4 checks
 

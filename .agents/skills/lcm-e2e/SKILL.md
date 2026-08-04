@@ -58,5 +58,6 @@ All operations use an isolated temp directory as `cwd`:
 - This modifies ONLY temp/test directories — never the user's real project
 - Auto-heal flow (16) is READ-ONLY in live mode: verify hooks exist, don't break them
 - If lcm is not in PATH, show an error and stop
-- If daemon is not running, try `lcm daemon start --detach` first
+- If daemon is unavailable, run `lcm doctor`, then `lcm daemon restart`; do not
+  kill or replace a process manually
 - Do not abort on first failure — the goal is a complete picture
