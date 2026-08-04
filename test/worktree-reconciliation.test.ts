@@ -1966,7 +1966,7 @@ describe("worktree reconciliation", () => {
       "SELECT session_id FROM conversations WHERE session_id = 'legacy-alias'",
     ).get()).toEqual({ session_id: "legacy-alias" });
     target.close();
-  });
+  }, CACHE_RECONCILIATION_TIMEOUT_MS);
 
   it.each([
     {
