@@ -37,6 +37,8 @@ type SupervisorCommandResult = Readonly<{
 }>;
 
 const roots: string[] = [];
+const VALID_RUNTIME_DIGEST = "a".repeat(64);
+const OTHER_RUNTIME_DIGEST = "b".repeat(64);
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -146,9 +148,14 @@ describe("canonical supervisor identity", () => {
     expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, executable: "/bin/node", args: ["bad\narg"] })).toThrow("argument");
     expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, executable: "/bin/node", stopTimeoutMs: 0 })).toThrow("timeout");
     expect(() => createSupervisorSpec({ kind: "bogus" as SupervisorKind, stateRoot: root, port: 1, executable: "/bin/node" })).toThrow("kind");
-    expect(createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, command: "/bin/node", argv: ["daemon"], cwd: "/tmp", entrypoint: "entry", runtimeDigest: "runtime", storageBackend: "sqlite" })).toMatchObject({ executable: "/bin/node", args: ["daemon"], cwd: "/tmp" });
+    expect(createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, command: "/bin/node", argv: ["daemon"], cwd: "/tmp", entrypoint: "entry", runtimeDigest: VALID_RUNTIME_DIGEST, storageBackend: "sqlite" })).toMatchObject({ executable: "/bin/node", args: ["daemon"], cwd: "/tmp", runtimeDigest: VALID_RUNTIME_DIGEST });
+    expect(createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, executable: "/bin/node" }).runtimeDigest).toBeUndefined();
+    expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, executable: "/bin/node", runtimeDigest: "a".repeat(63) })).toThrow("runtime digest");
+    expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, executable: "/bin/node", runtimeDigest: "a".repeat(65) })).toThrow("runtime digest");
+    expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, executable: "/bin/node", runtimeDigest: "A".repeat(64) })).toThrow("runtime digest");
+    expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, executable: "/bin/node", runtimeDigest: "g".repeat(64) })).toThrow("runtime digest");
     expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, executable: "/bin/node", entrypoint: "" })).toThrow("metadata");
-    expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, executable: "/bin/node", runtimeDigest: "line\nfeed" })).toThrow("metadata");
+    expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, executable: "/bin/node", runtimeDigest: "line\nfeed" })).toThrow("runtime digest");
     expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot: root, port: 1, executable: "/bin/node", credentialFiles: [{ name: "bad\nname", path: "/tmp/credential" }] })).toThrow("credential");
   });
 });
@@ -669,13 +676,13 @@ describe("systemd-user supervisor", () => {
   });
 
   it("binds admission to executable, argv, cwd, entrypoint, runtime, and storage identity", async () => {
-    const spec = makeSpec("systemd-user", makeRoot(), { cwd: "/tmp", entrypoint: "entry", runtimeDigest: "runtime", storageBackend: "sqlite" });
+    const spec = makeSpec("systemd-user", makeRoot(), { cwd: "/tmp", entrypoint: "entry", runtimeDigest: VALID_RUNTIME_DIGEST, storageBackend: "sqlite" });
     const variants = [
       managerText({ ...spec, executable: "/usr/bin/other" }, "active", 1),
       managerText({ ...spec, args: ["different"] }, "active", 1),
       managerText({ ...spec, cwd: "/var/tmp" }, "active", 1),
       managerText({ ...spec, entrypoint: "old" }, "active", 1),
-      managerText({ ...spec, runtimeDigest: "old" }, "active", 1),
+      managerText({ ...spec, runtimeDigest: OTHER_RUNTIME_DIGEST }, "active", 1),
       managerText({ ...spec, storageBackend: "postgresql" }, "active", 1),
     ];
     for (const output of variants) {
@@ -719,7 +726,7 @@ describe("systemd-user supervisor", () => {
     const spec = makeSpec("systemd-user", makeRoot(), {
       cwd: "/tmp",
       entrypoint: "entry",
-      runtimeDigest: "runtime",
+      runtimeDigest: VALID_RUNTIME_DIGEST,
       storageBackend: "sqlite",
     });
     expect(() => createSupervisor("bogus" as SupervisorKind, { run: vi.fn() })).toThrow("kind");
@@ -879,7 +886,7 @@ describe("launchd-user supervisor", () => {
     const spec = makeSpec("launchd-user", root, {
       cwd: "/tmp",
       entrypoint: "entry",
-      runtimeDigest: "runtime",
+      runtimeDigest: VALID_RUNTIME_DIGEST,
       storageBackend: "sqlite",
       credentialDirectory,
       credentialFiles: [{ name: "OPENAI_API_KEY", path: files[0] }],

@@ -245,6 +245,12 @@ function assertNonce(nonce: string): void {
   }
 }
 
+function assertRuntimeDigest(value: string): void {
+  if (!/^[0-9a-f]{64}$/u.test(value)) {
+    throw new Error("supervisor runtime digest is invalid");
+  }
+}
+
 function assertMetadataValue(value: string, label: string): void {
   if (
     value.length === 0
@@ -367,9 +373,8 @@ export function createSupervisorSpec(input: SupervisorSpecInput): SupervisorSpec
     assertPathMetadataValue(resolve(input.cwd), "supervisor working directory");
   }
   if (input.entrypoint !== undefined) assertPathMetadataValue(input.entrypoint, "supervisor metadata");
-  for (const value of [input.runtimeDigest, input.storageBackend]) {
-    if (value !== undefined) assertMetadataValue(value, "supervisor metadata");
-  }
+  if (input.runtimeDigest !== undefined) assertRuntimeDigest(input.runtimeDigest);
+  if (input.storageBackend !== undefined) assertMetadataValue(input.storageBackend, "supervisor metadata");
   const credentialFiles = input.credentialFiles === undefined
     ? undefined
     : Object.freeze(input.credentialFiles.map((credential) => {

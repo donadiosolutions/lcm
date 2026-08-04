@@ -39,6 +39,7 @@ const testIdentity = {
   ownerId: "lifecycle-tests",
   entrypoint: "/lcm-tests/lifecycle-daemon.mjs",
 } as const;
+const TEST_RUNTIME_DIGEST = "a".repeat(64);
 
 function makeSpawnChild(pid: number | undefined): SpawnChildMock {
   const child: SpawnChildMock = {
@@ -2366,7 +2367,7 @@ describe("ensureDaemon", () => {
       storageBackend: "sqlite",
       pid: fixture.pid,
       entrypoint: "lcm",
-      runtimeDigest: "runtime-digest",
+      runtimeDigest: TEST_RUNTIME_DIGEST,
     };
     const fetchMock = vi.fn(async (url: string): Promise<Response> => {
       if (!healthy) return { ok: false } as Response;
@@ -2382,7 +2383,7 @@ describe("ensureDaemon", () => {
       spawnTimeoutMs: 100,
       expectedVersion: "1.2.3",
       expectedEntrypoint: "lcm",
-      expectedRuntimeDigest: "runtime-digest",
+      expectedRuntimeDigest: TEST_RUNTIME_DIGEST,
       _fetchOverride: fetchMock as FetchOverride,
       _killOverride: killMock,
       _spawnOverride: spawnMock as unknown as SpawnOverride,
