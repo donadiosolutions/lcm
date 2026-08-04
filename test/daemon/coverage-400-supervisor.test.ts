@@ -525,7 +525,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
   it("exercises launchd plist creation, cleanup, collision, and stale candidate validation", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot, { cwd: "/tmp", entrypoint: "entry", runtimeDigest: DIGEST_A, storageBackend: "sqlite" });
-    const absent = { code: 1, stderr: "Could not find service" };
+    const absent = { code: 113, stderr: "Could not find service" };
     const runner = runQueue([absent, { code: 0, stdout: "bootstrapped" }, { code: 0, stdout: launchdText(value, "running", 88) }]);
     await expect(createSupervisor("launchd-user", { run: runner.run, platform: "darwin", uid: 501 }).start(value)).resolves.toMatchObject({ managerPid: 88 });
     const plist = join(stateRoot, `daemon.${value.shortDigest}.${value.nonce}.plist`);
@@ -593,7 +593,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
   it("cleans partial plist evidence when the private write seam fails", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
-    const absent = { code: 1, stderr: "Could not find service" };
+    const absent = { code: 113, stderr: "Could not find service" };
     const runner = runQueue([absent, absent]);
     fsFaults.write = true;
     try {
@@ -634,12 +634,12 @@ describe("supervisor coverage: credentials and private launch files", () => {
     const cleanupRoot = root();
     const cleanupSpec = spec("launchd-user", cleanupRoot);
     const cleanupPath = join(cleanupRoot, `daemon.${cleanupSpec.shortDigest}.${cleanupSpec.nonce}.plist`);
-    const launchRunner = runQueue([{ code: 1, stderr: "Could not find service" }, { code: 0, stdout: "bootstrapped" }, { code: 0, stdout: launchdText(cleanupSpec, "running", 12) }]);
+    const launchRunner = runQueue([{ code: 113, stderr: "Could not find service" }, { code: 0, stdout: "bootstrapped" }, { code: 0, stdout: launchdText(cleanupSpec, "running", 12) }]);
     await expect(createSupervisor("launchd-user", { run: launchRunner.run, platform: "darwin", uid: 501 }).start(cleanupSpec)).resolves.toMatchObject({ managerPid: 12 });
     const cleanupDescriptor = Object.getOwnPropertyDescriptor(process, "getuid");
     Object.defineProperty(process, "getuid", { configurable: true, value: undefined, writable: true });
     try {
-      const stopRunner = runQueue([{ code: 0, stdout: launchdText(cleanupSpec, "running", 12) }, { code: 0, stdout: "bootout" }, { code: 1, stderr: "Could not find service" }]);
+      const stopRunner = runQueue([{ code: 0, stdout: launchdText(cleanupSpec, "running", 12) }, { code: 0, stdout: "bootout" }, { code: 113, stderr: "Could not find service" }]);
       await expect(createSupervisor("launchd-user", { run: stopRunner.run, platform: "darwin", uid: 501 }).stopAndAwaitAbsent(cleanupSpec)).resolves.toBeUndefined();
       expect(existsSync(cleanupPath)).toBe(false);
     } finally {
@@ -667,8 +667,20 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     await expect(createSupervisor("systemd-user", { run: defaultSleep.run, platform: "linux", now: () => 0 }).stopAndAwaitAbsent(value)).rejects.toThrow("manager command");
     const onePoll = runQueue([{ code: 1, stderr: "Unit is not-found" }, { code: 0, stdout: "started" }, { code: 1, stderr: "Unit is not-found" }]);
     await expect(createSupervisor("systemd-user", { run: onePoll.run, platform: "linux", commandTimeoutMs: 1 }).start(value)).rejects.toThrow("manager command");
-    const unavailableStop = runQueue([{ code: 127, stderr: "systemctl not found" }]);
-    await expect(createSupervisor("systemd-user", { run: unavailableStop.run, platform: "linux" }).stopAndAwaitAbsent(value)).rejects.toThrow("unavailable");
+    const unavailableStop = runQueue([
+      { code: 0, stdout: systemdText(value, "active", 12) },
+      { code: 127, stderr: "systemctl not found" },
+      { code: 1, stderr: "Unit is not-found" },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: unavailableStop.run, platform: "linux" }).stopAndAwaitAbsent(value)).rejects.toMatchObject({ name: "SupervisorManagerError", reason: "manager-not-found" });
+    const unavailableInitial = runQueue([{ code: 127, stderr: "systemctl not found" }]);
+    await expect(createSupervisor("systemd-user", { run: unavailableInitial.run, platform: "linux" }).stopAndAwaitAbsent(value)).rejects.toMatchObject({ name: "SupervisorManagerError", reason: "manager-not-found" });
+    const genericStop = runQueue([
+      { code: 0, stdout: systemdText(value, "active", 12) },
+      { code: 1, stderr: "permission denied" },
+      { code: 1, stderr: "Unit is not-found" },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: genericStop.run, platform: "linux" }).stopAndAwaitAbsent(value)).rejects.toThrow("manager command");
     const absentRestart = runQueue([{ code: 1, stderr: "Unit is not-found" }, { code: 1, stderr: "Unit is not-found" }, { code: 0, stdout: "started" }, { code: 0, stdout: systemdText(value, "active", 101) }]);
     await expect(createSupervisor("systemd-user", { run: absentRestart.run, platform: "linux" }).stopAndStart(value)).resolves.toMatchObject({ managerPid: 101 });
   });
@@ -677,12 +689,12 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot, { nonce: "new", port: 4747 });
     const stale = launchdText({ ...value, nonce: "old", port: 3737 }, "not running", 0);
-    const staleRunner = runQueue([{ code: 0, stdout: stale }, { code: 0, stdout: stale }, { code: 0, stdout: "bootout" }, { code: 1, stderr: "Could not find service" }]);
+    const staleRunner = runQueue([{ code: 0, stdout: stale }, { code: 0, stdout: stale }, { code: 0, stdout: "bootout" }, { code: 113, stderr: "Could not find service" }]);
     await expect(createSupervisor("launchd-user", { run: staleRunner.run, platform: "darwin", uid: 501 }).stopAndAwaitAbsent(value)).rejects.toThrow("manager command");
     const noCandidate = launchdText({ ...value, nonce: "old", port: 3737 }, "not running", 0);
     const noCandidateRunner = runQueue([{ code: 0, stdout: noCandidate }, { code: 0, stdout: noCandidate }]);
     await expect(createSupervisor("launchd-user", { run: noCandidateRunner.run, platform: "darwin", uid: 501 }).stopAndStart(value)).rejects.toThrow("manager command");
-    const staleThenAbsent = runQueue([{ code: 0, stdout: stale }, { code: 1, stderr: "Could not find service" }]);
+    const staleThenAbsent = runQueue([{ code: 0, stdout: stale }, { code: 113, stderr: "Could not find service" }]);
     await expect(createSupervisor("launchd-user", { run: staleThenAbsent.run, platform: "darwin", uid: 501 }).stopAndStart(value)).rejects.toThrow("manager command");
   });
 });
