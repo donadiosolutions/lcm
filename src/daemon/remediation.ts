@@ -362,7 +362,8 @@ function writeOrReport(
 export function recordDaemonRemediation(
   input: DaemonRemediationInput,
 ): DaemonRemediationDecision {
-  const remediation = mapDaemonRefusalToRemediation(input.reason);
+  const reason = isDaemonRefusalReason(input.reason) ? input.reason : "ambiguous";
+  const remediation = mapDaemonRefusalToRemediation(reason);
   const scopeDigest = fullDigest(input);
   const path = markerPathFor(input);
   const fs = filesystemWithDefaults(input.fs);
@@ -390,7 +391,7 @@ export function recordDaemonRemediation(
     };
   }
 
-  const key = keyFor(scopeDigest, input.reason);
+  const key = keyFor(scopeDigest, reason);
   const prior = read.document.entries[key];
   const changedReason = Object.keys(read.document.entries).some(
     candidate => candidate.startsWith(`${scopeDigest}:`) && candidate !== key,
@@ -409,7 +410,7 @@ export function recordDaemonRemediation(
 
   const entries = { ...read.document.entries };
   removeScopeEntries(entries, scopeDigest);
-  entries[key] = Object.freeze({ reason: input.reason, lastNotifiedAtMs: now });
+  entries[key] = Object.freeze({ reason, lastNotifiedAtMs: now });
   const markerIoError = writeOrReport(
     path,
     { version: DAEMON_REMEDIATION_MARKER_VERSION, entries: Object.freeze(entries) },

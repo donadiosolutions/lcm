@@ -113,6 +113,36 @@ describe("daemon remediation marker", () => {
     }
   });
 
+  it("normalizes an invalid direct-call reason before persisting the marker", () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "marker.json");
+      const rawReason = "ATTACK:/secret/pid=4";
+      const result = recordDaemonRemediation({
+        markerPath,
+        scope: "scope-a",
+        reason: rawReason as never,
+        clock: () => 1,
+      });
+
+      expect(result.remediation.message).toBe(
+        "lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.",
+      );
+      const markerText = readFileSync(markerPath, "utf8");
+      expect(markerText).not.toContain(rawReason);
+      expect(markerText).not.toContain("secret");
+      expect(markerText).not.toContain("pid=4");
+      expect(readDaemonRemediationMarker({ markerPath }).entries).toEqual({
+        [`${daemonScopeDigest("scope-a")}:ambiguous`]: {
+          reason: "ambiguous",
+          lastNotifiedAtMs: 1,
+        },
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("treats a clock rollback as an immediate transition", () => {
     const root = makeRoot();
     try {
