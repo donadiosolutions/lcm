@@ -152,6 +152,7 @@ describe("CI workflow", () => {
     expect(install?.run).toBe("npm ci");
     expect(build?.run).toBe("npm run build");
     expect(integration?.env).toEqual({
+      LCM_SYSTEMD_CREDENTIAL_INTEGRATION: "1",
       LCM_LIFECYCLE_SYSTEMD_INTEGRATION: "1",
       LCM_LIFECYCLE_SCOPE_ID: "ci-${{ github.run_id }}-${{ github.run_attempt }}",
       LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR:
@@ -162,6 +163,10 @@ describe("CI workflow", () => {
     expect(integration?.run).toContain("systemctl --user is-system-running");
     expect(integration?.run).toContain("test/daemon/lifecycle-isolation.test.ts");
     expect(integration?.run).toContain("uses and removes one exact run-owned transient unit");
+    expect(integration?.run).toContain("test/daemon/systemd-credential-loader.test.ts");
+    expect(integration?.run).toContain(
+      '--testNamePattern "observes the real user-systemd LoadCredential modes"',
+    );
     expect(integration?.run).toContain("systemctl --user stop \"$unit_name\"");
     expect(integration?.run).toContain(
       'if [[ "$unit_name" =~ ^lcm-daemon-[0-9a-f]{20}\\.service$ ]]; then',
