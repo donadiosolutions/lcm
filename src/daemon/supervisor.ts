@@ -1431,11 +1431,9 @@ export function createSupervisor(
       const observed = await probe(spec);
       if (observed.kind === "absent") {
         if (!stopResultAllowsAbsent) {
-          if (result.code !== 0) {
-            const reason = unavailableReason(result);
-            if (reason === "manager-not-found" || reason === "manager-unavailable") {
-              throw managerUnavailableError(reason);
-            }
+          const reason = unavailableReason(result);
+          if (reason === "manager-not-found" || reason === "manager-unavailable") {
+            throw managerUnavailableError(reason);
           }
           throw commandFailedError();
         }
