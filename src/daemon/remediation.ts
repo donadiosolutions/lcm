@@ -583,9 +583,11 @@ function hasDuplicateJsonKeys(raw: string): boolean {
 }
 
 type MarkerStat = Readonly<{
+  ctimeMs: number;
   dev: number;
   ino: number;
   mode: number;
+  mtimeMs: number;
   nlink: number;
   size: number;
   uid: number;
@@ -606,9 +608,11 @@ function validateMarkerStat(path: string, fs: DaemonRemediationFileSystem): Mark
     throw new Error("remediation marker owner is not the current user");
   }
   return Object.freeze({
+    ctimeMs: stat.ctimeMs,
     dev: stat.dev,
     ino: stat.ino,
     mode: stat.mode,
+    mtimeMs: stat.mtimeMs,
     nlink: stat.nlink,
     size: stat.size,
     uid: stat.uid,
@@ -695,7 +699,14 @@ function readMarker(path: string, fs: DaemonRemediationFileSystem): ReadMarkerRe
       }).content;
     }
     const after = validateMarkerStat(path, fs);
-    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size) {
+    if (before.ctimeMs !== after.ctimeMs
+      || before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.mode !== after.mode
+      || before.mtimeMs !== after.mtimeMs
+      || before.nlink !== after.nlink
+      || before.size !== after.size
+      || before.uid !== after.uid) {
       throw new Error("remediation marker changed during validation");
     }
     const parsed = parseMarker(raw);
