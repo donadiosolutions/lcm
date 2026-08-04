@@ -259,40 +259,89 @@ const SYSTEMD_CREDENTIAL_ENV_NAME_SET = new Set<SystemdCredentialEnvName>(SYSTEM
 const LAUNCHD_CREDENTIAL_DIRECTORY_ENV = "LCM_CREDENTIAL_DIRECTORY";
 const LAUNCHD_CREDENTIAL_FILE_PREFIX = "LCM_CREDENTIAL_";
 const LAUNCHD_CREDENTIAL_FILE_SUFFIX = "_FILE";
-const LAUNCHD_CREDENTIAL_MAX_BYTES = 1024 * 1024;
+const CREDENTIAL_MAX_BYTES = 1024 * 1024;
 
-function systemdCredentialDirPrefixes(): string[] {
-  const prefixes = ["/run/credentials/"];
+/**
+ * systemd deliberately uses a read-only credential directory and read-only
+ * regular leaves.  The user manager observed on Linux exposes these as 0500
+ * and 0400 respectively; launchd's 0700/0600 contract is intentionally not
+ * reused here.
+ */
+const SYSTEMD_CREDENTIAL_DIRECTORY_MODES = Object.freeze([0o500]);
+const SYSTEMD_CREDENTIAL_FILE_MODES = Object.freeze([0o400]);
+const SYSTEMD_CREDENTIAL_MAX_COUNT = SYSTEMD_CREDENTIAL_ENV_NAMES.length;
+
+type SystemdCredentialPrefix = {
+  path: string;
+  expectedUid?: number;
+};
+
+type TrustedSystemdCredentialsDir = SystemdCredentialPrefix & {
+  path: string;
+  dev: number;
+  ino: number;
+};
+
+function systemdCredentialDirPrefixes(): SystemdCredentialPrefix[] {
+  const prefixes: SystemdCredentialPrefix[] = [{ path: "/run/credentials/" }];
   if (typeof process.getuid === "function") {
-    prefixes.push(`/run/user/${process.getuid()}/credentials/`);
+    const uid = process.getuid();
+    if (Number.isSafeInteger(uid) && uid >= 0) {
+      prefixes.push({ path: `/run/user/${uid}/credentials/`, expectedUid: uid });
+    }
   }
   return prefixes;
 }
 
-function hasTrustedSystemdCredentialPrefix(path: string): boolean {
-  return systemdCredentialDirPrefixes().some((prefix) => path.startsWith(prefix));
+function systemdCredentialDirectoryPrefix(path: string): SystemdCredentialPrefix | undefined {
+  const normalized = resolve(path);
+  return systemdCredentialDirPrefixes().find(({ path: prefix }) => {
+    if (!normalized.startsWith(prefix)) return false;
+    const suffix = normalized.slice(prefix.length);
+    return suffix.length > 0 && !suffix.includes("/");
+  });
 }
 
-function trustedSystemdCredentialsDir(credentialsDir: string | undefined): string | undefined {
+function trustedSystemdCredentialsDir(credentialsDir: string | undefined): TrustedSystemdCredentialsDir | undefined {
   if (!credentialsDir || !isAbsolute(credentialsDir)) return undefined;
+  const requested = resolve(credentialsDir);
+  let stats: ReturnType<typeof lstatSync>;
   let realDir: string;
   try {
-    realDir = realpathSync(resolve(credentialsDir));
+    stats = lstatSync(requested);
+    realDir = realpathSync(requested);
   } catch {
     return undefined;
   }
-  return hasTrustedSystemdCredentialPrefix(`${realDir}/`) ? realDir : undefined;
+  const prefix = systemdCredentialDirectoryPrefix(realDir);
+  if (
+    stats.isSymbolicLink()
+    || !stats.isDirectory()
+    || realDir !== requested
+    || prefix === undefined
+    || !SYSTEMD_CREDENTIAL_DIRECTORY_MODES.includes(stats.mode & 0o7777)
+    || (prefix.expectedUid !== undefined && stats.uid !== prefix.expectedUid)
+  ) return undefined;
+  return { ...prefix, path: realDir, dev: stats.dev, ino: stats.ino };
 }
 
 function isSystemdCredentialEnvName(name: string): name is SystemdCredentialEnvName {
   return SYSTEMD_CREDENTIAL_ENV_NAME_SET.has(name as SystemdCredentialEnvName);
 }
 
-function credentialNamesFromEnv(env: Record<string, string | undefined>): SystemdCredentialEnvName[] {
-  return (env.LCM_SYSTEMD_CRED_IDS ?? "")
-    .split(",")
-    .map((name) => name.trim())
-    .filter(isSystemdCredentialEnvName);
+function credentialNamesFromEnv(env: Record<string, string | undefined>): SystemdCredentialEnvName[] | undefined {
+  const raw = env.LCM_SYSTEMD_CRED_IDS;
+  if (raw === undefined) return [];
+  if (typeof raw !== "string") return undefined;
+  if (raw.trim() === "") return [];
+  const names = raw.split(",").map((name) => name.trim());
+  if (
+    names.length === 0
+    || names.length > SYSTEMD_CREDENTIAL_MAX_COUNT
+    || names.some((name) => !isSystemdCredentialEnvName(name))
+    || new Set(names).size !== names.length
+  ) return undefined;
+  return names as SystemdCredentialEnvName[];
 }
 
 function credentialFileName(name: SystemdCredentialEnvName): string {
@@ -308,22 +357,50 @@ function credentialFileName(name: SystemdCredentialEnvName): string {
   }
 }
 
+function trustedSystemdCredentialsDirStillValid(directory: TrustedSystemdCredentialsDir): boolean {
+  try {
+    const stats = lstatSync(directory.path);
+    const prefix = systemdCredentialDirectoryPrefix(directory.path);
+    return !stats.isSymbolicLink()
+      && stats.isDirectory()
+      && prefix !== undefined
+      && stats.dev === directory.dev
+      && stats.ino === directory.ino
+      && SYSTEMD_CREDENTIAL_DIRECTORY_MODES.includes(stats.mode & 0o7777)
+      && (prefix.expectedUid === undefined || stats.uid === prefix.expectedUid)
+      && realpathSync(directory.path) === directory.path;
+  } catch {
+    return false;
+  }
+}
+
 function readSystemdCredentialEnv(env: Record<string, string | undefined>): Record<string, string> {
   const credentialsDir = trustedSystemdCredentialsDir(env.CREDENTIALS_DIRECTORY);
-  if (!credentialsDir) return {};
+  const names = credentialNamesFromEnv(env);
+  if (!credentialsDir || names === undefined || names.length === 0) return {};
   const credentialEnv: Record<string, string> = {};
-  for (const name of credentialNamesFromEnv(env)) {
-    let credentialFile: string;
+  for (const name of names) {
+    if (!trustedSystemdCredentialsDirStillValid(credentialsDir)) return {};
+    const credentialFile = resolve(credentialsDir.path, credentialFileName(name));
     try {
-      credentialFile = realpathSync(resolve(credentialsDir, credentialFileName(name)));
+      if (realpathSync(credentialFile) !== credentialFile) continue;
     } catch {
       // Ignore missing credentials; normal env/config validation will report required keys.
       continue;
     }
-    if (!hasTrustedSystemdCredentialPrefix(credentialFile)) continue;
-    if (!credentialFile.startsWith(`${credentialsDir}/`)) continue;
     try {
-      credentialEnv[name] = readFileSync(credentialFile, "utf-8").replace(/\n+$/, "");
+      const value = readBoundedRegularFile(credentialFile, {
+        allowedRoot: credentialsDir.path,
+        maxBytes: CREDENTIAL_MAX_BYTES,
+        expectedUid: credentialsDir.expectedUid,
+        allowedModes: SYSTEMD_CREDENTIAL_FILE_MODES,
+        requireSingleLink: true,
+      }).replace(/\n+$/, "");
+      // A unit credential directory is immutable for this read.  If its
+      // canonical inode or security metadata changed while reading, discard
+      // every projected value rather than returning a mixed snapshot.
+      if (!trustedSystemdCredentialsDirStillValid(credentialsDir)) return {};
+      credentialEnv[name] = value;
     } catch {
       // Ignore missing credentials; normal env/config validation will report required keys.
     }
@@ -367,7 +444,7 @@ function readLaunchdCredentialEnv(env: Record<string, string | undefined>): Reco
       if (realpathSync(configured) !== expected) continue;
       credentialEnv[name] = consumeBoundedRegularFile(configured, {
         allowedRoot: directory,
-        maxBytes: LAUNCHD_CREDENTIAL_MAX_BYTES,
+        maxBytes: CREDENTIAL_MAX_BYTES,
       }).replace(/\n+$/u, "");
     } catch {
       // Missing, stale, tampered, and oversized launch credentials remain

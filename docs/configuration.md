@@ -391,6 +391,18 @@ CA file, pool size, or timeouts. On Linux, the managed user-systemd launch sends
 propagated as a normal environment value. `lcm config get storage --effective`
 shows the CA path and tuning values but replaces the URL with `[REDACTED]`.
 
+The daemon only accepts credentials that systemd exposed through a canonical
+per-unit directory under `/run/credentials/` or the current user's
+`/run/user/<uid>/credentials/` tree. The directory must use systemd's
+read-only `0500` mode (the user-manager directory is owned by the current
+UID), and each requested credential must be an allow-listed regular file with
+systemd's read-only `0400` mode, one hard link, and no more than 1 MiB of
+content. Credential IDs are bounded, must not be duplicated, and are rejected
+as a set when any ID is unknown or malformed. Invalid, missing, replaced, or
+oversized credentials are ignored without logging their path or contents; the
+usual configuration validation then reports any required value that remains
+unavailable.
+
 PostgreSQL is remote-primary: once repository support is enabled, an outage is
 reported rather than silently switching the authoritative store to SQLite.
 Hook capture remains local through the SQLite outbox so events can be queued

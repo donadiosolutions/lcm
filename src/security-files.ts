@@ -38,8 +38,18 @@ function isContainedPath(root: string, candidate: string): boolean {
 export type BoundedFileOptions = {
   allowedRoot: string;
   maxBytes: number;
+  /** Require the descriptor to be owned by this UID when provided. */
+  expectedUid?: number;
+  /** Require one of these exact permission/special-bit modes when provided. */
+  allowedModes?: readonly number[];
+  /** Reject files with more than one hard link when enabled. */
+  requireSingleLink?: boolean;
   /** @internal Deterministic race seam for descriptor-bound tests. */
   _afterStatForTesting?: () => void;
+  /** @internal Deterministic content-change seam before the bounded read. */
+  _beforeReadForTesting?: () => void;
+  /** @internal Deterministic post-path-stat race seam. */
+  _beforePostStatForTesting?: () => void;
   /** @internal Deterministic parent-swap seam for descriptor-bound tests. */
   _beforeOpenForTesting?: () => void;
   /** @internal Deterministic leaf-swap seam before consume unlink. */
@@ -68,6 +78,33 @@ function readDescriptorBounded(fd: number, maxBytes: number): string {
   return Buffer.concat(chunks, total).toString("utf-8");
 }
 
+function validateBoundedFileMetadata(
+  stat: Stats,
+  options: BoundedFileOptions,
+): void {
+  if (!stat.isFile()) throw new Error("path is not a regular file");
+  if (options.requireSingleLink && stat.nlink !== 1) {
+    throw new Error("file has multiple hard links");
+  }
+  if (options.expectedUid !== undefined && stat.uid !== options.expectedUid) {
+    throw new Error("file owner is not trusted");
+  }
+  if (options.allowedModes !== undefined && !options.allowedModes.includes(stat.mode & 0o7777)) {
+    throw new Error("file mode is not trusted");
+  }
+}
+
+function boundedFileMetadataChanged(before: Stats, after: Stats): boolean {
+  return before.dev !== after.dev
+    || before.ino !== after.ino
+    || before.size !== after.size
+    || before.nlink !== after.nlink
+    || before.uid !== after.uid
+    || (before.mode & 0o7777) !== (after.mode & 0o7777)
+    || before.mtimeMs !== after.mtimeMs
+    || before.ctimeMs !== after.ctimeMs;
+}
+
 /** Read a bounded regular file and its metadata from one descriptor. */
 export function readBoundedRegularFileWithStat(path: string, options: BoundedFileOptions): BoundedFileResult {
   if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0) {
@@ -80,11 +117,12 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
     throw new Error("file is outside the permitted root");
   }
 
+  const initialPath = lstatSync(path);
   options._beforeOpenForTesting?.();
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(fd);
-    if (!stat.isFile()) throw new Error("path is not a regular file");
+    validateBoundedFileMetadata(stat, options);
     options._afterStatForTesting?.();
     // Re-resolve after opening and bind the pathname to the descriptor. This
     // detects an intermediate directory or leaf replacement between the
@@ -98,9 +136,28 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
     if (current.dev !== stat.dev || current.ino !== stat.ino) {
       throw new Error("file changed during validation");
     }
+    if (initialPath.dev !== stat.dev || initialPath.ino !== stat.ino) {
+      throw new Error("file changed during validation");
+    }
     if (stat.size > options.maxBytes) throw new Error("file exceeds the configured size limit");
+    options._beforeReadForTesting?.();
+    const content = readDescriptorBounded(fd, options.maxBytes);
+    const finalPath = realpathSync(path);
+    if (!isContainedPath(allowedRoot, finalPath)) {
+      throw new Error("file is outside the permitted root");
+    }
+    const final = statSync(finalPath);
+    options._beforePostStatForTesting?.();
+    const afterRead = fstatSync(fd);
+    validateBoundedFileMetadata(afterRead, options);
+    if (boundedFileMetadataChanged(stat, final)) {
+      throw new Error("file changed during validation");
+    }
+    if (boundedFileMetadataChanged(stat, afterRead)) {
+      throw new Error("file changed during validation");
+    }
     const result: BoundedFileResult = {
-      content: readDescriptorBounded(fd, options.maxBytes),
+      content,
       mtimeMs: stat.mtimeMs,
       // Keep inode identity internal to the consume helper. Non-enumerable
       // fields preserve the historical result shape for callers/tests.

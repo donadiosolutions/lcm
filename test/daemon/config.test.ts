@@ -188,6 +188,17 @@ function makeTrustedCredentialDir(context: TestContext): string | undefined {
   return mkdtempSync(join(baseDir, "lcm-config-credentials-"));
 }
 
+function sealTrustedCredentialDir(path: string): void {
+  chmodSync(path, 0o500);
+}
+
+function removeTrustedCredentialDir(path: string): void {
+  // systemd's 0500 directory is intentionally not writable; restore a
+  // cleanup mode after each fixture has finished reading it.
+  chmodSync(path, 0o700);
+  rmSync(path, { recursive: true, force: true });
+}
+
 describe("loadDaemonConfig", () => {
   it("returns defaults when no config file exists", () => {
     const c = loadDaemonConfig("/nonexistent/config.json");
@@ -227,7 +238,8 @@ describe("loadDaemonConfig", () => {
     const credentialsDir = makeTrustedCredentialDir(context);
     if (credentialsDir === undefined) return;
     try {
-      writeFileSync(join(credentialsDir, "ANTHROPIC_API_KEY"), "sk-credential", { mode: 0o600 });
+      writeFileSync(join(credentialsDir, "ANTHROPIC_API_KEY"), "sk-credential", { mode: 0o400 });
+      sealTrustedCredentialDir(credentialsDir);
       const c = loadDaemonConfig(
         "/nonexistent",
         { llm: { provider: "anthropic", model: "claude-sonnet" } },
@@ -238,7 +250,7 @@ describe("loadDaemonConfig", () => {
       );
       expect(c.llm.apiKey).toBe("sk-credential");
     } finally {
-      rmSync(credentialsDir, { recursive: true, force: true });
+      removeTrustedCredentialDir(credentialsDir);
     }
   });
 
@@ -246,7 +258,8 @@ describe("loadDaemonConfig", () => {
     const credentialsDir = makeTrustedCredentialDir(context);
     if (credentialsDir === undefined) return;
     try {
-      writeFileSync(join(credentialsDir, "OPENAI_API_KEY"), "sk-openai-credential", { mode: 0o600 });
+      writeFileSync(join(credentialsDir, "OPENAI_API_KEY"), "sk-openai-credential", { mode: 0o400 });
+      sealTrustedCredentialDir(credentialsDir);
       const c = loadDaemonConfig(
         "/nonexistent",
         { llm: { provider: "openai", model: "test-model", baseURL: "http://localhost:11435/v1", apiKey: "${OPENAI_API_KEY}" } },
@@ -257,7 +270,7 @@ describe("loadDaemonConfig", () => {
       );
       expect(c.llm.apiKey).toBe("sk-openai-credential");
     } finally {
-      rmSync(credentialsDir, { recursive: true, force: true });
+      removeTrustedCredentialDir(credentialsDir);
     }
   });
 
@@ -265,7 +278,8 @@ describe("loadDaemonConfig", () => {
     const credentialsDir = makeTrustedCredentialDir(context);
     if (credentialsDir === undefined) return;
     try {
-      writeFileSync(join(credentialsDir, "OPENAI_API_KEY"), "sk-openai-credential", { mode: 0o600 });
+      writeFileSync(join(credentialsDir, "OPENAI_API_KEY"), "sk-openai-credential", { mode: 0o400 });
+      sealTrustedCredentialDir(credentialsDir);
       const c = loadDaemonConfig(
         "/nonexistent",
         { llm: { provider: "openai", model: "test-model", baseURL: "https://compatible.example/v1" } },
@@ -276,7 +290,7 @@ describe("loadDaemonConfig", () => {
       );
       expect(c.llm.apiKey).toBe("");
     } finally {
-      rmSync(credentialsDir, { recursive: true, force: true });
+      removeTrustedCredentialDir(credentialsDir);
     }
   });
 
@@ -286,8 +300,9 @@ describe("loadDaemonConfig", () => {
     const outsideDir = mkdtempSync(join(tmpdir(), "lcm-config-credential-outside-"));
     try {
       const outsideCredential = join(outsideDir, "OPENAI_API_KEY");
-      writeFileSync(outsideCredential, "sk-outside", { mode: 0o600 });
+      writeFileSync(outsideCredential, "sk-outside", { mode: 0o400 });
       symlinkSync(outsideCredential, join(credentialsDir, "OPENAI_API_KEY"));
+      sealTrustedCredentialDir(credentialsDir);
       const c = loadDaemonConfig(
         "/nonexistent",
         { llm: { provider: "openai", model: "test-model", baseURL: "http://localhost:11435/v1", apiKey: "${OPENAI_API_KEY}" } },
@@ -298,7 +313,7 @@ describe("loadDaemonConfig", () => {
       );
       expect(c.llm.apiKey).toBe("");
     } finally {
-      rmSync(credentialsDir, { recursive: true, force: true });
+      removeTrustedCredentialDir(credentialsDir);
       rmSync(outsideDir, { recursive: true, force: true });
     }
   });
