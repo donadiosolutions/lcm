@@ -518,6 +518,7 @@ describe("handleUserPromptSubmit", () => {
       expect(homedir()).toBe(home);
       rmSync(join(home, ".lcm"), { recursive: true, force: true });
       expect(existsSync(join(home, ".lcm"))).toBe(false);
+      mockExtractUserPromptEvents.mockReturnValue([]);
       mockEnsureDaemon.mockResolvedValueOnce({
         connected: false,
         port: 3737,
