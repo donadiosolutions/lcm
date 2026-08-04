@@ -35,6 +35,20 @@ import {
 } from "../../src/daemon/http-url.js";
 
 describe("mocked daemon HTTP response metadata", () => {
+  it("classifies TypeError and AggregateError transport causes", () => {
+    expect(isDaemonTransportFailure(new TypeError("fetch failed"))).toBe(true);
+
+    const aggregate = new AggregateError([
+      new Error("wrapper", {
+        cause: Object.assign(new Error("broken pipe"), { code: "EPIPE" }),
+      }),
+    ], "request failed");
+    expect(isDaemonTransportFailure(aggregate)).toBe(true);
+
+    expect(isDaemonTransportFailure(new AggregateError([new Error("application failure")]))).toBe(false);
+    expect(isDaemonTransportFailure({ code: 42, errors: "not-an-array" })).toBe(false);
+  });
+
   it("falls back when Node omits a response status code", async () => {
     state.status = undefined; state.body = ""; state.outcome = "end";
     await expect(daemonJsonRequest(1, "/health", { method: "GET" })).rejects.toThrow("HTTP 500");

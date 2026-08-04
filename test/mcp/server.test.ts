@@ -110,6 +110,62 @@ describe("handleDaemonRequest", () => {
     expect(res.content[0].text).toContain("daemon unavailable");
   });
 
+  it.each(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EPIPE", "ENETUNREACH", "EHOSTUNREACH"])(
+    "maps Node transport code %s to bounded remediation without lifecycle mutation",
+    async (code) => {
+      const ensure = vi.fn().mockResolvedValue({ connected: true });
+      const client = { post: vi.fn().mockRejectedValue(Object.assign(new Error(`socket ${code} /private/secret`), { code })) };
+
+      const res = await handleDaemonRequest(client, "/search", { q: "foo" }, { ...opts, _ensureDaemon: ensure });
+
+      expect(res).toEqual({
+        content: [{ type: "text", text: "lcm daemon unavailable (live-no-response); run 'lcm daemon restart' or 'lcm doctor'." }],
+        isError: true,
+      });
+      expect(client.post).toHaveBeenCalledOnce();
+      expect(ensure).not.toHaveBeenCalled();
+      expect(res.content[0].text).not.toContain("/private/secret");
+    },
+  );
+
+  it("maps AggregateError causes through the canonical transport classifier", async () => {
+    const ensure = vi.fn().mockResolvedValue({ connected: true });
+    const cause = Object.assign(new Error("broken pipe /private/secret"), { code: "EPIPE" });
+    const client = { post: vi.fn().mockRejectedValue(new AggregateError([new Error("wrapper", { cause })], "request failed")) };
+
+    const res = await handleDaemonRequest(client, "/search", { q: "foo" }, { ...opts, _ensureDaemon: ensure });
+
+    expect(res.content[0].text).toBe("lcm daemon unavailable (live-no-response); run 'lcm daemon restart' or 'lcm doctor'.");
+    expect(client.post).toHaveBeenCalledOnce();
+    expect(ensure).not.toHaveBeenCalled();
+  });
+
+  it("sanitizes non-transport error diagnostics without exposing endpoint, PID, path, or secret", async () => {
+    const client = {
+      post: vi.fn().mockRejectedValue(new Error(
+        "configuration failed https://alice:hunter2@secret.example.test:443/v1?token=abc host=secret.example pid=42 password=hunter2 at /private/secret",
+      )),
+    };
+
+    const res = await handleDaemonRequest(client, "/search", { q: "foo" }, opts);
+
+    expect(res).toEqual({ content: [{ type: "text", text: expect.stringContaining("lcm error:") }], isError: true });
+    expect(res.content[0].text).not.toContain("secret.example");
+    expect(res.content[0].text).not.toContain("hunter2");
+    expect(res.content[0].text).not.toContain("/private/secret");
+    expect(res.content[0].text).not.toContain("pid=42");
+    expect(ensureDaemonMock).not.toHaveBeenCalled();
+  });
+
+  it("uses a bounded fallback for an empty non-transport diagnostic", async () => {
+    const client = { post: vi.fn().mockRejectedValue(new Error("")) };
+
+    const res = await handleDaemonRequest(client, "/search", { q: "foo" }, opts);
+
+    expect(res.content[0].text).toBe("lcm error: request failed");
+    expect(res.isError).toBe(true);
+  });
+
   it("does not invoke lifecycle when the transport fails", async () => {
     ensureDaemonMock.mockRejectedValueOnce(new Error("spawn failed"));
     const client = {

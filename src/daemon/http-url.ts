@@ -91,10 +91,18 @@ const DAEMON_TRANSPORT_ERROR_CODES = new Set([
 /** Restrict managed-daemon recovery to local transport loss. */
 export function isDaemonTransportFailure(error: unknown): boolean {
   const seen = new Set<unknown>();
-  let current = error;
-  while (typeof current === "object" && current !== null && !seen.has(current)) {
+  const pending: unknown[] = [error];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (typeof current !== "object" || current === null || seen.has(current)) continue;
     seen.add(current);
-    const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
+    const candidate = current as {
+      code?: unknown;
+      message?: unknown;
+      cause?: unknown;
+      errors?: unknown;
+    };
+    if (current instanceof TypeError) return true;
     if (
       typeof candidate.code === "string"
       && DAEMON_TRANSPORT_ERROR_CODES.has(candidate.code.toUpperCase())
@@ -102,7 +110,8 @@ export function isDaemonTransportFailure(error: unknown): boolean {
       return true;
     }
     if (candidate.message === "Daemon request timed out") return true;
-    current = candidate.cause;
+    pending.push(candidate.cause);
+    if (Array.isArray(candidate.errors)) pending.push(...candidate.errors);
   }
   return false;
 }
