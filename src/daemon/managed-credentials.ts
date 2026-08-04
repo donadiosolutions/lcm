@@ -1,11 +1,9 @@
 import {
-  chmodSync,
   closeSync,
   constants,
   fchmodSync,
   fstatSync,
   lstatSync,
-  mkdirSync,
   openSync,
   readdirSync,
   realpathSync,
@@ -14,6 +12,7 @@ import {
   writeSync,
 } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { ensurePrivateDirectory } from "../security-files.js";
 
 /** Names that may be projected into a managed one-launch credential directory. */
 export const MANAGED_CREDENTIAL_NAMES = Object.freeze([
@@ -91,9 +90,9 @@ export function createManagedCredentialDirectory(
   }
   const base = resolve(canonicalRoot, "credentials");
   try {
-    mkdirSync(base, { mode: DIRECTORY_MODE });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("managed credential directory cannot be created");
+    ensurePrivateDirectory(base);
+  } catch {
+    throw new Error("managed credential directory cannot be created");
   }
   // The base directory may have pre-existed; validate it before using it.
   const canonicalBase = safeCanonicalDirectory(base, "managed credential base directory");
@@ -103,9 +102,9 @@ export function createManagedCredentialDirectory(
   }
   const directory = resolve(canonicalBase, nonce);
   try {
-    mkdirSync(directory, { mode: DIRECTORY_MODE });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("managed credential directory cannot be created");
+    ensurePrivateDirectory(directory);
+  } catch {
+    throw new Error("managed credential directory cannot be created");
   }
   const canonicalDirectory = safeCanonicalDirectory(directory, "managed credential directory");
   if (!isWithin(canonicalDirectory, canonicalRoot) || canonicalDirectory !== directory) {

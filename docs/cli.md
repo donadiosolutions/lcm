@@ -91,6 +91,13 @@ any unsupported or ambiguous launch are refused rather than force-recovered.
 Run `lcm doctor`, restore the host service manager, and retry `lcm daemon
 restart`.
 
+There is no detached offline force-recovery option. A service-manager identity
+is an ownership authority for LCM, not a same-UID filesystem security boundary:
+another process running as the same operating-system user can still read or
+modify that user's files and runtime state. When recovery is refused, inspect
+the host with `lcm doctor`, restore the manager, and retry one explicit
+`lcm daemon restart`.
+
 If a connector was removed or its installed paths are stale after an upgrade,
 repair it through the connector manager and then re-run doctor:
 

@@ -168,7 +168,6 @@ describe("Epic 400 lifecycle final branch closure", () => {
       environment: { PATH: "/bin", XDG_RUNTIME_DIR: fTempDir() },
     });
     const run = __lifecycleTestUtils.supervisorCommandRunner(f.seams as never, baseOptions(f));
-    const spawnSync = f.seams.spawnSync as ReturnType<typeof vi.fn>;
     run("manager", [], { timeoutMs: 10, env: { PATH: "/custom" } });
     const empty = fixture();
     writeFileSync(empty.tokenPath, "\n", { mode: 0o600 });

@@ -3,6 +3,7 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -212,8 +213,12 @@ describe("Epic 400 managed credential coverage", () => {
       const second = createManagedCredentialDirectory(root, "second");
       expect(first).not.toBe(second);
       expect(createManagedCredentialDirectory(root, "second")).toBe(second);
+      chmodSync(join(root, "credentials"), 0o755);
+      expect(createManagedCredentialDirectory(root, "tightened")).toContain(join(root, "credentials"));
+      expect(statSync(join(root, "credentials")).mode & 0o777).toBe(0o700);
       cleanupManagedCredentialDirectory(first, root);
       cleanupManagedCredentialDirectory(second, root);
+      cleanupManagedCredentialDirectory(join(root, "credentials", "tightened"), root);
 
       mkdirSync(join(root, "credentials", "non-normalized"), { mode: 0o700 });
       pathMocks.resolve.mockImplementation((...args: any[]) => {

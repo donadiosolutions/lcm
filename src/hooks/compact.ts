@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
 import { daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { fenceContent } from "../daemon/content-fence.js";
+import { safeLogError } from "./hook-errors.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
 import { selectStorageBackend } from "../storage/backend.js";
 import {
@@ -50,6 +51,11 @@ export async function handlePreCompact(
   let ensureResult: EnsureResultWithRefusal;
   try {
     selectStorageBackend(storage);
+  } catch (error) {
+    await safeLogError("PreCompact", error, {});
+    return { exitCode: 0, stdout: "" };
+  }
+  try {
     ensureResult = await ensureDaemon({
       port: daemonPort,
       pidFilePath,

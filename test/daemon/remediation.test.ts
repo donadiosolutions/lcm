@@ -554,12 +554,31 @@ describe("daemon remediation marker", () => {
         writeFileSync: (path: string, data: string, options: { encoding: BufferEncoding; mode: number; flag: string }) => {
           writeFileSync(path, data, options);
         },
-        chmodSync: () => { throw new Error("chmod denied"); },
+        chmodSync: (path: string, mode: number) => {
+          if (path.endsWith(".tmp")) throw new Error("chmod denied");
+          chmodSync(path, mode);
+        },
+        unlinkSync: () => { throw new Error("unlink denied"); },
       };
       expect(recordDaemonRemediation({
         ...input(cleanupPath, "scope-a", "ambiguous", () => 3),
         fs: writeThenFailFs,
       })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("tightens a pre-existing remediation directory before writing", () => {
+    const root = makeRoot();
+    try {
+      const directory = join(root, "remediation-state");
+      mkdirSync(directory, { mode: 0o755 });
+      chmodSync(directory, 0o755);
+      const markerPath = join(directory, "marker.json");
+      expect(recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", () => 1)))
+        .toMatchObject({ markerStatus: "created", markerIoError: false });
+      expect(statSync(directory).mode & 0o777).toBe(0o700);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -322,6 +322,8 @@ process is left untouched. Run `lcm doctor` for diagnostics and
 Windows, and containers without a user service manager are not offline recovery
 authorities. If a client connector is stale after an update, reinstall it with
 `lcm connectors install <agent>` and run its connector doctor before retrying.
+There is no detached offline force-recovery option, and service-manager
+ownership is not a same-UID filesystem security boundary.
 
 See [Machine registration and project identity](docs/project-identity.md) for
 linked-worktree consolidation, historical Codex reconciliation, PostgreSQL

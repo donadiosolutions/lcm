@@ -37,6 +37,23 @@ validates the complete effective configuration before asking the manager to
 replace the service, then waits for authenticated health. Run it once after a
 configuration or package update instead of starting a competing daemon.
 
+## Configuration and security boundary
+
+`daemon.idleTimeoutMs` controls how long an otherwise idle daemon may remain
+running; it does not enable, disable, or authorize recovery. Managed recovery
+has no force flag and no configuration switch for offline replacement. A
+detached or foreground daemon that gives no response is intentionally left
+untouched; inspect it with `lcm doctor` and use one explicit `lcm daemon
+restart` only after the service manager can prove ownership.
+
+Service-manager ownership is an authority boundary for LCM, not a same-UID
+filesystem security boundary. Another process running as the same operating
+system user can read or modify files and state in that user's home and runtime
+directories. Private modes, canonical-path checks, authenticated daemon
+metadata, and manager identity checks reduce accidental or cross-user access;
+they do not turn same-UID filesystem state into a capability. LCM therefore
+does not offer detached offline force-recovery or a PID/pathname-only fallback.
+
 ## The three health outcomes
 
 The lifecycle client keeps the response boundary distinct from transport

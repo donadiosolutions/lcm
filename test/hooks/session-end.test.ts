@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { handleSessionEnd } from "../../src/hooks/session-end.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { loadDaemonConfig, type DaemonConfig } from "../../src/daemon/config.js";
+import { safeLogError } from "../../src/hooks/hook-errors.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn().mockResolvedValue({ connected: true, port: 3737, spawned: false }),
@@ -12,6 +13,10 @@ vi.mock("../../src/daemon/lifecycle.js", () => ({
 
 vi.mock("../../src/daemon/config.js", () => ({
   loadDaemonConfig: vi.fn(),
+}));
+
+vi.mock("../../src/hooks/hook-errors.js", () => ({
+  safeLogError: vi.fn(),
 }));
 
 const mockHttpReq = vi.hoisted(() => ({
@@ -75,6 +80,7 @@ describe("handleSessionEnd", () => {
       backend: "postgresql",
     })).resolves.toEqual({ exitCode: 0, stdout: "" });
     expect(ensureDaemon).not.toHaveBeenCalled();
+    expect(safeLogError).toHaveBeenCalledWith("SessionEnd", expect.objectContaining({ name: "StorageBackendUnavailableError" }), {});
     expect(client.post).not.toHaveBeenCalled();
     expect(mockHttpReq.end).not.toHaveBeenCalled();
   });

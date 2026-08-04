@@ -5,7 +5,6 @@ import {
   readFileSync,
   renameSync,
   rmSync,
-  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -246,7 +245,6 @@ describe("ensureDaemon restart and terminal coverage", () => {
     const dir = root();
     writePid(dir, 20);
     writeFileSync(join(dir, "daemon.token"), "token", { mode: 0o600 });
-    const fetch = diagnosticsFetch(health(999));
     const ps = vi.fn(() => ({ status: 0, stdout: "node lcm daemon start --foreground\n", stderr: "" }));
     const result = await ensure({
       ...baseOptions(dir),
@@ -340,7 +338,7 @@ describe("ensureDaemon restart and terminal coverage", () => {
     writeFileSync(join(dir, "daemon.token"), "token", { mode: 0o600 });
     let healthCalls = 0;
     let alive = true;
-    const fetch = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+    const fetch = vi.fn(async (url: string): Promise<Response> => {
       if (url.endsWith("/stats/pool")) return response({ totalConnections: 0 });
       healthCalls += 1;
       if (healthCalls === 1) return response({ status: "warming" });
@@ -856,7 +854,7 @@ describe("managed restart refusal and repair coverage", () => {
       ["ambiguous", { probe: vi.fn(async (spec: SupervisorSpec) => ({ kind: "ambiguous", reason: "state-conflict", name: spec.name })) }, "ambiguous"],
       ["manager error", { probe: vi.fn(async (spec: SupervisorSpec) => ({ kind: "unavailable", reason: "metadata-mismatch", name: spec.name })) }, "manager-unavailable"],
     ];
-    for (const [_name, supervisor, refusalReason] of cases) {
+    for (const [, supervisor, refusalReason] of cases) {
       const dir = root();
       const result = await restart({ ...baseOptions(dir), enforceUserManagerParent: true, _supervisorOverride: supervisor as unknown as Supervisor });
       expect(result.refusalReason).toBe(refusalReason);

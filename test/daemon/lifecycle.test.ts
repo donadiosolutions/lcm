@@ -2139,7 +2139,6 @@ describe("ensureDaemon", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response)
       .mockResolvedValueOnce({ ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
     const killMock = vi.fn();
-    const managerUnavailable = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" });
     const spawnSyncMock = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
 
     const result = await ensureDaemon({
@@ -2170,7 +2169,6 @@ describe("ensureDaemon", () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
     const killMock = vi.fn();
     const spawnMock = vi.fn();
-    const managerUnavailable = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" });
     const listenerPorts = vi.fn().mockReturnValue([19999]);
 
     const result = await ensureDaemon({
@@ -2414,7 +2412,6 @@ describe("ensureDaemon", () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
     const killMock = vi.fn();
     const spawnMock = vi.fn();
-    const managerUnavailable = vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" });
     const listenerPorts = vi.fn()
       .mockReturnValueOnce([19999])
       .mockImplementationOnce((): number[] => {

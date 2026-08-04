@@ -212,7 +212,7 @@ async function waitForTerminal(
 }
 
 describe("real launchd daemon lifecycle", () => {
-  it.runIf(process.platform === "darwin")(
+  it.runIf(process.platform === "darwin" && process.env.LCM_LAUNCHD_INTEGRATION === "1")(
     "starts, authenticates, observes terminal exit, and boots out one scoped job",
     { timeout: 60_000 },
     async () => {

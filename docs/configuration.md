@@ -498,6 +498,18 @@ connector with `lcm connectors install <agent>` and verify it with
 `lcm install`. See [Managed daemon recovery](daemon-restart-recovery.md) for
 the complete user-facing boundary and refusal guidance.
 
+Recovery configuration is explicit and intentionally small.
+`daemon.idleTimeoutMs` controls normal idle lifetime only; no configuration
+value or force flag authorizes replacing a detached, foreground, or
+no-response process offline. Restore the per-user service manager, run
+`lcm doctor`, then use one explicit `lcm daemon restart`.
+
+The service manager is LCM's ownership authority, but it is not a same-UID
+filesystem security boundary. A process running as the same operating-system
+user can read or modify that user's files and runtime state. Private file modes,
+canonical paths, authenticated metadata, and manager identity checks reduce
+accidental or cross-user access without providing capability-style isolation.
+
 The MCP handshake check is time-bounded. If its helper process exits early,
 stops accepting input, or encounters a pipe error, `lcm doctor` reports the
 diagnostic as a warning and continues instead of waiting indefinitely or

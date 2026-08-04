@@ -2,11 +2,12 @@ import type { DaemonClient } from "../daemon/client.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
 import { loadDaemonConfig } from "../daemon/config.js";
 import { realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { request } from "node:http";
 import { Buffer } from "node:buffer";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
+import { safeLogError } from "./hook-errors.js";
 import { configPath as defaultConfigPath, daemonPidPath, daemonTokenPath, lcmHomeDir } from "../runtime-paths.js";
 import { readAuthToken } from "../daemon/auth.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
@@ -127,6 +128,11 @@ export async function handleSessionEnd(
   let ensureResult: EnsureResultWithRefusal;
   try {
     selectStorageBackend(storage);
+  } catch (error) {
+    await safeLogError("SessionEnd", error, {});
+    return { exitCode: 0, stdout: "" };
+  }
+  try {
     ensureResult = await ensureDaemon({
       port: daemonPort,
       pidFilePath,

@@ -9,8 +9,14 @@ vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn(),
 }));
 
+vi.mock("../../src/hooks/hook-errors.js", () => ({
+  safeLogError: vi.fn(),
+}));
+
 import { ensureDaemon } from "../../src/daemon/lifecycle.js";
+import { safeLogError } from "../../src/hooks/hook-errors.js";
 const mockEnsureDaemon = vi.mocked(ensureDaemon);
+const mockSafeLogError = vi.mocked(safeLogError);
 
 function mockDaemonClient(post: ReturnType<typeof vi.fn>): DaemonClient {
   // DaemonClient has private runtime state; hook tests only need its public post seam.
@@ -24,6 +30,7 @@ describe("handlePreCompact", () => {
       backend: "postgresql",
     })).resolves.toEqual({ exitCode: 0, stdout: "" });
     expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(mockSafeLogError).toHaveBeenCalledWith("PreCompact", expect.objectContaining({ name: "StorageBackendUnavailableError" }), {});
     expect(post).not.toHaveBeenCalled();
   });
 

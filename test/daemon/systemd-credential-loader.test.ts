@@ -179,7 +179,7 @@ describe("systemd credential loader hardening", () => {
   });
 
   it.each([
-    ["symlink", (path: string, directory: string) => {
+    ["symlink", (path: string) => {
       const outside = mkdtempSync(join(tmpdir(), "lcm-loader-outside-"));
       writeFileSync(join(outside, "secret"), "outside", { mode: 0o400 });
       symlinkSync(join(outside, "secret"), path);

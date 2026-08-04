@@ -25,9 +25,17 @@ import { basename, dirname, join, sep } from "node:path";
 export const PRIVATE_DIRECTORY_MODE = 0o700;
 export const PRIVATE_FILE_MODE = 0o600;
 
-export function ensurePrivateDirectory(path: string): void {
-  mkdirSync(path, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-  chmodSync(path, PRIVATE_DIRECTORY_MODE);
+export type PrivateDirectoryOperations = Readonly<{
+  mkdir?: (path: string, options: { recursive: boolean; mode: number }) => void;
+  chmod?: (path: string, mode: number) => void;
+}>;
+
+export function ensurePrivateDirectory(
+  path: string,
+  operations: PrivateDirectoryOperations = {},
+): void {
+  (operations.mkdir ?? mkdirSync)(path, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+  (operations.chmod ?? chmodSync)(path, PRIVATE_DIRECTORY_MODE);
 }
 
 function isContainedPath(root: string, candidate: string): boolean {

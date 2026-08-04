@@ -2,11 +2,11 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -216,9 +216,8 @@ describe("managed one-launch credentials", () => {
     chmodSync(root, 0o700);
     expect(() => createManagedCredentialDirectory(root, "n", uid + 1)).toThrow("uid");
     chmodSync(join(root, "credentials"), 0o755);
-    expect(() => createManagedCredentialDirectory(root, "n", uid)).toThrow("private");
-    chmodSync(join(root, "credentials"), 0o700);
     const directory = createManagedCredentialDirectory(root, "n", uid);
+    expect(statSync(join(root, "credentials")).mode & 0o777).toBe(0o700);
     expect(() => writeManagedCredentialFiles(directory, { OPENAI_API_KEY: 1 as unknown as string })).toThrow("value");
     expect(() => writeManagedCredentialFiles(directory, {
       ANTHROPIC_API_KEY: "a",

@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
   deleteRegularFile,
+  ensurePrivateDirectory,
   readBoundedRegularFileWithStat,
   writePrivateFileExclusive,
 } from "../security-files.js";
@@ -748,7 +749,7 @@ function writeMarker(
   fs: DaemonRemediationFileSystem,
 ): void {
   const directory = dirname(path);
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  ensurePrivateDirectory(directory, { mkdir: fs.mkdirSync, chmod: fs.chmodSync });
   const temporaryPath = `${path}.${randomBytes(12).toString("hex")}.tmp`;
   let ownsTemporaryPath = false;
   try {

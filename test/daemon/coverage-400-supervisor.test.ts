@@ -258,7 +258,7 @@ describe("supervisor coverage: validation and bounded parsing", () => {
     ]);
     const supervisor = createSupervisor("systemd-user", { run: runner.run, platform: "linux" });
     await expect(supervisor.probe(value)).resolves.toMatchObject({ kind: "registered-running-valid", managerPid: 123 });
-    for (const _ of malformed) {
+    for (let index = 0; index < malformed.length; index += 1) {
       const observed = await supervisor.probe(value);
       expect(observed.kind).not.toBe("registered-running-valid");
     }
@@ -277,7 +277,9 @@ describe("supervisor coverage: validation and bounded parsing", () => {
     ];
     const jsonRunner = runQueue(jsonCases.map((payload) => ({ code: 0, stdout: JSON.stringify(payload) })));
     const jsonSupervisor = createSupervisor("systemd-user", { run: jsonRunner.run, platform: "linux" });
-    for (const _ of jsonCases) expect((await jsonSupervisor.probe(value)).kind).not.toBe("registered-running-valid");
+    for (let index = 0; index < jsonCases.length; index += 1) {
+      expect((await jsonSupervisor.probe(value)).kind).not.toBe("registered-running-valid");
+    }
   });
 
   it("exercises parser byte ceilings after the command-output seam", async () => {
@@ -318,7 +320,9 @@ describe("supervisor coverage: validation and bounded parsing", () => {
     ];
     const runner = runQueue(cases.map((stdout) => ({ code: 0, stdout })));
     const supervisor = createSupervisor("systemd-user", { run: runner.run, platform: "linux" });
-    for (const _ of cases) expect((await supervisor.probe(value)).kind).not.toBe("registered-running-valid");
+    for (let index = 0; index < cases.length; index += 1) {
+      expect((await supervisor.probe(value)).kind).not.toBe("registered-running-valid");
+    }
   });
 });
 
@@ -408,7 +412,9 @@ describe("supervisor coverage: manager states and lifecycle boundaries", () => {
     ];
     const unconfiguredRunner = runQueue(optionalOnUnconfigured.map((extra) => ({ code: 0, stdout: systemdText(numericSpec, "inactive", 0, extra) })));
     const unconfiguredSupervisor = createSupervisor("systemd-user", { run: unconfiguredRunner.run, platform: "linux" });
-    for (const _ of optionalOnUnconfigured) expect(await unconfiguredSupervisor.probe(numericSpec)).toMatchObject({ kind: "registered-stale-config", reason: "metadata-mismatch" });
+    for (let index = 0; index < optionalOnUnconfigured.length; index += 1) {
+      expect(await unconfiguredSupervisor.probe(numericSpec)).toMatchObject({ kind: "registered-stale-config", reason: "metadata-mismatch" });
+    }
 
     // The metadata parser's lexical key check is defensive even though the
     // scanner normally admits only matching key characters. Force that seam to
