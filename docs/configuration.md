@@ -435,6 +435,9 @@ recognized active storage backend, the PID file, process liveness, and exact
 occupied port with missing or unverifiable identity is rejected rather than
 trusted. Daemons that predate backend identity are recognized as SQLite-only,
 so selecting PostgreSQL cannot silently reuse an existing SQLite process.
+The PID, PID-file, and listener observations in this admission check are
+consistency evidence for a responsive managed service; they are never offline
+authority to signal or replace a process.
 If bounded health checks remain unavailable while the exact PID-file process is
 still a live likely-LCM process and still owns the configured listener,
 lifecycle admission reports `connected: false` with a busy/unavailable warning
@@ -444,12 +447,13 @@ daemon. Retry after the current operation finishes. If health remains
 unavailable after the daemon should be idle, run `lcm doctor` and one explicit
 `lcm daemon restart`; if the service identity is ambiguous, the command
 preserves the process and state and reports the next safe action.
-During an explicit restart, the running daemon is authenticated by PID,
-installed version, listener ownership, and its local token without requiring it
-to already use the newly selected backend; the replacement must match the new
-backend. SessionSnapshot skips ingestion when bootstrap cannot verify daemon
-identity. PostToolUse also ignores payload-provided daemon ports and performs no
-network I/O.
+During a responsive explicit restart, authenticated health and the owning
+systemd/launchd service establish the existing service's identity; the
+replacement must match the newly selected backend. A no-response or ambiguous
+service has no offline PID, pathname, or token authority and is preserved rather
+than signaled or replaced. SessionSnapshot skips ingestion when bootstrap
+cannot verify daemon identity. PostToolUse also ignores payload-provided daemon
+ports and performs no network I/O.
 
 Use `lcm daemon restart` after configuration changes. It validates the complete
 effective configuration before asking the host service manager to replace the

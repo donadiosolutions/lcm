@@ -203,12 +203,7 @@ jobs:
           }
           trap cleanup EXIT
           mkdir -p -- "$resource_root"
-          launchd_test="test/daemon/lifecycle-launchd.integration.test.ts"
-          if [[ -f "$launchd_test" ]]; then
-            npx vitest run "$launchd_test"
-          else
-            echo "::notice::Launchd integration dependency: $launchd_test is not available yet; the service-manager integration owner must supply this dedicated test path. Checkout, Node 25.9.0, npm ci, and exact cleanup were validated."
-          fi
+          npx vitest run test/daemon/lifecycle-launchd.integration.test.ts
 
   ci:
     name: ci

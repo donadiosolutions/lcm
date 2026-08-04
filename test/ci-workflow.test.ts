@@ -165,7 +165,7 @@ describe("CI workflow", () => {
     expect(integration?.run).not.toMatch(/\b(?:pkill|killall)\b/u);
   });
 
-  it("keeps the macOS launchd feasibility job active while exposing its integration dependency", () => {
+  it("keeps the macOS launchd feasibility job active and runs its integration path", () => {
     const job = workflow.jobs["macos-launchd"];
     const checkout = job.steps.find((step) => step.name === "Checkout");
     const node = job.steps.find((step) => step.name === "Set up Node.js 25.9.0");
@@ -191,8 +191,29 @@ describe("CI workflow", () => {
       LCM_LAUNCHD_LABEL:
         "com.donadiosolutions.lcm.ci.${{ github.run_id }}.${{ github.run_attempt }}",
     });
-    expect(integration?.run).toContain("test/daemon/lifecycle-launchd.integration.test.ts");
-    expect(integration?.run).toContain("Launchd integration dependency");
+    expect(integration?.run?.trim()).toBe(
+      [
+        "set -Eeuo pipefail",
+        'resource_root="$LCM_LAUNCHD_RESOURCE_ROOT"',
+        'label="$LCM_LAUNCHD_LABEL"',
+        'ready_file="$resource_root/launchd.label"',
+        "cleanup() {",
+        "  set +e",
+        '  if [[ -f "$ready_file" ]]; then',
+        '    ready_label="$(<"$ready_file")"',
+        '    if [[ "$ready_label" == "$label" ]]; then',
+        '      launchctl bootout "gui/$(id -u)/$ready_label" || true',
+        "    else",
+        '      echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2',
+        "    fi",
+        "  fi",
+        '  rm -rf -- "$resource_root"',
+        "}",
+        "trap cleanup EXIT",
+        'mkdir -p -- "$resource_root"',
+        "npx vitest run test/daemon/lifecycle-launchd.integration.test.ts",
+      ].join("\n"),
+    );
     expect(integration?.run).toContain('launchctl bootout "gui/$(id -u)/$ready_label"');
     expect(integration?.run).toContain('rm -rf -- "$resource_root"');
     expect(integration?.run).not.toMatch(/\b(?:pkill|killall)\b/u);

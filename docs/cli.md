@@ -34,8 +34,11 @@ Authenticated daemon health includes a startup-captured SHA-256 digest of the
 packaged `lcm.mjs` entrypoint. LCM reuses a running daemon only when its version,
 storage backend, entrypoint, and runtime digest all match the invoking CLI. This
 also replaces a daemon left running across a same-version rebuild. A missing or
-mismatched digest can restart only a token-authenticated daemon whose PID and
-LCM process identity were verified; unrelated processes are never stopped.
+mismatched digest makes the running daemon ineligible for reuse. When the
+daemon is responsive, `lcm daemon restart` uses the authenticated lifecycle and
+the owning systemd/launchd service to apply the replacement; the digest check
+does not grant PID, pathname, or token authority for offline recovery. A
+no-response or ambiguous service remains untouched and fails closed.
 
 After `lcm compact` creates summaries, automatic promotion normally uses the
 same verified daemon connection. If that connection fails at the transport
