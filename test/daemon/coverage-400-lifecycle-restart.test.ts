@@ -155,7 +155,11 @@ function testScopeFixture(prefix = "scope-"): { root: string; scope: DaemonLifec
   writeFileSync(entrypoint, "setTimeout(() => {}, 60_000);\n");
   const dependencies = {
     fetch: vi.fn().mockRejectedValue(new Error("offline")),
-    spawn: vi.fn(),
+    spawn: vi.fn(() => ({
+      pid: undefined,
+      once: vi.fn().mockReturnThis(),
+      unref: vi.fn(),
+    })),
     spawnSync: vi.fn(),
     stopUnit: vi.fn(),
     killProcess: vi.fn(),
