@@ -3,6 +3,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -1053,11 +1054,21 @@ describe("legacy restart and terminal cleanup coverage", () => {
       spawnTimeoutMs: 100,
       _testScope: fixture.scope,
       validateBeforeRestart: () => {
-        rmSync(fixture.scope.stateDir, { recursive: true, force: true });
-        mkdirSync(fixture.scope.stateDir, { recursive: true });
+        renameSync(fixture.scope.stateDir, join(fixture.root, "state-before-validation"));
+        mkdirSync(fixture.scope.stateDir);
       },
     });
-    expect(result.warning).toContain("changed during restart validation");
+    expect(result).toMatchObject({
+      connected: false,
+      port: 19_999,
+      spawned: false,
+      restarted: false,
+      warning: "daemon lifecycle test state changed during restart validation",
+    });
+    expect(fixture.scope.dependencies.fetch).not.toHaveBeenCalled();
+    expect(fixture.scope.dependencies.spawn).not.toHaveBeenCalled();
+    expect(fixture.scope.dependencies.spawnSync).not.toHaveBeenCalled();
+    expect(fixture.scope.dependencies.killProcess).not.toHaveBeenCalled();
     expect(tokenPath).toContain("daemon.token");
   });
 
