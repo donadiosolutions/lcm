@@ -271,6 +271,7 @@ const CREDENTIAL_MAX_BYTES = 1024 * 1024;
 const SYSTEMD_CREDENTIAL_DIRECTORY_MODES = Object.freeze([0o500]);
 const SYSTEMD_CREDENTIAL_FILE_MODES = Object.freeze([0o400]);
 const SYSTEMD_CREDENTIAL_MAX_COUNT = SYSTEMD_CREDENTIAL_ENV_NAMES.length;
+const launchdCredentialSnapshots = new Map<string, CredentialProjection>();
 
 type SystemdCredentialPrefix = {
   path: string;
@@ -500,8 +501,35 @@ function trustedLaunchdCredentialsDir(path: string | undefined): string | undefi
   }
 }
 
+/**
+ * Identify one launchd credential context without touching its filesystem.
+ *
+ * The marker directory is nonce-scoped by the supervisor.  Keeping its
+ * normalized marker paths in the key prevents independent launch contexts from
+ * sharing a snapshot while still allowing a reload after launchd cleanup has
+ * removed the source files or directory.
+ */
+function normalizedLaunchdCredentialPath(path: string | undefined): string | null {
+  if (path === undefined) return null;
+  return isAbsolute(path) ? `absolute:${resolve(path)}` : `relative:${path}`;
+}
+
+function launchdCredentialSnapshotKey(env: Record<string, string | undefined>): string {
+  const configuredFiles = MANAGED_CREDENTIAL_NAMES.map(name => [
+    name,
+    normalizedLaunchdCredentialPath(env[`${LAUNCHD_CREDENTIAL_FILE_PREFIX}${name}${LAUNCHD_CREDENTIAL_FILE_SUFFIX}`]),
+  ]);
+  return JSON.stringify([
+    normalizedLaunchdCredentialPath(env[LAUNCHD_CREDENTIAL_DIRECTORY_ENV]),
+    configuredFiles,
+  ]);
+}
+
 /** Resolve allow-listed private one-launch credential files used by launchd. */
 function readLaunchdCredentialEnv(env: Record<string, string | undefined>): CredentialProjection {
+  const snapshotKey = launchdCredentialSnapshotKey(env);
+  const snapshot = launchdCredentialSnapshots.get(snapshotKey);
+  if (snapshot !== undefined) return snapshot;
   const directory = trustedLaunchdCredentialsDir(env[LAUNCHD_CREDENTIAL_DIRECTORY_ENV]);
   if (!directory) return EMPTY_CREDENTIAL_PROJECTION;
   const credentialEnv: Record<string, string> = {};
@@ -531,11 +559,13 @@ function readLaunchdCredentialEnv(env: Record<string, string | undefined>): Cred
     }
   }
   if (names.length === 0) return EMPTY_CREDENTIAL_PROJECTION;
-  return Object.freeze({
+  const projection = Object.freeze({
     authenticated: true,
     names: Object.freeze(names),
     values: Object.freeze(credentialEnv),
   });
+  launchdCredentialSnapshots.set(snapshotKey, projection);
+  return projection;
 }
 
 /** Resolve the environment used for daemon configuration, including trusted systemd credentials. */

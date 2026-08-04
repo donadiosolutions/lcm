@@ -416,7 +416,14 @@ user-owned private directory. Service identity metadata and credential-file mark
 names and paths only. API keys and database URLs are never copied into argv,
 unit properties, plist contents, or logs; the daemon reads them from the
 private one-launch credential files after the manager has authenticated their
-directory and per-file ownership, mode, and link metadata. A staged managed credential therefore takes precedence over a
+directory and per-file ownership, mode, and link metadata. Each authenticated
+launchd credential file is a one-shot input: LCM consumes it during the first
+configuration load and retains only an immutable in-memory startup snapshot
+for later in-process `loadDaemonConfig` reloads, including the `lcm stats`
+configuration read. It never reopens a missing, deleted, replaced, or tampered
+one-shot file after that first authenticated load. To apply a changed managed
+credential, run `lcm daemon restart` so the manager creates a new nonce-scoped
+credential set. A staged managed credential therefore takes precedence over a
 same-name ambient variable. Detached compatibility launches retain their
 historical direct-environment behavior. The `env -i` process is a short-lived
 same-user launch boundary; it does not grant a different privilege or user

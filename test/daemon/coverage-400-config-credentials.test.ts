@@ -213,12 +213,24 @@ describe("Epic 400 configuration credential-loader coverage", () => {
         LCM_CREDENTIAL_OPENAI_API_KEY_FILE: join(link, "OPENAI_API_KEY"),
       }).OPENAI_API_KEY).toBeUndefined();
 
-      writeFileSync(file, "canonical-race\n", { mode: 0o600 });
-      chmodSync(file, 0o600);
+      const raceRoot = makeRoot();
+      const raceDirectory = join(raceRoot, "credentials");
+      const raceFile = join(raceDirectory, "OPENAI_API_KEY");
+      mkdirSync(raceDirectory, { mode: 0o700 });
+      chmodSync(raceDirectory, 0o700);
+      writeFileSync(raceFile, "canonical-race\n", { mode: 0o600 });
+      chmodSync(raceFile, 0o600);
       fsMocks.realpathSync.mockImplementation((path: string) =>
-        path === file ? join(root, "escaped", "OPENAI_API_KEY") : fsMocks.originals!.realpathSync(path),
+        path === raceFile ? join(raceRoot, "escaped", "OPENAI_API_KEY") : fsMocks.originals!.realpathSync(path),
       );
-      expect(resolveDaemonConfigEnv(env).OPENAI_API_KEY).toBeUndefined();
+      try {
+        expect(resolveDaemonConfigEnv({
+          LCM_CREDENTIAL_DIRECTORY: raceDirectory,
+          LCM_CREDENTIAL_OPENAI_API_KEY_FILE: raceFile,
+        }).OPENAI_API_KEY).toBeUndefined();
+      } finally {
+        removeRoot(raceRoot);
+      }
     } finally {
       removeRoot(root);
     }

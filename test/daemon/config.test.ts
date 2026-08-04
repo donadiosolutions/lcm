@@ -738,7 +738,7 @@ describe("loadDaemonConfig", () => {
 });
 
 describe("launchd one-launch credential projection", () => {
-  it("reads only private allow-listed files through a bounded descriptor", () => {
+  it("reads only private allow-listed files and retains the startup snapshot across reloads", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-launchd-credentials-"));
     const directory = join(root, "credentials");
     mkdirSync(directory, { mode: 0o700 });
@@ -752,17 +752,111 @@ describe("launchd one-launch credential projection", () => {
       LCM_CREDENTIAL_UNKNOWN_FILE: file,
       OPENAI_API_KEY: "direct-value",
     };
-    expect(resolveDaemonConfigEnv(env)).toMatchObject({
-      OPENAI_API_KEY: "launchd-secret",
-      LCM_CREDENTIAL_DIRECTORY: directory,
-    });
-    expect(existsSync(file)).toBe(false);
-    writeFileSync(file, "launchd-secret\n", { mode: 0o600 });
+    try {
+      const overrides = {
+        llm: { provider: "openai", model: "test-model", baseURL: "http://localhost:11435/v1", apiKey: "${OPENAI_API_KEY}" },
+      };
+      expect(loadDaemonConfig("/nonexistent", overrides, env).llm.apiKey).toBe("launchd-secret");
+      expect(existsSync(file)).toBe(false);
+
+      writeFileSync(file, "replacement-secret\n", { mode: 0o600 });
+      chmodSync(file, 0o600);
+      env.OPENAI_API_KEY = "changed-direct-value";
+      expect(loadDaemonConfig("/nonexistent", overrides, env).llm.apiKey).toBe("launchd-secret");
+      expect(existsSync(file)).toBe(true);
+      expect(resolveDaemonConfigEnv(env)).toMatchObject({
+        OPENAI_API_KEY: "launchd-secret",
+        LCM_CREDENTIAL_DIRECTORY: directory,
+      });
+      rmSync(directory, { recursive: true, force: true });
+      expect(loadDaemonConfig("/nonexistent", overrides, env).llm.apiKey).toBe("launchd-secret");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("snapshots missing files and keeps distinct launch contexts isolated", () => {
+    const missingRoot = mkdtempSync(join(tmpdir(), "lcm-launchd-credentials-missing-"));
+    const missingDirectory = join(missingRoot, "credentials");
+    mkdirSync(missingDirectory, { mode: 0o700 });
+    chmodSync(missingDirectory, 0o700);
+    const missingFile = join(missingDirectory, "OPENAI_API_KEY");
+    const missingEnv = {
+      LCM_CREDENTIAL_DIRECTORY: missingDirectory,
+      LCM_CREDENTIAL_OPENAI_API_KEY_FILE: missingFile,
+      OPENAI_API_KEY: "ambient-value",
+    };
+
+    const firstRoot = mkdtempSync(join(tmpdir(), "lcm-launchd-credentials-isolation-a-"));
+    const firstDirectory = join(firstRoot, "credentials");
+    mkdirSync(firstDirectory, { mode: 0o700 });
+    chmodSync(firstDirectory, 0o700);
+    const firstFile = join(firstDirectory, "OPENAI_API_KEY");
+    writeFileSync(firstFile, "first-secret\n", { mode: 0o600 });
+    chmodSync(firstFile, 0o600);
+    const firstEnv = {
+      LCM_CREDENTIAL_DIRECTORY: firstDirectory,
+      LCM_CREDENTIAL_OPENAI_API_KEY_FILE: firstFile,
+    };
+
+    const secondRoot = mkdtempSync(join(tmpdir(), "lcm-launchd-credentials-isolation-b-"));
+    const secondDirectory = join(secondRoot, "credentials");
+    mkdirSync(secondDirectory, { mode: 0o700 });
+    chmodSync(secondDirectory, 0o700);
+    const secondFile = join(secondDirectory, "OPENAI_API_KEY");
+    writeFileSync(secondFile, "second-secret\n", { mode: 0o600 });
+    chmodSync(secondFile, 0o600);
+    const secondEnv = {
+      LCM_CREDENTIAL_DIRECTORY: secondDirectory,
+      LCM_CREDENTIAL_OPENAI_API_KEY_FILE: secondFile,
+    };
+
+    try {
+      expect(resolveDaemonConfigEnv(missingEnv).OPENAI_API_KEY).toBeUndefined();
+      writeFileSync(missingFile, "appeared-too-late\n", { mode: 0o600 });
+      chmodSync(missingFile, 0o600);
+      expect(resolveDaemonConfigEnv(missingEnv).OPENAI_API_KEY).toBeUndefined();
+      expect(existsSync(missingFile)).toBe(true);
+
+      expect(resolveDaemonConfigEnv(firstEnv).OPENAI_API_KEY).toBe("first-secret");
+      expect(resolveDaemonConfigEnv(secondEnv).OPENAI_API_KEY).toBe("second-secret");
+      writeFileSync(firstFile, "first-replacement\n", { mode: 0o600 });
+      writeFileSync(secondFile, "second-replacement\n", { mode: 0o600 });
+      chmodSync(firstFile, 0o600);
+      chmodSync(secondFile, 0o600);
+      expect(resolveDaemonConfigEnv(firstEnv).OPENAI_API_KEY).toBe("first-secret");
+      expect(resolveDaemonConfigEnv(secondEnv).OPENAI_API_KEY).toBe("second-secret");
+      expect(existsSync(firstFile)).toBe(true);
+      expect(existsSync(secondFile)).toBe(true);
+    } finally {
+      rmSync(missingRoot, { recursive: true, force: true });
+      rmSync(firstRoot, { recursive: true, force: true });
+      rmSync(secondRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reread a replaced or tampered one-shot file", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-launchd-credentials-tampered-"));
+    const directory = join(root, "credentials");
+    mkdirSync(directory, { mode: 0o700 });
+    chmodSync(directory, 0o700);
+    const file = join(directory, "OPENAI_API_KEY");
+    const outside = join(root, "outside");
+    writeFileSync(file, "original-secret\n", { mode: 0o600 });
     chmodSync(file, 0o600);
-    const envWithoutDirect = { ...env };
-    delete envWithoutDirect.OPENAI_API_KEY;
-    expect(resolveDaemonConfigEnv(envWithoutDirect).OPENAI_API_KEY).toBe("launchd-secret");
-    rmSync(root, { recursive: true, force: true });
+    writeFileSync(outside, "tampered-secret\n", { mode: 0o600 });
+    const env = {
+      LCM_CREDENTIAL_DIRECTORY: directory,
+      LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file,
+    };
+    try {
+      expect(resolveDaemonConfigEnv(env).OPENAI_API_KEY).toBe("original-secret");
+      symlinkSync(outside, file);
+      expect(resolveDaemonConfigEnv(env).OPENAI_API_KEY).toBe("original-secret");
+      expect(existsSync(file)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("preserves detached direct-environment semantics when launchd markers are malformed", () => {
@@ -787,31 +881,50 @@ describe("launchd one-launch credential projection", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("fails closed for missing, outside, symlinked, wrong-mode, and oversized leaves", () => {
-    const root = mkdtempSync(join(tmpdir(), "lcm-launchd-credentials-"));
-    const directory = join(root, "credentials");
-    mkdirSync(directory, { mode: 0o700 });
-    chmodSync(directory, 0o700);
-    const file = join(directory, "OPENAI_API_KEY");
-    const outside = join(root, "outside");
-    writeFileSync(outside, "outside", { mode: 0o600 });
-    symlinkSync(outside, file);
-    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
-    rmSync(file);
-    writeFileSync(file, "wrong-mode", { mode: 0o644 });
-    chmodSync(file, 0o644);
-    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
-    chmodSync(file, 0o600);
-    const hardlink = join(directory, "OPENAI_API_KEY_HARDLINK");
-    linkSync(file, hardlink);
-    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
-    rmSync(hardlink);
-    writeFileSync(file, "x".repeat(1024 * 1024 + 1), { mode: 0o600 });
-    chmodSync(file, 0o600);
-    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
-    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: outside }).OPENAI_API_KEY).toBeUndefined();
-    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: join(root, "missing"), LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
-    rmSync(root, { recursive: true, force: true });
+  it("fails closed for missing, outside, symlinked, hard-linked, wrong-mode, and oversized leaves", () => {
+    const cases = [
+      (root: string, directory: string, file: string, outside: string) => {
+        writeFileSync(outside, "outside", { mode: 0o600 });
+        symlinkSync(outside, file);
+        expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
+      },
+      (_root: string, directory: string, file: string) => {
+        writeFileSync(file, "wrong-mode", { mode: 0o644 });
+        chmodSync(file, 0o644);
+        expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
+      },
+      (_root: string, directory: string, file: string) => {
+        writeFileSync(file, "hard-linked", { mode: 0o600 });
+        chmodSync(file, 0o600);
+        const hardlink = join(directory, "OPENAI_API_KEY_HARDLINK");
+        linkSync(file, hardlink);
+        expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
+        rmSync(hardlink, { force: true });
+      },
+      (_root: string, directory: string, file: string) => {
+        writeFileSync(file, "x".repeat(1024 * 1024 + 1), { mode: 0o600 });
+        chmodSync(file, 0o600);
+        expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
+      },
+      (root: string, directory: string, file: string, outside: string) => {
+        writeFileSync(outside, "outside", { mode: 0o600 });
+        expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: outside }).OPENAI_API_KEY).toBeUndefined();
+        expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: join(root, "missing"), LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
+      },
+    ];
+    for (const setup of cases) {
+      const root = mkdtempSync(join(tmpdir(), "lcm-launchd-credentials-invalid-"));
+      const directory = join(root, "credentials");
+      mkdirSync(directory, { mode: 0o700 });
+      chmodSync(directory, 0o700);
+      const file = join(directory, "OPENAI_API_KEY");
+      const outside = join(root, "outside");
+      try {
+        setup(root, directory, file, outside);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
   });
 });
 

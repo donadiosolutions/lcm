@@ -31,6 +31,13 @@ lcm doctor
 lcm daemon restart
 ```
 
+Managed macOS launch credentials are one-shot inputs. LCM consumes each
+authenticated file at the first configuration load and keeps the resulting
+value only in memory for later reloads in that daemon process; it does not
+reread a file that was removed or replaced. Run `lcm daemon restart` after
+changing a managed credential so launchd receives a new private credential
+set.
+
 `lcm doctor` reports service-manager availability, daemon health, connector
 registration, MCP setup, and summarizer readiness. `lcm daemon restart`
 validates the complete effective configuration before asking the manager to
