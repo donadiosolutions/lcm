@@ -239,7 +239,7 @@ describe("real launchd daemon lifecycle", () => {
       // launchd user services. It is an integration failure, never a skip.
       const guiDomain = `gui/${uid}`;
       const guiProbe = await run("launchctl", ["print", guiDomain], { timeoutMs: 5_000 });
-      expect(guiProbe.timedOut).toBe(false);
+      expect(guiProbe.timedOut).not.toBe(true);
       expect(guiProbe.code).toBe(0);
 
       const spec = createSupervisorSpec({
