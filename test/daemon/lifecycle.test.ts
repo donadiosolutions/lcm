@@ -3173,6 +3173,7 @@ describe("ensureDaemon", () => {
     const clearTimeoutMock = vi.fn((_timeout: ReturnType<typeof setTimeout>): void => {});
     const sleepMock = vi.fn(async (_durationMs: number): Promise<void> => {});
 
+    const requestClock = vi.spyOn(performance, "now").mockReturnValue(0);
     const result = await ensureDaemon({
       port: 19999,
       pidFilePath: join(tempDir, "daemon.pid"),
@@ -3186,7 +3187,7 @@ describe("ensureDaemon", () => {
       _sleepOverride: sleepMock,
       _isProcessAliveOverride: (): boolean => true,
       _listeningPortsOverride: (): number[] => [19999],
-    });
+    }).finally(() => requestClock.mockRestore());
 
     expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "response-timeout" });
     expect(fetchMock).toHaveBeenCalledOnce();

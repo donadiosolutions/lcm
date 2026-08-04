@@ -793,6 +793,36 @@ describe("supervisor coverage: credentials and private launch files", () => {
 });
 
 describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
+  it("keeps default polling monotonic across wall-clock jumps", async () => {
+    const value = spec("systemd-user", root(), { stopTimeoutMs: 3 });
+    const runner = runQueue([
+      { code: 0, stdout: systemdText(value, "active", 12) },
+      { code: 0, stdout: "stopped" },
+      { code: 0, stdout: systemdText(value, "active", 12) },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    const wallClock = vi.spyOn(Date, "now")
+      .mockReturnValueOnce(0)
+      .mockReturnValue(Number.MAX_SAFE_INTEGER);
+    const monotonicClock = vi.spyOn(performance, "now")
+      .mockReturnValueOnce(100)
+      .mockReturnValue(101);
+    try {
+      await expect(createSupervisor("systemd-user", {
+        run: runner.run,
+        platform: "linux",
+        sleep,
+      }).stopAndAwaitAbsent(value)).rejects.toThrow("manager command");
+      expect(wallClock).not.toHaveBeenCalled();
+      expect(monotonicClock).toHaveBeenCalledTimes(2);
+      expect(sleep).toHaveBeenCalledOnce();
+      expect(sleep).toHaveBeenCalledWith(2);
+    } finally {
+      wallClock.mockRestore();
+      monotonicClock.mockRestore();
+    }
+  });
+
   it("covers reset-failed failure, nonzero stop, deadline expiry, and sleep seams", async () => {
     const value = spec("systemd-user", root(), { stopTimeoutMs: 3 });
     const resetFailure = runQueue([{ code: 0, stdout: systemdText(value, "failed") }, { code: 0, stdout: "stopped" }, { code: 1, stderr: "reset failed" }]);

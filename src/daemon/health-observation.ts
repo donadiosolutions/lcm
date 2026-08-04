@@ -60,9 +60,9 @@ export type ObserveHealthOptions<T = unknown> = Readonly<{
   fetchFn?: typeof globalThis.fetch;
   /** Bounded time waiting for fetch to resolve with response headers. */
   headerTimeoutMs?: number;
-  /** Bounded time waiting for the response body to complete. */
+  /** Monotonic whole-request budget across response headers and body. */
   bodyTimeoutMs?: number;
-  /** Optional shorthand used for both phases when phase-specific bounds match. */
+  /** Optional shorthand used when header and whole-request bounds match. */
   timeoutMs?: number;
   /** Request options; its signal is observed when `signal` is omitted. */
   requestInit?: RequestInit;
@@ -134,6 +134,17 @@ function requestSignal(requestInit: RequestInit | undefined): AbortSignal | unde
   return requestInit?.signal ?? undefined;
 }
 
+function cancelStreamingBody(response: Response): void {
+  try {
+    const body = response.body;
+    if (body === null || body === undefined) return;
+    void Promise.resolve(body.cancel()).catch(() => undefined);
+  } catch {
+    // The internal request abort is still authoritative when a malformed or
+    // already-locked response body cannot accept explicit cancellation.
+  }
+}
+
 /**
  * Observe a bounded HTTP health exchange without collapsing body failures into
  * a transport/no-response result.
@@ -146,8 +157,12 @@ export async function observeHttpHealth<T = unknown>(
   const clearTimeoutFn = options.clearTimeoutFn ?? DEFAULT_CLEAR_TIMEOUT;
   const requestInit = options.requestInit;
   const callerSignal = options.signal ?? requestSignal(requestInit);
-  const headerTimeoutMs = options.headerTimeoutMs ?? options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const bodyTimeoutMs = options.bodyTimeoutMs ?? options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const headerTimeoutMs = boundedDelay(
+    options.headerTimeoutMs ?? options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+  );
+  const requestTimeoutMs = boundedDelay(
+    options.bodyTimeoutMs ?? options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+  );
 
   // A pre-aborted caller must not invoke fetch. This check also ensures a
   // caller cannot turn an already-cancelled request into a competing process
@@ -155,6 +170,8 @@ export async function observeHttpHealth<T = unknown>(
   if (callerSignal?.aborted) {
     return { kind: "no-response", reason: "aborted-before-headers" };
   }
+
+  const requestDeadline = performance.now() + requestTimeoutMs;
 
   const controller = new AbortController();
   let phase: "headers" | "body" | "complete" = "headers";
@@ -237,7 +254,7 @@ export async function observeHttpHealth<T = unknown>(
       if (phase !== "headers") return;
       abortRequest();
       resolveHeaderTimeout(HEADER_TIMEOUT);
-    }, boundedDelay(headerTimeoutMs));
+    }, Math.min(headerTimeoutMs, requestTimeoutMs));
   } catch {
     phase = "complete";
     abortRequest();
@@ -294,9 +311,14 @@ export async function observeHttpHealth<T = unknown>(
   clearHeaderTimer();
   const response = headerResult.response;
   const status = safeStatus(response);
+  const cancelLatchedResponse = (): void => {
+    abortRequest();
+    cancelStreamingBody(response);
+  };
 
   if (!statusAllowsBody(status)) {
     phase = "complete";
+    cancelLatchedResponse();
     removeCallerListener();
     return {
       kind: "response",
@@ -304,6 +326,17 @@ export async function observeHttpHealth<T = unknown>(
       body: "invalid",
       reason: status === 0 ? "invalid-status" : "unexpected-status",
     };
+  }
+
+  const remainingBodyTimeoutMs = Math.min(
+    requestTimeoutMs,
+    requestDeadline - performance.now(),
+  );
+  if (remainingBodyTimeoutMs <= 0) {
+    phase = "complete";
+    cancelLatchedResponse();
+    removeCallerListener();
+    return { kind: "response", status, body: "timeout", reason: "body-timeout" };
   }
 
   let resolveBodyTimeout!: (value: typeof BODY_TIMEOUT) => void;
@@ -315,10 +348,10 @@ export async function observeHttpHealth<T = unknown>(
       if (phase !== "body") return;
       abortRequest();
       resolveBodyTimeout(BODY_TIMEOUT);
-    }, boundedDelay(bodyTimeoutMs));
+    }, boundedDelay(remainingBodyTimeoutMs));
   } catch {
     phase = "complete";
-    abortRequest();
+    cancelLatchedResponse();
     removeCallerListener();
     return { kind: "response", status, body: "timeout", reason: "body-timeout" };
   }
@@ -341,18 +374,21 @@ export async function observeHttpHealth<T = unknown>(
   if (bodyResult === BODY_TIMEOUT) {
     phase = "complete";
     clearBodyTimer();
+    cancelLatchedResponse();
     removeCallerListener();
     return { kind: "response", status, body: "timeout", reason: "body-timeout" };
   }
   if (bodyResult === BODY_ABORT) {
     phase = "complete";
     clearBodyTimer();
+    cancelLatchedResponse();
     removeCallerListener();
     return { kind: "response", status, body: "invalid", reason: "aborted-after-headers" };
   }
   if (bodyResult.kind === "rejected") {
     phase = "complete";
     clearBodyTimer();
+    cancelLatchedResponse();
     removeCallerListener();
     return {
       kind: "response",
@@ -373,10 +409,12 @@ export async function observeHttpHealth<T = unknown>(
   try {
     const parsedBody = options.validateBody(bodyResult.body, response);
     if (parsedBody === undefined) {
+      cancelLatchedResponse();
       return { kind: "response", status, body: "invalid", reason: "body-invalid" };
     }
     return { kind: "response", status, body: "valid", parsedBody };
   } catch {
+    cancelLatchedResponse();
     return { kind: "response", status, body: "invalid", reason: "body-rejected" };
   }
 }

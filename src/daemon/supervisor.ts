@@ -1479,7 +1479,7 @@ export function createSupervisor(
       if (resetFailed.timedOut || resetFailed.code !== 0) throw commandFailedError();
     }
     const maxPollIntervals = Math.max(1, Math.ceil(spec.stopTimeoutMs / DEFAULT_POLL_INTERVAL_MS));
-    const now = dependencies.now ?? Date.now;
+    const now = dependencies.now ?? performance.now.bind(performance);
     const stopDeadline = now() + spec.stopTimeoutMs;
     for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
       const observed = await probe(spec);

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as healthObservation from "../../src/daemon/health-observation.js";
 import {
   observeHttpHealth,
@@ -53,6 +53,14 @@ async function settleMicrotasks(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
 }
+
+beforeEach(() => {
+  vi.spyOn(performance, "now").mockReturnValue(0);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("observeHttpHealth", () => {
   it("does not expose removed compatibility aliases", () => {
@@ -131,12 +139,85 @@ describe("observeHttpHealth", () => {
     expect(timers.timers.map((timer) => timer.delayMs)).toEqual([40, 40]);
   });
 
-  it("keeps a non-2xx/non-503 status as a response without reading its body", async () => {
+  it("recomputes body time from one monotonic whole-request deadline", async () => {
+    const body = deferred<unknown>();
     const timers = timerSeams();
-    const json = vi.fn(async () => ({ status: "bad" }));
+    vi.mocked(performance.now)
+      .mockReturnValueOnce(100)
+      .mockReturnValueOnce(112)
+      .mockReturnValue(112);
+    const run = observeHttpHealth({
+      input: "http://127.0.0.1:3737/health",
+      fetchFn: vi.fn().mockResolvedValue({
+        status: 200,
+        json: vi.fn(() => body.promise),
+      } as unknown as Response),
+      headerTimeoutMs: 20,
+      bodyTimeoutMs: 30,
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+    });
+
+    await settleMicrotasks();
+    expect(timers.timers.map((timer) => timer.delayMs)).toEqual([20, 18]);
+    timers.fire(1);
+    await expect(run).resolves.toEqual({
+      kind: "response",
+      status: 200,
+      body: "timeout",
+      reason: "body-timeout",
+    });
+    body.resolve({ status: "ok" });
+  });
+
+  it("keeps the response latch when headers exhaust the whole-request deadline", async () => {
+    const timers = timerSeams();
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const json = vi.fn();
+    let requestSignal!: AbortSignal;
+    vi.mocked(performance.now)
+      .mockReturnValueOnce(100)
+      .mockReturnValueOnce(130)
+      .mockReturnValue(130);
+
     await expect(observeHttpHealth({
       input: "http://127.0.0.1:3737/health",
-      fetchFn: vi.fn().mockResolvedValue({ status: 401, json } as unknown as Response),
+      fetchFn: vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        requestSignal = init!.signal!;
+        return Promise.resolve({ status: 200, body: { cancel }, json } as unknown as Response);
+      }),
+      headerTimeoutMs: 40,
+      bodyTimeoutMs: 30,
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+    })).resolves.toEqual({
+      kind: "response",
+      status: 200,
+      body: "timeout",
+      reason: "body-timeout",
+    });
+
+    expect(timers.timers.map((timer) => timer.delayMs)).toEqual([30]);
+    expect(json).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(requestSignal.aborted).toBe(true);
+  });
+
+  it.each([
+    ["successful cancellation", () => Promise.resolve()],
+    ["rejected cancellation", () => Promise.reject(new Error("secret cancellation"))],
+    ["throwing cancellation", () => { throw new Error("secret cancellation"); }],
+  ])("cancels a non-admitted status with %s", async (_name, cancelBody) => {
+    const timers = timerSeams();
+    const json = vi.fn(async () => ({ status: "bad" }));
+    const cancel = vi.fn(cancelBody);
+    let requestSignal!: AbortSignal;
+    await expect(observeHttpHealth({
+      input: "http://127.0.0.1:3737/health",
+      fetchFn: vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        requestSignal = init!.signal!;
+        return Promise.resolve({ status: 401, body: { cancel }, json } as unknown as Response);
+      }),
       headerTimeoutMs: 10,
       bodyTimeoutMs: 10,
       setTimeoutFn: timers.setTimeoutFn,
@@ -147,7 +228,10 @@ describe("observeHttpHealth", () => {
       body: "invalid",
       reason: "unexpected-status",
     });
+    await settleMicrotasks();
     expect(json).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(requestSignal.aborted).toBe(true);
     expect(timers.timers).toHaveLength(1);
     expect(timers.timers[0]!.cleared).toBe(true);
   });
@@ -279,9 +363,14 @@ describe("observeHttpHealth", () => {
     const body = deferred<unknown>();
     const caller = new AbortController();
     const timers = timerSeams();
+    const cancel = vi.fn().mockResolvedValue(undefined);
     const run = observeHttpHealth({
       input: "http://127.0.0.1:3737/health",
-      fetchFn: vi.fn().mockResolvedValue({ status: 200, json: vi.fn(() => body.promise) } as unknown as Response),
+      fetchFn: vi.fn().mockResolvedValue({
+        status: 200,
+        body: { cancel },
+        json: vi.fn(() => body.promise),
+      } as unknown as Response),
       headerTimeoutMs: 10,
       bodyTimeoutMs: 10,
       signal: caller.signal,
@@ -298,18 +387,24 @@ describe("observeHttpHealth", () => {
     });
     expect(timers.timers[0]!.cleared).toBe(true);
     expect(timers.timers[1]!.cleared).toBe(true);
+    expect(cancel).toHaveBeenCalledOnce();
     body.resolve({ status: "ok" });
   });
 
   it("classifies a body timeout as a response and aborts the request body", async () => {
     const body = deferred<unknown>();
     const timers = timerSeams();
+    const cancel = vi.fn().mockResolvedValue(undefined);
     let requestSignal!: AbortSignal;
     const run = observeHttpHealth({
       input: "http://127.0.0.1:3737/health",
       fetchFn: vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
         requestSignal = init!.signal!;
-        return Promise.resolve({ status: 200, json: vi.fn(() => body.promise) } as unknown as Response);
+        return Promise.resolve({
+          status: 200,
+          body: { cancel },
+          json: vi.fn(() => body.promise),
+        } as unknown as Response);
       }),
       headerTimeoutMs: 10,
       bodyTimeoutMs: 20,
@@ -326,12 +421,18 @@ describe("observeHttpHealth", () => {
     });
     expect(requestSignal.aborted).toBe(true);
     expect(timers.timers[1]!.cleared).toBe(true);
+    expect(cancel).toHaveBeenCalledOnce();
     body.resolve({ status: "ok" });
   });
 
   it("keeps a JSON rejection as a response", async () => {
     const timers = timerSeams();
-    const response = { status: 200, json: vi.fn(() => { throw new Error("secret body"); }) } as unknown as Response;
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const response = {
+      status: 200,
+      body: { cancel },
+      json: vi.fn(() => { throw new Error("secret body"); }),
+    } as unknown as Response;
     await expect(observeHttpHealth({
       input: "http://127.0.0.1:3737/health",
       fetchFn: vi.fn().mockResolvedValue(response),
@@ -347,13 +448,19 @@ describe("observeHttpHealth", () => {
     });
     expect(JSON.stringify(response)).not.toContain("secret");
     expect(timers.timers[1]!.cleared).toBe(true);
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it("keeps a validator rejection and malformed body as bounded response outcomes", async () => {
     const invalid = timerSeams();
+    const invalidCancel = vi.fn().mockResolvedValue(undefined);
     await expect(observeHttpHealth({
       input: "http://127.0.0.1:3737/health",
-      fetchFn: vi.fn().mockResolvedValue(fakeResponse(200, { status: "not-ok" })),
+      fetchFn: vi.fn().mockResolvedValue({
+        status: 200,
+        body: { cancel: invalidCancel },
+        json: vi.fn(async () => ({ status: "not-ok" })),
+      } as unknown as Response),
       headerTimeoutMs: 10,
       bodyTimeoutMs: 10,
       setTimeoutFn: invalid.setTimeoutFn,
@@ -365,11 +472,17 @@ describe("observeHttpHealth", () => {
       body: "invalid",
       reason: "body-invalid",
     });
+    expect(invalidCancel).toHaveBeenCalledOnce();
 
     const rejected = timerSeams();
+    const rejectedCancel = vi.fn().mockResolvedValue(undefined);
     await expect(observeHttpHealth({
       input: "http://127.0.0.1:3737/health",
-      fetchFn: vi.fn().mockResolvedValue(fakeResponse(200, {})),
+      fetchFn: vi.fn().mockResolvedValue({
+        status: 200,
+        body: { cancel: rejectedCancel },
+        json: vi.fn(async () => ({})),
+      } as unknown as Response),
       headerTimeoutMs: 10,
       bodyTimeoutMs: 10,
       setTimeoutFn: rejected.setTimeoutFn,
@@ -381,6 +494,7 @@ describe("observeHttpHealth", () => {
       body: "invalid",
       reason: "body-rejected",
     });
+    expect(rejectedCancel).toHaveBeenCalledOnce();
   });
 
   it("uses a request-init signal when no explicit signal is supplied", async () => {
@@ -522,14 +636,32 @@ describe("observeHttpHealth", () => {
       input: "http://127.0.0.1:3737/health",
       fetchFn: vi.fn().mockResolvedValue(fakeResponse(200, {})),
       headerTimeoutMs: -1,
-      bodyTimeoutMs: Number.POSITIVE_INFINITY,
+      bodyTimeoutMs: 1,
       setTimeoutFn: timers.setTimeoutFn,
       clearTimeoutFn: timers.clearTimeoutFn,
     });
     expect(result).toMatchObject({ kind: "response", body: "valid" });
-    expect(timers.timers.map((timer) => timer.delayMs)).toEqual([0, 0]);
+    expect(timers.timers.map((timer) => timer.delayMs)).toEqual([0, 1]);
     timers.fire(0);
     timers.fire(1);
     expect(result).toMatchObject({ kind: "response", body: "valid" });
+  });
+
+  it("treats a non-finite whole-request budget as exhausted after headers", async () => {
+    const timers = timerSeams();
+    await expect(observeHttpHealth({
+      input: "http://127.0.0.1:3737/health",
+      fetchFn: vi.fn().mockResolvedValue(fakeResponse(200, {})),
+      headerTimeoutMs: 10,
+      bodyTimeoutMs: Number.POSITIVE_INFINITY,
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+    })).resolves.toEqual({
+      kind: "response",
+      status: 200,
+      body: "timeout",
+      reason: "body-timeout",
+    });
+    expect(timers.timers.map((timer) => timer.delayMs)).toEqual([0]);
   });
 });

@@ -489,6 +489,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
   });
 
   it("uses the injected ensure kill function for a version mismatch", async () => {
+    vi.spyOn(performance, "now").mockReturnValue(0);
     const dir = temp(); const procRoot = join(dir, "proc"); mkdirSync(procRoot);
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "33"); ensureAuthToken(join(dir, "daemon.token"));
     proc(procRoot, 33, "Uid:\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
