@@ -866,6 +866,32 @@ describe("bounded remediation marker persistence", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("fails closed when a recycled inode identity has changed timestamps", () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "timestamp-race.json");
+      const raw = writeMarkerDocument(markerPath, {});
+      let markerReads = 0;
+      expect(recordDaemonRemediation({
+        ...input(markerPath, "scope-a", "ambiguous", () => 1),
+        fs: {
+          lstatSync: path => {
+            markerReads += 1;
+            const stat = lstatSync(path);
+            if (markerReads !== 2) return stat;
+            return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+              ctimeMs: stat.ctimeMs + 1,
+            });
+          },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+      expect(markerReads).toBe(2);
+      expect(readFileSync(markerPath, "utf8")).toBe(raw);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("daemon remediation clearing", () => {
