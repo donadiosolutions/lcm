@@ -10,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -26,6 +27,8 @@ import {
   createSupervisor,
   createSupervisorSpec,
   isSupervisorPreflightUnavailableReason,
+  MANAGED_LAUNCH_ENV_ALLOWLIST,
+  managedLaunchEnvironment,
   type SupervisorKind,
   type SupervisorSpec,
 } from "../../src/daemon/supervisor.js";
@@ -94,6 +97,39 @@ function fakeRunner(results: Array<SupervisorCommandResult>): {
 }
 
 describe("canonical supervisor identity", () => {
+  it("projects only bounded non-secret launch values", () => {
+    expect(MANAGED_LAUNCH_ENV_ALLOWLIST).toContain("HOME");
+    const runtimeRoot = makeRoot();
+    const linkRoot = makeRoot();
+    const runtimeLink = join(linkRoot, "runtime");
+    symlinkSync(runtimeRoot, runtimeLink, "dir");
+    const environment = managedLaunchEnvironment({
+      HOME: "/home/test",
+      PATH: "/usr/bin",
+      XDG_RUNTIME_DIR: runtimeLink,
+      DBUS_SESSION_BUS_ADDRESS: "http://unsafe",
+      OPENAI_API_KEY: "ambient-secret",
+      FIRECRAWL_API_KEY: "ambient-secret",
+      DOCKERHUB_TOKEN: "ambient-secret",
+      LCM_POSTGRES_URL: "postgresql://user:secret@example/db",
+      BAD_NEWLINE: "bad\nvalue",
+      BAD_NUL: "bad\u0000value",
+      TOO_LARGE: "x".repeat(4097),
+    });
+    expect(environment).toEqual({ HOME: "/home/test", PATH: "/usr/bin" });
+    expect(managedLaunchEnvironment({
+      HOME: "/home/test",
+      PATH: "/usr/bin",
+      XDG_RUNTIME_DIR: runtimeRoot,
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+    })).toEqual({
+      HOME: "/home/test",
+      PATH: "/usr/bin",
+      XDG_RUNTIME_DIR: runtimeRoot,
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+    });
+  });
+
   it("allows detached compatibility only for read-only manager absence reasons", () => {
     const reasons = ["manager-unavailable", "manager-timeout", "manager-command-failed",
       "manager-not-found", "metadata-missing", "metadata-mismatch", "foreign-job",
@@ -429,6 +465,53 @@ describe("systemd-user supervisor", () => {
     await expect(createSupervisor("systemd-user", { run: malformed.run, platform: "linux" }).start(malformedSpec)).rejects.toThrow("manager command");
   });
 
+  it("carries allow-listed managed configuration through env -i without ambient secrets", async () => {
+    const root = makeRoot();
+    const environment = {
+      HOME: "/home/managed",
+      PATH: "/home/managed/bin:/usr/bin",
+      LCM_SUMMARY_PROVIDER: "openai",
+      LCM_SUMMARY_MODEL: "safe-model",
+      LCM_POSTGRES_CA_FILE: "/home/managed/ca.pem",
+      OPENAI_API_KEY: "ambient-secret",
+    };
+    const spec = makeSpec("systemd-user", root, {
+      executable: process.execPath,
+      args: ["-e", "process.stdout.write(JSON.stringify(process.env))"],
+      launchEnvironment: environment,
+    });
+    const runner = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: managerText(spec, "active", 322) },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      environment,
+      platform: "linux",
+    }).start(spec)).resolves.toMatchObject({ managerPid: 322 });
+    const args = runner.calls[1].args;
+    expect(args).toContain("HOME=/home/managed");
+    expect(args).toContain("PATH=/home/managed/bin:/usr/bin");
+    expect(args).toContain("LCM_SUMMARY_PROVIDER=openai");
+    expect(args).toContain("LCM_SUMMARY_MODEL=safe-model");
+    expect(args).toContain("LCM_POSTGRES_CA_FILE=/home/managed/ca.pem");
+    expect(args.join(" ")).not.toContain("ambient-secret");
+    const wrapperIndex = args.indexOf("/usr/bin/env");
+    expect(wrapperIndex).toBeGreaterThanOrEqual(0);
+    const childEnvironment = JSON.parse(execFileSync(args[wrapperIndex]!, args.slice(wrapperIndex + 1), { encoding: "utf8" })) as Record<string, string>;
+    expect(childEnvironment).toMatchObject({
+      HOME: "/home/managed",
+      PATH: "/home/managed/bin:/usr/bin",
+      LCM_SUMMARY_PROVIDER: "openai",
+      LCM_SUMMARY_MODEL: "safe-model",
+      LCM_POSTGRES_CA_FILE: "/home/managed/ca.pem",
+    });
+    expect(childEnvironment.OPENAI_API_KEY).toBeUndefined();
+    expect(childEnvironment.DOCKERHUB_TOKEN).toBeUndefined();
+    expect(childEnvironment.FIRECRAWL_API_KEY).toBeUndefined();
+  });
+
   it("projects only validated systemd credential names into LoadCredential and the config allow-list", async () => {
     const root = makeRoot();
     const directory = createManagedCredentialDirectory(root, "systemd-cred-001");
@@ -446,6 +529,10 @@ describe("systemd-user supervisor", () => {
     expect(runner.calls[1].args.join(" ")).toContain("--property=LoadCredential=OPENAI_API_KEY:");
     expect(runner.calls[1].args).toContain("--setenv=LCM_SYSTEMD_CRED_IDS=OPENAI_API_KEY");
     expect(runner.calls[1].args).toContain(`--setenv=LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${files[0]}`);
+    expect(runner.calls[1].args).toContain("/usr/bin/env");
+    expect(runner.calls[1].args).toContain("-i");
+    expect(runner.calls[1].args).toContain(`CREDENTIALS_DIRECTORY=/run/user/${process.getuid?.() ?? -1}/credentials/${spec.systemdUnit}`);
+    expect(runner.calls[1].args).toContain("LCM_SYSTEMD_CRED_IDS=OPENAI_API_KEY");
     expect(runner.calls[1].args.join(" ")).not.toContain("secret");
   });
 
@@ -494,6 +581,47 @@ describe("systemd-user supervisor", () => {
     ]);
     await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(loser)).rejects.toThrow("manager command");
     expect(existsSync(loserDirectory)).toBe(false);
+  });
+
+  it("fails closed when the systemd runtime root for credentials is missing or untrusted", async () => {
+    const root = makeRoot();
+    let attemptIndex = 0;
+    const attempt = async (runtimeRoot: string, uid?: number, removeBeforeStart = false): Promise<void> => {
+      attemptIndex += 1;
+      const directory = createManagedCredentialDirectory(root, `systemd-runtime-${attemptIndex}`);
+      const files = writeManagedCredentialFiles(directory, { OPENAI_API_KEY: "secret" });
+      const base = {
+        kind: "systemd-user" as const,
+        stateRoot: root,
+        port: 3737,
+        nonce: "nonce-001",
+        executable: "/usr/bin/node",
+        args: ["/opt/lcm/dist/lcm.mjs", "daemon", "run-managed"],
+        credentialDirectory: directory,
+        credentialFiles: [{ name: "OPENAI_API_KEY", path: files[0] }],
+      };
+      const spec = createSupervisorSpec({ ...base, launchEnvironment: { XDG_RUNTIME_DIR: runtimeRoot } });
+      if (removeBeforeStart) rmSync(runtimeRoot, { recursive: true, force: true });
+      const runner = fakeRunner([
+        { code: 1, stderr: "Unit is not-found" },
+        { code: 1, stderr: "Unit is not-found" },
+      ]);
+      await expect(createSupervisor("systemd-user", {
+        run: runner.run,
+        platform: "linux",
+        ...(uid === undefined ? {} : { uid }),
+      }).start(spec)).rejects.toThrow("manager command");
+    };
+    await attempt(join(root, "missing"));
+    const deleted = join(root, "deleted-runtime");
+    mkdirSync(deleted, { mode: 0o700 });
+    chmodSync(deleted, 0o700);
+    await attempt(deleted, undefined, true);
+    const untrusted = join(root, "runtime");
+    mkdirSync(untrusted, { mode: 0o755 });
+    chmodSync(untrusted, 0o755);
+    await attempt(untrusted);
+    await attempt(untrusted, -1);
   });
 
   it("refuses stale/collision starts and cleans exact terminal units through manager stop", async () => {
@@ -1112,6 +1240,11 @@ describe("launchd-user supervisor", () => {
     const document = readFileSync(plist, "utf8");
     expect(document).toContain(`<key>Label</key><string>${spec.launchdLabel}</string>`);
     expect(document).not.toContain("KeepAlive");
+    expect(document).toContain("<string>/usr/bin/env</string>");
+    expect(document).toContain("<string>-i</string>");
+    expect(document).toContain(`<string>LCM_CREDENTIAL_DIRECTORY=${credentialDirectory}</string>`);
+    expect(document).toContain(`<string>LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${files[0]}</string>`);
+    expect(document).not.toContain("secret");
     expect(lstatSync(plist).mode & 0o777).toBe(0o600);
     expect(runner.calls[1]).toMatchObject({ command: "launchctl", args: ["bootstrap", "gui/501", plist] });
 
@@ -1131,6 +1264,220 @@ describe("launchd-user supervisor", () => {
     const unsafe = makeSpec("launchd-user", spec.stateRoot, { credentialDirectory: spec.stateRoot, credentialFiles: [{ name: "OPENAI_API_KEY", path: join(spec.stateRoot, "secret") }] });
     const supervisor = createSupervisor("launchd-user", { run: vi.fn(async () => ({ code: 113, stderr: "Could not find service" })), platform: "darwin", uid: 501 });
     await expect(supervisor.start(unsafe)).rejects.toThrow("credential");
+  });
+
+  it("replaces an absent launchd plist after authenticating its prior staged credential paths", async () => {
+    const root = makeRoot();
+    const firstDirectory = createManagedCredentialDirectory(root, "launch-004");
+    const firstFiles = writeManagedCredentialFiles(firstDirectory, { OPENAI_API_KEY: "first-secret" });
+    const first = makeSpec("launchd-user", root, {
+      nonce: "nonce-replace",
+      credentialDirectory: firstDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: firstFiles[0] }],
+    });
+    const running = `state = running\npid = 543\nenvironment = {\n LCM_SUPERVISOR_MARKER => ${first.marker}\n LCM_SUPERVISOR_SCOPE => ${first.scopeDigest}\n LCM_SUPERVISOR_PORT => ${first.port}\n LCM_SUPERVISOR_NONCE => ${first.nonce}\n LCM_SUPERVISOR_EXECUTABLE => ${first.executable}\n LCM_SUPERVISOR_ARGS => ${JSON.stringify(first.args)}\n LCM_SUPERVISOR_CWD => `;
+    const initial = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: running },
+    ]);
+    await expect(createSupervisor("launchd-user", { run: initial.run, platform: "darwin", uid: 501 }).start(first)).resolves.toMatchObject({ managerPid: 543 });
+
+    const secondDirectory = createManagedCredentialDirectory(root, "launch-005");
+    const secondFiles = writeManagedCredentialFiles(secondDirectory, {
+      OPENAI_API_KEY: "second-secret",
+      LCM_POSTGRES_URL: "postgresql://second",
+    });
+    const second = makeSpec("launchd-user", root, {
+      nonce: first.nonce,
+      credentialDirectory: secondDirectory,
+      credentialFiles: secondFiles.map((path) => ({ name: path.slice(path.lastIndexOf("/") + 1), path })),
+    });
+    const firstPlist = join(root, `daemon.${first.shortDigest}.${first.nonce}.plist`);
+    const firstDocument = readFileSync(firstPlist, "utf8");
+    const credentialTampering = [
+      (document: string) => document.replace("</dict><key>RunAtLoad", "<key>OPENAI_API_KEY</key><string>secret</string></dict><key>RunAtLoad"),
+      (document: string) => document.replace("<string>LCM_SUPERVISOR_MARKER=", "<string>LCM_SUPERVISOR_RUNTIME_DIGEST=unexpected</string><string>LCM_SUPERVISOR_MARKER="),
+      (document: string) => document.replace(`<string>LCM_CREDENTIAL_DIRECTORY=${firstDirectory}</string>`, ""),
+      (document: string) => document.replace(`<string>LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${firstFiles[0]}</string>`, "<string>LCM_CREDENTIAL_OPENAI_API_KEY_FILE=/tmp/outside</string>"),
+      (document: string) => document.replace(`<key>LCM_CREDENTIAL_OPENAI_API_KEY_FILE</key><string>${firstFiles[0]}</string>`, "<key>LCM_CREDENTIAL_OPENAI_API_KEY_FILE</key><string>/tmp/other</string>"),
+      (document: string) => document.replace(`<key>LCM_CREDENTIAL_DIRECTORY</key><string>${firstDirectory}</string>`, "<key>LCM_CREDENTIAL_DIRECTORY</key><string>/tmp/other</string>"),
+      (document: string) => document.replace("<key>LCM_SYSTEMD_CRED_IDS</key><string>OPENAI_API_KEY</string>", "<key>LCM_SYSTEMD_CRED_IDS</key><string>BAD</string>"),
+    ];
+    for (const tamper of credentialTampering) {
+      const tampered = tamper(firstDocument);
+      expect(tampered).not.toBe(firstDocument);
+      writeFileSync(firstPlist, tampered, { mode: 0o600 });
+      chmodSync(firstPlist, 0o600);
+      const collision = fakeRunner([{ code: 113, stderr: "Could not find service" }, { code: 113, stderr: "Could not find service" }]);
+      await expect(createSupervisor("launchd-user", { run: collision.run, platform: "darwin", uid: 501 }).start(second)).rejects.toThrow("manager command");
+      expect(readFileSync(firstPlist, "utf8")).toBe(tampered);
+      writeFileSync(firstPlist, firstDocument, { mode: 0o600 });
+      chmodSync(firstPlist, 0o600);
+    }
+    const emptyCredentialDirectory = createManagedCredentialDirectory(root, "empty-replacement");
+    const noCredentials = makeSpec("launchd-user", root, {
+      nonce: first.nonce,
+      credentialDirectory: emptyCredentialDirectory,
+      credentialFiles: [],
+    });
+    const noCredentialRepair = fakeRunner([{ code: 113, stderr: "Could not find service" }, { code: 0, stdout: "bootstrap" }, { code: 0, stdout: running }]);
+    await expect(createSupervisor("launchd-user", { run: noCredentialRepair.run, platform: "darwin", uid: 501 }).start(noCredentials)).resolves.toMatchObject({ managerPid: 543 });
+    const replacement = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: running },
+    ]);
+    await expect(createSupervisor("launchd-user", { run: replacement.run, platform: "darwin", uid: 501 }).start(second)).resolves.toMatchObject({ managerPid: 543 });
+    expect(existsSync(firstDirectory)).toBe(false);
+    const plist = join(root, `daemon.${second.shortDigest}.${second.nonce}.plist`);
+    expect(readFileSync(plist, "utf8")).toContain(`<string>LCM_CREDENTIAL_DIRECTORY=${secondDirectory}</string>`);
+
+    const thirdDirectory = createManagedCredentialDirectory(root, "launch-006");
+    const thirdFiles = writeManagedCredentialFiles(thirdDirectory, { OPENAI_API_KEY: "third-secret" });
+    const third = makeSpec("launchd-user", root, {
+      nonce: first.nonce,
+      credentialDirectory: thirdDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: thirdFiles[0]! }],
+    });
+    const shrink = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: running },
+    ]);
+    await expect(createSupervisor("launchd-user", { run: shrink.run, platform: "darwin", uid: 501 }).start(third)).resolves.toMatchObject({ managerPid: 543 });
+    expect(existsSync(secondDirectory)).toBe(false);
+    const cleanup = fakeRunner([{ code: 113, stderr: "Could not find service" }]);
+    await expect(createSupervisor("launchd-user", { run: cleanup.run, platform: "darwin", uid: 501 }).stopAndAwaitAbsent(third)).resolves.toBeUndefined();
+    expect(existsSync(thirdDirectory)).toBe(false);
+
+    const plain = makeSpec("launchd-user", root, { nonce: "plain-replace" });
+    const plainRunning = `state = running\npid = 543\nenvironment = {\n LCM_SUPERVISOR_MARKER => ${plain.marker}\n LCM_SUPERVISOR_SCOPE => ${plain.scopeDigest}\n LCM_SUPERVISOR_PORT => ${plain.port}\n LCM_SUPERVISOR_NONCE => ${plain.nonce}\n LCM_SUPERVISOR_EXECUTABLE => ${plain.executable}\n LCM_SUPERVISOR_ARGS => ${JSON.stringify(plain.args)}\n LCM_SUPERVISOR_CWD => `;
+    const plainStart = fakeRunner([{ code: 113, stderr: "Could not find service" }, { code: 0, stdout: "bootstrap" }, { code: 0, stdout: plainRunning }]);
+    await expect(createSupervisor("launchd-user", { run: plainStart.run, platform: "darwin", uid: 501 }).start(plain)).resolves.toMatchObject({ managerPid: 543 });
+    const plainDirectory = createManagedCredentialDirectory(root, "plain-replacement");
+    const plainFile = writeManagedCredentialFiles(plainDirectory, { OPENAI_API_KEY: "plain-secret" })[0]!;
+    const plainReplacement = makeSpec("launchd-user", root, {
+      nonce: plain.nonce,
+      credentialDirectory: plainDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: plainFile }],
+    });
+    const plainRepair = fakeRunner([{ code: 113, stderr: "Could not find service" }, { code: 0, stdout: "bootstrap" }, { code: 0, stdout: plainRunning }]);
+    await expect(createSupervisor("launchd-user", { run: plainRepair.run, platform: "darwin", uid: 501 }).start(plainReplacement)).resolves.toMatchObject({ managerPid: 543 });
+    expect(readFileSync(join(root, `daemon.${plain.shortDigest}.${plain.nonce}.plist`), "utf8")).toContain(`<string>LCM_CREDENTIAL_DIRECTORY=${plainDirectory}</string>`);
+  });
+
+  it("refuses tampered launchd plist structure and bounded-environment assignments", async () => {
+    const root = makeRoot();
+    const spec = makeSpec("launchd-user", root, {
+      cwd: "/tmp",
+      entrypoint: "entry",
+      runtimeDigest: VALID_RUNTIME_DIGEST,
+      storageBackend: "sqlite",
+    });
+    const running = `state = running\npid = 543\nenvironment = {\n LCM_SUPERVISOR_MARKER => ${spec.marker}\n LCM_SUPERVISOR_SCOPE => ${spec.scopeDigest}\n LCM_SUPERVISOR_PORT => ${spec.port}\n LCM_SUPERVISOR_NONCE => ${spec.nonce}\n LCM_SUPERVISOR_EXECUTABLE => ${spec.executable}\n LCM_SUPERVISOR_ARGS => ${JSON.stringify(spec.args)}\n LCM_SUPERVISOR_CWD => ${spec.cwd}\n LCM_SUPERVISOR_ENTRYPOINT => ${spec.entrypoint}\n LCM_SUPERVISOR_RUNTIME_DIGEST => ${spec.runtimeDigest}\n LCM_SUPERVISOR_STORAGE_BACKEND => ${spec.storageBackend}`;
+    const initial = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: running },
+    ]);
+    await expect(createSupervisor("launchd-user", { run: initial.run, platform: "darwin", uid: 501 }).start(spec)).resolves.toMatchObject({ managerPid: 543 });
+    const plist = join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
+    const original = readFileSync(plist, "utf8");
+    for (const tamper of [
+      (document: string) => document.replace("</dict></plist>\n", "<key>OPENAI_API_KEY</key><string>secret</string></dict></plist>\n"),
+      (document: string) => document.replace(/<string>HOME=[^<]*<\/string>/u, `<string>HOME=${"x".repeat(4_097)}</string>`),
+      (document: string) => document.replace("<string>daemon</string>", "<string>tampered</string>"),
+      (document: string) => document.replace("<string>/usr/bin/node</string>", "<string>/usr/bin/other</string>"),
+      (document: string) => document.replace(/<key>Label<\/key><string>[^<]*<\/string>/u, "<key>Label</key><string>foreign.label</string>"),
+      (document: string) => document.replace("<key>LCM_SUPERVISOR_ENTRYPOINT</key><string>entry</string>", "<key>LCM_SUPERVISOR_ENTRYPOINT</key><string>other</string>"),
+      (document: string) => document.replace("<key>LCM_SUPERVISOR_RUNTIME_DIGEST</key><string>" + VALID_RUNTIME_DIGEST + "</string>", "<key>LCM_SUPERVISOR_RUNTIME_DIGEST</key><string>unexpected</string>"),
+      (document: string) => document.replace("<key>LCM_SUPERVISOR_CWD</key><string>/tmp</string>", "<key>LCM_SUPERVISOR_CWD</key><true/>"),
+      (document: string) => document.replace("<key>LCM_SUPERVISOR_CWD</key><string>/tmp</string>", "<key>LCM_SUPERVISOR_CWD</key><string>/tmp</string><key>LCM_SUPERVISOR_CWD</key><string>/tmp</string>"),
+      (document: string) => document.replace("<key>WorkingDirectory</key><string>/tmp</string>", "<key>WorkingDirectory</key><string>/other</string>"),
+      (document: string) => document.replace("</dict></plist>\n", "<key>WorkingDirectory</key><string>/tmp</string></dict></plist>\n"),
+      (document: string) => document.replace("<string>/usr/bin/node</string>", "<true/>"),
+      (document: string) => document.replace(/<key>ProgramArguments<\/key><array>.*?<\/array>/su, "<key>ProgramArguments</key><array></array>"),
+      (document: string) => document.replace("<key>RunAtLoad</key><true/>", "<key>RunAtLoad</key><false/>"),
+      (document: string) => document.replace("</dict></plist>\n", "<key>WorkingDirectory</key><true/></dict></plist>\n"),
+      (document: string) => document.replace(/<string>HOME=[^<]*<\/string>/u, "<string>invalid-assignment</string>"),
+      (document: string) => document.replace(/<string>HOME=[^<]*<\/string>/u, "<string>1BAD=foo</string>"),
+      (document: string) => document.replace("<string>HOME=", "<string>UNKNOWN=foo</string><string>HOME="),
+      (document: string) => document.replace(/<string>PATH=[^<]*<\/string>/u, ""),
+      (document: string) => document.replace(/<string>HOME=[^<]*<\/string>/u, (value) => `${value}<string>${value.slice(8)}</string>`),
+    ]) {
+      const tampered = tamper(original);
+      writeFileSync(plist, tampered, { mode: 0o600 });
+      chmodSync(plist, 0o600);
+      const collision = fakeRunner([
+        { code: 113, stderr: "Could not find service" },
+        { code: 113, stderr: "Could not find service" },
+      ]);
+      await expect(createSupervisor("launchd-user", { run: collision.run, platform: "darwin", uid: 501 }).start(spec)).rejects.toThrow("manager command");
+      expect(readFileSync(plist, "utf8")).toBe(tampered);
+      writeFileSync(plist, original, { mode: 0o600 });
+      chmodSync(plist, 0o600);
+    }
+  });
+
+  it("cleans an absent launchd descriptor after bounded environment drift but never executes it while running", async () => {
+    const root = makeRoot();
+    const firstEnvironment = { HOME: "/home/managed", PATH: "/usr/bin" };
+    const replacementEnvironment = { HOME: "/home/other", PATH: "/usr/bin" };
+    const spec = makeSpec("launchd-user", root);
+    const running = `state = running\npid = 543\nenvironment = {\n LCM_SUPERVISOR_MARKER => ${spec.marker}\n LCM_SUPERVISOR_SCOPE => ${spec.scopeDigest}\n LCM_SUPERVISOR_PORT => ${spec.port}\n LCM_SUPERVISOR_NONCE => ${spec.nonce}\n LCM_SUPERVISOR_EXECUTABLE => ${spec.executable}\n LCM_SUPERVISOR_ARGS => ${JSON.stringify(spec.args)}\n LCM_SUPERVISOR_CWD => `;
+    const initial = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: running },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: initial.run,
+      environment: firstEnvironment,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 543 });
+    const plist = join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
+    expect(readFileSync(plist, "utf8")).toContain(`<string>HOME=${firstEnvironment.HOME}</string>`);
+    const drifted = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: running },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: drifted.run,
+      environment: replacementEnvironment,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 543 });
+    expect(readFileSync(plist, "utf8")).toContain(`<string>HOME=${replacementEnvironment.HOME}</string>`);
+    expect(drifted.calls.some((call) => call.command === "launchctl" && call.args[0] === "bootstrap")).toBe(true);
+
+    const runningRoot = makeRoot();
+    const runningSpec = makeSpec("launchd-user", runningRoot);
+    const runningOutput = `state = running\npid = 777\nenvironment = {\n LCM_SUPERVISOR_MARKER => ${runningSpec.marker}\n LCM_SUPERVISOR_SCOPE => ${runningSpec.scopeDigest}\n LCM_SUPERVISOR_PORT => ${runningSpec.port}\n LCM_SUPERVISOR_NONCE => ${runningSpec.nonce}\n LCM_SUPERVISOR_EXECUTABLE => ${runningSpec.executable}\n LCM_SUPERVISOR_ARGS => ${JSON.stringify(runningSpec.args)}\n LCM_SUPERVISOR_CWD => `;
+    const runningInitial = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: runningOutput },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runningInitial.run,
+      environment: firstEnvironment,
+      platform: "darwin",
+      uid: 501,
+    }).start(runningSpec)).resolves.toMatchObject({ managerPid: 777 });
+    const runningPlist = join(runningRoot, `daemon.${runningSpec.shortDigest}.${runningSpec.nonce}.plist`);
+    const runningDocument = readFileSync(runningPlist, "utf8");
+    const runningWinner = fakeRunner([{ code: 0, stdout: runningOutput }]);
+    await expect(createSupervisor("launchd-user", {
+      run: runningWinner.run,
+      environment: replacementEnvironment,
+      platform: "darwin",
+      uid: 501,
+    }).start(runningSpec)).resolves.toMatchObject({ managerPid: 777 });
+    expect(runningWinner.calls).toHaveLength(1);
+    expect(readFileSync(runningPlist, "utf8")).toBe(runningDocument);
   });
 
   it("covers launchd terminal, collision, timeout, UID, and exact cleanup/refusal paths", async () => {

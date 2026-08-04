@@ -188,6 +188,24 @@ describe("Epic 400 configuration credential-loader coverage", () => {
         LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file,
       };
       expect(resolveDaemonConfigEnv(env).OPENAI_API_KEY).toBe("launchd-fallback");
+      expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory })).toEqual({ LCM_CREDENTIAL_DIRECTORY: directory });
+
+      const runtimeRoot = join(root, "runtime");
+      const systemdDirectory = join(runtimeRoot, "credentials", "fallback.service");
+      const systemdFile = join(systemdDirectory, "OPENAI_API_KEY");
+      mkdirSync(runtimeRoot, { mode: 0o700 });
+      mkdirSync(join(runtimeRoot, "credentials"), { mode: 0o755 });
+      mkdirSync(systemdDirectory, { mode: 0o700 });
+      chmodSync(runtimeRoot, 0o700);
+      writeFileSync(systemdFile, "systemd-fallback\n", { mode: 0o400 });
+      chmodSync(systemdFile, 0o400);
+      chmodSync(systemdDirectory, 0o500);
+      expect(resolveDaemonConfigEnv({
+        CREDENTIALS_DIRECTORY: systemdDirectory,
+        LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
+        XDG_RUNTIME_DIR: runtimeRoot,
+      }).OPENAI_API_KEY).toBe("systemd-fallback");
+      chmodSync(systemdDirectory, 0o700);
 
       symlinkSync(directory, link, "dir");
       expect(resolveDaemonConfigEnv({
@@ -202,6 +220,37 @@ describe("Epic 400 configuration credential-loader coverage", () => {
       );
       expect(resolveDaemonConfigEnv(env).OPENAI_API_KEY).toBeUndefined();
     } finally {
+      removeRoot(root);
+    }
+  });
+
+  it("fails closed when a custom systemd runtime root disappears during validation", () => {
+    const root = makeRoot();
+    const runtimeRoot = join(root, "runtime");
+    const directory = join(runtimeRoot, "credentials", "race.service");
+    const file = join(directory, "OPENAI_API_KEY");
+    mkdirSync(runtimeRoot, { mode: 0o700 });
+    mkdirSync(join(runtimeRoot, "credentials"), { mode: 0o755 });
+    mkdirSync(directory, { mode: 0o700 });
+    chmodSync(runtimeRoot, 0o700);
+    writeFileSync(file, "race-value\n", { mode: 0o400 });
+    chmodSync(file, 0o400);
+    chmodSync(directory, 0o500);
+    try {
+      let runtimeLstatCalls = 0;
+      const original = fsMocks.originals!;
+      fsMocks.lstatSync.mockImplementation((path: string, ...args: any[]) => {
+        if (path === runtimeRoot && ++runtimeLstatCalls >= 2) throw errorWithCode("EACCES");
+        return Reflect.apply(original.lstatSync as (...values: any[]) => any, original, [path, ...args]);
+      });
+      expect(resolveDaemonConfigEnv({
+        CREDENTIALS_DIRECTORY: directory,
+        LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
+        XDG_RUNTIME_DIR: runtimeRoot,
+        OPENAI_API_KEY: "ambient-value",
+      }).OPENAI_API_KEY).toBe("ambient-value");
+    } finally {
+      chmodSync(directory, 0o700);
       removeRoot(root);
     }
   });

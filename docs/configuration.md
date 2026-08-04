@@ -392,16 +392,42 @@ propagated as a normal environment value. `lcm config get storage --effective`
 shows the CA path and tuning values but replaces the URL with `[REDACTED]`.
 
 The daemon only accepts credentials that systemd exposed through a canonical
-per-unit directory under `/run/credentials/` or the current user's
-`/run/user/<uid>/credentials/` tree. The directory must use systemd's
-read-only `0500` mode (the user-manager directory is owned by the current
-UID), and each requested credential must be an allow-listed regular file with
+per-unit directory under `/run/credentials/`, the current user's
+`/run/user/<uid>/credentials/` tree, or a validated `XDG_RUNTIME_DIR` with the
+same `<runtime>/credentials/<unit>` shape. The runtime directory must be a
+canonical, non-symlink `0700` directory owned by the current UID. The
+credential directory must use systemd's read-only `0500` mode (the
+user-manager directory is owned by the current UID), and each requested credential must be an allow-listed regular file with
 systemd's read-only `0400` mode, one hard link, and no more than 1 MiB of
 content. Credential IDs are bounded, must not be duplicated, and are rejected
 as a set when any ID is unknown or malformed. Invalid, missing, replaced, or
 oversized credentials are ignored without logging their path or contents; the
 usual configuration validation then reports any required value that remains
 unavailable.
+
+Managed background starts cross one additional environment boundary. The
+systemd or launchd manager may have inherited arbitrary variables from the
+interactive session, but the daemon is launched through the trusted
+`/usr/bin/env -i` executable with a bounded set of non-secret runtime values
+(such as `HOME`, `PATH`, locale, timezone, and validated runtime socket
+addresses). Service identity metadata and credential-file markers are passed as
+names and paths only. API keys and database URLs are never copied into argv,
+unit properties, plist contents, or logs; the daemon reads them from the
+private one-launch credential files after the manager has authenticated their
+directory and per-file ownership, mode, and link metadata. A staged managed credential therefore takes precedence over a
+same-name ambient variable. Detached compatibility launches retain their
+historical direct-environment behavior. The `env -i` process is a short-lived
+same-user launch boundary; it does not grant a different privilege or user
+identity, and the service manager remains the lifecycle authority. A running or
+otherwise executable managed launch must authenticate the current filtered
+environment exactly. If a PATH, HOME, locale, socket address, or other
+allow-listed value changes while an old launch descriptor remains, LCM never
+executes that old descriptor. After the manager has independently proved exact
+absence, LCM may authenticate the old descriptor's bounded, non-secret
+allow-listed values solely to remove its canonical plist and owned credential
+directory before writing a new descriptor with the current values. Malformed,
+out-of-scope, or uncontrolled descriptors still fail closed and remain as
+collision evidence.
 
 PostgreSQL is remote-primary: once repository support is enabled, an outage is
 reported rather than silently switching the authoritative store to SQLite.
