@@ -36,10 +36,17 @@ vi.mock("node:fs", async (importOriginal) => {
     const race = fsFaults.plistRace;
     if (race === undefined || race.done || race.path !== path) return;
     race.done = true;
-    actual.rmSync(path, { force: true });
-    if (race.removeOnly === true) return;
-    actual.writeFileSync(path, race.replacement, { mode: 0o600 });
-    actual.chmodSync(path, 0o600);
+    if (race.removeOnly === true) {
+      actual.rmSync(path, { force: true });
+      return;
+    }
+    // Create the replacement while the original inode is still occupied, then
+    // atomically publish it over the pathname.  This guarantees a distinct
+    // inode even on filesystems that immediately reuse an unlinked inode.
+    const replacementPath = `${path}.replacement`;
+    actual.writeFileSync(replacementPath, race.replacement, { flag: "wx", mode: 0o600 });
+    actual.chmodSync(replacementPath, 0o600);
+    actual.renameSync(replacementPath, path);
   };
   fsFaults.replacePlistLeaf = replacePlistLeaf;
   return {
