@@ -223,6 +223,11 @@ export interface SupervisorDependencies {
   readonly stopTimeoutMs?: number;
   readonly sleep?: (milliseconds: number) => Promise<void> | void;
   readonly now?: () => number;
+  /** @internal Deterministic launchd plist race seam for coverage tests. */
+  readonly _plistRaceForTesting?: (
+    path: string,
+    phase: "before-open" | "after-read" | "before-unlink",
+  ) => void;
 }
 
 /** Public supervisor operations. */
@@ -1272,22 +1277,38 @@ function plistDocument(
 }
 
 type PrivatePlistRead = ReturnType<typeof readBoundedRegularFileWithStat>;
+type PlistRacePhase = "before-open" | "after-read" | "before-unlink";
+type PlistRaceFault = (path: string, phase: PlistRacePhase) => void;
 
-function readPrivatePlist(path: string, spec: SupervisorSpec, expectedUid?: number): PrivatePlistRead {
-  return readBoundedRegularFileWithStat(path, {
+function readPrivatePlist(
+  path: string,
+  spec: SupervisorSpec,
+  expectedUid?: number,
+  plistRaceFault?: PlistRaceFault,
+): PrivatePlistRead {
+  const descriptor = readBoundedRegularFileWithStat(path, {
     allowedRoot: spec.stateRoot,
     maxBytes: MAX_PLIST_BYTES,
     expectedUid,
     allowedModes: [0o600],
     requireSingleLink: true,
+    _beforeOpenForTesting: plistRaceFault === undefined
+      ? undefined
+      : () => plistRaceFault(path, "before-open"),
+    _beforePostStatForTesting: plistRaceFault === undefined
+      ? undefined
+      : () => plistRaceFault(path, "after-read"),
   });
+  return descriptor;
 }
 
 function assertPrivatePlistLeafIdentity(
   path: string,
   descriptor: PrivatePlistRead,
   expectedUid?: number,
+  plistRaceFault?: PlistRaceFault,
 ): void {
+  plistRaceFault?.(path, "before-unlink");
   const stats = lstatSync(path);
   if (
     stats.isSymbolicLink()
@@ -1301,12 +1322,16 @@ function assertPrivatePlistLeafIdentity(
   ) throw new Error("supervisor plist collision");
 }
 
-function writePrivatePlist(spec: SupervisorSpec, environment: Readonly<Record<string, string>>): string {
+function writePrivatePlist(
+  spec: SupervisorSpec,
+  environment: Readonly<Record<string, string>>,
+  plistRaceFault?: PlistRaceFault,
+): string {
   const path = plistPath(spec);
   if (existsSync(path)) {
     let descriptor: PrivatePlistRead;
     try {
-      descriptor = readPrivatePlist(path, spec);
+      descriptor = readPrivatePlist(path, spec, undefined, plistRaceFault);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw error;
       if ((error as NodeJS.ErrnoException).code !== undefined && (error as NodeJS.ErrnoException).code !== "ELOOP") {
@@ -1318,7 +1343,7 @@ function writePrivatePlist(spec: SupervisorSpec, environment: Readonly<Record<st
     if (existing === plistDocument(spec, environment)) {
       // The descriptor-bound read cannot make a future pathname consumer
       // atomic. Recheck the leaf before handing the exact plist to launchctl.
-      assertPrivatePlistLeafIdentity(path, descriptor);
+      assertPrivatePlistLeafIdentity(path, descriptor, undefined, plistRaceFault);
       return path;
     }
     // First authenticate the exact current descriptor.  A non-identical but
@@ -1337,7 +1362,7 @@ function writePrivatePlist(spec: SupervisorSpec, environment: Readonly<Record<st
       }
     }
     try {
-      assertPrivatePlistLeafIdentity(path, descriptor);
+      assertPrivatePlistLeafIdentity(path, descriptor, undefined, plistRaceFault);
       unlinkSync(path);
     } catch {
       throw new Error("supervisor plist collision");
@@ -1374,13 +1399,17 @@ function writePrivatePlist(spec: SupervisorSpec, environment: Readonly<Record<st
   return path;
 }
 
-function cleanupPrivatePlist(spec: SupervisorSpec, environment: Readonly<Record<string, string>>): void {
+function cleanupPrivatePlist(
+  spec: SupervisorSpec,
+  environment: Readonly<Record<string, string>>,
+  plistRaceFault?: PlistRaceFault,
+): void {
   const path = plistPath(spec);
   try {
     const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
     let descriptor: PrivatePlistRead;
     try {
-      descriptor = readPrivatePlist(path, spec, uid);
+      descriptor = readPrivatePlist(path, spec, uid, plistRaceFault);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
       if ((error as NodeJS.ErrnoException).code !== undefined && (error as NodeJS.ErrnoException).code !== "ELOOP") {
@@ -1396,7 +1425,7 @@ function cleanupPrivatePlist(spec: SupervisorSpec, environment: Readonly<Record<
     if (previous !== undefined && previous !== spec.credentialDirectory) {
       cleanupManagedCredentialDirectory(previous, spec.stateRoot);
     }
-    assertPrivatePlistLeafIdentity(path, descriptor, uid);
+    assertPrivatePlistLeafIdentity(path, descriptor, uid, plistRaceFault);
     unlinkSync(path);
   } catch (error) {
     // Idempotent cleanup: an absent plist is already clean. Any present but
@@ -1820,7 +1849,7 @@ export function createSupervisor(
     }
     let launchPath: string | undefined;
     try {
-      if (kind === "launchd-user") launchPath = writePrivatePlist(spec, runner.environment);
+      if (kind === "launchd-user") launchPath = writePrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
       const args = kind === "systemd-user"
         ? systemdStartArgs(spec, runner.uid, runner.environment)
         : ["bootstrap", launchdDomain(runner.uid), launchPath!];
@@ -1868,7 +1897,7 @@ export function createSupervisor(
       try {
         const after = await probe(spec);
         if (after.kind === "absent") {
-          if (kind === "launchd-user") cleanupPrivatePlist(spec, runner.environment);
+          if (kind === "launchd-user") cleanupPrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
           safeCredentialCleanup(spec);
         } else if (
           after.kind === "registered-not-running-valid"
@@ -1916,8 +1945,8 @@ export function createSupervisor(
     }
     if (current.kind === "absent") {
       if (kind === "launchd-user") {
-        if (stalePlistSpec !== undefined) cleanupPrivatePlist(stalePlistSpec, runner.environment);
-        else cleanupPrivatePlist(spec, runner.environment);
+        if (stalePlistSpec !== undefined) cleanupPrivatePlist(stalePlistSpec, runner.environment, dependencies._plistRaceForTesting);
+        else cleanupPrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
       }
       safeObservedCredentialCleanup(staleSource ?? current, spec);
       if (cleanupCredentials) safeCredentialCleanup(spec);
@@ -1973,8 +2002,8 @@ export function createSupervisor(
           throw commandFailedError();
         }
         if (kind === "launchd-user") {
-          if (stalePlistSpec !== undefined) cleanupPrivatePlist(stalePlistSpec, runner.environment);
-          else cleanupPrivatePlist(spec, runner.environment);
+          if (stalePlistSpec !== undefined) cleanupPrivatePlist(stalePlistSpec, runner.environment, dependencies._plistRaceForTesting);
+          else cleanupPrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
         }
         safeObservedCredentialCleanup(staleSource ?? current, spec);
         if (cleanupCredentials) safeCredentialCleanup(spec);

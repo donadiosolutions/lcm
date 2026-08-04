@@ -21,13 +21,12 @@ const fsFaults = vi.hoisted(() => ({
   existsRacePath: undefined as string | undefined,
   lstatPath: undefined as string | undefined,
   lstatHits: 0,
+  replacePlistLeaf: undefined as ((path: string) => void) | undefined,
   plistRace: undefined as {
     path: string;
     phase: "before-open" | "after-read" | "before-unlink";
     replacement: string;
     removeOnly?: boolean;
-    lstatHits: number;
-    readFd?: number;
     done: boolean;
   } | undefined,
 }));
@@ -42,6 +41,7 @@ vi.mock("node:fs", async (importOriginal) => {
     actual.writeFileSync(path, race.replacement, { mode: 0o600 });
     actual.chmodSync(path, 0o600);
   };
+  fsFaults.replacePlistLeaf = replacePlistLeaf;
   return {
     ...actual,
     existsSync: (...args: Parameters<typeof actual.existsSync>) => {
@@ -62,10 +62,7 @@ vi.mock("node:fs", async (importOriginal) => {
         if (fsFaults.openCode !== undefined) error.code = fsFaults.openCode;
         throw error;
       }
-      const fd = actual.openSync(...args);
-      const race = fsFaults.plistRace;
-      if (race !== undefined && race.phase === "after-read" && String(args[0]) === race.path) race.readFd = fd;
-      return fd;
+      return actual.openSync(...args);
     },
     closeSync: (...args: Parameters<typeof actual.closeSync>) => {
       if (fsFaults.close) throw new Error("close unavailable");
@@ -73,17 +70,7 @@ vi.mock("node:fs", async (importOriginal) => {
     },
     lstatSync: (...args: Parameters<typeof actual.lstatSync>) => {
       const path = String(args[0]);
-      const race = fsFaults.plistRace;
-      if (race !== undefined && race.path === path) {
-        race.lstatHits += 1;
-        if (race.phase === "before-unlink" && race.lstatHits === 2) replacePlistLeaf(path);
-      }
       const stats = actual.lstatSync(...args);
-      if (race !== undefined && race.path === path && race.phase === "before-open" && race.lstatHits === 1) {
-        // Keep the descriptor-bound helper's initial identity, then replace
-        // the pathname before its O_NOFOLLOW open(2).
-        replacePlistLeaf(path);
-      }
       if (fsFaults.lstatPath !== undefined && path === fsFaults.lstatPath && ++fsFaults.lstatHits >= 3) {
         const adjusted = Object.create(Object.getPrototypeOf(stats)) as typeof stats;
         Object.assign(adjusted, stats, { mode: 0o644 });
@@ -92,14 +79,6 @@ vi.mock("node:fs", async (importOriginal) => {
         return adjusted;
       }
       return stats;
-    },
-    readSync: (...args: Parameters<typeof actual.readSync>) => {
-      const bytesRead = actual.readSync(...args);
-      const race = fsFaults.plistRace;
-      if (race !== undefined && race.phase === "after-read" && race.readFd === args[0] && bytesRead > 0) {
-        replacePlistLeaf(race.path);
-      }
-      return bytesRead;
     },
     unlinkSync: (...args: Parameters<typeof actual.unlinkSync>) => {
       if (fsFaults.unlink) throw new Error("unlink unavailable");
@@ -151,6 +130,20 @@ function spec(kind: SupervisorKind, stateRoot = root(), overrides: Partial<Super
     args: ["daemon", "run-managed"],
     ...overrides,
   });
+}
+
+type PlistRacePhase = "before-open" | "after-read" | "before-unlink";
+
+function plistRaceDependencies(): {
+  readonly _plistRaceForTesting: (path: string, phase: PlistRacePhase) => void;
+} {
+  return {
+    _plistRaceForTesting: (path, phase) => {
+      const race = fsFaults.plistRace;
+      if (race === undefined || race.done || race.path !== path || race.phase !== phase) return;
+      fsFaults.replacePlistLeaf?.(path);
+    },
+  };
 }
 
 function runQueue(results: readonly CommandResult[]): {
@@ -637,7 +630,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
         uid: 501,
       }).start(value)).resolves.toMatchObject({ managerPid: 88 });
       const plist = join(stateRoot, `daemon.${value.shortDigest}.${value.nonce}.plist`);
-      fsFaults.plistRace = { path: plist, phase, replacement: "foreign-replacement", lstatHits: 0, done: false };
+      fsFaults.plistRace = { path: plist, phase, replacement: "foreign-replacement", done: false };
       try {
         const repair = runQueue([absent, { code: 0, stdout: "bootstrapped" }, { code: 0, stdout: launchdText(value, "running", 89) }]);
         await expect(createSupervisor("launchd-user", {
@@ -645,6 +638,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
           environment: { HOME: "/home/new", PATH: "/usr/bin" },
           platform: "darwin",
           uid: 501,
+          ...plistRaceDependencies(),
         }).start(value)).rejects.toThrow("manager command");
         expect(readFileSync(plist, "utf8")).toBe("foreign-replacement");
         expect(fsFaults.plistRace.done).toBe(true);
@@ -667,7 +661,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
       uid: 501,
     }).start(value)).resolves.toMatchObject({ managerPid: 88 });
     const plist = join(stateRoot, `daemon.${value.shortDigest}.${value.nonce}.plist`);
-    fsFaults.plistRace = { path: plist, phase: "before-unlink", replacement: "foreign-exact-evidence", lstatHits: 0, done: false };
+    fsFaults.plistRace = { path: plist, phase: "before-unlink", replacement: "foreign-exact-evidence", done: false };
     try {
       const rerun = runQueue([absent, absent]);
       await expect(createSupervisor("launchd-user", {
@@ -675,6 +669,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
         environment,
         platform: "darwin",
         uid: 501,
+        ...plistRaceDependencies(),
       }).start(value)).rejects.toThrow("manager command");
       expect(readFileSync(plist, "utf8")).toBe("foreign-exact-evidence");
       expect(rerun.calls.some((call) => call.command === "launchctl" && call.args[0] === "bootstrap")).toBe(false);
@@ -692,10 +687,15 @@ describe("supervisor coverage: credentials and private launch files", () => {
       const initial = runQueue([absent, { code: 0, stdout: "bootstrapped" }, { code: 0, stdout: launchdText(value, "running", 88) }]);
       await expect(createSupervisor("launchd-user", { run: initial.run, platform: "darwin", uid: 501 }).start(value)).resolves.toMatchObject({ managerPid: 88 });
       const plist = join(stateRoot, `daemon.${value.shortDigest}.${value.nonce}.plist`);
-      fsFaults.plistRace = { path: plist, phase, replacement: "foreign-cleanup-evidence", lstatHits: 0, done: false };
+      fsFaults.plistRace = { path: plist, phase, replacement: "foreign-cleanup-evidence", done: false };
       try {
         const cleanup = runQueue([absent]);
-        await expect(createSupervisor("launchd-user", { run: cleanup.run, platform: "darwin", uid: 501 }).stopAndAwaitAbsent(value)).rejects.toThrow("plist collision");
+        await expect(createSupervisor("launchd-user", {
+          run: cleanup.run,
+          platform: "darwin",
+          uid: 501,
+          ...plistRaceDependencies(),
+        }).stopAndAwaitAbsent(value)).rejects.toThrow("plist collision");
         expect(readFileSync(plist, "utf8")).toBe("foreign-cleanup-evidence");
         expect(fsFaults.plistRace.done).toBe(true);
       } finally {
@@ -711,10 +711,15 @@ describe("supervisor coverage: credentials and private launch files", () => {
     const initial = runQueue([absent, { code: 0, stdout: "bootstrapped" }, { code: 0, stdout: launchdText(value, "running", 88) }]);
     await expect(createSupervisor("launchd-user", { run: initial.run, platform: "darwin", uid: 501 }).start(value)).resolves.toMatchObject({ managerPid: 88 });
     const plist = join(stateRoot, `daemon.${value.shortDigest}.${value.nonce}.plist`);
-    fsFaults.plistRace = { path: plist, phase: "before-unlink", replacement: "", removeOnly: true, lstatHits: 0, done: false };
+    fsFaults.plistRace = { path: plist, phase: "before-unlink", replacement: "", removeOnly: true, done: false };
     try {
       const cleanup = runQueue([absent]);
-      await expect(createSupervisor("launchd-user", { run: cleanup.run, platform: "darwin", uid: 501 }).stopAndAwaitAbsent(value)).resolves.toBeUndefined();
+      await expect(createSupervisor("launchd-user", {
+        run: cleanup.run,
+        platform: "darwin",
+        uid: 501,
+        ...plistRaceDependencies(),
+      }).stopAndAwaitAbsent(value)).resolves.toBeUndefined();
       expect(existsSync(plist)).toBe(false);
       expect(fsFaults.plistRace.done).toBe(true);
     } finally {
