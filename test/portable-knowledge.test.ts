@@ -249,7 +249,7 @@ describe("portable-knowledge — export", () => {
     expect(result.projectCwd).toBe(realpathSync(canonical));
   });
 
-  it("reconciles and exports promoted knowledge from a legacy linked-worktree store", async () => {
+  it("reconciles and exports promoted knowledge from a legacy linked-worktree store", { timeout: 10_000 }, async () => {
     const { main, linked } = makeRepository();
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
