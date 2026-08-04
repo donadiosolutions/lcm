@@ -44,6 +44,7 @@ import {
 import { ensureAuthToken } from "../../src/daemon/auth.js";
 import { createDaemon } from "../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
+import { MANAGED_CREDENTIAL_NAMES } from "../../src/daemon/managed-credentials.js";
 import { RUNTIME_DIGEST } from "../../src/daemon/version.js";
 
 type ScopeFixture = {
@@ -938,8 +939,9 @@ describe("daemon lifecycle test-scope validation", () => {
     await expect(ensureDaemon(options)).resolves.toMatchObject({
       connected: false,
       spawned: false,
+      refusalReason: "ambiguous",
     });
-    expect(existsSync(fixture.pidPath)).toBe(false);
+    expect(existsSync(fixture.pidPath)).toBe(true);
   });
 
   it("blocks an unscoped Vitest worker before host discovery or mutation", async () => {
@@ -1262,6 +1264,9 @@ describe("daemon lifecycle test-scope validation", () => {
           ? { ok: true, status: 200, json: async () => restartHealth }
           : { ok: true, status: 200, json: async () => ({}) }
       ));
+      const processIdentity = vi.fn((command: string) => command === "/bin/ps"
+        ? { status: 0, stdout: "node lcm daemon start --foreground\n", stderr: "" }
+        : { status: 0, stdout: "", stderr: "" });
       await expect(restartDaemon({
         port: 37_352,
         pidFilePath: restartPidPath,
@@ -1270,6 +1275,7 @@ describe("daemon lifecycle test-scope validation", () => {
         expectedEntrypoint: fixture.scope.entrypoint,
         _platform: "darwin",
         _fetchOverride: fetchRestart as never,
+        _spawnSyncOverride: processIdentity as never,
         _isProcessAliveOverride: () => alive,
         _killOverride: kill,
         _sleepOverride: async () => undefined,
@@ -2140,6 +2146,9 @@ describe("run-owned lifecycle resources", () => {
       spawned: true,
       startMethod: "systemd-user" as const,
     }));
+    fixture.runSystemd.mockImplementation((command: string) => command === "/bin/ps"
+      ? { status: 0, stdout: "node lcm daemon start --foreground\n", stderr: "" }
+      : { status: 0, stdout: "", stderr: "" });
     await expect(restartDaemon({
       ...scopedOptions(fixture),
       _testScope: scope,
@@ -2388,7 +2397,51 @@ describe("same-user-systemd integration", () => {
       throw new Error(`run-owned systemd unit was not collected: ${unit}`);
     };
     const runSystemd = ((command: string, args: readonly string[], options: object) => {
-      unitName = args.find(arg => arg.startsWith("--unit="))!.slice(7);
+      if (command === "systemd-run" || command === "systemctl") {
+        const managerEnvironment = (options as { env?: NodeJS.ProcessEnv }).env;
+        expect(managerEnvironment?.XDG_RUNTIME_DIR).toBe(process.env.XDG_RUNTIME_DIR);
+        if (process.env.DBUS_SESSION_BUS_ADDRESS !== undefined) {
+          expect(managerEnvironment?.DBUS_SESSION_BUS_ADDRESS).toBe(process.env.DBUS_SESSION_BUS_ADDRESS);
+        }
+        expect(managerEnvironment?.HOME).toBeUndefined();
+        expect(managerEnvironment?.LCM_POSTGRES_URL).toBeUndefined();
+      }
+      if (command === "systemd-run") {
+        const unitArg = args.find(arg => arg.startsWith("--unit="));
+        if (unitArg === undefined) {
+          return {
+            status: 2,
+            stdout: "",
+            stderr: "systemd-run integration invocation did not name a unit",
+          };
+        }
+        const requestedUnit = unitArg.slice(7);
+        if (unitName !== "" && requestedUnit !== unitName) {
+          return {
+            status: 2,
+            stdout: "",
+            stderr: "systemd-run integration unit changed",
+          };
+        }
+        unitName = requestedUnit;
+      } else if (command === "systemctl") {
+        const requestedUnit = args.at(-1);
+        if (requestedUnit === undefined) {
+          return {
+            status: 2,
+            stdout: "",
+            stderr: "systemctl integration invocation did not name a unit",
+          };
+        }
+        if (unitName !== "" && requestedUnit !== unitName) {
+          return {
+            status: 2,
+            stdout: "",
+            stderr: "systemctl integration unit changed",
+          };
+        }
+        unitName = requestedUnit;
+      }
       const result = spawnSync(command, args, options);
       if (result.status !== 0) {
         console.info("[lcm lifecycle systemd failure]", JSON.stringify({
@@ -2480,7 +2533,7 @@ describe("same-user-systemd integration", () => {
         expect(new Set(ownership.map(resource => resource[key])).size).toBe(expectedScopes);
       }
       for (const resource of ownership) {
-        expect(resource.unitName).toMatch(/^lcm-test-daemon-/u);
+        expect(resource.unitName).toMatch(/^lcm-daemon-[a-f0-9]{20}\.service$/u);
         expect(resource.stateDir).toBe(join(resource.homeDir, ".lcm"));
       }
       writeFileSync(join(barrierDir, `${ownerId}.checked`), `${unitName}\n`);
@@ -2504,23 +2557,33 @@ describe("same-user-systemd integration", () => {
         sleep: async ms => new Promise(resolve => setTimeout(resolve, ms)),
       },
     });
-    const result = await ensureDaemon({
-      port: 48_322,
-      pidFilePath: join(stateDir, "daemon.pid"),
-      spawnTimeoutMs: 10_000,
-      expectedVersion: "1.4.2",
-      enforceUserManagerParent: true,
-      spawnCommand: process.execPath,
-      _platform: "linux",
-      _testScope: scope,
-      _skipHealthWait: true,
-    });
-    expect(result).toMatchObject({
-      startMethod: "systemd-user",
-      warning: undefined,
-    });
-    expect(unitName).toMatch(new RegExp(`^${scope.unitPrefix}[0-9]+-[0-9]+$`, "u"));
-    expect(unitName).not.toMatch(/^lcm-daemon-/u);
+    const savedManagedCredentials = Object.fromEntries(
+      MANAGED_CREDENTIAL_NAMES.map(name => [name, process.env[name]]),
+    );
+    for (const name of MANAGED_CREDENTIAL_NAMES) delete process.env[name];
+    let result: Awaited<ReturnType<typeof ensureDaemon>>;
+    try {
+      result = await ensureDaemon({
+        port: 48_322,
+        pidFilePath: join(stateDir, "daemon.pid"),
+        spawnTimeoutMs: 10_000,
+        expectedVersion: "1.4.2",
+        enforceUserManagerParent: true,
+        spawnCommand: process.execPath,
+        _platform: "linux",
+        _testScope: scope,
+        _skipHealthWait: true,
+      });
+    } finally {
+      for (const name of MANAGED_CREDENTIAL_NAMES) {
+        const value = savedManagedCredentials[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+    expect(result.startMethod).toBe("systemd-user");
+    expect(result.warning).toBeUndefined();
+    expect(unitName).toMatch(/^lcm-daemon-[a-f0-9]{20}\.service$/u);
     expect(existsSync(stateDir)).toBe(false);
     expect(existsSync(runtimeDir)).toBe(false);
     expect(existsSync(credentialDir)).toBe(false);

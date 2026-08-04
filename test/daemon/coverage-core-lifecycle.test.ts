@@ -25,6 +25,19 @@ const fetchHealthy = (pid?: number) => vi.fn(async (url: string) => url.endsWith
   ? { ok: true, json: async () => ({ status: "ok", version: "1", pid }) }
   : { ok: true, json: async () => ({}) });
 
+function unavailableSupervisor(): EnsureDaemonOptions["_supervisorOverride"] {
+  return {
+    probe: vi.fn(async (spec: { name: string }) => ({
+      kind: "unavailable" as const,
+      reason: "manager-unavailable" as const,
+      name: spec.name,
+    })),
+    start: vi.fn(),
+    stopAndStart: vi.fn(),
+    stopAndAwaitAbsent: vi.fn(),
+  } as never;
+}
+
 function withHermeticLifecycleSeams(options: EnsureDaemonOptions): EnsureDaemonOptions {
   const stateDir = dirname(options.pidFilePath);
   const runtimeDir = join(stateDir, ".hermetic-runtime");
@@ -96,7 +109,7 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(__lifecycleTestUtils.isProcessAlive(Number.MAX_SAFE_INTEGER)).toBe(false);
   });
 
-  it("resolves complete scoped, hermetic, override, and production dependency sets", () => {
+  it("resolves complete scoped, hermetic, override, and production dependency sets", async () => {
     const root = temp();
     const pidFilePath = join(root, "daemon.pid");
     const production = __lifecycleTestUtils.resolveLifecycleDependencies({
@@ -206,6 +219,61 @@ describe("lifecycle procfs and parent warnings", () => {
       XDG_RUNTIME_DIR: scopedOptions._testScope.runtimeDir,
       LCM_DAEMON_OWNER_ID: "owned",
     });
+
+    const transportRoot = temp();
+    const transportRuntime = join(transportRoot, "runtime");
+    mkdirSync(transportRuntime);
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+    const transportOptions: EnsureDaemonOptions = {
+      port: 1,
+      pidFilePath,
+      spawnTimeoutMs: 1,
+      _spawnSyncOverride: spawnSync as never,
+      _managerTransportEnvironmentOverride: {
+        PATH: "/usr/bin",
+        LANG: "en_US.UTF-8",
+        XDG_RUNTIME_DIR: transportRuntime,
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+        HOME: "/production/home",
+        LCM_POSTGRES_URL: "postgresql://user:secret@example.invalid/lcm",
+        OPENAI_API_KEY: "should-not-reach-manager",
+      },
+    };
+    const transportDependencies = __lifecycleTestUtils.resolveLifecycleDependencies(transportOptions);
+    const managerEnvironment = __lifecycleTestUtils.managerTransportEnvironment(
+      transportOptions,
+      transportDependencies,
+    );
+    expect(managerEnvironment).toEqual({
+      PATH: "/usr/bin",
+      LANG: "en_US.UTF-8",
+      XDG_RUNTIME_DIR: transportRuntime,
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+    });
+    const controlRunner = __lifecycleTestUtils.supervisorCommandRunner(
+      transportDependencies,
+      transportOptions,
+    );
+    await controlRunner("systemctl", ["--user", "show", "lcm-test.service"], { timeoutMs: 1 });
+    expect(spawnSync).toHaveBeenCalledWith(
+      "systemctl",
+      ["--user", "show", "lcm-test.service"],
+      expect.objectContaining({ env: managerEnvironment }),
+    );
+    expect(JSON.stringify(managerEnvironment)).not.toContain("production/home");
+    expect(JSON.stringify(managerEnvironment)).not.toContain("LCM_POSTGRES_URL");
+    expect(JSON.stringify(managerEnvironment)).not.toContain("should-not-reach-manager");
+    expect(__lifecycleTestUtils.managerTransportEnvironment(
+      {
+        ...transportOptions,
+        _managerTransportEnvironmentOverride: {
+          XDG_RUNTIME_DIR: "relative-runtime",
+          DBUS_SESSION_BUS_ADDRESS: "unsafe\naddress",
+          PATH: "/usr/bin",
+        },
+      },
+      transportDependencies,
+    )).toEqual({ PATH: "/usr/bin" });
 
     expect(__lifecycleTestUtils.lifecycleUnitName(
       { port: 1, pidFilePath, spawnTimeoutMs: 1 },
@@ -356,6 +424,7 @@ describe("lifecycle procfs and parent warnings", () => {
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(20) as never,
       _isProcessAliveOverride: () => alive, _listeningPortsOverride: () => [1], _skipSpawn: true,
       _monotonicNowOverride: (): number => 0,
+      _supervisorOverride: unavailableSupervisor(),
     });
     expect(result.connected).toBe(connected);
     if (warning) expect(result.warning).toContain(warning);
@@ -376,6 +445,7 @@ describe("lifecycle procfs and parent warnings", () => {
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(31) as never,
       _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [1], _skipSpawn: true,
       _monotonicNowOverride: (): number => 0,
+      _supervisorOverride: unavailableSupervisor(),
     });
     expect(result.warning).toContain("not an LCM daemon");
   });
@@ -422,8 +492,9 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     const dir = temp(); const procRoot = join(dir, "proc"); mkdirSync(procRoot);
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "33"); ensureAuthToken(join(dir, "daemon.token"));
     proc(procRoot, 33, "Uid:\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
-    const kill = vi.fn();
-    const alive = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValue(false);
+    let aliveState = true;
+    const kill = vi.fn(() => { aliveState = false; });
+    const alive = vi.fn(() => aliveState);
     await ensureDaemon({
       port: 6, pidFilePath: pidPath, spawnTimeoutMs: 1, expectedVersion: "2", _procRoot: procRoot,
       _fetchOverride: fetchHealthy(33) as never, _isProcessAliveOverride: alive, _killOverride: kill,
@@ -494,6 +565,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
       port: 13, pidFilePath: pidPath, spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
       _procRoot: root, _uid: 1000, _isProcessAliveOverride: () => true, _fetchOverride: fetchHealthy(20) as never,
       _listeningPortsOverride: () => [13], _monotonicNowOverride: () => 0, expectedVersion: "1",
+      _supervisorOverride: unavailableSupervisor(),
     });
     expect(result.connected).toBe(true); expect(result.warning).toBeUndefined();
   });

@@ -451,9 +451,76 @@ function parseEnvironmentAssignments(value: string): Map<string, string> | undef
   const assignments = new Map<string, string>();
   let index = 0;
   let count = 0;
+  const decodeEscape = (): string | undefined => {
+    if (index >= value.length) return undefined;
+    const escaped = value[index]!;
+    index += 1;
+    if (escaped === "x") {
+      const hex = value.slice(index, index + 2);
+      if (!/^[0-9A-Fa-f]{2}$/u.test(hex)) return undefined;
+      index += 2;
+      return String.fromCharCode(Number.parseInt(hex, 16));
+    }
+    switch (escaped) {
+      case "a": return "\u0007";
+      case "b": return "\b";
+      case "e": return "\u001b";
+      case "f": return "\f";
+      case "n": return "\n";
+      case "r": return "\r";
+      case "s": return " ";
+      case "t": return "\t";
+      case "v": return "\u000b";
+      default: return escaped;
+    }
+  };
+  const readQuoted = (quote: string): string | undefined => {
+    index += 1;
+    let decoded = "";
+    while (index < value.length) {
+      const character = value[index]!;
+      if (character === "\\") {
+        index += 1;
+        const escaped = decodeEscape();
+        if (escaped === undefined) return undefined;
+        decoded += escaped;
+        continue;
+      }
+      if (character === quote) {
+        index += 1;
+        return decoded;
+      }
+      decoded += character;
+      index += 1;
+      if (decoded.length > MAX_METADATA_VALUE_LENGTH) return undefined;
+    }
+    return undefined;
+  };
+  const addAssignment = (token: string): boolean => {
+    const separator = token.indexOf("=");
+    if (separator <= 0) return false;
+    const key = token.slice(0, separator);
+    const decoded = token.slice(separator + 1);
+    if (!/^[A-Za-z][A-Za-z0-9_.-]*$/u.test(key)
+      || decoded.length > MAX_METADATA_VALUE_LENGTH
+      || assignments.has(key)) return false;
+    assignments.set(key, decoded);
+    return true;
+  };
   while (index < value.length) {
     while (index < value.length && /\s/u.test(value[index]!)) index += 1;
     if (index >= value.length) break;
+    // systemd may quote the complete assignment token when the value contains
+    // spaces or shell-significant characters. Decode that token first, then
+    // apply the same strict key/value and duplicate bounds as unquoted forms.
+    if (value[index] === "\"" || value[index] === "'") {
+      const token = readQuoted(value[index]!);
+      if (token === undefined || (index < value.length && !/\s/u.test(value[index]!))) return undefined;
+      if (!addAssignment(token)) return undefined;
+      count += 1;
+      if (count > MAX_ARGUMENT_COUNT) return undefined;
+      continue;
+    }
     const keyStart = index;
     if (!/[A-Za-z]/u.test(value[index]!)) return undefined;
     index += 1;
@@ -469,9 +536,9 @@ function parseEnvironmentAssignments(value: string): Map<string, string> | undef
       const character = value[index]!;
       if (character === "\\") {
         index += 1;
-        if (index >= value.length) return undefined;
-        decoded += value[index]!;
-        index += 1;
+        const escaped = decodeEscape();
+        if (escaped === undefined) return undefined;
+        decoded += escaped;
         continue;
       }
       if (quote !== undefined && character === quote) {
@@ -486,6 +553,7 @@ function parseEnvironmentAssignments(value: string): Map<string, string> | undef
     }
     if (!closedQuote || assignments.has(key)) return undefined;
     if (quote !== undefined && index < value.length && !/\s/u.test(value[index]!)) return undefined;
+    if (!/^[A-Za-z][A-Za-z0-9_.-]*$/u.test(key)) return undefined;
     assignments.set(key, decoded);
     count += 1;
     if (count > MAX_ARGUMENT_COUNT) return undefined;
@@ -1152,6 +1220,22 @@ export function createSupervisor(
         if (after.kind === "absent") {
           if (kind === "launchd-user") cleanupPrivatePlist(spec);
           safeCredentialCleanup(spec);
+        } else if (
+          after.kind === "registered-not-running-valid"
+          && after.scopeDigest === spec.scopeDigest
+          && after.name === spec.name
+          && after.nonce === spec.nonce
+        ) {
+          // A transient service may acknowledge submission and then exit
+          // immediately.  This terminal state is still owned by the exact
+          // nonce, so retire it through the manager and prove absence before
+          // deleting its one-launch credentials or private launch plist.
+          try {
+            await stopAndAwaitAbsent(spec);
+          } catch {
+            // Preserve terminal evidence when stop/absence cannot be proven.
+            throw error;
+          }
         }
       } catch {
         // Preserve unresolved manager evidence.

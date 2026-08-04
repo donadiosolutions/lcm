@@ -3602,6 +3602,9 @@ describe("restartDaemon", () => {
       return { ok: true, json: async () => ({ totalConnections: 0 }) } as Response;
     });
     const killMock = vi.fn(() => { alive = false; });
+    const spawnSyncMock = vi.fn((command: string) => command === "/bin/ps"
+      ? { status: 0, stdout: "node lcm daemon start --foreground\n", stderr: "" }
+      : { status: 0, stdout: "", stderr: "" });
     const ensureMock = vi.fn(async (options: EnsureDaemonOptions) => ({
       connected: true,
       port: options.port,
@@ -3616,6 +3619,7 @@ describe("restartDaemon", () => {
       expectedStorageBackend: "postgresql",
       _platform: "darwin",
       _fetchOverride: fetchMock as FetchOverride,
+      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
       _listeningPortsOverride: (): number[] => [19999],
       _isProcessAliveOverride: () => alive,
       _killOverride: killMock,
@@ -3624,7 +3628,7 @@ describe("restartDaemon", () => {
     });
 
     expect(result).toMatchObject({ connected: true, restarted: true, stoppedPid: 4242 });
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
     expect(killMock).toHaveBeenCalledWith(4242, "SIGTERM");
     expect(ensureMock).toHaveBeenCalledWith(expect.objectContaining({
       expectedStorageBackend: "postgresql",
@@ -3940,7 +3944,7 @@ describe("restartDaemon", () => {
 
     expect(result.restarted).toBe(true);
     expect(killMock).toHaveBeenCalledWith(4242, "SIGTERM");
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
   });
 
   it("refuses to signal or start when a live PID is not a verified daemon", async () => {

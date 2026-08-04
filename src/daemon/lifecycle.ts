@@ -6,6 +6,7 @@ import {
   fchmodSync,
   fstatSync,
   ftruncateSync,
+  lstatSync,
   openSync,
   readFileSync,
   readlinkSync,
@@ -19,7 +20,7 @@ import {
 } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
-import { join, dirname, posix, win32 } from "node:path";
+import { dirname, isAbsolute, join, posix, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "./version.js";
 import type { StorageBackend } from "./config.js";
@@ -154,6 +155,8 @@ export type EnsureDaemonOptions = {
   _testScope?: DaemonLifecycleTestScope;
   /** @internal Complete hermetic side-effect boundary for production-mode lifecycle tests. */
   _hermeticTestSeams?: DaemonLifecycleHermeticTestSeams;
+  /** @internal Inject only the manager transport environment for lifecycle tests. */
+  _managerTransportEnvironmentOverride?: NodeJS.ProcessEnv;
   /** @internal Deterministic interruption seam for lifecycle tests. */
   _abortSignal?: AbortSignal;
 };
@@ -319,7 +322,7 @@ function supervisorCommandRunner(
         timeout: options.timeoutMs,
         cwd: options.cwd,
         env: options.env === undefined
-          ? sanitizedManagerEnvironment(lifecycleSpawnEnvironment(opts, dependencies))
+          ? managerTransportEnvironment(opts, dependencies)
           : { ...options.env },
         shell: false,
       });
@@ -1342,12 +1345,47 @@ function startViaDetachedSpawn(
 }
 
 function sanitizedManagerEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const result: NodeJS.ProcessEnv = { ...env };
-  for (const name of Object.keys(result)) {
-    if (MANAGED_CREDENTIAL_NAMES.includes(name as typeof MANAGED_CREDENTIAL_NAMES[number])
-      || /(?:API_)?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i.test(name)) delete result[name];
+  const result: NodeJS.ProcessEnv = {};
+  for (const name of [
+    "PATH",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TZ",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+  ]) {
+    const value = env[name];
+    if (typeof value !== "string" || value.length === 0 || value.length > 4096) continue;
+    if (/[\u0000\r\n]/u.test(value)) continue;
+    if (name === "XDG_RUNTIME_DIR") {
+      if (!isAbsolute(value)) continue;
+      try {
+        const stats = lstatSync(value);
+        if (stats.isSymbolicLink() || !stats.isDirectory()) continue;
+      } catch {
+        continue;
+      }
+    }
+    if (name === "DBUS_SESSION_BUS_ADDRESS" && !/^(?:unix|tcp|unixexec):/u.test(value)) continue;
+    result[name] = value;
   }
   return result;
+}
+
+function managerTransportEnvironment(
+  opts: EnsureDaemonOptions,
+  dependencies: ResolvedLifecycleDependencies,
+): NodeJS.ProcessEnv {
+  const source = opts._managerTransportEnvironmentOverride
+    ?? (opts._testScope ? process.env : dependencies.environment);
+  return sanitizedManagerEnvironment(source);
 }
 
 export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDaemonResult> {
@@ -1585,14 +1623,6 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     }, () => readOwnedPid());
   }
 
-  async function terminatePidFileProcess(): Promise<void> {
-    const pid = readOwnedPid();
-    if (pid !== null && isLikelyLcmDaemonProcess(pid, procRoot)) {
-      await terminatePid(pid, { isAlive, killProcess, sleepFn });
-    }
-    cleanOwnedPid();
-  }
-
   type MismatchRepair =
     | { outcome: "none" }
     | { outcome: "terminated" }
@@ -1602,7 +1632,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   async function terminateAuthenticatedDaemon(health: HealthResponse): Promise<MismatchRepair> {
     const authenticatedPid = health.pid;
     if (authenticatedPid === undefined || !endpointIdentityMatches(health)) return { outcome: "blocked" };
-    if (platform === "linux" && !isLikelyLcmDaemonProcess(authenticatedPid, procRoot)) {
+    if (!isLikelyLcmDaemonProcessForPlatform(
+      authenticatedPid,
+      platform,
+      dependencies.spawnSync,
+      procRoot,
+      windowsPowerShellPath,
+    )) {
       return { outcome: "blocked" };
     }
     // Health/authentication may have completed well before signaling. Re-read
@@ -1612,7 +1648,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (!endpointIdentityMatches(health)
       || readOwnedPid() !== authenticatedPid
       || !isAlive(authenticatedPid)
-      || (platform === "linux" && !isLikelyLcmDaemonProcess(authenticatedPid, procRoot))) {
+      || !isLikelyLcmDaemonProcessForPlatform(
+        authenticatedPid,
+        platform,
+        dependencies.spawnSync,
+        procRoot,
+        windowsPowerShellPath,
+      )) {
       return { outcome: "blocked" };
     }
     if (!endpointIdentityMatches(health) || readOwnedPid() !== authenticatedPid) {
@@ -1643,8 +1685,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (!identityMatches) return { outcome: "none" };
     if (!storageBackendMatches && !hasAccess) return { outcome: "blocked" };
     if (!versionMatches) {
-      await terminatePidFileProcess();
-      return { outcome: "terminated" };
+      return terminateAuthenticatedDaemon(health);
     }
     if (!storageBackendMatches || !entrypointMatches || !runtimeDigestMatches) {
       if (!hasAccess) return { outcome: "blocked" };
@@ -2536,6 +2577,23 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       if (currentPid !== null && currentPid !== pidFilePid) {
         return waitForConcurrentReplacement(currentPid);
       }
+      let currentPidIsAlive = false;
+      try {
+        currentPidIsAlive = currentPid === pidFilePid && isAlive(pidFilePid);
+      } catch {
+        return refusalResult(
+          "ambiguous",
+          "daemon PID liveness could not be verified; preserving the PID file and refusing replacement",
+          { pid: pidFilePid },
+        );
+      }
+      if (currentPidIsAlive) {
+        return refusalResult(
+          "ambiguous",
+          "daemon PID state is still live but its identity could not be proven; preserving the PID file and refusing replacement",
+          { pid: pidFilePid },
+        );
+      }
       cleanOwnedPid();
     }
   }
@@ -2843,6 +2901,12 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   const fetchFn = dependencies.fetch;
   const procRoot = dependencies.procRoot;
   const realpath = dependencies.realpath;
+  const windowsPowerShellPath = opts._windowsPowerShellPathOverride === undefined
+    ? resolveWindowsPowerShellPath(
+        dependencies.environment.SystemRoot,
+        dependencies.environment.WINDIR,
+      )
+    : opts._windowsPowerShellPathOverride;
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
@@ -3145,7 +3209,6 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
 
   async function isManaged(pid: number): Promise<boolean> {
     if (_isManagedProcessOverride) return _isManagedProcessOverride(pid);
-    if (platform === "linux" && !isLikelyLcmDaemonProcess(pid, procRoot)) return false;
     const listenerPorts = opts._listeningPortsOverride
       ? opts._listeningPortsOverride(pid)
       : findListeningTcpPorts(
@@ -3153,10 +3216,17 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
           platform,
           dependencies.spawnSync,
           procRoot,
-          opts.port,
-        );
+        opts.port,
+      );
     if (!listenerPorts.includes(opts.port)) return false;
-    return await isAuthenticatedDaemonAtPort(opts.port, pid);
+    if (!await isAuthenticatedDaemonAtPort(opts.port, pid)) return false;
+    return isLikelyLcmDaemonProcessForPlatform(
+      pid,
+      platform,
+      dependencies.spawnSync,
+      procRoot,
+      windowsPowerShellPath,
+    );
   }
   const killProcess = dependencies.killProcess;
   const sleepFn = dependencies.sleep;
@@ -3185,6 +3255,25 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         restarted: false,
         warning: "daemon lifecycle was interrupted before startup",
       };
+    }
+    // Revalidate platform-native command identity immediately before the
+    // signal.  Darwin has no procfs fallback: an unavailable or changed ps
+    // observation preserves the PID file and refuses the offline repair.
+    if (_isManagedProcessOverride === undefined) {
+      if (
+        readOwnedPid() !== pid
+        || !isAlive(pid)
+        || !isLikelyLcmDaemonProcessForPlatform(
+          pid,
+          platform,
+          dependencies.spawnSync,
+          procRoot,
+          windowsPowerShellPath,
+        )
+        || !(await isManaged(pid))
+      ) {
+        throw new Error(`Refusing to restart: PID ${pid} identity changed before signaling.`);
+      }
     }
     await terminatePid(pid, { isAlive, killProcess, sleepFn });
     if (isAlive(pid)) {
@@ -3220,6 +3309,8 @@ export const __lifecycleTestUtils = {
   resolveLifecycleDependencies,
   lifecycleUnitName,
   lifecycleSpawnEnvironment,
+  managerTransportEnvironment,
+  supervisorCommandRunner,
   runCleanupStages,
   sleep,
 };

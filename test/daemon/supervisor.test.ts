@@ -414,6 +414,25 @@ describe("systemd-user supervisor", () => {
     expect(await supervisor.probe({ ...spec, kind: "launchd-user" })).toMatchObject({ kind: "ambiguous" });
   });
 
+  it("parses systemd's outer-quoted Environment assignments without widening metadata", async () => {
+    const spec = makeSpec("systemd-user", makeRoot(), {
+      args: ["20"],
+    });
+    const output = [
+      "LoadState=loaded",
+      "ActiveState=active",
+      "SubState=running",
+      "MainPID=4242",
+      `Environment=LCM_SUPERVISOR_MARKER=${spec.marker} LCM_SUPERVISOR_SCOPE=${spec.scopeDigest} LCM_SUPERVISOR_PORT=${spec.port} LCM_SUPERVISOR_NONCE=${spec.nonce} LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_CWD= \"LCM_SUPERVISOR_ARGS=[\\\"20\\\"]\"`,
+    ].join("\n");
+    const runner = fakeRunner([{ code: 0, stdout: output }]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).probe(spec)).resolves.toMatchObject({
+      kind: "registered-running-valid",
+      managerPid: 4242,
+      args: JSON.stringify(spec.args),
+    });
+  });
+
   it("parses real launchd not-running and exit-code terminal output", async () => {
     const spec = makeSpec("launchd-user");
     const output = [
@@ -697,6 +716,64 @@ describe("systemd-user supervisor", () => {
       { code: 1, stderr: "Unit is not-found" },
     ]);
     await expect(createSupervisor("systemd-user", { run: terminalMutation.run, platform: "linux" }).start(terminalAfterStart)).rejects.toThrow("manager command");
+
+    const terminalCredentialRoot = makeRoot();
+    const terminalCredentialDirectory = createManagedCredentialDirectory(terminalCredentialRoot, "systemd-immediate-exit");
+    const terminalCredentialPath = writeManagedCredentialFiles(
+      terminalCredentialDirectory,
+      { OPENAI_API_KEY: "secret" },
+    )[0]!;
+    const terminalCredentialSpec = makeSpec("systemd-user", terminalCredentialRoot, {
+      credentialDirectory: terminalCredentialDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: terminalCredentialPath }],
+    });
+    const terminalCredentialRunner = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: managerText(terminalCredentialSpec, "inactive") },
+      { code: 1, stderr: "Unit is not-found" },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: terminalCredentialRunner.run,
+      platform: "linux",
+    }).start(terminalCredentialSpec)).rejects.toThrow("manager command");
+    expect(readdirSync(join(terminalCredentialRoot, "credentials"))).toHaveLength(0);
+
+    const launchdCredentialRoot = makeRoot();
+    const launchdCredentialDirectory = createManagedCredentialDirectory(launchdCredentialRoot, "launchd-immediate-exit");
+    const launchdCredentialPath = writeManagedCredentialFiles(
+      launchdCredentialDirectory,
+      { OPENAI_API_KEY: "secret" },
+    )[0]!;
+    const launchdCredentialSpec = makeSpec("launchd-user", launchdCredentialRoot, {
+      credentialDirectory: launchdCredentialDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: launchdCredentialPath }],
+    });
+    const launchdTerminalOutput = [
+      "state = not running",
+      "pid = 0",
+      "last exit code = 36",
+      `LCM_SUPERVISOR_MARKER => ${launchdCredentialSpec.marker}`,
+      `LCM_SUPERVISOR_SCOPE => ${launchdCredentialSpec.scopeDigest}`,
+      `LCM_SUPERVISOR_PORT => ${launchdCredentialSpec.port}`,
+      `LCM_SUPERVISOR_NONCE => ${launchdCredentialSpec.nonce}`,
+      `LCM_SUPERVISOR_EXECUTABLE => ${launchdCredentialSpec.executable}`,
+      `LCM_SUPERVISOR_ARGS => ${JSON.stringify(launchdCredentialSpec.args)}`,
+      "LCM_SUPERVISOR_CWD =>",
+    ].join("\n");
+    const launchdCredentialRunner = fakeRunner([
+      { code: 1, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdTerminalOutput },
+      { code: 1, stderr: "Could not find service" },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: launchdCredentialRunner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(launchdCredentialSpec)).rejects.toThrow("manager command");
+    expect(readdirSync(join(launchdCredentialRoot, "credentials"))).toHaveLength(0);
+    expect(readdirSync(launchdCredentialRoot).filter(name => name.endsWith(".plist"))).toHaveLength(0);
   });
 });
 
