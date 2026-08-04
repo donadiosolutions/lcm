@@ -173,6 +173,9 @@ describe("CI workflow", () => {
     expect(integration?.run).toContain("test/daemon/lifecycle-isolation.test.ts");
     expect(integration?.run).toContain("test/daemon/lifecycle-systemd.integration.test.ts");
     expect(integration?.run).toContain("test/daemon/systemd-credential-loader.test.ts");
+    expect(integration?.run).toContain(
+      '--testNamePattern "observes the real user-systemd LoadCredential modes"',
+    );
     for (const pattern of [
       "uses and removes one exact run-owned transient unit",
       "starts and admits a healthy managed unit with exact identity and cleanup",

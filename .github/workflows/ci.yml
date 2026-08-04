@@ -167,7 +167,10 @@ jobs:
             test/daemon/lifecycle-isolation.test.ts \
             test/daemon/lifecycle-systemd.integration.test.ts \
             test/daemon/systemd-credential-loader.test.ts \
-            --testNamePattern "uses and removes one exact run-owned transient unit|observes the real user-systemd LoadCredential modes|starts and admits a healthy managed unit with exact identity and cleanup|restarts a wedged registered unit through systemd without legacy signal fallback|recreates a terminal clean-exit unit after a registered-not-running observation|refuses stale manager identity before mutation and never falls back to legacy signals"
+            --testNamePattern "uses and removes one exact run-owned transient unit|starts and admits a healthy managed unit with exact identity and cleanup|restarts a wedged registered unit through systemd without legacy signal fallback|recreates a terminal clean-exit unit after a registered-not-running observation|refuses stale manager identity before mutation and never falls back to legacy signals"
+          npx vitest run \
+            test/daemon/systemd-credential-loader.test.ts \
+            --testNamePattern "observes the real user-systemd LoadCredential modes"
 
   macos-launchd:
     name: macOS 15 launchd feasibility

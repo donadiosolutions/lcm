@@ -169,23 +169,23 @@ describe("systemd credential loader hardening", () => {
       chmodSync(outsideDirectory, 0o500);
 
       expect(resolveDaemonConfigEnv({
-        ...credentialEnv(directory, "OPENAI_API_KEY"),
+        ...credentialEnv({ directory, runtimeRoot }, "OPENAI_API_KEY"),
         XDG_RUNTIME_DIR: runtimeRoot,
         OPENAI_API_KEY: "ambient-value",
       }).OPENAI_API_KEY).toBe("custom-staged");
       expect(resolveDaemonConfigEnv({
-        ...credentialEnv(outsideDirectory, "OPENAI_API_KEY"),
+        ...credentialEnv({ directory: outsideDirectory, runtimeRoot }, "OPENAI_API_KEY"),
         XDG_RUNTIME_DIR: runtimeRoot,
         OPENAI_API_KEY: "ambient-value",
       }).OPENAI_API_KEY).toBe("ambient-value");
       expect(resolveDaemonConfigEnv({
-        ...credentialEnv(outsideDirectory, "OPENAI_API_KEY"),
+        ...credentialEnv({ directory: outsideDirectory, runtimeRoot }, "OPENAI_API_KEY"),
         XDG_RUNTIME_DIR: join(runtimeRoot, "missing"),
         OPENAI_API_KEY: "ambient-value",
       }).OPENAI_API_KEY).toBe("ambient-value");
       chmodSync(runtimeRoot, 0o755);
       expect(resolveDaemonConfigEnv({
-        ...credentialEnv(directory, "OPENAI_API_KEY"),
+        ...credentialEnv({ directory, runtimeRoot }, "OPENAI_API_KEY"),
         XDG_RUNTIME_DIR: runtimeRoot,
         OPENAI_API_KEY: "ambient-value",
       }).OPENAI_API_KEY).toBe("ambient-value");
