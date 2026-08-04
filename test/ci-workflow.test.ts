@@ -113,7 +113,7 @@ describe("CI workflow", () => {
     });
     expect(workflow.jobs.ci).toMatchObject({
       name: "ci",
-      needs: ["environment", "core", "postgresql", "linux-systemd"],
+      needs: ["environment", "core", "postgresql", "linux-systemd", "macos-launchd"],
       if: "${{ always() }}",
     });
     const gate = workflow.jobs.ci.steps.find((step) => step.name === "Require every CI suite");
@@ -122,11 +122,14 @@ describe("CI workflow", () => {
       CORE_RESULT: "${{ needs.core.result }}",
       POSTGRESQL_RESULT: "${{ needs.postgresql.result }}",
       LINUX_SYSTEMD_RESULT: "${{ needs.linux-systemd.result }}",
+      MACOS_LAUNCHD_RESULT: "${{ needs.macos-launchd.result }}",
     });
     expect(gate?.run).toContain(
-      '[[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success || "$LINUX_SYSTEMD_RESULT" != success ]]',
+      '[[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success || "$LINUX_SYSTEMD_RESULT" != success || "$MACOS_LAUNCHD_RESULT" != success ]]',
     );
     expect(gate?.run).toContain("Linux user-systemd result: $LINUX_SYSTEMD_RESULT");
+    expect(gate?.run).toContain("macOS launchd result: $MACOS_LAUNCHD_RESULT");
+    expect(workflow.jobs.ci.needs).toContain("macos-launchd");
     expect(workflow.jobs.codecov.needs).toBe("ci");
     expect(workflow.jobs["codecov-fork"].needs).toBe("ci");
   });
@@ -244,7 +247,7 @@ describe("CI workflow", () => {
     expect(integration?.run).toContain('launchctl bootout "gui/$(id -u)/$ready_label"');
     expect(integration?.run).toContain('rm -rf -- "$resource_root"');
     expect(integration?.run).not.toMatch(/\b(?:pkill|killall)\b/u);
-    expect(workflow.jobs.ci.needs).not.toContain("macos-launchd");
+    expect(workflow.jobs.ci.needs).toContain("macos-launchd");
   });
 
   it("separates trusted OIDC uploads from tokenless fork uploads", () => {

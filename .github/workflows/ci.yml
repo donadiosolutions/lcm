@@ -218,6 +218,7 @@ jobs:
       - core
       - postgresql
       - linux-systemd
+      - macos-launchd
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -227,16 +228,18 @@ jobs:
           CORE_RESULT: ${{ needs.core.result }}
           POSTGRESQL_RESULT: ${{ needs.postgresql.result }}
           LINUX_SYSTEMD_RESULT: ${{ needs.linux-systemd.result }}
+          MACOS_LAUNCHD_RESULT: ${{ needs.macos-launchd.result }}
         run: |
           set -Eeuo pipefail
-          if [[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success || "$LINUX_SYSTEMD_RESULT" != success ]]; then
+          if [[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success || "$LINUX_SYSTEMD_RESULT" != success || "$MACOS_LAUNCHD_RESULT" != success ]]; then
             echo "Environment result: $ENVIRONMENT_RESULT" >&2
             echo "Core CI result: $CORE_RESULT" >&2
             echo "PostgreSQL matrix result: $POSTGRESQL_RESULT" >&2
             echo "Linux user-systemd result: $LINUX_SYSTEMD_RESULT" >&2
+            echo "macOS launchd result: $MACOS_LAUNCHD_RESULT" >&2
             exit 1
           fi
-          echo "Environment, Core CI, every PostgreSQL matrix run, and Linux user-systemd integration passed."
+          echo "Environment, Core CI, every PostgreSQL matrix run, Linux user-systemd integration, and macOS launchd integration passed."
 
   codecov:
     name: Codecov upload
