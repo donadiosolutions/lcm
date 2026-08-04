@@ -315,8 +315,11 @@ function supervisorCommandRunner(
         shell: false,
       });
       const error = result.error as NodeJS.ErrnoException | undefined;
+      const code = typeof result.status === "number" || result.status === null
+        ? result.status
+        : null;
       return {
-        code: result.status,
+        code,
         stdout: typeof result.stdout === "string" ? result.stdout : "",
         stderr: typeof result.stderr === "string" ? result.stderr : "",
         timedOut: error?.code === "ETIMEDOUT",

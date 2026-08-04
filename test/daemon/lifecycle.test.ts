@@ -1786,6 +1786,35 @@ describe("ensureDaemon", () => {
     expect(spawnMock).toHaveBeenCalled();
   });
 
+  it("treats a malformed manager command status as unavailable instead of success", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-malformed-manager-status-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const spawnSyncMock = vi.fn().mockReturnValue({
+      status: "not-a-number",
+      stdout: "",
+      stderr: "",
+    });
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      spawnCommand: process.execPath,
+      spawnArgs: ["/path/lcm.js", "daemon", "start", "--foreground"],
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _skipHealthWait: true,
+      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+    });
+
+    expect(result.startMethod).toBe("detached-spawn");
+    expect(result.warning).toContain("daemon parent invariant is not verified");
+    expect(spawnMock).toHaveBeenCalled();
+  });
+
   it("sanitizes a detached-spawn error before displaying it", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-detached-sanitize-"));
     tempDirs.push(tempDir);
