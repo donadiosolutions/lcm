@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -169,8 +170,14 @@ function plistRace(
       _plistRaceForTesting: (path, phase) => {
         if (triggered || phase !== expectedPhase) return;
         triggered = true;
-        rmSync(path, { force: true });
-        if (!removeOnly) writeFileSync(path, replacement, { mode: 0o600 });
+        if (removeOnly) {
+          rmSync(path, { force: true });
+          return;
+        }
+        const replacementPath = `${path}.replacement`;
+        writeFileSync(replacementPath, replacement, { flag: "wx", mode: 0o600 });
+        chmodSync(replacementPath, 0o600);
+        renameSync(replacementPath, path);
       },
     },
     wasTriggered: () => triggered,
