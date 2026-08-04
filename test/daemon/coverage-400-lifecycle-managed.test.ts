@@ -1,8 +1,12 @@
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -730,6 +734,51 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       _skipHealthWait: false,
       _monotonicNowOverride: () => now,
     }))).resolves.toMatchObject({ refusalReason: "startup-failure", spawned: true });
+  });
+
+  it("preserves staged credentials when owned manager absence cleanup is refused", async () => {
+    let now = 0;
+    let staged: SupervisorSpec | undefined;
+    const fixture = createFixture({
+      environment: { OPENAI_API_KEY: "staged-secret" },
+      fetch: sequenceFetch([new Error("offline")]),
+      sleep: async () => { now = 1_000; },
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    fixture.start.mockImplementationOnce(async (spec: SupervisorSpec) => {
+      staged = spec;
+      writeFileSync(fixture.pidPath, "4242");
+      return {
+        kind: spec.kind,
+        name: spec.name,
+        scopeDigest: spec.scopeDigest,
+        port: spec.port,
+        nonce: spec.nonce,
+        managerPid: 4242,
+      };
+    });
+    const cleanupRefusal = new Error("manager absence refused");
+    fixture.stopAndAwaitAbsent.mockRejectedValueOnce(cleanupRefusal);
+
+    await expect(ensureDaemon(optionsFor(fixture, {
+      _skipHealthWait: false,
+      _monotonicNowOverride: () => now,
+    }))).rejects.toBe(cleanupRefusal);
+
+    expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledOnce();
+    expect(staged?.credentialDirectory).toBeDefined();
+    const credentialDirectory = staged!.credentialDirectory!;
+    const credentialFile = join(credentialDirectory, "OPENAI_API_KEY");
+    expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledWith(expect.objectContaining({
+      credentialDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
+    }));
+    expect(existsSync(credentialDirectory)).toBe(true);
+    expect(readdirSync(credentialDirectory)).toEqual(["OPENAI_API_KEY"]);
+    expect(readFileSync(credentialFile, "utf8")).toBe("staged-secret");
+    expect(statSync(credentialFile).mode & 0o777).toBe(0o600);
   });
 
   it("covers deadline abort/timeout callbacks and platform process-command paths", async () => {
