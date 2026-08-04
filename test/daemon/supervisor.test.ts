@@ -65,11 +65,11 @@ function makeSpec(kind: SupervisorKind, stateRoot = makeRoot(), overrides: Parti
   });
 }
 
-function managerText(spec: SupervisorSpec, state = "active", pid = 1234): string {
+function managerText(spec: SupervisorSpec, state = "active", pid = 1234, subState = state === "active" ? "running" : state): string {
   return [
     "LoadState=loaded",
     `ActiveState=${state}`,
-    `SubState=${state === "active" ? "running" : state}`,
+    `SubState=${subState}`,
     `MainPID=${state === "active" ? pid : 0}`,
     `Environment=LCM_SUPERVISOR_MARKER=${spec.marker} LCM_SUPERVISOR_SCOPE=${spec.scopeDigest} LCM_SUPERVISOR_PORT=${spec.port} LCM_SUPERVISOR_NONCE=${spec.nonce} LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)} LCM_SUPERVISOR_CWD=${spec.cwd ?? ""}${spec.entrypoint === undefined ? "" : ` LCM_SUPERVISOR_ENTRYPOINT=${spec.entrypoint}`}${spec.runtimeDigest === undefined ? "" : ` LCM_SUPERVISOR_RUNTIME_DIGEST=${spec.runtimeDigest}`}${spec.storageBackend === undefined ? "" : ` LCM_SUPERVISOR_STORAGE_BACKEND=${spec.storageBackend}`}`,
   ].join("\n");
@@ -369,6 +369,116 @@ describe("systemd-user supervisor", () => {
     const adopted = await createSupervisor("systemd-user", { run: winner.run, platform: "linux" }).start(spec);
     expect(adopted.managerPid).toBe(987);
     expect(winner.calls).toHaveLength(1);
+  });
+
+  it("polls only exact owned activation states after a successful systemd submission", async () => {
+    const activating = (spec: SupervisorSpec): string => managerText(spec, "activating", 0, "start");
+    const sleep = vi.fn(async () => undefined);
+
+    const runningSpec = makeSpec("systemd-user");
+    const running = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: activating(runningSpec) },
+      { code: 0, stdout: managerText(runningSpec, "active", 777) },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: running.run, platform: "linux", sleep }).start(runningSpec)).resolves.toMatchObject({ managerPid: 777 });
+    expect(sleep).toHaveBeenCalledOnce();
+
+    const defaultSleepSpec = makeSpec("systemd-user");
+    const defaultSleep = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: activating(defaultSleepSpec) },
+      { code: 0, stdout: managerText(defaultSleepSpec, "active", 778) },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: defaultSleep.run, platform: "linux" }).start(defaultSleepSpec)).resolves.toMatchObject({ managerPid: 778 });
+
+    const failedSpec = makeSpec("systemd-user");
+    const failedSleep = vi.fn(async () => undefined);
+    const failed = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: activating(failedSpec) },
+      { code: 0, stdout: managerText(failedSpec, "failed") },
+      { code: 0, stdout: managerText(failedSpec, "failed") },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: failed.run, platform: "linux", sleep: failedSleep }).start(failedSpec)).rejects.toThrow("manager command");
+    expect(failedSleep).toHaveBeenCalledOnce();
+
+    const timeoutSpec = makeSpec("systemd-user");
+    const timeoutSleep = vi.fn(async () => undefined);
+    const clock = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(101);
+    const timeout = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: activating(timeoutSpec) },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: timeout.run,
+      platform: "linux",
+      commandTimeoutMs: 100,
+      sleep: timeoutSleep,
+      now: clock,
+    }).start(timeoutSpec)).rejects.toThrow("manager command");
+    expect(timeoutSleep).not.toHaveBeenCalled();
+
+    const boundedSpec = makeSpec("systemd-user");
+    const boundedSleep = vi.fn(async () => undefined);
+    const bounded = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: activating(boundedSpec) },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: bounded.run,
+      platform: "linux",
+      commandTimeoutMs: 1,
+      sleep: boundedSleep,
+      now: () => 0,
+    }).start(boundedSpec)).rejects.toThrow("manager command");
+    expect(boundedSleep).not.toHaveBeenCalled();
+
+    const mismatchSpec = makeSpec("systemd-user");
+    const mismatchSleep = vi.fn(async () => undefined);
+    const foreign = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: activating({ ...mismatchSpec, port: mismatchSpec.port + 1 }) },
+      { code: 0, stdout: activating({ ...mismatchSpec, port: mismatchSpec.port + 1 }) },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: foreign.run, platform: "linux", sleep: mismatchSleep }).start(mismatchSpec)).rejects.toThrow("manager command");
+    expect(mismatchSleep).not.toHaveBeenCalled();
+
+    const malformedSpec = makeSpec("systemd-user");
+    const malformedSleep = vi.fn(async () => undefined);
+    const malformed = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: managerText(malformedSpec, "activating", 0, "verify") },
+      { code: 0, stdout: managerText(malformedSpec, "activating", 0, "verify") },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: malformed.run, platform: "linux", sleep: malformedSleep }).start(malformedSpec)).rejects.toThrow("manager command");
+    expect(malformedSleep).not.toHaveBeenCalled();
+
+    const rejectAfterStart = async (spec: SupervisorSpec, output: string): Promise<void> => {
+      const runner = fakeRunner([
+        { code: 1, stderr: "Unit is not-found" },
+        { code: 0, stdout: "started" },
+        { code: 0, stdout: output },
+        { code: 0, stdout: output },
+      ]);
+      await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux", sleep: vi.fn(async () => undefined) }).start(spec)).rejects.toThrow("manager command");
+    };
+    const missingLoadSpec = makeSpec("systemd-user");
+    await rejectAfterStart(missingLoadSpec, managerText(missingLoadSpec, "activating", 0, "start").replace("LoadState=loaded\n", ""));
+    const missingActiveSpec = makeSpec("systemd-user");
+    await rejectAfterStart(missingActiveSpec, managerText(missingActiveSpec, "activating", 0, "start").replace("ActiveState=activating\n", ""));
+    const missingSubStateSpec = makeSpec("systemd-user");
+    await rejectAfterStart(missingSubStateSpec, managerText(missingSubStateSpec, "activating", 0, "start").replace("SubState=start\n", ""));
   });
 
   it("carries allow-listed managed configuration through env -i without ambient secrets", async () => {

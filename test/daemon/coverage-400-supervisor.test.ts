@@ -110,11 +110,12 @@ function systemdText(
   state = "active",
   pid = 123,
   extra = "",
+  subState = state === "active" ? "running" : state,
 ): string {
   return [
     "LoadState=loaded",
     `ActiveState=${state}`,
-    `SubState=${state === "active" ? "running" : state}`,
+    `SubState=${subState}`,
     `MainPID=${state === "active" ? pid : 0}`,
     `Environment=LCM_SUPERVISOR_MARKER=${value.marker} LCM_SUPERVISOR_SCOPE=${value.scopeDigest} LCM_SUPERVISOR_PORT=${value.port} LCM_SUPERVISOR_NONCE=${value.nonce} LCM_SUPERVISOR_EXECUTABLE=${value.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(value.args)} LCM_SUPERVISOR_CWD=${value.cwd ?? ""}${extra}`,
   ].join("\n");
@@ -441,7 +442,7 @@ describe("supervisor coverage: manager states and lifecycle boundaries", () => {
       { timedOut: true },
     ]);
     await expect(createSupervisor("systemd-user", { run: terminalCleanupFailure.run, platform: "linux" }).start(value)).rejects.toThrow("manager command");
-    const polling = runQueue([{ code: 1, stderr: "Unit is not-found" }, { code: 0, stdout: "started" }, { code: 1, stderr: "Unit is not-found" }, { code: 0, stdout: systemdText(value, "active", 77) }]);
+    const polling = runQueue([{ code: 1, stderr: "Unit is not-found" }, { code: 0, stdout: "started" }, { code: 0, stdout: systemdText(value, "activating", 0, "", "start") }, { code: 0, stdout: systemdText(value, "active", 77) }]);
     const sleep = vi.fn(async () => undefined);
     await expect(createSupervisor("systemd-user", { run: polling.run, platform: "linux", sleep }).start(value)).resolves.toMatchObject({ managerPid: 77 });
     expect(sleep).toHaveBeenCalled();

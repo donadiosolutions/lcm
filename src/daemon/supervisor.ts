@@ -1603,6 +1603,32 @@ function systemdProbeArgs(spec: SupervisorSpec): readonly string[] {
   ];
 }
 
+type SupervisorProbeCapture = {
+  parsed?: Map<string, string>;
+  code?: number | null;
+};
+
+/**
+ * Recognize only the manager state that can legitimately race a successful
+ * systemd-run --no-block submission.  The ordinary observation classifier
+ * deliberately treats this state as ambiguous because it is not a running
+ * service yet; start() may continue only when the raw observation proves the
+ * exact unit, metadata, and known service activation substate.
+ */
+function isOwnedSystemdActivation(
+  spec: SupervisorSpec,
+  capture: SupervisorProbeCapture,
+): boolean {
+  if (spec.kind !== "systemd-user" || capture.code !== 0 || capture.parsed === undefined) return false;
+  const loadState = lookup(capture.parsed, "LoadState", "loadState");
+  const activeState = lookup(capture.parsed, "ActiveState", "state", "State", "status");
+  const subState = lookup(capture.parsed, "SubState", "subState", "substate");
+  if (!/^loaded$/iu.test(loadState ?? "") || !/^activating$/iu.test(activeState ?? "")) return false;
+  if (!/^(?:start-pre|start|start-post)$/iu.test(subState ?? "")) return false;
+  const classified = classifyRegistered(spec, capture.parsed, capture.code);
+  return classified.kind === "ambiguous" && classified.reason === "metadata-malformed";
+}
+
 function launchdProbeArgs(spec: SupervisorSpec, uid: number): readonly string[] {
   return ["print", `${launchdDomain(uid)}/${spec.launchdLabel}`];
 }
@@ -1681,7 +1707,7 @@ export function createSupervisor(
   if (typeof dependencies.run !== "function") throw new Error("supervisor command runner is required");
   const runner = createObservationRunner(kind, dependencies);
 
-  const probe = async (spec: SupervisorSpec): Promise<SupervisorObservation> => {
+  const probeInternal = async (spec: SupervisorSpec, capture?: SupervisorProbeCapture): Promise<SupervisorObservation> => {
     if (spec.kind !== kind) return Object.freeze({ kind: "ambiguous", reason: "metadata-mismatch", name: spec.name });
     if (dependencies.platform === undefined && hostPlatform() !== managerPlatform(kind)) {
       return Object.freeze({ kind: "unavailable", reason: "unsupported-platform", name: spec.name });
@@ -1694,6 +1720,10 @@ export function createSupervisor(
       : await runner.invoke("launchctl", launchdProbeArgs(spec, runner.uid));
     if (result.timedOut) return Object.freeze({ kind: "unavailable", reason: "manager-timeout", name: spec.name });
     const parsed = parseManagerOutput(`${result.stdout}\n${result.stderr}`);
+    if (capture !== undefined) {
+      capture.parsed = parsed;
+      capture.code = result.code;
+    }
     if (result.code !== 0 && isLikelyAbsent({ kind, ...result })) return Object.freeze({ kind: "absent", name: spec.name });
     if (result.code !== 0 && parsed.size === 0) {
       return Object.freeze({ kind: "unavailable", reason: unavailableReason(result), name: spec.name });
@@ -1713,8 +1743,10 @@ export function createSupervisor(
     return classified;
   };
 
+  const probe = (spec: SupervisorSpec): Promise<SupervisorObservation> => probeInternal(spec);
+
   const start = async (spec: SupervisorSpec, terminalRecreated = false): Promise<SupervisorStartResult> => {
-    const current = await probe(spec);
+    const current = await probeInternal(spec);
     if (current.kind === "unavailable") throw managerUnavailableError(current.reason);
     if (current.kind === "registered-running-valid") {
       return Object.freeze({
@@ -1768,12 +1800,19 @@ export function createSupervisor(
         ),
       );
       let after: SupervisorObservation = Object.freeze({ kind: "absent", name: spec.name });
+      const now = dependencies.now ?? Date.now;
+      const pollDeadline = now() + (dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
       for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
-        after = await probe(spec);
-        if (after.kind !== "absent") break;
+        const capture: SupervisorProbeCapture = {};
+        after = await probeInternal(spec, capture);
+        const activation = isOwnedSystemdActivation(spec, capture);
+        if (!activation || now() >= pollDeadline) break;
         if (attempt + 1 < maxPollIntervals) {
-          if (dependencies.sleep !== undefined) await dependencies.sleep(DEFAULT_POLL_INTERVAL_MS);
-          else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, DEFAULT_POLL_INTERVAL_MS));
+          const remaining = pollDeadline - now();
+          if (remaining <= 0) break;
+          const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
+          if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
+          else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
         }
       }
       if (after.kind === "registered-running-valid") {
