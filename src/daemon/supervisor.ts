@@ -6,13 +6,13 @@ import {
   existsSync,
   lstatSync,
   openSync,
-  readFileSync,
   realpathSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { platform as hostPlatform } from "node:os";
+import { readBoundedRegularFileWithStat } from "../security-files.js";
 import {
   cleanupManagedCredentialDirectory,
   managedCredentialPath,
@@ -1271,21 +1271,56 @@ function plistDocument(
   ].join("");
 }
 
+type PrivatePlistRead = ReturnType<typeof readBoundedRegularFileWithStat>;
+
+function readPrivatePlist(path: string, spec: SupervisorSpec, expectedUid?: number): PrivatePlistRead {
+  return readBoundedRegularFileWithStat(path, {
+    allowedRoot: spec.stateRoot,
+    maxBytes: MAX_PLIST_BYTES,
+    expectedUid,
+    allowedModes: [0o600],
+    requireSingleLink: true,
+  });
+}
+
+function assertPrivatePlistLeafIdentity(
+  path: string,
+  descriptor: PrivatePlistRead,
+  expectedUid?: number,
+): void {
+  const stats = lstatSync(path);
+  if (
+    stats.isSymbolicLink()
+    || !stats.isFile()
+    || stats.nlink !== 1
+    || (expectedUid !== undefined && stats.uid !== expectedUid)
+    || (stats.mode & 0o777) !== 0o600
+    || stats.dev !== descriptor.dev
+    || stats.ino !== descriptor.ino
+    || stats.mtimeMs !== descriptor.mtimeMs
+  ) throw new Error("supervisor plist collision");
+}
+
 function writePrivatePlist(spec: SupervisorSpec, environment: Readonly<Record<string, string>>): string {
   const path = plistPath(spec);
   if (existsSync(path)) {
-    const stats = lstatSync(path);
-    if (
-      stats.isSymbolicLink()
-      || !stats.isFile()
-      || stats.nlink !== 1
-      || stats.size > MAX_PLIST_BYTES
-      || (stats.mode & 0o777) !== 0o600
-    ) {
+    let descriptor: PrivatePlistRead;
+    try {
+      descriptor = readPrivatePlist(path, spec);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw error;
+      if ((error as NodeJS.ErrnoException).code !== undefined && (error as NodeJS.ErrnoException).code !== "ELOOP") {
+        throw error;
+      }
       throw new Error("supervisor plist collision");
     }
-    const existing = readFileSync(path, "utf8");
-    if (existing === plistDocument(spec, environment)) return path;
+    const existing = descriptor.content;
+    if (existing === plistDocument(spec, environment)) {
+      // The descriptor-bound read cannot make a future pathname consumer
+      // atomic. Recheck the leaf before handing the exact plist to launchctl.
+      assertPrivatePlistLeafIdentity(path, descriptor);
+      return path;
+    }
     // First authenticate the exact current descriptor.  A non-identical but
     // structurally valid descriptor may then use the narrower absence-only
     // drift path below; this exact check is never used to execute a plist.
@@ -1302,6 +1337,7 @@ function writePrivatePlist(spec: SupervisorSpec, environment: Readonly<Record<st
       }
     }
     try {
+      assertPrivatePlistLeafIdentity(path, descriptor);
       unlinkSync(path);
     } catch {
       throw new Error("supervisor plist collision");
@@ -1341,22 +1377,26 @@ function writePrivatePlist(spec: SupervisorSpec, environment: Readonly<Record<st
 function cleanupPrivatePlist(spec: SupervisorSpec, environment: Readonly<Record<string, string>>): void {
   const path = plistPath(spec);
   try {
-    const stats = lstatSync(path);
-    const uid = typeof process.getuid === "function" ? process.getuid() : stats.uid;
-    const document = readFileSync(path, "utf8");
-    if (
-      stats.isSymbolicLink()
-      || !stats.isFile()
-      || stats.nlink !== 1
-      || stats.uid !== uid
-      || stats.size > MAX_PLIST_BYTES
-      || (stats.mode & 0o777) !== 0o600
-      || (document !== plistDocument(spec, environment) && !privatePlistMatchesStableIdentity(document, spec, environment, true))
-    ) throw new Error("supervisor plist collision");
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    let descriptor: PrivatePlistRead;
+    try {
+      descriptor = readPrivatePlist(path, spec, uid);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      if ((error as NodeJS.ErrnoException).code !== undefined && (error as NodeJS.ErrnoException).code !== "ELOOP") {
+        throw error;
+      }
+      throw new Error("supervisor plist collision");
+    }
+    const document = descriptor.content;
+    if (document !== plistDocument(spec, environment) && !privatePlistMatchesStableIdentity(document, spec, environment, true)) {
+      throw new Error("supervisor plist collision");
+    }
     const previous = parsePrivatePlistDocument(document)?.environment.get("LCM_CREDENTIAL_DIRECTORY");
     if (previous !== undefined && previous !== spec.credentialDirectory) {
       cleanupManagedCredentialDirectory(previous, spec.stateRoot);
     }
+    assertPrivatePlistLeafIdentity(path, descriptor, uid);
     unlinkSync(path);
   } catch (error) {
     // Idempotent cleanup: an absent plist is already clean. Any present but
