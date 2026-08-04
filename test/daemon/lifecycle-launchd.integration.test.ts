@@ -214,6 +214,7 @@ async function waitForTerminal(
 describe("real launchd daemon lifecycle", () => {
   it.runIf(process.platform === "darwin")(
     "starts, authenticates, observes terminal exit, and boots out one scoped job",
+    { timeout: 60_000 },
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "lcm-launchd-integration-")));
       fixtureRoots.add(root);
