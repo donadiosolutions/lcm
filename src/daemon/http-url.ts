@@ -88,30 +88,96 @@ const DAEMON_TRANSPORT_ERROR_CODES = new Set([
   "ETIMEDOUT",
 ]);
 
+/**
+ * Keep exception inspection finite: an arbitrary AggregateError/cause graph
+ * is input, not authority.  The caps preserve useful nested transport codes
+ * while preventing a malformed graph from turning remediation into an
+ * unbounded walk.
+ */
+const DAEMON_TRANSPORT_ERROR_MAX_DEPTH = 8;
+const DAEMON_TRANSPORT_ERROR_MAX_NODES = 32;
+const DAEMON_TRANSPORT_TYPE_ERROR_MAX_MESSAGE_CHARS = 256;
+const DAEMON_TRANSPORT_TYPE_ERROR_MESSAGES = new Set([
+  "fetch failed",
+  "failed to fetch",
+  "network error",
+  "network request failed",
+  "load failed",
+]);
+const DAEMON_TRANSPORT_TYPE_ERROR_SUFFIXES = new Set([
+  "econnaborted",
+  "econnrefused",
+  "econnreset",
+  "ehostunreach",
+  "enetunreach",
+  "epipe",
+  "etimedout",
+  "connection aborted",
+  "connection closed",
+  "connection failed",
+  "connection refused",
+  "connection reset",
+  "connection timed out",
+  "connection timeout",
+  "network error",
+  "network request failed",
+  "socket closed",
+  "socket error",
+  "socket failed",
+  "socket hang up",
+  "socket reset",
+]);
+
+function isKnownDaemonTransportTypeErrorMessage(message: unknown): boolean {
+  if (typeof message !== "string" || message.length > DAEMON_TRANSPORT_TYPE_ERROR_MAX_MESSAGE_CHARS) {
+    return false;
+  }
+  const normalized = message.toLowerCase();
+  const separator = normalized.indexOf(": ");
+  const base = separator < 0 ? normalized : normalized.slice(0, separator);
+  if (!DAEMON_TRANSPORT_TYPE_ERROR_MESSAGES.has(base)) return false;
+  if (separator < 0) return true;
+  const suffix = normalized.slice(separator + 2);
+  return DAEMON_TRANSPORT_TYPE_ERROR_SUFFIXES.has(suffix);
+}
+
 /** Restrict managed-daemon recovery to local transport loss. */
 export function isDaemonTransportFailure(error: unknown): boolean {
   const seen = new Set<unknown>();
-  const pending: unknown[] = [error];
-  while (pending.length > 0) {
-    const current = pending.pop();
+  const pending: Array<{ value: unknown; depth: number }> = [{ value: error, depth: 0 }];
+  let inspectedNodes = 0;
+  while (pending.length > 0 && inspectedNodes < DAEMON_TRANSPORT_ERROR_MAX_NODES) {
+    const { value: current, depth } = pending.pop()!;
     if (typeof current !== "object" || current === null || seen.has(current)) continue;
     seen.add(current);
+    inspectedNodes += 1;
     const candidate = current as {
       code?: unknown;
       message?: unknown;
       cause?: unknown;
       errors?: unknown;
     };
-    if (current instanceof TypeError) return true;
     if (
       typeof candidate.code === "string"
       && DAEMON_TRANSPORT_ERROR_CODES.has(candidate.code.toUpperCase())
     ) {
       return true;
     }
-    if (candidate.message === "Daemon request timed out") return true;
-    pending.push(candidate.cause);
-    if (Array.isArray(candidate.errors)) pending.push(...candidate.errors);
+    if (!(current instanceof TypeError) && candidate.message === "Daemon request timed out") return true;
+    // A direct TypeError is only a transport signal for the small vocabulary
+    // emitted by fetch implementations.  Generic/programming TypeErrors must
+    // remain non-transport so MCP can return a sanitized diagnostic instead
+    // of suppressing it behind recovery guidance.
+    if (current instanceof TypeError && isKnownDaemonTransportTypeErrorMessage(candidate.message)) {
+      return true;
+    }
+    if (depth >= DAEMON_TRANSPORT_ERROR_MAX_DEPTH) continue;
+    pending.push({ value: candidate.cause, depth: depth + 1 });
+    if (current instanceof AggregateError && Array.isArray(candidate.errors)) {
+      for (const nested of candidate.errors.slice(0, DAEMON_TRANSPORT_ERROR_MAX_NODES)) {
+        pending.push({ value: nested, depth: depth + 1 });
+      }
+    }
   }
   return false;
 }

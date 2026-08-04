@@ -110,6 +110,20 @@ describe("handleDaemonRequest", () => {
     expect(res.content[0].text).toContain("daemon unavailable");
   });
 
+  it("treats a programming TypeError as non-transport and sanitizes its diagnostic", async () => {
+    const client = {
+      post: vi.fn().mockRejectedValue(new TypeError("connect parser bug /private/secret")),
+    };
+
+    const res = await handleDaemonRequest(client, "/search", { q: "foo" }, opts);
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("lcm error:");
+    expect(res.content[0].text).toContain("connect parser bug");
+    expect(res.content[0].text).not.toContain("/private/secret");
+    expect(ensureDaemonMock).not.toHaveBeenCalled();
+  });
+
   it.each(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EPIPE", "ENETUNREACH", "EHOSTUNREACH"])(
     "maps Node transport code %s to bounded remediation without lifecycle mutation",
     async (code) => {

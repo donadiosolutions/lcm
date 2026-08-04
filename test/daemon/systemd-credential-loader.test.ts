@@ -54,6 +54,75 @@ function credentialEnv(directory: string, ids: string): Record<string, string> {
   };
 }
 
+const NONRUNNING_USER_MANAGER_STATES = new Set([
+  "initializing",
+  "offline",
+  "starting",
+  "stopped",
+  "stopping",
+  "unknown",
+]);
+
+function outputText(value: unknown): string {
+  if (typeof value === "string") return value;
+  return Buffer.isBuffer(value) ? value.toString("utf8") : "";
+}
+
+/** Skip only when an explicit preflight proves this host cannot run the probe. */
+function requireRunningUserManager(context: TestContext): boolean {
+  if (process.platform !== "linux") {
+    context.skip("live systemd credential probe requires Linux");
+    return false;
+  }
+  if (typeof process.getuid !== "function") {
+    context.skip("live systemd credential probe requires a POSIX UID");
+    return false;
+  }
+
+  let output: string;
+  try {
+    output = execFileSync("systemctl", ["--user", "is-system-running"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5_000,
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      context.skip("systemd user manager is unsupported: systemctl is unavailable");
+      return false;
+    }
+    const details = `${outputText((error as { stdout?: unknown }).stdout)}\n${outputText((error as { stderr?: unknown }).stderr)}`;
+    const state = details.trim().split(/\s+/u)[0] ?? "";
+    if (NONRUNNING_USER_MANAGER_STATES.has(state)
+      || /Failed to connect to bus:\s+(?:No medium found|No such file or directory)/iu.test(details)) {
+      context.skip(`systemd user manager is not running (${state || "unavailable"})`);
+      return false;
+    }
+    throw error;
+  }
+
+  const state = output.trim().split(/\s+/u)[0] ?? "";
+  if (state === "running" || state === "degraded") return true;
+  if (NONRUNNING_USER_MANAGER_STATES.has(state)) {
+    context.skip(`systemd user manager is not running (${state})`);
+    return false;
+  }
+  throw new Error(`unexpected systemd user manager preflight state: ${state || "empty"}`);
+}
+
+function requireTrustedCredentialBaseDir(): string {
+  if (typeof process.getuid !== "function") {
+    throw new Error("live systemd credential probe requires a POSIX UID");
+  }
+  const baseDir = `/run/user/${process.getuid()}/credentials`;
+  if (!existsSync(baseDir)) {
+    throw new Error(`running user manager did not expose ${baseDir}`);
+  }
+  const probe = mkdtempSync(join(baseDir, "lcm-loader-live-probe-"));
+  rmSync(probe, { recursive: true, force: true });
+  return baseDir;
+}
+
 describe("systemd credential loader hardening", () => {
   it.each([
     ["unknown id", "BAD,OPENAI_API_KEY"],
@@ -168,10 +237,9 @@ describe("systemd credential loader hardening", () => {
     }
   });
 
-  it("observes the real user-systemd LoadCredential modes without exposing its value", () => {
-    if (process.platform !== "linux" || typeof process.getuid !== "function") return;
-    const baseDir = trustedCredentialBaseDir();
-    if (baseDir === undefined) return;
+  it("observes the real user-systemd LoadCredential modes without exposing its value", (context: TestContext) => {
+    if (!requireRunningUserManager(context)) return;
+    const baseDir = requireTrustedCredentialBaseDir();
     const source = join(baseDir, `lcm-loader-source-${randomUUID()}`);
     const unit = `lcm-loader-probe-${randomUUID().replaceAll("-", "")}`;
     try {
@@ -191,10 +259,6 @@ describe("systemd credential loader hardening", () => {
       const lines = output.split("\n").map((line) => line.trim()).filter(Boolean);
       expect(lines).toContain(`${process.getuid()} 400 regular file 1 12`);
       expect(lines).toContain(`${process.getuid()} 500 directory 2`);
-    } catch {
-      // A host without a user manager cannot provide live evidence; all
-      // security behavior remains covered by deterministic filesystem tests.
-      return;
     } finally {
       rmSync(source, { force: true });
     }

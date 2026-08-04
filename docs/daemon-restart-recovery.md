@@ -55,6 +55,12 @@ PID/token file, delete a service it cannot identify, or fall back to
 be proved, the command fails closed and tells the operator to restore the
 manager or inspect the host before retrying.
 
+The no-response classifier accepts only the closed Node transport-code set and
+bounded standard fetch/network failure messages (including their bounded,
+known suffixes). Unrelated programming exceptions, including generic
+`TypeError` values, remain application diagnostics and are sanitized by MCP;
+they never trigger managed-daemon recovery.
+
 ## Unsupported launch contexts
 
 The following contexts are intentionally outside managed recovery:

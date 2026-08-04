@@ -19,6 +19,9 @@ import {
 /**
  * The marker is deliberately a small, non-authoritative hint.  Lifecycle
  * decisions must never depend on its presence, contents, or write result.
+ * The 64-entry eviction bound can remove an older scope/reason pair, so a
+ * later unchanged event may emit a bounded duplicate notice after eviction;
+ * that is an intentional notification tradeoff, not a recovery authority.
  */
 export const DAEMON_REMEDIATION_MARKER_VERSION = 1 as const;
 export const DAEMON_REMEDIATION_MARKER_NAME = "daemon-remediation.v1.json";
