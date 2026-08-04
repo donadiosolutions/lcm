@@ -23,6 +23,16 @@ import {
 export const DAEMON_REMEDIATION_MARKER_VERSION = 1 as const;
 export const DAEMON_REMEDIATION_MARKER_NAME = "daemon-remediation.v1.json";
 export const DAEMON_NOTICE_REPEAT_INTERVAL_MS = 30 * 60 * 1_000;
+/** Maximum encoded marker size accepted from or written to the filesystem. */
+export const DAEMON_REMEDIATION_MARKER_MAX_BYTES = 16 * 1024;
+/** Maximum number of scope/reason entries retained in one marker. */
+export const DAEMON_REMEDIATION_MARKER_MAX_ENTRIES = 64;
+/** Maximum UTF-8 key length accepted by the marker parser. */
+export const DAEMON_REMEDIATION_MARKER_MAX_KEY_BYTES = 128;
+/** Maximum UTF-8 reason length accepted before closed-vocabulary validation. */
+export const DAEMON_REMEDIATION_MARKER_MAX_REASON_BYTES = 32;
+/** Maximum timestamp representable without losing integer precision. */
+export const DAEMON_REMEDIATION_MARKER_MAX_TIME_MS = Number.MAX_SAFE_INTEGER;
 
 /**
  * The marker is shared by every scope under one state root.  Serialise the
@@ -150,6 +160,8 @@ export function daemonScopeDigest(scope: string): string {
 
 export type DaemonRemediationFileSystem = Readonly<{
   readFileSync: (path: string, encoding: BufferEncoding) => string;
+  lstatSync: typeof lstatSync;
+  readBoundedRegularFileWithStat: typeof readBoundedRegularFileWithStat;
   writeFileSync: (
     path: string,
     data: string,
@@ -172,7 +184,9 @@ export type DaemonRemediationLockOperations = Readonly<{
 export type DaemonRemediationClock = Readonly<{ now: () => number }> | (() => number);
 
 const DEFAULT_FILESYSTEM: DaemonRemediationFileSystem = {
-  readFileSync: (path, encoding) => readFileSync(path, encoding),
+  readFileSync: readFileSync as DaemonRemediationFileSystem["readFileSync"],
+  lstatSync,
+  readBoundedRegularFileWithStat,
   writeFileSync: (path, data, options) => writeFileSync(path, data, options),
   renameSync,
   unlinkSync,
@@ -443,12 +457,162 @@ function isMarkerEntry(value: unknown): value is MarkerEntry {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as { reason?: unknown; lastNotifiedAtMs?: unknown };
   return isDaemonRefusalReason(candidate.reason)
+    && Buffer.byteLength(candidate.reason, "utf8") <= DAEMON_REMEDIATION_MARKER_MAX_REASON_BYTES
     && typeof candidate.lastNotifiedAtMs === "number"
     && Number.isFinite(candidate.lastNotifiedAtMs)
-    && candidate.lastNotifiedAtMs >= 0;
+    && candidate.lastNotifiedAtMs >= 0
+    && candidate.lastNotifiedAtMs <= DAEMON_REMEDIATION_MARKER_MAX_TIME_MS;
+}
+
+/**
+ * JSON.parse keeps only the last value for duplicate object keys.  That is
+ * unsafe for a marker because an attacker could hide an entry that the
+ * parser would otherwise validate.  The marker is small, so a bounded
+ * recursive lexical pass is preferable to accepting an ambiguous document.
+ */
+function hasDuplicateJsonKeys(raw: string): boolean {
+  let index = 0;
+
+  const skipWhitespace = (): void => {
+    while (/\s/u.test(raw[index] ?? "")) index += 1;
+  };
+
+  const readString = (): string | null => {
+    if (raw[index] !== '"') return null;
+    const start = index;
+    index += 1;
+    while (index < raw.length) {
+      const character = raw[index];
+      if (character === "\\") {
+        index += 2;
+        continue;
+      }
+      index += 1;
+      if (character === '"') {
+        try {
+          return JSON.parse(raw.slice(start, index)) as string;
+        } catch {
+          return null;
+        }
+      }
+    }
+    return null;
+  };
+
+  const readValue = (): boolean => {
+    skipWhitespace();
+    const character = raw[index];
+    if (character === "{") return readObject();
+    if (character === "[") return readArray();
+    if (character === '"') return readString() === null;
+    if (character === "-") {
+      index += 1;
+      while (/[0-9.eE+-]/u.test(raw[index] ?? "")) index += 1;
+      return false;
+    }
+    if (/[0-9]/u.test(character ?? "")) {
+      index += 1;
+      while (/[0-9.eE+-]/u.test(raw[index] ?? "")) index += 1;
+      return false;
+    }
+    for (const literal of ["true", "false", "null"]) {
+      if (raw.startsWith(literal, index)) {
+        index += literal.length;
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const readArray = (): boolean => {
+    index += 1;
+    skipWhitespace();
+    if (raw[index] === "]") {
+      index += 1;
+      return false;
+    }
+    while (index < raw.length) {
+      if (readValue()) return true;
+      skipWhitespace();
+      if (raw[index] === "]") {
+        index += 1;
+        return false;
+      }
+      if (raw[index] !== ",") return true;
+      index += 1;
+      skipWhitespace();
+    }
+    return true;
+  };
+
+  const readObject = (): boolean => {
+    index += 1;
+    const keys = new Set<string>();
+    skipWhitespace();
+    if (raw[index] === "}") {
+      index += 1;
+      return false;
+    }
+    while (index < raw.length) {
+      skipWhitespace();
+      const key = readString();
+      if (key === null) return true;
+      if (keys.has(key)) return true;
+      keys.add(key);
+      skipWhitespace();
+      if (raw[index] !== ":") return true;
+      index += 1;
+      if (readValue()) return true;
+      skipWhitespace();
+      if (raw[index] === "}") {
+        index += 1;
+        return false;
+      }
+      if (raw[index] !== ",") return true;
+      index += 1;
+    }
+    return true;
+  };
+
+  return readValue();
+}
+
+type MarkerStat = Readonly<{
+  dev: number;
+  ino: number;
+  mode: number;
+  nlink: number;
+  size: number;
+  uid: number;
+}>;
+
+function validateMarkerStat(path: string, fs: DaemonRemediationFileSystem): MarkerStat {
+  const stat = fs.lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink()
+    || (stat.mode & 0o777) !== 0o600
+    || stat.nlink !== 1
+    || !Number.isSafeInteger(stat.size)
+    || stat.size < 0
+    || stat.size > DAEMON_REMEDIATION_MARKER_MAX_BYTES) {
+    throw new Error("remediation marker is not a private bounded regular file");
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (uid !== undefined && stat.uid !== uid) {
+    throw new Error("remediation marker owner is not the current user");
+  }
+  return Object.freeze({
+    dev: stat.dev,
+    ino: stat.ino,
+    mode: stat.mode,
+    nlink: stat.nlink,
+    size: stat.size,
+    uid: stat.uid,
+  });
 }
 
 function parseMarker(raw: string): MarkerDocument | null {
+  if (Buffer.byteLength(raw, "utf8") > DAEMON_REMEDIATION_MARKER_MAX_BYTES
+    || hasDuplicateJsonKeys(raw)) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw) as unknown;
@@ -457,23 +621,31 @@ function parseMarker(raw: string): MarkerDocument | null {
   }
   if (typeof parsed !== "object" || parsed === null) return null;
   const candidate = parsed as { version?: unknown; entries?: unknown };
+  const documentKeys = Object.keys(parsed).sort();
+  if (documentKeys.length !== 2 || documentKeys.join(",") !== "entries,version") return null;
   if (candidate.version !== DAEMON_REMEDIATION_MARKER_VERSION
     || typeof candidate.entries !== "object"
     || candidate.entries === null
     || Array.isArray(candidate.entries)) {
     return null;
   }
+  const entryRecords = Object.entries(candidate.entries);
+  if (entryRecords.length > DAEMON_REMEDIATION_MARKER_MAX_ENTRIES) return null;
   const entries: Record<string, MarkerEntry> = {};
-  for (const [key, value] of Object.entries(candidate.entries)) {
-    // Keys are intentionally opaque to the parser, but bounding them to the
-    // full digest + closed reason keeps a malformed marker from growing state
-    // without ever echoing marker content to a user.
+  for (const [key, value] of entryRecords) {
+    if (Buffer.byteLength(key, "utf8") > DAEMON_REMEDIATION_MARKER_MAX_KEY_BYTES
+      || !isMarkerEntry(value)
+      || typeof value !== "object"
+      || value === null
+      || Array.isArray(value)) return null;
+    const valueKeys = Object.keys(value).sort();
+    if (valueKeys.length !== 2 || valueKeys.join(",") !== "lastNotifiedAtMs,reason") return null;
     const separator = key.lastIndexOf(":");
     const digest = key.slice(0, separator);
     const reason = key.slice(separator + 1);
     if (separator !== 64 || !/^[a-f0-9]{64}$/u.test(digest)
-      || !isDaemonRefusalReason(reason) || !isMarkerEntry(value)
-      || value.reason !== reason) continue;
+      || !isDaemonRefusalReason(reason)
+      || value.reason !== reason) return null;
     entries[key] = Object.freeze({ reason: value.reason, lastNotifiedAtMs: value.lastNotifiedAtMs });
   }
   return Object.freeze({
@@ -484,7 +656,44 @@ function parseMarker(raw: string): MarkerDocument | null {
 
 function readMarker(path: string, fs: DaemonRemediationFileSystem): ReadMarkerResult {
   try {
-    const parsed = parseMarker(fs.readFileSync(path, "utf8"));
+    let raw = "";
+    let before: MarkerStat;
+    // Keep the historical filesystem seam useful to deterministic tests while
+    // the production default always uses the descriptor-bound bounded reader.
+    const customReadFile = fs.readFileSync !== DEFAULT_FILESYSTEM.readFileSync
+      && fs.readBoundedRegularFileWithStat === DEFAULT_FILESYSTEM.readBoundedRegularFileWithStat;
+    if (customReadFile) {
+      try {
+        raw = fs.readFileSync(path, "utf8");
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          return { document: emptyDocument(), exists: false, markerIoError: false };
+        }
+        throw error;
+      }
+      before = validateMarkerStat(path, fs);
+      if (Buffer.byteLength(raw, "utf8") > DAEMON_REMEDIATION_MARKER_MAX_BYTES) {
+        throw new Error("remediation marker exceeds the configured size limit");
+      }
+    } else {
+      before = validateMarkerStat(path, fs);
+    }
+    if (!customReadFile && fs.readBoundedRegularFileWithStat !== DEFAULT_FILESYSTEM.readBoundedRegularFileWithStat) {
+      raw = fs.readBoundedRegularFileWithStat(path, {
+        maxBytes: DAEMON_REMEDIATION_MARKER_MAX_BYTES,
+        allowedRoot: dirname(path),
+      }).content;
+    } else if (!customReadFile) {
+      raw = fs.readBoundedRegularFileWithStat(path, {
+        maxBytes: DAEMON_REMEDIATION_MARKER_MAX_BYTES,
+        allowedRoot: dirname(path),
+      }).content;
+    }
+    const after = validateMarkerStat(path, fs);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size) {
+      throw new Error("remediation marker changed during validation");
+    }
+    const parsed = parseMarker(raw);
     if (!parsed) return { document: emptyDocument(), exists: true, markerIoError: true };
     return { document: parsed, exists: true, markerIoError: false };
   } catch (error) {
@@ -496,10 +705,25 @@ function readMarker(path: string, fs: DaemonRemediationFileSystem): ReadMarkerRe
 }
 
 function encodeMarker(document: MarkerDocument): string {
+  const entriesByKey = Object.entries(document.entries);
   const entries = Object.fromEntries(
-    Object.entries(document.entries).sort(([left], [right]) => left.localeCompare(right)),
+    entriesByKey.sort(([left], [right]) => left.localeCompare(right)),
   );
+  // parseMarker rejects entries beyond the cap and record/clear both pass
+  // through pruneMarkerEntries, so every serialized document is bounded by
+  // the same entry/key/reason/time limits as the descriptor-bound reader.
   return `${JSON.stringify({ version: document.version, entries }, null, 2)}\n`;
+}
+
+/** Keep the newest entries and use the key as a stable tie-breaker. */
+function pruneMarkerEntries(entries: Record<string, MarkerEntry>): Record<string, MarkerEntry> {
+  const retained = Object.entries(entries)
+    .sort(([leftKey, left], [rightKey, right]) => (
+      right.lastNotifiedAtMs - left.lastNotifiedAtMs || leftKey.localeCompare(rightKey)
+    ))
+    .slice(0, DAEMON_REMEDIATION_MARKER_MAX_ENTRIES)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return Object.fromEntries(retained);
 }
 
 function writeMarker(
@@ -602,9 +826,10 @@ function recordDaemonRemediationUnderLock(
   const entries = { ...read.document.entries };
   removeScopeEntries(entries, scopeDigest);
   entries[key] = Object.freeze({ reason, lastNotifiedAtMs: now });
+  const retainedEntries = pruneMarkerEntries(entries);
   const markerIoError = writeOrReport(
     path,
-    { version: DAEMON_REMEDIATION_MARKER_VERSION, entries: Object.freeze(entries) },
+    { version: DAEMON_REMEDIATION_MARKER_VERSION, entries: Object.freeze(retainedEntries) },
     fs,
   );
   return {
@@ -657,14 +882,10 @@ function clearDaemonRemediationUnderLock(
   const read = readMarker(path, fs);
   if (!read.exists) return { cleared: false, markerIoError: false };
   if (read.markerIoError) {
-    // A malformed marker is not authority.  Best effort removal avoids
-    // retaining unbounded stale state, but failure is reported to the caller.
-    try {
-      fs.unlinkSync(path);
-      return { cleared: true, markerIoError: false };
-    } catch {
-      return { cleared: false, markerIoError: true };
-    }
+    // A malformed, oversized, or ambiguous marker is evidence.  Never delete
+    // it by pathname: retaining it makes the refusal visible and avoids a
+    // symlink/hard-link race turning a best-effort clear into data loss.
+    return { cleared: false, markerIoError: true };
   }
 
   const entries = { ...read.document.entries };
@@ -679,7 +900,10 @@ function clearDaemonRemediationUnderLock(
     } else {
       writeMarker(
         path,
-        { version: DAEMON_REMEDIATION_MARKER_VERSION, entries: Object.freeze(entries) },
+        {
+          version: DAEMON_REMEDIATION_MARKER_VERSION,
+          entries: Object.freeze(pruneMarkerEntries(entries)),
+        },
         fs,
       );
     }

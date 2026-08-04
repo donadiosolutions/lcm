@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -17,6 +20,9 @@ import { createHash } from "node:crypto";
 import {
   DAEMON_NOTICE_REPEAT_INTERVAL_MS,
   DAEMON_REFUSAL_REASONS,
+  DAEMON_REMEDIATION_MARKER_MAX_BYTES,
+  DAEMON_REMEDIATION_MARKER_MAX_ENTRIES,
+  DAEMON_REMEDIATION_MARKER_MAX_TIME_MS,
   DAEMON_REMEDIATION_MARKER_NAME,
   clearDaemonRemediation,
   daemonRemediationMarkerPath,
@@ -43,6 +49,29 @@ function input(
   now: () => number,
 ) {
   return { markerPath, scope, reason, clock: { now } };
+}
+
+function markerEntries(
+  count: number,
+  timestamp: (index: number) => number = index => index,
+): Record<string, { reason: (typeof DAEMON_REFUSAL_REASONS)[number]; lastNotifiedAtMs: number }> {
+  const entries: Record<string, { reason: (typeof DAEMON_REFUSAL_REASONS)[number]; lastNotifiedAtMs: number }> = {};
+  for (let index = 0; index < count; index += 1) {
+    const reason = DAEMON_REFUSAL_REASONS[index % DAEMON_REFUSAL_REASONS.length];
+    const digest = daemonScopeDigest(`generated-scope-${index}`);
+    entries[`${digest}:${reason}`] = { reason, lastNotifiedAtMs: timestamp(index) };
+  }
+  return entries;
+}
+
+function writeMarkerDocument(
+  markerPath: string,
+  entries: Record<string, { reason: (typeof DAEMON_REFUSAL_REASONS)[number]; lastNotifiedAtMs: number }>,
+): string {
+  const raw = `${JSON.stringify({ version: 1, entries }, null, 2)}\n`;
+  writeFileSync(markerPath, raw, { encoding: "utf8", mode: 0o600 });
+  chmodSync(markerPath, 0o600);
+  return raw;
 }
 
 describe("daemon remediation mapping", () => {
@@ -564,6 +593,267 @@ describe("daemon remediation marker", () => {
   });
 });
 
+describe("bounded remediation marker persistence", () => {
+  it("accepts the exact byte boundary and emits on one byte over", () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "boundary.json");
+      const digest = daemonScopeDigest("scope-a");
+      const base = JSON.stringify({
+        version: 1,
+        entries: {
+          [`${digest}:ambiguous`]: { reason: "ambiguous", lastNotifiedAtMs: 1 },
+        },
+      });
+      const exact = `${base}${" ".repeat(DAEMON_REMEDIATION_MARKER_MAX_BYTES - Buffer.byteLength(base))}`;
+      expect(Buffer.byteLength(exact)).toBe(DAEMON_REMEDIATION_MARKER_MAX_BYTES);
+      writeFileSync(markerPath, exact, { encoding: "utf8", mode: 0o600 });
+      expect(recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", () => 2)))
+        .toMatchObject({ emit: false, markerStatus: "suppressed", markerIoError: false });
+
+      writeFileSync(markerPath, `${exact} `, { encoding: "utf8", mode: 0o600 });
+      expect(recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", () => 2)))
+        .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts the maximum entry count, prunes the oldest deterministically, and rejects a flood", () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "entries.json");
+      const entries = markerEntries(DAEMON_REMEDIATION_MARKER_MAX_ENTRIES);
+      writeMarkerDocument(markerPath, entries);
+      const first = recordDaemonRemediation(input(markerPath, "new-scope", "ambiguous", () => 10_000));
+      expect(first).toMatchObject({ emit: true, markerStatus: "created", markerIoError: false });
+      const retained = readDaemonRemediationMarker({ markerPath }).entries;
+      expect(Object.keys(retained)).toHaveLength(DAEMON_REMEDIATION_MARKER_MAX_ENTRIES);
+      expect(retained[`${daemonScopeDigest("generated-scope-0")}:live-no-response`]).toBeUndefined();
+      expect(retained[`${daemonScopeDigest("new-scope")}:ambiguous`]).toEqual({
+        reason: "ambiguous",
+        lastNotifiedAtMs: 10_000,
+      });
+
+      const floodPath = join(root, "flood.json");
+      writeMarkerDocument(floodPath, markerEntries(DAEMON_REMEDIATION_MARKER_MAX_ENTRIES + 1));
+      expect(recordDaemonRemediation(input(floodPath, "scope-a", "ambiguous", () => 1)))
+        .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+      expect(readDaemonRemediationMarker({ markerPath: floodPath })).toMatchObject({
+        exists: true,
+        markerIoError: true,
+        entries: {},
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes retained entries in stable order regardless of source insertion order", () => {
+    const root = makeRoot();
+    try {
+      const firstPath = join(root, "first.json");
+      const secondPath = join(root, "second.json");
+      const entries = markerEntries(DAEMON_REMEDIATION_MARKER_MAX_ENTRIES - 1, () => 1);
+      const reversed = Object.fromEntries(Object.entries(entries).reverse());
+      writeMarkerDocument(firstPath, entries);
+      writeMarkerDocument(secondPath, reversed);
+      recordDaemonRemediation(input(firstPath, "new-scope", "ambiguous", () => 2));
+      recordDaemonRemediation(input(secondPath, "new-scope", "ambiguous", () => 2));
+      expect(readFileSync(firstPath, "utf8")).toBe(readFileSync(secondPath, "utf8"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects duplicate, extra, mismatched, and out-of-range marker fields", () => {
+    const root = makeRoot();
+    try {
+      const digest = daemonScopeDigest("scope-a");
+      const cases: Array<[string, string]> = [
+        ["duplicate.json", `{"version":1,"entries":{"${digest}:ambiguous":{"reason":"ambiguous","lastNotifiedAtMs":1},"${digest}:ambiguous":{"reason":"ambiguous","lastNotifiedAtMs":2}}}`],
+        ["top-extra.json", JSON.stringify({ version: 1, entries: {}, extra: "secret=/tmp/path" })],
+        ["entry-extra.json", JSON.stringify({ version: 1, entries: { [`${digest}:ambiguous`]: { reason: "ambiguous", lastNotifiedAtMs: 1, extra: "secret" } } })],
+        ["mismatch.json", JSON.stringify({ version: 1, entries: { [`${digest}:ambiguous`]: { reason: "not-running", lastNotifiedAtMs: 1 } } })],
+        ["invalid-entry.json", JSON.stringify({ version: 1, entries: { [`${digest}:ambiguous`]: { reason: "ambiguous", lastNotifiedAtMs: "1" } } })],
+        ["time.json", JSON.stringify({ version: 1, entries: { [`${digest}:ambiguous`]: { reason: "ambiguous", lastNotifiedAtMs: DAEMON_REMEDIATION_MARKER_MAX_TIME_MS + 1 } } })],
+        ["key.json", JSON.stringify({ version: 1, entries: { [`${digest}:${"a".repeat(DAEMON_REMEDIATION_MARKER_MAX_BYTES)}`]: { reason: "ambiguous", lastNotifiedAtMs: 1 } } })],
+        ["array-entry.json", JSON.stringify({ version: 1, entries: { [`${digest}:ambiguous`]: [] } })],
+        ["array-values.json", JSON.stringify({ version: 1, entries: { [`${digest}:ambiguous`]: [1, true, null, "value", {}] } })],
+        ["array-unknown.json", `{"version":1,"entries":{"${digest}:ambiguous":[x]}}`],
+        ["array-no-comma.json", `{"version":1,"entries":{"${digest}:ambiguous":[1 2]}}`],
+        ["array-eof.json", `{"version":1,"entries":{"${digest}:ambiguous":[1,`],
+        ["primitive-entry.json", JSON.stringify({ version: 1, entries: { [`${digest}:ambiguous`]: true } })],
+        ["entries-array.json", '{"version":1,"entries":[]}'],
+        ["top-number.json", "1"],
+        ["top-negative-number.json", "-1"],
+        ["top-negative.json", '{"version":-1,"entries":{}}'],
+        ["top-string.json", "\"value\""],
+        ["top-true.json", "true"],
+        ["unknown-value.json", '{"version":1,"entries":{"x":x}}'],
+        ["bad-colon.json", '{"version"=1}'],
+        ["bad-comma.json", '{"version":1 "entries":{}}'],
+        ["unterminated-object.json", '{"version":1'],
+        ["object-eof.json", '{"version":1,'],
+        ["value-eof.json", '{"version":'],
+        ["unterminated-string.json", '{"unterminated:1}'],
+        ["bad-escape.json", '{"bad\\x":1}'],
+        ["trailing.json", '{"version":1,"entries":{}} trailing'],
+      ];
+      for (const [name, raw] of cases) {
+        const markerPath = join(root, name);
+        writeFileSync(markerPath, raw, { encoding: "utf8", mode: 0o600 });
+        expect(recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", () => 2)))
+          .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform === "linux")("rejects marker FIFO, symlink, hardlink, directory, and broad mode", () => {
+    const root = makeRoot();
+    try {
+      const target = join(root, "target.json");
+      writeMarkerDocument(target, {});
+      const symlinkMarker = join(root, "symlink.json");
+      symlinkSync(target, symlinkMarker);
+      expect(recordDaemonRemediation(input(symlinkMarker, "scope-a", "ambiguous", () => 1)))
+        .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+      expect(readFileSync(target, "utf8")).not.toContain("scope-a");
+
+      const hardlinkMarker = join(root, "hardlink.json");
+      linkSync(target, hardlinkMarker);
+      expect(recordDaemonRemediation(input(hardlinkMarker, "scope-a", "ambiguous", () => 1)))
+        .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const directoryMarker = join(root, "directory.json");
+      mkdirSync(directoryMarker);
+      expect(recordDaemonRemediation(input(directoryMarker, "scope-a", "ambiguous", () => 1)))
+        .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const modeMarker = join(root, "mode.json");
+      writeMarkerDocument(modeMarker, {});
+      chmodSync(modeMarker, 0o640);
+      expect(recordDaemonRemediation(input(modeMarker, "scope-a", "ambiguous", () => 1)))
+        .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const fifoMarker = join(root, "fifo.json");
+      execFileSync("mkfifo", [fifoMarker]);
+      expect(recordDaemonRemediation(input(fifoMarker, "scope-a", "ambiguous", () => 1)))
+        .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a marker owned by another uid without exposing its contents", () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "owner.json");
+      writeMarkerDocument(markerPath, {});
+      let markerStats = 0;
+      expect(typeof process.getuid).toBe("function");
+      expect(recordDaemonRemediation({
+        ...input(markerPath, "scope-a", "ambiguous", () => 1),
+        fs: {
+          lstatSync: path => {
+            markerStats += 1;
+            const stat = lstatSync(path);
+            return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+              uid: (process.getuid?.() ?? 0) + 1,
+            });
+          },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+      expect(markerStats).toBeGreaterThan(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps bounded-reader and legacy read seams bounded and fail-safe", () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "seams.json");
+      const raw = writeMarkerDocument(markerPath, {});
+      expect(recordDaemonRemediation({
+        ...input(markerPath, "scope-a", "ambiguous", () => 1),
+        fs: {
+          readBoundedRegularFileWithStat: (path, options) => ({
+            ...readBoundedRegularFileWithStat(path, options),
+            content: raw,
+          }),
+        },
+      })).toMatchObject({ emit: true, markerStatus: "created", markerIoError: false });
+      expect(recordDaemonRemediation({
+        ...input(markerPath, "scope-a", "ambiguous", () => 1),
+        fs: { readFileSync: path => readFileSync(path, "utf8") },
+      })).toMatchObject({ emit: false, markerStatus: "suppressed", markerIoError: false });
+      const originalGetUid = process.getuid;
+      Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+      try {
+        expect(recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", () => 1)))
+          .toMatchObject({ emit: false, markerStatus: "suppressed", markerIoError: false });
+      } finally {
+        Object.defineProperty(process, "getuid", { configurable: true, value: originalGetUid });
+      }
+      expect(recordDaemonRemediation({
+        ...input(markerPath, "scope-a", "ambiguous", () => 1),
+        fs: { readFileSync: () => "x".repeat(DAEMON_REMEDIATION_MARKER_MAX_BYTES + 1) },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const missingPath = join(root, "missing.json");
+      expect(recordDaemonRemediation({
+        ...input(missingPath, "scope-a", "ambiguous", () => 1),
+        fs: { readFileSync: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); } },
+      })).toMatchObject({ emit: true, markerStatus: "created", markerIoError: false });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when marker growth or replacement races the bounded read", () => {
+    const root = makeRoot();
+    try {
+      const growthPath = join(root, "growth.json");
+      writeMarkerDocument(growthPath, {});
+      let growthReads = 0;
+      expect(recordDaemonRemediation({
+        ...input(growthPath, "scope-a", "ambiguous", () => 1),
+        fs: {
+          lstatSync: path => {
+            growthReads += 1;
+            if (growthReads === 2) appendFileSync(path, " ");
+            return lstatSync(path);
+          },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const replacementPath = join(root, "replacement.json");
+      writeMarkerDocument(replacementPath, {});
+      let replacementReads = 0;
+      expect(recordDaemonRemediation({
+        ...input(replacementPath, "scope-a", "ambiguous", () => 1),
+        fs: {
+          lstatSync: path => {
+            replacementReads += 1;
+            if (replacementReads === 2) {
+              rmSync(path);
+              writeMarkerDocument(path, {});
+            }
+            return lstatSync(path);
+          },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+      expect(existsSync(replacementPath)).toBe(true);
+      expect(readFileSync(replacementPath, "utf8")).not.toContain("scope-a");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("daemon remediation clearing", () => {
   it("fails closed when a live lock blocks marker clearing", () => {
     const root = makeRoot();
@@ -618,21 +908,23 @@ describe("daemon remediation clearing", () => {
     }
   });
 
-  it("best-effort clears malformed markers and reports clear I/O failures", () => {
+  it("retains malformed markers and reports clear I/O failures", () => {
     const root = makeRoot();
     try {
       const malformed = join(root, "malformed.json");
       writeFileSync(malformed, "{broken", { mode: 0o600 });
       expect(clearDaemonRemediation({ markerPath: malformed, scope: "scope-a" })).toEqual({
-        cleared: true,
-        markerIoError: false,
+        cleared: false,
+        markerIoError: true,
       });
+      expect(existsSync(malformed)).toBe(true);
       writeFileSync(malformed, "{broken", { mode: 0o600 });
       expect(clearDaemonRemediation({
         markerPath: malformed,
         scope: "scope-a",
         fs: { unlinkSync: () => { throw new Error("busy"); } },
       })).toEqual({ cleared: false, markerIoError: true });
+      expect(existsSync(malformed)).toBe(true);
 
       const markerPath = join(root, "marker.json");
       recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", () => 1));
