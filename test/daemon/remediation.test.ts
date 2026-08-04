@@ -847,19 +847,33 @@ describe("bounded remediation marker persistence", () => {
       const replacementPath = join(root, "replacement.json");
       writeMarkerDocument(replacementPath, {});
       let replacementReads = 0;
+      let originalInode: number | undefined;
       expect(recordDaemonRemediation({
         ...input(replacementPath, "scope-a", "ambiguous", () => 1),
         fs: {
           lstatSync: path => {
             replacementReads += 1;
+            const stat = lstatSync(path);
+            if (replacementReads === 1) {
+              originalInode = stat.ino;
+              return stat;
+            }
             if (replacementReads === 2) {
               rmSync(path);
               writeMarkerDocument(path, {});
+              const replacementStat = lstatSync(path);
+              // Overlay filesystems may recycle the same dev/ino for a
+              // same-size replacement.  Keep the real replacement, but make
+              // its observed identity deterministic for this race proof.
+              return Object.assign(Object.create(Object.getPrototypeOf(replacementStat)), replacementStat, {
+                ino: (originalInode ?? replacementStat.ino) + 1,
+              });
             }
-            return lstatSync(path);
+            return stat;
           },
         },
       })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+      expect(replacementReads).toBe(2);
       expect(existsSync(replacementPath)).toBe(true);
       expect(readFileSync(replacementPath, "utf8")).not.toContain("scope-a");
     } finally {
