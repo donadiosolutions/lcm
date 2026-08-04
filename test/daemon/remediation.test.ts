@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -7,6 +8,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,6 +26,11 @@ import {
   readDaemonRemediationMarker,
   recordDaemonRemediation,
 } from "../../src/daemon/remediation.js";
+import {
+  readBoundedRegularFileWithStat,
+  type BoundedFileOptions,
+} from "../../src/security-files.js";
+import type { DaemonRemediationLockOperations } from "../../src/daemon/remediation.js";
 
 function makeRoot(): string {
   return mkdtempSync(join(tmpdir(), "lcm-remediation-test-"));
@@ -64,6 +71,338 @@ describe("daemon remediation mapping", () => {
 });
 
 describe("daemon remediation marker", () => {
+  it("deduplicates same-scope notices across concurrent Promise callers", async () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "marker.json");
+      const calls = await Promise.all(Array.from({ length: 24 }, () => Promise.resolve().then(() => (
+        recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", () => 1_000))
+      ))));
+      expect(calls.filter(result => result.emit)).toHaveLength(1);
+      expect(calls.filter(result => !result.emit)).toHaveLength(23);
+      expect(existsSync(`${markerPath}.lock`)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes reason transitions and retains only the latest reason", () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "marker.json");
+      const clock = () => 2_000;
+      expect(recordDaemonRemediation(input(markerPath, "scope-a", "stale-config", clock))).toMatchObject({
+        emit: true,
+        markerStatus: "created",
+      });
+      expect(recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", clock))).toMatchObject({
+        emit: true,
+        markerStatus: "reason-changed",
+      });
+      expect(recordDaemonRemediation(input(markerPath, "scope-a", "stale-config", clock))).toMatchObject({
+        emit: true,
+        markerStatus: "reason-changed",
+      });
+      expect(Object.keys(readDaemonRemediationMarker({ markerPath }).entries)).toEqual([
+        `${daemonScopeDigest("scope-a")}:stale-config`,
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims a private stale lock without persisting scope, PID, or path", () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "marker.json");
+      const lockPath = `${markerPath}.lock`;
+      writeFileSync(lockPath, JSON.stringify({ version: 1, nonce: "a".repeat(32), createdAtMs: 1 }), { mode: 0o600 });
+      const result = recordDaemonRemediation(input(markerPath, "scope-with-secret", "ambiguous", () => 20_000));
+      expect(result).toMatchObject({ emit: true, markerStatus: "created", markerIoError: false });
+      expect(existsSync(lockPath)).toBe(false);
+      const marker = readFileSync(markerPath, "utf8");
+      expect(marker).not.toContain("scope-with-secret");
+      expect(marker).not.toContain(String(process.pid));
+      expect(marker).not.toContain(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed and remains bounded for live, malformed, symlink, and permission locks", () => {
+    const root = makeRoot();
+    try {
+      const cases = [
+        { name: "live", setup: (path: string) => writeFileSync(path, JSON.stringify({ version: 1, nonce: "b".repeat(32), createdAtMs: 20_000 }), { mode: 0o600 }) },
+        { name: "malformed", setup: (path: string) => writeFileSync(path, "secret=/private/path", { mode: 0o600 }) },
+        { name: "array-owner", setup: (path: string) => writeFileSync(path, "[]", { mode: 0o600 }) },
+        { name: "wrong-owner-keys", setup: (path: string) => writeFileSync(path, JSON.stringify({ version: 1, nonce: "b".repeat(32), createdAt: 20_000 }), { mode: 0o600 }) },
+        { name: "invalid-owner", setup: (path: string) => writeFileSync(path, JSON.stringify({ version: 1, nonce: "not-a-nonce", createdAtMs: -1 }), { mode: 0o600 }) },
+        { name: "permission", setup: (path: string) => {
+          writeFileSync(path, JSON.stringify({ version: 1, nonce: "c".repeat(32), createdAtMs: 20_000 }), { mode: 0o600 });
+          chmodSync(path, 0o640);
+        } },
+      ];
+      for (const testCase of cases) {
+        const markerPath = join(root, `${testCase.name}.json`);
+        testCase.setup(`${markerPath}.lock`);
+        const started = Date.now();
+        const result = recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", () => 20_000));
+        expect(Date.now() - started).toBeLessThan(1_000);
+        expect(result).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+        expect(result.remediation.message).not.toMatch(/private|path|secret|pid/iu);
+      }
+
+      const target = join(root, "target");
+      const symlinkMarkerPath = join(root, "symlink.json");
+      const symlinkLockPath = `${symlinkMarkerPath}.lock`;
+      writeFileSync(target, "do-not-touch", { mode: 0o600 });
+      symlinkSync(target, symlinkLockPath);
+      expect(recordDaemonRemediation(input(symlinkMarkerPath, "scope-a", "ambiguous", () => 20_000)))
+        .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+      expect(readFileSync(target, "utf8")).toBe("do-not-touch");
+
+      const metadataMarkerPath = join(root, "metadata.json");
+      const metadataOps: Partial<DaemonRemediationLockOperations> = {
+        readBoundedRegularFileWithStat: (path: string, options: BoundedFileOptions) => ({
+          ...readBoundedRegularFileWithStat(path, options),
+          mtimeMs: Number.NaN,
+        }),
+      };
+      expect(recordDaemonRemediation({
+        ...input(metadataMarkerPath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: metadataOps,
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const uidMarkerPath = join(root, "uid.json");
+      const uidOps: Partial<DaemonRemediationLockOperations> = {
+        lstatSync: () => ({
+          isFile: () => true,
+          mode: 0o600,
+          uid: (process.getuid?.() ?? 0) + 1,
+        }) as never,
+      };
+      expect(recordDaemonRemediation({
+        ...input(uidMarkerPath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: uidOps,
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const noUidPath = join(root, "no-uid.json");
+      const originalGetUid = process.getuid;
+      Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+      try {
+        expect(recordDaemonRemediation({
+          markerPath: noUidPath,
+          scope: "scope-a",
+          reason: "ambiguous",
+          clock: () => 20_000,
+        })).toMatchObject({ emit: true, markerStatus: "created", markerIoError: false });
+      } finally {
+        Object.defineProperty(process, "getuid", { configurable: true, value: originalGetUid });
+      }
+
+      const defaultClockPath = join(root, "default-clock.json");
+      expect(recordDaemonRemediation({
+        markerPath: defaultClockPath,
+        scope: "scope-a",
+        reason: "absent",
+      })).toMatchObject({ emit: true, markerStatus: "created", markerIoError: false });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform === "linux")("rejects a FIFO lock without blocking and does not follow it", () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "fifo.json");
+      const lockPath = `${markerPath}.lock`;
+      execFileSync("mkfifo", [lockPath]);
+      const started = Date.now();
+      expect(recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", () => 20_000)))
+        .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+      expect(Date.now() - started).toBeLessThan(1_000);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reclaim a future lock after a clock rollback", () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "rollback.json");
+      const lockPath = `${markerPath}.lock`;
+      writeFileSync(lockPath, JSON.stringify({ version: 1, nonce: "d".repeat(32), createdAtMs: 20_000 }), { mode: 0o600 });
+      const started = Date.now();
+      expect(recordDaemonRemediation(input(markerPath, "scope-a", "ambiguous", () => 10_000)))
+        .toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds injected lock races and leaves ambiguous ownership untouched", () => {
+    const root = makeRoot();
+    try {
+      const errorWithCode = (code: string): Error => Object.assign(new Error(code), { code });
+
+      const writeFailurePath = join(root, "write-failure.json");
+      expect(recordDaemonRemediation({
+        ...input(writeFailurePath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: {
+          writePrivateFileExclusive: () => { throw errorWithCode("EACCES"); },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const eexistPath = join(root, "eexist.json");
+      writeFileSync(`${eexistPath}.lock`, JSON.stringify({ version: 1, nonce: "e".repeat(32), createdAtMs: 20_000 }), { mode: 0o600 });
+      expect(recordDaemonRemediation({
+        ...input(eexistPath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: {
+          writePrivateFileExclusive: () => { throw errorWithCode("EEXIST"); },
+          readBoundedRegularFileWithStat: () => { throw errorWithCode("EACCES"); },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const createdValidationPath = join(root, "created-validation.json");
+      expect(recordDaemonRemediation({
+        ...input(createdValidationPath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: {
+          writePrivateFileExclusive: () => true,
+          readBoundedRegularFileWithStat: () => { throw errorWithCode("EACCES"); },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const disappearedPath = join(root, "disappeared.json");
+      writeFileSync(`${disappearedPath}.lock`, JSON.stringify({ version: 1, nonce: "4".repeat(32), createdAtMs: 20_000 }), { mode: 0o600 });
+      let disappearedReads = 0;
+      expect(recordDaemonRemediation({
+        ...input(disappearedPath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: {
+          writePrivateFileExclusive: () => false,
+          readBoundedRegularFileWithStat: () => {
+            disappearedReads += 1;
+            throw errorWithCode(disappearedReads === 1 ? "ENOENT" : "EACCES");
+          },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+      expect(disappearedReads).toBe(2);
+
+      const staleMismatchPath = join(root, "stale-mismatch.json");
+      writeFileSync(`${staleMismatchPath}.lock`, JSON.stringify({ version: 1, nonce: "f".repeat(32), createdAtMs: 1 }), { mode: 0o600 });
+      let mismatchReads = 0;
+      expect(recordDaemonRemediation({
+        ...input(staleMismatchPath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: {
+          writePrivateFileExclusive: () => false,
+          readBoundedRegularFileWithStat: (path: string, options: BoundedFileOptions) => {
+            mismatchReads += 1;
+            if (mismatchReads === 2) {
+              return {
+                ...readBoundedRegularFileWithStat(path, options),
+                content: `${JSON.stringify({ version: 1, nonce: "0".repeat(32), createdAtMs: 1 })}\n`,
+              };
+            }
+            if (mismatchReads >= 3) throw errorWithCode("EACCES");
+            return readBoundedRegularFileWithStat(path, options);
+          },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const staleDeletePath = join(root, "stale-delete.json");
+      writeFileSync(`${staleDeletePath}.lock`, JSON.stringify({ version: 1, nonce: "1".repeat(32), createdAtMs: 1 }), { mode: 0o600 });
+      let deleteReads = 0;
+      expect(recordDaemonRemediation({
+        ...input(staleDeletePath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: {
+          writePrivateFileExclusive: () => false,
+          readBoundedRegularFileWithStat: (path: string, options: BoundedFileOptions) => {
+            deleteReads += 1;
+            if (deleteReads >= 3) throw errorWithCode("EACCES");
+            return readBoundedRegularFileWithStat(path, options);
+          },
+          deleteRegularFile: () => false,
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const staleMissingPath = join(root, "stale-missing.json");
+      writeFileSync(`${staleMissingPath}.lock`, JSON.stringify({ version: 1, nonce: "2".repeat(32), createdAtMs: 1 }), { mode: 0o600 });
+      let missingReads = 0;
+      expect(recordDaemonRemediation({
+        ...input(staleMissingPath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: {
+          writePrivateFileExclusive: () => false,
+          readBoundedRegularFileWithStat: (path: string, options: BoundedFileOptions) => {
+            missingReads += 1;
+            if (missingReads === 2) throw errorWithCode("ENOENT");
+            if (missingReads >= 3) throw errorWithCode("EACCES");
+            return readBoundedRegularFileWithStat(path, options);
+          },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+
+      const staleErrorPath = join(root, "stale-error.json");
+      writeFileSync(`${staleErrorPath}.lock`, JSON.stringify({ version: 1, nonce: "5".repeat(32), createdAtMs: 1 }), { mode: 0o600 });
+      let staleErrorReads = 0;
+      expect(recordDaemonRemediation({
+        ...input(staleErrorPath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: {
+          writePrivateFileExclusive: () => false,
+          readBoundedRegularFileWithStat: (path: string, options: BoundedFileOptions) => {
+            staleErrorReads += 1;
+            if (staleErrorReads === 2) throw errorWithCode("EACCES");
+            return readBoundedRegularFileWithStat(path, options);
+          },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "unavailable", markerIoError: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not delete a replaced or unreadable lock during release", () => {
+    const root = makeRoot();
+    try {
+      const replacedPath = join(root, "replaced.json");
+      let replacedReads = 0;
+      expect(recordDaemonRemediation({
+        ...input(replacedPath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: {
+          readBoundedRegularFileWithStat: (path: string, options: BoundedFileOptions) => {
+            replacedReads += 1;
+            const result = readBoundedRegularFileWithStat(path, options);
+            if (replacedReads === 2) {
+              return {
+                ...result,
+                content: `${JSON.stringify({ version: 1, nonce: "3".repeat(32), createdAtMs: 20_000 })}\n`,
+              };
+            }
+            return result;
+          },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "created", markerIoError: false });
+      expect(existsSync(`${replacedPath}.lock`)).toBe(true);
+
+      const unreadablePath = join(root, "unreadable.json");
+      let unreadableReads = 0;
+      expect(recordDaemonRemediation({
+        ...input(unreadablePath, "scope-a", "ambiguous", () => 20_000),
+        _lockOperationsForTesting: {
+          readBoundedRegularFileWithStat: (path: string, options: BoundedFileOptions) => {
+            unreadableReads += 1;
+            if (unreadableReads === 2) throw new Error("release read failed");
+            return readBoundedRegularFileWithStat(path, options);
+          },
+        },
+      })).toMatchObject({ emit: true, markerStatus: "created", markerIoError: false });
+      expect(existsSync(`${unreadablePath}.lock`)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("atomically creates a private marker and suppresses unchanged notices", () => {
     const root = makeRoot();
     try {
@@ -226,6 +565,24 @@ describe("daemon remediation marker", () => {
 });
 
 describe("daemon remediation clearing", () => {
+  it("fails closed when a live lock blocks marker clearing", () => {
+    const root = makeRoot();
+    try {
+      const markerPath = join(root, "blocked-marker.json");
+      writeFileSync(`${markerPath}.lock`, JSON.stringify({
+        version: 1,
+        nonce: "6".repeat(32),
+        createdAtMs: Date.now(),
+      }), { mode: 0o600 });
+      expect(clearDaemonRemediation({ markerPath, scope: "scope-a" })).toEqual({
+        cleared: false,
+        markerIoError: true,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("clears one scope after healthy/safe recovery and removes the empty marker", () => {
     const root = makeRoot();
     try {

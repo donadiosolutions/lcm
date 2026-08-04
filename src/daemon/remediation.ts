@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -8,6 +9,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { performance } from "node:perf_hooks";
+import {
+  deleteRegularFile,
+  readBoundedRegularFileWithStat,
+  writePrivateFileExclusive,
+} from "../security-files.js";
 
 /**
  * The marker is deliberately a small, non-authoritative hint.  Lifecycle
@@ -16,6 +23,20 @@ import { dirname, join } from "node:path";
 export const DAEMON_REMEDIATION_MARKER_VERSION = 1 as const;
 export const DAEMON_REMEDIATION_MARKER_NAME = "daemon-remediation.v1.json";
 export const DAEMON_NOTICE_REPEAT_INTERVAL_MS = 30 * 60 * 1_000;
+
+/**
+ * The marker is shared by every scope under one state root.  Serialise the
+ * complete read/decision/replacement sequence rather than locking a single
+ * scope, otherwise independent scope writers could still overwrite one
+ * another's entries.  A short deadline keeps a damaged or abandoned lock
+ * from blocking hook delivery indefinitely.
+ */
+const DAEMON_REMEDIATION_LOCK_TIMEOUT_MS = 250;
+const DAEMON_REMEDIATION_LOCK_RETRY_MS = 5;
+const DAEMON_REMEDIATION_LOCK_STALE_MS = 10_000;
+const DAEMON_REMEDIATION_LOCK_MAX_BYTES = 512;
+const DAEMON_REMEDIATION_LOCK_VERSION = 1 as const;
+const LOCK_SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
 
 /**
  * Refusal reasons are a closed vocabulary.  Callers should map their richer
@@ -140,6 +161,14 @@ export type DaemonRemediationFileSystem = Readonly<{
   chmodSync: (path: string, mode: number) => void;
 }>;
 
+/** @internal Deterministic seam for lock collision and metadata tests. */
+export type DaemonRemediationLockOperations = Readonly<{
+  lstatSync: typeof lstatSync;
+  readBoundedRegularFileWithStat: typeof readBoundedRegularFileWithStat;
+  writePrivateFileExclusive: typeof writePrivateFileExclusive;
+  deleteRegularFile: typeof deleteRegularFile;
+}>;
+
 export type DaemonRemediationClock = Readonly<{ now: () => number }> | (() => number);
 
 const DEFAULT_FILESYSTEM: DaemonRemediationFileSystem = {
@@ -152,6 +181,12 @@ const DEFAULT_FILESYSTEM: DaemonRemediationFileSystem = {
 };
 
 const DEFAULT_CLOCK: DaemonRemediationClock = { now: () => Date.now() };
+const DEFAULT_LOCK_OPERATIONS: DaemonRemediationLockOperations = {
+  lstatSync,
+  readBoundedRegularFileWithStat,
+  writePrivateFileExclusive,
+  deleteRegularFile,
+};
 
 type MarkerEntry = Readonly<{
   reason: DaemonRefusalReason;
@@ -176,6 +211,7 @@ export type DaemonRemediationInput = Readonly<{
   scopeDigest?: string;
   fs?: Partial<DaemonRemediationFileSystem>;
   clock?: DaemonRemediationClock;
+  _lockOperationsForTesting?: Partial<DaemonRemediationLockOperations>;
 }>;
 
 export type DaemonRemediationDecision = Readonly<{
@@ -193,6 +229,7 @@ export type DaemonRemediationClearInput = Readonly<{
   markerPath?: string;
   scopeDigest?: string;
   fs?: Partial<DaemonRemediationFileSystem>;
+  _lockOperationsForTesting?: Partial<DaemonRemediationLockOperations>;
 }>;
 
 export type DaemonRemediationClearResult = Readonly<{
@@ -206,10 +243,176 @@ type ReadMarkerResult = Readonly<{
   markerIoError: boolean;
 }>;
 
+type RemediationLockOwner = Readonly<{
+  version: typeof DAEMON_REMEDIATION_LOCK_VERSION;
+  nonce: string;
+  createdAtMs: number;
+}>;
+
+type RemediationLockRecord = Readonly<{
+  content: string;
+  owner: RemediationLockOwner;
+  mtimeMs: number;
+}>;
+
+type RemediationLock = Readonly<{
+  path: string;
+  content: string;
+}>;
+
+function lockOperationsWithDefaults(
+  operations: Partial<DaemonRemediationLockOperations> | undefined,
+): DaemonRemediationLockOperations {
+  return { ...DEFAULT_LOCK_OPERATIONS, ...operations };
+}
+
 function filesystemWithDefaults(
   fs: Partial<DaemonRemediationFileSystem> | undefined,
 ): DaemonRemediationFileSystem {
   return { ...DEFAULT_FILESYSTEM, ...fs };
+}
+
+function remediationLockPath(markerPath: string): string {
+  return `${markerPath}.lock`;
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+function waitForRemediationLock(): void {
+  Atomics.wait(LOCK_SLEEP_CELL, 0, 0, DAEMON_REMEDIATION_LOCK_RETRY_MS);
+}
+
+function parseRemediationLockOwner(raw: string): RemediationLockOwner | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const candidate = parsed as Partial<RemediationLockOwner>;
+  const keys = Object.keys(parsed).sort();
+  if (keys.length !== 3 || keys.join(",") !== "createdAtMs,nonce,version") return null;
+  if (candidate.version !== DAEMON_REMEDIATION_LOCK_VERSION
+    || typeof candidate.nonce !== "string"
+    || !/^[a-f0-9]{32}$/u.test(candidate.nonce)
+    || typeof candidate.createdAtMs !== "number"
+    || !Number.isFinite(candidate.createdAtMs)
+    || candidate.createdAtMs < 0) {
+    return null;
+  }
+  return Object.freeze({
+    version: DAEMON_REMEDIATION_LOCK_VERSION,
+    nonce: candidate.nonce,
+    createdAtMs: candidate.createdAtMs,
+  });
+}
+
+/**
+ * Validate and read the lock through one no-follow, non-blocking descriptor.
+ * The lock contains only an opaque nonce and a bounded creation timestamp;
+ * paths, scopes, PIDs, and secrets never cross the filesystem boundary.
+ */
+function readRemediationLock(
+  path: string,
+  operations: DaemonRemediationLockOperations,
+): RemediationLockRecord {
+  const descriptor = operations.lstatSync(path);
+  if (!descriptor.isFile() || (descriptor.mode & 0o777) !== 0o600) {
+    throw new Error("remediation lock is not a private regular file");
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (uid !== undefined && descriptor.uid !== uid) {
+    throw new Error("remediation lock owner is not the current user");
+  }
+  const result = operations.readBoundedRegularFileWithStat(path, {
+    maxBytes: DAEMON_REMEDIATION_LOCK_MAX_BYTES,
+    allowedRoot: dirname(path),
+  });
+  if (!Number.isFinite(result.mtimeMs) || result.mtimeMs < 0) {
+    throw new Error("remediation lock metadata is invalid");
+  }
+  const owner = parseRemediationLockOwner(result.content.trim());
+  if (owner === null) throw new Error("remediation lock owner is malformed");
+  return Object.freeze({ content: result.content, owner, mtimeMs: result.mtimeMs });
+}
+
+function lockOwnerContent(now: number): string {
+  return `${JSON.stringify({
+    version: DAEMON_REMEDIATION_LOCK_VERSION,
+    nonce: randomBytes(16).toString("hex"),
+    createdAtMs: now,
+  })}\n`;
+}
+
+function remediationLockIsStale(lock: RemediationLockRecord, now: number): boolean {
+  // A rollback (or a lock created in the future) never authorizes reclamation.
+  // The owner timestamp is deliberately compared only after the lock has
+  // passed descriptor/mode/identity validation above.
+  return now >= lock.owner.createdAtMs
+    && now - lock.owner.createdAtMs >= DAEMON_REMEDIATION_LOCK_STALE_MS;
+}
+
+function releaseRemediationLock(lock: RemediationLock, operations: DaemonRemediationLockOperations): void {
+  try {
+    const current = readRemediationLock(lock.path, operations);
+    if (current.content !== lock.content) return;
+    operations.deleteRegularFile(lock.path);
+  } catch {
+    // A failed or replaced lock is never removed by pathname alone.  Leaving
+    // an ambiguous lock in place is fail-safe; its bounded owner timestamp
+    // allows a later caller to reclaim it only after stale validation.
+  }
+}
+
+function acquireRemediationLock(
+  markerPath: string,
+  now: number,
+  operations: DaemonRemediationLockOperations,
+): RemediationLock | null {
+  const path = remediationLockPath(markerPath);
+  const content = lockOwnerContent(now);
+  const deadline = performance.now() + DAEMON_REMEDIATION_LOCK_TIMEOUT_MS;
+  while (performance.now() <= deadline) {
+    try {
+      if (operations.writePrivateFileExclusive(path, content)) {
+        try {
+          if (readRemediationLock(path, operations).content === content) {
+            return Object.freeze({ path, content });
+          }
+        } catch {
+          // Do not remove an unverified path.  A later bounded stale check can
+          // reclaim a lock only after validating its complete owner record.
+        }
+        return null;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code !== "EEXIST") return null;
+    }
+
+    let existing: RemediationLockRecord;
+    try {
+      existing = readRemediationLock(path, operations);
+    } catch (error) {
+      if (isMissingPathError(error)) continue;
+      return null;
+    }
+    if (remediationLockIsStale(existing, now)) {
+      try {
+        // Re-read immediately before deletion so cleanup is restricted to the
+        // exact owner identity observed by this attempt.
+        const current = readRemediationLock(path, operations);
+        if (current.content === existing.content && operations.deleteRegularFile(path)) continue;
+      } catch (error) {
+        if (isMissingPathError(error)) continue;
+        return null;
+      }
+    }
+    waitForRemediationLock();
+  }
+  return null;
 }
 
 function markerPathFor(input: { markerPath?: string; stateRoot?: string }): string {
@@ -355,41 +558,29 @@ function writeOrReport(
   }
 }
 
-/**
- * Decide whether a refusal notice should be emitted and update the
- * non-authoritative marker when possible.
- */
-export function recordDaemonRemediation(
-  input: DaemonRemediationInput,
+function unavailableRemediationDecision(
+  remediation: SanitizedRemediation,
+  scopeDigest: string,
 ): DaemonRemediationDecision {
-  const reason = isDaemonRefusalReason(input.reason) ? input.reason : "ambiguous";
-  const remediation = mapDaemonRefusalToRemediation(reason);
-  const scopeDigest = fullDigest(input);
-  const path = markerPathFor(input);
-  const fs = filesystemWithDefaults(input.fs);
-  let now: number;
-  try {
-    now = clockNow(input.clock);
-  } catch {
-    return {
-      emit: true,
-      remediation,
-      markerStatus: "unavailable",
-      markerIoError: true,
-      scopeDigest,
-    };
-  }
+  return {
+    emit: true,
+    remediation,
+    markerStatus: "unavailable",
+    markerIoError: true,
+    scopeDigest,
+  };
+}
 
+function recordDaemonRemediationUnderLock(
+  path: string,
+  fs: DaemonRemediationFileSystem,
+  scopeDigest: string,
+  reason: DaemonRefusalReason,
+  remediation: SanitizedRemediation,
+  now: number,
+): DaemonRemediationDecision {
   const read = readMarker(path, fs);
-  if (read.markerIoError) {
-    return {
-      emit: true,
-      remediation,
-      markerStatus: "unavailable",
-      markerIoError: true,
-      scopeDigest,
-    };
-  }
+  if (read.markerIoError) return unavailableRemediationDecision(remediation, scopeDigest);
 
   const key = keyFor(scopeDigest, reason);
   const prior = read.document.entries[key];
@@ -427,18 +618,39 @@ export function recordDaemonRemediation(
   };
 }
 
-/** Clear refusal entries for one scope after healthy or safe recovery. */
-export function clearDaemonRemediation(
-  input: DaemonRemediationClearInput,
-): DaemonRemediationClearResult {
-  let path: string;
-  try {
-    path = markerPathFor(input);
-  } catch {
-    return { cleared: false, markerIoError: true };
-  }
-  const fs = filesystemWithDefaults(input.fs);
+/**
+ * Decide whether a refusal notice should be emitted and update the
+ * non-authoritative marker when possible.
+ */
+export function recordDaemonRemediation(
+  input: DaemonRemediationInput,
+): DaemonRemediationDecision {
+  const reason = isDaemonRefusalReason(input.reason) ? input.reason : "ambiguous";
+  const remediation = mapDaemonRefusalToRemediation(reason);
   const scopeDigest = fullDigest(input);
+  const path = markerPathFor(input);
+  const fs = filesystemWithDefaults(input.fs);
+  const lockOperations = lockOperationsWithDefaults(input._lockOperationsForTesting);
+  let now: number;
+  try {
+    now = clockNow(input.clock);
+  } catch {
+    return unavailableRemediationDecision(remediation, scopeDigest);
+  }
+  const lock = acquireRemediationLock(path, now, lockOperations);
+  if (lock === null) return unavailableRemediationDecision(remediation, scopeDigest);
+  try {
+    return recordDaemonRemediationUnderLock(path, fs, scopeDigest, reason, remediation, now);
+  } finally {
+    releaseRemediationLock(lock, lockOperations);
+  }
+}
+
+function clearDaemonRemediationUnderLock(
+  path: string,
+  fs: DaemonRemediationFileSystem,
+  scopeDigest: string,
+): DaemonRemediationClearResult {
   const read = readMarker(path, fs);
   if (!read.exists) return { cleared: false, markerIoError: false };
   if (read.markerIoError) {
@@ -471,6 +683,28 @@ export function clearDaemonRemediation(
     return { cleared: true, markerIoError: false };
   } catch {
     return { cleared: false, markerIoError: true };
+  }
+}
+
+/** Clear refusal entries for one scope after healthy or safe recovery. */
+export function clearDaemonRemediation(
+  input: DaemonRemediationClearInput,
+): DaemonRemediationClearResult {
+  let path: string;
+  try {
+    path = markerPathFor(input);
+  } catch {
+    return { cleared: false, markerIoError: true };
+  }
+  const fs = filesystemWithDefaults(input.fs);
+  const scopeDigest = fullDigest(input);
+  const lockOperations = lockOperationsWithDefaults(input._lockOperationsForTesting);
+  const lock = acquireRemediationLock(path, Date.now(), lockOperations);
+  if (lock === null) return { cleared: false, markerIoError: true };
+  try {
+    return clearDaemonRemediationUnderLock(path, fs, scopeDigest);
+  } finally {
+    releaseRemediationLock(lock, lockOperations);
   }
 }
 
