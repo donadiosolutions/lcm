@@ -7,6 +7,8 @@ import fastUri from "fast-uri";
 import pkg from "../package.json";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
+const PACKAGE_INVENTORY_TEST_TIMEOUT_MS = 45_000;
+const PACKAGE_COMMAND_TIMEOUT_MS = 30_000;
 
 function npmPackInventory(): string[] {
   const transcriptRuntime = resolve(
@@ -19,6 +21,7 @@ function npmPackInventory(): string[] {
       encoding: "utf8",
       stdio: "pipe",
       maxBuffer: 32 * 1024 * 1024,
+      timeout: PACKAGE_COMMAND_TIMEOUT_MS,
     });
   }
 
@@ -30,6 +33,7 @@ function npmPackInventory(): string[] {
       encoding: "utf8",
       stdio: "pipe",
       maxBuffer: 32 * 1024 * 1024,
+      timeout: PACKAGE_COMMAND_TIMEOUT_MS,
     },
   );
   const metadata = JSON.parse(output) as Array<{
@@ -118,23 +122,27 @@ describe("package.json", () => {
     expect(pkg.files).not.toContain(".claude-plugin/");
   });
 
-  it("packs native transcript exports without Rust or restart-helper artifacts", () => {
-    const paths = npmPackInventory();
-    expect(paths).toEqual(
-      expect.arrayContaining([
-        "dist/src/storage/native-transcripts.d.ts",
-        "dist/src/storage/native-transcripts.js",
-        "docs/postgresql-native-transcripts.md",
-      ]),
-    );
+  it(
+    "packs native transcript exports without Rust or restart-helper artifacts",
+    { timeout: PACKAGE_INVENTORY_TEST_TIMEOUT_MS },
+    () => {
+      const paths = npmPackInventory();
+      expect(paths).toEqual(
+        expect.arrayContaining([
+          "dist/src/storage/native-transcripts.d.ts",
+          "dist/src/storage/native-transcripts.js",
+          "docs/postgresql-native-transcripts.md",
+        ]),
+      );
 
-    const forbiddenArtifacts = paths.filter((path) =>
-      /(^|\/)(?:native|target|rust)(?:\/|$)/iu.test(path)
-      || /(?:cargo|rustc|daemon-restart-helper|native-helper)/iu.test(path)
-      || /\.(?:rs|rlib|a|dylib|so|exe)$/iu.test(path),
-    );
-    expect(forbiddenArtifacts).toEqual([]);
-  });
+      const forbiddenArtifacts = paths.filter((path) =>
+        /(^|\/)(?:native|target|rust)(?:\/|$)/iu.test(path)
+        || /(?:cargo|rustc|daemon-restart-helper|native-helper)/iu.test(path)
+        || /\.(?:rs|rlib|a|dylib|so|exe)$/iu.test(path),
+      );
+      expect(forbiddenArtifacts).toEqual([]);
+    },
+  );
 
   it("generates only the dist runtime bundle", () => {
     const source = readFileSync(new URL("../scripts/build-runtime.mjs", import.meta.url), "utf8");
