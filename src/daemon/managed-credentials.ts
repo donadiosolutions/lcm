@@ -28,6 +28,8 @@ type ManagedCredentialName = typeof MANAGED_CREDENTIAL_NAMES[number];
 const MANAGED_CREDENTIAL_NAME_SET = new Set<string>(MANAGED_CREDENTIAL_NAMES);
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
+const MAX_CREDENTIAL_COUNT = MANAGED_CREDENTIAL_NAMES.length;
+const MAX_CREDENTIAL_BYTES = 1024 * 1024;
 
 function currentUid(): number {
   return typeof process.getuid === "function" ? process.getuid() : -1;
@@ -44,24 +46,23 @@ function isWithin(candidate: string, parent: string): boolean {
   );
 }
 
-function safeCanonicalDirectory(path: string, label: string): string {
+function safeCanonicalDirectory(path: string, label: string, uid = currentUid()): string {
   if (!isAbsolute(path)) throw new Error(`${label} must be absolute`);
   let stats: ReturnType<typeof lstatSync>;
+  let canonical: string;
   try {
     stats = lstatSync(path);
+    canonical = realpathSync(path);
   } catch {
     throw new Error(`${label} is unavailable`);
   }
   if (stats.isSymbolicLink() || !stats.isDirectory() || (stats.mode & 0o777) !== DIRECTORY_MODE) {
     throw new Error(`${label} is not a private directory`);
   }
-  let canonical: string;
-  try {
-    canonical = realpathSync(path);
-  } catch {
-    throw new Error(`${label} is unavailable`);
+  if (canonical !== resolve(path)) {
+    throw new Error(`${label} is not canonical`);
   }
-  if (canonical !== resolve(path) || stats.uid !== currentUid()) {
+  if (uid !== -1 && stats.uid !== uid) {
     throw new Error(`${label} is not owned by the current user`);
   }
   return canonical;
@@ -92,8 +93,7 @@ export function createManagedCredentialDirectory(
   try {
     mkdirSync(base, { mode: DIRECTORY_MODE });
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "EEXIST") throw new Error("managed credential directory cannot be created");
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("managed credential directory cannot be created");
   }
   // The base directory may have pre-existed; validate it before using it.
   const canonicalBase = safeCanonicalDirectory(base, "managed credential base directory");
@@ -105,8 +105,7 @@ export function createManagedCredentialDirectory(
   try {
     mkdirSync(directory, { mode: DIRECTORY_MODE });
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "EEXIST") throw new Error("managed credential directory cannot be created");
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("managed credential directory cannot be created");
   }
   const canonicalDirectory = safeCanonicalDirectory(directory, "managed credential directory");
   if (!isWithin(canonicalDirectory, canonicalRoot) || canonicalDirectory !== directory) {
@@ -121,16 +120,23 @@ export function writeManagedCredentialFiles(
   values: Readonly<Record<string, string>>,
 ): readonly string[] {
   const canonicalDirectory = validateManagedCredentialDirectory(directory);
-  const paths: string[] = [];
-  for (const [name, value] of Object.entries(values)) {
+  const entries = Object.entries(values);
+  if (entries.length > MAX_CREDENTIAL_COUNT) throw new Error("managed credential set is too large");
+  let totalBytes = 0;
+  for (const [name, value] of entries) {
     validateName(name);
     if (typeof value !== "string") throw new Error("managed credential value is invalid");
+    totalBytes += Buffer.byteLength(value, "utf8");
+    if (totalBytes > MAX_CREDENTIAL_BYTES) throw new Error("managed credential set is too large");
+  }
+  const paths: string[] = [];
+  for (const [name, value] of entries) {
     const path = resolve(canonicalDirectory, name);
     let fd: number | undefined;
     try {
       fd = openSync(
         path,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
         FILE_MODE,
       );
       fchmodSync(fd, FILE_MODE);
@@ -138,27 +144,18 @@ export function writeManagedCredentialFiles(
       let written = 0;
       while (written < bytes.length) written += writeSync(fd, bytes, written, bytes.length - written);
       const stats = fstatSync(fd);
-      if (!stats.isFile() || stats.uid !== currentUid() || (stats.mode & 0o777) !== FILE_MODE) {
+      const uid = currentUid();
+      if (!stats.isFile() || (uid !== -1 && stats.uid !== uid) || (stats.mode & 0o777) !== FILE_MODE) {
         throw new Error("managed credential file failed validation");
       }
       paths.push(path);
     } catch (error) {
-      // Never surface a filesystem error containing a secret or an arbitrary path.
-      try {
-        if (fd !== undefined) closeSync(fd);
-      } catch {
-        // Cleanup is best effort; the caller's explicit cleanup remains idempotent.
-      }
       throw error instanceof Error && error.message === "managed credential file failed validation"
         ? error
         : new Error("managed credential file cannot be created");
     } finally {
       if (fd !== undefined) {
-        try {
-          closeSync(fd);
-        } catch {
-          // The descriptor may already have been closed on an exceptional path.
-        }
+        closeSync(fd);
       }
     }
   }
@@ -177,9 +174,9 @@ export function validateManagedCredentialDirectory(
   stateRoot?: string,
   uid = currentUid(),
 ): string {
-  const canonicalDirectory = safeCanonicalDirectory(directory, "managed credential directory");
+  const canonicalDirectory = safeCanonicalDirectory(directory, "managed credential directory", uid);
   if (stateRoot !== undefined) {
-    const canonicalRoot = safeCanonicalDirectory(stateRoot, "managed credential state root");
+    const canonicalRoot = safeCanonicalDirectory(stateRoot, "managed credential state root", uid);
     if (!isWithin(canonicalDirectory, canonicalRoot) || canonicalDirectory === canonicalRoot) {
       throw new Error("managed credential directory escapes state root");
     }
@@ -188,8 +185,10 @@ export function validateManagedCredentialDirectory(
     validateName(name);
     const path = resolve(canonicalDirectory, name);
     let stats: ReturnType<typeof lstatSync>;
+    let canonicalLeaf: string;
     try {
       stats = lstatSync(path);
+      canonicalLeaf = realpathSync(path);
     } catch {
       throw new Error("managed credential file is unavailable");
     }
@@ -201,12 +200,6 @@ export function validateManagedCredentialDirectory(
       || (uid !== -1 && stats.uid !== uid)
     ) {
       throw new Error("managed credential file failed validation");
-    }
-    let canonicalLeaf: string;
-    try {
-      canonicalLeaf = realpathSync(path);
-    } catch {
-      throw new Error("managed credential file is unavailable");
     }
     if (canonicalLeaf !== path || !isWithin(canonicalLeaf, canonicalDirectory)) {
       throw new Error("managed credential file escapes directory");
@@ -225,9 +218,6 @@ export function cleanupManagedCredentialDirectory(
   try {
     canonicalDirectory = validateManagedCredentialDirectory(directory, stateRoot, uid);
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    // A removed launch directory is the successful idempotent outcome.
-    if (code === "ENOENT") return;
     try {
       lstatSync(directory);
     } catch (missingError) {

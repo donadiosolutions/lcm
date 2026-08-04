@@ -11,7 +11,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { platform as hostPlatform } from "node:os";
 import {
   cleanupManagedCredentialDirectory,
@@ -73,6 +73,12 @@ type SupervisorObservationBase = Readonly<{
   stateRoot?: string;
   port?: number;
   nonce?: string;
+  executable?: string;
+  args?: string;
+  cwd?: string;
+  entrypoint?: string;
+  runtimeDigest?: string;
+  storageBackend?: string;
   managerPid?: number;
   name?: string;
 }>;
@@ -168,6 +174,9 @@ const MAX_POLL_INTERVALS = 100;
 const MAX_NONCE_LENGTH = 128;
 const MAX_METADATA_VALUE_LENGTH = 512;
 const MAX_COMMAND_OUTPUT_LENGTH = 64 * 1024;
+const MAX_PLIST_BYTES = 64 * 1024;
+const MAX_ARGUMENT_COUNT = 128;
+const MAX_ARGUMENT_BYTES = 64 * 1024;
 const XML_HEADER = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
 
 type Realpath = (path: string) => string;
@@ -199,11 +208,6 @@ function assertMetadataValue(value: string, label: string): void {
   ) {
     throw new Error(`${label} is invalid`);
   }
-}
-
-function isWithin(candidate: string, parent: string): boolean {
-  const distance = relative(resolve(parent), resolve(candidate));
-  return distance === "" || (!distance.startsWith("..") && !isAbsolute(distance));
 }
 
 function digestScope(stateRoot: string): string {
@@ -280,7 +284,11 @@ export function createSupervisorSpec(input: SupervisorSpecInput): SupervisorSpec
     throw new Error("supervisor executable must be absolute");
   }
   const args = [...(input.args ?? input.argv ?? [])];
-  if (args.some((arg) => typeof arg !== "string" || arg.length > MAX_METADATA_VALUE_LENGTH || /[\u0000\r\n]/u.test(arg))) {
+  if (
+    args.length > MAX_ARGUMENT_COUNT
+    || args.reduce((total, arg) => total + (typeof arg === "string" ? Buffer.byteLength(arg, "utf8") : MAX_ARGUMENT_BYTES), 0) > MAX_ARGUMENT_BYTES
+    || args.some((arg) => typeof arg !== "string" || arg.length > MAX_METADATA_VALUE_LENGTH || /[\u0000\r\n]/u.test(arg))
+  ) {
     throw new Error("supervisor argument is invalid");
   }
   if (input.cwd !== undefined && (!isAbsolute(input.cwd) || /[\u0000\r\n]/u.test(input.cwd))) {
@@ -360,7 +368,6 @@ function unavailableReason(result: {
   readonly stderr: string;
   readonly timedOut: boolean;
 }): SupervisorReason {
-  if (result.timedOut) return "manager-timeout";
   const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
   if (
     result.code === 127
@@ -373,8 +380,11 @@ function commandFailedError(): Error {
   return new Error("supervisor manager command failed");
 }
 
-function unsupportedError(): Error {
-  return new Error("supervisor manager is unavailable on this platform");
+function managerUnavailableError(reason: SupervisorReason): Error {
+  const error = new Error("supervisor manager unavailable");
+  error.name = "SupervisorManagerError";
+  Object.defineProperty(error, "reason", { value: reason, enumerable: true });
+  return error;
 }
 
 function parseScalar(value: string): string {
@@ -407,10 +417,8 @@ function flattenJsonValues(value: unknown, output: Map<string, string>, prefix =
     for (const [index, child] of value.entries()) flattenJsonValues(child, output, `${prefix}[${index}]`);
     return;
   }
-  if (typeof value === "object") {
-    for (const [key, child] of Object.entries(value)) {
-      flattenJsonValues(child, output, prefix ? `${prefix}.${key}` : key);
-    }
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    flattenJsonValues(child, output, prefix ? `${prefix}.${key}` : key);
   }
 }
 
@@ -442,14 +450,26 @@ function lookup(values: Map<string, string>, ...keys: string[]): string | undefi
 }
 
 function metadata(values: Map<string, string>, name: string): string | undefined {
-  const direct = lookup(values, name, `environment.${name}`, `environment[${name}]`, `env.${name}`);
+  const aliases: Record<string, readonly string[]> = {
+    LCM_SUPERVISOR_SCOPE: ["scopeDigest", "scope", "ScopeDigest"],
+    LCM_SUPERVISOR_MARKER: ["marker", "Marker"],
+    LCM_SUPERVISOR_STATE_ROOT: ["stateRoot", "StateRoot"],
+    LCM_SUPERVISOR_PORT: ["port", "Port"],
+    LCM_SUPERVISOR_NONCE: ["nonce", "Nonce"],
+    LCM_SUPERVISOR_EXECUTABLE: ["executable", "Executable"],
+    LCM_SUPERVISOR_ARGS: ["args", "Args"],
+    LCM_SUPERVISOR_CWD: ["cwd", "Cwd"],
+    LCM_SUPERVISOR_ENTRYPOINT: ["entrypoint", "Entrypoint"],
+    LCM_SUPERVISOR_RUNTIME_DIGEST: ["runtimeDigest", "RuntimeDigest"],
+    LCM_SUPERVISOR_STORAGE_BACKEND: ["storageBackend", "StorageBackend"],
+  };
+  const direct = lookup(values, name, ...aliases[name], `environment.${name}`, `environment[${name}]`, `env.${name}`);
   if (direct !== undefined) return direct;
   for (const [key, value] of values) {
-    if (key.toUpperCase().endsWith(`=${name}`) || key.toUpperCase().endsWith(`.${name}`)) return value;
     // systemd's Environment= field is a space-separated list of assignments;
     // launchctl print uses `KEY => VALUE` entries under environment = { ... }.
     if (key.toLowerCase() === "environment" || key.toLowerCase() === "env") {
-      const assignment = new RegExp(`(?:^|\\s)${name}=((?:"[^"\\n]*")|(?:[^\\s]+))`, "u").exec(value);
+      const assignment = new RegExp(`(?:^|\\s)${name}=((?:"[^"\\n]*")|(?:[^\\s]*))`, "u").exec(value);
       if (assignment) return parseScalar(assignment[1]);
     }
   }
@@ -471,7 +491,7 @@ function parsePort(value: string | undefined): number | undefined {
 function isNotFoundOutput(text: string): boolean {
   const lower = text.toLowerCase();
   if (/(?:systemctl|launchctl)\s+(?:command )?not found|enoent/u.test(lower)) return false;
-  return /unit .*not[- ]found|could not find (?:service|unit)|no such service|unit .* not loaded|unknown service|does not exist/u.test(lower);
+  return /unit .*not[- ]found|could not (?:find|be found)|no such service|unit .* not loaded|unknown service|does not exist/u.test(lower);
 }
 
 function isRunningState(value: string | undefined): boolean {
@@ -486,18 +506,30 @@ function isTerminalState(value: string | undefined): "inactive" | "failed" | "la
   return undefined;
 }
 
-function observationBase(spec: SupervisorSpec, values?: Map<string, string>): SupervisorObservationBase {
-  const scopeDigest = lookup(values ?? new Map(), "LCM_SUPERVISOR_SCOPE", "scopeDigest", "scope", "ScopeDigest");
-  const marker = metadata(values ?? new Map(), "LCM_SUPERVISOR_MARKER") ?? lookup(values ?? new Map(), "marker", "Marker");
-  const stateRoot = metadata(values ?? new Map(), "LCM_SUPERVISOR_STATE_ROOT") ?? lookup(values ?? new Map(), "stateRoot", "StateRoot");
-  const port = parsePort(metadata(values ?? new Map(), "LCM_SUPERVISOR_PORT") ?? lookup(values ?? new Map(), "port", "Port"));
-  const nonce = metadata(values ?? new Map(), "LCM_SUPERVISOR_NONCE") ?? lookup(values ?? new Map(), "nonce", "Nonce");
+function observationBase(spec: SupervisorSpec, values: Map<string, string>): SupervisorObservationBase {
+  const scopeDigest = metadata(values, "LCM_SUPERVISOR_SCOPE");
+  const marker = metadata(values, "LCM_SUPERVISOR_MARKER");
+  const stateRoot = metadata(values, "LCM_SUPERVISOR_STATE_ROOT");
+  const port = parsePort(metadata(values, "LCM_SUPERVISOR_PORT"));
+  const nonce = metadata(values, "LCM_SUPERVISOR_NONCE");
+  const executable = metadata(values, "LCM_SUPERVISOR_EXECUTABLE");
+  const args = metadata(values, "LCM_SUPERVISOR_ARGS");
+  const cwd = metadata(values, "LCM_SUPERVISOR_CWD");
+  const entrypoint = metadata(values, "LCM_SUPERVISOR_ENTRYPOINT");
+  const runtimeDigest = metadata(values, "LCM_SUPERVISOR_RUNTIME_DIGEST");
+  const storageBackend = metadata(values, "LCM_SUPERVISOR_STORAGE_BACKEND");
   return {
     ...(scopeDigest === undefined ? {} : { scopeDigest }),
     ...(marker === undefined ? {} : { marker }),
     ...(stateRoot === undefined ? {} : { stateRoot }),
     ...(port === undefined ? {} : { port }),
     ...(nonce === undefined ? {} : { nonce }),
+    ...(executable === undefined ? {} : { executable }),
+    ...(args === undefined ? {} : { args }),
+    ...(cwd === undefined ? {} : { cwd }),
+    ...(entrypoint === undefined ? {} : { entrypoint }),
+    ...(runtimeDigest === undefined ? {} : { runtimeDigest }),
+    ...(storageBackend === undefined ? {} : { storageBackend }),
     name: spec.name,
   };
 }
@@ -512,12 +544,19 @@ function staleReason(
   if (base.stateRoot !== undefined && base.stateRoot !== spec.stateRoot) return "metadata-mismatch";
   if (base.port !== undefined && base.port !== spec.port) return "metadata-mismatch";
   if (base.nonce !== undefined && base.nonce !== spec.nonce) return "metadata-mismatch";
-  // The canonical state root is not required to be repeated by every manager
-  // (the full digest is the authoritative scope identity), while marker,
-  // scope, port, and nonce are mandatory admission metadata.
-  if (base.marker === undefined || base.scopeDigest === undefined || base.port === undefined || base.nonce === undefined) {
-    return "metadata-missing";
-  }
+  const expectedArgs = JSON.stringify(spec.args);
+  if (base.executable !== undefined && base.executable !== spec.executable) return "metadata-mismatch";
+  if (base.args !== undefined && base.args !== expectedArgs) return "metadata-mismatch";
+  if (base.cwd !== undefined && base.cwd !== (spec.cwd ?? "")) return spec.cwd === undefined && base.cwd === "" ? "metadata-missing" : "metadata-mismatch";
+  if (base.entrypoint !== undefined && base.entrypoint !== (spec.entrypoint ?? "")) return "metadata-mismatch";
+  if (base.runtimeDigest !== undefined && base.runtimeDigest !== (spec.runtimeDigest ?? "")) return "metadata-mismatch";
+  if (base.storageBackend !== undefined && base.storageBackend !== (spec.storageBackend ?? "")) return "metadata-mismatch";
+  if (base.executable === undefined || base.args === undefined || base.cwd === undefined) return "metadata-missing";
+  if (spec.entrypoint !== undefined && base.entrypoint === undefined) return "metadata-missing";
+  if (spec.runtimeDigest !== undefined && base.runtimeDigest === undefined) return "metadata-missing";
+  if (spec.storageBackend !== undefined && base.storageBackend === undefined) return "metadata-missing";
+  // The canonical state root is not required to be repeated by every manager;
+  // full scope and launch identity are checked by classifyRegistered below.
   return "metadata-missing";
 }
 
@@ -533,6 +572,21 @@ function classifyRegistered(
   }
   if (reason !== "metadata-missing") {
     return Object.freeze({ kind: "registered-stale-config", reason, ...base });
+  }
+  if (
+    base.marker === undefined
+    || base.scopeDigest === undefined
+    || base.port === undefined
+    || base.nonce === undefined
+    || base.executable === undefined
+    || base.args === undefined
+    || base.cwd === undefined
+    || (spec.cwd !== undefined && base.cwd === "")
+    || (spec.entrypoint !== undefined && base.entrypoint === undefined)
+    || (spec.runtimeDigest !== undefined && base.runtimeDigest === undefined)
+    || (spec.storageBackend !== undefined && base.storageBackend === undefined)
+  ) {
+    return Object.freeze({ kind: "registered-stale-config", reason: "metadata-missing", ...base });
   }
   const state = lookup(values, "ActiveState", "SubState", "state", "State", "status");
   const active = isRunningState(state) || isRunningState(lookup(values, "ActiveState", "state"));
@@ -562,11 +616,7 @@ function launchdDomain(uid: number): string {
 }
 
 function plistPath(spec: SupervisorSpec): string {
-  const path = resolve(spec.stateRoot, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
-  if (!isWithin(path, spec.stateRoot) || relative(spec.stateRoot, path).includes("..")) {
-    throw new Error("supervisor plist escapes state root");
-  }
-  return path;
+  return resolve(spec.stateRoot, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
 }
 
 function xmlEscape(value: string): string {
@@ -584,10 +634,17 @@ function plistEnvironment(spec: SupervisorSpec): string {
     ["LCM_SUPERVISOR_STATE_ROOT", spec.stateRoot],
     ["LCM_SUPERVISOR_PORT", String(spec.port)],
     ["LCM_SUPERVISOR_NONCE", spec.nonce],
+    ["LCM_SUPERVISOR_EXECUTABLE", spec.executable],
+    ["LCM_SUPERVISOR_ARGS", JSON.stringify(spec.args)],
+    ["LCM_SUPERVISOR_CWD", spec.cwd ?? ""],
   ];
   if (spec.entrypoint !== undefined) values.push(["LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint]);
   if (spec.runtimeDigest !== undefined) values.push(["LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest]);
   if (spec.storageBackend !== undefined) values.push(["LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend]);
+  if (spec.credentialDirectory !== undefined) values.push(["LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory]);
+  if (spec.credentialFiles !== undefined && spec.credentialFiles.length > 0) {
+    values.push(["LCM_SYSTEMD_CRED_IDS", spec.credentialFiles.map(({ name }) => name).join(",")]);
+  }
   for (const credential of spec.credentialFiles ?? []) {
     values.push([`LCM_CREDENTIAL_${credential.name}_FILE`, credential.path]);
   }
@@ -613,11 +670,15 @@ function plistDocument(spec: SupervisorSpec): string {
 
 function writePrivatePlist(spec: SupervisorSpec): string {
   const path = plistPath(spec);
-  const parentStats = lstatSync(spec.stateRoot);
-  if (parentStats.isSymbolicLink() || !parentStats.isDirectory()) throw new Error("supervisor state root is invalid");
   if (existsSync(path)) {
     const stats = lstatSync(path);
-    if (stats.isSymbolicLink() || !stats.isFile() || (stats.mode & 0o777) !== 0o600) {
+    if (
+      stats.isSymbolicLink()
+      || !stats.isFile()
+      || stats.nlink !== 1
+      || stats.size > MAX_PLIST_BYTES
+      || (stats.mode & 0o777) !== 0o600
+    ) {
       throw new Error("supervisor plist collision");
     }
     const existing = readFileSync(path, "utf8");
@@ -626,17 +687,21 @@ function writePrivatePlist(spec: SupervisorSpec): string {
   }
   const document = plistDocument(spec);
   let fd: number | undefined;
+  let created = false;
   try {
-    fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+    fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    created = true;
     chmodSync(path, 0o600);
     const bytes = Buffer.from(document, "utf8");
     let written = 0;
     while (written < bytes.length) written += writeSync(fd, bytes, written, bytes.length - written);
   } catch {
-    try {
-      unlinkSync(path);
-    } catch {
-      // Do not overwrite a concurrent winner's plist.
+    if (created) {
+      try {
+        unlinkSync(path);
+      } catch {
+        // Preserve any partial evidence when deletion is unavailable.
+      }
     }
     throw new Error("supervisor plist cannot be created");
   } finally {
@@ -722,14 +787,14 @@ function isLikelyAbsent(result: {
   readonly stdout: string;
   readonly stderr: string;
 }): boolean {
-  return isNotFoundOutput(`${result.stdout}\n${result.stderr}`) || result.code === 113;
+  return isNotFoundOutput(`${result.stdout}\n${result.stderr}`);
 }
 
 function createObservationRunner(
   kind: SupervisorKind,
   dependencies: SupervisorDependencies,
 ): {
-  readonly invoke: (command: string, args: readonly string[], timeoutMs?: number, cwd?: string, env?: Readonly<Record<string, string>>) => Promise<{
+  readonly invoke: (command: string, args: readonly string[], timeoutMs?: number) => Promise<{
     readonly code: number | null;
     readonly stdout: string;
     readonly stderr: string;
@@ -743,8 +808,6 @@ function createObservationRunner(
     command: string,
     args: readonly string[],
     timeoutMs = commandTimeoutMs,
-    cwd?: string,
-    env?: Readonly<Record<string, string>>,
   ) => {
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
       return Object.freeze({ code: null, stdout: "", stderr: "", timedOut: true });
@@ -752,26 +815,13 @@ function createObservationRunner(
     if (dependencies.platform !== undefined && dependencies.platform !== managerPlatform(kind)) {
       return Object.freeze({ code: 127, stdout: "", stderr: "", timedOut: false });
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let settled = false;
-    const commandPromise = Promise.resolve().then(() => dependencies.run(command, args, {
-      timeoutMs,
-      ...(cwd === undefined ? {} : { cwd }),
-      ...(env === undefined ? {} : { env }),
-    }));
-    const timeoutPromise = new Promise<SupervisorCommandResult>((resolveTimeout) => {
-      timer = setTimeout(() => {
-        settled = true;
-        resolveTimeout({ timedOut: true, code: null });
-      }, timeoutMs);
-      timer.unref?.();
-    });
+    // The injected runner owns the child-process deadline and must settle
+    // before returning. Avoid racing a still-live mutation against a local
+    // timer: a late systemd/launchd command could otherwise create or stop a
+    // service after the caller has already entered cleanup.
     try {
-      const result = commandResult(await Promise.race([commandPromise, timeoutPromise]));
-      if (!settled && timer !== undefined) clearTimeout(timer);
-      return result;
+      return commandResult(await Promise.resolve(dependencies.run(command, args, { timeoutMs })));
     } catch {
-      if (!settled && timer !== undefined) clearTimeout(timer);
       return Object.freeze({ code: null, stdout: "", stderr: "", timedOut: false });
     }
   };
@@ -811,9 +861,6 @@ export function createSupervisor(
     if (loadState !== undefined && /^(not-found|notloaded)$/iu.test(loadState)) {
       return Object.freeze({ kind: "absent", name: spec.name });
     }
-    if (result.code !== 0 && isNotFoundOutput(`${result.stdout}\n${result.stderr}`)) {
-      return Object.freeze({ kind: "absent", name: spec.name });
-    }
     if (!validMetadata(spec, parsed)) return classifyRegistered(spec, parsed, result.code);
     const classified = classifyRegistered(spec, parsed, result.code);
     if (classified.kind === "registered-running-valid") {
@@ -824,7 +871,7 @@ export function createSupervisor(
 
   const start = async (spec: SupervisorSpec): Promise<SupervisorStartResult> => {
     const current = await probe(spec);
-    if (current.kind === "unavailable") throw unsupportedError();
+    if (current.kind === "unavailable") throw managerUnavailableError(current.reason);
     if (current.kind === "registered-running-valid") {
       return Object.freeze({
         kind,
@@ -835,10 +882,18 @@ export function createSupervisor(
         managerPid: current.managerPid,
       });
     }
+    if (current.kind === "registered-not-running-valid") {
+      // A terminal manager registration is retained intentionally (there is no
+      // --collect/KeepAlive policy). Recreate it only after an exact manager
+      // stop and an observed absent state; never race systemd-run/bootstrap
+      // against the old terminal unit.
+      await stopAndAwaitAbsent(spec);
+      return start(spec);
+    }
     if (current.kind === "registered-stale-config" || current.kind === "registered-invalid-collision" || current.kind === "ambiguous") {
       throw commandFailedError();
     }
-    if (kind === "launchd-user" && !credentialsAreSafe(spec)) {
+    if (!credentialsAreSafe(spec)) {
       throw new Error("supervisor credential validation failed");
     }
     let launchPath: string | undefined;
@@ -847,7 +902,7 @@ export function createSupervisor(
       const args = kind === "systemd-user"
         ? systemdStartArgs(spec)
         : ["bootstrap", launchdDomain(runner.uid), launchPath!];
-      const result = await runner.invoke(kind === "systemd-user" ? "systemd-run" : "launchctl", args, spec.stopTimeoutMs);
+      const result = await runner.invoke(kind === "systemd-user" ? "systemd-run" : "launchctl", args);
       const after = await probe(spec);
       if (after.kind === "registered-running-valid") {
         return Object.freeze({ kind, name: spec.name, scopeDigest: spec.scopeDigest, port: spec.port, nonce: spec.nonce, managerPid: after.managerPid });
@@ -871,33 +926,37 @@ export function createSupervisor(
       } catch {
         // Preserve unresolved manager evidence.
       }
-      if (error instanceof Error && error.message === "supervisor credential validation failed") throw error;
       throw commandFailedError();
     }
   };
 
-  const stopAndAwaitAbsent = async (spec: SupervisorSpec): Promise<void> => {
+  const stopAndAwaitAbsentInternal = async (spec: SupervisorSpec, allowStaleConfig = false): Promise<void> => {
     const current = await probe(spec);
     if (current.kind === "absent") {
       if (kind === "launchd-user") cleanupPrivatePlist(spec);
       safeCredentialCleanup(spec);
       return;
     }
-    if (current.kind === "unavailable") throw unsupportedError();
-    if (current.kind === "registered-invalid-collision" || current.kind === "ambiguous") throw commandFailedError();
+    if (current.kind === "unavailable") throw managerUnavailableError(current.reason);
+    if (
+      current.kind === "registered-invalid-collision"
+      || current.kind === "ambiguous"
+      || (current.kind === "registered-stale-config" && !allowStaleConfig)
+    ) throw commandFailedError();
     const stopArgs = kind === "systemd-user"
       ? ["--user", "stop", spec.systemdUnit]
-      : ["bootout", launchdDomain(runner.uid), `${launchdDomain(runner.uid)}/${spec.launchdLabel}`];
+      : ["bootout", `${launchdDomain(runner.uid)}/${spec.launchdLabel}`];
     const result = await runner.invoke(kind === "systemd-user" ? "systemctl" : "launchctl", stopArgs, spec.stopTimeoutMs);
     if (result.timedOut) throw commandFailedError();
-    for (let attempt = 0; attempt < MAX_POLL_INTERVALS; attempt += 1) {
+    const maxPollIntervals = Math.max(1, Math.ceil(spec.stopTimeoutMs / DEFAULT_POLL_INTERVAL_MS));
+    for (let attempt = 0; attempt < Math.min(MAX_POLL_INTERVALS, maxPollIntervals); attempt += 1) {
       const observed = await probe(spec);
       if (observed.kind === "absent") {
         if (kind === "launchd-user") cleanupPrivatePlist(spec);
         safeCredentialCleanup(spec);
         return;
       }
-      if (observed.kind === "unavailable") throw unsupportedError();
+      if (observed.kind === "unavailable") throw managerUnavailableError(observed.reason);
       if (observed.kind === "registered-invalid-collision" || observed.kind === "ambiguous") throw commandFailedError();
       if (result.code !== 0 && attempt === 0) throw commandFailedError();
       if (dependencies.sleep !== undefined) await dependencies.sleep(DEFAULT_POLL_INTERVAL_MS);
@@ -906,11 +965,15 @@ export function createSupervisor(
     throw commandFailedError();
   };
 
+  const stopAndAwaitAbsent = async (spec: SupervisorSpec): Promise<void> => stopAndAwaitAbsentInternal(spec);
+
   const stopAndStart = async (spec: SupervisorSpec): Promise<SupervisorStartResult> => {
+    if (!credentialsAreSafe(spec)) throw new Error("supervisor credential validation failed");
     const observed = await probe(spec);
-    if (observed.kind === "unavailable") throw unsupportedError();
+    if (observed.kind === "unavailable") throw managerUnavailableError(observed.reason);
     if (observed.kind === "registered-invalid-collision" || observed.kind === "ambiguous") throw commandFailedError();
-    if (observed.kind !== "absent") await stopAndAwaitAbsent(spec);
+    if (observed.kind === "registered-stale-config") await stopAndAwaitAbsentInternal(spec, true);
+    else if (observed.kind !== "absent") await stopAndAwaitAbsent(spec);
     return start(spec);
   };
 
@@ -924,10 +987,16 @@ function metadataEnvironmentArgs(spec: SupervisorSpec): string[] {
     ["LCM_SUPERVISOR_STATE_ROOT", spec.stateRoot],
     ["LCM_SUPERVISOR_PORT", String(spec.port)],
     ["LCM_SUPERVISOR_NONCE", spec.nonce],
+    ["LCM_SUPERVISOR_EXECUTABLE", spec.executable],
+    ["LCM_SUPERVISOR_ARGS", JSON.stringify(spec.args)],
+    ["LCM_SUPERVISOR_CWD", spec.cwd ?? ""],
   ];
   if (spec.entrypoint !== undefined) values.push(["LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint]);
   if (spec.runtimeDigest !== undefined) values.push(["LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest]);
   if (spec.storageBackend !== undefined) values.push(["LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend]);
+  if (spec.credentialFiles !== undefined && spec.credentialFiles.length > 0) {
+    values.push(["LCM_SYSTEMD_CRED_IDS", spec.credentialFiles.map(({ name }) => name).join(",")]);
+  }
   return values.map(([key, value]) => `--setenv=${key}=${value}`);
 }
 

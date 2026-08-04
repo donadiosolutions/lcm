@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, type TestContext } from "vitest";
@@ -18,6 +18,7 @@ import {
   parseDaemonConfig,
   parseLlmRequestPolicyConfig,
   parseStoredConfig,
+  resolveDaemonConfigEnv,
   resolveLlmRequestPolicy,
   deepMerge,
 } from "../../src/daemon/config.js";
@@ -720,6 +721,55 @@ describe("loadDaemonConfig", () => {
       },
     });
     expect(config.restoration.maxInjectedMemoryBytes).toBe(4096);
+  });
+});
+
+describe("launchd one-launch credential projection", () => {
+  it("reads only private allow-listed files through a bounded descriptor", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-launchd-credentials-"));
+    const directory = join(root, "credentials");
+    mkdirSync(directory, { mode: 0o700 });
+    chmodSync(directory, 0o700);
+    const file = join(directory, "OPENAI_API_KEY");
+    writeFileSync(file, "launchd-secret\n", { mode: 0o600 });
+    chmodSync(file, 0o600);
+    const env = {
+      LCM_CREDENTIAL_DIRECTORY: directory,
+      LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file,
+      LCM_CREDENTIAL_UNKNOWN_FILE: file,
+      OPENAI_API_KEY: "direct-value",
+    };
+    expect(resolveDaemonConfigEnv(env)).toMatchObject({
+      OPENAI_API_KEY: "direct-value",
+      LCM_CREDENTIAL_DIRECTORY: directory,
+    });
+    const envWithoutDirect = { ...env };
+    delete envWithoutDirect.OPENAI_API_KEY;
+    expect(resolveDaemonConfigEnv(envWithoutDirect).OPENAI_API_KEY).toBe("launchd-secret");
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("fails closed for missing, outside, symlinked, wrong-mode, and oversized leaves", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-launchd-credentials-"));
+    const directory = join(root, "credentials");
+    mkdirSync(directory, { mode: 0o700 });
+    chmodSync(directory, 0o700);
+    const file = join(directory, "OPENAI_API_KEY");
+    const outside = join(root, "outside");
+    writeFileSync(outside, "outside", { mode: 0o600 });
+    symlinkSync(outside, file);
+    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
+    rmSync(file);
+    writeFileSync(file, "wrong-mode", { mode: 0o644 });
+    chmodSync(file, 0o644);
+    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
+    chmodSync(file, 0o600);
+    writeFileSync(file, "x".repeat(1024 * 1024 + 1), { mode: 0o600 });
+    chmodSync(file, 0o600);
+    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
+    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory, LCM_CREDENTIAL_OPENAI_API_KEY_FILE: outside }).OPENAI_API_KEY).toBeUndefined();
+    expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: join(root, "missing"), LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file }).OPENAI_API_KEY).toBeUndefined();
+    rmSync(root, { recursive: true, force: true });
   });
 });
 

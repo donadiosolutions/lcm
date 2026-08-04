@@ -1,8 +1,9 @@
-import { readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
 import { readBoundedRegularFile } from "../security-files.js";
 import { hasUrlQueryComponent, sanitizeUrlForDisplay } from "../url-display.js";
+import { MANAGED_CREDENTIAL_NAMES } from "./managed-credentials.js";
 
 export { sanitizeUrlForDisplay } from "../url-display.js";
 
@@ -255,6 +256,10 @@ const SYSTEMD_CREDENTIAL_ENV_NAMES = [
 ] as const;
 type SystemdCredentialEnvName = typeof SYSTEMD_CREDENTIAL_ENV_NAMES[number];
 const SYSTEMD_CREDENTIAL_ENV_NAME_SET = new Set<SystemdCredentialEnvName>(SYSTEMD_CREDENTIAL_ENV_NAMES);
+const LAUNCHD_CREDENTIAL_DIRECTORY_ENV = "LCM_CREDENTIAL_DIRECTORY";
+const LAUNCHD_CREDENTIAL_FILE_PREFIX = "LCM_CREDENTIAL_";
+const LAUNCHD_CREDENTIAL_FILE_SUFFIX = "_FILE";
+const LAUNCHD_CREDENTIAL_MAX_BYTES = 1024 * 1024;
 
 function systemdCredentialDirPrefixes(): string[] {
   const prefixes = ["/run/credentials/"];
@@ -326,11 +331,57 @@ function readSystemdCredentialEnv(env: Record<string, string | undefined>): Reco
   return credentialEnv;
 }
 
+function trustedLaunchdCredentialsDir(path: string | undefined): string | undefined {
+  if (!path || !isAbsolute(path)) return undefined;
+  try {
+    const stats = lstatSync(path);
+    const canonical = realpathSync(path);
+    const uid = typeof process.getuid === "function" ? process.getuid() : stats.uid;
+    if (
+      stats.isSymbolicLink()
+      || !stats.isDirectory()
+      || stats.uid !== uid
+      || (stats.mode & 0o777) !== 0o700
+      || canonical !== resolve(path)
+    ) return undefined;
+    return canonical;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resolve allow-listed private one-launch credential files used by launchd. */
+function readLaunchdCredentialEnv(env: Record<string, string | undefined>): Record<string, string> {
+  const directory = trustedLaunchdCredentialsDir(env[LAUNCHD_CREDENTIAL_DIRECTORY_ENV]);
+  if (!directory) return {};
+  const credentialEnv: Record<string, string> = {};
+  for (const name of MANAGED_CREDENTIAL_NAMES) {
+    const configured = env[`${LAUNCHD_CREDENTIAL_FILE_PREFIX}${name}${LAUNCHD_CREDENTIAL_FILE_SUFFIX}`];
+    if (!configured || !isAbsolute(configured)) continue;
+    const expected = resolve(directory, name);
+    if (resolve(configured) !== expected) continue;
+    try {
+      const stats = lstatSync(configured);
+      const uid = typeof process.getuid === "function" ? process.getuid() : stats.uid;
+      if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1 || stats.uid !== uid || (stats.mode & 0o777) !== 0o600) continue;
+      if (realpathSync(configured) !== expected) continue;
+      credentialEnv[name] = readBoundedRegularFile(configured, {
+        allowedRoot: directory,
+        maxBytes: LAUNCHD_CREDENTIAL_MAX_BYTES,
+      }).replace(/\n+$/u, "");
+    } catch {
+      // Missing, stale, tampered, and oversized launch credentials remain
+      // unavailable; ordinary configuration validation reports the key.
+    }
+  }
+  return credentialEnv;
+}
+
 /** Resolve the environment used for daemon configuration, including trusted systemd credentials. */
 export function resolveDaemonConfigEnv(
   env: Record<string, string | undefined> = process.env,
 ): Record<string, string | undefined> {
-  return { ...readSystemdCredentialEnv(env), ...env };
+  return { ...readSystemdCredentialEnv(env), ...readLaunchdCredentialEnv(env), ...env };
 }
 
 export function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
