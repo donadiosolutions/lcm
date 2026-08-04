@@ -796,7 +796,6 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   } catch {}
 
   if (config.validationError || config.storageBackend === "unavailable") {
-    if (daemonHealthy) clearRemediationMarker();
     results.push(daemonHealthy
       ? {
           name: "daemon", category: "Daemon", status: "warn",
