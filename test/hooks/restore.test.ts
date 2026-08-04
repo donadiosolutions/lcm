@@ -8,6 +8,7 @@ import {
   tryAcquireSessionLockForTesting,
 } from "../../src/hooks/restore.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
+import * as storageBackend from "../../src/storage/backend.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn(),
@@ -45,13 +46,57 @@ describe("handleSessionStart", () => {
     }
   });
 
-  it("treats an unavailable PostgreSQL backend as a benign hook miss", async () => {
-    const post = vi.fn();
-    await expect(handleSessionStart("{}", { post }, 3737, {
-      backend: "postgresql",
-    })).resolves.toEqual({ exitCode: 0, stdout: "" });
-    expect(mockEnsureDaemon).not.toHaveBeenCalled();
-    expect(post).not.toHaveBeenCalled();
+  it("emits a sanitized notice for an unavailable PostgreSQL backend", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-restore-storage-"));
+    const previousHome = process.env.HOME;
+    const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    process.env.HOME = home;
+    try {
+      const post = vi.fn();
+      await expect(handleSessionStart("{}", { post }, 3737, {
+        backend: "postgresql",
+      })).resolves.toEqual({ exitCode: 0, stdout: "" });
+      await expect(handleSessionStart("{}", { post }, 3737, {
+        backend: "postgresql",
+      })).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(stderrWrite).toHaveBeenCalledWith(
+        "lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.\n",
+      );
+      expect(stderrWrite).toHaveBeenCalledTimes(1);
+      expect(readFileSync(join(home, ".lcm", "daemon-remediation.v1.json"), "utf8")).toContain("ambiguous");
+      expect(stderrWrite.mock.calls.flat().join(" ")).not.toContain("not available in this release");
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
+      expect(post).not.toHaveBeenCalled();
+    } finally {
+      stderrWrite.mockRestore();
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("sanitizes unexpected storage-selection failures before emitting a notice", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-restore-storage-throw-"));
+    const previousHome = process.env.HOME;
+    const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementationOnce(() => {
+      throw new Error("secret /tmp/private-config pid=4242");
+    });
+    process.env.HOME = home;
+    try {
+      await expect(handleSessionStart("{}", { post: vi.fn() })).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(stderrWrite).toHaveBeenCalledWith(
+        "lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.\n",
+      );
+      expect(stderrWrite.mock.calls.flat().join(" ")).not.toMatch(/secret|private-config|4242/u);
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    } finally {
+      selectStorageBackend.mockRestore();
+      stderrWrite.mockRestore();
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("fails open when daemon admission throws", async () => {

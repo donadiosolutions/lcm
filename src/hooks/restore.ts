@@ -163,6 +163,7 @@ export async function handleSessionStart(
   try {
     selectStorageBackend(storage);
   } catch {
+    emitAdmissionNotice(undefined, "ambiguous");
     return { exitCode: 0, stdout: "" };
   }
 

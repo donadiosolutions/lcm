@@ -139,7 +139,12 @@ export async function handleUserPromptSubmit(
       });
     }
 
-    selectStorageBackend(storage);
+    try {
+      selectStorageBackend(storage);
+    } catch {
+      emitAdmissionNotice(undefined, "ambiguous");
+      return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+    }
     let ensureResult: EnsureResultWithRefusal;
     try {
       ensureResult = await ensureDaemon({
