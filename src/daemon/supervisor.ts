@@ -948,6 +948,15 @@ export function createSupervisor(
       : ["bootout", `${launchdDomain(runner.uid)}/${spec.launchdLabel}`];
     const result = await runner.invoke(kind === "systemd-user" ? "systemctl" : "launchctl", stopArgs, spec.stopTimeoutMs);
     if (result.timedOut) throw commandFailedError();
+    if (
+      kind === "systemd-user"
+      && current.kind === "registered-not-running-valid"
+      && current.terminal === "failed"
+      && result.code === 0
+    ) {
+      const resetFailed = await runner.invoke("systemctl", ["--user", "reset-failed", spec.systemdUnit], spec.stopTimeoutMs);
+      if (resetFailed.timedOut || resetFailed.code !== 0) throw commandFailedError();
+    }
     const maxPollIntervals = Math.max(1, Math.ceil(spec.stopTimeoutMs / DEFAULT_POLL_INTERVAL_MS));
     for (let attempt = 0; attempt < Math.min(MAX_POLL_INTERVALS, maxPollIntervals); attempt += 1) {
       const observed = await probe(spec);

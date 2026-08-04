@@ -285,6 +285,20 @@ describe("systemd-user supervisor", () => {
     expect(stop.calls[1].args).toEqual(["--user", "stop", spec.systemdUnit]);
   });
 
+  it("resets an authenticated failed unit only after stop before requiring absence", async () => {
+    const spec = makeSpec("systemd-user");
+    const runner = fakeRunner([
+      { code: 0, stdout: managerText(spec, "failed") },
+      { code: 0, stdout: "stopped" },
+      { code: 0, stdout: "reset" },
+      { code: 1, stderr: "Unit is not-found" },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).stopAndAwaitAbsent(spec)).resolves.toBeUndefined();
+    expect(runner.calls[1].args).toEqual(["--user", "stop", spec.systemdUnit]);
+    expect(runner.calls[2].args).toEqual(["--user", "reset-failed", spec.systemdUnit]);
+    expect(runner.calls[2].timeoutMs).toBe(spec.stopTimeoutMs);
+  });
+
   it("parses JSON/key-value variants and all terminal/metadata refusal boundaries", async () => {
     const spec = makeSpec("systemd-user");
     const identity = ` LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)} LCM_SUPERVISOR_CWD=`;
