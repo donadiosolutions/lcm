@@ -195,6 +195,46 @@ type ResolvedLifecycleDependencies = Readonly<{
   uid: number | undefined;
 }>;
 
+type ManagedCredentialStage = Readonly<{
+  spec: SupervisorSpec;
+  credentialDirectory?: string;
+}>;
+
+function stageManagedCredentials(
+  spec: SupervisorSpec,
+  environment: NodeJS.ProcessEnv,
+): ManagedCredentialStage {
+  const values: Record<string, string> = {};
+  for (const name of MANAGED_CREDENTIAL_NAMES) {
+    const value = environment[name];
+    if (typeof value === "string" && value.length > 0) values[name] = value;
+  }
+  if (Object.keys(values).length === 0) return { spec };
+
+  // Credential directories are per manager mutation, not stable scope
+  // identity.  A fresh suffix prevents a terminal registration's old
+  // systemd files from colliding with its replacement.
+  const credentialNonce = `${spec.nonce}-${randomBytes(8).toString("hex")}`;
+  const directory = createManagedCredentialDirectory(spec.stateRoot, credentialNonce);
+  try {
+    const paths = writeManagedCredentialFiles(directory, values);
+    return {
+      spec: Object.freeze({
+        ...spec,
+        credentialDirectory: directory,
+        credentialFiles: Object.freeze(paths.map((path) => ({
+          name: path.slice(path.lastIndexOf("/") + 1),
+          path,
+        }))),
+      }),
+      credentialDirectory: directory,
+    };
+  } catch (error) {
+    try { cleanupManagedCredentialDirectory(directory, spec.stateRoot); } catch { /* preserve cleanup evidence */ }
+    throw error;
+  }
+}
+
 function scopedLifecycleEnvironment(
   scope: DaemonLifecycleTestScope,
 ): NodeJS.ProcessEnv {
@@ -1123,29 +1163,6 @@ async function terminatePid(
   }
 }
 
-async function requestDaemonHealth(
-  port: number,
-  fetchFn: typeof globalThis.fetch,
-  signal: AbortSignal,
-  token?: string,
-): Promise<HealthResponse | null> {
-  try {
-    const url = `http://127.0.0.1:${port}/health`;
-    const res = await fetchFn(url, {
-      ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
-      signal,
-    });
-    if (!res.ok && res.status !== 503) return null;
-    const body = await res.json() as unknown;
-    if (typeof body !== "object" || body === null || typeof (body as HealthResponse).status !== "string") {
-      return null;
-    }
-    return { ...(body as HealthResponse), httpStatus: res.status };
-  } catch {
-    return null;
-  }
-}
-
 function normalizeHealthResponse(response: Response): Response {
   // A few hermetic lifecycle seams historically returned `{ ok, json }`
   // without a numeric status.  Keep those seams useful while still routing
@@ -1915,37 +1932,6 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     return { spec, supervisor };
   }
 
-  function managedCredentialValues(): Record<string, string> {
-    const values: Record<string, string> = {};
-    for (const name of MANAGED_CREDENTIAL_NAMES) {
-      const value = dependencies.environment[name];
-      if (typeof value === "string" && value.length > 0) values[name] = value;
-    }
-    return values;
-  }
-
-  function specWithManagedCredentials(spec: SupervisorSpec): SupervisorSpec {
-    const values = managedCredentialValues();
-    if (Object.keys(values).length === 0) return spec;
-    // Credential directories are per manager mutation, not stable scope
-    // identity.  A fresh suffix prevents a terminal registration's old
-    // systemd files from colliding with its replacement.
-    const credentialNonce = `${spec.nonce}-${randomBytes(8).toString("hex")}`;
-    const directory = createManagedCredentialDirectory(spec.stateRoot, credentialNonce);
-    let paths: readonly string[];
-    try {
-      paths = writeManagedCredentialFiles(directory, values);
-    } catch (error) {
-      try { cleanupManagedCredentialDirectory(directory, spec.stateRoot); } catch { /* preserve cleanup evidence */ }
-      throw error;
-    }
-    const credentialFiles = Object.freeze(paths.map((path) => ({
-      name: path.slice(path.lastIndexOf("/") + 1),
-      path,
-    })));
-    return Object.freeze({ ...spec, credentialDirectory: directory, credentialFiles });
-  }
-
   async function cleanupManagedScopeResources(): Promise<void> {
     if (
       (managedOperationAmbiguous && testScope === undefined)
@@ -2195,8 +2181,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     managedOperationOwned = false;
     let launchSpec: SupervisorSpec;
     try {
-      launchSpec = specWithManagedCredentials(spec);
-      managedSpecForCleanup = launchSpec;
+      const staged = stageManagedCredentials(spec, dependencies.environment);
+      launchSpec = staged.spec;
+      managedSpecForCleanup = staged.spec;
     } catch {
       return refusalResult("startup-failure", "managed daemon credentials could not be prepared", { spawned: false });
     }
@@ -3061,38 +3048,8 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         stoppedPid: observation.kind === "registered-running-valid" ? observation.managerPid : undefined,
       };
     };
-    const restartSpecWithManagedCredentials = (): {
-      readonly spec: SupervisorSpec;
-      readonly credentialDirectory?: string;
-    } => {
-      const values: Record<string, string> = {};
-      for (const name of MANAGED_CREDENTIAL_NAMES) {
-        const value = dependencies.environment[name];
-        if (typeof value === "string" && value.length > 0) values[name] = value;
-      }
-      if (Object.keys(values).length === 0) return { spec };
-      const credentialNonce = `${spec.nonce}-${randomBytes(8).toString("hex")}`;
-      const directory = createManagedCredentialDirectory(spec.stateRoot, credentialNonce);
-      try {
-        const paths = writeManagedCredentialFiles(directory, values);
-        return {
-          spec: Object.freeze({
-            ...spec,
-            credentialDirectory: directory,
-            credentialFiles: Object.freeze(paths.map((path) => ({
-              name: path.slice(path.lastIndexOf("/") + 1),
-              path,
-            }))),
-          }),
-          credentialDirectory: directory,
-        };
-      } catch (error) {
-        try { cleanupManagedCredentialDirectory(directory, spec.stateRoot); } catch { /* preserve cleanup evidence */ }
-        throw error;
-      }
-    };
     const stopStartAndEnsure = async (): Promise<RestartDaemonResult> => {
-      const staged = restartSpecWithManagedCredentials();
+      const staged = stageManagedCredentials(spec, dependencies.environment);
       try {
         const started = await supervisor.stopAndStart(staged.spec);
         return await ensureAfterManagerOperation(started.managerPid);

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import * as healthObservation from "../../src/daemon/health-observation.js";
 import {
   observeHttpHealth,
   type HealthClearTimeout,
@@ -54,6 +55,11 @@ async function settleMicrotasks(): Promise<void> {
 }
 
 describe("observeHttpHealth", () => {
+  it("does not expose removed compatibility aliases", () => {
+    expect(Object.hasOwn(healthObservation, "observeHealth")).toBe(false);
+    expect(Object.hasOwn(healthObservation, "observeHealthResponse")).toBe(false);
+  });
+
   it("returns a validated body and clears both phase timers and the abort listener", async () => {
     const timers = timerSeams();
     const caller = new AbortController();

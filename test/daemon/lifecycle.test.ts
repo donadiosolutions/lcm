@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ensureAuthToken } from "../../src/daemon/auth.js";
 import { loadDaemonConfig, parseDaemonConfig } from "../../src/daemon/config.js";
@@ -23,6 +23,18 @@ type SpawnChildMock = {
   unref: ReturnType<typeof vi.fn>;
   once: ReturnType<typeof vi.fn>;
 };
+type ManagedSupervisorSpec = {
+  stateRoot: string;
+  nonce: string;
+  credentialDirectory?: string;
+  credentialFiles?: readonly { name: string; path: string }[];
+};
+type ManagedCredentialSnapshot = {
+  stateRoot: string;
+  nonce: string;
+  credentialDirectory?: string;
+  files: readonly { name: string; value: string; mode: number; path: string }[];
+};
 const testIdentity = {
   ownerId: "lifecycle-tests",
   entrypoint: "/lcm-tests/lifecycle-daemon.mjs",
@@ -42,6 +54,19 @@ function makeHermeticPidFile(prefix: string): string {
   const root = mkdtempSync(join(tmpdir(), prefix));
   tempDirs.push(root);
   return join(root, "daemon.pid");
+}
+
+function snapshotManagedCredentials(spec: ManagedSupervisorSpec): ManagedCredentialSnapshot {
+  return {
+    stateRoot: spec.stateRoot,
+    nonce: spec.nonce,
+    credentialDirectory: spec.credentialDirectory,
+    files: (spec.credentialFiles ?? []).map(file => ({
+      ...file,
+      value: readFileSync(file.path, "utf-8"),
+      mode: statSync(file.path).mode & 0o777,
+    })),
+  };
 }
 
 function withHermeticLifecycleSeams(
@@ -85,14 +110,18 @@ function withHermeticLifecycleSeams(
   return { ...options, _hermeticTestSeams: seams };
 }
 
-function ensureDaemon(options: EnsureDaemonOptions): ReturnType<typeof ensureDaemonProduction> {
-  return ensureDaemonProduction(withHermeticLifecycleSeams(options));
+function ensureDaemon(
+  options: EnsureDaemonOptions,
+  overrides: Partial<DaemonLifecycleHermeticTestSeams> = {},
+): ReturnType<typeof ensureDaemonProduction> {
+  return ensureDaemonProduction(withHermeticLifecycleSeams(options, overrides));
 }
 
 function restartDaemon(
   options: Parameters<typeof restartDaemonProduction>[0],
+  overrides: Partial<DaemonLifecycleHermeticTestSeams> = {},
 ): ReturnType<typeof restartDaemonProduction> {
-  return restartDaemonProduction(withHermeticLifecycleSeams(options));
+  return restartDaemonProduction(withHermeticLifecycleSeams(options, overrides));
 }
 
 afterEach(() => {
@@ -4114,6 +4143,7 @@ describe("restartDaemon", () => {
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
     let calls = 0;
+    let staged: ManagedCredentialSnapshot | undefined;
     const supervisor = {
       probe: vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => {
         calls += 1;
@@ -4121,7 +4151,10 @@ describe("restartDaemon", () => {
           ? { kind: "absent" as const, name: candidate.name }
           : { kind: "registered-running-valid" as const, managerPid: 201, scopeDigest: candidate.scopeDigest, nonce: candidate.nonce, name: candidate.name };
       }),
-      start: vi.fn(async () => ({ kind: "launchd-user" as const, name: "job", scopeDigest: "scope", port: 19999, nonce: "nonce", managerPid: 201 })),
+      start: vi.fn(async (candidate: ManagedSupervisorSpec) => {
+        staged = snapshotManagedCredentials(candidate);
+        return { kind: "launchd-user" as const, name: "job", scopeDigest: "scope", port: 19999, nonce: "nonce", managerPid: 201 };
+      }),
       stopAndStart: vi.fn(),
       stopAndAwaitAbsent: vi.fn(),
     };
@@ -4135,11 +4168,29 @@ describe("restartDaemon", () => {
       _supervisorOverride: supervisor as never,
       _isProcessAliveOverride: () => false,
       _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+    }, {
+      environment: {
+        ANTHROPIC_API_KEY: "anthropic-value",
+        OPENAI_API_KEY: "openai-value",
+        LCM_SUMMARY_API_KEY: "summary-value",
+        LCM_POSTGRES_URL: "postgres-value",
+        UNRELATED_SECRET: "must-not-be-staged",
+      },
     });
 
     expect(result).toMatchObject({ connected: false, spawned: true, startMethod: "launchd-user", pid: 201 });
     expect(supervisor.start).toHaveBeenCalledOnce();
     expect(supervisor.probe).toHaveBeenCalledTimes(2);
+    expect(staged?.stateRoot).toBe(tempDir);
+    expect(staged?.credentialDirectory).toBeDefined();
+    expect(dirname(staged!.credentialDirectory!)).toBe(join(tempDir, "credentials"));
+    expect(basename(staged!.credentialDirectory!)).toMatch(new RegExp(`^${staged!.nonce}-[a-f0-9]{16}$`, "u"));
+    expect(staged?.files.map(file => ({ name: file.name, value: file.value, mode: file.mode }))).toEqual([
+      { name: "ANTHROPIC_API_KEY", value: "anthropic-value", mode: 0o600 },
+      { name: "OPENAI_API_KEY", value: "openai-value", mode: 0o600 },
+      { name: "LCM_SUMMARY_API_KEY", value: "summary-value", mode: 0o600 },
+      { name: "LCM_POSTGRES_URL", value: "postgres-value", mode: 0o600 },
+    ]);
   });
 
   it.each([
@@ -4187,13 +4238,17 @@ describe("restartDaemon", () => {
     writeFileSync(pidFile, "202");
     writeFileSync(join(tempDir, "daemon.token"), "local-token");
     let calls = 0;
+    let staged: ManagedCredentialSnapshot | undefined;
     const supervisor = {
       probe: vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => {
         calls += 1;
         return { kind: "registered-running-valid" as const, managerPid: 202, scopeDigest: candidate.scopeDigest, nonce: candidate.nonce, name: candidate.name };
       }),
       start: vi.fn(),
-      stopAndStart: vi.fn(async () => ({ kind: "systemd-user" as const, name: "job", scopeDigest: "scope", port: 19999, nonce: "nonce", managerPid: 202 })),
+      stopAndStart: vi.fn(async (candidate: ManagedSupervisorSpec) => {
+        staged = snapshotManagedCredentials(candidate);
+        return { kind: "systemd-user" as const, name: "job", scopeDigest: "scope", port: 19999, nonce: "nonce", managerPid: 202 };
+      }),
       stopAndAwaitAbsent: vi.fn(),
     };
     const ensureMock = vi.fn(async () => ({ connected: true, port: 19999, spawned: false, startMethod: "systemd-user" as const }));
@@ -4208,12 +4263,27 @@ describe("restartDaemon", () => {
       _listeningPortsOverride: () => [19999],
       _supervisorOverride: supervisor as never,
       _ensureDaemonOverride: ensureMock,
+    }, {
+      environment: {
+        OPENAI_API_KEY: "restart-openai-value",
+        LCM_SUMMARY_API_KEY: "restart-summary-value",
+        UNRELATED_SECRET: "must-not-be-staged",
+      },
     });
 
     expect(result).toMatchObject({ restarted: true, stoppedPid: 202 });
     expect(supervisor.stopAndStart).toHaveBeenCalledOnce();
     expect(calls).toBe(2);
     expect(ensureMock).toHaveBeenCalledOnce();
+    expect(staged?.stateRoot).toBe(tempDir);
+    expect(staged?.credentialDirectory).toBeDefined();
+    expect(dirname(staged!.credentialDirectory!)).toBe(join(tempDir, "credentials"));
+    expect(basename(staged!.credentialDirectory!)).toMatch(new RegExp(`^${staged!.nonce}-[a-f0-9]{16}$`, "u"));
+    expect(staged?.files.map(file => ({ name: file.name, value: file.value, mode: file.mode }))).toEqual([
+      { name: "OPENAI_API_KEY", value: "restart-openai-value", mode: 0o600 },
+      { name: "LCM_SUMMARY_API_KEY", value: "restart-summary-value", mode: 0o600 },
+    ]);
+    expect(existsSync(staged!.credentialDirectory!)).toBe(false);
   });
 
   it("repairs an exact stale manager registration through explicit stop/start only", async () => {

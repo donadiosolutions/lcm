@@ -380,7 +380,3 @@ export async function observeHttpHealth<T = unknown>(
     return { kind: "response", status, body: "invalid", reason: "body-rejected" };
   }
 }
-
-/** Short aliases make the seam convenient for lifecycle and doctor callers. */
-export const observeHealth = observeHttpHealth;
-export const observeHealthResponse = observeHttpHealth;
