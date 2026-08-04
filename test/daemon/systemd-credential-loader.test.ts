@@ -16,40 +16,42 @@ import { join } from "node:path";
 import { describe, expect, it, type TestContext } from "vitest";
 import { resolveDaemonConfigEnv } from "../../src/daemon/config.js";
 
-function trustedCredentialBaseDir(): string | undefined {
-  if (typeof process.getuid !== "function") return undefined;
-  const baseDir = `/run/user/${process.getuid()}/credentials`;
-  try {
-    if (!existsSync(baseDir)) return undefined;
-    const probe = mkdtempSync(join(baseDir, "lcm-loader-probe-"));
-    rmSync(probe, { recursive: true, force: true });
-    return baseDir;
-  } catch {
-    return undefined;
-  }
-}
+type CredentialDirFixture = {
+  directory: string;
+  credentialsParent: string;
+  runtimeRoot: string;
+};
 
-function makeCredentialDir(context: TestContext): string | undefined {
-  const baseDir = trustedCredentialBaseDir();
-  if (baseDir === undefined) {
-    context.skip();
-    return undefined;
+/** Create a systemd-shaped credential directory under a private runtime root. */
+function makeCredentialDir(): CredentialDirFixture {
+  const runtimeRoot = mkdtempSync(join(tmpdir(), "lcm-loader-runtime-"));
+  const credentialsParent = join(runtimeRoot, "credentials");
+  const directory = join(credentialsParent, "lcm-loader-credentials");
+  try {
+    chmodSync(runtimeRoot, 0o700);
+    mkdirSync(credentialsParent, { mode: 0o755 });
+    mkdirSync(directory, { mode: 0o700 });
+    chmodSync(directory, 0o700);
+    return { directory, credentialsParent, runtimeRoot };
+  } catch (error) {
+    rmSync(runtimeRoot, { recursive: true, force: true });
+    throw error;
   }
-  return mkdtempSync(join(baseDir, "lcm-loader-credentials-"));
 }
 
 function sealCredentialDir(directory: string, mode = 0o500): void {
   chmodSync(directory, mode);
 }
 
-function removeCredentialDir(directory: string): void {
-  chmodSync(directory, 0o700);
-  rmSync(directory, { recursive: true, force: true });
+function removeCredentialDir(fixture: CredentialDirFixture): void {
+  chmodSync(fixture.directory, 0o700);
+  rmSync(fixture.runtimeRoot, { recursive: true, force: true });
 }
 
-function credentialEnv(directory: string, ids: string): Record<string, string> {
+function credentialEnv(fixture: Pick<CredentialDirFixture, "directory" | "runtimeRoot">, ids: string): Record<string, string> {
   return {
-    CREDENTIALS_DIRECTORY: directory,
+    CREDENTIALS_DIRECTORY: fixture.directory,
+    XDG_RUNTIME_DIR: fixture.runtimeRoot,
     LCM_SYSTEMD_CRED_IDS: ids,
   };
 }
@@ -62,6 +64,7 @@ const NONRUNNING_USER_MANAGER_STATES = new Set([
   "stopping",
   "unknown",
 ]);
+const LIVE_SYSTEMD_INTEGRATION_ENV = "LCM_SYSTEMD_CREDENTIAL_INTEGRATION";
 
 function outputText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -70,6 +73,10 @@ function outputText(value: unknown): string {
 
 /** Skip only when an explicit preflight proves this host cannot run the probe. */
 function requireRunningUserManager(context: TestContext): boolean {
+  if (process.env[LIVE_SYSTEMD_INTEGRATION_ENV] !== "1") {
+    context.skip("live systemd credential probe is limited to the dedicated Linux systemd job");
+    return false;
+  }
   if (process.platform !== "linux") {
     context.skip("live systemd credential probe requires Linux");
     return false;
@@ -110,32 +117,38 @@ function requireRunningUserManager(context: TestContext): boolean {
   throw new Error(`unexpected systemd user manager preflight state: ${state || "empty"}`);
 }
 
-function requireTrustedCredentialBaseDir(): string {
+function requireTrustedCredentialBaseDir(context: TestContext): string | undefined {
   if (typeof process.getuid !== "function") {
-    throw new Error("live systemd credential probe requires a POSIX UID");
+    context.skip("live systemd credential probe requires a POSIX UID");
+    return undefined;
   }
   const baseDir = `/run/user/${process.getuid()}/credentials`;
   if (!existsSync(baseDir)) {
-    throw new Error(`running user manager did not expose ${baseDir}`);
+    context.skip(`running user manager did not expose ${baseDir}`);
+    return undefined;
   }
-  const probe = mkdtempSync(join(baseDir, "lcm-loader-live-probe-"));
-  rmSync(probe, { recursive: true, force: true });
+  try {
+    const probe = mkdtempSync(join(baseDir, "lcm-loader-live-probe-"));
+    rmSync(probe, { recursive: true, force: true });
+  } catch {
+    context.skip(`live systemd credential probe cannot write ${baseDir}`);
+    return undefined;
+  }
   return baseDir;
 }
 
 describe("systemd credential loader hardening", () => {
-  it("prefers an authenticated staged credential over residual ambient environment", (context: TestContext) => {
-    const directory = makeCredentialDir(context);
-    if (directory === undefined) return;
+  it("prefers an authenticated staged credential over residual ambient environment", () => {
+    const fixture = makeCredentialDir();
     try {
-      writeFileSync(join(directory, "OPENAI_API_KEY"), "staged-value\n", { mode: 0o400 });
-      sealCredentialDir(directory);
+      writeFileSync(join(fixture.directory, "OPENAI_API_KEY"), "staged-value\n", { mode: 0o400 });
+      sealCredentialDir(fixture.directory);
       expect(resolveDaemonConfigEnv({
-        ...credentialEnv(directory, "OPENAI_API_KEY"),
+        ...credentialEnv(fixture, "OPENAI_API_KEY"),
         OPENAI_API_KEY: "ambient-value",
       }).OPENAI_API_KEY).toBe("staged-value");
     } finally {
-      removeCredentialDir(directory);
+      removeCredentialDir(fixture);
     }
   });
 
@@ -156,23 +169,23 @@ describe("systemd credential loader hardening", () => {
       chmodSync(outsideDirectory, 0o500);
 
       expect(resolveDaemonConfigEnv({
-        ...credentialEnv(directory, "OPENAI_API_KEY"),
+        ...credentialEnv({ directory, runtimeRoot }, "OPENAI_API_KEY"),
         XDG_RUNTIME_DIR: runtimeRoot,
         OPENAI_API_KEY: "ambient-value",
       }).OPENAI_API_KEY).toBe("custom-staged");
       expect(resolveDaemonConfigEnv({
-        ...credentialEnv(outsideDirectory, "OPENAI_API_KEY"),
+        ...credentialEnv({ directory: outsideDirectory, runtimeRoot }, "OPENAI_API_KEY"),
         XDG_RUNTIME_DIR: runtimeRoot,
         OPENAI_API_KEY: "ambient-value",
       }).OPENAI_API_KEY).toBe("ambient-value");
       expect(resolveDaemonConfigEnv({
-        ...credentialEnv(outsideDirectory, "OPENAI_API_KEY"),
+        ...credentialEnv({ directory: outsideDirectory, runtimeRoot }, "OPENAI_API_KEY"),
         XDG_RUNTIME_DIR: join(runtimeRoot, "missing"),
         OPENAI_API_KEY: "ambient-value",
       }).OPENAI_API_KEY).toBe("ambient-value");
       chmodSync(runtimeRoot, 0o755);
       expect(resolveDaemonConfigEnv({
-        ...credentialEnv(directory, "OPENAI_API_KEY"),
+        ...credentialEnv({ directory, runtimeRoot }, "OPENAI_API_KEY"),
         XDG_RUNTIME_DIR: runtimeRoot,
         OPENAI_API_KEY: "ambient-value",
       }).OPENAI_API_KEY).toBe("ambient-value");
@@ -190,56 +203,53 @@ describe("systemd credential loader hardening", () => {
     ["duplicate id", "OPENAI_API_KEY,OPENAI_API_KEY"],
     ["path traversal id", "../OPENAI_API_KEY"],
     ["empty id", "OPENAI_API_KEY,"],
-  ])("fails closed for malformed %s metadata", (_label, ids, context: TestContext) => {
-    const directory = makeCredentialDir(context);
-    if (directory === undefined) return;
+  ])("fails closed for malformed %s metadata", (_label, ids) => {
+    const fixture = makeCredentialDir();
     try {
-      writeFileSync(join(directory, "OPENAI_API_KEY"), "secret", { mode: 0o400 });
-      sealCredentialDir(directory);
-      expect(resolveDaemonConfigEnv(credentialEnv(directory, ids))).toEqual(credentialEnv(directory, ids));
+      writeFileSync(join(fixture.directory, "OPENAI_API_KEY"), "secret", { mode: 0o400 });
+      sealCredentialDir(fixture.directory);
+      expect(resolveDaemonConfigEnv(credentialEnv(fixture, ids))).toEqual(credentialEnv(fixture, ids));
     } finally {
-      removeCredentialDir(directory);
+      removeCredentialDir(fixture);
     }
   });
 
-  it("does not let malformed systemd markers replace detached direct environment", (context: TestContext) => {
-    const directory = makeCredentialDir(context);
-    if (directory === undefined) return;
+  it("does not let malformed systemd markers replace detached direct environment", () => {
+    const fixture = makeCredentialDir();
     try {
-      writeFileSync(join(directory, "OPENAI_API_KEY"), "staged-value", { mode: 0o400 });
-      sealCredentialDir(directory);
+      writeFileSync(join(fixture.directory, "OPENAI_API_KEY"), "staged-value", { mode: 0o400 });
+      sealCredentialDir(fixture.directory);
       expect(resolveDaemonConfigEnv({
-        ...credentialEnv(directory, "BAD"),
+        ...credentialEnv(fixture, "BAD"),
         OPENAI_API_KEY: "ambient-value",
       }).OPENAI_API_KEY).toBe("ambient-value");
     } finally {
-      removeCredentialDir(directory);
+      removeCredentialDir(fixture);
     }
   });
 
-  it("rejects a systemd directory that retains launchd's writable mode", (context: TestContext) => {
-    const directory = makeCredentialDir(context);
-    if (directory === undefined) return;
+  it("rejects a systemd directory that retains launchd's writable mode", () => {
+    const fixture = makeCredentialDir();
     try {
-      writeFileSync(join(directory, "OPENAI_API_KEY"), "secret", { mode: 0o400 });
-      sealCredentialDir(directory, 0o700);
-      expect(resolveDaemonConfigEnv(credentialEnv(directory, "OPENAI_API_KEY"))).toEqual(credentialEnv(directory, "OPENAI_API_KEY"));
+      writeFileSync(join(fixture.directory, "OPENAI_API_KEY"), "secret", { mode: 0o400 });
+      sealCredentialDir(fixture.directory, 0o700);
+      expect(resolveDaemonConfigEnv(credentialEnv(fixture, "OPENAI_API_KEY"))).toEqual(credentialEnv(fixture, "OPENAI_API_KEY"));
     } finally {
-      removeCredentialDir(directory);
+      removeCredentialDir(fixture);
     }
   });
 
-  it("rejects a symlinked systemd credential directory", (context: TestContext) => {
-    const directory = makeCredentialDir(context);
-    const baseDir = trustedCredentialBaseDir();
-    if (directory === undefined || baseDir === undefined) return;
-    const link = join(baseDir, `lcm-loader-directory-link-${randomUUID()}`);
+  it("rejects a symlinked systemd credential directory", () => {
+    const fixture = makeCredentialDir();
+    const link = join(fixture.credentialsParent, `lcm-loader-directory-link-${randomUUID()}`);
     try {
-      symlinkSync(directory, link, "dir");
-      expect(resolveDaemonConfigEnv(credentialEnv(link, "OPENAI_API_KEY"))).toEqual(credentialEnv(link, "OPENAI_API_KEY"));
+      symlinkSync(fixture.directory, link, "dir");
+      expect(resolveDaemonConfigEnv(credentialEnv({ directory: link, runtimeRoot: fixture.runtimeRoot }, "OPENAI_API_KEY"))).toEqual(
+        credentialEnv({ directory: link, runtimeRoot: fixture.runtimeRoot }, "OPENAI_API_KEY"),
+      );
     } finally {
       rmSync(link, { force: true });
-      removeCredentialDir(directory);
+      removeCredentialDir(fixture);
     }
   });
 
@@ -268,36 +278,40 @@ describe("systemd credential loader hardening", () => {
       writeFileSync(path, "mode", { mode: 0o600 });
       return undefined;
     }],
-  ] as const)("rejects a credential leaf that is a %s", (_label, createLeaf, context: TestContext) => {
-    const directory = makeCredentialDir(context);
-    if (directory === undefined) return;
+  ] as const)("rejects a credential leaf that is a %s", (_label, createLeaf) => {
+    const fixture = makeCredentialDir();
+    const directory = fixture.directory;
     const path = join(directory, "OPENAI_API_KEY");
     let cleanupOutside: (() => void) | undefined;
     try {
       cleanupOutside = createLeaf(path, directory) ?? undefined;
       sealCredentialDir(directory);
-      expect(resolveDaemonConfigEnv(credentialEnv(directory, "OPENAI_API_KEY"))).toEqual(credentialEnv(directory, "OPENAI_API_KEY"));
+      expect(resolveDaemonConfigEnv(credentialEnv(fixture, "OPENAI_API_KEY"))).toEqual(credentialEnv(fixture, "OPENAI_API_KEY"));
     } finally {
       cleanupOutside?.();
-      removeCredentialDir(directory);
+      removeCredentialDir(fixture);
     }
   });
 
-  it("rejects a credential larger than the systemd 1 MiB unit limit", (context: TestContext) => {
-    const directory = makeCredentialDir(context);
-    if (directory === undefined) return;
+  it("rejects a credential larger than the systemd 1 MiB unit limit", () => {
+    const fixture = makeCredentialDir();
+    const directory = fixture.directory;
     try {
       writeFileSync(join(directory, "OPENAI_API_KEY"), Buffer.alloc(1024 * 1024 + 1, 0x78), { mode: 0o400 });
       sealCredentialDir(directory);
-      expect(resolveDaemonConfigEnv(credentialEnv(directory, "OPENAI_API_KEY"))).toEqual(credentialEnv(directory, "OPENAI_API_KEY"));
+      expect(resolveDaemonConfigEnv(credentialEnv(fixture, "OPENAI_API_KEY"))).toEqual(credentialEnv(fixture, "OPENAI_API_KEY"));
     } finally {
-      removeCredentialDir(directory);
+      removeCredentialDir(fixture);
     }
   });
 
-  it("rejects a credential owned by a different UID when the test process can create one", (context: TestContext) => {
-    const directory = makeCredentialDir(context);
-    if (directory === undefined || typeof process.getuid !== "function") return;
+  it("rejects a credential owned by a different UID when the test process can create one", () => {
+    const fixture = makeCredentialDir();
+    const directory = fixture.directory;
+    if (typeof process.getuid !== "function") {
+      removeCredentialDir(fixture);
+      return;
+    }
     const path = join(directory, "OPENAI_API_KEY");
     try {
       writeFileSync(path, "owner", { mode: 0o400 });
@@ -307,15 +321,16 @@ describe("systemd credential loader hardening", () => {
         return;
       }
       sealCredentialDir(directory);
-      expect(resolveDaemonConfigEnv(credentialEnv(directory, "OPENAI_API_KEY"))).toEqual(credentialEnv(directory, "OPENAI_API_KEY"));
+      expect(resolveDaemonConfigEnv(credentialEnv(fixture, "OPENAI_API_KEY"))).toEqual(credentialEnv(fixture, "OPENAI_API_KEY"));
     } finally {
-      removeCredentialDir(directory);
+      removeCredentialDir(fixture);
     }
   });
 
   it("observes the real user-systemd LoadCredential modes without exposing its value", (context: TestContext) => {
     if (!requireRunningUserManager(context)) return;
-    const baseDir = requireTrustedCredentialBaseDir();
+    const baseDir = requireTrustedCredentialBaseDir(context);
+    if (baseDir === undefined) return;
     const source = join(baseDir, `lcm-loader-source-${randomUUID()}`);
     const unit = `lcm-loader-probe-${randomUUID().replaceAll("-", "")}`;
     try {

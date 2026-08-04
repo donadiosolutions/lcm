@@ -132,6 +132,7 @@ jobs:
 
       - name: Run real user-systemd integration
         env:
+          LCM_SYSTEMD_CREDENTIAL_INTEGRATION: "1"
           LCM_LIFECYCLE_SYSTEMD_INTEGRATION: "1"
           LCM_LIFECYCLE_SCOPE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
           LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR: ${{ runner.temp }}/lcm-systemd-${{ github.run_id }}-${{ github.run_attempt }}
@@ -162,6 +163,9 @@ jobs:
             test/daemon/lifecycle-isolation.test.ts \
             test/daemon/lifecycle-systemd.integration.test.ts \
             --testNamePattern "uses and removes one exact run-owned transient unit|starts and admits a healthy managed unit with exact identity and cleanup|restarts a wedged registered unit through systemd without legacy signal fallback|recreates a terminal clean-exit unit after a registered-not-running observation|refuses stale manager identity before mutation and never falls back to legacy signals"
+          npx vitest run \
+            test/daemon/systemd-credential-loader.test.ts \
+            --testNamePattern "observes the real user-systemd LoadCredential modes"
 
   macos-launchd:
     name: macOS 15 launchd feasibility
