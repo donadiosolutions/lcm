@@ -596,6 +596,35 @@ describe("runCli failure and alternate presentation branches", () => {
     expect((await invoke(["daemon", "restart"]))?.message).toBe("exit:1");
   });
 
+  it("covers lifecycle exceptions and preserves bounded refusal guidance", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    state.ensureDaemon.mockResolvedValueOnce({
+      connected: false,
+      spawned: false,
+      restartedForParent: false,
+      pid: undefined,
+      refusalReason: "not-running",
+    });
+    expect((await invoke(["search", "q"]))?.message).toBe("exit:1");
+    expect(consoleError).toHaveBeenCalledWith("  lcm daemon unavailable (not-running); run 'lcm daemon start'.");
+
+    consoleError.mockClear();
+    state.ensureDaemon.mockRejectedValueOnce(new Error("ensure failed"));
+    expect((await invoke(["search", "q"]))?.message).toBe("exit:1");
+    expect(consoleError).toHaveBeenCalledWith("  lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.");
+
+    consoleError.mockClear();
+    state.ensureDaemon.mockRejectedValueOnce(new Error("start failed"));
+    expect((await invoke(["daemon", "start"]))?.message).toBe("exit:1");
+    expect(consoleError).toHaveBeenCalledWith("  lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.");
+
+    consoleError.mockClear();
+    state.restartDaemon.mockRejectedValueOnce(new Error("restart failed"));
+    expect((await invoke(["daemon", "restart"]))?.message).toBe("exit:1");
+    expect(consoleError).toHaveBeenCalledWith("  lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.");
+  });
+
   it("omits invalid package versions from daemon expectations", async () => {
     state.packageVersion = 1;
     expect((await invoke(["daemon", "start"]))?.message).toBe("exit:0");
