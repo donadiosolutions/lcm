@@ -1,13 +1,11 @@
 import { randomBytes } from "node:crypto";
 import {
-  chmodSync,
   closeSync,
   constants,
   existsSync,
   fchmodSync,
   fstatSync,
   ftruncateSync,
-  mkdtempSync,
   openSync,
   readFileSync,
   readlinkSync,
@@ -15,7 +13,6 @@ import {
   realpathSync,
   renameSync,
   rmSync,
-  statSync,
   unlinkSync,
   writeFileSync,
   writeSync,
@@ -24,13 +21,25 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
 import { join, dirname, posix, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
-import { managedDaemonPath, SYSTEMD_DAEMON_PATH } from "./managed-path.js";
 import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "./version.js";
 import type { StorageBackend } from "./config.js";
 import {
   isStagedPostgreSqlHealth,
   STAGED_POSTGRESQL_ERROR_CODE,
 } from "./staged-postgresql.js";
+import {
+  observeHttpHealth,
+  type HealthObservation,
+} from "./health-observation.js";
+import {
+  canonicalSupervisorScope,
+  createSupervisor,
+  createSupervisorSpec,
+  type Supervisor,
+  type SupervisorKind,
+  type SupervisorObservation,
+  type SupervisorSpec,
+} from "./supervisor.js";
 import {
   daemonLifecycleTestIdentityArgs,
   type DaemonLifecycleHermeticTestSeams,
@@ -50,6 +59,21 @@ type SleepFn = (ms: number) => Promise<void>;
 type SetTimeoutFn = (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
 type ClearTimeoutFn = (timeout: ReturnType<typeof setTimeout>) => void;
 type CleanupFn = () => void | Promise<void>;
+
+/** Bounded, non-sensitive reasons surfaced to callers when lifecycle refuses. */
+export type DaemonLifecycleRefusalReason =
+  | "live-no-response"
+  | "response-invalid"
+  | "response-timeout"
+  | "response-auth-failure"
+  | "stale-config"
+  | "invalid-collision"
+  | "ambiguous"
+  | "detached-no-response"
+  | "manager-unavailable"
+  | "absent"
+  | "not-running"
+  | "startup-failure";
 type RequestDeadline = {
   timeoutMs: number;
   setTimeoutFn: SetTimeoutFn;
@@ -91,6 +115,10 @@ export type EnsureDaemonOptions = {
   _spawnOverride?: typeof spawn;
   _spawnSyncOverride?: typeof spawnSync;
   _skipHealthWait?: boolean;
+  /** @internal Prevent a post-manager-operation ensure from downgrading. */
+  _suppressDetachedFallback?: boolean;
+  /** @internal Authorize cleanup of one run-owned manager operation. */
+  _managedOperationAuthorized?: boolean;
   _fetchOverride?: typeof globalThis.fetch;
   _platform?: NodeJS.Platform;
   _procRoot?: string;
@@ -109,6 +137,10 @@ export type EnsureDaemonOptions = {
   _listeningPortsOverride?: (pid: number) => number[];
   /** @internal Deterministic trusted Windows PowerShell seam for lifecycle tests. */
   _windowsPowerShellPathOverride?: string | null;
+  /** @internal Isolated manager seam used by lifecycle tests and adapters. */
+  _supervisorOverride?: Supervisor;
+  /** @internal Alias retained for integrations that inject a supervisor. */
+  _supervisor?: Supervisor;
   /** @internal Complete run-owned lifecycle boundary for systemd integration tests. */
   _testScope?: DaemonLifecycleTestScope;
   /** @internal Complete hermetic side-effect boundary for production-mode lifecycle tests. */
@@ -125,7 +157,8 @@ export type EnsureDaemonResult = {
   parentPid?: number;
   userSystemdPid?: number;
   restartedForParent?: boolean;
-  startMethod?: "existing" | "systemd-user" | "detached-spawn";
+  startMethod?: "existing" | "systemd-user" | "launchd-user" | "detached-spawn";
+  refusalReason?: DaemonLifecycleRefusalReason;
   warning?: string;
 };
 
@@ -228,6 +261,76 @@ function lifecycleSpawnEnvironment(
     };
   }
   return { ...process.env };
+}
+
+function managedSupervisorKind(
+  platform: NodeJS.Platform,
+  enforceUserManagerParent: boolean | undefined,
+): SupervisorKind | undefined {
+  // The explicit flag is the compatibility boundary.  Callers that request a
+  // managed/default launch are never silently downgraded to a different
+  // manager, while detached/foreground test seams retain their historical
+  // behavior when the flag is false or omitted.
+  if (enforceUserManagerParent !== true) return undefined;
+  if (platform === "linux") return "systemd-user";
+  if (platform === "darwin") return "launchd-user";
+  return undefined;
+}
+
+function supervisorNonce(scopeDigest: string, port: number): string {
+  // A stable nonce lets every lifecycle invocation probe the same registered
+  // job without writing another authority file.  The canonical state-root
+  // digest remains the manager scope; port is launch metadata and therefore
+  // deliberately included only in the nonce.
+  return `${scopeDigest.slice(0, 32)}-${port.toString(16)}`;
+}
+
+function supervisorCommandRunner(
+  dependencies: ResolvedLifecycleDependencies,
+  opts: EnsureDaemonOptions,
+): (
+  command: string,
+  args: readonly string[],
+  options: {
+    timeoutMs: number;
+    cwd?: string;
+    env?: Readonly<Record<string, string>>;
+  },
+) => {
+  code?: number | null;
+  status?: number | null;
+  stdout?: string;
+  stderr?: string;
+  timedOut?: boolean;
+} {
+  return (command, args, options) => {
+    try {
+      const result = dependencies.spawnSync(command, [...args], {
+        encoding: "utf-8",
+        timeout: options.timeoutMs,
+        cwd: options.cwd,
+        env: options.env === undefined
+          ? sanitizedManagerEnvironment(lifecycleSpawnEnvironment(opts, dependencies))
+          : { ...options.env },
+        shell: false,
+      });
+      const error = result.error as NodeJS.ErrnoException | undefined;
+      return {
+        code: result.status,
+        stdout: typeof result.stdout === "string" ? result.stdout : "",
+        stderr: typeof result.stderr === "string" ? result.stderr : "",
+        timedOut: error?.code === "ETIMEDOUT",
+      };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      return {
+        code: typeof code === "string" && code === "ETIMEDOUT" ? null : 127,
+        stdout: "",
+        stderr: typeof code === "string" ? code : "",
+        timedOut: code === "ETIMEDOUT",
+      };
+    }
+  };
 }
 
 export type RestartDaemonResult = EnsureDaemonResult & {
@@ -1028,6 +1131,61 @@ async function requestDaemonHealth(
   }
 }
 
+function normalizeHealthResponse(response: Response): Response {
+  // A few hermetic lifecycle seams historically returned `{ ok, json }`
+  // without a numeric status.  Keep those seams useful while still routing
+  // every production exchange through the monotonic observation boundary.
+  let status: unknown;
+  try {
+    status = response.status;
+  } catch {
+    status = undefined;
+  }
+  if (typeof status === "number" && Number.isInteger(status) && status >= 0) return response;
+  const inferred = (() => {
+    try {
+      return response.ok === false ? 500 : 200;
+    } catch {
+      return 0;
+    }
+  })();
+  return new Proxy(response, {
+    get(target, property, receiver) {
+      if (property === "status") return inferred;
+      if (property === "ok") return inferred >= 200 && inferred <= 299;
+      if (property === "json") return target.json.bind(target);
+      return Reflect.get(target, property, receiver);
+    },
+  });
+}
+
+async function observeDaemonHealth(
+  port: number,
+  fetchFn: typeof globalThis.fetch,
+  deadline: RequestDeadline,
+  token?: string,
+): Promise<HealthObservation<HealthResponse>> {
+  const observed = await observeHttpHealth<HealthResponse>({
+    input: `http://127.0.0.1:${port}/health`,
+    fetchFn: async (input, init) => normalizeHealthResponse(await fetchFn(input, init)),
+    requestInit: token
+      ? { headers: { Authorization: `Bearer ${token}` } }
+      : undefined,
+    headerTimeoutMs: deadline.timeoutMs,
+    bodyTimeoutMs: deadline.timeoutMs,
+    setTimeoutFn: (callback, delayMs) => deadline.setTimeoutFn(callback, delayMs),
+    clearTimeoutFn: (handle) => deadline.clearTimeoutFn(handle as ReturnType<typeof setTimeout>),
+    signal: deadline.abortSignal,
+    validateBody: (body, response): HealthResponse | undefined => {
+      if (typeof body !== "object" || body === null || typeof (body as HealthResponse).status !== "string") {
+        return undefined;
+      }
+      return { ...(body as HealthResponse), httpStatus: response.status };
+    },
+  });
+  return observed;
+}
+
 async function runWithDeadline<T>(
   request: (signal: AbortSignal) => Promise<T>,
   deadline: RequestDeadline,
@@ -1064,14 +1222,10 @@ async function checkDaemonHealth(
   deadline: RequestDeadline,
   token?: string,
 ): Promise<HealthResponse | null> {
-  try {
-    return await runWithDeadline(
-      (signal: AbortSignal): Promise<HealthResponse | null> => requestDaemonHealth(port, fetchFn, signal, token),
-      deadline,
-    );
-  } catch {
-    return null;
-  }
+  const observation = await observeDaemonHealth(port, fetchFn, deadline, token);
+  return observation.kind === "response" && observation.body === "valid"
+    ? observation.parsedBody ?? null
+    : null;
 }
 
 async function checkDaemonAccess(
@@ -1175,240 +1329,12 @@ function startViaDetachedSpawn(
   };
 }
 
-const SYSTEMD_PROVIDER_SECRET_ENV_NAMES = new Set(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
-const SYSTEMD_LCM_SECRET_ENV_NAMES = new Set(["LCM_SUMMARY_API_KEY", "LCM_POSTGRES_URL"]);
-const SYSTEMD_SECRET_ENV_PATTERN = /(?:API_)?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/;
-const SYSTEMD_CREDENTIAL_DIR_PREFIX = "lcm-systemd-credentials-";
-const SYSTEMD_CREDENTIAL_SOURCE_MAX_AGE_MS = 10 * 60 * 1000;
-function shouldPropagateDaemonEnv(name: string, value: string | undefined): value is string {
-  return value !== undefined && (name.startsWith("LCM_") || SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name));
-}
-
-function isSecretDaemonEnvName(name: string): boolean {
-  return SYSTEMD_PROVIDER_SECRET_ENV_NAMES.has(name) || SYSTEMD_LCM_SECRET_ENV_NAMES.has(name);
-}
-
-function cleanupOldSystemdCredentialDirs(baseDir: string): void {
-  const cutoff = Date.now() - SYSTEMD_CREDENTIAL_SOURCE_MAX_AGE_MS;
-  try {
-    for (const entry of readdirSync(baseDir, { withFileTypes: true })) {
-      if (!entry.isDirectory() || !entry.name.startsWith(SYSTEMD_CREDENTIAL_DIR_PREFIX)) continue;
-      const entryPath = join(baseDir, entry.name);
-      try {
-        if (statSync(entryPath).mtimeMs < cutoff) {
-          rmSync(entryPath, { recursive: true, force: true });
-        }
-      } catch {
-        // Best-effort cleanup only.
-      }
-    }
-  } catch {
-    // Best-effort cleanup only.
-  }
-}
-
-function systemdDaemonSetenvArgs(
-  env: NodeJS.ProcessEnv,
-  credentialNames: string[],
-  executablePath = SYSTEMD_DAEMON_PATH,
-  testScope?: DaemonLifecycleTestScope,
-  hermeticSeams?: DaemonLifecycleHermeticTestSeams,
-): string[] {
-  const args = Object.entries(env)
-    .filter(([name, value]) => (
-      shouldPropagateDaemonEnv(name, value)
-      && !isSecretDaemonEnvName(name)
-      && !SYSTEMD_SECRET_ENV_PATTERN.test(name)
-    ))
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([name, value]) => `--setenv=${name}=${value}`);
-  if (testScope) {
-    args.push(
-      `--setenv=HOME=${testScope.homeDir}`,
-      `--setenv=LCM_DAEMON_OWNER_ID=${testScope.ownerId}`,
-      `--setenv=USERPROFILE=${testScope.homeDir}`,
-      `--setenv=XDG_RUNTIME_DIR=${testScope.runtimeDir}`,
-    );
-  } else if (hermeticSeams) {
-    args.push(
-      `--setenv=HOME=${hermeticSeams.homeDir}`,
-      `--setenv=USERPROFILE=${hermeticSeams.homeDir}`,
-      `--setenv=XDG_RUNTIME_DIR=${hermeticSeams.runtimeDir}`,
-    );
-  }
-  args.push(`--setenv=PATH=${executablePath}`);
-  if (credentialNames.length > 0) {
-    args.push(`--setenv=LCM_SYSTEMD_CRED_IDS=${credentialNames.join(",")}`);
-  }
-  return args;
-}
-
-function systemdRunProcessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+function sanitizedManagerEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = { ...env };
   for (const name of Object.keys(result)) {
-    if (isSecretDaemonEnvName(name) || SYSTEMD_SECRET_ENV_PATTERN.test(name)) delete result[name];
+    if (/(?:API_)?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i.test(name)) delete result[name];
   }
   return result;
-}
-
-function systemdManagerProcessEnv(
-  lifecycleEnv: NodeJS.ProcessEnv,
-  testScope?: DaemonLifecycleTestScope,
-): NodeJS.ProcessEnv {
-  if (!testScope) return systemdRunProcessEnv(lifecycleEnv);
-  return systemdRunProcessEnv({
-    ...lifecycleEnv,
-    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
-    DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS,
-  });
-}
-
-function systemdCredentialCleanup(
-  credentialDir: string,
-  testScope?: DaemonLifecycleTestScope,
-): () => void {
-  return () => {
-    try {
-      if (testScope && !lifecycleScopeFilesystemIsCurrent(testScope)) {
-        throw new LifecycleTestScopeStateError(
-          "refusing cleanup through a changed lifecycle test credential root",
-        );
-      }
-      rmSync(credentialDir, { recursive: true, force: true });
-    } catch (error) {
-      if (error instanceof LifecycleTestScopeStateError) throw error;
-      // Best-effort cleanup only; the age-based cleanup handles leftovers.
-    }
-  };
-}
-
-function systemdDaemonCredentialArgs(
-  env: NodeJS.ProcessEnv,
-  testScope?: DaemonLifecycleTestScope,
-  hermeticSeams?: DaemonLifecycleHermeticTestSeams,
-): { args: string[]; names: string[]; cleanup?: CleanupFn } {
-  const secrets = Object.entries(env)
-    .filter(([name, value]) => shouldPropagateDaemonEnv(name, value) && isSecretDaemonEnvName(name))
-    .sort(([left], [right]) => left.localeCompare(right));
-  if (secrets.length === 0) return { args: [], names: [] };
-  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  if (!testScope && !hermeticSeams && uid === undefined) {
-    throw new Error("current user id is unavailable");
-  }
-  const baseDir = testScope?.credentialDir
-    ?? hermeticSeams?.credentialDir
-    ?? `/run/user/${uid!}`;
-  const baseStats = statSync(baseDir);
-  if (!baseStats.isDirectory()) {
-    throw new Error(`${baseDir} is not a directory`);
-  }
-  let credentialDir: string | undefined;
-  try {
-    cleanupOldSystemdCredentialDirs(baseDir);
-    credentialDir = mkdtempSync(join(baseDir, SYSTEMD_CREDENTIAL_DIR_PREFIX));
-    chmodSync(credentialDir, 0o700);
-    const createdCredentialDir = credentialDir;
-    const names: string[] = [];
-    const args = secrets.map(([name, value]) => {
-      const credentialPath = join(createdCredentialDir, name);
-      writeFileSync(credentialPath, value!, { mode: 0o600 });
-      names.push(name);
-      return `--property=LoadCredential=${name}:${credentialPath}`;
-    });
-    return {
-      args,
-      names,
-      cleanup: systemdCredentialCleanup(createdCredentialDir, testScope),
-    };
-  } catch (err) {
-    if (credentialDir) systemdCredentialCleanup(credentialDir, testScope)();
-    throw err;
-  }
-}
-
-async function startViaUserSystemd(
-  opts: EnsureDaemonOptions,
-  spawnCommand: string,
-  spawnArgs: string[],
-  dependencies: ResolvedLifecycleDependencies,
-): Promise<{ ok: boolean; warning?: string; cleanup?: CleanupFn; unitName: string }> {
-  const testScope = opts._testScope;
-  const hermeticSeams = opts._hermeticTestSeams;
-  const lifecycleEnv = dependencies.environment;
-  const spawnSyncImpl = dependencies.spawnSync;
-  const unit = lifecycleUnitName(opts, process.pid, Date.now());
-  let credentials: { args: string[]; names: string[]; cleanup?: CleanupFn };
-  try {
-    credentials = systemdDaemonCredentialArgs(lifecycleEnv, testScope, hermeticSeams);
-  } catch (err) {
-    const detail = summarizeProcessDiagnostic("credential setup error", err);
-    return {
-      ok: false,
-      warning: `user systemd credential setup failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
-      unitName: unit,
-    };
-  }
-  let cleaned = false;
-  const cleanup = async (): Promise<void> => {
-    if (cleaned) return;
-    cleaned = true;
-    const stopUnit = testScope?.dependencies.stopUnit ?? hermeticSeams?.stopUnit;
-    await runCleanupStages([
-      ...(stopUnit ? [(): void | Promise<void> => stopUnit(unit)] : []),
-      ...(credentials.cleanup ? [credentials.cleanup] : []),
-    ]);
-  };
-  let result: ReturnType<typeof spawnSyncImpl>;
-  try {
-    result = spawnSyncImpl("systemd-run", [
-      "--user",
-      "--collect",
-      "--no-block",
-      "--quiet",
-      `--unit=${unit}`,
-      ...systemdDaemonSetenvArgs(
-        lifecycleEnv,
-        credentials.names,
-        managedDaemonPath(spawnCommand, spawnArgs),
-        testScope,
-        hermeticSeams,
-      ),
-      ...credentials.args,
-      spawnCommand,
-      ...spawnArgs,
-    ], {
-      encoding: "utf-8",
-      env: systemdManagerProcessEnv(lifecycleEnv, testScope),
-      timeout: Math.max(1, opts.spawnTimeoutMs),
-    });
-  } catch (err) {
-    await cleanup();
-    const detail = summarizeProcessDiagnostic("systemd start exception", err);
-    return {
-      ok: false,
-      warning: `user systemd start failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
-      cleanup,
-      unitName: unit,
-    };
-  }
-
-  if (result.status === 0) return { ok: true, cleanup, unitName: unit };
-  const stderr = typeof result.stderr === "string" && result.stderr.length > 0
-    ? summarizeProcessDiagnostic("systemd stderr", result.stderr)
-    : "";
-  const stdout = typeof result.stdout === "string" && result.stdout.length > 0
-    ? summarizeProcessDiagnostic("systemd stdout", result.stdout)
-    : "";
-  const error = result.error instanceof Error
-    ? summarizeProcessDiagnostic("systemd process error", result.error)
-    : "";
-  const detail = stderr || stdout || error || summarizeProcessExit(result.status, result.signal);
-  return {
-    ok: false,
-    warning: `user systemd start failed (${detail}); used detached spawn fallback; daemon parent invariant is not satisfied`,
-    cleanup,
-    unitName: unit,
-  };
 }
 
 export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDaemonResult> {
@@ -1518,6 +1444,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   const isAlive = dependencies.isProcessAlive;
   const killProcess = dependencies.killProcess;
   const enforceParent = opts.enforceUserManagerParent === true && platform === "linux";
+  const managerKind = managedSupervisorKind(platform, opts.enforceUserManagerParent);
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   const expectedStorageBackend = opts.expectedStorageBackend ?? "sqlite";
   const expectedEntrypoint = testScope?.entrypoint
@@ -1791,13 +1718,501 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     return { connected: false, port: opts.port, spawned: false };
   }
 
+  function refusalResult(
+    refusalReason: DaemonLifecycleRefusalReason,
+    warning: string,
+    extra: Partial<EnsureDaemonResult> = {},
+  ): EnsureDaemonResult {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      refusalReason,
+      warning,
+      ...extra,
+    };
+  }
+
+  function observationRefusalReason(
+    observation: HealthObservation<HealthResponse>,
+  ): DaemonLifecycleRefusalReason {
+    if (observation.kind === "no-response") return "live-no-response";
+    if (observation.body === "timeout") return "response-timeout";
+    return "response-invalid";
+  }
+
+  function supervisorMetadataMatches(
+    observation: SupervisorObservation,
+    spec: SupervisorSpec,
+  ): boolean {
+    return observation.kind === "registered-running-valid"
+      && observation.scopeDigest === spec.scopeDigest
+      && observation.nonce === spec.nonce
+      && observation.name === spec.name
+      && Number.isSafeInteger(observation.managerPid)
+      && observation.managerPid > 0;
+  }
+
+  function managerEndpointIdentityMatches(
+    observation: SupervisorObservation,
+    health: HealthResponse,
+    spec: SupervisorSpec,
+  ): boolean {
+    if (!supervisorMetadataMatches(observation, spec)) return false;
+    const managerPid = observation.managerPid;
+    if (health.pid !== managerPid || readOwnedPid() !== managerPid || !isAlive(managerPid)) return false;
+    const listenerPorts = opts._listeningPortsOverride
+      ? opts._listeningPortsOverride(managerPid)
+      : findListeningTcpPorts(
+          managerPid,
+          platform,
+          dependencies.spawnSync,
+          procRoot,
+          opts.port,
+        );
+    return listenerPorts.includes(opts.port);
+  }
+
+  function exactNoLivePidProof(): boolean {
+    try {
+      const first = readOwnedPid();
+      if (first !== null && isAlive(first)) return false;
+      const second = readOwnedPid();
+      if (second !== first) return false;
+      return second === null || !isAlive(second);
+    } catch {
+      // Incomplete process evidence is not a live-PID proof. Preserve the
+      // fail-closed refusal result rather than leaking a seam/host exception.
+      return false;
+    }
+  }
+
+  let managedSupervisorForCleanup: Supervisor | undefined;
+  let managedSpecForCleanup: SupervisorSpec | undefined;
+  let managedCleanupAuthorized = opts._managedOperationAuthorized === true;
+
+  async function createManagedSupervisor(): Promise<{
+    spec: SupervisorSpec;
+    supervisor: Supervisor;
+  } | null> {
+    if (managerKind === undefined) return null;
+    const stateRoot = dirname(opts.pidFilePath);
+    const executable = opts.spawnCommand ?? process.execPath;
+    const baseSpawnArgs = opts.spawnArgs
+      ?? [testScope?.entrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
+    const args = testScope
+      ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
+      : baseSpawnArgs;
+    if (!executable.startsWith("/") || args.some((arg) => typeof arg !== "string")) {
+      return null;
+    }
+    let scope: ReturnType<typeof canonicalSupervisorScope>;
+    try {
+      scope = canonicalSupervisorScope(stateRoot, realpath);
+    } catch {
+      return null;
+    }
+    let spec: SupervisorSpec;
+    try {
+      spec = createSupervisorSpec({
+        kind: managerKind,
+        stateRoot: scope.stateRoot,
+        port: opts.port,
+        nonce: supervisorNonce(scope.scopeDigest, opts.port),
+        executable,
+        args,
+        entrypoint: expectedEntrypoint,
+        runtimeDigest: expectedRuntimeDigest,
+        storageBackend: expectedStorageBackend,
+        stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+        realpath,
+      });
+    } catch {
+      return null;
+    }
+    const supervisor = opts._supervisorOverride
+      ?? opts._supervisor
+      ?? createSupervisor(managerKind, {
+          run: supervisorCommandRunner(dependencies, opts),
+          platform,
+          uid: dependencies.uid,
+          commandTimeoutMs: Math.max(1, opts.spawnTimeoutMs || 1_000),
+          stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+          sleep: sleepFn,
+        });
+    managedSupervisorForCleanup = supervisor;
+    managedSpecForCleanup = spec;
+    return { spec, supervisor };
+  }
+
+  async function cleanupManagedScopeResources(): Promise<void> {
+    if (!testScope || !managedCleanupAuthorized
+      || managedSupervisorForCleanup === undefined || managedSpecForCleanup === undefined) return;
+    await runCleanupStages([
+      () => managedSupervisorForCleanup!.stopAndAwaitAbsent(managedSpecForCleanup!),
+      () => cleanOwnedPid(),
+      () => {
+        assertScopedStateAccess(scopedState!);
+        rmSync(tokenPath, { force: true });
+        assertScopedStateAccess(scopedState!);
+      },
+      ...[
+        testScope.runtimeDir,
+        testScope.credentialDir,
+        testScope.stateDir,
+      ].map((path) => () => {
+        assertLifecycleScopeOwnsCurrentCleanupRoot(testScope, path);
+        rmSync(path, { recursive: true, force: true });
+      }),
+    ]);
+  }
+
+  async function runManagedEnsure(): Promise<EnsureDaemonResult | null> {
+    const managed = await createManagedSupervisor();
+    if (managed === null) return refusalResult(
+      "ambiguous",
+      "managed daemon supervisor could not be constructed; inspect the daemon configuration and retry",
+    );
+    const { spec, supervisor } = managed;
+    let observation: SupervisorObservation;
+    try {
+      observation = await supervisor.probe(spec);
+    } catch {
+      return refusalResult(
+        "ambiguous",
+        "managed daemon supervisor probe failed; inspect the daemon manager and retry",
+      );
+    }
+
+    // The only compatibility downgrade is an unavailable manager during the
+    // initial preflight. Every other manager observation remains authoritative.
+    if (observation.kind === "unavailable") {
+      managerPreflightUnavailable = true;
+      return null;
+    }
+    if (observation.kind === "registered-stale-config") {
+      return refusalResult(
+        "stale-config",
+        "managed daemon supervisor has stale configuration; run 'lcm daemon restart' explicitly",
+      );
+    }
+    if (observation.kind === "registered-invalid-collision") {
+      return refusalResult(
+        "invalid-collision",
+        "managed daemon supervisor found a foreign job for this state root; inspect the manager and retry",
+      );
+    }
+    if (observation.kind === "ambiguous") {
+      return refusalResult(
+        "ambiguous",
+        "managed daemon supervisor returned ambiguous state; inspect the manager and retry",
+      );
+    }
+    if (opts._abortSignal?.aborted) {
+      return {
+        connected: false,
+        port: opts.port,
+        spawned: false,
+        warning: "daemon lifecycle was interrupted before startup",
+      };
+    }
+
+    const noLivePid = exactNoLivePidProof();
+    if (observation.kind === "registered-not-running-valid") {
+      if (!noLivePid) {
+        return refusalResult(
+          "not-running",
+          "managed daemon was registered but its PID state is still live; refusing replacement",
+        );
+      }
+      cleanOwnedPid();
+      if (opts._skipSpawn || monotonicNow() >= deadline) {
+        return refusalResult("not-running", "managed daemon is not running; explicit start is required");
+      }
+      return startManagedDaemon(spec, supervisor, true);
+    }
+    if (observation.kind === "absent") {
+      // Probe first, then take one bounded endpoint observation before
+      // registering a new job. A responsive endpoint is a collision even when
+      // the manager has no matching registration; a pre-header no-response is
+      // the only observation that permits the managed start path.
+      const preStartDeadline = remainingRequestDeadline();
+      if (preStartDeadline) {
+        const preStartHealth = await observeDaemonHealth(opts.port, fetchFn, preStartDeadline);
+        if (opts._abortSignal?.aborted) {
+          return {
+            connected: false,
+            port: opts.port,
+            spawned: false,
+            warning: "daemon lifecycle was interrupted before startup",
+          };
+        }
+        if (preStartHealth.kind === "response") {
+          return refusalResult(
+            preStartHealth.body === "timeout" ? "response-timeout" : "invalid-collision",
+            "managed daemon endpoint responded while its supervisor job was absent; refusing replacement",
+          );
+        }
+      }
+      if (!noLivePid) {
+        return refusalResult(
+          "invalid-collision",
+          "managed daemon is absent but a live PID owns its state; refusing replacement",
+        );
+      }
+      cleanOwnedPid();
+      if (opts._skipSpawn || monotonicNow() >= deadline) {
+        return refusalResult("absent", "managed daemon is not registered; explicit start is required");
+      }
+      return startManagedDaemon(spec, supervisor, false);
+    }
+
+    // A registered-running job must be admitted through a responsive,
+    // authenticated endpoint. There is no offline ensure recovery path.
+    const healthDeadline = remainingRequestDeadline();
+    if (!healthDeadline) return refusalResult("startup-failure", "managed daemon health deadline expired");
+    const healthObservation = await observeDaemonHealth(opts.port, fetchFn, healthDeadline);
+    if (healthObservation.kind === "no-response") {
+      let secondProbe: SupervisorObservation;
+      try {
+        secondProbe = await supervisor.probe(spec);
+      } catch {
+        return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed after the no-response observation", { pid: observation.managerPid });
+      }
+      const sameManager = supervisorMetadataMatches(secondProbe, spec)
+        && secondProbe.managerPid === observation.managerPid;
+      const sameEndpoint = observation.managerPid !== undefined
+        && readOwnedPid() === observation.managerPid
+        && isAlive(observation.managerPid)
+        && (opts._listeningPortsOverride
+          ? opts._listeningPortsOverride(observation.managerPid).includes(opts.port)
+          : findListeningTcpPorts(observation.managerPid, platform, dependencies.spawnSync, procRoot, opts.port).includes(opts.port));
+      if (!sameManager || !sameEndpoint) {
+        return refusalResult("ambiguous", "managed daemon manager or endpoint identity changed during the no-response observation", { pid: observation.managerPid });
+      }
+      return refusalResult(
+        "live-no-response",
+        "managed daemon is running but gave no HTTP response; explicit restart is required",
+        { pid: observation.managerPid },
+      );
+    }
+    if (healthObservation.body !== "valid" || healthObservation.parsedBody === undefined) {
+      return refusalResult(
+        observationRefusalReason(healthObservation),
+        "managed daemon returned an invalid health response; inspect the daemon and retry",
+        { pid: observation.managerPid },
+      );
+    }
+    const health = healthObservation.parsedBody;
+    let secondProbe: SupervisorObservation;
+    try {
+      secondProbe = await supervisor.probe(spec);
+    } catch {
+      return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed before endpoint admission", { pid: observation.managerPid });
+    }
+    if (!isRecognizedDaemonHealth(health)
+      || !supervisorMetadataMatches(secondProbe, spec)
+      || secondProbe.managerPid !== observation.managerPid
+      || !managerEndpointIdentityMatches(secondProbe, health, spec)) {
+      return refusalResult(
+        "invalid-collision",
+        "managed daemon endpoint identity did not match its supervisor job; refusing reuse",
+        { pid: observation.managerPid },
+      );
+    }
+    const publicStorageBackend = recognizedHealthStorageBackend(health);
+    if (publicStorageBackend === null) {
+      return refusalResult("response-invalid", "managed daemon reported an unknown storage backend", { pid: observation.managerPid });
+    }
+    const authenticated = await checkDaemonDiagnostics(
+      opts.port,
+      tokenPath,
+      fetchFn,
+      remainingRequestDeadline,
+      health,
+      publicStorageBackend,
+      readOwnedToken,
+    );
+    if (authenticated === null) {
+      return refusalResult("response-auth-failure", "managed daemon health could not be authenticated", { pid: observation.managerPid });
+    }
+    const accepted = await daemonResult(
+      authenticated,
+      false,
+      managerKind,
+      { alreadyVerified: true },
+      undefined,
+      true,
+    );
+    return accepted ?? refusalResult("response-invalid", "managed daemon identity could not be admitted", { pid: observation.managerPid });
+  }
+
+  async function startManagedDaemon(
+    spec: SupervisorSpec,
+    supervisor: Supervisor,
+    recreateRegisteredJob: boolean,
+  ): Promise<EnsureDaemonResult> {
+    if (opts._abortSignal?.aborted) {
+      return {
+        connected: false,
+        port: opts.port,
+        spawned: false,
+        warning: "daemon lifecycle was interrupted before startup",
+      };
+    }
+    managedCleanupAuthorized = true;
+    let started: { managerPid?: number };
+    try {
+      started = recreateRegisteredJob
+        ? await supervisor.stopAndStart(spec)
+        : await supervisor.start(spec);
+    } catch {
+      return refusalResult("startup-failure", "managed daemon supervisor start failed", { spawned: false });
+    }
+    let second: SupervisorObservation;
+    try {
+      second = await supervisor.probe(spec);
+    } catch {
+      return refusalResult("startup-failure", "managed daemon supervisor could not be re-probed after start", { spawned: true, startMethod: managerKind });
+    }
+    if (!supervisorMetadataMatches(second, spec)
+      || (started.managerPid !== undefined && second.managerPid !== started.managerPid)) {
+      return refusalResult("ambiguous", "managed daemon supervisor identity changed during start", { spawned: true, startMethod: managerKind });
+    }
+    const managerPid = second.managerPid;
+    if (opts._abortSignal?.aborted) {
+      return {
+        connected: false,
+        port: opts.port,
+        spawned: true,
+        startMethod: managerKind,
+        warning: "daemon lifecycle was interrupted",
+      };
+    }
+    if (opts._skipHealthWait) {
+      return {
+        connected: false,
+        port: opts.port,
+        spawned: true,
+        pid: managerPid,
+        startMethod: managerKind,
+        restartedForParent,
+      };
+    }
+    while (true) {
+      if (opts._abortSignal?.aborted) {
+        return {
+          connected: false,
+          port: opts.port,
+          spawned: true,
+          pid: managerPid,
+          startMethod: managerKind,
+          warning: "daemon lifecycle was interrupted",
+        };
+      }
+      const healthDeadline = remainingRequestDeadline();
+      if (!healthDeadline) break;
+      const healthObservation = await observeDaemonHealth(opts.port, fetchFn, healthDeadline);
+      if (healthObservation.kind === "response" && healthObservation.body === "valid" && healthObservation.parsedBody !== undefined) {
+        const health = healthObservation.parsedBody;
+        if (isRecognizedDaemonHealth(health) && managerEndpointIdentityMatches(second, health, spec)) {
+          const storage = recognizedHealthStorageBackend(health);
+          if (storage !== null) {
+            const authenticated = await checkDaemonDiagnostics(
+              opts.port,
+              tokenPath,
+              fetchFn,
+              remainingRequestDeadline,
+              health,
+              storage,
+              readOwnedToken,
+            );
+            if (authenticated !== null) {
+              const accepted = await daemonResult(
+                authenticated,
+                true,
+                managerKind,
+                { alreadyVerified: true },
+                undefined,
+                true,
+              );
+              if (accepted) return accepted;
+            }
+          }
+        }
+      }
+      const remainingMs = deadline - monotonicNow();
+      if (remainingMs <= 0) break;
+      await sleepFn(Math.min(300, remainingMs));
+    }
+    return refusalResult(
+      "startup-failure",
+      "managed daemon supervisor started a job but its endpoint was not admitted before the deadline",
+      { spawned: true, pid: managerPid, startMethod: managerKind },
+    );
+  }
+
   let concurrentReplacementPid: number | undefined;
+  let managerPreflightUnavailable = false;
+
+  if (managerKind !== undefined) {
+    const managedResult = await runManagedEnsure();
+    if (managedResult !== null) {
+      await cleanupManagedScopeResources();
+      return managedResult;
+    }
+    if (managerPreflightUnavailable && opts._suppressDetachedFallback) {
+      return refusalResult(
+        "manager-unavailable",
+        "managed daemon supervisor became unavailable after a manager operation; refusing detached fallback",
+      );
+    }
+  }
 
   // Step 1: Check if daemon is already running via health check
   const initialHealthDeadline = remainingRequestDeadline();
-  const health = initialHealthDeadline
-    ? await checkDaemonHealth(opts.port, fetchFn, initialHealthDeadline)
+  const initialHealthObservation: HealthObservation<HealthResponse> = initialHealthDeadline
+    ? await observeDaemonHealth(opts.port, fetchFn, initialHealthDeadline)
+    : { kind: "no-response", reason: "header-timeout" };
+  const health = initialHealthObservation.kind === "response"
+    && initialHealthObservation.body === "valid"
+    ? initialHealthObservation.parsedBody ?? null
     : null;
+  const detachedCompatibility = managerKind === undefined;
+  if ((managerPreflightUnavailable || detachedCompatibility) && initialHealthObservation.kind === "no-response") {
+    try {
+      const existingPid = readOwnedPid();
+      if (existingPid !== null && isAlive(existingPid)) {
+        return refusalResult(
+          "detached-no-response",
+          "detached daemon gave no HTTP response; refusing offline PID recovery",
+          { pid: existingPid },
+        );
+      }
+    } catch {
+      // Preserve best-effort detached stale-state behavior when process
+      // inspection itself is unavailable; the subsequent PID path remains
+      // fail-closed and never signals an unverified process.
+    }
+  }
+  if (
+    (managerPreflightUnavailable || detachedCompatibility)
+    && initialHealthObservation.kind === "response"
+    && initialHealthObservation.body !== "valid"
+  ) {
+    try {
+      const existingPid = readOwnedPid();
+      if (existingPid !== null && isAlive(existingPid)) {
+        return refusalResult(
+          observationRefusalReason(initialHealthObservation),
+          "detached daemon returned an invalid health response; refusing PID recovery",
+          { pid: existingPid },
+        );
+      }
+    } catch {
+      // Fall through to the existing scoped-state checks.
+    }
+  }
   if (isRecognizedDaemonHealth(health)) {
     const identityMatches = endpointIdentityMatches(health);
     const versionMatches = healthVersionMatches(health, expectedVersion);
@@ -2038,44 +2453,27 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   let startMethod: EnsureDaemonResult["startMethod"] = "detached-spawn";
   let warning: string | undefined;
   let detachedStart: { getWarning: () => string | undefined; pid?: number } | undefined;
-  let cleanupSystemdResources: CleanupFn | undefined;
 
-  if (enforceParent) {
-    const systemdStart = await startViaUserSystemd(
-      opts,
-      spawnCommand,
-      spawnArgs,
-      dependencies,
-    );
-    cleanupSystemdResources = systemdStart.cleanup;
-    if (systemdStart.ok) {
-      startMethod = "systemd-user";
-    } else {
-      warning = systemdStart.warning;
-      detachedStart = startViaDetachedSpawn(
-        opts,
-        spawnCommand,
-        spawnArgs,
-        dependencies,
-        scopedState,
-      );
-    }
-  } else {
-    detachedStart = startViaDetachedSpawn(
-      opts,
-      spawnCommand,
-      spawnArgs,
-      dependencies,
-      scopedState,
-    );
+  // Managed starts are handled entirely by runManagedEnsure above. Reaching
+  // this branch means either detached mode was explicitly requested or the
+  // initial manager preflight was unavailable; only that preflight boundary
+  // permits the compatibility detached spawn.
+  if (managerPreflightUnavailable) {
+    warning = "user service manager unavailable; used detached spawn compatibility fallback; daemon parent invariant is not verified";
   }
+  detachedStart = startViaDetachedSpawn(
+    opts,
+    spawnCommand,
+    spawnArgs,
+    dependencies,
+    scopedState,
+  );
 
   let cleanupPromise: Promise<void> | undefined;
   const cleanupOwnedLifecycle = (): Promise<void> => {
     if (cleanupPromise) return cleanupPromise;
     cleanupPromise = (async (): Promise<void> => {
       const stages: CleanupFn[] = [];
-      if (cleanupSystemdResources) stages.push(cleanupSystemdResources);
       if (testScope && detachedStart?.pid !== undefined) {
         stages.push(() => terminatePid(detachedStart.pid!, {
           isAlive,
@@ -2323,6 +2721,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
   const verificationDeadline = monotonicNow() + opts.spawnTimeoutMs;
+  const managerKind = managedSupervisorKind(platform, opts.enforceUserManagerParent);
   function remainingVerificationDeadline(): RequestDeadline | null {
     const timeoutMs = verificationDeadline - monotonicNow();
     return timeoutMs <= 0
@@ -2359,6 +2758,200 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         realpath,
       );
   }
+
+  function restartRefusal(
+    refusalReason: DaemonLifecycleRefusalReason,
+    warning: string,
+    extra: Partial<RestartDaemonResult> = {},
+  ): RestartDaemonResult {
+    return {
+      connected: false,
+      port: opts.port,
+      spawned: false,
+      restarted: false,
+      refusalReason,
+      warning,
+      ...extra,
+    };
+  }
+
+  function exactNoLivePidProof(): boolean {
+    try {
+      const first = readOwnedPid();
+      if (first !== null && isAlive(first)) return false;
+      const second = readOwnedPid();
+      if (second !== first) return false;
+      return second === null || !isAlive(second);
+    } catch {
+      return false;
+    }
+  }
+
+  async function runManagedRestart(): Promise<RestartDaemonResult | null> {
+    if (managerKind === undefined) return null;
+    const stateRoot = dirname(opts.pidFilePath);
+    const executable = opts.spawnCommand ?? process.execPath;
+    const baseSpawnArgs = opts.spawnArgs
+      ?? [testScope?.entrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
+    const args = testScope
+      ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
+      : baseSpawnArgs;
+    if (!executable.startsWith("/") || args.some((arg) => typeof arg !== "string")) {
+      return restartRefusal("ambiguous", "managed daemon supervisor could not be constructed; inspect the daemon configuration and retry");
+    }
+    let scope: ReturnType<typeof canonicalSupervisorScope>;
+    try {
+      scope = canonicalSupervisorScope(stateRoot, realpath);
+    } catch {
+      return restartRefusal("ambiguous", "managed daemon state root is not canonical; inspect the daemon configuration and retry");
+    }
+    let spec: SupervisorSpec;
+    try {
+      spec = createSupervisorSpec({
+        kind: managerKind,
+        stateRoot: scope.stateRoot,
+        port: opts.port,
+        nonce: supervisorNonce(scope.scopeDigest, opts.port),
+        executable,
+        args,
+        entrypoint: testScope?.entrypoint ?? opts.expectedEntrypoint,
+        runtimeDigest: opts.expectedRuntimeDigest ?? RUNTIME_DIGEST,
+        storageBackend: opts.expectedStorageBackend ?? "sqlite",
+        stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+        realpath,
+      });
+    } catch {
+      return restartRefusal("ambiguous", "managed daemon supervisor specification is invalid; inspect the daemon configuration and retry");
+    }
+    const supervisor = opts._supervisorOverride
+      ?? opts._supervisor
+      ?? createSupervisor(managerKind, {
+          run: supervisorCommandRunner(dependencies, opts),
+          platform,
+          uid: dependencies.uid,
+          commandTimeoutMs: Math.max(1, opts.spawnTimeoutMs || 1_000),
+          stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+          sleep: dependencies.sleep,
+        });
+    let observation: SupervisorObservation;
+    try {
+      // Probe before any PID read, health request, signal, or start. Once this
+      // succeeds, no error path is allowed to fall back to detached signaling.
+      observation = await supervisor.probe(spec);
+    } catch {
+      return restartRefusal("ambiguous", "managed daemon supervisor probe failed; inspect the manager and retry");
+    }
+    if (observation.kind === "unavailable") return null;
+    if (observation.kind === "registered-stale-config") {
+      return restartRefusal("stale-config", "managed daemon supervisor has stale configuration; retry after an explicit manager repair");
+    }
+    if (observation.kind === "registered-invalid-collision") {
+      return restartRefusal("invalid-collision", "managed daemon supervisor found a foreign job for this state root; refusing restart");
+    }
+    if (observation.kind === "ambiguous") {
+      return restartRefusal("ambiguous", "managed daemon supervisor returned ambiguous state; refusing restart");
+    }
+    const ensure = _ensureDaemonOverride ?? ensureDaemon;
+    const ensureAfterManagerOperation = async (): Promise<RestartDaemonResult> => {
+      const ensured = await ensure({
+        ...ensureOptions,
+        _suppressDetachedFallback: true,
+        _managedOperationAuthorized: true,
+      });
+      return {
+        ...ensured,
+        restarted: true,
+        stoppedPid: observation.kind === "registered-running-valid" ? observation.managerPid : undefined,
+      };
+    };
+    if (observation.kind === "absent" || observation.kind === "registered-not-running-valid") {
+      if (!exactNoLivePidProof()) {
+        return restartRefusal(
+          "not-running",
+          "managed daemon is not running but its PID state is live; refusing replacement",
+        );
+      }
+      cleanOwnedPid();
+      if (opts._skipSpawn) return restartRefusal(
+        observation.kind === "absent" ? "absent" : "not-running",
+        "managed daemon is not running; explicit start is required",
+      );
+      return ensureAfterManagerOperation();
+    }
+
+    const managerPid = observation.managerPid;
+    const localManagerEndpoint = (): boolean => {
+      if (managerPid === undefined || readOwnedPid() !== managerPid || !isAlive(managerPid)) return false;
+      const listenerPorts = opts._listeningPortsOverride
+        ? opts._listeningPortsOverride(managerPid)
+        : findListeningTcpPorts(managerPid, platform, dependencies.spawnSync, procRoot, opts.port);
+      return listenerPorts.includes(opts.port);
+    };
+    const secondProbeMatches = async (): Promise<boolean> => {
+      let second: SupervisorObservation;
+      try {
+        second = await supervisor.probe(spec);
+      } catch {
+        return false;
+      }
+      return second.kind === "registered-running-valid"
+        && second.scopeDigest === spec.scopeDigest
+        && second.nonce === spec.nonce
+        && second.name === spec.name
+        && second.managerPid === managerPid;
+    };
+    const healthDeadline = remainingVerificationDeadline();
+    if (!healthDeadline) return restartRefusal("response-timeout", "daemon restart verification deadline expired");
+    const healthObservation = await observeDaemonHealth(opts.port, fetchFn, healthDeadline);
+    if (healthObservation.kind === "no-response") {
+      // Explicit restart is the one operation allowed to recover a live job
+      // with no HTTP response, but only with the manager PID/listener proof.
+      if (!localManagerEndpoint() || !(await secondProbeMatches())) {
+        return restartRefusal("live-no-response", "managed daemon gave no HTTP response but manager/PID identity was not revalidated", { pid: managerPid });
+      }
+    } else if (healthObservation.body !== "valid" || healthObservation.parsedBody === undefined) {
+      return restartRefusal(
+        healthObservation.body === "timeout" ? "response-timeout" : "response-invalid",
+        "managed daemon returned an invalid health response; refusing restart",
+        { pid: managerPid },
+      );
+    } else {
+      const health = healthObservation.parsedBody;
+      if (!isRecognizedDaemonHealth(health) || health.pid !== managerPid || !localManagerEndpoint()) {
+        return restartRefusal("invalid-collision", "managed daemon endpoint identity did not match its supervisor job; refusing restart", { pid: managerPid });
+      }
+      const storage = recognizedHealthStorageBackend(health);
+      if (storage === null) return restartRefusal("response-invalid", "managed daemon reported an unknown storage backend", { pid: managerPid });
+      const authenticated = await checkDaemonDiagnostics(
+        opts.port,
+        tokenPath,
+        fetchFn,
+        remainingVerificationDeadline,
+        health,
+        storage,
+        readOwnedToken,
+      );
+      if (authenticated === null) return restartRefusal("response-auth-failure", "managed daemon health could not be authenticated; refusing restart", { pid: managerPid });
+      if (!healthVersionMatches(authenticated, expectedVersion)
+        || !processEntrypointMatches(authenticated, testScope?.entrypoint ?? opts.expectedEntrypoint, platform, procRoot, realpath)) {
+        return restartRefusal("response-invalid", "managed daemon identity did not match the requested runtime; refusing restart", { pid: managerPid });
+      }
+      if (!(await secondProbeMatches())) return restartRefusal("ambiguous", "managed daemon supervisor identity changed before restart", { pid: managerPid });
+    }
+
+    try {
+      await supervisor.stopAndStart(spec);
+    } catch {
+      return restartRefusal("startup-failure", "managed daemon supervisor stop/start failed", { pid: managerPid });
+    }
+    return ensureAfterManagerOperation();
+  }
+
+  if (managerKind !== undefined) {
+    const managedResult = await runManagedRestart();
+    if (managedResult !== null) return managedResult;
+  }
+
   async function isManaged(pid: number): Promise<boolean> {
     if (_isManagedProcessOverride) return _isManagedProcessOverride(pid);
     if (platform === "linux" && !isLikelyLcmDaemonProcess(pid, procRoot)) return false;
@@ -2438,8 +3031,4 @@ export const __lifecycleTestUtils = {
   lifecycleSpawnEnvironment,
   runCleanupStages,
   sleep,
-  systemdDaemonSetenvArgs,
-  systemdDaemonCredentialArgs,
-  systemdManagerProcessEnv,
-  systemdRunProcessEnv,
 };

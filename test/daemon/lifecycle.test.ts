@@ -1385,7 +1385,7 @@ describe("ensureDaemon", () => {
     expect(readFileSync(pidFile, "utf-8")).toBe("201");
   });
 
-  it("preserves a concurrent replacement discovered during the Step 2 retry", async (): Promise<void> => {
+  it("refuses offline recovery before the Step 2 retry", async (): Promise<void> => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-storage-mismatch-step-two-replacement-"));
     tempDirs.push(tempDir);
     const procRoot = join(tempDir, "proc");
@@ -1436,13 +1436,12 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: (): number[] => [19999],
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: false });
-    expect(result.warning).toBeUndefined();
-    expect(healthChecks).toBe(4);
-    expect(killMock).toHaveBeenCalledOnce();
-    expect(killMock.mock.calls.every(([pid]) => pid === 200)).toBe(true);
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "response-invalid" });
+    expect(result.warning).toContain("refusing PID recovery");
+    expect(healthChecks).toBe(1);
+    expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
-    expect(readFileSync(pidFile, "utf-8")).toBe("201");
+    expect(readFileSync(pidFile, "utf-8")).toBe("200");
   });
 
   it.each([
@@ -1488,7 +1487,7 @@ describe("ensureDaemon", () => {
     expect(readFileSync(pidFile, "utf-8")).toBe("200");
   });
 
-  it("preserves a live PID when retry authentication rejects a backend mismatch", async (): Promise<void> => {
+  it("refuses a live PID when the initial backend health response is invalid", async (): Promise<void> => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-storage-mismatch-retry-auth-"));
     tempDirs.push(tempDir);
     const procRoot = join(tempDir, "proc");
@@ -1522,18 +1521,15 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: (): number[] => [19999],
     });
 
-    expect(result).toMatchObject({
-      connected: false,
-      spawned: false,
-      warning: "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry",
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "response-invalid" });
+    expect(result.warning).toContain("refusing PID recovery");
+    expect(fetchMock).toHaveBeenCalledOnce();
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
     expect(readFileSync(pidFile, "utf-8")).toBe("200");
   });
 
-  it("preserves a live PID when retry authentication rejects combined version and backend mismatches", async (): Promise<void> => {
+  it("refuses a live PID when the initial combined-mismatch health response is invalid", async (): Promise<void> => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-combined-mismatch-retry-auth-"));
     tempDirs.push(tempDir);
     const procRoot = join(tempDir, "proc");
@@ -1567,14 +1563,15 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: (): number[] => [19999],
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: false, warning: expect.stringContaining("storage-backend mismatch") });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "response-invalid" });
+    expect(result.warning).toContain("refusing PID recovery");
+    expect(fetchMock).toHaveBeenCalledOnce();
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
     expect(readFileSync(pidFile, "utf-8")).toBe("200");
   });
 
-  it("terminates a PID-file daemon when retry health reports the wrong version", async (): Promise<void> => {
+  it("refuses a PID-file daemon when initial health is invalid", async (): Promise<void> => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-retry-version-"));
     tempDirs.push(tempDir);
     const procRoot = join(tempDir, "proc");
@@ -1613,9 +1610,9 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: (): number[] => [19999],
     });
 
-    expect(result.connected).toBe(false);
-    expect(killMock).toHaveBeenCalledWith(200, "SIGTERM");
-    expect(killMock).toHaveBeenCalledWith(200, "SIGKILL");
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "response-invalid" });
+    expect(killMock).not.toHaveBeenCalled();
+    expect(healthCalls).toBe(1);
     expect(mockFetch.mock.calls.some(([url]) => String(url).endsWith("/stats/pool"))).toBe(false);
   });
 
@@ -1764,95 +1761,7 @@ describe("ensureDaemon", () => {
     expect(killMock).not.toHaveBeenCalled();
   });
 
-  it("starts via user systemd when parent enforcement is requested on Linux", async (): Promise<void> => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-systemd-"));
-    tempDirs.push(tempDir);
-    const pidFile = join(tempDir, "daemon.pid");
-    const runtimeDir = join(tempDir, "runtime");
-    const credentialDir = join(tempDir, "credentials");
-    mkdirSync(runtimeDir, { recursive: true });
-    mkdirSync(credentialDir, { recursive: true });
-    const spawnSyncMock = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
-    const spawnMock = vi.fn();
-    const stopUnitMock = vi.fn(async () => undefined);
-    const environment = {
-      ANTHROPIC_API_KEY: "sk-test",
-      LCM_POSTGRES_CA_FILE: "/etc/ssl/certs/postgres-ca.crt",
-      LCM_POSTGRES_URL: "postgresql://user:postgres-secret@db.example.com/lcm",
-      LCM_SUMMARY_API_KEY: "sk-lcm-test",
-      LCM_SUMMARY_PROVIDER: "anthropic",
-      PATH: "/opt/lcm-test/bin:/usr/bin",
-      UNRELATED_DAEMON_VALUE: "ignored",
-    };
-
-    const result = await ensureDaemonProduction(withHermeticLifecycleSeams(
-      {
-        port: 19999,
-        pidFilePath: pidFile,
-        spawnTimeoutMs: 100,
-        spawnCommand: "node",
-        spawnArgs: ["/path/lcm.js", "daemon", "start", "--foreground"],
-        enforceUserManagerParent: true,
-        _platform: "linux",
-        _skipHealthWait: true,
-        _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
-        _spawnOverride: spawnMock as unknown as SpawnOverride,
-      },
-      { credentialDir, environment, runtimeDir, stopUnit: stopUnitMock },
-    ));
-
-    expect(result.startMethod).toBe("systemd-user");
-    expect(spawnMock).not.toHaveBeenCalled();
-    expect(spawnSyncMock).toHaveBeenCalledWith(
-      "systemd-run",
-      expect.arrayContaining([
-        "--user",
-        "--collect",
-        "--no-block",
-        `--setenv=HOME=${tempDir}`,
-        `--setenv=USERPROFILE=${tempDir}`,
-        `--setenv=XDG_RUNTIME_DIR=${runtimeDir}`,
-        "--setenv=PATH=/path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "--setenv=LCM_POSTGRES_CA_FILE=/etc/ssl/certs/postgres-ca.crt",
-        "--setenv=LCM_SUMMARY_PROVIDER=anthropic",
-        "--setenv=LCM_SYSTEMD_CRED_IDS=ANTHROPIC_API_KEY,LCM_POSTGRES_URL,LCM_SUMMARY_API_KEY",
-        "node",
-        "/path/lcm.js",
-        "daemon",
-        "start",
-        "--foreground",
-      ]),
-      expect.objectContaining({ encoding: "utf-8", timeout: 100 }),
-    );
-    const systemdArgs = spawnSyncMock.mock.calls[0][1] as string[];
-    expect(systemdArgs.find(arg => arg.startsWith("--unit=")))
-      .toMatch(/^--unit=lcm-test-daemon-hermetic-[0-9]+-[0-9]+$/u);
-    expect(systemdArgs.find(arg => arg.startsWith("--unit=")))
-      .not.toContain("--unit=lcm-daemon-");
-    expect(stopUnitMock).toHaveBeenCalledExactlyOnceWith(
-      systemdArgs.find(arg => arg.startsWith("--unit="))!.slice(7),
-    );
-    const joinedArgs = systemdArgs.join("\n");
-    expect(joinedArgs).not.toContain("sk-test");
-    expect(joinedArgs).not.toContain("sk-lcm-test");
-    expect(joinedArgs).not.toContain("postgres-secret");
-    expect(systemdArgs).not.toContain("--setenv=UNRELATED_DAEMON_VALUE=ignored");
-    expect(systemdArgs).not.toContain("--setenv=PATH=/opt/lcm-test/bin:/usr/bin");
-    const credentialArgs = systemdArgs.filter((arg) => arg.startsWith("--property=LoadCredential="));
-    expect(credentialArgs).toEqual([
-      expect.stringContaining("ANTHROPIC_API_KEY:"),
-      expect.stringContaining("LCM_POSTGRES_URL:"),
-      expect.stringContaining("LCM_SUMMARY_API_KEY:"),
-    ]);
-    for (const arg of credentialArgs) {
-      const [, credentialPath] = arg.split(":", 2);
-      expect(credentialPath.startsWith(`${credentialDir}/lcm-systemd-credentials-`)).toBe(true);
-      expect(existsSync(credentialPath)).toBe(false);
-      expect(existsSync(dirname(credentialPath))).toBe(false);
-    }
-  });
-
-  it("falls back to detached spawn with a Linux parent-invariant warning when systemd-run fails", async () => {
+  it("falls back to detached spawn only when the manager preflight is unavailable", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-systemd-fallback-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
@@ -1863,7 +1772,7 @@ describe("ensureDaemon", () => {
       port: 19999,
       pidFilePath: pidFile,
       spawnTimeoutMs: 100,
-      spawnCommand: "node",
+      spawnCommand: process.execPath,
       spawnArgs: ["/path/lcm.js", "daemon", "start", "--foreground"],
       enforceUserManagerParent: true,
       _platform: "linux",
@@ -1873,56 +1782,8 @@ describe("ensureDaemon", () => {
     });
 
     expect(result.startMethod).toBe("detached-spawn");
-    expect(result.warning).toContain("daemon parent invariant is not satisfied");
+    expect(result.warning).toContain("daemon parent invariant is not verified");
     expect(spawnMock).toHaveBeenCalled();
-  });
-
-  it.each([
-    ["stderr", { status: 1, stdout: "", stderr: "" }],
-    ["stdout", { status: 1, stdout: "", stderr: "" }],
-    ["error", { status: null, stdout: "", stderr: "", error: new Error("") }],
-  ] as const)("sanitizes and bounds raw systemd %s diagnostics", async (field, baseResult) => {
-    const tempDir = mkdtempSync(join(tmpdir(), `lcm-lifecycle-systemd-${field}-`));
-    tempDirs.push(tempDir);
-    const pidFile = join(tempDir, "daemon.pid");
-    const rawDetail = [
-      "Authorization: Bearer systemd-bearer-secret",
-      "Authorization: Basic systemd-basic-secret",
-      "opaque-systemd-token-value",
-      "postgresql://user:systemd-url-secret@example.com/db?sslmode=disable",
-      `\u001b[31mENOENT\n${"x".repeat(800)}`,
-    ].join("\n");
-    const systemdResult = {
-      ...baseResult,
-      [field]: field === "error" ? new Error(rawDetail) : rawDetail,
-    };
-    const spawnSyncMock = vi.fn().mockReturnValue(systemdResult);
-    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
-
-    const result = await ensureDaemon({
-      port: 19999,
-      pidFilePath: pidFile,
-      spawnTimeoutMs: 100,
-      spawnCommand: "node",
-      spawnArgs: ["/path/lcm.js", "daemon", "start", "--foreground"],
-      enforceUserManagerParent: true,
-      _platform: "linux",
-      _skipHealthWait: true,
-      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
-      _spawnOverride: spawnMock as unknown as SpawnOverride,
-    });
-
-    expect(result.warning).not.toContain("systemd-bearer-secret");
-    expect(result.warning).not.toContain("systemd-basic-secret");
-    expect(result.warning).not.toContain("opaque-systemd-token-value");
-    expect(result.warning).not.toContain("systemd-url-secret");
-    expect(result.warning).not.toContain("Authorization");
-    expect(result.warning).not.toContain("sslmode");
-    expect(result.warning).not.toContain("\u001b");
-    expect(result.warning).not.toContain("\n");
-    expect(result.warning).toContain("executable or resource unavailable");
-    expect(result.warning).toContain("code ENOENT");
-    expect(result.warning!.length).toBeLessThan(300);
   });
 
   it("sanitizes a detached-spawn error before displaying it", async () => {
@@ -2080,10 +1941,9 @@ describe("ensureDaemon", () => {
       _skipHealthWait: true,
     });
 
-    expect(result.restartedForParent).toBe(true);
-    expect(result.startMethod).toBe("systemd-user");
-    expect(killMock).toHaveBeenCalledWith(200, "SIGTERM");
-    expect(killMock).toHaveBeenCalledWith(200, "SIGKILL");
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "ambiguous" });
+    expect(result.warning).toContain("ambiguous state");
+    expect(killMock).not.toHaveBeenCalled();
   });
 
   it("does not signal a replacement PID when wrong-parent identity changes before termination", async () => {
@@ -2195,7 +2055,7 @@ describe("ensureDaemon", () => {
 
     expect(result.connected).toBe(false);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(spawnSyncMock).not.toHaveBeenCalled();
+    expect(spawnSyncMock).toHaveBeenCalledOnce();
   });
 
   it("retries a live PID file process and restarts it when the parent is wrong", async () => {
@@ -2237,13 +2097,12 @@ describe("ensureDaemon", () => {
       _skipHealthWait: true,
     });
 
-    expect(result.restartedForParent).toBe(true);
-    expect(result.startMethod).toBe("systemd-user");
-    expect(killMock).toHaveBeenCalledWith(200, "SIGTERM");
-    expect(killMock).toHaveBeenCalledWith(200, "SIGKILL");
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "ambiguous" });
+    expect(result.warning).toContain("ambiguous state");
+    expect(killMock).not.toHaveBeenCalled();
   });
 
-  it("preserves an exact live likely-LCM listener when bounded health attempts remain unavailable", async (): Promise<void> => {
+  it("refuses an exact live likely-LCM listener when health is unavailable", async (): Promise<void> => {
     const fixture = createOwnedDaemonFixture("lcm-lifecycle-busy-owned-");
     const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
     const killMock = vi.fn();
@@ -2264,15 +2123,10 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: listenerPorts,
     });
 
-    expect(result).toEqual({
-      connected: false,
-      port: 19999,
-      spawned: false,
-      pid: fixture.pid,
-      warning: "daemon PID 200 still owns configured port 19999 but health remained unavailable after bounded retries; it may be busy, so it was preserved without signaling or replacement. Retry after the current operation completes; if it remains unavailable, inspect or explicitly stop the daemon before retrying",
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(listenerPorts).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ connected: false, port: 19999, spawned: false, pid: fixture.pid, refusalReason: "response-invalid" });
+    expect(result.warning).toContain("refusing PID recovery");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(listenerPorts).not.toHaveBeenCalled();
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
     expect(readFileSync(fixture.pidFile, "utf-8")).toBe("200");
@@ -2282,19 +2136,16 @@ describe("ensureDaemon", () => {
   it.each([
     {
       platform: "darwin" as const,
-      executable: "/bin/ps",
       windowsPowerShellPath: undefined,
       command: "node /usr/local/bin/lcm daemon start --foreground",
     },
     {
       platform: "win32" as const,
-      executable: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
       windowsPowerShellPath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
       command: "\"C:\\Program Files\\nodejs\\node.exe\" C:\\lcm\\lcm.mjs daemon start --foreground",
     },
-  ])("preserves a valid busy daemon on $platform using fail-closed command identity", async ({
+  ])("refuses a busy daemon on $platform before command identity inspection", async ({
     platform,
-    executable,
     windowsPowerShellPath,
     command,
   }): Promise<void> => {
@@ -2329,35 +2180,10 @@ describe("ensureDaemon", () => {
       _windowsPowerShellPathOverride: windowsPowerShellPath,
     });
 
-    expect(result).toMatchObject({
-      connected: false,
-      spawned: false,
-      pid: fixture.pid,
-      warning: expect.stringContaining("health remained unavailable after bounded retries"),
-    });
-    expect(processInspector).toHaveBeenCalledTimes(4);
-    for (const [actualExecutable, args, options] of processInspector.mock.calls) {
-      expect(actualExecutable).toBe(executable);
-      expect(options).toMatchObject({
-        encoding: "utf-8",
-        timeout: 1000,
-        maxBuffer: 64 * 1024,
-        shell: false,
-        windowsHide: true,
-      });
-      if (platform === "darwin") {
-        expect(args).toEqual(["-p", String(fixture.pid), "-o", "command="]);
-      } else {
-        expect(args).toEqual([
-          "-NoLogo",
-          "-NoProfile",
-          "-NonInteractive",
-          "-Command",
-          expect.stringMatching(new RegExp(`ProcessId = ${fixture.pid}\\b`, "u")),
-        ]);
-      }
-    }
-    expect(listenerPorts).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ connected: false, spawned: false, pid: fixture.pid, refusalReason: "response-invalid" });
+    expect(result.warning).toContain("refusing PID recovery");
+    expect(processInspector).not.toHaveBeenCalled();
+    expect(listenerPorts).not.toHaveBeenCalled();
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
     expect(readFileSync(fixture.pidFile, "utf-8")).toBe(String(fixture.pid));
@@ -2374,7 +2200,7 @@ describe("ensureDaemon", () => {
     { name: "a failed Windows inspection", platform: "win32" as const, outcome: "throw" as const },
     { name: "a missing trusted Windows inspector", platform: "win32" as const, outcome: "missing" as const },
     { name: "an unsupported platform", platform: "freebsd" as const, outcome: "unsupported" as const },
-  ])("rejects busy preservation for $name", async ({
+  ])("refuses busy replacement for $name", async ({
     platform,
     outcome,
   }): Promise<void> => {
@@ -2425,20 +2251,17 @@ describe("ensureDaemon", () => {
       _skipHealthWait: true,
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: true });
+    expect(result).toMatchObject({ connected: false, spawned: false, pid: fixture.pid, refusalReason: "response-invalid" });
+    expect(result.warning).toContain("refusing PID recovery");
     expect(killMock).not.toHaveBeenCalled();
-    expect(spawnMock).toHaveBeenCalledOnce();
+    expect(spawnMock).not.toHaveBeenCalled();
     expect(listenerPorts).not.toHaveBeenCalled();
-    expect(existsSync(fixture.pidFile)).toBe(false);
+    expect(existsSync(fixture.pidFile)).toBe(true);
     expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
-    if (outcome === "missing" || outcome === "unsupported") {
-      expect(processInspector).not.toHaveBeenCalled();
-    } else {
-      expect(processInspector).toHaveBeenCalledOnce();
-    }
+    expect(processInspector).not.toHaveBeenCalled();
   });
 
-  it("preserves the exact busy daemon after the health deadline is exhausted", async (): Promise<void> => {
+  it("refuses the exact busy daemon after the initial health response is invalid", async (): Promise<void> => {
     const fixture = createOwnedDaemonFixture("lcm-lifecycle-busy-deadline-");
     let monotonicMs = 0;
     const fetchMock = vi.fn(async (): Promise<Response> => {
@@ -2462,12 +2285,8 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: (): number[] => [19999],
     });
 
-    expect(result).toMatchObject({
-      connected: false,
-      spawned: false,
-      pid: fixture.pid,
-      warning: expect.stringContaining("health remained unavailable after bounded retries"),
-    });
+    expect(result).toMatchObject({ connected: false, spawned: false, pid: fixture.pid, refusalReason: "response-invalid" });
+    expect(result.warning).toContain("refusing PID recovery");
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
@@ -2475,7 +2294,7 @@ describe("ensureDaemon", () => {
     expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
   });
 
-  it("preserves repeated busy calls and reconnects to the same PID when health recovers", async (): Promise<void> => {
+  it("refuses repeated busy calls and reconnects only after health recovers", async (): Promise<void> => {
     const fixture = createOwnedDaemonFixture("lcm-lifecycle-busy-recovery-");
     let healthy = false;
     const health = {
@@ -2515,17 +2334,17 @@ describe("ensureDaemon", () => {
     healthy = true;
     const recovered = await ensureDaemon(options);
 
-    expect(first).toMatchObject({ connected: false, spawned: false, pid: fixture.pid });
-    expect(second).toMatchObject({ connected: false, spawned: false, pid: fixture.pid });
+    expect(first).toMatchObject({ connected: false, spawned: false, pid: fixture.pid, refusalReason: "response-invalid" });
+    expect(second).toMatchObject({ connected: false, spawned: false, pid: fixture.pid, refusalReason: "response-invalid" });
     expect(recovered).toMatchObject({ connected: true, spawned: false, pid: fixture.pid });
-    expect(fetchMock).toHaveBeenCalledTimes(7);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
     expect(readFileSync(fixture.pidFile, "utf-8")).toBe("200");
     expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
   });
 
-  it("does not preserve, clean, signal, or spawn after the PID is concurrently replaced during busy-state revalidation", async (): Promise<void> => {
+  it("does not preserve, clean, signal, or spawn during busy-state refusal", async (): Promise<void> => {
     const fixture = createOwnedDaemonFixture("lcm-lifecycle-busy-pid-race-");
     let monotonicMs = 0;
     const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
@@ -2555,16 +2374,16 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: listenerPorts,
     });
 
-    expect(result).toEqual({ connected: false, port: 19999, spawned: false });
+    expect(result).toMatchObject({ connected: false, port: 19999, spawned: false, pid: fixture.pid, refusalReason: "response-invalid" });
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(listenerPorts).toHaveBeenCalledTimes(2);
+    expect(listenerPorts).not.toHaveBeenCalled();
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
-    expect(readFileSync(fixture.pidFile, "utf-8")).toBe("201");
+    expect(readFileSync(fixture.pidFile, "utf-8")).toBe("200");
     expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
   });
 
-  it("retains fail-closed cleanup and replacement when the owned PID loses the configured listener", async (): Promise<void> => {
+  it("refuses replacement when the owned PID health response is invalid", async (): Promise<void> => {
     const fixture = createOwnedDaemonFixture("lcm-lifecycle-busy-listener-race-");
     const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
     const killMock = vi.fn();
@@ -2588,16 +2407,17 @@ describe("ensureDaemon", () => {
       _skipHealthWait: true,
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: true });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(listenerPorts).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ connected: false, spawned: false, pid: fixture.pid, refusalReason: "response-invalid" });
+    expect(result.warning).toContain("refusing PID recovery");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(listenerPorts).not.toHaveBeenCalled();
     expect(killMock).not.toHaveBeenCalled();
-    expect(spawnMock).toHaveBeenCalledOnce();
-    expect(existsSync(fixture.pidFile)).toBe(false);
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(existsSync(fixture.pidFile)).toBe(true);
     expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
   });
 
-  it("terminates an exact wrong-parent likely-LCM PID after the configured listener is lost", async (): Promise<void> => {
+  it("refuses an exact wrong-parent likely-LCM PID when health is unavailable", async (): Promise<void> => {
     const fixture = createOwnedDaemonFixture("lcm-lifecycle-busy-wrong-parent-listener-");
     writeProcEntry(
       fixture.procRoot,
@@ -2636,19 +2456,17 @@ describe("ensureDaemon", () => {
       _skipSpawn: true,
     });
 
-    expect(result).toMatchObject({
-      connected: false,
-      spawned: false,
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(listenerPorts).toHaveBeenCalledTimes(3);
-    expect(killMock).toHaveBeenCalledExactlyOnceWith(fixture.pid, "SIGTERM");
+    expect(result).toMatchObject({ connected: false, spawned: false, pid: fixture.pid, refusalReason: "response-invalid" });
+    expect(result.warning).toContain("refusing PID recovery");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(listenerPorts).not.toHaveBeenCalled();
+    expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
-    expect(existsSync(fixture.pidFile)).toBe(false);
+    expect(existsSync(fixture.pidFile)).toBe(true);
     expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
   });
 
-  it("retains exact wrong-parent termination when health probing is interrupted", async (): Promise<void> => {
+  it("refuses exact wrong-parent recovery when health probing is interrupted", async (): Promise<void> => {
     const fixture = createOwnedDaemonFixture("lcm-lifecycle-busy-wrong-parent-abort-");
     writeProcEntry(
       fixture.procRoot,
@@ -2684,15 +2502,15 @@ describe("ensureDaemon", () => {
       _skipSpawn: true,
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: false });
+    expect(result).toMatchObject({ connected: false, spawned: false, pid: fixture.pid, refusalReason: "detached-no-response" });
     expect(controller.signal.aborted).toBe(true);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(killMock).toHaveBeenCalledExactlyOnceWith(fixture.pid, "SIGTERM");
-    expect(existsSync(fixture.pidFile)).toBe(false);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(killMock).not.toHaveBeenCalled();
+    expect(existsSync(fixture.pidFile)).toBe(true);
     expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
   });
 
-  it("preserves a concurrent replacement discovered while revalidating the missing listener before a wrong-parent signal", async (): Promise<void> => {
+  it("refuses a concurrent replacement during wrong-parent health refusal", async (): Promise<void> => {
     const fixture = createOwnedDaemonFixture("lcm-lifecycle-busy-wrong-parent-pid-race-");
     writeProcEntry(
       fixture.procRoot,
@@ -2732,19 +2550,19 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: listenerPorts,
     });
 
-    expect(result).toEqual({ connected: false, port: 19999, spawned: false });
+    expect(result).toMatchObject({ connected: false, port: 19999, spawned: false, pid: fixture.pid, refusalReason: "response-invalid" });
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(listenerPorts).toHaveBeenCalledTimes(3);
+    expect(listenerPorts).not.toHaveBeenCalled();
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
-    expect(readFileSync(fixture.pidFile, "utf-8")).toBe("201");
+    expect(readFileSync(fixture.pidFile, "utf-8")).toBe("200");
     expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
   });
 
   it.each([
     { name: "the PID dies", processCommand: "node lcm daemon start --foreground", aliveAfterRetry: false },
     { name: "the PID is not a likely LCM daemon", processCommand: "sleep 1000", aliveAfterRetry: true },
-  ])("retains fail-closed cleanup and replacement when $name", async ({
+  ])("refuses fail-closed replacement when $name", async ({
     processCommand,
     aliveAfterRetry,
   }): Promise<void> => {
@@ -2778,10 +2596,11 @@ describe("ensureDaemon", () => {
       _skipHealthWait: true,
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: true });
+    expect(result).toMatchObject({ connected: false, spawned: false, pid: fixture.pid, refusalReason: "response-invalid" });
+    expect(result.warning).toContain("refusing PID recovery");
     expect(killMock).not.toHaveBeenCalled();
-    expect(spawnMock).toHaveBeenCalledOnce();
-    expect(existsSync(fixture.pidFile)).toBe(false);
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(existsSync(fixture.pidFile)).toBe(true);
     expect(readFileSync(fixture.tokenFile, "utf-8")).toBe("local-token");
     expect(listenerPorts).not.toHaveBeenCalled();
   });
@@ -2823,12 +2642,12 @@ describe("ensureDaemon", () => {
       _skipHealthWait: true,
     });
 
-    expect(result.connected).toBe(false);
-    expect(result.restartedForParent).toBe(false);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "ambiguous" });
+    expect(result.warning).toContain("ambiguous state");
+    expect(fetchMock).not.toHaveBeenCalled();
     expect(killMock).not.toHaveBeenCalled();
     expect(spawnSyncMock).toHaveBeenCalledOnce();
-    expect(existsSync(pidFile)).toBe(false);
+    expect(existsSync(pidFile)).toBe(true);
   });
 
   it("does not kill an unrelated PID-file process during version mismatch repair", async () => {
@@ -3297,12 +3116,12 @@ describe("ensureDaemon", () => {
       _listeningPortsOverride: (): number[] => [19999],
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: false });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "response-timeout" });
+    expect(fetchMock).toHaveBeenCalledOnce();
     expect(setTimeoutMock).toHaveBeenNthCalledWith(1, expect.any(Function), 350);
     expect(setTimeoutMock).toHaveBeenNthCalledWith(2, expect.any(Function), 350);
-    expect(accessSignalWasInitiallyAborted).toBe(false);
-    expect(accessSignal?.aborted).toBe(true);
+    expect(accessSignalWasInitiallyAborted).toBeUndefined();
+    expect(accessSignal).toBeUndefined();
     expect(clearTimeoutMock).toHaveBeenCalledWith(healthTimer);
     expect(clearTimeoutMock).toHaveBeenCalledWith(accessTimer);
     expect(sleepMock).not.toHaveBeenCalled();
@@ -3355,12 +3174,11 @@ describe("ensureDaemon", () => {
       _sleepOverride: sleepMock,
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: false });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(sleepMock).toHaveBeenCalledWith(350);
-    expect(retrySignal?.aborted).toBe(true);
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "response-invalid" });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(sleepMock).not.toHaveBeenCalled();
+    expect(retrySignal).toBeUndefined();
     expect(clearTimeoutMock).toHaveBeenCalledWith(initialTimer);
-    expect(clearTimeoutMock).toHaveBeenCalledWith(retryTimer);
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
@@ -3493,8 +3311,8 @@ describe("ensureDaemon", () => {
       _sleepOverride: async (_durationMs: number): Promise<void> => {},
     });
 
-    expect(result).toMatchObject({ connected: false, spawned: false });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "response-invalid" });
+    expect(fetchMock).toHaveBeenCalledOnce();
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
@@ -4127,5 +3945,190 @@ describe("restartDaemon", () => {
 
     expect(killMock).not.toHaveBeenCalled();
     expect(ensureMock).not.toHaveBeenCalled();
+  });
+
+  it("probes a managed Linux supervisor before admitting a responsive endpoint", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-managed-admit-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "200");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    let spec: { scopeDigest: string; nonce: string; name: string } | undefined;
+    const probe = vi.fn(async (candidate: typeof spec) => {
+      spec = candidate!;
+      return {
+        kind: "registered-running-valid" as const,
+        managerPid: 200,
+        scopeDigest: candidate!.scopeDigest,
+        nonce: candidate!.nonce,
+        name: candidate!.name,
+      };
+    });
+    const supervisor = { probe, start: vi.fn(), stopAndStart: vi.fn(), stopAndAwaitAbsent: vi.fn() };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: "ok", version: "1.4.2", pid: 200, entrypoint: "/bin/lcm", storageBackend: "sqlite" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: "ok", version: "1.4.2", pid: 200, entrypoint: "/bin/lcm", storageBackend: "sqlite" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ totalConnections: 0 }), { status: 200 }));
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.4.2",
+      expectedEntrypoint: "/bin/lcm",
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _fetchOverride: fetchMock as FetchOverride,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19999],
+      _supervisorOverride: supervisor as never,
+    });
+
+    expect(result).toMatchObject({ connected: true, spawned: false, startMethod: "systemd-user", pid: 200 });
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(spec).toBeDefined();
+    expect(supervisor.start).not.toHaveBeenCalled();
+  });
+
+  it("refuses managed ensure recovery when a registered job gives no response", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-managed-offline-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "200");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    const supervisor = {
+      probe: vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => ({
+        kind: "registered-running-valid" as const,
+        managerPid: 200,
+        scopeDigest: candidate.scopeDigest,
+        nonce: candidate.nonce,
+        name: candidate.name,
+      })),
+      start: vi.fn(),
+      stopAndStart: vi.fn(),
+      stopAndAwaitAbsent: vi.fn(),
+    };
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19999],
+      _supervisorOverride: supervisor as never,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "live-no-response", pid: 200 });
+    expect(supervisor.start).not.toHaveBeenCalled();
+    expect(supervisor.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("starts an absent managed macOS job and reports launchd-user", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-managed-launchd-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    let calls = 0;
+    const supervisor = {
+      probe: vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => {
+        calls += 1;
+        return calls === 1
+          ? { kind: "absent" as const, name: candidate.name }
+          : { kind: "registered-running-valid" as const, managerPid: 201, scopeDigest: candidate.scopeDigest, nonce: candidate.nonce, name: candidate.name };
+      }),
+      start: vi.fn(async () => ({ kind: "launchd-user" as const, name: "job", scopeDigest: "scope", port: 19999, nonce: "nonce", managerPid: 201 })),
+      stopAndStart: vi.fn(),
+      stopAndAwaitAbsent: vi.fn(),
+    };
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      enforceUserManagerParent: true,
+      _platform: "darwin",
+      _skipHealthWait: true,
+      _supervisorOverride: supervisor as never,
+      _isProcessAliveOverride: () => false,
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: true, startMethod: "launchd-user", pid: 201 });
+    expect(supervisor.start).toHaveBeenCalledOnce();
+    expect(supervisor.probe).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["linux", "systemd-user"],
+    ["darwin", "launchd-user"],
+  ] as const)("recreates a terminal %s manager job only after an exact no-live-PID proof", async (platform, method) => {
+    const tempDir = mkdtempSync(join(tmpdir(), `lcm-lifecycle-managed-terminal-${platform}-`));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "200");
+    let calls = 0;
+    const supervisor = {
+      probe: vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => {
+        calls += 1;
+        return calls === 1
+          ? { kind: "registered-not-running-valid" as const, terminal: "inactive" as const, name: candidate.name }
+          : { kind: "registered-running-valid" as const, managerPid: 201, scopeDigest: candidate.scopeDigest, nonce: candidate.nonce, name: candidate.name };
+      }),
+      start: vi.fn(),
+      stopAndStart: vi.fn(async () => ({ kind: method, name: "job", scopeDigest: "scope", port: 19999, nonce: "nonce", managerPid: 201 })),
+      stopAndAwaitAbsent: vi.fn(),
+    };
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      enforceUserManagerParent: true,
+      _platform: platform,
+      _skipHealthWait: true,
+      _supervisorOverride: supervisor as never,
+      _isProcessAliveOverride: () => false,
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+    });
+
+    expect(result).toMatchObject({ connected: false, spawned: true, startMethod: method, pid: 201 });
+    expect(supervisor.stopAndStart).toHaveBeenCalledOnce();
+    expect(supervisor.start).not.toHaveBeenCalled();
+    expect(supervisor.probe).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses manager stop/start for an explicit restart with no HTTP response", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-managed-restart-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    writeFileSync(pidFile, "202");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    let calls = 0;
+    const supervisor = {
+      probe: vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => {
+        calls += 1;
+        return { kind: "registered-running-valid" as const, managerPid: 202, scopeDigest: candidate.scopeDigest, nonce: candidate.nonce, name: candidate.name };
+      }),
+      start: vi.fn(),
+      stopAndStart: vi.fn(async () => ({ kind: "systemd-user" as const, name: "job", scopeDigest: "scope", port: 19999, nonce: "nonce", managerPid: 202 })),
+      stopAndAwaitAbsent: vi.fn(),
+    };
+    const ensureMock = vi.fn(async () => ({ connected: true, port: 19999, spawned: false, startMethod: "systemd-user" as const }));
+    const result = await restartDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19999],
+      _supervisorOverride: supervisor as never,
+      _ensureDaemonOverride: ensureMock,
+    });
+
+    expect(result).toMatchObject({ restarted: true, stoppedPid: 202 });
+    expect(supervisor.stopAndStart).toHaveBeenCalledOnce();
+    expect(calls).toBe(2);
+    expect(ensureMock).toHaveBeenCalledOnce();
   });
 });
