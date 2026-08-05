@@ -2004,7 +2004,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const args = testScope
       ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
       : baseSpawnArgs;
-    if (!executable.startsWith("/") || args.some((arg) => typeof arg !== "string")) {
+    if (!isAbsolute(executable) || args.some((arg) => typeof arg !== "string")) {
       return null;
     }
     const launchEnvironment = managedLaunchEnvironmentFor(dependencies.environment, executable, args);
@@ -3196,7 +3196,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     const args = testScope
       ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
       : baseSpawnArgs;
-    if (!executable.startsWith("/") || args.some((arg) => typeof arg !== "string")) {
+    if (!isAbsolute(executable) || args.some((arg) => typeof arg !== "string")) {
       return restartRefusal("ambiguous", "managed daemon supervisor could not be constructed; inspect the daemon configuration and retry");
     }
     const launchEnvironment = managedLaunchEnvironmentFor(dependencies.environment, executable, args);
