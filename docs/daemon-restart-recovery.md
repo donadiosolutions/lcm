@@ -15,6 +15,13 @@ authenticated state needed for the daemon to prove that it belongs to this
 installation. LCM asks the manager to stop and recreate that exact service; it
 does not scan for a process with a matching name or port.
 
+Default managed lifecycle calls use the same packaged runtime entrypoint in the
+manager arguments, even when the CLI was launched through a wrapper or shim.
+During an explicit restart, LCM also waits for the exact systemd unit to leave
+its bounded `deactivating`/`stop-*` transition and prove manager absence before
+requesting same-name recreation. A different identity, unknown transition, or
+unresolved manager state remains a fail-closed refusal.
+
 The service is deliberately not a supervisor loop. LCM does not configure a
 systemd `Restart=` policy or a launchd `KeepAlive` policy. A daemon that exits
 normally after `daemon.idleTimeoutMs` remains registered but does not consume a

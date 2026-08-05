@@ -2002,7 +2002,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
-      ?? [testScope?.entrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
+      ?? [testScope?.entrypoint ?? expectedEntrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
     const args = testScope
       ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
       : baseSpawnArgs;
@@ -2821,7 +2821,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
 
   const spawnCommand = opts.spawnCommand ?? process.execPath;
   const baseSpawnArgs = opts.spawnArgs
-    ?? [testScope?.entrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
+    ?? [testScope?.entrypoint ?? expectedEntrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
   const spawnArgs = testScope
     ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
     : baseSpawnArgs;
@@ -3203,7 +3203,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
-      ?? [testScope?.entrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
+      ?? [testScope?.entrypoint ?? expectedEntrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
     const args = testScope
       ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
       : baseSpawnArgs;

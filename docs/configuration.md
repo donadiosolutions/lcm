@@ -413,9 +413,12 @@ interactive session, but the daemon is launched through the trusted
 addresses). Process-based Claude and Codex providers also receive
 `CLAUDE_CONFIG_DIR` and `CODEX_HOME` only when each is an absolute, canonical,
 user-owned private directory. For managed systemd and launchd starts, `PATH` is
-synthesized from the trusted daemon entrypoint and fixed system directories so
-the service sees the same provider search path that `lcm doctor` checks. Service
-identity metadata and credential-file markers are passed as
+synthesized from the trusted packaged daemon entrypoint and fixed system
+directories so the service sees the same provider search path that `lcm doctor`
+checks, even when the command was invoked through a user-level wrapper. Default
+managed lifecycle calls use that same packaged entrypoint in their manager
+arguments, keeping start, doctor, and restart admission on one stable identity.
+Service identity metadata and credential-file markers are passed as
 names and paths only. API keys and database URLs are never copied into argv,
 unit properties, plist contents, or logs; the daemon reads them from the
 private one-launch credential files after the manager has authenticated their

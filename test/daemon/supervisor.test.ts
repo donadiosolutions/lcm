@@ -983,6 +983,37 @@ describe("systemd-user supervisor", () => {
     }).stopAndAwaitAbsent(spec)).rejects.toThrow("manager command");
   });
 
+  it("polls an exact systemd deactivating transition before proving absence", async () => {
+    const spec = makeSpec("systemd-user");
+    const transition = managerText(spec, "deactivating", 0, "stop-sigterm");
+    const runner = fakeRunner([
+      { code: 0, stdout: managerText(spec, "active", 515) },
+      { code: 0, stdout: "stopped" },
+      { code: 0, stdout: transition },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).stopAndAwaitAbsent(spec)).resolves.toBeUndefined();
+    expect(runner.calls.filter(({ command }) => command === "systemctl")).toHaveLength(4);
+    expect(runner.calls[2]!.args).toContain(spec.systemdUnit);
+  });
+
+  it.each([
+    ["different prior nonce", (spec: SupervisorSpec) => managerText({ ...spec, nonce: "other-nonce" }, "deactivating", 0, "stop-sigterm")],
+    ["unknown stop substate", (spec: SupervisorSpec) => managerText(spec, "deactivating", 0, "custom-transition")],
+    ["non-deactivating state", (spec: SupervisorSpec) => managerText(spec, "activating", 0, "start")],
+    ["missing stop substate", (spec: SupervisorSpec) => managerText(spec, "deactivating", 0, "stop-sigterm").replace("SubState=stop-sigterm\n", "")],
+  ])("does not treat %s as owned post-stop state", async (_label, transitionFor) => {
+    const spec = makeSpec("systemd-user");
+    const runner = fakeRunner([
+      { code: 0, stdout: managerText(spec, "active", 515) },
+      { code: 0, stdout: "stopped" },
+      { code: 0, stdout: transitionFor(spec) },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).stopAndAwaitAbsent(spec)).rejects.toThrow("manager command");
+    expect(runner.calls.filter(({ command }) => command === "systemctl")).toHaveLength(3);
+  });
+
   it("parses JSON/key-value variants and all terminal/metadata refusal boundaries", async () => {
     const spec = makeSpec("systemd-user");
     const identity = ` LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)} LCM_SUPERVISOR_CWD= LCM_SUPERVISOR_ENV_DIGEST=${systemdEnvironmentDigest(spec)}`;

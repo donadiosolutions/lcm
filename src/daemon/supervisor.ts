@@ -252,6 +252,16 @@ const DEFAULT_STOP_TIMEOUT_MS = 5_000;
 const DEFAULT_POLL_INTERVAL_MS = 50;
 const MAX_POLL_INTERVALS = 100;
 const MAX_LAUNCHD_TRANSITION_POLL_INTERVALS = 3;
+const SYSTEMD_STOP_TRANSITION_SUBSTATES = new Set([
+  "stop",
+  "stop-sigterm",
+  "stop-sigkill",
+  "stop-watchdog",
+  "stop-post",
+  "final-sigterm",
+  "final-sigkill",
+  "final-watchdog",
+]);
 const MAX_NONCE_LENGTH = 128;
 const MAX_METADATA_VALUE_LENGTH = 512;
 /**
@@ -1922,6 +1932,53 @@ function isOwnedSystemdActivation(
   return classified.kind === "ambiguous" && classified.reason === "metadata-malformed";
 }
 
+const SUPERVISOR_IDENTITY_FIELDS = [
+  "name",
+  "scopeDigest",
+  "marker",
+  "stateRoot",
+  "port",
+  "nonce",
+  "executable",
+  "args",
+  "cwd",
+  "entrypoint",
+  "runtimeDigest",
+  "storageBackend",
+  "postgresCaFile",
+  "launchEnvironmentDigest",
+  "credentialDirectory",
+] as const satisfies readonly (keyof SupervisorObservationBase)[];
+
+function supervisorIdentityMatches(
+  left: SupervisorObservationBase,
+  right: SupervisorObservationBase,
+): boolean {
+  return SUPERVISOR_IDENTITY_FIELDS.every((field) => left[field] === right[field])
+    && credentialFilesMatch(left.credentialFiles, right.credentialFiles);
+}
+
+/**
+ * Recognize only an exact, manager-reported systemd stop transition after an
+ * authenticated stop request.  systemd exposes ActiveState=deactivating with
+ * a stop/final SubState while it is still retiring the unit; this is bounded
+ * retryable state, not evidence that the unit is absent or safe to recreate.
+ */
+function isOwnedSystemdStopTransition(
+  spec: SupervisorSpec,
+  capture: SupervisorProbeCapture,
+  prior: SupervisorObservation,
+): boolean {
+  if (spec.kind !== "systemd-user" || capture.code !== 0 || capture.parsed === undefined) return false;
+  const loadState = lookup(capture.parsed, "LoadState", "loadState");
+  const activeState = lookup(capture.parsed, "ActiveState", "state", "State", "status");
+  const subState = lookup(capture.parsed, "SubState", "subState", "substate");
+  if (!/^loaded$/iu.test(loadState ?? "")
+    || !/^deactivating$/iu.test(activeState ?? "")
+    || !SYSTEMD_STOP_TRANSITION_SUBSTATES.has((subState ?? "").toLowerCase())) return false;
+  return supervisorIdentityMatches(observationBase(spec, capture.parsed), prior);
+}
+
 /**
  * Keep a prior manager stale observation bounded to its authenticated
  * registration.  During manager retirement a sparse or contradictory
@@ -2361,9 +2418,14 @@ export function createSupervisor(
     const maxPollIntervals = Math.max(1, Math.ceil(spec.stopTimeoutMs / DEFAULT_POLL_INTERVAL_MS));
     const now = dependencies.now ?? performance.now.bind(performance);
     const stopDeadline = now() + spec.stopTimeoutMs;
+    const authenticatedPrior = current;
     for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
-      const observed = await probe(spec);
-      if (observed.kind === "absent") {
+      const capture: SupervisorProbeCapture = {};
+      const observed = await probeInternal(spec, capture);
+      if (isOwnedSystemdStopTransition(spec, capture, authenticatedPrior)) {
+        // The manager still owns the exact prior unit. Continue the bounded
+        // absence poll; no cleanup or same-name recreation is authorized yet.
+      } else if (observed.kind === "absent") {
         if (!stopResultAllowsAbsent) {
           const reason = unavailableReason(result);
           if (reason === "manager-not-found" || reason === "manager-unavailable") {
@@ -2378,10 +2440,15 @@ export function createSupervisor(
         safeObservedCredentialCleanup(staleSource ?? (cleanupCredentials ? current : undefined), spec);
         if (cleanupCredentials) safeCredentialCleanup(spec);
         return;
+      } else {
+        if (observed.kind === "unavailable") throw managerUnavailableError(observed.reason);
+        if (
+          observed.kind === "registered-invalid-collision"
+          || observed.kind === "registered-stale-config"
+          || observed.kind === "ambiguous"
+        ) throw commandFailedError();
+        if (result.code !== 0 && attempt === 0) throw commandFailedError();
       }
-      if (observed.kind === "unavailable") throw managerUnavailableError(observed.reason);
-      if (observed.kind === "registered-invalid-collision" || observed.kind === "ambiguous") throw commandFailedError();
-      if (result.code !== 0 && attempt === 0) throw commandFailedError();
       const remaining = stopDeadline - now();
       if (remaining <= 0) break;
       const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);

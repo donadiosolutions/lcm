@@ -336,6 +336,34 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
     expect(fixture.start).not.toHaveBeenCalled();
   });
 
+  it("uses the authenticated packaged entrypoint for default manager identity args", async () => {
+    const fixture = createFixture({
+      fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,
+    });
+    const packagedEntrypoint = "/opt/lcm/dist/lcm.mjs";
+    const probed: SupervisorSpec[] = [];
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      probed.push(spec);
+      return observation(spec, "absent");
+    });
+    await ensureDaemon(optionsFor(fixture, {
+      expectedEntrypoint: undefined,
+      _packagedEntrypointOverride: packagedEntrypoint,
+      _skipSpawn: true,
+    }));
+
+    expect(probed).toHaveLength(1);
+    expect(probed[0]?.entrypoint).toBe(packagedEntrypoint);
+    expect(probed[0]?.args[0]).toBe(packagedEntrypoint);
+    expect(probed[0]?.launchEnvironment?.PATH).toBe(
+      managedDaemonPathForStableLaunch(
+        process.execPath,
+        [packagedEntrypoint, "daemon", "start", "--foreground"],
+        fixture.stateDir,
+      ),
+    );
+  });
+
   it("retains the stable launch environment while adopting an observed manager spec", async () => {
     const fixture = createFixture({
       fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,
