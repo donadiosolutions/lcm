@@ -3111,7 +3111,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     }
   }
 
-  async function runManagedRestart(managerKind: SupervisorKind): Promise<RestartDaemonResult> {
+  async function runManagedRestart(managerKind: SupervisorKind): Promise<RestartDaemonResult | null> {
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
@@ -3158,8 +3158,8 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         });
     let observation: SupervisorObservation;
     try {
-      // Probe before any PID read, health request, signal, or start. Once this
-      // succeeds, no error path is allowed to fall back to detached signaling.
+      // Probe before any PID read, health request, signal, or start. Only an
+      // allowlisted preflight-unavailable result may fall through before mutation.
       observation = await supervisor.probe(spec);
     } catch {
       return restartRefusal("ambiguous", "managed daemon supervisor probe failed; inspect the manager and retry");
@@ -3171,10 +3171,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
           `managed daemon supervisor preflight failed (${observation.reason}); refusing detached fallback`,
         );
       }
-      return restartRefusal(
-        "manager-unavailable",
-        "managed daemon supervisor is unavailable; refusing restart",
-      );
+      return null;
     }
     if (observation.kind === "registered-invalid-collision") {
       return restartRefusal("invalid-collision", "managed daemon supervisor found a foreign job for this state root; refusing restart");
@@ -3317,7 +3314,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
 
   if (managerKind !== undefined) {
     const managedResult = await runManagedRestart(managerKind);
-    return managedResult;
+    if (managedResult !== null) return managedResult;
   }
 
   async function isManaged(pid: number): Promise<boolean> {

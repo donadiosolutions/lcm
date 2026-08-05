@@ -753,7 +753,7 @@ describe("managed restart refusal and repair coverage", () => {
     ["linux", "manager-not-found"],
     ["darwin", "manager-unavailable"],
     ["darwin", "manager-not-found"],
-  ] as const)("refuses %s restart when the selected manager preflight is %s", async (platform, reason) => {
+  ] as const)("falls through %s restart when the selected manager preflight is %s", async (platform, reason) => {
     const dir = root(`issue-515-${platform}-${reason}-`);
     const pidPath = writePid(dir, 4242);
     const tokenPath = join(dir, "daemon.token");
@@ -782,16 +782,80 @@ describe("managed restart refusal and repair coverage", () => {
     expect(result).toMatchObject({
       connected: false,
       spawned: false,
-      restarted: false,
-      refusalReason: "manager-unavailable",
+      restarted: true,
+      stoppedPid: 4242,
     });
-    expect(kill).not.toHaveBeenCalled();
-    expect(ensureMock).not.toHaveBeenCalled();
+    expect(kill).toHaveBeenCalledWith(4242, "SIGTERM");
+    expect(ensureMock).toHaveBeenCalledOnce();
     expect(supervisor.start).not.toHaveBeenCalled();
     expect(supervisor.stopAndStart).not.toHaveBeenCalled();
     expect(supervisor.stopAndAwaitAbsent).not.toHaveBeenCalled();
-    expect(readFileSync(pidPath, "utf8")).toBe("4242");
+    expect(existsSync(pidPath)).toBe(false);
     expect(readFileSync(tokenPath, "utf8")).toBe("local-token");
+  });
+
+  it("uses the detached path only after authenticated legacy identity proof", async () => {
+    const dir = root("issue-400-authenticated-detached-");
+    const procRoot = join(dir, "proc");
+    const pidPath = writePid(dir, 4242);
+    writeFileSync(join(dir, "daemon.token"), "local-token", { mode: 0o600 });
+    writeProc(procRoot, 4242);
+    let alive = true;
+    const kill = vi.fn(() => { alive = false; });
+    const ensureMock = vi.fn(async () => ({
+      connected: false,
+      port: 19_999,
+      spawned: true,
+      startMethod: "detached-spawn" as const,
+    }));
+    const supervisor = unavailableSupervisor("manager-unavailable");
+
+    const result = await restart({
+      ...baseOptions(dir),
+      _procRoot: procRoot,
+      enforceUserManagerParent: true,
+      _isProcessAliveOverride: () => alive,
+      _listeningPortsOverride: () => [19_999],
+      _fetchOverride: diagnosticsFetch(health(4242), health(4242)),
+      _killOverride: kill,
+      _ensureDaemonOverride: ensureMock,
+      _supervisorOverride: supervisor,
+    });
+
+    expect(result).toMatchObject({ restarted: true, stoppedPid: 4242, spawned: true, startMethod: "detached-spawn" });
+    expect(kill).toHaveBeenCalledWith(4242, "SIGTERM");
+    expect(ensureMock).toHaveBeenCalledOnce();
+    expect(existsSync(pidPath)).toBe(false);
+    expect(supervisor.start).not.toHaveBeenCalled();
+    expect(supervisor.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["no response", vi.fn().mockRejectedValue(new Error("offline")) as unknown as FetchOverride],
+    ["unverified PID", diagnosticsFetch(health(999), health(999))],
+  ])("refuses detached fallback for %s before signaling", async (_case, fetch) => {
+    const dir = root("issue-400-detached-refusal-");
+    const pidPath = writePid(dir, 4242);
+    writeFileSync(join(dir, "daemon.token"), "local-token", { mode: 0o600 });
+    const kill = vi.fn();
+    const ensureMock = vi.fn();
+    const supervisor = unavailableSupervisor("manager-unavailable");
+
+    await expect(restart({
+      ...baseOptions(dir),
+      enforceUserManagerParent: true,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19_999],
+      _fetchOverride: fetch,
+      _killOverride: kill,
+      _ensureDaemonOverride: ensureMock,
+      _supervisorOverride: supervisor,
+    })).rejects.toThrow("not a verified LCM daemon");
+    expect(kill).not.toHaveBeenCalled();
+    expect(ensureMock).not.toHaveBeenCalled();
+    expect(existsSync(pidPath)).toBe(true);
+    expect(supervisor.start).not.toHaveBeenCalled();
+    expect(supervisor.stopAndStart).not.toHaveBeenCalled();
   });
 
   it("refuses a selected-manager ambiguous preflight before legacy recovery", async () => {
