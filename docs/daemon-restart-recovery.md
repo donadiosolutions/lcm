@@ -83,22 +83,24 @@ manager or inspect the host before retrying.
 
 ## Preserved credential directories
 
-Each managed launch stages one private credential directory at
-`<stateRoot>/credentials/<nonce>-<hex>/`: the directory is mode `0700` and
-holds mode `0600` credential files (for example API keys) that only that
-launch reads. When a launch is refused or its outcome is ambiguous, LCM
-intentionally preserves that directory as evidence: at refusal time a broad
-sweep cannot tell abandoned debris apart from a concurrent sibling launch's
-staged credentials, so deleting on suspicion could strip secrets from a
-launch that is about to succeed. Preserved directories hold live secrets and
-are excluded from any broad cleanup, deletion, or `--collect` action.
+If the daemon start environment includes managed credentials, each managed
+launch stages one private credential directory at
+`<stateRoot>/credentials/<nonce>/`, where the full directory name is the
+per-launch nonce itself. The directory is mode `0700` and holds mode `0600`
+credential files, so treat every preserved directory as live secret-bearing
+evidence. When a launch is refused or its outcome is ambiguous, LCM
+intentionally preserves that directory: at refusal time a broad sweep cannot
+tell abandoned debris apart from a concurrent sibling launch's staged
+credentials, so deleting on suspicion could strip secrets from a launch that
+is about to succeed.
 
 Inspect before removing anything, and only ever remove a directory you have
-positively identified as inactive:
+positively identified as inactive. `lcm doctor` alone does not prove
+inactivity:
 
 ```bash
 lcm doctor
-ls -la ~/.lcm/credentials/
+ls -la <stateRoot>/credentials/
 ```
 
 A directory is safe to remove only when `lcm doctor` reports the daemon
@@ -107,7 +109,7 @@ directory's nonce matches no active or pending launch. Positively identified
 inactive directories can then be removed by exact path, one at a time:
 
 ```bash
-rm -rf -- <stateRoot>/credentials/<exact-directory>
+rm -r -- <stateRoot>/credentials/<exact-nonce>
 ```
 
 The owner can delete the mode `0600` files directly; no `chmod` is needed.
@@ -158,8 +160,9 @@ use process-kill commands as a connector or daemon recovery procedure.
 ## What to report when recovery is refused
 
 Keep the complete `lcm doctor` output, the platform, and whether the daemon was
-started through the managed command. Do not delete `~/.lcm` state or retry with
-multiple daemon processes. A refusal means LCM could not prove safe ownership;
-it is not evidence that another process may be stopped. Restore the service
-manager or reinstall the connector as directed, then run the canonical doctor
-and restart commands again.
+started through the managed command. Do not delete the daemon's state root
+(for example `~/.lcm`) or retry with multiple daemon processes. A refusal
+means LCM could not prove safe ownership; it is not evidence that another
+process may be stopped. Restore the service manager or reinstall the
+connector as directed, then run the canonical doctor and restart commands
+again.
