@@ -150,8 +150,16 @@ describe("daemon remediation marker", () => {
       expect(result).toMatchObject({ emit: true, markerStatus: "created", markerIoError: false });
       expect(existsSync(lockPath)).toBe(false);
       const marker = readFileSync(markerPath, "utf8");
+      expect(JSON.parse(marker)).toEqual({
+        version: 1,
+        entries: {
+          [`${daemonScopeDigest("scope-with-secret")}:ambiguous`]: {
+            reason: "ambiguous",
+            lastNotifiedAtMs: 20_000,
+          },
+        },
+      });
       expect(marker).not.toContain("scope-with-secret");
-      expect(marker).not.toContain(String(process.pid));
       expect(marker).not.toContain(root);
     } finally {
       rmSync(root, { recursive: true, force: true });
