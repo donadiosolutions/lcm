@@ -341,12 +341,26 @@ describe("real user-systemd daemon lifecycle", () => {
       expect(first.managerPid).toBeGreaterThan(0);
       const terminal = await waitForTerminal(fixture);
       expect(["absent", "registered-not-running-valid"]).toContain(terminal.kind);
-      if (terminal.kind === "registered-not-running-valid") {
-        expect(fixture.calls.some((call) => call.command === "systemctl" && call.args[1] === "reset-failed")).toBe(true);
-      }
       const recreated = await fixture.supervisor.start(fixture.spec);
       expect(recreated.kind).toBe("systemd-user");
       expect(recreated.managerPid).toBeGreaterThan(0);
+      if (terminal.kind === "registered-not-running-valid") {
+        // systemd versions that retain a clean-exit transient registration
+        // (e.g. 255) require the terminal unit to be released through the
+        // manager before same-name recreation. reset-failed is only issued by
+        // the recreated start's internal terminal retirement, never by the
+        // read-only waitForTerminal probes above, so the exact call must appear
+        // only after start has traversed that cleanup.
+        expect(
+          fixture.calls.some((call) =>
+            call.command === "systemctl"
+            && call.args.length === 3
+            && call.args[0] === "--user"
+            && call.args[1] === "reset-failed"
+            && call.args[2] === fixture.spec.systemdUnit
+          ),
+        ).toBe(true);
+      }
       await waitForHealth(fixture, recreated.managerPid!);
       expect(await fixture.supervisor.probe(fixture.spec)).toMatchObject({
         kind: "registered-running-valid",

@@ -1641,6 +1641,106 @@ describe("launchd-user supervisor", () => {
     expect(expiredCollision.calls.some(({ args }) => args[0] === "bootout")).toBe(false);
   });
 
+  it("refuses a stale launchd repetition whose fresh security metadata drifted from the authenticated prior registration", async () => {
+    const root = makeRoot();
+    const prior = makeSpec("launchd-user", root, {
+      nonce: "prior-terminal",
+      entrypoint: "/opt/lcm/dist/lcm.mjs",
+      runtimeDigest: VALID_RUNTIME_DIGEST,
+      storageBackend: "sqlite",
+      cwd: root,
+    });
+    const replacement = makeSpec("launchd-user", root, {
+      nonce: "replacement-terminal",
+      entrypoint: "/opt/lcm/dist/lcm.mjs",
+      runtimeDigest: VALID_RUNTIME_DIGEST,
+      storageBackend: "sqlite",
+      cwd: root,
+    });
+    const terminal = launchdPrintText(prior, "exited", 0);
+    expect(prior.launchdLabel).toBe(replacement.launchdLabel);
+    expect(prior.scopeDigest).toBe(replacement.scopeDigest);
+
+    // A sparse/contradictory projection that resolves back to the exact prior
+    // identity remains the legitimate authenticated transition and must still
+    // authorize the exact bootout.
+    const sparseTransition = "state = exited\npid = 0";
+    const stable = fakeRunner([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: sparseTransition },
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: "bootout" },
+      { code: 113, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(replacement, "running", 544) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: stable.run,
+      platform: "darwin",
+      uid: 501,
+      sleep: vi.fn(async () => undefined),
+    }).stopAndStart(replacement)).resolves.toMatchObject({ managerPid: 544 });
+    expect(stable.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(1);
+
+    // Every security-relevant metadata surface that could drift between the
+    // authenticated prior registration and a fresh observation must remain
+    // fail-closed: the changed observation is not the authenticated prior
+    // launch and may never authorize bootout, even under the same label mutex.
+    const driftCases: ReadonlyArray<readonly [string, string]> = [
+      ["executable", terminal.replace(/^LCM_SUPERVISOR_EXECUTABLE => .*$/mu, "LCM_SUPERVISOR_EXECUTABLE => /evil/node")],
+      ["args", terminal.replace(/^LCM_SUPERVISOR_ARGS => .*$/mu, `LCM_SUPERVISOR_ARGS => ${JSON.stringify(["/evil/injected.js"])}`)],
+      ["entrypoint", terminal.replace(/^LCM_SUPERVISOR_ENTRYPOINT => .*$/mu, "LCM_SUPERVISOR_ENTRYPOINT => /evil/entry.js")],
+      ["runtimeDigest", terminal.replace(/^LCM_SUPERVISOR_RUNTIME_DIGEST => .*$/mu, `LCM_SUPERVISOR_RUNTIME_DIGEST => ${OTHER_RUNTIME_DIGEST}`)],
+      ["storageBackend", terminal.replace(/^LCM_SUPERVISOR_STORAGE_BACKEND => .*$/mu, "LCM_SUPERVISOR_STORAGE_BACKEND => postgresql")],
+      ["cwd", terminal.replace(/^LCM_SUPERVISOR_CWD => .*$/mu, "LCM_SUPERVISOR_CWD => /tmp/evil")],
+      ["credentialDirectory", terminal.replace(/^LCM_SUPERVISOR_CWD => .*$/mu, `LCM_SUPERVISOR_CWD => ${root}\nLCM_CREDENTIAL_DIRECTORY => ${root}/credentials/attacker`)],
+      ["credentialFile", terminal.replace(/^LCM_SUPERVISOR_CWD => .*$/mu, `LCM_SUPERVISOR_CWD => ${root}\nLCM_CREDENTIAL_OPENAI_API_KEY_FILE => ${root}/credentials/attacker/OPENAI_API_KEY`)],
+      ["postgresCaFile", terminal.replace(/^LCM_SUPERVISOR_CWD => .*$/mu, `LCM_SUPERVISOR_CWD => ${root}\nLCM_POSTGRES_CA_FILE => ${root}/ca.pem`)],
+      ["stateRoot", terminal.replace(/^LCM_SUPERVISOR_STATE_ROOT => .*$/mu, "LCM_SUPERVISOR_STATE_ROOT => /tmp/evil")],
+    ];
+    for (const [label, drifted] of driftCases) {
+      const runner = fakeRunner([
+        { code: 0, stdout: terminal },
+        { code: 0, stdout: sparseTransition },
+        { code: 0, stdout: drifted },
+        { code: 0, stdout: drifted },
+      ]);
+      await expect(createSupervisor("launchd-user", {
+        run: runner.run,
+        platform: "darwin",
+        uid: 501,
+        sleep: vi.fn(async () => undefined),
+      }).stopAndStart(replacement)).rejects.toThrow("manager command");
+      expect(runner.calls.filter(({ args }) => args[0] === "bootout"), label).toHaveLength(0);
+      expect(runner.calls.filter(({ args }) => args[0] === "bootstrap"), label).toHaveLength(0);
+    }
+
+    // A concurrent valid replacement that won the label mutex carries its own
+    // fresh nonce; the transition must not confuse it with the prior terminal
+    // and must refuse without mutation.
+    const winner = makeSpec("launchd-user", root, {
+      nonce: "winner-terminal",
+      entrypoint: "/opt/lcm/dist/lcm.mjs",
+      runtimeDigest: VALID_RUNTIME_DIGEST,
+      storageBackend: "sqlite",
+      cwd: root,
+    });
+    const concurrentWinner = fakeRunner([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: sparseTransition },
+      { code: 0, stdout: launchdPrintText(winner, "running", 777) },
+      { code: 0, stdout: launchdPrintText(winner, "running", 777) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: concurrentWinner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep: vi.fn(async () => undefined),
+    }).stopAndStart(replacement)).rejects.toThrow("manager command");
+    expect(concurrentWinner.calls.some(({ args }) => args[0] === "bootout")).toBe(false);
+  });
+
   it("retires a prior launchd plist with an older bounded assignment set", async () => {
     const root = makeRoot();
     const oldSpec = makeSpec("launchd-user", root, {

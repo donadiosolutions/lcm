@@ -1922,8 +1922,17 @@ function isOwnedSystemdActivation(
  * Keep a prior launchd terminal observation bounded to its authenticated
  * registration.  During bootout/exit launchd can briefly expose a sparse or
  * contradictory print projection; that is retryable read-only state, not
- * cleanup authority.  Only the same scope, label, and prior nonce can
- * authorize the pending bootout after that transition.
+ * cleanup authority.  A repetition may authorize the pending bootout only when
+ * the trusted manager repeats the *same* authenticated prior registration:
+ * the stable scope/label mutex plus the prior nonce and the exact launch
+ * identity (port, executable, JSON args, cwd) and every identity/security
+ * metadata surface recorded by the authenticated stale observation (marker,
+ * state-root, entrypoint, runtime/storage digests, PostgreSQL CA, and
+ * credential directory/files).  A value that was authenticated for the prior
+ * registration must repeat verbatim, and a fresh observation whose
+ * security-relevant metadata drifts never becomes cleanup authority (fail
+ * closed).  A concurrent winner carrying a different nonce under the same
+ * label mutex is a hard refusal, not a retryable transition.
  */
 function isAuthenticatedLaunchdStaleObservation(
   spec: SupervisorSpec,
@@ -1932,7 +1941,29 @@ function isAuthenticatedLaunchdStaleObservation(
 ): boolean {
   if (observation.kind !== "registered-stale-config") return false;
   if (observation.scopeDigest !== spec.scopeDigest || observation.name !== spec.name) return false;
-  return observation.nonce === staleSpec.nonce;
+  if (observation.nonce !== staleSpec.nonce) return false;
+  // The stable launchd label already mutexes state-root and port to the
+  // authenticated prior registration, so a feeble projection that merely
+  // omits a field never authenticates on absence alone: the prior nonce is
+  // always required and every observed value must equal the prior one.
+  // The launch-environment digest is the sole exception: it is recomputed
+  // per launch by the manager probe from the caller's filtered environment
+  // and is not carried on the stale plist spec, so it cannot authenticate a
+  // prior registration by equality here.  It carries no launch identity in
+  // this fail-closed transition (the prior executable/args/digests below
+  // already bind the launch), so it is not compared.
+  return observation.stateRoot === staleSpec.stateRoot
+    && observation.marker === staleSpec.marker
+    && observation.port === staleSpec.port
+    && observation.executable === staleSpec.executable
+    && observation.args === JSON.stringify(staleSpec.args)
+    && (observation.cwd ?? "") === (staleSpec.cwd ?? "")
+    && observation.entrypoint === staleSpec.entrypoint
+    && observation.runtimeDigest === staleSpec.runtimeDigest
+    && observation.storageBackend === staleSpec.storageBackend
+    && observation.postgresCaFile === staleSpec.postgresCaFile
+    && observation.credentialDirectory === staleSpec.credentialDirectory
+    && credentialFilesMatch(staleSpec.credentialFiles, observation.credentialFiles);
 }
 
 function launchdProbeArgs(spec: SupervisorSpec, uid: number): readonly string[] {
