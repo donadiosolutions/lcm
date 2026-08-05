@@ -4258,6 +4258,70 @@ describe("restartDaemon", () => {
     expect(existsSync(staged!.credentialDirectory!)).toBe(false);
   });
 
+  it("preserves staged launchd credentials when cleanup cannot prove manager absence", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-managed-launchd-cleanup-refused-"));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    let calls = 0;
+    let staged: ManagedCredentialSnapshot | undefined;
+    const supervisor = {
+      probe: vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => {
+        calls += 1;
+        return calls === 1
+          ? { kind: "absent" as const, name: candidate.name }
+          : {
+              kind: "registered-running-valid" as const,
+              managerPid: 201,
+              scopeDigest: candidate.scopeDigest,
+              nonce: candidate.nonce,
+              name: candidate.name,
+            };
+      }),
+      start: vi.fn(async (candidate: ManagedSupervisorSpec) => {
+        staged = snapshotManagedCredentials(candidate);
+        writeFileSync(pidFile, "201");
+        return {
+          kind: "launchd-user" as const,
+          name: candidate.name,
+          scopeDigest: candidate.scopeDigest,
+          port: 19_999,
+          nonce: candidate.nonce,
+          managerPid: 201,
+        };
+      }),
+      stopAndStart: vi.fn(),
+      stopAndAwaitAbsent: vi.fn(async () => {
+        throw new Error("absence proof refused");
+      }),
+    };
+
+    await expect(ensureDaemon({
+      port: 19_999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 5,
+      expectedVersion: "1.4.2",
+      enforceUserManagerParent: true,
+      _platform: "darwin",
+      _skipHealthWait: false,
+      _supervisorOverride: supervisor as never,
+      _isProcessAliveOverride: () => false,
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+    }, {
+      platform: "darwin",
+      uid: 501,
+      environment: { OPENAI_API_KEY: "unadmitted-secret" },
+    })).rejects.toThrow("absence proof refused");
+
+    expect(supervisor.stopAndAwaitAbsent).toHaveBeenCalledOnce();
+    expect(staged?.credentialDirectory).toBeDefined();
+    expect(existsSync(staged!.credentialDirectory!)).toBe(true);
+    expect(staged?.files.map(file => ({ name: file.name, value: file.value, mode: file.mode }))).toEqual([
+      { name: "OPENAI_API_KEY", value: "unadmitted-secret", mode: 0o600 },
+    ]);
+    expect(readFileSync(staged!.files[0]!.path, "utf-8")).toBe("unadmitted-secret");
+    expect(existsSync(pidFile)).toBe(false);
+  });
+
   it.each([
     ["linux", "systemd-user"],
     ["darwin", "launchd-user"],
