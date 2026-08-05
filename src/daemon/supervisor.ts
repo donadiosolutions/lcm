@@ -1270,28 +1270,41 @@ function privatePlistMatchesStableIdentity(
   // absent, its authoritative output is a flat projection: the plist
   // EnvironmentVariables block and the `env -i argv assignments are emitted
   // under the same names (and the top-level presence fallback runs last), so
-  // either surface authenticates identity.  A real generated plist repeats
-  // the value in both places, which this equality still rejects on any drift.
-  const environmentOrAssignment = (name: string): string | undefined =>
-    parsed.environment.has(name) ? parsed.environment.get(name) : assignments.get(name);
-  const credentialDirectory = environmentOrAssignment("LCM_CREDENTIAL_DIRECTORY");
-  const credentialNames = MANAGED_CREDENTIAL_NAMES.filter((name) => environmentOrAssignment(`LCM_CREDENTIAL_${name}_FILE`) !== undefined);
+  // either surface authenticates identity.  Capture both surfaces before
+  // selecting either value: a one-surface descriptor remains eligible for
+  // fallback, while a duplicated value that drifts is always rejected.
+  type CredentialSurface = Readonly<{
+    environment?: string;
+    assignment?: string;
+  }>;
+  const credentialSurface = (name: string): CredentialSurface => ({
+    environment: parsed.environment.get(name),
+    assignment: assignments.get(name),
+  });
+  const credentialSurfaceIsConsistent = ({ environment: environmentValue, assignment: assignmentValue }: CredentialSurface): boolean =>
+    environmentValue === undefined || assignmentValue === undefined || environmentValue === assignmentValue;
+  const credentialSurfaceValue = ({ environment: environmentValue, assignment: assignmentValue }: CredentialSurface): string | undefined =>
+    environmentValue ?? assignmentValue;
+  const credentialDirectorySurface = credentialSurface("LCM_CREDENTIAL_DIRECTORY");
+  if (!credentialSurfaceIsConsistent(credentialDirectorySurface)) return false;
+  const credentialDirectory = credentialSurfaceValue(credentialDirectorySurface);
+  const credentialFileSurfaces = MANAGED_CREDENTIAL_NAMES.map((name) => ({
+    name,
+    surface: credentialSurface(`LCM_CREDENTIAL_${name}_FILE`),
+  }));
+  if (credentialFileSurfaces.some(({ surface }) => !credentialSurfaceIsConsistent(surface))) return false;
+  const credentialFiles = credentialFileSurfaces.filter(({ surface }) => credentialSurfaceValue(surface) !== undefined);
+  const credentialNames = credentialFiles.map(({ name }) => name);
   if ((credentialDirectory === undefined) !== (credentialNames.length === 0)) return false;
-  for (const name of credentialNames) {
-    const path = environmentOrAssignment(`LCM_CREDENTIAL_${name}_FILE`)!;
+  for (const { name, surface } of credentialFiles) {
+    const path = credentialSurfaceValue(surface)!;
     if (!privateCredentialPathIsBounded(spec.stateRoot, credentialDirectory!, name, path)) return false;
-    if (parsed.environment.has(`LCM_CREDENTIAL_${name}_FILE`) && parsed.environment.get(`LCM_CREDENTIAL_${name}_FILE`) !== path) return false;
-    if (assignments.has(`LCM_CREDENTIAL_${name}_FILE`) && assignments.get(`LCM_CREDENTIAL_${name}_FILE`) !== path) return false;
-  }
-  if (credentialDirectory !== undefined) {
-    if (parsed.environment.has("LCM_CREDENTIAL_DIRECTORY") && parsed.environment.get("LCM_CREDENTIAL_DIRECTORY") !== credentialDirectory) return false;
-    if (assignments.has("LCM_CREDENTIAL_DIRECTORY") && assignments.get("LCM_CREDENTIAL_DIRECTORY") !== credentialDirectory) return false;
   }
   if (credentialNames.length > 0) {
-    const ids = environmentOrAssignment("LCM_SYSTEMD_CRED_IDS");
+    const credentialIdsSurface = credentialSurface("LCM_SYSTEMD_CRED_IDS");
+    if (!credentialSurfaceIsConsistent(credentialIdsSurface)) return false;
+    const ids = credentialSurfaceValue(credentialIdsSurface);
     if (ids !== credentialNames.join(",")) return false;
-    if (parsed.environment.has("LCM_SYSTEMD_CRED_IDS") && parsed.environment.get("LCM_SYSTEMD_CRED_IDS") !== ids) return false;
-    if (assignments.has("LCM_SYSTEMD_CRED_IDS") && assignments.get("LCM_SYSTEMD_CRED_IDS") !== ids) return false;
   }
   const expectedEnvironmentNames = new Set([
     ...Object.keys(expectedMetadata),
@@ -1338,8 +1351,11 @@ function privatePlistMatchesStableIdentity(
     ) expectedAssignmentNames.add(name);
   }
   if (credentialNames.length > 0) {
-    expectedAssignmentNames.add("LCM_CREDENTIAL_DIRECTORY");
-    for (const name of credentialNames) expectedAssignmentNames.add(`LCM_CREDENTIAL_${name}_FILE`);
+    if (credentialDirectorySurface.assignment !== undefined) expectedAssignmentNames.add("LCM_CREDENTIAL_DIRECTORY");
+    for (const { name, surface } of credentialFiles) {
+      if (surface.assignment !== undefined) expectedAssignmentNames.add(`LCM_CREDENTIAL_${name}_FILE`);
+    }
+    if (assignments.has("LCM_SYSTEMD_CRED_IDS")) expectedAssignmentNames.add("LCM_SYSTEMD_CRED_IDS");
   }
   return assignments.size === expectedAssignmentNames.size
     && [...expectedAssignmentNames].every((name) => assignments.has(name));

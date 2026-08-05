@@ -1478,25 +1478,92 @@ describe("launchd-user supervisor", () => {
     });
     const firstPlist = join(root, `daemon.${first.shortDigest}.${first.nonce}.plist`);
     const firstDocument = readFileSync(firstPlist, "utf8");
+    const credentialDirectoryAssignment = `<string>LCM_CREDENTIAL_DIRECTORY=${firstDirectory}</string>`;
+    const credentialDirectoryEnvironment = `<key>LCM_CREDENTIAL_DIRECTORY</key><string>${firstDirectory}</string>`;
+    const credentialFileAssignment = `<string>LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${firstFiles[0]}</string>`;
+    const credentialFileEnvironment = `<key>LCM_CREDENTIAL_OPENAI_API_KEY_FILE</key><string>${firstFiles[0]}</string>`;
+    const credentialIdsAssignment = "LCM_SYSTEMD_CRED_IDS=OPENAI_API_KEY";
+    const credentialIdsEnvironment = "<key>LCM_SYSTEMD_CRED_IDS</key><string>OPENAI_API_KEY</string>";
+    const mismatchedDirectory = join(root, "credentials", "launch-mismatch");
+    const addAssignment = (document: string, assignment: string): string =>
+      document.replace("<string>/usr/bin/node</string>", `<string>${assignment}</string><string>/usr/bin/node</string>`);
     const credentialTampering = [
       (document: string) => document.replace("</dict><key>RunAtLoad", "<key>OPENAI_API_KEY</key><string>secret</string></dict><key>RunAtLoad"),
       (document: string) => document.replace("<string>LCM_SUPERVISOR_MARKER=", "<string>LCM_SUPERVISOR_RUNTIME_DIGEST=unexpected</string><string>LCM_SUPERVISOR_MARKER="),
-      (document: string) => document.replace(`<string>LCM_CREDENTIAL_DIRECTORY=${firstDirectory}</string>`, ""),
-      (document: string) => document.replace(`<string>LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${firstFiles[0]}</string>`, "<string>LCM_CREDENTIAL_OPENAI_API_KEY_FILE=/tmp/outside</string>"),
-      (document: string) => document.replace(`<key>LCM_CREDENTIAL_OPENAI_API_KEY_FILE</key><string>${firstFiles[0]}</string>`, "<key>LCM_CREDENTIAL_OPENAI_API_KEY_FILE</key><string>/tmp/other</string>"),
-      (document: string) => document.replace(`<key>LCM_CREDENTIAL_DIRECTORY</key><string>${firstDirectory}</string>`, "<key>LCM_CREDENTIAL_DIRECTORY</key><string>/tmp/other</string>"),
-      (document: string) => document.replace("<key>LCM_SYSTEMD_CRED_IDS</key><string>OPENAI_API_KEY</string>", "<key>LCM_SYSTEMD_CRED_IDS</key><string>BAD</string>"),
+      // Directory: each surface may be absent, but duplicated values must
+      // agree before the old launch is authenticated.
+      (document: string) => document.replace(credentialDirectoryAssignment, `<string>LCM_CREDENTIAL_DIRECTORY=${mismatchedDirectory}</string>`),
+      // File path: exercise both one-surface fallbacks, a cross-surface
+      // collision, and the bounded-path rejection after equal surfaces pass.
+      (document: string) => document.replace(credentialFileAssignment, "<string>LCM_CREDENTIAL_OPENAI_API_KEY_FILE=/tmp/outside</string>"),
+      (document: string) => document
+        .replace(credentialFileAssignment, "<string>LCM_CREDENTIAL_OPENAI_API_KEY_FILE=/tmp/outside</string>")
+        .replace(credentialFileEnvironment, "<key>LCM_CREDENTIAL_OPENAI_API_KEY_FILE</key><string>/tmp/outside</string>"),
+      // IDs: exercise both fallbacks, cross-surface mismatch, and the
+      // equal-but-unexpected ID-set guard.
+      (document: string) => addAssignment(document, "LCM_SYSTEMD_CRED_IDS=BAD"),
+      (document: string) => addAssignment(document, "LCM_SYSTEMD_CRED_IDS=BAD").replace(credentialIdsEnvironment, "<key>LCM_SYSTEMD_CRED_IDS</key><string>BAD</string>"),
+      // A directory/file presence mismatch must fail before any path or ID
+      // selection.  Both surfaces are removed so this is not merely a
+      // cross-surface equality failure.
+      (document: string) => document.replaceAll(credentialDirectoryAssignment, "").replace(credentialDirectoryEnvironment, ""),
+      (document: string) => document.replaceAll(credentialFileAssignment, "").replace(credentialFileEnvironment, ""),
     ];
     for (const tamper of credentialTampering) {
       const tampered = tamper(firstDocument);
       expect(tampered).not.toBe(firstDocument);
+      expect(tampered).not.toContain("first-secret");
+      expect(tampered).not.toContain("second-secret");
       writeFileSync(firstPlist, tampered, { mode: 0o600 });
       chmodSync(firstPlist, 0o600);
       const collision = fakeRunner([{ code: 113, stderr: "Could not find service" }, { code: 113, stderr: "Could not find service" }]);
-      await expect(createSupervisor("launchd-user", { run: collision.run, platform: "darwin", uid: 501 }).start(second)).rejects.toThrow("manager command");
+      let rejection: unknown;
+      try {
+        await createSupervisor("launchd-user", { run: collision.run, platform: "darwin", uid: 501 }).start(second);
+      } catch (error) {
+        rejection = error;
+      }
+      expect(rejection).toBeInstanceOf(Error);
+      expect((rejection as Error).message).toBe("supervisor manager command failed");
+      expect((rejection as Error).message).not.toContain("first-secret");
+      expect((rejection as Error).message).not.toContain("second-secret");
       expect(readFileSync(firstPlist, "utf8")).toBe(tampered);
+      expect(readFileSync(firstPlist, "utf8")).not.toContain("first-secret");
+      expect(readFileSync(firstPlist, "utf8")).not.toContain("second-secret");
+      expect(collision.calls.some((call) => call.command === "launchctl" && call.args[0] === "bootstrap")).toBe(false);
       writeFileSync(firstPlist, firstDocument, { mode: 0o600 });
       chmodSync(firstPlist, 0o600);
+    }
+    const restoreFirstCredentials = (): void => {
+      rmSync(firstDirectory, { recursive: true, force: true });
+      createManagedCredentialDirectory(root, "launch-004");
+      writeManagedCredentialFiles(firstDirectory, { OPENAI_API_KEY: "first-secret" });
+    };
+    const credentialFallbacks = [
+      (document: string) => document.replace(credentialDirectoryAssignment, ""),
+      (document: string) => document.replace(credentialDirectoryEnvironment, ""),
+      (document: string) => document,
+      (document: string) => document.replace(credentialFileAssignment, ""),
+      (document: string) => document.replace(credentialFileEnvironment, ""),
+      (document: string) => document,
+      (document: string) => document,
+      (document: string) => addAssignment(document.replace(credentialIdsEnvironment, ""), credentialIdsAssignment),
+      (document: string) => addAssignment(document, credentialIdsAssignment),
+    ];
+    for (const fallback of credentialFallbacks) {
+      restoreFirstCredentials();
+      const fallbackDocument = fallback(firstDocument);
+      writeFileSync(firstPlist, fallbackDocument, { mode: 0o600 });
+      chmodSync(firstPlist, 0o600);
+      const fallbackRunner = fakeRunner([
+        { code: 113, stderr: "Could not find service" },
+        { code: 0, stdout: "bootstrapped" },
+        { code: 0, stdout: launchdPrintText(second, "running", 544) },
+      ]);
+      await expect(createSupervisor("launchd-user", { run: fallbackRunner.run, platform: "darwin", uid: 501 }).start(second)).resolves.toMatchObject({ managerPid: 544 });
+      expect(fallbackRunner.calls.some((call) => call.command === "launchctl" && call.args[0] === "bootstrap")).toBe(true);
+      expect(readFileSync(firstPlist, "utf8")).not.toContain("first-secret");
+      expect(readFileSync(firstPlist, "utf8")).not.toContain("second-secret");
     }
     const emptyCredentialDirectory = createManagedCredentialDirectory(root, "empty-replacement");
     const noCredentials = makeSpec("launchd-user", root, {
@@ -1506,6 +1573,12 @@ describe("launchd-user supervisor", () => {
     });
     const noCredentialRepair = fakeRunner([{ code: 113, stderr: "Could not find service" }, { code: 0, stdout: "bootstrap" }, { code: 0, stdout: launchdPrintText(noCredentials, "running", 543) }]);
     await expect(createSupervisor("launchd-user", { run: noCredentialRepair.run, platform: "darwin", uid: 501 }).start(noCredentials)).resolves.toMatchObject({ managerPid: 543 });
+    rmSync(secondDirectory, { recursive: true, force: true });
+    createManagedCredentialDirectory(root, "launch-005");
+    writeManagedCredentialFiles(secondDirectory, {
+      OPENAI_API_KEY: "second-secret",
+      LCM_POSTGRES_URL: "postgresql://second",
+    });
     const replacement = fakeRunner([
       { code: 113, stderr: "Could not find service" },
       { code: 0, stdout: "bootstrap" },
