@@ -238,6 +238,7 @@ jobs:
                 echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2
               fi
             elif [[ -f "$ready_file" ]]; then
+              ready_label="$(<"$ready_file")"
               echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2
             fi
             rm -rf -- "$resource_root"

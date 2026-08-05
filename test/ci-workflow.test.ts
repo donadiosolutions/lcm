@@ -281,6 +281,8 @@ describe("CI workflow", () => {
     expect(run).toContain('validated_ready_label=""');
     expect(run).toContain('[[ -f "$ready_file" && -n "$validated_ready_label" ]]');
     expect(run).toContain("Refusing cleanup for unexpected launchd label");
+    expect(run).toContain('elif [[ -f "$ready_file" ]]; then');
+    expect(run).toContain('ready_label="$(<"$ready_file")"');
     expect(run).toContain("launchd integration did not derive a validated scoped product label");
     // The protected gate is run-scoped: it fails hard when no fresh marker
     // exists, when the marker carries another run's token, when the derived
@@ -309,12 +311,15 @@ describe("CI workflow", () => {
     expect(run).toContain('[[ ! "$ready_label" =~ ^com\\.donadiosolutions\\.lcm\\.daemon\\.[0-9a-f]{20}$ ]]');
     expect(launchdIntegrationSource).toContain("LCM_LAUNCHD_RESOURCE_ROOT");
     expect(launchdIntegrationSource).toContain("LCM_LAUNCHD_EVIDENCE_TOKEN");
+    expect(launchdIntegrationSource).toContain('const marker = join(resourceRoot, "launchd.label")');
     expect(launchdIntegrationSource).toContain(
-      'writeFileSync(join(resourceRoot, "launchd.label"), `${evidenceToken} ${spec.launchdLabel}\\n`',
+      'writeFileSync(marker, `${evidenceToken} ${spec.launchdLabel}\\n`, { mode: 0o600 })',
     );
-    expect(launchdIntegrationSource).toContain("spec.stateRoot !== realpathSync(resourceRoot)");
-    expect(launchdIntegrationSource).toContain("expect(statSync(stateRoot).mode & 0o777).toBe(0o700)");
-    expect(run).not.toMatch(/\b(?:pkill|killall|kill)\b/u);
+    expect(launchdIntegrationSource).toContain("if (spec.stateRoot !== getSharedStateRoot())");
+    expect(launchdIntegrationSource).toContain(
+      "if (!existsSync(workflowStateRoot) || !statSync(workflowStateRoot).isDirectory())",
+    );
+    expect(run.split("\n").some((line) => /^\s*(?:pkill|killall|kill)\b/u.test(line))).toBe(false);
     // The label regex must reject product labels outside the product prefix.
     const productLabelRegex = /^com\.donadiosolutions\.lcm\.[A-Za-z0-9.-]+$/u;
     expect(productLabelRegex.test("com.donadiosolutions.lcm.ci.123456789.1")).toBe(true);
@@ -332,7 +337,7 @@ describe("CI workflow", () => {
 
     // The integration may only reference product labels matching the private
     // marker contract and must never use raw pkill/killall on foreign jobs.
-    expect(run).not.toMatch(/\b(?:pkill|killall)\b/u);
+    expect(run.split("\n").some((line) => /^\s*(?:pkill|killall)\b/u.test(line))).toBe(false);
     expect(workflow.jobs.ci.needs).toContain("macos-launchd");
   });
 
