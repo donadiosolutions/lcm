@@ -3117,6 +3117,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     ?? opts.expectedEntrypoint
     ?? opts._packagedEntrypointOverride
     ?? PACKAGED_RUNTIME_ENTRYPOINT;
+  const ensureOptionsWithEntrypoint = { ...ensureOptions, expectedEntrypoint };
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
