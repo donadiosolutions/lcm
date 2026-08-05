@@ -1,10 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const fsMocks = vi.hoisted(() => ({ realpathSync: vi.fn(), readFileSync: vi.fn() }));
+const fsMocks = vi.hoisted(() => ({ realpathSync: vi.fn(), readFileSync: vi.fn(), lstatSync: vi.fn() }));
+const securityMocks = vi.hoisted(() => ({ readBoundedRegularFile: vi.fn() }));
 vi.mock("node:fs", async importOriginal => ({
   ...(await importOriginal<typeof import("node:fs")>()),
   realpathSync: fsMocks.realpathSync,
   readFileSync: fsMocks.readFileSync,
+  lstatSync: fsMocks.lstatSync,
+}));
+vi.mock("../../src/security-files.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/security-files.js")>()),
+  readBoundedRegularFile: securityMocks.readBoundedRegularFile,
 }));
 
 import { resolveDaemonConfigEnv } from "../../src/daemon/config.js";
@@ -16,6 +22,31 @@ beforeEach(() => {
   vi.clearAllMocks();
   Object.defineProperty(process, "getuid", { configurable: true, value: () => 1000 });
   fsMocks.realpathSync.mockImplementation((path: string) => path);
+  fsMocks.lstatSync.mockImplementation((path: string) => {
+    if (path === credentialDir) {
+      return {
+        dev: 1,
+        ino: 1,
+        uid: 1000,
+        mode: 0o40500,
+        isSymbolicLink: () => false,
+        isDirectory: () => true,
+      };
+    }
+    return {
+      dev: 2,
+      ino: 2,
+      uid: 1000,
+      mode: 0o100400,
+      isSymbolicLink: () => false,
+      isDirectory: () => false,
+    };
+  });
+  securityMocks.readBoundedRegularFile.mockImplementation((path: string) => {
+    if (path.endsWith("LCM_SUMMARY_API_KEY")) return "summary-key\n";
+    if (path.endsWith("LCM_POSTGRES_URL")) return "postgresql://credential\n";
+    throw new Error(`missing credential: ${path}`);
+  });
   fsMocks.readFileSync.mockImplementation((path: string) => {
     if (path.endsWith("LCM_SUMMARY_API_KEY")) return "summary-key\n";
     if (path.endsWith("LCM_POSTGRES_URL")) return "postgresql://credential\n";
@@ -39,7 +70,7 @@ describe("portable systemd credential configuration", () => {
 
     const resolved = resolveDaemonConfigEnv({
       CREDENTIALS_DIRECTORY: credentialDir,
-      LCM_SYSTEMD_CRED_IDS: "BAD, ANTHROPIC_API_KEY, LCM_POSTGRES_URL, LCM_SUMMARY_API_KEY, OPENAI_API_KEY",
+      LCM_SYSTEMD_CRED_IDS: "ANTHROPIC_API_KEY, LCM_POSTGRES_URL, LCM_SUMMARY_API_KEY, OPENAI_API_KEY",
     });
 
     expect(resolved.LCM_SUMMARY_API_KEY).toBe("summary-key");
@@ -53,7 +84,67 @@ describe("portable systemd credential configuration", () => {
       CREDENTIALS_DIRECTORY: credentialDir,
     });
 
-    fsMocks.readFileSync.mockImplementation(() => { throw new Error("read failed"); });
+    securityMocks.readBoundedRegularFile.mockImplementation(() => { throw new Error("read failed"); });
+    expect(resolveDaemonConfigEnv({
+      CREDENTIALS_DIRECTORY: credentialDir,
+      LCM_SYSTEMD_CRED_IDS: "LCM_SUMMARY_API_KEY",
+    })).toEqual({
+      CREDENTIALS_DIRECTORY: credentialDir,
+      LCM_SYSTEMD_CRED_IDS: "LCM_SUMMARY_API_KEY",
+    });
+  });
+
+  it("fails closed for empty and non-string credential ID metadata", () => {
+    expect(resolveDaemonConfigEnv({
+      CREDENTIALS_DIRECTORY: credentialDir,
+      LCM_SYSTEMD_CRED_IDS: "   ",
+    })).toEqual({
+      CREDENTIALS_DIRECTORY: credentialDir,
+      LCM_SYSTEMD_CRED_IDS: "   ",
+    });
+    expect(resolveDaemonConfigEnv({
+      CREDENTIALS_DIRECTORY: credentialDir,
+      LCM_SYSTEMD_CRED_IDS: 42 as never,
+    })).toEqual({
+      CREDENTIALS_DIRECTORY: credentialDir,
+      LCM_SYSTEMD_CRED_IDS: 42,
+    });
+  });
+
+  it("fails closed when the trusted directory changes before or after a read", () => {
+    fsMocks.lstatSync.mockImplementationOnce(() => ({
+      dev: 1,
+      ino: 1,
+      uid: 1000,
+      mode: 0o40500,
+      isSymbolicLink: () => false,
+      isDirectory: () => true,
+    })).mockImplementationOnce(() => { throw new Error("directory race"); });
+    expect(resolveDaemonConfigEnv({
+      CREDENTIALS_DIRECTORY: credentialDir,
+      LCM_SYSTEMD_CRED_IDS: "LCM_SUMMARY_API_KEY",
+    })).toEqual({
+      CREDENTIALS_DIRECTORY: credentialDir,
+      LCM_SYSTEMD_CRED_IDS: "LCM_SUMMARY_API_KEY",
+    });
+
+    fsMocks.lstatSync.mockReset();
+    fsMocks.lstatSync.mockImplementationOnce(() => ({
+      dev: 1,
+      ino: 1,
+      uid: 1000,
+      mode: 0o40500,
+      isSymbolicLink: () => false,
+      isDirectory: () => true,
+    })).mockImplementationOnce(() => ({
+      dev: 1,
+      ino: 1,
+      uid: 1000,
+      mode: 0o40500,
+      isSymbolicLink: () => false,
+      isDirectory: () => true,
+    })).mockImplementationOnce(() => { throw new Error("directory race"); });
+    securityMocks.readBoundedRegularFile.mockReturnValue("summary-key\n");
     expect(resolveDaemonConfigEnv({
       CREDENTIALS_DIRECTORY: credentialDir,
       LCM_SYSTEMD_CRED_IDS: "LCM_SUMMARY_API_KEY",
@@ -75,7 +166,7 @@ describe("portable systemd credential configuration", () => {
       CREDENTIALS_DIRECTORY: credentialDir,
       LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
     });
-    expect(fsMocks.readFileSync).not.toHaveBeenCalled();
+    expect(securityMocks.readBoundedRegularFile).not.toHaveBeenCalled();
   });
 
   it("rejects relative, missing, and existing untrusted directories", () => {

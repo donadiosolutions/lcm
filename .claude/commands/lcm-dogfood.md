@@ -239,31 +239,30 @@ Call `lcm_describe` with the same node ID.
 
 ## Phase 9: Resilience (`resilience`) — 3 checks
 
-### Check 9.1 — Kill daemon
+### Check 9.1 — Managed restart
 ```bash
-pkill -f "lcm.*daemon" || true
+node dist/bin/lcm.js daemon restart
 sleep 1
 node dist/bin/lcm.js status
 ```
-**Pass if:** reports daemon is down clearly (no crash, no hang).
+**Pass if:** the managed service restarts successfully, or LCM returns an
+actionable refusal without touching an unverified process.
 
-### Check 9.2 — Auto-recovery
+### Check 9.2 — Diagnostics after restart
 ```bash
-node dist/bin/lcm.js daemon start --detach
-sleep 2
-node dist/bin/lcm.js status
+node dist/bin/lcm.js doctor
 ```
-**Pass if:** daemon comes back up, status shows "up".
+**Pass if:** diagnostics complete and report daemon, service-manager, hook,
+connector, MCP, and summarizer state.
 
-### Check 9.3 — Graceful degradation while daemon-down
-Kill daemon, then test hook:
+### Check 9.3 — Hook continuity
 ```bash
-pkill -f "lcm.*daemon" || true
-sleep 1
 timeout 10 sh -c 'echo "{\"prompt\":\"test\",\"cwd\":\"$(pwd)\"}" | node dist/bin/lcm.js user-prompt'
 echo "exit: $?"
 ```
-**Pass if:** returns within 10s, no crash. Empty output is acceptable. Then restart daemon for remaining checks.
+**Pass if:** returns within 10s without a crash or hang after the managed
+transition. If a connector is involved, run
+`node dist/bin/lcm.js connectors doctor <agent>` and repeat `node dist/bin/lcm.js doctor` before retrying.
 
 ---
 

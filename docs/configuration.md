@@ -391,6 +391,18 @@ CA file, pool size, or timeouts. On Linux, the managed user-systemd launch sends
 propagated as a normal environment value. `lcm config get storage --effective`
 shows the CA path and tuning values but replaces the URL with `[REDACTED]`.
 
+The daemon only accepts credentials that systemd exposed through a canonical
+per-unit directory under `/run/credentials/` or the current user's
+`/run/user/<uid>/credentials/` tree. The directory must use systemd's
+read-only `0500` mode (the user-manager directory is owned by the current
+UID), and each requested credential must be an allow-listed regular file with
+systemd's read-only `0400` mode, one hard link, and no more than 1 MiB of
+content. Credential IDs are bounded, must not be duplicated, and are rejected
+as a set when any ID is unknown or malformed. Invalid, missing, replaced, or
+oversized credentials are ignored without logging their path or contents; the
+usual configuration validation then reports any required value that remains
+unavailable.
+
 PostgreSQL is remote-primary: once repository support is enabled, an outage is
 reported rather than silently switching the authoritative store to SQLite.
 Hook capture remains local through the SQLite outbox so events can be queued
@@ -435,63 +447,68 @@ recognized active storage backend, the PID file, process liveness, and exact
 occupied port with missing or unverifiable identity is rejected rather than
 trusted. Daemons that predate backend identity are recognized as SQLite-only,
 so selecting PostgreSQL cannot silently reuse an existing SQLite process.
+The PID, PID-file, and listener observations in this admission check are
+consistency evidence for a responsive managed service; they are never offline
+authority to signal or replace a process.
 If bounded health checks remain unavailable while the exact PID-file process is
 still a live likely-LCM process and still owns the configured listener,
 lifecycle admission reports `connected: false` with a busy/unavailable warning
 and preserves the process, PID file, and token. It revalidates that evidence
 immediately before returning and does not signal, clean, or start a replacement
 daemon. Retry after the current operation finishes. If health remains
-unavailable after the daemon should be idle, inspect it and explicitly stop or
-restart it instead of repeatedly starting competing processes.
-During an explicit restart, the running daemon is authenticated by PID,
-installed version, listener ownership, and its local token without requiring it
-to already use the newly selected backend; the replacement must match the new
-backend. SessionSnapshot skips ingestion when bootstrap cannot verify daemon
-identity. PostToolUse also ignores payload-provided daemon ports and performs no
-network I/O.
+unavailable after the daemon should be idle, run `lcm doctor` and one explicit
+`lcm daemon restart`; if the service identity is ambiguous, the command
+preserves the process and state and reports the next safe action.
+During a responsive explicit restart, authenticated health and the owning
+systemd/launchd service establish the existing service's identity; the
+replacement must match the newly selected backend. A no-response or ambiguous
+service has no offline PID, pathname, or token authority and is preserved rather
+than signaled or replaced. SessionSnapshot skips ingestion when bootstrap
+cannot verify daemon identity. PostToolUse also ignores payload-provided daemon
+ports and performs no network I/O.
 
-Use `lcm daemon start` to start or validate the managed background daemon. Use
-`lcm daemon restart` after configuration changes; it validates the new
-configuration before stopping the managed process, then starts the daemon with
-the updated settings. Because restart fails closed unless the running daemon
-owns the configured listener, stop the daemon before changing `daemon.port`,
-then start it again after saving the new port. On Linux, lcm prefers the current user's `systemd --user`
-manager so the daemon remains a direct child of the user manager instead of
-being orphaned under PID 1. `lcm daemon start --detach` is kept as a compatibility
-alias for the same managed start behavior. Use `lcm daemon start --foreground`
-only when you want the daemon to stay attached to the current terminal for
-debugging.
+Use `lcm daemon restart` after configuration changes. It validates the complete
+effective configuration before asking the host service manager to replace the
+managed process, then waits for authenticated health. `lcm doctor` is the
+canonical diagnostic command; it checks daemon health, service-manager
+availability, hooks, connector registration, MCP setup, and summarizer
+readiness. Do not start a second daemon to work around a health failure.
 
-The planned kernel-backed recovery path does not broaden that rule yet. It is
-being designed for an explicit `lcm daemon restart` on Linux x64 only, after a
-health exchange receives no HTTP response and only when a prior authenticated
-managed-launch record exactly matches the daemon. Any HTTP response remains on
-the existing authenticated path. Older, foreground, unsupported, or ambiguous
-daemons remain untouched. See [Kernel-backed recovery for a wedged managed
-daemon](daemon-restart-recovery.md) for the protocol and security boundaries.
+On Linux, the current user's `systemd --user` manager owns the background
+service. On macOS, the current user's `launchd` agent owns it. LCM deliberately
+does not configure an automatic restart policy (`Restart=` or `KeepAlive`). A
+daemon that exits normally after `daemon.idleTimeoutMs` remains registered and
+is recreated on the next lifecycle request, so idle terminals do not keep a
+process alive while the service still has one authenticated owner.
 
-The managed systemd service receives a trusted executable path rather than the
-launching shell's `PATH`. It prepends the exact absolute launcher and runtime
-directories to a fixed set of system directories when those directories are
-outside the current project. Known global Node installations and the bundled
-Codex runtime remain valid trust anchors only when
-they are also outside the current project containment boundary. Canonical
-per-user installations remain trusted when the command runs directly from the
-user's home directory; similarly named directories rooted in a checkout do not. LCM
-rejects trust anchors containing the platform's `PATH` delimiter, all
-`node_modules` paths (including `npx` and `node_modules/.bin` launchers), the
-current project directory or its checkout ancestors when invoked from a
-subdirectory, and other project-local or shell-specific entries.
-If no trusted absolute entrypoint is available, the service uses only the fixed
-system directories. Put provider configuration in LCM settings or the
-documented `LCM_*` environment variables.
+Lifecycle health keeps the response boundary explicit. An HTTP response,
+including an error status, malformed body, or a body timeout after headers, is
+handled through the authenticated path. A transport deadline that expires
+before any response is **no-response** and may request service-manager
+recreation only after exact service ownership and state checks succeed. If the
+caller cannot distinguish those outcomes, or the service identity is
+ambiguous, recovery is refused and the process/state are preserved.
 
-On Linux, `lcm doctor` reads the effective `PATH` from the verified running
-daemon process when checking process-provider CLIs. If that process environment
-is unavailable, doctor falls back to the same deterministic restricted path
-used for a new managed daemon.
+Detached/foreground compatibility launches, Windows, containers without a
+per-user service manager, and any unsupported or ambiguous service are outside
+managed recovery. Run `lcm doctor`, restore the host manager, and retry
+`lcm daemon restart`. For stale client files after an upgrade, reinstall the
+connector with `lcm connectors install <agent>` and verify it with
+`lcm connectors doctor <agent>`; Claude Code's equivalent native repair is
+`lcm install`. See [Managed daemon recovery](daemon-restart-recovery.md) for
+the complete user-facing boundary and refusal guidance.
 
-`lcm doctor` verifies daemon health and, on Linux, repairs a healthy daemon that is not parented by the current user's systemd manager by restarting it through the managed start path. If the user systemd manager is unavailable, lcm falls back to the older detached spawn behavior and reports that the parent invariant is not satisfied.
+Recovery configuration is explicit and intentionally small.
+`daemon.idleTimeoutMs` controls normal idle lifetime only; no configuration
+value or force flag authorizes replacing a detached, foreground, or
+no-response process offline. Restore the per-user service manager, run
+`lcm doctor`, then use one explicit `lcm daemon restart`.
+
+The service manager is LCM's ownership authority, but it is not a same-UID
+filesystem security boundary. A process running as the same operating-system
+user can read or modify that user's files and runtime state. Private file modes,
+canonical paths, authenticated metadata, and manager identity checks reduce
+accidental or cross-user access without providing capability-style isolation.
 
 The MCP handshake check is time-bounded. If its helper process exits early,
 stops accepting input, or encounters a pipe error, `lcm doctor` reports the

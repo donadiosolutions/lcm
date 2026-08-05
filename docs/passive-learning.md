@@ -69,7 +69,8 @@ Lifecycle admission preserves that exact likely-LCM process and its PID/token
 state instead of signaling it or starting a replacement, and reports a
 busy/unavailable warning with `connected: false`. Let the current batch finish,
 then retry the command. If health remains unavailable after processing should
-be idle, inspect the backlog and daemon, then stop or restart it explicitly.
+be idle, run `lcm doctor`, then `lcm daemon restart`; do not stop a process
+manually.
 
 `lcm search` stays read-only: it searches already promoted memory and does not process queued sidecar events.
 

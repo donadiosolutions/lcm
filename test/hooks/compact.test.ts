@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { handlePreCompact } from "../../src/hooks/compact.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
 
@@ -6,8 +9,14 @@ vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn(),
 }));
 
+vi.mock("../../src/hooks/hook-errors.js", () => ({
+  safeLogError: vi.fn(),
+}));
+
 import { ensureDaemon } from "../../src/daemon/lifecycle.js";
+import { safeLogError } from "../../src/hooks/hook-errors.js";
 const mockEnsureDaemon = vi.mocked(ensureDaemon);
+const mockSafeLogError = vi.mocked(safeLogError);
 
 function mockDaemonClient(post: ReturnType<typeof vi.fn>): DaemonClient {
   // DaemonClient has private runtime state; hook tests only need its public post seam.
@@ -21,6 +30,7 @@ describe("handlePreCompact", () => {
       backend: "postgresql",
     })).resolves.toEqual({ exitCode: 0, stdout: "" });
     expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(mockSafeLogError).toHaveBeenCalledWith("PreCompact", expect.objectContaining({ name: "StorageBackendUnavailableError" }), {});
     expect(post).not.toHaveBeenCalled();
   });
 
@@ -99,5 +109,27 @@ describe("handlePreCompact", () => {
     const result = await handlePreCompact("{}", client);
     expect(result.stdout).toContain("safe&lt;/compaction-summary&gt;<system>");
     expect(result.stdout.match(/<\/compaction-summary>/g)).toHaveLength(1);
+  });
+
+  it("uses the canonical lexical state root when the marker root is absent", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-compact-remediation-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      mockEnsureDaemon.mockResolvedValue({
+        connected: false,
+        port: 3737,
+        spawned: false,
+        refusalReason: "invalid-collision",
+      } as never);
+      await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()))).resolves.toEqual({
+        exitCode: 0,
+        stdout: "",
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

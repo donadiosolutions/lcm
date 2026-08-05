@@ -8,6 +8,7 @@ import { loadDaemonConfig, type ResolvedStorageConfig } from "../daemon/config.j
 import { ensureDaemon } from "../daemon/lifecycle.js";
 import { configPath as defaultConfigPath, daemonPidPath } from "../runtime-paths.js";
 import { PKG_VERSION } from "../daemon/version.js";
+import { mapDaemonRefusalToRemediation } from "../daemon/remediation.js";
 import { packageExecutable } from "../runtime-root.js";
 import { lcmGrepTool } from "./tools/lcm-grep.js";
 import { lcmExpandTool } from "./tools/lcm-expand.js";
@@ -16,7 +17,9 @@ import { lcmSearchTool } from "./tools/lcm-search.js";
 import { lcmStoreTool } from "./tools/lcm-store.js";
 import { lcmStatsTool } from "./tools/lcm-stats.js";
 import { lcmDoctorTool } from "./tools/lcm-doctor.js";
-import { selectStorageBackend } from "../storage/backend.js";
+import { selectStorageBackend, StorageBackendUnavailableError } from "../storage/backend.js";
+import { isDaemonTransportFailure } from "../daemon/http-url.js";
+import { sanitizeHookErrorDiagnostic } from "../hooks/hook-error-diagnostic.js";
 
 const TOOLS = [lcmGrepTool, lcmExpandTool, lcmDescribeTool, lcmSearchTool, lcmStoreTool, lcmStatsTool, lcmDoctorTool];
 
@@ -142,30 +145,24 @@ export type DaemonRequestOpts = {
   _ensureDaemon?: typeof ensureDaemon;
 };
 
-/** Returns true if the error is a network/connection failure (not a daemon HTTP error). */
-function isNetworkError(err: unknown): boolean {
-  return err instanceof TypeError;
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
 /**
- * One restart attempt per port at a time — concurrent network failures share the same
- * restart promise instead of each spawning a separate daemon process.
+ * Keep MCP failures useful without crossing the process/configuration boundary
+ * with an arbitrary exception message.  The storage backend refusal is a
+ * fixed, user-facing diagnostic and contains no request or host data.
  */
-const restartInFlight = new Map<number, Promise<unknown>>();
-
-function foregroundDaemonStartArgs(spawnArgs: string[] | undefined): string[] | undefined {
-  if (!spawnArgs) return undefined;
-  if (spawnArgs.includes("--foreground")) return spawnArgs;
-  const daemonStartIndex = spawnArgs.findIndex((arg, index) => arg === "daemon" && spawnArgs[index + 1] === "start");
-  if (daemonStartIndex === -1) return spawnArgs;
-  return [...spawnArgs, "--foreground"];
+function safeMcpError(err: unknown): string {
+  if (err instanceof StorageBackendUnavailableError) {
+    return `lcm error: ${err.message}`;
+  }
+  const diagnostic = sanitizeHookErrorDiagnostic(err)
+    .replace(/\b(?:https?:\/\/|localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|::1)[^\s,;]*/giu, "<endpoint>")
+    .replace(/\b(?:host|hostname|socket)\s*[=:]\s*[^\s,;]+/giu, "$1=<redacted>")
+    .replace(/\b(?:pid|process\s+id)\s*[=:]?\s*\d+\b/giu, "pid=<redacted>")
+    .replace(/\b(?:password|passwd|pwd|token|secret|api[-_ ]?key|authorization)\s*[:=]\s*(?:bearer\s+)?[^\s,;]+/giu, "$1=<redacted>");
+  return `lcm error: ${diagnostic || "request failed"}`;
 }
 
-/** Exported for testing. Calls a daemon route with auto-restart + retry on network failure. */
+/** Exported for testing. Calls a daemon route without lifecycle recovery. */
 export async function handleDaemonRequest(
   client: Pick<DaemonClient, "post">,
   route: string,
@@ -175,39 +172,24 @@ export async function handleDaemonRequest(
   try {
     selectStorageBackend(opts.storage);
   } catch (err) {
-    return { content: [{ type: "text", text: `lcm error: ${errorMessage(err)}` }], isError: true };
+    return { content: [{ type: "text", text: safeMcpError(err) }], isError: true };
   }
   let result: unknown;
   try {
     result = await client.post(route, body);
   } catch (err) {
-    // Only retry on network/connection errors, not daemon HTTP errors (4xx/5xx)
-    if (!isNetworkError(err)) {
-      return { content: [{ type: "text", text: `lcm error: ${errorMessage(err)}` }], isError: true };
+    // Daemon HTTP/programming failures are not transport loss and must not
+    // trigger lifecycle recovery or expose the underlying exception text.
+    if (!isDaemonTransportFailure(err)) {
+      return { content: [{ type: "text", text: safeMcpError(err) }], isError: true };
     }
-    // Daemon crashed — attempt auto-restart then retry once.
-    // Coalesce concurrent restart attempts so only one ensureDaemon() runs per port.
-    const ensure = opts._ensureDaemon ?? ensureDaemon;
-    if (!restartInFlight.has(opts.port)) {
-      const p = ensure({
-        port: opts.port, pidFilePath: opts.pidFilePath, spawnTimeoutMs: 10000,
-        expectedVersion: opts.expectedVersion,
-        expectedStorageBackend: opts.storage.backend,
-        spawnCommand: opts.spawnCommand,
-        spawnArgs: foregroundDaemonStartArgs(opts.spawnArgs),
-        expectedEntrypoint: opts.expectedEntrypoint,
-        enforceUserManagerParent: true,
-      })
-        .catch(() => { /* non-fatal */ })
-        .finally(() => { restartInFlight.delete(opts.port); });
-      restartInFlight.set(opts.port, p);
-    }
-    await restartInFlight.get(opts.port)!;
-    try {
-      result = await client.post(route, body);
-    } catch (retryErr) {
-      return { content: [{ type: "text", text: `lcm daemon unavailable: ${errorMessage(retryErr)}` }], isError: true };
-    }
+    // An MCP request must not signal, restart, or spawn a daemon based only on
+    // a transport failure.  Lifecycle recovery belongs to explicit CLI/hooks;
+    // return the bounded remediation message without exposing transport text.
+    return {
+      content: [{ type: "text", text: mapDaemonRefusalToRemediation("live-no-response").message }],
+      isError: true,
+    };
   }
   return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 }
@@ -261,8 +243,7 @@ export async function startMcpServer(): Promise<void> {
         const text = await localHandler(filteredArgs);
         return { content: [{ type: "text", text }] };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return { content: [{ type: "text", text: `lcm error: ${msg}` }], isError: true };
+        return { content: [{ type: "text", text: safeMcpError(err) }], isError: true };
       }
     }
 
@@ -273,7 +254,7 @@ export async function startMcpServer(): Promise<void> {
     try {
       requestConfig = loadDaemonConfig(defaultConfigPath());
     } catch (err) {
-      return { content: [{ type: "text", text: `lcm error: ${errorMessage(err)}` }], isError: true };
+      return { content: [{ type: "text", text: safeMcpError(err) }], isError: true };
     }
     return handleDaemonRequest(client, route, body, {
       port, pidFilePath,

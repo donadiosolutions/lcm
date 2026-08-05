@@ -300,9 +300,7 @@ lcm sensitive purge --yes  # remove all stored data for the current project
 # Daemon
 lcm daemon start           # start managed daemon in background
 lcm daemon restart         # validate config, restart daemon, and apply changes
-lcm daemon start --detach  # compatibility alias for managed background start
-lcm daemon start --foreground  # start daemon in current terminal for debugging
-# If doctor reports a stale daemon version, stop the stale daemon process and rerun this command.
+# If the daemon is unavailable, run `lcm doctor` and then `lcm daemon restart`.
 
 # Hook handlers (internal — called by Claude Code hooks)
 lcm compact --hook         # PreCompact hook
@@ -314,6 +312,18 @@ lcm post-tool              # PostToolUse hook (passive learning)
 # MCP server
 lcm mcp                    # start MCP server
 ```
+
+Daemon recovery is service-manager based. Linux uses the current user's
+`systemd --user` manager and macOS uses the current user's `launchd` agent;
+neither is configured with automatic restart or `KeepAlive`. A normal idle
+exit is recreated on the next LCM request, while an uncertain or unsupported
+process is left untouched. Run `lcm doctor` for diagnostics and
+`lcm daemon restart` for a validated replacement. Detached/foreground launches,
+Windows, and containers without a user service manager are not offline recovery
+authorities. If a client connector is stale after an update, reinstall it with
+`lcm connectors install <agent>` and run its connector doctor before retrying.
+There is no detached offline force-recovery option, and service-manager
+ownership is not a same-UID filesystem security boundary.
 
 See [Machine registration and project identity](docs/project-identity.md) for
 linked-worktree consolidation, historical Codex reconciliation, PostgreSQL

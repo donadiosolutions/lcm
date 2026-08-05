@@ -107,12 +107,135 @@ jobs:
       - name: Run isolated PostgreSQL 18 conformance harness
         run: npm run test:postgresql
 
+  linux-systemd:
+    name: Linux Ubuntu 24.04 user-systemd integration
+    needs: environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 25.9.0
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "25.9.0"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build package
+        run: npm run build
+
+      - name: Run real user-systemd integration
+        env:
+          LCM_SYSTEMD_CREDENTIAL_INTEGRATION: "1"
+          LCM_LIFECYCLE_SYSTEMD_INTEGRATION: "1"
+          LCM_LIFECYCLE_SCOPE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+          LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR: ${{ runner.temp }}/lcm-systemd-${{ github.run_id }}-${{ github.run_attempt }}
+          LCM_LIFECYCLE_DAEMON_PORT: "48322"
+          LCM_LIFECYCLE_EXPECTED_SCOPES: "1"
+        run: |
+          set -Eeuo pipefail
+          barrier_dir="$LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR"
+          cleanup() {
+            set +e
+            if [[ -d "$barrier_dir" ]]; then
+              while IFS= read -r marker; do
+                [[ -f "$marker" ]] || continue
+                unit_name="$(node -e 'const fs = require("node:fs"); const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(value.unitName ?? "");' "$marker" 2>/dev/null)"
+                if [[ "$unit_name" =~ ^lcm-daemon-[0-9a-f]{20}\.service$ ]]; then
+                  systemctl --user stop "$unit_name" || true
+                  systemctl --user reset-failed "$unit_name" || true
+                else
+                  echo "Refusing cleanup for unexpected systemd unit: $unit_name" >&2
+                fi
+              done < <(find "$barrier_dir" -maxdepth 1 -type f -name '*.ready' -print)
+              rm -rf -- "$barrier_dir"
+            fi
+          }
+          trap cleanup EXIT
+          systemd_state="$(systemctl --user is-system-running || true)"
+          case "$systemd_state" in
+            running|degraded) ;;
+            *) echo "Unexpected user-systemd state: $systemd_state" >&2; exit 1 ;;
+          esac
+          npx vitest run test/daemon/lifecycle-isolation.test.ts \
+            --testNamePattern "uses and removes one exact run-owned transient unit"
+          npx vitest run test/daemon/systemd-credential-loader.test.ts \
+            --testNamePattern "observes the real user-systemd LoadCredential modes"
+
+  macos-launchd:
+    name: macOS 15 launchd feasibility
+    needs: environment
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 25.9.0
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "25.9.0"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run launchd integration path
+        env:
+          LCM_LAUNCHD_INTEGRATION: "1"
+          LCM_LAUNCHD_SCOPE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+          LCM_LAUNCHD_RESOURCE_ROOT: ${{ runner.temp }}/lcm-launchd-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -Eeuo pipefail
+          resource_root="$LCM_LAUNCHD_RESOURCE_ROOT"
+          ready_file="$resource_root/launchd.label"
+          evidence_token="$(uuidgen)"
+          export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"
+          validate_marker() {
+            [[ -f "$ready_file" ]] || return 1
+            ready_line="$(<"$ready_file")"
+            ready_token="${ready_line%% *}"
+            ready_label="${ready_line#* }"
+            [[ "$ready_line" == "$ready_token $ready_label" ]] || return 1
+            [[ "$ready_token" == "$evidence_token" ]] || return 1
+            [[ "$ready_label" =~ ^com\.donadiosolutions\.lcm\.daemon\.[0-9a-f]{20}$ ]] || return 1
+            [[ "$(stat -f '%Lp' "$ready_file" 2>/dev/null)" == "600" ]]
+          }
+          cleanup() {
+            set +e
+            if validate_marker; then
+                launchctl bootout "gui/$(id -u)/$ready_label" || true
+            elif [[ -f "$ready_file" ]]; then
+              echo "Refusing cleanup for malformed or foreign launchd evidence" >&2
+            fi
+            rm -rf -- "$resource_root"
+          }
+          trap cleanup EXIT
+          rm -rf -- "$resource_root"
+          mkdir -p -- "$resource_root"
+          chmod 0700 "$resource_root"
+          npx vitest run test/daemon/lifecycle-launchd.integration.test.ts
+          if ! validate_marker; then
+            echo "launchd integration produced malformed or foreign current-run evidence" >&2
+            exit 1
+          fi
+
   ci:
     name: ci
     needs:
       - environment
       - core
       - postgresql
+      - linux-systemd
+      - macos-launchd
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -121,15 +244,19 @@ jobs:
           ENVIRONMENT_RESULT: ${{ needs.environment.result }}
           CORE_RESULT: ${{ needs.core.result }}
           POSTGRESQL_RESULT: ${{ needs.postgresql.result }}
+          LINUX_SYSTEMD_RESULT: ${{ needs.linux-systemd.result }}
+          MACOS_LAUNCHD_RESULT: ${{ needs.macos-launchd.result }}
         run: |
           set -Eeuo pipefail
-          if [[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success ]]; then
+          if [[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success || "$LINUX_SYSTEMD_RESULT" != success || "$MACOS_LAUNCHD_RESULT" != success ]]; then
             echo "Environment result: $ENVIRONMENT_RESULT" >&2
             echo "Core CI result: $CORE_RESULT" >&2
             echo "PostgreSQL matrix result: $POSTGRESQL_RESULT" >&2
+            echo "Linux user-systemd result: $LINUX_SYSTEMD_RESULT" >&2
+            echo "macOS launchd result: $MACOS_LAUNCHD_RESULT" >&2
             exit 1
           fi
-          echo "Environment, Core CI, and every PostgreSQL matrix run passed."
+          echo "Environment, Core CI, every PostgreSQL matrix run, Linux user-systemd integration, and macOS launchd integration passed."
 
   codecov:
     name: Codecov upload

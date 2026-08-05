@@ -39,7 +39,7 @@ Consult `references/checks.md` for detailed pass/fail criteria for each check.
 | 6 | Pipeline | 2 | Full curate + diagnose |
 | 7 | Hooks | 6 | Wiring verification + live tests |
 | 8 | MCP | 8 | All 7 MCP tools + store-retrieve roundtrip |
-| 9 | Resilience | 3 | Kill/restart/graceful degradation |
+| 9 | Resilience | 3 | Managed restart, diagnostics, hook continuity |
 | 10 | Debug | 4 | Logs, PWD, DB existence, integrity |
 
 ## Key Commands

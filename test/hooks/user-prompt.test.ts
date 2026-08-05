@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
 import type { EventsDb as EventsDbType } from "../../src/hooks/events-db.js";
+import * as storageBackend from "../../src/storage/backend.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn(),
@@ -178,14 +182,30 @@ describe("handleUserPromptSubmit", () => {
     });
     const client = { post: vi.fn() };
 
-    const result = await handleUserPromptSubmit(
-      JSON.stringify({ prompt: "we decided to use PostgreSQL", cwd: "/proj", session_id: "s1" }),
-      asDaemonClient(client),
-      3737,
-      {
-        backend: "postgresql",
-      },
-    );
+    const home = mkdtempSync(join(tmpdir(), "lcm-user-prompt-storage-"));
+    const previousHome = process.env.HOME;
+    const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    process.env.HOME = home;
+    let result: Awaited<ReturnType<typeof handleUserPromptSubmit>>;
+    try {
+      result = await handleUserPromptSubmit(
+        JSON.stringify({ prompt: "we decided to use PostgreSQL", cwd: "/proj", session_id: "s1" }),
+        asDaemonClient(client),
+        3737,
+        {
+          backend: "postgresql",
+        },
+      );
+      expect(stderrWrite).toHaveBeenCalledWith(
+        "lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.\n",
+      );
+      expect(stderrWrite.mock.calls.flat().join(" ")).not.toContain("not available in this release");
+    } finally {
+      stderrWrite.mockRestore();
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
 
     expect(order).toEqual(["insert", "close"]);
     expect(mockInsertEvent).toHaveBeenCalledWith(
@@ -198,6 +218,34 @@ describe("handleUserPromptSubmit", () => {
     expect(firePromoteEventsNotifyRequest).not.toHaveBeenCalled();
     expect(client.post).not.toHaveBeenCalled();
     expect(result).toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+  });
+
+  it("sanitizes unexpected storage-selection failures before the protocol-safe return", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-user-prompt-storage-throw-"));
+    const previousHome = process.env.HOME;
+    const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementationOnce(() => {
+      throw new Error("secret /tmp/private-config pid=4242");
+    });
+    process.env.HOME = home;
+    try {
+      const result = await handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        asDaemonClient({ post: vi.fn() }),
+      );
+      expect(result).toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      expect(stderrWrite).toHaveBeenCalledWith(
+        "lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.\n",
+      );
+      expect(stderrWrite.mock.calls.flat().join(" ")).not.toMatch(/secret|private-config|4242/u);
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    } finally {
+      selectStorageBackend.mockRestore();
+      stderrWrite.mockRestore();
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("returns learning-instruction when prompt is missing", async () => {
@@ -505,5 +553,49 @@ describe("handleUserPromptSubmit", () => {
 
     expect(result.stdout).toContain("<!-- surfaced-memory-ids: memory-1 -->");
     expect(result.stdout).not.toContain("memory-2");
+  });
+
+  it("emits sanitized remediation for a refused daemon under a missing state root", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-user-prompt-remediation-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      expect(homedir()).toBe(home);
+      rmSync(join(home, ".lcm"), { recursive: true, force: true });
+      expect(existsSync(join(home, ".lcm"))).toBe(false);
+      mockExtractUserPromptEvents.mockReturnValue([]);
+      mockEnsureDaemon.mockResolvedValueOnce({
+        connected: false,
+        port: 3737,
+        spawned: false,
+        refusalReason: "live-no-response",
+      } as never);
+      const result = await handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        asDaemonClient({ health: vi.fn(), post: vi.fn() }),
+      );
+      expect(result.stdout).toContain("<learning-instruction>");
+
+      mockEnsureDaemon.mockResolvedValueOnce({
+        connected: false,
+        port: 3737,
+        spawned: false,
+        refusalReason: "attacker supplied reason",
+      } as never);
+      await handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        asDaemonClient({ health: vi.fn(), post: vi.fn() }),
+      );
+
+      mockEnsureDaemon.mockRejectedValueOnce(new Error("admission failed"));
+      await handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        asDaemonClient({ health: vi.fn(), post: vi.fn() }),
+      );
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

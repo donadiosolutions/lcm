@@ -32,6 +32,12 @@ import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
 import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
 import {
+  clearDaemonRemediation,
+  isDaemonRefusalReason,
+  mapDaemonRefusalToRemediation,
+  type DaemonRefusalReason,
+} from "../src/daemon/remediation.js";
+import {
   DAEMON_TEST_ENTRYPOINT_OPTION,
   DAEMON_TEST_OWNER_OPTION,
   type DaemonLifecycleTestIdentity,
@@ -1081,6 +1087,40 @@ export function writeCliError(value: string): void {
   process.stderr.write(value);
 }
 
+type LifecycleResultWithRefusal = Readonly<{
+  connected?: boolean;
+  refusalReason?: unknown;
+}>;
+
+function daemonRefusalReason(
+  result: LifecycleResultWithRefusal | undefined,
+  fallback: DaemonRefusalReason = "ambiguous",
+): DaemonRefusalReason {
+  return isDaemonRefusalReason(result?.refusalReason) ? result.refusalReason : fallback;
+}
+
+function daemonRemediationScope(): Readonly<{ scope: string; stateRoot: string }> {
+  const root = lcmHomeDir(homedir());
+  try {
+    const canonical = realpathSync(root);
+    return { scope: canonical, stateRoot: canonical };
+  } catch {
+    const lexical = resolve(root);
+    return { scope: lexical, stateRoot: lexical };
+  }
+}
+
+function daemonUnavailableMessage(
+  result: LifecycleResultWithRefusal | undefined,
+  fallback: DaemonRefusalReason,
+): string {
+  return mapDaemonRefusalToRemediation(daemonRefusalReason(result, fallback)).message;
+}
+
+function clearDaemonRemediationMarker(): void {
+  clearDaemonRemediation(daemonRemediationScope());
+}
+
 async function createDaemonClientOrExit(
   options: { readonly preflightStorage?: boolean } = {},
 ): Promise<DaemonClient> {
@@ -1094,18 +1134,25 @@ async function createDaemonClientOrExit(
   const port = config.daemon?.port ?? 3737;
   const pidFilePath = daemonPidPath();
   const tokenPath = daemonTokenPath();
-  const { connected } = await ensureDaemon({
-    port,
-    pidFilePath,
-    spawnTimeoutMs: 5000,
-    expectedStorageBackend: config.storage.backend,
-    enforceUserManagerParent: true,
-  });
-
-  if (!connected) {
-    console.error("  Daemon not available. Start it with: lcm daemon start --detach");
+  let result: LifecycleResultWithRefusal & { connected: boolean };
+  try {
+    result = await ensureDaemon({
+      port,
+      pidFilePath,
+      spawnTimeoutMs: 5000,
+      expectedStorageBackend: config.storage.backend,
+      enforceUserManagerParent: true,
+    });
+  } catch {
+    console.error(`  ${daemonUnavailableMessage(undefined, "ambiguous")}`);
     exit(1);
   }
+
+  if (!result.connected) {
+    console.error(`  ${daemonUnavailableMessage(result, "not-running")}`);
+    exit(1);
+  }
+  clearDaemonRemediationMarker();
 
   return new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
 }
@@ -1162,19 +1209,25 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         const { loadDaemonConfig } = await import("../src/daemon/config.js");
         const config = loadDaemonConfig(defaultConfigPath());
         const port = config.daemon?.port ?? 3737;
-        const result = await ensureDaemon({
-          port,
-          pidFilePath: daemonPidPath(),
-          spawnTimeoutMs: 10000,
-          expectedVersion: typeof pkg.version === "string" ? pkg.version : undefined,
-          expectedStorageBackend: config.storage.backend,
-          enforceUserManagerParent: true,
-        });
-        if (!result.connected) {
-          console.error("  Daemon not available. Try: lcm daemon start --foreground");
-          if (result.warning) console.error(`  Warning: ${result.warning}`);
+        let result: Awaited<ReturnType<typeof ensureDaemon>>;
+        try {
+          result = await ensureDaemon({
+            port,
+            pidFilePath: daemonPidPath(),
+            spawnTimeoutMs: 10000,
+            expectedVersion: typeof pkg.version === "string" ? pkg.version : undefined,
+            expectedStorageBackend: config.storage.backend,
+            enforceUserManagerParent: true,
+          });
+        } catch {
+          console.error(`  ${daemonUnavailableMessage(undefined, "ambiguous")}`);
           exit(1);
         }
+        if (!result.connected) {
+          console.error(`  ${daemonUnavailableMessage(result, "not-running")}`);
+          exit(1);
+        }
+        clearDaemonRemediationMarker();
         if (result.warning) console.warn(`Warning: ${result.warning}`);
         if (result.restartedForParent) {
           console.log(`lcm daemon restarted under user systemd on port ${port}${result.pid ? ` (PID ${result.pid})` : ""}`);
@@ -1225,20 +1278,26 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       const { restartDaemon } = await import("../src/daemon/lifecycle.js");
       const config = loadDaemonConfig(defaultConfigPath());
       const port = config.daemon?.port ?? 3737;
-      const result = await restartDaemon({
-        port,
-        pidFilePath: daemonPidPath(),
-        spawnTimeoutMs: 10000,
-        expectedVersion: typeof pkg.version === "string" ? pkg.version : undefined,
-        expectedStorageBackend: config.storage.backend,
-        enforceUserManagerParent: true,
-        validateBeforeRestart: () => { loadDaemonConfig(defaultConfigPath()); },
-      });
-      if (!result.connected) {
-        console.error("  Daemon restart failed. Try: lcm daemon start --foreground");
-        if (result.warning) console.error(`  Warning: ${result.warning}`);
+      let result: Awaited<ReturnType<typeof restartDaemon>>;
+      try {
+        result = await restartDaemon({
+          port,
+          pidFilePath: daemonPidPath(),
+          spawnTimeoutMs: 10000,
+          expectedVersion: typeof pkg.version === "string" ? pkg.version : undefined,
+          expectedStorageBackend: config.storage.backend,
+          enforceUserManagerParent: true,
+          validateBeforeRestart: () => { loadDaemonConfig(defaultConfigPath()); },
+        });
+      } catch {
+        console.error(`  ${daemonUnavailableMessage(undefined, "ambiguous")}`);
         exit(1);
       }
+      if (!result.connected) {
+        console.error(`  ${daemonUnavailableMessage(result, "startup-failure")}`);
+        exit(1);
+      }
+      clearDaemonRemediationMarker();
       if (result.warning) console.warn(`Warning: ${result.warning}`);
       const action = result.restarted ? "restarted" : result.spawned ? "started" : "already running";
       console.log(`lcm daemon ${action} on port ${port}${result.pid ? ` (PID ${result.pid})` : ""}`);
@@ -1354,17 +1413,18 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         }
         const port = config.daemon?.port ?? 3737;
         const pidFilePath = daemonPidPath();
-        const { connected } = await ensureDaemon({
+        const daemonResult = await ensureDaemon({
           port,
           pidFilePath,
           spawnTimeoutMs: 10000,
           expectedStorageBackend: config.storage.backend,
           enforceUserManagerParent: true,
         });
-        if (!connected) {
-          console.error("Could not connect to daemon. Start it with: lcm daemon start --detach");
+        if (!daemonResult.connected) {
+          console.error(`Could not connect to daemon: ${daemonUnavailableMessage(daemonResult, "not-running")}`);
           exit(1);
         }
+        clearDaemonRemediationMarker();
         const noPromote: boolean = !opts.promote;
         const minTokens = config.compaction.autoCompactMinTokens;
         const cwd = all ? undefined : process.cwd();
@@ -1416,7 +1476,10 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
                     expectedStorageBackend: config.storage.backend,
                     enforceUserManagerParent: true,
                   });
-                  if (!recovery.connected) throw error;
+                  if (!recovery.connected) {
+                    throw new Error(daemonUnavailableMessage(recovery, "live-no-response"));
+                  }
+                  clearDaemonRemediationMarker();
                   client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
                   result = await client.post("/promote", promotionBody);
                 }
@@ -2330,14 +2393,18 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       selectStorageBackend(config.storage);
       const port = config.daemon?.port ?? 3737;
       const pidFilePath = daemonPidPath();
-      const { connected } = await ensureDaemon({
+      const daemonResult = await ensureDaemon({
         port,
         pidFilePath,
         spawnTimeoutMs: 5000,
         expectedStorageBackend: config.storage.backend,
         enforceUserManagerParent: true,
       });
-      if (!connected) { console.error("  Daemon not available"); exit(1); }
+      if (!daemonResult.connected) {
+        console.error(`  ${daemonUnavailableMessage(daemonResult, "not-running")}`);
+        exit(1);
+      }
+      clearDaemonRemediationMarker();
 
       // Pre-scan for session count (enables accurate live progress bar)
       const claudeProjectsDir = join(homedir(), ".claude", "projects");
@@ -2429,17 +2496,18 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       selectStorageBackend(config.storage);
       const port = config.daemon?.port ?? 3737;
       const pidFilePath = daemonPidPath();
-      const { connected } = await ensureDaemon({
+      const daemonResult = await ensureDaemon({
         port,
         pidFilePath,
         spawnTimeoutMs: 5000,
         expectedStorageBackend: config.storage.backend,
         enforceUserManagerParent: true,
       });
-      if (!connected) {
-        console.error("  Daemon not available. Start it with: lcm daemon start --detach");
+      if (!daemonResult.connected) {
+        console.error(`  ${daemonUnavailableMessage(daemonResult, "not-running")}`);
         exit(1);
       }
+      clearDaemonRemediationMarker();
 
       const client = new DaemonClient(`http://127.0.0.1:${port}`);
       const { readdirSync, existsSync, readFileSync } = await import("node:fs");

@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   linkSync,
@@ -43,6 +44,7 @@ import {
 import { ensureAuthToken } from "../../src/daemon/auth.js";
 import { createDaemon } from "../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
+import { MANAGED_CREDENTIAL_NAMES } from "../../src/daemon/managed-credentials.js";
 import { RUNTIME_DIGEST } from "../../src/daemon/version.js";
 
 type ScopeFixture = {
@@ -55,6 +57,12 @@ type ScopeFixture = {
   spawnProcess: ReturnType<typeof vi.fn>;
   killProcess: ReturnType<typeof vi.fn>;
   isAlive: ReturnType<typeof vi.fn>;
+  supervisor: {
+    probe: ReturnType<typeof vi.fn>;
+    start: ReturnType<typeof vi.fn>;
+    stopAndStart: ReturnType<typeof vi.fn>;
+    stopAndAwaitAbsent: ReturnType<typeof vi.fn>;
+  };
 };
 
 const roots: string[] = [];
@@ -78,6 +86,8 @@ function createFixture(
   mkdirSync(runtimeDir, { recursive: true });
   mkdirSync(stateDir, { recursive: true });
   mkdirSync(credentialDir, { recursive: true });
+  chmodSync(stateDir, 0o700);
+  chmodSync(credentialDir, 0o700);
   writeFileSync(entrypoint, "setTimeout(() => {}, 60_000);\n");
 
   let alive = true;
@@ -111,6 +121,76 @@ function createFixture(
     entrypoint,
     dependencies,
   });
+  let registered = false;
+  let managerPid = 42_424;
+  const supervisor = {
+    probe: vi.fn(async (spec: { scopeDigest: string; nonce: string; name: string }) => registered
+      ? {
+          kind: "registered-running-valid" as const,
+          managerPid,
+          scopeDigest: spec.scopeDigest,
+          nonce: spec.nonce,
+          name: spec.name,
+        }
+      : { kind: "absent" as const, name: spec.name }),
+    start: vi.fn(async (spec: { scopeDigest: string; nonce: string; name: string; stateRoot: string }) => {
+      const result = runSystemd("systemd-run", [
+        "--user",
+        "--no-block",
+        "--quiet",
+        `--unit=${spec.name}`,
+        `--setenv=HOME=${scope.homeDir}`,
+        `--setenv=LCM_DAEMON_OWNER_ID=${scope.ownerId}`,
+        `--setenv=USERPROFILE=${scope.homeDir}`,
+        `--setenv=XDG_RUNTIME_DIR=${scope.runtimeDir}`,
+        scope.entrypoint,
+        "daemon",
+        "start",
+        "--foreground",
+        DAEMON_TEST_OWNER_OPTION,
+        scope.ownerId,
+        DAEMON_TEST_ENTRYPOINT_OPTION,
+        scope.entrypoint,
+      ], {
+        encoding: "utf-8",
+        env: {
+          HOME: scope.homeDir,
+          USERPROFILE: scope.homeDir,
+          XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
+          DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS,
+          LCM_DAEMON_OWNER_ID: scope.ownerId,
+        },
+        timeout: 25,
+      });
+      if (result.status !== 0) throw new Error("manager start failed");
+      registered = true;
+      writeFileSync(join(spec.stateRoot, "daemon.pid"), String(managerPid));
+      return {
+        kind: "systemd-user" as const,
+        name: spec.name,
+        scopeDigest: spec.scopeDigest,
+        port: 48_321,
+        nonce: spec.nonce,
+        managerPid,
+      };
+    }),
+    stopAndStart: vi.fn(async (spec: { scopeDigest: string; nonce: string; name: string; stateRoot: string }) => {
+      registered = true;
+      writeFileSync(join(spec.stateRoot, "daemon.pid"), String(managerPid));
+      return {
+        kind: "systemd-user" as const,
+        name: spec.name,
+        scopeDigest: spec.scopeDigest,
+        port: 48_321,
+        nonce: spec.nonce,
+        managerPid,
+      };
+    }),
+    stopAndAwaitAbsent: vi.fn(async (spec: { name: string }) => {
+      registered = false;
+      await stopUnit(spec.name);
+    }),
+  };
   return {
     root,
     scope,
@@ -121,6 +201,7 @@ function createFixture(
     spawnProcess,
     killProcess,
     isAlive,
+    supervisor,
   };
 }
 
@@ -135,6 +216,7 @@ function scopedOptions(fixture: ScopeFixture): Parameters<typeof ensureDaemon>[0
     _platform: "linux",
     _testScope: fixture.scope,
     _skipHealthWait: true,
+    _supervisorOverride: fixture.supervisor as never,
   };
 }
 
@@ -857,8 +939,9 @@ describe("daemon lifecycle test-scope validation", () => {
     await expect(ensureDaemon(options)).resolves.toMatchObject({
       connected: false,
       spawned: false,
+      refusalReason: "ambiguous",
     });
-    expect(existsSync(fixture.pidPath)).toBe(false);
+    expect(existsSync(fixture.pidPath)).toBe(true);
   });
 
   it("blocks an unscoped Vitest worker before host discovery or mutation", async () => {
@@ -1020,11 +1103,26 @@ describe("daemon lifecycle test-scope validation", () => {
     expect(readdirSync(fixture.scope.stateDir)).toEqual(stateBefore);
   });
 
-  it("preserves canonical unit naming for a fully mocked no-scope production invocation", async () => {
+  it("uses a stable canonical manager name for a fully mocked no-scope production invocation", async () => {
     const fixture = createFixture("production-default");
     const previousEntrypoint = process.argv[1];
     process.argv[1] = fixture.scope.entrypoint;
-    const runSystemd = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+    let observedSpec: { scopeDigest: string; nonce: string; name: string } | undefined;
+    let started = false;
+    const supervisor = {
+      probe: vi.fn(async (spec: typeof observedSpec) => {
+        observedSpec = spec!;
+        return started
+          ? { kind: "registered-running-valid" as const, managerPid: 42_424, scopeDigest: spec!.scopeDigest, nonce: spec!.nonce, name: spec!.name }
+          : { kind: "absent" as const, name: spec!.name };
+      }),
+      start: vi.fn(async (spec: typeof observedSpec) => {
+        started = true;
+        return { kind: "systemd-user" as const, name: spec!.name, scopeDigest: spec!.scopeDigest, nonce: spec!.nonce, port: 37_345, managerPid: 42_424 };
+      }),
+      stopAndStart: vi.fn(),
+      stopAndAwaitAbsent: vi.fn(),
+    };
     try {
       await expect(ensureDaemon({
         port: 37_345,
@@ -1035,7 +1133,7 @@ describe("daemon lifecycle test-scope validation", () => {
         spawnArgs: [fixture.scope.entrypoint],
         _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as never,
         _spawnOverride: fixture.spawnProcess as never,
-        _spawnSyncOverride: runSystemd as never,
+        _supervisorOverride: supervisor as never,
         _killOverride: fixture.killProcess,
         _isProcessAliveOverride: (): boolean => false,
         _sleepOverride: async () => undefined,
@@ -1052,12 +1150,9 @@ describe("daemon lifecycle test-scope validation", () => {
     } finally {
       process.argv[1] = previousEntrypoint;
     }
-    const systemdArgs = runSystemd.mock.calls[0]![1] as string[];
-    expect(systemdArgs.find(arg => arg.startsWith("--unit=")))
-      .toMatch(/^--unit=lcm-daemon-[0-9]+-[0-9]+$/u);
-    expect(systemdArgs.find(arg => arg.startsWith("--setenv=LCM_DAEMON_OWNER_ID=")))
-      .toBeUndefined();
-    expect(fixture.stopUnit).not.toHaveBeenCalled();
+    expect(observedSpec?.name).toMatch(/^lcm-daemon-[a-f0-9]{20}\.service$/u);
+    expect(supervisor.probe).toHaveBeenCalledTimes(2);
+    expect(supervisor.start).toHaveBeenCalledOnce();
   });
 
   it("preserves no-scope production PID cleanup and detached PID writes", async () => {
@@ -1169,6 +1264,9 @@ describe("daemon lifecycle test-scope validation", () => {
           ? { ok: true, status: 200, json: async () => restartHealth }
           : { ok: true, status: 200, json: async () => ({}) }
       ));
+      const processIdentity = vi.fn((command: string) => command === "/bin/ps"
+        ? { status: 0, stdout: "node lcm daemon start --foreground\n", stderr: "" }
+        : { status: 0, stdout: "", stderr: "" });
       await expect(restartDaemon({
         port: 37_352,
         pidFilePath: restartPidPath,
@@ -1177,6 +1275,7 @@ describe("daemon lifecycle test-scope validation", () => {
         expectedEntrypoint: fixture.scope.entrypoint,
         _platform: "darwin",
         _fetchOverride: fetchRestart as never,
+        _spawnSyncOverride: processIdentity as never,
         _isProcessAliveOverride: () => alive,
         _killOverride: kill,
         _sleepOverride: async () => undefined,
@@ -1246,8 +1345,7 @@ describe("run-owned lifecycle resources", () => {
     expect(fixture.runSystemd).toHaveBeenCalledOnce();
     const [, args, options] = fixture.runSystemd.mock.calls[0]!;
     const unitArg = (args as string[]).find(arg => arg.startsWith("--unit="));
-    expect(unitArg).toMatch(/^--unit=lcm-test-daemon-owned-success-[0-9]+-[0-9]+$/u);
-    expect(unitArg).not.toContain("--unit=lcm-daemon-");
+    expect(unitArg).toMatch(/^--unit=lcm-daemon-[a-f0-9]{20}\.service$/u);
     expect(args).toContain(`--setenv=HOME=${fixture.scope.homeDir}`);
     expect(args).toContain(`--setenv=LCM_DAEMON_OWNER_ID=${fixture.scope.ownerId}`);
     expect(args).toContain(`--setenv=XDG_RUNTIME_DIR=${fixture.scope.runtimeDir}`);
@@ -1270,7 +1368,7 @@ describe("run-owned lifecycle resources", () => {
     expect(options.env.LCM_DAEMON_OWNER_ID).toBe(fixture.scope.ownerId);
     expect(options.env.LCM_DATABASE_PATH).toBeUndefined();
     expect(options.env.LCM_SUMMARY_API_KEY).toBeUndefined();
-    expect(fixture.stopUnit).toHaveBeenCalledExactlyOnceWith(unitArg!.slice("--unit=".length));
+    expect(fixture.stopUnit).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/^lcm-daemon-[a-f0-9]{20}\.service$/u));
     expect(existsSync(fixture.scope.stateDir)).toBe(false);
     expect(existsSync(fixture.scope.runtimeDir)).toBe(false);
     expect(existsSync(fixture.scope.credentialDir)).toBe(false);
@@ -1289,28 +1387,44 @@ describe("run-owned lifecycle resources", () => {
     expect(existsSync(fixture.scope.stateDir)).toBe(false);
   });
 
-  it("cleans the exact unit and fallback process after systemd failure", async () => {
+  it("refuses detached fallback after a manager operation fails", async () => {
     const fixture = createFixture("owned-failure");
     fixture.runSystemd.mockReturnValue({ status: 1, stdout: "", stderr: "failed" });
     const result = await ensureDaemon(scopedOptions(fixture));
-    expect(result.startMethod).toBe("detached-spawn");
-    expect(result.warning).toContain("used detached spawn fallback");
-    expect(fixture.stopUnit).toHaveBeenCalledOnce();
-    expect(fixture.spawnProcess).toHaveBeenCalledOnce();
-    expect(fixture.killProcess).toHaveBeenCalledWith(42_424, "SIGTERM");
+    expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "startup-failure" });
+    expect(fixture.stopUnit).not.toHaveBeenCalled();
+    expect(fixture.spawnProcess).not.toHaveBeenCalled();
     expect(existsSync(fixture.scope.stateDir)).toBe(false);
   });
 
   it("cleans on a health timeout", async () => {
-    const fixture = createFixture("owned-timeout");
+    let postStartHealthProbe = false;
+    const fetch = vi.fn(async () => {
+      postStartHealthProbe = fetch.mock.calls.length > 1;
+      throw new Error("offline");
+    });
+    const fixture = createFixture("owned-timeout", { fetch: fetch as never });
     const result = await ensureDaemon({
       ...scopedOptions(fixture),
       spawnTimeoutMs: 3,
       _skipHealthWait: false,
+      _monotonicNowOverride: () => postStartHealthProbe ? 3 : 0,
     });
-    expect(result).toMatchObject({ connected: false, spawned: true });
-    expect(fixture.stopUnit).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      connected: false,
+      spawned: true,
+      refusalReason: "startup-failure",
+      startMethod: "systemd-user",
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fixture.supervisor.start).toHaveBeenCalledOnce();
+    const startedUnit = (fixture.supervisor.start.mock.calls[0]?.[0] as { name?: unknown } | undefined)?.name;
+    expect(startedUnit).toEqual(expect.stringMatching(/^lcm-daemon-[a-f0-9]{20}\.service$/u));
+    expect(fixture.supervisor.stopAndAwaitAbsent).toHaveBeenCalledOnce();
+    expect(fixture.stopUnit).toHaveBeenCalledExactlyOnceWith(startedUnit);
     expect(existsSync(fixture.scope.stateDir)).toBe(false);
+    expect(existsSync(fixture.scope.runtimeDir)).toBe(false);
+    expect(existsSync(fixture.scope.credentialDir)).toBe(false);
   });
 
   it("cleans immediately and reports interruption once", async () => {
@@ -1375,23 +1489,12 @@ describe("run-owned lifecycle resources", () => {
     const fixture = createFixture("owned-rejecting-cleanup", {
       fetch: fetch as never,
     });
-    fixture.runSystemd.mockReturnValue({ status: 1, stdout: "", stderr: "fallback" });
-    const stopUnit = vi.fn(async () => {
-      throw new Error("stop failed");
-    });
-    const scope = createDaemonLifecycleTestScope({
-      ...fixture.scope,
-      dependencies: {
-        ...fixture.scope.dependencies,
-        stopUnit,
-      },
-    });
+    fixture.supervisor.stopAndAwaitAbsent.mockRejectedValue(new Error("stop failed"));
     const unhandled = vi.fn();
     process.on("unhandledRejection", unhandled);
     try {
       const operation = ensureDaemon({
         ...scopedOptions(fixture),
-        _testScope: scope,
         spawnTimeoutMs: 500,
         _skipHealthWait: false,
         _abortSignal: controller.signal,
@@ -1400,8 +1503,8 @@ describe("run-owned lifecycle resources", () => {
       controller.abort();
       await expect(operation).rejects.toThrow("stop failed");
       await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(stopUnit).toHaveBeenCalledOnce();
-      expect(fixture.killProcess).toHaveBeenCalledWith(42_424, "SIGTERM");
+      expect(fixture.supervisor.stopAndAwaitAbsent).toHaveBeenCalledOnce();
+      expect(fixture.killProcess).not.toHaveBeenCalled();
       expect(existsSync(fixture.scope.stateDir)).toBe(false);
       expect(existsSync(fixture.scope.runtimeDir)).toBe(false);
       expect(existsSync(fixture.scope.credentialDir)).toBe(false);
@@ -1414,6 +1517,15 @@ describe("run-owned lifecycle resources", () => {
   it("cleans when interrupted during transient-unit startup", async () => {
     const controller = new AbortController();
     const fixture = createFixture("owned-startup-interrupt");
+    let started = false;
+    fixture.supervisor.probe.mockImplementation(async (spec: { scopeDigest: string; nonce: string; name: string }) => started
+      ? { kind: "registered-running-valid", managerPid: 42_424, scopeDigest: spec.scopeDigest, nonce: spec.nonce, name: spec.name }
+      : { kind: "absent", name: spec.name });
+    fixture.supervisor.start.mockImplementation(async (spec: { scopeDigest: string; nonce: string; name: string }) => {
+      started = true;
+      controller.abort();
+      return { kind: "systemd-user", name: spec.name, scopeDigest: spec.scopeDigest, nonce: spec.nonce, port: 48_321, managerPid: 42_424 };
+    });
     const scope = createDaemonLifecycleTestScope({
       ...fixture.scope,
       dependencies: {
@@ -1528,10 +1640,11 @@ describe("run-owned lifecycle resources", () => {
     })).resolves.toMatchObject({
       connected: false,
       spawned: false,
-      warning: expect.stringContaining("could not be authenticated"),
+      refusalReason: "invalid-collision",
+      warning: expect.stringContaining("live PID owns its state"),
     });
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(existsSync(fixture.pidPath)).toBe(false);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(existsSync(fixture.pidPath)).toBe(true);
     expect(fixture.killProcess).not.toHaveBeenCalled();
     expect(fixture.stopUnit).not.toHaveBeenCalled();
     expect(fixture.runSystemd).not.toHaveBeenCalled();
@@ -1605,7 +1718,7 @@ describe("run-owned lifecycle resources", () => {
     expect(fixture.stopUnit).not.toHaveBeenCalled();
   });
 
-  it("rejects a token leaf swap immediately before startup token access", async () => {
+  it("refuses a token leaf swap before startup token access", async () => {
     const fixture = createFixture("swap-token-startup");
     const spawnArgs = [fixture.scope.entrypoint, "daemon", "start", "--foreground"];
     Object.defineProperty(spawnArgs, "0", {
@@ -1619,14 +1732,19 @@ describe("run-owned lifecycle resources", () => {
     await expect(ensureDaemon({
       ...scopedOptions(fixture),
       spawnArgs,
-    })).rejects.toThrow("unsafe daemon lifecycle token access");
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      refusalReason: "invalid-collision",
+    });
+    expect(existsSync(fixture.tokenPath)).toBe(true);
     expect(readdirSync(fixture.tokenPath)).toEqual([]);
     expect(fixture.runSystemd).not.toHaveBeenCalled();
     expect(fixture.spawnProcess).not.toHaveBeenCalled();
     expect(fixture.killProcess).not.toHaveBeenCalled();
   });
 
-  it("rejects a token leaf swap after PID identity without accessing the replacement", async () => {
+  it("refuses a token leaf swap after PID identity without accessing the replacement", async () => {
     const fixture = createFixture("swap-token-after-pid");
     writeFileSync(fixture.pidPath, "5153");
     const fetch = vi.fn(async () => ({
@@ -1657,14 +1775,18 @@ describe("run-owned lifecycle resources", () => {
       _testScope: scope,
       _skipSpawn: true,
       _listeningPortsOverride: listeningPorts,
-    })).rejects.toThrow("unsafe daemon lifecycle token read");
-    expect(listeningPorts).toHaveBeenCalledOnce();
-    expect(readdirSync(fixture.tokenPath)).toEqual([]);
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      refusalReason: "invalid-collision",
+    });
+    expect(listeningPorts).not.toHaveBeenCalled();
+    expect(existsSync(fixture.tokenPath)).toBe(false);
     expect(fixture.killProcess).not.toHaveBeenCalled();
     expect(fixture.stopUnit).not.toHaveBeenCalled();
   });
 
-  it("propagates a scoped state swap discovered during stale-PID inspection", async () => {
+  it("refuses a scoped state swap before stale-PID recovery", async () => {
     const fixture = createFixture("swap-stale-pid");
     writeFileSync(fixture.pidPath, "5154");
     const targetRoot = mkdtempSync(join(tmpdir(), "lcm-lifecycle-stale-target-"));
@@ -1688,13 +1810,17 @@ describe("run-owned lifecycle resources", () => {
       ...scopedOptions(fixture),
       _testScope: scope,
       _skipSpawn: true,
-    })).rejects.toThrow("canonical owned file");
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      refusalReason: "invalid-collision",
+    });
     expect(readFileSync(join(targetRoot, "daemon.pid"), "utf-8")).toBe("9194");
     expect(fixture.killProcess).not.toHaveBeenCalled();
     expect(fixture.stopUnit).not.toHaveBeenCalled();
   });
 
-  it("rejects a state-root swap during health discovery before PID or token access", async () => {
+  it("refuses a state-root swap during health discovery before PID or token access", async () => {
     const fixture = createFixture("swap-health");
     writeFileSync(fixture.pidPath, "5151");
     ensureAuthToken(fixture.tokenPath);
@@ -1733,7 +1859,11 @@ describe("run-owned lifecycle resources", () => {
       _testScope: scope,
       _skipSpawn: true,
       _listeningPortsOverride: () => [48_321],
-    })).rejects.toThrow("canonical owned file");
+    })).resolves.toMatchObject({
+      connected: false,
+      spawned: false,
+      refusalReason: "invalid-collision",
+    });
     expect(readFileSync(join(targetRoot, "daemon.pid"), "utf-8")).toBe("9191");
     expect(readFileSync(join(targetRoot, "daemon.token"), "utf-8")).toBe("target-secret");
     expect(statSync(join(targetRoot, "daemon.pid")).mode & 0o777).toBe(0o640);
@@ -1790,6 +1920,7 @@ describe("run-owned lifecycle resources", () => {
         stopUnit,
       },
     });
+    fixture.supervisor.stopAndAwaitAbsent.mockImplementation(async (spec: { name: string }) => stopUnit(spec.name));
     await expect(ensureDaemon({
       ...scopedOptions(fixture),
       _testScope: scope,
@@ -1816,6 +1947,8 @@ describe("run-owned lifecycle resources", () => {
     });
 
     const stopUnit = vi.fn(async () => {
+      rmSync(fixture.pidPath, { force: true });
+      ensureAuthToken(fixture.tokenPath);
       linkSync(pidTarget, fixture.pidPath);
       linkSync(fixture.tokenPath, tokenTarget);
       linkSync(fixture.scope.entrypoint, entrypointLink);
@@ -1829,6 +1962,7 @@ describe("run-owned lifecycle resources", () => {
         stopUnit,
       },
     });
+    fixture.supervisor.stopAndAwaitAbsent.mockImplementation(async (spec: { name: string }) => stopUnit(spec.name));
 
     const previousSummaryApiKey = process.env.LCM_SUMMARY_API_KEY;
     process.env.LCM_SUMMARY_API_KEY = "cleanup-stage-credential";
@@ -1854,7 +1988,7 @@ describe("run-owned lifecycle resources", () => {
     const messages = flattenMessages(failure);
     expect(messages.filter(message => message.includes(
       "state paths changed or escaped",
-    ))).toHaveLength(2);
+    ))).toHaveLength(1);
     expect(messages).toContain(
       `lifecycle test cleanup root is not current owned state: ${fixture.scope.runtimeDir}`,
     );
@@ -1892,6 +2026,8 @@ describe("run-owned lifecycle resources", () => {
     expect(leftUnit).not.toBe(rightUnit);
     expect(left.stopUnit).toHaveBeenCalledExactlyOnceWith(leftUnit.slice(7));
     expect(right.stopUnit).toHaveBeenCalledExactlyOnceWith(rightUnit.slice(7));
+    expect(leftUnit).toMatch(/^--unit=lcm-daemon-[0-9a-f]{20}\.service$/);
+    expect(rightUnit).toMatch(/^--unit=lcm-daemon-[0-9a-f]{20}\.service$/);
     expect(left.stopUnit).not.toHaveBeenCalledWith(rightUnit.slice(7));
     expect(right.stopUnit).not.toHaveBeenCalledWith(leftUnit.slice(7));
     expect(existsSync(left.scope.stateDir)).toBe(false);
@@ -1988,7 +2124,11 @@ describe("run-owned lifecycle resources", () => {
       _testScope: scope,
       _platform: "darwin",
       _listeningPortsOverride: () => [48_321],
-    })).rejects.toThrow("not a verified LCM daemon");
+    })).resolves.toMatchObject({
+      restarted: false,
+      refusalReason: "not-running",
+      warning: expect.stringContaining("PID state is live"),
+    });
     expect(fixture.killProcess).not.toHaveBeenCalled();
   });
 
@@ -2021,10 +2161,14 @@ describe("run-owned lifecycle resources", () => {
       spawned: true,
       startMethod: "systemd-user" as const,
     }));
+    fixture.runSystemd.mockImplementation((command: string) => command === "/bin/ps"
+      ? { status: 0, stdout: "node lcm daemon start --foreground\n", stderr: "" }
+      : { status: 0, stdout: "", stderr: "" });
     await expect(restartDaemon({
       ...scopedOptions(fixture),
       _testScope: scope,
       _platform: "darwin",
+      enforceUserManagerParent: false,
       _listeningPortsOverride: () => [48_321],
       _ensureDaemonOverride: replacement,
     })).resolves.toMatchObject({
@@ -2045,6 +2189,7 @@ describe("run-owned lifecycle resources", () => {
     });
     await expect(restartDaemon({
       ...scopedOptions(fixture),
+      enforceUserManagerParent: false,
       _isManagedProcessOverride: isManaged,
     })).rejects.toThrow("PID changed before restart signaling");
     expect(isManaged).toHaveBeenCalledExactlyOnceWith(7374);
@@ -2072,6 +2217,7 @@ describe("run-owned lifecycle resources", () => {
 
     await expect(restartDaemon({
       ...scopedOptions(fixture),
+      enforceUserManagerParent: false,
       _abortSignal: controller.signal,
       _isManagedProcessOverride: isManaged,
       _ensureDaemonOverride: replacement,
@@ -2119,6 +2265,7 @@ describe("run-owned lifecycle resources", () => {
       ...scopedOptions(workerFixture),
       _testScope: workerScope,
       _platform: "darwin",
+      enforceUserManagerParent: false,
       _listeningPortsOverride: () => [48_321],
     })).rejects.toThrow("not a verified LCM daemon");
     expect(workerFixture.killProcess).not.toHaveBeenCalled();
@@ -2130,13 +2277,11 @@ describe("run-owned lifecycle resources", () => {
     await expect(restartDaemon({
       ...scopedOptions(interruptedFixture),
       _platform: "darwin",
+      enforceUserManagerParent: false,
       _listeningPortsOverride: () => [48_321],
       _abortSignal: controller.signal,
     })).rejects.toThrow("not a verified LCM daemon");
-    expect(interruptedFixture.scope.dependencies.fetch).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({ signal: expect.objectContaining({ aborted: true }) }),
-    );
+    expect(interruptedFixture.scope.dependencies.fetch).not.toHaveBeenCalled();
     expect(interruptedFixture.killProcess).not.toHaveBeenCalled();
 
     const elapsedFixture = createFixture("restart-deadline");
@@ -2147,6 +2292,7 @@ describe("run-owned lifecycle resources", () => {
     await expect(restartDaemon({
       ...scopedOptions(elapsedFixture),
       spawnTimeoutMs: 10,
+      enforceUserManagerParent: false,
       _platform: "darwin",
       _listeningPortsOverride: () => [48_321],
       _monotonicNowOverride: monotonicNow,
@@ -2266,7 +2412,51 @@ describe("same-user-systemd integration", () => {
       throw new Error(`run-owned systemd unit was not collected: ${unit}`);
     };
     const runSystemd = ((command: string, args: readonly string[], options: object) => {
-      unitName = args.find(arg => arg.startsWith("--unit="))!.slice(7);
+      if (command === "systemd-run" || command === "systemctl") {
+        const managerEnvironment = (options as { env?: NodeJS.ProcessEnv }).env;
+        expect(managerEnvironment?.XDG_RUNTIME_DIR).toBe(process.env.XDG_RUNTIME_DIR);
+        if (process.env.DBUS_SESSION_BUS_ADDRESS !== undefined) {
+          expect(managerEnvironment?.DBUS_SESSION_BUS_ADDRESS).toBe(process.env.DBUS_SESSION_BUS_ADDRESS);
+        }
+        expect(managerEnvironment?.HOME).toBeUndefined();
+        expect(managerEnvironment?.LCM_POSTGRES_URL).toBeUndefined();
+      }
+      if (command === "systemd-run") {
+        const unitArg = args.find(arg => arg.startsWith("--unit="));
+        if (unitArg === undefined) {
+          return {
+            status: 2,
+            stdout: "",
+            stderr: "systemd-run integration invocation did not name a unit",
+          };
+        }
+        const requestedUnit = unitArg.slice(7);
+        if (unitName !== "" && requestedUnit !== unitName) {
+          return {
+            status: 2,
+            stdout: "",
+            stderr: "systemd-run integration unit changed",
+          };
+        }
+        unitName = requestedUnit;
+      } else if (command === "systemctl") {
+        const requestedUnit = args.at(-1);
+        if (requestedUnit === undefined) {
+          return {
+            status: 2,
+            stdout: "",
+            stderr: "systemctl integration invocation did not name a unit",
+          };
+        }
+        if (unitName !== "" && requestedUnit !== unitName) {
+          return {
+            status: 2,
+            stdout: "",
+            stderr: "systemctl integration unit changed",
+          };
+        }
+        unitName = requestedUnit;
+      }
       const result = spawnSync(command, args, options);
       if (result.status !== 0) {
         console.info("[lcm lifecycle systemd failure]", JSON.stringify({
@@ -2358,7 +2548,7 @@ describe("same-user-systemd integration", () => {
         expect(new Set(ownership.map(resource => resource[key])).size).toBe(expectedScopes);
       }
       for (const resource of ownership) {
-        expect(resource.unitName).toMatch(/^lcm-test-daemon-/u);
+        expect(resource.unitName).toMatch(/^lcm-daemon-[a-f0-9]{20}\.service$/u);
         expect(resource.stateDir).toBe(join(resource.homeDir, ".lcm"));
       }
       writeFileSync(join(barrierDir, `${ownerId}.checked`), `${unitName}\n`);
@@ -2382,23 +2572,33 @@ describe("same-user-systemd integration", () => {
         sleep: async ms => new Promise(resolve => setTimeout(resolve, ms)),
       },
     });
-    const result = await ensureDaemon({
-      port: 48_322,
-      pidFilePath: join(stateDir, "daemon.pid"),
-      spawnTimeoutMs: 10_000,
-      expectedVersion: "1.4.2",
-      enforceUserManagerParent: true,
-      spawnCommand: process.execPath,
-      _platform: "linux",
-      _testScope: scope,
-      _skipHealthWait: true,
-    });
-    expect(result).toMatchObject({
-      startMethod: "systemd-user",
-      warning: undefined,
-    });
-    expect(unitName).toMatch(new RegExp(`^${scope.unitPrefix}[0-9]+-[0-9]+$`, "u"));
-    expect(unitName).not.toMatch(/^lcm-daemon-/u);
+    const savedManagedCredentials = Object.fromEntries(
+      MANAGED_CREDENTIAL_NAMES.map(name => [name, process.env[name]]),
+    );
+    for (const name of MANAGED_CREDENTIAL_NAMES) delete process.env[name];
+    let result: Awaited<ReturnType<typeof ensureDaemon>>;
+    try {
+      result = await ensureDaemon({
+        port: 48_322,
+        pidFilePath: join(stateDir, "daemon.pid"),
+        spawnTimeoutMs: 10_000,
+        expectedVersion: "1.4.2",
+        enforceUserManagerParent: true,
+        spawnCommand: process.execPath,
+        _platform: "linux",
+        _testScope: scope,
+        _skipHealthWait: true,
+      });
+    } finally {
+      for (const name of MANAGED_CREDENTIAL_NAMES) {
+        const value = savedManagedCredentials[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+    expect(result.startMethod).toBe("systemd-user");
+    expect(result.warning).toBeUndefined();
+    expect(unitName).toMatch(/^lcm-daemon-[a-f0-9]{20}\.service$/u);
     expect(existsSync(stateDir)).toBe(false);
     expect(existsSync(runtimeDir)).toBe(false);
     expect(existsSync(credentialDir)).toBe(false);

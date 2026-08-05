@@ -13,6 +13,7 @@ import {
   closeSync,
   fchmodSync,
   openSync,
+  linkSync,
   realpathSync,
   statSync as fsStatSync,
   unlinkSync,
@@ -27,6 +28,7 @@ import {
   atomicWritePrivateFile,
   atomicWritePrivateFileExclusive,
   copyRegularFilePrivateExclusive,
+  consumeBoundedRegularFile,
   deleteRegularFile,
   ensurePrivateDirectory,
   readBoundedRegularFile,
@@ -47,6 +49,72 @@ function makeRoot(): string {
 }
 
 describe("private filesystem primitives", () => {
+  it("consumes a bounded regular file only after descriptor and inode revalidation", () => {
+    const root = makeRoot();
+    const path = join(root, "credential");
+    writeFileSync(path, "secret\n", { mode: 0o600 });
+    expect(consumeBoundedRegularFile(path, { allowedRoot: root, maxBytes: 1024 })).toBe("secret\n");
+    expect(existsSync(path)).toBe(false);
+
+    const idempotent = join(root, "idempotent");
+    writeFileSync(idempotent, "value", { mode: 0o600 });
+    expect(consumeBoundedRegularFile(idempotent, {
+      allowedRoot: root,
+      maxBytes: 1024,
+      _beforeUnlinkForTesting: () => unlinkSync(idempotent),
+    })).toBe("value");
+    expect(existsSync(idempotent)).toBe(false);
+  });
+
+  it("preserves a replaced or linked leaf instead of consuming an ambiguous path", () => {
+    const root = makeRoot();
+    const path = join(root, "credential");
+    const replacement = join(root, "replacement");
+    writeFileSync(path, "secret", { mode: 0o600 });
+    writeFileSync(replacement, "replacement", { mode: 0o600 });
+    expect(() => consumeBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 1024,
+      _beforeUnlinkForTesting: () => {
+        rmSync(path);
+        symlinkSync(replacement, path);
+      },
+    })).toThrow("changed");
+    expect(readFileSync(path)).toEqual(readFileSync(replacement));
+
+    rmSync(path);
+    writeFileSync(path, "secret", { mode: 0o600 });
+    const hardlink = join(root, "hardlink");
+    linkSync(path, hardlink);
+    expect(() => consumeBoundedRegularFile(path, { allowedRoot: root, maxBytes: 1024 })).toThrow("changed");
+    expect(existsSync(path)).toBe(true);
+    expect(existsSync(hardlink)).toBe(true);
+  });
+
+  it("revalidates expected ownership and exact mode across the consume unlink race", () => {
+    const root = makeRoot();
+    const path = join(root, "credential-metadata-race");
+    writeFileSync(path, "secret", { mode: 0o600 });
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    expect(() => consumeBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 1024,
+      expectedUid,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+      _beforeUnlinkForTesting: () => chmodSync(path, 0o644),
+    })).toThrow("mode");
+    expect(existsSync(path)).toBe(true);
+    chmodSync(path, 0o600);
+    expect(consumeBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 1024,
+      expectedUid,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+    })).toBe("secret");
+  });
+
   it("creates and tightens private directories", () => {
     const path = join(makeRoot(), "private");
     mkdirSync(path, { mode: 0o755 });
@@ -296,6 +364,56 @@ describe("private filesystem primitives", () => {
     })).toThrow("size limit");
   });
 
+  it("enforces optional ownership, mode, link-count, and post-read identity checks", () => {
+    const root = makeRoot();
+    const path = join(root, "metadata");
+    const hardlink = join(root, "metadata-link");
+    writeFileSync(path, "original", { mode: 0o400 });
+
+    expect(() => readBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 100,
+      allowedModes: [0o600],
+    })).toThrow("mode");
+    expect(() => readBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 100,
+      expectedUid: (typeof process.getuid === "function" ? process.getuid() : 0) + 1,
+    })).toThrow("owner");
+
+    linkSync(path, hardlink);
+    expect(() => readBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 100,
+      requireSingleLink: true,
+    })).toThrow("hard links");
+    unlinkSync(hardlink);
+
+    expect(() => readBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 100,
+      allowedModes: [0o400],
+      _beforeReadForTesting: () => {
+        chmodSync(path, 0o600);
+        writeFileSync(path, "changed");
+        chmodSync(path, 0o400);
+      },
+    })).toThrow("changed during validation");
+
+    const postStat = join(root, "post-stat");
+    writeFileSync(postStat, "original", { mode: 0o400 });
+    expect(() => readBoundedRegularFile(postStat, {
+      allowedRoot: root,
+      maxBytes: 100,
+      allowedModes: [0o400],
+      _beforePostStatForTesting: () => {
+        chmodSync(postStat, 0o600);
+        writeFileSync(postStat, "post-stat");
+        chmodSync(postStat, 0o400);
+      },
+    })).toThrow("changed during validation");
+  });
+
   it("rejects an intermediate-directory swap between containment validation and open", () => {
     const root = makeRoot();
     const outside = makeRoot();
@@ -328,6 +446,62 @@ describe("private filesystem primitives", () => {
         writeFileSync(path, "replacement");
       },
     })).toThrow("changed during validation");
+  });
+
+  it("rejects a leaf replacement before open and path changes after the read", () => {
+    const root = makeRoot();
+    const outside = makeRoot();
+    const beforeOpen = join(root, "before-open");
+    writeFileSync(beforeOpen, "original", { mode: 0o600 });
+    expect(() => readBoundedRegularFile(beforeOpen, {
+      allowedRoot: root,
+      maxBytes: 100,
+      _beforeOpenForTesting: () => {
+        renameSync(beforeOpen, join(root, "before-open-original"));
+        writeFileSync(beforeOpen, "replacement", { mode: 0o600 });
+      },
+    })).toThrow("changed during validation");
+
+    const escaped = join(root, "escaped");
+    const outsideFile = join(outside, "outside");
+    writeFileSync(escaped, "trusted", { mode: 0o600 });
+    writeFileSync(outsideFile, "outside", { mode: 0o600 });
+    expect(() => readBoundedRegularFile(escaped, {
+      allowedRoot: root,
+      maxBytes: 100,
+      _beforeReadForTesting: () => {
+        renameSync(escaped, join(root, "escaped-original"));
+        symlinkSync(outsideFile, escaped);
+      },
+    })).toThrow("outside");
+
+    const changed = join(root, "changed-after-read");
+    writeFileSync(changed, "trusted", { mode: 0o600 });
+    expect(() => readBoundedRegularFile(changed, {
+      allowedRoot: root,
+      maxBytes: 100,
+      _beforeReadForTesting: () => {
+        renameSync(changed, join(root, "changed-after-read-original"));
+        writeFileSync(changed, "replacement", { mode: 0o600 });
+      },
+    })).toThrow("changed during validation");
+  });
+
+  it("rejects a credential consume when its parent is replaced", () => {
+    const root = makeRoot();
+    const outside = makeRoot();
+    const parent = join(root, "credentials");
+    const path = join(parent, "OPENAI_API_KEY");
+    mkdirSync(parent);
+    writeFileSync(path, "secret", { mode: 0o600 });
+    expect(() => consumeBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 100,
+      _beforeUnlinkForTesting: () => {
+        renameSync(parent, join(root, "credentials-original"));
+        symlinkSync(outside, parent, "dir");
+      },
+    })).toThrow("parent changed");
   });
 
   it("rejects symlinks, directories, escaped parents, oversized files, and invalid limits", () => {

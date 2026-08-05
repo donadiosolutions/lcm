@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
@@ -430,6 +430,41 @@ describe("runDoctor project map checks", () => {
 });
 
 describe("runDoctor daemon version mismatch", () => {
+  it("uses a lexical remediation scope when the state root is absent", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-remediation-"));
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        cwd: "/tmp/nonexistent-project-xyz",
+      }));
+      expect(results.find((result) => result.name === "daemon")?.message).toContain(
+        "lcm daemon unavailable (not-running)",
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uses an authoritative refusal reason for live daemon evidence", async () => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: false,
+      port: 3737,
+      spawned: false,
+      refusalReason: "live-no-response",
+    } as never);
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: "ok", version: "0.5.0" }),
+      }),
+    }));
+    expect(results.find((result) => result.name === "daemon")?.message).toContain(
+      "lcm daemon unavailable (live-no-response)",
+    );
+  });
+
   it.each(["fetch", "json"] as const)(
     "bounds the complete daemon health %s phase to two seconds",
     async (phase) => {
@@ -1057,7 +1092,11 @@ describe("runDoctor configuration validation", () => {
     const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
     const previousSummaryKey = process.env.LCM_SUMMARY_API_KEY;
     try {
-      writeFileSync(join(credentialsDir, "ANTHROPIC_API_KEY"), "sk-doctor-credential\n", { mode: 0o600 });
+      const credentialPath = join(credentialsDir, "ANTHROPIC_API_KEY");
+      writeFileSync(credentialPath, "sk-doctor-credential\n", { mode: 0o400 });
+      chmodSync(credentialsDir, 0o500);
+      expect(statSync(credentialsDir).mode & 0o7777).toBe(0o500);
+      expect(statSync(credentialPath).mode & 0o7777).toBe(0o400);
       process.env.CREDENTIALS_DIRECTORY = credentialsDir;
       process.env.LCM_SYSTEMD_CRED_IDS = "ANTHROPIC_API_KEY";
       delete process.env.ANTHROPIC_API_KEY;
@@ -1075,6 +1114,7 @@ describe("runDoctor configuration validation", () => {
       expect(results.find((result) => result.name === "config")).toMatchObject({ status: "pass" });
       expect(results.find((result) => result.name === "stack")?.message).toContain("Summarizer: anthropic");
     } finally {
+      chmodSync(credentialsDir, 0o700);
       rmSync(credentialsDir, { recursive: true, force: true });
       if (previousCredentialsDirectory === undefined) delete process.env.CREDENTIALS_DIRECTORY;
       else process.env.CREDENTIALS_DIRECTORY = previousCredentialsDirectory;

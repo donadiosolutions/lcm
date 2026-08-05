@@ -14,12 +14,6 @@ import type { DaemonLifecycleHermeticTestSeams } from "../../src/daemon/lifecycl
 
 const dirs: string[] = [];
 type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
-type MonotonicNowOverride = NonNullable<EnsureDaemonOptions["_monotonicNowOverride"]>;
-type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
-type SpawnChildDouble = Pick<ReturnType<SpawnOverride>, "pid" | "unref"> & {
-  once: (event: "error", callback: (error: Error) => void) => SpawnChildDouble;
-};
-type SpawnSyncOverride = NonNullable<EnsureDaemonOptions["_spawnSyncOverride"]>;
 afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const temp = () => { const d = mkdtempSync(join(tmpdir(), "lcm-core-life-")); dirs.push(d); return d; };
 const proc = (root: string, pid: number, status: string, command?: string) => {
@@ -30,6 +24,19 @@ const proc = (root: string, pid: number, status: string, command?: string) => {
 const fetchHealthy = (pid?: number) => vi.fn(async (url: string) => url.endsWith("/health")
   ? { ok: true, json: async () => ({ status: "ok", version: "1", pid }) }
   : { ok: true, json: async () => ({}) });
+
+function unavailableSupervisor(): EnsureDaemonOptions["_supervisorOverride"] {
+  return {
+    probe: vi.fn(async (spec: { name: string }) => ({
+      kind: "unavailable" as const,
+      reason: "manager-unavailable" as const,
+      name: spec.name,
+    })),
+    start: vi.fn(),
+    stopAndStart: vi.fn(),
+    stopAndAwaitAbsent: vi.fn(),
+  } as never;
+}
 
 function withHermeticLifecycleSeams(options: EnsureDaemonOptions): EnsureDaemonOptions {
   const stateDir = dirname(options.pidFilePath);
@@ -102,7 +109,7 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(__lifecycleTestUtils.isProcessAlive(Number.MAX_SAFE_INTEGER)).toBe(false);
   });
 
-  it("resolves complete scoped, hermetic, override, and production dependency sets", () => {
+  it("resolves complete scoped, hermetic, override, and production dependency sets", async () => {
     const root = temp();
     const pidFilePath = join(root, "daemon.pid");
     const production = __lifecycleTestUtils.resolveLifecycleDependencies({
@@ -213,6 +220,61 @@ describe("lifecycle procfs and parent warnings", () => {
       LCM_DAEMON_OWNER_ID: "owned",
     });
 
+    const transportRoot = temp();
+    const transportRuntime = join(transportRoot, "runtime");
+    mkdirSync(transportRuntime);
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+    const transportOptions: EnsureDaemonOptions = {
+      port: 1,
+      pidFilePath,
+      spawnTimeoutMs: 1,
+      _spawnSyncOverride: spawnSync as never,
+      _managerTransportEnvironmentOverride: {
+        PATH: "/usr/bin",
+        LANG: "en_US.UTF-8",
+        XDG_RUNTIME_DIR: transportRuntime,
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+        HOME: "/production/home",
+        LCM_POSTGRES_URL: "postgresql://user:secret@example.invalid/lcm",
+        OPENAI_API_KEY: "should-not-reach-manager",
+      },
+    };
+    const transportDependencies = __lifecycleTestUtils.resolveLifecycleDependencies(transportOptions);
+    const managerEnvironment = __lifecycleTestUtils.managerTransportEnvironment(
+      transportOptions,
+      transportDependencies,
+    );
+    expect(managerEnvironment).toEqual({
+      PATH: "/usr/bin",
+      LANG: "en_US.UTF-8",
+      XDG_RUNTIME_DIR: transportRuntime,
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+    });
+    const controlRunner = __lifecycleTestUtils.supervisorCommandRunner(
+      transportDependencies,
+      transportOptions,
+    );
+    await controlRunner("systemctl", ["--user", "show", "lcm-test.service"], { timeoutMs: 1 });
+    expect(spawnSync).toHaveBeenCalledWith(
+      "systemctl",
+      ["--user", "show", "lcm-test.service"],
+      expect.objectContaining({ env: managerEnvironment }),
+    );
+    expect(JSON.stringify(managerEnvironment)).not.toContain("production/home");
+    expect(JSON.stringify(managerEnvironment)).not.toContain("LCM_POSTGRES_URL");
+    expect(JSON.stringify(managerEnvironment)).not.toContain("should-not-reach-manager");
+    expect(__lifecycleTestUtils.managerTransportEnvironment(
+      {
+        ...transportOptions,
+        _managerTransportEnvironmentOverride: {
+          XDG_RUNTIME_DIR: "relative-runtime",
+          DBUS_SESSION_BUS_ADDRESS: "unsafe\naddress",
+          PATH: "/usr/bin",
+        },
+      },
+      transportDependencies,
+    )).toEqual({ PATH: "/usr/bin" });
+
     expect(__lifecycleTestUtils.lifecycleUnitName(
       { port: 1, pidFilePath, spawnTimeoutMs: 1 },
       10,
@@ -304,11 +366,6 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: false, reason: "missing-pid" })).toContain("PID file missing");
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: false, pid: 42, reason: "dead-pid" })).toContain("PID 42 is not running");
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: true, reason: "wrong-parent" })).toBe("daemon parent invariant is not verified");
-    expect(__lifecycleTestUtils.systemdDaemonSetenvArgs({ PATH: "/bin", LCM_MODE: "x", LCM_POSTGRES_URL: "secret", OTHER: "y", OPENAI_API_KEY: "secret", EMPTY: undefined }, [])).toEqual([
-      "--setenv=LCM_MODE=x", "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    ]);
-    expect(__lifecycleTestUtils.systemdDaemonSetenvArgs({ PATH: "/bin" }, ["OPENAI_API_KEY"])).toContain("--setenv=LCM_SYSTEMD_CRED_IDS=OPENAI_API_KEY");
-    expect(__lifecycleTestUtils.systemdRunProcessEnv({ PATH: "/bin", TOKEN: "secret", LCM_POSTGRES_URL: "secret", SAFE: "yes" })).toEqual({ PATH: "/bin", SAFE: "yes" });
   });
 
   it("covers malformed status fields, command reads, directory filtering, and cache hits", () => {
@@ -367,6 +424,7 @@ describe("lifecycle procfs and parent warnings", () => {
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(20) as never,
       _isProcessAliveOverride: () => alive, _listeningPortsOverride: () => [1], _skipSpawn: true,
       _monotonicNowOverride: (): number => 0,
+      _supervisorOverride: unavailableSupervisor(),
     });
     expect(result.connected).toBe(connected);
     if (warning) expect(result.warning).toContain(warning);
@@ -387,60 +445,13 @@ describe("lifecycle procfs and parent warnings", () => {
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(31) as never,
       _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [1], _skipSpawn: true,
       _monotonicNowOverride: (): number => 0,
+      _supervisorOverride: unavailableSupervisor(),
     });
     expect(result.warning).toContain("not an LCM daemon");
   });
 });
 
 describe("lifecycle spawn and restart failure boundaries", () => {
-  it("reports non-Error detached spawn failures and combines systemd warnings", async () => {
-    const dir = temp();
-    const result = await ensureDaemon({
-      port: 2, pidFilePath: join(dir, "daemon.pid"), spawnTimeoutMs: 1, _platform: "linux",
-      enforceUserManagerParent: true, _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
-      _spawnSyncOverride: vi.fn(() => { throw "systemd"; }) as never,
-      _spawnOverride: vi.fn(() => { throw "detached"; }) as never,
-      _skipHealthWait: true,
-      _monotonicNowOverride: (): number => 0,
-    });
-    expect(result.warning).toContain("systemd"); expect(result.warning).toContain("detached");
-  });
-
-  it.each([
-    [{ status: 1, stderr: "stderr", stdout: "", error: undefined, signal: null }, "systemd stderr", undefined],
-    [{ status: 1, stderr: Buffer.from("x"), stdout: "stdout", error: undefined, signal: null }, "systemd stdout", undefined],
-    [{ status: 1, stderr: undefined, stdout: undefined, error: new Error("error"), signal: null }, "systemd process error", undefined],
-    [{ status: 1, stderr: undefined, stdout: undefined, error: undefined, signal: "SIGTERM" }, "signal SIGTERM", undefined],
-    [{ status: 9, stderr: undefined, stdout: undefined, error: undefined, signal: "SIGTERM Bearer signal-secret" }, "exit status 9", "signal-secret"],
-    [{ status: null, stderr: undefined, stdout: undefined, error: undefined, signal: null }, "process exit unavailable", undefined],
-  ])("reports systemd-run detail from %#", async (spawnResult, detail, absent) => {
-    const dir = temp();
-    const result = await ensureDaemon({
-      port: 3, pidFilePath: join(dir, "daemon.pid"), spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
-      _fetchOverride: vi.fn().mockRejectedValue(new Error("down")), _spawnSyncOverride: vi.fn(() => spawnResult) as never,
-      _spawnOverride: vi.fn(() => ({ pid: undefined, once: vi.fn(), unref: vi.fn() })) as never, _skipHealthWait: true,
-      _monotonicNowOverride: (): number => 0,
-    });
-    expect(result.warning).toContain(detail);
-    if (absent) expect(result.warning).not.toContain(absent);
-  });
-
-  it("skips systemd-run when the initial health check consumes the startup deadline", async () => {
-    const dir = temp();
-    const monotonicNow = vi.fn()
-      .mockReturnValueOnce(0)
-      .mockReturnValueOnce(0)
-      .mockReturnValue(2);
-    const spawnSync = vi.fn();
-    const result = await ensureDaemon({
-      port: 3, pidFilePath: join(dir, "daemon.pid"), spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
-      _fetchOverride: vi.fn().mockRejectedValue(new Error("down")), _spawnSyncOverride: spawnSync as never,
-      _monotonicNowOverride: monotonicNow,
-    });
-    expect(result).toEqual({ connected: false, port: 3, spawned: false });
-    expect(spawnSync).not.toHaveBeenCalled();
-  });
-
   it("covers early-dead and throwing termination paths", async () => {
     for (const mode of ["early", "term", "kill"] as const) {
       const dir = temp(); const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "22");
@@ -478,11 +489,13 @@ describe("lifecycle spawn and restart failure boundaries", () => {
   });
 
   it("uses the injected ensure kill function for a version mismatch", async () => {
+    vi.spyOn(performance, "now").mockReturnValue(0);
     const dir = temp(); const procRoot = join(dir, "proc"); mkdirSync(procRoot);
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "33"); ensureAuthToken(join(dir, "daemon.token"));
     proc(procRoot, 33, "Uid:\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
-    const kill = vi.fn();
-    const alive = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValue(false);
+    let aliveState = true;
+    const kill = vi.fn(() => { aliveState = false; });
+    const alive = vi.fn(() => aliveState);
     await ensureDaemon({
       port: 6, pidFilePath: pidPath, spawnTimeoutMs: 1, expectedVersion: "2", _procRoot: procRoot,
       _fetchOverride: fetchHealthy(33) as never, _isProcessAliveOverride: alive, _killOverride: kill,
@@ -523,40 +536,6 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     expect(errored.warning).toContain("spawn error");
   });
 
-  it("combines systemd and detached errors after health wait expires", async () => {
-    const dir = temp();
-    const child: SpawnChildDouble = {
-      pid: undefined,
-      unref: vi.fn((): void => {}),
-      once: vi.fn((_event: "error", callback: (error: Error) => void): SpawnChildDouble => {
-        callback(new Error("async spawn"));
-        return child;
-      }),
-    };
-    const spawnSync: SpawnSyncOverride = vi.fn();
-    vi.mocked(spawnSync).mockReturnValue({
-      pid: 0, output: [null, null, null], stdout: "", stderr: "", status: 1, signal: null,
-    });
-    const spawn: SpawnOverride = vi.fn();
-    vi.mocked(spawn).mockReturnValue(child as ReturnType<SpawnOverride>);
-    const monotonicNow: MonotonicNowOverride = vi.fn()
-      .mockReturnValueOnce(0)
-      .mockReturnValueOnce(0)
-      .mockReturnValueOnce(0)
-      .mockReturnValueOnce(0)
-      .mockReturnValue(2);
-    const result = await ensureDaemon({
-      port: 11, pidFilePath: join(dir, "daemon.pid"), spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
-      _fetchOverride: vi.fn().mockRejectedValue(new Error("down")), _spawnSyncOverride: spawnSync,
-      _spawnOverride: spawn, _sleepOverride: async () => {}, _monotonicNowOverride: monotonicNow,
-    });
-    expect(spawnSync).toHaveBeenCalledTimes(1);
-    expect(spawn).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ connected: false, spawned: true, startMethod: "detached-spawn" });
-    expect(result.warning).toContain("exit status 1");
-    expect(result.warning).toContain("detached spawn error");
-  });
-
   it("uses restart default proc, listener, and ensure implementations", async () => {
     const dir = temp();
     for (const platform of ["linux", "darwin"] as const) {
@@ -587,6 +566,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
       port: 13, pidFilePath: pidPath, spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
       _procRoot: root, _uid: 1000, _isProcessAliveOverride: () => true, _fetchOverride: fetchHealthy(20) as never,
       _listeningPortsOverride: () => [13], _monotonicNowOverride: () => 0, expectedVersion: "1",
+      _supervisorOverride: unavailableSupervisor(),
     });
     expect(result.connected).toBe(true); expect(result.warning).toBeUndefined();
   });
@@ -614,7 +594,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     })).resolves.toMatchObject({ connected: false });
   });
 
-  it("accepts an authenticated daemon after a live PID retry", async () => {
+  it("refuses detached offline recovery before a live PID retry", async () => {
     const dir = temp(); const pidPath = join(dir, "daemon.pid");
     writeFileSync(pidPath, "20"); ensureAuthToken(join(dir, "daemon.token"));
     const fetch = vi.fn()
@@ -626,7 +606,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
       port: 16, pidFilePath: pidPath, spawnTimeoutMs: 1, expectedVersion: "1",
       _fetchOverride: fetch, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [16],
       _sleepOverride: async () => {}, _monotonicNowOverride: () => 0, _skipSpawn: true,
-    })).resolves.toMatchObject({ connected: true, spawned: false, pid: 20 });
+    })).resolves.toMatchObject({ connected: false, spawned: false, pid: 20, refusalReason: "detached-no-response" });
   });
 
   it("keeps ambient credentials outside a hermetic systemd invocation", async () => {

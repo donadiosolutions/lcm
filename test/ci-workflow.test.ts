@@ -10,6 +10,16 @@ interface WorkflowStep {
   with?: Record<string, unknown>;
 }
 
+interface IntegrationJob {
+  name: string;
+  needs: string;
+  "runs-on": string;
+  "timeout-minutes"?: number;
+  if?: string;
+  "continue-on-error"?: boolean;
+  steps: WorkflowStep[];
+}
+
 interface CodecovJob {
   needs: string;
   if: string;
@@ -35,6 +45,8 @@ interface CiWorkflow {
       "runs-on": string;
       strategy: { matrix: { run: number[] } };
     };
+    "linux-systemd": IntegrationJob;
+    "macos-launchd": IntegrationJob;
     ci: {
       name: string;
       needs: string[];
@@ -47,6 +59,10 @@ interface CiWorkflow {
 }
 
 const source = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+const launchdIntegrationSource = readFileSync(
+  new URL("./daemon/lifecycle-launchd.integration.test.ts", import.meta.url),
+  "utf8",
+);
 const workflow = loadYaml(source) as CiWorkflow;
 const expectedCodecovRunSteps = [
   {
@@ -87,9 +103,21 @@ describe("CI workflow", () => {
     expect(workflow.jobs.postgresql.needs).toBe("environment");
     expect(workflow.jobs.postgresql["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
     expect(workflow.jobs.postgresql.strategy.matrix.run).toEqual([1, 2]);
+    expect(workflow.jobs["linux-systemd"]).toMatchObject({
+      name: "Linux Ubuntu 24.04 user-systemd integration",
+      needs: "environment",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 15,
+    });
+    expect(workflow.jobs["macos-launchd"]).toMatchObject({
+      name: "macOS 15 launchd feasibility",
+      needs: "environment",
+      "runs-on": "macos-15",
+      "timeout-minutes": 15,
+    });
     expect(workflow.jobs.ci).toMatchObject({
       name: "ci",
-      needs: ["environment", "core", "postgresql"],
+      needs: ["environment", "core", "postgresql", "linux-systemd", "macos-launchd"],
       if: "${{ always() }}",
     });
     const gate = workflow.jobs.ci.steps.find((step) => step.name === "Require every CI suite");
@@ -97,12 +125,144 @@ describe("CI workflow", () => {
       ENVIRONMENT_RESULT: "${{ needs.environment.result }}",
       CORE_RESULT: "${{ needs.core.result }}",
       POSTGRESQL_RESULT: "${{ needs.postgresql.result }}",
+      LINUX_SYSTEMD_RESULT: "${{ needs.linux-systemd.result }}",
+      MACOS_LAUNCHD_RESULT: "${{ needs.macos-launchd.result }}",
     });
     expect(gate?.run).toContain(
-      '[[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success ]]',
+      '[[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success || "$LINUX_SYSTEMD_RESULT" != success || "$MACOS_LAUNCHD_RESULT" != success ]]',
     );
+    expect(gate?.run).toContain("Linux user-systemd result: $LINUX_SYSTEMD_RESULT");
+    expect(gate?.run).toContain("macOS launchd result: $MACOS_LAUNCHD_RESULT");
+    expect(workflow.jobs.ci.needs).toContain("macos-launchd");
     expect(workflow.jobs.codecov.needs).toBe("ci");
     expect(workflow.jobs["codecov-fork"].needs).toBe("ci");
+  });
+
+  it("runs the pinned Linux user-systemd integration with exact scoped cleanup", () => {
+    const job = workflow.jobs["linux-systemd"];
+    const checkout = job.steps.find((step) => step.name === "Checkout");
+    const node = job.steps.find((step) => step.name === "Set up Node.js 25.9.0");
+    const install = job.steps.find((step) => step.name === "Install dependencies");
+    const build = job.steps.find((step) => step.name === "Build package");
+    const integration = job.steps.find((step) => step.name === "Run real user-systemd integration");
+
+    expect(checkout).toEqual({
+      name: "Checkout",
+      uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+      with: { "persist-credentials": false },
+    });
+    expect(node).toEqual({
+      name: "Set up Node.js 25.9.0",
+      uses: "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+      with: { "node-version": "25.9.0", cache: "npm" },
+    });
+    expect(install?.run).toBe("npm ci");
+    expect(build?.run).toBe("npm run build");
+    expect(integration?.env).toEqual({
+      LCM_SYSTEMD_CREDENTIAL_INTEGRATION: "1",
+      LCM_LIFECYCLE_SYSTEMD_INTEGRATION: "1",
+      LCM_LIFECYCLE_SCOPE_ID: "ci-${{ github.run_id }}-${{ github.run_attempt }}",
+      LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR:
+        "${{ runner.temp }}/lcm-systemd-${{ github.run_id }}-${{ github.run_attempt }}",
+      LCM_LIFECYCLE_DAEMON_PORT: "48322",
+      LCM_LIFECYCLE_EXPECTED_SCOPES: "1",
+    });
+    expect(integration?.run).toMatch(
+      /systemd_state="\$\(systemctl --user is-system-running \|\| true\)"[\s\S]*case "\$systemd_state" in[\s\S]*running\|degraded\)\s*;;[\s\S]*\*\)[\s\S]*exit 1/u,
+    );
+    expect(integration?.run).toContain("test/daemon/lifecycle-isolation.test.ts");
+    expect(integration?.run).toContain("uses and removes one exact run-owned transient unit");
+    expect(integration?.run).toContain("test/daemon/systemd-credential-loader.test.ts");
+    expect(integration?.run).toContain(
+      '--testNamePattern "observes the real user-systemd LoadCredential modes"',
+    );
+    expect(integration?.run).toContain("systemctl --user stop \"$unit_name\"");
+    expect(integration?.run).toContain(
+      'if [[ "$unit_name" =~ ^lcm-daemon-[0-9a-f]{20}\\.service$ ]]; then',
+    );
+    expect(integration?.run).toContain('systemctl --user reset-failed "$unit_name"');
+    expect(integration?.run).not.toContain("lcm-test-daemon-${scope_id}");
+    const ownedUnit = /^lcm-daemon-[0-9a-f]{20}\.service$/u;
+    for (const value of [
+      "lcm-daemon-0123456789abcdef0123.service",
+    ]) {
+      expect(ownedUnit.test(value)).toBe(true);
+    }
+    for (const value of [
+      "lcm-test-daemon-ci-123-1-12-34",
+      "lcm-daemon-0123456789ABCDEF0123.service",
+      "lcm-daemon-0123456789abcdef0123.service.extra",
+      "lcm-daemon-0123456789abcdef0123.service; touch /tmp/pwned",
+      "other.service",
+    ]) {
+      expect(ownedUnit.test(value)).toBe(false);
+    }
+    expect(integration?.run).toContain('rm -rf -- "$barrier_dir"');
+    expect(integration?.run).not.toMatch(/\b(?:pkill|killall)\b/u);
+  });
+
+  it("keeps the macOS launchd feasibility job active and runs its integration path", () => {
+    const job = workflow.jobs["macos-launchd"];
+    const checkout = job.steps.find((step) => step.name === "Checkout");
+    const node = job.steps.find((step) => step.name === "Set up Node.js 25.9.0");
+    const install = job.steps.find((step) => step.name === "Install dependencies");
+    const integration = job.steps.find((step) => step.name === "Run launchd integration path");
+
+    expect(job.if).toBeUndefined();
+    expect(job["continue-on-error"]).toBeUndefined();
+    expect(checkout?.uses).toBe(
+      "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    );
+    expect(node).toEqual({
+      name: "Set up Node.js 25.9.0",
+      uses: "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+      with: { "node-version": "25.9.0", cache: "npm" },
+    });
+    expect(install?.run).toBe("npm ci");
+    expect(integration?.env).toEqual({
+      LCM_LAUNCHD_INTEGRATION: "1",
+      LCM_LAUNCHD_SCOPE_ID: "ci-${{ github.run_id }}-${{ github.run_attempt }}",
+      LCM_LAUNCHD_RESOURCE_ROOT:
+        "${{ runner.temp }}/lcm-launchd-${{ github.run_id }}-${{ github.run_attempt }}",
+    });
+    const run = integration?.run ?? "";
+    expect(run).toContain('evidence_token="$(uuidgen)"');
+    expect(run).toContain('export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"');
+    expect(run).toContain('launchctl bootout "gui/$(id -u)/$ready_label"');
+    expect(run).toContain('[[ "$ready_token" == "$evidence_token" ]]');
+    expect(run).toContain(
+      '[[ "$ready_label" =~ ^com\\.donadiosolutions\\.lcm\\.daemon\\.[0-9a-f]{20}$ ]]',
+    );
+    expect(run).toContain('rm -rf -- "$resource_root"');
+    expect(run).toContain('chmod 0700 "$resource_root"');
+    expect(run).toContain("validate_marker() {");
+    expect(run).toContain("Refusing cleanup for malformed or foreign launchd evidence");
+    expect(run).not.toMatch(/\b(?:pkill|killall|kill)\b/u);
+    const trap = run.indexOf("trap cleanup EXIT");
+    const reset = run.indexOf('rm -rf -- "$resource_root"', trap);
+    const testRun = run.indexOf("npx vitest run test/daemon/lifecycle-launchd.integration.test.ts");
+    expect(trap).toBeGreaterThanOrEqual(0);
+    expect(reset).toBeGreaterThan(trap);
+    expect(reset).toBeLessThan(testRun);
+    expect(run.indexOf('chmod 0700 "$resource_root"')).toBeLessThan(testRun);
+    expect(run.indexOf("if validate_marker; then")).toBeGreaterThanOrEqual(0);
+    expect(run.indexOf('launchctl bootout "gui/$(id -u)/$ready_label"')).toBeGreaterThan(
+      run.indexOf("if validate_marker; then"),
+    );
+    expect(launchdIntegrationSource).toContain("LCM_LAUNCHD_RESOURCE_ROOT");
+    expect(launchdIntegrationSource).toContain("LCM_LAUNCHD_EVIDENCE_TOKEN");
+    expect(launchdIntegrationSource).toContain(
+      'writeFileSync(join(resourceRoot, "launchd.label"), `${evidenceToken} ${spec.launchdLabel}\\n`',
+    );
+    const start = launchdIntegrationSource.indexOf("const started = await supervisor.start(spec);");
+    const publish = launchdIntegrationSource.indexOf("publishLaunchdEvidence(spec);", start);
+    const health = launchdIntegrationSource.indexOf("waitForExactHealth(spec, managerPid)", publish);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(publish).toBeGreaterThan(start);
+    expect(health).toBeGreaterThan(publish);
+    expect(launchdIntegrationSource).toContain("spec.stateRoot !== realpathSync(resourceRoot)");
+    expect(launchdIntegrationSource).toContain("expect(statSync(stateRoot).mode & 0o777).toBe(0o700)");
+    expect(workflow.jobs.ci.needs).toContain("macos-launchd");
   });
 
   it("separates trusted OIDC uploads from tokenless fork uploads", () => {

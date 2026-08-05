@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -28,8 +28,20 @@ describe("project map file races", () => {
 
     const canonical = join(tempHome, "canonical");
     mkdirSync(canonical, { recursive: true });
+    const mapPath = join(tempHome, ".lcm", "map.json");
+    mkdirSync(join(tempHome, ".lcm"), { recursive: true });
+    writeFileSync(mapPath, "{}\n", "utf-8");
 
     const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+    let disappeared = false;
+    const lstatSync = vi.fn((path: import("node:fs").PathLike) => {
+      const stat = actualFs.lstatSync(path);
+      if (!disappeared && typeof path === "string" && path === mapPath) {
+        disappeared = true;
+        actualFs.rmSync(path);
+      }
+      return stat;
+    });
     const openSync = vi.fn((path: import("node:fs").PathLike, flags: import("node:fs").OpenMode) => {
       if (typeof path === "string" && path.endsWith(join(".lcm", "map.json"))) {
         const err = new Error("map.json disappeared") as NodeJS.ErrnoException;
@@ -41,6 +53,7 @@ describe("project map file races", () => {
 
     vi.doMock("node:fs", () => ({
       ...actualFs,
+      lstatSync,
       openSync,
     }));
 
@@ -49,6 +62,7 @@ describe("project map file races", () => {
     const identity = resolveProjectIdentity(canonical);
 
     expect(identity.canonical).toBe(canonical);
+    expect(lstatSync).toHaveBeenCalledWith(projectMapPath());
     expect(openSync).toHaveBeenCalledWith(projectMapPath(), expect.any(Number));
     expect(actualFs.existsSync(projectMapPath())).toBe(true);
   });

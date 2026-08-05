@@ -91,8 +91,8 @@ lcm install
 
 | Error | Recovery |
 |---|---|
-| Daemon not running | Run `lcm start` via Bash, then retry |
-| "unauthorized" or version mismatch | Stop the stale daemon process, run `lcm daemon start --detach` via Bash, then retry — the daemon is likely running an older version than the MCP server expects |
+| Daemon unavailable | Run `lcm doctor`, then `lcm daemon restart` via Bash and retry |
+| "unauthorized" or version mismatch | Run `lcm doctor`, reinstall the affected connector with `lcm connectors install <agent>`, then run `lcm connectors doctor <agent>` |
 | "No results" from search | Try `lcm_grep` with different keywords, or broaden the query |
 | Node not found on expand | Use `lcm_search` to find the correct nodeId |
 | Store succeeds but daemon restarted before SessionEnd | Call `lcm_doctor` to verify persistence; re-store if the node is missing |

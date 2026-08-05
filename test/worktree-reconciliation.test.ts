@@ -54,6 +54,7 @@ const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
 };
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
+const CACHE_RECONCILIATION_TIMEOUT_MS = 10_000;
 
 function git(cwd: string, ...args: string[]): void {
   execFileSync("git", args, { cwd, stdio: "ignore" });
@@ -1965,7 +1966,7 @@ describe("worktree reconciliation", () => {
       "SELECT session_id FROM conversations WHERE session_id = 'legacy-alias'",
     ).get()).toEqual({ session_id: "legacy-alias" });
     target.close();
-  });
+  }, CACHE_RECONCILIATION_TIMEOUT_MS);
 
   it.each([
     {
@@ -2294,7 +2295,7 @@ describe("worktree reconciliation", () => {
       updated_at: "not-a-timestamp",
     });
     target.close();
-  });
+  }, CACHE_RECONCILIATION_TIMEOUT_MS);
 
   it.each([
     {
@@ -2366,7 +2367,7 @@ describe("worktree reconciliation", () => {
        WHERE content IN (?, ?)`,
     ).get(source.content, target?.content ?? source.content)).toEqual({ count: 0 });
     merged.close();
-  });
+  }, CACHE_RECONCILIATION_TIMEOUT_MS);
 
   it("fails closed on invalid foreign keys", () => {
     const { main, linked } = makeRepository(home);

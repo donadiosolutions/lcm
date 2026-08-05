@@ -35,6 +35,74 @@ import {
 } from "../../src/daemon/http-url.js";
 
 describe("mocked daemon HTTP response metadata", () => {
+  it("classifies only bounded, known TypeError transport messages", () => {
+    for (const message of [
+      "fetch failed",
+      "Failed to fetch",
+      "network error",
+      "network request failed",
+      "load failed",
+      "fetch failed: ECONNREFUSED",
+      "fetch failed: connection refused",
+    ]) {
+      expect(isDaemonTransportFailure(new TypeError(message))).toBe(true);
+    }
+
+    for (const message of [
+      "Cannot read properties of undefined",
+      "connect parser bug",
+      "socket hang up",
+      "Daemon request timed out",
+      "fetch failed: secret=/private/credential",
+      "fetch failed".repeat(100),
+    ]) {
+      expect(isDaemonTransportFailure(new TypeError(message)), message).toBe(false);
+    }
+
+    const codedCause = new TypeError("programming failure", {
+      cause: Object.assign(new Error("broken pipe"), { code: "EPIPE" }),
+    });
+    expect(isDaemonTransportFailure(codedCause)).toBe(true);
+  });
+
+  it("traverses bounded causes and AggregateError entries without trusting cycles", () => {
+    expect(isDaemonTransportFailure(new Error("wrapper", {
+      cause: new TypeError("load failed"),
+    }))).toBe(true);
+
+    const aggregate = new AggregateError([
+      new Error("wrapper", {
+        cause: Object.assign(new Error("broken pipe"), { code: "EPIPE" }),
+      }),
+    ], "request failed");
+    expect(isDaemonTransportFailure(aggregate)).toBe(true);
+    expect(isDaemonTransportFailure(new AggregateError([new Error("application failure")]))).toBe(false);
+
+    const malformedAggregate = new AggregateError([], "not-an-array");
+    Object.defineProperty(malformedAggregate, "errors", { value: "not-an-array" });
+    expect(isDaemonTransportFailure(malformedAggregate)).toBe(false);
+
+    const cycle = Object.assign(new Error("application failure"), { cause: undefined as unknown });
+    cycle.cause = cycle;
+    expect(isDaemonTransportFailure(cycle)).toBe(false);
+
+    const deepRoot = new Error("too deep");
+    let deepCursor = deepRoot as Error & { cause?: unknown };
+    for (let depth = 0; depth < 9; depth += 1) {
+      const nested = new Error("too deep") as Error & { cause?: unknown };
+      deepCursor.cause = nested;
+      deepCursor = nested;
+    }
+    deepCursor.cause = Object.assign(new Error("broken pipe"), { code: "EPIPE" });
+    expect(isDaemonTransportFailure(deepRoot)).toBe(false);
+
+    const boundedEntries = [
+      Object.assign(new Error("hidden transport"), { code: "EPIPE" }),
+      ...Array.from({ length: 32 }, () => new Error("application failure")),
+    ];
+    expect(isDaemonTransportFailure(new AggregateError(boundedEntries, "bounded"))).toBe(false);
+  });
+
   it("falls back when Node omits a response status code", async () => {
     state.status = undefined; state.body = ""; state.outcome = "end";
     await expect(daemonJsonRequest(1, "/health", { method: "GET" })).rejects.toThrow("HTTP 500");

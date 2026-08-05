@@ -25,9 +25,17 @@ import { basename, dirname, join, sep } from "node:path";
 export const PRIVATE_DIRECTORY_MODE = 0o700;
 export const PRIVATE_FILE_MODE = 0o600;
 
-export function ensurePrivateDirectory(path: string): void {
-  mkdirSync(path, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-  chmodSync(path, PRIVATE_DIRECTORY_MODE);
+export type PrivateDirectoryOperations = Readonly<{
+  mkdir?: (path: string, options: { recursive: boolean; mode: number }) => void;
+  chmod?: (path: string, mode: number) => void;
+}>;
+
+export function ensurePrivateDirectory(
+  path: string,
+  operations: PrivateDirectoryOperations = {},
+): void {
+  (operations.mkdir ?? mkdirSync)(path, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+  (operations.chmod ?? chmodSync)(path, PRIVATE_DIRECTORY_MODE);
 }
 
 function isContainedPath(root: string, candidate: string): boolean {
@@ -38,15 +46,29 @@ function isContainedPath(root: string, candidate: string): boolean {
 export type BoundedFileOptions = {
   allowedRoot: string;
   maxBytes: number;
+  /** Require the descriptor to be owned by this UID when provided. */
+  expectedUid?: number;
+  /** Require one of these exact permission/special-bit modes when provided. */
+  allowedModes?: readonly number[];
+  /** Reject files with more than one hard link when enabled. */
+  requireSingleLink?: boolean;
   /** @internal Deterministic race seam for descriptor-bound tests. */
   _afterStatForTesting?: () => void;
+  /** @internal Deterministic content-change seam before the bounded read. */
+  _beforeReadForTesting?: () => void;
+  /** @internal Deterministic post-path-stat race seam. */
+  _beforePostStatForTesting?: () => void;
   /** @internal Deterministic parent-swap seam for descriptor-bound tests. */
   _beforeOpenForTesting?: () => void;
+  /** @internal Deterministic leaf-swap seam before consume unlink. */
+  _beforeUnlinkForTesting?: () => void;
 };
 
 export type BoundedFileResult = {
   content: string;
   mtimeMs: number;
+  dev: number;
+  ino: number;
 };
 
 function readDescriptorBounded(fd: number, maxBytes: number): string {
@@ -64,6 +86,33 @@ function readDescriptorBounded(fd: number, maxBytes: number): string {
   return Buffer.concat(chunks, total).toString("utf-8");
 }
 
+function validateBoundedFileMetadata(
+  stat: Stats,
+  options: BoundedFileOptions,
+): void {
+  if (!stat.isFile()) throw new Error("path is not a regular file");
+  if (options.requireSingleLink && stat.nlink !== 1) {
+    throw new Error("file has multiple hard links");
+  }
+  if (options.expectedUid !== undefined && stat.uid !== options.expectedUid) {
+    throw new Error("file owner is not trusted");
+  }
+  if (options.allowedModes !== undefined && !options.allowedModes.includes(stat.mode & 0o7777)) {
+    throw new Error("file mode is not trusted");
+  }
+}
+
+function boundedFileMetadataChanged(before: Stats, after: Stats): boolean {
+  return before.dev !== after.dev
+    || before.ino !== after.ino
+    || before.size !== after.size
+    || before.nlink !== after.nlink
+    || before.uid !== after.uid
+    || (before.mode & 0o7777) !== (after.mode & 0o7777)
+    || before.mtimeMs !== after.mtimeMs
+    || before.ctimeMs !== after.ctimeMs;
+}
+
 /** Read a bounded regular file and its metadata from one descriptor. */
 export function readBoundedRegularFileWithStat(path: string, options: BoundedFileOptions): BoundedFileResult {
   if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0) {
@@ -76,11 +125,12 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
     throw new Error("file is outside the permitted root");
   }
 
+  const initialPath = lstatSync(path);
   options._beforeOpenForTesting?.();
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(fd);
-    if (!stat.isFile()) throw new Error("path is not a regular file");
+    validateBoundedFileMetadata(stat, options);
     options._afterStatForTesting?.();
     // Re-resolve after opening and bind the pathname to the descriptor. This
     // detects an intermediate directory or leaf replacement between the
@@ -94,8 +144,37 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
     if (current.dev !== stat.dev || current.ino !== stat.ino) {
       throw new Error("file changed during validation");
     }
+    if (initialPath.dev !== stat.dev || initialPath.ino !== stat.ino) {
+      throw new Error("file changed during validation");
+    }
     if (stat.size > options.maxBytes) throw new Error("file exceeds the configured size limit");
-    return { content: readDescriptorBounded(fd, options.maxBytes), mtimeMs: stat.mtimeMs };
+    options._beforeReadForTesting?.();
+    const content = readDescriptorBounded(fd, options.maxBytes);
+    const finalPath = realpathSync(path);
+    if (!isContainedPath(allowedRoot, finalPath)) {
+      throw new Error("file is outside the permitted root");
+    }
+    const final = statSync(finalPath);
+    options._beforePostStatForTesting?.();
+    const afterRead = fstatSync(fd);
+    validateBoundedFileMetadata(afterRead, options);
+    if (boundedFileMetadataChanged(stat, final)) {
+      throw new Error("file changed during validation");
+    }
+    if (boundedFileMetadataChanged(stat, afterRead)) {
+      throw new Error("file changed during validation");
+    }
+    const result: BoundedFileResult = {
+      content,
+      mtimeMs: stat.mtimeMs,
+      // Keep inode identity internal to the consume helper. Non-enumerable
+      // fields preserve the historical result shape for callers/tests.
+      dev: stat.dev,
+      ino: stat.ino,
+    };
+    Object.defineProperty(result, "dev", { value: stat.dev, enumerable: false });
+    Object.defineProperty(result, "ino", { value: stat.ino, enumerable: false });
+    return result;
   } finally {
     closeSync(fd);
   }
@@ -104,6 +183,33 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
 /** Read a bounded regular file without following a symlink at the leaf. */
 export function readBoundedRegularFile(path: string, options: BoundedFileOptions): string {
   return readBoundedRegularFileWithStat(path, options).content;
+}
+
+/**
+ * Read a private bounded regular file and consume only the exact inode that
+ * was read.  The pathname is revalidated immediately before unlink; a
+ * replacement, symlink, or hard-link collision is preserved as evidence.
+ * An already-absent leaf after a successful read is an idempotent consume.
+ */
+export function consumeBoundedRegularFile(path: string, options: BoundedFileOptions): string {
+  const expectedParent = realpathSync(dirname(path));
+  const result = readBoundedRegularFileWithStat(path, options);
+  options._beforeUnlinkForTesting?.();
+  try {
+    if (realpathSync(dirname(path)) !== expectedParent) {
+      throw new Error("file parent changed during consume");
+    }
+    const current = lstatSync(path);
+    if (current.isSymbolicLink() || current.nlink !== 1 || current.dev !== result.dev || current.ino !== result.ino) {
+      throw new Error("file changed during consume");
+    }
+    validateBoundedFileMetadata(current, options);
+    unlinkSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return result.content;
+    throw error;
+  }
+  return result.content;
 }
 
 /** Atomically replace a private file from a same-directory exclusive temp file. */
