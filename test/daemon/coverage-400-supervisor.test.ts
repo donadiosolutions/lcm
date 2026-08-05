@@ -144,6 +144,8 @@ function systemdText(
 }
 
 function launchdText(value: SupervisorSpec, state = "running", pid = 123, extra = ""): string {
+  const environment = value.launchEnvironment ?? managedLaunchEnvironment(process.env);
+  const environmentDigest = managedLaunchEnvironmentDigest(value, "launchd-user", -1, environment);
   return [
     `state = ${state}`,
     `pid = ${state === "running" ? pid : 0}`,
@@ -154,9 +156,11 @@ function launchdText(value: SupervisorSpec, state = "running", pid = 123, extra 
     `LCM_SUPERVISOR_EXECUTABLE => ${value.executable}`,
     `LCM_SUPERVISOR_ARGS => ${JSON.stringify(value.args)}`,
     `LCM_SUPERVISOR_CWD => ${value.cwd ?? ""}`,
+    `LCM_SUPERVISOR_ENV_DIGEST => ${environmentDigest}`,
     value.entrypoint === undefined ? "" : `LCM_SUPERVISOR_ENTRYPOINT => ${value.entrypoint}`,
     value.runtimeDigest === undefined ? "" : `LCM_SUPERVISOR_RUNTIME_DIGEST => ${value.runtimeDigest}`,
     value.storageBackend === undefined ? "" : `LCM_SUPERVISOR_STORAGE_BACKEND => ${value.storageBackend}`,
+    value.postgresCaFile === undefined ? "" : `LCM_POSTGRES_CA_FILE => ${value.postgresCaFile}`,
     extra,
   ].join("\n");
 }

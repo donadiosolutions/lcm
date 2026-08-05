@@ -974,10 +974,9 @@ function staleReason(
       ? "metadata-missing"
       : "metadata-mismatch";
   }
-  if (spec.kind === "systemd-user") {
-    if (base.launchEnvironmentDigest === undefined) return "metadata-missing";
-    if (expectedLaunchEnvironmentDigest === undefined || base.launchEnvironmentDigest !== expectedLaunchEnvironmentDigest) return "metadata-mismatch";
-  }
+  if (base.launchEnvironmentDigest === undefined) return "metadata-missing";
+  if (!/^[0-9a-f]{64}$/u.test(base.launchEnvironmentDigest)) return "metadata-malformed";
+  if (expectedLaunchEnvironmentDigest === undefined || base.launchEnvironmentDigest !== expectedLaunchEnvironmentDigest) return "metadata-mismatch";
   if (base.executable === undefined || base.args === undefined || base.cwd === undefined) return "metadata-missing";
   if (spec.entrypoint !== undefined && base.entrypoint === undefined) return "metadata-missing";
   if (spec.runtimeDigest !== undefined && base.runtimeDigest === undefined) return "metadata-missing";
@@ -1017,7 +1016,7 @@ function classifyRegistered(
     || (base.postgresCaFile ?? "") !== (spec.postgresCaFile ?? "")
     || (spec.credentialDirectory !== undefined && base.credentialDirectory === undefined)
     || !credentialFilesMatch(spec.credentialFiles, base.credentialFiles)
-    || (spec.kind === "systemd-user" && base.launchEnvironmentDigest === undefined)
+    || base.launchEnvironmentDigest === undefined
   ) {
     return Object.freeze({ kind: "registered-stale-config", reason: "metadata-missing", ...base });
   }
@@ -1077,7 +1076,10 @@ function plistArray(values: readonly string[]): string {
   return `<array>${values.map((value) => `<string>${xmlEscape(value)}</string>`).join("")}</array>`;
 }
 
-function plistEnvironment(spec: SupervisorSpec): string {
+function plistEnvironment(
+  spec: SupervisorSpec,
+  environment: Readonly<Record<string, string>>,
+): string {
   const credentialFiles = spec.credentialFiles === undefined ? [] : spec.credentialFiles;
   const values: Array<readonly [string, string]> = [
     ["LCM_SUPERVISOR_MARKER", spec.marker],
@@ -1088,6 +1090,7 @@ function plistEnvironment(spec: SupervisorSpec): string {
     ["LCM_SUPERVISOR_EXECUTABLE", spec.executable],
     ["LCM_SUPERVISOR_ARGS", JSON.stringify(spec.args)],
     ["LCM_SUPERVISOR_CWD", spec.cwd ?? ""],
+    ["LCM_SUPERVISOR_ENV_DIGEST", managedLaunchEnvironmentDigest(spec, "launchd-user", -1, environment)],
   ];
   if (spec.entrypoint !== undefined) values.push(["LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint]);
   if (spec.runtimeDigest !== undefined) values.push(["LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest]);
@@ -1232,10 +1235,24 @@ function privatePlistMatchesStableIdentity(
     LCM_SUPERVISOR_EXECUTABLE: spec.executable,
     LCM_SUPERVISOR_ARGS: JSON.stringify(spec.args),
     LCM_SUPERVISOR_CWD: spec.cwd ?? "",
+    LCM_SUPERVISOR_ENV_DIGEST: managedLaunchEnvironmentDigest(spec, "launchd-user", -1, environment),
   };
   if (parsed.label !== spec.launchdLabel) return false;
   for (const [name, expected] of Object.entries(expectedMetadata)) {
-    if (parsed.environment.get(name) !== expected || assignments.get(name) !== expected) return false;
+    const parsedValue = parsed.environment.get(name);
+    const assignmentValue = assignments.get(name);
+    if (name === "LCM_SUPERVISOR_ENV_DIGEST" && allowEnvironmentDrift) {
+      // A prior descriptor may legitimately carry the old bounded environment
+      // during absence-only cleanup. Both manager-owned plist surfaces must
+      // still contain the same well-formed digest; launchctl output remains the
+      // only authority for admitting a running job.
+      if (
+        parsedValue === undefined
+        || assignmentValue === undefined
+        || parsedValue !== assignmentValue
+        || !/^[0-9a-f]{64}$/u.test(parsedValue)
+      ) return false;
+    } else if (parsedValue !== expected || assignmentValue !== expected) return false;
   }
   for (const [name, expected] of [
     ["LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint],
@@ -1334,6 +1351,7 @@ function privatePlistMatchesStableIdentity(
     "LCM_SUPERVISOR_EXECUTABLE",
     "LCM_SUPERVISOR_ARGS",
     "LCM_SUPERVISOR_CWD",
+    "LCM_SUPERVISOR_ENV_DIGEST",
     "LCM_SUPERVISOR_ENTRYPOINT",
     "LCM_SUPERVISOR_RUNTIME_DIGEST",
     "LCM_SUPERVISOR_STORAGE_BACKEND",
@@ -1381,7 +1399,7 @@ function plistDocument(
     "<plist version=\"1.0\"><dict>",
     `<key>Label</key><string>${xmlEscape(spec.launchdLabel)}</string>`,
     `<key>ProgramArguments</key>${programArguments}`,
-    `<key>EnvironmentVariables</key>${plistEnvironment(spec)}`,
+    `<key>EnvironmentVariables</key>${plistEnvironment(spec, environment)}`,
     `<key>RunAtLoad</key><true/>`,
     workingDirectory,
     "</dict></plist>\n",
@@ -1697,9 +1715,7 @@ function managedLaunchAssignments(
   environment: Readonly<Record<string, string>>,
 ): readonly string[] {
   const values = managedLaunchEnvironmentValues(spec, kind, uid, environment);
-  if (kind === "systemd-user") {
-    launchEnvironmentValue(values, "LCM_SUPERVISOR_ENV_DIGEST", managedLaunchEnvironmentDigest(spec, kind, uid, environment));
-  }
+  launchEnvironmentValue(values, "LCM_SUPERVISOR_ENV_DIGEST", managedLaunchEnvironmentDigest(spec, kind, uid, environment));
   // Metadata is intentionally duplicated into the child environment. The
   // manager's own metadata remains authoritative for identity probes, while
   // the env -i boundary prevents unrelated manager variables from leaking.
@@ -1982,9 +1998,7 @@ export function createSupervisor(
     if (kind === "launchd-user" && runner.uid < 0) {
       return Object.freeze({ kind: "unavailable", reason: "manager-unavailable", name: spec.name });
     }
-    const expectedLaunchEnvironmentDigest = kind === "systemd-user"
-      ? managedLaunchEnvironmentDigest(spec, kind, runner.uid, runner.environment)
-      : undefined;
+    const expectedLaunchEnvironmentDigest = managedLaunchEnvironmentDigest(spec, kind, runner.uid, runner.environment);
     const result = kind === "systemd-user"
       ? await runner.invoke("systemctl", systemdProbeArgs(spec))
       : await runner.invoke("launchctl", launchdProbeArgs(spec, runner.uid));
@@ -2053,9 +2067,7 @@ export function createSupervisor(
     // launch's staged nonce directory from abandoned debris, so deletion is
     // reserved for the exact manager absence/winner proofs below and in
     // stopAndAwaitAbsent; unresolved stale data is preserved as evidence.
-    const expectedLaunchEnvironmentDigest = kind === "systemd-user"
-      ? managedLaunchEnvironmentDigest(spec, kind, runner.uid, runner.environment)
-      : undefined;
+    const expectedLaunchEnvironmentDigest = managedLaunchEnvironmentDigest(spec, kind, runner.uid, runner.environment);
     let launchPath: string | undefined;
     try {
       if (kind === "launchd-user") launchPath = writePrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);

@@ -80,6 +80,18 @@ function systemdEnvironmentDigest(
   );
 }
 
+function launchdEnvironmentDigest(
+  spec: SupervisorSpec,
+  environmentOverride?: Readonly<Record<string, string>>,
+): string {
+  return managedLaunchEnvironmentDigest(
+    spec,
+    "launchd-user",
+    -1,
+    environmentOverride ?? spec.launchEnvironment ?? managedLaunchEnvironment(process.env),
+  );
+}
+
 function managerText(
   spec: SupervisorSpec,
   state = "active",
@@ -105,7 +117,13 @@ function managerText(
  * flat top-level `KEY => VALUE` entries, not nested inside the environment
  * dictionary.  The supervisor's parser authenticates this projection.
  */
-function launchdPrintText(value: SupervisorSpec, state = "running", pid = 543): string {
+function launchdPrintText(
+  value: SupervisorSpec,
+  state = "running",
+  pid = 543,
+  environmentOverride?: Readonly<Record<string, string>>,
+): string {
+  const environmentDigest = launchdEnvironmentDigest(value, environmentOverride);
   const lines = [
     `state = ${state}`,
     `pid = ${state === "running" ? pid : 0}`,
@@ -117,10 +135,12 @@ function launchdPrintText(value: SupervisorSpec, state = "running", pid = 543): 
     `LCM_SUPERVISOR_EXECUTABLE => ${value.executable}`,
     `LCM_SUPERVISOR_ARGS => ${JSON.stringify(value.args)}`,
     `LCM_SUPERVISOR_CWD => ${value.cwd ?? ""}`,
+    `LCM_SUPERVISOR_ENV_DIGEST => ${environmentDigest}`,
   ];
   if (value.entrypoint !== undefined) lines.push(`LCM_SUPERVISOR_ENTRYPOINT => ${value.entrypoint}`);
   if (value.runtimeDigest !== undefined) lines.push(`LCM_SUPERVISOR_RUNTIME_DIGEST => ${value.runtimeDigest}`);
   if (value.storageBackend !== undefined) lines.push(`LCM_SUPERVISOR_STORAGE_BACKEND => ${value.storageBackend}`);
+  if (value.postgresCaFile !== undefined) lines.push(`LCM_POSTGRES_CA_FILE => ${value.postgresCaFile}`);
   if (value.credentialDirectory !== undefined) {
     lines.push(`LCM_CREDENTIAL_DIRECTORY => ${value.credentialDirectory}`);
     if ((value.credentialFiles ?? []).length > 0) {
@@ -463,6 +483,7 @@ describe("systemd-user supervisor", () => {
         `LCM_SUPERVISOR_EXECUTABLE => ${launchdSpec.executable}`,
         `LCM_SUPERVISOR_ARGS => ${JSON.stringify(launchdSpec.args)}`,
         "LCM_SUPERVISOR_CWD =>",
+        `LCM_SUPERVISOR_ENV_DIGEST => ${launchdEnvironmentDigest(launchdSpec)}`,
       ].join("\n"),
     }]);
     await expect(createSupervisor("launchd-user", { run: launchd.run, platform: "darwin", uid: 501 }).probe(launchdSpec)).resolves.toMatchObject({
@@ -669,7 +690,7 @@ describe("systemd-user supervisor", () => {
       const spec = makeSpec(kind, makeRoot(), { postgresCaFile: caFile });
       const runner = fakeRunner(kind === "systemd-user"
         ? [{ code: 1, stderr: "Unit is not-found" }, { code: 0, stdout: "started" }, { code: 0, stdout: managerText(spec, "active", 444) }]
-        : [{ code: 113, stderr: "Could not find service" }, { code: 0, stdout: "bootstrap" }, { code: 0, stdout: managerText(spec, "active", 444) }]);
+        : [{ code: 113, stderr: "Could not find service" }, { code: 0, stdout: "bootstrap" }, { code: 0, stdout: launchdPrintText(spec, "running", 444) }]);
       await expect(createSupervisor(kind, { run: runner.run, platform: kind === "systemd-user" ? "linux" : "darwin", uid: 501 }).start(spec)).resolves.toMatchObject({ managerPid: 444 });
       if (kind === "systemd-user") {
         expect(runner.calls[1]!.args).toContain(`--setenv=LCM_POSTGRES_CA_FILE=${caFile}`);
@@ -1020,6 +1041,7 @@ describe("systemd-user supervisor", () => {
       `LCM_SUPERVISOR_EXECUTABLE => ${spec.executable}`,
       `LCM_SUPERVISOR_ARGS => ${JSON.stringify(spec.args)}`,
       "LCM_SUPERVISOR_CWD =>",
+      `LCM_SUPERVISOR_ENV_DIGEST => ${launchdEnvironmentDigest(spec)}`,
     ].join("\n");
     const runner = fakeRunner([{ code: 0, stdout: output }]);
     await expect(createSupervisor("launchd-user", { run: runner.run, platform: "darwin", uid: 501 }).probe(spec)).resolves.toMatchObject({
@@ -1336,6 +1358,7 @@ describe("systemd-user supervisor", () => {
       `LCM_SUPERVISOR_EXECUTABLE => ${launchdCredentialSpec.executable}`,
       `LCM_SUPERVISOR_ARGS => ${JSON.stringify(launchdCredentialSpec.args)}`,
       "LCM_SUPERVISOR_CWD =>",
+      `LCM_SUPERVISOR_ENV_DIGEST => ${launchdEnvironmentDigest(launchdCredentialSpec)}`,
     ].join("\n");
     const launchdCredentialRunner = fakeRunner([
       { code: 113, stderr: "Could not find service" },
@@ -1395,6 +1418,40 @@ describe("launchd-user supervisor", () => {
       platform: "darwin",
       uid: 501,
     }).probe(spec)).resolves.toMatchObject({ kind: "unavailable", reason: "manager-command-failed" });
+  });
+
+  it("authenticates launchd environment drift from manager-observed digest variants", async () => {
+    const spec = makeSpec("launchd-user");
+    const environment = { HOME: "/home/managed", PATH: "/usr/bin", OPENAI_API_KEY: "manager-secret" };
+    const filteredEnvironment = managedLaunchEnvironment(environment);
+    const matching = launchdPrintText(spec, "running", 301, filteredEnvironment);
+    const [state, pid, ...metadataLines] = matching.split("\n");
+    const nested = `${state}\n${pid}\nenvironment = {\n${metadataLines.map((line) => ` ${line}`).join("\n")}\n}`;
+    const missing = matching.replace(/\nLCM_SUPERVISOR_ENV_DIGEST => [^\n]+/u, "");
+    const malformed = matching.replace(/LCM_SUPERVISOR_ENV_DIGEST => [^\n]+/u, "LCM_SUPERVISOR_ENV_DIGEST => not-a-digest");
+    const drifted = matching.replace(
+      /LCM_SUPERVISOR_ENV_DIGEST => [^\n]+/u,
+      `LCM_SUPERVISOR_ENV_DIGEST => ${launchdEnvironmentDigest(spec, managedLaunchEnvironment({ HOME: "/home/other", PATH: "/usr/bin" }))}`,
+    );
+    expect(matching).not.toContain(environment.OPENAI_API_KEY);
+    const runner = fakeRunner([
+      { code: 0, stdout: matching },
+      { code: 0, stdout: nested },
+      { code: 0, stdout: missing },
+      { code: 0, stdout: malformed },
+      { code: 0, stdout: drifted },
+    ]);
+    const supervisor = createSupervisor("launchd-user", {
+      run: runner.run,
+      environment,
+      platform: "darwin",
+      uid: 501,
+    });
+    await expect(supervisor.probe(spec)).resolves.toMatchObject({ kind: "registered-running-valid", managerPid: 301 });
+    await expect(supervisor.probe(spec)).resolves.toMatchObject({ kind: "registered-running-valid", managerPid: 301 });
+    await expect(supervisor.probe(spec)).resolves.toMatchObject({ kind: "registered-stale-config", reason: "metadata-missing" });
+    await expect(supervisor.probe(spec)).resolves.toMatchObject({ kind: "registered-stale-config", reason: "metadata-malformed" });
+    await expect(supervisor.probe(spec)).resolves.toMatchObject({ kind: "registered-stale-config", reason: "metadata-mismatch" });
   });
 
   it("writes a private plist without KeepAlive and uses gui UID bootstrap/print/bootout", async () => {
@@ -1643,6 +1700,7 @@ describe("launchd-user supervisor", () => {
     for (const tamper of [
       (document: string) => document.replace("</dict></plist>\n", "<key>OPENAI_API_KEY</key><string>secret</string></dict></plist>\n"),
       (document: string) => document.replace(/<string>HOME=[^<]*<\/string>/u, `<string>HOME=${"x".repeat(4_097)}</string>`),
+      (document: string) => document.replace(/<string>LCM_SUPERVISOR_ENV_DIGEST=[^<]*<\/string>/u, "<string>LCM_SUPERVISOR_ENV_DIGEST=not-a-digest</string>"),
       (document: string) => document.replace("<string>daemon</string>", "<string>tampered</string>"),
       (document: string) => document.replace("<string>/usr/bin/node</string>", "<string>/usr/bin/other</string>"),
       (document: string) => document.replace(/<key>Label<\/key><string>[^<]*<\/string>/u, "<key>Label</key><string>foreign.label</string>"),
@@ -1681,11 +1739,12 @@ describe("launchd-user supervisor", () => {
     const firstEnvironment = { HOME: "/home/managed", PATH: "/usr/bin" };
     const replacementEnvironment = { HOME: "/home/other", PATH: "/usr/bin" };
     const spec = makeSpec("launchd-user", root);
-    const running = launchdPrintText(spec, "running", 543);
+    const firstRunning = launchdPrintText(spec, "running", 543, firstEnvironment);
+    const replacementRunning = launchdPrintText(spec, "running", 543, replacementEnvironment);
     const initial = fakeRunner([
       { code: 113, stderr: "Could not find service" },
       { code: 0, stdout: "bootstrap" },
-      { code: 0, stdout: running },
+      { code: 0, stdout: firstRunning },
     ]);
     await expect(createSupervisor("launchd-user", {
       run: initial.run,
@@ -1698,7 +1757,7 @@ describe("launchd-user supervisor", () => {
     const drifted = fakeRunner([
       { code: 113, stderr: "Could not find service" },
       { code: 0, stdout: "bootstrap" },
-      { code: 0, stdout: running },
+      { code: 0, stdout: replacementRunning },
     ]);
     await expect(createSupervisor("launchd-user", {
       run: drifted.run,
@@ -1711,7 +1770,7 @@ describe("launchd-user supervisor", () => {
 
     const runningRoot = makeRoot();
     const runningSpec = makeSpec("launchd-user", runningRoot);
-    const runningOutput = `state = running\npid = 777\nenvironment = {\n LCM_SUPERVISOR_MARKER => ${runningSpec.marker}\n LCM_SUPERVISOR_SCOPE => ${runningSpec.scopeDigest}\n LCM_SUPERVISOR_PORT => ${runningSpec.port}\n LCM_SUPERVISOR_NONCE => ${runningSpec.nonce}\n LCM_SUPERVISOR_EXECUTABLE => ${runningSpec.executable}\n LCM_SUPERVISOR_ARGS => ${JSON.stringify(runningSpec.args)}\n LCM_SUPERVISOR_CWD => `;
+    const runningOutput = `state = running\npid = 777\nenvironment = {\n LCM_SUPERVISOR_MARKER => ${runningSpec.marker}\n LCM_SUPERVISOR_SCOPE => ${runningSpec.scopeDigest}\n LCM_SUPERVISOR_PORT => ${runningSpec.port}\n LCM_SUPERVISOR_NONCE => ${runningSpec.nonce}\n LCM_SUPERVISOR_EXECUTABLE => ${runningSpec.executable}\n LCM_SUPERVISOR_ARGS => ${JSON.stringify(runningSpec.args)}\n LCM_SUPERVISOR_CWD => \n LCM_SUPERVISOR_ENV_DIGEST => ${launchdEnvironmentDigest(runningSpec, firstEnvironment)}`;
     const runningInitial = fakeRunner([
       { code: 113, stderr: "Could not find service" },
       { code: 0, stdout: "bootstrap" },
@@ -1731,7 +1790,7 @@ describe("launchd-user supervisor", () => {
       environment: replacementEnvironment,
       platform: "darwin",
       uid: 501,
-    }).start(runningSpec)).resolves.toMatchObject({ managerPid: 777 });
+    }).start(runningSpec)).rejects.toThrow("manager command");
     expect(runningWinner.calls).toHaveLength(1);
     expect(readFileSync(runningPlist, "utf8")).toBe(runningDocument);
   });
@@ -1739,8 +1798,8 @@ describe("launchd-user supervisor", () => {
   it("covers launchd terminal, collision, timeout, UID, and exact cleanup/refusal paths", async () => {
     const root = makeRoot();
     const spec = makeSpec("launchd-user", root);
-    const running = `state = running\npid = 777\nLCM_SUPERVISOR_MARKER => ${spec.marker}\nLCM_SUPERVISOR_SCOPE => ${spec.scopeDigest}\nLCM_SUPERVISOR_PORT => ${spec.port}\nLCM_SUPERVISOR_NONCE => ${spec.nonce}\nLCM_SUPERVISOR_EXECUTABLE => ${spec.executable}\nLCM_SUPERVISOR_ARGS => ${JSON.stringify(spec.args)}\nLCM_SUPERVISOR_CWD => `;
-    const terminal = `state = exited\npid = 0\nLCM_SUPERVISOR_MARKER => ${spec.marker}\nLCM_SUPERVISOR_SCOPE => ${spec.scopeDigest}\nLCM_SUPERVISOR_PORT => ${spec.port}\nLCM_SUPERVISOR_NONCE => ${spec.nonce}\nLCM_SUPERVISOR_EXECUTABLE => ${spec.executable}\nLCM_SUPERVISOR_ARGS => ${JSON.stringify(spec.args)}\nLCM_SUPERVISOR_CWD => `;
+    const running = `state = running\npid = 777\nLCM_SUPERVISOR_MARKER => ${spec.marker}\nLCM_SUPERVISOR_SCOPE => ${spec.scopeDigest}\nLCM_SUPERVISOR_PORT => ${spec.port}\nLCM_SUPERVISOR_NONCE => ${spec.nonce}\nLCM_SUPERVISOR_EXECUTABLE => ${spec.executable}\nLCM_SUPERVISOR_ARGS => ${JSON.stringify(spec.args)}\nLCM_SUPERVISOR_CWD => \nLCM_SUPERVISOR_ENV_DIGEST => ${launchdEnvironmentDigest(spec)}`;
+    const terminal = `state = exited\npid = 0\nLCM_SUPERVISOR_MARKER => ${spec.marker}\nLCM_SUPERVISOR_SCOPE => ${spec.scopeDigest}\nLCM_SUPERVISOR_PORT => ${spec.port}\nLCM_SUPERVISOR_NONCE => ${spec.nonce}\nLCM_SUPERVISOR_EXECUTABLE => ${spec.executable}\nLCM_SUPERVISOR_ARGS => ${JSON.stringify(spec.args)}\nLCM_SUPERVISOR_CWD => \nLCM_SUPERVISOR_ENV_DIGEST => ${launchdEnvironmentDigest(spec)}`;
     const runner = fakeRunner([
       { code: 0, stdout: terminal },
       { code: 0, stdout: terminal },
@@ -1817,6 +1876,7 @@ describe("launchd-user supervisor", () => {
       `LCM_SUPERVISOR_EXECUTABLE => ${oldSpec.executable}`,
       `LCM_SUPERVISOR_ARGS => ${JSON.stringify(oldSpec.args)}`,
       "LCM_SUPERVISOR_CWD =>",
+      `LCM_SUPERVISOR_ENV_DIGEST => ${launchdEnvironmentDigest(oldSpec)}`,
       ...(oldCa === undefined ? [] : [`LCM_POSTGRES_CA_FILE => ${oldCa}`]),
     ].join("\n");
     const oldRunner = fakeRunner([
