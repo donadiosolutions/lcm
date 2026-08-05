@@ -3093,6 +3093,10 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       )
     : opts._windowsPowerShellPathOverride;
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
+  const expectedEntrypoint = testScope?.entrypoint
+    ?? opts.expectedEntrypoint
+    ?? opts._packagedEntrypointOverride
+    ?? PACKAGED_RUNTIME_ENTRYPOINT;
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
@@ -3128,7 +3132,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     return authenticatedHealth !== null
       && processEntrypointMatches(
         authenticatedHealth,
-        testScope?.entrypoint ?? opts.expectedEntrypoint,
+        expectedEntrypoint,
         platform,
         procRoot,
         realpath,
@@ -3189,7 +3193,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         nonce: opts._supervisorNonceOverride?.() ?? supervisorNonce(),
         executable,
         args,
-        entrypoint: testScope?.entrypoint ?? opts.expectedEntrypoint,
+        entrypoint: expectedEntrypoint,
         runtimeDigest: opts.expectedRuntimeDigest ?? RUNTIME_DIGEST,
         storageBackend: opts.expectedStorageBackend ?? "sqlite",
         postgresCaFile: dependencies.environment.LCM_POSTGRES_CA_FILE,
@@ -3239,6 +3243,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     ): Promise<RestartDaemonResult> => {
       const ensured = await ensure({
         ...ensureOptions,
+        expectedEntrypoint,
         _suppressDetachedFallback: true,
         _managedOperationAuthorized: true,
         ...(managerPid === undefined ? {} : { _managedOperationManagerPid: managerPid }),
@@ -3347,7 +3352,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         readOwnedToken,
       );
       if (authenticated === null) return restartRefusal("response-auth-failure", "managed daemon health could not be authenticated; refusing restart", { pid: managerPid });
-      if (!processEntrypointMatches(authenticated, testScope?.entrypoint ?? opts.expectedEntrypoint, platform, procRoot, realpath)
+      if (!processEntrypointMatches(authenticated, expectedEntrypoint, platform, procRoot, realpath)
         || !healthRuntimeDigestMatches(authenticated, opts.expectedRuntimeDigest)) {
         return restartRefusal("response-invalid", "managed daemon identity did not match the requested runtime; refusing restart", { pid: managerPid });
       }

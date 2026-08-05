@@ -158,7 +158,11 @@ jobs:
             fi
           }
           trap cleanup EXIT
-          systemctl --user is-system-running
+          systemd_state="$(systemctl --user is-system-running || true)"
+          case "$systemd_state" in
+            running|degraded) ;;
+            *) echo "Unexpected user-systemd state: $systemd_state" >&2; exit 1 ;;
+          esac
           npx vitest run test/daemon/lifecycle-isolation.test.ts \
             --testNamePattern "uses and removes one exact run-owned transient unit"
           npx vitest run test/daemon/systemd-credential-loader.test.ts \

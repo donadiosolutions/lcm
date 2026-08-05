@@ -933,7 +933,7 @@ describe("managed restart refusal and repair coverage", () => {
     expect(fallback.restarted).toBe(false);
   });
 
-  it("repairs stale registrations and reports stop/start failures", async () => {
+  it("repairs stale registrations and propagates the normal CLI packaged entrypoint", async () => {
     const dir = root();
     const stopAndStart = vi.fn(async () => ({ kind: "systemd-user", managerPid: 200 }));
     const managed = managedSupervisor((spec) => ({
@@ -944,10 +944,12 @@ describe("managed restart refusal and repair coverage", () => {
     }), { kind: "systemd-user", managerPid: 200 });
     managed.stopAndStart.mockImplementation(stopAndStart);
     const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: false }));
-    const result = await restart({ ...baseOptions(dir), enforceUserManagerParent: true, _supervisorOverride: managed.supervisor, _ensureDaemonOverride: ensureMock });
+    const result = await restart({ ...baseOptions(dir), expectedEntrypoint: undefined, _packagedEntrypointOverride: "/packaged-lcm", enforceUserManagerParent: true, _supervisorOverride: managed.supervisor, _ensureDaemonOverride: ensureMock });
     expect(result).toMatchObject({ restarted: true, connected: true });
     expect(stopAndStart).toHaveBeenCalledOnce();
+    expect(managed.probe).toHaveBeenCalledWith(expect.objectContaining({ entrypoint: "/packaged-lcm" }));
     expect(ensureMock).toHaveBeenCalledOnce();
+    expect(ensureMock).toHaveBeenCalledWith(expect.objectContaining({ expectedEntrypoint: "/packaged-lcm" }));
 
     const mismatch = managedSupervisor((spec) => ({ kind: "registered-stale-config", reason: "metadata-mismatch", scopeDigest: "foreign", name: spec.name }));
     const refused = await restart({ ...baseOptions(root()), enforceUserManagerParent: true, _supervisorOverride: mismatch.supervisor });

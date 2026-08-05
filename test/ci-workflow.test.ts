@@ -163,7 +163,9 @@ describe("CI workflow", () => {
       LCM_LIFECYCLE_DAEMON_PORT: "48322",
       LCM_LIFECYCLE_EXPECTED_SCOPES: "1",
     });
-    expect(integration?.run).toContain("systemctl --user is-system-running");
+    expect(integration?.run).toMatch(
+      /systemd_state="\$\(systemctl --user is-system-running \|\| true\)"[\s\S]*case "\$systemd_state" in[\s\S]*running\|degraded\)\s*;;[\s\S]*\*\)[\s\S]*exit 1/u,
+    );
     expect(integration?.run).toContain("test/daemon/lifecycle-isolation.test.ts");
     expect(integration?.run).toContain("uses and removes one exact run-owned transient unit");
     expect(integration?.run).toContain("test/daemon/systemd-credential-loader.test.ts");
