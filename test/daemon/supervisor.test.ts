@@ -211,6 +211,17 @@ describe("canonical supervisor identity", () => {
     expect(managedLaunchEnvironment({ CODEX_HOME: "relative" })).toEqual({});
   });
 
+  it("uses the private directory owner when process.getuid is unavailable", () => {
+    const root = makeRoot();
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    Object.defineProperty(process, "getuid", { configurable: true, enumerable: true, value: undefined, writable: true });
+    try {
+      expect(managedLaunchEnvironment({ CODEX_HOME: root })).toEqual({ CODEX_HOME: root });
+    } finally {
+      if (descriptor !== undefined) Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
   it("allows detached compatibility only for read-only manager absence reasons", () => {
     const reasons = ["manager-unavailable", "manager-timeout", "manager-command-failed",
       "manager-not-found", "metadata-missing", "metadata-mismatch", "foreign-job",
@@ -1386,6 +1397,20 @@ describe("launchd-user supervisor", () => {
       uid: 501,
     }).probe(spec)).resolves.toMatchObject({ kind: "absent", name: spec.launchdLabel });
 
+    const noSuchProcess = fakeRunner([{ code: 3, stderr: "No such process" }]);
+    await expect(createSupervisor("launchd-user", {
+      run: noSuchProcess.run,
+      platform: "darwin",
+      uid: 501,
+    }).probe(spec)).resolves.toMatchObject({ kind: "absent", name: spec.launchdLabel });
+
+    const absentStop = fakeRunner([{ code: 3, stderr: "No such process" }]);
+    await expect(createSupervisor("launchd-user", {
+      run: absentStop.run,
+      platform: "darwin",
+      uid: 501,
+    }).stopAndAwaitAbsent(spec)).resolves.toBeUndefined();
+
     const capturedNotFound = fakeRunner([{
       code: 113,
       stderr: `Could not find service "${spec.launchdLabel}" in domain gui/501`,
@@ -1418,6 +1443,122 @@ describe("launchd-user supervisor", () => {
       platform: "darwin",
       uid: 501,
     }).probe(spec)).resolves.toMatchObject({ kind: "unavailable", reason: "manager-command-failed" });
+  });
+
+  it("preserves staged credentials across a same-spec launchd stop/start", async () => {
+    const root = makeRoot();
+    const credentialDirectory = createManagedCredentialDirectory(root, "same-spec-restart");
+    const credentialFile = writeManagedCredentialFiles(credentialDirectory, { OPENAI_API_KEY: "secret" })[0]!;
+    const spec = makeSpec("launchd-user", root, {
+      credentialDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
+    });
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = fakeRunner([
+      { code: 0, stdout: launchdPrintText(spec, "running", 543) },
+      { code: 0, stdout: launchdPrintText(spec, "running", 543) },
+      { code: 0, stdout: "bootout" },
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(spec, "running", 544) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+    }).stopAndStart(spec)).resolves.toMatchObject({ managerPid: 544 });
+    expect(existsSync(credentialFile)).toBe(true);
+    expect(runner.calls.some((call) => call.command === "launchctl" && call.args[0] === "bootout")).toBe(true);
+    expect(runner.calls.some((call) => call.command === "launchctl" && call.args[0] === "bootstrap")).toBe(true);
+  });
+
+  it("handles a launchd stop/start race that proves the exact job absent", async () => {
+    const root = makeRoot();
+    const spec = makeSpec("launchd-user", root);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = fakeRunner([
+      { code: 0, stdout: launchdPrintText(spec, "running", 543) },
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(spec, "running", 544) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+    }).stopAndStart(spec)).resolves.toMatchObject({ managerPid: 544 });
+    expect(runner.calls.some((call) => call.args[0] === "bootout")).toBe(false);
+  });
+
+  it("retires a prior launchd plist with an older bounded assignment set", async () => {
+    const root = makeRoot();
+    const oldSpec = makeSpec("launchd-user", root, {
+      launchEnvironment: { HOME: "/home/old", PATH: "/usr/bin" },
+    });
+    const replacementSpec = makeSpec("launchd-user", root, {
+      launchEnvironment: { HOME: "/home/new", PATH: "/usr/bin", LCM_SUMMARY_PROVIDER: "openai" },
+    });
+    const oldRunner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(oldSpec, "running", 543) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: oldRunner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(oldSpec)).resolves.toMatchObject({ managerPid: 543 });
+
+    const replacementRunner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(replacementSpec, "running", 544) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: replacementRunner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(replacementSpec)).resolves.toMatchObject({ managerPid: 544 });
+    expect(readFileSync(join(root, `daemon.${replacementSpec.shortDigest}.${replacementSpec.nonce}.plist`), "utf8"))
+      .toContain("<string>LCM_SUMMARY_PROVIDER=openai</string>");
+  });
+
+  it("checks current assignment values before allowing absence-only digest drift", async () => {
+    const root = makeRoot();
+    const oldEnvironment = { HOME: "/home/old", PATH: "/usr/bin" };
+    const replacementEnvironment = { HOME: "/home/new", PATH: "/usr/bin" };
+    const spec = makeSpec("launchd-user", root);
+    const oldDigest = launchdEnvironmentDigest(spec, oldEnvironment);
+    const replacementDigest = launchdEnvironmentDigest(spec, replacementEnvironment);
+    const oldRunner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(spec, "running", 543, oldEnvironment) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: oldRunner.run,
+      environment: oldEnvironment,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 543 });
+
+    const plist = join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
+    const forgedDigestDocument = readFileSync(plist, "utf8").replaceAll(oldDigest, replacementDigest);
+    writeFileSync(plist, forgedDigestDocument, { mode: 0o600 });
+    const replacementRunner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(spec, "running", 544, replacementEnvironment) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: replacementRunner.run,
+      environment: replacementEnvironment,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 544 });
+    expect(readFileSync(plist, "utf8")).toContain(`<string>HOME=${replacementEnvironment.HOME}</string>`);
   });
 
   it("authenticates launchd environment drift from manager-observed digest variants", async () => {
@@ -1699,6 +1840,7 @@ describe("launchd-user supervisor", () => {
     const original = readFileSync(plist, "utf8");
     for (const tamper of [
       (document: string) => document.replace("</dict></plist>\n", "<key>OPENAI_API_KEY</key><string>secret</string></dict></plist>\n"),
+      (document: string) => document.replace(/<string>LCM_SUPERVISOR_MARKER=[^<]*<\/string>/u, "<string>malformed-assignment</string>"),
       (document: string) => document.replace(/<string>HOME=[^<]*<\/string>/u, `<string>HOME=${"x".repeat(4_097)}</string>`),
       (document: string) => document.replace(/<string>LCM_SUPERVISOR_ENV_DIGEST=[^<]*<\/string>/u, "<string>LCM_SUPERVISOR_ENV_DIGEST=not-a-digest</string>"),
       (document: string) => document.replace("<string>daemon</string>", "<string>tampered</string>"),
@@ -1717,7 +1859,6 @@ describe("launchd-user supervisor", () => {
       (document: string) => document.replace(/<string>HOME=[^<]*<\/string>/u, "<string>invalid-assignment</string>"),
       (document: string) => document.replace(/<string>HOME=[^<]*<\/string>/u, "<string>1BAD=foo</string>"),
       (document: string) => document.replace("<string>HOME=", "<string>UNKNOWN=foo</string><string>HOME="),
-      (document: string) => document.replace(/<string>PATH=[^<]*<\/string>/u, ""),
       (document: string) => document.replace(/<string>HOME=[^<]*<\/string>/u, (value) => `${value}<string>${value.slice(8)}</string>`),
     ]) {
       const tampered = tamper(original);

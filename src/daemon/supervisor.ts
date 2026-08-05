@@ -870,6 +870,9 @@ function isNotFoundOutput(
     // service-specific diagnostics establish an absent registration; a bare
     // transport or permission failure must remain unresolved.
     if (code === 36) return true;
+    // Terminal or already-unloaded GUI jobs can report ESRCH (3) with the
+    // service-specific "No such process" diagnostic.
+    if (code === 3) return /\bno such process\b/u.test(lower);
     if (code !== 113) return false;
     return /\b(?:no such process|could not find\b[^\r\n]{0,256}\bservice\b|service\b[^\r\n]{0,256}\b(?:not found|does not exist)\b)/u.test(lower);
   }
@@ -1180,7 +1183,7 @@ function launchAssignmentMap(values: readonly string[]): Map<string, string> | u
   const assignments = new Map<string, string>();
   for (const value of values) {
     const separator = value.indexOf("=");
-    if (separator <= 0) break;
+    if (separator <= 0) return undefined;
     const name = value.slice(0, separator);
     const assignment = value.slice(separator + 1);
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name) || assignments.has(name)) return undefined;
@@ -1361,7 +1364,8 @@ function privatePlistMatchesStableIdentity(
   ]);
   if (![...assignments.keys()].every((name) => allowedNames.has(name))) return false;
   const expectedAssignmentNames = new Set<string>();
-  for (const name of expectedAssignments.keys()) {
+  const assignmentNames = allowEnvironmentDrift ? assignments.keys() : expectedAssignments.keys();
+  for (const name of assignmentNames) {
     if (
       name !== "LCM_CREDENTIAL_DIRECTORY"
       && name !== "LCM_SYSTEMD_CRED_IDS"
@@ -2186,7 +2190,7 @@ export function createSupervisor(
         if (stalePlistSpec !== undefined) cleanupPrivatePlist(stalePlistSpec, runner.environment, dependencies._plistRaceForTesting);
         else cleanupPrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
       }
-      safeObservedCredentialCleanup(staleSource ?? current, spec);
+      safeObservedCredentialCleanup(staleSource ?? (cleanupCredentials ? current : undefined), spec);
       if (cleanupCredentials) safeCredentialCleanup(spec);
       return;
     }
@@ -2243,7 +2247,7 @@ export function createSupervisor(
           if (stalePlistSpec !== undefined) cleanupPrivatePlist(stalePlistSpec, runner.environment, dependencies._plistRaceForTesting);
           else cleanupPrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
         }
-        safeObservedCredentialCleanup(staleSource ?? current, spec);
+        safeObservedCredentialCleanup(staleSource ?? (cleanupCredentials ? current : undefined), spec);
         if (cleanupCredentials) safeCredentialCleanup(spec);
         return;
       }
