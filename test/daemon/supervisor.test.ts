@@ -899,6 +899,31 @@ describe("systemd-user supervisor", () => {
     expect(runner.calls[2].timeoutMs).toBe(spec.stopTimeoutMs);
   });
 
+  it("tolerates a clean-exit unit disappearing before reset-failed and proves absence", async () => {
+    const spec = makeSpec("systemd-user");
+    const runner = fakeRunner([
+      { code: 0, stdout: managerText(spec, "inactive") },
+      { code: 0, stdout: "stopped" },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).stopAndAwaitAbsent(spec)).resolves.toBeUndefined();
+    expect(runner.calls[2].args).toEqual(["--user", "reset-failed", spec.systemdUnit]);
+    expect(runner.calls[3].args).toEqual(["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,Environment,ExecMainStartTimestamp,FragmentPath", spec.systemdUnit]);
+  });
+
+  it("refuses a reset-failed failure other than exact not-found", async () => {
+    const spec = makeSpec("systemd-user");
+    const runner = fakeRunner([
+      { code: 0, stdout: managerText(spec, "failed") },
+      { code: 0, stdout: "stopped" },
+      { code: 1, stderr: "permission denied" },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).stopAndAwaitAbsent(spec)).rejects.toThrow("manager command");
+    expect(runner.calls[2].args).toEqual(["--user", "reset-failed", spec.systemdUnit]);
+    expect(runner.calls).toHaveLength(3);
+  });
+
   it("resets and proves absence of a retained clean-exit unit before same-name recreation", async () => {
     const spec = makeSpec("systemd-user");
     const terminal = managerText(spec, "inactive");
@@ -1301,6 +1326,80 @@ describe("systemd-user supervisor", () => {
       { code: 0, stdout: managerText(spec, "active", 818) },
     ]);
     await expect(createSupervisor("systemd-user", { run: restartRunner.run, platform: "linux" }).stopAndStart(spec)).resolves.toMatchObject({ managerPid: 818 });
+  });
+
+  it("requires an exact fresh systemd stale registration before replacement mutation", async () => {
+    const root = makeRoot();
+    const credentialDirectory = createManagedCredentialDirectory(root, "replacement");
+    const credentialFile = writeManagedCredentialFiles(credentialDirectory, { OPENAI_API_KEY: "replacement-secret" })[0]!;
+    const spec = makeSpec("systemd-user", root, {
+      credentialDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
+    });
+    const prior = makeSpec("systemd-user", root, {
+      port: spec.port + 1,
+      nonce: "prior-stale",
+      credentialDirectory: join(root, "credentials", "prior-stale"),
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: join(root, "credentials", "prior-stale", "OPENAI_API_KEY") }],
+    });
+    const stale = managerText(prior, "inactive");
+    const stable = fakeRunner([
+      { code: 0, stdout: stale },
+      { code: 0, stdout: stale },
+      { code: 0, stdout: "stopped" },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: managerText(spec, "active", 818) },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: stable.run, platform: "linux" }).stopAndStart(spec)).resolves.toMatchObject({ managerPid: 818 });
+    expect(stable.calls.some(({ command, args }) => command === "systemctl" && args[1] === "stop")).toBe(true);
+    expect(existsSync(credentialDirectory)).toBe(true);
+
+    const replacedCases: ReadonlyArray<readonly [string, SupervisorCommandResult]> = [
+      ["absence", { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` }],
+      ["different nonce", { code: 0, stdout: managerText(makeSpec("systemd-user", root, { nonce: "concurrent-winner" }), "active", 777) }],
+      ["collision", { code: 0, stdout: stale.replace(`LCM_SUPERVISOR_MARKER=${prior.marker}`, "LCM_SUPERVISOR_MARKER=foreign") }],
+      ["ambiguity", { code: 0, stdout: managerText(spec, "active", 777, "stopped") }],
+      ["unavailable", { code: 1, stderr: "permission denied" }],
+      ["sparse observation", { code: 0, stdout: stale.replace("LCM_SUPERVISOR_CWD=", "LCM_SUPERVISOR_OTHER=") }],
+      ["malformed environment digest", { code: 0, stdout: stale.replace(/LCM_SUPERVISOR_ENV_DIGEST=[0-9a-f]{64}/u, "LCM_SUPERVISOR_ENV_DIGEST=not-a-digest") }],
+    ];
+    for (const [label, fresh] of replacedCases) {
+      const runner = fakeRunner([
+        { code: 0, stdout: stale },
+        fresh,
+      ]);
+      await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).stopAndStart(spec), label).rejects.toThrow("manager command");
+      expect(runner.calls.some(({ command, args }) => command === "systemctl" && (args[1] === "stop" || args[1] === "reset-failed")), label).toBe(false);
+      expect(runner.calls.some(({ command }) => command === "systemd-run"), label).toBe(false);
+      expect(existsSync(credentialDirectory), label).toBe(true);
+    }
+
+    const configured = makeSpec("systemd-user", root, { entrypoint: "/opt/lcm/dist/lcm.mjs" });
+    const incompletePrior = makeSpec("systemd-user", root, { port: configured.port + 1, nonce: "incomplete-prior" });
+    const incompleteRunner = fakeRunner([
+      { code: 0, stdout: managerText(incompletePrior, "inactive") },
+      { code: 0, stdout: managerText(incompletePrior, "inactive") },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: incompleteRunner.run, platform: "linux" }).stopAndStart(configured)).rejects.toThrow("manager command");
+    expect(incompleteRunner.calls.some(({ command, args }) => command === "systemctl" && args[1] === "stop")).toBe(false);
+
+    const missingMarker = managerText(incompletePrior, "inactive").replace(`LCM_SUPERVISOR_MARKER=${incompletePrior.marker} `, "");
+    const missingMarkerRunner = fakeRunner([
+      { code: 0, stdout: missingMarker },
+      { code: 0, stdout: missingMarker },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: missingMarkerRunner.run, platform: "linux" }).stopAndStart(configured)).rejects.toThrow("manager command");
+    expect(missingMarkerRunner.calls.some(({ command, args }) => command === "systemctl" && args[1] === "stop")).toBe(false);
+
+    const configuredWithCa = makeSpec("systemd-user", root, { postgresCaFile: join(root, "ca.pem") });
+    const missingCaRunner = fakeRunner([
+      { code: 0, stdout: managerText(incompletePrior, "inactive") },
+      { code: 0, stdout: managerText(incompletePrior, "inactive") },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: missingCaRunner.run, platform: "linux" }).stopAndStart(configuredWithCa)).rejects.toThrow("manager command");
+    expect(missingCaRunner.calls.some(({ command, args }) => command === "systemctl" && args[1] === "stop")).toBe(false);
   });
 
   it("covers command preflight, bounded timeout, runner errors, and explicit restart decisions", async () => {

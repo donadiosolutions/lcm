@@ -1873,7 +1873,10 @@ function safeObservedCredentialCleanup(
     || observation.name !== spec.name
     || observation.credentialDirectory === undefined
   ) return;
-  if (observation.stateRoot !== undefined && observation.stateRoot !== spec.stateRoot) return;
+  // Managed stale transitions authenticate the observed state root before
+  // reaching this absence-only cleanup stage.  The credential validator below
+  // remains the final containment fence for the observed path and leaves
+  // tampered evidence untouched.
   try {
     cleanupManagedCredentialDirectory(observation.credentialDirectory, spec.stateRoot);
   } catch {
@@ -1919,22 +1922,16 @@ function isOwnedSystemdActivation(
 }
 
 /**
- * Keep a prior launchd terminal observation bounded to its authenticated
- * registration.  During bootout/exit launchd can briefly expose a sparse or
- * contradictory print projection; that is retryable read-only state, not
- * cleanup authority.  A repetition may authorize the pending bootout only when
- * the trusted manager repeats the *same* authenticated prior registration:
- * the stable scope/label mutex plus the prior nonce and the exact launch
- * identity (port, executable, JSON args, cwd) and every identity/security
- * metadata surface recorded by the authenticated stale observation (marker,
- * state-root, entrypoint, runtime/storage digests, PostgreSQL CA, and
- * credential directory/files).  A value that was authenticated for the prior
- * registration must repeat verbatim, and a fresh observation whose
- * security-relevant metadata drifts never becomes cleanup authority (fail
- * closed).  A concurrent winner carrying a different nonce under the same
- * label mutex is a hard refusal, not a retryable transition.
+ * Keep a prior manager stale observation bounded to its authenticated
+ * registration.  During manager retirement a sparse or contradictory
+ * projection is retryable read-only state, not cleanup authority.  A
+ * repetition may authorize the pending transition only when the trusted
+ * manager repeats the same authenticated prior registration: the stable scope
+ * mutex, prior nonce, exact launch identity, and every recorded identity or
+ * credential surface.  A concurrent winner carrying a different nonce is a
+ * hard refusal, not a retryable transition.
  */
-function isAuthenticatedLaunchdStaleObservation(
+function isAuthenticatedStaleObservation(
   spec: SupervisorSpec,
   staleSpec: SupervisorSpec,
   observation: SupervisorObservation,
@@ -1942,16 +1939,13 @@ function isAuthenticatedLaunchdStaleObservation(
   if (observation.kind !== "registered-stale-config") return false;
   if (observation.scopeDigest !== spec.scopeDigest || observation.name !== spec.name) return false;
   if (observation.nonce !== staleSpec.nonce) return false;
-  // The stable launchd label already mutexes state-root and port to the
-  // authenticated prior registration, so a feeble projection that merely
-  // omits a field never authenticates on absence alone: the prior nonce is
-  // always required and every observed value must equal the prior one.
-  // The launch-environment digest is the sole exception: it is recomputed
-  // per launch by the manager probe from the caller's filtered environment
-  // and is not carried on the stale plist spec, so it cannot authenticate a
-  // prior registration by equality here.  It carries no launch identity in
-  // this fail-closed transition (the prior executable/args/digests below
-  // already bind the launch), so it is not compared.
+  // The stable manager name already mutexes state-root and port to the
+  // authenticated prior registration, so a projection that merely omits a
+  // field never authenticates on absence alone: the prior nonce is always
+  // required and every observed identity value must repeat verbatim.
+  // Launch-environment digests are platform-specific admission metadata and
+  // are bound by the systemd wrapper below when the manager exposes them; they
+  // are not carried on staleSpec for this shared identity comparison.
   return observation.stateRoot === staleSpec.stateRoot
     && observation.marker === staleSpec.marker
     && observation.port === staleSpec.port
@@ -1964,6 +1958,38 @@ function isAuthenticatedLaunchdStaleObservation(
     && observation.postgresCaFile === staleSpec.postgresCaFile
     && observation.credentialDirectory === staleSpec.credentialDirectory
     && credentialFilesMatch(staleSpec.credentialFiles, observation.credentialFiles);
+}
+
+/**
+ * Keep a systemd stale transition bound to the exact registration that the
+ * initial probe authenticated.  The stable unit name is the same-scope mutex,
+ * but it does not identify which launch currently occupies that unit.  A
+ * second probe therefore has to repeat the prior nonce and every recorded
+ * launch/credential identity before stop or cleanup may acquire authority.
+ * Any absent, ambiguous, unavailable, valid, or different-nonce observation
+ * fails closed without a manager mutation.
+ */
+function isAuthenticatedSystemdStaleObservation(
+  spec: SupervisorSpec,
+  staleObservation: Extract<SupervisorObservation, { kind: "registered-stale-config" }>,
+  observation: SupervisorObservation,
+): boolean {
+  if (
+    staleObservation.marker !== spec.marker
+    || staleObservation.scopeDigest !== spec.scopeDigest
+    || staleObservation.stateRoot !== spec.stateRoot
+    || staleObservation.name !== spec.name
+    || staleObservation.cwd === undefined
+    || staleObservation.launchEnvironmentDigest === undefined
+    || !/^[0-9a-f]{64}$/u.test(staleObservation.launchEnvironmentDigest)
+    || (spec.postgresCaFile !== undefined && staleObservation.postgresCaFile === undefined)
+  ) return false;
+  const staleSpec = plistSpecFromObservation(spec, staleObservation);
+  return staleSpec !== undefined
+    && isAuthenticatedStaleObservation(spec, staleSpec, observation)
+    && observation.marker === staleObservation.marker
+    && observation.cwd === staleObservation.cwd
+    && observation.launchEnvironmentDigest === staleObservation.launchEnvironmentDigest;
 }
 
 function launchdProbeArgs(spec: SupervisorSpec, uid: number): readonly string[] {
@@ -2235,6 +2261,17 @@ export function createSupervisor(
     if (kind === "launchd-user" && allowStaleConfig && staleSource !== undefined && stalePlistSpec === undefined) {
       throw commandFailedError();
     }
+    if (
+      kind === "systemd-user"
+      && allowStaleConfig
+      && (staleSource === undefined || !isAuthenticatedSystemdStaleObservation(
+        spec,
+        staleSource as Extract<SupervisorObservation, { kind: "registered-stale-config" }>,
+        current,
+      ))
+    ) {
+      throw commandFailedError();
+    }
     const launchdStaleTransition = kind === "launchd-user"
       && allowStaleConfig
       && stalePlistSpec !== undefined;
@@ -2253,7 +2290,7 @@ export function createSupervisor(
           || current.kind === "registered-not-running-valid"
           || current.kind === "unavailable"
           || current.kind === "registered-running-valid"
-          || isAuthenticatedLaunchdStaleObservation(spec, stalePlistSpec, current);
+          || isAuthenticatedStaleObservation(spec, stalePlistSpec, current);
         if (stable || attempt + 1 >= maxTransitionPolls) break;
         const remaining = transitionDeadline - now();
         if (remaining <= 0) break;
@@ -2280,7 +2317,7 @@ export function createSupervisor(
       || (
         launchdStaleTransition
         && current.kind === "registered-stale-config"
-        && !isAuthenticatedLaunchdStaleObservation(spec, stalePlistSpec, current)
+        && !isAuthenticatedStaleObservation(spec, stalePlistSpec, current)
       )
       || (launchdStaleTransition && current.kind === "registered-running-valid")
     ) throw commandFailedError();
@@ -2310,12 +2347,15 @@ export function createSupervisor(
       && current.kind === "registered-not-running-valid"
       && result.code === 0
     ) {
-      // systemd 255 can retain a clean-exit transient registration after
-      // stop.  reset-failed is the manager-authoritative cleanup request that
-      // also releases that retained terminal unit; absence is still proved by
-      // the bounded probes below before same-name recreation.
+      // If a terminal registration remains manager-referenced after stop,
+      // reset-failed is the scoped cleanup request before same-name
+      // recreation. Manager GC may remove it before reset-failed reaches the
+      // manager, so tolerate only its exact not-found result; the bounded
+      // absence probes below remain authoritative.
       const resetFailed = await runner.invoke("systemctl", ["--user", "reset-failed", spec.systemdUnit], spec.stopTimeoutMs);
-      if (resetFailed.timedOut || resetFailed.code !== 0) throw commandFailedError();
+      const resetFailedIsNotFound = resetFailed.code !== 0
+        && isNotFoundOutput(kind, resetFailed.code, `${resetFailed.stdout}\n${resetFailed.stderr}`);
+      if (resetFailed.timedOut || (resetFailed.code !== 0 && !resetFailedIsNotFound)) throw commandFailedError();
     }
     const maxPollIntervals = Math.max(1, Math.ceil(spec.stopTimeoutMs / DEFAULT_POLL_INTERVAL_MS));
     const now = dependencies.now ?? performance.now.bind(performance);
