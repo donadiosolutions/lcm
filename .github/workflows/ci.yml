@@ -204,41 +204,102 @@ jobs:
           label="$LCM_LAUNCHD_LABEL"
           ready_file="$resource_root/launchd.label"
           out_file="$resource_root/launchd.out"
+          # Current-run evidence binds every launchd artifact to this workflow
+          # run and to nothing else. A fresh unpredictable UUID is generated
+          # here and passed to the integration worker exclusively through the
+          # environment, never logged or echoed. The worker must prove current
+          # run ownership by writing one 0600 marker whose content is exactly
+          # "<uuid> <derived-product-label>". A stale or planted marker cannot
+          # know this fresh token, so it cannot satisfy the trap or the
+          # post-run validation.
           evidence_token="$(uuidgen)"
           export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"
-          validate_marker() {
-            [[ -f "$ready_file" ]] || return 1
-            ready_line="$(<"$ready_file")"
-            ready_token="${ready_line%% *}"
-            ready_label="${ready_line#* }"
-            [[ "$ready_line" == "$ready_token $ready_label" ]] || return 1
-            [[ "$ready_token" == "$evidence_token" ]] || return 1
-            [[ "$ready_label" =~ ^com\.donadiosolutions\.lcm\.daemon\.[0-9a-f]{20}$ ]] || return 1
-            [[ "$ready_label" != "$label" ]] || return 1
-            [[ "$(stat -f '%Lp' "$ready_file" 2>/dev/null)" == "600" ]]
-          }
+          # No current-run evidence is trusted until it is validated below.
+          validated_ready_label=""
           cleanup() {
             set +e
-            if validate_marker; then
-                launchctl bootout "gui/$(id -u)/$ready_label" || true
+            if [[ -f "$ready_file" && -n "$validated_ready_label" ]]; then
+              ready_line="$(<"$ready_file")"
+              ready_token="${ready_line%% *}"
+              ready_label="${ready_line#* }"
+              # Bootout is authorized only when the marker was written by this
+              # current workflow run (fresh token match) and carries the exact
+              # validated derived product label admitted below. Any stale,
+              # replanted, malformed, or manifest-mismatched marker refuses to
+              # bootout and never falls back to a broad label sweep or a
+              # native/PID kill.
+              if [[ "$ready_token" == "$evidence_token" && "$ready_line" == "$evidence_token $validated_ready_label" && "$ready_label" == "$validated_ready_label" ]]; then
+                if [[ "$(stat -f '%Lp' "$ready_file" 2>/dev/null)" == "600" ]]; then
+                  launchctl bootout "gui/$(id -u)/$ready_label" || true
+                else
+                  echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2
+                fi
+              else
+                echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2
+              fi
             elif [[ -f "$ready_file" ]]; then
-              echo "Refusing cleanup for malformed or foreign launchd evidence" >&2
+              echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2
             fi
             rm -rf -- "$resource_root"
           }
           trap cleanup EXIT
+          # Fail closed on any pre-existing launchd evidence. The run-scoped
+          # root must start empty so a leftover marker or trapped output from an
+          # earlier retry cannot be inherited as this run's proof.
           rm -rf -- "$resource_root"
           mkdir -p -- "$resource_root"
           chmod 0700 "$resource_root"
           npx vitest run test/daemon/lifecycle-launchd.integration.test.ts 2>&1 \
             | tee "$out_file"
-          if ! validate_marker; then
-            echo "launchd integration produced malformed or foreign current-run evidence" >&2
+          # After the worker exits, the marker must hold the exact current-run
+          # evidence and the single derived product label, or nothing is
+          # trusted for cleanup and the job fails hard.
+          if [[ ! -f "$ready_file" ]]; then
+            echo "launchd integration produced no fresh current-run marker (missing: $ready_file)" >&2
             exit 1
           fi
-          ready_label="${ready_label:-}"
-          if [[ -z "$ready_label" ]]; then
-            echo "launchd integration did not derive a validated scoped product label" >&2
+          ready_line="$(<"$ready_file")"
+          ready_token="${ready_line%% *}"
+          ready_label="${ready_line#* }"
+          if [[ "$ready_token" != "$evidence_token" ]]; then
+            echo "launchd integration marker does not carry the current run evidence token" >&2
+            exit 1
+          fi
+          if [[ ! "$ready_label" =~ ^com\.donadiosolutions\.lcm\.[A-Za-z0-9.-]+$ ]]; then
+            echo "launchd integration did not derive a validated scoped product label: $ready_label" >&2
+            exit 1
+          fi
+          if [[ "$(stat -f '%Lp' "$ready_file" 2>/dev/null)" != "600" ]]; then
+            echo "launchd integration marker does not have mode 0600" >&2
+            exit 1
+          fi
+          if [[ "$ready_label" == "$label" ]]; then
+            # The derived product label can never be this run's static CI
+            # manifest label; an equality gate here would make cleanup dead by
+            # construction, so we reject it instead.
+            echo "launchd integration derived product label must not equal the CI manifest label" >&2
+            exit 1
+          fi
+          if [[ ! "$ready_label" =~ ^com\.donadiosolutions\.lcm\.daemon\.[0-9a-f]{20}$ ]]; then
+            echo "launchd integration derived product label must match the exact run-owned daemon identity" >&2
+            exit 1
+          fi
+          # Ownership proven by the token plus the derived product label; only
+          # now may the EXIT trap consider a bootout on failure teardown.
+          validated_ready_label="$ready_label"
+          # Fail hard when every launchd integration test skipped: a skipped
+          # run still exits 0 and produces no real manager evidence, so this
+          # gate requires observed skips to be zero and a real launched manager
+          # to have been exercised. The counts come only from this run's fresh
+          # captured output, never from any pre-existing file.
+          if grep -qE 'Tests[[:space:]]+.*skipped' "$out_file"; then
+            skipped_count="$(grep -oE 'Tests[[:space:]]+[0-9]+ skipped[^|]*' "$out_file" | grep -oE '[0-9]+ skipped' | grep -oE '^[0-9]+' | head -1)"
+          else
+            skipped_count=0
+          fi
+          passed_count="$(grep -oE 'Tests[[:space:]]+[0-9]+ passed' "$out_file" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' | head -1 || true)"
+          if [[ "${skipped_count:-0}" != "0" || "${passed_count:-0}" == "0" || -z "${passed_count:-}" ]]; then
+            echo "launchd integration produced no current-run passed evidence (skipped=${skipped_count:-0} passed=${passed_count:-0})" >&2
             exit 1
           fi
           grep -q "launchd-user" "$out_file"

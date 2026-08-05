@@ -41,20 +41,27 @@ type CommandCall = Readonly<{
 
 const launchdProductLabel: { value?: string } = {};
 
-/** Record the actual derived launchd product label privately for the trap. */
+/**
+ * Record the actual derived launchd product label privately for the trap.
+ *
+ * The workflow passes one fresh unpredictable run evidence token via
+ * LCM_LAUNCHD_EVIDENCE_TOKEN. We bind the exact derived product label to that
+ * token (0600, "<uuid> <label>") so the EXIT trap can prove the marker was
+ * written by the current workflow run before any bootout. Without the token
+ * the marker is not written at all; the workflow then fails hard because no
+ * fresh current-run evidence exists.
+ */
 function exposeProductLabel(spec: SupervisorSpec): void {
   const resourceRoot = process.env.LCM_LAUNCHD_RESOURCE_ROOT;
   const manifestLabel = process.env.LCM_LAUNCHD_LABEL;
-  if (resourceRoot === undefined || manifestLabel === undefined) return;
+  const evidenceToken = process.env.LCM_LAUNCHD_EVIDENCE_TOKEN;
+  if (resourceRoot === undefined || manifestLabel === undefined || evidenceToken === undefined) return;
   if (spec.launchdLabel !== launchdProductLabel.value && launchdProductLabel.value !== undefined) {
     throw new Error("launchd integration derived more than one product label");
   }
   launchdProductLabel.value = spec.launchdLabel;
-  // The workflow holds the manifest's run-scope label in $LCM_LAUNCHD_LABEL.
-  // We store the actual privately derived product label keyed to that manifest,
-  // so the EXIT trap reads a pinned marker instead of re-deriving one itself.
   const marker = join(resourceRoot, "launchd.label");
-  writeFileSync(marker, spec.launchdLabel, { mode: 0o600 });
+  writeFileSync(marker, `${evidenceToken} ${spec.launchdLabel}\n`, { mode: 0o600 });
 }
 
 const MAX_CAPTURED_MANAGER_OUTPUT = 64 * 1024;

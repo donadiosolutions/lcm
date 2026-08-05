@@ -240,54 +240,91 @@ describe("CI workflow", () => {
         "com.donadiosolutions.lcm.ci.${{ github.run_id }}.${{ github.run_attempt }}",
     });
     const run = integration?.run ?? "";
+    // The run creates one fresh unpredictable current-run evidence token,
+    // passes it to the worker only through the environment, and the trap may
+    // bootout only exact evidence proven to belong to this run. A stale or
+    // planted marker without the fresh token must never be accepted.
+    expect(run).toContain('evidence_token="$(uuidgen)"');
+    expect(run).toContain('export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"');
+    expect(run).toContain('LCM_LAUNCHD_EVIDENCE_TOKEN');
+    // The run root must be cleared before the worker starts so no leaked
+    // pre-existing marker or stale captured output can satisfy the gate.
+    const vitestIndex = run.indexOf("npx vitest run test/daemon/lifecycle-launchd.integration.test.ts");
+    const trapIndex = run.indexOf("trap cleanup EXIT");
+    expect(trapIndex).toBeGreaterThanOrEqual(0);
+    expect(vitestIndex).toBeGreaterThan(0);
+    const preRunResetIndex = run.indexOf('rm -rf -- "$resource_root"', trapIndex);
+    expect(preRunResetIndex).toBeGreaterThan(trapIndex);
+    expect(preRunResetIndex).toBeLessThan(vitestIndex);
+    const chmodIndex = run.indexOf('chmod 0700 "$resource_root"');
+    expect(chmodIndex).toBeGreaterThan(preRunResetIndex);
+    expect(chmodIndex).toBeLessThan(vitestIndex);
+    // The trap must read the pinned marker, require the current-run evidence
+    // token, and boot out only the exact validated derived product label.
     expect(run).toContain('ready_file="$resource_root/launchd.label"');
     expect(run).toContain('out_file="$resource_root/launchd.out"');
     expect(run).toContain('evidence_token="$(uuidgen)"');
     expect(run).toContain('export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"');
     expect(run).toContain('launchctl bootout "gui/$(id -u)/$ready_label"');
-    expect(run).toContain('[[ "$ready_token" == "$evidence_token" ]]');
-    expect(run).toContain(
-      '[[ "$ready_label" =~ ^com\\.donadiosolutions\\.lcm\\.daemon\\.[0-9a-f]{20}$ ]]',
-    );
-    expect(run).toContain('[[ "$ready_label" != "$label" ]]');
     expect(run).toContain('rm -rf -- "$resource_root"');
     expect(run).toContain('mkdir -p -- "$resource_root"');
     expect(run).toContain('chmod 0700 "$resource_root"');
     expect(run).toContain('tee "$out_file"');
     expect(run).toContain('grep -q "launchd-user" "$out_file"');
-    expect(run).toContain("validate_marker() {");
-    expect(run).toContain("Refusing cleanup for malformed or foreign launchd evidence");
-    expect(run).not.toMatch(/\b(?:pkill|killall|kill)\b/u);
-    const trap = run.indexOf("trap cleanup EXIT");
-    const reset = run.indexOf('rm -rf -- "$resource_root"', trap);
-    const testRun = run.indexOf("npx vitest run test/daemon/lifecycle-launchd.integration.test.ts");
-    expect(trap).toBeGreaterThanOrEqual(0);
-    expect(reset).toBeGreaterThan(trap);
-    expect(reset).toBeLessThan(testRun);
-    expect(run.indexOf('chmod 0700 "$resource_root"')).toBeLessThan(testRun);
-    expect(run.indexOf("if validate_marker; then")).toBeGreaterThanOrEqual(0);
-    expect(run.indexOf('launchctl bootout "gui/$(id -u)/$ready_label"')).toBeGreaterThan(
-      run.indexOf("if validate_marker; then"),
+    // The trap gates every bootout on exact current-run evidence: the fresh
+    // token, the exact validated derived product label, and the exact pinned
+    // marker line. There is no broader label sweep and no native/PID fallback.
+    expect(run).toContain(
+      '[[ "$ready_token" == "$evidence_token" && "$ready_line" == "$evidence_token $validated_ready_label" && "$ready_label" == "$validated_ready_label" ]]',
     );
+    expect(run).toContain('validated_ready_label=""');
+    expect(run).toContain('[[ -f "$ready_file" && -n "$validated_ready_label" ]]');
+    expect(run).toContain("Refusing cleanup for unexpected launchd label");
+    expect(run).toContain("launchd integration did not derive a validated scoped product label");
+    // The protected gate is run-scoped: it fails hard when no fresh marker
+    // exists, when the marker carries another run's token, when the derived
+    // product label collides with the static CI manifest label, or when every
+    // macOS launchd integration test skipped.
+    expect(run).toContain("launchd integration produced no fresh current-run marker (missing: $ready_file)");
+    expect(run).toContain("launchd integration marker does not carry the current run evidence token");
+    expect(run).toContain("launchd integration derived product label must not equal the CI manifest label");
+    expect(run).toContain(
+      "launchd integration derived product label must match the exact run-owned daemon identity",
+    );
+    expect(run).toContain(
+      "launchd integration produced no current-run passed evidence (skipped=${skipped_count:-0} passed=${passed_count:-0})",
+    );
+    expect(run).toContain("grep -qE 'Tests[[:space:]]+.*skipped' \"$out_file\"");
+    // The derived product label must match the exact run-owned daemon shape,
+    // which is what revives workflow cleanup ownership after the manifest
+    // equality gate was removed: the old equality gate compared against the
+    // static ci.<run_id>.<run_attempt> manifest and therefore could never
+    // authorize bootout of the derived com.donadiosolutions.lcm.daemon.<hex>
+    // product label.
+    expect(run).toContain('[[ "$ready_label" == "$label" ]]');
+    expect(run).toContain('[[ ! "$ready_label" =~ ^com\\.donadiosolutions\\.lcm\\.daemon\\.[0-9a-f]{20}$ ]]');
     expect(launchdIntegrationSource).toContain("LCM_LAUNCHD_RESOURCE_ROOT");
     expect(launchdIntegrationSource).toContain("LCM_LAUNCHD_EVIDENCE_TOKEN");
     expect(launchdIntegrationSource).toContain(
       'writeFileSync(join(resourceRoot, "launchd.label"), `${evidenceToken} ${spec.launchdLabel}\\n`',
     );
-    const start = launchdIntegrationSource.indexOf("const started = await supervisor.start(spec);");
-    const publish = launchdIntegrationSource.indexOf("publishLaunchdEvidence(spec);", start);
-    const health = launchdIntegrationSource.indexOf("waitForExactHealth(spec, managerPid)", publish);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(publish).toBeGreaterThan(start);
-    expect(health).toBeGreaterThan(publish);
     expect(launchdIntegrationSource).toContain("spec.stateRoot !== realpathSync(resourceRoot)");
     expect(launchdIntegrationSource).toContain("expect(statSync(stateRoot).mode & 0o777).toBe(0o700)");
+    expect(run).not.toMatch(/\b(?:pkill|killall|kill)\b/u);
     // The label regex must reject product labels outside the product prefix.
     const productLabelRegex = /^com\.donadiosolutions\.lcm\.[A-Za-z0-9.-]+$/u;
     expect(productLabelRegex.test("com.donadiosolutions.lcm.ci.123456789.1")).toBe(true);
     expect(productLabelRegex.test("com.donadiosolutions.lcm.daemon.0123456789abcdef0123")).toBe(true);
     expect(productLabelRegex.test("com.donadiosolutions.other.daemon.0123456789abcdef0123")).toBe(false);
     expect(productLabelRegex.test("com.donadiosolutions.lcm.")).toBe(false);
+    // The strict run-owned daemon label shape requires 20 lowercase hex
+    // characters so cleanup ownership cannot be claimed by an uppercase or
+    // differently-sized label.
+    const exactRunOwnedLabelRegex = /^com\.donadiosolutions\.lcm\.daemon\.[0-9a-f]{20}$/u;
+    expect(exactRunOwnedLabelRegex.test("com.donadiosolutions.lcm.daemon.0123456789abcdef0123")).toBe(true);
+    expect(exactRunOwnedLabelRegex.test("com.donadiosolutions.lcm.daemon.0123456789ABCDEF0123")).toBe(false);
+    expect(exactRunOwnedLabelRegex.test("com.donadiosolutions.lcm.daemon.0123456789abcdef012")).toBe(false);
+    expect(exactRunOwnedLabelRegex.test("com.donadiosolutions.lcm.ci.123456789.1")).toBe(false);
 
     // The integration may only reference product labels matching the private
     // marker contract and must never use raw pkill/killall on foreign jobs.
