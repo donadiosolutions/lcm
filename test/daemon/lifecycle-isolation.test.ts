@@ -66,10 +66,42 @@ type ScopeFixture = {
 };
 
 const roots: string[] = [];
+function shouldCollectSystemdBarrier(
+  command: string,
+  args: readonly string[],
+  status: number | null | undefined,
+  barrierDir: string | undefined,
+): boolean {
+  return command === "systemd-run"
+    && args.some(arg => arg.startsWith("--unit="))
+    && status === 0
+    && barrierDir !== undefined;
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+describe("systemd manager command-vector harness", () => {
+  it("collects readiness only after a successful systemd-run mutation", () => {
+    const unit = "lcm-daemon-0123456789abcdef0123.service";
+    const probeArgs = [
+      "--user",
+      "show",
+      "--no-pager",
+      "--property=LoadState,ActiveState,SubState,MainPID,Environment,ExecMainStartTimestamp,FragmentPath",
+      unit,
+    ] as const;
+    const startArgs = ["--user", "--no-block", `--unit=${unit}`, "/usr/bin/env", "-i"] as const;
+    expect(shouldCollectSystemdBarrier("systemctl", probeArgs, 0, "/tmp/barrier")).toBe(false);
+    expect(shouldCollectSystemdBarrier("systemd-run", startArgs, 0, "/tmp/barrier")).toBe(true);
+    expect(shouldCollectSystemdBarrier("systemd-run", startArgs, 1, "/tmp/barrier")).toBe(false);
+    expect(shouldCollectSystemdBarrier("systemd-run", startArgs, 0, undefined)).toBe(false);
+    expect(shouldCollectSystemdBarrier("systemd-run", [
+      "--user",
+    ], 0, "/tmp/barrier")).toBe(false);
+  });
 });
 
 function createFixture(
@@ -2384,7 +2416,7 @@ describe("same-user-systemd integration", () => {
     const builtCliUrl = pathToFileURL(join(process.cwd(), "dist", "bin", "lcm.js")).href;
     writeFileSync(
       entrypoint,
-      `import { runCli } from ${JSON.stringify(builtCliUrl)};\nawait runCli(process.argv);\n`,
+      `process.env.LCM_DAEMON_OWNER_ID = ${JSON.stringify(ownerId)};\nimport { runCli } from ${JSON.stringify(builtCliUrl)};\nawait runCli(process.argv);\n`,
     );
     const daemonPort = Number(
       process.env.LCM_LIFECYCLE_DAEMON_PORT
@@ -2469,7 +2501,7 @@ describe("same-user-systemd integration", () => {
       }
       const barrierDir = process.env.LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR;
       const expectedScopes = Number(process.env.LCM_LIFECYCLE_EXPECTED_SCOPES ?? "1");
-      if (result.status !== 0 || barrierDir === undefined) return result;
+      if (!shouldCollectSystemdBarrier(command, args, result.status, barrierDir)) return result;
 
       const pause = (): void => {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
