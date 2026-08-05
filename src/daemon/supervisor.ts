@@ -1189,7 +1189,7 @@ function supervisorSpecFromObservation(
       ...(observation.entrypoint === undefined ? {} : { entrypoint: observation.entrypoint }),
       ...(observation.runtimeDigest === undefined ? {} : { runtimeDigest: observation.runtimeDigest }),
       ...(observation.storageBackend === undefined ? {} : { storageBackend: observation.storageBackend }),
-      ...(spec.postgresCaFile === undefined ? {} : { postgresCaFile: spec.postgresCaFile }),
+      ...(observation.postgresCaFile === undefined ? {} : { postgresCaFile: observation.postgresCaFile }),
       ...(observation.credentialDirectory === undefined ? {} : { credentialDirectory: observation.credentialDirectory }),
       ...(observation.credentialFiles === undefined ? {} : { credentialFiles: observation.credentialFiles }),
       stopTimeoutMs: spec.stopTimeoutMs,

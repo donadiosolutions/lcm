@@ -1197,9 +1197,13 @@ describe("launchd-user supervisor", () => {
     expect(unsafeRestartRunner.calls).toHaveLength(0);
   });
 
-  it("removes only the authenticated old launchd plist during stale-config repair", async () => {
+  it.each([
+    ["changed", "/etc/lcm/old-ca.crt", "/etc/lcm/new-ca.crt"],
+    ["old-present-new-absent", "/etc/lcm/old-ca.crt", undefined],
+    ["old-absent-new-present", undefined, "/etc/lcm/new-ca.crt"],
+  ] as const)("removes only the authenticated old launchd plist during stale-config repair (%s)", async (_case, oldCa, newCa) => {
     const root = makeRoot();
-    const oldSpec = makeSpec("launchd-user", root, { nonce: "old-nonce", port: 3737, postgresCaFile: "/etc/lcm/ca.crt" });
+    const oldSpec = makeSpec("launchd-user", root, { nonce: "old-nonce", port: 3737, ...(oldCa === undefined ? {} : { postgresCaFile: oldCa }) });
     const running = [
       "state = running",
       "pid = 777",
@@ -1210,7 +1214,7 @@ describe("launchd-user supervisor", () => {
       `LCM_SUPERVISOR_EXECUTABLE => ${oldSpec.executable}`,
       `LCM_SUPERVISOR_ARGS => ${JSON.stringify(oldSpec.args)}`,
       "LCM_SUPERVISOR_CWD =>",
-      `LCM_POSTGRES_CA_FILE => ${oldSpec.postgresCaFile}`,
+      ...(oldCa === undefined ? [] : [`LCM_POSTGRES_CA_FILE => ${oldCa}`]),
     ].join("\n");
     const oldRunner = fakeRunner([
       { code: 113, stderr: "Could not find service" },
@@ -1222,7 +1226,7 @@ describe("launchd-user supervisor", () => {
     expect(lstatSync(oldPlist).isFile()).toBe(true);
     const foreignPlist = join(root, `daemon.${oldSpec.shortDigest}.foreign.plist`);
     writeFileSync(foreignPlist, "foreign", { mode: 0o600 });
-    const newSpec = makeSpec("launchd-user", root, { nonce: "new-nonce", port: 4747, postgresCaFile: oldSpec.postgresCaFile });
+    const newSpec = makeSpec("launchd-user", root, { nonce: "new-nonce", port: 4747, ...(newCa === undefined ? {} : { postgresCaFile: newCa }) });
     const stale = running
       .replace(`state = running`, "state = not running")
       .replace(`pid = 777`, "pid = 0");
@@ -1241,12 +1245,19 @@ describe("launchd-user supervisor", () => {
       { code: 113, stderr: "Could not find service" },
       { code: 113, stderr: "Could not find service" },
       { code: 0, stdout: "bootstrapped" },
-      { code: 0, stdout: running
+      { code: 0, stdout: (oldCa === undefined
+        ? `${running}\nLCM_POSTGRES_CA_FILE => ${newCa}`
+        : running.replace(`LCM_POSTGRES_CA_FILE => ${oldCa}`, newCa === undefined ? "" : `LCM_POSTGRES_CA_FILE => ${newCa}`))
         .replaceAll(oldSpec.port.toString(), newSpec.port.toString())
         .replaceAll(oldSpec.nonce, newSpec.nonce) },
     ]);
-    await expect(createSupervisor("launchd-user", { run: stopRunner.run, platform: "darwin", uid: 501 }).stopAndStart(newSpec)).resolves.toMatchObject({ managerPid: 777 });
+    await expect(createSupervisor("launchd-user", { run: stopRunner.run, platform: "darwin", uid: 501 }).stopAndStart(newSpec)).resolves.toMatchObject({ managerPid: 777, port: newSpec.port, nonce: newSpec.nonce });
+    const newPlist = join(root, `daemon.${newSpec.shortDigest}.${newSpec.nonce}.plist`);
+    expect(stopRunner.calls[5]?.args[2]).toBe(newPlist);
     expect(existsSync(oldPlist)).toBe(false);
     expect(existsSync(foreignPlist)).toBe(true);
+    const document = readFileSync(newPlist, "utf8");
+    if (newCa === undefined) expect(document).not.toContain("LCM_POSTGRES_CA_FILE");
+    else expect(document).toContain(`<key>LCM_POSTGRES_CA_FILE</key><string>${newCa}</string>`);
   });
 });
