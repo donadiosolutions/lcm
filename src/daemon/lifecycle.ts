@@ -28,6 +28,7 @@ import {
   isStagedPostgreSqlHealth,
   STAGED_POSTGRESQL_ERROR_CODE,
 } from "./staged-postgresql.js";
+import { managedDaemonPath } from "./managed-path.js";
 import {
   observeHttpHealth,
   type HealthObservation,
@@ -334,6 +335,17 @@ function managedSupervisorKind(
   if (platform === "linux") return "systemd-user";
   if (platform === "darwin") return "launchd-user";
   return undefined;
+}
+
+function managedLaunchEnvironmentFor(
+  environment: NodeJS.ProcessEnv,
+  spawnCommand: string,
+  spawnArgs: readonly string[],
+): Readonly<Record<string, string>> {
+  return Object.freeze({
+    ...managedLaunchEnvironment(environment),
+    PATH: managedDaemonPath(spawnCommand, spawnArgs),
+  });
 }
 
 function supervisorNonce(): string {
@@ -1985,7 +1997,6 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     spec: SupervisorSpec;
     supervisor: Supervisor;
   } | null> {
-    const launchEnvironment = managedLaunchEnvironment(dependencies.environment);
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
@@ -1996,6 +2007,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (!executable.startsWith("/") || args.some((arg) => typeof arg !== "string")) {
       return null;
     }
+    const launchEnvironment = managedLaunchEnvironmentFor(dependencies.environment, executable, args);
     let scope: ReturnType<typeof canonicalSupervisorScope>;
     try {
       scope = canonicalSupervisorScope(stateRoot, realpath);
@@ -3176,7 +3188,6 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
   }
 
   async function runManagedRestart(managerKind: SupervisorKind): Promise<RestartDaemonResult | null> {
-    const launchEnvironment = managedLaunchEnvironment(dependencies.environment);
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
@@ -3187,6 +3198,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     if (!executable.startsWith("/") || args.some((arg) => typeof arg !== "string")) {
       return restartRefusal("ambiguous", "managed daemon supervisor could not be constructed; inspect the daemon configuration and retry");
     }
+    const launchEnvironment = managedLaunchEnvironmentFor(dependencies.environment, executable, args);
     let scope: ReturnType<typeof canonicalSupervisorScope>;
     try {
       scope = canonicalSupervisorScope(stateRoot, realpath);

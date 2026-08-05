@@ -19,6 +19,7 @@ import {
   type EnsureDaemonOptions,
 } from "../../src/daemon/lifecycle.js";
 import { ensureAuthToken } from "../../src/daemon/auth.js";
+import { managedDaemonPath } from "../../src/daemon/managed-path.js";
 import type { Supervisor, SupervisorObservation, SupervisorSpec } from "../../src/daemon/supervisor.js";
 import {
   createDaemonLifecycleTestScope,
@@ -281,6 +282,38 @@ function setRunningProbe(fixture: Fixture, pid = 4242): void {
 }
 
 describe("issue 400 lifecycle managed preparation and utility boundaries", () => {
+  it.each([
+    ["linux", "systemd-user"],
+    ["darwin", "launchd-user"],
+  ] as const)("projects the trusted synthesized PATH into the managed %s launch", async (platform, method) => {
+    const fixture = createFixture({
+      platform,
+      fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,
+      environment: {
+        PATH: "/ambient/bin",
+        LCM_SUMMARY_PROVIDER: "codex-process",
+        OPENAI_API_KEY: "ambient-secret",
+      },
+    });
+    const spawnCommand = "/usr/bin/node";
+    const spawnArgs = ["/opt/lcm/bin/lcm.mjs", "daemon", "start", "--foreground"];
+    await ensureDaemon(optionsFor(fixture, {
+      _skipHealthWait: true,
+      spawnCommand,
+      spawnArgs,
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as never,
+    }));
+
+    const started = fixture.start.mock.calls[0]?.[0] as SupervisorSpec | undefined;
+    expect(started?.kind).toBe(method);
+    expect(started?.launchEnvironment).toMatchObject({
+      PATH: managedDaemonPath(spawnCommand, spawnArgs),
+      LCM_SUMMARY_PROVIDER: "codex-process",
+    });
+    expect(started?.launchEnvironment?.PATH).not.toBe("/ambient/bin");
+    expect(JSON.stringify(started?.launchEnvironment)).not.toContain("ambient-secret");
+  });
+
   it("classifies manager platforms, process diagnostics, and malformed command runners", async () => {
     const fixture = createFixture({ platform: "freebsd" });
     await expect(ensureDaemon(optionsFor(fixture, { _skipSpawn: true }))).resolves.toMatchObject({
