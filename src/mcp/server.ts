@@ -154,13 +154,27 @@ function safeMcpError(err: unknown): string {
   if (err instanceof StorageBackendUnavailableError) {
     return `lcm error: ${err.message}`;
   }
-  const diagnostic = sanitizeHookErrorDiagnostic(err)
+  // Private-use sentinels keep the shared scrubber from interpreting protected labels as secrets.
+  const redactionKeyMarker = "\uE000";
+  const redactionSeparator = "\uE001";
+  const raw = err instanceof Error ? err.message : String(err);
+  const protectedRaw = raw.replace(
+    /\b(host|hostname|socket|server|password|passwd|pwd|token|secret|api[-_ ]?key|authorization)(\s*)[:=]\s*(?:bearer\s+)?([^\s,;]+?)([.!?])?(?=\s|[,;]|$)/giu,
+    (_match, key: string, spacing: string, _value: string, terminalPunctuation: string = "") =>
+      `${key.slice(0, 1)}${redactionKeyMarker}${key.slice(1)}${spacing}${redactionSeparator}<redacted>${terminalPunctuation}`,
+  );
+  const diagnostic = sanitizeHookErrorDiagnostic(
+    protectedRaw,
+  )
     .replace(/\b(?:https?:\/\/|localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|::1)[^\s,;]*/giu, "<endpoint>")
-    .replace(/\b(?:host|hostname|socket)\s*[=:]\s*[^\s,;]+/giu, "$1=<redacted>")
     .replace(/\b(?:pid|process\s+id)\s*[=:]?\s*\d+\b/giu, "pid=<redacted>")
-    .replace(/\b(?:password|passwd|pwd|token|secret|api[-_ ]?key|authorization)\s*[:=]\s*(?:bearer\s+)?[^\s,;]+/giu, "$1=<redacted>");
+    .replaceAll(redactionKeyMarker, "")
+    .replaceAll(redactionSeparator, "=");
   return `lcm error: ${diagnostic || "request failed"}`;
 }
+
+/** Narrow seam so tests can assert the exact redaction contract deterministically. */
+export const __lcmMcpTestHooks = { safeMcpError };
 
 /** Exported for testing. Calls a daemon route without lifecycle recovery. */
 export async function handleDaemonRequest(

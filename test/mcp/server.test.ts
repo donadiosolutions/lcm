@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { getMcpToolDefinitions, handleDaemonRequest } from "../../src/mcp/server.js";
+import { __lcmMcpTestHooks, getMcpToolDefinitions, handleDaemonRequest } from "../../src/mcp/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 
 const ensureDaemonMcpMock = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: false }));
@@ -178,6 +178,100 @@ describe("handleDaemonRequest", () => {
 
     expect(res.content[0].text).toBe("lcm error: request failed");
     expect(res.isError).toBe(true);
+  });
+
+  it("sanitizes an AggregateError transport diagnostic leaf through the url-display fallback branch", async () => {
+    const ensure = vi.fn().mockResolvedValue({ connected: true });
+    // A malformed protocol-relative credential URI reaches the url-display
+    // sanitizer's inner catch fallback leaf inside safeMcpError.
+    const cause = Object.assign(new Error("upstream failure"), { code: "ECONNREFUSED" });
+    const client = {
+      post: vi.fn().mockRejectedValue(new AggregateError([cause], "retry against //user:hunter2@[::1/nf")),
+    };
+
+    const res = await handleDaemonRequest(client, "/search", { q: "foo" }, { ...opts, _ensureDaemon: ensure });
+
+    expect(res.content[0].text).toBe("lcm daemon unavailable (live-no-response); run 'lcm daemon restart' or 'lcm doctor'.");
+    expect(res.content[0].text).not.toContain("hunter2");
+    expect(ensure).not.toHaveBeenCalled();
+  });
+
+  describe("safeMcpError redaction", () => {
+    const { safeMcpError } = __lcmMcpTestHooks;
+
+    it.each([
+      ["host", "host=db.internal.example"],
+      ["host mixed-case with colon", "HOST: db.internal.example"],
+      ["host with spaces around separator", "host = db.internal.example"],
+      ["hostname", "hostname=db.internal.example"],
+      ["socket", "socket=/run/lcm/lcm.sock"],
+      ["socket mixed-case with spaces", "SoCkEt : /run/lcm/lcm.sock"],
+    ])("preserves the %s key and redacts only the value", (_label, fragment) => {
+      const rendered = safeMcpError(new Error(`cannot reach ${fragment}, giving up`));
+
+      const separatorMatch = fragment.match(/[=:]/u);
+      const key = fragment.slice(0, separatorMatch!.index);
+      const value = fragment.slice(separatorMatch!.index! + 1).trim();
+      expect(rendered).toContain(`${key}=<redacted>`);
+      expect(rendered).not.toContain(value);
+      expect(rendered).not.toContain("$1");
+    });
+
+    it.each([
+      ["password", "password=hunter2"],
+      ["passwd mixed-case", "PASSWD:hunter2"],
+      ["pwd with spaces", "pwd = hunter2"],
+      ["token", "token=tok_live_9x7"],
+      ["secret mixed-case", "SECRET: tok_live_9x7"],
+      ["api key dashed", "api-key=tok_live_9x7"],
+      ["api key spaced", "api key = tok_live_9x7"],
+      ["api key underscored", "API_KEY:tok_live_9x7"],
+      ["authorization bearer", "Authorization: Bearer tok_live_9x7"],
+      ["authorization bearer mixed-case", "authorization = bearer tok_live_9x7"],
+    ])("preserves the %s key, keeps the credential undislosed, and leaves no literal $1", (_label, fragment) => {
+      const rendered = safeMcpError(new Error(`auth failed: ${fragment}; retry`));
+
+      expect(rendered).not.toContain("hunter2");
+      expect(rendered).not.toContain("tok_live_9x7");
+      expect(rendered).not.toContain("$1");
+      const keyPattern = fragment.slice(0, fragment.search(/[=:]/u));
+      expect(rendered.toLowerCase()).toContain(keyPattern.toLowerCase());
+    });
+
+    it.each([
+      ["postgres URI with inline credentials", "connect postgres://svc:hunter2@db.internal.example:5432/lcm?sslmode=require failed"],
+      ["http URI with inline credentials", "fetch https://svc:hunter2@db.internal.example/v1?token=tok_live_9x7 failed"],
+      ["connection-string assignment", "Server=db.internal.example;Database=lcm;User Id=svc;Password=hunter2;"],
+      ["quoted connection-string password", `Server=db.internal.example;Password="hunter2";`],
+    ])("redacts secrets inside %s without leaking host or credential text", (_label, fragment) => {
+      const rendered = safeMcpError(new Error(fragment));
+
+      expect(rendered).not.toContain("hunter2");
+      expect(rendered).not.toContain("tok_live_9x7");
+      expect(rendered).not.toContain("db.internal.example");
+      expect(rendered).not.toContain("$1");
+      expect(rendered).toContain("lcm error:");
+    });
+
+    it("keeps punctuation outside the redacted value", () => {
+      const rendered = safeMcpError(new Error("host=db.internal.example, token=tok_live_9x7; socket=/run/lcm/lcm.sock."));
+      expect(rendered).toContain("host=<redacted>,");
+      expect(rendered).toContain("token=<redacted>;");
+      expect(rendered).toContain("socket=<redacted>.");
+      expect(rendered).not.toContain("$1");
+    });
+
+    it("annotates clean diagnostics without inventing redactions", () => {
+      const rendered = safeMcpError(new Error("plain configuration parsing failure"));
+      expect(rendered).toBe("lcm error: plain configuration parsing failure");
+      expect(rendered).not.toContain("$1");
+    });
+
+    it("preserves the <redacted> marker rather than a literal capture-group token", () => {
+      const combined = safeMcpError(new Error("host=h1 hostname=h2 socket=/s password=p1 token=t1"));
+      expect(combined).not.toMatch(/\$\d/u);
+      expect(combined.match(/<redacted>/gu)).toHaveLength(5);
+    });
   });
 
   it("does not invoke lifecycle when the transport fails", async () => {
