@@ -1331,6 +1331,7 @@ function privatePlistMatchesStableIdentity(
     ...(spec.entrypoint === undefined ? [] : ["LCM_SUPERVISOR_ENTRYPOINT"]),
     ...(spec.runtimeDigest === undefined ? [] : ["LCM_SUPERVISOR_RUNTIME_DIGEST"]),
     ...(spec.storageBackend === undefined ? [] : ["LCM_SUPERVISOR_STORAGE_BACKEND"]),
+    ...(spec.postgresCaFile === undefined ? [] : ["LCM_POSTGRES_CA_FILE"]),
   ]);
   // Credential keys are validated individually above and are the only
   // EnvironmentVariables keys permitted to vary between a descriptor being
