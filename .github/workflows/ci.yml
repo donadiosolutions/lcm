@@ -302,7 +302,15 @@ jobs:
             echo "launchd integration produced no current-run passed evidence (skipped=${skipped_count:-0} passed=${passed_count:-0})" >&2
             exit 1
           fi
-          grep -q "launchd-user" "$out_file"
+          # The integration emits exactly one fixed, bounded sentinel only
+          # after a child has answered exact health through launchd. This is
+          # fresh manager activity evidence, not a test-name or credential
+          # echo, and duplicate/missing sentinels fail closed.
+          sentinel_count="$(grep -c '^launchd-user$' "$out_file" || true)"
+          if [[ "$sentinel_count" != "1" ]]; then
+            echo "launchd integration produced no single manager-activity sentinel (count=$sentinel_count)" >&2
+            exit 1
+          fi
 
   ci:
     name: ci

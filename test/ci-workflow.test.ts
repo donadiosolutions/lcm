@@ -270,7 +270,8 @@ describe("CI workflow", () => {
     expect(run).toContain('mkdir -p -- "$resource_root"');
     expect(run).toContain('chmod 0700 "$resource_root"');
     expect(run).toContain('tee "$out_file"');
-    expect(run).toContain('grep -q "launchd-user" "$out_file"');
+    expect(run).toContain('sentinel_count="$(grep -c \'^launchd-user$\' "$out_file" || true)"');
+    expect(run).toContain('[[ "$sentinel_count" != "1" ]]');
     // The trap gates every bootout on exact current-run evidence: the fresh
     // token, the exact validated derived product label, and the exact pinned
     // marker line. There is no broader label sweep and no native/PID fallback.
@@ -295,6 +296,9 @@ describe("CI workflow", () => {
       "launchd integration produced no current-run passed evidence (skipped=${skipped_count:-0} passed=${passed_count:-0})",
     );
     expect(run).toContain("grep -qE 'Tests[[:space:]]+.*skipped' \"$out_file\"");
+    expect(run).toContain(
+      'if [[ "${skipped_count:-0}" != "0" || "${passed_count:-0}" == "0" || -z "${passed_count:-}" ]]; then',
+    );
     // The derived product label must match the exact run-owned daemon shape,
     // which is what revives workflow cleanup ownership after the manifest
     // equality gate was removed: the old equality gate compared against the
@@ -330,6 +334,48 @@ describe("CI workflow", () => {
     // marker contract and must never use raw pkill/killall on foreign jobs.
     expect(run).not.toMatch(/\b(?:pkill|killall)\b/u);
     expect(workflow.jobs.ci.needs).toContain("macos-launchd");
+  });
+
+  it("binds launchd activity to one shared run root without credential or token disclosure", () => {
+    const run = workflow.jobs["macos-launchd"].steps.find(
+      (step) => step.name === "Run launchd integration path",
+    )?.run ?? "";
+
+    // All sequential real tests must derive one exact label from the workflow
+    // state root, while their runtime and home roots remain per-fixture.
+    expect(launchdIntegrationSource).toContain("process.env.LCM_LAUNCHD_RESOURCE_ROOT");
+    expect(launchdIntegrationSource).toContain("const stateRoot = getSharedStateRoot()");
+    expect(launchdIntegrationSource).toContain("if (spec.stateRoot !== getSharedStateRoot())");
+    expect(launchdIntegrationSource).toContain('const homeRoot = join(root, "home")');
+    expect(launchdIntegrationSource).toContain('const runtimeRoot = join(root, "runtime")');
+    expect(launchdIntegrationSource).toContain("createManagedCredentialDirectory(fixture.stateRoot");
+    expect(launchdIntegrationSource).toContain("console.log(LAUNCHD_MANAGER_ACTIVITY_SENTINEL)");
+
+    // The current-run token is generated before the worker and is never
+    // printed. A marker without that token cannot authorize cleanup.
+    const tokenIndex = run.indexOf('evidence_token="$(uuidgen)"');
+    const workerIndex = run.indexOf("npx vitest run test/daemon/lifecycle-launchd.integration.test.ts");
+    expect(tokenIndex).toBeGreaterThanOrEqual(0);
+    expect(tokenIndex).toBeLessThan(workerIndex);
+    expect(run).not.toContain('echo "$evidence_token"');
+    expect(run).not.toContain('printf \'%s\\n\' "$evidence_token"');
+
+    // A successful manager health response is the only source of the fixed
+    // sentinel; missing, duplicate, or skipped evidence fails the job.
+    expect(run).toContain('sentinel_count="$(grep -c \'^launchd-user$\' "$out_file" || true)"');
+    expect(run).toContain("launchd integration produced no single manager-activity sentinel");
+    expect(launchdIntegrationSource).toContain('const LAUNCHD_MANAGER_ACTIVITY_SENTINEL = "launchd-user"');
+    expect(launchdIntegrationSource).toContain("if (!managerActivityReported)");
+
+    // Credential assertions are based only on observed file metadata/bytes;
+    // no test-only expectation variables or secret value enter the child.
+    const expectedCredentialEnvironmentPrefix = ["LCM", "TEST", "EXPECTED", "CREDENTIAL"].join("_");
+    const wedgeEnvironmentName = ["LCM", "TEST", "WEDGE", "FILE"].join("_");
+    expect(launchdIntegrationSource).not.toContain(expectedCredentialEnvironmentPrefix);
+    expect(launchdIntegrationSource).not.toContain(wedgeEnvironmentName);
+    expect(launchdIntegrationSource).toContain("credentialLength: value.byteLength");
+    expect(launchdIntegrationSource).toContain("credentialClaimed: stats.isFile() && value.byteLength > 0");
+    expect(launchdIntegrationSource).toContain("expect(JSON.stringify(health).includes(\"fixture-value\")).toBe(false)");
   });
 
   it("separates trusted OIDC uploads from tokenless fork uploads", () => {
