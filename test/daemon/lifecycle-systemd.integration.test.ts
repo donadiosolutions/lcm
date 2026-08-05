@@ -341,6 +341,9 @@ describe("real user-systemd daemon lifecycle", () => {
       expect(first.managerPid).toBeGreaterThan(0);
       const terminal = await waitForTerminal(fixture);
       expect(["absent", "registered-not-running-valid"]).toContain(terminal.kind);
+      if (terminal.kind === "registered-not-running-valid") {
+        expect(fixture.calls.some((call) => call.command === "systemctl" && call.args[1] === "reset-failed")).toBe(true);
+      }
       const recreated = await fixture.supervisor.start(fixture.spec);
       expect(recreated.kind).toBe("systemd-user");
       expect(recreated.managerPid).toBeGreaterThan(0);

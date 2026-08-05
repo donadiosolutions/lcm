@@ -251,6 +251,7 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_STOP_TIMEOUT_MS = 5_000;
 const DEFAULT_POLL_INTERVAL_MS = 50;
 const MAX_POLL_INTERVALS = 100;
+const MAX_LAUNCHD_TRANSITION_POLL_INTERVALS = 3;
 const MAX_NONCE_LENGTH = 128;
 const MAX_METADATA_VALUE_LENGTH = 512;
 /**
@@ -1917,6 +1918,23 @@ function isOwnedSystemdActivation(
   return classified.kind === "ambiguous" && classified.reason === "metadata-malformed";
 }
 
+/**
+ * Keep a prior launchd terminal observation bounded to its authenticated
+ * registration.  During bootout/exit launchd can briefly expose a sparse or
+ * contradictory print projection; that is retryable read-only state, not
+ * cleanup authority.  Only the same scope, label, and prior nonce can
+ * authorize the pending bootout after that transition.
+ */
+function isAuthenticatedLaunchdStaleObservation(
+  spec: SupervisorSpec,
+  staleSpec: SupervisorSpec,
+  observation: SupervisorObservation,
+): boolean {
+  if (observation.kind !== "registered-stale-config") return false;
+  if (observation.scopeDigest !== spec.scopeDigest || observation.name !== spec.name) return false;
+  return observation.nonce === staleSpec.nonce;
+}
+
 function launchdProbeArgs(spec: SupervisorSpec, uid: number): readonly string[] {
   return ["print", `${launchdDomain(uid)}/${spec.launchdLabel}`];
 }
@@ -2172,7 +2190,7 @@ export function createSupervisor(
     staleObservation?: SupervisorObservation,
     cleanupCredentials = true,
   ): Promise<void> => {
-    const current = await probe(spec);
+    let current = await probe(spec);
     // Keep the first authenticated stale observation as the source of the old
     // launchd nonce.  A registration may disappear between the initial probe
     // and this fresh probe; cleanup still needs to remove that exact old plist
@@ -2185,6 +2203,34 @@ export function createSupervisor(
       : undefined;
     if (kind === "launchd-user" && allowStaleConfig && staleSource !== undefined && stalePlistSpec === undefined) {
       throw commandFailedError();
+    }
+    const launchdStaleTransition = kind === "launchd-user"
+      && allowStaleConfig
+      && stalePlistSpec !== undefined;
+    if (launchdStaleTransition) {
+      const now = dependencies.now ?? performance.now.bind(performance);
+      const transitionDeadline = now() + spec.stopTimeoutMs;
+      const maxTransitionPolls = Math.max(
+        1,
+        Math.min(
+          MAX_LAUNCHD_TRANSITION_POLL_INTERVALS,
+          Math.ceil(spec.stopTimeoutMs / DEFAULT_POLL_INTERVAL_MS),
+        ),
+      );
+      for (let attempt = 0; attempt < maxTransitionPolls; attempt += 1) {
+        const stable = current.kind === "absent"
+          || current.kind === "registered-not-running-valid"
+          || current.kind === "unavailable"
+          || current.kind === "registered-running-valid"
+          || isAuthenticatedLaunchdStaleObservation(spec, stalePlistSpec, current);
+        if (stable || attempt + 1 >= maxTransitionPolls) break;
+        const remaining = transitionDeadline - now();
+        if (remaining <= 0) break;
+        const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
+        if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
+        else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
+        current = await probe(spec);
+      }
     }
     if (current.kind === "absent") {
       if (kind === "launchd-user") {
@@ -2200,6 +2246,12 @@ export function createSupervisor(
       current.kind === "registered-invalid-collision"
       || current.kind === "ambiguous"
       || (current.kind === "registered-stale-config" && !allowStaleConfig)
+      || (
+        launchdStaleTransition
+        && current.kind === "registered-stale-config"
+        && !isAuthenticatedLaunchdStaleObservation(spec, stalePlistSpec, current)
+      )
+      || (launchdStaleTransition && current.kind === "registered-running-valid")
     ) throw commandFailedError();
     const stopArgs = kind === "systemd-user"
       ? ["--user", "stop", spec.systemdUnit]
@@ -2225,9 +2277,12 @@ export function createSupervisor(
     if (
       kind === "systemd-user"
       && current.kind === "registered-not-running-valid"
-      && current.terminal === "failed"
       && result.code === 0
     ) {
+      // systemd 255 can retain a clean-exit transient registration after
+      // stop.  reset-failed is the manager-authoritative cleanup request that
+      // also releases that retained terminal unit; absence is still proved by
+      // the bounded probes below before same-name recreation.
       const resetFailed = await runner.invoke("systemctl", ["--user", "reset-failed", spec.systemdUnit], spec.stopTimeoutMs);
       if (resetFailed.timedOut || resetFailed.code !== 0) throw commandFailedError();
     }

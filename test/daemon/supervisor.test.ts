@@ -877,10 +877,12 @@ describe("systemd-user supervisor", () => {
     const stop = fakeRunner([
       { code: 0, stdout: managerText(spec, "inactive") },
       { code: 0, stdout: "stopped" },
+      { code: 0, stdout: "reset" },
       { code: 1, stderr: "Unit is not-found" },
     ]);
     await expect(createSupervisor("systemd-user", { run: stop.run, platform: "linux" }).stopAndAwaitAbsent(spec)).resolves.toBeUndefined();
     expect(stop.calls[1].args).toEqual(["--user", "stop", spec.systemdUnit]);
+    expect(stop.calls[2].args).toEqual(["--user", "reset-failed", spec.systemdUnit]);
   });
 
   it("resets an authenticated failed unit only after stop before requiring absence", async () => {
@@ -895,6 +897,41 @@ describe("systemd-user supervisor", () => {
     expect(runner.calls[1].args).toEqual(["--user", "stop", spec.systemdUnit]);
     expect(runner.calls[2].args).toEqual(["--user", "reset-failed", spec.systemdUnit]);
     expect(runner.calls[2].timeoutMs).toBe(spec.stopTimeoutMs);
+  });
+
+  it("resets and proves absence of a retained clean-exit unit before same-name recreation", async () => {
+    const spec = makeSpec("systemd-user");
+    const terminal = managerText(spec, "inactive");
+    const runner = fakeRunner([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: "stopped" },
+      { code: 0, stdout: "reset" },
+      { code: 0, stdout: terminal },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: managerText(spec, "active", 909) },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(spec)).resolves.toMatchObject({
+      kind: "systemd-user",
+      managerPid: 909,
+    });
+    expect(runner.calls[2]?.args).toEqual(["--user", "stop", spec.systemdUnit]);
+    expect(runner.calls[3]?.args).toEqual(["--user", "reset-failed", spec.systemdUnit]);
+    expect(runner.calls.filter(({ command }) => command === "systemd-run")).toHaveLength(1);
+    expect(runner.calls.some(({ args }) => args.includes("--collect"))).toBe(false);
+
+    const terminalReplacement = fakeRunner([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: "stopped" },
+      { code: 0, stdout: "reset" },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+      { code: 0, stdout: terminal },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: terminalReplacement.run, platform: "linux" }).start(spec)).rejects.toThrow("manager command");
+    expect(terminalReplacement.calls.filter(({ command }) => command === "systemd-run")).toHaveLength(0);
   });
 
   it("accepts a not-loaded stop race only after an exact prior probe and absent poll", async () => {
@@ -1303,6 +1340,7 @@ describe("systemd-user supervisor", () => {
       { code: 0, stdout: managerText(spec, "inactive") },
       { code: 0, stdout: managerText(spec, "inactive") },
       { code: 0, stdout: "stopped" },
+      { code: 0, stdout: "reset" },
       { code: 1, stderr: "Unit is not-found" },
       { code: 1, stderr: "Unit is not-found" },
       { code: 0, stdout: "started" },
@@ -1526,6 +1564,81 @@ describe("launchd-user supervisor", () => {
       uid: 501,
     }).stopAndStart(spec)).resolves.toMatchObject({ managerPid: 544 });
     expect(runner.calls.some((call) => call.args[0] === "bootout")).toBe(false);
+  });
+
+  it("retries a launchd stale-terminal transition read-only before exact bootout", async () => {
+    const root = makeRoot();
+    const prior = makeSpec("launchd-user", root, { nonce: "prior-terminal" });
+    const replacement = makeSpec("launchd-user", root, { nonce: "replacement-terminal" });
+    const terminal = launchdPrintText(prior, "exited", 0);
+    const sparseTransition = "state = exited\npid = 0";
+    const runner = fakeRunner([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: sparseTransition },
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: "bootout" },
+      { code: 113, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(replacement, "running", 544) },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).stopAndStart(replacement)).resolves.toMatchObject({
+      kind: "launchd-user",
+      managerPid: 544,
+      nonce: replacement.nonce,
+    });
+    expect(sleep).toHaveBeenCalledWith(50);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(1);
+    expect(runner.calls.some(({ command }) => /^(?:kill|pkill|killall)$/u.test(command))).toBe(false);
+
+    const transitionAbsent = fakeRunner([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: sparseTransition },
+      { code: 113, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(replacement, "running", 545) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: transitionAbsent.run,
+      platform: "darwin",
+      uid: 501,
+      sleep: vi.fn(async () => undefined),
+    }).stopAndStart(replacement)).resolves.toMatchObject({ managerPid: 545 });
+    expect(transitionAbsent.calls.some(({ args }) => args[0] === "bootout")).toBe(false);
+
+    const foreignTerminal = launchdPrintText(makeSpec("launchd-user", makeRoot(), { nonce: "foreign-terminal" }), "exited", 0);
+    const persistentCollision = fakeRunner([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: foreignTerminal },
+      { code: 0, stdout: sparseTransition },
+      { code: 0, stdout: sparseTransition },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: persistentCollision.run,
+      platform: "darwin",
+      uid: 501,
+    }).stopAndStart(replacement)).rejects.toThrow("manager command");
+    expect(persistentCollision.calls.some(({ args }) => args[0] === "bootout")).toBe(false);
+
+    const expiredCollision = fakeRunner([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: sparseTransition },
+    ]);
+    const now = vi.fn().mockReturnValueOnce(0).mockReturnValue(10_000);
+    await expect(createSupervisor("launchd-user", {
+      run: expiredCollision.run,
+      platform: "darwin",
+      uid: 501,
+      now,
+    }).stopAndStart(replacement)).rejects.toThrow("manager command");
+    expect(expiredCollision.calls.some(({ args }) => args[0] === "bootout")).toBe(false);
   });
 
   it("retires a prior launchd plist with an older bounded assignment set", async () => {
