@@ -1855,11 +1855,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       || observation.stateRoot !== requested.stateRoot
       || observation.name !== requested.name
       || observation.port === undefined
+      || observation.port !== requested.port
       || observation.nonce === undefined
       || observation.executable === undefined
       || observation.args === undefined
-      || observation.managerPid === undefined
-      || observation.managerPid < 1
     ) return undefined;
     let args: readonly string[];
     try {

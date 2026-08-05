@@ -3,6 +3,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -114,6 +116,15 @@ function staleObservation(
     managerPid: 4242,
     ...extra,
   } as SupervisorObservation;
+}
+
+function parserShapedStaleObservation(
+  spec: SupervisorSpec,
+  extra: Record<string, unknown> = {},
+): SupervisorObservation {
+  const { managerPid, ...parsed } = staleObservation(spec, extra);
+  void managerPid;
+  return parsed;
 }
 
 function healthy(
@@ -641,7 +652,7 @@ describe("issue 400 managed ensure admission matrix", () => {
     const probes: SupervisorSpec[] = [];
     fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
       probes.push(spec);
-      if (probes.length === 1) return staleObservation(spec, { nonce: priorNonce });
+      if (probes.length === 1) return parserShapedStaleObservation(spec, { nonce: priorNonce });
       if (probes.length === 2) return observation(spec, "registered-not-running-valid", { terminal: "inactive" });
       return observation(spec, "registered-running-valid", { managerPid: 4242 });
     });
@@ -654,6 +665,59 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(result).toMatchObject({ spawned: true, startMethod: "systemd-user", pid: 4242 });
     expect(probes.map(({ nonce }) => nonce)).toEqual([currentNonce, priorNonce, priorNonce]);
     expect(fixture.stopAndStart).toHaveBeenCalledWith(expect.objectContaining({ nonce: priorNonce }));
+  });
+
+  it("refuses prior-nonce terminal adoption when the observed port is stale", async () => {
+    const fixture = createFixture({
+      isAlive: () => false,
+      environment: { OPENAI_API_KEY: "stale-port-secret" },
+    });
+    const priorNonce = "existing-stale-port-nonce";
+    const currentNonce = "new-stale-port-nonce";
+    writeFileSync(fixture.pidPath, "4242");
+    writeFileSync(fixture.tokenPath, "preserved-token", { mode: 0o600 });
+    let probeCalls = 0;
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      probeCalls += 1;
+      if (probeCalls === 1) {
+        return staleObservation(spec, {
+          nonce: priorNonce,
+          port: fixture.port - 1,
+        });
+      }
+      if (probeCalls === 2) return observation(spec, "registered-not-running-valid", { terminal: "inactive" });
+      return observation(spec, "registered-running-valid", { managerPid: 4242 });
+    });
+    const credentialRoot = join(fixture.stateDir, "credentials");
+    const preservedCredentialDirectory = join(credentialRoot, "preserved");
+    mkdirSync(credentialRoot, { recursive: true });
+    chmodSync(credentialRoot, 0o700);
+    mkdirSync(preservedCredentialDirectory, { recursive: true });
+    chmodSync(preservedCredentialDirectory, 0o700);
+    const beforeCredentialEntries = readdirSync(credentialRoot);
+    const beforePid = readFileSync(fixture.pidPath, "utf8");
+    const beforeToken = readFileSync(fixture.tokenPath, "utf8");
+
+    await expect(ensureDaemon(optionsFor(fixture, {
+      _supervisorNonceOverride: () => currentNonce,
+      _skipHealthWait: true,
+    }))).resolves.toMatchObject({
+      refusalReason: "stale-config",
+      spawned: false,
+    });
+
+    expect(fixture.probe).toHaveBeenCalledOnce();
+    expect(fixture.stopAndStart).not.toHaveBeenCalled();
+    expect(fixture.stopAndAwaitAbsent).not.toHaveBeenCalled();
+    expect(fixture.start).not.toHaveBeenCalled();
+    expect(fixture.seams.spawn).not.toHaveBeenCalled();
+    expect(fixture.seams.stopUnit).not.toHaveBeenCalled();
+    expect(fixture.seams.killProcess).not.toHaveBeenCalled();
+    expect(existsSync(fixture.pidPath)).toBe(true);
+    expect(readFileSync(fixture.pidPath, "utf8")).toBe(beforePid);
+    expect(readFileSync(fixture.tokenPath, "utf8")).toBe(beforeToken);
+    expect(readdirSync(credentialRoot)).toEqual(beforeCredentialEntries);
+    expect(existsSync(preservedCredentialDirectory)).toBe(true);
   });
 
   it("refuses prior-nonce terminal adoption on invalid metadata or live PID evidence", async () => {
@@ -688,9 +752,9 @@ describe("issue 400 managed ensure admission matrix", () => {
       });
     }
 
-    const invalidPort = createFixture();
-    invalidPort.probe.mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec, { port: 65_536 }));
-    await expect(ensureDaemon(optionsFor(invalidPort, { _skipSpawn: true }))).resolves.toMatchObject({
+    const invalidNonce = createFixture();
+    invalidNonce.probe.mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec, { nonce: "invalid nonce" }));
+    await expect(ensureDaemon(optionsFor(invalidNonce, { _skipSpawn: true }))).resolves.toMatchObject({
       refusalReason: "stale-config",
     });
 
