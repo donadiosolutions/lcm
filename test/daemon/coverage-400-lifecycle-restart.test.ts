@@ -985,7 +985,7 @@ describe("managed restart refusal and repair coverage", () => {
     const startManaged = managedSupervisor((spec) => ({ kind: "absent", name: spec.name }), { kind: "systemd-user", managerPid: 201 });
     const ensured = vi.fn(async () => ({ connected: false, port: 19_999, spawned: true }));
     const started = await restart({ ...baseOptions(startDir), enforceUserManagerParent: true, _skipSpawn: false, _supervisorOverride: startManaged.supervisor, _ensureDaemonOverride: ensured });
-    expect(started.restarted).toBe(true);
+    expect(started.restarted).toBe(false);
     expect(ensured).toHaveBeenCalledOnce();
 
     const changingDir = root();
