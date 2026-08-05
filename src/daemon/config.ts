@@ -271,6 +271,12 @@ const CREDENTIAL_MAX_BYTES = 1024 * 1024;
 const SYSTEMD_CREDENTIAL_DIRECTORY_MODES = Object.freeze([0o500]);
 const SYSTEMD_CREDENTIAL_FILE_MODES = Object.freeze([0o400]);
 const SYSTEMD_CREDENTIAL_MAX_COUNT = SYSTEMD_CREDENTIAL_ENV_NAMES.length;
+/**
+ * Production launchd uses one credential context. Keep a small fixed allowance
+ * for isolated in-process contexts, but never evict an established snapshot:
+ * eviction could make a later reload reopen a one-shot credential file.
+ */
+const LAUNCHD_CREDENTIAL_SNAPSHOT_CAPACITY = 16;
 const launchdCredentialSnapshots = new Map<string, CredentialProjection>();
 
 type SystemdCredentialPrefix = {
@@ -525,6 +531,35 @@ function launchdCredentialSnapshotKey(env: Record<string, string | undefined>): 
   ]);
 }
 
+type LaunchdCredentialMarker = Readonly<{ name: string; path: string; expected: string }>;
+
+function launchdCredentialMarkers(
+  env: Record<string, string | undefined>,
+  directory: string,
+): readonly LaunchdCredentialMarker[] | undefined {
+  const markers: LaunchdCredentialMarker[] = [];
+  for (const name of MANAGED_CREDENTIAL_NAMES) {
+    const configured = env[`${LAUNCHD_CREDENTIAL_FILE_PREFIX}${name}${LAUNCHD_CREDENTIAL_FILE_SUFFIX}`];
+    if (configured === undefined) continue;
+    if (!isAbsolute(configured)) return undefined;
+    const expected = resolve(directory, name);
+    if (resolve(configured) !== expected) return undefined;
+    markers.push(Object.freeze({ name, path: configured, expected }));
+  }
+  return markers;
+}
+
+function authenticatedCredentialProjection(
+  names: readonly string[],
+  values: Readonly<Record<string, string>>,
+): CredentialProjection {
+  return Object.freeze({
+    authenticated: true,
+    names: Object.freeze([...names]),
+    values: Object.freeze({ ...values }),
+  });
+}
+
 /** Resolve allow-listed private one-launch credential files used by launchd. */
 function readLaunchdCredentialEnv(env: Record<string, string | undefined>): CredentialProjection {
   const snapshotKey = launchdCredentialSnapshotKey(env);
@@ -532,21 +567,23 @@ function readLaunchdCredentialEnv(env: Record<string, string | undefined>): Cred
   if (snapshot !== undefined) return snapshot;
   const directory = trustedLaunchdCredentialsDir(env[LAUNCHD_CREDENTIAL_DIRECTORY_ENV]);
   if (!directory) return EMPTY_CREDENTIAL_PROJECTION;
+  const markers = launchdCredentialMarkers(env, directory);
+  if (markers === undefined || markers.length === 0) return EMPTY_CREDENTIAL_PROJECTION;
+  const names = markers.map(({ name }) => name);
+  if (launchdCredentialSnapshots.size >= LAUNCHD_CREDENTIAL_SNAPSHOT_CAPACITY) {
+    // The bound is deliberately fail-closed. Do not read a new file and do not
+    // evict an established context, because either action could expose a later
+    // reload to a replacement one-shot file.
+    return authenticatedCredentialProjection(names, {});
+  }
   const credentialEnv: Record<string, string> = {};
-  const names: string[] = [];
-  for (const name of MANAGED_CREDENTIAL_NAMES) {
-    const configured = env[`${LAUNCHD_CREDENTIAL_FILE_PREFIX}${name}${LAUNCHD_CREDENTIAL_FILE_SUFFIX}`];
-    if (configured === undefined) continue;
-    if (!isAbsolute(configured)) return EMPTY_CREDENTIAL_PROJECTION;
-    const expected = resolve(directory, name);
-    if (resolve(configured) !== expected) return EMPTY_CREDENTIAL_PROJECTION;
-    names.push(name);
+  for (const { name, path, expected } of markers) {
     try {
-      const stats = lstatSync(configured);
+      const stats = lstatSync(path);
       const uid = typeof process.getuid === "function" ? process.getuid() : stats.uid;
       if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1 || stats.uid !== uid || (stats.mode & 0o777) !== 0o600) continue;
-      if (realpathSync(configured) !== expected) continue;
-      credentialEnv[name] = consumeBoundedRegularFile(configured, {
+      if (realpathSync(path) !== expected) continue;
+      credentialEnv[name] = consumeBoundedRegularFile(path, {
         allowedRoot: directory,
         maxBytes: CREDENTIAL_MAX_BYTES,
         expectedUid: typeof process.getuid === "function" && Number.isSafeInteger(uid) ? uid : undefined,
@@ -558,12 +595,7 @@ function readLaunchdCredentialEnv(env: Record<string, string | undefined>): Cred
       // unavailable; ordinary configuration validation reports the key.
     }
   }
-  if (names.length === 0) return EMPTY_CREDENTIAL_PROJECTION;
-  const projection = Object.freeze({
-    authenticated: true,
-    names: Object.freeze(names),
-    values: Object.freeze(credentialEnv),
-  });
+  const projection = authenticatedCredentialProjection(names, credentialEnv);
   launchdCredentialSnapshots.set(snapshotKey, projection);
   return projection;
 }

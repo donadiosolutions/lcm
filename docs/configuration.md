@@ -428,7 +428,13 @@ one-shot file after that first authenticated load. To apply a changed managed
 credential, run `lcm daemon restart` so the manager creates a new nonce-scoped
 credential set. A staged managed credential therefore takes precedence over a
 same-name ambient variable. Detached compatibility launches retain their
-historical direct-environment behavior. The `env -i` process is a short-lived
+historical direct-environment behavior. The in-process launchd snapshot cache
+admits at most 16 distinct valid contexts and never evicts an established
+context; once the bound is reached, a new context is rejected before any
+credential file is opened and its configured credential names are masked so
+configuration fails closed. Production uses one context, while the fixed
+allowance preserves deterministic isolation for in-process parallel tests. The
+`env -i` process is a short-lived
 same-user launch boundary; it does not grant a different privilege or user
 identity, and the service manager remains the lifecycle authority. A running or
 otherwise executable managed launch must authenticate the current filtered

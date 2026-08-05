@@ -36,7 +36,9 @@ authenticated file at the first configuration load and keeps the resulting
 value only in memory for later reloads in that daemon process; it does not
 reread a file that was removed or replaced. Run `lcm daemon restart` after
 changing a managed credential so launchd receives a new private credential
-set.
+set. A daemon process accepts at most 16 distinct launchd marker contexts;
+after that bounded allowance, a new context fails closed without opening its
+credential files, and established snapshots are never evicted.
 
 `lcm doctor` reports service-manager availability, daemon health, connector
 registration, MCP setup, and summarizer readiness. `lcm daemon restart`
