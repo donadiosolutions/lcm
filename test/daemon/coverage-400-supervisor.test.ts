@@ -961,7 +961,8 @@ describe("supervisor coverage: credentials and private launch files", () => {
       credentialFiles: [{ name: "OPENAI_API_KEY", path: oldFile }],
     });
     const absent = { code: 113, stderr: "Could not find service" };
-    const oldStart = runQueue([absent, { code: 0, stdout: "bootstrapped" }, { code: 0, stdout: launchdText(oldSpec, "running", 88) }]);
+    const oldCredentials = `LCM_CREDENTIAL_DIRECTORY => ${oldDirectory}\nLCM_CREDENTIAL_OPENAI_API_KEY_FILE => ${oldFile}`;
+    const oldStart = runQueue([absent, { code: 0, stdout: "bootstrapped" }, { code: 0, stdout: launchdText(oldSpec, "running", 88, oldCredentials) }]);
     await expect(createSupervisor("launchd-user", { run: oldStart.run, platform: "darwin", uid: 501 }).start(oldSpec)).resolves.toMatchObject({ managerPid: 88 });
 
     const replacementDirectory = createManagedCredentialDirectory(stateRoot, "replacement-cleanup");
