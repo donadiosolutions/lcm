@@ -418,9 +418,6 @@ describe("supervisor coverage: manager states and lifecycle boundaries", () => {
       expect(await unconfiguredSupervisor.probe(numericSpec)).toMatchObject({ kind: "registered-stale-config", reason: "metadata-mismatch" });
     }
 
-    // The metadata parser's lexical key check is defensive even though the
-    // scanner normally admits only matching key characters. Force that seam to
-    // fail once to verify the fail-closed branch without changing production.
     const originalTest = RegExp.prototype.test;
     const regex = vi.spyOn(RegExp.prototype, "test").mockImplementation(function (this: RegExp, input: string): boolean {
       if (this.source === "^[A-Za-z][A-Za-z0-9_.-]*$" && input === "LCM_PADDING") return false;

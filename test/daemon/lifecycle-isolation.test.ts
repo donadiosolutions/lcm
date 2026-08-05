@@ -1392,9 +1392,6 @@ describe("run-owned lifecycle resources", () => {
     fixture.runSystemd.mockReturnValue({ status: 1, stdout: "", stderr: "failed" });
     const result = await ensureDaemon(scopedOptions(fixture));
     expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "startup-failure" });
-    // A manager mutation that throws has unresolved ownership.  The lifecycle
-    // must not issue a second stop, even though the hermetic test scope can
-    // still be removed by its exact-root cleanup fence.
     expect(fixture.stopUnit).not.toHaveBeenCalled();
     expect(fixture.spawnProcess).not.toHaveBeenCalled();
     expect(existsSync(fixture.scope.stateDir)).toBe(false);

@@ -193,8 +193,6 @@ function sealTrustedCredentialDir(path: string): void {
 }
 
 function removeTrustedCredentialDir(path: string): void {
-  // systemd's 0500 directory is intentionally not writable; restore a
-  // cleanup mode after each fixture has finished reading it.
   chmodSync(path, 0o700);
   rmSync(path, { recursive: true, force: true });
 }

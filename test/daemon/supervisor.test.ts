@@ -95,35 +95,13 @@ function fakeRunner(results: Array<SupervisorCommandResult>): {
 
 describe("canonical supervisor identity", () => {
   it("allows detached compatibility only for read-only manager absence reasons", () => {
-    const reasons = [
-      "manager-unavailable",
-      "manager-timeout",
-      "manager-command-failed",
-      "manager-not-found",
-      "metadata-missing",
-      "metadata-mismatch",
-      "foreign-job",
-      "pid-missing",
-      "pid-invalid",
-      "state-conflict",
-      "credential-invalid",
-      "cleanup-failed",
-      "unsupported-platform",
+    const reasons = ["manager-unavailable", "manager-timeout", "manager-command-failed",
+      "manager-not-found", "metadata-missing", "metadata-mismatch", "foreign-job",
+      "pid-missing", "pid-invalid", "state-conflict", "credential-invalid",
+      "cleanup-failed", "unsupported-platform"
     ] as const;
-    expect(reasons.map(isSupervisorPreflightUnavailableReason)).toEqual([
-      true,
-      false,
-      false,
-      true,
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
-      false,
+    expect(reasons.map(isSupervisorPreflightUnavailableReason)).toEqual([true, false, false,
+      true, false, false, false, false, false, false, false, false, false
     ]);
   });
 

@@ -881,9 +881,6 @@ describe("bounded remediation marker persistence", () => {
               rmSync(path);
               writeMarkerDocument(path, {});
               const replacementStat = lstatSync(path);
-              // Overlay filesystems may recycle the same dev/ino for a
-              // same-size replacement.  Keep the real replacement, but make
-              // its observed identity deterministic for this race proof.
               return Object.assign(Object.create(Object.getPrototypeOf(replacementStat)), replacementStat, {
                 ino: (originalInode ?? replacementStat.ino) + 1,
               });

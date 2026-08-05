@@ -9,14 +9,9 @@ import {
 
 const repositoryRoot = join(fileURLToPath(new URL(".", import.meta.url)), "../..");
 const productionFiles = [
-  "bin/lcm.ts",
-  "src/doctor/doctor.ts",
-  "src/cli-help.ts",
-  "src/hooks/user-prompt.ts",
-  "src/hooks/compact.ts",
-  "src/hooks/restore.ts",
-  "src/hooks/session-end.ts",
-  "src/mcp/server.ts",
+  "bin/lcm.ts", "src/doctor/doctor.ts", "src/cli-help.ts", "src/hooks/user-prompt.ts",
+  "src/hooks/compact.ts", "src/hooks/restore.ts", "src/hooks/session-end.ts",
+  "src/mcp/server.ts"
 ];
 
 // Keep this list explicit: these are the tracked Markdown/help surfaces that
@@ -24,41 +19,20 @@ const productionFiles = [
 // Implementation and test files are intentionally excluded so compatibility
 // aliases and lifecycle seams remain testable without becoming recovery advice.
 const guidanceSurfaceFiles = [
-  "README.md",
-  ".codex/skills/lcm-memory/SKILL.md",
-  ".claude/commands/lcm-dogfood.md",
-  ".github/skills/lcm-memory/SKILL.md",
-  ".agents/skills/lcm-context/SKILL.md",
-  ".agents/skills/lcm-dogfood/SKILL.md",
-  ".agents/skills/lcm-dogfood/references/checks.md",
+  "README.md", ".codex/skills/lcm-memory/SKILL.md", ".claude/commands/lcm-dogfood.md",
+  ".github/skills/lcm-memory/SKILL.md", ".agents/skills/lcm-context/SKILL.md",
+  ".agents/skills/lcm-dogfood/SKILL.md", ".agents/skills/lcm-dogfood/references/checks.md",
   ".agents/skills/lcm-dogfood/references/known-issues.md",
-  ".agents/skills/lcm-e2e/SKILL.md",
-  ".agents/skills/lcm-e2e/checklist.md",
-  ".agents/skills/lcm-release/SKILL.md",
-  "docs/agent-tools.md",
-  "docs/architecture.md",
-  "docs/cli.md",
-  "docs/configuration.md",
-  "docs/daemon-restart-recovery.md",
-  "docs/external-admission.md",
-  "docs/fts5.md",
-  "docs/hook-protocol.md",
-  "docs/issue-triage.md",
-  "docs/passive-learning.md",
-  "docs/postgresql-coordination.md",
-  "docs/postgresql-development.md",
-  "docs/postgresql-memory-administration.md",
-  "docs/postgresql-native-transcripts.md",
-  "docs/postgresql-schema.md",
-  "docs/postgresql-search.md",
-  "docs/postgresql-summary-context.md",
-  "docs/privacy.md",
-  "docs/project-identity.md",
-  "docs/releasing.md",
-  "docs/tag-schema.md",
-  "docs/vscode-codex.md",
-  "src/cli-help.ts",
-  "src/connectors/templates/base.md",
+  ".agents/skills/lcm-e2e/SKILL.md", ".agents/skills/lcm-e2e/checklist.md",
+  ".agents/skills/lcm-release/SKILL.md", "docs/agent-tools.md", "docs/architecture.md",
+  "docs/cli.md", "docs/configuration.md", "docs/daemon-restart-recovery.md",
+  "docs/external-admission.md", "docs/fts5.md", "docs/hook-protocol.md",
+  "docs/issue-triage.md", "docs/passive-learning.md", "docs/postgresql-coordination.md",
+  "docs/postgresql-development.md", "docs/postgresql-memory-administration.md",
+  "docs/postgresql-native-transcripts.md", "docs/postgresql-schema.md",
+  "docs/postgresql-search.md", "docs/postgresql-summary-context.md", "docs/privacy.md",
+  "docs/project-identity.md", "docs/releasing.md", "docs/tag-schema.md",
+  "docs/vscode-codex.md", "src/cli-help.ts", "src/connectors/templates/base.md",
   "src/connectors/templates/mcp-base.md",
   "src/connectors/templates/sections/command-reference.md",
   "src/connectors/templates/sections/mcp-workflow.md",
@@ -73,15 +47,12 @@ const guidanceSurfaceFiles = [
   "src/connectors/templates/claude/commands/lcm-promote.md",
   "src/connectors/templates/claude/commands/lcm-sensitive.md",
   "src/connectors/templates/claude/commands/lcm-stats.md",
-  "src/connectors/templates/claude/commands/lcm-status.md",
+  "src/connectors/templates/claude/commands/lcm-status.md"
 ] as const;
 
 const compatibilityFiles = [
-  "bin/lcm.ts",
-  "src/bootstrap.ts",
-  "src/daemon/lifecycle.ts",
-  "test/cli-help.test.ts",
-  "test/bin/lcm-run-cli.test.ts",
+  "bin/lcm.ts", "src/bootstrap.ts", "src/daemon/lifecycle.ts", "test/cli-help.test.ts",
+  "test/bin/lcm-run-cli.test.ts"
 ] as const;
 
 const staleRecoveryPatterns: readonly [RegExp, string][] = [

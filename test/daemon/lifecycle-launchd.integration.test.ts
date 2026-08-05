@@ -116,8 +116,6 @@ function runLaunchctl(
         cwd: options.cwd,
         env: options.env === undefined ? process.env : { ...process.env, ...options.env },
         encoding: "utf8",
-        // A whole GUI domain can be larger than the bounded observation text;
-        // retain only the bounded prefix returned to the supervisor parser.
         maxBuffer: MAX_MANAGER_EXEC_BUFFER,
         timeout: options.timeoutMs,
       },
@@ -205,7 +203,6 @@ async function waitForExactHealth(
         if (isExactHealth(body, spec, managerPid)) return body;
       }
     } catch {
-      // The launchd child may still be between bootstrap and listen().
     }
     await wait(100);
   }
@@ -255,8 +252,6 @@ describe("real launchd daemon lifecycle", () => {
         return runLaunchctl(command, args, options);
       };
 
-      // A Darwin worker without a GUI bootstrap domain cannot safely exercise
-      // launchd user services. It is an integration failure, never a skip.
       const guiDomain = `gui/${uid}`;
       const guiProbe = await run("launchctl", ["print", guiDomain], { timeoutMs: 5_000 });
       expect(guiProbe.timedOut).not.toBe(true);
@@ -342,17 +337,10 @@ describe("real launchd daemon lifecycle", () => {
 
         const bootstrapCalls = calls.filter((call) => call.args[0] === "bootstrap");
         expect(bootstrapCalls).toHaveLength(1);
-        expect(bootstrapCalls[0]?.args).toEqual([
-          "bootstrap",
-          guiDomain,
-          plistPath,
-        ]);
+        expect(bootstrapCalls[0]?.args).toEqual(["bootstrap", guiDomain, plistPath]);
         const bootoutCalls = calls.filter((call) => call.args[0] === "bootout");
         expect(bootoutCalls).toHaveLength(1);
-        expect(bootoutCalls[0]?.args).toEqual([
-          "bootout",
-          `${guiDomain}/${spec.launchdLabel}`,
-        ]);
+        expect(bootoutCalls[0]?.args).toEqual(["bootout", `${guiDomain}/${spec.launchdLabel}`]);
       } finally {
         if (managerReady) await supervisor.stopAndAwaitAbsent(spec);
         rmSync(root, { recursive: true, force: true });
