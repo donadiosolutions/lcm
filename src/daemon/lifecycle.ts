@@ -377,7 +377,9 @@ function supervisorCommandRunner(
       return {
         code,
         stdout: typeof result.stdout === "string" ? result.stdout : "",
-        stderr: typeof result.stderr === "string" ? result.stderr : "",
+        stderr: typeof result.stderr === "string" && result.stderr.length > 0
+          ? result.stderr
+          : error?.code === "ENOENT" ? error.code : "",
         timedOut: error?.code === "ETIMEDOUT",
       };
     } catch (error) {

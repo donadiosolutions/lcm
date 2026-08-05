@@ -1816,6 +1816,49 @@ describe("ensureDaemon", () => {
     expect(spawnMock).toHaveBeenCalled();
   });
 
+  it.each([
+    { platform: "linux" as const, manager: "systemctl", errorCode: "ENOENT", fallback: true },
+    { platform: "linux" as const, manager: "systemctl", errorCode: "EACCES", fallback: false },
+    { platform: "darwin" as const, manager: "launchctl", errorCode: "ENOENT", fallback: true },
+    { platform: "darwin" as const, manager: "launchctl", errorCode: "EACCES", fallback: false },
+  ])("classifies spawnSync $errorCode for $manager on $platform", async ({ platform, manager, errorCode, fallback }) => {
+    const tempDir = mkdtempSync(join(tmpdir(), `lcm-lifecycle-manager-${platform}-${errorCode.toLowerCase()}-`));
+    tempDirs.push(tempDir);
+    const pidFile = join(tempDir, "daemon.pid");
+    const spawnSyncMock = vi.fn().mockReturnValue({
+      status: null,
+      stdout: "",
+      stderr: "",
+      error: Object.assign(new Error(`spawn ${manager} ${errorCode}`), { code: errorCode }),
+    });
+    const spawnMock = vi.fn().mockReturnValue(makeSpawnChild(12345));
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      spawnCommand: process.execPath,
+      spawnArgs: ["/path/lcm.js", "daemon", "start", "--foreground"],
+      enforceUserManagerParent: true,
+      _platform: platform,
+      _skipHealthWait: true,
+      _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
+      _spawnOverride: spawnMock as unknown as SpawnOverride,
+    });
+
+    expect(spawnSyncMock).toHaveBeenCalledOnce();
+    expect(spawnSyncMock.mock.calls[0]?.[0]).toBe(manager);
+    if (fallback) {
+      expect(result).toMatchObject({ connected: false, spawned: true, startMethod: "detached-spawn" });
+      expect(result.warning).toContain("manager unavailable");
+      expect(spawnMock).toHaveBeenCalledOnce();
+    } else {
+      expect(result).toMatchObject({ connected: false, spawned: false, refusalReason: "manager-unavailable" });
+      expect(result.warning).toContain("manager-command-failed");
+      expect(spawnMock).not.toHaveBeenCalled();
+    }
+  });
+
   it("treats a malformed manager command status as unavailable instead of success", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-malformed-manager-status-"));
     tempDirs.push(tempDir);
