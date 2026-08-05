@@ -2067,7 +2067,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     }
 
     // A fresh per-start nonce is not part of the stable manager name.  When a
-    // running no-credential job is already registered, authenticate its
+    // no-credential job is already registered, authenticate its
     // exact observed nonce and adopt that launch identity.  Credential-bearing
     // jobs are deliberately not adopted without the exact requested paths.
     if (observation.kind === "registered-stale-config") {
@@ -2075,7 +2075,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       if (observedSpec !== undefined) {
         try {
           const observed = await supervisor.probe(observedSpec);
-          if (observed.kind === "registered-running-valid") {
+          if (
+            observed.kind === "registered-running-valid"
+            || observed.kind === "registered-not-running-valid"
+          ) {
             requestedSpec = observedSpec;
             observation = observed;
           }
@@ -2136,7 +2139,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       if (opts._skipSpawn || monotonicNow() >= deadline) {
         return refusalResult("not-running", "managed daemon is not running; explicit start is required");
       }
-      return startManagedDaemon(spec, supervisor, true);
+      return startManagedDaemon(requestedSpec, supervisor, true);
     }
     if (observation.kind === "absent") {
       // Probe first, then take one bounded endpoint observation before

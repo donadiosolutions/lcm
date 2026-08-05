@@ -634,6 +634,51 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(calls).toBe(4);
   });
 
+  it("recreates a terminal job through its prior nonce after exact no-live-PID proof", async () => {
+    const priorNonce = "existing-terminal-nonce";
+    const currentNonce = "new-terminal-nonce";
+    const fixture = createFixture({ isAlive: () => false });
+    const probes: SupervisorSpec[] = [];
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      probes.push(spec);
+      if (probes.length === 1) return staleObservation(spec, { nonce: priorNonce });
+      if (probes.length === 2) return observation(spec, "registered-not-running-valid", { terminal: "inactive" });
+      return observation(spec, "registered-running-valid", { managerPid: 4242 });
+    });
+
+    const result = await ensureDaemon(optionsFor(fixture, {
+      _supervisorNonceOverride: () => currentNonce,
+      _skipHealthWait: true,
+    }));
+
+    expect(result).toMatchObject({ spawned: true, startMethod: "systemd-user", pid: 4242 });
+    expect(probes.map(({ nonce }) => nonce)).toEqual([currentNonce, priorNonce, priorNonce]);
+    expect(fixture.stopAndStart).toHaveBeenCalledWith(expect.objectContaining({ nonce: priorNonce }));
+  });
+
+  it("refuses prior-nonce terminal adoption on invalid metadata or live PID evidence", async () => {
+    const invalidMetadata = createFixture({ isAlive: () => false });
+    invalidMetadata.probe.mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec, {
+      nonce: "existing-invalid-metadata-nonce",
+      args: "[1]",
+    }));
+    await expect(ensureDaemon(optionsFor(invalidMetadata, {
+      _supervisorNonceOverride: () => "new-invalid-metadata-nonce",
+      _skipSpawn: true,
+    }))).resolves.toMatchObject({ refusalReason: "stale-config" });
+    expect(invalidMetadata.stopAndStart).not.toHaveBeenCalled();
+
+    const livePid = createFixture({ isAlive: () => true });
+    writeFileSync(livePid.pidPath, "4242");
+    livePid.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec, { nonce: "existing-live-pid-nonce" }))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-not-running-valid", { terminal: "inactive" }));
+    await expect(ensureDaemon(optionsFor(livePid, {
+      _supervisorNonceOverride: () => "new-live-pid-nonce",
+    }))).resolves.toMatchObject({ refusalReason: "not-running" });
+    expect(livePid.stopAndStart).not.toHaveBeenCalled();
+  });
+
   it("rejects malformed observed launch metadata and unreconstructable specs", async () => {
     for (const args of ["{", "{}", "[1]"]) {
       const fixture = createFixture();
