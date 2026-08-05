@@ -4262,6 +4262,7 @@ describe("restartDaemon", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-managed-launchd-cleanup-refused-"));
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
+    let monotonicMs = 0;
     let calls = 0;
     let staged: ManagedCredentialSnapshot | undefined;
     const supervisor = {
@@ -4306,6 +4307,8 @@ describe("restartDaemon", () => {
       _supervisorOverride: supervisor as never,
       _isProcessAliveOverride: () => false,
       _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+      _monotonicNowOverride: (): number => monotonicMs,
+      _sleepOverride: async (durationMs: number): Promise<void> => { monotonicMs += durationMs; },
     }, {
       platform: "darwin",
       uid: 501,
@@ -4380,7 +4383,11 @@ describe("restartDaemon", () => {
       }),
       stopAndAwaitAbsent: vi.fn(),
     };
-    const ensureMock = vi.fn(async () => ({ connected: true, port: 19999, spawned: false, startMethod: "systemd-user" as const }));
+    let ensuredOptions: EnsureDaemonOptions | undefined;
+    const ensureMock = vi.fn(async (options: EnsureDaemonOptions) => {
+      ensuredOptions = options;
+      return { connected: true, port: 19999, spawned: false, startMethod: "systemd-user" as const };
+    });
     const result = await restartDaemon({
       port: 19999,
       pidFilePath: pidFile,
@@ -4404,6 +4411,8 @@ describe("restartDaemon", () => {
     expect(supervisor.stopAndStart).toHaveBeenCalledOnce();
     expect(calls).toBe(2);
     expect(ensureMock).toHaveBeenCalledOnce();
+    expect(ensuredOptions?._supervisorCredentialDirectoryOverride).toBe(staged?.credentialDirectory);
+    expect(ensuredOptions?._supervisorCredentialFilesOverride).toEqual(staged?.files.map(({ name, path }) => ({ name, path })));
     expect(staged?.stateRoot).toBe(tempDir);
     expect(staged?.credentialDirectory).toBeDefined();
     expect(dirname(staged!.credentialDirectory!)).toBe(join(tempDir, "credentials"));

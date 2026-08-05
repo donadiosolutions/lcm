@@ -645,6 +645,130 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(calls).toBe(4);
   });
 
+  it.each([
+    ["linux", "systemd-user"],
+    ["darwin", "launchd-user"],
+  ] as const)("reuses a healthy credential-bearing %s job after one-shot cleanup", async (platform, method) => {
+    const persistedNonce = "persisted-credential-nonce";
+    const fetch = sequenceFetch([healthy(4242), healthy(4242), response({}, 200)]);
+    const fixture = createFixture({ platform, fetch, isAlive: () => true });
+    const credentialDirectory = join(fixture.stateDir, "credentials", `${persistedNonce}-0123456789abcdef`);
+    const credentialFile = join(credentialDirectory, "OPENAI_API_KEY");
+    mkdirSync(credentialDirectory, { recursive: true, mode: 0o700 });
+    chmodSync(credentialDirectory, 0o700);
+    writeFileSync(credentialFile, "deleted-secret", { mode: 0o600 });
+    rmSync(credentialDirectory, { recursive: true, force: true });
+    const observed: SupervisorSpec[] = [];
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      observed.push(spec);
+      return observed.length === 1
+        ? staleObservation(spec, {
+            nonce: persistedNonce,
+            credentialDirectory,
+            credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
+          })
+        : observation(spec, "registered-running-valid", { managerPid: 4242 });
+    });
+    writeFileSync(fixture.pidPath, "4242");
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+
+    const result = await ensureDaemon(optionsFor(fixture, {
+      _platform: platform,
+      _supervisorNonceOverride: () => "new-ordinary-nonce",
+    }));
+
+    expect(result).toMatchObject({ connected: true, spawned: false, startMethod: method, pid: 4242 });
+    expect(observed[0]?.credentialDirectory).toBeUndefined();
+    expect(observed).toHaveLength(4);
+    expect(observed.slice(1).every(spec => spec.nonce === persistedNonce && spec.credentialDirectory === credentialDirectory && spec.credentialFiles?.[0]?.path === credentialFile)).toBe(true);
+    expect(observed[1]).toMatchObject({
+      nonce: persistedNonce,
+      credentialDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
+    });
+    expect(fixture.start).not.toHaveBeenCalled();
+    expect(fixture.stopAndStart).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(existsSync(credentialDirectory)).toBe(false);
+  });
+
+  it.each(["linux", "darwin"] as const)("refuses %s credential metadata before mutation", async (platform) => {
+    const cases: readonly ((directory: string, root: string) => Record<string, unknown>)[] = [
+      directory => ({ credentialDirectory: directory }),
+      directory => ({ credentialDirectory: directory, credentialFiles: [] }),
+      directory => ({ credentialDirectory: directory, credentialFiles: [undefined] }),
+      directory => ({ credentialDirectory: directory, credentialFiles: [null] }),
+      (directory, root) => {
+        const outsideDirectory = join(root, "outside", directory.slice(directory.lastIndexOf("/") + 1));
+        return { credentialDirectory: outsideDirectory, credentialFiles: [{ name: "OPENAI_API_KEY", path: join(outsideDirectory, "OPENAI_API_KEY") }] };
+      },
+      (directory, root) => ({ credentialDirectory: directory, credentialFiles: [{ name: "OPENAI_API_KEY", path: join(root, "foreign", "OPENAI_API_KEY") }] }),
+      directory => ({ credentialDirectory: directory, credentialFiles: [{ name: "EVIL", path: join(directory, "EVIL") }] }),
+      directory => ({ credentialDirectory: directory, credentialFiles: [{ name: "OPENAI_API_KEY", path: join(directory, "OPENAI_API_KEY") }, { name: "OPENAI_API_KEY", path: join(directory, "OPENAI_API_KEY") }] }),
+      directory => {
+        const longDirectory = `${directory}${"x".repeat(4100)}`;
+        return { credentialDirectory: longDirectory, credentialFiles: [{ name: "OPENAI_API_KEY", path: join(longDirectory, "OPENAI_API_KEY") }] };
+      },
+    ];
+    for (const makeMetadata of cases) {
+      const fixture = createFixture({ platform });
+      const credentialDirectory = join(fixture.stateDir, "credentials", "persisted-credential-nonce-0123456789abcdef");
+      fixture.probe.mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec, {
+        nonce: "persisted-credential-nonce",
+        ...makeMetadata(credentialDirectory, fixture.root),
+      }));
+      await expect(ensureDaemon(optionsFor(fixture, { _platform: platform, _skipSpawn: true }))).resolves.toMatchObject({
+        connected: false,
+        spawned: false,
+        refusalReason: "stale-config",
+      });
+      expect(fixture.probe).toHaveBeenCalledOnce();
+      expect(fixture.start).not.toHaveBeenCalled();
+      expect(fixture.stopAndStart).not.toHaveBeenCalled();
+      expect(fixture.stopAndAwaitAbsent).not.toHaveBeenCalled();
+      expect(fixture.seams.fetch).not.toHaveBeenCalled();
+    }
+
+    const foreignManager = createFixture({ platform });
+    const credentialDirectory = join(foreignManager.root, "manager-credentials", "persisted-credential-nonce-0123456789abcdef");
+    foreignManager.probe.mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec, {
+      name: "foreign-manager",
+      credentialDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: join(credentialDirectory, "OPENAI_API_KEY") }],
+    }));
+    await expect(ensureDaemon(optionsFor(foreignManager, { _platform: platform, _skipSpawn: true }))).resolves.toMatchObject({ refusalReason: "stale-config" });
+    expect(foreignManager.start).not.toHaveBeenCalled();
+    expect(foreignManager.stopAndStart).not.toHaveBeenCalled();
+
+    const terminal = createFixture({ platform });
+    const terminalDirectory = join(terminal.stateDir, "credentials", "terminal-credential-nonce-0123456789abcdef");
+    terminal.probe.mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec, {
+      managerPid: undefined,
+      nonce: "terminal-credential-nonce",
+      credentialDirectory: terminalDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: join(terminalDirectory, "OPENAI_API_KEY") }],
+    }));
+    await expect(ensureDaemon(optionsFor(terminal, { _platform: platform, _skipSpawn: true }))).resolves.toMatchObject({ refusalReason: "stale-config" });
+    expect(terminal.probe).toHaveBeenCalledOnce();
+    expect(terminal.start).not.toHaveBeenCalled();
+    expect(terminal.stopAndStart).not.toHaveBeenCalled();
+
+    const terminalRace = createFixture({ platform, isAlive: () => false });
+    const raceDirectory = join(terminalRace.stateDir, "credentials", "running-credential-nonce-0123456789abcdef");
+    terminalRace.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => staleObservation(spec, {
+        managerPid: 4242,
+        nonce: "running-credential-nonce",
+        credentialDirectory: raceDirectory,
+        credentialFiles: [{ name: "OPENAI_API_KEY", path: join(raceDirectory, "OPENAI_API_KEY") }],
+      }))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-not-running-valid", { terminal: "inactive" }));
+    await expect(ensureDaemon(optionsFor(terminalRace, { _platform: platform, _skipSpawn: true }))).resolves.toMatchObject({ refusalReason: "stale-config" });
+    expect(terminalRace.probe).toHaveBeenCalledTimes(2);
+    expect(terminalRace.start).not.toHaveBeenCalled();
+    expect(terminalRace.stopAndStart).not.toHaveBeenCalled();
+  });
+
   it("recreates a terminal job through its prior nonce after exact no-live-PID proof", async () => {
     const priorNonce = "existing-terminal-nonce";
     const currentNonce = "new-terminal-nonce";

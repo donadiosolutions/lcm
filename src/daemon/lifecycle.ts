@@ -1844,6 +1844,50 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     return listenerPorts.includes(opts.port);
   }
 
+  function observedCredentialMetadataIsSafe(
+    requested: SupervisorSpec,
+    observation: SupervisorObservation,
+  ): boolean {
+    const directory = observation.credentialDirectory;
+    const files = observation.credentialFiles;
+    const managerPid = observation.managerPid;
+    // A deleted one-shot directory is expected during normal reuse.  Validate
+    // only the immutable manager metadata below; never reread or recreate its
+    // credential files.
+    if (directory === undefined && files === undefined) return true;
+    if (
+      typeof directory !== "string"
+      || !Array.isArray(files)
+      || files.length === 0
+      || files.length > MANAGED_CREDENTIAL_NAMES.length
+      || typeof managerPid !== "number"
+      || !Number.isSafeInteger(managerPid)
+      || managerPid < 1
+      || typeof observation.nonce !== "string"
+      || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(observation.nonce)
+    ) return false;
+    const directoryPrefix = join(requested.stateRoot, "credentials", `${observation.nonce}-`);
+    if (
+      !directory.startsWith(directoryPrefix)
+      || !/^[a-f0-9]{16}$/u.test(directory.slice(directoryPrefix.length))
+    ) return false;
+    const names = new Set<string>();
+    return files.every((credential) => {
+      if (
+        credential === undefined
+        || credential === null
+        || typeof credential !== "object"
+        || typeof credential.name !== "string"
+        || typeof credential.path !== "string"
+        || !MANAGED_CREDENTIAL_NAMES.some((name) => name === credential.name)
+        || names.has(credential.name)
+        || credential.path !== join(directory, credential.name)
+      ) return false;
+      names.add(credential.name);
+      return true;
+    });
+  }
+
   function observedSupervisorSpec(
     requested: SupervisorSpec,
     observation: SupervisorObservation,
@@ -1871,7 +1915,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const optionalMetadataMatches = (observed: string | undefined, expected: string | undefined): boolean =>
       (observed ?? "") === (expected ?? "");
     const sameCredentials = requested.credentialDirectory === undefined
-      ? observation.credentialDirectory === undefined && (observation.credentialFiles?.length ?? 0) === 0
+      ? observedCredentialMetadataIsSafe(requested, observation)
       : observation.credentialDirectory === requested.credentialDirectory
         && (requested.credentialFiles ?? []).length === (observation.credentialFiles ?? []).length
         && (requested.credentialFiles ?? []).every((credential, index) => {
@@ -2076,7 +2120,11 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           const observed = await supervisor.probe(observedSpec);
           if (
             observed.kind === "registered-running-valid"
-            || observed.kind === "registered-not-running-valid"
+            || (
+              observed.kind === "registered-not-running-valid"
+              && observedSpec.credentialDirectory === undefined
+              && (observedSpec.credentialFiles?.length ?? 0) === 0
+            )
           ) {
             requestedSpec = observedSpec;
             observation = observed;
