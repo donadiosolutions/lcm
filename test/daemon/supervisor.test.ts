@@ -77,7 +77,7 @@ function managerText(
     `ActiveState=${state}`,
     `SubState=${subState}`,
     `MainPID=${state === "active" ? pid : 0}`,
-    `Environment=LCM_SUPERVISOR_MARKER=${spec.marker} LCM_SUPERVISOR_SCOPE=${spec.scopeDigest} LCM_SUPERVISOR_STATE_ROOT=${spec.stateRoot} LCM_SUPERVISOR_PORT=${spec.port} LCM_SUPERVISOR_NONCE=${spec.nonce} LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)} LCM_SUPERVISOR_CWD=${spec.cwd ?? ""}${spec.entrypoint === undefined ? "" : ` LCM_SUPERVISOR_ENTRYPOINT=${spec.entrypoint}`}${spec.runtimeDigest === undefined ? "" : ` LCM_SUPERVISOR_RUNTIME_DIGEST=${spec.runtimeDigest}`}${spec.storageBackend === undefined ? "" : ` LCM_SUPERVISOR_STORAGE_BACKEND=${spec.storageBackend}`}${credentialMetadata}`,
+    `Environment=LCM_SUPERVISOR_MARKER=${spec.marker} LCM_SUPERVISOR_SCOPE=${spec.scopeDigest} LCM_SUPERVISOR_STATE_ROOT=${spec.stateRoot} LCM_SUPERVISOR_PORT=${spec.port} LCM_SUPERVISOR_NONCE=${spec.nonce} LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(spec.args)} LCM_SUPERVISOR_CWD=${spec.cwd ?? ""}${spec.entrypoint === undefined ? "" : ` LCM_SUPERVISOR_ENTRYPOINT=${spec.entrypoint}`}${spec.runtimeDigest === undefined ? "" : ` LCM_SUPERVISOR_RUNTIME_DIGEST=${spec.runtimeDigest}`}${spec.storageBackend === undefined ? "" : ` LCM_SUPERVISOR_STORAGE_BACKEND=${spec.storageBackend}`}${spec.postgresCaFile === undefined ? "" : ` LCM_POSTGRES_CA_FILE=${spec.postgresCaFile}`}${credentialMetadata}`,
   ].join("\n");
 }
 
@@ -469,6 +469,32 @@ describe("systemd-user supervisor", () => {
     expect(runner.calls[1].args).toContain("--setenv=LCM_SYSTEMD_CRED_IDS=OPENAI_API_KEY");
     expect(runner.calls[1].args).toContain(`--setenv=LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${files[0]}`);
     expect(runner.calls[1].args.join(" ")).not.toContain("secret");
+  });
+
+  it("projects only the non-secret PostgreSQL CA path into both manager launch surfaces", async () => {
+    const caFile = "/etc/lcm/ca.crt";
+    for (const kind of ["systemd-user", "launchd-user"] as const) {
+      const spec = makeSpec(kind, makeRoot(), { postgresCaFile: caFile });
+      const runner = fakeRunner(kind === "systemd-user"
+        ? [{ code: 1, stderr: "Unit is not-found" }, { code: 0, stdout: "started" }, { code: 0, stdout: managerText(spec, "active", 444) }]
+        : [{ code: 113, stderr: "Could not find service" }, { code: 0, stdout: "bootstrap" }, { code: 0, stdout: managerText(spec, "active", 444) }]);
+      await expect(createSupervisor(kind, { run: runner.run, platform: kind === "systemd-user" ? "linux" : "darwin", uid: 501 }).start(spec)).resolves.toMatchObject({ managerPid: 444 });
+      if (kind === "systemd-user") {
+        expect(runner.calls[1]!.args).toContain(`--setenv=LCM_POSTGRES_CA_FILE=${caFile}`);
+        expect(runner.calls[1]!.args.join(" ")).not.toContain("LCM_POSTGRES_URL");
+      } else {
+        const plist = readFileSync(join(spec.stateRoot, `daemon.${spec.shortDigest}.${spec.nonce}.plist`), "utf8");
+        expect(plist).toContain(`<key>LCM_POSTGRES_CA_FILE</key><string>${caFile}</string>`);
+        expect(plist).not.toContain("LCM_POSTGRES_URL");
+      }
+    }
+    const unset = makeSpec("systemd-user");
+    const runner = fakeRunner([{ code: 1, stderr: "Unit is not-found" }, { code: 0, stdout: "started" }, { code: 0, stdout: managerText(unset, "active", 445) }]);
+    await createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(unset);
+    expect(runner.calls[1]!.args.join(" ")).not.toContain("LCM_POSTGRES_CA_FILE");
+    const mismatch = makeSpec("systemd-user", makeRoot(), { postgresCaFile: caFile });
+    await expect(createSupervisor("systemd-user", { run: fakeRunner([{ code: 0, stdout: `${managerText(mismatch).replace(` LCM_POSTGRES_CA_FILE=${caFile}`, "")}\nLCM_POSTGRES_CA_FILE=/other/ca.crt` }]).run, platform: "linux" }).probe(mismatch)).resolves.toMatchObject({ reason: "metadata-missing", postgresCaFile: "/other/ca.crt" });
+    await expect(createSupervisor("systemd-user", { run: fakeRunner([{ code: 0, stdout: managerText(mismatch).replace(` LCM_POSTGRES_CA_FILE=${caFile}`, "") }]).run, platform: "linux" }).probe(mismatch)).resolves.toMatchObject({ reason: "metadata-missing" });
   });
 
   it("cleans only a losing launch credential directory after a different exact winner is running", async () => {
@@ -1195,7 +1221,7 @@ describe("launchd-user supervisor", () => {
 
   it("removes only the authenticated old launchd plist during stale-config repair", async () => {
     const root = makeRoot();
-    const oldSpec = makeSpec("launchd-user", root, { nonce: "old-nonce", port: 3737 });
+    const oldSpec = makeSpec("launchd-user", root, { nonce: "old-nonce", port: 3737, postgresCaFile: "/etc/lcm/ca.crt" });
     const running = [
       "state = running",
       "pid = 777",
@@ -1206,6 +1232,7 @@ describe("launchd-user supervisor", () => {
       `LCM_SUPERVISOR_EXECUTABLE => ${oldSpec.executable}`,
       `LCM_SUPERVISOR_ARGS => ${JSON.stringify(oldSpec.args)}`,
       "LCM_SUPERVISOR_CWD =>",
+      `LCM_POSTGRES_CA_FILE => ${oldSpec.postgresCaFile}`,
     ].join("\n");
     const oldRunner = fakeRunner([
       { code: 113, stderr: "Could not find service" },
@@ -1217,7 +1244,7 @@ describe("launchd-user supervisor", () => {
     expect(lstatSync(oldPlist).isFile()).toBe(true);
     const foreignPlist = join(root, `daemon.${oldSpec.shortDigest}.foreign.plist`);
     writeFileSync(foreignPlist, "foreign", { mode: 0o600 });
-    const newSpec = makeSpec("launchd-user", root, { nonce: "new-nonce", port: 4747 });
+    const newSpec = makeSpec("launchd-user", root, { nonce: "new-nonce", port: 4747, postgresCaFile: oldSpec.postgresCaFile });
     const stale = running
       .replace(`state = running`, "state = not running")
       .replace(`pid = 777`, "pid = 0");

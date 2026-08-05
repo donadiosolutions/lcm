@@ -1931,6 +1931,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       || !optionalMetadataMatches(observation.entrypoint, requested.entrypoint)
       || !optionalMetadataMatches(observation.runtimeDigest, requested.runtimeDigest)
       || !optionalMetadataMatches(observation.storageBackend, requested.storageBackend)
+      || !optionalMetadataMatches(observation.postgresCaFile, requested.postgresCaFile)
     ) return undefined;
     try {
       return createSupervisorSpec({
@@ -1943,6 +1944,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         ...(observation.entrypoint === undefined ? {} : { entrypoint: observation.entrypoint }),
         ...(observation.runtimeDigest === undefined ? {} : { runtimeDigest: observation.runtimeDigest }),
         storageBackend: requested.storageBackend!,
+        ...(requested.postgresCaFile === undefined ? {} : { postgresCaFile: requested.postgresCaFile }),
         ...(observation.credentialDirectory === undefined ? {} : { credentialDirectory: observation.credentialDirectory }),
         ...(observation.credentialFiles === undefined ? {} : { credentialFiles: observation.credentialFiles }),
         stopTimeoutMs: requested.stopTimeoutMs,
@@ -2010,6 +2012,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         entrypoint: expectedEntrypoint,
         runtimeDigest: expectedRuntimeDigest,
         storageBackend: expectedStorageBackend,
+        postgresCaFile: dependencies.environment.LCM_POSTGRES_CA_FILE,
         stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
         realpath,
         ...(opts._supervisorCredentialDirectoryOverride === undefined ? {} : { credentialDirectory: opts._supervisorCredentialDirectoryOverride }),
@@ -3189,6 +3192,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         entrypoint: testScope?.entrypoint ?? opts.expectedEntrypoint,
         runtimeDigest: opts.expectedRuntimeDigest ?? RUNTIME_DIGEST,
         storageBackend: opts.expectedStorageBackend ?? "sqlite",
+        postgresCaFile: dependencies.environment.LCM_POSTGRES_CA_FILE,
         stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
         realpath,
       });

@@ -609,6 +609,7 @@ describe("issue 400 managed ensure admission matrix", () => {
   it("adopts an existing no-credential running job through its observed nonce", async () => {
     const fixture = createFixture({
       isAlive: () => true,
+      environment: { LCM_POSTGRES_CA_FILE: "/etc/lcm/ca.crt" },
       fetch: sequenceFetch([healthy(4242), healthy(4242), response({}, 200)]),
     });
     let calls = 0;
@@ -630,6 +631,7 @@ describe("issue 400 managed ensure admission matrix", () => {
           entrypoint: spec.entrypoint,
           runtimeDigest: spec.runtimeDigest,
           storageBackend: spec.storageBackend,
+          postgresCaFile: spec.postgresCaFile,
           managerPid: 4242,
         };
       }

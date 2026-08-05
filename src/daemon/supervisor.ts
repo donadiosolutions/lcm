@@ -91,6 +91,7 @@ export interface SupervisorSpec {
   readonly entrypoint?: string;
   readonly runtimeDigest?: string;
   readonly storageBackend?: string;
+  readonly postgresCaFile?: string;
   readonly credentialFiles?: readonly CredentialFileReference[];
   readonly credentialDirectory?: string;
   readonly stopTimeoutMs: number;
@@ -108,6 +109,7 @@ type SupervisorObservationBase = Readonly<{
   entrypoint?: string;
   runtimeDigest?: string;
   storageBackend?: string;
+  postgresCaFile?: string;
   credentialDirectory?: string;
   credentialFiles?: readonly CredentialFileReference[];
   managerPid?: number;
@@ -351,6 +353,7 @@ type SupervisorSpecInput = Readonly<{
   entrypoint?: string;
   runtimeDigest?: string;
   storageBackend?: string;
+  postgresCaFile?: string;
   credentialFiles?: readonly CredentialFileReference[];
   credentialDirectory?: string;
   stopTimeoutMs?: number;
@@ -381,6 +384,10 @@ export function createSupervisorSpec(input: SupervisorSpecInput): SupervisorSpec
   if (input.entrypoint !== undefined) assertPathMetadataValue(input.entrypoint, "supervisor metadata");
   if (input.runtimeDigest !== undefined) assertRuntimeDigest(input.runtimeDigest);
   if (input.storageBackend !== undefined) assertMetadataValue(input.storageBackend, "supervisor metadata");
+  if (input.postgresCaFile !== undefined) {
+    if (!isAbsolute(input.postgresCaFile)) throw new Error("supervisor PostgreSQL CA file is invalid");
+    assertPathMetadataValue(input.postgresCaFile, "supervisor PostgreSQL CA file");
+  }
   const credentialFiles = input.credentialFiles === undefined
     ? undefined
     : Object.freeze(input.credentialFiles.map((credential) => {
@@ -424,6 +431,7 @@ export function createSupervisorSpec(input: SupervisorSpecInput): SupervisorSpec
     ...(input.entrypoint === undefined ? {} : { entrypoint: input.entrypoint }),
     ...(input.runtimeDigest === undefined ? {} : { runtimeDigest: input.runtimeDigest }),
     ...(input.storageBackend === undefined ? {} : { storageBackend: input.storageBackend }),
+    ...(input.postgresCaFile === undefined ? {} : { postgresCaFile: input.postgresCaFile }),
     ...(credentialFiles === undefined ? {} : { credentialFiles }),
     ...(credentialDirectory === undefined ? {} : { credentialDirectory }),
   };
@@ -517,6 +525,7 @@ function environmentAssignmentValueLimit(key: string): number {
     || upper === "LCM_SUPERVISOR_EXECUTABLE"
     || upper === "LCM_SUPERVISOR_CWD"
     || upper === "LCM_SUPERVISOR_ENTRYPOINT"
+    || upper === "LCM_POSTGRES_CA_FILE"
     || upper === "LCM_CREDENTIAL_DIRECTORY"
     || /^LCM_CREDENTIAL_[A-Z0-9_]+_FILE$/u.test(upper)
   ) return MAX_PATH_METADATA_BYTES;
@@ -823,6 +832,7 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
   const entrypoint = metadata(values, "LCM_SUPERVISOR_ENTRYPOINT");
   const runtimeDigest = metadata(values, "LCM_SUPERVISOR_RUNTIME_DIGEST");
   const storageBackend = metadata(values, "LCM_SUPERVISOR_STORAGE_BACKEND");
+  const postgresCaFile = metadata(values, "LCM_POSTGRES_CA_FILE");
   const managerPid = parsePid(lookup(values, "MainPID", "pid", "PID", "process.pid", "ProcessID"));
   const credentialDirectory = metadata(values, "LCM_CREDENTIAL_DIRECTORY");
   const credentialFiles = MANAGED_CREDENTIAL_NAMES.flatMap((name) => {
@@ -841,6 +851,7 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
     ...(entrypoint === undefined ? {} : { entrypoint }),
     ...(runtimeDigest === undefined ? {} : { runtimeDigest }),
     ...(storageBackend === undefined ? {} : { storageBackend }),
+    ...(postgresCaFile === undefined ? {} : { postgresCaFile }),
     ...(credentialDirectory === undefined ? {} : { credentialDirectory }),
     ...(credentialFiles.length === 0 ? {} : { credentialFiles: Object.freeze(credentialFiles) }),
     ...(managerPid === undefined ? {} : { managerPid }),
@@ -889,6 +900,7 @@ function staleReason(
   if (spec.entrypoint !== undefined && base.entrypoint === undefined) return "metadata-missing";
   if (spec.runtimeDigest !== undefined && base.runtimeDigest === undefined) return "metadata-missing";
   if (spec.storageBackend !== undefined && base.storageBackend === undefined) return "metadata-missing";
+  if (spec.postgresCaFile !== undefined && base.postgresCaFile === undefined) return "metadata-missing";
   // The canonical state root is not required to be repeated by every manager;
   // full scope and launch identity are checked by classifyRegistered below.
   return "metadata-missing";
@@ -919,6 +931,7 @@ function classifyRegistered(
     || (spec.entrypoint !== undefined && base.entrypoint === undefined)
     || (spec.runtimeDigest !== undefined && base.runtimeDigest === undefined)
     || (spec.storageBackend !== undefined && base.storageBackend === undefined)
+    || (base.postgresCaFile ?? "") !== (spec.postgresCaFile ?? "")
     || (spec.credentialDirectory !== undefined && base.credentialDirectory === undefined)
     || !credentialFilesMatch(spec.credentialFiles, base.credentialFiles)
   ) {
@@ -994,6 +1007,7 @@ function plistEnvironment(spec: SupervisorSpec): string {
   if (spec.entrypoint !== undefined) values.push(["LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint]);
   if (spec.runtimeDigest !== undefined) values.push(["LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest]);
   if (spec.storageBackend !== undefined) values.push(["LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend]);
+  if (spec.postgresCaFile !== undefined) values.push(["LCM_POSTGRES_CA_FILE", spec.postgresCaFile]);
   if (spec.credentialDirectory !== undefined) values.push(["LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory]);
   if (spec.credentialFiles !== undefined && spec.credentialFiles.length > 0) {
     values.push(["LCM_SYSTEMD_CRED_IDS", spec.credentialFiles.map(({ name }) => name).join(",")]);
@@ -1175,6 +1189,7 @@ function supervisorSpecFromObservation(
       ...(observation.entrypoint === undefined ? {} : { entrypoint: observation.entrypoint }),
       ...(observation.runtimeDigest === undefined ? {} : { runtimeDigest: observation.runtimeDigest }),
       ...(observation.storageBackend === undefined ? {} : { storageBackend: observation.storageBackend }),
+      ...(spec.postgresCaFile === undefined ? {} : { postgresCaFile: spec.postgresCaFile }),
       ...(observation.credentialDirectory === undefined ? {} : { credentialDirectory: observation.credentialDirectory }),
       ...(observation.credentialFiles === undefined ? {} : { credentialFiles: observation.credentialFiles }),
       stopTimeoutMs: spec.stopTimeoutMs,
@@ -1222,6 +1237,7 @@ function differentRunningWinnerSpec(
     || !optionalMetadataMatches(observation.entrypoint, spec.entrypoint)
     || !optionalMetadataMatches(observation.runtimeDigest, spec.runtimeDigest)
     || !optionalMetadataMatches(observation.storageBackend, spec.storageBackend)
+    || !optionalMetadataMatches(observation.postgresCaFile, spec.postgresCaFile)
     || observation.managerPid === undefined
     || observation.managerPid < 1
   ) return undefined;
@@ -1659,6 +1675,7 @@ function metadataEnvironmentArgs(spec: SupervisorSpec): string[] {
   if (spec.entrypoint !== undefined) values.push(["LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint]);
   if (spec.runtimeDigest !== undefined) values.push(["LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest]);
   if (spec.storageBackend !== undefined) values.push(["LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend]);
+  if (spec.postgresCaFile !== undefined) values.push(["LCM_POSTGRES_CA_FILE", spec.postgresCaFile]);
   if (spec.credentialDirectory !== undefined) values.push(["LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory]);
   if (spec.credentialFiles !== undefined && spec.credentialFiles.length > 0) {
     values.push(["LCM_SYSTEMD_CRED_IDS", spec.credentialFiles.map(({ name }) => name).join(",")]);
