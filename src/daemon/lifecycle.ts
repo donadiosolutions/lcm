@@ -3272,11 +3272,21 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     };
     const stopStartAndEnsure = async (): Promise<RestartDaemonResult> => {
       const staged = stageManagedCredentials(spec, dependencies.environment);
+      // The staged one-launch credential directory belongs to the launched
+      // daemon until endpoint admission succeeds: a throwing stop/start leaves
+      // the manager state unresolved, and until admission the launchd daemon
+      // may still consume the secrets from this directory.  Delete it only
+      // after admission; on every other outcome preserve it as evidence.  A
+      // failsafe refusal here must leak the directory rather than destroy
+      // live launch evidence, so no cleanup satisfies its own refusal.
+      let admitted = false;
       try {
         const started = await supervisor.stopAndStart(staged.spec);
-        return await ensureAfterManagerOperation(started.managerPid, staged.spec);
+        const ensured = await ensureAfterManagerOperation(started.managerPid, staged.spec);
+        admitted = ensured.connected === true;
+        return ensured;
       } finally {
-        if (staged.credentialDirectory !== undefined) {
+        if (admitted && staged.credentialDirectory !== undefined) {
           try { cleanupManagedCredentialDirectory(staged.credentialDirectory, spec.stateRoot); } catch { /* preserve unresolved evidence */ }
         }
       }

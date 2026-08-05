@@ -1,8 +1,11 @@
+import { randomBytes } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -16,6 +19,7 @@ import {
   ensureDaemon as ensureDaemonProduction,
   restartDaemon as restartDaemonProduction,
 } from "../../src/daemon/lifecycle.js";
+import { cleanupManagedCredentialDirectory } from "../../src/daemon/managed-credentials.js";
 import {
   createDaemonLifecycleTestScope,
   type DaemonLifecycleHermeticTestSeams,
@@ -29,6 +33,10 @@ type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
 type SpawnSyncOverride = NonNullable<EnsureDaemonOptions["_spawnSyncOverride"]>;
 type Supervisor = NonNullable<EnsureDaemonOptions["_supervisorOverride"]>;
 type SupervisorSpec = Parameters<Supervisor["probe"]>[0];
+type ManagedCredentialSnapshot = {
+  directory: string;
+  files: readonly { name: string; path: string }[];
+};
 
 const roots: string[] = [];
 
@@ -1111,6 +1119,177 @@ describe("managed restart refusal and repair coverage", () => {
     failed.stopAndStart.mockRejectedValue(new Error("manager stop"));
     const failure = await restart({ ...baseOptions(failedDir), enforceUserManagerParent: true, _supervisorOverride: failed.supervisor, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as unknown as FetchOverride });
     expect(failure.refusalReason).toBe("startup-failure");
+  });
+});
+
+describe("managed restart staged credential cleanup", () => {
+  function snapshotStagedCredentials(spec: SupervisorSpec): ManagedCredentialSnapshot {
+    expect(spec.credentialDirectory).toBeDefined();
+    return {
+      directory: spec.credentialDirectory!,
+      files: (spec.credentialFiles ?? []).map((file) => ({
+        name: file.name,
+        path: file.path,
+      })),
+    };
+  }
+
+  function expectPreservedSnapshot(
+    snapshot: ManagedCredentialSnapshot,
+    stateRoot: string,
+    credentialValues: Record<string, string>,
+  ): void {
+    const canonicalRoot = realpathSync(stateRoot);
+    const canonicalDirectory = realpathSync(snapshot.directory);
+    expect(canonicalDirectory.startsWith(`${canonicalRoot}/`)).toBe(true);
+    expect(readdirSync(canonicalDirectory).sort()).toEqual(snapshot.files.map((file) => file.name).sort());
+    for (const file of snapshot.files) {
+      expect(readFileSync(file.path, "utf-8")).toBe(credentialValues[file.name]);
+    }
+  }
+
+  function runningManagerSetup(): { supervisor: Supervisor; staged: () => ManagedCredentialSnapshot | undefined } {
+    let staged: ManagedCredentialSnapshot | undefined;
+    const probe = vi.fn(async (spec: SupervisorSpec) => ({
+      kind: "registered-running-valid" as const,
+      managerPid: 200,
+      scopeDigest: spec.scopeDigest,
+      nonce: spec.nonce,
+      name: spec.name,
+    }));
+    const stopAndStart = vi.fn(async (spec: SupervisorSpec) => {
+      staged = snapshotStagedCredentials(spec);
+      return { kind: "launchd-user" as const, name: spec.name, scopeDigest: spec.scopeDigest, port: 19_999, nonce: spec.nonce, managerPid: 201 };
+    });
+    return {
+      staged: () => staged,
+      supervisor: {
+        probe,
+        start: vi.fn(),
+        stopAndStart,
+        stopAndAwaitAbsent: vi.fn(async (spec: SupervisorSpec) => {
+          if (spec.credentialDirectory !== undefined) {
+            cleanupManagedCredentialDirectory(spec.credentialDirectory, spec.stateRoot);
+          }
+        }),
+      } as unknown as Supervisor,
+    };
+  }
+
+  function credentialRestartWith(
+    dir: string,
+    supervisor: Supervisor,
+    ensureMock: (o: EnsureDaemonOptions) => Promise<Record<string, unknown>>,
+    values: Record<string, string>,
+  ) {
+    writePid(dir, 200);
+    writeFileSync(join(dir, "daemon.token"), "token", { mode: 0o600 });
+    const options: RestartDaemonOptions = {
+      ...baseOptions(dir),
+      _platform: "darwin",
+      enforceUserManagerParent: true,
+      _supervisorOverride: supervisor,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19_999],
+      _fetchOverride: diagnosticsFetch(health(200), health(200)),
+      _ensureDaemonOverride: ensureMock as NonNullable<RestartDaemonOptions["_ensureDaemonOverride"]>,
+    };
+    const hermeticOptions = hermetic(options);
+    hermeticOptions._hermeticTestSeams!.environment = values;
+    return restartDaemonProduction(hermeticOptions);
+  }
+
+  const stagedCredentialValues = (): Record<string, string> => ({
+    OPENAI_API_KEY: `restart-staged-secret-${randomBytes(4).toString("hex")}`,
+  });
+
+  it("removes the staged directory only after authenticated admission inside its state root", async () => {
+    const dir = root("staged-success-");
+    const { supervisor, staged } = runningManagerSetup();
+    const values = stagedCredentialValues();
+    const result = await credentialRestartWith(
+      dir,
+      supervisor,
+      async () => ({ connected: true, port: 19_999, spawned: true, startMethod: "launchd-user" }),
+      values,
+    );
+    expect(result).toMatchObject({ connected: true, restarted: true, startMethod: "launchd-user" });
+    const snapshot = staged();
+    expect(snapshot).toBeDefined();
+    expect(snapshot!.files).toEqual([{ name: "OPENAI_API_KEY", path: join(snapshot!.directory, "OPENAI_API_KEY") }]);
+    expect(existsSync(snapshot!.directory)).toBe(false);
+    expect(realpathSync(dir)).toBe(dir);
+  });
+
+  it("preserves exact staged evidence when manager stop/start fails unresolved", async () => {
+    const dir = root("staged-throw-");
+    const { supervisor, staged } = runningManagerSetup();
+    const values = stagedCredentialValues();
+    let capturedStaged: SupervisorSpec | undefined;
+    (supervisor.stopAndStart as ReturnType<typeof vi.fn>).mockImplementation(async (spec: SupervisorSpec) => {
+      capturedStaged = spec;
+      throw new Error("manager stop/start failed");
+    });
+    const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: false }));
+    const result = await credentialRestartWith(dir, supervisor, ensureMock, values);
+    expect(result).toMatchObject({ connected: false, restarted: false, refusalReason: "startup-failure" });
+    expect(ensureMock).not.toHaveBeenCalled();
+    expect(capturedStaged?.credentialDirectory).toBeDefined();
+    const directory = capturedStaged!.credentialDirectory!;
+    const files = (capturedStaged!.credentialFiles ?? []).map((file) => ({ name: file.name, path: file.path }));
+    expectPreservedSnapshot({ directory, files }, dir, values);
+    expect(staged()).toBeUndefined();
+  });
+
+  it("preserves exact staged evidence when the post-start ensure is not admitted", async () => {
+    const dir = root("staged-unadmitted-");
+    const { supervisor, staged } = runningManagerSetup();
+    const values = stagedCredentialValues();
+    const ensureMock = vi.fn(async () => ({ connected: false, port: 19_999, spawned: true, refusalReason: "response-timeout" as const, warning: "mooted" }));
+    const observation = await credentialRestartWith(dir, supervisor, ensureMock, values);
+    expect(observation).toMatchObject({ connected: false, restarted: true, refusalReason: "response-timeout", warning: "mooted" });
+    expect(ensureMock).toHaveBeenCalledOnce();
+    const snapshot = staged();
+    expect(snapshot).toBeDefined();
+    expectPreservedSnapshot(snapshot!, dir, values);
+  });
+
+  it("treats an already-consumed missing staged directory after admission as clean", async () => {
+    const dir = root("staged-consumed-");
+    const { supervisor, staged } = runningManagerSetup();
+    const values = stagedCredentialValues();
+    const ensureMock = vi.fn(async (o: EnsureDaemonOptions) => {
+      const directory = o._supervisorCredentialDirectoryOverride!;
+      rmSync(directory, { recursive: true, force: true });
+      return { connected: true, port: 19_999, spawned: true, startMethod: "launchd-user" };
+    });
+    const result = await credentialRestartWith(dir, supervisor, ensureMock, values);
+    expect(result).toMatchObject({ connected: true, restarted: true });
+    expect(staged()?.directory).toBeDefined();
+  });
+
+  it("never lets lifecycle cleanup remove credentials owned by a neighbor state root", async () => {
+    const dir = root("staged-isolation-");
+    const neighbor = root("staged-neighbor-");
+    mkdirSync(join(neighbor, "credentials"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(neighbor, "credentials", "OPENAI_API_KEY"), "neighbor-secret", { mode: 0o600 });
+    const { supervisor } = runningManagerSetup();
+    const ensureMock = vi.fn(async (o: EnsureDaemonOptions) => {
+      const statedDirectory = o._supervisorCredentialDirectoryOverride!;
+      const foreignDirectory = join(neighbor, "credentials");
+      expect(statedDirectory).not.toBe(foreignDirectory);
+      try {
+        cleanupManagedCredentialDirectory(foreignDirectory, dir);
+        throw new Error("cleanup accepted a credential directory outside its state root");
+      } catch (error) {
+        expect(String(error)).toContain("escapes state root");
+      }
+      expect(readFileSync(join(foreignDirectory, "OPENAI_API_KEY"), "utf-8")).toBe("neighbor-secret");
+      return { connected: true, port: 19_999, spawned: true, startMethod: "launchd-user" };
+    });
+    const result = await credentialRestartWith(dir, supervisor, ensureMock, stagedCredentialValues());
+    expect(result).toMatchObject({ connected: true, restarted: true });
+    expect(readFileSync(join(neighbor, "credentials", "OPENAI_API_KEY"), "utf-8")).toBe("neighbor-secret");
   });
 });
 
