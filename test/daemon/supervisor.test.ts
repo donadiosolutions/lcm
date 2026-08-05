@@ -371,7 +371,7 @@ describe("systemd-user supervisor", () => {
     expect(winner.calls).toHaveLength(1);
   });
 
-  it("rejects absent or different credential metadata during manager admission", async () => {
+  it("rejects absent, tampered, or unknown credential metadata during manager admission", async () => {
     const root = makeRoot();
     const directory = createManagedCredentialDirectory(root, "credential-identity-001");
     const file = writeManagedCredentialFiles(directory, { OPENAI_API_KEY: "secret" })[0]!;
@@ -389,6 +389,15 @@ describe("systemd-user supervisor", () => {
     await expect(createSupervisor("systemd-user", { run: different.run, platform: "linux" }).probe(credentialSpec)).resolves.toMatchObject({
       kind: "registered-stale-config",
       reason: "metadata-mismatch",
+    });
+    const unknown = fakeRunner([{
+      code: 0,
+      stdout: managerText({ ...credentialSpec, credentialFiles: undefined }, "active", 444)
+        .replace(`LCM_CREDENTIAL_DIRECTORY=${directory}`, `LCM_CREDENTIAL_DIRECTORY=${directory} LCM_CREDENTIAL_UNKNOWN_FILE=${file}`),
+    }]);
+    await expect(createSupervisor("systemd-user", { run: unknown.run, platform: "linux" }).probe(credentialSpec)).resolves.toMatchObject({
+      kind: "registered-stale-config",
+      reason: "metadata-missing",
     });
     const exact = fakeRunner([{ code: 0, stdout: managerText(credentialSpec, "active", 444) }]);
     await expect(createSupervisor("systemd-user", { run: exact.run, platform: "linux" }).probe(credentialSpec)).resolves.toMatchObject({
@@ -458,6 +467,7 @@ describe("systemd-user supervisor", () => {
     await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(spec)).resolves.toMatchObject({ managerPid: 444 });
     expect(runner.calls[1].args.join(" ")).toContain("--property=LoadCredential=OPENAI_API_KEY:");
     expect(runner.calls[1].args).toContain("--setenv=LCM_SYSTEMD_CRED_IDS=OPENAI_API_KEY");
+    expect(runner.calls[1].args).toContain(`--setenv=LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${files[0]}`);
     expect(runner.calls[1].args.join(" ")).not.toContain("secret");
   });
 

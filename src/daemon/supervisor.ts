@@ -1662,6 +1662,11 @@ function metadataEnvironmentArgs(spec: SupervisorSpec): string[] {
   if (spec.credentialDirectory !== undefined) values.push(["LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory]);
   if (spec.credentialFiles !== undefined && spec.credentialFiles.length > 0) {
     values.push(["LCM_SYSTEMD_CRED_IDS", spec.credentialFiles.map(({ name }) => name).join(",")]);
+    // Mirror the allow-listed LoadCredential source paths as manager metadata
+    // so systemd observation can re-authenticate the exact one-launch sources.
+    for (const credential of spec.credentialFiles) {
+      values.push([`LCM_CREDENTIAL_${credential.name}_FILE`, credential.path]);
+    }
   }
   return values.map(([key, value]) => `--setenv=${key}=${value}`);
 }
