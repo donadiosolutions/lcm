@@ -81,6 +81,41 @@ PID/token file, delete a service it cannot identify, or fall back to
 be proved, the command fails closed and tells the operator to restore the
 manager or inspect the host before retrying.
 
+## Preserved credential directories
+
+Each managed launch stages one private credential directory at
+`<stateRoot>/credentials/<nonce>-<hex>/`: the directory is mode `0700` and
+holds mode `0600` credential files (for example API keys) that only that
+launch reads. When a launch is refused or its outcome is ambiguous, LCM
+intentionally preserves that directory as evidence: at refusal time a broad
+sweep cannot tell abandoned debris apart from a concurrent sibling launch's
+staged credentials, so deleting on suspicion could strip secrets from a
+launch that is about to succeed. Preserved directories hold live secrets and
+are excluded from any broad cleanup, deletion, or `--collect` action.
+
+Inspect before removing anything, and only ever remove a directory you have
+positively identified as inactive:
+
+```bash
+lcm doctor
+ls -la ~/.lcm/credentials/
+```
+
+A directory is safe to remove only when `lcm doctor` reports the daemon
+healthy and idle, no other `lcm daemon` start or restart is running, and the
+directory's nonce matches no active or pending launch. Positively identified
+inactive directories can then be removed by exact path, one at a time:
+
+```bash
+rm -rf -- <stateRoot>/credentials/<exact-directory>
+```
+
+The owner can delete the mode `0600` files directly; no `chmod` is needed.
+Never glob the `credentials/` base directory, never remove a directory whose
+launch may still exist, and never pre-create or rename these directories as
+a recovery step. If you cannot positively identify a directory as inactive,
+leave it in place and include it in the recovery report below.
+
 The no-response classifier accepts only the closed Node transport-code set and
 bounded standard fetch/network failure messages (including their bounded,
 known suffixes). Unrelated programming exceptions, including generic

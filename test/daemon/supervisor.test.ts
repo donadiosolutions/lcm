@@ -19,7 +19,6 @@ import {
   cleanupManagedCredentialDirectory,
   createManagedCredentialDirectory,
   managedCredentialPath,
-  scavengeStaleManagedCredentialDirectories,
   validateManagedCredentialDirectory,
   writeManagedCredentialFiles,
 } from "../../src/daemon/managed-credentials.js";
