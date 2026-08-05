@@ -58,14 +58,14 @@ vi.mock("node:path", async importOriginal => {
 });
 
 import { parseDaemonConfig, parseLlmRequestPolicyConfig, resolveDaemonConfigEnv } from "../../src/daemon/config.js";
-import {
+import * as managedCredentials from "../../src/daemon/managed-credentials.js";
+const {
   cleanupManagedCredentialDirectory,
   createManagedCredentialDirectory,
   managedCredentialPath,
-  scavengeStaleManagedCredentialDirectories,
   validateManagedCredentialDirectory,
   writeManagedCredentialFiles,
-} from "../../src/daemon/managed-credentials.js";
+} = managedCredentials;
 
 const originalGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
 
@@ -357,29 +357,24 @@ describe("Epic 400 managed credential coverage", () => {
   it("fails closed for missing or unreadable bases and handles optional preservation", () => {
     const root = makeRoot();
     try {
-      expect(() => scavengeStaleManagedCredentialDirectories(root, "missing-base")).not.toThrow();
-
       const base = join(root, "credentials");
       mkdirSync(base, { mode: 0o700 });
       chmodSync(base, 0o700);
 
-      const withoutPreserve = createManagedCredentialDirectory(root, "stale-without-abcdef0123456789");
-      writeManagedCredentialFiles(withoutPreserve, { OPENAI_API_KEY: "stale" });
-      scavengeStaleManagedCredentialDirectories(root, "manager-without-preserve");
-      expect(existsSync(withoutPreserve)).toBe(false);
-
-      const stale = createManagedCredentialDirectory(root, "stale-with-preserve-fedcba9876543210");
-      const preserved = createManagedCredentialDirectory(root, "current-with-preserve-0123456789abcdef");
+      // Start-time broad stale scavenging has no production API: a concurrent
+      // pre-registration nonce directory must always survive.  Unreadable or
+      // tampered children remain private evidence instead of being deleted.
+      expect("scavengeStaleManagedCredentialDirectories" in managedCredentials).toBe(false);
+      const stale = createManagedCredentialDirectory(root, "stale-preserved-fedcba9876543210");
+      const preserved = createManagedCredentialDirectory(root, "concurrent-pre-registration-0123456789abcdef");
       writeManagedCredentialFiles(stale, { OPENAI_API_KEY: "stale" });
       writeManagedCredentialFiles(preserved, { OPENAI_API_KEY: "current" });
-
-      fsMocks.readdirSync.mockImplementationOnce(() => { throw errorWithCode("EACCES"); });
-      expect(() => scavengeStaleManagedCredentialDirectories(root, "manager-unreadable", preserved)).not.toThrow();
       expect(existsSync(stale)).toBe(true);
       expect(existsSync(preserved)).toBe(true);
-      restoreFsForwarders();
 
-      scavengeStaleManagedCredentialDirectories(root, "manager-with-preserve", preserved);
+      // Explicit, nonce-owned cleanup remains available; nothing broad ever
+      // deletes a concurrent pre-registration nonce directory at start time.
+      cleanupManagedCredentialDirectory(stale, root);
       expect(existsSync(stale)).toBe(false);
       expect(existsSync(preserved)).toBe(true);
       cleanupManagedCredentialDirectory(preserved, root);

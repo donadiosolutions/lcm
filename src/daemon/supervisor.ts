@@ -17,7 +17,6 @@ import {
   cleanupManagedCredentialDirectory,
   managedCredentialPath,
   MANAGED_CREDENTIAL_NAMES,
-  scavengeStaleManagedCredentialDirectories,
   validateManagedCredentialDirectory,
 } from "./managed-credentials.js";
 
@@ -1263,31 +1262,55 @@ function privatePlistMatchesStableIdentity(
     // never execute that descriptor or classify it as running-valid.
     if (!allowEnvironmentDrift && actual !== expectedAssignments.get(name)) return false;
   }
-  const credentialDirectory = assignments.get("LCM_CREDENTIAL_DIRECTORY");
   // Credential names/paths belong to the authenticated old launch, not the
   // replacement's current ambient secret set.  Accept only the fixed managed
   // name allow-list and bounded state-root paths, then clean that old launch
   // directory before writing the replacement plist.
-  const credentialNames = MANAGED_CREDENTIAL_NAMES.filter((name) => assignments.has(`LCM_CREDENTIAL_${name}_FILE`));
+  // When the trusted manager independently proves the exact registration
+  // absent, its authoritative output is a flat projection: the plist
+  // EnvironmentVariables block and the `env -i argv assignments are emitted
+  // under the same names (and the top-level presence fallback runs last), so
+  // either surface authenticates identity.  A real generated plist repeats
+  // the value in both places, which this equality still rejects on any drift.
+  const environmentOrAssignment = (name: string): string | undefined =>
+    parsed.environment.has(name) ? parsed.environment.get(name) : assignments.get(name);
+  const credentialDirectory = environmentOrAssignment("LCM_CREDENTIAL_DIRECTORY");
+  const credentialNames = MANAGED_CREDENTIAL_NAMES.filter((name) => environmentOrAssignment(`LCM_CREDENTIAL_${name}_FILE`) !== undefined);
   if ((credentialDirectory === undefined) !== (credentialNames.length === 0)) return false;
   for (const name of credentialNames) {
-    const path = assignments.get(`LCM_CREDENTIAL_${name}_FILE`)!;
+    const path = environmentOrAssignment(`LCM_CREDENTIAL_${name}_FILE`)!;
     if (!privateCredentialPathIsBounded(spec.stateRoot, credentialDirectory!, name, path)) return false;
-    if (parsed.environment.get(`LCM_CREDENTIAL_${name}_FILE`) !== path) return false;
+    if (parsed.environment.has(`LCM_CREDENTIAL_${name}_FILE`) && parsed.environment.get(`LCM_CREDENTIAL_${name}_FILE`) !== path) return false;
+    if (assignments.has(`LCM_CREDENTIAL_${name}_FILE`) && assignments.get(`LCM_CREDENTIAL_${name}_FILE`) !== path) return false;
   }
-  if (credentialDirectory !== undefined && parsed.environment.get("LCM_CREDENTIAL_DIRECTORY") !== credentialDirectory) return false;
-  if (credentialNames.length > 0 && parsed.environment.get("LCM_SYSTEMD_CRED_IDS") !== credentialNames.join(",")) return false;
+  if (credentialDirectory !== undefined) {
+    if (parsed.environment.has("LCM_CREDENTIAL_DIRECTORY") && parsed.environment.get("LCM_CREDENTIAL_DIRECTORY") !== credentialDirectory) return false;
+    if (assignments.has("LCM_CREDENTIAL_DIRECTORY") && assignments.get("LCM_CREDENTIAL_DIRECTORY") !== credentialDirectory) return false;
+  }
+  if (credentialNames.length > 0) {
+    const ids = environmentOrAssignment("LCM_SYSTEMD_CRED_IDS");
+    if (ids !== credentialNames.join(",")) return false;
+    if (parsed.environment.has("LCM_SYSTEMD_CRED_IDS") && parsed.environment.get("LCM_SYSTEMD_CRED_IDS") !== ids) return false;
+    if (assignments.has("LCM_SYSTEMD_CRED_IDS") && assignments.get("LCM_SYSTEMD_CRED_IDS") !== ids) return false;
+  }
   const expectedEnvironmentNames = new Set([
     ...Object.keys(expectedMetadata),
     ...(spec.entrypoint === undefined ? [] : ["LCM_SUPERVISOR_ENTRYPOINT"]),
     ...(spec.runtimeDigest === undefined ? [] : ["LCM_SUPERVISOR_RUNTIME_DIGEST"]),
     ...(spec.storageBackend === undefined ? [] : ["LCM_SUPERVISOR_STORAGE_BACKEND"]),
-    ...(credentialNames.length === 0 ? [] : ["LCM_CREDENTIAL_DIRECTORY", "LCM_SYSTEMD_CRED_IDS", ...credentialNames.map((name) => `LCM_CREDENTIAL_${name}_FILE`)]),
   ]);
-  // Every expected key is checked above; a size mismatch is therefore enough
-  // to reject an extra or missing EnvironmentVariables entry without a second
-  // traversal (and keeps the authenticated key set exact).
-  if (parsed.environment.size !== expectedEnvironmentNames.size) return false;
+  // Credential keys are validated individually above and are the only
+  // EnvironmentVariables keys permitted to vary between a descriptor being
+  // retired and its replacement: absence-only cleanup may remove or add one
+  // managed credential set without changing launch identity.  Exclude them
+  // from the identity key count so drift-mode retirement stays valid.
+  const parsedEnvironmentKeyCount = [...parsed.environment.keys()].filter(
+    (name) =>
+      name !== "LCM_CREDENTIAL_DIRECTORY"
+      && name !== "LCM_SYSTEMD_CRED_IDS"
+      && !/^LCM_CREDENTIAL_[A-Z0-9_]+_FILE$/u.test(name),
+  ).length;
+  if (parsedEnvironmentKeyCount !== expectedEnvironmentNames.size) return false;
   const allowedNames = new Set([
     ...MANAGED_LAUNCH_ENV_ALLOWLIST,
     "LCM_SUPERVISOR_MARKER",
@@ -1420,7 +1443,8 @@ function writePrivatePlist(
     // structurally valid descriptor may then use the narrower absence-only
     // drift path below; this exact check is never used to execute a plist.
     const matchesCurrentEnvironment = privatePlistMatchesStableIdentity(existing, spec, environment);
-    if (!matchesCurrentEnvironment && !privatePlistMatchesStableIdentity(existing, spec, environment, true)) {
+    const matchesDrift = matchesCurrentEnvironment || privatePlistMatchesStableIdentity(existing, spec, environment, true);
+    if (!matchesDrift) {
       throw new Error("supervisor plist collision");
     }
     // The descriptor-bound read cannot make a future pathname consumer
@@ -1605,6 +1629,16 @@ function managedLaunchEnvironmentValues(
     if (names.length > 0) {
       launchEnvironmentValue(values, "CREDENTIALS_DIRECTORY", systemdCredentialDirectory(spec, uid, values));
       launchEnvironmentValue(values, "LCM_SYSTEMD_CRED_IDS", names.join(","));
+      // Retain the allow-listed LoadCredential source paths in the child
+      // environment too.  systemd's Environment= metadata mirrors every
+      // --setenv assignment but not the child-only argv wrapper, so admission
+      // re-probing needs these exact keys to authenticate a credential-bearing
+      // start against the staged one-launch sources.  Only credential IDs and
+      // source paths cross the boundary; values never enter the manager's
+      // metadata, argv, or the child environment.
+      for (const credential of credentialFiles) {
+        launchEnvironmentValue(values, `LCM_CREDENTIAL_${credential.name}_FILE`, credential.path);
+      }
     }
   } else if (spec.credentialDirectory !== undefined && credentialFiles.length > 0) {
     launchEnvironmentValue(values, "LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory);
@@ -1998,7 +2032,11 @@ export function createSupervisor(
     if (!credentialsAreSafe(spec)) {
       throw new Error("supervisor credential validation failed");
     }
-    scavengeStaleManagedCredentialDirectories(spec.stateRoot, spec.nonce, spec.credentialDirectory);
+    // Never scavenge credential directories before a start proves success.
+    // A broad pre-registration sweep cannot distinguish a concurrent sibling
+    // launch's staged nonce directory from abandoned debris, so deletion is
+    // reserved for the exact manager absence/winner proofs below and in
+    // stopAndAwaitAbsent; unresolved stale data is preserved as evidence.
     const expectedLaunchEnvironmentDigest = kind === "systemd-user"
       ? managedLaunchEnvironmentDigest(spec, kind, runner.uid, runner.environment)
       : undefined;
@@ -2231,8 +2269,11 @@ function metadataEnvironmentArgs(
   if (spec.credentialDirectory !== undefined) values.push(["LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory]);
   if (spec.credentialFiles !== undefined && spec.credentialFiles.length > 0) {
     values.push(["LCM_SYSTEMD_CRED_IDS", spec.credentialFiles.map(({ name }) => name).join(",")]);
-    // Mirror the allow-listed LoadCredential source paths as manager metadata
-    // so systemd observation can re-authenticate the exact one-launch sources.
+    // Mirror the allow-listed LoadCredential source paths as manager
+    // metadata.  systemd re-exports every --setenv assignment in the unit's
+    // Environment= property, so a probe can re-authenticate exactly which
+    // one-launch source staged each credential ID without ever seeing a
+    // value.
     for (const credential of spec.credentialFiles) {
       values.push([`LCM_CREDENTIAL_${credential.name}_FILE`, credential.path]);
     }
