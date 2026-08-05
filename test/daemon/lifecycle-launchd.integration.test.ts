@@ -5,6 +5,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
@@ -84,6 +85,18 @@ afterEach(() => {
 
 function boundedText(value: unknown): string {
   return typeof value === "string" ? value.slice(0, MAX_CAPTURED_MANAGER_OUTPUT) : "";
+}
+
+function publishLaunchdEvidence(spec: SupervisorSpec): void {
+  const resourceRoot = process.env.LCM_LAUNCHD_RESOURCE_ROOT;
+  const evidenceToken = process.env.LCM_LAUNCHD_EVIDENCE_TOKEN;
+  if (resourceRoot === undefined || evidenceToken === undefined) return;
+  if (spec.stateRoot !== realpathSync(resourceRoot)) {
+    throw new Error("launchd integration must use the workflow resource root");
+  }
+  writeFileSync(join(resourceRoot, "launchd.label"), `${evidenceToken} ${spec.launchdLabel}\n`, {
+    mode: 0o600,
+  });
 }
 
 /** Run only the exact launchctl command requested by the supervisor. */
@@ -218,8 +231,15 @@ describe("real launchd daemon lifecycle", () => {
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "lcm-launchd-integration-")));
       fixtureRoots.add(root);
+      const configuredResourceRoot = process.env.LCM_LAUNCHD_RESOURCE_ROOT;
+      const stateRoot = configuredResourceRoot === undefined
+        ? root
+        : realpathSync(configuredResourceRoot);
+      if (configuredResourceRoot !== undefined) {
+        expect(statSync(stateRoot).mode & 0o777).toBe(0o700);
+      }
       const nonce = `${FIXTURE_NONCE}-${process.pid}`;
-      const credentialDirectory = createManagedCredentialDirectory(root, nonce);
+      const credentialDirectory = createManagedCredentialDirectory(stateRoot, nonce);
       const credentialFile = writeManagedCredentialFiles(credentialDirectory, {
         OPENAI_API_KEY: "fixture-value",
       })[0];
@@ -244,7 +264,7 @@ describe("real launchd daemon lifecycle", () => {
 
       const spec = createSupervisorSpec({
         kind: "launchd-user",
-        stateRoot: root,
+        stateRoot,
         port,
         nonce,
         executable: process.execPath,
@@ -254,7 +274,7 @@ describe("real launchd daemon lifecycle", () => {
         credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
         stopTimeoutMs: 10_000,
       });
-      expect(spec.stateRoot).toBe(root);
+      expect(spec.stateRoot).toBe(stateRoot);
       expect(spec.credentialDirectory).toBe(credentialDirectory);
       expect(spec.launchdLabel).toMatch(/^com\.donadiosolutions\.lcm\.daemon\.[0-9a-f]{20}$/u);
       expect(spec.port).toBeGreaterThan(0);
@@ -264,6 +284,7 @@ describe("real launchd daemon lifecycle", () => {
       let managerReady = true;
       try {
         const started = await supervisor.start(spec);
+        publishLaunchdEvidence(spec);
         expect(started.kind).toBe("launchd-user");
         expect(started.name).toBe(spec.launchdLabel);
         expect(started.scopeDigest).toBe(spec.scopeDigest);

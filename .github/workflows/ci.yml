@@ -193,27 +193,40 @@ jobs:
           LCM_LAUNCHD_INTEGRATION: "1"
           LCM_LAUNCHD_SCOPE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
           LCM_LAUNCHD_RESOURCE_ROOT: ${{ runner.temp }}/lcm-launchd-${{ github.run_id }}-${{ github.run_attempt }}
-          LCM_LAUNCHD_LABEL: com.donadiosolutions.lcm.ci.${{ github.run_id }}.${{ github.run_attempt }}
         run: |
           set -Eeuo pipefail
           resource_root="$LCM_LAUNCHD_RESOURCE_ROOT"
-          label="$LCM_LAUNCHD_LABEL"
           ready_file="$resource_root/launchd.label"
+          evidence_token="$(uuidgen)"
+          export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"
+          validate_marker() {
+            [[ -f "$ready_file" ]] || return 1
+            ready_line="$(<"$ready_file")"
+            ready_token="${ready_line%% *}"
+            ready_label="${ready_line#* }"
+            [[ "$ready_line" == "$ready_token $ready_label" ]] || return 1
+            [[ "$ready_token" == "$evidence_token" ]] || return 1
+            [[ "$ready_label" =~ ^com\.donadiosolutions\.lcm\.daemon\.[0-9a-f]{20}$ ]] || return 1
+            [[ "$(stat -f '%Lp' "$ready_file" 2>/dev/null)" == "600" ]]
+          }
           cleanup() {
             set +e
-            if [[ -f "$ready_file" ]]; then
-              ready_label="$(<"$ready_file")"
-              if [[ "$ready_label" == "$label" ]]; then
+            if validate_marker; then
                 launchctl bootout "gui/$(id -u)/$ready_label" || true
-              else
-                echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2
-              fi
+            elif [[ -f "$ready_file" ]]; then
+              echo "Refusing cleanup for malformed or foreign launchd evidence" >&2
             fi
             rm -rf -- "$resource_root"
           }
           trap cleanup EXIT
+          rm -rf -- "$resource_root"
           mkdir -p -- "$resource_root"
+          chmod 0700 "$resource_root"
           npx vitest run test/daemon/lifecycle-launchd.integration.test.ts
+          if ! validate_marker; then
+            echo "launchd integration produced malformed or foreign current-run evidence" >&2
+            exit 1
+          fi
 
   ci:
     name: ci

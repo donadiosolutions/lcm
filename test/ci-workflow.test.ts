@@ -59,6 +59,10 @@ interface CiWorkflow {
 }
 
 const source = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+const launchdIntegrationSource = readFileSync(
+  new URL("./daemon/lifecycle-launchd.integration.test.ts", import.meta.url),
+  "utf8",
+);
 const workflow = loadYaml(source) as CiWorkflow;
 const expectedCodecovRunSteps = [
   {
@@ -220,35 +224,44 @@ describe("CI workflow", () => {
       LCM_LAUNCHD_SCOPE_ID: "ci-${{ github.run_id }}-${{ github.run_attempt }}",
       LCM_LAUNCHD_RESOURCE_ROOT:
         "${{ runner.temp }}/lcm-launchd-${{ github.run_id }}-${{ github.run_attempt }}",
-      LCM_LAUNCHD_LABEL:
-        "com.donadiosolutions.lcm.ci.${{ github.run_id }}.${{ github.run_attempt }}",
     });
-    expect(integration?.run?.trim()).toBe(
-      [
-        "set -Eeuo pipefail",
-        'resource_root="$LCM_LAUNCHD_RESOURCE_ROOT"',
-        'label="$LCM_LAUNCHD_LABEL"',
-        'ready_file="$resource_root/launchd.label"',
-        "cleanup() {",
-        "  set +e",
-        '  if [[ -f "$ready_file" ]]; then',
-        '    ready_label="$(<"$ready_file")"',
-        '    if [[ "$ready_label" == "$label" ]]; then',
-        '      launchctl bootout "gui/$(id -u)/$ready_label" || true',
-        "    else",
-        '      echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2',
-        "    fi",
-        "  fi",
-        '  rm -rf -- "$resource_root"',
-        "}",
-        "trap cleanup EXIT",
-        'mkdir -p -- "$resource_root"',
-        "npx vitest run test/daemon/lifecycle-launchd.integration.test.ts",
-      ].join("\n"),
+    const run = integration?.run ?? "";
+    expect(run).toContain('evidence_token="$(uuidgen)"');
+    expect(run).toContain('export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"');
+    expect(run).toContain('launchctl bootout "gui/$(id -u)/$ready_label"');
+    expect(run).toContain('[[ "$ready_token" == "$evidence_token" ]]');
+    expect(run).toContain(
+      '[[ "$ready_label" =~ ^com\\.donadiosolutions\\.lcm\\.daemon\\.[0-9a-f]{20}$ ]]',
     );
-    expect(integration?.run).toContain('launchctl bootout "gui/$(id -u)/$ready_label"');
-    expect(integration?.run).toContain('rm -rf -- "$resource_root"');
-    expect(integration?.run).not.toMatch(/\b(?:pkill|killall)\b/u);
+    expect(run).toContain('rm -rf -- "$resource_root"');
+    expect(run).toContain('chmod 0700 "$resource_root"');
+    expect(run).toContain("validate_marker() {");
+    expect(run).toContain("Refusing cleanup for malformed or foreign launchd evidence");
+    expect(run).not.toMatch(/\b(?:pkill|killall|kill)\b/u);
+    const trap = run.indexOf("trap cleanup EXIT");
+    const reset = run.indexOf('rm -rf -- "$resource_root"', trap);
+    const testRun = run.indexOf("npx vitest run test/daemon/lifecycle-launchd.integration.test.ts");
+    expect(trap).toBeGreaterThanOrEqual(0);
+    expect(reset).toBeGreaterThan(trap);
+    expect(reset).toBeLessThan(testRun);
+    expect(run.indexOf('chmod 0700 "$resource_root"')).toBeLessThan(testRun);
+    expect(run.indexOf("if validate_marker; then")).toBeGreaterThanOrEqual(0);
+    expect(run.indexOf('launchctl bootout "gui/$(id -u)/$ready_label"')).toBeGreaterThan(
+      run.indexOf("if validate_marker; then"),
+    );
+    expect(launchdIntegrationSource).toContain("LCM_LAUNCHD_RESOURCE_ROOT");
+    expect(launchdIntegrationSource).toContain("LCM_LAUNCHD_EVIDENCE_TOKEN");
+    expect(launchdIntegrationSource).toContain(
+      'writeFileSync(join(resourceRoot, "launchd.label"), `${evidenceToken} ${spec.launchdLabel}\\n`',
+    );
+    const start = launchdIntegrationSource.indexOf("const started = await supervisor.start(spec);");
+    const publish = launchdIntegrationSource.indexOf("publishLaunchdEvidence(spec);", start);
+    const health = launchdIntegrationSource.indexOf("waitForExactHealth(spec, managerPid)", publish);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(publish).toBeGreaterThan(start);
+    expect(health).toBeGreaterThan(publish);
+    expect(launchdIntegrationSource).toContain("spec.stateRoot !== realpathSync(resourceRoot)");
+    expect(launchdIntegrationSource).toContain("expect(statSync(stateRoot).mode & 0o777).toBe(0o700)");
     expect(workflow.jobs.ci.needs).toContain("macos-launchd");
   });
 
