@@ -677,6 +677,67 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(existsSync(secondDir)).toBe(true);
   });
 
+  it("contains observed credential cleanup to an authenticated matching state root", async () => {
+    const parentRoot = root();
+    const stateRoot = join(parentRoot, "state");
+    mkdirSync(stateRoot);
+    chmodSync(stateRoot, 0o700);
+    const directory = createManagedCredentialDirectory(stateRoot, "state-root-fence");
+    const file = writeManagedCredentialFiles(directory, { OPENAI_API_KEY: "secret" })[0]!;
+    const base = spec("systemd-user", stateRoot, {
+      credentialDirectory: directory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: file }],
+    });
+    type MutableSupervisorSpec = Omit<SupervisorSpec, "stateRoot"> & { stateRoot: string };
+    // Keep the observed parent root within both the old and new roots. The
+    // mutable projection is a deterministic public-seam fixture for a state
+    // root drift between authenticated stale re-probe and absence cleanup:
+    // without the exact guard, the credential validator would accept and
+    // delete this directory.
+    const mutable = { ...base, stateRoot: parentRoot } as MutableSupervisorSpec;
+    const metadata = (observedRoot: string): string =>
+      ` LCM_SUPERVISOR_STATE_ROOT=${observedRoot} LCM_CREDENTIAL_DIRECTORY=${directory} LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${file}`;
+    const prior = { ...mutable, port: mutable.port + 1, nonce: "prior-stale" } as MutableSupervisorSpec;
+    const foreignStale = systemdText(prior, "inactive", 0, metadata(parentRoot));
+    const matchingRunning = systemdText(base, "active", 88, metadata(stateRoot));
+    const queue: CommandResult[] = [
+      { code: 0, stdout: foreignStale },
+      { code: 0, stdout: foreignStale },
+      { code: 0, stdout: "stopped" },
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: matchingRunning },
+    ];
+    const calls: Array<{ command: string; args: readonly string[]; timeoutMs: number }> = [];
+    const run = vi.fn(async (command: string, args: readonly string[], options: { timeoutMs: number }) => {
+      calls.push({ command, args, timeoutMs: options.timeoutMs });
+      const result = queue.shift() ?? { code: 0, stdout: "", stderr: "" };
+      if (command === "systemctl" && args[1] === "stop") mutable.stateRoot = stateRoot;
+      return result;
+    });
+    await expect(createSupervisor("systemd-user", { run, platform: "linux" }).stopAndStart(mutable)).resolves.toMatchObject({
+      managerPid: 88,
+    });
+    expect(calls.some(({ command, args }) => command === "systemctl" && args[1] === "stop")).toBe(true);
+    expect(existsSync(directory)).toBe(true);
+
+    const matchingDirectory = createManagedCredentialDirectory(stateRoot, "matching-state-root");
+    const matchingFile = writeManagedCredentialFiles(matchingDirectory, { OPENAI_API_KEY: "matching-secret" })[0]!;
+    const matching = spec("systemd-user", stateRoot, {
+      credentialDirectory: matchingDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: matchingFile }],
+    });
+    const matchingMetadata = ` LCM_SUPERVISOR_STATE_ROOT=${stateRoot} LCM_CREDENTIAL_DIRECTORY=${matchingDirectory} LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${matchingFile}`;
+    const matchingRunner = runQueue([
+      { code: 0, stdout: systemdText(matching, "active", 89, matchingMetadata) },
+      { code: 0, stdout: "stopped" },
+      { code: 1, stderr: "Unit is not-found" },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: matchingRunner.run, platform: "linux" }).stopAndAwaitAbsent(matching)).resolves.toBeUndefined();
+    expect(existsSync(matchingDirectory)).toBe(false);
+  });
+
   it("fails closed when a credential leaf changes after directory validation", async () => {
     const stateRoot = root();
     const directory = createManagedCredentialDirectory(stateRoot, "credential-race");

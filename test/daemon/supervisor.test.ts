@@ -1358,6 +1358,7 @@ describe("systemd-user supervisor", () => {
 
     const replacedCases: ReadonlyArray<readonly [string, SupervisorCommandResult]> = [
       ["absence", { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` }],
+      ["same nonce running-valid", { code: 0, stdout: managerText(spec, "active", 777) }],
       ["different nonce", { code: 0, stdout: managerText(makeSpec("systemd-user", root, { nonce: "concurrent-winner" }), "active", 777) }],
       ["collision", { code: 0, stdout: stale.replace(`LCM_SUPERVISOR_MARKER=${prior.marker}`, "LCM_SUPERVISOR_MARKER=foreign") }],
       ["ambiguity", { code: 0, stdout: managerText(spec, "active", 777, "stopped") }],

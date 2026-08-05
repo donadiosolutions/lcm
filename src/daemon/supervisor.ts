@@ -1873,6 +1873,7 @@ function safeObservedCredentialCleanup(
     || observation.name !== spec.name
     || observation.credentialDirectory === undefined
   ) return;
+  if (observation.stateRoot !== undefined && observation.stateRoot !== spec.stateRoot) return;
   // Managed stale transitions authenticate the observed state root before
   // reaching this absence-only cleanup stage.  The credential validator below
   // remains the final containment fence for the observed path and leaves
