@@ -12,7 +12,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -25,6 +25,8 @@ import {
   type DaemonLifecycleHermeticTestSeams,
   type DaemonLifecycleTestScope,
 } from "../../src/daemon/lifecycle-scope.js";
+import { managedDaemonPath } from "../../src/daemon/managed-path.js";
+import { managedLaunchEnvironmentDigest } from "../../src/daemon/supervisor.js";
 
 type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
 type RestartDaemonOptions = Parameters<typeof restartDaemonProduction>[0];
@@ -718,6 +720,62 @@ describe("ensureDaemon restart and terminal coverage", () => {
 });
 
 describe("managed restart refusal and repair coverage", () => {
+  it("anchors restart admission to canonical state rather than caller cwd", async () => {
+    const dir = root();
+    const callerHome = homedir();
+    const projectCwd = join(dir, "project");
+    const spawnCommand = "/usr/bin/node";
+    const spawnArgs = [
+      join(callerHome, ".local", "lib", "node_modules", "@donadiosolutions", "lcm", "dist", "lcm.mjs"),
+      "daemon",
+      "start",
+      "--foreground",
+    ];
+    let callerCwd = callerHome;
+    vi.spyOn(process, "cwd").mockImplementation(() => callerCwd);
+    const probed: SupervisorSpec[] = [];
+    const managed = managedSupervisor((spec) => {
+      probed.push(spec);
+      return {
+        kind: "registered-stale-config",
+        reason: "metadata-mismatch",
+        scopeDigest: spec.scopeDigest,
+        name: spec.name,
+      };
+    });
+    const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: false }));
+    const options = {
+      ...baseOptions(dir),
+      spawnCommand,
+      spawnArgs,
+      enforceUserManagerParent: true,
+      _supervisorOverride: managed.supervisor,
+      _ensureDaemonOverride: ensureMock,
+    };
+
+    await expect(restart(options)).resolves.toMatchObject({ restarted: true, connected: true });
+    callerCwd = projectCwd;
+    await expect(restart(options)).resolves.toMatchObject({ restarted: true, connected: true });
+
+    expect(probed).toHaveLength(2);
+    expect(probed[0]?.launchEnvironment?.PATH).toBe(probed[1]?.launchEnvironment?.PATH);
+    expect(probed[0]?.launchEnvironment?.PATH).toContain(join(callerHome, ".local", "bin"));
+    expect(probed[0]?.launchEnvironment?.PATH).toBe(
+      managedDaemonPath(spawnCommand, spawnArgs, dir),
+    );
+    expect(managedLaunchEnvironmentDigest(
+      probed[0]!,
+      "systemd-user",
+      1000,
+      probed[0]!.launchEnvironment!,
+    )).toBe(managedLaunchEnvironmentDigest(
+      probed[1]!,
+      "systemd-user",
+      1000,
+      probed[1]!.launchEnvironment!,
+    ));
+  });
+
   it.each([
     ["relative executable", { spawnCommand: "lcm" }],
     ["non-string argument", { spawnArgs: ["/tmp/lcm", 42] as unknown as string[] }],

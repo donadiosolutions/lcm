@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { managedDaemonPath, SYSTEMD_DAEMON_PATH } from "../../src/daemon/managed-path.js";
+import {
+  managedDaemonPath,
+  managedDaemonPathForStableLaunch,
+  SYSTEMD_DAEMON_PATH,
+} from "../../src/daemon/managed-path.js";
 
 describe("managed daemon executable path", () => {
   it("prepends the directory of an absolute Node-launched LCM entrypoint", () => {
@@ -82,6 +86,29 @@ describe("managed daemon executable path", () => {
       "/usr/bin/node",
       ["/work/project/.claude/plugins/cache/lcm/1.4.0/lcm.mjs", "daemon", "start"],
       "/work/project/packages/app",
+    )).toBe(SYSTEMD_DAEMON_PATH);
+  });
+
+  it("rejects home-scoped installation lookalikes without caller-cwd containment", () => {
+    const stableAnchor = "/var/lib/lcm";
+    const home = "/home/alice";
+    expect(managedDaemonPathForStableLaunch(
+      "/usr/bin/node",
+      ["/work/project/.codex/plugins/cache/lcm/1.4.0/lcm.mjs", "daemon", "start"],
+      stableAnchor,
+      home,
+    )).toBe(SYSTEMD_DAEMON_PATH);
+    expect(managedDaemonPathForStableLaunch(
+      "/usr/bin/node",
+      ["/work/project/.claude/plugins/cache/lcm/1.4.0/lcm.mjs", "daemon", "start"],
+      stableAnchor,
+      home,
+    )).toBe(SYSTEMD_DAEMON_PATH);
+    expect(managedDaemonPathForStableLaunch(
+      "/usr/bin/node",
+      ["/work/project/.npm-global/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs", "daemon", "start"],
+      stableAnchor,
+      home,
     )).toBe(SYSTEMD_DAEMON_PATH);
   });
 

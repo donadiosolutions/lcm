@@ -23,6 +23,7 @@ import {
   validateManagedCredentialDirectory,
   writeManagedCredentialFiles,
 } from "../../src/daemon/managed-credentials.js";
+import { managedDaemonPathForStableLaunch } from "../../src/daemon/managed-path.js";
 import {
   canonicalSupervisorScope,
   createSupervisor,
@@ -420,6 +421,42 @@ describe("managed one-launch credentials", () => {
 });
 
 describe("systemd-user supervisor", () => {
+  it("admits the same stable launch identity from distinct caller directories", async () => {
+    const root = makeRoot();
+    const spawnCommand = "/usr/bin/node";
+    const spawnArgs = [
+      "/home/alice/.local/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs",
+      "daemon",
+      "start",
+      "--foreground",
+    ];
+    const callerDirectories = ["/home/alice", "/work/project"];
+    const environments = callerDirectories.map(() => ({
+      HOME: "/home/alice",
+      PATH: managedDaemonPathForStableLaunch(spawnCommand, spawnArgs, root, "/home/alice"),
+    }));
+    const specs = environments.map((launchEnvironment, index) => createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: root,
+      port: 3737,
+      nonce: `stable-${index}`,
+      executable: spawnCommand,
+      args: spawnArgs,
+      launchEnvironment,
+    }));
+    expect(managedLaunchEnvironmentDigest(specs[0]!, "systemd-user", process.getuid?.() ?? -1, environments[0]!))
+      .toBe(managedLaunchEnvironmentDigest(specs[1]!, "systemd-user", process.getuid?.() ?? -1, environments[1]!));
+    for (const [index, spec] of specs.entries()) {
+      const environment = environments[index]!;
+      const runner = fakeRunner([{ code: 0, stdout: managerText(spec, "active", 4321, "running", environment) }]);
+      await expect(createSupervisor("systemd-user", {
+        run: runner.run,
+        environment,
+        platform: "linux",
+      }).probe(spec)).resolves.toMatchObject({ kind: "registered-running-valid", managerPid: 4321 });
+    }
+  });
+
   it("rejects clean-environment drift before admitting a registered unit", async () => {
     const root = makeRoot();
     const original = makeSpec("systemd-user", root, { launchEnvironment: { PATH: "/usr/bin" } });

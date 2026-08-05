@@ -9,7 +9,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -19,8 +19,16 @@ import {
   type EnsureDaemonOptions,
 } from "../../src/daemon/lifecycle.js";
 import { ensureAuthToken } from "../../src/daemon/auth.js";
-import { managedDaemonPath } from "../../src/daemon/managed-path.js";
-import type { Supervisor, SupervisorObservation, SupervisorSpec } from "../../src/daemon/supervisor.js";
+import {
+  managedDaemonPath,
+  managedDaemonPathForStableLaunch,
+} from "../../src/daemon/managed-path.js";
+import {
+  managedLaunchEnvironmentDigest,
+  type Supervisor,
+  type SupervisorObservation,
+  type SupervisorSpec,
+} from "../../src/daemon/supervisor.js";
 import {
   createDaemonLifecycleTestScope,
   type DaemonLifecycleHermeticTestSeams,
@@ -282,6 +290,83 @@ function setRunningProbe(fixture: Fixture, pid = 4242): void {
 }
 
 describe("issue 400 lifecycle managed preparation and utility boundaries", () => {
+  it("anchors ensure admission to canonical state rather than caller cwd", async () => {
+    const fixture = createFixture({
+      fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,
+      environment: { PATH: "/ambient/bin" },
+    });
+    const callerHome = homedir();
+    const projectCwd = join(fixture.root, "project");
+    const spawnCommand = "/usr/bin/node";
+    const spawnArgs = [
+      join(callerHome, ".local", "lib", "node_modules", "@donadiosolutions", "lcm", "dist", "lcm.mjs"),
+      "daemon",
+      "start",
+      "--foreground",
+    ];
+    let callerCwd = callerHome;
+    vi.spyOn(process, "cwd").mockImplementation(() => callerCwd);
+    const probed: SupervisorSpec[] = [];
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      probed.push(spec);
+      return observation(spec, "absent");
+    });
+    const options = optionsFor(fixture, {
+      spawnCommand,
+      spawnArgs,
+      _skipSpawn: true,
+    });
+
+    await ensureDaemon(options);
+    callerCwd = projectCwd;
+    await ensureDaemon(options);
+
+    expect(probed).toHaveLength(2);
+    expect(probed[0]?.stateRoot).toBe(probed[1]?.stateRoot);
+    expect(probed[0]?.scopeDigest).toBe(probed[1]?.scopeDigest);
+    expect(probed[0]?.launchEnvironment?.PATH).toBe(probed[1]?.launchEnvironment?.PATH);
+    expect(probed[0]?.launchEnvironment?.PATH).toContain(join(callerHome, ".local", "bin"));
+    const digest = (spec: SupervisorSpec): string => managedLaunchEnvironmentDigest(
+      spec,
+      spec.kind,
+      fixture.seams.uid,
+      spec.launchEnvironment ?? {},
+    );
+    expect(digest(probed[0]!)).toBe(digest(probed[1]!));
+    expect(fixture.start).not.toHaveBeenCalled();
+  });
+
+  it("retains the stable launch environment while adopting an observed manager spec", async () => {
+    const fixture = createFixture({
+      fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,
+      environment: { PATH: "/ambient/bin" },
+    });
+    const spawnCommand = "/usr/bin/node";
+    const spawnArgs = ["/work/project/.codex/plugins/cache/lcm/1.4.0/lcm.mjs", "daemon", "start", "--foreground"];
+    const probed: SupervisorSpec[] = [];
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => {
+        probed.push(spec);
+        return staleObservation(spec, { nonce: "prior-launch" });
+      })
+      .mockImplementationOnce(async (spec: SupervisorSpec) => {
+        probed.push(spec);
+        return observation(spec, "registered-not-running-valid", { terminal: "inactive" });
+      });
+
+    await expect(ensureDaemon(optionsFor(fixture, {
+      spawnCommand,
+      spawnArgs,
+      _skipSpawn: true,
+    }))).resolves.toMatchObject({ refusalReason: "not-running" });
+
+    expect(probed).toHaveLength(2);
+    expect(probed[1]?.launchEnvironment).toEqual(probed[0]?.launchEnvironment);
+    expect(probed[1]?.launchEnvironment?.PATH).toBe(
+      managedDaemonPathForStableLaunch(spawnCommand, spawnArgs, fixture.stateDir),
+    );
+  });
+
   it.each([
     ["linux", "systemd-user"],
     ["darwin", "launchd-user"],

@@ -28,7 +28,7 @@ import {
   isStagedPostgreSqlHealth,
   STAGED_POSTGRESQL_ERROR_CODE,
 } from "./staged-postgresql.js";
-import { managedDaemonPath } from "./managed-path.js";
+import { managedDaemonPathForStableLaunch } from "./managed-path.js";
 import {
   observeHttpHealth,
   type HealthObservation,
@@ -341,10 +341,11 @@ function managedLaunchEnvironmentFor(
   environment: NodeJS.ProcessEnv,
   spawnCommand: string,
   spawnArgs: readonly string[],
+  workingDirectory: string,
 ): Readonly<Record<string, string>> {
   return Object.freeze({
     ...managedLaunchEnvironment(environment),
-    PATH: managedDaemonPath(spawnCommand, spawnArgs),
+    PATH: managedDaemonPathForStableLaunch(spawnCommand, spawnArgs, workingDirectory),
   });
 }
 
@@ -1958,6 +1959,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         ...(observation.runtimeDigest === undefined ? {} : { runtimeDigest: observation.runtimeDigest }),
         storageBackend: requested.storageBackend!,
         ...(requested.postgresCaFile === undefined ? {} : { postgresCaFile: requested.postgresCaFile }),
+        launchEnvironment: requested.launchEnvironment,
         ...(observation.credentialDirectory === undefined ? {} : { credentialDirectory: observation.credentialDirectory }),
         ...(observation.credentialFiles === undefined ? {} : { credentialFiles: observation.credentialFiles }),
         stopTimeoutMs: requested.stopTimeoutMs,
@@ -2007,13 +2009,22 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (!isAbsolute(executable) || args.some((arg) => typeof arg !== "string")) {
       return null;
     }
-    const launchEnvironment = managedLaunchEnvironmentFor(dependencies.environment, executable, args);
     let scope: ReturnType<typeof canonicalSupervisorScope>;
     try {
       scope = canonicalSupervisorScope(stateRoot, realpath);
     } catch {
       return null;
     }
+    // The managed PATH participates in the authenticated manager identity.
+    // Anchor it to the canonical supervisor state root, never to the caller's
+    // mutable process.cwd(), while managedDaemonPath retains its public
+    // caller-cwd default for doctor and other direct consumers.
+    const launchEnvironment = managedLaunchEnvironmentFor(
+      dependencies.environment,
+      executable,
+      args,
+      scope.stateRoot,
+    );
     let spec: SupervisorSpec;
     try {
       spec = createSupervisorSpec({
@@ -3199,13 +3210,18 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     if (!isAbsolute(executable) || args.some((arg) => typeof arg !== "string")) {
       return restartRefusal("ambiguous", "managed daemon supervisor could not be constructed; inspect the daemon configuration and retry");
     }
-    const launchEnvironment = managedLaunchEnvironmentFor(dependencies.environment, executable, args);
     let scope: ReturnType<typeof canonicalSupervisorScope>;
     try {
       scope = canonicalSupervisorScope(stateRoot, realpath);
     } catch {
       return restartRefusal("ambiguous", "managed daemon state root is not canonical; inspect the daemon configuration and retry");
     }
+    const launchEnvironment = managedLaunchEnvironmentFor(
+      dependencies.environment,
+      executable,
+      args,
+      scope.stateRoot,
+    );
     let spec: SupervisorSpec;
     try {
       spec = createSupervisorSpec({
