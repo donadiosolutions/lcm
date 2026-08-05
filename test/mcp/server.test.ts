@@ -198,6 +198,10 @@ describe("handleDaemonRequest", () => {
 
   describe("safeMcpError redaction", () => {
     const { safeMcpError } = __lcmMcpTestHooks;
+    const bmpPrivateUseRange = Array.from(
+      { length: 0xF8FF - 0xE000 + 1 },
+      (_, index) => String.fromCharCode(0xE000 + index),
+    ).join("");
 
     it.each([
       ["host", "host=db.internal.example"],
@@ -261,9 +265,59 @@ describe("handleDaemonRequest", () => {
       expect(rendered).not.toContain("$1");
     });
 
+    it("does not treat attacker-supplied marker code points as trusted redaction markers", () => {
+      const rendered = safeMcpError(new Error([
+        "pass\uE000word=hunter2",
+        "secr\uE001et=secret-value",
+        "ho\uE000stname=db.internal.example",
+        "host\uE001=db.internal.example",
+        "user\uE000name=private-user",
+        "https://svc\uE001:hunter2@db.internal.example/v1?token=tok_live_9x7",
+      ].join("; ")));
+
+      expect(rendered).not.toContain("hunter2");
+      expect(rendered).not.toContain("secret-value");
+      expect(rendered).not.toContain("db.internal.example");
+      expect(rendered).not.toContain("private-user");
+      expect(rendered).not.toContain("tok_live_9x7");
+      expect(rendered).not.toMatch(/[\uE000-\uF8FF]/u);
+      expect(rendered).toContain("password=<redacted>");
+      expect(rendered).toContain("secret=<redacted>");
+    });
+
+    it.each([
+      ["password", `pass${bmpPrivateUseRange}word=hunter2`, "hunter2"],
+      ["secret", `secr${bmpPrivateUseRange}et=secret-value`, "secret-value"],
+      ["hostname", `host${bmpPrivateUseRange}name=db.internal.example`, "db.internal.example"],
+      ["host", `ho${bmpPrivateUseRange}st=db.internal.example`, "db.internal.example"],
+      ["username", `user${bmpPrivateUseRange}name=private-user`, "private-user"],
+      ["URL", `ht${bmpPrivateUseRange}tps://svc:hunter2@db.internal.example/v1?token=tok_live_9x7`, "hunter2"],
+    ])("neutralizes the complete BMP private-use range around %s before scrubbing", (_label, fragment, secret) => {
+      const rendered = safeMcpError(new Error(fragment));
+
+      expect(rendered).not.toContain(secret);
+      expect(rendered).not.toMatch(/[\uE000-\uF8FF]/u);
+    });
+
+    it("removes malformed surrogate code units, strips supplementary private-use code points, and preserves valid Unicode", () => {
+      const rendered = safeMcpError(new Error([
+        "pass\uD800word=hunter2",
+        "secr\uDC00et=secret-value",
+        "host\u{F0000}name=db.internal.example",
+        "ho\u{100000}st=db.internal.example",
+        "normal message 🚀",
+      ].join("; ")));
+
+      expect(rendered).not.toContain("hunter2");
+      expect(rendered).not.toContain("secret-value");
+      expect(rendered).not.toContain("db.internal.example");
+      expect(rendered).not.toMatch(/[\uD800-\uDFFF\uE000-\uF8FF]/u);
+      expect(rendered).toContain("normal message 🚀");
+    });
+
     it("annotates clean diagnostics without inventing redactions", () => {
-      const rendered = safeMcpError(new Error("plain configuration parsing failure"));
-      expect(rendered).toBe("lcm error: plain configuration parsing failure");
+      const rendered = safeMcpError(new Error("plain configuration parsing failure 🚀"));
+      expect(rendered).toBe("lcm error: plain configuration parsing failure 🚀");
       expect(rendered).not.toContain("$1");
     });
 
