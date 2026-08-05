@@ -34,6 +34,7 @@ type SystemdFixture = Readonly<{
   supervisor: Supervisor;
   calls: ManagerCall[];
   markerPath?: string;
+  markerBarrierDir?: string;
 }>;
 
 const integrationEnabled = process.env.LCM_LIFECYCLE_SYSTEMD_INTEGRATION === "1";
@@ -182,6 +183,10 @@ async function createFixture(options: { exitAfterMs?: number } = {}): Promise<Sy
     stopTimeoutMs: 5_000,
   });
   const barrierDir = process.env.LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR;
+  // Every real run-owned unit writes its exact .ready marker as soon as the
+  // fixture proves run ownership, even when this run is the only expected
+  // scope.  The optional barrier only gates a valid multi-scope observation.
+  const markerBarrierDir = barrierDir === undefined ? undefined : barrierDir;
   const markerPath = barrierDir === undefined
     ? undefined
     : (() => {
@@ -202,7 +207,7 @@ async function createFixture(options: { exitAfterMs?: number } = {}): Promise<Sy
     stopTimeoutMs: 5_000,
     sleep: wait,
   });
-  return { root, port, wedgePath, spec, supervisor, calls, markerPath };
+  return { root, port, wedgePath, spec, supervisor, calls, markerPath, markerBarrierDir };
 }
 
 async function cleanupFixture(fixture: SystemdFixture): Promise<void> {
@@ -214,7 +219,13 @@ async function cleanupFixture(fixture: SystemdFixture): Promise<void> {
     // Preserve the primary assertion; the exact unit remains bounded to this
     // fixture root and is never addressed through a broad process signal.
   }
-  if (managerAbsent && fixture.markerPath !== undefined) rmSync(fixture.markerPath, { force: true });
+  // Preserve the marker for the workflow EXIT trap until the workflow itself
+  // removes its barrier directory; local cleanup never leaves a marker behind.
+  const preserveForWorkflowBarrier = fixture.markerBarrierDir !== undefined
+    && process.env.LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR === fixture.markerBarrierDir;
+  if (managerAbsent && fixture.markerPath !== undefined && !preserveForWorkflowBarrier) {
+    rmSync(fixture.markerPath, { force: true });
+  }
   fixtureRoots.delete(fixture.root);
   rmSync(fixture.root, { recursive: true, force: true });
 }
@@ -263,34 +274,6 @@ async function waitForTerminal(
 const linuxSystemd = process.platform === "linux" && integrationEnabled ? it : it.skip;
 
 describe("real user-systemd daemon lifecycle", () => {
-  linuxSystemd("starts and admits a healthy managed unit with exact identity and cleanup", { timeout: 60_000 }, async () => {
-    const fixture = await createFixture();
-    try {
-      const started = await fixture.supervisor.start(fixture.spec);
-      expect(started).toMatchObject({
-        kind: "systemd-user",
-        name: fixture.spec.systemdUnit,
-        scopeDigest: fixture.spec.scopeDigest,
-        nonce: fixture.spec.nonce,
-        port: fixture.port,
-      });
-      expect(started.managerPid).toBeGreaterThan(0);
-      const health = await waitForHealth(fixture, started.managerPid!);
-      expect(health.entrypoint).toBe(fixture.spec.entrypoint);
-      expect(await fixture.supervisor.probe(fixture.spec)).toMatchObject({
-        kind: "registered-running-valid",
-        managerPid: started.managerPid,
-        name: fixture.spec.name,
-        scopeDigest: fixture.spec.scopeDigest,
-        nonce: fixture.spec.nonce,
-      });
-      expect(fixture.spec.systemdUnit).toMatch(/^lcm-daemon-[0-9a-f]{20}\.service$/u);
-    } finally {
-      await cleanupFixture(fixture);
-    }
-    expect(existsSync(fixture.root)).toBe(false);
-  });
-
   linuxSystemd("restarts a wedged registered unit through systemd without legacy signal fallback", { timeout: 60_000 }, async () => {
     const fixture = await createFixture();
     try {
@@ -322,6 +305,34 @@ describe("real user-systemd daemon lifecycle", () => {
     } finally {
       await cleanupFixture(fixture);
     }
+  });
+
+  linuxSystemd("starts and admits a healthy managed unit with exact identity and cleanup", { timeout: 60_000 }, async () => {
+    const fixture = await createFixture();
+    try {
+      const started = await fixture.supervisor.start(fixture.spec);
+      expect(started).toMatchObject({
+        kind: "systemd-user",
+        name: fixture.spec.systemdUnit,
+        scopeDigest: fixture.spec.scopeDigest,
+        nonce: fixture.spec.nonce,
+        port: fixture.port,
+      });
+      expect(started.managerPid).toBeGreaterThan(0);
+      const health = await waitForHealth(fixture, started.managerPid!);
+      expect(health.entrypoint).toBe(fixture.spec.entrypoint);
+      expect(await fixture.supervisor.probe(fixture.spec)).toMatchObject({
+        kind: "registered-running-valid",
+        managerPid: started.managerPid,
+        name: fixture.spec.name,
+        scopeDigest: fixture.spec.scopeDigest,
+        nonce: fixture.spec.nonce,
+      });
+      expect(fixture.spec.systemdUnit).toMatch(/^lcm-daemon-[0-9a-f]{20}\.service$/u);
+    } finally {
+      await cleanupFixture(fixture);
+    }
+    expect(existsSync(fixture.root)).toBe(false);
   });
 
   linuxSystemd("recreates a terminal clean-exit unit after a registered-not-running observation", { timeout: 60_000 }, async () => {

@@ -182,6 +182,7 @@ describe("CI workflow", () => {
       "restarts a wedged registered unit through systemd without legacy signal fallback",
       "recreates a terminal clean-exit unit after a registered-not-running observation",
       "refuses stale manager identity before mutation and never falls back to legacy signals",
+      "refuses clean-environment drift before admitting an existing unit",
       "observes the real user-systemd LoadCredential modes",
     ]) {
       expect(integration?.run).toContain(pattern);
@@ -212,7 +213,7 @@ describe("CI workflow", () => {
     expect(integration?.run).not.toMatch(/\b(?:pkill|killall)\b/u);
   });
 
-  it("keeps the macOS launchd feasibility job active and runs its integration path", () => {
+  it("keeps the macOS launchd feasibility job active, validates the private derived product label, and runs its integration path", () => {
     const job = workflow.jobs["macos-launchd"];
     const checkout = job.steps.find((step) => step.name === "Checkout");
     const node = job.steps.find((step) => step.name === "Set up Node.js 25.9.0");
@@ -235,8 +236,12 @@ describe("CI workflow", () => {
       LCM_LAUNCHD_SCOPE_ID: "ci-${{ github.run_id }}-${{ github.run_attempt }}",
       LCM_LAUNCHD_RESOURCE_ROOT:
         "${{ runner.temp }}/lcm-launchd-${{ github.run_id }}-${{ github.run_attempt }}",
+      LCM_LAUNCHD_LABEL:
+        "com.donadiosolutions.lcm.ci.${{ github.run_id }}.${{ github.run_attempt }}",
     });
     const run = integration?.run ?? "";
+    expect(run).toContain('ready_file="$resource_root/launchd.label"');
+    expect(run).toContain('out_file="$resource_root/launchd.out"');
     expect(run).toContain('evidence_token="$(uuidgen)"');
     expect(run).toContain('export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"');
     expect(run).toContain('launchctl bootout "gui/$(id -u)/$ready_label"');
@@ -244,8 +249,12 @@ describe("CI workflow", () => {
     expect(run).toContain(
       '[[ "$ready_label" =~ ^com\\.donadiosolutions\\.lcm\\.daemon\\.[0-9a-f]{20}$ ]]',
     );
+    expect(run).toContain('[[ "$ready_label" != "$label" ]]');
     expect(run).toContain('rm -rf -- "$resource_root"');
+    expect(run).toContain('mkdir -p -- "$resource_root"');
     expect(run).toContain('chmod 0700 "$resource_root"');
+    expect(run).toContain('tee "$out_file"');
+    expect(run).toContain('grep -q "launchd-user" "$out_file"');
     expect(run).toContain("validate_marker() {");
     expect(run).toContain("Refusing cleanup for malformed or foreign launchd evidence");
     expect(run).not.toMatch(/\b(?:pkill|killall|kill)\b/u);
@@ -273,6 +282,16 @@ describe("CI workflow", () => {
     expect(health).toBeGreaterThan(publish);
     expect(launchdIntegrationSource).toContain("spec.stateRoot !== realpathSync(resourceRoot)");
     expect(launchdIntegrationSource).toContain("expect(statSync(stateRoot).mode & 0o777).toBe(0o700)");
+    // The label regex must reject product labels outside the product prefix.
+    const productLabelRegex = /^com\.donadiosolutions\.lcm\.[A-Za-z0-9.-]+$/u;
+    expect(productLabelRegex.test("com.donadiosolutions.lcm.ci.123456789.1")).toBe(true);
+    expect(productLabelRegex.test("com.donadiosolutions.lcm.daemon.0123456789abcdef0123")).toBe(true);
+    expect(productLabelRegex.test("com.donadiosolutions.other.daemon.0123456789abcdef0123")).toBe(false);
+    expect(productLabelRegex.test("com.donadiosolutions.lcm.")).toBe(false);
+
+    // The integration may only reference product labels matching the private
+    // marker contract and must never use raw pkill/killall on foreign jobs.
+    expect(run).not.toMatch(/\b(?:pkill|killall)\b/u);
     expect(workflow.jobs.ci.needs).toContain("macos-launchd");
   });
 

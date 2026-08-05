@@ -167,7 +167,7 @@ jobs:
             test/daemon/lifecycle-isolation.test.ts \
             test/daemon/lifecycle-systemd.integration.test.ts \
             test/daemon/systemd-credential-loader.test.ts \
-            --testNamePattern "uses and removes one exact run-owned transient unit|starts and admits a healthy managed unit with exact identity and cleanup|restarts a wedged registered unit through systemd without legacy signal fallback|recreates a terminal clean-exit unit after a registered-not-running observation|refuses stale manager identity before mutation and never falls back to legacy signals"
+            --testNamePattern "uses and removes one exact run-owned transient unit|starts and admits a healthy managed unit with exact identity and cleanup|restarts a wedged registered unit through systemd without legacy signal fallback|recreates a terminal clean-exit unit after a registered-not-running observation|refuses stale manager identity before mutation and never falls back to legacy signals|refuses clean-environment drift before admitting an existing unit"
           npx vitest run \
             test/daemon/systemd-credential-loader.test.ts \
             --testNamePattern "observes the real user-systemd LoadCredential modes"
@@ -197,10 +197,13 @@ jobs:
           LCM_LAUNCHD_INTEGRATION: "1"
           LCM_LAUNCHD_SCOPE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
           LCM_LAUNCHD_RESOURCE_ROOT: ${{ runner.temp }}/lcm-launchd-${{ github.run_id }}-${{ github.run_attempt }}
+          LCM_LAUNCHD_LABEL: com.donadiosolutions.lcm.ci.${{ github.run_id }}.${{ github.run_attempt }}
         run: |
           set -Eeuo pipefail
           resource_root="$LCM_LAUNCHD_RESOURCE_ROOT"
+          label="$LCM_LAUNCHD_LABEL"
           ready_file="$resource_root/launchd.label"
+          out_file="$resource_root/launchd.out"
           evidence_token="$(uuidgen)"
           export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"
           validate_marker() {
@@ -211,6 +214,7 @@ jobs:
             [[ "$ready_line" == "$ready_token $ready_label" ]] || return 1
             [[ "$ready_token" == "$evidence_token" ]] || return 1
             [[ "$ready_label" =~ ^com\.donadiosolutions\.lcm\.daemon\.[0-9a-f]{20}$ ]] || return 1
+            [[ "$ready_label" != "$label" ]] || return 1
             [[ "$(stat -f '%Lp' "$ready_file" 2>/dev/null)" == "600" ]]
           }
           cleanup() {
@@ -226,11 +230,18 @@ jobs:
           rm -rf -- "$resource_root"
           mkdir -p -- "$resource_root"
           chmod 0700 "$resource_root"
-          npx vitest run test/daemon/lifecycle-launchd.integration.test.ts
+          npx vitest run test/daemon/lifecycle-launchd.integration.test.ts 2>&1 \
+            | tee "$out_file"
           if ! validate_marker; then
             echo "launchd integration produced malformed or foreign current-run evidence" >&2
             exit 1
           fi
+          ready_label="${ready_label:-}"
+          if [[ -z "$ready_label" ]]; then
+            echo "launchd integration did not derive a validated scoped product label" >&2
+            exit 1
+          fi
+          grep -q "launchd-user" "$out_file"
 
   ci:
     name: ci

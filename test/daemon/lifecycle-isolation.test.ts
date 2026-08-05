@@ -2469,7 +2469,7 @@ describe("same-user-systemd integration", () => {
       }
       const barrierDir = process.env.LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR;
       const expectedScopes = Number(process.env.LCM_LIFECYCLE_EXPECTED_SCOPES ?? "1");
-      if (result.status !== 0 || barrierDir === undefined || expectedScopes <= 1) return result;
+      if (result.status !== 0 || barrierDir === undefined) return result;
 
       const pause = (): void => {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
@@ -2505,6 +2505,9 @@ describe("same-user-systemd integration", () => {
       expect(token.length).toBeGreaterThan(0);
       expect(execStart).toContain(entrypoint);
       mkdirSync(barrierDir, { recursive: true });
+      // Every real run-owned unit writes its exact .ready marker even when it
+      // is the only expected scope, so the protected workflow's EXIT trap can
+      // prove one exact unit for this run from marker evidence alone.
       writeFileSync(join(barrierDir, `${ownerId}.ready`), JSON.stringify({
         unitName,
         homeDir,
@@ -2514,6 +2517,9 @@ describe("same-user-systemd integration", () => {
         entrypoint,
         daemonPid,
       }));
+      // Preserve the multi-scope barrier: cross-scope uniqueness assertions
+      // apply only when the workflow launches more than one run-owned scope.
+      if (expectedScopes <= 1) return result;
       const waitForMarkers = (suffix: string): string[] => {
         for (let attempt = 0; attempt < 500; attempt++) {
           const markers = readdirSync(barrierDir)

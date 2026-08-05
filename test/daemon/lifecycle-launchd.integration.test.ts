@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
@@ -13,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  MANAGED_CREDENTIAL_NAMES,
   createManagedCredentialDirectory,
   writeManagedCredentialFiles,
 } from "../../src/daemon/managed-credentials.js";
@@ -22,6 +24,7 @@ import {
   type SupervisorDependencies,
   type SupervisorObservation,
   type SupervisorSpec,
+  type SupervisorStartResult,
 } from "../../src/daemon/supervisor.js";
 
 type CommandResult = Readonly<{
@@ -36,11 +39,30 @@ type CommandCall = Readonly<{
   args: readonly string[];
 }>;
 
+const launchdProductLabel: { value?: string } = {};
+
+/** Record the actual derived launchd product label privately for the trap. */
+function exposeProductLabel(spec: SupervisorSpec): void {
+  const resourceRoot = process.env.LCM_LAUNCHD_RESOURCE_ROOT;
+  const manifestLabel = process.env.LCM_LAUNCHD_LABEL;
+  if (resourceRoot === undefined || manifestLabel === undefined) return;
+  if (spec.launchdLabel !== launchdProductLabel.value && launchdProductLabel.value !== undefined) {
+    throw new Error("launchd integration derived more than one product label");
+  }
+  launchdProductLabel.value = spec.launchdLabel;
+  // The workflow holds the manifest's run-scope label in $LCM_LAUNCHD_LABEL.
+  // We store the actual privately derived product label keyed to that manifest,
+  // so the EXIT trap reads a pinned marker instead of re-deriving one itself.
+  const marker = join(resourceRoot, "launchd.label");
+  writeFileSync(marker, spec.launchdLabel, { mode: 0o600 });
+}
+
 const MAX_CAPTURED_MANAGER_OUTPUT = 64 * 1024;
 const MAX_MANAGER_EXEC_BUFFER = 1024 * 1024;
 const FIXTURE_NONCE = "launchd-integration";
 const CHILD_SOURCE = `
 import { createServer } from "node:http";
+import { existsSync } from "node:fs";
 
 const port = Number(process.env.LCM_SUPERVISOR_PORT);
 const metadata = () => ({
@@ -52,21 +74,48 @@ const metadata = () => ({
   port,
   pid: process.pid,
 });
+const credentialPath = process.env.LCM_CREDENTIAL_OPENAI_API_KEY_FILE;
+const wedgePath = process.env.LCM_TEST_WEDGE_FILE;
+const expectedCredentialLength = Number(process.env.LCM_TEST_EXPECTED_CREDENTIAL_LENGTH ?? "0");
+const exitRequest = (response) => {
+  response.statusCode = 200;
+  response.end("bye", () => {
+    server.close();
+    const timer = setTimeout(() => process.exit(0), 25);
+    timer.unref();
+  });
+};
 
 const server = createServer((request, response) => {
   response.setHeader("Connection", "close");
   if (request.url === "/health") {
-    response.setHeader("Content-Type", "application/json");
-    response.end(JSON.stringify(metadata()));
+    if (wedgePath !== undefined && existsSync(wedgePath)) return;
+    void (async () => {
+      let additions = "";
+      if (credentialPath !== undefined) {
+        const { stat, readFile } = await import("node:fs/promises");
+        const stats = await stat(credentialPath);
+        const credentialMode = stats.mode & 0o777;
+        // The exact secret value is never echoed; the response is limited to
+        // its redacted evidence so captured output cannot leak the credential.
+        const value = (await readFile(credentialPath, "utf8")).trim();
+        additions = JSON.stringify({
+          credentialLength: value.length,
+          credentialMode,
+          credentialClaimed: expectedCredentialLength > 0 && Number(value.length) === expectedCredentialLength,
+        }).slice(1, -1) + ",";
+      }
+      response.setHeader("Content-Type", "application/json");
+      const body = JSON.stringify(metadata());
+      response.end(additions === "" ? body : "{" + additions + body.slice(1));
+    })().catch((error) => {
+      response.statusCode = 500;
+      response.end(String(error));
+    });
     return;
   }
   if (request.url === "/exit") {
-    response.statusCode = 200;
-    response.end("bye", () => {
-      server.close();
-      const timer = setTimeout(() => process.exit(0), 25);
-      timer.unref();
-    });
+    exitRequest(response);
     return;
   }
   response.statusCode = 404;
@@ -77,6 +126,102 @@ server.listen(port, "127.0.0.1");
 `;
 
 const fixtureRoots = new Set<string>();
+
+function launchdIntegrationEnvironment(extra: Record<string, string | undefined>): Record<string, string> {
+  const environment: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) environment[key] = value;
+  }
+  for (const managed of MANAGED_CREDENTIAL_NAMES) delete environment[managed];
+  for (const [key, value] of Object.entries(extra)) {
+    if (value === undefined) delete environment[key];
+    else environment[key] = value;
+  }
+  return environment;
+}
+
+type LaunchdIntegrationFixture = Readonly<{
+  root: string;
+  childEntrypoint: string;
+  port: number;
+  calls: readonly CommandCall[];
+  supervisor: ReturnType<typeof createSupervisor>;
+  guiDomain: string;
+  uid: number;
+  nonce: string;
+  buildSpec: (options?: {
+    nonce?: string;
+    credentialDirectory?: string;
+    credentialFiles?: ReadonlyArray<{ readonly name: string; readonly path: string }>;
+    launchEnvironment?: Readonly<Record<string, string>>;
+  }) => SupervisorSpec;
+}>;
+
+async function createLaunchdFixture(options?: {
+  nonceSuffix?: string;
+  launchEnvironmentExtra?: Record<string, string>;
+}): Promise<LaunchdIntegrationFixture> {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "lcm-launchd-integration-")));
+  fixtureRoots.add(root);
+  const uid = typeof process.getuid === "function" ? process.getuid() : -1;
+  expect(uid).toBeGreaterThanOrEqual(0);
+  const guiDomain = `gui/${uid}`;
+  const nonce = `${FIXTURE_NONCE}-${process.pid}${options?.nonceSuffix ?? ""}`;
+  const childEntrypoint = join(root, "health-child.mjs");
+  writeFileSync(childEntrypoint, CHILD_SOURCE, { mode: 0o700 });
+  const port = await allocatePort();
+
+  const calls: CommandCall[] = [];
+  const run: SupervisorDependencies["run"] = async (command, args, runOptions) => {
+    calls.push(Object.freeze({ command, args: [...args] }));
+    return runLaunchctl(command, args, runOptions);
+  };
+
+  const supervisor = createSupervisor("launchd-user", {
+    run,
+    platform: "darwin",
+    uid,
+  });
+
+  const buildSpec: LaunchdIntegrationFixture["buildSpec"] = (buildOptions = {}) => {
+    const launchEnvironment = launchdIntegrationEnvironment(options?.launchEnvironmentExtra ?? {});
+    const spec = createSupervisorSpec({
+      kind: "launchd-user",
+      stateRoot: root,
+      port,
+      nonce: buildOptions.nonce ?? nonce,
+      executable: process.execPath,
+      args: [childEntrypoint],
+      cwd: root,
+      launchEnvironment,
+      credentialDirectory: buildOptions.credentialDirectory,
+      credentialFiles: buildOptions.credentialFiles,
+      stopTimeoutMs: 10_000,
+    });
+    return spec;
+  };
+
+  return Object.freeze({
+    root,
+    childEntrypoint,
+    port,
+    calls,
+    supervisor,
+    guiDomain,
+    uid,
+    nonce,
+    buildSpec,
+  });
+}
+
+async function cleanupLaunchdFixture(fixture: LaunchdIntegrationFixture, spec: SupervisorSpec): Promise<void> {
+  try {
+    await fixture.supervisor.stopAndAwaitAbsent(spec);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+    fixtureRoots.delete(fixture.root);
+  }
+}
 
 afterEach(() => {
   for (const root of fixtureRoots) rmSync(root, { recursive: true, force: true });
@@ -171,6 +316,9 @@ type ExactHealth = {
   nonce: string;
   port: number;
   pid: number;
+  credentialLength?: number;
+  credentialMode?: number;
+  credentialClaimed?: boolean;
 };
 
 function isExactHealth(
@@ -278,6 +426,7 @@ describe("real launchd daemon lifecycle", () => {
       const supervisor = createSupervisor("launchd-user", { run, platform: "darwin", uid });
       let managerReady = true;
       try {
+        exposeProductLabel(spec);
         const started = await supervisor.start(spec);
         publishLaunchdEvidence(spec);
         expect(started.kind).toBe("launchd-user");
@@ -345,6 +494,295 @@ describe("real launchd daemon lifecycle", () => {
         if (managerReady) await supervisor.stopAndAwaitAbsent(spec);
         rmSync(root, { recursive: true, force: true });
         fixtureRoots.delete(root);
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" && process.env.LCM_LAUNCHD_INTEGRATION === "1")(
+    "claims one exact credential with mode 0600 through a healthy managed admission and removes it on exact cleanup",
+    { timeout: 60_000 },
+    async () => {
+      const fixture = await createLaunchdFixture({ nonceSuffix: "-claim" });
+      const credentialDirectory = createManagedCredentialDirectory(fixture.root, fixture.nonce);
+      const secretValue = "sk-proj-launchd-real-redaction-fixture-value";
+      const credentialFile = writeManagedCredentialFiles(credentialDirectory, {
+        OPENAI_API_KEY: secretValue,
+      })[0];
+      const launchEnvironment = launchdIntegrationEnvironment({
+        LCM_TEST_EXPECTED_CREDENTIAL_MODE: "384",
+        LCM_TEST_EXPECTED_CREDENTIAL_LENGTH: String(secretValue.length),
+      });
+      const spec = createSupervisorSpec({
+        kind: "launchd-user",
+        stateRoot: fixture.root,
+        port: fixture.port,
+        nonce: fixture.nonce,
+        executable: process.execPath,
+        args: [fixture.childEntrypoint],
+        cwd: fixture.root,
+        credentialDirectory,
+        credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
+        launchEnvironment,
+        stopTimeoutMs: 10_000,
+      });
+      expect(existsSync(credentialFile)).toBe(true);
+      expect(statSync(credentialFile).mode & 0o777).toBe(0o600);
+
+      let managerReady = true;
+      try {
+        exposeProductLabel(spec);
+        const started = await fixture.supervisor.start(spec);
+        expect(started.kind).toBe("launchd-user");
+        expect(started.managerPid).toBeTypeOf("number");
+        expect(started.name).toBe(spec.launchdLabel);
+
+        const health = await waitForExactHealth(spec, started.managerPid!);
+        expect(health).toMatchObject({
+          status: "ok",
+          marker: spec.marker,
+          scope: spec.scopeDigest,
+          stateRoot: spec.stateRoot,
+          nonce: spec.nonce,
+          port: spec.port,
+          pid: started.managerPid,
+          credentialLength: secretValue.length,
+          credentialMode: 0o600,
+          credentialClaimed: true,
+        });
+        const serializedHealth = JSON.stringify(health);
+        expect(serializedHealth.includes(secretValue)).toBe(false);
+
+        await fixture.supervisor.stopAndAwaitAbsent(spec);
+        managerReady = false;
+        const finalObservation = await fixture.supervisor.probe(spec);
+        expect(finalObservation).toMatchObject({ kind: "absent", name: spec.launchdLabel });
+
+        expect(existsSync(credentialFile)).toBe(false);
+        expect(existsSync(credentialDirectory)).toBe(false);
+      } finally {
+        if (managerReady) await fixture.supervisor.stopAndAwaitAbsent(spec);
+        rmSync(fixture.root, { recursive: true, force: true });
+        fixtureRoots.delete(fixture.root);
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" && process.env.LCM_LAUNCHD_INTEGRATION === "1")(
+    "redacts the one-launch secret from every bounded manager output while restarting a wedged no-response job through launchctl without legacy signals",
+    { timeout: 60_000 },
+    async () => {
+      const fixture = await createLaunchdFixture({ nonceSuffix: "-restart" });
+      const credentialDirectory = createManagedCredentialDirectory(fixture.root, fixture.nonce);
+      const secretValue = "sk-proj-launchd-real-redaction-fixture-value";
+      const credentialFile = writeManagedCredentialFiles(credentialDirectory, {
+        OPENAI_API_KEY: secretValue,
+      })[0];
+      const wedgePath = join(fixture.root, "wedged");
+      const launchEnvironment = launchdIntegrationEnvironment({
+        LCM_TEST_WEDGE_FILE: wedgePath,
+        LCM_TEST_EXPECTED_CREDENTIAL_MODE: "384",
+        LCM_TEST_EXPECTED_CREDENTIAL_LENGTH: String(secretValue.length),
+      });
+      const spec = createSupervisorSpec({
+        kind: "launchd-user",
+        stateRoot: fixture.root,
+        port: fixture.port,
+        nonce: fixture.nonce,
+        executable: process.execPath,
+        args: [fixture.childEntrypoint],
+        cwd: fixture.root,
+        credentialDirectory,
+        credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
+        launchEnvironment,
+        stopTimeoutMs: 10_000,
+      });
+      expect(existsSync(credentialFile)).toBe(true);
+      expect(statSync(credentialFile).mode & 0o777).toBe(0o600);
+
+      const guiProbe = await fixture.supervisor.probe(spec);
+      if (guiProbe.kind === "unavailable") {
+        throw new Error(`launchd integration GUI domain unavailable: ${guiProbe.reason}`);
+      }
+
+      let managerReady = true;
+      try {
+        exposeProductLabel(spec);
+        const started = await fixture.supervisor.start(spec);
+        expect(started.kind).toBe("launchd-user");
+        const initialManagerPid = started.managerPid!;
+        await waitForExactHealth(spec, initialManagerPid);
+
+        writeFileSync(wedgePath, "wedged\n");
+        const controller = new AbortController();
+        const noResponse = await Promise.race([
+          fetch(`http://127.0.0.1:${spec.port}/health`, { signal: controller.signal })
+            .then(() => false)
+            .catch(() => true),
+          wait(500).then(() => true),
+        ]);
+        controller.abort();
+        expect(noResponse).toBe(true);
+        rmSync(wedgePath, { force: true });
+
+        const wedgedObservation = await fixture.supervisor.probe(spec);
+        expect(wedgedObservation).toMatchObject({
+          kind: "registered-running-valid",
+          managerPid: initialManagerPid,
+          scopeDigest: spec.scopeDigest,
+          nonce: spec.nonce,
+          name: spec.launchdLabel,
+        });
+
+        const restarted = await fixture.supervisor.stopAndStart(spec);
+        expect(restarted.kind).toBe("launchd-user");
+        expect(restarted.managerPid).toBeGreaterThan(0);
+        expect(restarted.managerPid).not.toBe(initialManagerPid);
+
+        const recoveryHealth = await waitForExactHealth(spec, restarted.managerPid!);
+        expect(recoveryHealth).toMatchObject({
+          status: "ok",
+          pid: restarted.managerPid,
+          credentialLength: secretValue.length,
+          credentialMode: 0o600,
+          credentialClaimed: true,
+        });
+
+        const bootoutCalls = fixture.calls.filter(call => call.args[0] === "bootout");
+        expect(bootoutCalls.some(call => call.args[1] === `${fixture.guiDomain}/${spec.launchdLabel}`)).toBe(true);
+        const bootstrapCalls = fixture.calls.filter(call => call.args[0] === "bootstrap");
+        expect(bootstrapCalls.length).toBeGreaterThanOrEqual(2);
+        expect(fixture.calls.some(call => /^(?:kill|pkill|killall)$/u.test(call.command))).toBe(false);
+
+        const boundedOutputs = fixture.calls.map(call => {
+          return `${call.command} ${call.args.join(" ")}`;
+        }).join("\n");
+        expect(boundedOutputs.includes(secretValue)).toBe(false);
+
+        // A second proof of absence must never depend on an unconstrained raw
+        // print of the final plist; assert the exact observed JSON and the
+        // absence verdict after an exact-scoped cleanup.
+        const observation = await fixture.supervisor.probe(spec);
+        expect(observation).toMatchObject({
+          kind: "registered-running-valid",
+          managerPid: restarted.managerPid,
+          scopeDigest: spec.scopeDigest,
+          nonce: spec.nonce,
+          name: spec.launchdLabel,
+        });
+
+        await fixture.supervisor.stopAndAwaitAbsent(spec);
+        managerReady = false;
+        expect(await fixture.supervisor.probe(spec)).toMatchObject({
+          kind: "absent",
+          name: spec.launchdLabel,
+        });
+        expect(existsSync(credentialFile)).toBe(false);
+        expect(existsSync(credentialDirectory)).toBe(false);
+      } finally {
+        if (managerReady) await fixture.supervisor.stopAndAwaitAbsent(spec);
+        rmSync(fixture.root, { recursive: true, force: true });
+        fixtureRoots.delete(fixture.root);
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" && process.env.LCM_LAUNCHD_INTEGRATION === "1")(
+    "recreates a prior-nonce terminal clean-exit registration exactly once and admits the replacement before cleanup",
+    { timeout: 90_000 },
+    async () => {
+      const firstNonce = `launchd-integration-${process.pid}-first`;
+      const recreatedNonce = `launchd-integration-${process.pid}-recreated`;
+      const fixture = await createLaunchdFixture({ nonceSuffix: "-terminal", launchEnvironmentExtra: {} });
+      const firstCredentialDirectory = createManagedCredentialDirectory(fixture.root, firstNonce);
+      const firstCredentialFile = writeManagedCredentialFiles(firstCredentialDirectory, {
+        OPENAI_API_KEY: "sk-proj-launchd-real-redaction-fixture-value",
+      })[0];
+      const firstSpec = fixture.buildSpec({
+        nonce: firstNonce,
+        credentialDirectory: firstCredentialDirectory,
+        credentialFiles: [{ name: "OPENAI_API_KEY", path: firstCredentialFile }],
+        launchEnvironment: launchdIntegrationEnvironment({
+          LCM_TEST_EXPECTED_CREDENTIAL_MODE: "384",
+          LCM_TEST_EXPECTED_CREDENTIAL_LENGTH: String("sk-proj-launchd-real-redaction-fixture-value".length),
+        }),
+      });
+      const recreatedCredentialDirectory = createManagedCredentialDirectory(fixture.root, recreatedNonce);
+      const recreatedCredentialFile = writeManagedCredentialFiles(recreatedCredentialDirectory, {
+        OPENAI_API_KEY: "sk-proj-launchd-real-redaction-fixture-value",
+      })[0];
+      const recreatedSpec = fixture.buildSpec({
+        nonce: recreatedNonce,
+        credentialDirectory: recreatedCredentialDirectory,
+        credentialFiles: [{ name: "OPENAI_API_KEY", path: recreatedCredentialFile }],
+        launchEnvironment: launchdIntegrationEnvironment({
+          LCM_TEST_EXPECTED_CREDENTIAL_MODE: "384",
+          LCM_TEST_EXPECTED_CREDENTIAL_LENGTH: String("sk-proj-launchd-real-redaction-fixture-value".length),
+        }),
+      });
+
+      let managerReady = true;
+      let recreatedStarted: SupervisorStartResult | undefined;
+      try {
+        exposeProductLabel(firstSpec);
+        const firstStarted = await fixture.supervisor.start(firstSpec);
+        expect(firstStarted.managerPid).toBeTypeOf("number");
+        await waitForExactHealth(firstSpec, firstStarted.managerPid!);
+
+        // Trigger the intentional idle exit; the supervisor must observe
+        // registered-not-running before any recreation authority exists.
+        const exitResponse = await fetch(`http://127.0.0.1:${firstSpec.port}/exit`, {
+          signal: AbortSignal.timeout(5_000),
+        });
+        expect(exitResponse.status).toBe(200);
+        const terminal = await waitForTerminal(fixture.supervisor, firstSpec);
+        expect(terminal).toMatchObject({
+          kind: "registered-not-running-valid",
+          scopeDigest: firstSpec.scopeDigest,
+          nonce: firstSpec.nonce,
+          name: firstSpec.launchdLabel,
+        });
+        expect(["inactive", "failed", "last-exit"]).toContain(terminal.terminal);
+
+        // The prior nonce observed terminal existed but has already exited;
+        // its private runtime artifacts must not be present for recreation.
+        expect(existsSync(firstCredentialFile)).toBe(false);
+
+        const restarted = await fixture.supervisor.stopAndStart(recreatedSpec);
+        recreatedStarted = restarted;
+        expect(restarted.kind).toBe("launchd-user");
+        expect(restarted.managerPid).toBeGreaterThan(0);
+        expect(restarted.nonce).toBe(recreatedSpec.nonce);
+        await waitForExactHealth(recreatedSpec, restarted.managerPid!);
+        const admitted = await fixture.supervisor.probe(recreatedSpec);
+        expect(admitted).toMatchObject({
+          kind: "registered-running-valid",
+          managerPid: restarted.managerPid,
+          scopeDigest: recreatedSpec.scopeDigest,
+          nonce: recreatedSpec.nonce,
+          name: recreatedSpec.launchdLabel,
+        });
+
+        await fixture.supervisor.stopAndAwaitAbsent(recreatedSpec);
+        managerReady = false;
+        expect(await fixture.supervisor.probe(recreatedSpec)).toMatchObject({
+          kind: "absent",
+          name: recreatedSpec.launchdLabel,
+        });
+        expect(existsSync(recreatedCredentialFile)).toBe(false);
+        expect(existsSync(recreatedCredentialDirectory)).toBe(false);
+        expect(readdirSync(fixture.root).filter(entry => entry.endsWith(".plist"))).toEqual([]);
+
+        const bootoutCalls = fixture.calls.filter(call => call.args[0] === "bootout");
+        expect(bootoutCalls.some(call => call.args[1] === `${fixture.guiDomain}/${firstSpec.launchdLabel}`)).toBe(true);
+        expect(bootoutCalls.some(call => call.args[1] === `${fixture.guiDomain}/${recreatedSpec.launchdLabel}`)).toBe(true);
+        expect(fixture.calls.some(call => /^(?:kill|pkill|killall)$/u.test(call.command))).toBe(false);
+      } finally {
+        if (managerReady) await fixture.supervisor.stopAndAwaitAbsent(recreatedSpec);
+        rmSync(fixture.root, { recursive: true, force: true });
+        fixtureRoots.delete(fixture.root);
+      }
+      if (recreatedStarted !== undefined) {
+        expect(recreatedStarted.kind).toBe("launchd-user");
       }
     },
   );
