@@ -95,18 +95,24 @@ credentials, so deleting on suspicion could strip secrets from a launch that
 is about to succeed.
 
 Inspect before removing anything, and only ever remove a directory you have
-positively identified as inactive. `lcm doctor` alone does not prove
-inactivity:
+positively identified as inactive. `lcm doctor` reports whether the daemon
+is up or down; it never reports whether the daemon is idle. Doctor output is
+context only and is never deletion authority:
 
 ```bash
 lcm doctor
 ls -la <stateRoot>/credentials/
 ```
 
-A directory is safe to remove only when `lcm doctor` reports the daemon
-healthy and idle, no other `lcm daemon` start or restart is running, and the
-directory's nonce matches no active or pending launch. Positively identified
-inactive directories can then be removed by exact path, one at a time:
+Delete the directory only after positive out-of-band host evidence that the
+exact nonce is not referenced by any of the following:
+
+- a systemd or launchd job, active or registered;
+- a running `lcm daemon` start or restart process; or
+- an active or pending launch.
+
+Deletion is exact and single-directory: name one positively identified
+inactive directory by its full path, one at a time:
 
 ```bash
 rm -r -- <stateRoot>/credentials/<exact-nonce>
