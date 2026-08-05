@@ -24,6 +24,7 @@ type SpawnChildMock = {
   once: ReturnType<typeof vi.fn>;
 };
 type ManagedSupervisorSpec = {
+  kind: "systemd-user" | "launchd-user";
   stateRoot: string;
   nonce: string;
   credentialDirectory?: string;
@@ -4573,5 +4574,296 @@ describe("restartDaemon", () => {
     expect(killMock).not.toHaveBeenCalled();
     expect(ensureMock).toHaveBeenCalledOnce();
     expect(spec).toBeDefined();
+  });
+
+  it.each([
+    ["absent", { kind: "absent" as const }],
+    ["registered-not-running-valid", { kind: "registered-not-running-valid" as const, terminal: "inactive" as const }],
+  ] as const)("reports restarted=false when a manager %s job is started without a stop", async (_name, initialObservation) => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-start-only-"));
+    tempDirs.push(tempDir);
+    const supervisor = {
+      probe: vi.fn(async (candidate: { name: string }) => ({ ...initialObservation, name: candidate.name })),
+      start: vi.fn(),
+      stopAndStart: vi.fn(),
+      stopAndAwaitAbsent: vi.fn(),
+    };
+    const ensureMock = vi.fn(async () => ({
+      connected: false,
+      port: 19999,
+      spawned: true,
+      startMethod: "systemd-user" as const,
+    }));
+
+    const result = await restartDaemon({
+      port: 19999,
+      pidFilePath: join(tempDir, "daemon.pid"),
+      spawnTimeoutMs: 100,
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _supervisorOverride: supervisor as never,
+      _ensureDaemonOverride: ensureMock,
+    });
+
+    expect(result).toMatchObject({ restarted: false, connected: false, spawned: true });
+    expect(ensureMock).toHaveBeenCalledOnce();
+    expect(supervisor.start).not.toHaveBeenCalled();
+    expect(supervisor.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["linux", "stale-config", { kind: "registered-stale-config" as const, reason: "metadata-mismatch" as const }],
+    ["linux", "running-valid", { kind: "registered-running-valid" as const, managerPid: 202 }],
+    ["darwin", "running-valid", { kind: "registered-running-valid" as const, managerPid: 202 }],
+  ] as const)(
+    "removes staged credentials after successful authenticated restart admission (%s %s)",
+    async (platform, _name, initialObservation) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-credential-success-"));
+      tempDirs.push(tempDir);
+      writeFileSync(join(tempDir, "daemon.pid"), "202");
+      writeFileSync(join(tempDir, "daemon.token"), "local-token");
+      let staged: ManagedCredentialSnapshot | undefined;
+      const probe = vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => ({
+        ...initialObservation,
+        scopeDigest: candidate.scopeDigest,
+        nonce: candidate.nonce,
+        name: candidate.name,
+        ...(initialObservation.kind === "registered-stale-config"
+          ? { port: 19998, executable: process.execPath, args: JSON.stringify(["/path/lcm.js", "daemon", "start", "--foreground"]) }
+          : {}),
+      }));
+      const stopAndStart = vi.fn(async (candidate: ManagedSupervisorSpec) => {
+        staged = snapshotManagedCredentials(candidate);
+        return { kind: candidate.kind, name: candidate.name, scopeDigest: candidate.scopeDigest, port: 19999, nonce: candidate.nonce, managerPid: 202 };
+      });
+      const method = platform === "darwin" ? "launchd-user" as const : "systemd-user" as const;
+      const ensureMock = vi.fn(async () => ({ connected: true as const, port: 19999, spawned: false, startMethod: method }));
+      const result = await restartDaemon({
+        port: 19999,
+        pidFilePath: join(tempDir, "daemon.pid"),
+        spawnTimeoutMs: 100,
+        enforceUserManagerParent: true,
+        _platform: platform,
+        spawnArgs: initialObservation.kind === "registered-stale-config" ? ["/path/lcm.js", "daemon", "start", "--foreground"] : undefined,
+        _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+        _isProcessAliveOverride: () => true,
+        _listeningPortsOverride: () => [19999],
+        _supervisorOverride: { probe, start: vi.fn(), stopAndStart, stopAndAwaitAbsent: vi.fn() } as never,
+        _ensureDaemonOverride: ensureMock,
+      }, { environment: { OPENAI_API_KEY: "restart-openai", LCM_SUMMARY_API_KEY: "restart-summary", UNRELATED_SECRET: "must-not-be-staged" } });
+
+      expect(result).toMatchObject({ restarted: true, connected: true });
+      expect(stopAndStart).toHaveBeenCalledOnce();
+      expect(ensureMock).toHaveBeenCalledOnce();
+      expect(staged?.stateRoot).toBe(tempDir);
+      expect(staged?.credentialDirectory).toBeDefined();
+      expect(staged?.files.map(file => ({ name: file.name, value: file.value, mode: file.mode }))).toEqual([
+        { name: "OPENAI_API_KEY", value: "restart-openai", mode: 0o600 },
+        { name: "LCM_SUMMARY_API_KEY", value: "restart-summary", mode: 0o600 },
+      ]);
+      expect(existsSync(staged!.credentialDirectory!)).toBe(false);
+    },
+  );
+
+  it.each([
+    ["stale-config", { kind: "registered-stale-config" as const, reason: "metadata-mismatch" as const }],
+    ["running-valid", { kind: "registered-running-valid" as const, managerPid: 202 }],
+  ] as const)(
+    "preserves staged launchd credentials when the manager stop/start throws (%s)",
+    async (_name, initialObservation) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-credential-throw-"));
+      tempDirs.push(tempDir);
+      writeFileSync(join(tempDir, "daemon.pid"), "202");
+      writeFileSync(join(tempDir, "daemon.token"), "local-token");
+      let staged: ManagedCredentialSnapshot | undefined;
+      const probe = vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => ({
+        ...initialObservation,
+        scopeDigest: candidate.scopeDigest,
+        nonce: candidate.nonce,
+        name: candidate.name,
+        ...(initialObservation.kind === "registered-stale-config"
+          ? { port: 19998, executable: process.execPath, args: JSON.stringify(["/path/lcm.js", "daemon", "start", "--foreground"]) }
+          : {}),
+      }));
+      const stopAndStart = vi.fn(async (candidate: ManagedSupervisorSpec) => {
+        staged = snapshotManagedCredentials(candidate);
+        throw new Error("manager stop/start failed");
+      });
+      const ensureMock = vi.fn();
+      const result = await restartDaemon({
+        port: 19999,
+        pidFilePath: join(tempDir, "daemon.pid"),
+        spawnTimeoutMs: 100,
+        enforceUserManagerParent: true,
+        _platform: "linux",
+        spawnArgs: initialObservation.kind === "registered-stale-config" ? ["/path/lcm.js", "daemon", "start", "--foreground"] : undefined,
+        _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+        _isProcessAliveOverride: () => true,
+        _listeningPortsOverride: () => [19999],
+        _supervisorOverride: { probe, start: vi.fn(), stopAndStart, stopAndAwaitAbsent: vi.fn() } as never,
+        _ensureDaemonOverride: ensureMock,
+      }, { environment: { OPENAI_API_KEY: "evidence-openai" } });
+
+      expect(result).toMatchObject({ restarted: false, connected: false, refusalReason: "startup-failure" });
+      expect(stopAndStart).toHaveBeenCalledOnce();
+      expect(ensureMock).not.toHaveBeenCalled();
+      expect(staged?.credentialDirectory).toBeDefined();
+      expect(existsSync(staged!.credentialDirectory!)).toBe(true);
+      expect(staged?.files.map(file => ({ name: file.name, value: file.value }))).toEqual([
+        { name: "OPENAI_API_KEY", value: "evidence-openai" },
+      ]);
+      for (const file of staged!.files) {
+        expect(readFileSync(file.path, "utf-8")).toBe(file.value);
+      }
+    },
+  );
+
+  it("preserves staged launchd credentials when the post-start ensure is not admitted and cleanup is refused", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-credential-refusal-"));
+      tempDirs.push(tempDir);
+      writeFileSync(join(tempDir, "daemon.pid"), "202");
+      writeFileSync(join(tempDir, "daemon.token"), "local-token");
+      let staged: ManagedCredentialSnapshot | undefined;
+      const probe = vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => ({
+        kind: "registered-running-valid" as const,
+        managerPid: 202,
+        scopeDigest: candidate.scopeDigest,
+        nonce: candidate.nonce,
+        name: candidate.name,
+      }));
+      const stopAndStart = vi.fn(async (candidate: ManagedSupervisorSpec) => {
+        staged = snapshotManagedCredentials(candidate);
+        return { kind: candidate.kind, name: candidate.name, scopeDigest: candidate.scopeDigest, port: 19999, nonce: candidate.nonce, managerPid: 202 };
+      });
+      // Real ensure terminal-cleans an unadmitted spawned restart before
+      // return; only a refused manager absence proof preserves the evidence
+      // (fail-closed), so this is the production-true unadmitted refusal seam.
+      const stopAndAwaitAbsent = vi.fn(async () => { throw new Error("absence proof refused"); });
+      const ensureResult = { connected: false, spawned: true, refusalReason: "startup-failure" as const };
+      const ensureMock = vi.fn(async () => ensureResult);
+      const result = await restartDaemon({
+        port: 19999,
+        pidFilePath: join(tempDir, "daemon.pid"),
+        spawnTimeoutMs: 100,
+        enforceUserManagerParent: true,
+        _platform: "linux",
+        _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+        _isProcessAliveOverride: () => true,
+        _listeningPortsOverride: () => [19999],
+        _supervisorOverride: { probe, start: vi.fn(), stopAndStart, stopAndAwaitAbsent } as never,
+        _ensureDaemonOverride: ensureMock,
+      }, { environment: { OPENAI_API_KEY: "unadmitted-secret" } });
+
+      expect(result).toMatchObject(ensureResult);
+      expect(stopAndStart).toHaveBeenCalledOnce();
+      expect(ensureMock).toHaveBeenCalledOnce();
+      expect(staged?.credentialDirectory).toBeDefined();
+      expect(existsSync(staged!.credentialDirectory!)).toBe(true);
+      for (const file of staged!.files) {
+        expect(readFileSync(file.path, "utf-8")).toBe("unadmitted-secret");
+      }
+  });
+
+  it.each([
+    ["stale-config", { kind: "registered-stale-config" as const, reason: "metadata-mismatch" as const }],
+    ["running-valid", { kind: "registered-running-valid" as const, managerPid: 202 }],
+  ] as const)(
+    "treats an already-absent staged credential directory as success (%s)",
+    async (_name, initialObservation) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-credential-consumed-"));
+      tempDirs.push(tempDir);
+      writeFileSync(join(tempDir, "daemon.pid"), "202");
+      writeFileSync(join(tempDir, "daemon.token"), "local-token");
+      let staged: ManagedCredentialSnapshot | undefined;
+      let stagedDirectory = "";
+      const probe = vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => ({
+        ...initialObservation,
+        scopeDigest: candidate.scopeDigest,
+        nonce: candidate.nonce,
+        name: candidate.name,
+        ...(initialObservation.kind === "registered-stale-config"
+          ? { port: 19998, executable: process.execPath, args: JSON.stringify(["/path/lcm.js", "daemon", "start", "--foreground"]) }
+          : {}),
+      }));
+      const stopAndStart = vi.fn(async (candidate: ManagedSupervisorSpec) => {
+        staged = snapshotManagedCredentials(candidate);
+        stagedDirectory = candidate.credentialDirectory!;
+        rmSync(stagedDirectory, { recursive: true, force: true });
+        return { kind: candidate.kind, name: candidate.name, scopeDigest: candidate.scopeDigest, port: 19999, nonce: candidate.nonce, managerPid: 202 };
+      });
+      const ensureMock = vi.fn(async () => ({ connected: true as const, port: 19999, spawned: false }));
+      const result = await restartDaemon({
+        port: 19999,
+        pidFilePath: join(tempDir, "daemon.pid"),
+        spawnTimeoutMs: 100,
+        enforceUserManagerParent: true,
+        _platform: "linux",
+        spawnArgs: initialObservation.kind === "registered-stale-config" ? ["/path/lcm.js", "daemon", "start", "--foreground"] : undefined,
+        _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+        _isProcessAliveOverride: () => true,
+        _listeningPortsOverride: () => [19999],
+        _supervisorOverride: { probe, start: vi.fn(), stopAndStart, stopAndAwaitAbsent: vi.fn() } as never,
+        _ensureDaemonOverride: ensureMock,
+      }, { environment: { OPENAI_API_KEY: "consumed-secret" } });
+
+      expect(result).toMatchObject({ restarted: true, connected: true });
+      expect(stagedDirectory).not.toBe("");
+      expect(existsSync(stagedDirectory)).toBe(false);
+      expect(staged?.files.map(file => ({ name: file.name, value: file.value }))).toEqual([
+        { name: "OPENAI_API_KEY", value: "consumed-secret" },
+      ]);
+    },
+  );
+
+  it("stages each restart credential directory separately and leaves unrelated restart evidence untouched", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-restart-credential-isolation-"));
+    tempDirs.push(tempDir);
+    writeFileSync(join(tempDir, "daemon.pid"), "202");
+    writeFileSync(join(tempDir, "daemon.token"), "local-token");
+    const probe = vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => ({
+      kind: "registered-running-valid" as const,
+      managerPid: 202,
+      scopeDigest: candidate.scopeDigest,
+      nonce: candidate.nonce,
+      name: candidate.name,
+    }));
+    const directories: string[] = [];
+    const values: string[] = [];
+    const stopAndStart = vi.fn(async (candidate: ManagedSupervisorSpec) => {
+      const snapshot = snapshotManagedCredentials(candidate);
+      directories.push(snapshot.credentialDirectory!);
+      values.push(snapshot.files.map(file => file.value).join(","));
+      return { kind: candidate.kind, name: candidate.name, scopeDigest: candidate.scopeDigest, port: 19999, nonce: candidate.nonce, managerPid: 202 };
+    });
+    const options = (value: string, spawned: boolean) => ({
+      port: 19999,
+      pidFilePath: join(tempDir, "daemon.pid"),
+      spawnTimeoutMs: 100,
+      enforceUserManagerParent: true,
+      _platform: "linux" as const,
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19999],
+      _supervisorOverride: { probe, start: vi.fn(), stopAndStart, stopAndAwaitAbsent: vi.fn() } as never,
+      _ensureDaemonOverride: vi.fn(async () => ({ connected: true as const, port: 19999, spawned })),
+      environment: { OPENAI_API_KEY: value },
+    });
+
+    const first = await restartDaemon(options("first-secret", false), { environment: { OPENAI_API_KEY: "first-secret" } });
+    expect(first).toMatchObject({ restarted: true, connected: true });
+    expect(existsSync(directories[0]!)).toBe(false);
+    mkdirSync(directories[0]!, { recursive: true });
+    writeFileSync(join(directories[0]!, "OPENAI_API_KEY"), "preserved-evidence", { mode: 0o600 });
+
+    const second = await restartDaemon(options("second-secret", true), { environment: { OPENAI_API_KEY: "second-secret" } });
+    expect(second).toMatchObject({ restarted: true, connected: true });
+    expect(directories).toHaveLength(2);
+    expect(directories[0]).not.toBe(directories[1]);
+    expect(basename(directories[0]!)).not.toBe(basename(directories[1]!));
+    expect(values).toEqual(["first-secret", "second-secret"]);
+    expect(existsSync(directories[1]!)).toBe(false);
+    expect(existsSync(directories[0]!)).toBe(true);
+    expect(readFileSync(join(directories[0]!, "OPENAI_API_KEY"), "utf-8")).toBe("preserved-evidence");
+    expect(statSync(join(directories[0]!, "OPENAI_API_KEY")).mode & 0o777).toBe(0o600);
   });
 });

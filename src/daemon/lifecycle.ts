@@ -3251,6 +3251,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     const ensureAfterManagerOperation = async (
       managerPid?: number,
       admittedSpec?: SupervisorSpec,
+      restarted = false,
     ): Promise<RestartDaemonResult> => {
       const ensured = await ensure({
         ...ensureOptions,
@@ -3266,7 +3267,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       });
       return {
         ...ensured,
-        restarted: true,
+        restarted,
         stoppedPid: observation.kind === "registered-running-valid" ? observation.managerPid : undefined,
       };
     };
@@ -3282,7 +3283,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       let admitted = false;
       try {
         const started = await supervisor.stopAndStart(staged.spec);
-        const ensured = await ensureAfterManagerOperation(started.managerPid, staged.spec);
+        const ensured = await ensureAfterManagerOperation(started.managerPid, staged.spec, true);
         admitted = ensured.connected === true;
         return ensured;
       } finally {
