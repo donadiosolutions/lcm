@@ -10,6 +10,10 @@ import {
 } from "../summarize.js";
 
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
+const CLAUDE_CREDENTIAL_ENV_NAMES = [
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+] as const;
 type ClaudeProcessDeps = {
   model?: string;
   reasoningEffort?: ClaudeProcessReasoningEffort;
@@ -31,6 +35,19 @@ function normalizeSpawnError(error: unknown): Error {
     return friendlyMissingClaudeError();
   }
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function resolveClaudeProcessEnvironment(
+  environment: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  const resolved = resolveDaemonConfigEnv(environment);
+  const childEnvironment = { ...environment };
+  for (const name of CLAUDE_CREDENTIAL_ENV_NAMES) {
+    const value = resolved[name];
+    if (value === undefined) delete childEnvironment[name];
+    else childEnvironment[name] = value;
+  }
+  return childEnvironment;
 }
 
 export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): LcmSummarizeFn {
@@ -77,7 +94,7 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
       try {
         proc = spawn("claude", args, {
           stdio: ["pipe", "pipe", "pipe"],
-          env: resolveDaemonConfigEnv(environment),
+          env: resolveClaudeProcessEnvironment(environment),
         });
       } catch (error) {
         reject(normalizeSpawnError(error));

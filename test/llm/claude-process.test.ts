@@ -84,6 +84,38 @@ describe("createClaudeProcessSummarizer", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+  it("does not project unrelated launchd credentials into the Claude child environment", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-claude-launchd-credentials-"));
+    const directory = join(root, "credentials");
+    mkdirSync(directory, { mode: 0o700 });
+    chmodSync(directory, 0o700);
+    const credentialValues = {
+      CLAUDE_CODE_OAUTH_TOKEN: "claude-token",
+      OPENAI_API_KEY: "unrelated-openai-token",
+      LCM_POSTGRES_URL: "postgresql://unrelated-database-secret",
+    };
+    const environment: Record<string, string> = { LCM_CREDENTIAL_DIRECTORY: directory };
+    for (const [name, value] of Object.entries(credentialValues)) {
+      const path = join(directory, name);
+      writeFileSync(path, `${value}\n`, { mode: 0o600 });
+      chmodSync(path, 0o600);
+      environment[`LCM_CREDENTIAL_${name}_FILE`] = path;
+    }
+    const spawn = vi.fn().mockReturnValue(makeChild());
+    try {
+      const summarizer = createClaudeProcessSummarizer({
+        spawn: spawn as unknown as SpawnFn,
+        environment,
+      });
+      await expect(summarizer("Conversation text", false)).resolves.toBe("summary text");
+      const childEnvironment = (spawn.mock.calls[0][2] as { env?: NodeJS.ProcessEnv }).env;
+      expect(childEnvironment?.CLAUDE_CODE_OAUTH_TOKEN).toBe("claude-token");
+      expect(childEnvironment?.OPENAI_API_KEY).toBeUndefined();
+      expect(childEnvironment?.LCM_POSTGRES_URL).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   it("passes the configured model to the Claude CLI", async () => {
     const spawn = vi.fn().mockReturnValue(makeChild());
     const summarizer = createClaudeProcessSummarizer({
