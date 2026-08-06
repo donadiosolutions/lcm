@@ -4273,7 +4273,7 @@ describe("restartDaemon", () => {
     const result = await ensureDaemon({
       port: 19_999,
       pidFilePath: pidFile,
-      spawnTimeoutMs: 5,
+      spawnTimeoutMs: 100,
       expectedVersion: "1.4.2",
       enforceUserManagerParent: true,
       _platform: "darwin",
