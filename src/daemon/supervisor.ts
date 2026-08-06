@@ -2208,6 +2208,36 @@ export function createSupervisor(
 
   const probe = (spec: SupervisorSpec): Promise<SupervisorObservation> => probeInternal(spec);
 
+  /**
+   * launchd can report a bootout target absent before it has released the
+   * label from the GUI domain.  A same-label bootstrap in that small window
+   * fails even though a bounded print reports no registration.  Retry the
+   * exact bootstrap once only after two consecutive absence proofs; any
+   * registered, ambiguous, or unavailable observation leaves the original
+   * failure authoritative.
+   */
+  const retryLaunchdBootstrapAfterAbsence = async (
+    spec: SupervisorSpec,
+    args: readonly string[],
+    initial: Awaited<ReturnType<typeof runner.invoke>>,
+  ): Promise<Awaited<ReturnType<typeof runner.invoke>>> => {
+    if (kind !== "launchd-user" || initial.timedOut || initial.code === 0) return initial;
+    const now = dependencies.now ?? performance.now.bind(performance);
+    const deadline = now() + (dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
+    let absenceProofs = 0;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if ((await probeInternal(spec)).kind !== "absent") return initial;
+      absenceProofs += 1;
+      if (absenceProofs >= 2) break;
+      const remaining = deadline - now();
+      if (remaining <= 0) return initial;
+      const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
+      if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
+      else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
+    }
+    return runner.invoke("launchctl", args);
+  };
+
   const start = async (spec: SupervisorSpec, terminalRecreated = false): Promise<SupervisorStartResult> => {
     const current = await probeInternal(spec);
     if (current.kind === "unavailable") throw managerUnavailableError(current.reason);
@@ -2253,7 +2283,8 @@ export function createSupervisor(
       const args = kind === "systemd-user"
         ? systemdStartArgs(spec, runner.uid, runner.environment)
         : ["bootstrap", launchdDomain(runner.uid), launchPath!];
-      const result = await runner.invoke(kind === "systemd-user" ? "systemd-run" : "launchctl", args);
+      const initialResult = await runner.invoke(kind === "systemd-user" ? "systemd-run" : "launchctl", args);
+      const result = await retryLaunchdBootstrapAfterAbsence(spec, args, initialResult);
       if (result.timedOut || result.code !== 0) throw commandFailedError();
 
       // systemd-run --no-block acknowledges the job submission before the

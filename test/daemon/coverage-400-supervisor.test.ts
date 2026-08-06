@@ -794,6 +794,88 @@ describe("supervisor coverage: credentials and private launch files", () => {
     await expect(createSupervisor("launchd-user", { run: staleRunner.run, platform: "darwin", uid: 501 }).stopAndStart(value)).rejects.toThrow("manager command");
   });
 
+  it("retries an exact launchd bootstrap after the GUI domain settles an absent label", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const terminal = launchdText(value, "exited", 0);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const running = launchdText(value, "running", 544);
+    const runner = runQueue([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: "bootout" },
+      absent,
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: running },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).resolves.toMatchObject({ managerPid: 544 });
+    expect(sleep).toHaveBeenCalledWith(50);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(1);
+  });
+
+  it("uses the bounded host timer when launchd absence must settle", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const terminal = launchdText(value, "exited", 0);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: "bootout" },
+      absent,
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 545) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 1,
+      now: () => 0,
+    }).start(value)).resolves.toMatchObject({ managerPid: 545 });
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
+  });
+
+  it("does not retry a launchd bootstrap after its absence deadline expires", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const terminal = launchdText(value, "exited", 0);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: "bootout" },
+      absent,
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      absent,
+    ]);
+    const now = vi.fn().mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(1);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 1,
+      now,
+    }).start(value)).rejects.toThrow("manager command");
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
   it.each(["before-open", "after-read", "before-unlink"] as const)(
     "preserves a replaced exact launchd plist before bootstrap (%s)",
     async (phase) => {
