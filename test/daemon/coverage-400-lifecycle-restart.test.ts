@@ -1083,7 +1083,7 @@ describe("managed restart refusal and repair coverage", () => {
       return restart({ ...baseOptions(dir), enforceUserManagerParent: true, _supervisorOverride: managed.supervisor, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: fetch, ...extra });
     };
     const noResponse = await make(vi.fn().mockRejectedValue(new Error("offline")) as unknown as FetchOverride);
-    expect(noResponse.refusalReason).toBe("live-no-response");
+    expect(noResponse.refusalReason).toBe("startup-failure");
 
     const noPidDir = root();
     const noPidSupervisor = managedSupervisor((spec) => ({ kind: "registered-running-valid", managerPid: 200, scopeDigest: spec.scopeDigest, nonce: spec.nonce, name: spec.name }));

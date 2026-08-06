@@ -794,6 +794,43 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(calls).toBe(4);
   });
 
+  it("adopts the same running manager across independent fresh candidate nonces", async () => {
+    const priorNonce = "persisted-running-nonce";
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        healthy(4242), healthy(4242), response({}, 200),
+        healthy(4242), healthy(4242), response({}, 200),
+      ]),
+    });
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      const result = {
+        ...staleObservation(spec, { nonce: priorNonce }),
+        kind: "registered-running-valid",
+      } as SupervisorObservation;
+      return result;
+    });
+    writeFileSync(fixture.pidPath, "4242");
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+
+    const first = await ensureDaemon(optionsFor(fixture, {
+      _supervisorNonceOverride: () => "fresh-candidate-one",
+    }));
+    writeFileSync(fixture.pidPath, "4242");
+    const second = await ensureDaemon(optionsFor(fixture, {
+      _supervisorNonceOverride: () => "fresh-candidate-two",
+    }));
+
+    expect(first).toMatchObject({ connected: true, spawned: false, pid: 4242 });
+    expect(second).toMatchObject({ connected: true, spawned: false, pid: 4242 });
+    expect(fixture.probe.mock.calls.map(([spec]) => (spec as SupervisorSpec).nonce)).toEqual([
+      "fresh-candidate-one", priorNonce, priorNonce, priorNonce,
+      "fresh-candidate-two", priorNonce, priorNonce, priorNonce,
+    ]);
+    expect(fixture.start).not.toHaveBeenCalled();
+    expect(fixture.stopAndStart).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["linux", "systemd-user"],
     ["darwin", "launchd-user"],
@@ -1157,6 +1194,14 @@ describe("issue 400 managed ensure admission matrix", () => {
   });
 
   it("refuses running managers on no response, probe races, invalid responses, or failed auth", async () => {
+    const ordinary = createFixture({ fetch: sequenceFetch([new Error("offline")]), isAlive: () => true });
+    const ordinarySleep = vi.fn(async () => undefined);
+    setRunningProbe(ordinary);
+    await expect(ensureDaemon(optionsFor(ordinary, { _sleepOverride: ordinarySleep }))).resolves.toMatchObject({
+      refusalReason: "live-no-response",
+    });
+    expect(ordinarySleep).not.toHaveBeenCalled();
+
     const noResponse = createFixture({ fetch: sequenceFetch([new Error("offline")]), isAlive: () => true });
     setRunningProbe(noResponse);
     noResponse.probe
@@ -1181,6 +1226,144 @@ describe("issue 400 managed ensure admission matrix", () => {
     setRunningProbe(unauthenticated);
     writeFileSync(unauthenticated.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(unauthenticated))).resolves.toMatchObject({ refusalReason: "response-auth-failure" });
+  });
+
+  it("waits for an authorized replacement to publish PID and health, while fencing manager drift", async () => {
+    const preAdmissionDrift = createFixture({
+      fetch: sequenceFetch([new Error("replacement is still booting")]),
+      isAlive: () => true,
+    });
+    preAdmissionDrift.probe.mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 5253 }));
+    await expect(ensureDaemon(optionsFor(preAdmissionDrift, {
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 5252,
+      _supervisorNonceOverride: () => "replacement-nonce",
+    }))).resolves.toMatchObject({ refusalReason: "ambiguous" });
+    expect(preAdmissionDrift.stopAndAwaitAbsent).not.toHaveBeenCalled();
+
+    let now = 0;
+    let replacement!: Fixture;
+    const sleep = vi.fn(async () => {
+      now += 1;
+      writeFileSync(replacement.pidPath, "5252");
+    });
+    replacement = createFixture({
+      fetch: sequenceFetch([new Error("replacement is still booting"), healthy(5252), healthy(5252), response({}, 200)]),
+      isAlive: (pid) => pid === 5252,
+      sleep,
+    });
+    replacement.probe.mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 5252 }));
+    writeFileSync(replacement.tokenPath, "replacement-token", { mode: 0o600 });
+
+    const replacementResult = await ensureDaemon(optionsFor(replacement, {
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 5252,
+      _supervisorNonceOverride: () => "replacement-nonce",
+      _monotonicNowOverride: () => now,
+      _sleepOverride: sleep,
+    }));
+    expect(replacementResult).toMatchObject({ connected: true, pid: 5252 });
+    expect(sleep).toHaveBeenCalledOnce();
+    expect(replacement.stopAndAwaitAbsent).not.toHaveBeenCalled();
+    expect(replacement.probe.mock.calls).toHaveLength(4);
+    expect(replacement.probe.mock.calls.every(([spec]) => (spec as SupervisorSpec).nonce === "replacement-nonce")).toBe(true);
+
+    let driftProbeCalls = 0;
+    const drift = createFixture({
+      fetch: sequenceFetch([new Error("replacement is still booting")]),
+      isAlive: () => true,
+    });
+    drift.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      driftProbeCalls += 1;
+      return observation(spec, "registered-running-valid", { managerPid: driftProbeCalls === 1 ? 5252 : 5253 });
+    });
+    await expect(ensureDaemon(optionsFor(drift, {
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 5252,
+      _supervisorNonceOverride: () => "replacement-nonce",
+      _sleepOverride: vi.fn(async () => undefined),
+    }))).resolves.toMatchObject({ refusalReason: "ambiguous" });
+    expect(drift.stopAndAwaitAbsent).not.toHaveBeenCalled();
+
+    let finalDriftProbeCalls = 0;
+    const finalDrift = createFixture({
+      fetch: sequenceFetch([new Error("replacement is still booting"), new Error("replacement is still booting")]),
+      isAlive: () => true,
+    });
+    finalDrift.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      finalDriftProbeCalls += 1;
+      return observation(spec, "registered-running-valid", { managerPid: finalDriftProbeCalls < 3 ? 5252 : 5253 });
+    });
+    await expect(ensureDaemon(optionsFor(finalDrift, {
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 5252,
+      _supervisorNonceOverride: () => "replacement-nonce",
+    }))).resolves.toMatchObject({ refusalReason: "ambiguous" });
+    expect(finalDrift.stopAndAwaitAbsent).not.toHaveBeenCalled();
+
+    let admissionDriftProbeCalls = 0;
+    const admissionDrift = createFixture({
+      fetch: sequenceFetch([healthy(5252)]),
+      isAlive: () => true,
+    });
+    admissionDrift.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      admissionDriftProbeCalls += 1;
+      return observation(spec, "registered-running-valid", { managerPid: admissionDriftProbeCalls === 1 ? 5252 : 5253 });
+    });
+    await expect(ensureDaemon(optionsFor(admissionDrift, {
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 5252,
+      _supervisorNonceOverride: () => "replacement-nonce",
+    }))).resolves.toMatchObject({ refusalReason: "ambiguous" });
+    expect(admissionDrift.stopAndAwaitAbsent).not.toHaveBeenCalled();
+
+    const admissionProbeFailure = createFixture({
+      fetch: sequenceFetch([new Error("replacement is still booting")]),
+      isAlive: () => true,
+    });
+    admissionProbeFailure.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 5252 }))
+      .mockRejectedValue(new Error("manager probe failed"));
+    await expect(ensureDaemon(optionsFor(admissionProbeFailure, {
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 5252,
+      _supervisorNonceOverride: () => "replacement-nonce",
+    }))).resolves.toMatchObject({ refusalReason: "ambiguous" });
+    expect(admissionProbeFailure.stopAndAwaitAbsent).not.toHaveBeenCalled();
+
+    const finalProbeFailure = createFixture({
+      fetch: sequenceFetch([new Error("replacement is still booting"), new Error("replacement is still booting")]),
+      isAlive: () => true,
+    });
+    finalProbeFailure.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 5252 }))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 5252 }))
+      .mockRejectedValue(new Error("manager probe failed"));
+    await expect(ensureDaemon(optionsFor(finalProbeFailure, {
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 5252,
+      _supervisorNonceOverride: () => "replacement-nonce",
+    }))).resolves.toMatchObject({ refusalReason: "ambiguous" });
+    expect(finalProbeFailure.stopAndAwaitAbsent).not.toHaveBeenCalled();
+
+    for (const mode of ["before-wait", "after-wait"] as const) {
+      let clockReads = 0;
+      const timeout = createFixture({
+        fetch: sequenceFetch([new Error("replacement is still booting")]),
+        isAlive: () => true,
+      });
+      timeout.probe.mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 5252 }));
+      await expect(ensureDaemon(optionsFor(timeout, {
+        _managedOperationAuthorized: true,
+        _managedOperationManagerPid: 5252,
+        _supervisorNonceOverride: () => "replacement-nonce",
+        _monotonicNowOverride: () => {
+          clockReads += 1;
+          return mode === "before-wait" ? (clockReads === 3 ? 1_000 : 0) : (clockReads >= 4 ? 1_000 : 0);
+        },
+      }))).resolves.toMatchObject({ refusalReason: "startup-failure" });
+      expect(timeout.stopAndAwaitAbsent).toHaveBeenCalledOnce();
+    }
   });
 
   it("refuses running managers when re-probe or identity admission fails", async () => {
