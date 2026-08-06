@@ -57,6 +57,28 @@ export const MANAGED_LAUNCH_ENV_ALLOWLIST = Object.freeze([
   "LCM_SUMMARY_MODEL",
   "LCM_POSTGRES_CA_FILE",
 ] as const);
+/**
+ * Locale and time-zone variables remain part of the bounded child launch, but
+ * are shell-local presentation preferences rather than manager identity.  A
+ * doctor or recovery caller must therefore be able to admit the same managed
+ * unit when these values differ.  Keep this list explicit so every other
+ * allow-listed value remains bound to manager admission.
+ */
+const MANAGED_LAUNCH_ENV_PRESENTATION_NAMES: ReadonlySet<string> = new Set([
+  "LANG",
+  "LANGUAGE",
+  "LC_ALL",
+  "LC_COLLATE",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "LC_MONETARY",
+  "LC_NUMERIC",
+  "LC_TIME",
+  "TZ",
+]);
+const MANAGED_LAUNCH_ENV_IDENTITY_NAMES: ReadonlySet<string> = new Set(
+  MANAGED_LAUNCH_ENV_ALLOWLIST.filter((name) => !MANAGED_LAUNCH_ENV_PRESENTATION_NAMES.has(name)),
+);
 const MANAGED_LAUNCH_ENV_VALUE_MAX_BYTES = 4096;
 const MANAGED_ENV_EXECUTABLE = "/usr/bin/env";
 const MANAGED_LAUNCH_ENV_DIGEST_LENGTH = 64;
@@ -1718,6 +1740,7 @@ export function managedLaunchEnvironmentDigest(
   // systemd launch-assignment path, after manager preflight has succeeded.
   const values = new Map<string, string>();
   for (const [name, value] of Object.entries(spec.launchEnvironment ?? environment)) {
+    if (!MANAGED_LAUNCH_ENV_IDENTITY_NAMES.has(name)) continue;
     launchEnvironmentValue(values, name, value);
   }
   const canonical = [...values.entries()].sort(([left], [right]) => left.localeCompare(right));

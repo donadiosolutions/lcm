@@ -465,6 +465,70 @@ describe("systemd-user supervisor", () => {
     }
   });
 
+  it("admits the same stable launch identity across locale and time-zone projections", async () => {
+    const root = makeRoot();
+    const common = {
+      HOME: "/home/alice",
+      PATH: "/usr/bin",
+      USER: "alice",
+      LCM_SUMMARY_PROVIDER: "disabled",
+      LCM_SUMMARY_MODEL: "model",
+    };
+    const environments = [
+      {
+        ...common,
+        LANG: "C.UTF-8",
+        LANGUAGE: "C",
+        LC_ALL: "C.UTF-8",
+        LC_COLLATE: "C.UTF-8",
+        LC_CTYPE: "C.UTF-8",
+        LC_MESSAGES: "C.UTF-8",
+        LC_MONETARY: "C.UTF-8",
+        LC_NUMERIC: "C.UTF-8",
+        LC_TIME: "C.UTF-8",
+        TZ: "UTC",
+      },
+      {
+        ...common,
+        LANG: "pt_BR.UTF-8",
+        LANGUAGE: "pt_BR:pt",
+        LC_ALL: "pt_BR.UTF-8",
+        LC_COLLATE: "pt_BR.UTF-8",
+        LC_CTYPE: "pt_BR.UTF-8",
+        LC_MESSAGES: "pt_BR.UTF-8",
+        LC_MONETARY: "pt_BR.UTF-8",
+        LC_NUMERIC: "pt_BR.UTF-8",
+        LC_TIME: "pt_BR.UTF-8",
+        TZ: "America/Sao_Paulo",
+      },
+    ];
+    const specs = environments.map((launchEnvironment) => createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: root,
+      port: 3737,
+      nonce: "locale-stable",
+      executable: "/usr/bin/node",
+      args: ["/opt/lcm/dist/lcm.mjs", "daemon", "run-managed"],
+      launchEnvironment,
+    }));
+    const digestA = managedLaunchEnvironmentDigest(specs[0]!, "systemd-user", process.getuid?.() ?? -1, environments[0]!);
+    const digestB = managedLaunchEnvironmentDigest(specs[1]!, "systemd-user", process.getuid?.() ?? -1, environments[1]!);
+    expect(digestA).toBe(digestB);
+    const directEnvironmentSpec = makeSpec("systemd-user", root, { nonce: "direct-filter" });
+    expect(managedLaunchEnvironmentDigest(
+      directEnvironmentSpec,
+      "systemd-user",
+      process.getuid?.() ?? -1,
+      { ...environments[0], OPENAI_API_KEY: "ambient-secret" },
+    )).toBe(managedLaunchEnvironmentDigest(directEnvironmentSpec, "systemd-user", process.getuid?.() ?? -1, environments[0]!));
+    const runner = fakeRunner([{ code: 0, stdout: managerText(specs[0]!, "active", 4321, "running", environments[0]!) }]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      environment: environments[1],
+      platform: "linux",
+    }).probe(specs[1]!)).resolves.toMatchObject({ kind: "registered-running-valid", managerPid: 4321 });
+  });
+
   it("rejects clean-environment drift before admitting a registered unit", async () => {
     const root = makeRoot();
     const original = makeSpec("systemd-user", root, { launchEnvironment: { PATH: "/usr/bin" } });
@@ -488,6 +552,44 @@ describe("systemd-user supervisor", () => {
       reason: "metadata-mismatch",
     });
     expect(runner.calls).toHaveLength(1);
+  });
+
+  it.each([
+    ["HOME", "/home/bob"],
+    ["PATH", "/opt/bin"],
+    ["LCM_SUMMARY_PROVIDER", "openai"],
+    ["LCM_SUMMARY_MODEL", "different-model"],
+    ["LCM_POSTGRES_CA_FILE", "/etc/ssl/other-ca.pem"],
+  ] as const)("refuses behavior-relevant managed environment drift in %s", async (name, value) => {
+    const root = makeRoot();
+    const originalEnvironment = {
+      HOME: "/home/alice",
+      PATH: "/usr/bin",
+      USER: "alice",
+      LCM_SUMMARY_PROVIDER: "disabled",
+      LCM_SUMMARY_MODEL: "model",
+      LCM_POSTGRES_CA_FILE: "/etc/ssl/ca.pem",
+    };
+    const driftedEnvironment = { ...originalEnvironment, [name]: value };
+    const original = makeSpec("systemd-user", root, { launchEnvironment: originalEnvironment, nonce: "behavior-drift" });
+    const drifted = createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: root,
+      port: original.port,
+      nonce: original.nonce,
+      executable: original.executable,
+      args: original.args,
+      launchEnvironment: driftedEnvironment,
+    });
+    const runner = fakeRunner([{ code: 0, stdout: managerText(original, "active", 4321, "running", originalEnvironment) }]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      environment: driftedEnvironment,
+      platform: "linux",
+    }).probe(drifted)).resolves.toMatchObject({
+      kind: "registered-stale-config",
+      reason: "metadata-mismatch",
+    });
   });
 
   it("probes unavailable, absent, valid running, terminal, stale, collision, and ambiguous states", async () => {

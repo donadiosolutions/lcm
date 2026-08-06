@@ -440,15 +440,21 @@ allowance preserves deterministic isolation for in-process parallel tests. The
 `env -i` process is a short-lived
 same-user launch boundary; it does not grant a different privilege or user
 identity, and the service manager remains the lifecycle authority. A running or
-otherwise executable managed launch must authenticate the current filtered
-environment exactly. If a PATH, HOME, locale, socket address, or other
-allow-listed value changes while an old launch descriptor remains, LCM never
-executes that old descriptor. After the manager has independently proved exact
-absence, LCM may authenticate the old descriptor's bounded, non-secret
-allow-listed values solely to remove its canonical plist and owned credential
-directory before writing a new descriptor with the current values. Malformed,
-out-of-scope, or uncontrolled descriptors still fail closed and remain as
-collision evidence.
+otherwise executable managed launch must authenticate the current identity-
+bearing environment exactly. Locale and time-zone presentation variables
+(`LANG`, `LANGUAGE`, `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`,
+`LC_MONETARY`, `LC_NUMERIC`, `LC_TIME`, and `TZ`) remain bounded child-launch
+values but are intentionally excluded from manager identity, so a healthy
+stable unit remains admissible when callers use different shell presentation
+preferences. Other allow-listed values, such as `PATH`, `HOME`, socket
+addresses, provider configuration, and the PostgreSQL CA pathname, remain
+identity-bound. If one of those identity-bearing values changes while an old
+launch descriptor remains, LCM never executes that old descriptor. After the
+manager has independently proved exact absence, LCM may authenticate the old
+descriptor's bounded, non-secret allow-listed values solely to remove its
+canonical plist and owned credential directory before writing a new descriptor
+with the current values. Malformed, out-of-scope, or uncontrolled descriptors
+still fail closed and remain as collision evidence.
 
 When the Claude process provider is used, `CLAUDE_CODE_OAUTH_TOKEN` is staged
 through the same private one-launch credential mechanism. It is restored only
