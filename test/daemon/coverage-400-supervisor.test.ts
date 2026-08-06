@@ -878,6 +878,33 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(3);
   });
 
+  it("retires an exact failed launchd registration before one bounded start retry", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const terminal = { code: 0, stdout: launchdText(value, "exited", 0) };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      terminal,
+      terminal,
+      terminal,
+      { code: 0, stdout: "bootout" },
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 549) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep: async () => undefined,
+    }).start(value)).resolves.toMatchObject({ managerPid: 549 });
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(1);
+  });
+
   it("preserves a failed launchd bootstrap when a retry proof is not absent", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);

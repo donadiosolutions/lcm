@@ -2334,6 +2334,7 @@ export function createSupervisor(
     } catch (error) {
       // Never clean a concurrent winner. Only remove this nonce's private
       // launch files when the manager proves that the exact spec is absent.
+      let retiredExactTerminal = false;
       try {
         const after = await probe(spec);
         if (after.kind === "absent") {
@@ -2366,7 +2367,11 @@ export function createSupervisor(
             // nonce, so retire it through the manager and prove absence before
             // deleting its one-launch credentials or private launch plist.
             try {
-              await stopAndAwaitAbsent(spec);
+              // Preserve this launch's staged credentials while retiring the
+              // exact failed registration. They have not been admitted yet
+              // and are required by the one bounded retry below.
+              await stopAndAwaitAbsentInternal(spec, false, undefined, false);
+              retiredExactTerminal = true;
             } catch {
               // Preserve terminal evidence when stop/absence cannot be proven.
               throw error;
@@ -2376,6 +2381,7 @@ export function createSupervisor(
       } catch {
         // Preserve unresolved manager evidence.
       }
+      if (retiredExactTerminal && !terminalRecreated) return start(spec, true);
       throw commandFailedError();
     }
   };

@@ -664,6 +664,17 @@ describe("real launchd daemon lifecycle", () => {
           credentialClaimed: true,
         });
         expect(JSON.stringify(initialHealth).includes(secretValue)).toBe(false);
+        expect(existsSync(credentialFile)).toBe(false);
+
+        // The production lifecycle stages a fresh one-shot snapshot before an
+        // explicit manager restart. This integration calls the low-level
+        // supervisor directly, so model that lifecycle step explicitly rather
+        // than racing reuse of the file consumed by the first daemon.
+        const restagedDirectory = createManagedCredentialDirectory(fixture.stateRoot, fixture.nonce);
+        const restagedCredentialFile = writeManagedCredentialFiles(restagedDirectory, {
+          OPENAI_API_KEY: secretValue,
+        })[0];
+        expect(restagedCredentialFile).toBe(credentialFile);
 
         writeFileSync(wedgePath, "wedged\n");
         const controller = new AbortController();
