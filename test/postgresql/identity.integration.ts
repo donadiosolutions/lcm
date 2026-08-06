@@ -30,7 +30,10 @@ async function grantIdentityRuntimePrivileges(
   database: PostgreSqlTestDatabase,
 ): Promise<void> {
   const template = readFileSync(
-    join(process.cwd(), "docs", "postgresql-runtime-identity-grants.sql"),
+    join(
+      process.cwd(),
+      "src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql",
+    ),
     "utf8",
   );
   const sql = template
@@ -67,7 +70,10 @@ describe("PostgreSQL 18 machine and project identities", () => {
   it("fails without identity grants and the reviewed grant script is least-privilege", async () => {
     await withPostgreSqlTestDatabase("identity-grants", async (database) => {
       const grantScript = readFileSync(
-        join(process.cwd(), "docs", "postgresql-runtime-identity-grants.sql"),
+        join(
+          process.cwd(),
+          "src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql",
+        ),
         "utf8",
       );
       expect(grantScript.startsWith("\\set ON_ERROR_STOP on\n")).toBe(true);

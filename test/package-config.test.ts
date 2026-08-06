@@ -9,6 +9,22 @@ import pkg from "../package.json";
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const PACKAGE_INVENTORY_TEST_TIMEOUT_MS = 45_000;
 const PACKAGE_COMMAND_TIMEOUT_MS = 30_000;
+const POSTGRESQL_REFERENCE_FILES = [
+  "postgresql-coordination.md",
+  "postgresql-development.md",
+  "postgresql-memory-administration.md",
+  "postgresql-native-transcripts.md",
+  "postgresql-runtime-conversation-grants.sql",
+  "postgresql-runtime-coordination-grants.sql",
+  "postgresql-runtime-identity-grants.sql",
+  "postgresql-runtime-memory-grants.sql",
+  "postgresql-runtime-search-grants.sql",
+  "postgresql-runtime-summary-context-grants.sql",
+  "postgresql-runtime-transcript-grants.sql",
+  "postgresql-schema.md",
+  "postgresql-search.md",
+  "postgresql-summary-context.md",
+] as const;
 
 function npmPackInventory(): string[] {
   const transcriptRuntime = resolve(
@@ -116,6 +132,7 @@ describe("package.json", () => {
 
   it("ships acknowledgments and npm-owned assets without Marketplace files", () => {
     expect(pkg.files).toContain("dist/");
+    expect(pkg.files).toContain("src/storage/postgresql/reference/");
     expect(pkg.files).toContain("ACKNOWLEDGMENTS.md");
     expect(pkg.files).not.toContain("lcm.mjs");
     expect(pkg.files).not.toContain("mcp.mjs");
@@ -123,7 +140,7 @@ describe("package.json", () => {
   });
 
   it(
-    "packs native transcript exports without Rust or restart-helper artifacts",
+    "packs native transcript exports and PostgreSQL references without native artifacts",
     { timeout: PACKAGE_INVENTORY_TEST_TIMEOUT_MS },
     () => {
       const paths = npmPackInventory();
@@ -131,9 +148,15 @@ describe("package.json", () => {
         expect.arrayContaining([
           "dist/src/storage/native-transcripts.d.ts",
           "dist/src/storage/native-transcripts.js",
-          "docs/postgresql-native-transcripts.md",
+          "docs/README.md",
+          ...POSTGRESQL_REFERENCE_FILES.map(
+            (fileName) => `src/storage/postgresql/reference/${fileName}`,
+          ),
         ]),
       );
+      expect(
+        paths.filter((path) => path.startsWith("docs/postgresql-")),
+      ).toEqual([]);
 
       const forbiddenArtifacts = paths.filter((path) =>
         /(^|\/)(?:native|target|rust)(?:\/|$)/iu.test(path)

@@ -235,7 +235,7 @@ those repositories are activated. Managed start/restart recognizes that authenti
 as daemon readiness; it does not treat PostgreSQL storage as ready and never
 falls back to SQLite after an explicit PostgreSQL selection. The internal readiness contract also requires
 the parity extensions at their current default versions in the `public` schema;
-see the [PostgreSQL schema reference](postgresql-schema.md#required-extensions-and-postgresql-version).
+see the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md#required-extensions-and-postgresql-version).
 
 The installed no-override PreCompact command (`lcm compact --hook`) is a
 best-effort exception to that fail-closed admission path. Before dispatch, its
@@ -312,63 +312,63 @@ changes ownership, or grants application privileges.
 
 After migration, apply only the reviewed scripts required by the repositories
 that this runtime role will use:
-[`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql),
-[`postgresql-runtime-conversation-grants.sql`](postgresql-runtime-conversation-grants.sql),
-[`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql),
+[`postgresql-runtime-identity-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql),
+[`postgresql-runtime-conversation-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-conversation-grants.sql),
+[`postgresql-runtime-transcript-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql),
 and
-[`postgresql-runtime-memory-grants.sql`](postgresql-runtime-memory-grants.sql).
+[`postgresql-runtime-memory-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-memory-grants.sql).
 Direct issue #90 coordination callers additionally use
-[`postgresql-runtime-coordination-grants.sql`](postgresql-runtime-coordination-grants.sql).
+[`postgresql-runtime-coordination-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql).
 Run them as an administrator, substituting the deployment's restricted runtime
 role:
 
 ```bash
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file docs/postgresql-runtime-identity-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file docs/postgresql-runtime-conversation-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-conversation-grants.sql
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file docs/postgresql-runtime-transcript-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file docs/postgresql-runtime-memory-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-memory-grants.sql
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file docs/postgresql-runtime-coordination-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql
 ```
 
 The transcript grant permits immutable inserts, provenance reads, and bounded
 checkpoint updates only; it grants no payload update, deletion, truncation, or
 unrelated table access. Applying it makes the programmatic repository usable,
 not the staged daemon/CLI routes. See
-[PostgreSQL native transcripts](postgresql-native-transcripts.md) before
+[PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) before
 running an explicit backfill.
 The memory grant permits direct use of the staged promoted-memory, recall,
 redaction-administration, and session-coordination repositories. Deletes are
 limited to their six owned mutable-state tables; generated search data is
 removed with promoted memory, while identity, conversations, summaries,
 transcripts, checkpoints, events, and leases are retained. See
-[PostgreSQL memory and administration](postgresql-memory-administration.md).
+[PostgreSQL memory and administration](../src/storage/postgresql/reference/postgresql-memory-administration.md).
 The coordination grant permits project-scoped lease reads, bounded deletes,
 column-limited acquisition/renewal/release updates, fencing-sequence `USAGE`,
 and column-limited passive-inbox claims. It grants no inbox insertion,
 completion, deletion, payload update, table truncation, sequence inspection or
 restart, schema mutation, or unrelated-domain access. Applying it exposes only
 the staged programmatic primitives described in
-[PostgreSQL cross-machine coordination](postgresql-coordination.md); it does
+[PostgreSQL cross-machine coordination](../src/storage/postgresql/reference/postgresql-coordination.md); it does
 not enable the application backend or start a worker.
 
 Finally restore `LCM_POSTGRES_URL` to the restricted runtime-role URL, run
 `lcm machine register`, pair projects explicitly, and restart the daemon.
 Never leave the daemon or identity commands configured with migration-owner
-credentials. See the [PostgreSQL schema reference](postgresql-schema.md) for
+credentials. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for
 the exact extension, role, ownership, ACL, backup, and recovery contracts.
 
 The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,
@@ -472,7 +472,7 @@ for backend ownership, transaction, capability, health, and adapter-extension
 contracts.
 
 Developers implementing a PostgreSQL repository should use the isolated
-container workflow in [PostgreSQL development](postgresql-development.md). It
+container workflow in [PostgreSQL development](../src/storage/postgresql/reference/postgresql-development.md). It
 uses disposable credentials and databases and must not be pointed at a shared
 or production PostgreSQL cluster.
 

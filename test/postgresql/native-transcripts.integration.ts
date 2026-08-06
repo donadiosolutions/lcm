@@ -32,7 +32,10 @@ async function grantTranscriptRuntimePrivileges(
   database: PostgreSqlTestDatabase,
 ): Promise<void> {
   const template = readFileSync(
-    join(process.cwd(), "docs", "postgresql-runtime-transcript-grants.sql"),
+    join(
+      process.cwd(),
+      "src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql",
+    ),
     "utf8",
   );
   const sql = template

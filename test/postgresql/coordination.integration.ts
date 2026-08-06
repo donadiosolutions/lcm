@@ -34,7 +34,10 @@ async function grantCoordinationRuntimePrivileges(
   database: PostgreSqlTestDatabase,
 ): Promise<void> {
   const template = readFileSync(
-    join(process.cwd(), "docs", "postgresql-runtime-coordination-grants.sql"),
+    join(
+      process.cwd(),
+      "src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql",
+    ),
     "utf8",
   );
   const sql = template

@@ -30,6 +30,7 @@
   "files": [
     "dist/",
     "docs/",
+    "src/storage/postgresql/reference/",
     "README.md",
     "ACKNOWLEDGMENTS.md",
     "LICENSE"

@@ -24,7 +24,10 @@ async function grantMemoryRuntimePrivileges(
   database: PostgreSqlTestDatabase,
 ): Promise<void> {
   const template = readFileSync(
-    join(process.cwd(), "docs", "postgresql-runtime-memory-grants.sql"),
+    join(
+      process.cwd(),
+      "src/storage/postgresql/reference/postgresql-runtime-memory-grants.sql",
+    ),
     "utf8",
   );
   const sql = template

@@ -352,7 +352,7 @@ as the migration owner:
 ```bash
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file=docs/postgresql-runtime-transcript-grants.sql
+  --file=src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
 ```
 
 Replace `lcm_runtime` with the existing restricted runtime role. The script

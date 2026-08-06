@@ -27,7 +27,7 @@ script as an administrator:
 ```bash
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file docs/postgresql-runtime-coordination-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql
 ```
 
 Replace `lcm_runtime` with the existing restricted runtime role. The script

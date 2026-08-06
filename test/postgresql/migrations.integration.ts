@@ -69,7 +69,10 @@ async function applySummaryContextRuntimeGrant(
   const template = readFileSync(
     join(
       process.cwd(),
-      "docs",
+      "src",
+      "storage",
+      "postgresql",
+      "reference",
       "postgresql-runtime-summary-context-grants.sql",
     ),
     "utf8",
@@ -91,7 +94,10 @@ async function applyCoordinationRuntimeGrant(
   const template = readFileSync(
     join(
       process.cwd(),
-      "docs",
+      "src",
+      "storage",
+      "postgresql",
+      "reference",
       "postgresql-runtime-coordination-grants.sql",
     ),
     "utf8",

@@ -24,13 +24,11 @@ const guidanceSurfaceFiles = [
   ".agents/skills/lcm-dogfood/SKILL.md", ".agents/skills/lcm-dogfood/references/checks.md",
   ".agents/skills/lcm-dogfood/references/known-issues.md",
   ".agents/skills/lcm-e2e/SKILL.md", ".agents/skills/lcm-e2e/checklist.md",
-  ".agents/skills/lcm-release/SKILL.md", "docs/agent-tools.md", "docs/architecture.md",
-  "docs/cli.md", "docs/configuration.md", "docs/daemon-restart-recovery.md",
+  ".agents/skills/lcm-release/SKILL.md", "docs/README.md", "docs/agent-tools.md",
+  "docs/architecture.md", "docs/cli.md", "docs/configuration.md",
+  "docs/daemon-restart-recovery.md",
   "docs/external-admission.md", "docs/fts5.md", "docs/hook-protocol.md",
-  "docs/issue-triage.md", "docs/passive-learning.md", "docs/postgresql-coordination.md",
-  "docs/postgresql-development.md", "docs/postgresql-memory-administration.md",
-  "docs/postgresql-native-transcripts.md", "docs/postgresql-schema.md",
-  "docs/postgresql-search.md", "docs/postgresql-summary-context.md", "docs/privacy.md",
+  "docs/issue-triage.md", "docs/passive-learning.md", "docs/privacy.md",
   "docs/project-identity.md", "docs/releasing.md", "docs/tag-schema.md",
   "docs/vscode-codex.md", "src/cli-help.ts", "src/connectors/templates/base.md",
   "src/connectors/templates/mcp-base.md",
@@ -47,7 +45,14 @@ const guidanceSurfaceFiles = [
   "src/connectors/templates/claude/commands/lcm-promote.md",
   "src/connectors/templates/claude/commands/lcm-sensitive.md",
   "src/connectors/templates/claude/commands/lcm-stats.md",
-  "src/connectors/templates/claude/commands/lcm-status.md"
+  "src/connectors/templates/claude/commands/lcm-status.md",
+  "src/storage/postgresql/reference/postgresql-coordination.md",
+  "src/storage/postgresql/reference/postgresql-development.md",
+  "src/storage/postgresql/reference/postgresql-memory-administration.md",
+  "src/storage/postgresql/reference/postgresql-native-transcripts.md",
+  "src/storage/postgresql/reference/postgresql-schema.md",
+  "src/storage/postgresql/reference/postgresql-search.md",
+  "src/storage/postgresql/reference/postgresql-summary-context.md"
 ] as const;
 
 const compatibilityFiles = [

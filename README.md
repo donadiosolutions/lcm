@@ -23,6 +23,7 @@
 <p align="center">
   <a href="#runtime-model">Runtime Model</a> &bull;
   <a href="#installation">Installation</a> &bull;
+  <a href="docs/README.md">Documentation</a> &bull;
   <a href="#mcp-tools">MCP Tools</a> &bull;
   <a href="#development">Development</a>
 </p>
@@ -412,36 +413,36 @@ registration and the explicit project binding, then fail safely at the
 unavailable repository boundary. Connection credentials stay out of JSON and
 effective configuration output. Provision the schema as its migration owner
 with `lcm postgres migrate`, then apply the reviewed
-[identity](docs/postgresql-runtime-identity-grants.sql) and
-[conversation](docs/postgresql-runtime-conversation-grants.sql) runtime grants,
+[identity](src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql) and
+[conversation](src/storage/postgresql/reference/postgresql-runtime-conversation-grants.sql) runtime grants,
 plus the separate
-[native-transcript](docs/postgresql-runtime-transcript-grants.sql) grants when
+[native-transcript](src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql) grants when
 that repository is used, and the
-[memory and administration](docs/postgresql-runtime-memory-grants.sql) grants
+[memory and administration](src/storage/postgresql/reference/postgresql-runtime-memory-grants.sql) grants
 for the #88 adapters. Direct distributed-coordination callers also apply the
 separate
-[coordination](docs/postgresql-runtime-coordination-grants.sql) grants. The
+[coordination](src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql) grants. The
 same grant script supplies only the additional column-scoped inbox writes,
 applied-row deletion, and identity-sequence usage required by staged #91
 delivery; it does not grant table-wide writes or sequence inspection. The
 staged summary, context, and large-file adapters use their dedicated
-[summary/context](docs/postgresql-runtime-summary-context-grants.sql) grants.
+[summary/context](src/storage/postgresql/reference/postgresql-runtime-summary-context-grants.sql) grants.
 See
 [storage backend configuration](docs/configuration.md#storage-backend)
-for operators, the [PostgreSQL schema reference](docs/postgresql-schema.md) for
+for operators, the [PostgreSQL schema reference](src/storage/postgresql/reference/postgresql-schema.md) for
 the 23-table data and namespace-aware extension contract, and the
 [storage repository architecture](docs/architecture.md#storage-repository-architecture)
 for repository ownership, lifetimes, transactions, and the local-outbox boundary.
-The [native-transcript guide](docs/postgresql-native-transcripts.md) defines
+The [native-transcript guide](src/storage/postgresql/reference/postgresql-native-transcripts.md) defines
 sanitized “raw” records, provenance, checkpoints, quarantine, and rollback.
-The [PostgreSQL memory and administration guide](docs/postgresql-memory-administration.md)
+The [PostgreSQL memory and administration guide](src/storage/postgresql/reference/postgresql-memory-administration.md)
 defines metadata, tag, recall, counter, coordination, and scoped-purge
 semantics.
-The [PostgreSQL cross-machine coordination guide](docs/postgresql-coordination.md)
+The [PostgreSQL cross-machine coordination guide](src/storage/postgresql/reference/postgresql-coordination.md)
 defines transaction-lock, fenced-lease, final-write fence, queue-claim,
 delivery, acknowledgement, replay, quarantine, cleanup, diagnostic, and
 crash-recovery semantics.
-The [PostgreSQL summary, context, and large-file guide](docs/postgresql-summary-context.md)
+The [PostgreSQL summary, context, and large-file guide](src/storage/postgresql/reference/postgresql-summary-context.md)
 defines graph, coverage, context-range, ordering, lock/fence, grant, query-plan,
 diagnostic, and recovery semantics.
 
@@ -457,7 +458,7 @@ npm run test:postgresql
 
 The PostgreSQL command owns an exact PostgreSQL 18 container and all temporary
 TLS, network, volume, credential, and database resources. See
-[PostgreSQL development](docs/postgresql-development.md) before changing its
+[PostgreSQL development](src/storage/postgresql/reference/postgresql-development.md) before changing its
 image digest, migrations, runtime, or cleanup guards.
 
 ### Repository layout
