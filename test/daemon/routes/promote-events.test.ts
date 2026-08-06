@@ -143,6 +143,7 @@ describe("promote-events route", () => {
 
   afterEach(async () => {
     const cleanupErrors: unknown[] = [];
+    attemptCleanup(cleanupErrors, () => vi.useRealTimers());
     const settled = await Promise.allSettled(startedPromotionOperations);
     for (const result of settled) {
       if (result.status === "rejected") cleanupErrors.push(result.reason);
@@ -260,7 +261,85 @@ describe("promote-events route", () => {
     expect(remaining).toHaveLength(0);
   });
 
-  it("parks events for a deleted cwd without deleting their historical or delivery rows", async () => {
+  it("defers a transiently unavailable cwd and resets its confirmation after recovery", async () => {
+    const transientCwd = join(dir, "transient-project");
+    mkdirSync(transientCwd);
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: "retry after remount", priority: 1 }, "PostToolUse");
+    edb.close();
+    rmSync(transientCwd, { recursive: true, force: true });
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+
+    const first = await promoteEventsForCwd(makeConfig(), transientCwd);
+    const immediateRepeat = await promoteEventsForCwd(makeConfig(), transientCwd);
+
+    expect(first).toMatchObject({
+      promoted: 0,
+      skipped: 0,
+      errors: 0,
+      deferred: {
+        kind: "awaiting-confirmation",
+        reason: "unavailable-cwd",
+        observations: 1,
+        retryAfterMs: 5 * 60 * 1000,
+      },
+    });
+    expect(immediateRepeat).toMatchObject({
+      deferred: { observations: 1, retryAfterMs: 5 * 60 * 1000 },
+    });
+    const deferred = new EventsDb(sidecarPath);
+    expect(deferred.getUnprocessed()).toHaveLength(1);
+    expect(deferred.getHealthStats().deliveryPending).toBe(1);
+    deferred.close();
+    expect(vi.mocked(deduplicateAndInsert)).not.toHaveBeenCalled();
+
+    mkdirSync(transientCwd);
+    const projectDb = setupProjectDb(transientCwd);
+    projectDb.close();
+    await expect(promoteEventsForCwd(makeConfig(), transientCwd)).resolves.toMatchObject({
+      promoted: 1,
+      errors: 0,
+    });
+
+    const resumed = new EventsDb(sidecarPath);
+    resumed.insertEvent("s2", { type: "decision", category: "decision", data: "require fresh confirmation", priority: 1 }, "PostToolUse");
+    resumed.close();
+    rmSync(transientCwd, { recursive: true, force: true });
+    await expect(promoteEventsForCwd(makeConfig(), transientCwd)).resolves.toMatchObject({
+      deferred: { observations: 1 },
+    });
+  });
+
+  it("restarts missing-cwd evidence when the confirming observation exceeds its total window", async () => {
+    const deletedCwd = join(dir, "expired-confirmation-project");
+    mkdirSync(deletedCwd);
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: "do not park after a stale confirmation", priority: 1 }, "PostToolUse");
+    edb.close();
+    rmSync(deletedCwd, { recursive: true, force: true });
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+
+    await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
+      deferred: { observations: 1 },
+    });
+    vi.advanceTimersByTime(20 * 60 * 1000);
+    await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
+      deferred: { observations: 2 },
+    });
+    vi.advanceTimersByTime(20 * 60 * 1000);
+    await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
+      deferred: { observations: 1 },
+    });
+
+    const pending = new EventsDb(sidecarPath);
+    expect(pending.getUnprocessed()).toHaveLength(1);
+    pending.close();
+    expect(vi.mocked(deduplicateAndInsert)).not.toHaveBeenCalled();
+  });
+
+  it("parks events only after stable missing-cwd evidence without deleting historical or delivery rows", async () => {
     const deletedCwd = join(dir, "deleted-project");
     mkdirSync(deletedCwd);
     const edb = new EventsDb(sidecarPath);
@@ -268,7 +347,17 @@ describe("promote-events route", () => {
     edb.insertEvent("s1", { type: "git", category: "git", data: "retain this delivery", priority: 2 }, "PostToolUse");
     edb.close();
     rmSync(deletedCwd, { recursive: true, force: true });
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
 
+    await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
+      deferred: { observations: 1, retryAfterMs: 5 * 60 * 1000 },
+    });
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
+      deferred: { observations: 2, retryAfterMs: 5 * 60 * 1000 },
+    });
+    vi.advanceTimersByTime(5 * 60 * 1000);
     const result = await promoteEventsForCwd(makeConfig(), deletedCwd);
 
     expect(result).toMatchObject({
@@ -291,14 +380,30 @@ describe("promote-events route", () => {
     reopened.close();
   });
 
-  it("parks deleted-cwd events through a full drain without entering retry state", async () => {
+  it("marks a full drain incomplete until stable missing-cwd evidence permits parking", async () => {
     const deletedCwd = join(dir, "deleted-drain-project");
     mkdirSync(deletedCwd);
     const edb = new EventsDb(sidecarPath);
     edb.insertEvent("s1", { type: "decision", category: "decision", data: "drain and retain", priority: 1 }, "PostToolUse");
     edb.close();
     rmSync(deletedCwd, { recursive: true, force: true });
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
 
+    await expect(drainEventsForCwd(makeConfig(), deletedCwd, sidecarPath)).resolves.toMatchObject({
+      batches: 0,
+      incomplete: true,
+      skipped: 0,
+      errors: 0,
+      deferred: { observations: 1 },
+    });
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    await expect(drainEventsForCwd(makeConfig(), deletedCwd, sidecarPath)).resolves.toMatchObject({
+      batches: 0,
+      incomplete: true,
+      deferred: { observations: 2 },
+    });
+    vi.advanceTimersByTime(5 * 60 * 1000);
     const result = await drainEventsForCwd(makeConfig(), deletedCwd, sidecarPath);
 
     expect(result).toMatchObject({
@@ -319,13 +424,27 @@ describe("promote-events route", () => {
     const deletedCwd = join(dir, "deleted-without-sidecar");
     const missingSidecar = join(dir, "not-created.db");
 
+    await expect(promoteEventsForCwd(makeConfig(), deletedCwd, missingSidecar)).resolves.toMatchObject({
+      promoted: 0,
+      skipped: 0,
+      errors: 0,
+      terminal: { kind: "parked", reason: "unavailable-cwd" },
+      message: "no sidecar events to park for unavailable cwd",
+    });
     await expect(parkUnavailableCwdEvents(deletedCwd, missingSidecar)).resolves.toMatchObject({
       promoted: 0,
       skipped: 0,
       errors: 0,
       message: "no sidecar events to park for unavailable cwd",
     });
+    await expect(parkUnavailableCwdEvents(deletedCwd)).resolves.toMatchObject({
+      promoted: 0,
+      skipped: 0,
+      errors: 0,
+      message: "no sidecar events to park for unavailable cwd",
+    });
     expect(existsSync(missingSidecar)).toBe(false);
+    expect(existsSync(sidecarPath)).toBe(false);
   });
 
   it("reports an already-empty sidecar without changing its terminal state", async () => {

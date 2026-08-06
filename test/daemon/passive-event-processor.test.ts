@@ -163,6 +163,39 @@ describe("PassiveEventProcessor", () => {
     expect(deps.safeLogError).not.toHaveBeenCalled();
   });
 
+  it("retries a cwd awaiting absence confirmation without growing the error ledger", async () => {
+    const { deps } = timerDeps();
+    const promoteEventsForCwd = vi.fn().mockResolvedValue({
+      promoted: 0,
+      skipped: 0,
+      correlated: 0,
+      errors: 0,
+      deferred: {
+        kind: "awaiting-confirmation",
+        reason: "unavailable-cwd",
+        observations: 1,
+        retryAfterMs: 5 * 60 * 1000,
+      },
+      message: "cwd is unavailable; awaiting confirmation (1/3)",
+    });
+    const collectEventSidecars = vi.fn().mockReturnValue([{
+      cwd: "/temporarily-unavailable-project",
+      path: "/events/temporary.db",
+      unprocessed: 1,
+    }]);
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      collectEventSidecars: collectEventSidecars as any,
+      promoteEventsForCwd: promoteEventsForCwd as any,
+    });
+
+    await processor.runSweep();
+    await processor.runSweep();
+
+    expect(promoteEventsForCwd).toHaveBeenCalledTimes(2);
+    expect(deps.safeLogError).not.toHaveBeenCalled();
+  });
+
   it("does not requeue a terminal parked result at the batch boundary", async () => {
     const { deps } = timerDeps();
     const promoteEventsForCwd = vi.fn().mockResolvedValue({
