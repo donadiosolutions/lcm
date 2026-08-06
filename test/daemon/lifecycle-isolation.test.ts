@@ -66,10 +66,42 @@ type ScopeFixture = {
 };
 
 const roots: string[] = [];
+function shouldCollectSystemdBarrier(
+  command: string,
+  args: readonly string[],
+  status: number | null | undefined,
+  barrierDir: string | undefined,
+): boolean {
+  return command === "systemd-run"
+    && args.some(arg => arg.startsWith("--unit="))
+    && status === 0
+    && barrierDir !== undefined;
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+describe("systemd manager command-vector harness", () => {
+  it("collects readiness only after a successful systemd-run mutation", () => {
+    const unit = "lcm-daemon-0123456789abcdef0123.service";
+    const probeArgs = [
+      "--user",
+      "show",
+      "--no-pager",
+      "--property=LoadState,ActiveState,SubState,MainPID,Environment,ExecMainStartTimestamp,FragmentPath",
+      unit,
+    ] as const;
+    const startArgs = ["--user", "--no-block", `--unit=${unit}`, "/usr/bin/env", "-i"] as const;
+    expect(shouldCollectSystemdBarrier("systemctl", probeArgs, 0, "/tmp/barrier")).toBe(false);
+    expect(shouldCollectSystemdBarrier("systemd-run", startArgs, 0, "/tmp/barrier")).toBe(true);
+    expect(shouldCollectSystemdBarrier("systemd-run", startArgs, 1, "/tmp/barrier")).toBe(false);
+    expect(shouldCollectSystemdBarrier("systemd-run", startArgs, 0, undefined)).toBe(false);
+    expect(shouldCollectSystemdBarrier("systemd-run", [
+      "--user",
+    ], 0, "/tmp/barrier")).toBe(false);
+  });
 });
 
 function createFixture(
@@ -2384,7 +2416,7 @@ describe("same-user-systemd integration", () => {
     const builtCliUrl = pathToFileURL(join(process.cwd(), "dist", "bin", "lcm.js")).href;
     writeFileSync(
       entrypoint,
-      `import { runCli } from ${JSON.stringify(builtCliUrl)};\nawait runCli(process.argv);\n`,
+      `process.env.LCM_DAEMON_OWNER_ID = ${JSON.stringify(ownerId)};\nimport { runCli } from ${JSON.stringify(builtCliUrl)};\nawait runCli(process.argv);\n`,
     );
     const daemonPort = Number(
       process.env.LCM_LIFECYCLE_DAEMON_PORT
@@ -2469,7 +2501,7 @@ describe("same-user-systemd integration", () => {
       }
       const barrierDir = process.env.LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR;
       const expectedScopes = Number(process.env.LCM_LIFECYCLE_EXPECTED_SCOPES ?? "1");
-      if (result.status !== 0 || barrierDir === undefined || expectedScopes <= 1) return result;
+      if (!shouldCollectSystemdBarrier(command, args, result.status, barrierDir)) return result;
 
       const pause = (): void => {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
@@ -2505,6 +2537,9 @@ describe("same-user-systemd integration", () => {
       expect(token.length).toBeGreaterThan(0);
       expect(execStart).toContain(entrypoint);
       mkdirSync(barrierDir, { recursive: true });
+      // Every real run-owned unit writes its exact .ready marker even when it
+      // is the only expected scope, so the protected workflow's EXIT trap can
+      // prove one exact unit for this run from marker evidence alone.
       writeFileSync(join(barrierDir, `${ownerId}.ready`), JSON.stringify({
         unitName,
         homeDir,
@@ -2514,6 +2549,9 @@ describe("same-user-systemd integration", () => {
         entrypoint,
         daemonPid,
       }));
+      // Preserve the multi-scope barrier: cross-scope uniqueness assertions
+      // apply only when the workflow launches more than one run-owned scope.
+      if (expectedScopes <= 1) return result;
       const waitForMarkers = (suffix: string): string[] => {
         for (let attempt = 0; attempt < 500; attempt++) {
           const markers = readdirSync(barrierDir)
@@ -2579,7 +2617,7 @@ describe("same-user-systemd integration", () => {
     let result: Awaited<ReturnType<typeof ensureDaemon>>;
     try {
       result = await ensureDaemon({
-        port: 48_322,
+        port: daemonPort,
         pidFilePath: join(stateDir, "daemon.pid"),
         spawnTimeoutMs: 10_000,
         expectedVersion: "1.4.2",

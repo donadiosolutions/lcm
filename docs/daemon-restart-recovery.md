@@ -15,6 +15,13 @@ authenticated state needed for the daemon to prove that it belongs to this
 installation. LCM asks the manager to stop and recreate that exact service; it
 does not scan for a process with a matching name or port.
 
+Default managed lifecycle calls use the same packaged runtime entrypoint in the
+manager arguments, even when the CLI was launched through a wrapper or shim.
+During an explicit restart, LCM also waits for the exact systemd unit to leave
+its bounded `deactivating`/`stop-*` transition and prove manager absence before
+requesting same-name recreation. A different identity, unknown transition, or
+unresolved manager state remains a fail-closed refusal.
+
 The service is deliberately not a supervisor loop. LCM does not configure a
 systemd `Restart=` policy or a launchd `KeepAlive` policy. A daemon that exits
 normally after `daemon.idleTimeoutMs` remains registered but does not consume a
@@ -30,6 +37,15 @@ Use these commands for normal operation:
 lcm doctor
 lcm daemon restart
 ```
+
+Managed macOS launch credentials are one-shot inputs. LCM consumes each
+authenticated file at the first configuration load and keeps the resulting
+value only in memory for later reloads in that daemon process; it does not
+reread a file that was removed or replaced. Run `lcm daemon restart` after
+changing a managed credential so launchd receives a new private credential
+set. A daemon process accepts at most 16 distinct launchd marker contexts;
+after that bounded allowance, a new context fails closed without opening its
+credential files, and established snapshots are never evicted.
 
 `lcm doctor` reports service-manager availability, daemon health, connector
 registration, MCP setup, and summarizer readiness. `lcm daemon restart`
@@ -71,6 +87,49 @@ PID/token file, delete a service it cannot identify, or fall back to
 `kill`, `pkill`, or a pathname-only check. If the exact managed service cannot
 be proved, the command fails closed and tells the operator to restore the
 manager or inspect the host before retrying.
+
+## Preserved credential directories
+
+If the daemon start environment includes managed credentials, each managed
+launch stages one private credential directory at
+`<stateRoot>/credentials/<nonce>/`, where the full directory name is the
+per-launch nonce itself. The directory is mode `0700` and holds mode `0600`
+credential files, so treat every preserved directory as live secret-bearing
+evidence. When a launch is refused or its outcome is ambiguous, LCM
+intentionally preserves that directory: at refusal time a broad sweep cannot
+tell abandoned debris apart from a concurrent sibling launch's staged
+credentials, so deleting on suspicion could strip secrets from a launch that
+is about to succeed.
+
+Inspect before removing anything, and only ever remove a directory you have
+positively identified as inactive. `lcm doctor` reports whether the daemon
+is up or down; it never reports whether the daemon is idle. Doctor output is
+context only and is never deletion authority:
+
+```bash
+lcm doctor
+ls -la <stateRoot>/credentials/
+```
+
+Delete the directory only after positive out-of-band host evidence that the
+exact nonce is not referenced by any of the following:
+
+- a systemd or launchd job, active or registered;
+- a running `lcm daemon` start or restart process; or
+- an active or pending launch.
+
+Deletion is exact and single-directory: name one positively identified
+inactive directory by its full path, one at a time:
+
+```bash
+rm -r -- <stateRoot>/credentials/<exact-nonce>
+```
+
+The owner can delete the mode `0600` files directly; no `chmod` is needed.
+Never glob the `credentials/` base directory, never remove a directory whose
+launch may still exist, and never pre-create or rename these directories as
+a recovery step. If you cannot positively identify a directory as inactive,
+leave it in place and include it in the recovery report below.
 
 The no-response classifier accepts only the closed Node transport-code set and
 bounded standard fetch/network failure messages (including their bounded,
@@ -114,8 +173,9 @@ use process-kill commands as a connector or daemon recovery procedure.
 ## What to report when recovery is refused
 
 Keep the complete `lcm doctor` output, the platform, and whether the daemon was
-started through the managed command. Do not delete `~/.lcm` state or retry with
-multiple daemon processes. A refusal means LCM could not prove safe ownership;
-it is not evidence that another process may be stopped. Restore the service
-manager or reinstall the connector as directed, then run the canonical doctor
-and restart commands again.
+started through the managed command. Do not delete the daemon's state root
+(for example `~/.lcm`) or retry with multiple daemon processes. A refusal
+means LCM could not prove safe ownership; it is not evidence that another
+process may be stopped. Restore the service manager or reinstall the
+connector as directed, then run the canonical doctor and restart commands
+again.

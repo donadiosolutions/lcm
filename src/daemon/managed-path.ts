@@ -22,13 +22,23 @@ function isTrustedInstallationDir(
   directory: string,
   workingDirectory: string,
   homeDirectory: string,
+  requireCanonicalHome: boolean,
 ): boolean {
   if (/(?:^|\/)node_modules(?:\/|$)/.test(directory)) return false;
   const installationRoot = homeScopedInstallationRoot(directory);
+  const installationRootOutsideHome = installationRoot !== undefined
+    && relative(homeDirectory, installationRoot) !== "";
+  if (requireCanonicalHome && installationRootOutsideHome) {
+    // Recognized user-installation layouts are trusted only below the
+    // canonical home root. This keeps checkout-controlled .codex/.claude and
+    // package-manager lookalikes rejected even when a managed lifecycle uses a
+    // stable supervisor anchor instead of the caller's working directory.
+    return false;
+  }
   if (installationRoot && isWithin(workingDirectory, installationRoot)) {
     // The real per-user installation root remains trusted even when a command
     // is run from $HOME. Lookalike caches rooted in a checkout do not.
-    if (relative(homeDirectory, installationRoot) !== "") return false;
+    if (installationRootOutsideHome) return false;
   }
   // Project containment wins over recognizable install layouts. A checkout can
   // contain attacker-controlled .codex/.claude caches or package-manager paths
@@ -52,6 +62,7 @@ function trustedExecutableDirs(
   spawnArgs: readonly string[],
   workingDirectory: string,
   homeDirectory: string,
+  requireCanonicalHome: boolean,
 ): TrustedExecutableDir[] {
   const firstArg = spawnArgs[0];
   const executables: Array<{ path: string; entrypoint: boolean }> = [];
@@ -66,8 +77,29 @@ function trustedExecutableDirs(
   return executables
     .map(({ path, entrypoint }) => ({ directory: dirname(path), entrypoint }))
     .filter(({ directory }) =>
-      !directory.includes(delimiter) && isTrustedInstallationDir(directory, workingDirectory, homeDirectory)
+      !directory.includes(delimiter)
+      && isTrustedInstallationDir(directory, workingDirectory, homeDirectory, requireCanonicalHome)
     );
+}
+
+function buildManagedDaemonPath(
+  spawnCommand: string,
+  spawnArgs: readonly string[],
+  workingDirectory: string,
+  homeDirectory: string,
+  requireCanonicalHome: boolean,
+): string {
+  const systemDirs = SYSTEMD_DAEMON_PATH.split(":");
+  const trustedDirs = trustedExecutableDirs(
+    spawnCommand,
+    spawnArgs,
+    workingDirectory,
+    homeDirectory,
+    requireCanonicalHome,
+  )
+    .filter(({ directory, entrypoint }) => entrypoint || !systemDirs.includes(directory))
+    .map(({ directory }) => directory);
+  return [...new Set([...trustedDirs, ...systemDirs])].join(":");
 }
 
 /** Build the executable path used by the managed Linux systemd daemon. */
@@ -77,9 +109,15 @@ export function managedDaemonPath(
   workingDirectory = process.cwd(),
   homeDirectory = homedir(),
 ): string {
-  const systemDirs = SYSTEMD_DAEMON_PATH.split(":");
-  const trustedDirs = trustedExecutableDirs(spawnCommand, spawnArgs, workingDirectory, homeDirectory)
-    .filter(({ directory, entrypoint }) => entrypoint || !systemDirs.includes(directory))
-    .map(({ directory }) => directory);
-  return [...new Set([...trustedDirs, ...systemDirs])].join(":");
+  return buildManagedDaemonPath(spawnCommand, spawnArgs, workingDirectory, homeDirectory, false);
+}
+
+/** Build a stable managed-launch PATH with canonical home trust checks. */
+export function managedDaemonPathForStableLaunch(
+  spawnCommand: string,
+  spawnArgs: readonly string[],
+  workingDirectory: string,
+  homeDirectory = homedir(),
+): string {
+  return buildManagedDaemonPath(spawnCommand, spawnArgs, workingDirectory, homeDirectory, true);
 }

@@ -28,6 +28,7 @@ import {
   isStagedPostgreSqlHealth,
   STAGED_POSTGRESQL_ERROR_CODE,
 } from "./staged-postgresql.js";
+import { managedDaemonPathForStableLaunch } from "./managed-path.js";
 import {
   observeHttpHealth,
   type HealthObservation,
@@ -37,6 +38,7 @@ import {
   createSupervisor,
   createSupervisorSpec,
   isSupervisorPreflightUnavailableReason,
+  managedLaunchEnvironment,
   type Supervisor,
   type SupervisorKind,
   type SupervisorObservation,
@@ -333,6 +335,18 @@ function managedSupervisorKind(
   if (platform === "linux") return "systemd-user";
   if (platform === "darwin") return "launchd-user";
   return undefined;
+}
+
+function managedLaunchEnvironmentFor(
+  environment: NodeJS.ProcessEnv,
+  spawnCommand: string,
+  spawnArgs: readonly string[],
+  workingDirectory: string,
+): Readonly<Record<string, string>> {
+  return Object.freeze({
+    ...managedLaunchEnvironment(environment),
+    PATH: managedDaemonPathForStableLaunch(spawnCommand, spawnArgs, workingDirectory),
+  });
 }
 
 function supervisorNonce(): string {
@@ -1945,6 +1959,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         ...(observation.runtimeDigest === undefined ? {} : { runtimeDigest: observation.runtimeDigest }),
         storageBackend: requested.storageBackend!,
         ...(requested.postgresCaFile === undefined ? {} : { postgresCaFile: requested.postgresCaFile }),
+        launchEnvironment: requested.launchEnvironment,
         ...(observation.credentialDirectory === undefined ? {} : { credentialDirectory: observation.credentialDirectory }),
         ...(observation.credentialFiles === undefined ? {} : { credentialFiles: observation.credentialFiles }),
         stopTimeoutMs: requested.stopTimeoutMs,
@@ -1987,11 +2002,11 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
-      ?? [testScope?.entrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
+      ?? [testScope?.entrypoint ?? expectedEntrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
     const args = testScope
       ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
       : baseSpawnArgs;
-    if (!executable.startsWith("/") || args.some((arg) => typeof arg !== "string")) {
+    if (!isAbsolute(executable) || args.some((arg) => typeof arg !== "string")) {
       return null;
     }
     let scope: ReturnType<typeof canonicalSupervisorScope>;
@@ -2000,6 +2015,16 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     } catch {
       return null;
     }
+    // The managed PATH participates in the authenticated manager identity.
+    // Anchor it to the canonical supervisor state root, never to the caller's
+    // mutable process.cwd(), while managedDaemonPath retains its public
+    // caller-cwd default for doctor and other direct consumers.
+    const launchEnvironment = managedLaunchEnvironmentFor(
+      dependencies.environment,
+      executable,
+      args,
+      scope.stateRoot,
+    );
     let spec: SupervisorSpec;
     try {
       spec = createSupervisorSpec({
@@ -2013,6 +2038,11 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         runtimeDigest: expectedRuntimeDigest,
         storageBackend: expectedStorageBackend,
         postgresCaFile: dependencies.environment.LCM_POSTGRES_CA_FILE,
+        // Manager transport is deliberately narrower than the managed child
+        // environment. Filter the full lifecycle source independently so
+        // non-secret configuration/runtime values such as HOME and the
+        // PostgreSQL CA pathname are not lost while credentials remain out.
+        launchEnvironment,
         stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
         realpath,
         ...(opts._supervisorCredentialDirectoryOverride === undefined ? {} : { credentialDirectory: opts._supervisorCredentialDirectoryOverride }),
@@ -2025,6 +2055,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       ?? opts._supervisor
       ?? createSupervisor(kind, {
           run: supervisorCommandRunner(dependencies, opts),
+          environment: launchEnvironment,
           platform,
           uid: dependencies.uid,
           commandTimeoutMs: Math.max(1, opts.spawnTimeoutMs || 1_000),
@@ -2790,7 +2821,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
 
   const spawnCommand = opts.spawnCommand ?? process.execPath;
   const baseSpawnArgs = opts.spawnArgs
-    ?? [testScope?.entrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
+    ?? [testScope?.entrypoint ?? expectedEntrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
   const spawnArgs = testScope
     ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
     : baseSpawnArgs;
@@ -3097,6 +3128,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     ?? opts.expectedEntrypoint
     ?? opts._packagedEntrypointOverride
     ?? PACKAGED_RUNTIME_ENTRYPOINT;
+  const ensureOptionsWithEntrypoint = { ...ensureOptions, expectedEntrypoint };
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
@@ -3171,11 +3203,11 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     const stateRoot = dirname(opts.pidFilePath);
     const executable = opts.spawnCommand ?? process.execPath;
     const baseSpawnArgs = opts.spawnArgs
-      ?? [testScope?.entrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
+      ?? [testScope?.entrypoint ?? expectedEntrypoint ?? process.argv[1], "daemon", "start", "--foreground"];
     const args = testScope
       ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
       : baseSpawnArgs;
-    if (!executable.startsWith("/") || args.some((arg) => typeof arg !== "string")) {
+    if (!isAbsolute(executable) || args.some((arg) => typeof arg !== "string")) {
       return restartRefusal("ambiguous", "managed daemon supervisor could not be constructed; inspect the daemon configuration and retry");
     }
     let scope: ReturnType<typeof canonicalSupervisorScope>;
@@ -3184,6 +3216,12 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     } catch {
       return restartRefusal("ambiguous", "managed daemon state root is not canonical; inspect the daemon configuration and retry");
     }
+    const launchEnvironment = managedLaunchEnvironmentFor(
+      dependencies.environment,
+      executable,
+      args,
+      scope.stateRoot,
+    );
     let spec: SupervisorSpec;
     try {
       spec = createSupervisorSpec({
@@ -3197,6 +3235,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         runtimeDigest: opts.expectedRuntimeDigest ?? RUNTIME_DIGEST,
         storageBackend: opts.expectedStorageBackend ?? "sqlite",
         postgresCaFile: dependencies.environment.LCM_POSTGRES_CA_FILE,
+        launchEnvironment,
         stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
         realpath,
       });
@@ -3207,6 +3246,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       ?? opts._supervisor
       ?? createSupervisor(managerKind, {
           run: supervisorCommandRunner(dependencies, opts),
+          environment: launchEnvironment,
           platform,
           uid: dependencies.uid,
           commandTimeoutMs: Math.max(1, opts.spawnTimeoutMs || 1_000),
@@ -3240,6 +3280,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     const ensureAfterManagerOperation = async (
       managerPid?: number,
       admittedSpec?: SupervisorSpec,
+      restarted = false,
     ): Promise<RestartDaemonResult> => {
       const ensured = await ensure({
         ...ensureOptions,
@@ -3255,17 +3296,27 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       });
       return {
         ...ensured,
-        restarted: true,
+        restarted,
         stoppedPid: observation.kind === "registered-running-valid" ? observation.managerPid : undefined,
       };
     };
     const stopStartAndEnsure = async (): Promise<RestartDaemonResult> => {
       const staged = stageManagedCredentials(spec, dependencies.environment);
+      // The staged one-launch credential directory belongs to the launched
+      // daemon until endpoint admission succeeds: a throwing stop/start leaves
+      // the manager state unresolved, and until admission the launchd daemon
+      // may still consume the secrets from this directory.  Delete it only
+      // after admission; on every other outcome preserve it as evidence.  A
+      // failsafe refusal here must leak the directory rather than destroy
+      // live launch evidence, so no cleanup satisfies its own refusal.
+      let admitted = false;
       try {
         const started = await supervisor.stopAndStart(staged.spec);
-        return await ensureAfterManagerOperation(started.managerPid, staged.spec);
+        const ensured = await ensureAfterManagerOperation(started.managerPid, staged.spec, true);
+        admitted = ensured.connected === true;
+        return ensured;
       } finally {
-        if (staged.credentialDirectory !== undefined) {
+        if (admitted && staged.credentialDirectory !== undefined) {
           try { cleanupManagedCredentialDirectory(staged.credentialDirectory, spec.stateRoot); } catch { /* preserve unresolved evidence */ }
         }
       }
@@ -3454,7 +3505,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
 
   if (scopedState) assertScopedStateAccess(scopedState);
   const ensure = _ensureDaemonOverride ?? ensureDaemon;
-  const result = await ensure(ensureOptions);
+  const result = await ensure(ensureOptionsWithEntrypoint);
   if (!restarted && result.connected && !result.spawned) {
     throw new Error(
       "Refusing to report a restart: a daemon is reachable but no verified daemon PID was available to stop.",

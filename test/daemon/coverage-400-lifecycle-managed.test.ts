@@ -6,9 +6,10 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -18,7 +19,16 @@ import {
   type EnsureDaemonOptions,
 } from "../../src/daemon/lifecycle.js";
 import { ensureAuthToken } from "../../src/daemon/auth.js";
-import type { Supervisor, SupervisorObservation, SupervisorSpec } from "../../src/daemon/supervisor.js";
+import {
+  managedDaemonPath,
+  managedDaemonPathForStableLaunch,
+} from "../../src/daemon/managed-path.js";
+import {
+  managedLaunchEnvironmentDigest,
+  type Supervisor,
+  type SupervisorObservation,
+  type SupervisorSpec,
+} from "../../src/daemon/supervisor.js";
 import {
   createDaemonLifecycleTestScope,
   type DaemonLifecycleHermeticTestSeams,
@@ -280,6 +290,143 @@ function setRunningProbe(fixture: Fixture, pid = 4242): void {
 }
 
 describe("issue 400 lifecycle managed preparation and utility boundaries", () => {
+  it("anchors ensure admission to canonical state rather than caller cwd", async () => {
+    const fixture = createFixture({
+      fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,
+      environment: { PATH: "/ambient/bin" },
+    });
+    const callerHome = homedir();
+    const projectCwd = join(fixture.root, "project");
+    const spawnCommand = "/usr/bin/node";
+    const spawnArgs = [
+      join(callerHome, ".local", "lib", "node_modules", "@donadiosolutions", "lcm", "dist", "lcm.mjs"),
+      "daemon",
+      "start",
+      "--foreground",
+    ];
+    let callerCwd = callerHome;
+    vi.spyOn(process, "cwd").mockImplementation(() => callerCwd);
+    const probed: SupervisorSpec[] = [];
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      probed.push(spec);
+      return observation(spec, "absent");
+    });
+    const options = optionsFor(fixture, {
+      spawnCommand,
+      spawnArgs,
+      _skipSpawn: true,
+    });
+
+    await ensureDaemon(options);
+    callerCwd = projectCwd;
+    await ensureDaemon(options);
+
+    expect(probed).toHaveLength(2);
+    expect(probed[0]?.stateRoot).toBe(probed[1]?.stateRoot);
+    expect(probed[0]?.scopeDigest).toBe(probed[1]?.scopeDigest);
+    expect(probed[0]?.launchEnvironment?.PATH).toBe(probed[1]?.launchEnvironment?.PATH);
+    expect(probed[0]?.launchEnvironment?.PATH).toContain(join(callerHome, ".local", "bin"));
+    const digest = (spec: SupervisorSpec): string => managedLaunchEnvironmentDigest(
+      spec,
+      spec.kind,
+      fixture.seams.uid,
+      spec.launchEnvironment ?? {},
+    );
+    expect(digest(probed[0]!)).toBe(digest(probed[1]!));
+    expect(fixture.start).not.toHaveBeenCalled();
+  });
+
+  it("uses the authenticated packaged entrypoint for default manager identity args", async () => {
+    const fixture = createFixture({
+      fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,
+    });
+    const packagedEntrypoint = "/opt/lcm/dist/lcm.mjs";
+    const probed: SupervisorSpec[] = [];
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      probed.push(spec);
+      return observation(spec, "absent");
+    });
+    await ensureDaemon(optionsFor(fixture, {
+      expectedEntrypoint: undefined,
+      _packagedEntrypointOverride: packagedEntrypoint,
+      _skipSpawn: true,
+    }));
+
+    expect(probed).toHaveLength(1);
+    expect(probed[0]?.entrypoint).toBe(packagedEntrypoint);
+    expect(probed[0]?.args[0]).toBe(packagedEntrypoint);
+    expect(probed[0]?.launchEnvironment?.PATH).toBe(
+      managedDaemonPathForStableLaunch(
+        process.execPath,
+        [packagedEntrypoint, "daemon", "start", "--foreground"],
+        fixture.stateDir,
+      ),
+    );
+  });
+
+  it("retains the stable launch environment while adopting an observed manager spec", async () => {
+    const fixture = createFixture({
+      fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,
+      environment: { PATH: "/ambient/bin" },
+    });
+    const spawnCommand = "/usr/bin/node";
+    const spawnArgs = ["/work/project/.codex/plugins/cache/lcm/1.4.0/lcm.mjs", "daemon", "start", "--foreground"];
+    const probed: SupervisorSpec[] = [];
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => {
+        probed.push(spec);
+        return staleObservation(spec, { nonce: "prior-launch" });
+      })
+      .mockImplementationOnce(async (spec: SupervisorSpec) => {
+        probed.push(spec);
+        return observation(spec, "registered-not-running-valid", { terminal: "inactive" });
+      });
+
+    await expect(ensureDaemon(optionsFor(fixture, {
+      spawnCommand,
+      spawnArgs,
+      _skipSpawn: true,
+    }))).resolves.toMatchObject({ refusalReason: "not-running" });
+
+    expect(probed).toHaveLength(2);
+    expect(probed[1]?.launchEnvironment).toEqual(probed[0]?.launchEnvironment);
+    expect(probed[1]?.launchEnvironment?.PATH).toBe(
+      managedDaemonPathForStableLaunch(spawnCommand, spawnArgs, fixture.stateDir),
+    );
+  });
+
+  it.each([
+    ["linux", "systemd-user"],
+    ["darwin", "launchd-user"],
+  ] as const)("projects the trusted synthesized PATH into the managed %s launch", async (platform, method) => {
+    const fixture = createFixture({
+      platform,
+      fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,
+      environment: {
+        PATH: "/ambient/bin",
+        LCM_SUMMARY_PROVIDER: "codex-process",
+        OPENAI_API_KEY: "ambient-secret",
+      },
+    });
+    const spawnCommand = "/usr/bin/node";
+    const spawnArgs = ["/opt/lcm/bin/lcm.mjs", "daemon", "start", "--foreground"];
+    await ensureDaemon(optionsFor(fixture, {
+      _skipHealthWait: true,
+      spawnCommand,
+      spawnArgs,
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as never,
+    }));
+
+    const started = fixture.start.mock.calls[0]?.[0] as SupervisorSpec | undefined;
+    expect(started?.kind).toBe(method);
+    expect(started?.launchEnvironment).toMatchObject({
+      PATH: managedDaemonPath(spawnCommand, spawnArgs),
+      LCM_SUMMARY_PROVIDER: "codex-process",
+    });
+    expect(started?.launchEnvironment?.PATH).not.toBe("/ambient/bin");
+    expect(JSON.stringify(started?.launchEnvironment)).not.toContain("ambient-secret");
+  });
+
   it("classifies manager platforms, process diagnostics, and malformed command runners", async () => {
     const fixture = createFixture({ platform: "freebsd" });
     await expect(ensureDaemon(optionsFor(fixture, { _skipSpawn: true }))).resolves.toMatchObject({
@@ -1225,6 +1372,51 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       _skipHealthWait: false,
       _monotonicNowOverride: () => now,
     }))).resolves.toMatchObject({ refusalReason: "startup-failure", spawned: true });
+  });
+
+  it("preserves staged credentials when owned manager absence cleanup is refused", async () => {
+    let now = 0;
+    let staged: SupervisorSpec | undefined;
+    const fixture = createFixture({
+      environment: { OPENAI_API_KEY: "staged-secret" },
+      fetch: sequenceFetch([new Error("offline")]),
+      sleep: async () => { now = 1_000; },
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    fixture.start.mockImplementationOnce(async (spec: SupervisorSpec) => {
+      staged = spec;
+      writeFileSync(fixture.pidPath, "4242");
+      return {
+        kind: spec.kind,
+        name: spec.name,
+        scopeDigest: spec.scopeDigest,
+        port: spec.port,
+        nonce: spec.nonce,
+        managerPid: 4242,
+      };
+    });
+    const cleanupRefusal = new Error("manager absence refused");
+    fixture.stopAndAwaitAbsent.mockRejectedValueOnce(cleanupRefusal);
+
+    await expect(ensureDaemon(optionsFor(fixture, {
+      _skipHealthWait: false,
+      _monotonicNowOverride: () => now,
+    }))).rejects.toBe(cleanupRefusal);
+
+    expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledOnce();
+    expect(staged?.credentialDirectory).toBeDefined();
+    const credentialDirectory = staged!.credentialDirectory!;
+    const credentialFile = join(credentialDirectory, "OPENAI_API_KEY");
+    expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledWith(expect.objectContaining({
+      credentialDirectory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
+    }));
+    expect(existsSync(credentialDirectory)).toBe(true);
+    expect(readdirSync(credentialDirectory)).toEqual(["OPENAI_API_KEY"]);
+    expect(readFileSync(credentialFile, "utf8")).toBe("staged-secret");
+    expect(statSync(credentialFile).mode & 0o777).toBe(0o600);
   });
 
   it("covers deadline abort/timeout callbacks and platform process-command paths", async () => {

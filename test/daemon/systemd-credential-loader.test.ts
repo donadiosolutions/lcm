@@ -138,6 +138,80 @@ function requireTrustedCredentialBaseDir(context: TestContext): string | undefin
 }
 
 describe("systemd credential loader hardening", () => {
+  it("prefers an authenticated staged credential over residual ambient environment", () => {
+    const fixture = makeCredentialDir();
+    try {
+      writeFileSync(join(fixture.directory, "OPENAI_API_KEY"), "staged-value\n", { mode: 0o400 });
+      sealCredentialDir(fixture.directory);
+      expect(resolveDaemonConfigEnv({
+        ...credentialEnv(fixture, "OPENAI_API_KEY"),
+        OPENAI_API_KEY: "ambient-value",
+      }).OPENAI_API_KEY).toBe("staged-value");
+    } finally {
+      removeCredentialDir(fixture);
+    }
+  });
+
+  it("projects the staged Claude OAuth token without trusting the ambient value", () => {
+    const fixture = makeCredentialDir();
+    try {
+      writeFileSync(join(fixture.directory, "CLAUDE_CODE_OAUTH_TOKEN"), "staged-oauth\n", { mode: 0o400 });
+      sealCredentialDir(fixture.directory);
+      expect(resolveDaemonConfigEnv({
+        ...credentialEnv(fixture, "CLAUDE_CODE_OAUTH_TOKEN"),
+        CLAUDE_CODE_OAUTH_TOKEN: "ambient-oauth",
+      }).CLAUDE_CODE_OAUTH_TOKEN).toBe("staged-oauth");
+    } finally {
+      removeCredentialDir(fixture);
+    }
+  });
+
+  it("accepts staged credentials beneath a validated XDG runtime root and rejects a mismatched root", () => {
+    const runtimeRoot = mkdtempSync(join(tmpdir(), "lcm-loader-runtime-"));
+    const outsideRoot = mkdtempSync(join(tmpdir(), "lcm-loader-outside-runtime-"));
+    const credentialsParent = join(runtimeRoot, "credentials");
+    const directory = join(credentialsParent, "custom-unit.service");
+    const outsideDirectory = join(outsideRoot, "custom-unit.service");
+    try {
+      chmodSync(runtimeRoot, 0o700);
+      mkdirSync(credentialsParent, { mode: 0o755 });
+      mkdirSync(directory, { mode: 0o700 });
+      writeFileSync(join(directory, "OPENAI_API_KEY"), "custom-staged\n", { mode: 0o400 });
+      chmodSync(directory, 0o500);
+      mkdirSync(outsideDirectory, { mode: 0o700 });
+      writeFileSync(join(outsideDirectory, "OPENAI_API_KEY"), "outside-staged\n", { mode: 0o400 });
+      chmodSync(outsideDirectory, 0o500);
+
+      expect(resolveDaemonConfigEnv({
+        ...credentialEnv({ directory, runtimeRoot }, "OPENAI_API_KEY"),
+        XDG_RUNTIME_DIR: runtimeRoot,
+        OPENAI_API_KEY: "ambient-value",
+      }).OPENAI_API_KEY).toBe("custom-staged");
+      expect(resolveDaemonConfigEnv({
+        ...credentialEnv({ directory: outsideDirectory, runtimeRoot }, "OPENAI_API_KEY"),
+        XDG_RUNTIME_DIR: runtimeRoot,
+        OPENAI_API_KEY: "ambient-value",
+      }).OPENAI_API_KEY).toBe("ambient-value");
+      expect(resolveDaemonConfigEnv({
+        ...credentialEnv({ directory: outsideDirectory, runtimeRoot }, "OPENAI_API_KEY"),
+        XDG_RUNTIME_DIR: join(runtimeRoot, "missing"),
+        OPENAI_API_KEY: "ambient-value",
+      }).OPENAI_API_KEY).toBe("ambient-value");
+      chmodSync(runtimeRoot, 0o755);
+      expect(resolveDaemonConfigEnv({
+        ...credentialEnv({ directory, runtimeRoot }, "OPENAI_API_KEY"),
+        XDG_RUNTIME_DIR: runtimeRoot,
+        OPENAI_API_KEY: "ambient-value",
+      }).OPENAI_API_KEY).toBe("ambient-value");
+      chmodSync(runtimeRoot, 0o700);
+    } finally {
+      if (existsSync(directory)) chmodSync(directory, 0o700);
+      if (existsSync(outsideDirectory)) chmodSync(outsideDirectory, 0o700);
+      rmSync(runtimeRoot, { recursive: true, force: true });
+      rmSync(outsideRoot, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     ["unknown id", "BAD,OPENAI_API_KEY"],
     ["duplicate id", "OPENAI_API_KEY,OPENAI_API_KEY"],
@@ -149,6 +223,21 @@ describe("systemd credential loader hardening", () => {
       writeFileSync(join(fixture.directory, "OPENAI_API_KEY"), "secret", { mode: 0o400 });
       sealCredentialDir(fixture.directory);
       expect(resolveDaemonConfigEnv(credentialEnv(fixture, ids))).toEqual(credentialEnv(fixture, ids));
+    } finally {
+      removeCredentialDir(fixture);
+    }
+  });
+
+  it("does not let malformed systemd markers replace detached direct environment", () => {
+    const fixture = makeCredentialDir();
+    try {
+      writeFileSync(join(fixture.directory, "OPENAI_API_KEY"), "staged-value", { mode: 0o400 });
+      sealCredentialDir(fixture.directory);
+      const environment = {
+        ...credentialEnv(fixture, "BAD"),
+        OPENAI_API_KEY: "ambient-value",
+      };
+      expect(resolveDaemonConfigEnv(environment).OPENAI_API_KEY).toBe("ambient-value");
     } finally {
       removeCredentialDir(fixture);
     }

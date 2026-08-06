@@ -1,5 +1,8 @@
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { load as loadYaml } from "js-yaml";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 interface WorkflowStep {
@@ -64,6 +67,84 @@ const launchdIntegrationSource = readFileSync(
   "utf8",
 );
 const workflow = loadYaml(source) as CiWorkflow;
+const launchdEvidenceRun =
+  workflow.jobs["macos-launchd"].steps.find((step) => step.name === "Run launchd integration path")?.run ?? "";
+const launchdFixtureToken = "11111111-1111-1111-1111-111111111111";
+const launchdFixtureLabel = "com.donadiosolutions.lcm.daemon.0123456789abcdef0123";
+
+function runLaunchdEvidenceFixture(output: string): {
+  success: boolean;
+  injectedFileCreated: boolean;
+} {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "lcm-ci-evidence-"));
+  const resourceRoot = join(fixtureRoot, "resource");
+  const binRoot = join(fixtureRoot, "bin");
+  const fixtureOutput = join(fixtureRoot, "fixture.out");
+  const injectedFile = `${fixtureRoot}-injected`;
+  mkdirSync(binRoot);
+  writeFileSync(
+    fixtureOutput,
+    output.replaceAll("__LCM_LAUNCHD_INJECTED_FILE__", injectedFile),
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    join(binRoot, "uuidgen"),
+    `#!/bin/sh
+printf '%s\\n' '${launchdFixtureToken}'
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(
+    join(binRoot, "npx"),
+    `#!/bin/sh
+set -eu
+printf '%s %s\\n' "$LCM_LAUNCHD_EVIDENCE_TOKEN" "$LCM_LAUNCHD_FIXTURE_LABEL" > "$LCM_LAUNCHD_RESOURCE_ROOT/launchd.label"
+chmod 0600 "$LCM_LAUNCHD_RESOURCE_ROOT/launchd.label"
+cat "$LCM_LAUNCHD_FIXTURE_OUTPUT"
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(
+    join(binRoot, "stat"),
+    `#!/bin/sh
+set -eu
+if [ "$1" = "-f" ] && [ "$2" = "%Lp" ]; then
+  printf '600\\n'
+  exit 0
+fi
+exit 1
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(join(binRoot, "launchctl"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: `${binRoot}:${process.env.PATH ?? ""}`,
+    LCM_LAUNCHD_FIXTURE_OUTPUT: fixtureOutput,
+    LCM_LAUNCHD_FIXTURE_LABEL: launchdFixtureLabel,
+    LCM_LAUNCHD_RESOURCE_ROOT: resourceRoot,
+    LCM_LAUNCHD_LABEL: "com.donadiosolutions.lcm.ci.1.1",
+    LCM_LAUNCHD_SCOPE_ID: "ci-fixture-1-1",
+  };
+  delete env.NODE;
+  delete env.NODE_PATH;
+
+  let success = false;
+  let injectedFileCreated = false;
+  try {
+    execFileSync("bash", ["-c", launchdEvidenceRun], { env, stdio: "ignore" });
+    success = true;
+  } catch {
+    success = false;
+  } finally {
+    injectedFileCreated = existsSync(injectedFile);
+    rmSync(injectedFile, { force: true });
+    rmSync(fixtureRoot, { force: true, recursive: true });
+  }
+  return { success, injectedFileCreated };
+}
+
 const expectedCodecovRunSteps = [
   {
     name: "Download Vitest reports",
@@ -171,11 +252,23 @@ describe("CI workflow", () => {
       /systemd_state="\$\(systemctl --user is-system-running \|\| true\)"[\s\S]*case "\$systemd_state" in[\s\S]*running\|degraded\)\s*;;[\s\S]*\*\)[\s\S]*exit 1/u,
     );
     expect(integration?.run).toContain("test/daemon/lifecycle-isolation.test.ts");
-    expect(integration?.run).toContain("uses and removes one exact run-owned transient unit");
+    expect(integration?.run).toContain("test/daemon/lifecycle-systemd.integration.test.ts");
     expect(integration?.run).toContain("test/daemon/systemd-credential-loader.test.ts");
     expect(integration?.run).toContain(
       '--testNamePattern "observes the real user-systemd LoadCredential modes"',
     );
+    for (const pattern of [
+      "uses and removes one exact run-owned transient unit",
+      "starts and admits a healthy managed unit with exact identity and cleanup",
+      "restarts a wedged registered unit through systemd without legacy signal fallback",
+      "recreates a terminal clean-exit unit after a registered-not-running observation",
+      "refuses stale manager identity before mutation and never falls back to legacy signals",
+      "refuses clean-environment drift before admitting an existing unit",
+      "observes the real user-systemd LoadCredential modes",
+    ]) {
+      expect(integration?.run).toContain(pattern);
+    }
+    expect(integration?.run).toContain("|starts and admits a healthy managed unit");
     expect(integration?.run).toContain("systemctl --user stop \"$unit_name\"");
     expect(integration?.run).toContain(
       'if [[ "$unit_name" =~ ^lcm-daemon-[0-9a-f]{20}\\.service$ ]]; then',
@@ -201,7 +294,7 @@ describe("CI workflow", () => {
     expect(integration?.run).not.toMatch(/\b(?:pkill|killall)\b/u);
   });
 
-  it("keeps the macOS launchd feasibility job active and runs its integration path", () => {
+  it("keeps the macOS launchd feasibility job active, validates the private derived product label, and runs its integration path", () => {
     const job = workflow.jobs["macos-launchd"];
     const checkout = job.steps.find((step) => step.name === "Checkout");
     const node = job.steps.find((step) => step.name === "Set up Node.js 25.9.0");
@@ -224,45 +317,249 @@ describe("CI workflow", () => {
       LCM_LAUNCHD_SCOPE_ID: "ci-${{ github.run_id }}-${{ github.run_attempt }}",
       LCM_LAUNCHD_RESOURCE_ROOT:
         "${{ runner.temp }}/lcm-launchd-${{ github.run_id }}-${{ github.run_attempt }}",
+      LCM_LAUNCHD_LABEL:
+        "com.donadiosolutions.lcm.ci.${{ github.run_id }}.${{ github.run_attempt }}",
     });
     const run = integration?.run ?? "";
+    // The run creates one fresh unpredictable current-run evidence token,
+    // passes it to the worker only through the environment, and the trap may
+    // bootout only exact evidence proven to belong to this run. A stale or
+    // planted marker without the fresh token must never be accepted.
+    expect(run).toContain('evidence_token="$(uuidgen)"');
+    expect(run).toContain('export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"');
+    expect(run).toContain('LCM_LAUNCHD_EVIDENCE_TOKEN');
+    // The run root must be cleared before the worker starts so no leaked
+    // pre-existing marker or stale captured output can satisfy the gate.
+    const vitestIndex = run.indexOf("npx vitest run test/daemon/lifecycle-launchd.integration.test.ts");
+    const trapIndex = run.indexOf("trap cleanup EXIT");
+    expect(trapIndex).toBeGreaterThanOrEqual(0);
+    expect(vitestIndex).toBeGreaterThan(0);
+    const preRunResetIndex = run.indexOf('rm -rf -- "$resource_root"', trapIndex);
+    expect(preRunResetIndex).toBeGreaterThan(trapIndex);
+    expect(preRunResetIndex).toBeLessThan(vitestIndex);
+    const chmodIndex = run.indexOf('chmod 0700 "$resource_root"');
+    expect(chmodIndex).toBeGreaterThan(preRunResetIndex);
+    expect(chmodIndex).toBeLessThan(vitestIndex);
+    // The trap must read the pinned marker, require the current-run evidence
+    // token, and boot out only the exact validated derived product label.
+    expect(run).toContain('ready_file="$resource_root/launchd.label"');
+    expect(run).toContain('out_file="$resource_root/launchd.out"');
     expect(run).toContain('evidence_token="$(uuidgen)"');
     expect(run).toContain('export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"');
     expect(run).toContain('launchctl bootout "gui/$(id -u)/$ready_label"');
-    expect(run).toContain('[[ "$ready_token" == "$evidence_token" ]]');
-    expect(run).toContain(
-      '[[ "$ready_label" =~ ^com\\.donadiosolutions\\.lcm\\.daemon\\.[0-9a-f]{20}$ ]]',
-    );
     expect(run).toContain('rm -rf -- "$resource_root"');
+    expect(run).toContain('mkdir -p -- "$resource_root"');
     expect(run).toContain('chmod 0700 "$resource_root"');
-    expect(run).toContain("validate_marker() {");
-    expect(run).toContain("Refusing cleanup for malformed or foreign launchd evidence");
-    expect(run).not.toMatch(/\b(?:pkill|killall|kill)\b/u);
-    const trap = run.indexOf("trap cleanup EXIT");
-    const reset = run.indexOf('rm -rf -- "$resource_root"', trap);
-    const testRun = run.indexOf("npx vitest run test/daemon/lifecycle-launchd.integration.test.ts");
-    expect(trap).toBeGreaterThanOrEqual(0);
-    expect(reset).toBeGreaterThan(trap);
-    expect(reset).toBeLessThan(testRun);
-    expect(run.indexOf('chmod 0700 "$resource_root"')).toBeLessThan(testRun);
-    expect(run.indexOf("if validate_marker; then")).toBeGreaterThanOrEqual(0);
-    expect(run.indexOf('launchctl bootout "gui/$(id -u)/$ready_label"')).toBeGreaterThan(
-      run.indexOf("if validate_marker; then"),
+    expect(run).toContain('tee "$out_file"');
+    expect(run).toContain('normalized_out_file="$resource_root/launchd.normalized.out"');
+    expect(run).toContain('LC_ALL=C sed $\'s/\\033\\\\[[0-9;]*m//g\' "$out_file" > "$normalized_out_file"');
+    expect(run).toContain(
+      'sentinel_count="$(LC_ALL=C grep -c \'^launchd-user$\' "$normalized_out_file" || true)"',
     );
+    expect(run).toContain('[[ "$sentinel_count" != "1" ]]');
+    // The trap gates every bootout on exact current-run evidence: the fresh
+    // token, the exact validated derived product label, and the exact pinned
+    // marker line. There is no broader label sweep and no native/PID fallback.
+    expect(run).toContain('if [[ -f "$ready_file" ]]; then');
+    expect(run).toContain('ready_token="${ready_line%% *}"');
+    expect(run).toContain('ready_label="${ready_line#* }"');
+    expect(run).toContain('[[ "$ready_token" == "$evidence_token"');
+    expect(run).toContain('"$ready_line" == "$evidence_token $validated_ready_label"');
+    expect(run).toContain('"$ready_label" == "$validated_ready_label"');
+    expect(run).toContain('"$ready_label" =~ ^com\\.donadiosolutions\\.lcm\\.daemon\\.[0-9a-f]{20}$');
+    expect(run).toContain('echo "Refusing cleanup for malformed launchd evidence marker" >&2');
+    expect(run).toContain('if [[ -z "$ready_token" || -z "$ready_label" || "$ready_line" != "$ready_token $ready_label" ]]; then');
+    expect(run).toContain('validated_ready_label=""');
+    expect(run).not.toContain('[[ -f "$ready_file" && -n "$validated_ready_label" ]]');
+    expect(run).toContain("Refusing cleanup for unexpected launchd label");
+    expect(run).not.toContain('ready_label="$(<"$ready_file")"');
+    expect(run).toContain("launchd integration marker must contain exactly one current-run token and one derived product label");
+    expect(run).toContain("launchd integration did not derive a validated scoped product label");
+    // The protected gate is run-scoped: it fails hard when no fresh marker
+    // exists, when the marker carries another run's token, when the derived
+    // product label collides with the static CI manifest label, or when every
+    // macOS launchd integration test skipped.
+    expect(run).toContain("launchd integration produced no fresh current-run marker (missing: $ready_file)");
+    expect(run).toContain("launchd integration marker does not carry the current run evidence token");
+    expect(run).toContain("launchd integration derived product label must not equal the CI manifest label");
+    expect(run).toContain(
+      "launchd integration derived product label must match the exact run-owned daemon identity",
+    );
+    expect(run).toContain(
+      "launchd integration produced no current-run passed evidence (skipped=${skipped_count:-0} passed=${passed_count:-0})",
+    );
+    expect(run).toContain(
+      "tests_summary_count=\"$(LC_ALL=C grep -Ec '^[[:space:]]*Tests([[:space:]]|$)' \"$normalized_out_file\" || true)\"",
+    );
+    expect(run).toContain(
+      "launchd integration requires exactly one Tests summary (count=$tests_summary_count)",
+    );
+    expect(run).toContain("launchd integration produced an ambiguous Tests summary");
+    expect(run).toContain("launchd integration produced ambiguous passed/skipped counts");
+    expect(run).toContain(
+      'if [[ "${skipped_count:-0}" != "0" || "${passed_count:-0}" == "0" || -z "${passed_count:-}" ]]; then',
+    );
+    expect(run).not.toContain("head -1");
+    expect(run).not.toMatch(/grep[^\n]*"\$out_file"/u);
+    // The derived product label must match the exact run-owned daemon shape,
+    // which is what revives workflow cleanup ownership after the manifest
+    // equality gate was removed: the old equality gate compared against the
+    // static ci.<run_id>.<run_attempt> manifest and therefore could never
+    // authorize bootout of the derived com.donadiosolutions.lcm.daemon.<hex>
+    // product label.
+    expect(run).toContain('[[ "$ready_label" == "$label" ]]');
+    expect(run).toContain('[[ ! "$ready_label" =~ ^com\\.donadiosolutions\\.lcm\\.daemon\\.[0-9a-f]{20}$ ]]');
     expect(launchdIntegrationSource).toContain("LCM_LAUNCHD_RESOURCE_ROOT");
     expect(launchdIntegrationSource).toContain("LCM_LAUNCHD_EVIDENCE_TOKEN");
+    expect(launchdIntegrationSource).toContain('const marker = join(resourceRoot, "launchd.label")');
     expect(launchdIntegrationSource).toContain(
-      'writeFileSync(join(resourceRoot, "launchd.label"), `${evidenceToken} ${spec.launchdLabel}\\n`',
+      'writeFileSync(marker, `${evidenceToken} ${spec.launchdLabel}\\n`, { mode: 0o600 })',
     );
-    const start = launchdIntegrationSource.indexOf("const started = await supervisor.start(spec);");
-    const publish = launchdIntegrationSource.indexOf("publishLaunchdEvidence(spec);", start);
-    const health = launchdIntegrationSource.indexOf("waitForExactHealth(spec, managerPid)", publish);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(publish).toBeGreaterThan(start);
-    expect(health).toBeGreaterThan(publish);
-    expect(launchdIntegrationSource).toContain("spec.stateRoot !== realpathSync(resourceRoot)");
-    expect(launchdIntegrationSource).toContain("expect(statSync(stateRoot).mode & 0o777).toBe(0o700)");
+    expect(launchdIntegrationSource).toContain("if (spec.stateRoot !== getSharedStateRoot())");
+    expect(launchdIntegrationSource).toContain(
+      "if (!existsSync(workflowStateRoot) || !statSync(workflowStateRoot).isDirectory())",
+    );
+    expect(run.split("\n").some((line) => /^\s*(?:pkill|killall|kill)\b/u.test(line))).toBe(false);
+    // The label regex must reject product labels outside the product prefix.
+    const productLabelRegex = /^com\.donadiosolutions\.lcm\.[A-Za-z0-9.-]+$/u;
+    expect(productLabelRegex.test("com.donadiosolutions.lcm.ci.123456789.1")).toBe(true);
+    expect(productLabelRegex.test("com.donadiosolutions.lcm.daemon.0123456789abcdef0123")).toBe(true);
+    expect(productLabelRegex.test("com.donadiosolutions.other.daemon.0123456789abcdef0123")).toBe(false);
+    expect(productLabelRegex.test("com.donadiosolutions.lcm.")).toBe(false);
+    // The strict run-owned daemon label shape requires 20 lowercase hex
+    // characters so cleanup ownership cannot be claimed by an uppercase or
+    // differently-sized label.
+    const exactRunOwnedLabelRegex = /^com\.donadiosolutions\.lcm\.daemon\.[0-9a-f]{20}$/u;
+    expect(exactRunOwnedLabelRegex.test("com.donadiosolutions.lcm.daemon.0123456789abcdef0123")).toBe(true);
+    expect(exactRunOwnedLabelRegex.test("com.donadiosolutions.lcm.daemon.0123456789ABCDEF0123")).toBe(false);
+    expect(exactRunOwnedLabelRegex.test("com.donadiosolutions.lcm.daemon.0123456789abcdef012")).toBe(false);
+    expect(exactRunOwnedLabelRegex.test("com.donadiosolutions.lcm.ci.123456789.1")).toBe(false);
+
+    // The integration may only reference product labels matching the private
+    // marker contract and must never use raw pkill/killall on foreign jobs.
+    expect(run.split("\n").some((line) => /^\s*(?:pkill|killall)\b/u.test(line))).toBe(false);
     expect(workflow.jobs.ci.needs).toContain("macos-launchd");
+  });
+
+  it("binds launchd activity to one shared run root without credential or token disclosure", () => {
+    const run = workflow.jobs["macos-launchd"].steps.find(
+      (step) => step.name === "Run launchd integration path",
+    )?.run ?? "";
+
+    // All sequential real tests must derive one exact label from the workflow
+    // state root, while their runtime and home roots remain per-fixture.
+    expect(launchdIntegrationSource).toContain("process.env.LCM_LAUNCHD_RESOURCE_ROOT");
+    expect(launchdIntegrationSource).toContain("const stateRoot = getSharedStateRoot()");
+    expect(launchdIntegrationSource).toContain("if (spec.stateRoot !== getSharedStateRoot())");
+    expect(launchdIntegrationSource).toContain('const homeRoot = join(root, "home")');
+    expect(launchdIntegrationSource).toContain('const runtimeRoot = join(root, "runtime")');
+    expect(launchdIntegrationSource).toContain("createManagedCredentialDirectory(fixture.stateRoot");
+    expect(launchdIntegrationSource).toContain("console.log(LAUNCHD_MANAGER_ACTIVITY_SENTINEL)");
+
+    // The current-run token is generated before the worker and is never
+    // printed. A marker without that token cannot authorize cleanup.
+    const tokenIndex = run.indexOf('evidence_token="$(uuidgen)"');
+    const workerIndex = run.indexOf("npx vitest run test/daemon/lifecycle-launchd.integration.test.ts");
+    expect(tokenIndex).toBeGreaterThanOrEqual(0);
+    expect(tokenIndex).toBeLessThan(workerIndex);
+    expect(run).not.toContain('echo "$evidence_token"');
+    expect(run).not.toContain('printf \'%s\\n\' "$evidence_token"');
+
+    // A successful manager health response is the only source of the fixed
+    // sentinel; missing, duplicate, or skipped evidence fails the job.
+    expect(run).toContain(
+      'sentinel_count="$(LC_ALL=C grep -c \'^launchd-user$\' "$normalized_out_file" || true)"',
+    );
+    expect(run).toContain("launchd integration produced no single manager-activity sentinel");
+    expect(launchdIntegrationSource).toContain('const LAUNCHD_MANAGER_ACTIVITY_SENTINEL = "launchd-user"');
+    expect(launchdIntegrationSource).toContain("if (!managerActivityReported)");
+
+    // Credential assertions are based only on observed file metadata/bytes;
+    // no test-only expectation variables or secret value enter the child.
+    const expectedCredentialEnvironmentPrefix = ["LCM", "TEST", "EXPECTED", "CREDENTIAL"].join("_");
+    const wedgeEnvironmentName = ["LCM", "TEST", "WEDGE", "FILE"].join("_");
+    expect(launchdIntegrationSource).not.toContain(expectedCredentialEnvironmentPrefix);
+    expect(launchdIntegrationSource).not.toContain(wedgeEnvironmentName);
+    expect(launchdIntegrationSource).toContain("credentialLength: value.byteLength");
+    expect(launchdIntegrationSource).toContain("credentialClaimed: stats.isFile() && value.byteLength > 0");
+    expect(launchdIntegrationSource).toContain("expect(JSON.stringify(health).includes(\"fixture-value\")).toBe(false)");
+  });
+
+  it("executes deterministic ANSI and evidence-boundary fixtures", () => {
+    const sgrGreen = "\u001b[32m";
+    const sgrYellow = "\u001b[33m";
+    const sgrReset = "\u001b[39m";
+    const fixtures = [
+      {
+        name: "colored pass summary",
+        output: `${sgrGreen}Tests${sgrReset}  ${sgrGreen}4 passed${sgrReset} (4)\nlaunchd-user\n`,
+        success: true,
+      },
+      {
+        name: "colored zero-skip summary",
+        output: `${sgrYellow}Tests  4 passed | 0 skipped (4)${sgrReset}\nlaunchd-user\n`,
+        success: true,
+      },
+      {
+        name: "colored nonzero-skip summary",
+        output: `${sgrYellow}Tests  4 passed | 1 skipped (5)${sgrReset}\nlaunchd-user\n`,
+        success: false,
+      },
+      {
+        name: "missing summary",
+        output: "launchd-user\n",
+        success: false,
+      },
+      {
+        name: "duplicate summary",
+        output: "Tests  4 passed (4)\nTests  4 passed (4)\nlaunchd-user\n",
+        success: false,
+      },
+      {
+        name: "ambiguous passed count",
+        output: "Tests  4 passed | 1 passed (5)\nlaunchd-user\n",
+        success: false,
+      },
+      {
+        name: "residual controls and injection text",
+        output:
+          `${sgrGreen}Tests  4 passed (4)${sgrReset}\nlaunchd-user\n\u001b[2J\u0001$(touch __LCM_LAUNCHD_INJECTED_FILE__)\n`,
+        success: false,
+        noInjection: true,
+      },
+      {
+        name: "zero sentinels",
+        output: "Tests  4 passed (4)\n",
+        success: false,
+      },
+      {
+        name: "two sentinels",
+        output: "Tests  4 passed (4)\nlaunchd-user\nlaunchd-user\n",
+        success: false,
+      },
+    ];
+
+    for (const fixture of fixtures) {
+      const result = runLaunchdEvidenceFixture(fixture.output);
+      expect(result.success, fixture.name).toBe(fixture.success);
+      if (fixture.noInjection) {
+        expect(result.injectedFileCreated, fixture.name).toBe(false);
+      }
+    }
+  });
+
+  it("keeps the SGR normalizer executable with BSD/GNU-compatible sed syntax", () => {
+    expect(launchdEvidenceRun).toContain(
+      'LC_ALL=C sed $\'s/\\033\\\\[[0-9;]*m//g\' "$out_file" > "$normalized_out_file"',
+    );
+    expect(launchdEvidenceRun).not.toContain("sed -E");
+    expect(launchdEvidenceRun).not.toContain("sed -r");
+    expect(() => execFileSync("bash", ["-n"], { input: launchdEvidenceRun })).not.toThrow();
+    const normalized = execFileSync("bash", ["-c", "LC_ALL=C sed $'s/\\033\\\\[[0-9;]*m//g'"], {
+      encoding: "utf8",
+      input: "\u001b[32mTests\u001b[39m  \u001b[1;33m4 passed\u001b[0m (4)\n",
+    });
+    expect(normalized).toBe("Tests  4 passed (4)\n");
   });
 
   it("separates trusted OIDC uploads from tokenless fork uploads", () => {

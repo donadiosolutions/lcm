@@ -392,16 +392,74 @@ propagated as a normal environment value. `lcm config get storage --effective`
 shows the CA path and tuning values but replaces the URL with `[REDACTED]`.
 
 The daemon only accepts credentials that systemd exposed through a canonical
-per-unit directory under `/run/credentials/` or the current user's
-`/run/user/<uid>/credentials/` tree. The directory must use systemd's
-read-only `0500` mode (the user-manager directory is owned by the current
-UID), and each requested credential must be an allow-listed regular file with
+per-unit directory under `/run/credentials/`, the current user's
+`/run/user/<uid>/credentials/` tree, or a validated `XDG_RUNTIME_DIR` with the
+same `<runtime>/credentials/<unit>` shape. The runtime directory must be a
+canonical, non-symlink `0700` directory owned by the current UID. The
+credential directory must use systemd's read-only `0500` mode (the
+user-manager directory is owned by the current UID), and each requested credential must be an allow-listed regular file with
 systemd's read-only `0400` mode, one hard link, and no more than 1 MiB of
 content. Credential IDs are bounded, must not be duplicated, and are rejected
 as a set when any ID is unknown or malformed. Invalid, missing, replaced, or
 oversized credentials are ignored without logging their path or contents; the
 usual configuration validation then reports any required value that remains
 unavailable.
+
+Managed background starts cross one additional environment boundary. The
+systemd or launchd manager may have inherited arbitrary variables from the
+interactive session, but the daemon is launched through the trusted
+`/usr/bin/env -i` executable with a bounded set of non-secret runtime values
+(such as `HOME`, `PATH`, locale, timezone, and validated runtime socket
+addresses). Process-based Claude and Codex providers also receive
+`CLAUDE_CONFIG_DIR` and `CODEX_HOME` only when each is an absolute, canonical,
+user-owned private directory. For managed systemd and launchd starts, `PATH` is
+synthesized from the trusted packaged daemon entrypoint and fixed system
+directories so the service sees the same provider search path that `lcm doctor`
+checks, even when the command was invoked through a user-level wrapper. Default
+managed lifecycle calls use that same packaged entrypoint in their manager
+arguments, keeping start, doctor, and restart admission on one stable identity.
+Service identity metadata and credential-file markers are passed as
+names and paths only. API keys and database URLs are never copied into argv,
+unit properties, plist contents, or logs; the daemon reads them from the
+private one-launch credential files after the manager has authenticated their
+directory and per-file ownership, mode, and link metadata. Each authenticated
+launchd credential file is a one-shot input: LCM consumes it during the first
+configuration load and retains only an immutable in-memory startup snapshot
+for later in-process `loadDaemonConfig` reloads, including the `lcm stats`
+configuration read. It never reopens a missing, deleted, replaced, or tampered
+one-shot file after that first authenticated load. To apply a changed managed
+credential, run `lcm daemon restart` so the manager creates a new nonce-scoped
+credential set. A staged managed credential therefore takes precedence over a
+same-name ambient variable. Detached compatibility launches retain their
+historical direct-environment behavior. The in-process launchd snapshot cache
+admits at most 16 distinct valid contexts and never evicts an established
+context; once the bound is reached, a new context is rejected before any
+credential file is opened and its configured credential names are masked so
+configuration fails closed. Production uses one context, while the fixed
+allowance preserves deterministic isolation for in-process parallel tests. The
+`env -i` process is a short-lived
+same-user launch boundary; it does not grant a different privilege or user
+identity, and the service manager remains the lifecycle authority. A running or
+otherwise executable managed launch must authenticate the current identity-
+bearing environment exactly. Locale and time-zone presentation variables
+(`LANG`, `LANGUAGE`, `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`,
+`LC_MONETARY`, `LC_NUMERIC`, `LC_TIME`, and `TZ`) remain bounded child-launch
+values but are intentionally excluded from manager identity, so a healthy
+stable unit remains admissible when callers use different shell presentation
+preferences. Other allow-listed values, such as `PATH`, `HOME`, socket
+addresses, provider configuration, and the PostgreSQL CA pathname, remain
+identity-bound. If one of those identity-bearing values changes while an old
+launch descriptor remains, LCM never executes that old descriptor. After the
+manager has independently proved exact absence, LCM may authenticate the old
+descriptor's bounded, non-secret allow-listed values solely to remove its
+canonical plist and owned credential directory before writing a new descriptor
+with the current values. Malformed, out-of-scope, or uncontrolled descriptors
+still fail closed and remain as collision evidence.
+
+When the Claude process provider is used, `CLAUDE_CODE_OAUTH_TOKEN` is staged
+through the same private one-launch credential mechanism. It is restored only
+inside the authenticated Claude child environment; it is never placed in
+systemd properties, launchd plist contents, command arguments, or diagnostics.
 
 PostgreSQL is remote-primary: once repository support is enabled, an outage is
 reported rather than silently switching the authoritative store to SQLite.

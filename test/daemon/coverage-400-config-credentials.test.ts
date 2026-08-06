@@ -58,14 +58,14 @@ vi.mock("node:path", async importOriginal => {
 });
 
 import { parseDaemonConfig, parseLlmRequestPolicyConfig, resolveDaemonConfigEnv } from "../../src/daemon/config.js";
-import {
+import * as managedCredentials from "../../src/daemon/managed-credentials.js";
+const {
   cleanupManagedCredentialDirectory,
   createManagedCredentialDirectory,
   managedCredentialPath,
-  scavengeStaleManagedCredentialDirectories,
   validateManagedCredentialDirectory,
   writeManagedCredentialFiles,
-} from "../../src/daemon/managed-credentials.js";
+} = managedCredentials;
 
 const originalGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
 
@@ -188,6 +188,24 @@ describe("Epic 400 configuration credential-loader coverage", () => {
         LCM_CREDENTIAL_OPENAI_API_KEY_FILE: file,
       };
       expect(resolveDaemonConfigEnv(env).OPENAI_API_KEY).toBe("launchd-fallback");
+      expect(resolveDaemonConfigEnv({ LCM_CREDENTIAL_DIRECTORY: directory })).toEqual({ LCM_CREDENTIAL_DIRECTORY: directory });
+
+      const runtimeRoot = join(root, "runtime");
+      const systemdDirectory = join(runtimeRoot, "credentials", "fallback.service");
+      const systemdFile = join(systemdDirectory, "OPENAI_API_KEY");
+      mkdirSync(runtimeRoot, { mode: 0o700 });
+      mkdirSync(join(runtimeRoot, "credentials"), { mode: 0o755 });
+      mkdirSync(systemdDirectory, { mode: 0o700 });
+      chmodSync(runtimeRoot, 0o700);
+      writeFileSync(systemdFile, "systemd-fallback\n", { mode: 0o400 });
+      chmodSync(systemdFile, 0o400);
+      chmodSync(systemdDirectory, 0o500);
+      expect(resolveDaemonConfigEnv({
+        CREDENTIALS_DIRECTORY: systemdDirectory,
+        LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
+        XDG_RUNTIME_DIR: `${runtimeRoot}/./`,
+      }).OPENAI_API_KEY).toBe("systemd-fallback");
+      chmodSync(systemdDirectory, 0o700);
 
       symlinkSync(directory, link, "dir");
       expect(resolveDaemonConfigEnv({
@@ -195,13 +213,56 @@ describe("Epic 400 configuration credential-loader coverage", () => {
         LCM_CREDENTIAL_OPENAI_API_KEY_FILE: join(link, "OPENAI_API_KEY"),
       }).OPENAI_API_KEY).toBeUndefined();
 
-      writeFileSync(file, "canonical-race\n", { mode: 0o600 });
-      chmodSync(file, 0o600);
+      const raceRoot = makeRoot();
+      const raceDirectory = join(raceRoot, "credentials");
+      const raceFile = join(raceDirectory, "OPENAI_API_KEY");
+      mkdirSync(raceDirectory, { mode: 0o700 });
+      chmodSync(raceDirectory, 0o700);
+      writeFileSync(raceFile, "canonical-race\n", { mode: 0o600 });
+      chmodSync(raceFile, 0o600);
       fsMocks.realpathSync.mockImplementation((path: string) =>
-        path === file ? join(root, "escaped", "OPENAI_API_KEY") : fsMocks.originals!.realpathSync(path),
+        path === raceFile ? join(raceRoot, "escaped", "OPENAI_API_KEY") : fsMocks.originals!.realpathSync(path),
       );
-      expect(resolveDaemonConfigEnv(env).OPENAI_API_KEY).toBeUndefined();
+      try {
+        expect(resolveDaemonConfigEnv({
+          LCM_CREDENTIAL_DIRECTORY: raceDirectory,
+          LCM_CREDENTIAL_OPENAI_API_KEY_FILE: raceFile,
+        }).OPENAI_API_KEY).toBeUndefined();
+      } finally {
+        removeRoot(raceRoot);
+      }
     } finally {
+      removeRoot(root);
+    }
+  });
+
+  it("fails closed when a custom systemd runtime root disappears during validation", () => {
+    const root = makeRoot();
+    const runtimeRoot = join(root, "runtime");
+    const directory = join(runtimeRoot, "credentials", "race.service");
+    const file = join(directory, "OPENAI_API_KEY");
+    mkdirSync(runtimeRoot, { mode: 0o700 });
+    mkdirSync(join(runtimeRoot, "credentials"), { mode: 0o755 });
+    mkdirSync(directory, { mode: 0o700 });
+    chmodSync(runtimeRoot, 0o700);
+    writeFileSync(file, "race-value\n", { mode: 0o400 });
+    chmodSync(file, 0o400);
+    chmodSync(directory, 0o500);
+    try {
+      let runtimeLstatCalls = 0;
+      const original = fsMocks.originals!;
+      fsMocks.lstatSync.mockImplementation((path: string, ...args: any[]) => {
+        if (path === runtimeRoot && ++runtimeLstatCalls >= 2) throw errorWithCode("EACCES");
+        return Reflect.apply(original.lstatSync as (...values: any[]) => any, original, [path, ...args]);
+      });
+      expect(resolveDaemonConfigEnv({
+        CREDENTIALS_DIRECTORY: directory,
+        LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
+        XDG_RUNTIME_DIR: runtimeRoot,
+        OPENAI_API_KEY: "ambient-value",
+      }).OPENAI_API_KEY).toBe("ambient-value");
+    } finally {
+      chmodSync(directory, 0o700);
       removeRoot(root);
     }
   });
@@ -296,29 +357,24 @@ describe("Epic 400 managed credential coverage", () => {
   it("fails closed for missing or unreadable bases and handles optional preservation", () => {
     const root = makeRoot();
     try {
-      expect(() => scavengeStaleManagedCredentialDirectories(root, "missing-base")).not.toThrow();
-
       const base = join(root, "credentials");
       mkdirSync(base, { mode: 0o700 });
       chmodSync(base, 0o700);
 
-      const withoutPreserve = createManagedCredentialDirectory(root, "stale-without-abcdef0123456789");
-      writeManagedCredentialFiles(withoutPreserve, { OPENAI_API_KEY: "stale" });
-      scavengeStaleManagedCredentialDirectories(root, "manager-without-preserve");
-      expect(existsSync(withoutPreserve)).toBe(false);
-
-      const stale = createManagedCredentialDirectory(root, "stale-with-preserve-fedcba9876543210");
-      const preserved = createManagedCredentialDirectory(root, "current-with-preserve-0123456789abcdef");
+      // Start-time broad stale scavenging has no production API: a concurrent
+      // pre-registration nonce directory must always survive.  Unreadable or
+      // tampered children remain private evidence instead of being deleted.
+      expect("scavengeStaleManagedCredentialDirectories" in managedCredentials).toBe(false);
+      const stale = createManagedCredentialDirectory(root, "stale-preserved-fedcba9876543210");
+      const preserved = createManagedCredentialDirectory(root, "concurrent-pre-registration-0123456789abcdef");
       writeManagedCredentialFiles(stale, { OPENAI_API_KEY: "stale" });
       writeManagedCredentialFiles(preserved, { OPENAI_API_KEY: "current" });
-
-      fsMocks.readdirSync.mockImplementationOnce(() => { throw errorWithCode("EACCES"); });
-      expect(() => scavengeStaleManagedCredentialDirectories(root, "manager-unreadable", preserved)).not.toThrow();
       expect(existsSync(stale)).toBe(true);
       expect(existsSync(preserved)).toBe(true);
-      restoreFsForwarders();
 
-      scavengeStaleManagedCredentialDirectories(root, "manager-with-preserve", preserved);
+      // Explicit, nonce-owned cleanup remains available; nothing broad ever
+      // deletes a concurrent pre-registration nonce directory at start time.
+      cleanupManagedCredentialDirectory(stale, root);
       expect(existsSync(stale)).toBe(false);
       expect(existsSync(preserved)).toBe(true);
       cleanupManagedCredentialDirectory(preserved, root);
