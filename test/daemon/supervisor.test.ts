@@ -14,7 +14,7 @@ import {
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanupManagedCredentialDirectory,
   createManagedCredentialDirectory,
@@ -45,8 +45,17 @@ type SupervisorCommandResult = Readonly<{
 const roots: string[] = [];
 const VALID_RUNTIME_DIGEST = "a".repeat(64);
 const OTHER_RUNTIME_DIGEST = "b".repeat(64);
+const originalXdgRuntimeDir = process.env.XDG_RUNTIME_DIR;
+
+beforeEach(() => {
+  const runtimeRoot = makeRoot();
+  chmodSync(runtimeRoot, 0o700);
+  process.env.XDG_RUNTIME_DIR = runtimeRoot;
+});
 
 afterEach(() => {
+  if (originalXdgRuntimeDir === undefined) delete process.env.XDG_RUNTIME_DIR;
+  else process.env.XDG_RUNTIME_DIR = originalXdgRuntimeDir;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -718,7 +727,9 @@ describe("systemd-user supervisor", () => {
     expect(runner.calls[1].args).toContain(`LCM_CREDENTIAL_OPENAI_API_KEY_FILE=${files[0]}`);
     expect(runner.calls[1].args).toContain("/usr/bin/env");
     expect(runner.calls[1].args).toContain("-i");
-    expect(runner.calls[1].args).toContain(`CREDENTIALS_DIRECTORY=/run/user/${process.getuid?.() ?? -1}/credentials/${spec.systemdUnit}`);
+    const runtimeRoot = process.env.XDG_RUNTIME_DIR;
+    expect(runtimeRoot).toBeDefined();
+    expect(runner.calls[1].args).toContain(`CREDENTIALS_DIRECTORY=${runtimeRoot}/credentials/${spec.systemdUnit}`);
     expect(runner.calls[1].args).toContain("LCM_SYSTEMD_CRED_IDS=OPENAI_API_KEY");
     expect(runner.calls[1].args.join(" ")).not.toContain("secret");
     // Post-start verification used the mirrored source-path metadata to admit
@@ -778,7 +789,7 @@ describe("systemd-user supervisor", () => {
     expect(existsSync(loserDirectory)).toBe(false);
   });
 
-  it("keeps the clean-environment digest stable across per-launch credential markers", () => {
+  it("keeps the clean-environment digest stable without a systemd runtime root", () => {
     const root = makeRoot();
     const directory = createManagedCredentialDirectory(root, "systemd-digest-001");
     const file = writeManagedCredentialFiles(directory, { OPENAI_API_KEY: "secret" })[0]!;
@@ -794,8 +805,48 @@ describe("systemd-user supervisor", () => {
       credentialDirectory: directory,
       credentialFiles: [{ name: "OPENAI_API_KEY", path: file }],
     });
-    expect(managedLaunchEnvironmentDigest(plain, "systemd-user", process.getuid?.() ?? -1, plain.launchEnvironment!))
-      .toBe(managedLaunchEnvironmentDigest(credentialed, "systemd-user", process.getuid?.() ?? -1, credentialed.launchEnvironment!));
+    const missingRuntimeRootUid = 2_147_483_647;
+    expect(managedLaunchEnvironmentDigest(plain, "systemd-user", missingRuntimeRootUid, plain.launchEnvironment!))
+      .toBe(managedLaunchEnvironmentDigest(credentialed, "systemd-user", missingRuntimeRootUid, credentialed.launchEnvironment!));
+  });
+
+  it("probes credentialed systemd specs without XDG_RUNTIME_DIR but refuses the actual launch", async () => {
+    const root = makeRoot();
+    const directory = createManagedCredentialDirectory(root, "systemd-missing-runtime");
+    const file = writeManagedCredentialFiles(directory, { OPENAI_API_KEY: "secret" })[0]!;
+    const spec = makeSpec("systemd-user", root, {
+      credentialDirectory: directory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: file }],
+      launchEnvironment: {},
+    });
+    const missingRuntimeRootUid = 2_147_483_647;
+    const absent = { code: 1, stderr: "Unit is not-found" };
+    const probeRunner = fakeRunner([absent]);
+    await expect(createSupervisor("systemd-user", {
+      run: probeRunner.run,
+      environment: {},
+      platform: "linux",
+      uid: missingRuntimeRootUid,
+    }).probe(spec)).resolves.toMatchObject({ kind: "absent" });
+    expect(probeRunner.calls.map(({ command }) => command)).toEqual(["systemctl"]);
+
+    const startRunner = fakeRunner([absent]);
+    await expect(createSupervisor("systemd-user", {
+      run: startRunner.run,
+      environment: {},
+      platform: "linux",
+      uid: missingRuntimeRootUid,
+    }).start(spec)).rejects.toThrow("manager command");
+    expect(startRunner.calls.some(({ command }) => command === "systemd-run")).toBe(false);
+
+    const invalidUidRunner = fakeRunner([absent]);
+    await expect(createSupervisor("systemd-user", {
+      run: invalidUidRunner.run,
+      environment: {},
+      platform: "linux",
+      uid: -1,
+    }).start(spec)).rejects.toThrow("manager command");
+    expect(invalidUidRunner.calls.some(({ command }) => command === "systemd-run")).toBe(false);
   });
 
   it("derives the canonical user runtime root when XDG_RUNTIME_DIR is absent", async () => {
@@ -808,6 +859,7 @@ describe("systemd-user supervisor", () => {
     const spec = makeSpec("systemd-user", root, {
       credentialDirectory: directory,
       credentialFiles: [{ name: "OPENAI_API_KEY", path: file }],
+      launchEnvironment: {},
     });
     const runner = fakeRunner([
       { code: 1, stderr: "Unit is not-found" },
@@ -821,12 +873,14 @@ describe("systemd-user supervisor", () => {
       uid,
     }).start(spec)).resolves.toMatchObject({ managerPid: 445 });
     expect(runner.calls[1]!.args).toContain(`CREDENTIALS_DIRECTORY=${runtimeRoot}/credentials/${spec.systemdUnit}`);
+    const invalidUidRunner = fakeRunner([{ code: 1, stderr: "Unit is not-found" }]);
     await expect(createSupervisor("systemd-user", {
-      run: fakeRunner([]).run,
+      run: invalidUidRunner.run,
       environment: {},
       platform: "linux",
       uid: -1,
-    }).start(spec)).rejects.toThrow("systemd runtime directory");
+    }).start(spec)).rejects.toThrow("manager command");
+    expect(invalidUidRunner.calls.some(({ command }) => command === "systemd-run")).toBe(false);
   });
 
   it("fails closed when the systemd runtime root for credentials is missing or untrusted", async () => {
@@ -857,8 +911,9 @@ describe("systemd-user supervisor", () => {
         platform: "linux",
         ...(uid === undefined ? {} : { uid }),
       }).start(spec)).rejects.toThrow(/manager command|systemd runtime directory/u);
+      expect(runner.calls.some(({ command }) => command === "systemd-run")).toBe(false);
     };
-    await attempt(join(root, "missing"));
+    await attempt(join(root, "missing"), 2_147_483_647);
     const deleted = join(root, "deleted-runtime");
     mkdirSync(deleted, { mode: 0o700 });
     chmodSync(deleted, 0o700);

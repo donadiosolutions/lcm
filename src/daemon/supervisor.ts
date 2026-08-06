@@ -1677,6 +1677,10 @@ function managedLaunchEnvironmentValues(
   if (kind === "systemd-user") {
     const names = credentialFiles.map(({ name }) => name);
     if (names.length > 0) {
+      // Runtime-root trust is required only when constructing the actual
+      // credentialed manager launch.  Keep it out of digest computation so a
+      // reachable injected manager can still be probed without a host
+      // runtime directory.
       launchEnvironmentValue(values, "CREDENTIALS_DIRECTORY", systemdCredentialDirectory(spec, uid, values));
       launchEnvironmentValue(values, "LCM_SYSTEMD_CRED_IDS", names.join(","));
       // Retain the allow-listed LoadCredential source paths in the child
@@ -1710,15 +1714,11 @@ export function managedLaunchEnvironmentDigest(
   // (CREDENTIALS_DIRECTORY, credential IDs, and launchd file paths) are
   // manager-owned ephemeral state; including them would make every ordinary
   // probe compare an existing credentialed unit against an unstaged spec.
+  // Keep this computation pure: host runtime-root trust belongs to the actual
+  // systemd launch-assignment path, after manager preflight has succeeded.
   const values = new Map<string, string>();
   for (const [name, value] of Object.entries(spec.launchEnvironment ?? environment)) {
     launchEnvironmentValue(values, name, value);
-  }
-  // Keep the runtime-root trust check on an actual credentialed systemd
-  // launch.  A base probe without staged credentials may legitimately omit
-  // XDG_RUNTIME_DIR and use the manager's own stable unit identity.
-  if (kind === "systemd-user" && (spec.credentialFiles?.length ?? 0) > 0) {
-    systemdCredentialDirectory(spec, uid, values);
   }
   const canonical = [...values.entries()].sort(([left], [right]) => left.localeCompare(right));
   return createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
