@@ -291,17 +291,58 @@ jobs:
           # Ownership proven by the token plus the derived product label; only
           # now may the EXIT trap consider a bootout on failure teardown.
           validated_ready_label="$ready_label"
-          # Fail hard when every launchd integration test skipped: a skipped
-          # run still exits 0 and produces no real manager evidence, so this
-          # gate requires observed skips to be zero and a real launched manager
-          # to have been exercised. The counts come only from this run's fresh
-          # captured output, never from any pre-existing file.
-          if grep -qE 'Tests[[:space:]]+.*skipped' "$out_file"; then
-            skipped_count="$(grep -oE 'Tests[[:space:]]+[0-9]+ skipped[^|]*' "$out_file" | grep -oE '[0-9]+ skipped' | grep -oE '^[0-9]+' | head -1)"
-          else
-            skipped_count=0
+          # Parse only a fresh normalized copy. Strip only CSI SGR sequences;
+          # any other escape or C0 control byte remains evidence corruption.
+          normalized_out_file="$resource_root/launchd.normalized.out"
+          LC_ALL=C sed $'s/\033\\[[0-9;]*m//g' "$out_file" > "$normalized_out_file"
+          if LC_ALL=C od -An -v -tu1 "$normalized_out_file" | awk '
+            {
+              for (i = 1; i <= NF; i++) {
+                if ($i <= 8 || ($i >= 11 && $i <= 31) || $i == 127) {
+                  found = 1
+                }
+              }
+            }
+            END {
+              if (found) {
+                exit 0
+              }
+              exit 1
+            }
+          '
+          then
+            echo "launchd integration output contains residual ESC/C0 control bytes" >&2
+            exit 1
           fi
-          passed_count="$(grep -oE 'Tests[[:space:]]+[0-9]+ passed' "$out_file" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' | head -1 || true)"
+          # Fail hard when the fresh output does not contain exactly one
+          # unambiguous Vitest Tests summary. Never select a first match from
+          # duplicate or ambiguous evidence.
+          tests_summary_count="$(LC_ALL=C grep -Ec '^[[:space:]]*Tests([[:space:]]|$)' "$normalized_out_file" || true)"
+          if [[ "$tests_summary_count" != "1" ]]; then
+            echo "launchd integration requires exactly one Tests summary (count=$tests_summary_count)" >&2
+            exit 1
+          fi
+          tests_summary="$(LC_ALL=C grep -E '^[[:space:]]*Tests([[:space:]]|$)' "$normalized_out_file")"
+          tests_summary_pattern='^[[:space:]]*Tests[[:space:]]+[[:digit:]]+[[:space:]]+(passed|skipped)([[:space:]]*\|[[:space:]]+[[:digit:]]+[[:space:]]+(passed|skipped))*[[:space:]]+\([[:digit:]]+\)[[:space:]]*$'
+          if [[ ! "$tests_summary" =~ $tests_summary_pattern ]]; then
+            echo "launchd integration produced an ambiguous Tests summary" >&2
+            exit 1
+          fi
+          passed_match_count="$(printf '%s\n' "$tests_summary" | LC_ALL=C grep -oE '[[:digit:]]+[[:space:]]+passed' | awk 'END { print NR + 0 }' || true)"
+          skipped_match_count="$(printf '%s\n' "$tests_summary" | LC_ALL=C grep -oE '[[:digit:]]+[[:space:]]+skipped' | awk 'END { print NR + 0 }' || true)"
+          if [[ "$passed_match_count" != "1" || "$skipped_match_count" -gt 1 ]]; then
+            echo "launchd integration produced ambiguous passed/skipped counts" >&2
+            exit 1
+          fi
+          if [[ "$tests_summary" =~ ([[:digit:]]+)[[:space:]]+passed ]]; then
+            passed_count="${BASH_REMATCH[1]}"
+          else
+            passed_count=""
+          fi
+          skipped_count=0
+          if [[ "$tests_summary" =~ ([[:digit:]]+)[[:space:]]+skipped ]]; then
+            skipped_count="${BASH_REMATCH[1]}"
+          fi
           if [[ "${skipped_count:-0}" != "0" || "${passed_count:-0}" == "0" || -z "${passed_count:-}" ]]; then
             echo "launchd integration produced no current-run passed evidence (skipped=${skipped_count:-0} passed=${passed_count:-0})" >&2
             exit 1
@@ -310,7 +351,7 @@ jobs:
           # after a child has answered exact health through launchd. This is
           # fresh manager activity evidence, not a test-name or credential
           # echo, and duplicate/missing sentinels fail closed.
-          sentinel_count="$(grep -c '^launchd-user$' "$out_file" || true)"
+          sentinel_count="$(LC_ALL=C grep -c '^launchd-user$' "$normalized_out_file" || true)"
           if [[ "$sentinel_count" != "1" ]]; then
             echo "launchd integration produced no single manager-activity sentinel (count=$sentinel_count)" >&2
             exit 1

@@ -1,5 +1,8 @@
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { load as loadYaml } from "js-yaml";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 interface WorkflowStep {
@@ -64,6 +67,84 @@ const launchdIntegrationSource = readFileSync(
   "utf8",
 );
 const workflow = loadYaml(source) as CiWorkflow;
+const launchdEvidenceRun =
+  workflow.jobs["macos-launchd"].steps.find((step) => step.name === "Run launchd integration path")?.run ?? "";
+const launchdFixtureToken = "11111111-1111-1111-1111-111111111111";
+const launchdFixtureLabel = "com.donadiosolutions.lcm.daemon.0123456789abcdef0123";
+
+function runLaunchdEvidenceFixture(output: string): {
+  success: boolean;
+  injectedFileCreated: boolean;
+} {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "lcm-ci-evidence-"));
+  const resourceRoot = join(fixtureRoot, "resource");
+  const binRoot = join(fixtureRoot, "bin");
+  const fixtureOutput = join(fixtureRoot, "fixture.out");
+  const injectedFile = `${fixtureRoot}-injected`;
+  mkdirSync(binRoot);
+  writeFileSync(
+    fixtureOutput,
+    output.replaceAll("__LCM_LAUNCHD_INJECTED_FILE__", injectedFile),
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    join(binRoot, "uuidgen"),
+    `#!/bin/sh
+printf '%s\\n' '${launchdFixtureToken}'
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(
+    join(binRoot, "npx"),
+    `#!/bin/sh
+set -eu
+printf '%s %s\\n' "$LCM_LAUNCHD_EVIDENCE_TOKEN" "$LCM_LAUNCHD_FIXTURE_LABEL" > "$LCM_LAUNCHD_RESOURCE_ROOT/launchd.label"
+chmod 0600 "$LCM_LAUNCHD_RESOURCE_ROOT/launchd.label"
+cat "$LCM_LAUNCHD_FIXTURE_OUTPUT"
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(
+    join(binRoot, "stat"),
+    `#!/bin/sh
+set -eu
+if [ "$1" = "-f" ] && [ "$2" = "%Lp" ]; then
+  printf '600\\n'
+  exit 0
+fi
+exit 1
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(join(binRoot, "launchctl"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: `${binRoot}:${process.env.PATH ?? ""}`,
+    LCM_LAUNCHD_FIXTURE_OUTPUT: fixtureOutput,
+    LCM_LAUNCHD_FIXTURE_LABEL: launchdFixtureLabel,
+    LCM_LAUNCHD_RESOURCE_ROOT: resourceRoot,
+    LCM_LAUNCHD_LABEL: "com.donadiosolutions.lcm.ci.1.1",
+    LCM_LAUNCHD_SCOPE_ID: "ci-fixture-1-1",
+  };
+  delete env.NODE;
+  delete env.NODE_PATH;
+
+  let success = false;
+  let injectedFileCreated = false;
+  try {
+    execFileSync("bash", ["-c", launchdEvidenceRun], { env, stdio: "ignore" });
+    success = true;
+  } catch {
+    success = false;
+  } finally {
+    injectedFileCreated = existsSync(injectedFile);
+    rmSync(injectedFile, { force: true });
+    rmSync(fixtureRoot, { force: true, recursive: true });
+  }
+  return { success, injectedFileCreated };
+}
+
 const expectedCodecovRunSteps = [
   {
     name: "Download Vitest reports",
@@ -270,7 +351,11 @@ describe("CI workflow", () => {
     expect(run).toContain('mkdir -p -- "$resource_root"');
     expect(run).toContain('chmod 0700 "$resource_root"');
     expect(run).toContain('tee "$out_file"');
-    expect(run).toContain('sentinel_count="$(grep -c \'^launchd-user$\' "$out_file" || true)"');
+    expect(run).toContain('normalized_out_file="$resource_root/launchd.normalized.out"');
+    expect(run).toContain('LC_ALL=C sed $\'s/\\033\\\\[[0-9;]*m//g\' "$out_file" > "$normalized_out_file"');
+    expect(run).toContain(
+      'sentinel_count="$(LC_ALL=C grep -c \'^launchd-user$\' "$normalized_out_file" || true)"',
+    );
     expect(run).toContain('[[ "$sentinel_count" != "1" ]]');
     // The trap gates every bootout on exact current-run evidence: the fresh
     // token, the exact validated derived product label, and the exact pinned
@@ -303,10 +388,19 @@ describe("CI workflow", () => {
     expect(run).toContain(
       "launchd integration produced no current-run passed evidence (skipped=${skipped_count:-0} passed=${passed_count:-0})",
     );
-    expect(run).toContain("grep -qE 'Tests[[:space:]]+.*skipped' \"$out_file\"");
+    expect(run).toContain(
+      "tests_summary_count=\"$(LC_ALL=C grep -Ec '^[[:space:]]*Tests([[:space:]]|$)' \"$normalized_out_file\" || true)\"",
+    );
+    expect(run).toContain(
+      "launchd integration requires exactly one Tests summary (count=$tests_summary_count)",
+    );
+    expect(run).toContain("launchd integration produced an ambiguous Tests summary");
+    expect(run).toContain("launchd integration produced ambiguous passed/skipped counts");
     expect(run).toContain(
       'if [[ "${skipped_count:-0}" != "0" || "${passed_count:-0}" == "0" || -z "${passed_count:-}" ]]; then',
     );
+    expect(run).not.toContain("head -1");
+    expect(run).not.toMatch(/grep[^\n]*"\$out_file"/u);
     // The derived product label must match the exact run-owned daemon shape,
     // which is what revives workflow cleanup ownership after the manifest
     // equality gate was removed: the old equality gate compared against the
@@ -373,7 +467,9 @@ describe("CI workflow", () => {
 
     // A successful manager health response is the only source of the fixed
     // sentinel; missing, duplicate, or skipped evidence fails the job.
-    expect(run).toContain('sentinel_count="$(grep -c \'^launchd-user$\' "$out_file" || true)"');
+    expect(run).toContain(
+      'sentinel_count="$(LC_ALL=C grep -c \'^launchd-user$\' "$normalized_out_file" || true)"',
+    );
     expect(run).toContain("launchd integration produced no single manager-activity sentinel");
     expect(launchdIntegrationSource).toContain('const LAUNCHD_MANAGER_ACTIVITY_SENTINEL = "launchd-user"');
     expect(launchdIntegrationSource).toContain("if (!managerActivityReported)");
@@ -387,6 +483,83 @@ describe("CI workflow", () => {
     expect(launchdIntegrationSource).toContain("credentialLength: value.byteLength");
     expect(launchdIntegrationSource).toContain("credentialClaimed: stats.isFile() && value.byteLength > 0");
     expect(launchdIntegrationSource).toContain("expect(JSON.stringify(health).includes(\"fixture-value\")).toBe(false)");
+  });
+
+  it("executes deterministic ANSI and evidence-boundary fixtures", () => {
+    const sgrGreen = "\u001b[32m";
+    const sgrYellow = "\u001b[33m";
+    const sgrReset = "\u001b[39m";
+    const fixtures = [
+      {
+        name: "colored pass summary",
+        output: `${sgrGreen}Tests${sgrReset}  ${sgrGreen}4 passed${sgrReset} (4)\nlaunchd-user\n`,
+        success: true,
+      },
+      {
+        name: "colored zero-skip summary",
+        output: `${sgrYellow}Tests  4 passed | 0 skipped (4)${sgrReset}\nlaunchd-user\n`,
+        success: true,
+      },
+      {
+        name: "colored nonzero-skip summary",
+        output: `${sgrYellow}Tests  4 passed | 1 skipped (5)${sgrReset}\nlaunchd-user\n`,
+        success: false,
+      },
+      {
+        name: "missing summary",
+        output: "launchd-user\n",
+        success: false,
+      },
+      {
+        name: "duplicate summary",
+        output: "Tests  4 passed (4)\nTests  4 passed (4)\nlaunchd-user\n",
+        success: false,
+      },
+      {
+        name: "ambiguous passed count",
+        output: "Tests  4 passed | 1 passed (5)\nlaunchd-user\n",
+        success: false,
+      },
+      {
+        name: "residual controls and injection text",
+        output:
+          `${sgrGreen}Tests  4 passed (4)${sgrReset}\nlaunchd-user\n\u001b[2J\u0001$(touch __LCM_LAUNCHD_INJECTED_FILE__)\n`,
+        success: false,
+        noInjection: true,
+      },
+      {
+        name: "zero sentinels",
+        output: "Tests  4 passed (4)\n",
+        success: false,
+      },
+      {
+        name: "two sentinels",
+        output: "Tests  4 passed (4)\nlaunchd-user\nlaunchd-user\n",
+        success: false,
+      },
+    ];
+
+    for (const fixture of fixtures) {
+      const result = runLaunchdEvidenceFixture(fixture.output);
+      expect(result.success, fixture.name).toBe(fixture.success);
+      if (fixture.noInjection) {
+        expect(result.injectedFileCreated, fixture.name).toBe(false);
+      }
+    }
+  });
+
+  it("keeps the SGR normalizer executable with BSD/GNU-compatible sed syntax", () => {
+    expect(launchdEvidenceRun).toContain(
+      'LC_ALL=C sed $\'s/\\033\\\\[[0-9;]*m//g\' "$out_file" > "$normalized_out_file"',
+    );
+    expect(launchdEvidenceRun).not.toContain("sed -E");
+    expect(launchdEvidenceRun).not.toContain("sed -r");
+    expect(() => execFileSync("bash", ["-n"], { input: launchdEvidenceRun })).not.toThrow();
+    const normalized = execFileSync("bash", ["-c", "LC_ALL=C sed $'s/\\033\\\\[[0-9;]*m//g'"], {
+      encoding: "utf8",
+      input: "\u001b[32mTests\u001b[39m  \u001b[1;33m4 passed\u001b[0m (4)\n",
+    });
+    expect(normalized).toBe("Tests  4 passed (4)\n");
   });
 
   it("separates trusted OIDC uploads from tokenless fork uploads", () => {
