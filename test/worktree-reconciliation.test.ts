@@ -4174,7 +4174,7 @@ describe("worktree reconciliation", () => {
       "SELECT COUNT(*) AS count FROM session_ingest_log WHERE session_id = 'late-write'",
     ).get()).toEqual({ count: 0 });
     evidence.close();
-  }, 15_000);
+  }, 15_000); // Full-suite child-process contention can exceed Vitest's 5s default.
 
   it("commits the source fence before making the target marker durable", () => {
     const { main, linked } = makeRepository(home);
@@ -4224,7 +4224,7 @@ describe("worktree reconciliation", () => {
       "SELECT session_id FROM conversations WHERE session_id = 'commit-order'",
     ).get()).toEqual({ session_id: "commit-order" });
     merged.close();
-  }, 15_000);
+  }, 15_000); // Full-suite child-process contention can exceed Vitest's 5s default.
 
   it("fails closed while a legacy writer transaction is active and retries after quiescence", () => {
     const { main, linked } = makeRepository(home);
