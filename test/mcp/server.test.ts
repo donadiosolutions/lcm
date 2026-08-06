@@ -238,6 +238,7 @@ describe("handleDaemonRequest", () => {
       ["api key underscored", `API_KEY:${SYNTHETIC_TOKEN}`],
       ["authorization bearer", `Authorization: Bearer ${SYNTHETIC_TOKEN}`],
       ["authorization bearer mixed-case", `authorization = bearer ${SYNTHETIC_TOKEN}`],
+      ["authorization basic", `Authorization: Basic ${SYNTHETIC_CREDENTIAL}`],
     ])("preserves the %s key, keeps the credential undislosed, and leaves no literal $1", (_label, fragment) => {
       const rendered = safeMcpError(new Error(`auth failed: ${fragment}; retry`));
 

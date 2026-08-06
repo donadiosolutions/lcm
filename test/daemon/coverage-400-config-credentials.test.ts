@@ -203,7 +203,7 @@ describe("Epic 400 configuration credential-loader coverage", () => {
       expect(resolveDaemonConfigEnv({
         CREDENTIALS_DIRECTORY: systemdDirectory,
         LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
-        XDG_RUNTIME_DIR: runtimeRoot,
+        XDG_RUNTIME_DIR: `${runtimeRoot}/./`,
       }).OPENAI_API_KEY).toBe("systemd-fallback");
       chmodSync(systemdDirectory, 0o700);
 

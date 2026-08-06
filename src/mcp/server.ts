@@ -225,7 +225,7 @@ function safeMcpError(err: unknown): string {
   // this function, never marker-shaped text supplied by the caller.
   const markerSafeRaw = stripUntrustedMarkerCodePoints(raw);
   const protectedRaw = redactQuotedMcpAssignments(markerSafeRaw, redactionKeyMarker, redactionSeparator).replace(
-    /\b(host|hostname|socket|server|password|passwd|pwd|token|secret|api[-_ ]?key|authorization)(\s*)[:=]\s*(?:bearer\s+)?([^\s,;]+?)([.!?])?(?=\s|[,;]|$)/giu,
+    /\b(host|hostname|socket|server|password|passwd|pwd|token|secret|api[-_ ]?key|authorization)(\s*)[:=]\s*(?:(?:basic|bearer)\s+)?([^\s,;]+?)([.!?])?(?=\s|[,;]|$)/giu,
     (_match, key: string, spacing: string, _value: string, terminalPunctuation: string = "") =>
       `${key.slice(0, 1)}${redactionKeyMarker}${key.slice(1)}${spacing}${redactionSeparator}<redacted>${terminalPunctuation}`,
   );

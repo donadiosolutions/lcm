@@ -325,15 +325,16 @@ function systemdCredentialDirectoryPrefix(path: string): SystemdCredentialPrefix
 }
 
 function trustedSystemdRuntimeDirectory(path: string | undefined): string | undefined {
-  if (!path || !isAbsolute(path) || resolve(path) !== path || /[\u0000\r\n]/u.test(path)) return undefined;
+  if (!path || !isAbsolute(path) || /[\u0000\r\n]/u.test(path)) return undefined;
+  const normalized = resolve(path);
   try {
-    const stats = lstatSync(path);
-    const canonical = realpathSync(path);
+    const stats = lstatSync(normalized);
+    const canonical = realpathSync(normalized);
     const uid = typeof process.getuid === "function" ? process.getuid() : stats.uid;
     if (
       stats.isSymbolicLink()
       || !stats.isDirectory()
-      || canonical !== path
+      || canonical !== normalized
       || stats.uid !== uid
       || (stats.mode & 0o777) !== 0o700
     ) return undefined;
