@@ -1829,6 +1829,7 @@ describe("launchd-user supervisor", () => {
       ["credentialFile", terminal.replace(/^LCM_SUPERVISOR_CWD => .*$/mu, `LCM_SUPERVISOR_CWD => ${root}\nLCM_CREDENTIAL_OPENAI_API_KEY_FILE => ${root}/credentials/attacker/OPENAI_API_KEY`)],
       ["postgresCaFile", terminal.replace(/^LCM_SUPERVISOR_CWD => .*$/mu, `LCM_SUPERVISOR_CWD => ${root}\nLCM_POSTGRES_CA_FILE => ${root}/ca.pem`)],
       ["stateRoot", terminal.replace(/^LCM_SUPERVISOR_STATE_ROOT => .*$/mu, "LCM_SUPERVISOR_STATE_ROOT => /tmp/evil")],
+      ["launchEnvironmentDigest", terminal.replace(/^LCM_SUPERVISOR_ENV_DIGEST => .*$/mu, `LCM_SUPERVISOR_ENV_DIGEST => ${"f".repeat(64)}`)],
     ];
     for (const [label, drifted] of driftCases) {
       const runner = fakeRunner([
@@ -1843,6 +1844,27 @@ describe("launchd-user supervisor", () => {
         uid: 501,
         sleep: vi.fn(async () => undefined),
       }).stopAndStart(replacement)).rejects.toThrow("manager command");
+      expect(runner.calls.filter(({ args }) => args[0] === "bootout"), label).toHaveLength(0);
+      expect(runner.calls.filter(({ args }) => args[0] === "bootstrap"), label).toHaveLength(0);
+    }
+
+    const incompletePriorCases: ReadonlyArray<readonly [string, string]> = [
+      ["missing launch environment digest", terminal.replace(/\nLCM_SUPERVISOR_ENV_DIGEST => [^\n]+/u, "")],
+      ["malformed launch environment digest", terminal.replace(/LCM_SUPERVISOR_ENV_DIGEST => [^\n]+/u, "LCM_SUPERVISOR_ENV_DIGEST => not-a-digest")],
+    ];
+    for (const [label, incompletePrior] of incompletePriorCases) {
+      const runner = fakeRunner([
+        { code: 0, stdout: incompletePrior },
+        { code: 0, stdout: sparseTransition },
+        { code: 0, stdout: incompletePrior },
+        { code: 0, stdout: incompletePrior },
+      ]);
+      await expect(createSupervisor("launchd-user", {
+        run: runner.run,
+        platform: "darwin",
+        uid: 501,
+        sleep: vi.fn(async () => undefined),
+      }).stopAndStart(replacement), label).rejects.toThrow("manager command");
       expect(runner.calls.filter(({ args }) => args[0] === "bootout"), label).toHaveLength(0);
       expect(runner.calls.filter(({ args }) => args[0] === "bootstrap"), label).toHaveLength(0);
     }

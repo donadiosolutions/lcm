@@ -285,6 +285,34 @@ async function createLaunchdFixture(options?: {
   });
 }
 
+async function cleanupLaunchdFixture(
+  fixture: LaunchdIntegrationFixture,
+  managerReady: boolean,
+  spec: SupervisorSpec,
+  primaryError: unknown,
+): Promise<void> {
+  let cleanupError: unknown;
+  if (managerReady) {
+    try {
+      await fixture.supervisor.stopAndAwaitAbsent(spec);
+    } catch (error) {
+      cleanupError = error;
+    }
+  }
+  try {
+    rmSync(fixture.root, { recursive: true, force: true });
+  } catch (error) {
+    cleanupError ??= error;
+  }
+  fixtureRoots.delete(fixture.root);
+  if (cleanupError === undefined) return;
+  if (primaryError !== undefined) {
+    console.error("launchd fixture cleanup failed after the primary test failure", cleanupError);
+    return;
+  }
+  throw cleanupError;
+}
+
 afterEach(() => {
   for (const root of fixtureRoots) rmSync(root, { recursive: true, force: true });
   fixtureRoots.clear();
@@ -456,6 +484,7 @@ describe("real launchd daemon lifecycle", () => {
       expect(existsSync(credentialFile)).toBe(true);
 
       let managerReady = true;
+      let primaryError: unknown;
       try {
         exposeProductLabel(spec);
         const started = await fixture.supervisor.start(spec);
@@ -531,10 +560,11 @@ describe("real launchd daemon lifecycle", () => {
           "bootout",
           `${fixture.guiDomain}/${spec.launchdLabel}`,
         ]);
+      } catch (error) {
+        primaryError = error;
+        throw error;
       } finally {
-        if (managerReady) await fixture.supervisor.stopAndAwaitAbsent(spec);
-        rmSync(fixture.root, { recursive: true, force: true });
-        fixtureRoots.delete(fixture.root);
+        await cleanupLaunchdFixture(fixture, managerReady, spec, primaryError);
       }
     },
   );
@@ -557,6 +587,7 @@ describe("real launchd daemon lifecycle", () => {
       expect(statSync(credentialFile).mode & 0o777).toBe(0o600);
 
       let managerReady = true;
+      let primaryError: unknown;
       try {
         exposeProductLabel(spec);
         const started = await fixture.supervisor.start(spec);
@@ -587,10 +618,11 @@ describe("real launchd daemon lifecycle", () => {
 
         expect(existsSync(credentialFile)).toBe(false);
         expect(existsSync(credentialDirectory)).toBe(false);
+      } catch (error) {
+        primaryError = error;
+        throw error;
       } finally {
-        if (managerReady) await fixture.supervisor.stopAndAwaitAbsent(spec);
-        rmSync(fixture.root, { recursive: true, force: true });
-        fixtureRoots.delete(fixture.root);
+        await cleanupLaunchdFixture(fixture, managerReady, spec, primaryError);
       }
     },
   );
@@ -619,6 +651,7 @@ describe("real launchd daemon lifecycle", () => {
       }
 
       let managerReady = true;
+      let primaryError: unknown;
       try {
         exposeProductLabel(spec);
         const started = await fixture.supervisor.start(spec);
@@ -699,10 +732,11 @@ describe("real launchd daemon lifecycle", () => {
         });
         expect(existsSync(credentialFile)).toBe(false);
         expect(existsSync(credentialDirectory)).toBe(false);
+      } catch (error) {
+        primaryError = error;
+        throw error;
       } finally {
-        if (managerReady) await fixture.supervisor.stopAndAwaitAbsent(spec);
-        rmSync(fixture.root, { recursive: true, force: true });
-        fixtureRoots.delete(fixture.root);
+        await cleanupLaunchdFixture(fixture, managerReady, spec, primaryError);
       }
     },
   );
@@ -735,6 +769,7 @@ describe("real launchd daemon lifecycle", () => {
 
       let managerReady = true;
       let recreatedStarted: SupervisorStartResult | undefined;
+      let primaryError: unknown;
       try {
         exposeProductLabel(firstSpec);
         const firstStarted = await fixture.supervisor.start(firstSpec);
@@ -756,9 +791,10 @@ describe("real launchd daemon lifecycle", () => {
         });
         expect(["inactive", "failed", "last-exit"]).toContain(terminal.terminal);
 
-        // The prior nonce observed terminal existed but has already exited;
-        // its private runtime artifacts must not be present for recreation.
-        expect(existsSync(firstCredentialFile)).toBe(false);
+        // The prior nonce is terminal but still manager-registered. Its
+        // one-launch credentials remain until exact manager absence is proven;
+        // deleting them earlier would violate the cleanup boundary.
+        expect(existsSync(firstCredentialFile)).toBe(true);
 
         const restarted = await fixture.supervisor.stopAndStart(recreatedSpec);
         recreatedStarted = restarted;
@@ -766,6 +802,7 @@ describe("real launchd daemon lifecycle", () => {
         expect(restarted.managerPid).toBeGreaterThan(0);
         expect(restarted.nonce).toBe(recreatedSpec.nonce);
         await waitForExactHealth(recreatedSpec, restarted.managerPid!);
+        expect(existsSync(firstCredentialFile)).toBe(false);
         const admitted = await fixture.supervisor.probe(recreatedSpec);
         expect(admitted).toMatchObject({
           kind: "registered-running-valid",
@@ -789,10 +826,11 @@ describe("real launchd daemon lifecycle", () => {
         expect(bootoutCalls.some(call => call.args[1] === `${fixture.guiDomain}/${firstSpec.launchdLabel}`)).toBe(true);
         expect(bootoutCalls.some(call => call.args[1] === `${fixture.guiDomain}/${recreatedSpec.launchdLabel}`)).toBe(true);
         expect(fixture.calls.some(call => /^(?:kill|pkill|killall)$/u.test(call.command))).toBe(false);
+      } catch (error) {
+        primaryError = error;
+        throw error;
       } finally {
-        if (managerReady) await fixture.supervisor.stopAndAwaitAbsent(recreatedSpec);
-        rmSync(fixture.root, { recursive: true, force: true });
-        fixtureRoots.delete(fixture.root);
+        await cleanupLaunchdFixture(fixture, managerReady, recreatedSpec, primaryError);
       }
       if (recreatedStarted !== undefined) {
         expect(recreatedStarted.kind).toBe("launchd-user");

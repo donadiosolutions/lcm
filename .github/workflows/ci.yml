@@ -218,7 +218,7 @@ jobs:
           validated_ready_label=""
           cleanup() {
             set +e
-            if [[ -f "$ready_file" && -n "$validated_ready_label" ]]; then
+            if [[ -f "$ready_file" ]]; then
               ready_line="$(<"$ready_file")"
               ready_token="${ready_line%% *}"
               ready_label="${ready_line#* }"
@@ -228,18 +228,17 @@ jobs:
               # replanted, malformed, or manifest-mismatched marker refuses to
               # bootout and never falls back to a broad label sweep or a
               # native/PID kill.
-              if [[ "$ready_token" == "$evidence_token" && "$ready_line" == "$evidence_token $validated_ready_label" && "$ready_label" == "$validated_ready_label" ]]; then
-                if [[ "$(stat -f '%Lp' "$ready_file" 2>/dev/null)" == "600" ]]; then
-                  launchctl bootout "gui/$(id -u)/$ready_label" || true
-                else
-                  echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2
-                fi
+              if [[ -z "$ready_token" || -z "$ready_label" || "$ready_line" != "$ready_token $ready_label" ]]; then
+                echo "Refusing cleanup for malformed launchd evidence marker" >&2
+              elif [[ "$ready_token" == "$evidence_token" \
+                && "$ready_line" == "$evidence_token $validated_ready_label" \
+                && "$ready_label" == "$validated_ready_label" \
+                && "$ready_label" =~ ^com\.donadiosolutions\.lcm\.daemon\.[0-9a-f]{20}$ \
+                && "$(stat -f '%Lp' "$ready_file" 2>/dev/null)" == "600" ]]; then
+                launchctl bootout "gui/$(id -u)/$ready_label" || true
               else
                 echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2
               fi
-            elif [[ -f "$ready_file" ]]; then
-              ready_label="$(<"$ready_file")"
-              echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2
             fi
             rm -rf -- "$resource_root"
           }
@@ -262,6 +261,10 @@ jobs:
           ready_line="$(<"$ready_file")"
           ready_token="${ready_line%% *}"
           ready_label="${ready_line#* }"
+          if [[ -z "$ready_token" || -z "$ready_label" || "$ready_line" != "$ready_token $ready_label" ]]; then
+            echo "launchd integration marker must contain exactly one current-run token and one derived product label" >&2
+            exit 1
+          fi
           if [[ "$ready_token" != "$evidence_token" ]]; then
             echo "launchd integration marker does not carry the current run evidence token" >&2
             exit 1

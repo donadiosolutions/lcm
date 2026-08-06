@@ -1993,17 +1993,23 @@ function isAuthenticatedStaleObservation(
   spec: SupervisorSpec,
   staleSpec: SupervisorSpec,
   observation: SupervisorObservation,
+  priorObservation?: Extract<SupervisorObservation, { kind: "registered-stale-config" }>,
 ): boolean {
   if (observation.kind !== "registered-stale-config") return false;
   if (observation.scopeDigest !== spec.scopeDigest || observation.name !== spec.name) return false;
   if (observation.nonce !== staleSpec.nonce) return false;
+  if (
+    priorObservation !== undefined
+    && (
+      !supervisorIdentityMatches(priorObservation, observation)
+      || priorObservation.launchEnvironmentDigest === undefined
+      || !/^[0-9a-f]{64}$/u.test(priorObservation.launchEnvironmentDigest)
+    )
+  ) return false;
   // The stable manager name already mutexes state-root and port to the
   // authenticated prior registration, so a projection that merely omits a
   // field never authenticates on absence alone: the prior nonce is always
   // required and every observed identity value must repeat verbatim.
-  // Launch-environment digests are platform-specific admission metadata and
-  // are bound by the systemd wrapper below when the manager exposes them; they
-  // are not carried on staleSpec for this shared identity comparison.
   return observation.stateRoot === staleSpec.stateRoot
     && observation.marker === staleSpec.marker
     && observation.port === staleSpec.port
@@ -2348,7 +2354,12 @@ export function createSupervisor(
           || current.kind === "registered-not-running-valid"
           || current.kind === "unavailable"
           || current.kind === "registered-running-valid"
-          || isAuthenticatedStaleObservation(spec, stalePlistSpec, current);
+          || isAuthenticatedStaleObservation(
+            spec,
+            stalePlistSpec,
+            current,
+            staleSource as Extract<SupervisorObservation, { kind: "registered-stale-config" }>,
+          );
         if (stable || attempt + 1 >= maxTransitionPolls) break;
         const remaining = transitionDeadline - now();
         if (remaining <= 0) break;
@@ -2375,7 +2386,12 @@ export function createSupervisor(
       || (
         launchdStaleTransition
         && current.kind === "registered-stale-config"
-        && !isAuthenticatedStaleObservation(spec, stalePlistSpec, current)
+        && !isAuthenticatedStaleObservation(
+          spec,
+          stalePlistSpec,
+          current,
+          staleSource as Extract<SupervisorObservation, { kind: "registered-stale-config" }>,
+        )
       )
       || (launchdStaleTransition && current.kind === "registered-running-valid")
     ) throw commandFailedError();

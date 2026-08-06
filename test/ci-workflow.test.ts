@@ -275,14 +275,20 @@ describe("CI workflow", () => {
     // The trap gates every bootout on exact current-run evidence: the fresh
     // token, the exact validated derived product label, and the exact pinned
     // marker line. There is no broader label sweep and no native/PID fallback.
-    expect(run).toContain(
-      '[[ "$ready_token" == "$evidence_token" && "$ready_line" == "$evidence_token $validated_ready_label" && "$ready_label" == "$validated_ready_label" ]]',
-    );
+    expect(run).toContain('if [[ -f "$ready_file" ]]; then');
+    expect(run).toContain('ready_token="${ready_line%% *}"');
+    expect(run).toContain('ready_label="${ready_line#* }"');
+    expect(run).toContain('[[ "$ready_token" == "$evidence_token"');
+    expect(run).toContain('"$ready_line" == "$evidence_token $validated_ready_label"');
+    expect(run).toContain('"$ready_label" == "$validated_ready_label"');
+    expect(run).toContain('"$ready_label" =~ ^com\\.donadiosolutions\\.lcm\\.daemon\\.[0-9a-f]{20}$');
+    expect(run).toContain('echo "Refusing cleanup for malformed launchd evidence marker" >&2');
+    expect(run).toContain('if [[ -z "$ready_token" || -z "$ready_label" || "$ready_line" != "$ready_token $ready_label" ]]; then');
     expect(run).toContain('validated_ready_label=""');
-    expect(run).toContain('[[ -f "$ready_file" && -n "$validated_ready_label" ]]');
+    expect(run).not.toContain('[[ -f "$ready_file" && -n "$validated_ready_label" ]]');
     expect(run).toContain("Refusing cleanup for unexpected launchd label");
-    expect(run).toContain('elif [[ -f "$ready_file" ]]; then');
-    expect(run).toContain('ready_label="$(<"$ready_file")"');
+    expect(run).not.toContain('ready_label="$(<"$ready_file")"');
+    expect(run).toContain("launchd integration marker must contain exactly one current-run token and one derived product label");
     expect(run).toContain("launchd integration did not derive a validated scoped product label");
     // The protected gate is run-scoped: it fails hard when no fresh marker
     // exists, when the marker carries another run's token, when the derived
