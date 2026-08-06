@@ -1313,7 +1313,11 @@ function privatePlistMatchesStableIdentity(
     // identity.  Cleanup-only callers may authenticate a prior descriptor
     // after the manager has independently proved exact absence, but they may
     // never execute that descriptor or classify it as running-valid.
-    if (!allowEnvironmentDrift && actual !== expectedAssignments.get(name)) return false;
+    if (
+      !allowEnvironmentDrift
+      && !MANAGED_LAUNCH_ENV_PRESENTATION_NAMES.has(name)
+      && actual !== expectedAssignments.get(name)
+    ) return false;
   }
   // Credential names/paths belong to the authenticated old launch, not the
   // replacement's current ambient secret set.  Accept only the fixed managed
@@ -1404,7 +1408,13 @@ function privatePlistMatchesStableIdentity(
       name !== "LCM_CREDENTIAL_DIRECTORY"
       && name !== "LCM_SYSTEMD_CRED_IDS"
       && !/^LCM_CREDENTIAL_[A-Z0-9_]+_FILE$/u.test(name)
+      && (!MANAGED_LAUNCH_ENV_PRESENTATION_NAMES.has(name) || allowEnvironmentDrift)
     ) expectedAssignmentNames.add(name);
+  }
+  if (!allowEnvironmentDrift) {
+    for (const name of assignments.keys()) {
+      if (MANAGED_LAUNCH_ENV_PRESENTATION_NAMES.has(name)) expectedAssignmentNames.add(name);
+    }
   }
   if (credentialNames.length > 0) {
     if (credentialDirectorySurface.assignment !== undefined) expectedAssignmentNames.add("LCM_CREDENTIAL_DIRECTORY");
@@ -1743,7 +1753,9 @@ export function managedLaunchEnvironmentDigest(
     if (!MANAGED_LAUNCH_ENV_IDENTITY_NAMES.has(name)) continue;
     launchEnvironmentValue(values, name, value);
   }
-  const canonical = [...values.entries()].sort(([left], [right]) => left.localeCompare(right));
+  // Map keys are unique, so direct UTF-16 code-unit ordering is a complete
+  // comparator here and cannot inherit the caller's locale or time zone.
+  const canonical = [...values.entries()].sort(([left], [right]) => left < right ? -1 : 1);
   return createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
 }
 

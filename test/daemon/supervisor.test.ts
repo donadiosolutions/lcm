@@ -529,6 +529,65 @@ describe("systemd-user supervisor", () => {
     }).probe(specs[1]!)).resolves.toMatchObject({ kind: "registered-running-valid", managerPid: 4321 });
   });
 
+  it("canonicalizes the stable environment digest without ambient collation", () => {
+    const root = makeRoot();
+    const environment = {
+      LCM_POSTGRES_CA_FILE: "/etc/ssl/ca.pem",
+      LCM_SUMMARY_MODEL: "model",
+      LCM_SUMMARY_PROVIDER: "disabled",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+      TMPDIR: "/tmp/lcm",
+      PATH: "/usr/bin",
+      HOME: "/home/alice",
+    };
+    const spec = makeSpec("systemd-user", root, { launchEnvironment: environment });
+    const expected = managedLaunchEnvironmentDigest(spec, "systemd-user", process.getuid?.() ?? -1, environment);
+    const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => 1);
+    try {
+      expect(managedLaunchEnvironmentDigest(spec, "systemd-user", process.getuid?.() ?? -1, environment)).toBe(expected);
+    } finally {
+      localeCompare.mockRestore();
+    }
+  });
+
+  it("keeps the digest stable for the three live locale projections", () => {
+    const root = makeRoot();
+    const common = {
+      HOME: "/home/alice",
+      PATH: "/usr/bin",
+      USER: "alice",
+      LCM_SUMMARY_PROVIDER: "disabled",
+      LCM_SUMMARY_MODEL: "model",
+    };
+    const projections = [
+      {
+        ...common,
+        LANG: "C.UTF-8",
+        LC_CTYPE: "C.UTF-8",
+        LC_MONETARY: "pt_BR.UTF-8",
+        LC_NUMERIC: "pt_BR.UTF-8",
+        LC_TIME: "pt_BR.UTF-8",
+      },
+      {
+        ...common,
+        LANG: "C",
+        LC_ALL: "C",
+        TZ: "UTC",
+      },
+      {
+        ...common,
+        LANG: "C.UTF-8",
+        LC_ALL: "pt_BR.UTF-8",
+        TZ: "America/Sao_Paulo",
+      },
+    ];
+    const digests = projections.map((launchEnvironment) => {
+      const spec = makeSpec("systemd-user", root, { launchEnvironment });
+      return managedLaunchEnvironmentDigest(spec, "systemd-user", process.getuid?.() ?? -1, launchEnvironment);
+    });
+    expect(new Set(digests)).toEqual(new Set([digests[0]]));
+  });
+
   it("rejects clean-environment drift before admitting a registered unit", async () => {
     const root = makeRoot();
     const original = makeSpec("systemd-user", root, { launchEnvironment: { PATH: "/usr/bin" } });
@@ -2082,6 +2141,74 @@ describe("launchd-user supervisor", () => {
     }).start(replacementSpec)).resolves.toMatchObject({ managerPid: 544 });
     expect(readFileSync(join(root, `daemon.${replacementSpec.shortDigest}.${replacementSpec.nonce}.plist`), "utf8"))
       .toContain("<string>LCM_SUMMARY_PROVIDER=openai</string>");
+  });
+
+  it("keeps launchd presentation assignments out of admission while passing them to the child", async () => {
+    const root = makeRoot();
+    const common = {
+      HOME: "/home/alice",
+      PATH: "/usr/bin",
+      USER: "alice",
+    };
+    const oldEnvironment = {
+      ...common,
+      LANG: "C.UTF-8",
+      LC_CTYPE: "C.UTF-8",
+      LC_MONETARY: "pt_BR.UTF-8",
+      LC_NUMERIC: "pt_BR.UTF-8",
+      LC_TIME: "pt_BR.UTF-8",
+    };
+    const currentEnvironment = {
+      ...common,
+      LANG: "C",
+      LANGUAGE: "C",
+      LC_ALL: "C",
+      LC_COLLATE: "C",
+      LC_CTYPE: "C",
+      LC_MESSAGES: "C",
+      LC_MONETARY: "C",
+      LC_NUMERIC: "C",
+      LC_TIME: "C",
+      TZ: "UTC",
+    };
+    const oldSpec = makeSpec("launchd-user", root, {
+      nonce: "locale-plist",
+      launchEnvironment: oldEnvironment,
+    });
+    const currentSpec = makeSpec("launchd-user", root, {
+      nonce: oldSpec.nonce,
+      launchEnvironment: currentEnvironment,
+    });
+    expect(launchdEnvironmentDigest(oldSpec, oldEnvironment)).toBe(launchdEnvironmentDigest(currentSpec, currentEnvironment));
+    const oldRunner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(oldSpec, "running", 543, oldEnvironment) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: oldRunner.run,
+      environment: oldEnvironment,
+      platform: "darwin",
+      uid: 501,
+    }).start(oldSpec)).resolves.toMatchObject({ managerPid: 543 });
+
+    const currentRunner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(currentSpec, "running", 544, currentEnvironment) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: currentRunner.run,
+      environment: currentEnvironment,
+      platform: "darwin",
+      uid: 501,
+    }).start(currentSpec)).resolves.toMatchObject({ managerPid: 544 });
+    const plist = readFileSync(join(root, `daemon.${currentSpec.shortDigest}.${currentSpec.nonce}.plist`), "utf8");
+    expect(plist).toContain("<string>LANG=C</string>");
+    expect(plist).toContain("<string>LC_ALL=C</string>");
+    expect(plist).toContain("<string>TZ=UTC</string>");
+    expect(plist).toContain(`<string>HOME=${common.HOME}</string>`);
+    expect(plist).toContain(`<string>PATH=${common.PATH}</string>`);
   });
 
   it("checks current assignment values before allowing absence-only digest drift", async () => {
