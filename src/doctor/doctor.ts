@@ -400,7 +400,7 @@ function daemonProcessPath(deps: DoctorDeps, pid: number | undefined): string | 
   }
 }
 
-function usesManagedDaemonPath(platform: NodeJS.Platform): boolean {
+function usesManagedDaemonPath(platform: string): boolean {
   return platform === "linux" || platform === "darwin";
 }
 
