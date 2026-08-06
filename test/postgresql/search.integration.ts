@@ -31,7 +31,10 @@ async function grantSearchRuntimePrivileges(
   grantingRuntime: PostgreSqlRuntime = database.migrator
 ): Promise<void> {
   const template = readFileSync(
-    join(process.cwd(), "docs", "postgresql-runtime-search-grants.sql"),
+    join(
+      process.cwd(),
+      "src/storage/postgresql/reference/postgresql-runtime-search-grants.sql",
+    ),
     "utf8"
   );
   const sql = template

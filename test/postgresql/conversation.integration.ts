@@ -21,7 +21,10 @@ async function grantConversationRuntimePrivileges(
   database: PostgreSqlTestDatabase,
 ): Promise<void> {
   const template = readFileSync(
-    join(process.cwd(), "docs", "postgresql-runtime-conversation-grants.sql"),
+    join(
+      process.cwd(),
+      "src/storage/postgresql/reference/postgresql-runtime-conversation-grants.sql",
+    ),
     "utf8",
   );
   const sql = template

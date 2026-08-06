@@ -37,7 +37,7 @@ falling back to SQLite. Issue #92 activates PostgreSQL as authoritative after
 the adapter gates pass, while issue #224 owns normal daemon/CLI transcript
 routing. The local SQLite hook outbox and the metadata-only transcript
 quarantine are not general caches and remain local after that activation. See
-the [PostgreSQL schema reference](postgresql-schema.md) for table ownership,
+the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
 integrity, indexes, retention, extension policy, and recovery implications.
 
 ## Storage repository architecture
@@ -63,12 +63,12 @@ foundations; they do not enable daemon or CLI routing. Until all PostgreSQL
 domain adapters and rollout gates land, selecting `postgresql` leaves general
 storage routes explicitly unavailable behind the staged loopback daemon rather
 than falling back to SQLite. See
-[PostgreSQL native transcripts](postgresql-native-transcripts.md) for the
+[PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) for the
 local-scrubbing, checkpoint, quarantine, and rollback boundaries.
 The issue #88 adapters implement the existing `ProjectRepositories` contracts
 for promoted memory, recall, redaction administration, and coordination, but
 remain deliberately absent from the unavailable PostgreSQL storage factory.
-See [PostgreSQL memory and administration](postgresql-memory-administration.md)
+See [PostgreSQL memory and administration](../src/storage/postgresql/reference/postgresql-memory-administration.md)
 for their metadata, concurrency, purge, and retention contract. Issue #90
 extends the concrete staged `PostgreSqlCoordinationRepository` with distributed
 work coordination without changing the backend-neutral SQLite contract:
@@ -76,7 +76,7 @@ transaction-scoped advisory locks, database-clock fenced leases,
 same-transaction final fence validation, fair durable inbox claims, bounded cleanup,
 and diagnostics. Long-running model or network work stays outside transactions;
 only the final fence check and protected write share a short transaction. See
-[PostgreSQL cross-machine coordination](postgresql-coordination.md).
+[PostgreSQL cross-machine coordination](../src/storage/postgresql/reference/postgresql-coordination.md).
 Issue #91 adds a separate staged `PostgreSqlPassiveEventRepository` and drain
 worker around that exact coordination contract. It inserts and reads the
 existing inbox idempotently, completes an event effect and its `applied`

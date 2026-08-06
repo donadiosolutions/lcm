@@ -46,7 +46,7 @@ identity exists only in the opaque database namespace, not in quarantine rows,
 so identical Claude and Codex metadata cannot deduplicate across clients.
 Native-transcript daemon and CLI routing is not active yet; explicit backfill
 and adapter use are documented in
-[PostgreSQL native transcripts](postgresql-native-transcripts.md).
+[PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md).
 
 ## Secret redaction
 

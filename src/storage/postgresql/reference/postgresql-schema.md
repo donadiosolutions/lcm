@@ -682,19 +682,19 @@ scripts:
 ```bash
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file docs/postgresql-runtime-identity-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file docs/postgresql-runtime-conversation-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-conversation-grants.sql
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file docs/postgresql-runtime-transcript-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file docs/postgresql-runtime-memory-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-memory-grants.sql
 ```
 
 Replace `lcm_runtime` with the deployment's runtime role. The script grants
@@ -824,4 +824,5 @@ for the complete runtime, transaction, diagnostic, and recovery contract.
 
 For the isolated local/CI workflow and checksum recovery procedure, see
 [PostgreSQL development](postgresql-development.md). For repository ownership
-and the staged activation boundary, see [Architecture](architecture.md#storage-repository-architecture).
+and the staged activation boundary, see
+[Architecture](../../../../docs/architecture.md#storage-repository-architecture).

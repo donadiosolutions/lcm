@@ -60,7 +60,14 @@ async function applyRuntimeGrant(
   operation: string,
 ): Promise<void> {
   const template = readFileSync(
-    join(process.cwd(), "docs", fileName),
+    join(
+      process.cwd(),
+      "src",
+      "storage",
+      "postgresql",
+      "reference",
+      fileName,
+    ),
     "utf8",
   );
   const sql = template
