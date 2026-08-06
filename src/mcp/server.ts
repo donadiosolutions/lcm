@@ -48,7 +48,7 @@ function stripUntrustedMarkerCodePoints(value: string): string {
   }).join("");
 }
 
-const MCP_ASSIGNMENT_PREFIX_PATTERN = /(["']?)\b(host|hostname|socket|server|password|passwd|pwd|token|secret|api[-_ ]?key|authorization)\1(\s*)[:=]\s*(?:bearer\s+)?/giu;
+const MCP_ASSIGNMENT_PREFIX_PATTERN = /(["']?)\b(host|hostname|socket|server|password|passwd|pwd|token|secret|api[-_ ]?key|authorization)\1(\s*)[:=]\s*(?:(?:basic|bearer)\s+)?/giu;
 const MAX_MCP_QUOTED_VALUE_LENGTH = 256;
 
 function findBoundedQuotedValueEnd(value: string, start: number, quote: string): number | undefined {

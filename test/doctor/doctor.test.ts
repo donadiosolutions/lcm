@@ -973,10 +973,10 @@ describe("runDoctor summarizer modes", () => {
       writeFileSync: vi.fn(),
       mkdirSync: vi.fn(),
       spawnSync: vi.fn((cmd: string, args: string[]) => {
-        if (cmd === "sh" && args[1]?.includes("command -v claude")) {
+        if (cmd === "/bin/sh" && args[1]?.includes("command -v claude")) {
           return { status: 0, stdout: "/usr/bin/claude", stderr: "" };
         }
-        if (cmd === "sh" && args[1]?.includes("command -v codex")) {
+        if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
           return { status: 0, stdout: "/usr/bin/codex", stderr: "" };
         }
         return { status: 0, stdout: "", stderr: "" };
@@ -1004,7 +1004,7 @@ describe("runDoctor summarizer modes", () => {
           if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
           return "{}";
         },
-        platform: "darwin",
+        platform: "win32",
       }),
       spawnSync: vi.fn((cmd: string, args: string[]) => ({
         status: cmd === "sh" && args[1]?.startsWith("command -v ") ? 1 : 0,

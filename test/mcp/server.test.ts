@@ -274,6 +274,16 @@ describe("handleDaemonRequest", () => {
       expect(rendered).not.toContain("with spaces");
     });
 
+    it("redacts a quoted Basic authorization payload as one complete value", () => {
+      const rendered = safeMcpError(new Error(
+        `auth failed: Authorization: Basic "${SYNTHETIC_CREDENTIAL} with spaces"; retrying`,
+      ));
+
+      expect(rendered).toContain("Authorization=<redacted>;");
+      expect(rendered).not.toContain(SYNTHETIC_CREDENTIAL);
+      expect(rendered).not.toContain("with spaces");
+    });
+
     it.each([
       ["missing closing quote", `auth failed: password="${SYNTHETIC_CREDENTIAL}`],
       ["escaped trailing byte", `auth failed: password="${SYNTHETIC_CREDENTIAL}\\`],
