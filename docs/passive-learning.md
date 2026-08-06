@@ -91,6 +91,12 @@ directory before confirmation completes when local promotion is required; once
 parked, the event remains preserved for inspection or independent delivery
 rather than being silently deleted.
 
+Parking is also bounded. It reports a terminal parked outcome only after an
+empty sidecar batch confirms that every local-promotion row was consumed. If
+the parking batch limit is reached first, the sidecar remains pending and
+nonterminal; the background processor requeues it and `lcm events promote
+--all` reports that project as incomplete rather than as a successful park.
+
 `lcm search` stays read-only: it searches already promoted memory and does not process queued sidecar events.
 
 ### Three-Tier Promotion
@@ -232,6 +238,7 @@ The UserPromptSubmit extractor includes guards against false-positive decisions.
 | Hard kill (SIGKILL) | Events survive in sidecar, scavenged on next SessionStart |
 | Stale sidecars in other projects | `lcm events promote --all` drains all metadata-backed sidecars |
 | Recorded cwd remains unavailable for three five-minute observations within 30 minutes | Unprocessed local-promotion rows are parked with `processed_at`; event data and independent delivery state are retained |
+| Parking cap reached before an empty batch is observed | Sidecar remains pending and is retried; the operation is incomplete rather than terminal |
 | Unprocessed cap or age guard exceeded | Events remain durable; a maintenance diagnostic reports the retained backlog |
 | Worker crashes after inbox insert | Exact immutable readback proves whether insertion committed |
 | Worker crashes during apply | PostgreSQL transaction rollback or exact `applied` readback resolves the outcome |

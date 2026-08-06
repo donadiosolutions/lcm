@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { isLcmConnectionOpen } from "../../src/db/connection.js";
@@ -222,6 +222,24 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     await factory.close();
   });
 
+  it("opens only an existing local outbox without creating missing path state", async () => {
+    const existingPath = pathFor("existing-only");
+    const missingParent = join(dirname(existingPath), "missing");
+    const missingPath = join(missingParent, "outbox.db");
+    const factory = new SQLiteLocalHookOutboxFactory();
+
+    await expect(factory.openExisting(missingPath)).resolves.toBeNull();
+    expect(existsSync(missingPath)).toBe(false);
+    expect(existsSync(missingParent)).toBe(false);
+
+    const created = await factory.open(existingPath);
+    await created.close();
+    const existing = await factory.openExisting(existingPath);
+    expect(existing).not.toBeNull();
+    await existing?.close();
+    await factory.close();
+  });
+
   it("closes every open repository and rejects new work after factory close", async () => {
     const firstPath = pathFor("first");
     const secondPath = pathFor("second");
@@ -238,6 +256,12 @@ describe("SQLiteLocalHookOutboxFactory", () => {
       backend: "sqlite",
       domain: "passive-events",
       operation: "open",
+    });
+    await expect(factory.openExisting(pathFor("late-existing"))).rejects.toMatchObject({
+      code: "STORAGE_CLOSED",
+      backend: "sqlite",
+      domain: "passive-events",
+      operation: "openExisting",
     });
   });
 

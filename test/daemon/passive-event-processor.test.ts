@@ -1,10 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
+import type { EventSidecarSummary, collectEventSidecars } from "../../src/db/event-sidecars.js";
 import {
   createPromoteEventsNotifyHandler,
   PassiveEventProcessor,
   PASSIVE_EVENT_PROCESSOR_DEFAULTS,
 } from "../../src/daemon/passive-event-processor.js";
+import type { PromoteResult, promoteEventsForCwd } from "../../src/daemon/routes/promote-events.js";
+
+type CollectEventSidecars = typeof collectEventSidecars;
+type PromoteEventsForCwd = typeof promoteEventsForCwd;
 
 function makeConfig() {
   return loadDaemonConfig("/nonexistent", { daemon: { port: 0 }, llm: { provider: "disabled" } });
@@ -42,6 +47,29 @@ function timerDeps() {
       clearInterval: clearInterval as any,
       safeLogError: vi.fn(),
     },
+  };
+}
+
+function sidecar(overrides: Partial<EventSidecarSummary> = {}): EventSidecarSummary {
+  return {
+    file: "project.db",
+    projectId: "project",
+    path: "/events/project.db",
+    cwd: "/tmp",
+    metadataMissing: false,
+    captured: 1,
+    unprocessed: 1,
+    errors: 0,
+    lastCapture: null,
+    deliveryPending: 0,
+    deliveryClaimed: 0,
+    deliveryRetry: 0,
+    deliveryReplicated: 0,
+    deliveryAcknowledged: 0,
+    deliveryAwaitingRemotePrune: 0,
+    deliveryQuarantined: 0,
+    oldestDeliveryAt: null,
+    ...overrides,
   };
 }
 
@@ -135,7 +163,7 @@ describe("PassiveEventProcessor", () => {
   it("does not retry or log a sidecar after its unavailable cwd is terminalized", async () => {
     let unprocessed = 1;
     const { deps } = timerDeps();
-    const promoteEventsForCwd = vi.fn().mockImplementation(async () => {
+    const promote = vi.fn<PromoteEventsForCwd>().mockImplementation(async () => {
       unprocessed = 0;
       return {
         promoted: 0,
@@ -145,27 +173,27 @@ describe("PassiveEventProcessor", () => {
         message: "parked 1 events because cwd is unavailable",
       };
     });
-    const collectEventSidecars = vi.fn().mockImplementation(() => [{
+    const collect = vi.fn<CollectEventSidecars>().mockImplementation(async () => [sidecar({
       cwd: "/deleted-project",
       path: "/events/deleted.db",
       unprocessed,
-    }]);
+    })]);
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
-      collectEventSidecars: collectEventSidecars as any,
-      promoteEventsForCwd: promoteEventsForCwd as any,
+      collectEventSidecars: collect,
+      promoteEventsForCwd: promote,
     });
 
     await processor.runSweep();
     await processor.runSweep();
 
-    expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+    expect(promote).toHaveBeenCalledTimes(1);
     expect(deps.safeLogError).not.toHaveBeenCalled();
   });
 
   it("retries a cwd awaiting absence confirmation without growing the error ledger", async () => {
     const { deps } = timerDeps();
-    const promoteEventsForCwd = vi.fn().mockResolvedValue({
+    const deferred: PromoteResult = {
       promoted: 0,
       skipped: 0,
       correlated: 0,
@@ -177,23 +205,55 @@ describe("PassiveEventProcessor", () => {
         retryAfterMs: 5 * 60 * 1000,
       },
       message: "cwd is unavailable; awaiting confirmation (1/3)",
-    });
-    const collectEventSidecars = vi.fn().mockReturnValue([{
+    };
+    const promote = vi.fn<PromoteEventsForCwd>().mockResolvedValue(deferred);
+    const collect = vi.fn<CollectEventSidecars>().mockResolvedValue([sidecar({
       cwd: "/temporarily-unavailable-project",
       path: "/events/temporary.db",
       unprocessed: 1,
-    }]);
+    })]);
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
-      collectEventSidecars: collectEventSidecars as any,
-      promoteEventsForCwd: promoteEventsForCwd as any,
+      collectEventSidecars: collect,
+      promoteEventsForCwd: promote,
     });
 
     await processor.runSweep();
     await processor.runSweep();
 
-    expect(promoteEventsForCwd).toHaveBeenCalledTimes(2);
+    expect(promote).toHaveBeenCalledTimes(2);
     expect(deps.safeLogError).not.toHaveBeenCalled();
+  });
+
+  it("requeues a nonterminal incomplete parking result even below the normal batch size", async () => {
+    const { deps } = timerDeps();
+    const incomplete: PromoteResult = {
+      promoted: 0,
+      skipped: 0,
+      correlated: 0,
+      errors: 0,
+      incomplete: true,
+      message: "stopped after maximum parking batches before sidecar was observed empty",
+    };
+    const promote = vi.fn<PromoteEventsForCwd>()
+      .mockResolvedValueOnce(incomplete)
+      .mockResolvedValueOnce({
+        promoted: 0,
+        skipped: 0,
+        correlated: 0,
+        errors: 0,
+        message: "no unprocessed events",
+      });
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      promoteEventsForCwd: promote,
+    });
+
+    processor.notify({ cwd: "/tmp", priority: 1 });
+    await processor.flushOnce();
+    await processor.flushOnce();
+
+    expect(promote).toHaveBeenCalledTimes(2);
   });
 
   it("does not requeue a terminal parked result at the batch boundary", async () => {

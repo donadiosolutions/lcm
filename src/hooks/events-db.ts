@@ -3,7 +3,12 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { getLcmConnection, closeLcmConnection, isLcmConnectionOpen } from "../db/connection.js";
+import {
+  getExistingLcmConnection,
+  getLcmConnection,
+  closeLcmConnection,
+  isLcmConnectionOpen,
+} from "../db/connection.js";
 import { sanitizeError } from "../daemon/safe-error.js";
 import { readMachineIdentity } from "../machine-identity.js";
 import { sanitizeHookErrorDiagnostic } from "./hook-error-diagnostic.js";
@@ -192,14 +197,30 @@ export class EventsDb {
   private busyTimeoutOverrideId: symbol | undefined;
   private sequenceAllocator: LocalHookEventSequenceAllocator | undefined;
 
-  constructor(dbPath: string, options: LocalHookOutboxOpenOptions = {}) {
-    mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
+  static openExisting(
+    dbPath: string,
+    options: LocalHookOutboxOpenOptions = {},
+  ): EventsDb | null {
+    const connection = getExistingLcmConnection(dbPath);
+    return connection === null ? null : new EventsDb(dbPath, options, connection);
+  }
+
+  constructor(
+    dbPath: string,
+    options: LocalHookOutboxOpenOptions = {},
+    existingConnection?: DatabaseSync,
+  ) {
     this.dbPath = dbPath;
-    // getLcmConnection returns the pooled (or newly-opened) DatabaseSync handle
-    // and increments its ref-count. Connections are kept alive across EventsDb
-    // instances so that high-frequency hooks (PostToolUse fires 50-200x/session)
-    // reuse the same underlying connection instead of opening/closing each time.
-    this.db = getLcmConnection(dbPath);
+    if (existingConnection) {
+      this.db = existingConnection;
+    } else {
+      mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
+      // getLcmConnection returns the pooled (or newly-opened) DatabaseSync handle
+      // and increments its ref-count. Connections are kept alive across EventsDb
+      // instances so that high-frequency hooks (PostToolUse fires 50-200x/session)
+      // reuse the same underlying connection instead of opening/closing each time.
+      this.db = getLcmConnection(dbPath);
+    }
     if (options.busyTimeoutMs !== undefined && Number.isFinite(options.busyTimeoutMs)) {
       try {
         this.addBusyTimeoutOverride(Math.max(0, Math.trunc(options.busyTimeoutMs)));

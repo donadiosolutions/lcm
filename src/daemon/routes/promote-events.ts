@@ -67,6 +67,7 @@ export interface PromoteResult {
   skipped: number;
   correlated: number;
   errors: number;
+  incomplete?: boolean;
   deferred?: PromoteDeferredOutcome;
   terminal?: PromoteTerminalOutcome;
   message?: string;
@@ -264,25 +265,33 @@ export async function parkUnavailableCwdEvents(
   const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
   return withSidecarPromotionLock(sidecarPath, async () => {
     if (!existsSync(sidecarPath)) {
-      return {
-        promoted: 0,
-        skipped: 0,
-        correlated: 0,
-        errors: 0,
-        terminal: { kind: "parked", reason: "unavailable-cwd" },
-        message: "no sidecar events to park for unavailable cwd",
-      };
+      return noSidecarParkingResult();
     }
 
     const outboxFactory = new SQLiteLocalHookOutboxFactory();
     try {
-      const edb = await outboxFactory.open(sidecarPath);
+      const edb = await outboxFactory.openExisting(sidecarPath);
+      if (!edb) return noSidecarParkingResult();
       let parked = 0;
+      let observedEmpty = false;
       for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
         const events = await edb.getUnprocessed();
-        if (events.length === 0) break;
+        if (events.length === 0) {
+          observedEmpty = true;
+          break;
+        }
         await edb.markProcessed(events.map((event) => event.event_id));
         parked += events.length;
+      }
+      if (!observedEmpty) {
+        return {
+          promoted: 0,
+          skipped: parked,
+          correlated: 0,
+          errors: 0,
+          incomplete: true,
+          message: "stopped after maximum parking batches before sidecar was observed empty",
+        };
       }
       return {
         promoted: 0,
@@ -298,6 +307,17 @@ export async function parkUnavailableCwdEvents(
       await closeRouteStorage(outboxFactory);
     }
   });
+}
+
+function noSidecarParkingResult(): PromoteResult {
+  return {
+    promoted: 0,
+    skipped: 0,
+    correlated: 0,
+    errors: 0,
+    terminal: { kind: "parked", reason: "unavailable-cwd" },
+    message: "no sidecar events to park for unavailable cwd",
+  };
 }
 
 export function createPromoteEventsHandler(

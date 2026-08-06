@@ -232,6 +232,32 @@ describe("isLcmConnectionOpen", () => {
     }
   });
 
+  it("returns null when an existing-only path disappears during initialization", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-existing-disappearing-test-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "disappearing.sqlite");
+    new DatabaseSync(dbPath).close();
+    const originalExec = DatabaseSync.prototype.exec;
+    const exec = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      const result = originalExec.call(this, sql);
+      if (sql === "PRAGMA foreign_keys = ON") rmSync(dbPath, { force: true });
+      return result;
+    });
+    const close = vi.spyOn(DatabaseSync.prototype, "close");
+
+    try {
+      expect(getExistingLcmConnection(dbPath)).toBeNull();
+      expect(close).toHaveBeenCalledOnce();
+      expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    } finally {
+      exec.mockRestore();
+      close.mockRestore();
+    }
+  });
+
   it("rejects database symlink leaves without modifying their targets", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-symlink-test-"));
     tempDirs.push(tempDir);

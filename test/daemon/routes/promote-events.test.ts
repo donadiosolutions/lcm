@@ -447,6 +447,36 @@ describe("promote-events route", () => {
     expect(existsSync(sidecarPath)).toBe(false);
   });
 
+  it("does not recreate a sidecar or its parent when it disappears after the existence check", async () => {
+    const sidecarParent = mkdtempSync(join(tmpdir(), "promote-events-race-"));
+    extraDirs.push(sidecarParent);
+    const disappearingSidecar = join(sidecarParent, "events.db");
+    new EventsDb(disappearingSidecar).close();
+    const openExisting = EventsDb.openExisting;
+    const openSpy = vi.spyOn(EventsDb, "openExisting").mockImplementation((dbPath, options) => {
+      if (dbPath === disappearingSidecar) {
+        rmSync(sidecarParent, { recursive: true, force: true });
+      }
+      return openExisting(dbPath, options);
+    });
+
+    try {
+      await expect(parkUnavailableCwdEvents(join(dir, "deleted-project"), disappearingSidecar))
+        .resolves.toMatchObject({
+          promoted: 0,
+          skipped: 0,
+          errors: 0,
+          terminal: { kind: "parked", reason: "unavailable-cwd" },
+          message: "no sidecar events to park for unavailable cwd",
+        });
+      expect(openSpy).toHaveBeenCalledOnce();
+      expect(existsSync(disappearingSidecar)).toBe(false);
+      expect(existsSync(sidecarParent)).toBe(false);
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
   it("reports an already-empty sidecar without changing its terminal state", async () => {
     const deletedCwd = join(dir, "deleted-empty-sidecar");
     const emptySidecar = join(dir, "empty.db");

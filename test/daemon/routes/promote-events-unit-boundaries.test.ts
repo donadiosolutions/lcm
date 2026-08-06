@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { EventRow, PatternReinforcementStats } from "../../../src/hooks/events-db.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
@@ -26,7 +29,11 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../src/hooks/events-db.js", () => ({
-  EventsDb: class {
+  EventsDb: class EventsDb {
+    static openExisting() {
+      return new EventsDb();
+    }
+
     constructor() { mocks.openOutbox(); }
     getUnprocessed = mocks.events;
     getPatternReinforcement = mocks.reinforcement;
@@ -56,6 +63,7 @@ import {
   createPromoteAllEventsHandler,
   createPromoteEventsHandler,
   drainEventsForCwd,
+  parkUnavailableCwdEvents,
   promoteEventsForCwd,
 } from "../../../src/daemon/routes/promote-events.js";
 import {
@@ -331,6 +339,30 @@ describe("promote-events unit boundaries", () => {
       message: "stopped after maximum promotion batches",
     });
     expect(mocks.scrub).toHaveBeenCalledTimes(10_000);
+  });
+
+  it("keeps capped unavailable-cwd parking nonterminal until an empty batch is observed", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-park-cap-test-"));
+    const sidecarPath = join(directory, "events.db");
+    writeFileSync(sidecarPath, "existing sidecar");
+    mocks.events.mockReturnValue([event({ event_id: 1 })]);
+
+    try {
+      const result = await parkUnavailableCwdEvents("/missing", sidecarPath);
+
+      expect(result).toMatchObject({
+        promoted: 0,
+        skipped: 10_000,
+        correlated: 0,
+        errors: 0,
+        incomplete: true,
+        message: "stopped after maximum parking batches before sidecar was observed empty",
+      });
+      expect(result.terminal).toBeUndefined();
+      expect(mocks.mark).toHaveBeenCalledTimes(10_000);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("covers correlation tiers, reinforcement, existing matches, defaults, and event errors", async () => {

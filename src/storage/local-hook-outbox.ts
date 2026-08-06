@@ -182,9 +182,32 @@ export class SQLiteLocalHookOutboxFactory {
       );
     }
 
+    return this.register(new EventsDb(dbPath, options));
+  }
+
+  /** Open an existing local outbox without creating its file or parent directory. */
+  async openExisting(
+    dbPath: string,
+    options: LocalHookOutboxOpenOptions = {},
+  ): Promise<LocalHookOutboxRepository | null> {
+    if (this.closed) {
+      throw new StorageOperationError(
+        "STORAGE_CLOSED",
+        "sqlite",
+        undefined,
+        "passive-events",
+        "openExisting",
+      );
+    }
+
+    const database = EventsDb.openExisting(dbPath, options);
+    return database === null ? null : this.register(database);
+  }
+
+  private register(database: EventsDb): LocalHookOutboxRepository {
     let repository: SQLiteLocalHookOutboxRepository;
     repository = new SQLiteLocalHookOutboxRepository(
-      new EventsDb(dbPath, options),
+      database,
       () => this.repositories.delete(repository),
     );
     this.repositories.add(repository);
