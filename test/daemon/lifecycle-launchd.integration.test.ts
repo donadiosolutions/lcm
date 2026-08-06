@@ -641,6 +641,16 @@ describe("real launchd daemon lifecycle", () => {
         credentialDirectory,
         credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
       });
+      const recoveryNonce = `${fixture.nonce}-recovered`;
+      const recoveryCredentialDirectory = createManagedCredentialDirectory(fixture.stateRoot, recoveryNonce);
+      const recoveryCredentialFile = writeManagedCredentialFiles(recoveryCredentialDirectory, {
+        OPENAI_API_KEY: secretValue,
+      })[0];
+      const recoverySpec = fixture.buildSpec({
+        nonce: recoveryNonce,
+        credentialDirectory: recoveryCredentialDirectory,
+        credentialFiles: [{ name: "OPENAI_API_KEY", path: recoveryCredentialFile }],
+      });
       const wedgePath = fixture.wedgePath;
       expect(existsSync(credentialFile)).toBe(true);
       expect(statSync(credentialFile).mode & 0o777).toBe(0o600);
@@ -664,17 +674,6 @@ describe("real launchd daemon lifecycle", () => {
           credentialClaimed: true,
         });
         expect(JSON.stringify(initialHealth).includes(secretValue)).toBe(false);
-        expect(existsSync(credentialFile)).toBe(false);
-
-        // The production lifecycle stages a fresh one-shot snapshot before an
-        // explicit manager restart. This integration calls the low-level
-        // supervisor directly, so model that lifecycle step explicitly rather
-        // than racing reuse of the file consumed by the first daemon.
-        const restagedDirectory = createManagedCredentialDirectory(fixture.stateRoot, fixture.nonce);
-        const restagedCredentialFile = writeManagedCredentialFiles(restagedDirectory, {
-          OPENAI_API_KEY: secretValue,
-        })[0];
-        expect(restagedCredentialFile).toBe(credentialFile);
 
         writeFileSync(wedgePath, "wedged\n");
         const controller = new AbortController();
@@ -697,12 +696,17 @@ describe("real launchd daemon lifecycle", () => {
           name: spec.launchdLabel,
         });
 
-        const restarted = await fixture.supervisor.stopAndStart(spec);
+        // Recovery receives a newly staged one-shot snapshot and nonce. The
+        // supervisor must authenticate and retire the wedged prior launch
+        // before admitting this replacement; reusing the consumed launch's
+        // credential path would not model the production lifecycle.
+        const restarted = await fixture.supervisor.stopAndStart(recoverySpec);
         expect(restarted.kind).toBe("launchd-user");
         expect(restarted.managerPid).toBeGreaterThan(0);
         expect(restarted.managerPid).not.toBe(initialManagerPid);
+        expect(restarted.nonce).toBe(recoverySpec.nonce);
 
-        const recoveryHealth = await waitForExactHealth(spec, restarted.managerPid!);
+        const recoveryHealth = await waitForExactHealth(recoverySpec, restarted.managerPid!);
         expect(recoveryHealth).toMatchObject({
           status: "ok",
           pid: restarted.managerPid,
@@ -726,28 +730,30 @@ describe("real launchd daemon lifecycle", () => {
         // A second proof of absence must never depend on an unconstrained raw
         // print of the final plist; assert the exact observed JSON and the
         // absence verdict after an exact-scoped cleanup.
-        const observation = await fixture.supervisor.probe(spec);
+        const observation = await fixture.supervisor.probe(recoverySpec);
         expect(observation).toMatchObject({
           kind: "registered-running-valid",
           managerPid: restarted.managerPid,
-          scopeDigest: spec.scopeDigest,
-          nonce: spec.nonce,
-          name: spec.launchdLabel,
+          scopeDigest: recoverySpec.scopeDigest,
+          nonce: recoverySpec.nonce,
+          name: recoverySpec.launchdLabel,
         });
 
-        await fixture.supervisor.stopAndAwaitAbsent(spec);
+        await fixture.supervisor.stopAndAwaitAbsent(recoverySpec);
         managerReady = false;
-        expect(await fixture.supervisor.probe(spec)).toMatchObject({
+        expect(await fixture.supervisor.probe(recoverySpec)).toMatchObject({
           kind: "absent",
-          name: spec.launchdLabel,
+          name: recoverySpec.launchdLabel,
         });
         expect(existsSync(credentialFile)).toBe(false);
         expect(existsSync(credentialDirectory)).toBe(false);
+        expect(existsSync(recoveryCredentialFile)).toBe(false);
+        expect(existsSync(recoveryCredentialDirectory)).toBe(false);
       } catch (error) {
         primaryError = error;
         throw error;
       } finally {
-        await cleanupLaunchdFixture(fixture, managerReady, spec, primaryError);
+        await cleanupLaunchdFixture(fixture, managerReady, recoverySpec, primaryError);
       }
     },
   );
