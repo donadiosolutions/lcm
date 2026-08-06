@@ -321,12 +321,15 @@ function assertFinitePort(port: number): void {
 }
 
 function assertNonce(nonce: string): void {
-  if (
-    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(nonce)
-    || nonce.length > MAX_NONCE_LENGTH
-  ) {
+  if (!isValidNonce(nonce)) {
     throw new Error("supervisor nonce is invalid");
   }
+}
+
+function isValidNonce(value: string | undefined): value is string {
+  return typeof value === "string"
+    && value.length <= MAX_NONCE_LENGTH
+    && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(value);
 }
 
 function assertRuntimeDigest(value: string): void {
@@ -996,7 +999,6 @@ function staleReason(
   if (base.scopeDigest !== undefined && base.scopeDigest !== spec.scopeDigest) return "metadata-mismatch";
   if (base.stateRoot !== undefined && base.stateRoot !== spec.stateRoot) return "metadata-mismatch";
   if (base.port !== undefined && base.port !== spec.port) return "metadata-mismatch";
-  if (base.nonce !== undefined && base.nonce !== spec.nonce) return "metadata-mismatch";
   const expectedArgs = JSON.stringify(spec.args);
   if (base.executable !== undefined && base.executable !== spec.executable) return "metadata-mismatch";
   if (base.args !== undefined && base.args !== expectedArgs) return "metadata-mismatch";
@@ -1020,7 +1022,9 @@ function staleReason(
   if (spec.storageBackend !== undefined && base.storageBackend === undefined) return "metadata-missing";
   if (spec.postgresCaFile !== undefined && base.postgresCaFile === undefined) return "metadata-missing";
   // The canonical state root is not required to be repeated by every manager;
-  // full scope and launch identity are checked by classifyRegistered below.
+  // stable scope/configuration is completed by classifyRegistered below. The
+  // nonce is authenticated observed launch identity and is compared with a
+  // candidate only by lifecycle adoption and mutation fences.
   return "metadata-missing";
 }
 
@@ -1042,7 +1046,7 @@ function classifyRegistered(
     base.marker === undefined
     || base.scopeDigest === undefined
     || base.port === undefined
-    || base.nonce === undefined
+    || !isValidNonce(base.nonce)
     || base.executable === undefined
     || base.args === undefined
     || base.cwd === undefined
@@ -1074,6 +1078,12 @@ function classifyRegistered(
     ?? (spec.kind === "launchd-user" && isLaunchdTerminalExitCode(lookup(values, "last exit code", "lastExitCode", "exit code", "ExitCode"))
       ? "last-exit"
       : undefined);
+  // A terminal registration still needs the stale-transition authentication
+  // path so explicit restart can stop it through its observed prior nonce.
+  // Running registrations, by contrast, are read-only adoption candidates.
+  if (terminal !== undefined && base.nonce !== spec.nonce) {
+    return Object.freeze({ kind: "registered-stale-config", reason: "metadata-mismatch", ...base });
+  }
   const pidValue = lookup(values, "MainPID", "pid", "PID", "process.pid", "ProcessID");
   if (active) {
     const managerPid = parsePid(pidValue);
@@ -1791,6 +1801,7 @@ function supervisorSpecFromObservation(
 ): SupervisorSpec | undefined {
   if (
     observation.kind !== "registered-stale-config"
+    && observation.kind !== "registered-running-valid"
     || observation.scopeDigest !== spec.scopeDigest
     || observation.name !== spec.name
     || observation.nonce === undefined
@@ -1854,6 +1865,7 @@ function differentRunningWinnerSpec(
     expected === undefined ? observed === undefined || observed === "" : observed === expected;
   if (
     observation.kind !== "registered-stale-config"
+    && observation.kind !== "registered-running-valid"
     || observation.marker !== spec.marker
     || observation.scopeDigest !== spec.scopeDigest
     || observation.stateRoot !== spec.stateRoot
@@ -2258,6 +2270,7 @@ export function createSupervisor(
     const current = await probeInternal(spec);
     if (current.kind === "unavailable") throw managerUnavailableError(current.reason);
     if (current.kind === "registered-running-valid") {
+      if (current.nonce !== spec.nonce) throw commandFailedError();
       return Object.freeze({
         kind,
         name: spec.name,
@@ -2404,6 +2417,10 @@ export function createSupervisor(
     cleanupCredentials = true,
   ): Promise<void> => {
     let current = await probe(spec);
+    if (
+      (current.kind === "registered-running-valid" || current.kind === "registered-not-running-valid")
+      && current.nonce !== spec.nonce
+    ) throw commandFailedError();
     // Keep the first authenticated stale observation as the source of the old
     // launchd nonce.  A registration may disappear between the initial probe
     // and this fresh probe; cleanup still needs to remove that exact old plist
@@ -2530,6 +2547,10 @@ export function createSupervisor(
     for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
       const capture: SupervisorProbeCapture = {};
       const observed = await probeInternal(spec, capture);
+      if (
+        (observed.kind === "registered-running-valid" || observed.kind === "registered-not-running-valid")
+        && observed.nonce !== authenticatedPrior.nonce
+      ) throw commandFailedError();
       if (isOwnedSystemdStopTransition(spec, capture, authenticatedPrior)) {
         // The manager still owns the exact prior unit. Continue the bounded
         // absence poll; no cleanup or same-name recreation is authorized yet.
@@ -2573,7 +2594,16 @@ export function createSupervisor(
     const observed = await probe(spec);
     if (observed.kind === "unavailable") throw managerUnavailableError(observed.reason);
     if (observed.kind === "registered-invalid-collision" || observed.kind === "ambiguous") throw commandFailedError();
-    if (observed.kind === "registered-stale-config") {
+    const observedPriorSpec = observed.kind === "registered-running-valid"
+      && observed.nonce !== spec.nonce
+      ? supervisorSpecFromObservation(spec, observed)
+      : undefined;
+    if (observedPriorSpec !== undefined) {
+      // The manager-reported prior nonce authenticates the job being stopped;
+      // the caller's fresh nonce remains reserved for the replacement start.
+      await stopAndAwaitAbsentInternal(observedPriorSpec);
+      await settleLaunchdLabelReuse();
+    } else if (observed.kind === "registered-stale-config") {
       await stopAndAwaitAbsentInternal(spec, true, observed, false);
       await settleLaunchdLabelReuse();
     } else if (observed.kind !== "absent") {

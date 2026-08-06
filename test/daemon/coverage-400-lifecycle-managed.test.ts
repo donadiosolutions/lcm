@@ -794,6 +794,43 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(calls).toBe(4);
   });
 
+  it("adopts the same running manager across independent fresh candidate nonces", async () => {
+    const priorNonce = "persisted-running-nonce";
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        healthy(4242), healthy(4242), response({}, 200),
+        healthy(4242), healthy(4242), response({}, 200),
+      ]),
+    });
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      const result = {
+        ...staleObservation(spec, { nonce: priorNonce }),
+        kind: "registered-running-valid",
+      } as SupervisorObservation;
+      return result;
+    });
+    writeFileSync(fixture.pidPath, "4242");
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+
+    const first = await ensureDaemon(optionsFor(fixture, {
+      _supervisorNonceOverride: () => "fresh-candidate-one",
+    }));
+    writeFileSync(fixture.pidPath, "4242");
+    const second = await ensureDaemon(optionsFor(fixture, {
+      _supervisorNonceOverride: () => "fresh-candidate-two",
+    }));
+
+    expect(first).toMatchObject({ connected: true, spawned: false, pid: 4242 });
+    expect(second).toMatchObject({ connected: true, spawned: false, pid: 4242 });
+    expect(fixture.probe.mock.calls.map(([spec]) => (spec as SupervisorSpec).nonce)).toEqual([
+      "fresh-candidate-one", priorNonce, priorNonce, priorNonce,
+      "fresh-candidate-two", priorNonce, priorNonce, priorNonce,
+    ]);
+    expect(fixture.start).not.toHaveBeenCalled();
+    expect(fixture.stopAndStart).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["linux", "systemd-user"],
     ["darwin", "launchd-user"],

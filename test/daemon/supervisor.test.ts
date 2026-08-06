@@ -676,6 +676,54 @@ describe("systemd-user supervisor", () => {
     expect(runner.calls.every((call) => call.timeoutMs === 5_000)).toBe(true);
   });
 
+  it("keeps an observed running nonce for adoption and refuses nonce-mismatched mutations", async () => {
+    const root = makeRoot();
+    const candidate = makeSpec("systemd-user", root, { nonce: "candidate-launch" });
+    const prior = { ...candidate, nonce: "prior-launch" };
+    const running = managerText(prior, "active", 1234);
+
+    const probeRunner = fakeRunner([{ code: 0, stdout: running }]);
+    await expect(createSupervisor("systemd-user", { run: probeRunner.run, platform: "linux" }).probe(candidate)).resolves.toMatchObject({
+      kind: "registered-running-valid",
+      nonce: prior.nonce,
+      managerPid: 1234,
+    });
+
+    const startRunner = fakeRunner([{ code: 0, stdout: running }]);
+    await expect(createSupervisor("systemd-user", { run: startRunner.run, platform: "linux" }).start(candidate)).rejects.toThrow("manager command");
+    expect(startRunner.calls.some(({ command }) => command === "systemd-run")).toBe(false);
+
+    const strictStopRunner = fakeRunner([{ code: 0, stdout: running }]);
+    await expect(createSupervisor("systemd-user", { run: strictStopRunner.run, platform: "linux" }).stopAndAwaitAbsent(candidate)).rejects.toThrow("manager command");
+    expect(strictStopRunner.calls.some(({ command, args }) => command === "systemctl" && args[1] === "stop")).toBe(false);
+
+    const mutationRunner = fakeRunner([{ code: 0, stdout: running }]);
+    await expect(createSupervisor("systemd-user", { run: mutationRunner.run, platform: "linux" }).stopAndStart(candidate)).rejects.toThrow("manager command");
+    expect(mutationRunner.calls.some(({ command, args }) => command === "systemctl" && args[1] === "stop")).toBe(false);
+    expect(mutationRunner.calls.some(({ command }) => command === "systemd-run")).toBe(false);
+
+    const winnerRaceRunner = fakeRunner([
+      { code: 0, stdout: managerText(candidate, "active", 1234) },
+      { code: 0, stdout: "stopped" },
+      { code: 0, stdout: running },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: winnerRaceRunner.run, platform: "linux" }).stopAndAwaitAbsent(candidate)).rejects.toThrow("manager command");
+
+    const replacementRunner = fakeRunner([
+      { code: 0, stdout: running },
+      { code: 0, stdout: running },
+      { code: 0, stdout: "stopped" },
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: managerText(candidate, "active", 1235) },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: replacementRunner.run, platform: "linux" }).stopAndStart(candidate)).resolves.toMatchObject({
+      managerPid: 1235,
+      nonce: candidate.nonce,
+    });
+  });
+
   it("rejects contradictory active and terminal manager state fields", async () => {
     const spec = makeSpec("systemd-user");
     const systemd = fakeRunner([{

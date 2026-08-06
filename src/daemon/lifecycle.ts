@@ -1910,6 +1910,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   ): SupervisorSpec | undefined {
     if (
       observation.kind !== "registered-stale-config"
+      && observation.kind !== "registered-running-valid"
+      && observation.kind !== "registered-not-running-valid"
       || observation.marker !== requested.marker
       || observation.scopeDigest !== requested.scopeDigest
       || observation.stateRoot !== requested.stateRoot
@@ -2145,11 +2147,18 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       );
     }
 
-    // A fresh per-start nonce is not part of the stable manager name.  When a
-    // no-credential job is already registered, authenticate its
-    // exact observed nonce and adopt that launch identity.  Credential-bearing
-    // jobs are deliberately not adopted without the exact requested paths.
-    if (observation.kind === "registered-stale-config") {
+    // A fresh per-start nonce is not part of the stable manager name. When a
+    // registered job exposes a different authenticated launch nonce, rebuild
+    // its exact observed spec and adopt that launch identity only after a
+    // second manager probe. Credential metadata must remain safely bounded;
+    // never infer or recreate consumed one-shot credential files.
+    if (
+      observation.kind === "registered-stale-config"
+      || (
+        (observation.kind === "registered-running-valid" || observation.kind === "registered-not-running-valid")
+        && observation.nonce !== spec.nonce
+      )
+    ) {
       const observedSpec = observedSupervisorSpec(spec, observation);
       if (observedSpec !== undefined) {
         try {
@@ -3367,7 +3376,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       }
       return second.kind === "registered-running-valid"
         && second.scopeDigest === spec.scopeDigest
-        && second.nonce === spec.nonce
+        && second.nonce === (observation.nonce ?? spec.nonce)
         && second.name === spec.name
         && second.managerPid === managerPid;
     };
