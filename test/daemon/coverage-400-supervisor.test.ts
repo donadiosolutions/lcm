@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const fsFaults = vi.hoisted(() => ({
   write: false,
@@ -85,8 +85,17 @@ type CommandResult = Readonly<{
 
 const roots: string[] = [];
 const DIGEST_A = "a".repeat(64);
+const originalXdgRuntimeDir = process.env.XDG_RUNTIME_DIR;
+
+beforeEach(() => {
+  const runtimeRoot = root();
+  chmodSync(runtimeRoot, 0o700);
+  process.env.XDG_RUNTIME_DIR = runtimeRoot;
+});
 
 afterEach(() => {
+  if (originalXdgRuntimeDir === undefined) delete process.env.XDG_RUNTIME_DIR;
+  else process.env.XDG_RUNTIME_DIR = originalXdgRuntimeDir;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
