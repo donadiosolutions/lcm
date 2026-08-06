@@ -400,8 +400,10 @@ function daemonProcessPath(deps: DoctorDeps, pid: number | undefined): string | 
   }
 }
 
+const MANAGED_DAEMON_PLATFORMS = new Set(["linux", "darwin"]);
+
 function usesManagedDaemonPath(platform: string): boolean {
-  return platform === "linux" || platform === "darwin";
+  return MANAGED_DAEMON_PLATFORMS.has(platform);
 }
 
 function checkBinary(deps: DoctorDeps, command: string, daemonPath: string): boolean {
