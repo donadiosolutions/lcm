@@ -272,6 +272,7 @@ const SCOPE_NAME_HEX_LENGTH = 20;
 const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_STOP_TIMEOUT_MS = 5_000;
 const DEFAULT_POLL_INTERVAL_MS = 50;
+const LAUNCHD_LABEL_REUSE_SETTLE_MS = 2_000;
 const MAX_POLL_INTERVALS = 100;
 const MAX_LAUNCHD_TRANSITION_POLL_INTERVALS = 3;
 const SYSTEMD_STOP_TRANSITION_SUBSTATES = new Set([
@@ -2247,6 +2248,12 @@ export function createSupervisor(
     return result;
   };
 
+  const settleLaunchdLabelReuse = async (): Promise<void> => {
+    if (kind !== "launchd-user") return;
+    if (dependencies.sleep !== undefined) await dependencies.sleep(LAUNCHD_LABEL_REUSE_SETTLE_MS);
+    else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, LAUNCHD_LABEL_REUSE_SETTLE_MS));
+  };
+
   const start = async (spec: SupervisorSpec, terminalRecreated = false): Promise<SupervisorStartResult> => {
     const current = await probeInternal(spec);
     if (current.kind === "unavailable") throw managerUnavailableError(current.reason);
@@ -2272,6 +2279,7 @@ export function createSupervisor(
       // stop and an observed absent state; never race systemd-run/bootstrap
       // against the old terminal unit.
       await stopAndAwaitAbsent(spec);
+      await settleLaunchdLabelReuse();
       return start(spec, true);
     }
     if (current.kind === "registered-stale-config" || current.kind === "registered-invalid-collision" || current.kind === "ambiguous") {
@@ -2381,7 +2389,10 @@ export function createSupervisor(
       } catch {
         // Preserve unresolved manager evidence.
       }
-      if (retiredExactTerminal && !terminalRecreated) return start(spec, true);
+      if (retiredExactTerminal && !terminalRecreated) {
+        await settleLaunchdLabelReuse();
+        return start(spec, true);
+      }
       throw commandFailedError();
     }
   };
@@ -2562,8 +2573,13 @@ export function createSupervisor(
     const observed = await probe(spec);
     if (observed.kind === "unavailable") throw managerUnavailableError(observed.reason);
     if (observed.kind === "registered-invalid-collision" || observed.kind === "ambiguous") throw commandFailedError();
-    if (observed.kind === "registered-stale-config") await stopAndAwaitAbsentInternal(spec, true, observed, false);
-    else if (observed.kind !== "absent") await stopAndAwaitAbsentInternal(spec, false, undefined, false);
+    if (observed.kind === "registered-stale-config") {
+      await stopAndAwaitAbsentInternal(spec, true, observed, false);
+      await settleLaunchdLabelReuse();
+    } else if (observed.kind !== "absent") {
+      await stopAndAwaitAbsentInternal(spec, false, undefined, false);
+      await settleLaunchdLabelReuse();
+    }
     return start(spec);
   };
 

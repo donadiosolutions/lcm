@@ -303,7 +303,7 @@ async function cleanupLaunchdFixture(
     // launchctl print can report an exact label absent before the GUI domain
     // releases that label for a subsequent bootstrap. Keep sequential cases
     // isolated without weakening the supervisor's fail-closed observation.
-    await wait(1_000);
+    await wait(2_000);
   }
   try {
     rmSync(fixture.root, { recursive: true, force: true });
