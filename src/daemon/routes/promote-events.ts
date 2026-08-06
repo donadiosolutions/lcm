@@ -1,8 +1,9 @@
 import type { EventRow, PatternReinforcementStats } from "../../hooks/events-db.js";
+import { existsSync } from "node:fs";
 import { eventsDbPath } from "../../db/events-path.js";
 import { deduplicateAndInsert } from "../../promotion/dedup.js";
 import { sendJson, type RouteHandler } from "../server.js";
-import { validateCwd } from "../validate-cwd.js";
+import { isMissingCwdError, validateCwd } from "../validate-cwd.js";
 import { projectDir, projectIdentity } from "../project.js";
 import type { DaemonConfig } from "../config.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
@@ -41,11 +42,17 @@ const AUTO_PROMOTABLE_PATTERN_CATEGORIES = new Set(["file", "mcp", "skill", "sub
 const EMPTY_REINFORCEMENT: PatternReinforcementStats = { totalCount: 0, distinctSessions: 0 };
 const sidecarPromotionLocks = new Map<string, Promise<void>>();
 
+export type PromoteTerminalOutcome = {
+  kind: "parked";
+  reason: "unavailable-cwd";
+};
+
 export interface PromoteResult {
   promoted: number;
   skipped: number;
   correlated: number;
   errors: number;
+  terminal?: PromoteTerminalOutcome;
   message?: string;
 }
 
@@ -129,6 +136,55 @@ async function withSidecarPromotionLock<T>(sidecarPath: string, fn: () => Promis
       sidecarPromotionLocks.delete(sidecarPath);
     }
   }
+}
+
+/**
+ * Consume local promotion work that can never be promoted because its recorded
+ * project directory is gone. The event rows and independent delivery state
+ * remain intact; only the local promotion checkpoint advances so sweeps do
+ * not retry the same permanent failure forever.
+ */
+export async function parkUnavailableCwdEvents(
+  cwd: string,
+  sidecarPathOverride?: string,
+): Promise<PromoteResult> {
+  const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
+  return withSidecarPromotionLock(sidecarPath, async () => {
+    if (!existsSync(sidecarPath)) {
+      return {
+        promoted: 0,
+        skipped: 0,
+        correlated: 0,
+        errors: 0,
+        terminal: { kind: "parked", reason: "unavailable-cwd" },
+        message: "no sidecar events to park for unavailable cwd",
+      };
+    }
+
+    const outboxFactory = new SQLiteLocalHookOutboxFactory();
+    try {
+      const edb = await outboxFactory.open(sidecarPath);
+      let parked = 0;
+      for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
+        const events = await edb.getUnprocessed();
+        if (events.length === 0) break;
+        await edb.markProcessed(events.map((event) => event.event_id));
+        parked += events.length;
+      }
+      return {
+        promoted: 0,
+        skipped: parked,
+        correlated: 0,
+        errors: 0,
+        terminal: { kind: "parked", reason: "unavailable-cwd" },
+        message: parked === 0
+          ? "no unprocessed events"
+          : `parked ${parked} events because cwd is unavailable`,
+      };
+    } finally {
+      await closeRouteStorage(outboxFactory);
+    }
+  });
 }
 
 export function createPromoteEventsHandler(
@@ -334,7 +390,15 @@ export async function drainEventsForCwd(
   sidecarPathOverride?: string,
   storageFactory?: StorageBackendFactory,
 ): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
-  cwd = validateCwd(cwd);
+  try {
+    cwd = validateCwd(cwd);
+  } catch (error) {
+    if (isMissingCwdError(error)) {
+      const parked = await parkUnavailableCwdEvents(cwd, sidecarPathOverride);
+      return { ...parked, batches: 0 };
+    }
+    throw error;
+  }
   const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
   return withSidecarPromotionLock(sidecarPath, () =>
     drainEventsForCwdUnlocked(config, cwd, sidecarPath, storageFactory));
@@ -413,7 +477,12 @@ export async function promoteEventsForCwd(
   sidecarPathOverride?: string,
   storageFactory?: StorageBackendFactory,
 ): Promise<PromoteResult> {
-  cwd = validateCwd(cwd);
+  try {
+    cwd = validateCwd(cwd);
+  } catch (error) {
+    if (isMissingCwdError(error)) return parkUnavailableCwdEvents(cwd, sidecarPathOverride);
+    throw error;
+  }
   const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
   return withSidecarPromotionLock(sidecarPath, () =>
     promoteEventsForCwdUnlocked(config, cwd, sidecarPath, storageFactory));

@@ -220,6 +220,7 @@ export class PassiveEventProcessor {
         await this.logError("passive-event-processor", error, { cwd });
         return;
       }
+      if (result.terminal) return;
       if (result.message === "no unprocessed events") return;
       const processed = result.promoted + result.skipped;
       if (processed === 0) return;

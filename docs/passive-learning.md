@@ -72,6 +72,19 @@ then retry the command. If health remains unavailable after processing should
 be idle, run `lcm doctor`, then `lcm daemon restart`; do not stop a process
 manually.
 
+If a queued event's recorded working directory has been permanently removed,
+the daemon parks the sidecar's currently unprocessed events after the missing
+directory is confirmed. Parking advances only the local `processed_at`
+checkpoint: the event rows, payloads, historical sidecar, and independent
+remote-delivery checkpoints remain intact. The event is not promoted into local
+memory, but it is no longer retried by the background processor, and the
+permanent missing-directory condition does not add another entry to the hook
+error ledger on every sweep. The same terminal behavior is used by
+`lcm events promote --all` for metadata-backed sidecars. Restore the directory
+before processing begins when local promotion is required; once parked, the
+event remains preserved for inspection or independent delivery rather than
+being silently deleted.
+
 `lcm search` stays read-only: it searches already promoted memory and does not process queued sidecar events.
 
 ### Three-Tier Promotion
@@ -212,6 +225,7 @@ The UserPromptSubmit extractor includes guards against false-positive decisions.
 | PostgreSQL unavailable | Hooks continue local commits; staged replication retries with bounded backoff and does not bypass an earlier local sequence blocker |
 | Hard kill (SIGKILL) | Events survive in sidecar, scavenged on next SessionStart |
 | Stale sidecars in other projects | `lcm events promote --all` drains all metadata-backed sidecars |
+| Recorded cwd permanently removed | Unprocessed local-promotion rows are parked with `processed_at`; event data and independent delivery state are retained |
 | Unprocessed cap or age guard exceeded | Events remain durable; a maintenance diagnostic reports the retained backlog |
 | Worker crashes after inbox insert | Exact immutable readback proves whether insertion committed |
 | Worker crashes during apply | PostgreSQL transaction rollback or exact `applied` readback resolves the outcome |

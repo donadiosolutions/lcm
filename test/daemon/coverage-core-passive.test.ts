@@ -20,6 +20,11 @@ function harness(overrides: Record<string, unknown> = {}) {
 }
 
 describe("passive event processor boundary coverage", () => {
+  it("uses production dependencies when no test seams are supplied", () => {
+    const processor = new PassiveEventProcessor(config());
+    processor.stop();
+  });
+
   it("ignores work after stop and logs rejected periodic and startup sweeps", async () => {
     const h = harness();
     h.processor.stop();

@@ -5,7 +5,13 @@ import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { EventsDb } from "../../../src/hooks/events-db.js";
-import { createPromoteAllEventsHandler, createPromoteEventsHandler, drainEventsForCwd, promoteEventsForCwd } from "../../../src/daemon/routes/promote-events.js";
+import {
+  createPromoteAllEventsHandler,
+  createPromoteEventsHandler,
+  drainEventsForCwd,
+  parkUnavailableCwdEvents,
+  promoteEventsForCwd,
+} from "../../../src/daemon/routes/promote-events.js";
 import { ensureProjectDir, projectDbPath, projectId } from "../../../src/daemon/project.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
@@ -252,6 +258,98 @@ describe("promote-events route", () => {
     const remaining = edb2.getUnprocessed();
     edb2.close();
     expect(remaining).toHaveLength(0);
+  });
+
+  it("parks events for a deleted cwd without deleting their historical or delivery rows", async () => {
+    const deletedCwd = join(dir, "deleted-project");
+    mkdirSync(deletedCwd);
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: "retain this event", priority: 1 }, "PostToolUse");
+    edb.insertEvent("s1", { type: "git", category: "git", data: "retain this delivery", priority: 2 }, "PostToolUse");
+    edb.close();
+    rmSync(deletedCwd, { recursive: true, force: true });
+
+    const result = await promoteEventsForCwd(makeConfig(), deletedCwd);
+
+    expect(result).toMatchObject({
+      promoted: 0,
+      skipped: 2,
+      correlated: 0,
+      errors: 0,
+      terminal: { kind: "parked", reason: "unavailable-cwd" },
+      message: "parked 2 events because cwd is unavailable",
+    });
+    expect(vi.mocked(deduplicateAndInsert)).not.toHaveBeenCalled();
+
+    const reopened = new EventsDb(sidecarPath);
+    expect(reopened.getUnprocessed()).toHaveLength(0);
+    expect(reopened.getHealthStats()).toMatchObject({
+      totalEvents: 2,
+      errors: 0,
+      deliveryPending: 2,
+    });
+    reopened.close();
+  });
+
+  it("parks deleted-cwd events through a full drain without entering retry state", async () => {
+    const deletedCwd = join(dir, "deleted-drain-project");
+    mkdirSync(deletedCwd);
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: "drain and retain", priority: 1 }, "PostToolUse");
+    edb.close();
+    rmSync(deletedCwd, { recursive: true, force: true });
+
+    const result = await drainEventsForCwd(makeConfig(), deletedCwd, sidecarPath);
+
+    expect(result).toMatchObject({
+      batches: 0,
+      promoted: 0,
+      skipped: 1,
+      errors: 0,
+      terminal: { kind: "parked", reason: "unavailable-cwd" },
+      message: "parked 1 events because cwd is unavailable",
+    });
+    const reopened = new EventsDb(sidecarPath);
+    expect(reopened.getUnprocessed()).toHaveLength(0);
+    expect(reopened.getHealthStats().totalEvents).toBe(1);
+    reopened.close();
+  });
+
+  it("does not create a sidecar when there is nothing durable to park", async () => {
+    const deletedCwd = join(dir, "deleted-without-sidecar");
+    const missingSidecar = join(dir, "not-created.db");
+
+    await expect(parkUnavailableCwdEvents(deletedCwd, missingSidecar)).resolves.toMatchObject({
+      promoted: 0,
+      skipped: 0,
+      errors: 0,
+      message: "no sidecar events to park for unavailable cwd",
+    });
+    expect(existsSync(missingSidecar)).toBe(false);
+  });
+
+  it("reports an already-empty sidecar without changing its terminal state", async () => {
+    const deletedCwd = join(dir, "deleted-empty-sidecar");
+    const emptySidecar = join(dir, "empty.db");
+    new EventsDb(emptySidecar).close();
+
+    await expect(parkUnavailableCwdEvents(deletedCwd, emptySidecar)).resolves.toMatchObject({
+      promoted: 0,
+      skipped: 0,
+      errors: 0,
+      message: "no unprocessed events",
+    });
+  });
+
+  it("does not park a cwd that still exists but is not a directory", async () => {
+    const fileCwd = join(dir, "project-file");
+    writeFileSync(fileCwd, "not a directory");
+
+    await expect(promoteEventsForCwd(makeConfig(), fileCwd, sidecarPath))
+      .rejects.toThrow("cwd must be a directory");
+    await expect(drainEventsForCwd(makeConfig(), fileCwd, sidecarPath))
+      .rejects.toThrow("cwd must be a directory");
+    expect(existsSync(sidecarPath)).toBe(false);
   });
 
   it("serializes concurrent promotion attempts for the same sidecar", async () => {

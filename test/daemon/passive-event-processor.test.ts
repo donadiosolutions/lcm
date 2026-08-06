@@ -132,6 +132,58 @@ describe("PassiveEventProcessor", () => {
     expect(promoteEventsForCwd.mock.calls[0][2]).toBe("/events/tmp.db");
   });
 
+  it("does not retry or log a sidecar after its unavailable cwd is terminalized", async () => {
+    let unprocessed = 1;
+    const { deps } = timerDeps();
+    const promoteEventsForCwd = vi.fn().mockImplementation(async () => {
+      unprocessed = 0;
+      return {
+        promoted: 0,
+        skipped: 1,
+        correlated: 0,
+        errors: 0,
+        message: "parked 1 events because cwd is unavailable",
+      };
+    });
+    const collectEventSidecars = vi.fn().mockImplementation(() => [{
+      cwd: "/deleted-project",
+      path: "/events/deleted.db",
+      unprocessed,
+    }]);
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      collectEventSidecars: collectEventSidecars as any,
+      promoteEventsForCwd: promoteEventsForCwd as any,
+    });
+
+    await processor.runSweep();
+    await processor.runSweep();
+
+    expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+    expect(deps.safeLogError).not.toHaveBeenCalled();
+  });
+
+  it("does not requeue a terminal parked result at the batch boundary", async () => {
+    const { deps } = timerDeps();
+    const promoteEventsForCwd = vi.fn().mockResolvedValue({
+      promoted: 0,
+      skipped: 500,
+      correlated: 0,
+      errors: 0,
+      terminal: { kind: "parked", reason: "unavailable-cwd" },
+    });
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      promoteEventsForCwd: promoteEventsForCwd as any,
+    });
+
+    processor.notify({ cwd: "/tmp", priority: 1 });
+    await processor.flushOnce();
+    await processor.flushOnce();
+
+    expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+  });
+
   it("prevents concurrent active drains and requeues remaining work after the batch limit", async () => {
     const { deps } = timerDeps();
     let resolvePromotion: ((value: unknown) => void) | undefined;

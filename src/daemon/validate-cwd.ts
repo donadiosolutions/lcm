@@ -2,6 +2,19 @@ import { resolve, isAbsolute } from "node:path";
 import { statSync } from "node:fs";
 import { sanitizeError } from "./safe-error.js";
 
+export class MissingCwdError extends Error {
+  readonly code = "CWD_NOT_FOUND" as const;
+
+  constructor(cwd: string) {
+    super(sanitizeError(`cwd does not exist: ${cwd}`));
+    this.name = "MissingCwdError";
+  }
+}
+
+export function isMissingCwdError(error: unknown): error is MissingCwdError {
+  return error instanceof MissingCwdError;
+}
+
 /**
  * Normalize and validate a cwd parameter from a daemon route.
  *
@@ -25,7 +38,7 @@ export function validateCwd(cwd: string): string {
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new Error(sanitizeError(`cwd does not exist: ${resolved}`));
+      throw new MissingCwdError(resolved);
     }
     // Sanitize all other filesystem errors (e.g. EACCES) to avoid leaking absolute paths.
     const msg = err instanceof Error ? err.message : "filesystem error";
