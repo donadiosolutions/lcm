@@ -129,7 +129,7 @@ export type EnsureDaemonOptions = {
   _suppressDetachedFallback?: boolean;
   /** @internal Authorize cleanup of one run-owned manager operation. */
   _managedOperationAuthorized?: boolean;
-  /** @internal Expected PID for cleanup after an explicit manager restart. */
+  /** @internal Expected PID for startup admission and cleanup after an explicit manager restart. */
   _managedOperationManagerPid?: number;
   _fetchOverride?: typeof globalThis.fetch;
   _platform?: NodeJS.Platform;
@@ -2271,9 +2271,90 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
 
     // A registered-running job must be admitted through a responsive,
     // authenticated endpoint. There is no offline ensure recovery path.
+    const authorizedManagerPid = opts._managedOperationAuthorized === true
+      ? opts._managedOperationManagerPid
+      : undefined;
+    const hasAuthorizedManagerStartup = authorizedManagerPid !== undefined;
+    const exactAuthorizedManagerObservation = (candidate: SupervisorObservation): boolean =>
+      hasAuthorizedManagerStartup
+      && supervisorMetadataMatches(candidate, requestedSpec)
+      && candidate.managerPid === authorizedManagerPid;
+    if (hasAuthorizedManagerStartup && !exactAuthorizedManagerObservation(observation)) {
+      managedOperationAmbiguous = true;
+      return refusalResult(
+        "ambiguous",
+        "managed daemon manager identity changed before startup admission",
+        { pid: authorizedManagerPid },
+      );
+    }
     const healthDeadline = remainingRequestDeadline();
     if (!healthDeadline) return refusalResult("startup-failure", "managed daemon health deadline expired");
-    const healthObservation = await observeDaemonHealth(opts.port, fetchFn, healthDeadline);
+    let healthObservation = await observeDaemonHealth(opts.port, fetchFn, healthDeadline);
+    if (healthObservation.kind === "no-response" && hasAuthorizedManagerStartup) {
+      // A manager operation authorized by explicit restart has already proved
+      // the exact replacement registration. Give that process a bounded
+      // admission window to publish daemon.pid and answer health. This is
+      // deliberately scoped to the authenticated manager name/scope/nonce/PID;
+      // ordinary ensure/doctor still refuses a live no-response immediately.
+      const maxStartupAdmissionAttempts = Math.max(1, Math.ceil(opts.spawnTimeoutMs / 300));
+      for (
+        let attempt = 0;
+        attempt < maxStartupAdmissionAttempts && healthObservation.kind === "no-response";
+        attempt += 1
+      ) {
+        let startupProbe: SupervisorObservation;
+        try {
+          startupProbe = await supervisor.probe(requestedSpec);
+        } catch {
+          managedOperationAmbiguous = true;
+          return refusalResult(
+            "ambiguous",
+            "managed daemon supervisor could not be re-probed during startup admission",
+            { pid: authorizedManagerPid },
+          );
+        }
+        if (!exactAuthorizedManagerObservation(startupProbe)) {
+          managedOperationAmbiguous = true;
+          return refusalResult(
+            "ambiguous",
+            "managed daemon manager identity changed during startup admission",
+            { pid: authorizedManagerPid },
+          );
+        }
+        const remainingMs = deadline - monotonicNow();
+        if (remainingMs <= 0) break;
+        await sleepFn(Math.min(300, remainingMs));
+        const nextHealthDeadline = remainingRequestDeadline();
+        if (!nextHealthDeadline) break;
+        healthObservation = await observeDaemonHealth(opts.port, fetchFn, nextHealthDeadline);
+      }
+      if (healthObservation.kind === "no-response") {
+        let finalStartupProbe: SupervisorObservation;
+        try {
+          finalStartupProbe = await supervisor.probe(requestedSpec);
+        } catch {
+          managedOperationAmbiguous = true;
+          return refusalResult(
+            "ambiguous",
+            "managed daemon supervisor could not be re-probed after startup admission",
+            { pid: authorizedManagerPid },
+          );
+        }
+        if (!exactAuthorizedManagerObservation(finalStartupProbe)) {
+          managedOperationAmbiguous = true;
+          return refusalResult(
+            "ambiguous",
+            "managed daemon manager identity changed after startup admission",
+            { pid: authorizedManagerPid },
+          );
+        }
+        return refusalResult(
+          "startup-failure",
+          "managed daemon supervisor started a job but its endpoint was not admitted before the deadline",
+          { pid: authorizedManagerPid },
+        );
+      }
+    }
     if (healthObservation.kind === "no-response") {
       let secondProbe: SupervisorObservation;
       try {
@@ -2310,7 +2391,12 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     try {
       secondProbe = await supervisor.probe(requestedSpec);
     } catch {
+      managedOperationAmbiguous = true;
       return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed before endpoint admission", { pid: observation.managerPid });
+    }
+    if (hasAuthorizedManagerStartup && !exactAuthorizedManagerObservation(secondProbe)) {
+      managedOperationAmbiguous = true;
+      return refusalResult("ambiguous", "managed daemon manager identity changed before authenticated admission", { pid: authorizedManagerPid });
     }
     if (!isRecognizedDaemonHealth(health)
       || !supervisorMetadataMatches(secondProbe, requestedSpec)
@@ -2342,10 +2428,12 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     try {
       finalProbe = await supervisor.probe(requestedSpec);
     } catch {
+      managedOperationAmbiguous = true;
       return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed after authenticated admission", { pid: observation.managerPid });
     }
     if (!managerEndpointIdentityMatches(finalProbe, authenticated, requestedSpec)
       || finalProbe.managerPid !== observation.managerPid) {
+      managedOperationAmbiguous = true;
       return refusalResult("ambiguous", "managed daemon manager identity changed after authenticated admission", { pid: observation.managerPid });
     }
     const accepted = await daemonResult(
