@@ -2211,8 +2211,9 @@ export function createSupervisor(
   /**
    * launchd can report a bootout target absent before it has released the
    * label from the GUI domain.  A same-label bootstrap in that small window
-   * fails even though a bounded print reports no registration.  Retry the
-   * exact bootstrap once only after two consecutive absence proofs; any
+   * fails even though a bounded print reports no registration. Retry the
+   * exact bootstrap within the existing command budget only after two
+   * consecutive absence proofs before each attempt; any
    * registered, ambiguous, or unavailable observation leaves the original
    * failure authoritative.
    */
@@ -2223,19 +2224,27 @@ export function createSupervisor(
   ): Promise<Awaited<ReturnType<typeof runner.invoke>>> => {
     if (kind !== "launchd-user" || initial.timedOut || initial.code === 0) return initial;
     const now = dependencies.now ?? performance.now.bind(performance);
-    const deadline = now() + (dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
-    let absenceProofs = 0;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      if ((await probeInternal(spec)).kind !== "absent") return initial;
-      absenceProofs += 1;
-      if (absenceProofs >= 2) break;
+    const commandTimeoutMs = dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    const deadline = now() + commandTimeoutMs;
+    const maxRetries = Math.max(
+      1,
+      Math.min(MAX_LAUNCHD_TRANSITION_POLL_INTERVALS, Math.ceil(commandTimeoutMs / DEFAULT_POLL_INTERVAL_MS)),
+    );
+    let result = initial;
+    for (let retry = 0; retry < maxRetries; retry += 1) {
+      if (result.timedOut || result.code === 0) return result;
+      if (deadline - now() <= 0) return result;
+      if ((await probeInternal(spec)).kind !== "absent") return result;
       const remaining = deadline - now();
-      if (remaining <= 0) return initial;
+      if (remaining <= 0) return result;
       const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
       if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
       else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
+      if (deadline - now() <= 0) return result;
+      if ((await probeInternal(spec)).kind !== "absent") return result;
+      result = await runner.invoke("launchctl", args);
     }
-    return runner.invoke("launchctl", args);
+    return result;
   };
 
   const start = async (spec: SupervisorSpec, terminalRecreated = false): Promise<SupervisorStartResult> => {

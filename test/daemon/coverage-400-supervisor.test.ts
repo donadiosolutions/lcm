@@ -851,6 +851,99 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
   });
 
+  it("retries repeated launchd bootstrap settling failures within the existing budget", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const failed = { code: 5, stderr: "Bootstrap failed: 5: Input/output error" };
+    const runner = runQueue([
+      absent,
+      failed,
+      absent,
+      absent,
+      failed,
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 546) },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).resolves.toMatchObject({ managerPid: 546 });
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(3);
+  });
+
+  it("preserves a failed launchd bootstrap when a retry proof is not absent", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      { code: 0, stdout: launchdText(value, "running", 547) },
+      { code: 0, stdout: launchdText(value, "running", 547) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(value)).rejects.toThrow("manager command");
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it("preserves a failed launchd bootstrap when its second absence proof changes", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const running = { code: 0, stdout: launchdText(value, "running", 548) };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      absent,
+      running,
+      running,
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep: async () => undefined,
+    }).start(value)).rejects.toThrow("manager command");
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it.each([
+    { name: "after the first absence proof", times: [0, 0, 1] },
+    { name: "after the settling delay", times: [0, 0, 0, 1] },
+  ])("preserves a failed launchd bootstrap when the deadline expires $name", async ({ times }) => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      absent,
+      absent,
+    ]);
+    const now = vi.fn();
+    for (const time of times) now.mockReturnValueOnce(time);
+    now.mockReturnValue(1);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 1,
+      now,
+      sleep: async () => undefined,
+    }).start(value)).rejects.toThrow("manager command");
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
   it("does not retry a launchd bootstrap after its absence deadline expires", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
