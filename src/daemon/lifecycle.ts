@@ -182,6 +182,16 @@ export type EnsureDaemonResult = {
   warning?: string;
 };
 
+function isManagedInterruptionResult(
+  result: EnsureDaemonResult,
+  abortSignal: AbortSignal | undefined,
+): boolean {
+  return abortSignal?.aborted === true
+    && result.connected === false
+    && result.spawned === true
+    && (result.startMethod === "systemd-user" || result.startMethod === "launchd-user");
+}
+
 export type RestartDaemonOptions = EnsureDaemonOptions & {
   /** Optional caller validation hook. It always completes before any signal is sent. */
   validateBeforeRestart?: () => void | Promise<void>;
@@ -472,6 +482,7 @@ function recognizedHealthStorageBackend(health: HealthResponse): StorageBackend 
 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const MAX_SUPERVISOR_COMMAND_TIMEOUT_MS = 60_000;
 const STORAGE_BACKEND_AUTH_WARNING = "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
 const RUNTIME_IDENTITY_AUTH_WARNING = "daemon reuse or replacement was blocked because the runtime-identity mismatch (entrypoint or packaged-runtime digest) could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
@@ -552,6 +563,10 @@ function validateSpawnTimeout(spawnTimeoutMs: number): void {
   if (!Number.isFinite(spawnTimeoutMs) || spawnTimeoutMs < 0 || spawnTimeoutMs > MAX_TIMER_DELAY_MS) {
     throw new RangeError(`spawnTimeoutMs must be between 0 and ${MAX_TIMER_DELAY_MS}`);
   }
+}
+
+function supervisorCommandTimeoutMs(spawnTimeoutMs: number): number {
+  return Math.max(1, Math.floor(Math.min(MAX_SUPERVISOR_COMMAND_TIMEOUT_MS, spawnTimeoutMs || 1_000)));
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -2045,7 +2060,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         // non-secret configuration/runtime values such as HOME and the
         // PostgreSQL CA pathname are not lost while credentials remain out.
         launchEnvironment,
-        stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+        stopTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
         realpath,
         ...(opts._supervisorCredentialDirectoryOverride === undefined ? {} : { credentialDirectory: opts._supervisorCredentialDirectoryOverride }),
         ...(opts._supervisorCredentialFilesOverride === undefined ? {} : { credentialFiles: opts._supervisorCredentialFilesOverride }),
@@ -2060,9 +2075,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           environment: launchEnvironment,
           platform,
           uid: dependencies.uid,
-          commandTimeoutMs: Math.max(1, opts.spawnTimeoutMs || 1_000),
-          stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+          commandTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
+          stopTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
           sleep: sleepFn,
+          now: monotonicNow,
         });
     managedSupervisorForCleanup = supervisor;
     managedSpecForCleanup = spec;
@@ -2079,11 +2095,15 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       ))
     ) return;
     const stages: Array<() => void | Promise<void>> = [];
-    if (managedOperationOwned && !managedOperationAmbiguous) {
-      let managerAbsenceProven = false;
+    const managerAbsenceRequired = managedOperationOwned && !managedOperationAmbiguous;
+    let managerAbsenceProven = !managerAbsenceRequired;
+    if (managerAbsenceRequired) {
       stages.push(
         async () => {
-          await managedSupervisorForCleanup!.stopAndAwaitAbsent(managedSpecForCleanup!);
+          await managedSupervisorForCleanup!.stopAndAwaitAbsent(
+            managedSpecForCleanup!,
+            { deadline },
+          );
           managerAbsenceProven = true;
         },
       );
@@ -2100,6 +2120,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       }
       stages.push(
         () => {
+          if (!managerAbsenceProven) return;
           const currentPid = readOwnedPid();
           if (
             managedOperationManagerPid === undefined
@@ -2110,6 +2131,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       );
       if (scopedState !== undefined) {
         stages.push(() => {
+          if (!managerAbsenceProven) return;
           assertScopedStateAccess(scopedState!);
           rmSync(tokenPath, { force: true });
           assertScopedStateAccess(scopedState!);
@@ -2117,14 +2139,15 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       }
     }
     if (testScope !== undefined) {
-      stages.push(...[
-        testScope.runtimeDir,
-        testScope.credentialDir,
-        testScope.stateDir,
-      ].map((path) => () => {
+      stages.push(...[testScope.runtimeDir, testScope.credentialDir].map((path) => () => {
         assertLifecycleScopeOwnsCurrentCleanupRoot(testScope!, path);
         rmSync(path, { recursive: true, force: true });
       }));
+      stages.push(() => {
+        if (!managerAbsenceProven) return;
+        assertLifecycleScopeOwnsCurrentCleanupRoot(testScope!, testScope.stateDir);
+        rmSync(testScope.stateDir, { recursive: true, force: true });
+      });
     }
     await runCleanupStages(stages);
   }
@@ -2139,7 +2162,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     let requestedSpec = spec;
     let observation: SupervisorObservation;
     try {
-      observation = await supervisor.probe(spec);
+      observation = await supervisor.probe(spec, { deadline });
     } catch {
       return refusalResult(
         "ambiguous",
@@ -2162,7 +2185,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       const observedSpec = observedSupervisorSpec(spec, observation);
       if (observedSpec !== undefined) {
         try {
-          const observed = await supervisor.probe(observedSpec);
+          const observed = await supervisor.probe(observedSpec, { deadline });
           if (
             observed.kind === "registered-running-valid"
             || (
@@ -2304,7 +2327,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       ) {
         let startupProbe: SupervisorObservation;
         try {
-          startupProbe = await supervisor.probe(requestedSpec);
+          startupProbe = await supervisor.probe(requestedSpec, { deadline });
         } catch {
           managedOperationAmbiguous = true;
           return refusalResult(
@@ -2331,7 +2354,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       if (healthObservation.kind === "no-response") {
         let finalStartupProbe: SupervisorObservation;
         try {
-          finalStartupProbe = await supervisor.probe(requestedSpec);
+          finalStartupProbe = await supervisor.probe(requestedSpec, { deadline });
         } catch {
           managedOperationAmbiguous = true;
           return refusalResult(
@@ -2358,7 +2381,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (healthObservation.kind === "no-response") {
       let secondProbe: SupervisorObservation;
       try {
-        secondProbe = await supervisor.probe(requestedSpec);
+        secondProbe = await supervisor.probe(requestedSpec, { deadline });
       } catch {
         return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed after the no-response observation", { pid: observation.managerPid });
       }
@@ -2389,7 +2412,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const health = healthObservation.parsedBody;
     let secondProbe: SupervisorObservation;
     try {
-      secondProbe = await supervisor.probe(requestedSpec);
+      secondProbe = await supervisor.probe(requestedSpec, { deadline });
     } catch {
       managedOperationAmbiguous = true;
       return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed before endpoint admission", { pid: observation.managerPid });
@@ -2426,7 +2449,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     }
     let finalProbe: SupervisorObservation;
     try {
-      finalProbe = await supervisor.probe(requestedSpec);
+      finalProbe = await supervisor.probe(requestedSpec, { deadline });
     } catch {
       managedOperationAmbiguous = true;
       return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed after authenticated admission", { pid: observation.managerPid });
@@ -2475,11 +2498,12 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       return refusalResult("startup-failure", "managed daemon credentials could not be prepared", { spawned: false });
     }
     managedOperationOwned = true;
+    const managerOperation = { deadline };
     let started: { managerPid?: number };
     try {
       started = recreateRegisteredJob
-        ? await supervisor.stopAndStart(launchSpec)
-        : await supervisor.start(launchSpec);
+        ? await supervisor.stopAndStart(launchSpec, managerOperation)
+        : await supervisor.start(launchSpec, managerOperation);
     } catch {
       // A settled manager mutation that throws may have raced a concurrent
       // winner.  The supervisor owns its own absent-proof cleanup; lifecycle
@@ -2490,7 +2514,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     }
     let second: SupervisorObservation;
     try {
-      second = await supervisor.probe(launchSpec);
+      second = await supervisor.probe(launchSpec, managerOperation);
     } catch {
       // A post-start re-probe is part of the ownership proof.  If it cannot
       // settle, the manager mutation may have raced a concurrent winner; do
@@ -2557,7 +2581,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
             if (authenticated !== null) {
               let finalProbe: SupervisorObservation;
               try {
-                finalProbe = await supervisor.probe(launchSpec);
+                finalProbe = await supervisor.probe(launchSpec, managerOperation);
               } catch {
                 managedOperationOwned = false;
                 managedOperationAmbiguous = true;
@@ -2624,6 +2648,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   if (managerKind !== undefined) {
     const managedResult = await runManagedEnsure(managerKind);
     if (managedResult !== null) {
+      const hasPrimaryManagedOutcome = managedResult.refusalReason !== undefined
+        || isManagedInterruptionResult(managedResult, opts._abortSignal);
       const failedManagedOperation = managedCleanupAuthorized
         && managedOperationOwned
         && !managedOperationAmbiguous
@@ -2639,7 +2665,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       const failedTestOperation = testScope !== undefined
         && managedCleanupAuthorized
         && !managedResult.connected;
-      if (ownedTestStart || failedManagedOperation || failedTestOperation) await cleanupManagedScopeResources();
+      if (ownedTestStart || failedManagedOperation || failedTestOperation) {
+        try {
+          await cleanupManagedScopeResources();
+        } catch (error) {
+          if (!failedManagedOperation || !hasPrimaryManagedOutcome) throw error;
+        }
+      }
       return managedResult;
     }
     if (managerPreflightUnavailable && opts._suppressDetachedFallback) {
@@ -3333,7 +3365,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         storageBackend: opts.expectedStorageBackend ?? "sqlite",
         postgresCaFile: dependencies.environment.LCM_POSTGRES_CA_FILE,
         launchEnvironment,
-        stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+        stopTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
         realpath,
       });
     } catch {
@@ -3346,15 +3378,16 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
           environment: launchEnvironment,
           platform,
           uid: dependencies.uid,
-          commandTimeoutMs: Math.max(1, opts.spawnTimeoutMs || 1_000),
-          stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+          commandTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
+          stopTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
           sleep: dependencies.sleep,
+          now: monotonicNow,
         });
     let observation: SupervisorObservation;
     try {
       // Probe before any PID read, health request, signal, or start. Only an
       // allowlisted preflight-unavailable result may fall through before mutation.
-      observation = await supervisor.probe(spec);
+      observation = await supervisor.probe(spec, { deadline: verificationDeadline });
     } catch {
       return restartRefusal("ambiguous", "managed daemon supervisor probe failed; inspect the manager and retry");
     }
@@ -3379,9 +3412,12 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       admittedSpec?: SupervisorSpec,
       restarted = false,
     ): Promise<RestartDaemonResult> => {
+      const remainingSpawnTimeoutMs = Math.max(0, Math.floor(verificationDeadline - monotonicNow()));
       const ensured = await ensure({
         ...ensureOptions,
+        spawnTimeoutMs: remainingSpawnTimeoutMs,
         expectedEntrypoint,
+        _monotonicNowOverride: monotonicNow,
         _suppressDetachedFallback: true,
         _managedOperationAuthorized: true,
         ...(managerPid === undefined ? {} : { _managedOperationManagerPid: managerPid }),
@@ -3408,7 +3444,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       // live launch evidence, so no cleanup satisfies its own refusal.
       let admitted = false;
       try {
-        const started = await supervisor.stopAndStart(staged.spec);
+        const started = await supervisor.stopAndStart(staged.spec, { deadline: verificationDeadline });
         const ensured = await ensureAfterManagerOperation(started.managerPid, staged.spec, true);
         admitted = ensured.connected === true;
         return ensured;
@@ -3458,7 +3494,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     const secondProbeMatches = async (): Promise<boolean> => {
       let second: SupervisorObservation;
       try {
-        second = await supervisor.probe(spec);
+        second = await supervisor.probe(spec, { deadline: verificationDeadline });
       } catch {
         return false;
       }

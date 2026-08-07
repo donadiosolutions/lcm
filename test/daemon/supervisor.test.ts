@@ -2709,7 +2709,13 @@ describe("launchd-user supervisor", () => {
       { code: 0, stdout: "bootstrapped" },
       { code: 113, stderr: "Could not find service" },
     ]);
-    await expect(createSupervisor("launchd-user", { run: second.run, platform: "darwin", uid: 501 }).start(spec)).rejects.toThrow("manager command");
+    await expect(createSupervisor("launchd-user", {
+      run: second.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 1,
+      sleep: async () => undefined,
+    }).start(spec)).rejects.toThrow("manager command");
 
     const badPlist = join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
     writeFileSync(badPlist, "foreign", { mode: 0o644 });
