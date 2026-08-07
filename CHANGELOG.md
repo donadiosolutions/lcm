@@ -1,5 +1,13 @@
 # @donadiosolutions/lcm
 
+## 1.4.3
+
+### Patch Changes
+
+- Update nested js-yaml, brace-expansion, fast-uri, Hono, ip-address, and
+  PostCSS to patched versions, eliminating the known dependency
+  vulnerabilities present in the v1.4.2 maintenance line.
+
 ## 1.4.2
 
 ### Patch Changes
