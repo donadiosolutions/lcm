@@ -177,7 +177,7 @@ snapshot_incomplete_or_exit() {
 matching_prs="$(fetch_associated_pull_requests)"
 PR_NUMBER="$(resolve_eligible_pr_number <<<"$matching_prs")"
 if [[ -z "$PR_NUMBER" ]]; then
-  echo "Provider result does not identify exactly one eligible pull request; admission remains pending."
+  echo "CI/DCO admission result does not identify exactly one eligible pull request; admission remains pending."
   trap - EXIT INT TERM
   exit 0
 fi

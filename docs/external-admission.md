@@ -81,7 +81,7 @@ writes, PR association, and policy comparisons.
 ## Security and trusted revision
 
 `repository_dispatch` runs this workflow only when the workflow file exists on
-the repository default branch. GitHub sets the run ref to the default branch
+the repository's default branch. GitHub sets the run ref to the default branch
 and the run SHA to its latest commit; callers cannot choose another branch or
 tag. The executable evaluator and policy are sparsely checked out from
 `github.workflow_sha` with credentials disabled. The client payload supplies
