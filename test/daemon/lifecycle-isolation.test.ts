@@ -1511,7 +1511,7 @@ describe("run-owned lifecycle resources", () => {
     expect(fixture.stopUnit).not.toHaveBeenCalled();
   });
 
-  it("observes abort cleanup rejection until finish awaits it", async () => {
+  it("preserves a post-start interruption when cleanup rejects", async () => {
     const controller = new AbortController();
     const fetch = vi.fn()
       .mockRejectedValueOnce(new Error("initially offline"))
@@ -1533,7 +1533,12 @@ describe("run-owned lifecycle resources", () => {
       });
       await vi.waitFor(() => expect(fixture.runSystemd).toHaveBeenCalledOnce());
       controller.abort();
-      await expect(operation).rejects.toThrow("stop failed");
+      await expect(operation).resolves.toMatchObject({
+        connected: false,
+        spawned: true,
+        startMethod: "systemd-user",
+        warning: "daemon lifecycle was interrupted",
+      });
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(fixture.supervisor.stopAndAwaitAbsent).toHaveBeenCalledOnce();
       expect(fixture.killProcess).not.toHaveBeenCalled();

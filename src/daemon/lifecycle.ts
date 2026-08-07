@@ -182,6 +182,16 @@ export type EnsureDaemonResult = {
   warning?: string;
 };
 
+function isManagedInterruptionResult(
+  result: EnsureDaemonResult,
+  abortSignal: AbortSignal | undefined,
+): boolean {
+  return abortSignal?.aborted === true
+    && result.connected === false
+    && result.spawned === true
+    && (result.startMethod === "systemd-user" || result.startMethod === "launchd-user");
+}
+
 export type RestartDaemonOptions = EnsureDaemonOptions & {
   /** Optional caller validation hook. It always completes before any signal is sent. */
   validateBeforeRestart?: () => void | Promise<void>;
@@ -2638,6 +2648,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   if (managerKind !== undefined) {
     const managedResult = await runManagedEnsure(managerKind);
     if (managedResult !== null) {
+      const hasPrimaryManagedOutcome = managedResult.refusalReason !== undefined
+        || isManagedInterruptionResult(managedResult, opts._abortSignal);
       const failedManagedOperation = managedCleanupAuthorized
         && managedOperationOwned
         && !managedOperationAmbiguous
@@ -2657,7 +2669,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         try {
           await cleanupManagedScopeResources();
         } catch (error) {
-          if (managedResult.refusalReason === undefined) throw error;
+          if (!hasPrimaryManagedOutcome) throw error;
         }
       }
       return managedResult;

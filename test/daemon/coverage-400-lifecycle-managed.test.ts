@@ -1714,6 +1714,69 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     expect(existsSync(fixture.tokenPath)).toBe(true);
   });
 
+  it("preserves a post-start interruption when expired cleanup cannot prove manager absence", async () => {
+    let now = 0;
+    const controller = new AbortController();
+    const fixture = createFixture({ fetch: sequenceFetch([new Error("offline")]) });
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    const cleanupMutation = vi.fn();
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => {
+        now = 50;
+        controller.abort();
+        return observation(spec, "registered-running-valid", { managerPid: 4242 });
+      });
+    fixture.stopAndAwaitAbsent.mockImplementation(async (
+      _spec: SupervisorSpec,
+      operation?: { readonly deadline?: number },
+    ) => {
+      if (operation?.deadline === undefined || now < operation.deadline) {
+        cleanupMutation();
+        return;
+      }
+      const error = new Error("manager operation deadline expired") as Error & { reason?: string };
+      error.name = "SupervisorCommandError";
+      error.reason = "timeout";
+      throw error;
+    });
+
+    await expect(ensureDaemon(optionsFor(fixture, {
+      spawnTimeoutMs: 50,
+      _skipHealthWait: false,
+      _abortSignal: controller.signal,
+      _monotonicNowOverride: () => now,
+    }))).resolves.toMatchObject({
+      connected: false,
+      spawned: true,
+      startMethod: "systemd-user",
+      warning: "daemon lifecycle was interrupted",
+    });
+
+    expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledWith(expect.anything(), { deadline: 50 });
+    expect(cleanupMutation).not.toHaveBeenCalled();
+    expect(readFileSync(fixture.pidPath, "utf8").trim()).toBe("4242");
+    expect(existsSync(fixture.tokenPath)).toBe(true);
+  });
+
+  it("propagates cleanup failure without a refusal or managed interruption result", async () => {
+    const fixture = createScopedFixture({ fetch: sequenceFetch([new Error("offline")]) });
+    const { _hermeticTestSeams: _ignoredHermeticSeams, ...scopedOptions } = optionsFor(fixture, {
+      _testScope: fixture.scope,
+      _skipHealthWait: true,
+      expectedEntrypoint: fixture.scope.entrypoint,
+    });
+    void _ignoredHermeticSeams;
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    fixture.stopAndAwaitAbsent.mockRejectedValueOnce(new Error("cleanup failed"));
+
+    await expect(ensureDaemon(scopedOptions)).rejects.toThrow("cleanup failed");
+
+    expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledOnce();
+  });
+
   it("covers deadline abort/timeout callbacks and platform process-command paths", async () => {
     const timeoutHandle = { id: "timeout" } as never;
     let timeoutCallback: (() => void) | undefined;
