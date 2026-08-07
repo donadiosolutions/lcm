@@ -42,13 +42,20 @@ deadline established for the original bootstrap attempt has budget. This
 handles label release that takes more than one settle interval without turning
 other failures into generic retries.
 
+During that code-5 recovery only, a transient malformed metadata observation
+does not authorize bootstrap. LCM may wait briefly and observe the exact label
+again within the same deadline, but it still requires both exact absence proofs
+before retrying. Malformed metadata that persists to the deadline ends with the
+bounded `malformed-state` reason.
+
 The numeric result is used because launchd's accompanying human text varies by
 macOS version. Permission failures remain permission failures even if they use
-code 5. A timeout, transport failure, malformed or ambiguous manager response,
-registered label, permission error, other command result, or code 5 that lasts
-to the deadline stops immediately with a bounded failure classification. LCM
-never includes raw manager output, plist paths, or credentials in that error,
-and it never falls back to manual process signaling.
+code 5. A timeout, transport failure, registered label, permission error, other
+ambiguous manager response, malformed response outside the active code-5
+recovery, other command result, or code 5 that lasts to the deadline stops with
+a bounded failure classification. LCM never includes raw manager output, plist
+paths, or credentials in that error, and it never falls back to manual process
+signaling.
 
 Use these commands for normal operation:
 

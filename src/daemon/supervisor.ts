@@ -1990,6 +1990,7 @@ function systemdProbeArgs(spec: SupervisorSpec): readonly string[] {
 type SupervisorProbeCapture = {
   parsed?: Map<string, string>;
   code?: number | null;
+  permissionFailure?: boolean;
 };
 
 /**
@@ -2237,6 +2238,7 @@ export function createSupervisor(
     if (capture !== undefined) {
       capture.parsed = parsed;
       capture.code = result.code;
+      capture.permissionFailure = isPermissionFailure(result);
     }
     if (result.code !== 0 && isLikelyAbsent({ kind, ...result })) return Object.freeze({ kind: "absent", name: spec.name });
     if (result.code !== 0 && parsed.size === 0) {
@@ -2267,8 +2269,10 @@ export function createSupervisor(
    * versions, so the exact bootstrap command plus its numeric result is the
    * classification boundary. Continue only while that exact result is
    * surrounded by two absence proofs and the original command deadline still
-   * has budget; registered, malformed, ambiguous, unavailable, permission,
-   * transport, timeout, and other command results remain authoritative.
+   * has budget. A metadata-malformed projection may be observed again without
+   * mutation during that already-authenticated recovery; registered, other
+   * ambiguous, unavailable, permission, transport, timeout, and other command
+   * results remain authoritative.
    */
   const retryLaunchdBootstrapAfterAbsence = async (
     spec: SupervisorSpec,
@@ -2277,6 +2281,28 @@ export function createSupervisor(
     deadline: number,
   ): Promise<Awaited<ReturnType<typeof runner.invoke>>> => {
     const now = dependencies.now ?? performance.now.bind(performance);
+    const awaitExactAbsence = async (): Promise<void> => {
+      let sawMalformed = false;
+      while (true) {
+        let remaining = Math.floor(deadline - now());
+        if (remaining <= 0) {
+          throw commandFailedError(sawMalformed ? "malformed-state" : "label-release-deadline");
+        }
+        const capture: SupervisorProbeCapture = {};
+        const observed = await probeInternal(spec, capture, remaining);
+        if (observed.kind === "absent") return;
+        if (capture.permissionFailure === true) throw commandFailedError("permission");
+        if (observed.kind !== "ambiguous" || observed.reason !== "metadata-malformed") {
+          throw commandFailedError(observationFailureClass(observed));
+        }
+        sawMalformed = true;
+        remaining = Math.floor(deadline - now());
+        if (remaining <= 0) throw commandFailedError("malformed-state");
+        const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
+        if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
+        else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
+      }
+    };
     let result = initial;
     while (
       kind === "launchd-user"
@@ -2284,19 +2310,15 @@ export function createSupervisor(
       && result.code === 5
       && !isPermissionFailure(result)
     ) {
+      await awaitExactAbsence();
       let remaining = Math.floor(deadline - now());
-      if (remaining <= 0) return result;
-      const before = await probeInternal(spec, undefined, remaining);
-      if (before.kind !== "absent") throw commandFailedError(observationFailureClass(before));
-      remaining = Math.floor(deadline - now());
       if (remaining <= 0) return result;
       const delay = Math.min(LAUNCHD_LABEL_REUSE_SETTLE_MS, remaining);
       if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
       else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
       remaining = Math.floor(deadline - now());
       if (remaining <= 0) return result;
-      const after = await probeInternal(spec, undefined, remaining);
-      if (after.kind !== "absent") throw commandFailedError(observationFailureClass(after));
+      await awaitExactAbsence();
       remaining = Math.floor(deadline - now());
       if (remaining <= 0) return result;
       result = await runner.invoke("launchctl", args, remaining);

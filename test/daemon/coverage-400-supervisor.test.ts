@@ -836,6 +836,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
       absent,
       absent,
       { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      { code: 0, stdout: "unparseable launchd response" },
       absent,
       absent,
       { code: 0, stdout: "bootstrapped" },
@@ -980,7 +981,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
   it.each([
     { name: "after the first absence proof", times: [0, 0, 1] },
     { name: "after the settling delay", times: [0, 0, 0, 1] },
-    { name: "after the second absence proof", times: [0, 0, 0, 0, 1] },
+    { name: "after the second absence proof", times: [0, 0, 0, 0, 0, 1] },
   ])("preserves a failed launchd bootstrap when the deadline expires $name", async ({ times }) => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
@@ -1005,6 +1006,33 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
 
+  it("preserves malformed-state when its observation consumes the remaining deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "diagnostic wording is not an authority" },
+      { code: 0, stdout: "unparseable launchd response" },
+      absent,
+    ]);
+    const now = vi.fn().mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(1);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 1,
+      now,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "malformed-state",
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
   it("classifies an initial launchd bootstrap transport failure without retrying", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
@@ -1024,11 +1052,77 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
 
+  it("observes malformed launchd projections until two exact absences authorize one retry", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const malformed = { code: 0, stdout: "unparseable launchd response" };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "diagnostic wording is not an authority" },
+      malformed,
+      absent,
+      malformed,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 550) },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).resolves.toMatchObject({ managerPid: 550 });
+    expect(sleep.mock.calls).toEqual([[50], [2_000], [50]]);
+    expect(runner.calls.map(({ args }) => args[0])).toEqual([
+      "print",
+      "bootstrap",
+      "print",
+      "print",
+      "print",
+      "print",
+      "bootstrap",
+      "print",
+    ]);
+  });
+
+  it("fails with bounded malformed state when observation-only recovery exhausts its deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const malformed = { code: 0, stdout: "unparseable launchd response" };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "diagnostic wording is not an authority" },
+      malformed,
+      malformed,
+      absent,
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 100,
+      now: () => currentTime,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "malformed-state",
+    });
+    expect(sleep.mock.calls).toEqual([[50], [50]]);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
   it.each([
     {
-      name: "malformed manager state",
-      proof: { code: 0, stdout: "unparseable launchd response" },
-      reason: "malformed-state",
+      name: "manager permission failure",
+      proof: { code: 1, stderr: "Operation not permitted" },
+      reason: "permission",
     },
     {
       name: "manager transport failure",
