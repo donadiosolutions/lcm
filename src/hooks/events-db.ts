@@ -1,10 +1,19 @@
 // src/hooks/events-db.ts
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { getLcmConnection, closeLcmConnection, isLcmConnectionOpen } from "../db/connection.js";
+import {
+  getExistingLcmConnection,
+  getLcmConnection,
+  closeLcmConnection,
+  isLcmConnectionOpen,
+} from "../db/connection.js";
 import { sanitizeError } from "../daemon/safe-error.js";
+import {
+  ensurePrivateDirectory,
+  PRIVATE_DIRECTORY_MODE,
+} from "../security-files.js";
 import { readMachineIdentity } from "../machine-identity.js";
 import { sanitizeHookErrorDiagnostic } from "./hook-error-diagnostic.js";
 import {
@@ -20,6 +29,7 @@ import type {
   LocalHookErrorRecord,
   LocalHookEvent,
   LocalHookEventRow,
+  LocalHookMissingCwdState,
   LocalHookOutboxHealth,
   LocalHookOutboxOpenOptions,
   PatternReinforcementStats,
@@ -53,7 +63,8 @@ export type HealthStats = LocalHookOutboxHealth;
 export type { PatternReinforcementStats } from "../storage/local-hook-outbox.js";
 export { MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH } from "./hook-error-diagnostic.js";
 
-const SCHEMA_VERSION = 4;
+export const EVENTS_SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = EVENTS_SCHEMA_VERSION;
 export const EVENTS_UNPROCESSED_BATCH_LIMIT = 500;
 export const EVENTS_DELIVERY_BATCH_LIMIT = 500;
 const DEFAULT_RECENT_ERROR_LIMIT = 5;
@@ -62,6 +73,52 @@ const LEGACY_EVENT_CREATED_AT_FALLBACK = "1970-01-01 00:00:00";
 const MAX_POSTGRESQL_BIGINT = 9_223_372_036_854_775_807n;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[457][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const MISSING_CWD_PARKING_OBSERVATIONS = 3;
+
+export type MissingCwdStateRow = {
+  readonly id: number;
+  readonly observations: number;
+  readonly last_observed_at: number;
+  readonly parked_at: string | null;
+};
+
+function isCanonicalSqliteUtcTimestamp(
+  db: DatabaseSync,
+  value: unknown,
+): value is string {
+  if (typeof value !== "string") return false;
+  const normalized = db.prepare("SELECT datetime(?) AS value").get(value) as {
+    value: string | null;
+  };
+  return normalized.value === value;
+}
+
+/** Validate persisted missing-CWD state before any caller interprets it. */
+export function isValidMissingCwdStateRow(
+  db: DatabaseSync,
+  row: unknown,
+): row is MissingCwdStateRow {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return false;
+  const state = row as Record<string, unknown>;
+  if (state.id !== 1) return false;
+  if (
+    typeof state.observations !== "number"
+    || !Number.isSafeInteger(state.observations)
+    || state.observations <= 0
+  ) {
+    return false;
+  }
+  if (
+    typeof state.last_observed_at !== "number"
+    || !Number.isSafeInteger(state.last_observed_at)
+    || state.last_observed_at < 0
+  ) {
+    return false;
+  }
+  if (state.parked_at === null) return true;
+  return state.observations >= MISSING_CWD_PARKING_OBSERVATIONS
+    && isCanonicalSqliteUtcTimestamp(db, state.parked_at);
+}
 
 function normalizeRecentErrorLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_RECENT_ERROR_LIMIT;
@@ -136,11 +193,21 @@ CREATE TABLE IF NOT EXISTS error_log (
 CREATE INDEX IF NOT EXISTS idx_error_log_created ON error_log(created_at);
 `;
 
+const MISSING_CWD_STATE_SQL = `
+CREATE TABLE IF NOT EXISTS missing_cwd_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  observations INTEGER NOT NULL CHECK (observations > 0),
+  last_observed_at INTEGER NOT NULL CHECK (last_observed_at >= 0),
+  parked_at TEXT CHECK (parked_at IS NULL OR observations >= 3)
+);
+`;
+
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 ${EVENTS_TABLE_SQL}
 ${EVENT_INDEX_SQL}
 ${ERROR_LOG_SQL}
+${MISSING_CWD_STATE_SQL}
 `;
 
 function currentRegisteredMachineId(): string | null {
@@ -192,14 +259,41 @@ export class EventsDb {
   private busyTimeoutOverrideId: symbol | undefined;
   private sequenceAllocator: LocalHookEventSequenceAllocator | undefined;
 
-  constructor(dbPath: string, options: LocalHookOutboxOpenOptions = {}) {
-    mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
+  static openExisting(
+    dbPath: string,
+    options: LocalHookOutboxOpenOptions = {},
+  ): EventsDb | null {
+    const connection = getExistingLcmConnection(dbPath);
+    if (connection === null) return null;
+    try {
+      chmodSync(dirname(dbPath), PRIVATE_DIRECTORY_MODE);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        closeLcmConnection(dbPath, connection);
+        throw error;
+      }
+    }
+    return new EventsDb(dbPath, options, connection);
+  }
+
+  constructor(
+    dbPath: string,
+    options: LocalHookOutboxOpenOptions = {},
+    existingConnection?: DatabaseSync,
+  ) {
     this.dbPath = dbPath;
-    // getLcmConnection returns the pooled (or newly-opened) DatabaseSync handle
-    // and increments its ref-count. Connections are kept alive across EventsDb
-    // instances so that high-frequency hooks (PostToolUse fires 50-200x/session)
-    // reuse the same underlying connection instead of opening/closing each time.
-    this.db = getLcmConnection(dbPath);
+    if (existingConnection) {
+      this.db = existingConnection;
+    } else {
+      // Create-capable opens always enforce the private-directory invariant,
+      // including when getLcmConnection reuses an already-pooled handle.
+      ensurePrivateDirectory(dirname(dbPath));
+      // getLcmConnection returns the pooled (or newly-opened) DatabaseSync handle
+      // and increments its ref-count. Connections are kept alive across EventsDb
+      // instances so that high-frequency hooks (PostToolUse fires 50-200x/session)
+      // reuse the same underlying connection instead of opening/closing each time.
+      this.db = getLcmConnection(dbPath);
+    }
     if (options.busyTimeoutMs !== undefined && Number.isFinite(options.busyTimeoutMs)) {
       try {
         this.addBusyTimeoutOverride(Math.max(0, Math.trunc(options.busyTimeoutMs)));
@@ -283,17 +377,6 @@ export class EventsDb {
   }
 
   private migrate(): void {
-    const schema = this.readSchemaVersion();
-    if (schema?.currentVersion === SCHEMA_VERSION) {
-      const eventsTable = this.db.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='events'",
-      ).get();
-      if (eventsTable) {
-        this.db.exec(`${EVENT_INDEX_SQL}${ERROR_LOG_SQL}`);
-        return;
-      }
-    }
-
     this.runMigrationTransaction(() => {
       this.migrateUnderExclusiveLock();
     });
@@ -313,10 +396,27 @@ export class EventsDb {
         "SELECT name FROM sqlite_master WHERE type='table' AND name='events'",
       ).get();
       if (!eventsTable) {
+        this.db.exec(EVENTS_TABLE_SQL);
+      }
+      // Current-schema repair is deliberately part of this migration
+      // transaction: a later DDL failure rolls every earlier repair back.
+      this.db.exec(EVENT_INDEX_SQL);
+      this.db.exec(ERROR_LOG_SQL);
+      this.db.exec(MISSING_CWD_STATE_SQL);
+      return;
+    }
+
+    if (currentVersion === 4) {
+      const eventsTable = this.db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='events'",
+      ).get();
+      if (!eventsTable) {
         this.db.exec(`${EVENTS_TABLE_SQL}${EVENT_INDEX_SQL}${ERROR_LOG_SQL}`);
       } else {
         this.db.exec(`${EVENT_INDEX_SQL}${ERROR_LOG_SQL}`);
       }
+      this.db.exec(MISSING_CWD_STATE_SQL);
+      this.db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
       return;
     }
 
@@ -387,6 +487,7 @@ export class EventsDb {
       DROP TABLE events;
       ALTER TABLE events_v4 RENAME TO events;
       ${EVENT_INDEX_SQL}
+      ${MISSING_CWD_STATE_SQL}
     `);
     if (versionRow) {
       this.db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
@@ -402,8 +503,9 @@ export class EventsDb {
       this.db.exec("COMMIT");
     } catch (e) {
       try { this.db.exec("ROLLBACK"); } catch { /* preserve the migration failure */ }
-      const message = sanitizeError(e instanceof Error ? e.message : String(e));
-      throw new Error(message);
+      // The constructor owns the public error boundary and sanitizes both
+      // Error and non-Error migration failures after releasing the connection.
+      throw e;
     }
   }
 
@@ -451,6 +553,69 @@ export class EventsDb {
        SET processed_at = COALESCE(processed_at, datetime('now'))
        WHERE event_id IN (${placeholders})`
     ).run(...eventIds);
+  }
+
+  observeMissingCwd(
+    observedAtMs: number,
+    minimumIntervalMs: number,
+    requiredObservations: number,
+  ): LocalHookMissingCwdState {
+    if (!Number.isSafeInteger(observedAtMs) || observedAtMs < 0) {
+      throw new Error("observedAtMs must be a non-negative safe integer");
+    }
+    if (!Number.isSafeInteger(minimumIntervalMs) || minimumIntervalMs < 0) {
+      throw new Error("minimumIntervalMs must be a non-negative safe integer");
+    }
+    if (!Number.isSafeInteger(requiredObservations) || requiredObservations <= 0) {
+      throw new Error("requiredObservations must be a positive safe integer");
+    }
+
+    const stateRows = this.db.prepare(
+      "SELECT id, observations, last_observed_at, parked_at FROM missing_cwd_state",
+    ).all() as unknown[];
+    if (stateRows.length > 1) {
+      throw new Error("invalid missing-CWD state");
+    }
+    const rawState = stateRows[0];
+    if (rawState !== undefined && !isValidMissingCwdStateRow(this.db, rawState)) {
+      throw new Error("invalid missing-CWD state");
+    }
+    const state = rawState as MissingCwdStateRow | undefined;
+    if (state && state.parked_at !== null) {
+      return { parked: true, observations: state.observations, retryAfterMs: 0 };
+    }
+
+    const elapsed = state === undefined ? minimumIntervalMs : Math.max(
+      0,
+      observedAtMs - state.last_observed_at,
+    );
+    if (state && elapsed < minimumIntervalMs) {
+      return {
+        parked: false,
+        observations: state.observations,
+        retryAfterMs: minimumIntervalMs - elapsed,
+      };
+    }
+
+    const observations = (state?.observations ?? 0) + 1;
+    const parked = observations >= requiredObservations;
+    this.db.prepare(`
+      INSERT INTO missing_cwd_state (id, observations, last_observed_at, parked_at)
+      VALUES (1, ?, ?, CASE WHEN ? THEN datetime('now') ELSE NULL END)
+      ON CONFLICT(id) DO UPDATE SET
+        observations = excluded.observations,
+        last_observed_at = excluded.last_observed_at,
+        parked_at = excluded.parked_at
+    `).run(observations, observedAtMs, parked ? 1 : 0);
+    return {
+      parked,
+      observations,
+      retryAfterMs: parked ? 0 : minimumIntervalMs,
+    };
+  }
+
+  clearMissingCwd(): void {
+    this.db.prepare("DELETE FROM missing_cwd_state WHERE id = 1").run();
   }
 
   pruneProcessed(olderThanDays: number): number {

@@ -72,6 +72,38 @@ then retry the command. If health remains unavailable after processing should
 be idle, run `lcm doctor`, then `lcm daemon restart`; do not stop a process
 manually.
 
+If a queued event's recorded working directory is unavailable, the daemon
+keeps its sidecar events pending and records the missing-directory evidence in
+that sidecar. It requires three observations at least five minutes apart before
+parking local promotion. The evidence has no expiry window: it survives daemon
+idle restarts and converges even when a large installation revisits a sidecar
+only every 20 minutes. Until the third observation, no local `processed_at`
+checkpoint is advanced and no hook-error-ledger entry is added.
+
+The three-observation threshold and five-minute minimum spacing are fixed
+safety constants; they are not configurable in `~/.lcm/config.json`.
+
+After confirmation, the daemon durably parks **local promotion**, not the
+events themselves. The sidecar records its parked state but leaves every event
+unprocessed, preserving event payloads, historical rows, and independent
+delivery state exactly as captured. While the cwd remains absent, later sweeps
+perform only a cheap availability/state check and return the terminal parked
+outcome; they do not rescan the events for promotion or add repeated errors.
+`lcm events promote --all` reports the same terminal state for a metadata-backed
+sidecar.
+
+If the directory returns at any later time, normal promotion clears the durable
+missing-CWD state and promotes the preserved unprocessed events. This makes a
+long mount outage, workspace rebuild, or rename reversible even after it was
+previously parked. A sidecar that no longer exists is treated as terminal
+immediately because it contains no local work to preserve.
+
+Only a genuinely missing cwd (`ENOENT`, including an absent ancestor reported
+as `ENOTDIR`) enters this confirmation flow. Permission failures such as
+`EACCES`/`EPERM`, malformed paths, and unreadable or corrupt sidecars fail
+closed: they are reported to the caller and do not create parking evidence,
+advance `processed_at`, or otherwise consume queued events.
+
 `lcm search` stays read-only: it searches already promoted memory and does not process queued sidecar events.
 
 ### Three-Tier Promotion
@@ -141,7 +173,9 @@ On SessionStart, recently promoted passive insights are surfaced in a `<learned-
 
 ## Configuration
 
-All thresholds are configurable in `~/.lcm/config.json` under `compaction.promotionThresholds`:
+Promotion-confidence thresholds are configurable in `~/.lcm/config.json`
+under `compaction.promotionThresholds`. The missing-CWD confirmation constants
+described above are intentionally not part of this configuration:
 
 ```json
 {
@@ -173,7 +207,7 @@ When a pattern crosses the reinforcement threshold, `reinforcementBoost` is adde
     acknowledged and any remote applied row is proven pruned
   - Unprocessed and replayable events are never discarded by age or row-count
     retention guards; a maintenance diagnostic records guard breaches
-  - Schema versioned for future migrations (currently v4)
+  - Schema versioned for future migrations (currently v5)
 
 - **Machine sequence DB**: `~/.lcm/events/.machine-sequence.sqlite`
   - Shared by every local project sidecar
@@ -212,6 +246,8 @@ The UserPromptSubmit extractor includes guards against false-positive decisions.
 | PostgreSQL unavailable | Hooks continue local commits; staged replication retries with bounded backoff and does not bypass an earlier local sequence blocker |
 | Hard kill (SIGKILL) | Events survive in sidecar, scavenged on next SessionStart |
 | Stale sidecars in other projects | `lcm events promote --all` drains all metadata-backed sidecars |
+| Recorded cwd remains unavailable for three observations at least five minutes apart | Durable reversible parking state is recorded; event rows stay unprocessed and retain payload, history, and delivery state |
+| A durably parked cwd returns | Parking state is cleared and the preserved unprocessed backlog is promoted normally |
 | Unprocessed cap or age guard exceeded | Events remain durable; a maintenance diagnostic reports the retained backlog |
 | Worker crashes after inbox insert | Exact immutable readback proves whether insertion committed |
 | Worker crashes during apply | PostgreSQL transaction rollback or exact `applied` readback resolves the outcome |

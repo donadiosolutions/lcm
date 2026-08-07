@@ -1,12 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
-  mode: "constructor" as "constructor" | "migration" | "bootstrap" | "stale-migrator",
+  mode: "constructor" as "constructor" | "directory" | "migration" | "migration-error" | "bootstrap" | "stale-migrator",
   execSql: [] as string[],
   selectedSql: [] as string[],
   versionReads: 0,
 }));
 const closeLcmConnection = vi.hoisted(() => vi.fn());
+const ensurePrivateDirectory = vi.hoisted(() => vi.fn(() => {
+  if (state.mode === "directory") throw new Error("private directory repair failed");
+}));
+
+vi.mock("../../src/security-files.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../src/security-files.js")>(),
+  ensurePrivateDirectory,
+}));
 
 vi.mock("../../src/db/connection.js", () => ({
   getLcmConnection: vi.fn(() => ({
@@ -19,7 +27,7 @@ vi.mock("../../src/db/connection.js", () => ({
         if (sql.includes("SELECT version")) {
           state.versionReads += 1;
           return {
-            version: state.mode === "stale-migrator" && state.versionReads > 1 ? 4 : 1,
+            version: state.mode === "stale-migrator" ? 5 : 1,
           };
         }
         return undefined;
@@ -38,6 +46,9 @@ vi.mock("../../src/db/connection.js", () => ({
       state.execSql.push(sql);
       if (state.mode === "bootstrap" && sql === "ROLLBACK") throw "plain rollback failure";
       if (state.mode === "migration" && sql.includes("CREATE TABLE")) throw "plain migration failure";
+      if (state.mode === "migration-error" && sql.includes("CREATE TABLE")) {
+        throw new Error("error migration failure");
+      }
     }),
   })),
   closeLcmConnection,
@@ -52,6 +63,7 @@ describe("EventsDb non-Error migration failures", () => {
     state.selectedSql = [];
     state.versionReads = 0;
     closeLcmConnection.mockClear();
+    ensurePrivateDirectory.mockClear();
     _resetMigratedPathsForTesting();
   });
 
@@ -61,12 +73,26 @@ describe("EventsDb non-Error migration failures", () => {
     expect(closeLcmConnection).toHaveBeenCalled();
   });
 
+  it("propagates private-directory repair failure before opening a connection", () => {
+    state.mode = "directory";
+    expect(() => new EventsDb("/tmp/lcm-events-directory/test.db"))
+      .toThrow("private directory repair failed");
+    expect(closeLcmConnection).not.toHaveBeenCalled();
+  });
+
   it("sanitizes a migration-stage non-Error failure after rollback", () => {
     state.mode = "migration";
     expect(() => new EventsDb("/tmp/lcm-events-migration/test.db")).toThrow("plain migration failure");
     expect(state.execSql[0]).toBe("BEGIN EXCLUSIVE");
     expect(state.execSql.at(-1)).toBe("ROLLBACK");
     expect(state.execSql).not.toContain("COMMIT");
+  });
+
+  it("sanitizes a migration-stage Error failure after rollback", () => {
+    state.mode = "migration-error";
+    expect(() => new EventsDb("/tmp/lcm-events-error-migration/test.db"))
+      .toThrow("error migration failure");
+    expect(state.execSql.at(-1)).toBe("ROLLBACK");
   });
 
   it("rolls back an initial bootstrap when schema-version insertion fails", () => {
@@ -83,7 +109,7 @@ describe("EventsDb non-Error migration failures", () => {
     state.mode = "stale-migrator";
     const db = new EventsDb("/tmp/lcm-events-stale-migrator/test.db");
 
-    expect(state.versionReads).toBe(2);
+    expect(state.versionReads).toBe(1);
     expect(state.execSql[0]).toBe("BEGIN EXCLUSIVE");
     expect(state.selectedSql).toEqual([]);
     expect(state.execSql).not.toContain("DROP TABLE IF EXISTS events_v4");

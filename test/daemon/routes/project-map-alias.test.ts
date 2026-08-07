@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,8 @@ import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { addProjectAlias, clearProjectMapCache } from "../../../src/project-map.js";
 import { projectDbPath, projectId } from "../../../src/daemon/project.js";
 import { eventsDbPath } from "../../../src/db/events-path.js";
+import { EventsDb } from "../../../src/hooks/events-db.js";
+import { promoteEventsForCwd } from "../../../src/daemon/routes/promote-events.js";
 
 const tempDirs: string[] = [];
 const originalHome = process.env.HOME;
@@ -22,6 +24,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   clearProjectMapCache();
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
@@ -41,6 +44,44 @@ function makeProject(prefix: string): string {
 }
 
 describe("daemon routes with project path aliases", () => {
+  it("uses one exact sidecar for lexically equivalent missing cwd paths", async () => {
+    const parent = makeProject("lcm-missing-lexical-parent-");
+    const missing = join(parent, "missing-project");
+    const lexical = `${parent}/unused/../missing-project/`;
+    const exactSidecar = eventsDbPath(missing);
+    const events = new EventsDb(exactSidecar);
+    events.insertEvent(
+      "missing-lexical-session",
+      { type: "decision", category: "decision", data: "preserve exact sidecar", priority: 1 },
+      "PostToolUse",
+    );
+    events.close();
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const config = loadDaemonConfig("/nonexistent");
+
+    await expect(promoteEventsForCwd(config, lexical)).resolves.toMatchObject({
+      deferred: { observations: 1 },
+    });
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    await expect(promoteEventsForCwd(config, `${parent}/./missing-project/`))
+      .resolves.toMatchObject({ deferred: { observations: 2 } });
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    await expect(promoteEventsForCwd(config, missing)).resolves.toMatchObject({
+      terminal: { kind: "parked", reason: "unavailable-cwd" },
+    });
+
+    expect(eventsDbPath(lexical)).toBe(exactSidecar);
+    const preserved = new DatabaseSync(exactSidecar, { readOnly: true });
+    expect(preserved.prepare(`
+      SELECT data, processed_at FROM events
+    `).get()).toEqual({ data: "preserve exact sidecar", processed_at: null });
+    expect(preserved.prepare(`
+      SELECT observations, parked_at FROM missing_cwd_state WHERE id = 1
+    `).get()).toEqual({ observations: 3, parked_at: expect.any(String) });
+    preserved.close();
+  });
+
   it("preserves a lexical symlink alias at the daemon validation boundary", async () => {
     const canonical = makeProject("lcm-symlink-canonical-");
     const aliasParent = makeProject("lcm-symlink-parent-");

@@ -553,6 +553,27 @@ export function readProjectMapSnapshot(homeDir?: string): ProjectMap {
   return populateFromExistingProjectMetadata(map, homeDir).map;
 }
 
+/**
+ * Resolve a project identity from already-persisted map or project metadata.
+ *
+ * Unlike resolveProjectIdentity, this function never creates or publishes a
+ * project-map entry. It is used by recovery paths that may receive a cwd that
+ * has disappeared since its last event was captured.
+ */
+export function resolveExistingProjectIdentity(cwd: string): ProjectIdentity | null {
+  const map = readProjectMapSnapshot();
+  let gitAnchor: ReturnType<typeof resolveGitProjectAnchor> = null;
+  try {
+    gitAnchor = resolveGitProjectAnchor(cwd);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+  }
+  const lookupPath = gitAnchor?.canonical ?? cwd;
+  const normalized = gitAnchor?.canonical ?? normalizeProjectPath(cwd);
+  return identityForMatches(map, lookupPath, normalized);
+}
+
 export function showProjectMapEntry(target?: string): { hash: string; entry: ProjectMapEntry; transient?: boolean } {
   const map = loadProjectMapWithMetadata({ strict: true, reload: true });
   const requestedPath = target ?? process.cwd();

@@ -82,6 +82,13 @@ export interface LocalHookErrorQuery {
   includeMaintenance?: boolean;
 }
 
+/** Durable sidecar state used to suspend local promotion while its cwd is absent. */
+export interface LocalHookMissingCwdState {
+  readonly parked: boolean;
+  readonly observations: number;
+  readonly retryAfterMs: number;
+}
+
 export interface LocalHookDeliveryClaimInput {
   readonly machineId: string;
   readonly claimOwner: string;
@@ -105,6 +112,12 @@ export interface LocalHookOutboxRepository {
   insertEvent(sessionId: string, event: LocalHookEvent, sourceHook: string): Promise<number>;
   getUnprocessed(limit?: number): Promise<LocalHookEventRow[]>;
   markProcessed(eventIds: number[]): Promise<void>;
+  observeMissingCwd(
+    observedAtMs: number,
+    minimumIntervalMs: number,
+    requiredObservations: number,
+  ): Promise<LocalHookMissingCwdState>;
+  clearMissingCwd(): Promise<void>;
   pruneProcessed(olderThanDays: number): Promise<number>;
   setPrevEventId(eventId: number, prevEventId: number): Promise<void>;
   getPatternReinforcement(
@@ -182,9 +195,32 @@ export class SQLiteLocalHookOutboxFactory {
       );
     }
 
+    return this.register(new EventsDb(dbPath, options));
+  }
+
+  /** Open an existing local outbox without creating its file or parent directory. */
+  async openExisting(
+    dbPath: string,
+    options: LocalHookOutboxOpenOptions = {},
+  ): Promise<LocalHookOutboxRepository | null> {
+    if (this.closed) {
+      throw new StorageOperationError(
+        "STORAGE_CLOSED",
+        "sqlite",
+        undefined,
+        "passive-events",
+        "openExisting",
+      );
+    }
+
+    const database = EventsDb.openExisting(dbPath, options);
+    return database === null ? null : this.register(database);
+  }
+
+  private register(database: EventsDb): LocalHookOutboxRepository {
     let repository: SQLiteLocalHookOutboxRepository;
     repository = new SQLiteLocalHookOutboxRepository(
-      new EventsDb(dbPath, options),
+      database,
       () => this.repositories.delete(repository),
     );
     this.repositories.add(repository);
@@ -221,6 +257,24 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
   async markProcessed(eventIds: number[]): Promise<void> {
     this.assertOpen("markProcessed");
     this.database.markProcessed(eventIds);
+  }
+
+  async observeMissingCwd(
+    observedAtMs: number,
+    minimumIntervalMs: number,
+    requiredObservations: number,
+  ): Promise<LocalHookMissingCwdState> {
+    this.assertOpen("observeMissingCwd");
+    return this.database.observeMissingCwd(
+      observedAtMs,
+      minimumIntervalMs,
+      requiredObservations,
+    );
+  }
+
+  async clearMissingCwd(): Promise<void> {
+    this.assertOpen("clearMissingCwd");
+    this.database.clearMissingCwd();
   }
 
   async pruneProcessed(olderThanDays: number): Promise<number> {

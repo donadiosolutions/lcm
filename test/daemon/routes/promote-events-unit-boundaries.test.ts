@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   events: vi.fn(() => [] as EventRow[]),
   reinforcement: vi.fn((): PatternReinforcementStats => ({ totalCount: 0, distinctSessions: 0 })),
   mark: vi.fn(),
+  observeMissingCwd: vi.fn(() => ({ parked: false, observations: 1, retryAfterMs: 5 * 60 * 1000 })),
+  clearMissingCwd: vi.fn(),
   setPrev: vi.fn(),
   closeEvents: vi.fn(),
   collect: vi.fn(() => [] as unknown[]),
@@ -23,22 +25,37 @@ const mocks = vi.hoisted(() => ({
   scrub: vi.fn((text: string) => text),
   identity: vi.fn(() => ({ id: "pid", canonical: "/cwd" })),
   openOutbox: vi.fn(),
+  eventsPath: vi.fn(() => "/events.db"),
+  existingEventsPath: vi.fn(),
 }));
+const missingCwdError = vi.hoisted(() => new Error("missing cwd"));
 
 vi.mock("../../../src/hooks/events-db.js", () => ({
-  EventsDb: class {
+  EventsDb: class EventsDb {
+    static openExisting() {
+      return new EventsDb();
+    }
+
     constructor() { mocks.openOutbox(); }
     getUnprocessed = mocks.events;
     getPatternReinforcement = mocks.reinforcement;
     markProcessed = mocks.mark;
+    observeMissingCwd = mocks.observeMissingCwd;
+    clearMissingCwd = mocks.clearMissingCwd;
     setPrevEventId = mocks.setPrev;
     close = mocks.closeEvents;
   },
 }));
-vi.mock("../../../src/db/events-path.js", () => ({ eventsDbPath: () => "/events.db" }));
+vi.mock("../../../src/db/events-path.js", () => ({
+  eventsDbPath: mocks.eventsPath,
+  existingEventsDbPath: mocks.existingEventsPath,
+}));
 vi.mock("../../../src/promotion/dedup.js", () => ({ deduplicateAndInsert: mocks.dedup }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
-vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
+vi.mock("../../../src/daemon/validate-cwd.js", () => ({
+  validateCwd: mocks.validate,
+  isMissingCwdError: (error: unknown) => error === missingCwdError,
+}));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDir: () => "/project",
   projectIdentity: mocks.identity,
@@ -56,6 +73,7 @@ import {
   createPromoteAllEventsHandler,
   createPromoteEventsHandler,
   drainEventsForCwd,
+  parkUnavailableCwdEvents,
   promoteEventsForCwd,
 } from "../../../src/daemon/routes/promote-events.js";
 import {
@@ -110,6 +128,11 @@ describe("promote-events unit boundaries", () => {
     for (const mock of Object.values(mocks)) mock.mockClear();
     mocks.events.mockReturnValue([]);
     mocks.reinforcement.mockReturnValue({ totalCount: 0, distinctSessions: 0 });
+    mocks.observeMissingCwd.mockReturnValue({
+      parked: false,
+      observations: 1,
+      retryAfterMs: 5 * 60 * 1000,
+    });
     mocks.collect.mockReturnValue([]);
     mocks.openProject.mockResolvedValue(projectStorage());
     mocks.storeSearch.mockReturnValue([]);
@@ -117,6 +140,8 @@ describe("promote-events unit boundaries", () => {
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
     mocks.identity.mockReturnValue({ id: "pid", canonical: "/cwd" });
+    mocks.eventsPath.mockReturnValue("/events.db");
+    mocks.existingEventsPath.mockReturnValue(undefined);
     mocks.closeProject.mockResolvedValue(undefined);
     mocks.closeFactory.mockResolvedValue(undefined);
     mocks.closeEvents.mockImplementation(() => undefined);
@@ -332,6 +357,75 @@ describe("promote-events unit boundaries", () => {
     });
     expect(mocks.scrub).toHaveBeenCalledTimes(10_000);
   });
+
+  it("parks through durable sidecar state without consuming unprocessed rows", async () => {
+    mocks.observeMissingCwd.mockReturnValue({ parked: true, observations: 3, retryAfterMs: 0 });
+    mocks.validate.mockImplementation(() => { throw missingCwdError; });
+
+    const result = await parkUnavailableCwdEvents("/missing", "/events.db");
+
+    expect(result).toMatchObject({
+      promoted: 0,
+      skipped: 0,
+      correlated: 0,
+      errors: 0,
+      terminal: { kind: "parked", reason: "unavailable-cwd" },
+    });
+    expect(mocks.events).not.toHaveBeenCalled();
+    expect(mocks.mark).not.toHaveBeenCalled();
+    expect(mocks.observeMissingCwd).toHaveBeenCalledOnce();
+  });
+
+  it.each(["EACCES", "EPERM"] as const)(
+    "fails closed on initial cwd %s without opening or mutating the sidecar",
+    async (code) => {
+      const failure = Object.assign(new Error(`${code}: cwd denied`), { code });
+      mocks.validate.mockImplementation(() => { throw failure; });
+
+      await expect(promoteEventsForCwd(config, "/denied-cwd"))
+        .rejects.toBe(failure);
+      expect(mocks.openOutbox).not.toHaveBeenCalled();
+      expect(mocks.observeMissingCwd).not.toHaveBeenCalled();
+      expect(mocks.clearMissingCwd).not.toHaveBeenCalled();
+      expect(mocks.events).not.toHaveBeenCalled();
+      expect(mocks.mark).not.toHaveBeenCalled();
+    },
+  );
+
+  it("normalizes an equivalent missing cwd before deriving its sidecar path", async () => {
+    const lexical = "/workspace/child/../missing/";
+    mocks.validate.mockImplementation((cwd: string, options?: { allowMissing?: boolean }) => {
+      if (options?.allowMissing) return "/workspace/missing";
+      if (cwd === lexical) throw missingCwdError;
+      return cwd;
+    });
+    mocks.existingEventsPath.mockReturnValue("/events.db");
+
+    await expect(promoteEventsForCwd(config, lexical)).resolves.toMatchObject({
+      deferred: { kind: "awaiting-confirmation", observations: 1 },
+    });
+    expect(mocks.existingEventsPath).toHaveBeenCalledOnce();
+    expect(mocks.existingEventsPath).toHaveBeenCalledWith("/workspace/missing");
+    expect(mocks.eventsPath).not.toHaveBeenCalled();
+    expect(mocks.observeMissingCwd).toHaveBeenCalledOnce();
+  });
+
+  it.each(["EACCES", "EPERM"] as const)(
+    "fails closed when cwd revalidation changes to %s after lock acquisition",
+    async (code) => {
+      const failure = Object.assign(new Error(`${code}: cwd denied under lock`), { code });
+      mocks.validate
+        .mockReturnValueOnce("/cwd")
+        .mockImplementationOnce(() => { throw failure; });
+
+      await expect(promoteEventsForCwd(config, "/cwd"))
+        .rejects.toBe(failure);
+      expect(mocks.openOutbox).not.toHaveBeenCalled();
+      expect(mocks.observeMissingCwd).not.toHaveBeenCalled();
+      expect(mocks.clearMissingCwd).not.toHaveBeenCalled();
+      expect(mocks.mark).not.toHaveBeenCalled();
+    },
+  );
 
   it("covers correlation tiers, reinforcement, existing matches, defaults, and event errors", async () => {
     const events = [

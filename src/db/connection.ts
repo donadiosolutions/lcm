@@ -195,9 +195,10 @@ function openLcmConnection(dbPath: string, createIfMissing: boolean): DatabaseSy
       url.searchParams.set("mode", "rw");
       return url;
     })();
-  const db = new DatabaseSync(location);
+  let db: DatabaseSync | undefined;
   let fileIdentity: DatabaseFileIdentity | null = null;
   try {
+    db = new DatabaseSync(location);
     if (!isInMemory) chmodSync(dbPath, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
     db.exec("PRAGMA journal_mode = WAL");
@@ -213,12 +214,17 @@ function openLcmConnection(dbPath: string, createIfMissing: boolean): DatabaseSy
       throw new Error("database path changed while opening");
     }
   } catch (error) {
-    forceCloseConnection({ db, refs: 0, fileIdentity });
+    if (db) forceCloseConnection({ db, refs: 0, fileIdentity });
+    // An existing-only caller treats an unlink after the pre-open lstat as
+    // absence, not an initialization failure. It must never recreate the file.
+    if (!createIfMissing && !isInMemory && inspectExistingLcmDatabasePath(dbPath) === null) {
+      return null;
+    }
     throw error;
   }
 
-  _connections.set(dbPath, { db, refs: 1, fileIdentity });
-  return db;
+  _connections.set(dbPath, { db: db!, refs: 1, fileIdentity });
+  return db!;
 }
 
 export function getLcmConnection(dbPath: string): DatabaseSync {

@@ -1,8 +1,8 @@
 import type { EventRow, PatternReinforcementStats } from "../../hooks/events-db.js";
-import { eventsDbPath } from "../../db/events-path.js";
+import { eventsDbPath, existingEventsDbPath } from "../../db/events-path.js";
 import { deduplicateAndInsert } from "../../promotion/dedup.js";
 import { sendJson, type RouteHandler } from "../server.js";
-import { validateCwd } from "../validate-cwd.js";
+import { isMissingCwdError, validateCwd } from "../validate-cwd.js";
 import { projectDir, projectIdentity } from "../project.js";
 import type { DaemonConfig } from "../config.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
@@ -35,17 +35,33 @@ const AUTO_TAGS: Record<string, string> = {
 
 const CORRELATION_WINDOW = 20;
 const MAX_GLOBAL_PROMOTION_BATCHES = 10_000;
+const MISSING_CWD_CONFIRMATION_OBSERVATIONS = 3;
+const MISSING_CWD_CONFIRMATION_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_REINFORCED_PATTERN_OCCURRENCES = 3;
 const MIN_REINFORCED_PATTERN_SESSIONS = 2;
 const AUTO_PROMOTABLE_PATTERN_CATEGORIES = new Set(["file", "mcp", "skill", "subagent"]);
 const EMPTY_REINFORCEMENT: PatternReinforcementStats = { totalCount: 0, distinctSessions: 0 };
 const sidecarPromotionLocks = new Map<string, Promise<void>>();
 
+export type PromoteTerminalOutcome = {
+  kind: "parked";
+  reason: "unavailable-cwd";
+};
+
+export type PromoteDeferredOutcome = {
+  kind: "awaiting-confirmation";
+  reason: "unavailable-cwd";
+  observations: number;
+  retryAfterMs: number;
+};
+
 export interface PromoteResult {
   promoted: number;
   skipped: number;
   correlated: number;
   errors: number;
+  deferred?: PromoteDeferredOutcome;
+  terminal?: PromoteTerminalOutcome;
   message?: string;
 }
 
@@ -131,6 +147,144 @@ async function withSidecarPromotionLock<T>(sidecarPath: string, fn: () => Promis
   }
 }
 
+function pendingMissingCwdResult(
+  observations: number,
+  retryAfterMs: number,
+): PromoteResult {
+  return {
+    promoted: 0,
+    skipped: 0,
+    correlated: 0,
+    errors: 0,
+    deferred: {
+      kind: "awaiting-confirmation",
+      reason: "unavailable-cwd",
+      observations,
+      retryAfterMs,
+    },
+    message: `cwd is unavailable; awaiting confirmation (${observations}/${MISSING_CWD_CONFIRMATION_OBSERVATIONS})`,
+  };
+}
+
+async function withLockedCwdPromotion<T>(
+  cwd: string,
+  sidecarPathOverride: string | undefined,
+  onReady: (resolvedCwd: string, sidecarPath: string) => Promise<T>,
+  onUnavailable: (result: PromoteResult) => T,
+): Promise<T> {
+  let sidecarPath = sidecarPathOverride;
+  if (sidecarPath === undefined) {
+    try {
+      const resolvedCwd = validateCwd(cwd);
+      sidecarPath = existingEventsDbPath(resolvedCwd) ?? eventsDbPath(resolvedCwd);
+    } catch (error) {
+      if (!isMissingCwdError(error)) throw error;
+      // Preserve the same absolute lexical normalization used for an existing
+      // cwd without requiring the missing path to become stat-able. Sidecar
+      // identity must never depend on unresolved `..` or trailing separators.
+      const resolvedCwd = validateCwd(cwd, { allowMissing: true });
+      sidecarPath = existingEventsDbPath(resolvedCwd);
+      if (sidecarPath === undefined) return onUnavailable(noSidecarParkingResult());
+    }
+  }
+
+  return withSidecarPromotionLock(sidecarPath, async () => {
+    try {
+      // The lock may have been contended long enough for a mount or renamed
+      // cwd to recover. This is the decisive check for both state mutation and
+      // terminal parking.
+      const resolvedCwd = validateCwd(cwd);
+      return await onReady(resolvedCwd, sidecarPath);
+    } catch (error) {
+      if (!isMissingCwdError(error)) throw error;
+      return onUnavailable(await parkUnavailableCwdEventsUnlocked(sidecarPath));
+    }
+  });
+}
+
+/**
+ * Durably suspend local promotion while a recorded cwd remains unavailable.
+ * The sidecar retains every event and delivery checkpoint so a future cwd
+ * recovery can resume normal local promotion without data loss.
+ */
+export async function parkUnavailableCwdEvents(
+  cwd: string,
+  sidecarPathOverride?: string,
+): Promise<PromoteResult> {
+  // The cwd is revalidated under the lock, while an explicit sidecar path
+  // remains the exact durable record to clear or observe. This permits a
+  // recovered alias to resume its already-discovered sidecar without deriving
+  // or creating a different path.
+  return withLockedCwdPromotion(
+    cwd,
+    sidecarPathOverride,
+    (_resolvedCwd, sidecarPath) => clearRecoveredMissingCwdState(sidecarPath),
+    (result) => result,
+  );
+}
+
+async function clearRecoveredMissingCwdState(
+  sidecarPath: string,
+): Promise<PromoteResult> {
+  const outboxFactory = new SQLiteLocalHookOutboxFactory();
+  try {
+    const edb = await outboxFactory.openExisting(sidecarPath);
+    await edb?.clearMissingCwd();
+    return {
+      promoted: 0,
+      skipped: 0,
+      correlated: 0,
+      errors: 0,
+      message: "cwd recovered; cleared durable parking state",
+    };
+  } finally {
+    await closeRouteStorage(outboxFactory);
+  }
+}
+
+async function parkUnavailableCwdEventsUnlocked(
+  sidecarPath: string,
+): Promise<PromoteResult> {
+  const outboxFactory = new SQLiteLocalHookOutboxFactory();
+  try {
+    const edb = await outboxFactory.openExisting(sidecarPath);
+    if (!edb) return noSidecarParkingResult();
+    const state = await edb.observeMissingCwd(
+      Date.now(),
+      MISSING_CWD_CONFIRMATION_INTERVAL_MS,
+      MISSING_CWD_CONFIRMATION_OBSERVATIONS,
+    );
+    if (!state.parked) {
+      return pendingMissingCwdResult(state.observations, state.retryAfterMs);
+    }
+    return parkedCwdResult();
+  } finally {
+    await closeRouteStorage(outboxFactory);
+  }
+}
+
+function parkedCwdResult(): PromoteResult {
+  return {
+    promoted: 0,
+    skipped: 0,
+    correlated: 0,
+    errors: 0,
+    terminal: { kind: "parked", reason: "unavailable-cwd" },
+    message: "parked local promotion for unavailable cwd; preserved unprocessed events",
+  };
+}
+
+function noSidecarParkingResult(): PromoteResult {
+  return {
+    promoted: 0,
+    skipped: 0,
+    correlated: 0,
+    errors: 0,
+    terminal: { kind: "parked", reason: "unavailable-cwd" },
+    message: "no sidecar events to park for unavailable cwd",
+  };
+}
+
 export function createPromoteEventsHandler(
   config: DaemonConfig,
   storageFactory?: StorageBackendFactory,
@@ -145,7 +299,9 @@ export function createPromoteEventsHandler(
 
     let cwd: string;
     try {
-      cwd = validateCwd(input.cwd);
+      // Preserve direct-route validation for malformed inputs while allowing
+      // a missing recorded cwd to reach durable unavailable-CWD preparation.
+      cwd = validateCwd(input.cwd, { allowMissing: true });
     } catch (err) {
       // Log the detailed error server-side and return a generic message to the client
       await safeLogError("promote-events", err, {});
@@ -334,10 +490,20 @@ export async function drainEventsForCwd(
   sidecarPathOverride?: string,
   storageFactory?: StorageBackendFactory,
 ): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
-  cwd = validateCwd(cwd);
-  const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
-  return withSidecarPromotionLock(sidecarPath, () =>
-    drainEventsForCwdUnlocked(config, cwd, sidecarPath, storageFactory));
+  return withLockedCwdPromotion(
+    cwd,
+    sidecarPathOverride,
+    (resolvedCwd, sidecarPath) =>
+      drainEventsForCwdUnlocked(config, resolvedCwd, sidecarPath, storageFactory),
+    (parkingResult) => {
+      const result: PromoteResult & { batches: number; incomplete?: boolean } = {
+        ...parkingResult,
+        batches: 0,
+      };
+      if (!result.terminal) result.incomplete = true;
+      return result;
+    },
+  );
 }
 
 async function drainEventsForCwdUnlocked(
@@ -364,6 +530,7 @@ async function drainEventsForCwdUnlocked(
       project = await factory.openProject(identity);
     }
     const edb = await outboxFactory.open(sidecarPath);
+    await edb.clearMissingCwd();
     project ??= await factory.openProject(identity);
     const scrubber = await ScrubEngine.forProject(
       config.security.sensitivePatterns,
@@ -413,10 +580,13 @@ export async function promoteEventsForCwd(
   sidecarPathOverride?: string,
   storageFactory?: StorageBackendFactory,
 ): Promise<PromoteResult> {
-  cwd = validateCwd(cwd);
-  const sidecarPath = sidecarPathOverride ?? eventsDbPath(cwd);
-  return withSidecarPromotionLock(sidecarPath, () =>
-    promoteEventsForCwdUnlocked(config, cwd, sidecarPath, storageFactory));
+  return withLockedCwdPromotion(
+    cwd,
+    sidecarPathOverride,
+    (resolvedCwd, sidecarPath) =>
+      promoteEventsForCwdUnlocked(config, resolvedCwd, sidecarPath, storageFactory),
+    (result) => result,
+  );
 }
 
 async function promoteEventsForCwdUnlocked(
@@ -435,6 +605,7 @@ async function promoteEventsForCwdUnlocked(
       project = await factory.openProject(identity);
     }
     const edb = await outboxFactory.open(sidecarPath);
+    await edb.clearMissingCwd();
     project ??= await factory.openProject(identity);
     const scrubber = await ScrubEngine.forProject(
       config.security.sensitivePatterns,
