@@ -261,8 +261,10 @@ describe("release workflows", () => {
     expect(releasePolicySource).toContain('status: "completed"');
     expect(releasePolicySource).toContain("const failedRuns = releaseRuns");
     expect(releasePolicySource).toContain(
-      "const successfulRuns = [...releaseRuns, ...recoveryRuns]",
+      "const successfulRuns = [...successfulReleaseRuns, ...successfulRecoveryRuns]",
     );
+    expect(releasePolicySource).toContain("ignoreMalformed: true");
+    expect(releasePolicySource).toContain("Ignoring legacy successful recovery run");
     expect(releasePolicySource).toContain("run.conclusion !== \"success\"");
     expect(releasePolicySource).toContain('run.conclusion === "success"');
     expect(releasePolicySource).toContain("run.display_title");

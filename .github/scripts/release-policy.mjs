@@ -479,9 +479,16 @@ export function classifyReleaseRunProvenance(run) {
   }
 }
 
-function classifiedHistoricalRun(run, warning) {
+function classifiedHistoricalRun(run, warning, { ignoreMalformed = false } = {}) {
   const provenance = classifyReleaseRunProvenance(run);
   if (provenance.kind === "malformed") {
+    if (ignoreMalformed) {
+      warning(
+        `Ignoring legacy successful recovery run ${provenance.runId} without usable ` +
+          "release-tag provenance",
+      );
+      return undefined;
+    }
     throw new Error(
       `Historical publication run ${provenance.runId} has missing or malformed release-tag provenance`,
     );
@@ -531,10 +538,19 @@ export async function enforceEarlierPublicationSuccess({
     .filter((run) => run.id < currentRunId && run.conclusion !== "success")
     .map((run) => classifiedHistoricalRun(run, warning))
     .filter(Boolean);
-  const successfulRuns = [...releaseRuns, ...recoveryRuns]
+  const successfulReleaseRuns = releaseRuns
     .filter((run) => run.id < currentRunId && run.conclusion === "success")
     .map((run) => classifiedHistoricalRun(run, warning))
     .filter(Boolean);
+  // Legacy workflow_dispatch runs predate tag-bound run names. They can only
+  // provide evidence that supersedes a canonical release failure, so ignoring
+  // malformed successes cannot authorize publication; it merely withholds
+  // unusable supersession evidence. Release-event history remains fail-closed.
+  const successfulRecoveryRuns = recoveryRuns
+    .filter((run) => run.id < currentRunId && run.conclusion === "success")
+    .map((run) => classifiedHistoricalRun(run, warning, { ignoreMalformed: true }))
+    .filter(Boolean);
+  const successfulRuns = [...successfulReleaseRuns, ...successfulRecoveryRuns];
 
   const blockingFailures = [];
   for (const run of failedRuns) {
