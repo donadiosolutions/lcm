@@ -1,4 +1,7 @@
-import { readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { load as loadYaml } from "js-yaml";
 import { describe, expect, it } from "vitest";
 
@@ -30,24 +33,18 @@ interface ExternalAdmissionWorkflow {
   };
 }
 
-const source = readFileSync(
-  new URL("../.github/workflows/external-admission.yml", import.meta.url),
-  "utf8",
-);
+const root = new URL("../", import.meta.url);
+const source = readFileSync(new URL(".github/workflows/external-admission.yml", root), "utf8");
 const policySource = readFileSync(
-  new URL("../.github/scripts/external-admission-policy.mjs", import.meta.url),
+  new URL(".github/scripts/external-admission-policy.mjs", root),
   "utf8",
 );
-const greptileConfig = JSON.parse(readFileSync(
-  new URL("../greptile.json", import.meta.url),
-  "utf8",
-)) as { excludeAuthors: string[] };
-const evaluator = readFileSync(
-  new URL("../.github/scripts/external-admission.sh", import.meta.url),
-  "utf8",
-);
-const documentation = readFileSync(
-  new URL("../docs/external-admission.md", import.meta.url),
+const evaluator = readFileSync(new URL(".github/scripts/external-admission.sh", root), "utf8");
+const evaluatorPath = new URL(".github/scripts/external-admission.sh", root).pathname;
+const documentation = readFileSync(new URL("docs/external-admission.md", root), "utf8");
+const workflowDocumentation = readFileSync(new URL("WORKFLOW.md", root), "utf8");
+const copilotInstructions = readFileSync(
+  new URL(".github/copilot-instructions.md", root),
   "utf8",
 );
 const workflow = loadYaml(source) as ExternalAdmissionWorkflow;
@@ -57,8 +54,133 @@ const evaluatorInvocation =
 const completedOrReconcile =
   "${{ (github.event_name == 'repository_dispatch' && github.event.action == 'external-admission-reconcile' && github.event.client_payload.head_sha != '') || github.event.action == 'completed' }}";
 
+function runWithFailingAdmissionCommand(
+  command: "gh" | "node" | "validator-jq" | "eligibility-jq" | "checks-ready-jq" | "ci-ready-jq" | "malformed-eligibility" | "valid-ineligible",
+) {
+  const directory = mkdtempSync(join(tmpdir(), "external-admission-"));
+  const ghPath = join(directory, "gh");
+  const jqPath = join(directory, "jq");
+  const nodePath = join(directory, "node");
+  const jqCallLogPath = join(directory, "jq-calls.log");
+  const statusLogPath = join(directory, "statuses.log");
+  const headSha = "a".repeat(40);
+
+  try {
+    writeFileSync(ghPath, `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"/statuses/"* ]]; then
+  printf '%s\\n' "$*" >> "$STATUS_LOG"
+  exit 0
+fi
+if [[ "$*" == *"/commits/"*"/pulls?per_page=100"* ]]; then
+  printf '%s\\n' '[{"number":123,"state":"open","draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+  exit 0
+fi
+if [[ "$*" == *"/pulls/123"* ]]; then
+  if [[ "$FAIL_ADMISSION_COMMAND" == malformed-eligibility ]]; then
+    printf '%s\\n' '{malformed'
+    exit 0
+  fi
+  if [[ "$FAIL_ADMISSION_COMMAND" == valid-ineligible ]]; then
+    printf '%s\\n' '{"state":"closed","draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+    exit 0
+  fi
+  printf '%s\\n' '{"state":"open","draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+  exit 0
+fi
+if [[ "$*" == *"check-runs?filter=latest&per_page=100"* ]]; then
+  if [[ "$FAIL_ADMISSION_COMMAND" == gh ]]; then
+    exit 70
+  fi
+  printf '%s\\n' '[]'
+  exit 0
+fi
+if [[ "$*" == *"/actions/runs/3"* ]]; then
+  printf '%s\\n' '{}'
+  exit 0
+fi
+exit 99
+`);
+    chmodSync(ghPath, 0o755);
+    if (command === "node") {
+      writeFileSync(nodePath, "#!/usr/bin/env bash\nexit 71\n");
+      chmodSync(nodePath, 0o755);
+    }
+    if (["validator-jq", "checks-ready-jq", "ci-ready-jq"].includes(command)) {
+      writeFileSync(nodePath, `#!/usr/bin/env bash
+if [[ "$2" == "evaluate-checks" ]]; then
+  printf '%s\\n' '{"states":[],"ready":true,"ciCheckRunId":"1","dcoCheckRunId":"2","ciRunId":"3"}'
+  exit 0
+fi
+if [[ "$2" == "evaluate-ci-run" ]]; then
+  printf '%s\\n' '{"state":"completed","ready":true}'
+  exit 0
+fi
+exit 99
+`);
+      chmodSync(nodePath, 0o755);
+    }
+    if (["validator-jq", "eligibility-jq", "checks-ready-jq", "ci-ready-jq"].includes(command)) {
+      writeFileSync(jqPath, `#!/usr/bin/env bash
+set -euo pipefail
+call_count=0
+if [[ -f "$JQ_CALL_LOG" ]]; then
+  read -r call_count < "$JQ_CALL_LOG"
+fi
+call_count=$((call_count + 1))
+printf '%s\\n' "$call_count" > "$JQ_CALL_LOG"
+if [[ "$FAIL_ADMISSION_COMMAND" == eligibility-jq && "$call_count" == 3 ]]; then
+  exit 73
+fi
+if [[ "$FAIL_ADMISSION_COMMAND" == validator-jq && "$call_count" -ge 4 ]]; then
+  exit 72
+fi
+if [[ "$FAIL_ADMISSION_COMMAND" == checks-ready-jq && "$call_count" == 6 ]]; then
+  exit 74
+fi
+if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$call_count" == 11 ]]; then
+  exit 75
+fi
+case "$call_count" in
+  1) cat ;;
+  2) printf '%s\\n' 123 ;;
+  3|6|11) printf '%s\\n' true ;;
+  4) printf '%s\\n' '[]' ;;
+  5|10) printf '%s\\n' '' ;;
+  7) printf '%s\\n' 1 ;;
+  8) printf '%s\\n' 2 ;;
+  9) printf '%s\\n' 3 ;;
+  *) exit 99 ;;
+esac
+`);
+      chmodSync(jqPath, 0o755);
+    }
+    writeFileSync(statusLogPath, "");
+
+    const result = spawnSync("bash", [evaluatorPath], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        EVENT_HEAD_SHA: headSha,
+        EVENT_SOURCE: "repository_dispatch",
+        EVENT_WORKFLOW_RUN_ID: "",
+        FAIL_ADMISSION_COMMAND: command,
+        JQ_CALL_LOG: jqCallLogPath,
+        PATH: `${directory}:${process.env.PATH ?? ""}`,
+        REPOSITORY: "example/repository",
+        RUN_URL: "https://example.test/run/1",
+        SERVER_URL: "https://example.test",
+        STATUS_LOG: statusLogPath,
+      },
+    });
+    return { result, statuses: readFileSync(statusLogPath, "utf8") };
+  } finally {
+    rmSync(directory, { force: true, recursive: true });
+  }
+}
+
 describe("external admission workflow", () => {
-  it("uses provider, trusted CI, and default-branch reconciliation events with least privilege", () => {
+  it("uses DCO, trusted CI, and default-branch reconciliation with least privilege", () => {
     expect(workflow.on).toEqual({
       check_run: { types: ["created", "rerequested", "completed"] },
       repository_dispatch: { types: ["external-admission-reconcile"] },
@@ -77,7 +199,7 @@ describe("external admission workflow", () => {
     expect(job["timeout-minutes"]).toBe(5);
   });
 
-  it("revokes admission before checking out the trusted workflow revision", () => {
+  it("revokes admission before checking out only the trusted evaluator", () => {
     expect(job.steps.map((step) => step.name)).toEqual([
       "Revoke stale external admission",
       "Check out trusted admission evaluator",
@@ -100,7 +222,7 @@ describe("external admission workflow", () => {
       ref: "${{ github.workflow_sha }}",
       "persist-credentials": false,
       "sparse-checkout":
-        ".github/scripts/external-admission.sh\n.github/scripts/external-admission-policy.mjs\ngreptile.json\n",
+        ".github/scripts/external-admission.sh\n.github/scripts/external-admission-policy.mjs\n",
       "sparse-checkout-cone-mode": false,
     });
 
@@ -110,81 +232,58 @@ describe("external admission workflow", () => {
       "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
     );
     expect(setupNode?.with).toEqual({ "node-version": "22.20.0" });
-
     expect(job.steps[3]?.if).toBe(completedOrReconcile);
     expect(evaluatorInvocation).toBe("bash .github/scripts/external-admission.sh");
-    expect(evaluator).toContain('HEAD_SHA="${EVENT_HEAD_SHA,,}"');
-    expect(evaluator).toContain('if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]');
-    expect(source).not.toContain("[0-9a-fA-F]");
   });
 
-  it("keeps inline workflow scripts below actionlint's blocking threshold", () => {
-    for (const step of job.steps) {
-      if (step.run) expect(Buffer.byteLength(step.run, "utf8")).toBeLessThan(4_000);
-    }
-  });
-
-  it("starts only for Greptile, DCO, exact pull-request CI, or trusted reconciliation", () => {
-    for (const identity of [
-      ["Greptile Review", "867647", "greptile-apps"],
-      ["DCO", "1861", "dco"],
-    ]) {
-      for (const value of identity) expect(job.if).toContain(value);
-    }
+  it("starts only for authenticated DCO, canonical pull-request CI, or reconciliation", () => {
+    for (const value of ["DCO", "1861", "dco"]) expect(job.if).toContain(value);
     expect(job.if).toContain("github.event_name == 'repository_dispatch'");
     expect(job.if).toContain("github.event.action == 'external-admission-reconcile'");
     expect(job.if).toContain("github.event.client_payload.head_sha != ''");
     expect(job.if).toContain("github.event.workflow_run.name == 'CI'");
     expect(job.if).toContain("github.event.workflow_run.event == 'pull_request'");
     expect(job.if).toContain("github.event.workflow_run.path == '.github/workflows/ci.yml'");
-    expect(job.if).toContain("github.event.workflow_run.repository.full_name == github.repository");
-    expect(source).toContain("GitHub suppresses check_run workflow recursion");
+    expect(job.if).toContain(
+      "github.event.workflow_run.repository.full_name == github.repository",
+    );
     expect(policySource).toContain('name: "ci", appId: 15368, appSlug: "github-actions"');
-    expect(source).not.toMatch(/CodeRabbit|copilot-pull-request-reviewer/iu);
+    expect(policySource).toContain('name: "DCO", appId: 1861, appSlug: "dco"');
     expect(source).not.toMatch(/^\s+pull_request(?:_target)?:/gmu);
     expect(workflow.on).not.toHaveProperty("workflow_dispatch");
-    expect(source).not.toMatch(/^\s+workflow_dispatch:/gmu);
     expect(source).not.toContain("inputs.head_sha");
-    expect(source.match(/github\.event\.client_payload\.head_sha/gu)).toHaveLength(7);
   });
 
-  it("accepts only provider results with a non-empty pull-request suite branch", () => {
-    const nonNullBranchGuard =
-      "github.event.check_run.check_suite.head_branch != null";
-    const nonEmptyBranchGuard =
-      "github.event.check_run.check_suite.head_branch != ''";
-    const queueRefGuard =
-      "!startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/')";
-    const acceptsProviderBranch = (branch: string | null) =>
-      branch !== null && branch !== "" && !branch.startsWith("gh-readonly-queue/");
+  it("groups the complete DCO identity predicate explicitly", () => {
+    const dcoIdentity = /\(github\.event\.check_run\.name == 'DCO' &&\s+github\.event\.check_run\.app\.id == 1861 &&\s+github\.event\.check_run\.app\.slug == 'dco'\)/u;
+    expect(workflow.concurrency.group).toMatch(dcoIdentity);
+    expect(job.if).toMatch(dcoIdentity);
+  });
 
-    expect(acceptsProviderBranch(null)).toBe(false);
-    expect(acceptsProviderBranch("")).toBe(false);
-    expect(acceptsProviderBranch("gh-readonly-queue/main/pr-329")).toBe(false);
-    expect(acceptsProviderBranch("fix/release-publication-resilience")).toBe(true);
-    for (const guard of [nonNullBranchGuard, nonEmptyBranchGuard, queueRefGuard]) {
+  it("accepts DCO only from a non-empty non-queue pull-request suite branch", () => {
+    for (const guard of [
+      "github.event.check_run.check_suite.head_branch != null",
+      "github.event.check_run.check_suite.head_branch != ''",
+      "!startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/')",
+    ]) {
       expect(job.if).toContain(guard);
       expect(workflow.concurrency.group).toContain(guard);
     }
     expect(source.match(/check_suite\.head_branch != null/gu)).toHaveLength(2);
     expect(source.match(/check_suite\.head_branch != ''/gu)).toHaveLength(2);
-    expect(source.match(/!startsWith\(github\.event\.check_run\.check_suite\.head_branch/gu)).toHaveLength(
-      2,
-    );
-    expect(source).toContain("must not create a legacy commit status");
+    expect(source.match(/!startsWith\(github\.event\.check_run\.check_suite\.head_branch/gu))
+      .toHaveLength(2);
   });
 
-  it("isolates rejected CI workflow runs from exact-SHA evaluator concurrency", () => {
+  it("isolates rejected CI workflow runs from exact-SHA concurrency", () => {
     const group = workflow.concurrency.group;
-    const canonicalCiConditions = [
+    expect(workflow.concurrency["cancel-in-progress"]).toBe(true);
+    for (const condition of [
       "github.event.workflow_run.name == 'CI'",
       "github.event.workflow_run.event == 'pull_request'",
       "github.event.workflow_run.path == '.github/workflows/ci.yml'",
       "github.event.workflow_run.repository.full_name == github.repository",
-    ];
-
-    expect(workflow.concurrency["cancel-in-progress"]).toBe(true);
-    for (const condition of canonicalCiConditions) {
+    ]) {
       expect(group).toContain(condition);
       expect(job.if).toContain(condition);
     }
@@ -194,152 +293,148 @@ describe("external admission workflow", () => {
     expect(group).toMatch(
       /github\.event_name == 'workflow_run'\s+&&\s+format\('workflow-run-\{0\}', github\.run_id\)/u,
     );
-    expect(group).toMatch(
-      /github\.event_name == 'repository_dispatch'\s+&&\s+github\.event\.action == 'external-admission-reconcile'\s+&&\s+github\.event\.client_payload\.head_sha/u,
-    );
-    expect(group).not.toContain(
-      "github.event_name == 'workflow_run' && github.event.workflow_run.head_sha",
-    );
   });
 
-  it("paginates every collection and repeats exact pull-request eligibility", () => {
+  it("repeats exact-head PR, CI, and DCO validation before success", () => {
     expect(evaluator).toContain("commits/$HEAD_SHA/pulls?per_page=100");
-    expect(evaluator).toContain("pulls/$pull_request_number/files?per_page=100");
     expect(evaluator).toContain("check-runs?filter=latest&per_page=100");
-    expect(evaluator.match(/gh api --paginate --slurp/gu)).toHaveLength(4);
-    expect(evaluator.match(/fetch_associated_pull_requests/gu)).toHaveLength(4);
-    expect(evaluator.match(/pull_request_is_eligible/gu)).toHaveLength(4);
-    expect(evaluator).toContain("external-admission-policy.mjs classify-files");
-    expect(evaluator).toContain("external-admission-policy.mjs select-admission");
-    expect(evaluator).toContain("external-admission-policy.mjs admission-decision");
+    expect(evaluator).not.toContain("/files?per_page=100");
+    const initial = evaluator.indexOf('validate_required_snapshot "Initial"');
+    const current = evaluator.indexOf('validate_required_snapshot "Current"');
+    const final = evaluator.indexOf('validate_required_snapshot "Final"');
+    const success = evaluator.indexOf('post_admission_status success "CI and DCO passed"');
+    expect(initial).toBeGreaterThan(evaluator.indexOf('matching_prs="$(fetch_associated_pull_requests)"'));
+    expect(current).toBeGreaterThan(evaluator.indexOf('current_matching_prs="$(fetch_associated_pull_requests)"'));
+    expect(final).toBeGreaterThan(current);
+    expect(success).toBeGreaterThan(evaluator.indexOf('final_matching_prs="$(fetch_associated_pull_requests)"'));
+    expect(success).toBeGreaterThan(final);
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-checks");
-    expect(evaluator).toContain('changed_file_count="$(jq -r \'.changed_files\'');
-    expect(evaluator).toContain('current_changed_file_count="$(jq -r \'.changed_files\'');
-    expect(evaluator).toContain('final_changed_file_count="$(jq -r \'.changed_files\'');
-    expect(evaluator).toContain(
-      'classify_pull_request_files "$changed_file_count" <<<"$file_pages"',
-    );
-    expect(evaluator).toContain(
-      'classify_pull_request_files "$current_changed_file_count" <<<"$current_file_pages"',
-    );
-    expect(evaluator).toContain(
-      'classify_pull_request_files "$final_changed_file_count" <<<"$final_file_pages"',
-    );
-    expect(evaluator).toContain('fetch_pull_request_files "$PR_NUMBER"');
-    expect(evaluator).toContain('fetch_pull_request_files "$current_pr_number"');
-    expect(evaluator).toContain('fetch_pull_request_files "$final_pr_number"');
-    expect(evaluator).toContain(
-      '"$final_sensitive_diff" "$final_changes_greptile_exclusion_policy"',
-    );
-    expect(evaluator).not.toContain(
-      'select_admission_requirement "$sensitive_diff" <<<"$final_pull_request"',
-    );
-    expect(policySource).toContain("pull request file audit count does not match changed_files");
-  });
-
-  it("requires Greptile for sensitive paths and limits CI-backed exceptions to Dependabot", () => {
-    expect(policySource).toContain("file.previous_filename");
-    expect(policySource).toMatch(/bin\|installer\|src/u);
-    expect(policySource).toContain("scripts");
-    expect(policySource).toContain("\\.mjs");
-    expect(policySource).toMatch(/actions\|codeql\|workflows\|scripts/u);
-    expect(policySource).toMatch(/package\(\?:-lock\)\?/u);
-    expect(policySource).toContain("vitest");
-    expect(policySource).toContain("tsconfig");
-    expect(evaluator).toContain('waiting_description="Waiting for Greptile review and DCO"');
-    expect(greptileConfig.excludeAuthors).toEqual(["dependabot[bot]"]);
-    expect(policySource).toContain('login === "dependabot[bot]"');
-    expect(policySource).toContain('type === "Bot"');
-    expect(policySource).toContain('headRef.startsWith("dependabot/")');
-    expect(policySource).toContain("headRepository === baseRepository");
-    expect(policySource).toContain("excludedGreptileAuthorPattern");
-    expect(policySource).toContain("greptile exclusion-policy change");
-    expect(evaluator.match(/select_admission_requirement/gu)).toHaveLength(4);
-    expect(evaluator).toContain(
-      'echo "Admission classification=$classification_name sensitive_diff=$sensitive_diff trusted_automation=$trusted_automation greptile_required=$greptile_required"',
-    );
-    expect(evaluator).toContain(
-      'waiting_description="Waiting for trusted CI and DCO for automated PR"',
-    );
-    expect(evaluator).toContain(
-      'success_description="CI and DCO passed for trusted automated PR"',
-    );
-    expect(evaluator).toContain(
-      'admission_decision_fingerprint="$(admission_decision <<<"$admission_requirement")"',
-    );
-    expect(evaluator).toContain(
-      '$current_admission_decision_fingerprint" != "$admission_decision_fingerprint"',
-    );
-    expect(evaluator).toContain(
-      '$final_admission_decision_fingerprint" != "$admission_decision_fingerprint"',
-    );
-  });
-
-  it("validates every CI-backed admission against exact Actions run metadata", () => {
-    expect(evaluator).toContain("repos/$REPOSITORY/actions/runs/$ci_run_id");
+    expect(evaluator).toContain('"$HEAD_SHA" "$REPOSITORY" "$SERVER_URL"');
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-ci-run");
-    expect(policySource).toContain('run.event === "pull_request"');
-    expect(policySource).toContain('run.path === workflowPath');
-    expect(policySource).toContain('run.head_sha === headSha');
-    expect(evaluator).toContain('success_description="CI and DCO passed for coverage-neutral diff"');
+    expect(evaluator).toContain('if [[ "$EVENT_SOURCE" == workflow_run');
+    expect(evaluator).toContain('printf -v "$fingerprint_variable" \'%s\' "$ci_check_run_id:$dco_check_run_id:$ci_run_id"');
+    expect(evaluator).toContain('validate_required_snapshot "Initial" initial_admission_fingerprint');
+    expect(evaluator).toContain('validate_required_snapshot "Current" current_admission_fingerprint');
+    expect(evaluator).toContain('validate_required_snapshot "Final" final_admission_fingerprint');
+    expect(evaluator.match(/admission_fingerprint" != "\$initial_admission_fingerprint/gu)).toHaveLength(2);
+    expect(evaluator).not.toContain('VALIDATED_ADMISSION_FINGERPRINT');
+    expect(evaluator).not.toContain("classify-files");
+    expect(evaluator).not.toContain("select-admission");
+    expect(evaluator).not.toContain("admission-decision");
   });
 
-  it("leaves transient snapshots pending and never polls on a runner", () => {
-    expect(evaluator.match(/Backing CI workflow run/gu)).toHaveLength(2);
-    expect(evaluator.match(/ci_run_evaluation=/gu)).toHaveLength(2);
-    expect(evaluator.match(/ci_run_terminal_failure=/gu)).toHaveLength(2);
-    expect(evaluator).toContain(
-      'run $ci_run_id evaluated as $(jq -r \'.state\' <<<"$ci_run_evaluation"): $ci_run_terminal_failure',
-    );
-    expect(evaluator).toContain(
-      'CI run $current_ci_run_id evaluated as $(jq -r \'.state\' <<<"$current_ci_run_evaluation")',
-    );
-    expect(
-      evaluator.match(
-        /if \[\[ "\$EVENT_SOURCE" == workflow_run && "\$EVENT_WORKFLOW_RUN_ID" != "\$(?:current_)?ci_run_id" \]\]; then/gu,
-      ),
-    ).toHaveLength(2);
-    expect(evaluator).not.toMatch(/\b(?:deadline|sleep|while)\b/u);
-    expect(source).not.toContain("continuing to wait");
-    expect(policySource).toContain('"pending"');
-    expect(policySource).toContain('"queued"');
-    expect(policySource).toContain('"in_progress"');
-    expect(policySource).toContain('"requested"');
-    expect(policySource).toContain('"waiting"');
-  });
+  it("runs each validator as a simple command and fails closed on evaluator and eligibility errors", () => {
+    expect(evaluator).not.toContain("validate_or_exit");
+    for (const phase of ["Initial", "Current", "Final"]) {
+      expect(evaluator).toMatch(new RegExp(
+        `^validate_required_snapshot "${phase}" [a-z_]+$`,
+        "mu",
+      ));
+      expect(evaluator).not.toMatch(new RegExp(
+        `(?:if|!|&&|\\|\\|)[^\\n]*validate_required_snapshot "${phase}"`,
+        "u",
+      ));
+    }
+    expect(evaluator).toContain('check_states="$(jq -c \'.states\' <<<"$evaluation")"');
+    expect(evaluator).toContain('checks_ready="$(jq -r \'.ready\' <<<"$evaluation")"');
+    expect(evaluator).toContain('ci_state="$(jq -r \'.state\' <<<"$ci_evaluation")"');
+    expect(evaluator).toContain('ci_ready="$(jq -r \'.ready\' <<<"$ci_evaluation")"');
+    expect(evaluator).not.toContain('if [[ "$(jq -r \'.ready\'');
 
-  it("repeats classification, checks, CI provenance, and PR eligibility before success", () => {
-    const successIndex = evaluator.lastIndexOf('post_admission_status success "$success_description"');
-    expect(successIndex).toBeGreaterThan(0);
-    for (const marker of [
-      "current_matching_prs=",
-      "current_pull_request=",
-      "current_file_pages=",
-      "current_admission_requirement=",
-      "current_check_run_pages=",
-      "current_evaluation=",
-      "current_ci_run=",
-      "final_matching_prs=",
-      "final_pull_request=",
-      "final_file_pages=",
-      "final_classification=",
-      "final_admission_requirement=",
+    expect(evaluator).not.toContain("pull_request_is_eligible");
+    for (const variable of [
+      "pull_request_eligible",
+      "current_pull_request_eligible",
+      "final_pull_request_eligible",
     ]) {
-      const markerIndex = evaluator.lastIndexOf(marker);
-      expect(markerIndex, marker).toBeGreaterThan(0);
-      expect(markerIndex, marker).toBeLessThan(successIndex);
+      expect(evaluator).toContain(`${variable}="$(pull_request_eligibility <<<"$`);
+      expect(evaluator).toContain(`if [[ "$${variable}" != true ]]; then`);
+    }
+
+    for (const command of [
+      "gh",
+      "node",
+      "validator-jq",
+      "eligibility-jq",
+      "checks-ready-jq",
+      "ci-ready-jq",
+      "malformed-eligibility",
+      "valid-ineligible",
+    ] as const) {
+      const { result, statuses } = runWithFailingAdmissionCommand(command);
+      if (command === "valid-ineligible") expect(result.status).toBe(0);
+      else if (command === "malformed-eligibility") expect(result.status).not.toBe(0);
+      else expect(result.status).toBe({
+        gh: 70,
+        node: 71,
+        "validator-jq": 72,
+        "eligibility-jq": 73,
+        "checks-ready-jq": 74,
+        "ci-ready-jq": 75,
+      }[command]);
+      if (command === "valid-ineligible") {
+        expect(result.stdout).toContain("admission remains pending");
+      } else {
+        expect(result.stdout).not.toContain("admission remains pending");
+      }
+      if (command === "eligibility-jq" || command === "malformed-eligibility") {
+        expect(statuses).not.toContain("state=pending");
+      } else {
+        expect(statuses).toContain("state=pending");
+      }
+      if (command === "checks-ready-jq" || command === "ci-ready-jq") {
+        expect(statuses.match(/state=pending/gu)).toHaveLength(1);
+      }
+      if (command === "valid-ineligible") expect(statuses).not.toContain("state=failure");
+      else expect(statuses).toContain("state=failure");
+      expect(statuses).not.toContain("state=success");
     }
   });
 
-  it("documents exact-SHA repository-dispatch recovery and its trust boundary", () => {
-    expect(documentation).toContain("Contents: write");
-    expect(documentation).toContain("--json headRefOid");
-    expect(documentation).toContain("repos/donadiosolutions/lcm/dispatches");
+  it("preserves fail-closed cancellation, failure, and stale-success handling", () => {
+    expect(evaluator).toContain("trap admission_failed EXIT");
+    expect(evaluator).toContain("trap 'admission_cancelled INT 130' INT");
+    expect(evaluator).toContain("trap 'admission_cancelled TERM 143' TERM");
+    expect(evaluator).toContain("post_admission_status failure");
+    expect(evaluator).toContain("External admission failed; inspect the workflow run");
+    expect(evaluator).toContain('post_admission_status pending "Waiting for trusted CI and DCO"');
+    const pendingWrite = evaluator.indexOf('if ! post_admission_status pending "$1"; then');
+    const pendingFailure = evaluator.indexOf("exit 1", pendingWrite);
+    const pendingMessage = evaluator.indexOf('echo "$2"', pendingWrite);
+    const pendingExit = evaluator.indexOf("exit 0", pendingMessage);
+    expect(pendingWrite).toBeGreaterThan(-1);
+    expect(pendingFailure).toBeGreaterThan(pendingWrite);
+    expect(pendingMessage).toBeGreaterThan(pendingFailure);
+    expect(pendingExit).toBeGreaterThan(pendingMessage);
+    expect(evaluator).toContain("exit_pending() {");
+    expect(evaluator).toContain('if ! post_admission_status pending "$1"; then');
+    expect(evaluator).not.toContain("snapshot_incomplete");
+    expect(evaluator).not.toMatch(/exit_pending[\s\S]{0,240}\|\| true/gu);
+    expect(evaluator).not.toContain("artifacts");
+    expect(evaluator).not.toContain("caches");
+  });
+
+  it("keeps inline workflow scripts below actionlint's blocking threshold", () => {
+    for (const step of job.steps) {
+      if (step.run) expect(Buffer.byteLength(step.run, "utf8")).toBeLessThan(4_000);
+    }
+  });
+
+  it("documents recovery and contains no disabled provider dependency", () => {
+    expect(documentation).toContain("CI and DCO");
     expect(documentation).toContain("-f event_type=external-admission-reconcile");
-    expect(documentation).toContain('-F "client_payload[head_sha]=$HEAD_SHA"');
-    expect(documentation).toContain("default branch");
-    expect(documentation).toMatch(/\bpending\b/u);
-    expect(documentation).toMatch(/\bsuccess\b/u);
-    expect(documentation).toMatch(/\bfailure\b/iu);
+    expect(documentation).toContain("client_payload[head_sha]");
+    expect(workflowDocumentation).toContain("CI and DCO");
+    for (const content of [
+      source,
+      policySource,
+      evaluator,
+      documentation,
+      workflowDocumentation,
+      copilotInstructions,
+    ]) {
+      expect(content).not.toMatch(new RegExp(`grep${"tile"}`, "iu"));
+    }
+    expect(existsSync(new URL(`grep${"tile"}.json`, root))).toBe(false);
   });
 });

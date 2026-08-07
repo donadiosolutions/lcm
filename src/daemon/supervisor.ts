@@ -219,6 +219,19 @@ export interface SupervisorStartResult {
   readonly managerPid?: number;
 }
 
+/**
+ * Optional caller-owned bounds for one manager operation.
+ *
+ * Configured per-command timeouts apply by default. The optional deadline is
+ * an absolute timestamp from the supervisor's monotonic clock
+ * (`SupervisorDependencies.now`) that further caps every command in one
+ * operation. Omitting it preserves the configured per-command behavior for
+ * direct callers.
+ */
+export interface SupervisorOperationOptions {
+  readonly deadline?: number;
+}
+
 type SupervisorCommandResult = Readonly<{
   code?: number | null;
   status?: number | null;
@@ -260,10 +273,10 @@ export interface SupervisorDependencies {
 
 /** Public supervisor operations. */
 export interface Supervisor {
-  readonly probe: (spec: SupervisorSpec) => Promise<SupervisorObservation>;
-  readonly start: (spec: SupervisorSpec) => Promise<SupervisorStartResult>;
-  readonly stopAndStart: (spec: SupervisorSpec) => Promise<SupervisorStartResult>;
-  readonly stopAndAwaitAbsent: (spec: SupervisorSpec) => Promise<void>;
+  readonly probe: (spec: SupervisorSpec, options?: SupervisorOperationOptions) => Promise<SupervisorObservation>;
+  readonly start: (spec: SupervisorSpec, options?: SupervisorOperationOptions) => Promise<SupervisorStartResult>;
+  readonly stopAndStart: (spec: SupervisorSpec, options?: SupervisorOperationOptions) => Promise<SupervisorStartResult>;
+  readonly stopAndAwaitAbsent: (spec: SupervisorSpec, options?: SupervisorOperationOptions) => Promise<void>;
 }
 
 const MARKER = "lcm-supervisor-v1" as const;
@@ -271,6 +284,8 @@ const SHA256_HEX_LENGTH = 64;
 const SCOPE_NAME_HEX_LENGTH = 20;
 const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_STOP_TIMEOUT_MS = 5_000;
+const MIN_RUNNER_TIMEOUT_MS = 1;
+const MAX_RUNNER_TIMEOUT_MS = 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 50;
 const LAUNCHD_LABEL_REUSE_SETTLE_MS = 2_000;
 const MAX_POLL_INTERVALS = 100;
@@ -287,6 +302,10 @@ const SYSTEMD_STOP_TRANSITION_SUBSTATES = new Set([
 ]);
 const MAX_NONCE_LENGTH = 128;
 const MAX_METADATA_VALUE_LENGTH = 512;
+
+function clampRunnerTimeout(timeoutMs: number): number {
+  return Math.max(MIN_RUNNER_TIMEOUT_MS, Math.min(MAX_RUNNER_TIMEOUT_MS, Math.floor(timeoutMs)));
+}
 /**
  * Bound path-shaped manager metadata by bytes, not JavaScript code units.  The
  * service-manager metadata is not a filesystem API, but keeping this aligned
@@ -538,7 +557,7 @@ export function createSupervisorSpec(input: SupervisorSpecInput): SupervisorSpec
       return Object.freeze({ name: credential.name, path: resolvedPath });
     }));
   const stopTimeoutMs = input.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
-  if (!Number.isInteger(stopTimeoutMs) || stopTimeoutMs < 1 || stopTimeoutMs > 60_000) {
+  if (!Number.isInteger(stopTimeoutMs) || stopTimeoutMs < MIN_RUNNER_TIMEOUT_MS || stopTimeoutMs > MAX_RUNNER_TIMEOUT_MS) {
     throw new Error("supervisor stop timeout is invalid");
   }
   const credentialDirectory = input.credentialDirectory === undefined
@@ -583,6 +602,10 @@ function boundedText(value: unknown): string {
   return typeof value === "string" ? value.slice(0, MAX_COMMAND_OUTPUT_LENGTH) : "";
 }
 
+function isPermissionFailure(result: { readonly stdout: string; readonly stderr: string }): boolean {
+  return /\b(?:operation not permitted|permission denied|not privileged)\b/iu.test(`${result.stdout}\n${result.stderr}`);
+}
+
 function commandResult(result: SupervisorCommandResult): {
   readonly code: number | null;
   readonly stdout: string;
@@ -613,8 +636,29 @@ function unavailableReason(result: {
   return "manager-command-failed";
 }
 
-function commandFailedError(): Error {
-  return new Error("supervisor manager command failed");
+type SupervisorCommandFailureClass =
+  | "ambiguous-state"
+  | "command"
+  | "label-release-deadline"
+  | "malformed-state"
+  | "permission"
+  | "timeout"
+  | "transport";
+
+class SupervisorCommandError extends Error {
+  readonly reason: SupervisorCommandFailureClass;
+
+  constructor(reason: SupervisorCommandFailureClass = "command") {
+    super(reason === "command"
+      ? "supervisor manager command failed"
+      : `supervisor manager command failed (${reason})`);
+    this.name = "SupervisorCommandError";
+    this.reason = reason;
+  }
+}
+
+function commandFailedError(reason?: SupervisorCommandFailureClass): Error {
+  return new SupervisorCommandError(reason);
 }
 
 function managerUnavailableError(reason: SupervisorReason): Error {
@@ -622,6 +666,15 @@ function managerUnavailableError(reason: SupervisorReason): Error {
   error.name = "SupervisorManagerError";
   Object.defineProperty(error, "reason", { value: reason, enumerable: true });
   return error;
+}
+
+function observationFailureClass(observation: SupervisorObservation): SupervisorCommandFailureClass {
+  if (observation.kind === "unavailable") {
+    return observation.reason === "manager-timeout" ? "timeout" : "transport";
+  }
+  return observation.kind === "ambiguous" && observation.reason === "metadata-malformed"
+    ? "malformed-state"
+    : "ambiguous-state";
 }
 
 function parseScalar(value: string): string {
@@ -1956,6 +2009,7 @@ function systemdProbeArgs(spec: SupervisorSpec): readonly string[] {
 type SupervisorProbeCapture = {
   parsed?: Map<string, string>;
   code?: number | null;
+  permissionFailure?: boolean;
 };
 
 /**
@@ -2146,7 +2200,7 @@ function createObservationRunner(
   readonly uid: number;
   readonly environment: Readonly<Record<string, string>>;
 } {
-  const commandTimeoutMs = dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+  const commandTimeoutMs = clampRunnerTimeout(dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
   const uid = dependencies.uid ?? (typeof process.getuid === "function" ? process.getuid() : -1);
   const environment = managedLaunchEnvironment(dependencies.environment ?? process.env);
   const invoke = async (
@@ -2154,7 +2208,7 @@ function createObservationRunner(
     args: readonly string[],
     timeoutMs = commandTimeoutMs,
   ) => {
-    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+    if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_RUNNER_TIMEOUT_MS || timeoutMs > MAX_RUNNER_TIMEOUT_MS) {
       return Object.freeze({ code: null, stdout: "", stderr: "", timedOut: true });
     }
     if (dependencies.platform !== undefined && dependencies.platform !== managerPlatform(kind)) {
@@ -2181,8 +2235,33 @@ export function createSupervisor(
   if (kind !== "systemd-user" && kind !== "launchd-user") throw new Error("supervisor kind is invalid");
   if (typeof dependencies.run !== "function") throw new Error("supervisor command runner is required");
   const runner = createObservationRunner(kind, dependencies);
+  const now = dependencies.now ?? performance.now.bind(performance);
+  const configuredCommandTimeoutMs = dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
 
-  const probeInternal = async (spec: SupervisorSpec, capture?: SupervisorProbeCapture): Promise<SupervisorObservation> => {
+  const resolveOperationDeadline = (options?: SupervisorOperationOptions): number | undefined => {
+    if (options?.deadline === undefined) return undefined;
+    if (!Number.isFinite(options.deadline)) throw new RangeError("supervisor deadline is invalid");
+    return options.deadline;
+  };
+
+  const remainingOperationTimeout = (deadline: number): number => {
+    const remaining = Math.floor(deadline - now());
+    if (remaining <= 0) throw commandFailedError("timeout");
+    return remaining;
+  };
+
+  const operationTimeout = (deadline: number | undefined, fallback: number): number => {
+    const configuredTimeout = clampRunnerTimeout(fallback);
+    return deadline === undefined
+      ? configuredTimeout
+      : Math.min(configuredTimeout, remainingOperationTimeout(deadline));
+  };
+
+  const probeInternal = async (
+    spec: SupervisorSpec,
+    capture?: SupervisorProbeCapture,
+    commandTimeoutMs?: number,
+  ): Promise<SupervisorObservation> => {
     if (spec.kind !== kind) return Object.freeze({ kind: "ambiguous", reason: "metadata-mismatch", name: spec.name });
     if (dependencies.platform === undefined && hostPlatform() !== managerPlatform(kind)) {
       return Object.freeze({ kind: "unavailable", reason: "unsupported-platform", name: spec.name });
@@ -2192,13 +2271,19 @@ export function createSupervisor(
     }
     const expectedLaunchEnvironmentDigest = managedLaunchEnvironmentDigest(spec, kind, runner.uid, runner.environment);
     const result = kind === "systemd-user"
-      ? await runner.invoke("systemctl", systemdProbeArgs(spec))
-      : await runner.invoke("launchctl", launchdProbeArgs(spec, runner.uid));
+      ? await runner.invoke("systemctl", systemdProbeArgs(spec), commandTimeoutMs)
+      : await runner.invoke("launchctl", launchdProbeArgs(spec, runner.uid), commandTimeoutMs);
     if (result.timedOut) return Object.freeze({ kind: "unavailable", reason: "manager-timeout", name: spec.name });
     const parsed = parseManagerOutput(`${result.stdout}\n${result.stderr}`);
     if (capture !== undefined) {
       capture.parsed = parsed;
       capture.code = result.code;
+      // A successful manager projection is state data, not a diagnostic
+      // authority.  launchctl may faithfully project arbitrary environment,
+      // path, or argument values containing permission-like words; only a
+      // failed manager command can turn that diagnostic evidence into the
+      // terminal permission classification used by recovery.
+      capture.permissionFailure = result.code !== 0 && isPermissionFailure(result);
     }
     if (result.code !== 0 && isLikelyAbsent({ kind, ...result })) return Object.freeze({ kind: "absent", name: spec.name });
     if (result.code !== 0 && parsed.size === 0) {
@@ -2219,55 +2304,121 @@ export function createSupervisor(
     return classified;
   };
 
-  const probe = (spec: SupervisorSpec): Promise<SupervisorObservation> => probeInternal(spec);
+  const probe = (
+    spec: SupervisorSpec,
+    options?: SupervisorOperationOptions,
+  ): Promise<SupervisorObservation> => probeWithinOperation(
+    spec,
+    undefined,
+    resolveOperationDeadline(options),
+  );
+
+  const probeWithinOperation = (
+    spec: SupervisorSpec,
+    capture: SupervisorProbeCapture | undefined,
+    deadline: number | undefined,
+  ): Promise<SupervisorObservation> => probeInternal(
+    spec,
+    capture,
+    operationTimeout(deadline, configuredCommandTimeoutMs),
+  );
 
   /**
    * launchd can report a bootout target absent before it has released the
    * label from the GUI domain.  A same-label bootstrap in that small window
-   * fails even though a bounded print reports no registration. Retry the
-   * exact bootstrap within the existing command budget only after two
-   * consecutive absence proofs before each attempt; any
-   * registered, ambiguous, or unavailable observation leaves the original
-   * failure authoritative.
+   * fails with EIO (numeric code 5) even though a bounded print reports no
+   * registration. The human-readable diagnostic is not stable across launchd
+   * versions, so the exact bootstrap command plus its numeric result is the
+   * classification boundary. Continue only while that exact result is
+   * surrounded by two absence proofs and the original command deadline still
+   * has budget. A metadata-malformed projection may be observed again without
+   * mutation during that already-authenticated recovery; registered, other
+   * ambiguous, unavailable, permission, transport, timeout, and other command
+   * results remain authoritative.
    */
   const retryLaunchdBootstrapAfterAbsence = async (
     spec: SupervisorSpec,
     args: readonly string[],
     initial: Awaited<ReturnType<typeof runner.invoke>>,
+    deadline: number,
   ): Promise<Awaited<ReturnType<typeof runner.invoke>>> => {
-    if (kind !== "launchd-user" || initial.timedOut || initial.code === 0) return initial;
     const now = dependencies.now ?? performance.now.bind(performance);
-    const commandTimeoutMs = dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
-    const deadline = now() + commandTimeoutMs;
-    const maxRetries = Math.max(
-      1,
-      Math.min(MAX_LAUNCHD_TRANSITION_POLL_INTERVALS, Math.ceil(commandTimeoutMs / DEFAULT_POLL_INTERVAL_MS)),
-    );
+    const awaitExactAbsence = async (): Promise<void> => {
+      let sawMalformed = false;
+      while (true) {
+        let remaining = Math.floor(deadline - now());
+        if (remaining <= 0) {
+          throw commandFailedError(sawMalformed ? "malformed-state" : "label-release-deadline");
+        }
+        const capture: SupervisorProbeCapture = {};
+        const observed = await probeInternal(
+          spec,
+          capture,
+          // `remaining` was sampled before this observation started.  Keep
+          // that command budget for the in-flight observation so an
+          // observation that completes exactly at the deadline can preserve
+          // its authoritative classification (for example, malformed-state)
+          // instead of being replaced by a second timeout check.
+          Math.min(clampRunnerTimeout(configuredCommandTimeoutMs), remaining),
+        );
+        if (capture.permissionFailure === true) throw commandFailedError("permission");
+        if (observed.kind === "absent") return;
+        if (observed.kind !== "ambiguous" || observed.reason !== "metadata-malformed") {
+          throw commandFailedError(observationFailureClass(observed));
+        }
+        sawMalformed = true;
+        remaining = Math.floor(deadline - now());
+        if (remaining <= 0) throw commandFailedError("malformed-state");
+        const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
+        if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
+        else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
+      }
+    };
     let result = initial;
-    for (let retry = 0; retry < maxRetries; retry += 1) {
-      if (result.timedOut || result.code === 0) return result;
-      if (deadline - now() <= 0) return result;
-      if ((await probeInternal(spec)).kind !== "absent") return result;
-      const remaining = deadline - now();
+    while (
+      kind === "launchd-user"
+      && !result.timedOut
+      && result.code === 5
+      && !isPermissionFailure(result)
+    ) {
+      await awaitExactAbsence();
+      let remaining = Math.floor(deadline - now());
       if (remaining <= 0) return result;
-      const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
+      const delay = Math.min(LAUNCHD_LABEL_REUSE_SETTLE_MS, remaining);
       if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
       else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
-      if (deadline - now() <= 0) return result;
-      if ((await probeInternal(spec)).kind !== "absent") return result;
-      result = await runner.invoke("launchctl", args);
+      remaining = Math.floor(deadline - now());
+      if (remaining <= 0) return result;
+      await awaitExactAbsence();
+      remaining = Math.floor(deadline - now());
+      if (remaining <= 0) return result;
+      result = await runner.invoke(
+        "launchctl",
+        args,
+        operationTimeout(deadline, configuredCommandTimeoutMs),
+      );
     }
     return result;
   };
 
-  const settleLaunchdLabelReuse = async (): Promise<void> => {
+  const settleLaunchdLabelReuse = async (deadline?: number): Promise<void> => {
     if (kind !== "launchd-user") return;
-    if (dependencies.sleep !== undefined) await dependencies.sleep(LAUNCHD_LABEL_REUSE_SETTLE_MS);
-    else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, LAUNCHD_LABEL_REUSE_SETTLE_MS));
+    const delay = deadline === undefined
+      ? LAUNCHD_LABEL_REUSE_SETTLE_MS
+      : Math.min(LAUNCHD_LABEL_REUSE_SETTLE_MS, remainingOperationTimeout(deadline));
+    if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
+    else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
+    if (deadline !== undefined) remainingOperationTimeout(deadline);
   };
 
-  const start = async (spec: SupervisorSpec, terminalRecreated = false): Promise<SupervisorStartResult> => {
-    const current = await probeInternal(spec);
+  const startInternal = async (
+    spec: SupervisorSpec,
+    terminalRecreated: boolean,
+    operationDeadline: number | undefined,
+  ): Promise<SupervisorStartResult> => {
+    const initialCapture: SupervisorProbeCapture = {};
+    const current = await probeWithinOperation(spec, initialCapture, operationDeadline);
+    if (initialCapture.permissionFailure === true) throw commandFailedError("permission");
     if (current.kind === "unavailable") throw managerUnavailableError(current.reason);
     if (current.kind === "registered-running-valid") {
       if (current.nonce !== spec.nonce) throw commandFailedError();
@@ -2291,9 +2442,9 @@ export function createSupervisor(
       // --collect/KeepAlive policy). Recreate it only after an exact manager
       // stop and an observed absent state; never race systemd-run/bootstrap
       // against the old terminal unit.
-      await stopAndAwaitAbsent(spec);
-      await settleLaunchdLabelReuse();
-      return start(spec, true);
+      await stopAndAwaitAbsentInternal(spec, false, undefined, true, operationDeadline);
+      await settleLaunchdLabelReuse(operationDeadline);
+      return startInternal(spec, true, operationDeadline);
     }
     if (current.kind === "registered-stale-config" || current.kind === "registered-invalid-collision" || current.kind === "ambiguous") {
       throw commandFailedError();
@@ -2308,35 +2459,70 @@ export function createSupervisor(
     // stopAndAwaitAbsent; unresolved stale data is preserved as evidence.
     const expectedLaunchEnvironmentDigest = managedLaunchEnvironmentDigest(spec, kind, runner.uid, runner.environment);
     let launchPath: string | undefined;
+    let postMutationDeadline: number | undefined;
     try {
       if (kind === "launchd-user") launchPath = writePrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
       const args = kind === "systemd-user"
         ? systemdStartArgs(spec, runner.uid, runner.environment)
         : ["bootstrap", launchdDomain(runner.uid), launchPath!];
-      const initialResult = await runner.invoke(kind === "systemd-user" ? "systemd-run" : "launchctl", args);
-      const result = await retryLaunchdBootstrapAfterAbsence(spec, args, initialResult);
-      if (result.timedOut || result.code !== 0) throw commandFailedError();
+      const commandDeadline = operationDeadline ?? (kind === "launchd-user"
+        ? now() + operationTimeout(undefined, configuredCommandTimeoutMs)
+        : 0);
+      const initialTimeout = operationTimeout(operationDeadline, configuredCommandTimeoutMs);
+      const initialResult = await runner.invoke(
+        kind === "systemd-user" ? "systemd-run" : "launchctl",
+        args,
+        initialTimeout,
+      );
+      const result = await retryLaunchdBootstrapAfterAbsence(spec, args, initialResult, commandDeadline);
+      if (result.timedOut) throw commandFailedError("timeout");
+      if (result.code !== 0) {
+        if (isPermissionFailure(result)) throw commandFailedError("permission");
+        if (kind === "launchd-user" && result.code === 5) throw commandFailedError("label-release-deadline");
+        if (result.code === null || result.code === 127) throw commandFailedError("transport");
+        throw commandFailedError();
+      }
 
       // systemd-run --no-block acknowledges the job submission before the
       // transient unit is active.  Poll the exact stable unit for a bounded
       // interval so a legitimate activation race cannot become a spurious
-      // startup failure, while terminal/ambiguous observations remain
-      // authoritative and fail closed.
-      const maxPollIntervals = Math.max(
-        1,
-        Math.min(
-          MAX_POLL_INTERVALS,
-          Math.ceil((dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS) / DEFAULT_POLL_INTERVAL_MS),
-        ),
-      );
+      // startup failure.  launchd can likewise expose an exact
+      // metadata-malformed projection immediately after bootstrap; re-observe
+      // that state read-only within this same budget, but never treat it as
+      // admission or mutation authority.  The exception is launchd-only:
+      // systemd's activation fence below is the authenticated continuation
+      // state, and every other observation remains fail closed.
+      const pollDeadline = operationDeadline ?? now() + operationTimeout(undefined, configuredCommandTimeoutMs);
+      postMutationDeadline = pollDeadline;
+      const pollBudget = operationDeadline === undefined
+        ? operationTimeout(undefined, configuredCommandTimeoutMs)
+        : Math.max(0, Math.floor(pollDeadline - now()));
+      // Launchd's metadata-malformed window is observation-only and can
+      // legitimately outlive the historical 100-poll (5 s) convenience cap.
+      // Allow one final observation at the caller's absolute deadline while
+      // retaining systemd's activation cap.
+      const maxPollIntervals = kind === "launchd-user"
+        ? Math.max(1, Math.ceil(pollBudget / DEFAULT_POLL_INTERVAL_MS) + 1)
+        : Math.max(1, Math.min(MAX_POLL_INTERVALS, Math.ceil(pollBudget / DEFAULT_POLL_INTERVAL_MS)));
       let after: SupervisorObservation = Object.freeze({ kind: "absent", name: spec.name });
-      const now = dependencies.now ?? performance.now.bind(performance);
-      const pollDeadline = now() + (dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
+      let afterPermissionFailure = false;
       for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
+        // The first post-mutation observation retains the caller's direct
+        // operation semantics. Every continuation, including repeated
+        // absence, is bounded by the one poll deadline established above.
+        if (attempt > 0 && pollDeadline - now() <= 0) break;
         const capture: SupervisorProbeCapture = {};
-        after = await probeInternal(spec, capture);
+        after = await probeWithinOperation(
+          spec,
+          capture,
+          attempt === 0 ? operationDeadline : pollDeadline,
+        );
+        afterPermissionFailure ||= capture.permissionFailure === true;
         const activation = isOwnedSystemdActivation(spec, capture, expectedLaunchEnvironmentDigest);
-        if (after.kind !== "absent" && !activation) break;
+        const transientLaunchdMetadata = kind === "launchd-user"
+          && after.kind === "ambiguous"
+          && after.reason === "metadata-malformed";
+        if (afterPermissionFailure || (after.kind !== "absent" && !activation && !transientLaunchdMetadata)) break;
         if (attempt + 1 < maxPollIntervals) {
           const remaining = pollDeadline - now();
           if (remaining <= 0) break;
@@ -2351,13 +2537,17 @@ export function createSupervisor(
       // A successful manager mutation that is still absent, terminal, stale,
       // colliding, unavailable, or ambiguous is not an authenticated running
       // daemon; preserve exact evidence for caller.
-      throw commandFailedError();
+      if (afterPermissionFailure) throw commandFailedError("permission");
+      throw commandFailedError(observationFailureClass(after));
     } catch (error) {
+      const mayRecoverExactTerminal = error instanceof SupervisorCommandError
+        && error.reason === "ambiguous-state";
       // Never clean a concurrent winner. Only remove this nonce's private
       // launch files when the manager proves that the exact spec is absent.
       let retiredExactTerminal = false;
       try {
-        const after = await probe(spec);
+        const cleanupDeadline = postMutationDeadline ?? operationDeadline;
+        const after = await probeWithinOperation(spec, undefined, cleanupDeadline);
         if (after.kind === "absent") {
           if (kind === "launchd-user") cleanupPrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
           safeCredentialCleanup(spec);
@@ -2365,7 +2555,7 @@ export function createSupervisor(
           if (spec.credentialDirectory !== undefined) {
             const winnerSpec = differentRunningWinnerSpec(spec, after);
             if (winnerSpec !== undefined) {
-              const winner = await probe(winnerSpec);
+              const winner = await probeWithinOperation(winnerSpec, undefined, cleanupDeadline);
               if (
                 winner.kind === "registered-running-valid"
                 && winner.scopeDigest === winnerSpec.scopeDigest
@@ -2378,6 +2568,8 @@ export function createSupervisor(
             }
           }
           if (
+            mayRecoverExactTerminal
+            &&
             after.kind === "registered-not-running-valid"
             && after.scopeDigest === spec.scopeDigest
             && after.name === spec.name
@@ -2391,7 +2583,7 @@ export function createSupervisor(
               // Preserve this launch's staged credentials while retiring the
               // exact failed registration. They have not been admitted yet
               // and are required by the one bounded retry below.
-              await stopAndAwaitAbsentInternal(spec, false, undefined, false);
+              await stopAndAwaitAbsentInternal(spec, false, undefined, false, cleanupDeadline);
               retiredExactTerminal = true;
             } catch {
               // Preserve terminal evidence when stop/absence cannot be proven.
@@ -2403,20 +2595,26 @@ export function createSupervisor(
         // Preserve unresolved manager evidence.
       }
       if (retiredExactTerminal && !terminalRecreated) {
-        await settleLaunchdLabelReuse();
-        return start(spec, true);
+        await settleLaunchdLabelReuse(operationDeadline);
+        return startInternal(spec, true, operationDeadline);
       }
-      throw commandFailedError();
+      throw error instanceof SupervisorCommandError ? error : commandFailedError();
     }
   };
+
+  const start = async (
+    spec: SupervisorSpec,
+    options?: SupervisorOperationOptions,
+  ): Promise<SupervisorStartResult> => startInternal(spec, false, resolveOperationDeadline(options));
 
   const stopAndAwaitAbsentInternal = async (
     spec: SupervisorSpec,
     allowStaleConfig = false,
     staleObservation?: SupervisorObservation,
     cleanupCredentials = true,
+    operationDeadline?: number,
   ): Promise<void> => {
-    let current = await probe(spec);
+    let current = await probeWithinOperation(spec, undefined, operationDeadline);
     if (
       (current.kind === "registered-running-valid" || current.kind === "registered-not-running-valid")
       && current.nonce !== spec.nonce
@@ -2449,14 +2647,12 @@ export function createSupervisor(
       && allowStaleConfig
       && stalePlistSpec !== undefined;
     if (launchdStaleTransition) {
-      const now = dependencies.now ?? performance.now.bind(performance);
-      const transitionDeadline = now() + spec.stopTimeoutMs;
+      const transitionDeadline = operationDeadline === undefined
+        ? now() + spec.stopTimeoutMs
+        : Math.min(operationDeadline, now() + spec.stopTimeoutMs);
       const maxTransitionPolls = Math.max(
         1,
-        Math.min(
-          MAX_LAUNCHD_TRANSITION_POLL_INTERVALS,
-          Math.ceil(spec.stopTimeoutMs / DEFAULT_POLL_INTERVAL_MS),
-        ),
+        Math.min(MAX_LAUNCHD_TRANSITION_POLL_INTERVALS, Math.ceil(Math.max(0, transitionDeadline - now()) / DEFAULT_POLL_INTERVAL_MS)),
       );
       for (let attempt = 0; attempt < maxTransitionPolls; attempt += 1) {
         const stable = current.kind === "absent"
@@ -2475,7 +2671,7 @@ export function createSupervisor(
         const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
         if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
         else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
-        current = await probe(spec);
+        current = await probeWithinOperation(spec, undefined, operationDeadline === undefined ? undefined : transitionDeadline);
       }
     }
     if (current.kind === "absent") {
@@ -2507,8 +2703,12 @@ export function createSupervisor(
     const stopArgs = kind === "systemd-user"
       ? ["--user", "stop", spec.systemdUnit]
       : ["bootout", `${launchdDomain(runner.uid)}/${spec.launchdLabel}`];
-    const result = await runner.invoke(kind === "systemd-user" ? "systemctl" : "launchctl", stopArgs, spec.stopTimeoutMs);
-    if (result.timedOut) throw commandFailedError();
+    const result = await runner.invoke(
+      kind === "systemd-user" ? "systemctl" : "launchctl",
+      stopArgs,
+      operationTimeout(operationDeadline, spec.stopTimeoutMs),
+    );
+    if (result.timedOut) throw commandFailedError("timeout");
     const exactPriorObservation = current.kind === "registered-running-valid"
       || current.kind === "registered-not-running-valid"
       || (
@@ -2535,18 +2735,31 @@ export function createSupervisor(
       // recreation. Manager GC may remove it before reset-failed reaches the
       // manager, so tolerate only its exact not-found result; the bounded
       // absence probes below remain authoritative.
-      const resetFailed = await runner.invoke("systemctl", ["--user", "reset-failed", spec.systemdUnit], spec.stopTimeoutMs);
+      const resetFailed = await runner.invoke(
+        "systemctl",
+        ["--user", "reset-failed", spec.systemdUnit],
+        operationTimeout(operationDeadline, spec.stopTimeoutMs),
+      );
       const resetFailedIsNotFound = resetFailed.code !== 0
         && isNotFoundOutput(kind, resetFailed.code, `${resetFailed.stdout}\n${resetFailed.stderr}`);
-      if (resetFailed.timedOut || (resetFailed.code !== 0 && !resetFailedIsNotFound)) throw commandFailedError();
+      if (resetFailed.timedOut) throw commandFailedError("timeout");
+      if (resetFailed.code !== 0 && !resetFailedIsNotFound) throw commandFailedError();
     }
-    const maxPollIntervals = Math.max(1, Math.ceil(spec.stopTimeoutMs / DEFAULT_POLL_INTERVAL_MS));
-    const now = dependencies.now ?? performance.now.bind(performance);
-    const stopDeadline = now() + spec.stopTimeoutMs;
+    const stopDeadline = operationDeadline === undefined
+      ? now() + spec.stopTimeoutMs
+      : Math.min(operationDeadline, now() + spec.stopTimeoutMs);
+    if (operationDeadline !== undefined && stopDeadline - now() <= 0) throw commandFailedError("timeout");
+    const maxPollIntervals = operationDeadline === undefined
+      ? Math.max(1, Math.ceil(spec.stopTimeoutMs / DEFAULT_POLL_INTERVAL_MS))
+      : Math.max(1, Math.ceil(Math.max(0, stopDeadline - now()) / DEFAULT_POLL_INTERVAL_MS));
     const authenticatedPrior = current;
     for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
       const capture: SupervisorProbeCapture = {};
-      const observed = await probeInternal(spec, capture);
+      const observed = await probeWithinOperation(
+        spec,
+        capture,
+        operationDeadline === undefined ? undefined : stopDeadline,
+      );
       if (
         (observed.kind === "registered-running-valid" || observed.kind === "registered-not-running-valid")
         && observed.nonce !== authenticatedPrior.nonce
@@ -2587,11 +2800,18 @@ export function createSupervisor(
     throw commandFailedError();
   };
 
-  const stopAndAwaitAbsent = async (spec: SupervisorSpec): Promise<void> => stopAndAwaitAbsentInternal(spec);
+  const stopAndAwaitAbsent = async (
+    spec: SupervisorSpec,
+    options?: SupervisorOperationOptions,
+  ): Promise<void> => stopAndAwaitAbsentInternal(spec, false, undefined, true, resolveOperationDeadline(options));
 
-  const stopAndStart = async (spec: SupervisorSpec): Promise<SupervisorStartResult> => {
+  const stopAndStart = async (
+    spec: SupervisorSpec,
+    options?: SupervisorOperationOptions,
+  ): Promise<SupervisorStartResult> => {
+    const operationDeadline = resolveOperationDeadline(options);
     if (!credentialsAreSafe(spec)) throw new Error("supervisor credential validation failed");
-    const observed = await probe(spec);
+    const observed = await probeWithinOperation(spec, undefined, operationDeadline);
     if (observed.kind === "unavailable") throw managerUnavailableError(observed.reason);
     if (observed.kind === "registered-invalid-collision" || observed.kind === "ambiguous") throw commandFailedError();
     const observedPriorSpec = observed.kind === "registered-running-valid"
@@ -2601,16 +2821,16 @@ export function createSupervisor(
     if (observedPriorSpec !== undefined) {
       // The manager-reported prior nonce authenticates the job being stopped;
       // the caller's fresh nonce remains reserved for the replacement start.
-      await stopAndAwaitAbsentInternal(observedPriorSpec);
-      await settleLaunchdLabelReuse();
+      await stopAndAwaitAbsentInternal(observedPriorSpec, false, undefined, true, operationDeadline);
+      await settleLaunchdLabelReuse(operationDeadline);
     } else if (observed.kind === "registered-stale-config") {
-      await stopAndAwaitAbsentInternal(spec, true, observed, false);
-      await settleLaunchdLabelReuse();
+      await stopAndAwaitAbsentInternal(spec, true, observed, false, operationDeadline);
+      await settleLaunchdLabelReuse(operationDeadline);
     } else if (observed.kind !== "absent") {
-      await stopAndAwaitAbsentInternal(spec, false, undefined, false);
-      await settleLaunchdLabelReuse();
+      await stopAndAwaitAbsentInternal(spec, false, undefined, false, operationDeadline);
+      await settleLaunchdLabelReuse(operationDeadline);
     }
-    return start(spec);
+    return startInternal(spec, false, operationDeadline);
   };
 
   return Object.freeze({ probe, start, stopAndStart, stopAndAwaitAbsent });

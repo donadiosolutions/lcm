@@ -290,6 +290,93 @@ function setRunningProbe(fixture: Fixture, pid = 4242): void {
 }
 
 describe("issue 400 lifecycle managed preparation and utility boundaries", () => {
+  it("caps manager commands for long spawn windows while retaining the full lifecycle deadline", async () => {
+    const managerSpawn = vi.fn(() => ({ status: 1, stdout: "", stderr: "Unit is not-found" }));
+    const scoped = createScopedFixture({
+      fetch: vi.fn(async () => { throw new Error("offline"); }) as never,
+      spawnSync: managerSpawn as never,
+    });
+    await expect(ensureDaemon({
+      port: scoped.port,
+      pidFilePath: scoped.pidPath,
+      spawnTimeoutMs: 120_000,
+      enforceUserManagerParent: true,
+      _testScope: scoped.scope,
+      _skipSpawn: true,
+      _monotonicNowOverride: () => 0,
+    })).resolves.toMatchObject({ refusalReason: "absent" });
+    expect(managerSpawn).toHaveBeenCalledOnce();
+    expect(managerSpawn.mock.calls[0]?.[2]).toMatchObject({ timeout: 60_000 });
+
+    const restartSpawn = vi.fn(() => ({ status: 1, stdout: "", stderr: "Unit is not-found" }));
+    const restartScoped = createScopedFixture({
+      fetch: vi.fn(async () => { throw new Error("offline"); }) as never,
+      spawnSync: restartSpawn as never,
+    });
+    const wallClock = vi.spyOn(performance, "now").mockReturnValue(1_000_000);
+    try {
+      await expect(restartDaemon({
+        port: restartScoped.port,
+        pidFilePath: restartScoped.pidPath,
+        spawnTimeoutMs: 120_000,
+        enforceUserManagerParent: true,
+        _testScope: restartScoped.scope,
+        _skipSpawn: true,
+        _monotonicNowOverride: () => 0,
+      })).resolves.toMatchObject({ refusalReason: "absent", restarted: false });
+    } finally {
+      wallClock.mockRestore();
+    }
+    expect(restartSpawn).toHaveBeenCalledOnce();
+    expect(restartSpawn.mock.calls[0]?.[2]).toMatchObject({ timeout: 60_000 });
+
+    for (const [spawnTimeoutMs, expectedCommandTimeoutMs] of [[1.9, 1], [60_000.9, 60_000]] as const) {
+      const fractionalSpawn = vi.fn(() => ({ status: 1, stdout: "", stderr: "Unit is not-found" }));
+      const fractional = createScopedFixture({
+        fetch: vi.fn(async () => { throw new Error("offline"); }) as never,
+        spawnSync: fractionalSpawn as never,
+      });
+      await expect(ensureDaemon({
+        port: fractional.port,
+        pidFilePath: fractional.pidPath,
+        spawnTimeoutMs,
+        enforceUserManagerParent: true,
+        _testScope: fractional.scope,
+        _skipSpawn: true,
+        _monotonicNowOverride: () => 0,
+      })).resolves.toMatchObject({ refusalReason: "absent" });
+      expect(fractionalSpawn.mock.calls[0]?.[2]).toMatchObject({ timeout: expectedCommandTimeoutMs });
+    }
+
+    const fixture = createFixture({ fetch: sequenceFetch([new Error("offline")]) });
+    let operationDeadline: number | undefined;
+    fixture.probe
+      .mockImplementationOnce(async (value: SupervisorSpec) => observation(value, "absent"))
+      .mockImplementation(async (value: SupervisorSpec) => observation(value, "registered-running-valid", { managerPid: 4242 }));
+    fixture.start.mockImplementationOnce(async (
+      value: SupervisorSpec,
+      operation?: { readonly deadline?: number },
+    ) => {
+      operationDeadline = operation?.deadline;
+      return {
+        kind: value.kind,
+        name: value.name,
+        scopeDigest: value.scopeDigest,
+        port: value.port,
+        nonce: value.nonce,
+        managerPid: 4242,
+      };
+    });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      spawnTimeoutMs: 120_000,
+      _skipHealthWait: true,
+      _monotonicNowOverride: () => 0,
+    }))).resolves.toMatchObject({ spawned: true, startMethod: "systemd-user" });
+    expect(operationDeadline).toBe(120_000);
+    expect(fixture.probe).toHaveBeenNthCalledWith(1, expect.anything(), { deadline: 120_000 });
+    expect(fixture.probe).toHaveBeenNthCalledWith(2, expect.anything(), { deadline: 120_000 });
+  });
+
   it("anchors ensure admission to canonical state rather than caller cwd", async () => {
     const fixture = createFixture({
       fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,
@@ -974,7 +1061,10 @@ describe("issue 400 managed ensure admission matrix", () => {
 
     expect(result).toMatchObject({ spawned: true, startMethod: "systemd-user", pid: 4242 });
     expect(probes.map(({ nonce }) => nonce)).toEqual([currentNonce, priorNonce, priorNonce]);
-    expect(fixture.stopAndStart).toHaveBeenCalledWith(expect.objectContaining({ nonce: priorNonce }));
+    expect(fixture.stopAndStart).toHaveBeenCalledWith(
+      expect.objectContaining({ nonce: priorNonce }),
+      { deadline: 100 },
+    );
   });
 
   it("refuses prior-nonce terminal adoption when the observed port is stale", async () => {
@@ -1169,7 +1259,7 @@ describe("issue 400 managed ensure admission matrix", () => {
       nonce: "deterministic-launch-nonce",
       credentialDirectory: observed[1]?.credentialDirectory,
       credentialFiles: observed[1]?.credentialFiles,
-    }));
+    }), { deadline: 100 });
   });
 
   it("erases operation-owned staged credentials only after authenticated admission", async () => {
@@ -1565,6 +1655,7 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       fetch: sequenceFetch([new Error("offline")]),
       sleep: async () => { now = 1_000; },
     });
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
     fixture.probe
       .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
       .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
@@ -1586,7 +1677,7 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     await expect(ensureDaemon(optionsFor(fixture, {
       _skipHealthWait: false,
       _monotonicNowOverride: () => now,
-    }))).rejects.toBe(cleanupRefusal);
+    }))).resolves.toMatchObject({ refusalReason: "startup-failure", spawned: true });
 
     expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledOnce();
     expect(staged?.credentialDirectory).toBeDefined();
@@ -1595,11 +1686,116 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledWith(expect.objectContaining({
       credentialDirectory,
       credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
-    }));
+    }), { deadline: 100 });
+    expect(readFileSync(fixture.pidPath, "utf8").trim()).toBe("4242");
+    expect(existsSync(fixture.tokenPath)).toBe(true);
     expect(existsSync(credentialDirectory)).toBe(true);
     expect(readdirSync(credentialDirectory)).toEqual(["OPENAI_API_KEY"]);
     expect(readFileSync(credentialFile, "utf8")).toBe("staged-secret");
     expect(statSync(credentialFile).mode & 0o777).toBe(0o600);
+  });
+
+  it("does not give failed-admission cleanup a fresh manager-operation budget", async () => {
+    let now = 0;
+    const fixture = createFixture({
+      fetch: sequenceFetch([new Error("offline")]),
+      sleep: async () => { now = 50; },
+    });
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    const cleanupMutation = vi.fn();
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    fixture.stopAndAwaitAbsent.mockImplementation(async (
+      _spec: SupervisorSpec,
+      operation?: { readonly deadline?: number },
+    ) => {
+      if (operation?.deadline === undefined || now < operation.deadline) {
+        cleanupMutation();
+        return;
+      }
+      const error = new Error("manager operation deadline expired") as Error & { reason?: string };
+      error.name = "SupervisorCommandError";
+      error.reason = "timeout";
+      throw error;
+    });
+
+    await expect(ensureDaemon(optionsFor(fixture, {
+      spawnTimeoutMs: 50,
+      _skipHealthWait: false,
+      _monotonicNowOverride: () => now,
+    }))).resolves.toMatchObject({ refusalReason: "startup-failure", spawned: true });
+
+    expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledWith(expect.anything(), { deadline: 50 });
+    expect(cleanupMutation).not.toHaveBeenCalled();
+    expect(readFileSync(fixture.pidPath, "utf8").trim()).toBe("4242");
+    expect(existsSync(fixture.tokenPath)).toBe(true);
+  });
+
+  it.each([
+    { platform: "linux" as const, startMethod: "systemd-user" as const },
+    { platform: "darwin" as const, startMethod: "launchd-user" as const },
+  ])("preserves a post-start $startMethod interruption when expired cleanup cannot prove manager absence", async ({ platform, startMethod }) => {
+    let now = 0;
+    const controller = new AbortController();
+    const fixture = createFixture({ platform, fetch: sequenceFetch([new Error("offline")]) });
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    const cleanupMutation = vi.fn();
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => {
+        now = 50;
+        controller.abort();
+        return observation(spec, "registered-running-valid", { managerPid: 4242 });
+      });
+    fixture.stopAndAwaitAbsent.mockImplementation(async (
+      _spec: SupervisorSpec,
+      operation?: { readonly deadline?: number },
+    ) => {
+      if (operation?.deadline === undefined || now < operation.deadline) {
+        cleanupMutation();
+        return;
+      }
+      const error = new Error("manager operation deadline expired") as Error & { reason?: string };
+      error.name = "SupervisorCommandError";
+      error.reason = "timeout";
+      throw error;
+    });
+
+    await expect(ensureDaemon(optionsFor(fixture, {
+      spawnTimeoutMs: 50,
+      _skipHealthWait: false,
+      _abortSignal: controller.signal,
+      _monotonicNowOverride: () => now,
+    }))).resolves.toMatchObject({
+      connected: false,
+      spawned: true,
+      startMethod,
+      warning: "daemon lifecycle was interrupted",
+    });
+
+    expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledWith(expect.anything(), { deadline: 50 });
+    expect(cleanupMutation).not.toHaveBeenCalled();
+    expect(readFileSync(fixture.pidPath, "utf8").trim()).toBe("4242");
+    expect(existsSync(fixture.tokenPath)).toBe(true);
+  });
+
+  it("propagates cleanup failure without a refusal or managed interruption result", async () => {
+    const fixture = createScopedFixture({ fetch: sequenceFetch([new Error("offline")]) });
+    const { _hermeticTestSeams: _ignoredHermeticSeams, ...scopedOptions } = optionsFor(fixture, {
+      _testScope: fixture.scope,
+      _skipHealthWait: true,
+      expectedEntrypoint: fixture.scope.entrypoint,
+    });
+    void _ignoredHermeticSeams;
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    fixture.stopAndAwaitAbsent.mockRejectedValueOnce(new Error("cleanup failed"));
+
+    await expect(ensureDaemon(scopedOptions)).rejects.toThrow("cleanup failed");
+
+    expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledOnce();
   });
 
   it("covers deadline abort/timeout callbacks and platform process-command paths", async () => {
@@ -1781,7 +1977,58 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     await expect(ensureDaemon(optionsFor(cleanupFailure, {
       _skipHealthWait: false,
       _monotonicNowOverride: () => 0,
-    }))).rejects.toThrow("managed credential file failed validation");
+    }))).resolves.toMatchObject({
+      refusalReason: "startup-failure",
+      spawned: true,
+      pid: 4242,
+    });
+  });
+
+  it("preserves independent test-scope cleanup failures after an ambiguous manager result", async () => {
+    const fixture = createScopedFixture({
+      fetch: sequenceFetch([new Error("pre-start offline")]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(
+        spec,
+        "registered-running-valid",
+        { managerPid: 9999 },
+      ));
+    fixture.start.mockImplementationOnce(async (spec: SupervisorSpec) => {
+      rmSync(fixture.scope.runtimeDir, { recursive: true, force: true });
+      return {
+        kind: spec.kind,
+        name: spec.name,
+        scopeDigest: spec.scopeDigest,
+        port: spec.port,
+        nonce: spec.nonce,
+        managerPid: 4242,
+      };
+    });
+
+    await expect(ensureDaemon({
+      port: fixture.port,
+      pidFilePath: fixture.pidPath,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1",
+      expectedEntrypoint: fixture.scope.entrypoint,
+      expectedRuntimeDigest: RUNTIME_DIGEST,
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _testScope: fixture.scope,
+      _supervisorOverride: fixture.supervisor,
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 4242,
+      _skipHealthWait: true,
+      _monotonicNowOverride: () => 0,
+    })).rejects.toThrow(
+      `lifecycle test cleanup root is not current owned state: ${fixture.scope.runtimeDir}`,
+    );
+
+    expect(fixture.probe).toHaveBeenCalledTimes(2);
+    expect(fixture.start).toHaveBeenCalledOnce();
+    expect(fixture.stopAndAwaitAbsent).not.toHaveBeenCalled();
   });
 
   it("bounds authenticated diagnostics on timeout and caller abort", async () => {

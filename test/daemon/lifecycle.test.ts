@@ -4360,7 +4360,12 @@ describe("restartDaemon", () => {
       platform: "darwin",
       uid: 501,
       environment: { OPENAI_API_KEY: "unadmitted-secret" },
-    })).rejects.toThrow("absence proof refused");
+    })).resolves.toMatchObject({
+      refusalReason: "startup-failure",
+      spawned: true,
+      pid: 201,
+      startMethod: "launchd-user",
+    });
 
     expect(supervisor.stopAndAwaitAbsent).toHaveBeenCalledOnce();
     expect(staged?.credentialDirectory).toBeDefined();
@@ -4369,7 +4374,7 @@ describe("restartDaemon", () => {
       { name: "OPENAI_API_KEY", value: "unadmitted-secret", mode: 0o600 },
     ]);
     expect(readFileSync(staged!.files[0]!.path, "utf-8")).toBe("unadmitted-secret");
-    expect(existsSync(pidFile)).toBe(false);
+    expect(readFileSync(pidFile, "utf-8").trim()).toBe("201");
   });
 
   it.each([

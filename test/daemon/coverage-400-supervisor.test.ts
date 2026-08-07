@@ -522,6 +522,69 @@ describe("supervisor coverage: manager states and lifecycle boundaries", () => {
     await expect(rejected.probe(value)).resolves.toMatchObject({ kind: "unavailable" });
   });
 
+  it("keeps a systemd result code 5 as a generic command failure", async () => {
+    const value = spec("systemd-user");
+    const runner = runQueue([
+      { code: 1, stderr: `Unit ${value.systemdUnit} is not-found` },
+      { code: 5, stderr: "systemd-run failed" },
+      { code: 1, stderr: `Unit ${value.systemdUnit} is not-found` },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "command",
+    });
+  });
+
+  it.each([
+    { name: "numeric code-5", initial: { code: 5, stderr: "Operation not permitted" } },
+    { name: "mixed absent-channel", initial: { code: 113, stdout: "Could not find service", stderr: "Operation not permitted" } },
+  ])("keeps initial launchd $name permission evidence authoritative before bootstrap", async ({ initial }) => {
+    const value = spec("launchd-user", root());
+    const runner = runQueue([initial]);
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "permission",
+    });
+
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print"]);
+  });
+
+  it("still bootstraps from a true initial launchd absence", async () => {
+    const value = spec("launchd-user", root());
+    const runner = runQueue([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 554) },
+    ]);
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(value)).resolves.toMatchObject({ managerPid: 554 });
+
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "bootstrap", "print"]);
+  });
+
+  it("preserves permission evidence from the post-start manager probe", async () => {
+    const value = spec("systemd-user");
+    const runner = runQueue([
+      { code: 1, stderr: `Unit ${value.systemdUnit} is not-found` },
+      { code: 0, stdout: "started" },
+      { code: 1, stderr: "Operation not permitted" },
+      { code: 1, stderr: `Unit ${value.systemdUnit} is not-found` },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "permission",
+    });
+  });
+
   it("covers activation metadata fences and the monotonic start deadline", async () => {
     const rejectAfterPoll = async (value: SupervisorSpec, after: string): Promise<void> => {
       const runner = runQueue([
@@ -794,6 +857,204 @@ describe("supervisor coverage: credentials and private launch files", () => {
     await expect(createSupervisor("launchd-user", { run: staleRunner.run, platform: "darwin", uid: 501 }).stopAndStart(value)).rejects.toThrow("manager command");
   });
 
+  it("re-observes transient launchd metadata-malformed state after bootstrap", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const transient = launchdText(value, "starting", 0);
+    const running = launchdText(value, "running", 551);
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: transient },
+      { code: 0, stdout: running },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).resolves.toMatchObject({ managerPid: 551 });
+    expect(sleep).toHaveBeenCalledWith(50);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
+  });
+
+  it("uses the bounded host timer for launchd post-start re-observation", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const transient = launchdText(value, "starting", 0);
+    const running = launchdText(value, "running", 552);
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: transient },
+      { code: 0, stdout: running },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 100,
+    }).start(value)).resolves.toMatchObject({ managerPid: 552 });
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it("fails closed when launchd metadata-malformed state persists to the poll deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const transient = launchdText(value, "starting", 0);
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: transient },
+      { code: 0, stdout: transient },
+      { code: 0, stdout: transient },
+      absent,
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 101,
+      now: () => currentTime,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "malformed-state",
+    });
+    expect(sleep.mock.calls).toEqual([[50], [50], [1]]);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
+  });
+
+  it("keeps re-observing launchd metadata-malformed state past five seconds while the operation deadline remains", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const transient = { code: 0, stdout: launchdText(value, "starting", 0) };
+    const running = { code: 0, stdout: launchdText(value, "running", 553) };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      ...Array.from({ length: 101 }, () => transient),
+      running,
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 60_000,
+      now: () => currentTime,
+      sleep,
+    }).start(value, { deadline: 6_000 })).resolves.toMatchObject({ managerPid: 553 });
+
+    expect(currentTime).toBe(5_050);
+    expect(sleep).toHaveBeenCalledTimes(101);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
+  });
+
+  it("does not give absent launchd post-start polling a fresh timeout after its implicit deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      absent,
+      absent,
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 100,
+      now: () => currentTime,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "ambiguous-state",
+    });
+
+    expect(currentTime).toBe(100);
+    expect(sleep.mock.calls).toEqual([[50], [50]]);
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "bootstrap", "print", "print"]);
+    expect(runner.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([100, 100, 100, 50]);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
+  });
+
+  it("keeps persistent launchd metadata-malformed state bounded by the terminal operation deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const transient = { code: 0, stdout: launchdText(value, "starting", 0) };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      ...Array.from({ length: 121 }, () => transient),
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 60_000,
+      now: () => currentTime,
+      sleep,
+    }).start(value, { deadline: 6_000 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "malformed-state",
+    });
+
+    expect(currentTime).toBe(6_000);
+    expect(sleep).toHaveBeenCalledTimes(120);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
+  });
+
+  it("keeps systemd metadata-malformed post-start state fail closed", async () => {
+    const value = spec("systemd-user");
+    const absent = { code: 1, stderr: "Unit is not-found" };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: systemdText(value, "activating", 0) },
+      absent,
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "malformed-state",
+    });
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
   it("retries an exact launchd bootstrap after the GUI domain settles an absent label", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
@@ -819,7 +1080,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
       uid: 501,
       sleep,
     }).start(value)).resolves.toMatchObject({ managerPid: 544 });
-    expect(sleep).toHaveBeenCalledWith(50);
+    expect(sleep).toHaveBeenCalledWith(2_000);
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
     expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(1);
   });
@@ -836,6 +1097,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
       absent,
       absent,
       { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      { code: 0, stdout: "unparseable launchd response" },
       absent,
       absent,
       { code: 0, stdout: "bootstrapped" },
@@ -851,11 +1113,13 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
   });
 
-  it("retries repeated launchd bootstrap settling failures within the existing budget", async () => {
+  it("continues authenticated label-release settling after repeated numeric EIO results", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
     const absent = { code: 113, stderr: "Could not find service" };
-    const failed = { code: 5, stderr: "Bootstrap failed: 5: Input/output error" };
+    // launchctl's human text varies by macOS build; the exact bootstrap
+    // command and Darwin's numeric EIO result are the stable classification.
+    const failed = { code: 5, stderr: "launchd diagnostic unavailable" };
     const runner = runQueue([
       absent,
       failed,
@@ -875,7 +1139,77 @@ describe("supervisor coverage: credentials and private launch files", () => {
       sleep,
     }).start(value)).resolves.toMatchObject({ managerPid: 546 });
     expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenNthCalledWith(1, 2_000);
+    expect(sleep).toHaveBeenNthCalledWith(2, 2_000);
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(3);
+  });
+
+  it("honors the caller deadline across terminal stop/start label-release recovery", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const terminal = launchdText(value, "exited", 0);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: "bootout" },
+      absent,
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      absent,
+      absent,
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 5_000,
+      now: () => currentTime,
+      sleep,
+    }).stopAndStart(value, { deadline: 2_500 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "label-release-deadline",
+    });
+    expect(sleep.mock.calls).toEqual([[2_000], [500]]);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+    expect(runner.calls.find(({ args }) => args[0] === "bootstrap")?.timeoutMs).toBe(500);
+  });
+
+  it("rejects a non-finite caller deadline before manager access", async () => {
+    const runner = runQueue([]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec("launchd-user"), { deadline: Number.NaN })).rejects.toThrow("deadline");
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it("keeps a numeric code-5 launchd permission failure authoritative", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Operation not permitted" },
+      absent,
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "permission",
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
 
   it("retires an exact failed launchd registration before one bounded start retry", async () => {
@@ -919,7 +1253,10 @@ describe("supervisor coverage: credentials and private launch files", () => {
       run: runner.run,
       platform: "darwin",
       uid: 501,
-    }).start(value)).rejects.toThrow("manager command");
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "ambiguous-state",
+    });
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
 
@@ -940,13 +1277,17 @@ describe("supervisor coverage: credentials and private launch files", () => {
       platform: "darwin",
       uid: 501,
       sleep: async () => undefined,
-    }).start(value)).rejects.toThrow("manager command");
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "ambiguous-state",
+    });
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
 
   it.each([
     { name: "after the first absence proof", times: [0, 0, 1] },
     { name: "after the settling delay", times: [0, 0, 0, 1] },
+    { name: "after the second absence proof", times: [0, 0, 0, 0, 0, 1] },
   ])("preserves a failed launchd bootstrap when the deadline expires $name", async ({ times }) => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
@@ -968,6 +1309,203 @@ describe("supervisor coverage: credentials and private launch files", () => {
       now,
       sleep: async () => undefined,
     }).start(value)).rejects.toThrow("manager command");
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it("preserves malformed-state when its observation consumes the remaining deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "diagnostic wording is not an authority" },
+      { code: 0, stdout: "unparseable launchd response" },
+      absent,
+    ]);
+    const now = vi.fn().mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(1);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 1,
+      now,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "malformed-state",
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it("classifies an initial launchd bootstrap transport failure without retrying", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([absent, { code: null }, absent]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "transport",
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it("observes malformed launchd projections until two exact absences authorize one retry", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    // `launchctl print` may project arbitrary manager data.  Permission-like
+    // text in a successful projection is not failed-command evidence and must
+    // not preempt the bounded, read-only malformed-state reprobe.
+    const malformed = {
+      code: 0,
+      stdout: launchdText(value, "starting", 0, "manager value => Permission denied"),
+    };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "diagnostic wording is not an authority" },
+      malformed,
+      absent,
+      malformed,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 550) },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).resolves.toMatchObject({ managerPid: 550 });
+    expect(sleep.mock.calls).toEqual([[50], [2_000], [50]]);
+    expect(runner.calls.map(({ args }) => args[0])).toEqual([
+      "print",
+      "bootstrap",
+      "print",
+      "print",
+      "print",
+      "print",
+      "bootstrap",
+      "print",
+    ]);
+  });
+
+  it("fails with bounded malformed state when observation-only recovery exhausts its deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    // `launchctl print` may project arbitrary manager data. Permission-like
+    // text in a successful projection is not failed-command evidence and must
+    // not preempt the bounded, read-only malformed-state reprobe.
+    const malformed = {
+      code: 0,
+      stdout: launchdText(value, "starting", 0, "manager value => Permission denied"),
+    };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "diagnostic wording is not an authority" },
+      malformed,
+      malformed,
+      absent,
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 100,
+      now: () => currentTime,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "malformed-state",
+    });
+    expect(sleep.mock.calls).toEqual([[50], [50]]);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      name: "manager permission failure",
+      proof: { code: 1, stderr: "Operation not permitted" },
+      reason: "permission",
+    },
+    {
+      name: "manager transport failure",
+      proof: { code: null },
+      reason: "transport",
+    },
+    {
+      name: "manager command timeout",
+      proof: { timedOut: true },
+      reason: "timeout",
+    },
+  ])("keeps $name authoritative during label-release recovery", async ({ proof, reason }) => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "diagnostic wording is not an authority" },
+      proof,
+      absent,
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason,
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it.each([
+    { name: "before the label-release settle", proofs: 1, expectedSleeps: [] as number[][] },
+    { name: "after the label-release settle", proofs: 2, expectedSleeps: [[2_000]] },
+  ])("keeps mixed-channel permission evidence authoritative $name", async ({ proofs, expectedSleeps }) => {
+    const value = spec("launchd-user", root());
+    const absent = { code: 113, stderr: "Could not find service" };
+    const mixedPermission = {
+      code: 113,
+      stdout: "Could not find service",
+      stderr: "Operation not permitted",
+    };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      ...(proofs === 2 ? [absent] : []),
+      mixedPermission,
+      mixedPermission,
+    ]);
+    const sleep = vi.fn(async () => undefined);
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "permission",
+    });
+    expect(sleep.mock.calls).toEqual(expectedSleeps);
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
 
@@ -1273,6 +1811,343 @@ describe("supervisor coverage: credentials and private launch files", () => {
 });
 
 describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
+  it("does not mutate a stale launchd registration after the caller deadline expires during transition observation", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot, { stopTimeoutMs: 100 });
+    const stale = launchdText({ ...value, nonce: "stale-transition-nonce" }, "not running", 0);
+    const runner = runQueue([
+      { code: 0, stdout: stale },
+      { code: 0, stdout: "unparseable launchd response" },
+    ]);
+    const now = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(100);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      now,
+      sleep,
+    }).stopAndStart(value, { deadline: 100 })).rejects.toThrow("manager command");
+    expect(sleep).not.toHaveBeenCalled();
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "print"]);
+  });
+
+  it("re-observes a stale launchd transition within the caller deadline before refusing ambiguity", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot, { stopTimeoutMs: 100 });
+    const stale = launchdText({ ...value, nonce: "stale-transition-nonce" }, "not running", 0);
+    const runner = runQueue([
+      { code: 0, stdout: stale },
+      { code: 0, stdout: "unparseable launchd response" },
+      { code: 0, stdout: "unparseable launchd response" },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      now: () => 0,
+      sleep,
+    }).stopAndStart(value, { deadline: 100 })).rejects.toThrow("manager command");
+    expect(sleep).toHaveBeenCalledOnce();
+    expect(sleep).toHaveBeenCalledWith(50);
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "print", "print"]);
+  });
+
+  it("stops before absence polling when a caller deadline is exhausted after the manager stop", async () => {
+    const value = spec("systemd-user", root(), { stopTimeoutMs: 100 });
+    const runner = runQueue([
+      { code: 0, stdout: systemdText(value, "active", 12) },
+      { code: 0, stdout: "stopped" },
+    ]);
+    const now = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(1);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      now,
+      sleep,
+    }).stopAndAwaitAbsent(value, { deadline: 1 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(runner.calls.map(({ args }) => args[1] ?? args[0])).toEqual(["show", "stop"]);
+  });
+
+  it("fails an already-expired caller deadline before any manager command", async () => {
+    const runner = runQueue([]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      now: () => 0,
+    }).start(spec("launchd-user"), { deadline: 0 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it("uses the caller deadline for successful launchd post-start polling", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 900) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      now: () => 0,
+    }).start(value, { deadline: 100 })).resolves.toMatchObject({ managerPid: 900 });
+    expect(runner.calls.find(({ args }) => args[0] === "bootstrap")?.timeoutMs).toBe(100);
+  });
+
+  it("caps operation-scoped launchd probes and label-release retries at the configured timeout", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const configuredCommandTimeoutMs = 100;
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 901) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: configuredCommandTimeoutMs,
+      now: () => 0,
+      sleep: async () => undefined,
+    }).start(value, { deadline: 1_000 })).resolves.toMatchObject({ managerPid: 901 });
+    expect(runner.calls.map(({ args }) => args[0])).toEqual([
+      "print",
+      "bootstrap",
+      "print",
+      "print",
+      "bootstrap",
+      "print",
+    ]);
+    expect(runner.calls.map(({ timeoutMs }) => timeoutMs)).toEqual(
+      Array(runner.calls.length).fill(configuredCommandTimeoutMs),
+    );
+  });
+
+  it.each([
+    { configuredCommandTimeoutMs: 7.5, expectedTimeoutMs: 7 },
+    { configuredCommandTimeoutMs: 60_001.5, expectedTimeoutMs: 60_000 },
+  ])("clamps direct probe timeout $configuredCommandTimeoutMs to the runner bounds", async ({ configuredCommandTimeoutMs, expectedTimeoutMs }) => {
+    const value = spec("systemd-user", root());
+    const runner = runQueue([{ code: 0, stdout: systemdText(value, "active", 904) }]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      commandTimeoutMs: configuredCommandTimeoutMs,
+    }).probe(value)).resolves.toMatchObject({ kind: "registered-running-valid", managerPid: 904 });
+    expect(runner.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([expectedTimeoutMs]);
+  });
+
+  it("classifies a non-finite configured probe timeout without invoking the manager", async () => {
+    const value = spec("systemd-user", root());
+    const runner = runQueue([]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      commandTimeoutMs: Number.NaN,
+    }).probe(value)).resolves.toMatchObject({
+      kind: "unavailable",
+      reason: "manager-timeout",
+    });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it.each([
+    { name: "permission", failure: { code: 1, stderr: "Operation not permitted" }, reason: "permission" },
+    { name: "timeout", failure: { timedOut: true }, reason: "timeout" },
+    { name: "transport", failure: { code: null }, reason: "transport" },
+  ])("keeps an authoritative $name failure despite a later terminal re-probe", async ({ failure, reason }) => {
+    const value = spec("launchd-user", root());
+    const absent = { code: 113, stderr: "Could not find service" };
+    const terminal = { code: 0, stdout: launchdText(value, "exited", 0) };
+    const runner = runQueue([absent, failure, terminal]);
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason,
+    });
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "bootstrap", "print"]);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it("retries one exact immediate-exit registration after a successful bootstrap", async () => {
+    const value = spec("launchd-user", root());
+    const absent = { code: 113, stderr: "Could not find service" };
+    const terminal = { code: 0, stdout: launchdText(value, "exited", 0) };
+    const running = { code: 0, stdout: launchdText(value, "running", 902) };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      terminal,
+      terminal,
+      terminal,
+      { code: 0, stdout: "bootout" },
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      running,
+    ]);
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep: async () => undefined,
+    }).start(value)).resolves.toMatchObject({ managerPid: 902 });
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
+  });
+
+  it("bounds terminal post-start cleanup and its exact absence probe by the same caller deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const terminal = { code: 0, stdout: launchdText(value, "exited", 0) };
+    const queue = [
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      terminal,
+      terminal,
+      terminal,
+      { code: 0, stdout: "bootout" },
+      absent,
+    ];
+    let currentTime = 0;
+    const calls: Array<{ command: string; args: readonly string[]; timeoutMs: number }> = [];
+    const run = vi.fn(async (command: string, args: readonly string[], options: { timeoutMs: number }) => {
+      calls.push({ command, args, timeoutMs: options.timeoutMs });
+      const result = queue.shift() ?? { code: 0, stdout: "", stderr: "" };
+      if (calls.length === 3) currentTime = 998;
+      return result;
+    });
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+    await expect(createSupervisor("launchd-user", {
+      run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 60_000,
+      now: () => currentTime,
+      sleep,
+    }).start(value, { deadline: 1_000 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+    expect(calls.map(({ args }) => args[0])).toEqual([
+      "print",
+      "bootstrap",
+      "print",
+      "print",
+      "print",
+      "bootout",
+      "print",
+    ]);
+    expect(calls.map(({ timeoutMs }) => timeoutMs)).toEqual([1_000, 1_000, 1_000, 2, 2, 2, 2]);
+    expect(sleep).toHaveBeenCalledWith(2);
+  });
+
+  it("does not begin terminal post-start cleanup after its operation deadline expires", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const terminal = { code: 0, stdout: launchdText(value, "exited", 0) };
+    const runner = runQueue([absent, { code: 0, stdout: "bootstrapped" }, terminal]);
+    const now = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValue(1);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      now,
+    }).start(value, { deadline: 1 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "ambiguous-state",
+    });
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "bootstrap", "print"]);
+  });
+
+  it("preserves timeout classification and independent stop and reset-failed budgets", async () => {
+    const value = spec("systemd-user", root(), { stopTimeoutMs: 100 });
+    const configuredCommandTimeoutMs = 7;
+    const timedOutStop = runQueue([
+      { code: 0, stdout: systemdText(value, "active", 12) },
+      { timedOut: true },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: timedOutStop.run,
+      platform: "linux",
+      commandTimeoutMs: configuredCommandTimeoutMs,
+    }).stopAndAwaitAbsent(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+    expect(timedOutStop.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([7, 100]);
+
+    const timedOutReset = runQueue([
+      { code: 0, stdout: systemdText(value, "failed") },
+      { code: 0, stdout: "stopped" },
+      { timedOut: true },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: timedOutReset.run,
+      platform: "linux",
+      commandTimeoutMs: configuredCommandTimeoutMs,
+    }).stopAndAwaitAbsent(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+    expect(timedOutReset.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([7, 100, 100]);
+
+    const deadlineBoundStop = runQueue([
+      { code: 0, stdout: systemdText(value, "active", 12) },
+      { timedOut: true },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: deadlineBoundStop.run,
+      platform: "linux",
+      commandTimeoutMs: configuredCommandTimeoutMs,
+      now: () => 0,
+    }).stopAndAwaitAbsent(value, { deadline: 50 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+    expect(deadlineBoundStop.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([7, 50]);
+  });
+
   it("keeps default polling monotonic across wall-clock jumps", async () => {
     const value = spec("systemd-user", root(), { stopTimeoutMs: 3 });
     const runner = runQueue([

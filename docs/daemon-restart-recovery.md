@@ -31,6 +31,52 @@ crashed or wedged process is not silently replaced in the background.
 If launchd reports a spawned service that has crashed, run `lcm doctor` and
 `lcm daemon restart`; do not manually kill or boot out the job.
 
+On macOS, launchd can briefly retain a service label after reporting that exact
+job is absent. If the next exact bootstrap returns launchd's numeric code 5
+(input/output error), LCM enters a bounded label-release check. Before every
+retry it confirms the exact label absent, waits up to the two-second settle
+interval as capped by the remaining internal `spawnTimeoutMs` deadline, and
+confirms the label absent again. If launchd repeats code 5, LCM may repeat that
+authenticated check only while the same monotonic `spawnTimeoutMs` lifecycle
+deadline has budget. For terminal-job recreation, that deadline is established
+before manager stop and label settling and is carried into the replacement
+start, so recovery cannot silently reset the lifecycle budget. This handles
+label release that takes more than one settle interval without turning other
+failures into generic retries.
+
+`spawnTimeoutMs` is an internal lifecycle budget. It establishes the absolute
+deadline for one lifecycle operation, including owned failed-admission manager
+cleanup; each manager command remains capped by the configured per-command
+limit (at most 60 seconds) and the deadline's remaining budget. It is not a
+user-facing configuration setting and cannot be
+changed in `config.json` or with `lcm config set`. The public
+`daemon.idleTimeoutMs` setting is separate: it controls normal idle daemon
+lifetime and does not change manager-command deadlines.
+
+During that code-5 recovery only, a transient malformed metadata observation
+does not authorize bootstrap. LCM may wait briefly and observe the exact label
+again within the same deadline, but it still requires both exact absence proofs
+before retrying. Malformed metadata that persists to the deadline ends with the
+bounded `malformed-state` reason.
+
+After a successful launchd bootstrap, the exact label can also briefly expose a
+metadata-malformed projection while its registration settles. LCM re-observes
+that projection read-only at the existing bounded poll interval and deadline;
+it never treats malformed metadata as success or as authority for a manager
+mutation. Only a later authenticated running observation admits the start. A
+persisting projection ends with the bounded `malformed-state` reason. This
+launchd-only settling exception does not change systemd's separate authenticated
+activation fence; other systemd and launchd observations remain fail closed.
+
+The numeric result is used because launchd's accompanying human text varies by
+macOS version. Permission failures remain permission failures even if they use
+code 5. A timeout, transport failure, registered label, permission error, other
+ambiguous manager response, malformed response outside the active code-5
+recovery or bounded post-start launchd settling, other command result, or code 5
+that lasts to the deadline stops with a bounded failure classification. LCM
+never includes raw manager output, plist paths, or credentials in that error,
+and it never falls back to manual process signaling.
+
 Use these commands for normal operation:
 
 ```bash
