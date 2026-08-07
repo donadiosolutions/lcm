@@ -522,6 +522,33 @@ describe("supervisor coverage: manager states and lifecycle boundaries", () => {
     await expect(rejected.probe(value)).resolves.toMatchObject({ kind: "unavailable" });
   });
 
+  it("keeps a systemd result code 5 as a generic command failure", async () => {
+    const value = spec("systemd-user");
+    const runner = runQueue([
+      { code: 1, stderr: `Unit ${value.systemdUnit} is not-found` },
+      { code: 5, stderr: "systemd-run failed" },
+      { code: 1, stderr: `Unit ${value.systemdUnit} is not-found` },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "command",
+    });
+  });
+
+  it("preserves permission evidence from the post-start manager probe", async () => {
+    const value = spec("systemd-user");
+    const runner = runQueue([
+      { code: 1, stderr: `Unit ${value.systemdUnit} is not-found` },
+      { code: 0, stdout: "started" },
+      { code: 1, stderr: "Operation not permitted" },
+      { code: 1, stderr: `Unit ${value.systemdUnit} is not-found` },
+    ]);
+    await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "permission",
+    });
+  });
+
   it("covers activation metadata fences and the monotonic start deadline", async () => {
     const rejectAfterPoll = async (value: SupervisorSpec, after: string): Promise<void> => {
       const runner = runQueue([

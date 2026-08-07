@@ -2388,7 +2388,7 @@ export function createSupervisor(
       if (result.timedOut) throw commandFailedError("timeout");
       if (result.code !== 0) {
         if (isPermissionFailure(result)) throw commandFailedError("permission");
-        if (result.code === 5) throw commandFailedError("label-release-deadline");
+        if (kind === "launchd-user" && result.code === 5) throw commandFailedError("label-release-deadline");
         if (result.code === null || result.code === 127) throw commandFailedError("transport");
         throw commandFailedError();
       }
@@ -2406,11 +2406,13 @@ export function createSupervisor(
         ),
       );
       let after: SupervisorObservation = Object.freeze({ kind: "absent", name: spec.name });
+      let afterPermissionFailure = false;
       const now = dependencies.now ?? performance.now.bind(performance);
       const pollDeadline = now() + (dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
       for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
         const capture: SupervisorProbeCapture = {};
         after = await probeInternal(spec, capture);
+        afterPermissionFailure ||= capture.permissionFailure === true;
         const activation = isOwnedSystemdActivation(spec, capture, expectedLaunchEnvironmentDigest);
         if (after.kind !== "absent" && !activation) break;
         if (attempt + 1 < maxPollIntervals) {
@@ -2427,6 +2429,7 @@ export function createSupervisor(
       // A successful manager mutation that is still absent, terminal, stale,
       // colliding, unavailable, or ambiguous is not an authenticated running
       // daemon; preserve exact evidence for caller.
+      if (afterPermissionFailure) throw commandFailedError("permission");
       throw commandFailedError(observationFailureClass(after));
     } catch (error) {
       // Never clean a concurrent winner. Only remove this nonce's private
