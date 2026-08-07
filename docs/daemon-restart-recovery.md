@@ -36,9 +36,10 @@ job is absent. If the next exact bootstrap returns launchd's numeric code 5
 (input/output error), LCM enters a bounded label-release check. Before every
 retry it confirms the exact label absent, waits the fixed two-second settle
 interval, and confirms the label absent again. If launchd repeats code 5, LCM
-may repeat that authenticated check only while the original five-second command
-deadline has budget. This handles label release that takes more than one settle
-interval without turning other failures into generic retries.
+may repeat that authenticated check only while the configured manager-command
+deadline established for the original bootstrap attempt has budget. This
+handles label release that takes more than one settle interval without turning
+other failures into generic retries.
 
 The numeric result is used because launchd's accompanying human text varies by
 macOS version. Permission failures remain permission failures even if they use
