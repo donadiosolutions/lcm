@@ -114,7 +114,7 @@ jobs:
             -f target_url="$RUN_URL" >/dev/null
 
       # The evaluator and policy must come from the workflow revision, never
-      # from the untrusted pull-request head whose files they classify.
+      # from the untrusted pull-request head whose admission evidence they evaluate.
       - name: Check out trusted admission evaluator
         if: ${{ (github.event_name == 'repository_dispatch' && github.event.action == 'external-admission-reconcile' && github.event.client_payload.head_sha != '') || github.event.action == 'completed' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
