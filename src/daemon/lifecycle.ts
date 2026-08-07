@@ -2085,8 +2085,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       ))
     ) return;
     const stages: Array<() => void | Promise<void>> = [];
-    if (managedOperationOwned && !managedOperationAmbiguous) {
-      let managerAbsenceProven = false;
+    const managerAbsenceRequired = managedOperationOwned && !managedOperationAmbiguous;
+    let managerAbsenceProven = !managerAbsenceRequired;
+    if (managerAbsenceRequired) {
       stages.push(
         async () => {
           await managedSupervisorForCleanup!.stopAndAwaitAbsent(
@@ -2109,6 +2110,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       }
       stages.push(
         () => {
+          if (!managerAbsenceProven) return;
           const currentPid = readOwnedPid();
           if (
             managedOperationManagerPid === undefined
@@ -2119,6 +2121,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       );
       if (scopedState !== undefined) {
         stages.push(() => {
+          if (!managerAbsenceProven) return;
           assertScopedStateAccess(scopedState!);
           rmSync(tokenPath, { force: true });
           assertScopedStateAccess(scopedState!);
@@ -2126,14 +2129,15 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       }
     }
     if (testScope !== undefined) {
-      stages.push(...[
-        testScope.runtimeDir,
-        testScope.credentialDir,
-        testScope.stateDir,
-      ].map((path) => () => {
+      stages.push(...[testScope.runtimeDir, testScope.credentialDir].map((path) => () => {
         assertLifecycleScopeOwnsCurrentCleanupRoot(testScope!, path);
         rmSync(path, { recursive: true, force: true });
       }));
+      stages.push(() => {
+        if (!managerAbsenceProven) return;
+        assertLifecycleScopeOwnsCurrentCleanupRoot(testScope!, testScope.stateDir);
+        rmSync(testScope.stateDir, { recursive: true, force: true });
+      });
     }
     await runCleanupStages(stages);
   }
@@ -3390,9 +3394,12 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       admittedSpec?: SupervisorSpec,
       restarted = false,
     ): Promise<RestartDaemonResult> => {
+      const remainingSpawnTimeoutMs = Math.max(0, verificationDeadline - monotonicNow());
       const ensured = await ensure({
         ...ensureOptions,
+        spawnTimeoutMs: remainingSpawnTimeoutMs,
         expectedEntrypoint,
+        _monotonicNowOverride: monotonicNow,
         _suppressDetachedFallback: true,
         _managedOperationAuthorized: true,
         ...(managerPid === undefined ? {} : { _managedOperationManagerPid: managerPid }),

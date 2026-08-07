@@ -1637,6 +1637,7 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       fetch: sequenceFetch([new Error("offline")]),
       sleep: async () => { now = 1_000; },
     });
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
     fixture.probe
       .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
       .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
@@ -1668,6 +1669,8 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       credentialDirectory,
       credentialFiles: [{ name: "OPENAI_API_KEY", path: credentialFile }],
     }), { deadline: 100 });
+    expect(readFileSync(fixture.pidPath, "utf8").trim()).toBe("4242");
+    expect(existsSync(fixture.tokenPath)).toBe(true);
     expect(existsSync(credentialDirectory)).toBe(true);
     expect(readdirSync(credentialDirectory)).toEqual(["OPENAI_API_KEY"]);
     expect(readFileSync(credentialFile, "utf8")).toBe("staged-secret");

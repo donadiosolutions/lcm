@@ -1125,9 +1125,19 @@ describe("managed restart refusal and repair coverage", () => {
       health(200, { entrypoint: "/expected", runtimeDigest: "b".repeat(64) }),
     );
     const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: false }));
-    const repaired = await restart({ ...baseOptions(dir), spawnTimeoutMs: 120_000, enforceUserManagerParent: true, expectedVersion: "2.0.0", expectedEntrypoint: "/expected", expectedRuntimeDigest: "b".repeat(64), spawnCommand: process.execPath, spawnArgs: ["/lcm", "daemon", "start", "--foreground"], _supervisorOverride: managed.supervisor, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: fetch, _ensureDaemonOverride: ensureMock });
+    let monotonicNow = 0;
+    const clock = (): number => monotonicNow;
+    managed.stopAndStart.mockImplementationOnce(async () => {
+      monotonicNow = 30_000;
+      return { kind: "systemd-user", managerPid: 200 };
+    });
+    const repaired = await restart({ ...baseOptions(dir), spawnTimeoutMs: 120_000, enforceUserManagerParent: true, expectedVersion: "2.0.0", expectedEntrypoint: "/expected", expectedRuntimeDigest: "b".repeat(64), spawnCommand: process.execPath, spawnArgs: ["/lcm", "daemon", "start", "--foreground"], _supervisorOverride: managed.supervisor, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: fetch, _ensureDaemonOverride: ensureMock, _monotonicNowOverride: clock });
     expect(repaired.restarted).toBe(true);
     expect(managed.stopAndStart).toHaveBeenCalledWith(expect.anything(), { deadline: 120_000 });
+    expect(ensureMock).toHaveBeenCalledWith(expect.objectContaining({
+      spawnTimeoutMs: 90_000,
+      _monotonicNowOverride: clock,
+    }));
 
     const changed = managedSupervisor((spec, call) => call === 1
       ? { kind: "registered-running-valid", managerPid: 200, scopeDigest: spec.scopeDigest, nonce: spec.nonce, name: spec.name }
