@@ -350,6 +350,8 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
       _monotonicNowOverride: () => 0,
     }))).resolves.toMatchObject({ spawned: true, startMethod: "systemd-user" });
     expect(operationDeadline).toBe(120_000);
+    expect(fixture.probe).toHaveBeenNthCalledWith(1, expect.anything(), { deadline: 120_000 });
+    expect(fixture.probe).toHaveBeenNthCalledWith(2, expect.anything(), { deadline: 120_000 });
   });
 
   it("anchors ensure admission to canonical state rather than caller cwd", async () => {

@@ -1017,7 +1017,10 @@ describe("managed restart refusal and repair coverage", () => {
     const result = await restart({ ...baseOptions(dir), expectedEntrypoint: undefined, _packagedEntrypointOverride: "/packaged-lcm", enforceUserManagerParent: true, _supervisorOverride: managed.supervisor, _ensureDaemonOverride: ensureMock });
     expect(result).toMatchObject({ restarted: true, connected: true });
     expect(stopAndStart).toHaveBeenCalledOnce();
-    expect(managed.probe).toHaveBeenCalledWith(expect.objectContaining({ entrypoint: "/packaged-lcm" }));
+    expect(managed.probe).toHaveBeenCalledWith(
+      expect.objectContaining({ entrypoint: "/packaged-lcm" }),
+      { deadline: 100 },
+    );
     expect(ensureMock).toHaveBeenCalledOnce();
     expect(ensureMock).toHaveBeenCalledWith(expect.objectContaining({ expectedEntrypoint: "/packaged-lcm" }));
 
@@ -1122,9 +1125,9 @@ describe("managed restart refusal and repair coverage", () => {
       health(200, { entrypoint: "/expected", runtimeDigest: "b".repeat(64) }),
     );
     const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: false }));
-    const repaired = await restart({ ...baseOptions(dir), enforceUserManagerParent: true, expectedVersion: "2.0.0", expectedEntrypoint: "/expected", expectedRuntimeDigest: "b".repeat(64), spawnCommand: process.execPath, spawnArgs: ["/lcm", "daemon", "start", "--foreground"], _supervisorOverride: managed.supervisor, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: fetch, _ensureDaemonOverride: ensureMock });
+    const repaired = await restart({ ...baseOptions(dir), spawnTimeoutMs: 120_000, enforceUserManagerParent: true, expectedVersion: "2.0.0", expectedEntrypoint: "/expected", expectedRuntimeDigest: "b".repeat(64), spawnCommand: process.execPath, spawnArgs: ["/lcm", "daemon", "start", "--foreground"], _supervisorOverride: managed.supervisor, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: fetch, _ensureDaemonOverride: ensureMock });
     expect(repaired.restarted).toBe(true);
-    expect(managed.stopAndStart).toHaveBeenCalledOnce();
+    expect(managed.stopAndStart).toHaveBeenCalledWith(expect.anything(), { deadline: 120_000 });
 
     const changed = managedSupervisor((spec, call) => call === 1
       ? { kind: "registered-running-valid", managerPid: 200, scopeDigest: spec.scopeDigest, nonce: spec.nonce, name: spec.name }

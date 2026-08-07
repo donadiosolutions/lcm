@@ -2145,7 +2145,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     let requestedSpec = spec;
     let observation: SupervisorObservation;
     try {
-      observation = await supervisor.probe(spec);
+      observation = await supervisor.probe(spec, { deadline });
     } catch {
       return refusalResult(
         "ambiguous",
@@ -2168,7 +2168,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       const observedSpec = observedSupervisorSpec(spec, observation);
       if (observedSpec !== undefined) {
         try {
-          const observed = await supervisor.probe(observedSpec);
+          const observed = await supervisor.probe(observedSpec, { deadline });
           if (
             observed.kind === "registered-running-valid"
             || (
@@ -2310,7 +2310,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       ) {
         let startupProbe: SupervisorObservation;
         try {
-          startupProbe = await supervisor.probe(requestedSpec);
+          startupProbe = await supervisor.probe(requestedSpec, { deadline });
         } catch {
           managedOperationAmbiguous = true;
           return refusalResult(
@@ -2337,7 +2337,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       if (healthObservation.kind === "no-response") {
         let finalStartupProbe: SupervisorObservation;
         try {
-          finalStartupProbe = await supervisor.probe(requestedSpec);
+          finalStartupProbe = await supervisor.probe(requestedSpec, { deadline });
         } catch {
           managedOperationAmbiguous = true;
           return refusalResult(
@@ -2364,7 +2364,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     if (healthObservation.kind === "no-response") {
       let secondProbe: SupervisorObservation;
       try {
-        secondProbe = await supervisor.probe(requestedSpec);
+        secondProbe = await supervisor.probe(requestedSpec, { deadline });
       } catch {
         return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed after the no-response observation", { pid: observation.managerPid });
       }
@@ -2395,7 +2395,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const health = healthObservation.parsedBody;
     let secondProbe: SupervisorObservation;
     try {
-      secondProbe = await supervisor.probe(requestedSpec);
+      secondProbe = await supervisor.probe(requestedSpec, { deadline });
     } catch {
       managedOperationAmbiguous = true;
       return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed before endpoint admission", { pid: observation.managerPid });
@@ -2432,7 +2432,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     }
     let finalProbe: SupervisorObservation;
     try {
-      finalProbe = await supervisor.probe(requestedSpec);
+      finalProbe = await supervisor.probe(requestedSpec, { deadline });
     } catch {
       managedOperationAmbiguous = true;
       return refusalResult("ambiguous", "managed daemon supervisor could not be re-probed after authenticated admission", { pid: observation.managerPid });
@@ -2481,9 +2481,9 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       return refusalResult("startup-failure", "managed daemon credentials could not be prepared", { spawned: false });
     }
     managedOperationOwned = true;
+    const managerOperation = { deadline };
     let started: { managerPid?: number };
     try {
-      const managerOperation = { deadline };
       started = recreateRegisteredJob
         ? await supervisor.stopAndStart(launchSpec, managerOperation)
         : await supervisor.start(launchSpec, managerOperation);
@@ -2497,7 +2497,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     }
     let second: SupervisorObservation;
     try {
-      second = await supervisor.probe(launchSpec);
+      second = await supervisor.probe(launchSpec, managerOperation);
     } catch {
       // A post-start re-probe is part of the ownership proof.  If it cannot
       // settle, the manager mutation may have raced a concurrent winner; do
@@ -2564,7 +2564,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
             if (authenticated !== null) {
               let finalProbe: SupervisorObservation;
               try {
-                finalProbe = await supervisor.probe(launchSpec);
+                finalProbe = await supervisor.probe(launchSpec, managerOperation);
               } catch {
                 managedOperationOwned = false;
                 managedOperationAmbiguous = true;
@@ -3361,7 +3361,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     try {
       // Probe before any PID read, health request, signal, or start. Only an
       // allowlisted preflight-unavailable result may fall through before mutation.
-      observation = await supervisor.probe(spec);
+      observation = await supervisor.probe(spec, { deadline: verificationDeadline });
     } catch {
       return restartRefusal("ambiguous", "managed daemon supervisor probe failed; inspect the manager and retry");
     }
@@ -3415,7 +3415,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       // live launch evidence, so no cleanup satisfies its own refusal.
       let admitted = false;
       try {
-        const started = await supervisor.stopAndStart(staged.spec);
+        const started = await supervisor.stopAndStart(staged.spec, { deadline: verificationDeadline });
         const ensured = await ensureAfterManagerOperation(started.managerPid, staged.spec, true);
         admitted = ensured.connected === true;
         return ensured;
@@ -3465,7 +3465,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     const secondProbeMatches = async (): Promise<boolean> => {
       let second: SupervisorObservation;
       try {
-        second = await supervisor.probe(spec);
+        second = await supervisor.probe(spec, { deadline: verificationDeadline });
       } catch {
         return false;
       }

@@ -222,9 +222,11 @@ export interface SupervisorStartResult {
 /**
  * Optional caller-owned bounds for one manager operation.
  *
- * The deadline is an absolute timestamp from the supervisor's monotonic clock
- * (`SupervisorDependencies.now`).  Omitting it preserves the supervisor's
- * existing per-operation command timeout behavior for direct callers.
+ * Configured per-command timeouts apply by default. The optional deadline is
+ * an absolute timestamp from the supervisor's monotonic clock
+ * (`SupervisorDependencies.now`) that further caps every command in one
+ * operation. Omitting it preserves the configured per-command behavior for
+ * direct callers.
  */
 export interface SupervisorOperationOptions {
   readonly deadline?: number;
@@ -271,7 +273,7 @@ export interface SupervisorDependencies {
 
 /** Public supervisor operations. */
 export interface Supervisor {
-  readonly probe: (spec: SupervisorSpec) => Promise<SupervisorObservation>;
+  readonly probe: (spec: SupervisorSpec, options?: SupervisorOperationOptions) => Promise<SupervisorObservation>;
   readonly start: (spec: SupervisorSpec, options?: SupervisorOperationOptions) => Promise<SupervisorStartResult>;
   readonly stopAndStart: (spec: SupervisorSpec, options?: SupervisorOperationOptions) => Promise<SupervisorStartResult>;
   readonly stopAndAwaitAbsent: (spec: SupervisorSpec, options?: SupervisorOperationOptions) => Promise<void>;
@@ -2296,7 +2298,14 @@ export function createSupervisor(
     return classified;
   };
 
-  const probe = (spec: SupervisorSpec): Promise<SupervisorObservation> => probeInternal(spec);
+  const probe = (
+    spec: SupervisorSpec,
+    options?: SupervisorOperationOptions,
+  ): Promise<SupervisorObservation> => probeWithinOperation(
+    spec,
+    undefined,
+    resolveOperationDeadline(options),
+  );
 
   const probeWithinOperation = (
     spec: SupervisorSpec,
