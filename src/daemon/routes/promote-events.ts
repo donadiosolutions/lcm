@@ -178,7 +178,10 @@ async function withLockedCwdPromotion<T>(
       sidecarPath = eventsDbPath(validateCwd(cwd));
     } catch (error) {
       if (!isMissingCwdError(error)) throw error;
-      sidecarPath = eventsDbPath(cwd);
+      // Preserve the same absolute lexical normalization used for an existing
+      // cwd without requiring the missing path to become stat-able. Sidecar
+      // identity must never depend on unresolved `..` or trailing separators.
+      sidecarPath = eventsDbPath(validateCwd(cwd, { allowMissing: true }));
     }
   }
 

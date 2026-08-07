@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   scrub: vi.fn((text: string) => text),
   identity: vi.fn(() => ({ id: "pid", canonical: "/cwd" })),
   openOutbox: vi.fn(),
+  eventsPath: vi.fn(() => "/events.db"),
 }));
 const missingCwdError = vi.hoisted(() => new Error("missing cwd"));
 
@@ -44,7 +45,7 @@ vi.mock("../../../src/hooks/events-db.js", () => ({
     close = mocks.closeEvents;
   },
 }));
-vi.mock("../../../src/db/events-path.js", () => ({ eventsDbPath: () => "/events.db" }));
+vi.mock("../../../src/db/events-path.js", () => ({ eventsDbPath: mocks.eventsPath }));
 vi.mock("../../../src/promotion/dedup.js", () => ({ deduplicateAndInsert: mocks.dedup }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({
@@ -135,6 +136,7 @@ describe("promote-events unit boundaries", () => {
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
     mocks.identity.mockReturnValue({ id: "pid", canonical: "/cwd" });
+    mocks.eventsPath.mockReturnValue("/events.db");
     mocks.closeProject.mockResolvedValue(undefined);
     mocks.closeFactory.mockResolvedValue(undefined);
     mocks.closeEvents.mockImplementation(() => undefined);
@@ -384,6 +386,22 @@ describe("promote-events unit boundaries", () => {
       expect(mocks.mark).not.toHaveBeenCalled();
     },
   );
+
+  it("normalizes an equivalent missing cwd before deriving its sidecar path", async () => {
+    const lexical = "/workspace/child/../missing/";
+    mocks.validate.mockImplementation((cwd: string, options?: { allowMissing?: boolean }) => {
+      if (options?.allowMissing) return "/workspace/missing";
+      if (cwd === lexical) throw missingCwdError;
+      return cwd;
+    });
+
+    await expect(promoteEventsForCwd(config, lexical)).resolves.toMatchObject({
+      deferred: { kind: "awaiting-confirmation", observations: 1 },
+    });
+    expect(mocks.eventsPath).toHaveBeenCalledOnce();
+    expect(mocks.eventsPath).toHaveBeenCalledWith("/workspace/missing");
+    expect(mocks.observeMissingCwd).toHaveBeenCalledOnce();
+  });
 
   it.each(["EACCES", "EPERM"] as const)(
     "fails closed when cwd revalidation changes to %s after lock acquisition",

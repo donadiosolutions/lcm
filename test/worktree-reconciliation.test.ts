@@ -3599,6 +3599,9 @@ describe("worktree reconciliation", () => {
     { label: "fractional timestamp", state: [1, 0.5, null] },
     { label: "negative timestamp", state: [1, -1, null] },
     { label: "non-text parked timestamp", state: [3, 600_000, 42] },
+    { label: "non-date parked timestamp", state: [3, 600_000, "not-a-timestamp"] },
+    { label: "timezone-suffixed parked timestamp", state: [3, 600_000, "2026-08-06T12:00:00Z"] },
+    { label: "fractional parked timestamp", state: [3, 600_000, "2026-08-06 12:00:00.000"] },
   ] as const)("fails closed on $label in schema-v5 missing-CWD state", ({ state }) => {
     const fixture = makeEventsReconciliation(home);
     makeVersionedEvents(fixture.sourceEvents);

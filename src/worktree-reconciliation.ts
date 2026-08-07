@@ -481,6 +481,17 @@ type ReconciliableMissingCwdState = {
   readonly parkedAt: string | null;
 };
 
+function isCanonicalSqliteUtcTimestamp(
+  db: DatabaseSync,
+  value: unknown,
+): value is string {
+  if (typeof value !== "string") return false;
+  const normalized = db.prepare("SELECT datetime(?) AS value").get(value) as {
+    value: string | null;
+  };
+  return normalized.value === value;
+}
+
 function readReconciliableMissingCwdState(
   db: DatabaseSync,
   schemaVersion: number,
@@ -506,7 +517,7 @@ function readReconciliableMissingCwdState(
     || typeof state.last_observed_at !== "number"
     || !Number.isSafeInteger(state.last_observed_at)
     || state.last_observed_at < 0
-    || (state.parked_at !== null && typeof state.parked_at !== "string")
+    || (state.parked_at !== null && !isCanonicalSqliteUtcTimestamp(db, state.parked_at))
   ) {
     throw new Error(`${side} events schema v5 has invalid missing-CWD state`);
   }
