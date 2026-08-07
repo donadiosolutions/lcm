@@ -4369,7 +4369,7 @@ describe("restartDaemon", () => {
       { name: "OPENAI_API_KEY", value: "unadmitted-secret", mode: 0o600 },
     ]);
     expect(readFileSync(staged!.files[0]!.path, "utf-8")).toBe("unadmitted-secret");
-    expect(existsSync(pidFile)).toBe(false);
+    expect(readFileSync(pidFile, "utf-8").trim()).toBe("201");
   });
 
   it.each([

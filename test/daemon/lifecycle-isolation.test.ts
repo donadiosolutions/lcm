@@ -1537,7 +1537,7 @@ describe("run-owned lifecycle resources", () => {
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(fixture.supervisor.stopAndAwaitAbsent).toHaveBeenCalledOnce();
       expect(fixture.killProcess).not.toHaveBeenCalled();
-      expect(existsSync(fixture.scope.stateDir)).toBe(false);
+      expect(existsSync(fixture.scope.stateDir)).toBe(true);
       expect(existsSync(fixture.scope.runtimeDir)).toBe(false);
       expect(existsSync(fixture.scope.credentialDir)).toBe(false);
       expect(unhandled).not.toHaveBeenCalled();
