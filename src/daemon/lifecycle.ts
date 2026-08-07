@@ -2089,7 +2089,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       let managerAbsenceProven = false;
       stages.push(
         async () => {
-          await managedSupervisorForCleanup!.stopAndAwaitAbsent(managedSpecForCleanup!);
+          await managedSupervisorForCleanup!.stopAndAwaitAbsent(
+            managedSpecForCleanup!,
+            { deadline },
+          );
           managerAbsenceProven = true;
         },
       );
@@ -3356,6 +3359,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
           commandTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
           stopTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
           sleep: dependencies.sleep,
+          now: monotonicNow,
         });
     let observation: SupervisorObservation;
     try {

@@ -45,9 +45,10 @@ label release that takes more than one settle interval without turning other
 failures into generic retries.
 
 `spawnTimeoutMs` is an internal lifecycle budget. It establishes the absolute
-deadline for one supervisor operation; each manager command remains capped by
-the configured per-command limit (at most 60 seconds) and the deadline's
-remaining budget. It is not a user-facing configuration setting and cannot be
+deadline for one lifecycle operation, including owned failed-admission manager
+cleanup; each manager command remains capped by the configured per-command
+limit (at most 60 seconds) and the deadline's remaining budget. It is not a
+user-facing configuration setting and cannot be
 changed in `config.json` or with `lcm config set`. The public
 `daemon.idleTimeoutMs` setting is separate: it controls normal idle daemon
 lifetime and does not change manager-command deadlines.
