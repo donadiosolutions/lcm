@@ -56,7 +56,7 @@
     "@sinclair/typebox": "0.34.51",
     "body-parser": "2.3.0",
     "commander": "15.0.0",
-    "fast-uri": "3.1.4",
+    "fast-uri": "3.1.5",
     "js-yaml": "5.2.2",
     "safe-regex": "2.1.1"
   },
