@@ -2348,8 +2348,8 @@ export function createSupervisor(
           capture,
           Math.min(configuredCommandTimeoutMs, remaining),
         );
-        if (observed.kind === "absent") return;
         if (capture.permissionFailure === true) throw commandFailedError("permission");
+        if (observed.kind === "absent") return;
         if (observed.kind !== "ambiguous" || observed.reason !== "metadata-malformed") {
           throw commandFailedError(observationFailureClass(observed));
         }

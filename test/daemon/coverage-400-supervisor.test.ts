@@ -1341,6 +1341,39 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
 
+  it.each([
+    { name: "before the label-release settle", proofs: 1, expectedSleeps: [] as number[][] },
+    { name: "after the label-release settle", proofs: 2, expectedSleeps: [[2_000]] },
+  ])("keeps mixed-channel permission evidence authoritative $name", async ({ proofs, expectedSleeps }) => {
+    const value = spec("launchd-user", root());
+    const absent = { code: 113, stderr: "Could not find service" };
+    const mixedPermission = {
+      code: 113,
+      stdout: "Could not find service",
+      stderr: "Operation not permitted",
+    };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      ...(proofs === 2 ? [absent] : []),
+      mixedPermission,
+      mixedPermission,
+    ]);
+    const sleep = vi.fn(async () => undefined);
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "permission",
+    });
+    expect(sleep.mock.calls).toEqual(expectedSleeps);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
   it("does not retry a launchd bootstrap after its absence deadline expires", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
