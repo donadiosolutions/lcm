@@ -1,4 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { load as loadYaml } from "js-yaml";
 import { describe, expect, it } from "vitest";
 
@@ -37,6 +40,7 @@ const policySource = readFileSync(
   "utf8",
 );
 const evaluator = readFileSync(new URL(".github/scripts/external-admission.sh", root), "utf8");
+const evaluatorPath = new URL(".github/scripts/external-admission.sh", root).pathname;
 const documentation = readFileSync(new URL("docs/external-admission.md", root), "utf8");
 const workflowDocumentation = readFileSync(new URL("WORKFLOW.md", root), "utf8");
 const copilotInstructions = readFileSync(
@@ -49,6 +53,131 @@ const evaluatorInvocation =
   job.steps.find((step) => step.name === "Evaluate external admission snapshot")?.run ?? "";
 const completedOrReconcile =
   "${{ (github.event_name == 'repository_dispatch' && github.event.action == 'external-admission-reconcile' && github.event.client_payload.head_sha != '') || github.event.action == 'completed' }}";
+
+function runWithFailingAdmissionCommand(
+  command: "gh" | "node" | "validator-jq" | "eligibility-jq" | "checks-ready-jq" | "ci-ready-jq" | "malformed-eligibility" | "valid-ineligible",
+) {
+  const directory = mkdtempSync(join(tmpdir(), "external-admission-"));
+  const ghPath = join(directory, "gh");
+  const jqPath = join(directory, "jq");
+  const nodePath = join(directory, "node");
+  const jqCallLogPath = join(directory, "jq-calls.log");
+  const statusLogPath = join(directory, "statuses.log");
+  const headSha = "a".repeat(40);
+
+  try {
+    writeFileSync(ghPath, `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"/statuses/"* ]]; then
+  printf '%s\\n' "$*" >> "$STATUS_LOG"
+  exit 0
+fi
+if [[ "$*" == *"/commits/"*"/pulls?per_page=100"* ]]; then
+  printf '%s\\n' '[{"number":123,"state":"open","draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+  exit 0
+fi
+if [[ "$*" == *"/pulls/123"* ]]; then
+  if [[ "$FAIL_ADMISSION_COMMAND" == malformed-eligibility ]]; then
+    printf '%s\\n' '{malformed'
+    exit 0
+  fi
+  if [[ "$FAIL_ADMISSION_COMMAND" == valid-ineligible ]]; then
+    printf '%s\\n' '{"state":"closed","draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+    exit 0
+  fi
+  printf '%s\\n' '{"state":"open","draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+  exit 0
+fi
+if [[ "$*" == *"check-runs?filter=latest&per_page=100"* ]]; then
+  if [[ "$FAIL_ADMISSION_COMMAND" == gh ]]; then
+    exit 70
+  fi
+  printf '%s\\n' '[]'
+  exit 0
+fi
+if [[ "$*" == *"/actions/runs/3"* ]]; then
+  printf '%s\\n' '{}'
+  exit 0
+fi
+exit 99
+`);
+    chmodSync(ghPath, 0o755);
+    if (command === "node") {
+      writeFileSync(nodePath, "#!/usr/bin/env bash\nexit 71\n");
+      chmodSync(nodePath, 0o755);
+    }
+    if (["validator-jq", "checks-ready-jq", "ci-ready-jq"].includes(command)) {
+      writeFileSync(nodePath, `#!/usr/bin/env bash
+if [[ "$2" == "evaluate-checks" ]]; then
+  printf '%s\\n' '{"states":[],"ready":true,"ciCheckRunId":"1","dcoCheckRunId":"2","ciRunId":"3"}'
+  exit 0
+fi
+if [[ "$2" == "evaluate-ci-run" ]]; then
+  printf '%s\\n' '{"state":"completed","ready":true}'
+  exit 0
+fi
+exit 99
+`);
+      chmodSync(nodePath, 0o755);
+    }
+    if (["validator-jq", "eligibility-jq", "checks-ready-jq", "ci-ready-jq"].includes(command)) {
+      writeFileSync(jqPath, `#!/usr/bin/env bash
+set -euo pipefail
+call_count=0
+if [[ -f "$JQ_CALL_LOG" ]]; then
+  read -r call_count < "$JQ_CALL_LOG"
+fi
+call_count=$((call_count + 1))
+printf '%s\\n' "$call_count" > "$JQ_CALL_LOG"
+if [[ "$FAIL_ADMISSION_COMMAND" == eligibility-jq && "$call_count" == 3 ]]; then
+  exit 73
+fi
+if [[ "$FAIL_ADMISSION_COMMAND" == validator-jq && "$call_count" -ge 4 ]]; then
+  exit 72
+fi
+if [[ "$FAIL_ADMISSION_COMMAND" == checks-ready-jq && "$call_count" == 6 ]]; then
+  exit 74
+fi
+if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$call_count" == 11 ]]; then
+  exit 75
+fi
+case "$call_count" in
+  1) cat ;;
+  2) printf '%s\\n' 123 ;;
+  3|6|11) printf '%s\\n' true ;;
+  4) printf '%s\\n' '[]' ;;
+  5|10) printf '%s\\n' '' ;;
+  7) printf '%s\\n' 1 ;;
+  8) printf '%s\\n' 2 ;;
+  9) printf '%s\\n' 3 ;;
+  *) exit 99 ;;
+esac
+`);
+      chmodSync(jqPath, 0o755);
+    }
+    writeFileSync(statusLogPath, "");
+
+    const result = spawnSync("bash", [evaluatorPath], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        EVENT_HEAD_SHA: headSha,
+        EVENT_SOURCE: "repository_dispatch",
+        EVENT_WORKFLOW_RUN_ID: "",
+        FAIL_ADMISSION_COMMAND: command,
+        JQ_CALL_LOG: jqCallLogPath,
+        PATH: `${directory}:${process.env.PATH ?? ""}`,
+        REPOSITORY: "example/repository",
+        RUN_URL: "https://example.test/run/1",
+        SERVER_URL: "https://example.test",
+        STATUS_LOG: statusLogPath,
+      },
+    });
+    return { result, statuses: readFileSync(statusLogPath, "utf8") };
+  } finally {
+    rmSync(directory, { force: true, recursive: true });
+  }
+}
 
 describe("external admission workflow", () => {
   it("uses DCO, trusted CI, and default-branch reconciliation with least privilege", () => {
@@ -170,9 +299,9 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("commits/$HEAD_SHA/pulls?per_page=100");
     expect(evaluator).toContain("check-runs?filter=latest&per_page=100");
     expect(evaluator).not.toContain("/files?per_page=100");
-    const initial = evaluator.indexOf('validate_or_exit "Initial"');
-    const current = evaluator.indexOf('validate_or_exit "Current"');
-    const final = evaluator.indexOf('validate_or_exit "Final"');
+    const initial = evaluator.indexOf('validate_required_snapshot "Initial"');
+    const current = evaluator.indexOf('validate_required_snapshot "Current"');
+    const final = evaluator.indexOf('validate_required_snapshot "Final"');
     const success = evaluator.indexOf('post_admission_status success "CI and DCO passed"');
     expect(initial).toBeGreaterThan(evaluator.indexOf('matching_prs="$(fetch_associated_pull_requests)"'));
     expect(current).toBeGreaterThan(evaluator.indexOf('current_matching_prs="$(fetch_associated_pull_requests)"'));
@@ -184,14 +313,82 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-ci-run");
     expect(evaluator).toContain('if [[ "$EVENT_SOURCE" == workflow_run');
     expect(evaluator).toContain('printf -v "$fingerprint_variable" \'%s\' "$ci_check_run_id:$dco_check_run_id:$ci_run_id"');
-    expect(evaluator).toContain('validate_or_exit "Initial" initial_admission_fingerprint');
-    expect(evaluator).toContain('validate_or_exit "Current" current_admission_fingerprint');
-    expect(evaluator).toContain('validate_or_exit "Final" final_admission_fingerprint');
+    expect(evaluator).toContain('validate_required_snapshot "Initial" initial_admission_fingerprint');
+    expect(evaluator).toContain('validate_required_snapshot "Current" current_admission_fingerprint');
+    expect(evaluator).toContain('validate_required_snapshot "Final" final_admission_fingerprint');
     expect(evaluator.match(/admission_fingerprint" != "\$initial_admission_fingerprint/gu)).toHaveLength(2);
     expect(evaluator).not.toContain('VALIDATED_ADMISSION_FINGERPRINT');
     expect(evaluator).not.toContain("classify-files");
     expect(evaluator).not.toContain("select-admission");
     expect(evaluator).not.toContain("admission-decision");
+  });
+
+  it("runs each validator as a simple command and fails closed on evaluator and eligibility errors", () => {
+    expect(evaluator).not.toContain("validate_or_exit");
+    for (const phase of ["Initial", "Current", "Final"]) {
+      expect(evaluator).toMatch(new RegExp(
+        `^validate_required_snapshot "${phase}" [a-z_]+$`,
+        "mu",
+      ));
+      expect(evaluator).not.toMatch(new RegExp(
+        `(?:if|!|&&|\\|\\|)[^\\n]*validate_required_snapshot "${phase}"`,
+        "u",
+      ));
+    }
+    expect(evaluator).toContain('check_states="$(jq -c \'.states\' <<<"$evaluation")"');
+    expect(evaluator).toContain('checks_ready="$(jq -r \'.ready\' <<<"$evaluation")"');
+    expect(evaluator).toContain('ci_state="$(jq -r \'.state\' <<<"$ci_evaluation")"');
+    expect(evaluator).toContain('ci_ready="$(jq -r \'.ready\' <<<"$ci_evaluation")"');
+    expect(evaluator).not.toContain('if [[ "$(jq -r \'.ready\'');
+
+    expect(evaluator).not.toContain("pull_request_is_eligible");
+    for (const variable of [
+      "pull_request_eligible",
+      "current_pull_request_eligible",
+      "final_pull_request_eligible",
+    ]) {
+      expect(evaluator).toContain(`${variable}="$(pull_request_eligibility <<<"$`);
+      expect(evaluator).toContain(`if [[ "$${variable}" != true ]]; then`);
+    }
+
+    for (const command of [
+      "gh",
+      "node",
+      "validator-jq",
+      "eligibility-jq",
+      "checks-ready-jq",
+      "ci-ready-jq",
+      "malformed-eligibility",
+      "valid-ineligible",
+    ] as const) {
+      const { result, statuses } = runWithFailingAdmissionCommand(command);
+      if (command === "valid-ineligible") expect(result.status).toBe(0);
+      else if (command === "malformed-eligibility") expect(result.status).not.toBe(0);
+      else expect(result.status).toBe({
+        gh: 70,
+        node: 71,
+        "validator-jq": 72,
+        "eligibility-jq": 73,
+        "checks-ready-jq": 74,
+        "ci-ready-jq": 75,
+      }[command]);
+      if (command === "valid-ineligible") {
+        expect(result.stdout).toContain("admission remains pending");
+      } else {
+        expect(result.stdout).not.toContain("admission remains pending");
+      }
+      if (command === "eligibility-jq" || command === "malformed-eligibility") {
+        expect(statuses).not.toContain("state=pending");
+      } else {
+        expect(statuses).toContain("state=pending");
+      }
+      if (command === "checks-ready-jq" || command === "ci-ready-jq") {
+        expect(statuses.match(/state=pending/gu)).toHaveLength(1);
+      }
+      if (command === "valid-ineligible") expect(statuses).not.toContain("state=failure");
+      else expect(statuses).toContain("state=failure");
+      expect(statuses).not.toContain("state=success");
+    }
   });
 
   it("preserves fail-closed cancellation, failure, and stale-success handling", () => {
@@ -202,15 +399,17 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("External admission failed; inspect the workflow run");
     expect(evaluator).toContain('post_admission_status pending "Waiting for trusted CI and DCO"');
     const pendingWrite = evaluator.indexOf('if ! post_admission_status pending "$1"; then');
-    const pendingFailure = evaluator.indexOf("return 2", pendingWrite);
+    const pendingFailure = evaluator.indexOf("exit 1", pendingWrite);
     const pendingMessage = evaluator.indexOf('echo "$2"', pendingWrite);
-    const pendingExit = evaluator.indexOf("return 1", pendingMessage);
+    const pendingExit = evaluator.indexOf("exit 0", pendingMessage);
     expect(pendingWrite).toBeGreaterThan(-1);
     expect(pendingFailure).toBeGreaterThan(pendingWrite);
     expect(pendingMessage).toBeGreaterThan(pendingFailure);
     expect(pendingExit).toBeGreaterThan(pendingMessage);
-    expect(evaluator).toContain('snapshot_incomplete "$@" || result=$?');
-    expect(evaluator).not.toMatch(/snapshot_incomplete[\s\S]{0,240}\|\| true/gu);
+    expect(evaluator).toContain("exit_pending() {");
+    expect(evaluator).toContain('if ! post_admission_status pending "$1"; then');
+    expect(evaluator).not.toContain("snapshot_incomplete");
+    expect(evaluator).not.toMatch(/exit_pending[\s\S]{0,240}\|\| true/gu);
     expect(evaluator).not.toContain("artifacts");
     expect(evaluator).not.toContain("caches");
   });

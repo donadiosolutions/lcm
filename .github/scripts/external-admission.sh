@@ -18,13 +18,15 @@ resolve_eligible_pr_number() {
   '
 }
 
-pull_request_is_eligible() {
-  jq -e --arg sha "$HEAD_SHA" '
-    .state == "open" and
-    .draft == false and
-    .base.ref == "main" and
-    .head.sha == $sha
-  ' >/dev/null
+pull_request_eligibility() {
+  jq -r --arg sha "$HEAD_SHA" '
+    if (
+      .state == "open" and
+      .draft == false and
+      .base.ref == "main" and
+      .head.sha == $sha
+    ) then "true" else "false" end
+  '
 }
 
 post_admission_status() {
@@ -90,46 +92,49 @@ trap admission_failed EXIT
 trap 'admission_cancelled INT 130' INT
 trap 'admission_cancelled TERM 143' TERM
 
-snapshot_incomplete() {
+exit_pending() {
   if ! post_admission_status pending "$1"; then
     echo "Failed to publish pending external admission status." >&2
-    return 2
+    exit 1
   fi
   echo "$2"
-  return 1
+  trap - EXIT INT TERM
+  exit 0
 }
 
 validate_required_snapshot() {
   local phase="$1"
   local fingerprint_variable="$2"
-  local check_run_pages evaluation terminal_failure ci_check_run_id dco_check_run_id ci_run_id
+  local check_run_pages evaluation check_states terminal_failure checks_ready ci_check_run_id dco_check_run_id ci_run_id
   local ci_run ci_evaluation
-  local ci_terminal_failure
+  local ci_terminal_failure ci_ready ci_state
 
   check_run_pages="$(gh api --paginate --slurp \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?filter=latest&per_page=100")"
   evaluation="$(evaluate_check_runs <<<"$check_run_pages")"
-  echo "$phase check states: $(jq -c '.states' <<<"$evaluation")"
+  check_states="$(jq -c '.states' <<<"$evaluation")"
+  echo "$phase check states: $check_states"
 
   terminal_failure="$(jq -r '.terminalFailure // empty' <<<"$evaluation")"
   if [[ -n "$terminal_failure" ]]; then
     echo "$phase required check reported an invalid or terminal state: $terminal_failure" >&2
     return 2
   fi
-  if [[ "$(jq -r '.ready' <<<"$evaluation")" != true ]]; then
-    snapshot_incomplete \
+  checks_ready="$(jq -r '.ready' <<<"$evaluation")"
+  if [[ "$checks_ready" != true ]]; then
+    exit_pending \
       "Waiting for trusted CI and DCO" \
-      "$phase required checks are incomplete; admission remains pending." || return $?
+      "$phase required checks are incomplete; admission remains pending."
   fi
 
   ci_check_run_id="$(jq -r '.ciCheckRunId' <<<"$evaluation")"
   dco_check_run_id="$(jq -r '.dcoCheckRunId' <<<"$evaluation")"
   ci_run_id="$(jq -r '.ciRunId' <<<"$evaluation")"
   if [[ "$EVENT_SOURCE" == workflow_run && "$EVENT_WORKFLOW_RUN_ID" != "$ci_run_id" ]]; then
-    snapshot_incomplete \
+    exit_pending \
       "Completed CI event does not match the latest aggregate check" \
-      "$phase CI event run $EVENT_WORKFLOW_RUN_ID does not match latest run $ci_run_id; admission remains pending." || return $?
+      "$phase CI event run $EVENT_WORKFLOW_RUN_ID does not match latest run $ci_run_id; admission remains pending."
   fi
 
   ci_run="$(gh api \
@@ -141,38 +146,16 @@ validate_required_snapshot() {
     echo "$phase CI run $ci_run_id is not a successful canonical pull-request run: $ci_terminal_failure" >&2
     return 2
   fi
-  if [[ "$(jq -r '.ready' <<<"$ci_evaluation")" != true ]]; then
-    snapshot_incomplete \
+  ci_ready="$(jq -r '.ready' <<<"$ci_evaluation")"
+  if [[ "$ci_ready" != true ]]; then
+    ci_state="$(jq -r '.state' <<<"$ci_evaluation")"
+    exit_pending \
       "Backing CI workflow is not terminally successful" \
-      "$phase CI workflow run is $(jq -r '.state' <<<"$ci_evaluation"); admission remains pending." || return $?
+      "$phase CI workflow run is $ci_state; admission remains pending."
   fi
 
   printf -v "$fingerprint_variable" '%s' "$ci_check_run_id:$dco_check_run_id:$ci_run_id"
   return 0
-}
-
-validate_or_exit() {
-  local phase="$1"
-  local fingerprint_variable="$2"
-  local result=0
-  validate_required_snapshot "$phase" "$fingerprint_variable" || result=$?
-  if (( result == 1 )); then
-    trap - EXIT INT TERM
-    exit 0
-  fi
-  if (( result != 0 )); then
-    exit 1
-  fi
-}
-
-snapshot_incomplete_or_exit() {
-  local result=0
-  snapshot_incomplete "$@" || result=$?
-  if (( result == 1 )); then
-    trap - EXIT INT TERM
-    exit 0
-  fi
-  return "$result"
 }
 
 matching_prs="$(fetch_associated_pull_requests)"
@@ -184,41 +167,43 @@ if [[ -z "$PR_NUMBER" ]]; then
 fi
 
 pull_request="$(fetch_pull_request "$PR_NUMBER")"
-if ! pull_request_is_eligible <<<"$pull_request"; then
-  echo "Pull request is no longer an eligible main-branch admission candidate; admission remains pending."
-  trap - EXIT INT TERM
-  exit 0
+pull_request_eligible="$(pull_request_eligibility <<<"$pull_request")"
+if [[ "$pull_request_eligible" != true ]]; then
+  exit_pending \
+    "Pull request is no longer eligible for admission" \
+    "Pull request is no longer an eligible main-branch admission candidate; admission remains pending."
 fi
 
 post_admission_status pending "Waiting for trusted CI and DCO"
 initial_admission_fingerprint=""
-validate_or_exit "Initial" initial_admission_fingerprint
+validate_required_snapshot "Initial" initial_admission_fingerprint
 
 current_matching_prs="$(fetch_associated_pull_requests)"
 current_pr_number="$(resolve_eligible_pr_number <<<"$current_matching_prs")"
 if [[ "$current_pr_number" != "$PR_NUMBER" ]]; then
-  snapshot_incomplete_or_exit \
+  exit_pending \
     "Pull request is no longer uniquely eligible for admission" \
     "Pull request eligibility changed during evaluation; admission remains pending."
 fi
 current_pull_request="$(fetch_pull_request "$current_pr_number")"
-if ! pull_request_is_eligible <<<"$current_pull_request"; then
-  snapshot_incomplete_or_exit \
+current_pull_request_eligible="$(pull_request_eligibility <<<"$current_pull_request")"
+if [[ "$current_pull_request_eligible" != true ]]; then
+  exit_pending \
     "Pull request is no longer eligible for admission" \
     "Pull request eligibility changed during evaluation; admission remains pending."
 fi
 current_admission_fingerprint=""
-validate_or_exit "Current" current_admission_fingerprint
+validate_required_snapshot "Current" current_admission_fingerprint
 if [[ "$current_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
-  snapshot_incomplete_or_exit \
+  exit_pending \
     "Latest trusted check changed during admission" \
     "Trusted CI or DCO check changed during evaluation; admission remains pending."
 fi
 
 final_admission_fingerprint=""
-validate_or_exit "Final" final_admission_fingerprint
+validate_required_snapshot "Final" final_admission_fingerprint
 if [[ "$final_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
-  snapshot_incomplete_or_exit \
+  exit_pending \
     "Latest trusted check changed during final validation" \
     "Final trusted CI or DCO check changed during evaluation; admission remains pending."
 fi
@@ -226,13 +211,14 @@ fi
 final_matching_prs="$(fetch_associated_pull_requests)"
 final_pr_number="$(resolve_eligible_pr_number <<<"$final_matching_prs")"
 if [[ "$final_pr_number" != "$PR_NUMBER" ]]; then
-  snapshot_incomplete_or_exit \
+  exit_pending \
     "Pull request is no longer uniquely eligible for admission" \
     "Final pull request association changed; admission remains pending."
 fi
 final_pull_request="$(fetch_pull_request "$final_pr_number")"
-if ! pull_request_is_eligible <<<"$final_pull_request"; then
-  snapshot_incomplete_or_exit \
+final_pull_request_eligible="$(pull_request_eligibility <<<"$final_pull_request")"
+if [[ "$final_pull_request_eligible" != true ]]; then
+  exit_pending \
     "Pull request is no longer eligible for admission" \
     "Final pull request eligibility changed; admission remains pending."
 fi
