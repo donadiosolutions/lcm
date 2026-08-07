@@ -55,6 +55,8 @@ const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const CACHE_RECONCILIATION_TIMEOUT_MS = 10_000;
+// Full-suite child-process contention can exceed Vitest's 5-second default.
+const FULL_SUITE_PROCESS_TEST_TIMEOUT_MS = 15_000;
 
 function git(cwd: string, ...args: string[]): void {
   execFileSync("git", args, { cwd, stdio: "ignore" });
@@ -4174,7 +4176,7 @@ describe("worktree reconciliation", () => {
       "SELECT COUNT(*) AS count FROM session_ingest_log WHERE session_id = 'late-write'",
     ).get()).toEqual({ count: 0 });
     evidence.close();
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("commits the source fence before making the target marker durable", () => {
     const { main, linked } = makeRepository(home);
@@ -4224,7 +4226,7 @@ describe("worktree reconciliation", () => {
       "SELECT session_id FROM conversations WHERE session_id = 'commit-order'",
     ).get()).toEqual({ session_id: "commit-order" });
     merged.close();
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("fails closed while a legacy writer transaction is active and retries after quiescence", () => {
     const { main, linked } = makeRepository(home);
