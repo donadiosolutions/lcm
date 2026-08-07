@@ -1,9 +1,9 @@
 name: External admission
 
 on:
-  # Provider result events intentionally restart exact-SHA admission after a
-  # rerun, revoking stale success. Irrelevant events create skipped runs, but
-  # identity-qualified concurrency groups keep that noise from the evaluator.
+  # DCO result events intentionally restart exact-SHA admission after a rerun,
+  # revoking stale success. Irrelevant events create skipped runs, but the
+  # identity-qualified concurrency group keeps that noise from the evaluator.
   check_run:
     types:
       - created
@@ -51,10 +51,8 @@ concurrency:
         github.event.check_run.check_suite.head_branch != null &&
         github.event.check_run.check_suite.head_branch != '' &&
         !startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/') &&
-        ((github.event.check_run.name == 'Greptile Review' && github.event.check_run.app.id == 867647 &&
-          github.event.check_run.app.slug == 'greptile-apps') ||
         (github.event.check_run.name == 'DCO' && github.event.check_run.app.id == 1861 &&
-          github.event.check_run.app.slug == 'dco')) && github.event.check_run.head_sha ||
+          github.event.check_run.app.slug == 'dco') && github.event.check_run.head_sha ||
       github.event_name == 'check_run' &&
         format('check-run-{0}-{1}-{2}', github.event.check_run.head_sha,
           github.event.check_run.app.id, github.event.check_run.name)
@@ -66,8 +64,8 @@ jobs:
     name: external-admission-evaluator
     # CI wake-ups are limited to the canonical pull-request workflow. Push and
     # merge-group runs are owned by their native required checks and the
-    # permissionless external-admission-merge-group workflow. Provider results
-    # on GitHub's reserved queue refs must not create a legacy commit status.
+    # permissionless external-admission-merge-group workflow. DCO results on
+    # GitHub's reserved queue refs must not create a legacy commit status.
     if: >-
       (github.event_name == 'repository_dispatch' &&
         github.event.action == 'external-admission-reconcile' &&
@@ -81,10 +79,8 @@ jobs:
         github.event.check_run.check_suite.head_branch != null &&
         github.event.check_run.check_suite.head_branch != '' &&
         !startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/') &&
-        ((github.event.check_run.name == 'Greptile Review' && github.event.check_run.app.id == 867647 &&
-          github.event.check_run.app.slug == 'greptile-apps') ||
         (github.event.check_run.name == 'DCO' && github.event.check_run.app.id == 1861 &&
-          github.event.check_run.app.slug == 'dco')))
+          github.event.check_run.app.slug == 'dco'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -118,7 +114,7 @@ jobs:
             -f target_url="$RUN_URL" >/dev/null
 
       # The evaluator and policy must come from the workflow revision, never
-      # from the untrusted pull-request head whose files they classify.
+      # from the untrusted pull-request head whose admission evidence they evaluate.
       - name: Check out trusted admission evaluator
         if: ${{ (github.event_name == 'repository_dispatch' && github.event.action == 'external-admission-reconcile' && github.event.client_payload.head_sha != '') || github.event.action == 'completed' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -128,7 +124,6 @@ jobs:
           sparse-checkout: |
             .github/scripts/external-admission.sh
             .github/scripts/external-admission-policy.mjs
-            greptile.json
           sparse-checkout-cone-mode: false
 
       - name: Set up Node.js

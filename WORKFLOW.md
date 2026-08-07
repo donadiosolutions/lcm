@@ -14,7 +14,7 @@ This document is a living record. **Update it whenever you learn something:**
 
 **When to update:** At the end of every feature cycle (after the implementation PR merges), review this doc against what actually happened. If reality diverged from the doc, fix the doc — not reality.
 
-**How to update:** Create a `docs/TOPIC` branch, push, complete the Copilot review loop, and require a merge-ready Greptile report covering the exact current head. After every protected-branch check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`. Same flow as any other docs change.
+**How to update:** Create a `docs/TOPIC` branch, push, complete the Copilot review loop, and require every protected exact-head check to pass. Set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`. Same flow as any other docs change.
 
 ## Branch Strategy
 
@@ -36,83 +36,49 @@ maintenance and forward-port commits remaining ancestors of `main`. Routine
 administrator bypasses remain prohibited except for documented emergencies.
 
 The required `external-admission` status separates pull-request admission from
-merge-group validation for providers that do not report on synthetic queue
-commits. Authenticated provider `check_run` events and lifecycle events from the
+merge-group validation for DCO, which does not report on synthetic queue
+commits. Authenticated DCO `check_run` events and lifecycle events from the
 canonical `.github/workflows/ci.yml` workflow drive `external-admission.yml`;
-pull-request lifecycle events do not start this write-capable workflow. Provider
-and CI start or rerun events revoke stale admission and exit immediately. Their
-completion events evaluate one current exact-SHA snapshot and exit instead of
+pull-request lifecycle events do not start this write-capable workflow. DCO and
+CI start or rerun events revoke stale admission and exit immediately. Their
+completion events evaluate a current exact-SHA snapshot and exit instead of
 occupying a runner while polling. A default-branch
 `external-admission-reconcile` repository dispatch with the exact PR head SHA
-provides fail-closed reconciliation if an external event is delayed or lost;
-see the [external-admission recovery guide](docs/external-admission.md).
-The handler audits every paginated PR file record,
-including both `filename` and `previous_filename`, before selecting one of two
-admission paths. The flattened file records must exactly match the pull
-request's authoritative `changed_files` count, so GitHub's file-list cap or an
-incomplete page cannot silently produce a coverage-neutral classification. A
-change to any file under `bin/`, `installer/`, or `src/` (including shipped
-prompt and connector assets and PostgreSQL migrations); any `.mjs` file under
-`scripts/` at any depth; trust-sensitive automation under `.github/actions/`,
-`.github/codeql/`, `.github/workflows/`, or `.github/scripts/`; trusted root
-`greptile.json`; or key coverage/build configuration (`package.json`, the
-lockfile, Vitest config, or TypeScript config) normally requires authenticated
-`Greptile Review` and DCO successes on the PR's exact head SHA. A sensitive PR
-instead requires authenticated DCO and exact-head canonical CI only for
-authoritative same-repository Dependabot provenance: exact
-`dependabot[bot]` login, GitHub `Bot` type, a non-empty `dependabot/` head ref,
-equal head/base repository names, an explicit trusted-root `greptile.json`
-`excludeAuthors` match, and no current or previous `greptile.json` filename.
-Absent or malformed provenance fails closed. `github-actions[bot]`, including
-the `changeset-release/main` version PR, always requires Greptile for sensitive
-changes. The exclusion-policy file is non-bypassable and always requires
-Greptile plus DCO. Exclusion patterns are case-insensitive and support `*` and
-`?`; `[`, `]`, and `!` are literal. Tests, documentation, Changesets metadata,
-and other coverage-neutral diffs use the CI-backed path.
-Only `pull_request` runs of the canonical CI workflow
-can wake the evaluator; push and synthetic merge-group runs are rejected before
-a runner starts. Every CI-backed path resolves the check's Actions run and requires
-a successful terminal `pull_request` run of `.github/workflows/ci.yml` for the
-same repository and head SHA. An aggregate `ci` check may succeed while a
-trailing workflow job is still running, so documented transient run states
-remain pending until the next trusted CI or provider event; provenance
-mismatches and terminal non-success results fail.
-Every authenticated provider event with a valid commit SHA replaces any stale
-successful admission with `pending` before the PR-association lookup. This is
-necessary because GitHub may omit closed unmerged PRs from a commit's PR
-associations. The handler admits only one open, non-draft, main-targeting PR at
-the exact event SHA and repeats that validation immediately before publishing
-success, including fresh file classification, automation-author identity,
-check evaluation, and CI run validation; a closed, draft, ineligible,
-unassociated, or ambiguous commit remains
-pending. Commit-associated PRs, PR files, and check runs are all paginated and
-flattened before evaluation. The executable admission policy and root
-`greptile.json` are sparsely checked out from the trusted workflow revision
-with persisted credentials disabled; neither is loaded from the untrusted PR head. Although a
-`workflow_run` handler receives a write-capable token, this evaluator never
-downloads CI artifacts or caches and never checks out or executes PR-controlled
-content.
+provides fail-closed reconciliation if an event is delayed or lost; see the
+[external-admission recovery guide](docs/external-admission.md).
 
-Changes to the admission workflow or its policy are themselves trust-sensitive
-and therefore require Greptile after this policy is active. The PR that first
-introduces this policy cannot use code that is not yet present on the default
-branch to admit itself. A maintainer must use the documented one-time bootstrap
-or emergency bypass for that rollout, inspect the exact head and successful CI
-and DCO results manually, and then return to the normal no-bypass flow.
+Every eligible pull request requires authenticated DCO and exact-head canonical
+CI. Only `pull_request` runs of `.github/workflows/ci.yml` for the exact
+repository and head SHA can satisfy admission; push and synthetic merge-group
+runs are rejected before a runner starts. An aggregate `ci` check may succeed
+while a trailing workflow job is still running, so documented transient run
+states remain pending until the next trusted event. Provenance mismatches and
+terminal non-success results fail.
+
+Every valid event replaces stale successful admission with `pending` before
+checkout or PR association. The handler admits only one open, non-draft,
+main-targeting PR at the exact event SHA and repeats PR eligibility, latest
+authenticated CI and DCO evaluation, and CI-run provenance validation before
+success. Commit-associated PRs and check runs are paginated and flattened. The
+executable evaluator and policy are sparsely checked out from the trusted
+workflow revision with persisted credentials disabled. Although a
+`workflow_run` handler receives a write-capable token, it never downloads CI
+artifacts or caches and never checks out or executes PR-controlled content.
+
+The initial transition from the legacy review-provider policy required one
+documented maintainer bootstrap because the default-branch evaluator could not
+admit its own replacement. That exact head was manually required to pass CI,
+DCO, Socket, CodeQL, coverage, and review gates. Subsequent admission changes
+use the normal protected no-bypass flow.
 
 After PR-head admission, the separate
 `external-admission-merge-group.yml` workflow runs a permissionless Actions
 check named `external-admission` on each synthetic `merge_group` commit. It does
-not publish a commit status. This exception applies only to those two external
-providers, which cannot report on that commit: CI, both default CodeQL
-analyses, the security-extended CodeQL analysis, and both Socket checks still
-run against the synthetic commit before it may merge.
+not publish a commit status. This exception applies only to DCO, which cannot
+report on that commit: CI, both default CodeQL analyses, the security-extended
+CodeQL analysis, and both Socket checks still run against the synthetic commit
+before it may merge.
 
-Greptile is the authenticated review provider for coverable or trust-sensitive
-diffs from normal contributors and must report success on the exact PR head
-before external admission succeeds. Only authoritative same-repository
-Dependabot provenance explicitly matched by trusted `greptile.json` uses
-exact-head canonical CI plus DCO unless the diff changes that config.
 CodeRabbit reports remain informational and best-effort and are not encoded as
 an admission requirement.
 
@@ -136,7 +102,7 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | Workflow                             | Trigger                                                                              | Purpose                                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
-| `external-admission.yml`             | Authenticated Greptile/DCO checks, canonical PR CI lifecycle, default-branch exact-SHA repository dispatch | Statelessly require Greptile+DCO for sensitive diffs or trusted CI+DCO for neutral and authoritative same-repository Dependabot diffs |
+| `external-admission.yml`             | Authenticated DCO checks, canonical PR CI lifecycle, default-branch exact-SHA repository dispatch | Statelessly require exact-head canonical CI and DCO for every eligible pull request |
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
 | `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
 | `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
@@ -199,7 +165,7 @@ separate merge-group workflow supplies the required `external-admission` check.
 | Install behavior        | Auto-write files (match ByteRover (brv) UX)                    |
 | State tracking          | Filesystem scan (no state files)                               |
 | Release strategy        | Parallel tracks with separate PRs                              |
-| PR review               | Greptile report on the exact head; CodeRabbit is informational |
+| PR review               | Copilot review loop; CodeRabbit is informational               |
 
 ## Phase 1: Design (Opus, max effort)
 
@@ -219,7 +185,7 @@ separate merge-group workflow supplies the required `external-admission` check.
 4. Push and open PR
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
 6. Run review loop (see Copilot Review Loop below)
-7. Once the Copilot loop is complete (max 3 rounds — see Review Loop), Greptile reports the exact current head as merge-ready, and every protected-branch check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`.
+7. Once the Copilot loop is complete (max 3 rounds — see Review Loop) and every protected exact-head check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`.
 8. Confirm `gh pr view "${PR_NUMBER}" --repo donadiosolutions/lcm --json state --jq .state` reports `MERGED` before starting implementation. If the merge command or final state check fails, inspect `gh pr checks "${PR_NUMBER}" --repo donadiosolutions/lcm` and resolve the protected-branch failure without an administrator bypass.
 
 ## Phase 3: Implementation (Sonnet subagents)
@@ -243,7 +209,7 @@ separate merge-group workflow supplies the required `external-admission` check.
 1. Push implementation branch, open PR
 2. Request Copilot review (add to reviewers list)
 3. Run review loop (see below)
-4. Once the Copilot loop is complete, Greptile reports the exact current head as merge-ready, and every protected-branch check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`
+4. Once the Copilot loop is complete and every protected exact-head check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`
 5. Confirm the implementation PR reports `MERGED` before beginning post-merge validation or dependent work.
 
 ## Copilot Interaction
@@ -310,7 +276,7 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
    a. **Batch ALL fixes** into a single commit (do not fix-push-review one at a time)
    b. Push once
    c. Re-trigger review (DELETE + POST)
-5. **Max 3 rounds.** After round 3, stop the Copilot loop if only minor nits remain. Do not chase zero Copilot comments indefinitely; Greptile readiness on the exact current head is still required before merge.
+5. **Max 3 rounds.** After round 3, stop the Copilot loop if only minor nits remain. Do not chase zero Copilot comments indefinitely; all protected exact-head checks and actionable review threads are still required before merge.
 6. Review is "clean" when: 0 new comments, or only context-specific nits that Copilot can't understand (e.g., Agent conventions)
 
 ### Common Pitfalls
