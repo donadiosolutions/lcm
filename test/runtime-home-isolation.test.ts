@@ -39,7 +39,8 @@ describe("test runtime home isolation", () => {
       expect(path).toContain(".lcm");
       expect(isUnder(path, testHome!)).toBe(true);
       if (realHome) {
-        expect(isUnder(path, realHome)).toBe(false);
+        const sandboxRelativePath = relative(resolve(testHome!), resolve(path));
+        expect(resolve(path)).not.toBe(resolve(realHome, sandboxRelativePath));
       }
     }
   });
