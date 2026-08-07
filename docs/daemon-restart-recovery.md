@@ -32,7 +32,7 @@ If launchd reports a spawned service that has crashed, run `lcm doctor` and
 `lcm daemon restart`; do not manually kill or boot out the job.
 
 On macOS, launchd can briefly retain a service label after reporting that exact
-job absent. If the next exact bootstrap returns launchd's numeric code 5
+job is absent. If the next exact bootstrap returns launchd's numeric code 5
 (input/output error), LCM enters a bounded label-release check. Before every
 retry it confirms the exact label absent, waits the fixed two-second settle
 interval, and confirms the label absent again. If launchd repeats code 5, LCM
