@@ -1714,10 +1714,13 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     expect(existsSync(fixture.tokenPath)).toBe(true);
   });
 
-  it("preserves a post-start interruption when expired cleanup cannot prove manager absence", async () => {
+  it.each([
+    { platform: "linux" as const, startMethod: "systemd-user" as const },
+    { platform: "darwin" as const, startMethod: "launchd-user" as const },
+  ])("preserves a post-start $startMethod interruption when expired cleanup cannot prove manager absence", async ({ platform, startMethod }) => {
     let now = 0;
     const controller = new AbortController();
-    const fixture = createFixture({ fetch: sequenceFetch([new Error("offline")]) });
+    const fixture = createFixture({ platform, fetch: sequenceFetch([new Error("offline")]) });
     writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
     const cleanupMutation = vi.fn();
     fixture.probe
@@ -1749,7 +1752,7 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     }))).resolves.toMatchObject({
       connected: false,
       spawned: true,
-      startMethod: "systemd-user",
+      startMethod,
       warning: "daemon lifecycle was interrupted",
     });
 
