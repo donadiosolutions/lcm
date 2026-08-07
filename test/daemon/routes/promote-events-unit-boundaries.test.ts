@@ -1,7 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { EventRow, PatternReinforcementStats } from "../../../src/hooks/events-db.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
@@ -11,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   events: vi.fn(() => [] as EventRow[]),
   reinforcement: vi.fn((): PatternReinforcementStats => ({ totalCount: 0, distinctSessions: 0 })),
   mark: vi.fn(),
+  observeMissingCwd: vi.fn(() => ({ parked: false, observations: 1, retryAfterMs: 5 * 60 * 1000 })),
+  clearMissingCwd: vi.fn(),
   setPrev: vi.fn(),
   closeEvents: vi.fn(),
   collect: vi.fn(() => [] as unknown[]),
@@ -27,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   identity: vi.fn(() => ({ id: "pid", canonical: "/cwd" })),
   openOutbox: vi.fn(),
 }));
+const missingCwdError = vi.hoisted(() => new Error("missing cwd"));
 
 vi.mock("../../../src/hooks/events-db.js", () => ({
   EventsDb: class EventsDb {
@@ -38,6 +38,8 @@ vi.mock("../../../src/hooks/events-db.js", () => ({
     getUnprocessed = mocks.events;
     getPatternReinforcement = mocks.reinforcement;
     markProcessed = mocks.mark;
+    observeMissingCwd = mocks.observeMissingCwd;
+    clearMissingCwd = mocks.clearMissingCwd;
     setPrevEventId = mocks.setPrev;
     close = mocks.closeEvents;
   },
@@ -45,7 +47,10 @@ vi.mock("../../../src/hooks/events-db.js", () => ({
 vi.mock("../../../src/db/events-path.js", () => ({ eventsDbPath: () => "/events.db" }));
 vi.mock("../../../src/promotion/dedup.js", () => ({ deduplicateAndInsert: mocks.dedup }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
-vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
+vi.mock("../../../src/daemon/validate-cwd.js", () => ({
+  validateCwd: mocks.validate,
+  isMissingCwdError: (error: unknown) => error === missingCwdError,
+}));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDir: () => "/project",
   projectIdentity: mocks.identity,
@@ -118,6 +123,11 @@ describe("promote-events unit boundaries", () => {
     for (const mock of Object.values(mocks)) mock.mockClear();
     mocks.events.mockReturnValue([]);
     mocks.reinforcement.mockReturnValue({ totalCount: 0, distinctSessions: 0 });
+    mocks.observeMissingCwd.mockReturnValue({
+      parked: false,
+      observations: 1,
+      retryAfterMs: 5 * 60 * 1000,
+    });
     mocks.collect.mockReturnValue([]);
     mocks.openProject.mockResolvedValue(projectStorage());
     mocks.storeSearch.mockReturnValue([]);
@@ -341,29 +351,56 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.scrub).toHaveBeenCalledTimes(10_000);
   });
 
-  it("keeps capped unavailable-cwd parking nonterminal until an empty batch is observed", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "lcm-park-cap-test-"));
-    const sidecarPath = join(directory, "events.db");
-    writeFileSync(sidecarPath, "existing sidecar");
-    mocks.events.mockReturnValue([event({ event_id: 1 })]);
+  it("parks through durable sidecar state without consuming unprocessed rows", async () => {
+    mocks.observeMissingCwd.mockReturnValue({ parked: true, observations: 3, retryAfterMs: 0 });
+    mocks.validate.mockImplementation(() => { throw missingCwdError; });
 
-    try {
-      const result = await parkUnavailableCwdEvents("/missing", sidecarPath);
+    const result = await parkUnavailableCwdEvents("/missing", "/events.db");
 
-      expect(result).toMatchObject({
-        promoted: 0,
-        skipped: 10_000,
-        correlated: 0,
-        errors: 0,
-        incomplete: true,
-        message: "stopped after maximum parking batches before sidecar was observed empty",
-      });
-      expect(result.terminal).toBeUndefined();
-      expect(mocks.mark).toHaveBeenCalledTimes(10_000);
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
+    expect(result).toMatchObject({
+      promoted: 0,
+      skipped: 0,
+      correlated: 0,
+      errors: 0,
+      terminal: { kind: "parked", reason: "unavailable-cwd" },
+    });
+    expect(mocks.events).not.toHaveBeenCalled();
+    expect(mocks.mark).not.toHaveBeenCalled();
+    expect(mocks.observeMissingCwd).toHaveBeenCalledOnce();
   });
+
+  it.each(["EACCES", "EPERM"] as const)(
+    "fails closed on initial cwd %s without opening or mutating the sidecar",
+    async (code) => {
+      const failure = Object.assign(new Error(`${code}: cwd denied`), { code });
+      mocks.validate.mockImplementation(() => { throw failure; });
+
+      await expect(promoteEventsForCwd(config, "/denied-cwd"))
+        .rejects.toBe(failure);
+      expect(mocks.openOutbox).not.toHaveBeenCalled();
+      expect(mocks.observeMissingCwd).not.toHaveBeenCalled();
+      expect(mocks.clearMissingCwd).not.toHaveBeenCalled();
+      expect(mocks.events).not.toHaveBeenCalled();
+      expect(mocks.mark).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["EACCES", "EPERM"] as const)(
+    "fails closed when cwd revalidation changes to %s after lock acquisition",
+    async (code) => {
+      const failure = Object.assign(new Error(`${code}: cwd denied under lock`), { code });
+      mocks.validate
+        .mockReturnValueOnce("/cwd")
+        .mockImplementationOnce(() => { throw failure; });
+
+      await expect(promoteEventsForCwd(config, "/cwd"))
+        .rejects.toBe(failure);
+      expect(mocks.openOutbox).not.toHaveBeenCalled();
+      expect(mocks.observeMissingCwd).not.toHaveBeenCalled();
+      expect(mocks.clearMissingCwd).not.toHaveBeenCalled();
+      expect(mocks.mark).not.toHaveBeenCalled();
+    },
+  );
 
   it("covers correlation tiers, reinforcement, existing matches, defaults, and event errors", async () => {
     const events = [

@@ -64,6 +64,9 @@ const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9
 const MAX_DISCOVERY_ENTRIES = 50_000;
 const DEFAULT_SOURCE_BUSY_TIMEOUT_MS = 5_000;
 const RECONCILIATION_CACHE_TTL_MS = 1_000;
+// Reconciliation must be audited independently for every event schema. Do not
+// replace this ceiling with the live EventsDb schema version.
+const MAX_RECONCILIABLE_EVENT_SCHEMA_VERSION = 5;
 
 type ReconciledProcessCacheEntry = {
   readonly discoveryFingerprint: string;
@@ -470,6 +473,90 @@ function legacyEventsSchemaVersion(db: DatabaseSync): number {
     throw new Error(`legacy events database has invalid schema_version: ${String(value)}`);
   }
   return value;
+}
+
+type ReconciliableMissingCwdState = {
+  readonly observations: number;
+  readonly lastObservedAt: number;
+  readonly parkedAt: string | null;
+};
+
+function readReconciliableMissingCwdState(
+  db: DatabaseSync,
+  schemaVersion: number,
+  side: "source" | "target",
+): ReconciliableMissingCwdState | undefined {
+  if (schemaVersion < 5) return undefined;
+  if (!tableExists(db, "missing_cwd_state")) {
+    throw new Error(`${side} events schema v5 is missing missing_cwd_state`);
+  }
+  const stateRows = rows(
+    db,
+    "SELECT observations, last_observed_at, parked_at FROM missing_cwd_state",
+  );
+  if (stateRows.length === 0) return undefined;
+  if (stateRows.length !== 1) {
+    throw new Error(`${side} events schema v5 has conflicting missing-CWD state rows`);
+  }
+  const state = stateRows[0]!;
+  if (
+    typeof state.observations !== "number"
+    || !Number.isSafeInteger(state.observations)
+    || state.observations <= 0
+    || typeof state.last_observed_at !== "number"
+    || !Number.isSafeInteger(state.last_observed_at)
+    || state.last_observed_at < 0
+    || (state.parked_at !== null && typeof state.parked_at !== "string")
+  ) {
+    throw new Error(`${side} events schema v5 has invalid missing-CWD state`);
+  }
+  return {
+    observations: state.observations,
+    lastObservedAt: state.last_observed_at,
+    parkedAt: state.parked_at,
+  };
+}
+
+/**
+ * Merge copied sidecar evidence as an idempotent join, never as a sum.
+ * Stronger observation count and recency win independently; parking is
+ * monotonic and retains the earliest timestamp at which any copy parked.
+ * SQLite datetime('now') emits fixed-width UTC `YYYY-MM-DD HH:MM:SS`, so
+ * lexicographic ordering is chronological for every parked_at value produced
+ * by EventsDb. Reconciliation preserves that canonical representation.
+ */
+function mergeMissingCwdState(
+  source: DatabaseSync,
+  target: DatabaseSync,
+  sourceSchemaVersion: number,
+  targetSchemaVersion: number,
+): void {
+  const sourceState = readReconciliableMissingCwdState(
+    source,
+    sourceSchemaVersion,
+    "source",
+  );
+  if (!sourceState) return;
+  const targetState = readReconciliableMissingCwdState(
+    target,
+    targetSchemaVersion,
+    "target",
+  );
+  const parkedAt = [targetState?.parkedAt, sourceState.parkedAt]
+    .filter((value): value is string => value !== null && value !== undefined)
+    .sort()[0] ?? null;
+  target.prepare(`
+    INSERT INTO missing_cwd_state(id, observations, last_observed_at, parked_at)
+    VALUES(1, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      observations = excluded.observations,
+      last_observed_at = excluded.last_observed_at,
+      parked_at = excluded.parked_at
+  `).run(
+    Math.max(targetState?.observations ?? 0, sourceState.observations),
+    Math.max(targetState?.lastObservedAt ?? 0, sourceState.lastObservedAt),
+    parkedAt,
+  );
 }
 
 function comparable(value: unknown): string {
@@ -1052,6 +1139,7 @@ function mergeEventsDatabase(
   targetPath: string,
   sourceHash: string,
   busyTimeoutMs: number,
+  afterTargetMigration: () => void,
   afterSourceFenceCommit?: () => void,
 ): void {
   withSourceWriteFence(sourcePath, sourceHash, "events", busyTimeoutMs, (
@@ -1060,8 +1148,17 @@ function mergeEventsDatabase(
   ) => {
     const migratedTarget = new EventsDb(targetPath);
     migratedTarget.close();
+    // Deterministic audit seam between live-schema migration and the
+    // independently versioned reconciliation admission check.
+    afterTargetMigration();
     const target = getLcmConnection(targetPath);
     try {
+      const targetSchemaVersion = legacyEventsSchemaVersion(target);
+      if (targetSchemaVersion > MAX_RECONCILIABLE_EVENT_SCHEMA_VERSION) {
+        throw new Error(
+          `unsupported target events database schema: ${String(targetSchemaVersion)}`,
+        );
+      }
       target.exec(`
         CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
           source_hash TEXT PRIMARY KEY,
@@ -1083,7 +1180,7 @@ function mergeEventsDatabase(
           return;
         }
         const sourceSchemaVersion = legacyEventsSchemaVersion(source);
-        if (sourceSchemaVersion > 4) {
+        if (sourceSchemaVersion > MAX_RECONCILIABLE_EVENT_SCHEMA_VERSION) {
           throw new Error(
             `unsupported legacy events database schema: ${String(sourceSchemaVersion)}`,
           );
@@ -1380,6 +1477,12 @@ function mergeEventsDatabase(
             if (!existing) insertRow(target, "error_log", value);
           }
         }
+        mergeMissingCwdState(
+          source,
+          target,
+          sourceSchemaVersion,
+          targetSchemaVersion,
+        );
         target
           .prepare("INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)")
           .run(sourceHash);
@@ -2058,6 +2161,7 @@ export function reconcileWorktrees(
               targetEventsPath,
               source.hash,
               sourceBusyTimeoutMs,
+              () => opts._observer?.("after-target-events-migration", source),
               () => opts._observer?.(
                 "after-source-fence-commit-before-target-commit",
                 source,

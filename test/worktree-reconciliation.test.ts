@@ -1,4 +1,4 @@
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -519,6 +519,58 @@ function makeEventsReconciliation(root: string): {
     targetEvents: join(root, ".lcm", "events", `${targetHash}.db`),
     sourceEvents: join(root, ".lcm", "events", `${sourceHash}.db`),
   };
+}
+
+function setMissingCwdState(
+  path: string,
+  observations: number,
+  lastObservedAt: number,
+  parkedAt: string | null,
+): void {
+  const db = new DatabaseSync(path);
+  db.prepare(`
+    INSERT INTO missing_cwd_state(id, observations, last_observed_at, parked_at)
+    VALUES(1, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      observations = excluded.observations,
+      last_observed_at = excluded.last_observed_at,
+      parked_at = excluded.parked_at
+  `).run(observations, lastObservedAt, parkedAt);
+  db.close();
+}
+
+function missingCwdState(path: string): unknown {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    return db.prepare(`
+      SELECT observations, last_observed_at, parked_at
+      FROM missing_cwd_state WHERE id = 1
+    `).get();
+  } finally {
+    db.close();
+  }
+}
+
+function replaceMissingCwdStateWithUncheckedRows(
+  path: string,
+  states: ReadonlyArray<readonly [SQLInputValue, SQLInputValue, SQLInputValue]>,
+): void {
+  const db = new DatabaseSync(path);
+  db.exec(`
+    DROP TABLE missing_cwd_state;
+    CREATE TABLE missing_cwd_state(
+      id,
+      observations,
+      last_observed_at,
+      parked_at
+    );
+  `);
+  const insert = db.prepare(`
+    INSERT INTO missing_cwd_state(id, observations, last_observed_at, parked_at)
+    VALUES(?, ?, ?, ?)
+  `);
+  states.forEach((state, index) => insert.run(index + 1, ...state));
+  db.close();
 }
 
 function makeSeparatelyMigratedLegacyCopies(
@@ -2707,7 +2759,7 @@ describe("worktree reconciliation", () => {
   });
 
   it.each([1, 2])(
-    "does not collapse arbitrary v4 rows at event version %i that only share a UUID",
+    "does not collapse arbitrary versioned rows at event version %i that only share a UUID",
     (eventVersion) => {
       const fixture = makeEventsReconciliation(home);
       makeVersionedEvents(fixture.targetEvents, {
@@ -3423,11 +3475,137 @@ describe("worktree reconciliation", () => {
     const fixture = makeEventsReconciliation(home);
     makeVersionedEvents(fixture.sourceEvents);
     const source = new DatabaseSync(fixture.sourceEvents);
-    source.exec("UPDATE schema_version SET version = 5");
+    source.exec("UPDATE schema_version SET version = 6");
     source.close();
 
     expect(() => reconcileWorktrees(fixture.main)).toThrow(
-      "unsupported legacy events database schema: 5",
+      "unsupported legacy events database schema: 6",
+    );
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it("rejects a target event schema above the separately audited v5 ceiling", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.targetEvents);
+    makeVersionedEvents(fixture.sourceEvents);
+    let raisedTargetVersion = false;
+
+    expect(() => reconcileWorktrees(fixture.main, {
+      _observer: (event) => {
+        if (event !== "after-target-events-migration" || raisedTargetVersion) return;
+        raisedTargetVersion = true;
+        const target = new DatabaseSync(fixture.targetEvents);
+        target.exec("UPDATE schema_version SET version = 6");
+        target.close();
+      },
+    })).toThrow("unsupported target events database schema: 6");
+    expect(raisedTargetVersion).toBe(true);
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it("merges schema-v5 missing-CWD evidence before retiring the source", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.targetEvents);
+    makeVersionedEvents(fixture.sourceEvents);
+    setMissingCwdState(fixture.sourceEvents, 2, 1_200_000, null);
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    expect(missingCwdState(fixture.targetEvents)).toEqual({
+      observations: 2,
+      last_observed_at: 1_200_000,
+      parked_at: null,
+    });
+    expect(statSync(fixture.sourceEvents).isDirectory()).toBe(true);
+  });
+
+  it("converges copied missing-CWD evidence idempotently without adding observations", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.targetEvents);
+    makeVersionedEvents(fixture.sourceEvents);
+    setMissingCwdState(fixture.targetEvents, 2, 1_200_000, null);
+    setMissingCwdState(fixture.sourceEvents, 2, 1_200_000, null);
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    expect(missingCwdState(fixture.targetEvents)).toEqual({
+      observations: 2,
+      last_observed_at: 1_200_000,
+      parked_at: null,
+    });
+    expect(reconcileWorktrees(fixture.main).status).toBe("completed");
+    expect(missingCwdState(fixture.targetEvents)).toEqual({
+      observations: 2,
+      last_observed_at: 1_200_000,
+      parked_at: null,
+    });
+  });
+
+  it("resolves divergent missing-CWD checkpoints with a deterministic monotonic join", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.targetEvents);
+    makeVersionedEvents(fixture.sourceEvents);
+    setMissingCwdState(
+      fixture.targetEvents,
+      3,
+      1_200_000,
+      "2026-08-06 12:05:00",
+    );
+    setMissingCwdState(
+      fixture.sourceEvents,
+      3,
+      2_400_000,
+      "2026-08-06 12:00:00",
+    );
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    expect(missingCwdState(fixture.targetEvents)).toEqual({
+      observations: 3,
+      last_observed_at: 2_400_000,
+      parked_at: "2026-08-06 12:00:00",
+    });
+  });
+
+  it("fails closed when a schema-v5 source omits durable missing-CWD state storage", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.sourceEvents);
+    const source = new DatabaseSync(fixture.sourceEvents);
+    source.exec("DROP TABLE missing_cwd_state");
+    source.close();
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "source events schema v5 is missing missing_cwd_state",
+    );
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it("fails closed on conflicting schema-v5 missing-CWD state rows", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.sourceEvents);
+    replaceMissingCwdStateWithUncheckedRows(fixture.sourceEvents, [
+      [1, 0, null],
+      [2, 300_000, null],
+    ]);
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "source events schema v5 has conflicting missing-CWD state rows",
+    );
+    expect(existsSync(fixture.sourceEvents)).toBe(true);
+  });
+
+  it.each([
+    { label: "non-numeric observations", state: ["one", 0, null] },
+    { label: "fractional observations", state: [1.5, 0, null] },
+    { label: "non-positive observations", state: [0, 0, null] },
+    { label: "non-numeric timestamp", state: [1, "now", null] },
+    { label: "fractional timestamp", state: [1, 0.5, null] },
+    { label: "negative timestamp", state: [1, -1, null] },
+    { label: "non-text parked timestamp", state: [3, 600_000, 42] },
+  ] as const)("fails closed on $label in schema-v5 missing-CWD state", ({ state }) => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.sourceEvents);
+    replaceMissingCwdStateWithUncheckedRows(fixture.sourceEvents, [state]);
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "source events schema v5 has invalid missing-CWD state",
     );
     expect(existsSync(fixture.sourceEvents)).toBe(true);
   });

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -311,36 +311,9 @@ describe("promote-events route", () => {
     });
   });
 
-  it("restarts missing-cwd evidence when the confirming observation exceeds its total window", async () => {
-    const deletedCwd = join(dir, "expired-confirmation-project");
-    mkdirSync(deletedCwd);
-    const edb = new EventsDb(sidecarPath);
-    edb.insertEvent("s1", { type: "decision", category: "decision", data: "do not park after a stale confirmation", priority: 1 }, "PostToolUse");
-    edb.close();
-    rmSync(deletedCwd, { recursive: true, force: true });
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
-
-    await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
-      deferred: { observations: 1 },
-    });
-    vi.advanceTimersByTime(20 * 60 * 1000);
-    await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
-      deferred: { observations: 2 },
-    });
-    vi.advanceTimersByTime(20 * 60 * 1000);
-    await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
-      deferred: { observations: 1 },
-    });
-
-    const pending = new EventsDb(sidecarPath);
-    expect(pending.getUnprocessed()).toHaveLength(1);
-    pending.close();
-    expect(vi.mocked(deduplicateAndInsert)).not.toHaveBeenCalled();
-  });
-
-  it("parks events only after stable missing-cwd evidence without deleting historical or delivery rows", async () => {
-    const deletedCwd = join(dir, "deleted-project");
+  it("converges across sparse sweeps, parks reversibly, and resumes after cwd recovery", async () => {
+    const deletedCwd = join(dir, "durable-deleted-project");
+    const intervalMs = 5 * 60 * 1000;
     mkdirSync(deletedCwd);
     const edb = new EventsDb(sidecarPath);
     edb.insertEvent("s1", { type: "decision", category: "decision", data: "retain this event", priority: 1 }, "PostToolUse");
@@ -351,36 +324,71 @@ describe("promote-events route", () => {
     vi.setSystemTime(0);
 
     await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
-      deferred: { observations: 1, retryAfterMs: 5 * 60 * 1000 },
+      deferred: { observations: 1, retryAfterMs: intervalMs },
     });
-    vi.advanceTimersByTime(5 * 60 * 1000);
+    vi.advanceTimersByTime(20 * 60 * 1000);
     await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
-      deferred: { observations: 2, retryAfterMs: 5 * 60 * 1000 },
+      deferred: { observations: 2, retryAfterMs: intervalMs },
     });
-    vi.advanceTimersByTime(5 * 60 * 1000);
-    const result = await promoteEventsForCwd(makeConfig(), deletedCwd);
-
-    expect(result).toMatchObject({
+    vi.advanceTimersByTime(20 * 60 * 1000);
+    await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
       promoted: 0,
-      skipped: 2,
+      skipped: 0,
       correlated: 0,
       errors: 0,
       terminal: { kind: "parked", reason: "unavailable-cwd" },
-      message: "parked 2 events because cwd is unavailable",
+      message: "parked local promotion for unavailable cwd; preserved unprocessed events",
     });
     expect(vi.mocked(deduplicateAndInsert)).not.toHaveBeenCalled();
 
-    const reopened = new EventsDb(sidecarPath);
-    expect(reopened.getUnprocessed()).toHaveLength(0);
-    expect(reopened.getHealthStats()).toMatchObject({
+    const parked = new EventsDb(sidecarPath);
+    expect(parked.getUnprocessed()).toMatchObject([
+      { data: "retain this event", processed_at: null, delivery_state: "pending" },
+      { data: "retain this delivery", processed_at: null, delivery_state: "pending" },
+    ]);
+    expect(parked.getHealthStats()).toMatchObject({
       totalEvents: 2,
       errors: 0,
       deliveryPending: 2,
     });
-    reopened.close();
+    expect(parked.getRecentErrors({ includeMaintenance: true })).toEqual([]);
+    parked.close();
+
+    const getUnprocessed = vi.spyOn(EventsDb.prototype, "getUnprocessed");
+    try {
+      vi.advanceTimersByTime(20 * 60 * 1000);
+      await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
+        terminal: { kind: "parked", reason: "unavailable-cwd" },
+        skipped: 0,
+        errors: 0,
+      });
+      expect(getUnprocessed).not.toHaveBeenCalled();
+    } finally {
+      getUnprocessed.mockRestore();
+    }
+    const stillParked = new EventsDb(sidecarPath);
+    expect(stillParked.getRecentErrors({ includeMaintenance: true })).toEqual([]);
+    stillParked.close();
+
+    mkdirSync(deletedCwd);
+    setupProjectDb(deletedCwd).close();
+    await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
+      promoted: 2,
+      errors: 0,
+    });
+    expect(vi.mocked(deduplicateAndInsert)).toHaveBeenCalledTimes(2);
+
+    const resumed = new EventsDb(sidecarPath);
+    expect(resumed.getUnprocessed()).toEqual([]);
+    resumed.insertEvent("s2", { type: "decision", category: "decision", data: "confirm reset", priority: 1 }, "PostToolUse");
+    resumed.close();
+    rmSync(deletedCwd, { recursive: true, force: true });
+    await expect(promoteEventsForCwd(makeConfig(), deletedCwd)).resolves.toMatchObject({
+      deferred: { observations: 1, retryAfterMs: intervalMs },
+    });
   });
 
-  it("marks a full drain incomplete until stable missing-cwd evidence permits parking", async () => {
+  it("marks a full drain terminal after durable missing-cwd evidence without consuming events", async () => {
     const deletedCwd = join(dir, "deleted-drain-project");
     mkdirSync(deletedCwd);
     const edb = new EventsDb(sidecarPath);
@@ -409,13 +417,13 @@ describe("promote-events route", () => {
     expect(result).toMatchObject({
       batches: 0,
       promoted: 0,
-      skipped: 1,
+      skipped: 0,
       errors: 0,
       terminal: { kind: "parked", reason: "unavailable-cwd" },
-      message: "parked 1 events because cwd is unavailable",
+      message: "parked local promotion for unavailable cwd; preserved unprocessed events",
     });
     const reopened = new EventsDb(sidecarPath);
-    expect(reopened.getUnprocessed()).toHaveLength(0);
+    expect(reopened.getUnprocessed()).toHaveLength(1);
     expect(reopened.getHealthStats().totalEvents).toBe(1);
     reopened.close();
   });
@@ -477,17 +485,89 @@ describe("promote-events route", () => {
     }
   });
 
-  it("reports an already-empty sidecar without changing its terminal state", async () => {
+  it("fails closed when an unavailable cwd has a corrupt sidecar", async () => {
+    const deletedCwd = join(dir, "deleted-corrupt-sidecar-project");
+    const corruptSidecar = join(dir, "parking-corrupt.db");
+    const evidence = Buffer.from("not a sqlite database");
+    writeFileSync(corruptSidecar, evidence);
+
+    await expect(parkUnavailableCwdEvents(deletedCwd, corruptSidecar)).rejects.toThrow();
+    expect(readFileSync(corruptSidecar)).toEqual(evidence);
+  });
+
+  it("propagates unreadable-sidecar errors without changing events or parking state", async () => {
+    const deletedCwd = join(dir, "deleted-unreadable-sidecar-project");
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent(
+      "s1",
+      { type: "decision", category: "decision", data: "preserve on EACCES", priority: 1 },
+      "PostToolUse",
+    );
+    edb.close();
+    const failure = Object.assign(new Error("EACCES: sidecar denied"), { code: "EACCES" });
+    const originalOpenExisting = EventsDb.openExisting;
+    const openSpy = vi.spyOn(EventsDb, "openExisting").mockImplementation((dbPath, options) => {
+      if (dbPath === sidecarPath) throw failure;
+      return originalOpenExisting(dbPath, options);
+    });
+
+    try {
+      await expect(parkUnavailableCwdEvents(deletedCwd, sidecarPath)).rejects.toBe(failure);
+    } finally {
+      openSpy.mockRestore();
+    }
+    const preserved = new DatabaseSync(sidecarPath, { readOnly: true });
+    expect(preserved.prepare(
+      "SELECT data, processed_at FROM events",
+    ).all()).toEqual([{ data: "preserve on EACCES", processed_at: null }]);
+    expect(preserved.prepare("SELECT * FROM missing_cwd_state").all()).toEqual([]);
+    preserved.close();
+  });
+
+  it("records missing-CWD evidence for an empty sidecar without scanning event rows", async () => {
     const deletedCwd = join(dir, "deleted-empty-sidecar");
     const emptySidecar = join(dir, "empty.db");
     new EventsDb(emptySidecar).close();
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const getUnprocessed = vi.spyOn(EventsDb.prototype, "getUnprocessed");
 
-    await expect(parkUnavailableCwdEvents(deletedCwd, emptySidecar)).resolves.toMatchObject({
+    try {
+      await expect(parkUnavailableCwdEvents(deletedCwd, emptySidecar)).resolves.toMatchObject({
+        promoted: 0,
+        skipped: 0,
+        errors: 0,
+        deferred: { observations: 1 },
+      });
+      expect(getUnprocessed).not.toHaveBeenCalled();
+    } finally {
+      getUnprocessed.mockRestore();
+    }
+  });
+
+  it("clears durable state when direct parking revalidates a recovered cwd", async () => {
+    const recoveredCwd = join(dir, "recovered-direct-park");
+    mkdirSync(recoveredCwd);
+    const existing = new EventsDb(sidecarPath);
+    existing.observeMissingCwd(0, 5 * 60 * 1000, 3);
+    existing.close();
+
+    await expect(parkUnavailableCwdEvents(recoveredCwd, sidecarPath)).resolves.toEqual({
       promoted: 0,
       skipped: 0,
+      correlated: 0,
       errors: 0,
-      message: "no unprocessed events",
+      message: "cwd recovered; cleared durable parking state",
     });
+    const cleared = new DatabaseSync(sidecarPath, { readOnly: true });
+    expect(cleared.prepare("SELECT * FROM missing_cwd_state").all()).toEqual([]);
+    cleared.close();
+
+    const absentSidecar = join(dir, "still-absent.db");
+    await expect(parkUnavailableCwdEvents(recoveredCwd, absentSidecar)).resolves.toMatchObject({
+      message: "cwd recovered; cleared durable parking state",
+    });
+    expect(existsSync(absentSidecar)).toBe(false);
   });
 
   it("does not park a cwd that still exists but is not a directory", async () => {
@@ -519,6 +599,65 @@ describe("promote-events route", () => {
     const remaining = remainingDb.getUnprocessed();
     remainingDb.close();
     expect(remaining).toHaveLength(0);
+  });
+
+  it("revalidates after lock contention and promotes when the cwd recovers", async () => {
+    const contendedCwd = join(dir, "contended-project");
+    mkdirSync(contendedCwd);
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent(
+      "s1",
+      { type: "decision", category: "decision", data: "first locked event", priority: 1 },
+      "PostToolUse",
+    );
+    edb.close();
+    setupProjectDb(contendedCwd).close();
+
+    let releaseFirst!: () => void;
+    let firstEntered!: () => void;
+    const firstEnteredPromise = new Promise<void>((resolve) => { firstEntered = resolve; });
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    vi.mocked(deduplicateAndInsert).mockImplementationOnce(async () => {
+      firstEntered();
+      await firstGate;
+      return "first-id";
+    });
+
+    const firstPromotion = registerPromotionOperation(
+      promoteEventsForCwd(makeConfig(), contendedCwd, sidecarPath),
+    );
+    await firstEnteredPromise;
+
+    const missingState = new EventsDb(sidecarPath);
+    missingState.observeMissingCwd(0, 5 * 60 * 1000, 3);
+    missingState.insertEvent(
+      "s2",
+      { type: "decision", category: "decision", data: "recovered waiter event", priority: 1 },
+      "PostToolUse",
+    );
+    missingState.close();
+    rmSync(contendedCwd, { recursive: true, force: true });
+
+    const waitingPromotion = registerPromotionOperation(
+      promoteEventsForCwd(makeConfig(), contendedCwd, sidecarPath),
+    );
+    await Promise.resolve();
+    mkdirSync(contendedCwd, { recursive: true });
+    setupProjectDb(contendedCwd).close();
+    releaseFirst();
+
+    await expect(firstPromotion).resolves.toMatchObject({ promoted: 1 });
+    await expect(waitingPromotion).resolves.toMatchObject({ promoted: 1, errors: 0 });
+    expect(deduplicateAndInsert).toHaveBeenCalledTimes(2);
+    const recovered = new DatabaseSync(sidecarPath, { readOnly: true });
+    expect(recovered.prepare("SELECT * FROM missing_cwd_state").all()).toEqual([]);
+    expect(recovered.prepare(
+      "SELECT data, processed_at FROM events ORDER BY event_id",
+    ).all()).toEqual([
+      { data: "first locked event", processed_at: expect.any(String) },
+      { data: "recovered waiter event", processed_at: expect.any(String) },
+    ]);
+    recovered.close();
   });
 
   it("bootstraps repeated priority 3 file patterns without a seeded memory", async () => {
@@ -600,10 +739,26 @@ describe("promote-events route", () => {
     expect(emptyBody.getBody().error).toBe("cwd is required");
   });
 
-  it("returns generic errors for invalid cwd and sidecar failures", async () => {
+  it("routes a missing direct-promotion cwd through durable preparation", async () => {
     const handler = createPromoteEventsHandler(makeConfig());
+    const missingCwd = join(dir, "missing-direct-project");
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "decision", category: "decision", data: "direct recovery", priority: 1 }, "PostToolUse");
+    edb.close();
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const missing = mockRes();
+    await handler(request, missing.res, JSON.stringify({ cwd: missingCwd }));
+    expect(missing.res.writeHead).toHaveBeenCalledWith(200, expect.any(Object));
+    expect(missing.getBody()).toMatchObject({
+      deferred: { kind: "awaiting-confirmation", observations: 1 },
+      errors: 0,
+    });
+
+    const invalidPath = join(dir, "project-file");
+    writeFileSync(invalidPath, "not a directory");
     const invalid = mockRes();
-    await handler(request, invalid.res, JSON.stringify({ cwd: join(dir, "missing") }));
+    await handler(request, invalid.res, JSON.stringify({ cwd: invalidPath }));
     expect(invalid.getBody()).toEqual({ error: "cwd is invalid" });
 
     writeFileSync(sidecarPath, "not sqlite");

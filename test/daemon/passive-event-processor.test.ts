@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import type { EventSidecarSummary, collectEventSidecars } from "../../src/db/event-sidecars.js";
 import {
@@ -10,6 +11,14 @@ import type { PromoteResult, promoteEventsForCwd } from "../../src/daemon/routes
 
 type CollectEventSidecars = typeof collectEventSidecars;
 type PromoteEventsForCwd = typeof promoteEventsForCwd;
+type PassiveEventProcessorDeps = NonNullable<ConstructorParameters<typeof PassiveEventProcessor>[2]>;
+type ScheduledTimer = {
+  callback: () => void;
+  ms: number;
+  unref: ReturnType<typeof vi.fn>;
+};
+
+const request = {} as IncomingMessage;
 
 function makeConfig() {
   return loadDaemonConfig("/nonexistent", { daemon: { port: 0 }, llm: { provider: "disabled" } });
@@ -20,31 +29,51 @@ function mockRes() {
   const res = {
     writeHead: vi.fn().mockReturnThis(),
     end: vi.fn((data?: string) => { body = data ?? ""; }),
-  } as any;
+  } as unknown as ServerResponse;
   return { res, getBody: () => JSON.parse(body || "{}") };
 }
 
-function timerDeps() {
-  const timers: Array<{ callback: () => void; ms: number; unref: ReturnType<typeof vi.fn> }> = [];
-  const intervals: Array<{ callback: () => void; ms: number; unref: ReturnType<typeof vi.fn> }> = [];
-  const clearTimeout = vi.fn();
-  const clearInterval = vi.fn();
+function timerDeps(): {
+  timers: ScheduledTimer[];
+  intervals: ScheduledTimer[];
+  deps: PassiveEventProcessorDeps;
+} {
+  const timers: ScheduledTimer[] = [];
+  const intervals: ScheduledTimer[] = [];
+  const clearTimeout: typeof globalThis.clearTimeout = vi.fn();
+  const clearInterval: typeof globalThis.clearInterval = vi.fn();
+  const setTimeout: typeof globalThis.setTimeout = (callback, ms = 0, ...args) => {
+    const handle: ScheduledTimer = {
+      callback: () => {
+        if (typeof callback === "function") callback(...args);
+      },
+      ms: Number(ms),
+      unref: vi.fn(),
+    };
+    timers.push(handle);
+    // Node's Timeout is opaque; this deterministic scheduler needs only `unref`.
+    return handle as unknown as ReturnType<typeof globalThis.setTimeout>;
+  };
+  const setInterval: typeof globalThis.setInterval = (callback, ms = 0, ...args) => {
+    const handle: ScheduledTimer = {
+      callback: () => {
+        if (typeof callback === "function") callback(...args);
+      },
+      ms: Number(ms),
+      unref: vi.fn(),
+    };
+    intervals.push(handle);
+    // Node's Interval is opaque; this deterministic scheduler needs only `unref`.
+    return handle as unknown as ReturnType<typeof globalThis.setInterval>;
+  };
   return {
     timers,
     intervals,
     deps: {
-      setTimeout: vi.fn((callback: () => void, ms: number) => {
-        const handle = { callback, ms, unref: vi.fn() };
-        timers.push(handle);
-        return handle as any;
-      }),
-      clearTimeout: clearTimeout as any,
-      setInterval: vi.fn((callback: () => void, ms: number) => {
-        const handle = { callback, ms, unref: vi.fn() };
-        intervals.push(handle);
-        return handle as any;
-      }),
-      clearInterval: clearInterval as any,
+      setTimeout,
+      clearTimeout,
+      setInterval,
+      clearInterval,
       safeLogError: vi.fn(),
     },
   };
@@ -131,20 +160,19 @@ describe("PassiveEventProcessor", () => {
     const { timers, intervals, deps } = timerDeps();
     let resolveDrained: (() => void) | undefined;
     const drained = new Promise<void>(resolve => { resolveDrained = resolve; });
-    const promoteEventsForCwd = vi.fn().mockImplementation(async () => {
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(async () => {
       resolveDrained?.();
-      return { promoted: 1, skipped: 0, correlated: 0, errors: 0, batches: 1 };
+      return { promoted: 1, skipped: 0, correlated: 0, errors: 0 };
     });
-    const collectEventSidecars = vi.fn().mockReturnValue([
-      // Covers one processable sidecar, one empty sidecar, and one orphan sidecar.
-      { cwd: "/tmp", path: "/events/tmp.db", unprocessed: 1 },
-      { cwd: "/tmp", path: "/events/tmp.db", unprocessed: 0 },
-      { path: "/events/orphan.db", unprocessed: 1 },
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/tmp", path: "/events/tmp.db", unprocessed: 1 }),
+      sidecar({ cwd: "/tmp", path: "/events/tmp.db", unprocessed: 0 }),
+      sidecar({ cwd: undefined, path: "/events/orphan.db", unprocessed: 1 }),
     ]);
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
-      collectEventSidecars: collectEventSidecars as any,
-      promoteEventsForCwd: promoteEventsForCwd as any,
+      collectEventSidecars,
+      promoteEventsForCwd,
     });
 
     processor.start();
@@ -160,23 +188,20 @@ describe("PassiveEventProcessor", () => {
     expect(promoteEventsForCwd.mock.calls[0][2]).toBe("/events/tmp.db");
   });
 
-  it("does not retry or log a sidecar after its unavailable cwd is terminalized", async () => {
-    let unprocessed = 1;
+  it("rechecks a durably parked sidecar without logging or reprocessing it", async () => {
     const { deps } = timerDeps();
-    const promote = vi.fn<PromoteEventsForCwd>().mockImplementation(async () => {
-      unprocessed = 0;
-      return {
-        promoted: 0,
-        skipped: 1,
-        correlated: 0,
-        errors: 0,
-        message: "parked 1 events because cwd is unavailable",
-      };
+    const promote = vi.fn<PromoteEventsForCwd>().mockResolvedValue({
+      promoted: 0,
+      skipped: 0,
+      correlated: 0,
+      errors: 0,
+      terminal: { kind: "parked", reason: "unavailable-cwd" },
+      message: "parked local promotion for unavailable cwd; preserved unprocessed events",
     });
     const collect = vi.fn<CollectEventSidecars>().mockImplementation(async () => [sidecar({
       cwd: "/deleted-project",
       path: "/events/deleted.db",
-      unprocessed,
+      unprocessed: 1,
     })]);
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
@@ -187,7 +212,7 @@ describe("PassiveEventProcessor", () => {
     await processor.runSweep();
     await processor.runSweep();
 
-    expect(promote).toHaveBeenCalledTimes(1);
+    expect(promote).toHaveBeenCalledTimes(2);
     expect(deps.safeLogError).not.toHaveBeenCalled();
   });
 
@@ -225,49 +250,18 @@ describe("PassiveEventProcessor", () => {
     expect(deps.safeLogError).not.toHaveBeenCalled();
   });
 
-  it("requeues a nonterminal incomplete parking result even below the normal batch size", async () => {
-    const { deps } = timerDeps();
-    const incomplete: PromoteResult = {
-      promoted: 0,
-      skipped: 0,
-      correlated: 0,
-      errors: 0,
-      incomplete: true,
-      message: "stopped after maximum parking batches before sidecar was observed empty",
-    };
-    const promote = vi.fn<PromoteEventsForCwd>()
-      .mockResolvedValueOnce(incomplete)
-      .mockResolvedValueOnce({
-        promoted: 0,
-        skipped: 0,
-        correlated: 0,
-        errors: 0,
-        message: "no unprocessed events",
-      });
-    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
-      ...deps,
-      promoteEventsForCwd: promote,
-    });
-
-    processor.notify({ cwd: "/tmp", priority: 1 });
-    await processor.flushOnce();
-    await processor.flushOnce();
-
-    expect(promote).toHaveBeenCalledTimes(2);
-  });
-
   it("does not requeue a terminal parked result at the batch boundary", async () => {
     const { deps } = timerDeps();
-    const promoteEventsForCwd = vi.fn().mockResolvedValue({
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockResolvedValue({
       promoted: 0,
-      skipped: 500,
+      skipped: 0,
       correlated: 0,
       errors: 0,
       terminal: { kind: "parked", reason: "unavailable-cwd" },
     });
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
-      promoteEventsForCwd: promoteEventsForCwd as any,
+      promoteEventsForCwd,
     });
 
     processor.notify({ cwd: "/tmp", priority: 1 });
@@ -279,15 +273,15 @@ describe("PassiveEventProcessor", () => {
 
   it("prevents concurrent active drains and requeues remaining work after the batch limit", async () => {
     const { deps } = timerDeps();
-    let resolvePromotion: ((value: unknown) => void) | undefined;
-    const promoteEventsForCwd = vi.fn()
-      .mockImplementationOnce(() => new Promise(resolve => {
+    let resolvePromotion: ((value: PromoteResult) => void) | undefined;
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>()
+      .mockImplementationOnce(() => new Promise<PromoteResult>(resolve => {
         resolvePromotion = resolve;
       }))
       .mockResolvedValue({ promoted: 1, skipped: 0, correlated: 0, errors: 0 });
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
-      promoteEventsForCwd: promoteEventsForCwd as any,
+      promoteEventsForCwd,
     });
 
     processor.notify({ cwd: "/tmp", priority: 1, pendingCount: 1 });
@@ -305,12 +299,12 @@ describe("PassiveEventProcessor", () => {
 
   it("requeues active work when a batch reports promotion errors", async () => {
     const { deps } = timerDeps();
-    const promoteEventsForCwd = vi.fn()
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>()
       .mockResolvedValueOnce({ promoted: 2, skipped: 0, correlated: 0, errors: 1 })
       .mockResolvedValueOnce({ promoted: 0, skipped: 0, correlated: 0, errors: 0, message: "no unprocessed events" });
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
-      promoteEventsForCwd: promoteEventsForCwd as any,
+      promoteEventsForCwd,
     });
 
     processor.notify({ cwd: "/tmp", priority: 1, pendingCount: 1 });
@@ -397,7 +391,7 @@ describe("createPromoteEventsNotifyHandler", () => {
     const handler = createPromoteEventsNotifyHandler(processor);
     const { res, getBody } = mockRes();
 
-    await handler({} as any, res, JSON.stringify({
+    await handler(request, res, JSON.stringify({
       cwd: "  /tmp  ",
       priority: 1,
       pendingCount: 12,
@@ -419,7 +413,7 @@ describe("createPromoteEventsNotifyHandler", () => {
     const handler = createPromoteEventsNotifyHandler(processor);
     const { res, getBody } = mockRes();
 
-    await handler({} as any, res, JSON.stringify({ priority: 1 }));
+    await handler(request, res, JSON.stringify({ priority: 1 }));
 
     expect(res.writeHead).toHaveBeenCalledWith(400, expect.any(Object));
     expect(getBody().error).toBe("cwd is required");

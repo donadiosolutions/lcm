@@ -40,6 +40,11 @@ describe("SQLiteLocalHookOutboxFactory", () => {
       },
       { operation: "getUnprocessed", run: () => repository.getUnprocessed() },
       { operation: "markProcessed", run: () => repository.markProcessed([1]) },
+      {
+        operation: "observeMissingCwd",
+        run: () => repository.observeMissingCwd(0, 1, 3),
+      },
+      { operation: "clearMissingCwd", run: () => repository.clearMissingCwd() },
       { operation: "pruneProcessed", run: () => repository.pruneProcessed(7) },
       { operation: "setPrevEventId", run: () => repository.setPrevEventId(2, 1) },
       {
@@ -178,6 +183,16 @@ describe("SQLiteLocalHookOutboxFactory", () => {
 
     await repository.markProcessed([]);
     await repository.markProcessed([secondSession]);
+    expect(await repository.observeMissingCwd(0, 5 * 60 * 1000, 3)).toEqual({
+      parked: false,
+      observations: 1,
+      retryAfterMs: 5 * 60 * 1000,
+    });
+    await repository.clearMissingCwd();
+    expect(await repository.observeMissingCwd(5 * 60 * 1000, 5 * 60 * 1000, 3)).toMatchObject({
+      parked: false,
+      observations: 1,
+    });
     const activeMachineId = (await repository.getUnprocessed())[0]?.machine_id
       ?? machineId;
     const claimed = await repository.claimDeliveries({

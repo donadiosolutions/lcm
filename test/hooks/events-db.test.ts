@@ -1,13 +1,14 @@
 // test/hooks/events-db.test.ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
+  EVENTS_SCHEMA_VERSION,
   EventsDb,
   MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH,
   _resetMigratedPathsForTesting,
   type EventRow,
   type HealthStats,
 } from "../../src/hooks/events-db.js";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -74,6 +75,64 @@ describe("EventsDb", () => {
     const db = new EventsDb(dbPath);
     // Should not throw
     db.close();
+  });
+
+  it("repairs broadened sidecar-directory permissions before reusing a pooled connection", () => {
+    const first = new EventsDb(dbPath);
+    chmodSync(dir, 0o777);
+    const second = new EventsDb(dbPath);
+    try {
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+    } finally {
+      second.close();
+      first.close();
+    }
+  });
+
+  it("persists reversible missing-CWD parking across close and reopen", () => {
+    const intervalMs = 5 * 60 * 1000;
+    const first = new EventsDb(dbPath);
+    expect(first.observeMissingCwd(0, intervalMs, 3)).toEqual({
+      parked: false,
+      observations: 1,
+      retryAfterMs: intervalMs,
+    });
+    first.close();
+
+    const second = new EventsDb(dbPath);
+    expect(second.observeMissingCwd(intervalMs - 1, intervalMs, 3)).toEqual({
+      parked: false,
+      observations: 1,
+      retryAfterMs: 1,
+    });
+    expect(second.observeMissingCwd(intervalMs, intervalMs, 3)).toEqual({
+      parked: false,
+      observations: 2,
+      retryAfterMs: intervalMs,
+    });
+    second.close();
+
+    const third = new EventsDb(dbPath);
+    expect(third.observeMissingCwd(2 * intervalMs, intervalMs, 3)).toEqual({
+      parked: true,
+      observations: 3,
+      retryAfterMs: 0,
+    });
+    third.close();
+
+    const reopened = new EventsDb(dbPath);
+    expect(reopened.observeMissingCwd(3 * intervalMs, intervalMs, 3)).toEqual({
+      parked: true,
+      observations: 3,
+      retryAfterMs: 0,
+    });
+    reopened.clearMissingCwd();
+    expect(reopened.observeMissingCwd(4 * intervalMs, intervalMs, 3)).toEqual({
+      parked: false,
+      observations: 1,
+      retryAfterMs: intervalMs,
+    });
+    reopened.close();
   });
 
   it("keeps event capture offline-safe when machine identity is unreadable", () => {
@@ -791,14 +850,14 @@ describe("EventsDb", () => {
       const rawDb = new DatabaseSync(dbPath);
       const applicationObjects = rawDb.prepare(`
         SELECT name FROM sqlite_master
-        WHERE name IN ('schema_version', 'events', 'error_log', 'idx_events_unprocessed')
+        WHERE name IN ('schema_version', 'events', 'error_log', 'idx_events_unprocessed', 'missing_cwd_state')
       `).all();
       expect(applicationObjects).toEqual([]);
       rawDb.close();
 
       const recovered = new EventsDb(dbPath);
       expect(withSqlite(dbPath, (raw) => (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version))
-        .toBe(4);
+        .toBe(EVENTS_SCHEMA_VERSION);
       recovered.close();
     });
 
@@ -815,7 +874,8 @@ describe("EventsDb", () => {
       `);
       rawDb.close();
       const db = new EventsDb(dbPath);
-      expect(withSqlite(dbPath, (raw) => (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version)).toBe(4);
+      expect(withSqlite(dbPath, (raw) => (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version))
+        .toBe(EVENTS_SCHEMA_VERSION);
       db.close();
     });
 
@@ -942,7 +1002,43 @@ describe("EventsDb", () => {
       }
     });
 
-    it("leaves an already-current schema version unchanged", () => {
+    it("adds missing-CWD state to a v4 sidecar without rewriting delivery state", () => {
+      const initial = new EventsDb(dbPath);
+      const eventId = initial.insertEvent(
+        "v4-session",
+        { type: "decision", category: "decision", data: "retain delivery", priority: 1 },
+        "PostToolUse",
+      );
+      initial.close();
+      withSqlite(dbPath, (raw) => {
+        raw.exec("DROP TABLE missing_cwd_state; UPDATE schema_version SET version = 4;");
+        raw.prepare(`
+          UPDATE events
+          SET delivery_state = 'quarantined',
+              delivery_generation = 4,
+              quarantine_reason = 'preserve v4 delivery state'
+          WHERE event_id = ?
+        `).run(eventId);
+      });
+      _resetMigratedPathsForTesting();
+
+      const migrated = new EventsDb(dbPath);
+      expect(withSqlite(dbPath, (raw) => (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version))
+        .toBe(EVENTS_SCHEMA_VERSION);
+      expect(withSqlite(dbPath, (raw) => raw.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='missing_cwd_state'",
+      ).get())).toBeDefined();
+      expect(withSqlite(dbPath, (raw) => raw.prepare(
+        "SELECT delivery_state, delivery_generation, quarantine_reason FROM events WHERE event_id = ?",
+      ).get(eventId))).toEqual({
+        delivery_state: "quarantined",
+        delivery_generation: 4,
+        quarantine_reason: "preserve v4 delivery state",
+      });
+      migrated.close();
+    });
+
+    it("repairs a v4 schema marker whose events table is absent", () => {
       const rawDb = new DatabaseSync(dbPath);
       rawDb.exec(`
         CREATE TABLE schema_version (version INTEGER NOT NULL);
@@ -950,25 +1046,97 @@ describe("EventsDb", () => {
       `);
       rawDb.close();
 
+      const repaired = new EventsDb(dbPath);
+      expect(repaired.getUnprocessed()).toEqual([]);
+      expect(withSqlite(dbPath, (raw) => (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version))
+        .toBe(EVENTS_SCHEMA_VERSION);
+      repaired.close();
+    });
+
+    it("repairs a current schema marker whose tables are absent", () => {
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec(`
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version VALUES (${EVENTS_SCHEMA_VERSION});
+      `);
+      rawDb.close();
+
       const db = new EventsDb(dbPath);
       expect(withSqlite(dbPath, (raw) => (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version))
-        .toBe(4);
+        .toBe(EVENTS_SCHEMA_VERSION);
+      expect(withSqlite(dbPath, (raw) => raw.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='missing_cwd_state'",
+      ).get())).toBeDefined();
       db.close();
       const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
       let reopened: EventsDb | undefined;
       try {
         reopened = new EventsDb(dbPath);
         expect(reopened.getUnprocessed()).toEqual([]);
-        expect(execSpy).not.toHaveBeenCalledWith("BEGIN EXCLUSIVE");
+        expect(execSpy).toHaveBeenCalledWith("BEGIN EXCLUSIVE");
       } finally {
         reopened?.close();
         execSpy.mockRestore();
       }
     });
 
+    it("rolls back every current-v5 repair when later repair DDL fails", () => {
+      const initial = new EventsDb(dbPath);
+      const eventId = initial.insertEvent(
+        "repair-session",
+        { type: "decision", category: "decision", data: "preserve", priority: 1 },
+        "PostToolUse",
+      );
+      initial.close();
+      withSqlite(dbPath, (raw) => raw.exec(`
+        DROP INDEX idx_events_unprocessed;
+        DROP INDEX idx_events_session;
+        DROP INDEX idx_events_pattern_lookup;
+        DROP INDEX idx_events_delivery_ready;
+        DROP INDEX idx_events_delivery_remote;
+        DROP TABLE error_log;
+        DROP TABLE missing_cwd_state;
+      `));
+      _resetMigratedPathsForTesting();
+
+      const originalExec = DatabaseSync.prototype.exec;
+      const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+        this: DatabaseSync,
+        sql: string,
+      ) {
+        if (sql.includes("CREATE TABLE IF NOT EXISTS missing_cwd_state")) {
+          throw new Error("injected missing-CWD repair failure");
+        }
+        return originalExec.call(this, sql);
+      });
+      try {
+        expect(() => new EventsDb(dbPath)).toThrow("injected missing-CWD repair failure");
+      } finally {
+        execSpy.mockRestore();
+      }
+
+      withSqlite(dbPath, (raw) => {
+        expect(raw.prepare(`
+          SELECT name FROM sqlite_master
+          WHERE name IN (
+            'idx_events_unprocessed', 'idx_events_session',
+            'idx_events_pattern_lookup', 'idx_events_delivery_ready',
+            'idx_events_delivery_remote', 'error_log', 'missing_cwd_state'
+          )
+        `).all()).toEqual([]);
+        expect(raw.prepare("SELECT event_id, data FROM events").get()).toEqual({
+          event_id: eventId,
+          data: "preserve",
+        });
+        expect(raw.prepare("SELECT version FROM schema_version").get()).toEqual({
+          version: EVENTS_SCHEMA_VERSION,
+        });
+      });
+    });
+
     it.each([
       [0, "invalid events schema version"],
-      [5, "unsupported events schema version"],
+      [EVENTS_SCHEMA_VERSION + 1, "unsupported events schema version"],
     ])("rejects incompatible schema version %s", (version, message) => {
       const rawDb = new DatabaseSync(dbPath);
       rawDb.exec(`
@@ -1033,7 +1201,7 @@ describe("EventsDb", () => {
       expect(tableRow).toBeDefined();
       expect(indexRow).toBeDefined();
       const versionRow = withSqlite(dbPath, (raw) => raw.prepare("SELECT version FROM schema_version").get()) as { version: number };
-      expect(versionRow.version).toBe(4);
+      expect(versionRow.version).toBe(EVENTS_SCHEMA_VERSION);
       db.close();
     });
 

@@ -223,7 +223,7 @@ export class PassiveEventProcessor {
       if (result.terminal) return;
       if (result.message === "no unprocessed events") return;
       const processed = result.promoted + result.skipped;
-      remaining = result.incomplete || processed >= EVENTS_UNPROCESSED_BATCH_LIMIT || result.errors > 0;
+      remaining = processed >= EVENTS_UNPROCESSED_BATCH_LIMIT || result.errors > 0;
       if (processed === 0 && !remaining) return;
       if (!remaining) return;
     }

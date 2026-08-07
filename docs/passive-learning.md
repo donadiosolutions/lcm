@@ -73,29 +73,36 @@ be idle, run `lcm doctor`, then `lcm daemon restart`; do not stop a process
 manually.
 
 If a queued event's recorded working directory is unavailable, the daemon
-first keeps its sidecar events pending. It requires three missing-directory
-observations at least five minutes apart within a 30-minute confirmation window
-before treating the directory as permanently removed. A successful directory
-validation also resets that confirmation, so a temporary rename, workspace
-rebuild, or mount interruption can recover and promote normally. Until removal
-is confirmed, no local
-`processed_at` checkpoint is advanced and no hook-error-ledger entry is added.
+keeps its sidecar events pending and records the missing-directory evidence in
+that sidecar. It requires three observations at least five minutes apart before
+parking local promotion. The evidence has no expiry window: it survives daemon
+idle restarts and converges even when a large installation revisits a sidecar
+only every 20 minutes. Until the third observation, no local `processed_at`
+checkpoint is advanced and no hook-error-ledger entry is added.
 
-After removal is confirmed, the daemon parks the sidecar's currently
-unprocessed events. Parking advances only the local `processed_at` checkpoint:
-the event rows, payloads, historical sidecar, and independent remote-delivery
-checkpoints remain intact. The event is not promoted into local memory, but it
-is no longer retried by the background processor. The same terminal behavior is
-used by `lcm events promote --all` for metadata-backed sidecars. Restore the
-directory before confirmation completes when local promotion is required; once
-parked, the event remains preserved for inspection or independent delivery
-rather than being silently deleted.
+The three-observation threshold and five-minute minimum spacing are fixed
+safety constants; they are not configurable in `~/.lcm/config.json`.
 
-Parking is also bounded. It reports a terminal parked outcome only after an
-empty sidecar batch confirms that every local-promotion row was consumed. If
-the parking batch limit is reached first, the sidecar remains pending and
-nonterminal; the background processor requeues it and `lcm events promote
---all` reports that project as incomplete rather than as a successful park.
+After confirmation, the daemon durably parks **local promotion**, not the
+events themselves. The sidecar records its parked state but leaves every event
+unprocessed, preserving event payloads, historical rows, and independent
+delivery state exactly as captured. While the cwd remains absent, later sweeps
+perform only a cheap availability/state check and return the terminal parked
+outcome; they do not rescan the events for promotion or add repeated errors.
+`lcm events promote --all` reports the same terminal state for a metadata-backed
+sidecar.
+
+If the directory returns at any later time, normal promotion clears the durable
+missing-CWD state and promotes the preserved unprocessed events. This makes a
+long mount outage, workspace rebuild, or rename reversible even after it was
+previously parked. A sidecar that no longer exists is treated as terminal
+immediately because it contains no local work to preserve.
+
+Only a genuinely missing cwd (`ENOENT`, including an absent ancestor reported
+as `ENOTDIR`) enters this confirmation flow. Permission failures such as
+`EACCES`/`EPERM`, malformed paths, and unreadable or corrupt sidecars fail
+closed: they are reported to the caller and do not create parking evidence,
+advance `processed_at`, or otherwise consume queued events.
 
 `lcm search` stays read-only: it searches already promoted memory and does not process queued sidecar events.
 
@@ -166,7 +173,9 @@ On SessionStart, recently promoted passive insights are surfaced in a `<learned-
 
 ## Configuration
 
-All thresholds are configurable in `~/.lcm/config.json` under `compaction.promotionThresholds`:
+Promotion-confidence thresholds are configurable in `~/.lcm/config.json`
+under `compaction.promotionThresholds`. The missing-CWD confirmation constants
+described above are intentionally not part of this configuration:
 
 ```json
 {
@@ -198,7 +207,7 @@ When a pattern crosses the reinforcement threshold, `reinforcementBoost` is adde
     acknowledged and any remote applied row is proven pruned
   - Unprocessed and replayable events are never discarded by age or row-count
     retention guards; a maintenance diagnostic records guard breaches
-  - Schema versioned for future migrations (currently v4)
+  - Schema versioned for future migrations (currently v5)
 
 - **Machine sequence DB**: `~/.lcm/events/.machine-sequence.sqlite`
   - Shared by every local project sidecar
@@ -237,8 +246,8 @@ The UserPromptSubmit extractor includes guards against false-positive decisions.
 | PostgreSQL unavailable | Hooks continue local commits; staged replication retries with bounded backoff and does not bypass an earlier local sequence blocker |
 | Hard kill (SIGKILL) | Events survive in sidecar, scavenged on next SessionStart |
 | Stale sidecars in other projects | `lcm events promote --all` drains all metadata-backed sidecars |
-| Recorded cwd remains unavailable for three five-minute observations within 30 minutes | Unprocessed local-promotion rows are parked with `processed_at`; event data and independent delivery state are retained |
-| Parking cap reached before an empty batch is observed | Sidecar remains pending and is retried; the operation is incomplete rather than terminal |
+| Recorded cwd remains unavailable for three observations at least five minutes apart | Durable reversible parking state is recorded; event rows stay unprocessed and retain payload, history, and delivery state |
+| A durably parked cwd returns | Parking state is cleared and the preserved unprocessed backlog is promoted normally |
 | Unprocessed cap or age guard exceeded | Events remain durable; a maintenance diagnostic reports the retained backlog |
 | Worker crashes after inbox insert | Exact immutable readback proves whether insertion committed |
 | Worker crashes during apply | PostgreSQL transaction rollback or exact `applied` readback resolves the outcome |
