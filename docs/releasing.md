@@ -114,11 +114,15 @@ automatic work from silently overtaking it.
 Each publication workflow run stores its direct event tag in the strict
 `release-tag:TAG` run name. Completed-run recovery policy reads only that stored
 name; it does not infer a tag from a branch or commit SHA. A failed historical
-run with a canonical tag remains blocking until it is retried successfully or
-its release is withdrawn to draft. An explicitly noncanonical stored tag is a
-preflight-impossible attempt and is warned about and ignored. Missing or
-malformed stored run provenance fails closed because the workflow cannot safely
-associate it with an immutable release.
+run with a canonical tag remains blocking until a later tag-bound run succeeds,
+its release is withdrawn to draft, or the release
+remains published with the exact `@donadiosolutions/lcm` version authoritatively
+present in npm. Published-package proof resolves the history without rerunning
+the release or moving it back to draft. An explicitly noncanonical stored tag
+is a preflight-impossible attempt and is warned about and ignored. Missing or
+malformed history, a missing exact npm version, or a GitHub/npm lookup error
+fails closed because the workflow cannot safely associate the history with an
+immutable release.
 
 ## Immutable published-release recovery
 
