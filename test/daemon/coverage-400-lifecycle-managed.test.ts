@@ -290,6 +290,68 @@ function setRunningProbe(fixture: Fixture, pid = 4242): void {
 }
 
 describe("issue 400 lifecycle managed preparation and utility boundaries", () => {
+  it("caps manager commands for long spawn windows while retaining the full lifecycle deadline", async () => {
+    const managerSpawn = vi.fn(() => ({ status: 1, stdout: "", stderr: "Unit is not-found" }));
+    const scoped = createScopedFixture({
+      fetch: vi.fn(async () => { throw new Error("offline"); }) as never,
+      spawnSync: managerSpawn as never,
+    });
+    await expect(ensureDaemon({
+      port: scoped.port,
+      pidFilePath: scoped.pidPath,
+      spawnTimeoutMs: 120_000,
+      enforceUserManagerParent: true,
+      _testScope: scoped.scope,
+      _skipSpawn: true,
+      _monotonicNowOverride: () => 0,
+    })).resolves.toMatchObject({ refusalReason: "absent" });
+    expect(managerSpawn).toHaveBeenCalledOnce();
+    expect(managerSpawn.mock.calls[0]?.[2]).toMatchObject({ timeout: 60_000 });
+
+    const restartSpawn = vi.fn(() => ({ status: 1, stdout: "", stderr: "Unit is not-found" }));
+    const restartScoped = createScopedFixture({
+      fetch: vi.fn(async () => { throw new Error("offline"); }) as never,
+      spawnSync: restartSpawn as never,
+    });
+    await expect(restartDaemon({
+      port: restartScoped.port,
+      pidFilePath: restartScoped.pidPath,
+      spawnTimeoutMs: 120_000,
+      enforceUserManagerParent: true,
+      _testScope: restartScoped.scope,
+      _skipSpawn: true,
+      _monotonicNowOverride: () => 0,
+    })).resolves.toMatchObject({ refusalReason: "absent", restarted: false });
+    expect(restartSpawn).toHaveBeenCalledOnce();
+    expect(restartSpawn.mock.calls[0]?.[2]).toMatchObject({ timeout: 60_000 });
+
+    const fixture = createFixture({ fetch: sequenceFetch([new Error("offline")]) });
+    let operationDeadline: number | undefined;
+    fixture.probe
+      .mockImplementationOnce(async (value: SupervisorSpec) => observation(value, "absent"))
+      .mockImplementation(async (value: SupervisorSpec) => observation(value, "registered-running-valid", { managerPid: 4242 }));
+    fixture.start.mockImplementationOnce(async (
+      value: SupervisorSpec,
+      operation?: { readonly deadline?: number },
+    ) => {
+      operationDeadline = operation?.deadline;
+      return {
+        kind: value.kind,
+        name: value.name,
+        scopeDigest: value.scopeDigest,
+        port: value.port,
+        nonce: value.nonce,
+        managerPid: 4242,
+      };
+    });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      spawnTimeoutMs: 120_000,
+      _skipHealthWait: true,
+      _monotonicNowOverride: () => 0,
+    }))).resolves.toMatchObject({ spawned: true, startMethod: "systemd-user" });
+    expect(operationDeadline).toBe(120_000);
+  });
+
   it("anchors ensure admission to canonical state rather than caller cwd", async () => {
     const fixture = createFixture({
       fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,

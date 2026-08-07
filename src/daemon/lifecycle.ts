@@ -472,6 +472,7 @@ function recognizedHealthStorageBackend(health: HealthResponse): StorageBackend 
 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const MAX_SUPERVISOR_COMMAND_TIMEOUT_MS = 60_000;
 const STORAGE_BACKEND_AUTH_WARNING = "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
 const RUNTIME_IDENTITY_AUTH_WARNING = "daemon reuse or replacement was blocked because the runtime-identity mismatch (entrypoint or packaged-runtime digest) could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
@@ -552,6 +553,10 @@ function validateSpawnTimeout(spawnTimeoutMs: number): void {
   if (!Number.isFinite(spawnTimeoutMs) || spawnTimeoutMs < 0 || spawnTimeoutMs > MAX_TIMER_DELAY_MS) {
     throw new RangeError(`spawnTimeoutMs must be between 0 and ${MAX_TIMER_DELAY_MS}`);
   }
+}
+
+function supervisorCommandTimeoutMs(spawnTimeoutMs: number): number {
+  return Math.max(1, Math.min(MAX_SUPERVISOR_COMMAND_TIMEOUT_MS, spawnTimeoutMs || 1_000));
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -2045,7 +2050,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         // non-secret configuration/runtime values such as HOME and the
         // PostgreSQL CA pathname are not lost while credentials remain out.
         launchEnvironment,
-        stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+        stopTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
         realpath,
         ...(opts._supervisorCredentialDirectoryOverride === undefined ? {} : { credentialDirectory: opts._supervisorCredentialDirectoryOverride }),
         ...(opts._supervisorCredentialFilesOverride === undefined ? {} : { credentialFiles: opts._supervisorCredentialFilesOverride }),
@@ -2060,8 +2065,8 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           environment: launchEnvironment,
           platform,
           uid: dependencies.uid,
-          commandTimeoutMs: Math.max(1, opts.spawnTimeoutMs || 1_000),
-          stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+          commandTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
+          stopTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
           sleep: sleepFn,
           now: monotonicNow,
         });
@@ -3335,7 +3340,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
         storageBackend: opts.expectedStorageBackend ?? "sqlite",
         postgresCaFile: dependencies.environment.LCM_POSTGRES_CA_FILE,
         launchEnvironment,
-        stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+        stopTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
         realpath,
       });
     } catch {
@@ -3348,8 +3353,8 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
           environment: launchEnvironment,
           platform,
           uid: dependencies.uid,
-          commandTimeoutMs: Math.max(1, opts.spawnTimeoutMs || 1_000),
-          stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
+          commandTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
+          stopTimeoutMs: supervisorCommandTimeoutMs(opts.spawnTimeoutMs),
           sleep: dependencies.sleep,
         });
     let observation: SupervisorObservation;
