@@ -31,6 +31,14 @@ crashed or wedged process is not silently replaced in the background.
 If launchd reports a spawned service that has crashed, run `lcm doctor` and
 `lcm daemon restart`; do not manually kill or boot out the job.
 
+On macOS, launchd can briefly retain a service label after reporting that exact
+job absent. If the next bootstrap fails with launchd's specific code-5
+input/output-error diagnostic, LCM automatically confirms absence, waits a
+bounded label-release interval, confirms absence again, and retries that exact
+bootstrap once. A repeated failure, a permission error, any other diagnostic,
+or manager state that is no longer absent remains an error; LCM does not broaden
+the retry or fall back to manual process signaling.
+
 Use these commands for normal operation:
 
 ```bash
