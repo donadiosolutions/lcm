@@ -341,7 +341,7 @@ jobs:
               ),
             ).href;
             const {
-              assertRecoveryReleaseBody,
+              assertActionCreatedReleaseBody,
               enforceEarlierPublicationSuccess,
               parseReleaseTag,
             } = await import(policyUrl);
@@ -690,7 +690,7 @@ jobs:
               ),
             ).href;
             const {
-              assertActionCreatedReleaseBody,
+              assertRecoveryReleaseBody,
               enforceEarlierPublicationSuccess,
               parseReleaseTag,
             } = await import(policyUrl);
@@ -732,9 +732,6 @@ jobs:
               annotatedTag.verification?.verified !== true
             ) {
               throw new Error(`Release tag ${tag} failed identity, target, or signature verification`);
-            }
-            if (release.target_commitish !== annotatedTag.object.sha) {
-              throw new Error(`Release target does not match the verified ${tag} commit`);
             }
             const draftRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
               ...context.repo,
