@@ -2403,7 +2403,9 @@ export function createSupervisor(
     terminalRecreated: boolean,
     operationDeadline: number | undefined,
   ): Promise<SupervisorStartResult> => {
-    const current = await probeWithinOperation(spec, undefined, operationDeadline);
+    const initialCapture: SupervisorProbeCapture = {};
+    const current = await probeWithinOperation(spec, initialCapture, operationDeadline);
+    if (initialCapture.permissionFailure === true) throw commandFailedError("permission");
     if (current.kind === "unavailable") throw managerUnavailableError(current.reason);
     if (current.kind === "registered-running-valid") {
       if (current.nonce !== spec.nonce) throw commandFailedError();

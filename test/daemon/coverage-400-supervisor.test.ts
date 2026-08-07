@@ -535,6 +535,42 @@ describe("supervisor coverage: manager states and lifecycle boundaries", () => {
     });
   });
 
+  it.each([
+    { name: "numeric code-5", initial: { code: 5, stderr: "Operation not permitted" } },
+    { name: "mixed absent-channel", initial: { code: 113, stdout: "Could not find service", stderr: "Operation not permitted" } },
+  ])("keeps initial launchd $name permission evidence authoritative before bootstrap", async ({ initial }) => {
+    const value = spec("launchd-user", root());
+    const runner = runQueue([initial]);
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "permission",
+    });
+
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print"]);
+  });
+
+  it("still bootstraps from a true initial launchd absence", async () => {
+    const value = spec("launchd-user", root());
+    const runner = runQueue([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 554) },
+    ]);
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(value)).resolves.toMatchObject({ managerPid: 554 });
+
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "bootstrap", "print"]);
+  });
+
   it("preserves permission evidence from the post-start manager probe", async () => {
     const value = spec("systemd-user");
     const runner = runQueue([
