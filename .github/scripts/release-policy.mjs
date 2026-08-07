@@ -382,15 +382,69 @@ export function renderReleaseNotes({ targetTag, highlights, categorized }) {
   return `${lines.join("\n")}\n`;
 }
 
+function assertReleaseHighlights(body) {
+  if (typeof body !== "string") throw new TypeError("Release body must be a string");
+  const match = /(?:^|\n)## Highlights\r?\n([\s\S]*?)(?=\r?\n## |$)/u.exec(body);
+  if (!match || match[1].trim().length === 0) {
+    throw new Error("Release body is missing a non-empty Highlights section");
+  }
+}
+
 export function assertActionCreatedReleaseBody(body, targetTag) {
   const expectedMarker = releaseDraftMarker(targetTag);
   if (typeof body !== "string" || !body.includes(expectedMarker)) {
     throw new Error(`Release was not created for ${targetTag} by the draft release workflow`);
   }
-  const match = /(?:^|\n)## Highlights\r?\n([\s\S]*?)(?=\r?\n## |$)/u.exec(body);
-  if (!match || match[1].trim().length === 0) {
-    throw new Error("Release body is missing a non-empty Highlights section");
+  assertReleaseHighlights(body);
+}
+
+export function assertRecoveryReleaseBody({
+  body,
+  targetTag,
+  expectedCommit,
+  publishedAt,
+  draftRuns,
+}) {
+  try {
+    assertActionCreatedReleaseBody(body, targetTag);
+    return "draft-marker";
+  } catch (error) {
+    if (typeof body === "string" && body.includes(RELEASE_DRAFT_MARKER)) throw error;
   }
+
+  assertReleaseHighlights(body);
+  parseReleaseTag(targetTag);
+  if (typeof expectedCommit !== "string" || !/^[0-9a-f]{40}$/u.test(expectedCommit)) {
+    throw new Error("Recovery expected commit must be a lowercase 40-character SHA");
+  }
+  const publicationTime = Date.parse(publishedAt);
+  if (!Number.isFinite(publicationTime)) {
+    throw new Error("Recovery release has an invalid publication timestamp");
+  }
+  if (!Array.isArray(draftRuns)) throw new TypeError("Recovery draft runs must be an array");
+
+  const exactRuns = draftRuns.filter(
+    (run) =>
+      run?.event === "push" &&
+      run?.status === "completed" &&
+      run?.display_title === `${RELEASE_RUN_NAME_PREFIX}${targetTag}` &&
+      run?.head_branch === targetTag &&
+      run?.head_sha === expectedCommit,
+  );
+  if (exactRuns.some((run) => run.conclusion === "success")) {
+    throw new Error(`Successful draft workflow provenance for ${targetTag} requires its marker`);
+  }
+  const failedBeforePublication = exactRuns.some((run) => {
+    if (run.conclusion !== "failure") return false;
+    const completedAt = Date.parse(run.updated_at);
+    return Number.isFinite(completedAt) && completedAt <= publicationTime;
+  });
+  if (!failedBeforePublication) {
+    throw new Error(
+      `Manual recovery for ${targetTag} requires an exact failed draft run before publication`,
+    );
+  }
+  return "failed-draft-run";
 }
 
 function historicalRunId(run) {

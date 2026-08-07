@@ -125,9 +125,12 @@ associate it with an immutable release.
 Normal npm publication starts from the GitHub `release: published` event. If
 that run restores the release to draft, fix the failure and publish the same
 draft again. Use the manual immutable-release recovery path only when the
-workflow-created GitHub Release is already public and cannot be restored to
-draft, its canonical signed annotated tag and protected marker remain intact,
-and npm trusted publishing is configured for the `npm-publish` environment.
+GitHub Release is already public and cannot be restored to draft, its canonical
+signed annotated tag remains intact, and npm trusted publishing is configured
+for the `npm-publish` environment. The release must retain a non-empty
+Highlights section and either the protected draft marker or an exact failed
+tag-push draft run for the same tag and commit that completed before manual
+publication.
 
 Dispatch recovery from protected `main`, never another ref:
 
@@ -139,11 +142,14 @@ gh workflow run publish.yml \
 ```
 
 The read-only recovery preflight first checks out the trusted default-branch
-release policy. It validates the live marker and publication history before
-checking out tagged code or executing any tagged package or npm code. It then
-verifies the immutable tag, ancestry, package version, changelog, npm ordering,
-tests, build, and package artifact. The OIDC job uses only trusted tools and the
-verified tarball; it does not check out or execute tagged package code.
+release policy. It validates publication history plus either the live marker or
+the bounded failed-draft provenance before checking out tagged code or executing
+any tagged package or npm code. The fallback requires the release target and
+failed run tag, branch, commit, failure conclusion, and completion time to match
+the verified immutable tag and publication. It then verifies the immutable tag,
+ancestry, package version, changelog, npm ordering, tests, build, and package
+artifact. The OIDC job uses only trusted tools and the verified tarball; it does
+not check out or execute tagged package code.
 
 Recovery is idempotent. If npm already contains the version, the workflow
 verifies the package and dist-tags without rebuilding, repacking, downloading,
