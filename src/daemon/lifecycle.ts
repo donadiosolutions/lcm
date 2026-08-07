@@ -2063,6 +2063,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
           commandTimeoutMs: Math.max(1, opts.spawnTimeoutMs || 1_000),
           stopTimeoutMs: Math.max(1, Math.min(60_000, opts.spawnTimeoutMs || 1_000)),
           sleep: sleepFn,
+          now: monotonicNow,
         });
     managedSupervisorForCleanup = supervisor;
     managedSpecForCleanup = spec;
@@ -2477,9 +2478,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     managedOperationOwned = true;
     let started: { managerPid?: number };
     try {
+      const managerOperation = { deadline };
       started = recreateRegisteredJob
-        ? await supervisor.stopAndStart(launchSpec)
-        : await supervisor.start(launchSpec);
+        ? await supervisor.stopAndStart(launchSpec, managerOperation)
+        : await supervisor.start(launchSpec, managerOperation);
     } catch {
       // A settled manager mutation that throws may have raced a concurrent
       // winner.  The supervisor owns its own absent-proof cleanup; lifecycle

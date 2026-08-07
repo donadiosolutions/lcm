@@ -974,7 +974,10 @@ describe("issue 400 managed ensure admission matrix", () => {
 
     expect(result).toMatchObject({ spawned: true, startMethod: "systemd-user", pid: 4242 });
     expect(probes.map(({ nonce }) => nonce)).toEqual([currentNonce, priorNonce, priorNonce]);
-    expect(fixture.stopAndStart).toHaveBeenCalledWith(expect.objectContaining({ nonce: priorNonce }));
+    expect(fixture.stopAndStart).toHaveBeenCalledWith(
+      expect.objectContaining({ nonce: priorNonce }),
+      { deadline: 100 },
+    );
   });
 
   it("refuses prior-nonce terminal adoption when the observed port is stale", async () => {
@@ -1169,7 +1172,7 @@ describe("issue 400 managed ensure admission matrix", () => {
       nonce: "deterministic-launch-nonce",
       credentialDirectory: observed[1]?.credentialDirectory,
       credentialFiles: observed[1]?.credentialFiles,
-    }));
+    }), { deadline: 100 });
   });
 
   it("erases operation-owned staged credentials only after authenticated admission", async () => {

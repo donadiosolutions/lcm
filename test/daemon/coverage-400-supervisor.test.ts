@@ -1009,6 +1009,51 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(3);
   });
 
+  it("honors the caller deadline across terminal stop/start label-release recovery", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const terminal = launchdText(value, "exited", 0);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: terminal },
+      { code: 0, stdout: "bootout" },
+      absent,
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      absent,
+      absent,
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 5_000,
+      now: () => currentTime,
+      sleep,
+    }).stopAndStart(value, { deadline: 2_500 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "label-release-deadline",
+    });
+    expect(sleep.mock.calls).toEqual([[2_000], [500]]);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+    expect(runner.calls.find(({ args }) => args[0] === "bootstrap")?.timeoutMs).toBe(500);
+  });
+
+  it("rejects a non-finite caller deadline before manager access", async () => {
+    const runner = runQueue([]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec("launchd-user"), { deadline: Number.NaN })).rejects.toThrow("deadline");
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
   it("keeps a numeric code-5 launchd permission failure authoritative", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
@@ -1182,7 +1227,13 @@ describe("supervisor coverage: credentials and private launch files", () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
     const absent = { code: 113, stderr: "Could not find service" };
-    const malformed = { code: 0, stdout: "unparseable launchd response" };
+    // `launchctl print` may project arbitrary manager data.  Permission-like
+    // text in a successful projection is not failed-command evidence and must
+    // not preempt the bounded, read-only malformed-state reprobe.
+    const malformed = {
+      code: 0,
+      stdout: launchdText(value, "starting", 0, "manager value => Permission denied"),
+    };
     const runner = runQueue([
       absent,
       { code: 5, stderr: "diagnostic wording is not an authority" },
@@ -1217,7 +1268,13 @@ describe("supervisor coverage: credentials and private launch files", () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
     const absent = { code: 113, stderr: "Could not find service" };
-    const malformed = { code: 0, stdout: "unparseable launchd response" };
+    // `launchctl print` may project arbitrary manager data. Permission-like
+    // text in a successful projection is not failed-command evidence and must
+    // not preempt the bounded, read-only malformed-state reprobe.
+    const malformed = {
+      code: 0,
+      stdout: launchdText(value, "starting", 0, "manager value => Permission denied"),
+    };
     const runner = runQueue([
       absent,
       { code: 5, stderr: "diagnostic wording is not an authority" },
