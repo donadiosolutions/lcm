@@ -1659,7 +1659,7 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     await expect(ensureDaemon(optionsFor(fixture, {
       _skipHealthWait: false,
       _monotonicNowOverride: () => now,
-    }))).rejects.toBe(cleanupRefusal);
+    }))).resolves.toMatchObject({ refusalReason: "startup-failure", spawned: true });
 
     expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledOnce();
     expect(staged?.credentialDirectory).toBeDefined();
@@ -1683,6 +1683,7 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       fetch: sequenceFetch([new Error("offline")]),
       sleep: async () => { now = 50; },
     });
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
     const cleanupMutation = vi.fn();
     fixture.probe
       .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
@@ -1691,7 +1692,14 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       _spec: SupervisorSpec,
       operation?: { readonly deadline?: number },
     ) => {
-      if (operation?.deadline === undefined || now < operation.deadline) cleanupMutation();
+      if (operation?.deadline === undefined || now < operation.deadline) {
+        cleanupMutation();
+        return;
+      }
+      const error = new Error("manager operation deadline expired") as Error & { reason?: string };
+      error.name = "SupervisorCommandError";
+      error.reason = "timeout";
+      throw error;
     });
 
     await expect(ensureDaemon(optionsFor(fixture, {
@@ -1702,6 +1710,8 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
 
     expect(fixture.stopAndAwaitAbsent).toHaveBeenCalledWith(expect.anything(), { deadline: 50 });
     expect(cleanupMutation).not.toHaveBeenCalled();
+    expect(readFileSync(fixture.pidPath, "utf8").trim()).toBe("4242");
+    expect(existsSync(fixture.tokenPath)).toBe(true);
   });
 
   it("covers deadline abort/timeout callbacks and platform process-command paths", async () => {
@@ -1883,7 +1893,11 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     await expect(ensureDaemon(optionsFor(cleanupFailure, {
       _skipHealthWait: false,
       _monotonicNowOverride: () => 0,
-    }))).rejects.toThrow("managed credential file failed validation");
+    }))).resolves.toMatchObject({
+      refusalReason: "startup-failure",
+      spawned: true,
+      pid: 4242,
+    });
   });
 
   it("bounds authenticated diagnostics on timeout and caller abort", async () => {

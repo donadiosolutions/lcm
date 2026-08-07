@@ -4360,7 +4360,12 @@ describe("restartDaemon", () => {
       platform: "darwin",
       uid: 501,
       environment: { OPENAI_API_KEY: "unadmitted-secret" },
-    })).rejects.toThrow("absence proof refused");
+    })).resolves.toMatchObject({
+      refusalReason: "startup-failure",
+      spawned: true,
+      pid: 201,
+      startMethod: "launchd-user",
+    });
 
     expect(supervisor.stopAndAwaitAbsent).toHaveBeenCalledOnce();
     expect(staged?.credentialDirectory).toBeDefined();

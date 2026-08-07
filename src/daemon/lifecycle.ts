@@ -2653,7 +2653,13 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       const failedTestOperation = testScope !== undefined
         && managedCleanupAuthorized
         && !managedResult.connected;
-      if (ownedTestStart || failedManagedOperation || failedTestOperation) await cleanupManagedScopeResources();
+      if (ownedTestStart || failedManagedOperation || failedTestOperation) {
+        try {
+          await cleanupManagedScopeResources();
+        } catch (error) {
+          if (managedResult.refusalReason === undefined) throw error;
+        }
+      }
       return managedResult;
     }
     if (managerPreflightUnavailable && opts._suppressDetachedFallback) {
