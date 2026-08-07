@@ -1643,6 +1643,111 @@ describe("supervisor coverage: credentials and private launch files", () => {
 });
 
 describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
+  it("does not mutate a stale launchd registration after the caller deadline expires during transition observation", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot, { stopTimeoutMs: 100 });
+    const stale = launchdText({ ...value, nonce: "stale-transition-nonce" }, "not running", 0);
+    const runner = runQueue([
+      { code: 0, stdout: stale },
+      { code: 0, stdout: "unparseable launchd response" },
+    ]);
+    const now = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(100);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      now,
+      sleep,
+    }).stopAndStart(value, { deadline: 100 })).rejects.toThrow("manager command");
+    expect(sleep).not.toHaveBeenCalled();
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "print"]);
+  });
+
+  it("re-observes a stale launchd transition within the caller deadline before refusing ambiguity", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot, { stopTimeoutMs: 100 });
+    const stale = launchdText({ ...value, nonce: "stale-transition-nonce" }, "not running", 0);
+    const runner = runQueue([
+      { code: 0, stdout: stale },
+      { code: 0, stdout: "unparseable launchd response" },
+      { code: 0, stdout: "unparseable launchd response" },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      now: () => 0,
+      sleep,
+    }).stopAndStart(value, { deadline: 100 })).rejects.toThrow("manager command");
+    expect(sleep).toHaveBeenCalledOnce();
+    expect(sleep).toHaveBeenCalledWith(50);
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "print", "print"]);
+  });
+
+  it("stops before absence polling when a caller deadline is exhausted after the manager stop", async () => {
+    const value = spec("systemd-user", root(), { stopTimeoutMs: 100 });
+    const runner = runQueue([
+      { code: 0, stdout: systemdText(value, "active", 12) },
+      { code: 0, stdout: "stopped" },
+    ]);
+    const now = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(1);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      now,
+      sleep,
+    }).stopAndAwaitAbsent(value, { deadline: 1 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(runner.calls.map(({ args }) => args[1] ?? args[0])).toEqual(["show", "stop"]);
+  });
+
+  it("fails an already-expired caller deadline before any manager command", async () => {
+    const runner = runQueue([]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      now: () => 0,
+    }).start(spec("launchd-user"), { deadline: 0 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it("uses the caller deadline for successful launchd post-start polling", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 900) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      now: () => 0,
+    }).start(value, { deadline: 100 })).resolves.toMatchObject({ managerPid: 900 });
+    expect(runner.calls.find(({ args }) => args[0] === "bootstrap")?.timeoutMs).toBe(100);
+  });
+
   it("keeps default polling monotonic across wall-clock jumps", async () => {
     const value = spec("systemd-user", root(), { stopTimeoutMs: 3 });
     const runner = runQueue([
