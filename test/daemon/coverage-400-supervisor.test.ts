@@ -821,6 +821,105 @@ describe("supervisor coverage: credentials and private launch files", () => {
     await expect(createSupervisor("launchd-user", { run: staleRunner.run, platform: "darwin", uid: 501 }).stopAndStart(value)).rejects.toThrow("manager command");
   });
 
+  it("re-observes transient launchd metadata-malformed state after bootstrap", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const transient = launchdText(value, "starting", 0);
+    const running = launchdText(value, "running", 551);
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: transient },
+      { code: 0, stdout: running },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).resolves.toMatchObject({ managerPid: 551 });
+    expect(sleep).toHaveBeenCalledWith(50);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
+  });
+
+  it("uses the bounded host timer for launchd post-start re-observation", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const transient = launchdText(value, "starting", 0);
+    const running = launchdText(value, "running", 552);
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: transient },
+      { code: 0, stdout: running },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 100,
+    }).start(value)).resolves.toMatchObject({ managerPid: 552 });
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it("fails closed when launchd metadata-malformed state persists to the poll deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const transient = launchdText(value, "starting", 0);
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: transient },
+      { code: 0, stdout: transient },
+      { code: 0, stdout: transient },
+      absent,
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 101,
+      now: () => currentTime,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "malformed-state",
+    });
+    expect(sleep.mock.calls).toEqual([[50], [50]]);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
+  });
+
+  it("keeps systemd metadata-malformed post-start state fail closed", async () => {
+    const value = spec("systemd-user");
+    const absent = { code: 1, stderr: "Unit is not-found" };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: systemdText(value, "activating", 0) },
+      absent,
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "malformed-state",
+    });
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
   it("retries an exact launchd bootstrap after the GUI domain settles an absent label", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);

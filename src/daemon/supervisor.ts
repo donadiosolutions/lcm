@@ -2396,8 +2396,12 @@ export function createSupervisor(
       // systemd-run --no-block acknowledges the job submission before the
       // transient unit is active.  Poll the exact stable unit for a bounded
       // interval so a legitimate activation race cannot become a spurious
-      // startup failure, while terminal/ambiguous observations remain
-      // authoritative and fail closed.
+      // startup failure.  launchd can likewise expose an exact
+      // metadata-malformed projection immediately after bootstrap; re-observe
+      // that state read-only within this same budget, but never treat it as
+      // admission or mutation authority.  The exception is launchd-only:
+      // systemd's activation fence below is the authenticated continuation
+      // state, and every other observation remains fail closed.
       const maxPollIntervals = Math.max(
         1,
         Math.min(
@@ -2414,7 +2418,10 @@ export function createSupervisor(
         after = await probeInternal(spec, capture);
         afterPermissionFailure ||= capture.permissionFailure === true;
         const activation = isOwnedSystemdActivation(spec, capture, expectedLaunchEnvironmentDigest);
-        if (after.kind !== "absent" && !activation) break;
+        const transientLaunchdMetadata = kind === "launchd-user"
+          && after.kind === "ambiguous"
+          && after.reason === "metadata-malformed";
+        if (afterPermissionFailure || (after.kind !== "absent" && !activation && !transientLaunchdMetadata)) break;
         if (attempt + 1 < maxPollIntervals) {
           const remaining = pollDeadline - now();
           if (remaining <= 0) break;

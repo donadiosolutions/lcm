@@ -54,14 +54,23 @@ again within the same deadline, but it still requires both exact absence proofs
 before retrying. Malformed metadata that persists to the deadline ends with the
 bounded `malformed-state` reason.
 
+After a successful launchd bootstrap, the exact label can also briefly expose a
+metadata-malformed projection while its registration settles. LCM re-observes
+that projection read-only at the existing bounded poll interval and deadline;
+it never treats malformed metadata as success or as authority for a manager
+mutation. Only a later authenticated running observation admits the start. A
+persisting projection ends with the bounded `malformed-state` reason. This
+launchd-only settling exception does not change systemd's separate authenticated
+activation fence; other systemd and launchd observations remain fail closed.
+
 The numeric result is used because launchd's accompanying human text varies by
 macOS version. Permission failures remain permission failures even if they use
 code 5. A timeout, transport failure, registered label, permission error, other
 ambiguous manager response, malformed response outside the active code-5
-recovery, other command result, or code 5 that lasts to the deadline stops with
-a bounded failure classification. LCM never includes raw manager output, plist
-paths, or credentials in that error, and it never falls back to manual process
-signaling.
+recovery or bounded post-start launchd settling, other command result, or code 5
+that lasts to the deadline stops with a bounded failure classification. LCM
+never includes raw manager output, plist paths, or credentials in that error,
+and it never falls back to manual process signaling.
 
 Use these commands for normal operation:
 
