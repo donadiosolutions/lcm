@@ -786,14 +786,15 @@ test("fails closed on missing, malformed, and unresolved canonical history", asy
   );
 });
 
-test("fails closed on malformed recovery-run provenance independently", async () => {
+test("ignores legacy successful recovery runs without using them as supersession evidence", async () => {
+  const warnings = [];
   const github = publicationHistoryGithub({
     recoveryRuns: [
       { id: 1, conclusion: "success", display_title: "Publish Package" },
     ],
   });
 
-  await assert.rejects(
+  await assert.doesNotReject(
     () =>
       enforceEarlierPublicationSuccess({
         github,
@@ -801,8 +802,32 @@ test("fails closed on malformed recovery-run provenance independently", async ()
         repo: "lcm",
         currentRunId: 2,
         currentTag: "v1.5.0",
+        warning: (message) => warnings.push(message),
       }),
-    /missing or malformed release-tag provenance/u,
+  );
+  assert.deepEqual(warnings, [
+    "Ignoring legacy successful recovery run 1 without usable release-tag provenance",
+  ]);
+
+  const unresolvedFailure = publicationHistoryGithub({
+    releaseRuns: [
+      { id: 2, conclusion: "failure", display_title: "release-tag:v1.4.2" },
+    ],
+    recoveryRuns: [
+      { id: 3, conclusion: "success", display_title: "Publish Package" },
+    ],
+    releases: new Map([["v1.4.2", { draft: false }]]),
+  });
+  await assert.rejects(
+    () =>
+      enforceEarlierPublicationSuccess({
+        github: unresolvedFailure,
+        owner: "donadiosolutions",
+        repo: "lcm",
+        currentRunId: 4,
+        currentTag: "v1.5.0",
+      }),
+    /Earlier release runs for other tags failed/u,
   );
 });
 

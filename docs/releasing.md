@@ -132,6 +132,19 @@ Highlights section and either the protected draft marker or an exact failed
 tag-push draft run for the same tag and commit that completed before manual
 publication.
 
+### Recovery configuration
+
+The recovery workflow is configured by the repository; the operator only needs
+to dispatch `publish.yml` from the protected default branch and provide the
+exact immutable release tag as its required `tag` input. The recovery preflight
+uses Actions-read and contents-read permissions. Its publication job runs in
+the `npm-publish` environment with Actions-read, contents-read, and
+`id-token: write` permissions, and therefore requires npm trusted publishing
+to be configured for that environment.
+
+There are no additional user-settable recovery options. Do not select another
+ref, substitute a commit or version for the tag, or add workflow inputs.
+
 Dispatch recovery from protected `main`, never another ref:
 
 ```bash
