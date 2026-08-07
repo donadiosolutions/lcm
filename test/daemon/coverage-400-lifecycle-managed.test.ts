@@ -1963,6 +1963,53 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     });
   });
 
+  it("preserves independent test-scope cleanup failures after an ambiguous manager result", async () => {
+    const fixture = createScopedFixture({
+      fetch: sequenceFetch([new Error("pre-start offline")]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(
+        spec,
+        "registered-running-valid",
+        { managerPid: 9999 },
+      ));
+    fixture.start.mockImplementationOnce(async (spec: SupervisorSpec) => {
+      rmSync(fixture.scope.runtimeDir, { recursive: true, force: true });
+      return {
+        kind: spec.kind,
+        name: spec.name,
+        scopeDigest: spec.scopeDigest,
+        port: spec.port,
+        nonce: spec.nonce,
+        managerPid: 4242,
+      };
+    });
+
+    await expect(ensureDaemon({
+      port: fixture.port,
+      pidFilePath: fixture.pidPath,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1",
+      expectedEntrypoint: fixture.scope.entrypoint,
+      expectedRuntimeDigest: RUNTIME_DIGEST,
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _testScope: fixture.scope,
+      _supervisorOverride: fixture.supervisor,
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 4242,
+      _skipHealthWait: true,
+      _monotonicNowOverride: () => 0,
+    })).rejects.toThrow(
+      `lifecycle test cleanup root is not current owned state: ${fixture.scope.runtimeDir}`,
+    );
+
+    expect(fixture.probe).toHaveBeenCalledTimes(2);
+    expect(fixture.start).toHaveBeenCalledOnce();
+    expect(fixture.stopAndAwaitAbsent).not.toHaveBeenCalled();
+  });
+
   it("bounds authenticated diagnostics on timeout and caller abort", async () => {
     const timed = createFixture({
       isAlive: () => true,

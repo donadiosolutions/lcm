@@ -2669,7 +2669,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         try {
           await cleanupManagedScopeResources();
         } catch (error) {
-          if (!hasPrimaryManagedOutcome) throw error;
+          if (!failedManagedOperation || !hasPrimaryManagedOutcome) throw error;
         }
       }
       return managedResult;
