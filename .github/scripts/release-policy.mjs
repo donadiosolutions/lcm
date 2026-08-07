@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { PACKAGE_NAME } from "./npm-release-policy.mjs";
+import { PACKAGE_NAME, checkNpmVersionPublished } from "./npm-release-policy.mjs";
 import { parseReleaseTag } from "./release-tag-policy.mjs";
 
 export {
@@ -10,6 +10,7 @@ export {
   assertNpmDistTags,
   assertReleaseCanAdvanceDistTag,
   checkNpmReleaseState,
+  checkNpmVersionPublished,
   verifyNpmRelease,
 } from "./npm-release-policy.mjs";
 export { assertVerifiedReleaseTag, parseReleaseTag } from "./release-tag-policy.mjs";
@@ -509,12 +510,16 @@ export async function enforceEarlierPublicationSuccess({
   repo,
   currentRunId,
   currentTag,
+  checkPublishedVersion = (version) => checkNpmVersionPublished({ version }),
   warning = () => {},
 }) {
   if (!Number.isSafeInteger(currentRunId) || currentRunId <= 0) {
     throw new Error(`Invalid workflow run id ${currentRunId}`);
   }
   parseReleaseTag(currentTag);
+  if (typeof checkPublishedVersion !== "function") {
+    throw new TypeError("checkPublishedVersion must be a function");
+  }
   if (typeof warning !== "function") throw new TypeError("warning must be a function");
 
   const releaseRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
@@ -568,19 +573,38 @@ export async function enforceEarlierPublicationSuccess({
       );
       continue;
     }
+    let release;
     try {
-      const { data: release } = await github.rest.repos.getReleaseByTag({
+      ({ data: release } = await github.rest.repos.getReleaseByTag({
         owner,
         repo,
         tag: run.releaseTag,
-      });
-      if (release.draft) {
-        warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown error";
+      warning(`Could not look up GitHub release for failed release run ${run.id}; failing closed: ${message}`);
+      blockingFailures.push(run);
+      continue;
+    }
+    if (release.draft) {
+      warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
+      continue;
+    }
+
+    const failedVersion = parseReleaseTag(run.releaseTag).version;
+    try {
+      if (await checkPublishedVersion(failedVersion)) {
+        warning(
+          `Ignoring failed release run ${run.id}; ${PACKAGE_NAME}@${failedVersion} is published`,
+        );
         continue;
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown error";
-      warning(`Could not prove failed release run ${run.id} was withdrawn: ${message}`);
+      warning(
+        `Could not probe npm publication for failed release run ${run.id} ` +
+          `(${PACKAGE_NAME}@${failedVersion}); failing closed: ${message}`,
+      );
     }
     blockingFailures.push(run);
   }

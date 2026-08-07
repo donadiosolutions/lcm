@@ -265,6 +265,8 @@ describe("release workflows", () => {
     );
     expect(releasePolicySource).toContain("ignoreMalformed: true");
     expect(releasePolicySource).toContain("Ignoring legacy successful recovery run");
+    expect(releasePolicySource).toContain("checkNpmVersionPublished");
+    expect(releasePolicySource).toContain("is published");
     expect(releasePolicySource).toContain("run.conclusion !== \"success\"");
     expect(releasePolicySource).toContain('run.conclusion === "success"');
     expect(releasePolicySource).toContain("run.display_title");
@@ -283,7 +285,7 @@ describe("release workflows", () => {
     expect(releasePolicySource).toContain("for other tags failed");
     expect(releasePolicySource).not.toContain("setTimeout");
     expect(publishWorkflow.jobs.preflight.steps.indexOf(trustedPolicy!)).toBe(0);
-    expect(publishWorkflow.jobs.preflight.steps.indexOf(publicationPolicy!)).toBe(1);
+    expect(publishWorkflow.jobs.preflight.steps.indexOf(publicationPolicy!)).toBe(2);
 
     const restore = publishWorkflow.jobs["restore-draft"];
     expect(restore.if).toContain("needs.preflight.result == 'failure'");
@@ -427,6 +429,7 @@ describe("release workflows", () => {
     const trustedProvenanceIndex = preflightSteps.findIndex(
       (step) => step.name === "Validate trusted release provenance",
     );
+    const preflightSetupNodeIndex = preflightSteps.findIndex((step) => step.name === "Setup Node");
     const preflightTagCheckIndex = preflightSteps.findIndex(
       (step) => step.name === "Verify signed annotated release tag",
     );
@@ -434,7 +437,13 @@ describe("release workflows", () => {
       (step) => step.name === "Checkout verified release commit",
     );
     expect(trustedPolicyIndex).toBe(0);
-    expect(trustedProvenanceIndex).toBe(1);
+    expect(preflightSetupNodeIndex).toBe(1);
+    expect(trustedProvenanceIndex).toBe(2);
+    expect(preflightSteps[preflightSetupNodeIndex]).toMatchObject({
+      uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+      with: { "node-version": 24, "registry-url": "https://registry.npmjs.org/" },
+    });
+    expect(preflightSetupNodeIndex).toBeLessThan(trustedProvenanceIndex);
     expect(trustedProvenanceIndex).toBeLessThan(preflightTagCheckIndex);
     expect(preflightTagCheckIndex).toBeLessThan(releaseCheckoutIndex);
     const trustedCheckout = publishWorkflow.jobs.publish.steps.find(
@@ -526,10 +535,19 @@ describe("release workflows", () => {
     expect(trustedPolicyRefs.some((ref) => String(ref).includes("default_branch"))).toBe(false);
     expect(trustedRecoveryPolicy?.with?.path).toBe("trusted");
     expect(recoveryPreflight.steps.indexOf(trustedRecoveryPolicy!)).toBe(0);
+    const recoverySetupNodeIndex = recoveryPreflight.steps.findIndex(
+      (step) => step.name === "Setup Node",
+    );
     const recoveryHistory = recoveryPreflight.steps.find(
       (step) => step.name === "Verify recovery request and immutable release tag",
     );
-    expect(recoveryPreflight.steps.indexOf(recoveryHistory!)).toBe(1);
+    expect(recoverySetupNodeIndex).toBe(1);
+    expect(recoveryPreflight.steps.indexOf(recoveryHistory!)).toBe(2);
+    expect(recoveryPreflight.steps[recoverySetupNodeIndex]).toMatchObject({
+      uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+      with: { "node-version": 24, "registry-url": "https://registry.npmjs.org/" },
+    });
+    expect(recoverySetupNodeIndex).toBeLessThan(recoveryPreflight.steps.indexOf(recoveryHistory!));
     expect(recoveryHistory?.with?.script).toMatch(
       /join\(\s*process\.env\.GITHUB_WORKSPACE,\s*"trusted"/u,
     );
@@ -635,7 +653,7 @@ describe("release workflows", () => {
     expect(marker?.with?.script).toContain(
       "assertActionCreatedReleaseBody(release.body, currentTag)",
     );
-    expect(publishWorkflow.jobs.preflight.steps.indexOf(marker!)).toBe(1);
+    expect(publishWorkflow.jobs.preflight.steps.indexOf(marker!)).toBe(2);
   });
 
   it("records prerelease support as a minor package change", () => {
