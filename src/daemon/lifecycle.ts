@@ -566,7 +566,7 @@ function validateSpawnTimeout(spawnTimeoutMs: number): void {
 }
 
 function supervisorCommandTimeoutMs(spawnTimeoutMs: number): number {
-  return Math.max(1, Math.min(MAX_SUPERVISOR_COMMAND_TIMEOUT_MS, spawnTimeoutMs || 1_000));
+  return Math.max(1, Math.floor(Math.min(MAX_SUPERVISOR_COMMAND_TIMEOUT_MS, spawnTimeoutMs || 1_000)));
 }
 
 function isProcessAlive(pid: number): boolean {

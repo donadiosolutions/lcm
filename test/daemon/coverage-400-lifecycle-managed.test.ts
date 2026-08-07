@@ -330,6 +330,24 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
     expect(restartSpawn).toHaveBeenCalledOnce();
     expect(restartSpawn.mock.calls[0]?.[2]).toMatchObject({ timeout: 60_000 });
 
+    for (const [spawnTimeoutMs, expectedCommandTimeoutMs] of [[1.9, 1], [60_000.9, 60_000]] as const) {
+      const fractionalSpawn = vi.fn(() => ({ status: 1, stdout: "", stderr: "Unit is not-found" }));
+      const fractional = createScopedFixture({
+        fetch: vi.fn(async () => { throw new Error("offline"); }) as never,
+        spawnSync: fractionalSpawn as never,
+      });
+      await expect(ensureDaemon({
+        port: fractional.port,
+        pidFilePath: fractional.pidPath,
+        spawnTimeoutMs,
+        enforceUserManagerParent: true,
+        _testScope: fractional.scope,
+        _skipSpawn: true,
+        _monotonicNowOverride: () => 0,
+      })).resolves.toMatchObject({ refusalReason: "absent" });
+      expect(fractionalSpawn.mock.calls[0]?.[2]).toMatchObject({ timeout: expectedCommandTimeoutMs });
+    }
+
     const fixture = createFixture({ fetch: sequenceFetch([new Error("offline")]) });
     let operationDeadline: number | undefined;
     fixture.probe

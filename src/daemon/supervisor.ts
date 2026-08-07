@@ -2480,13 +2480,21 @@ export function createSupervisor(
       const pollBudget = operationDeadline === undefined
         ? configuredCommandTimeoutMs
         : Math.max(0, Math.floor(pollDeadline - now()));
-      const maxPollIntervals = Math.max(
-        1,
-        Math.min(MAX_POLL_INTERVALS, Math.ceil(pollBudget / DEFAULT_POLL_INTERVAL_MS)),
-      );
+      // Launchd's metadata-malformed window is observation-only and can
+      // legitimately outlive the historical 100-poll (5 s) convenience cap.
+      // Allow one final observation at the caller's absolute deadline while
+      // retaining systemd's activation cap.
+      const maxPollIntervals = kind === "launchd-user"
+        ? Math.max(1, Math.ceil(pollBudget / DEFAULT_POLL_INTERVAL_MS) + 1)
+        : Math.max(1, Math.min(MAX_POLL_INTERVALS, Math.ceil(pollBudget / DEFAULT_POLL_INTERVAL_MS)));
       let after: SupervisorObservation = Object.freeze({ kind: "absent", name: spec.name });
       let afterPermissionFailure = false;
       for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
+        if (
+          after.kind === "ambiguous"
+          && after.reason === "metadata-malformed"
+          && pollDeadline - now() <= 0
+        ) break;
         const capture: SupervisorProbeCapture = {};
         after = await probeWithinOperation(spec, capture, operationDeadline);
         afterPermissionFailure ||= capture.permissionFailure === true;

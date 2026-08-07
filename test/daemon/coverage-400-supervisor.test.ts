@@ -894,7 +894,72 @@ describe("supervisor coverage: credentials and private launch files", () => {
       name: "SupervisorCommandError",
       reason: "malformed-state",
     });
-    expect(sleep.mock.calls).toEqual([[50], [50]]);
+    expect(sleep.mock.calls).toEqual([[50], [50], [1]]);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
+  });
+
+  it("keeps re-observing launchd metadata-malformed state past five seconds while the operation deadline remains", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const transient = { code: 0, stdout: launchdText(value, "starting", 0) };
+    const running = { code: 0, stdout: launchdText(value, "running", 553) };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      ...Array.from({ length: 101 }, () => transient),
+      running,
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 60_000,
+      now: () => currentTime,
+      sleep,
+    }).start(value, { deadline: 6_000 })).resolves.toMatchObject({ managerPid: 553 });
+
+    expect(currentTime).toBe(5_050);
+    expect(sleep).toHaveBeenCalledTimes(101);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
+  });
+
+  it("keeps persistent launchd metadata-malformed state bounded by the terminal operation deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const transient = { code: 0, stdout: launchdText(value, "starting", 0) };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      ...Array.from({ length: 121 }, () => transient),
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 60_000,
+      now: () => currentTime,
+      sleep,
+    }).start(value, { deadline: 6_000 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "malformed-state",
+    });
+
+    expect(currentTime).toBe(6_000);
+    expect(sleep).toHaveBeenCalledTimes(120);
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
     expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
   });
