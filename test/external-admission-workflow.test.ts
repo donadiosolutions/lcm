@@ -183,9 +183,12 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain('"$HEAD_SHA" "$REPOSITORY" "$SERVER_URL"');
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-ci-run");
     expect(evaluator).toContain('if [[ "$EVENT_SOURCE" == workflow_run');
-    expect(evaluator).toContain('VALIDATED_ADMISSION_FINGERPRINT="$ci_check_run_id:$dco_check_run_id:$ci_run_id"');
-    expect(evaluator).toContain('initial_admission_fingerprint="$VALIDATED_ADMISSION_FINGERPRINT"');
-    expect(evaluator.match(/VALIDATED_ADMISSION_FINGERPRINT" != "\$initial_admission_fingerprint/gu)).toHaveLength(2);
+    expect(evaluator).toContain('printf -v "$fingerprint_variable" \'%s\' "$ci_check_run_id:$dco_check_run_id:$ci_run_id"');
+    expect(evaluator).toContain('validate_or_exit "Initial" initial_admission_fingerprint');
+    expect(evaluator).toContain('validate_or_exit "Current" current_admission_fingerprint');
+    expect(evaluator).toContain('validate_or_exit "Final" final_admission_fingerprint');
+    expect(evaluator.match(/admission_fingerprint" != "\$initial_admission_fingerprint/gu)).toHaveLength(2);
+    expect(evaluator).not.toContain('VALIDATED_ADMISSION_FINGERPRINT');
     expect(evaluator).not.toContain("classify-files");
     expect(evaluator).not.toContain("select-admission");
     expect(evaluator).not.toContain("admission-decision");

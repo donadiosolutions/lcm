@@ -99,9 +99,9 @@ snapshot_incomplete() {
   return 1
 }
 
-VALIDATED_ADMISSION_FINGERPRINT=""
 validate_required_snapshot() {
   local phase="$1"
+  local fingerprint_variable="$2"
   local check_run_pages evaluation terminal_failure ci_check_run_id dco_check_run_id ci_run_id
   local ci_run ci_evaluation
   local ci_terminal_failure
@@ -147,14 +147,15 @@ validate_required_snapshot() {
       "$phase CI workflow run is $(jq -r '.state' <<<"$ci_evaluation"); admission remains pending." || return $?
   fi
 
-  VALIDATED_ADMISSION_FINGERPRINT="$ci_check_run_id:$dco_check_run_id:$ci_run_id"
+  printf -v "$fingerprint_variable" '%s' "$ci_check_run_id:$dco_check_run_id:$ci_run_id"
   return 0
 }
 
 validate_or_exit() {
   local phase="$1"
+  local fingerprint_variable="$2"
   local result=0
-  validate_required_snapshot "$phase" || result=$?
+  validate_required_snapshot "$phase" "$fingerprint_variable" || result=$?
   if (( result == 1 )); then
     trap - EXIT INT TERM
     exit 0
@@ -190,8 +191,8 @@ if ! pull_request_is_eligible <<<"$pull_request"; then
 fi
 
 post_admission_status pending "Waiting for trusted CI and DCO"
-validate_or_exit "Initial"
-initial_admission_fingerprint="$VALIDATED_ADMISSION_FINGERPRINT"
+initial_admission_fingerprint=""
+validate_or_exit "Initial" initial_admission_fingerprint
 
 current_matching_prs="$(fetch_associated_pull_requests)"
 current_pr_number="$(resolve_eligible_pr_number <<<"$current_matching_prs")"
@@ -206,15 +207,17 @@ if ! pull_request_is_eligible <<<"$current_pull_request"; then
     "Pull request is no longer eligible for admission" \
     "Pull request eligibility changed during evaluation; admission remains pending."
 fi
-validate_or_exit "Current"
-if [[ "$VALIDATED_ADMISSION_FINGERPRINT" != "$initial_admission_fingerprint" ]]; then
+current_admission_fingerprint=""
+validate_or_exit "Current" current_admission_fingerprint
+if [[ "$current_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
   snapshot_incomplete_or_exit \
     "Latest trusted check changed during admission" \
     "Trusted CI or DCO check changed during evaluation; admission remains pending."
 fi
 
-validate_or_exit "Final"
-if [[ "$VALIDATED_ADMISSION_FINGERPRINT" != "$initial_admission_fingerprint" ]]; then
+final_admission_fingerprint=""
+validate_or_exit "Final" final_admission_fingerprint
+if [[ "$final_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
   snapshot_incomplete_or_exit \
     "Latest trusted check changed during final validation" \
     "Final trusted CI or DCO check changed during evaluation; admission remains pending."
