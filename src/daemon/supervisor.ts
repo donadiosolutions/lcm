@@ -284,6 +284,8 @@ const SHA256_HEX_LENGTH = 64;
 const SCOPE_NAME_HEX_LENGTH = 20;
 const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_STOP_TIMEOUT_MS = 5_000;
+const MIN_RUNNER_TIMEOUT_MS = 1;
+const MAX_RUNNER_TIMEOUT_MS = 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 50;
 const LAUNCHD_LABEL_REUSE_SETTLE_MS = 2_000;
 const MAX_POLL_INTERVALS = 100;
@@ -300,6 +302,10 @@ const SYSTEMD_STOP_TRANSITION_SUBSTATES = new Set([
 ]);
 const MAX_NONCE_LENGTH = 128;
 const MAX_METADATA_VALUE_LENGTH = 512;
+
+function clampRunnerTimeout(timeoutMs: number): number {
+  return Math.max(MIN_RUNNER_TIMEOUT_MS, Math.min(MAX_RUNNER_TIMEOUT_MS, Math.floor(timeoutMs)));
+}
 /**
  * Bound path-shaped manager metadata by bytes, not JavaScript code units.  The
  * service-manager metadata is not a filesystem API, but keeping this aligned
@@ -551,7 +557,7 @@ export function createSupervisorSpec(input: SupervisorSpecInput): SupervisorSpec
       return Object.freeze({ name: credential.name, path: resolvedPath });
     }));
   const stopTimeoutMs = input.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
-  if (!Number.isInteger(stopTimeoutMs) || stopTimeoutMs < 1 || stopTimeoutMs > 60_000) {
+  if (!Number.isInteger(stopTimeoutMs) || stopTimeoutMs < MIN_RUNNER_TIMEOUT_MS || stopTimeoutMs > MAX_RUNNER_TIMEOUT_MS) {
     throw new Error("supervisor stop timeout is invalid");
   }
   const credentialDirectory = input.credentialDirectory === undefined
@@ -2194,7 +2200,7 @@ function createObservationRunner(
   readonly uid: number;
   readonly environment: Readonly<Record<string, string>>;
 } {
-  const commandTimeoutMs = dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+  const commandTimeoutMs = clampRunnerTimeout(dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
   const uid = dependencies.uid ?? (typeof process.getuid === "function" ? process.getuid() : -1);
   const environment = managedLaunchEnvironment(dependencies.environment ?? process.env);
   const invoke = async (
@@ -2202,7 +2208,7 @@ function createObservationRunner(
     args: readonly string[],
     timeoutMs = commandTimeoutMs,
   ) => {
-    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+    if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_RUNNER_TIMEOUT_MS || timeoutMs > MAX_RUNNER_TIMEOUT_MS) {
       return Object.freeze({ code: null, stdout: "", stderr: "", timedOut: true });
     }
     if (dependencies.platform !== undefined && dependencies.platform !== managerPlatform(kind)) {
@@ -2245,7 +2251,7 @@ export function createSupervisor(
   };
 
   const operationTimeout = (deadline: number | undefined, fallback: number): number => {
-    const configuredTimeout = Math.min(fallback, configuredCommandTimeoutMs);
+    const configuredTimeout = clampRunnerTimeout(fallback);
     return deadline === undefined
       ? configuredTimeout
       : Math.min(configuredTimeout, remainingOperationTimeout(deadline));
@@ -2311,9 +2317,11 @@ export function createSupervisor(
     spec: SupervisorSpec,
     capture: SupervisorProbeCapture | undefined,
     deadline: number | undefined,
-  ): Promise<SupervisorObservation> => deadline === undefined
-    ? probeInternal(spec, capture)
-    : probeInternal(spec, capture, operationTimeout(deadline, configuredCommandTimeoutMs));
+  ): Promise<SupervisorObservation> => probeInternal(
+    spec,
+    capture,
+    operationTimeout(deadline, configuredCommandTimeoutMs),
+  );
 
   /**
    * launchd can report a bootout target absent before it has released the
@@ -2346,7 +2354,12 @@ export function createSupervisor(
         const observed = await probeInternal(
           spec,
           capture,
-          Math.min(configuredCommandTimeoutMs, remaining),
+          // `remaining` was sampled before this observation started.  Keep
+          // that command budget for the in-flight observation so an
+          // observation that completes exactly at the deadline can preserve
+          // its authoritative classification (for example, malformed-state)
+          // instead of being replaced by a second timeout check.
+          Math.min(clampRunnerTimeout(configuredCommandTimeoutMs), remaining),
         );
         if (capture.permissionFailure === true) throw commandFailedError("permission");
         if (observed.kind === "absent") return;
@@ -2382,7 +2395,7 @@ export function createSupervisor(
       result = await runner.invoke(
         "launchctl",
         args,
-        Math.min(configuredCommandTimeoutMs, remaining),
+        operationTimeout(deadline, configuredCommandTimeoutMs),
       );
     }
     return result;
@@ -2453,7 +2466,7 @@ export function createSupervisor(
         ? systemdStartArgs(spec, runner.uid, runner.environment)
         : ["bootstrap", launchdDomain(runner.uid), launchPath!];
       const commandDeadline = operationDeadline ?? (kind === "launchd-user"
-        ? now() + configuredCommandTimeoutMs
+        ? now() + operationTimeout(undefined, configuredCommandTimeoutMs)
         : 0);
       const initialTimeout = operationTimeout(operationDeadline, configuredCommandTimeoutMs);
       const initialResult = await runner.invoke(
@@ -2479,10 +2492,10 @@ export function createSupervisor(
       // admission or mutation authority.  The exception is launchd-only:
       // systemd's activation fence below is the authenticated continuation
       // state, and every other observation remains fail closed.
-      const pollDeadline = operationDeadline ?? now() + configuredCommandTimeoutMs;
+      const pollDeadline = operationDeadline ?? now() + operationTimeout(undefined, configuredCommandTimeoutMs);
       postMutationDeadline = pollDeadline;
       const pollBudget = operationDeadline === undefined
-        ? configuredCommandTimeoutMs
+        ? operationTimeout(undefined, configuredCommandTimeoutMs)
         : Math.max(0, Math.floor(pollDeadline - now()));
       // Launchd's metadata-malformed window is observation-only and can
       // legitimately outlive the historical 100-poll (5 s) convenience cap.

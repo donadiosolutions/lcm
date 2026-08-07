@@ -1951,6 +1951,34 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
   });
 
   it.each([
+    { configuredCommandTimeoutMs: 7.5, expectedTimeoutMs: 7 },
+    { configuredCommandTimeoutMs: 60_001.5, expectedTimeoutMs: 60_000 },
+  ])("clamps direct probe timeout $configuredCommandTimeoutMs to the runner bounds", async ({ configuredCommandTimeoutMs, expectedTimeoutMs }) => {
+    const value = spec("systemd-user", root());
+    const runner = runQueue([{ code: 0, stdout: systemdText(value, "active", 904) }]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      commandTimeoutMs: configuredCommandTimeoutMs,
+    }).probe(value)).resolves.toMatchObject({ kind: "registered-running-valid", managerPid: 904 });
+    expect(runner.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([expectedTimeoutMs]);
+  });
+
+  it("classifies a non-finite configured probe timeout without invoking the manager", async () => {
+    const value = spec("systemd-user", root());
+    const runner = runQueue([]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      commandTimeoutMs: Number.NaN,
+    }).probe(value)).resolves.toMatchObject({
+      kind: "unavailable",
+      reason: "manager-timeout",
+    });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it.each([
     { name: "permission", failure: { code: 1, stderr: "Operation not permitted" }, reason: "permission" },
     { name: "timeout", failure: { timedOut: true }, reason: "timeout" },
     { name: "transport", failure: { code: null }, reason: "transport" },
@@ -2072,7 +2100,7 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "bootstrap", "print"]);
   });
 
-  it("preserves timeout classification and configured caps for stop and reset-failed commands", async () => {
+  it("preserves timeout classification and independent stop and reset-failed budgets", async () => {
     const value = spec("systemd-user", root(), { stopTimeoutMs: 100 });
     const configuredCommandTimeoutMs = 7;
     const timedOutStop = runQueue([
@@ -2087,7 +2115,7 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
       name: "SupervisorCommandError",
       reason: "timeout",
     });
-    expect(timedOutStop.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([7, 7]);
+    expect(timedOutStop.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([7, 100]);
 
     const timedOutReset = runQueue([
       { code: 0, stdout: systemdText(value, "failed") },
@@ -2102,7 +2130,22 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
       name: "SupervisorCommandError",
       reason: "timeout",
     });
-    expect(timedOutReset.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([7, 7, 7]);
+    expect(timedOutReset.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([7, 100, 100]);
+
+    const deadlineBoundStop = runQueue([
+      { code: 0, stdout: systemdText(value, "active", 12) },
+      { timedOut: true },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: deadlineBoundStop.run,
+      platform: "linux",
+      commandTimeoutMs: configuredCommandTimeoutMs,
+      now: () => 0,
+    }).stopAndAwaitAbsent(value, { deadline: 50 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+    expect(deadlineBoundStop.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([7, 50]);
   });
 
   it("keeps default polling monotonic across wall-clock jumps", async () => {
