@@ -4241,6 +4241,7 @@ describe("restartDaemon", () => {
     tempDirs.push(tempDir);
     const pidFile = join(tempDir, "daemon.pid");
     let registered = false;
+    let monotonicMs = 0;
     let staged: ManagedCredentialSnapshot | undefined;
     const supervisor = {
       probe: vi.fn(async (candidate: { scopeDigest: string; nonce: string; name: string }) => registered
@@ -4280,6 +4281,8 @@ describe("restartDaemon", () => {
       _skipHealthWait: false,
       _supervisorOverride: supervisor as never,
       _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride,
+      _monotonicNowOverride: (): number => monotonicMs,
+      _sleepOverride: async (durationMs: number): Promise<void> => { monotonicMs += durationMs; },
     }, {
       platform: "darwin",
       uid: 501,
