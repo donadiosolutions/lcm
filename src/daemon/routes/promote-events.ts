@@ -1,5 +1,5 @@
 import type { EventRow, PatternReinforcementStats } from "../../hooks/events-db.js";
-import { eventsDbPath } from "../../db/events-path.js";
+import { eventsDbPath, existingEventsDbPath } from "../../db/events-path.js";
 import { deduplicateAndInsert } from "../../promotion/dedup.js";
 import { sendJson, type RouteHandler } from "../server.js";
 import { isMissingCwdError, validateCwd } from "../validate-cwd.js";
@@ -175,13 +175,16 @@ async function withLockedCwdPromotion<T>(
   let sidecarPath = sidecarPathOverride;
   if (sidecarPath === undefined) {
     try {
-      sidecarPath = eventsDbPath(validateCwd(cwd));
+      const resolvedCwd = validateCwd(cwd);
+      sidecarPath = existingEventsDbPath(resolvedCwd) ?? eventsDbPath(resolvedCwd);
     } catch (error) {
       if (!isMissingCwdError(error)) throw error;
       // Preserve the same absolute lexical normalization used for an existing
       // cwd without requiring the missing path to become stat-able. Sidecar
       // identity must never depend on unresolved `..` or trailing separators.
-      sidecarPath = eventsDbPath(validateCwd(cwd, { allowMissing: true }));
+      const resolvedCwd = validateCwd(cwd, { allowMissing: true });
+      sidecarPath = existingEventsDbPath(resolvedCwd);
+      if (sidecarPath === undefined) return onUnavailable(noSidecarParkingResult());
     }
   }
 

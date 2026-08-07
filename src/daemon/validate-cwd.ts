@@ -23,7 +23,8 @@ export interface ValidateCwdOptions {
 /**
  * Normalize and validate a cwd parameter from a daemon route.
  *
- * Preserve the caller's lexical path after validation so an explicitly mapped
+ * The returned path is normalized with path.resolve(), collapsing lexical
+ * traversal and trailing separators. Preserve that resolved lexical path so an explicitly mapped
  * project alias remains distinguishable from the canonical directory it may
  * currently reference. Project identity resolution performs its own canonical
  * fallback for paths that are not aliases.

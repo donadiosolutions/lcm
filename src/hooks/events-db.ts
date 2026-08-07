@@ -1,6 +1,7 @@
 // src/hooks/events-db.ts
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
   getExistingLcmConnection,
@@ -9,7 +10,10 @@ import {
   isLcmConnectionOpen,
 } from "../db/connection.js";
 import { sanitizeError } from "../daemon/safe-error.js";
-import { ensurePrivateDirectory } from "../security-files.js";
+import {
+  ensurePrivateDirectory,
+  PRIVATE_DIRECTORY_MODE,
+} from "../security-files.js";
 import { readMachineIdentity } from "../machine-identity.js";
 import { sanitizeHookErrorDiagnostic } from "./hook-error-diagnostic.js";
 import {
@@ -69,6 +73,52 @@ const LEGACY_EVENT_CREATED_AT_FALLBACK = "1970-01-01 00:00:00";
 const MAX_POSTGRESQL_BIGINT = 9_223_372_036_854_775_807n;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[457][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const MISSING_CWD_PARKING_OBSERVATIONS = 3;
+
+export type MissingCwdStateRow = {
+  readonly id: number;
+  readonly observations: number;
+  readonly last_observed_at: number;
+  readonly parked_at: string | null;
+};
+
+function isCanonicalSqliteUtcTimestamp(
+  db: DatabaseSync,
+  value: unknown,
+): value is string {
+  if (typeof value !== "string") return false;
+  const normalized = db.prepare("SELECT datetime(?) AS value").get(value) as {
+    value: string | null;
+  };
+  return normalized.value === value;
+}
+
+/** Validate persisted missing-CWD state before any caller interprets it. */
+export function isValidMissingCwdStateRow(
+  db: DatabaseSync,
+  row: unknown,
+): row is MissingCwdStateRow {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return false;
+  const state = row as Record<string, unknown>;
+  if (state.id !== 1) return false;
+  if (
+    typeof state.observations !== "number"
+    || !Number.isSafeInteger(state.observations)
+    || state.observations <= 0
+  ) {
+    return false;
+  }
+  if (
+    typeof state.last_observed_at !== "number"
+    || !Number.isSafeInteger(state.last_observed_at)
+    || state.last_observed_at < 0
+  ) {
+    return false;
+  }
+  if (state.parked_at === null) return true;
+  return state.observations >= MISSING_CWD_PARKING_OBSERVATIONS
+    && isCanonicalSqliteUtcTimestamp(db, state.parked_at);
+}
 
 function normalizeRecentErrorLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_RECENT_ERROR_LIMIT;
@@ -148,7 +198,7 @@ CREATE TABLE IF NOT EXISTS missing_cwd_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   observations INTEGER NOT NULL CHECK (observations > 0),
   last_observed_at INTEGER NOT NULL CHECK (last_observed_at >= 0),
-  parked_at TEXT
+  parked_at TEXT CHECK (parked_at IS NULL OR observations >= 3)
 );
 `;
 
@@ -214,7 +264,16 @@ export class EventsDb {
     options: LocalHookOutboxOpenOptions = {},
   ): EventsDb | null {
     const connection = getExistingLcmConnection(dbPath);
-    return connection === null ? null : new EventsDb(dbPath, options, connection);
+    if (connection === null) return null;
+    try {
+      chmodSync(dirname(dbPath), PRIVATE_DIRECTORY_MODE);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        closeLcmConnection(dbPath, connection);
+        throw error;
+      }
+    }
+    return new EventsDb(dbPath, options, connection);
   }
 
   constructor(
@@ -501,13 +560,27 @@ export class EventsDb {
     minimumIntervalMs: number,
     requiredObservations: number,
   ): LocalHookMissingCwdState {
-    const state = this.db.prepare(
-      "SELECT observations, last_observed_at, parked_at FROM missing_cwd_state WHERE id = 1",
-    ).get() as {
-      observations: number;
-      last_observed_at: number;
-      parked_at: string | null;
-    } | undefined;
+    if (!Number.isSafeInteger(observedAtMs) || observedAtMs < 0) {
+      throw new Error("observedAtMs must be a non-negative safe integer");
+    }
+    if (!Number.isSafeInteger(minimumIntervalMs) || minimumIntervalMs < 0) {
+      throw new Error("minimumIntervalMs must be a non-negative safe integer");
+    }
+    if (!Number.isSafeInteger(requiredObservations) || requiredObservations <= 0) {
+      throw new Error("requiredObservations must be a positive safe integer");
+    }
+
+    const stateRows = this.db.prepare(
+      "SELECT id, observations, last_observed_at, parked_at FROM missing_cwd_state",
+    ).all() as unknown[];
+    if (stateRows.length > 1) {
+      throw new Error("invalid missing-CWD state");
+    }
+    const rawState = stateRows[0];
+    if (rawState !== undefined && !isValidMissingCwdStateRow(this.db, rawState)) {
+      throw new Error("invalid missing-CWD state");
+    }
+    const state = rawState as MissingCwdStateRow | undefined;
     if (state && state.parked_at !== null) {
       return { parked: true, observations: state.observations, retryAfterMs: 0 };
     }

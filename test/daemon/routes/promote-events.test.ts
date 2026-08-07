@@ -31,11 +31,13 @@ const FORCED_WRAPPER_TIMEOUT_MS = 1;
 
 const eventPathMocks = vi.hoisted(() => ({
   eventsDir: vi.fn(),
+  existingEventsDbPath: vi.fn(),
 }));
 
 // Mock eventsDbPath to point at our temp dir
 vi.mock("../../../src/db/events-path.js", () => ({
   eventsDbPath: vi.fn(),
+  existingEventsDbPath: eventPathMocks.existingEventsDbPath,
   eventsDir: eventPathMocks.eventsDir,
 }));
 
@@ -136,6 +138,7 @@ describe("promote-events route", () => {
     extraDirs = [];
     startedPromotionOperations = [];
     eventPathMocks.eventsDir.mockReturnValue(dir);
+    eventPathMocks.existingEventsDbPath.mockReturnValue(sidecarPath);
     vi.mocked(eventsDbPath).mockReturnValue(sidecarPath);
     vi.mocked(deduplicateAndInsert).mockClear();
     clearProjectMapCache();

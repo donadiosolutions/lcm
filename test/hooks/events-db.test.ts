@@ -5,22 +5,39 @@ import {
   EventsDb,
   MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH,
   _resetMigratedPathsForTesting,
+  isValidMissingCwdStateRow,
   type EventRow,
   type HealthStats,
 } from "../../src/hooks/events-db.js";
 import { chmodSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import {
   closeLcmConnection,
   getLcmConnection,
+  getPoolStats,
   isLcmConnectionOpen,
 } from "../../src/db/connection.js";
 
 // Full-suite coverage contention has stretched this 501-transaction stress case
 // to 12.7 seconds. Keep a bounded budget above twice that observed tail.
 const DURABLE_SEQUENCE_STRESS_TIMEOUT_MS = 30_000;
+
+const fsState = vi.hoisted(() => ({
+  chmodError: undefined as NodeJS.ErrnoException | undefined,
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    chmodSync: (...args: Parameters<typeof actual.chmodSync>) => {
+      if (fsState.chmodError) throw fsState.chmodError;
+      return actual.chmodSync(...args);
+    },
+  };
+});
 
 const machineIdentityState = vi.hoisted(() => ({ fail: false }));
 
@@ -61,6 +78,7 @@ describe("EventsDb", () => {
   }
 
   beforeEach(() => {
+    fsState.chmodError = undefined;
     machineIdentityState.fail = false;
     _resetMigratedPathsForTesting();
     dir = mkdtempSync(join(tmpdir(), "events-db-test-"));
@@ -86,6 +104,142 @@ describe("EventsDb", () => {
     } finally {
       second.close();
       first.close();
+    }
+  });
+
+  it("repairs an existing sidecar parent without changing the 0600 database leaf", () => {
+    const created = new EventsDb(dbPath);
+    created.close();
+    chmodSync(dir, 0o777);
+    chmodSync(dbPath, 0o644);
+
+    const existing = EventsDb.openExisting(dbPath);
+    try {
+      expect(existing).not.toBeNull();
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+      expect(statSync(dbPath).mode & 0o777).toBe(0o600);
+    } finally {
+      existing?.close();
+    }
+  });
+
+  it("does not create a missing parent during an existing-only open", () => {
+    const missingParent = join(dir, "missing-parent");
+    expect(EventsDb.openExisting(join(missingParent, "events.db"))).toBeNull();
+    expect(existsSync(missingParent)).toBe(false);
+  });
+
+  it("swallows ENOENT while repairing an existing sidecar parent", () => {
+    const initial = new EventsDb(dbPath);
+    fsState.chmodError = Object.assign(new Error("injected missing parent"), { code: "ENOENT" });
+    try {
+      const existing = EventsDb.openExisting(dbPath);
+      expect(existing).not.toBeNull();
+      existing?.close();
+    } finally {
+      fsState.chmodError = undefined;
+      initial.close();
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it("closes the reused connection and rethrows non-ENOENT parent chmod errors", () => {
+    const initial = new EventsDb(dbPath);
+    fsState.chmodError = Object.assign(new Error("injected chmod failure"), { code: "EACCES" });
+    try {
+      expect(() => EventsDb.openExisting(dbPath)).toThrow("injected chmod failure");
+      expect(getPoolStats().connections.find(({ path }) => path === dbPath))
+        .toMatchObject({ refs: 1 });
+    } finally {
+      fsState.chmodError = undefined;
+      initial.close();
+      closeLcmConnection(dbPath);
+    }
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+  });
+
+  function replaceMissingCwdState(
+    ...rows: Array<readonly [SQLInputValue, SQLInputValue, SQLInputValue, SQLInputValue]>
+  ): void {
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(`
+      DROP TABLE missing_cwd_state;
+      CREATE TABLE missing_cwd_state(id, observations, last_observed_at, parked_at);
+    `);
+    const insert = raw.prepare(`
+      INSERT INTO missing_cwd_state(id, observations, last_observed_at, parked_at)
+      VALUES(?, ?, ?, ?)
+    `);
+    for (const row of rows) insert.run(...row);
+    raw.close();
+  }
+
+  it.each([
+    { label: "id", row: [2, 1, 0, null] },
+    { label: "non-positive observations", row: [1, 0, 0, null] },
+    { label: "fractional observations", row: [1, 1.5, 0, null] },
+    { label: "unsafe observations", row: [1, Number.MAX_SAFE_INTEGER + 1, 0, null] },
+    { label: "negative last observation timestamp", row: [1, 1, -1, null] },
+    { label: "fractional last observation timestamp", row: [1, 1, 0.5, null] },
+    { label: "non-numeric last observation timestamp", row: [1, 1, "now", null] },
+    { label: "non-canonical parked timestamp", row: [1, 3, 0, "2026-08-06T12:00:00Z"] },
+    { label: "non-numeric parked timestamp", row: [1, 3, 0, 123] },
+    { label: "parked before confirmation threshold", row: [1, 2, 0, "2026-08-06 12:00:00"] },
+  ] as const)("fails closed on malformed missing-CWD state: $label", ({ row }) => {
+    const initial = new EventsDb(dbPath);
+    initial.close();
+    replaceMissingCwdState(row);
+
+    const reopened = new EventsDb(dbPath);
+    try {
+      expect(() => reopened.observeMissingCwd(0, 5 * 60 * 1000, 3))
+        .toThrow("invalid missing-CWD state");
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it("fails closed when missing-CWD state contains multiple rows", () => {
+    const initial = new EventsDb(dbPath);
+    initial.close();
+    replaceMissingCwdState(
+      [1, 1, 0, null],
+      [1, 1, 5 * 60 * 1000, null],
+    );
+
+    const reopened = new EventsDb(dbPath);
+    try {
+      expect(() => reopened.observeMissingCwd(0, 5 * 60 * 1000, 3))
+        .toThrow("invalid missing-CWD state");
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it("rejects non-object missing-CWD state rows", () => {
+    const raw = new DatabaseSync(":memory:");
+    try {
+      expect(isValidMissingCwdStateRow(raw, null)).toBe(false);
+      expect(isValidMissingCwdStateRow(raw, "state")).toBe(false);
+      expect(isValidMissingCwdStateRow(raw, [])).toBe(false);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it.each([
+    { label: "negative observed timestamp", args: [-1, 0, 1] },
+    { label: "fractional observed timestamp", args: [0.5, 0, 1] },
+    { label: "negative minimum interval", args: [0, -1, 1] },
+    { label: "fractional minimum interval", args: [0, 0.5, 1] },
+    { label: "zero required observations", args: [0, 0, 0] },
+    { label: "fractional required observations", args: [0, 0, 1.5] },
+  ] as const)("rejects invalid missing-CWD observation arguments: $label", ({ args }) => {
+    const db = new EventsDb(dbPath);
+    try {
+      expect(() => db.observeMissingCwd(...args)).toThrow();
+    } finally {
+      db.close();
     }
   });
 
@@ -859,6 +1013,25 @@ describe("EventsDb", () => {
       expect(withSqlite(dbPath, (raw) => (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version))
         .toBe(EVENTS_SCHEMA_VERSION);
       recovered.close();
+    });
+
+    it("sanitizes a non-Error migration failure before rethrowing", () => {
+      const originalPrepare = DatabaseSync.prototype.prepare;
+      const prepareSpy = vi.spyOn(DatabaseSync.prototype, "prepare").mockImplementation(function (
+        this: DatabaseSync,
+        sql: string,
+      ) {
+        if (sql === "INSERT INTO schema_version (version) VALUES (?)") {
+          throw "injected non-Error schema failure";
+        }
+        return originalPrepare.call(this, sql);
+      });
+
+      try {
+        expect(() => new EventsDb(dbPath)).toThrow("injected non-Error schema failure");
+      } finally {
+        prepareSpy.mockRestore();
+      }
     });
 
     it("repairs an empty schema-version table", () => {

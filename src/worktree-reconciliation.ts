@@ -15,7 +15,10 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { runLcmMigrations } from "./db/migration.js";
 import { getLcmDbFeatures } from "./db/features.js";
-import { EventsDb } from "./hooks/events-db.js";
+import {
+  EventsDb,
+  isValidMissingCwdStateRow,
+} from "./hooks/events-db.js";
 import {
   closeLcmConnection,
   getExistingLcmConnection,
@@ -481,17 +484,6 @@ type ReconciliableMissingCwdState = {
   readonly parkedAt: string | null;
 };
 
-function isCanonicalSqliteUtcTimestamp(
-  db: DatabaseSync,
-  value: unknown,
-): value is string {
-  if (typeof value !== "string") return false;
-  const normalized = db.prepare("SELECT datetime(?) AS value").get(value) as {
-    value: string | null;
-  };
-  return normalized.value === value;
-}
-
 function readReconciliableMissingCwdState(
   db: DatabaseSync,
   schemaVersion: number,
@@ -503,22 +495,14 @@ function readReconciliableMissingCwdState(
   }
   const stateRows = rows(
     db,
-    "SELECT observations, last_observed_at, parked_at FROM missing_cwd_state",
+    "SELECT id, observations, last_observed_at, parked_at FROM missing_cwd_state",
   );
   if (stateRows.length === 0) return undefined;
   if (stateRows.length !== 1) {
     throw new Error(`${side} events schema v5 has conflicting missing-CWD state rows`);
   }
   const state = stateRows[0]!;
-  if (
-    typeof state.observations !== "number"
-    || !Number.isSafeInteger(state.observations)
-    || state.observations <= 0
-    || typeof state.last_observed_at !== "number"
-    || !Number.isSafeInteger(state.last_observed_at)
-    || state.last_observed_at < 0
-    || (state.parked_at !== null && !isCanonicalSqliteUtcTimestamp(db, state.parked_at))
-  ) {
+  if (!isValidMissingCwdStateRow(db, state)) {
     throw new Error(`${side} events schema v5 has invalid missing-CWD state`);
   }
   return {
@@ -547,12 +531,12 @@ function mergeMissingCwdState(
     sourceSchemaVersion,
     "source",
   );
-  if (!sourceState) return;
   const targetState = readReconciliableMissingCwdState(
     target,
     targetSchemaVersion,
     "target",
   );
+  if (!sourceState) return;
   const parkedAt = [targetState?.parkedAt, sourceState.parkedAt]
     .filter((value): value is string => value !== null && value !== undefined)
     .sort()[0] ?? null;
