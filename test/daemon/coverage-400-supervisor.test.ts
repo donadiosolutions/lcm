@@ -819,7 +819,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
       uid: 501,
       sleep,
     }).start(value)).resolves.toMatchObject({ managerPid: 544 });
-    expect(sleep).toHaveBeenCalledWith(50);
+    expect(sleep).toHaveBeenCalledWith(2_000);
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
     expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(1);
   });
@@ -851,7 +851,7 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
   });
 
-  it("retries repeated launchd bootstrap settling failures within the existing budget", async () => {
+  it("preserves a repeated launchd bootstrap settling failure after one exact retry", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
     const absent = { code: 113, stderr: "Could not find service" };
@@ -873,9 +873,30 @@ describe("supervisor coverage: credentials and private launch files", () => {
       platform: "darwin",
       uid: 501,
       sleep,
-    }).start(value)).resolves.toMatchObject({ managerPid: 546 });
-    expect(sleep).toHaveBeenCalledTimes(2);
-    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(3);
+    }).start(value)).rejects.toThrow("manager command");
+    expect(sleep).toHaveBeenCalledOnce();
+    expect(sleep).toHaveBeenCalledWith(2_000);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
+  });
+
+  it("does not retry a launchd bootstrap failure without the label-release diagnostic", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Operation not permitted" },
+      absent,
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).rejects.toThrow("manager command");
+    expect(sleep).not.toHaveBeenCalled();
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
 
   it("retires an exact failed launchd registration before one bounded start retry", async () => {

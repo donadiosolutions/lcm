@@ -2224,9 +2224,10 @@ export function createSupervisor(
   /**
    * launchd can report a bootout target absent before it has released the
    * label from the GUI domain.  A same-label bootstrap in that small window
-   * fails even though a bounded print reports no registration. Retry the
-   * exact bootstrap within the existing command budget only after two
-   * consecutive absence proofs before each attempt; any
+   * fails with its specific code-5 I/O diagnostic even though a bounded print
+   * reports no registration. Retry the exact bootstrap once within the
+   * existing command budget, after the established label-release interval and
+   * two consecutive absence proofs; any
    * registered, ambiguous, or unavailable observation leaves the original
    * failure authoritative.
    */
@@ -2235,29 +2236,26 @@ export function createSupervisor(
     args: readonly string[],
     initial: Awaited<ReturnType<typeof runner.invoke>>,
   ): Promise<Awaited<ReturnType<typeof runner.invoke>>> => {
-    if (kind !== "launchd-user" || initial.timedOut || initial.code === 0) return initial;
+    const diagnostic = `${initial.stdout}\n${initial.stderr}`;
+    const labelReleaseFailure = initial.code === 5
+      && /\bbootstrap failed:\s*5:\s*input\/output error\b/iu.test(diagnostic);
+    if (kind !== "launchd-user" || initial.timedOut || !labelReleaseFailure) return initial;
     const now = dependencies.now ?? performance.now.bind(performance);
     const commandTimeoutMs = dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
     const deadline = now() + commandTimeoutMs;
-    const maxRetries = Math.max(
-      1,
-      Math.min(MAX_LAUNCHD_TRANSITION_POLL_INTERVALS, Math.ceil(commandTimeoutMs / DEFAULT_POLL_INTERVAL_MS)),
-    );
-    let result = initial;
-    for (let retry = 0; retry < maxRetries; retry += 1) {
-      if (result.timedOut || result.code === 0) return result;
-      if (deadline - now() <= 0) return result;
-      if ((await probeInternal(spec)).kind !== "absent") return result;
-      const remaining = deadline - now();
-      if (remaining <= 0) return result;
-      const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
-      if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
-      else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
-      if (deadline - now() <= 0) return result;
-      if ((await probeInternal(spec)).kind !== "absent") return result;
-      result = await runner.invoke("launchctl", args);
-    }
-    return result;
+    if (deadline - now() <= 0) return initial;
+    if ((await probeInternal(spec)).kind !== "absent") return initial;
+    const remaining = deadline - now();
+    if (remaining <= 0) return initial;
+    const delay = Math.min(LAUNCHD_LABEL_REUSE_SETTLE_MS, remaining);
+    if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
+    else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
+    if (deadline - now() <= 0) return initial;
+    if ((await probeInternal(spec)).kind !== "absent") return initial;
+    // One exact diagnostic-gated retry is sufficient to cross launchd's
+    // label-release window without turning permission, transport, malformed,
+    // or repeated bootstrap failures into generic retries.
+    return runner.invoke("launchctl", args);
   };
 
   const settleLaunchdLabelReuse = async (): Promise<void> => {
