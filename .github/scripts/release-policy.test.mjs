@@ -14,6 +14,7 @@ import {
   buildHighlightsPrompt,
   categorizeReleasePullRequests,
   checkNpmReleaseState,
+  checkNpmVersionPublished,
   classifyReleaseRunProvenance,
   classifyPullRequest,
   collectReleasePullRequests,
@@ -747,6 +748,7 @@ test("fails closed on missing, malformed, and unresolved canonical history", asy
         repo: "lcm",
         currentRunId: 2,
         currentTag: "v1.5.0",
+        checkPublishedVersion: () => false,
       }),
     /Earlier release runs for other tags failed/u,
   );
@@ -826,9 +828,42 @@ test("ignores legacy successful recovery runs without using them as supersession
         repo: "lcm",
         currentRunId: 4,
         currentTag: "v1.5.0",
+        checkPublishedVersion: () => false,
       }),
     /Earlier release runs for other tags failed/u,
   );
+});
+
+test("resolves failed release history only through exact npm publication", async () => {
+  const warnings = [];
+  const github = publicationHistoryGithub({
+    releaseRuns: [
+      { id: 1, conclusion: "failure", display_title: "release-tag:v1.4.2" },
+      { id: 2, conclusion: "failure", display_title: "release-tag:v1.4.3" },
+    ],
+    releases: new Map([
+      ["v1.4.2", { draft: false }],
+      ["v1.4.3", { draft: false }],
+    ]),
+  });
+  const checked = [];
+
+  await assert.doesNotReject(() =>
+    enforceEarlierPublicationSuccess({
+      github,
+      owner: "donadiosolutions",
+      repo: "lcm",
+      currentRunId: 3,
+      currentTag: "v1.5.0",
+      checkPublishedVersion: (version) => {
+        checked.push(version);
+        return true;
+      },
+      warning: (message) => warnings.push(message),
+    }),
+  );
+  assert.deepEqual(checked, ["1.4.2", "1.4.3"]);
+  assert.equal(warnings.every((message) => message.includes("is published")), true);
 });
 
 test("queries npm release state with E404-only missing-package handling", () => {
@@ -856,6 +891,21 @@ test("queries npm release state with E404-only missing-package handling", () => 
     ["view", "@donadiosolutions/lcm@1.5.0-beta.0", "version"],
     ["view", "@donadiosolutions/lcm", "dist-tags", "--json"],
   ]);
+
+  assert.equal(
+    checkNpmVersionPublished({
+      version: "1.4.2",
+      runNpm: () => ({ status: 0, stdout: "1.4.2\n", stderr: "" }),
+    }),
+    true,
+  );
+  assert.equal(
+    checkNpmVersionPublished({
+      version: "1.4.3",
+      runNpm: () => ({ status: 1, stdout: "", stderr: "npm error code E404" }),
+    }),
+    false,
+  );
 
   assert.throws(
     () =>

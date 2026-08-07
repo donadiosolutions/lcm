@@ -317,14 +317,7 @@ export function checkNpmReleaseState({
   runNpm = defaultRunNpm,
 }) {
   parseReleaseTag(`v${version}`);
-  const published = npmView(
-    ["view", `${packageName}@${version}`, "version"],
-    `${packageName}@${version}`,
-    runNpm,
-  );
-  if (published.found && published.output !== version) {
-    throw new Error(`npm returned an unexpected exact-version response for ${packageName}@${version}`);
-  }
+  const alreadyPublished = checkNpmVersionPublished({ version, packageName, runNpm });
 
   const distTagResult = npmView(
     ["view", packageName, "dist-tags", "--json"],
@@ -336,9 +329,25 @@ export function checkNpmReleaseState({
     throw new Error(`npm returned invalid JSON for ${packageName} dist-tags`);
   }
 
-  const alreadyPublished = published.found;
   assertReleaseCanAdvanceDistTag({ version, distTags, alreadyPublished });
   return { alreadyPublished, distTags };
+}
+
+export function checkNpmVersionPublished({
+  version,
+  packageName = PACKAGE_NAME,
+  runNpm = defaultRunNpm,
+}) {
+  parseReleaseTag(`v${version}`);
+  const published = npmView(
+    ["view", `${packageName}@${version}`, "version"],
+    `${packageName}@${version}`,
+    runNpm,
+  );
+  if (published.found && published.output !== version) {
+    throw new Error(`npm returned an unexpected exact-version response for ${packageName}@${version}`);
+  }
+  return published.found;
 }
 
 function readNpmReleaseSnapshot({ version, packageName, runNpm }) {

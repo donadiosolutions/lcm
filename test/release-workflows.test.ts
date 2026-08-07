@@ -265,6 +265,8 @@ describe("release workflows", () => {
     );
     expect(releasePolicySource).toContain("ignoreMalformed: true");
     expect(releasePolicySource).toContain("Ignoring legacy successful recovery run");
+    expect(releasePolicySource).toContain("checkNpmVersionPublished");
+    expect(releasePolicySource).toContain("is published");
     expect(releasePolicySource).toContain("run.conclusion !== \"success\"");
     expect(releasePolicySource).toContain('run.conclusion === "success"');
     expect(releasePolicySource).toContain("run.display_title");
