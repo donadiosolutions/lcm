@@ -30,6 +30,21 @@ vi.mock("../../src/db/events-path.js", () => ({
   },
 }));
 
+const gitAnchorMocks = vi.hoisted(() => ({
+  resolveGitProjectAnchor: undefined as (() => never) | undefined,
+}));
+
+vi.mock("../../src/git-project.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/git-project.js")>();
+  return {
+    ...actual,
+    resolveGitProjectAnchor: (cwd: string) => {
+      if (gitAnchorMocks.resolveGitProjectAnchor) return gitAnchorMocks.resolveGitProjectAnchor();
+      return actual.resolveGitProjectAnchor(cwd);
+    },
+  };
+});
+
 import { handlePostToolUse } from "../../src/hooks/post-tool.js";
 import { EventsDb, type EventRow } from "../../src/hooks/events-db.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
@@ -41,6 +56,7 @@ import { getLcmConnection, closeLcmConnection } from "../../src/db/connection.js
 import { runLcmMigrations } from "../../src/db/migration.js";
 import { PromotedStore } from "../../src/db/promoted.js";
 import { projectId, projectDbPath } from "../../src/daemon/project.js";
+import { resolveExistingProjectIdentity } from "../../src/project-map.js";
 import { loadDaemonConfig, type DaemonConfig } from "../../src/daemon/config.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
@@ -88,9 +104,30 @@ describe("Passive Learning E2E", { timeout: 30_000 }, () => {
 
   afterEach(() => {
     // Close any lingering connections
+    gitAnchorMocks.resolveGitProjectAnchor = undefined;
     closeLcmConnection();
     rmSync(tempDir, { recursive: true, force: true });
     rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  // ── Coverage: resolveExistingProjectIdentity git anchor error branches ─────
+
+  it("rethrows non-ENOENT/ENOTDIR git anchor errors", () => {
+    gitAnchorMocks.resolveGitProjectAnchor = () => {
+      throw Object.assign(new Error("injected git anchor failure"), { code: "EACCES" });
+    };
+
+    expect(() => resolveExistingProjectIdentity("/tmp/anywhere")).toThrow(
+      "injected git anchor failure",
+    );
+  });
+
+  it("ignores ENOENT/ENOTDIR git anchor errors and falls back to lexical identity lookup", () => {
+    gitAnchorMocks.resolveGitProjectAnchor = () => {
+      throw Object.assign(new Error("missing ancestor"), { code: "ENOTDIR" });
+    };
+
+    expect(resolveExistingProjectIdentity("/tmp/anywhere")).toBeNull();
   });
 
   // ── Test A: Capture → sidecar ────────────────────────────────────────────
