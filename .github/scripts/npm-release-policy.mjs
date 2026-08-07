@@ -316,7 +316,6 @@ export function checkNpmReleaseState({
   packageName = PACKAGE_NAME,
   runNpm = defaultRunNpm,
 }) {
-  parseReleaseTag(`v${version}`);
   const alreadyPublished = checkNpmVersionPublished({ version, packageName, runNpm });
 
   const distTagResult = npmView(

@@ -573,17 +573,26 @@ export async function enforceEarlierPublicationSuccess({
       );
       continue;
     }
+    let release;
     try {
-      const { data: release } = await github.rest.repos.getReleaseByTag({
+      ({ data: release } = await github.rest.repos.getReleaseByTag({
         owner,
         repo,
         tag: run.releaseTag,
-      });
-      if (release.draft) {
-        warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
-        continue;
-      }
-      const failedVersion = parseReleaseTag(run.releaseTag).version;
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown error";
+      warning(`Could not look up GitHub release for failed release run ${run.id}; failing closed: ${message}`);
+      blockingFailures.push(run);
+      continue;
+    }
+    if (release.draft) {
+      warning(`Ignoring withdrawn draft from failed release run ${run.id}`);
+      continue;
+    }
+
+    const failedVersion = parseReleaseTag(run.releaseTag).version;
+    try {
       if (await checkPublishedVersion(failedVersion)) {
         warning(
           `Ignoring failed release run ${run.id}; ${PACKAGE_NAME}@${failedVersion} is published`,
@@ -592,7 +601,10 @@ export async function enforceEarlierPublicationSuccess({
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown error";
-      warning(`Could not prove failed release run ${run.id} was withdrawn: ${message}`);
+      warning(
+        `Could not probe npm publication for failed release run ${run.id} ` +
+          `(${PACKAGE_NAME}@${failedVersion}); failing closed: ${message}`,
+      );
     }
     blockingFailures.push(run);
   }

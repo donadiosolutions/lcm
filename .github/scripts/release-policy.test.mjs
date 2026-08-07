@@ -863,7 +863,59 @@ test("resolves failed release history only through exact npm publication", async
     }),
   );
   assert.deepEqual(checked, ["1.4.2", "1.4.3"]);
-  assert.equal(warnings.every((message) => message.includes("is published")), true);
+  assert.deepEqual(warnings, [
+    "Ignoring failed release run 1; @donadiosolutions/lcm@1.4.2 is published",
+    "Ignoring failed release run 2; @donadiosolutions/lcm@1.4.3 is published",
+  ]);
+});
+
+test("distinguishes GitHub release lookup and npm probe failures while failing closed", async () => {
+  const releaseLookupWarnings = [];
+  const releaseLookupFailure = publicationHistoryGithub({
+    releaseRuns: [{ id: 1, conclusion: "failure", display_title: "release-tag:v1.4.2" }],
+    releases: new Map([["v1.4.2", new Error("GitHub API unavailable")]]),
+  });
+  await assert.rejects(
+    () =>
+      enforceEarlierPublicationSuccess({
+        github: releaseLookupFailure,
+        owner: "donadiosolutions",
+        repo: "lcm",
+        currentRunId: 2,
+        currentTag: "v1.5.0",
+        checkPublishedVersion: () => assert.fail("npm must not be probed after a GitHub lookup failure"),
+        warning: (message) => releaseLookupWarnings.push(message),
+      }),
+    /Earlier release runs for other tags failed/u,
+  );
+  assert.deepEqual(releaseLookupWarnings, [
+    "Could not look up GitHub release for failed release run 1; failing closed: GitHub API unavailable",
+  ]);
+
+  const npmProbeWarnings = [];
+  const npmProbeFailure = publicationHistoryGithub({
+    releaseRuns: [{ id: 1, conclusion: "failure", display_title: "release-tag:v1.4.2" }],
+    releases: new Map([["v1.4.2", { draft: false }]]),
+  });
+  await assert.rejects(
+    () =>
+      enforceEarlierPublicationSuccess({
+        github: npmProbeFailure,
+        owner: "donadiosolutions",
+        repo: "lcm",
+        currentRunId: 2,
+        currentTag: "v1.5.0",
+        checkPublishedVersion: () => {
+          throw new Error("npm registry unavailable");
+        },
+        warning: (message) => npmProbeWarnings.push(message),
+      }),
+    /Earlier release runs for other tags failed/u,
+  );
+  assert.deepEqual(npmProbeWarnings, [
+    "Could not probe npm publication for failed release run 1 " +
+      "(@donadiosolutions/lcm@1.4.2); failing closed: npm registry unavailable",
+  ]);
 });
 
 test("queries npm release state with E404-only missing-package handling", () => {

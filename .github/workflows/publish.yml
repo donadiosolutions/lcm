@@ -325,6 +325,12 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github/scripts
 
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+
       - name: Validate trusted release provenance
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -414,12 +420,6 @@ jobs:
           path: release
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Setup Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org/
 
       - name: Check npm release ordering
         id: npm
@@ -673,6 +673,12 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github/scripts
 
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+
       - name: Verify recovery request and immutable release tag
         id: tag
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -768,12 +774,6 @@ jobs:
           path: release
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Setup Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org/
 
       - name: Check npm release ordering
         id: npm
