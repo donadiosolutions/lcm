@@ -186,11 +186,14 @@ associate that run with an immutable release.
 Use the manual immutable-release recovery path only when all of these conditions
 hold:
 
-- the protected workflow-created GitHub Release is already public and immutable,
-  so the workflow cannot restore it to draft;
+- the GitHub Release is already public and immutable, so the workflow cannot
+  restore it to draft;
 - the canonical signed annotated tag still targets the release commit, that
   commit is reachable from `main`, the package version and changelog match, and
-  the release retains its protected draft marker and Highlights;
+  the release retains a non-empty Highlights section;
+- the release either retains its protected draft marker or an exact failed
+  tag-push draft run for the same tag and commit completed before the manual
+  release was published, with no successful exact draft run missing its marker;
 - npm trusted publishing for the `npm-publish` environment is configured, and
   the requested npm version is either absent or already published with the
   expected package version and channel-safe dist-tags; and
@@ -207,11 +210,14 @@ gh workflow run publish.yml \
 ```
 
 The read-only recovery preflight checks out the trusted default-branch release
-policy and validates the live marker and publication history before checking
-out tagged code in a separate directory. It builds, tests, and packs that tag
-before uploading a short-lived artifact. The `npm-publish` job receives OIDC
-permission but never checks out or executes tagged package code; it revalidates
-the tag and npm ordering before downloading and publishing the artifact.
+policy and validates publication history plus either the live marker or the
+bounded failed-draft provenance before checking out tagged code in a separate
+directory. The fallback requires the release target, failed run tag, branch,
+commit, conclusion, and completion time to match the verified immutable tag and
+publication. It builds, tests, and packs that tag before uploading a short-lived
+artifact. The `npm-publish` job receives OIDC permission but never checks out or
+executes tagged package code; it revalidates the tag and npm ordering before
+downloading and publishing the artifact.
 
 Recovery is idempotent. If npm already contains the version, both jobs verify
 the published package and dist-tags without rebuilding, repacking, downloading,

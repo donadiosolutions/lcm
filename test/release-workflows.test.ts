@@ -245,7 +245,13 @@ describe("release workflows", () => {
     expect(publicationPolicy?.with?.script).toMatch(
       /join\(\s*process\.env\.GITHUB_WORKSPACE,\s*"trusted"/u,
     );
-    expect(publicationPolicy?.with?.script).toContain("assertActionCreatedReleaseBody");
+    expect(publicationPolicy?.with?.script).toContain(
+      "assertActionCreatedReleaseBody(release.body, currentTag)",
+    );
+    expect(publicationPolicy?.with?.script).toMatch(
+      /const\s*\{\s*assertActionCreatedReleaseBody,/u,
+    );
+    expect(publicationPolicy?.with?.script).not.toContain("assertRecoveryReleaseBody");
     expect(publicationPolicy?.with?.script).toContain("enforceEarlierPublicationSuccess");
     expect(publicationPolicy?.with?.script).toContain("parseReleaseTag");
     expect(publicationPolicy?.with?.script).not.toContain("run.display_title");
@@ -269,7 +275,7 @@ describe("release workflows", () => {
     expect(releasePolicySource).toContain("later run ${supersedingRun.id}");
     expect(releasePolicySource).toContain("run.releaseTag === currentTag");
     expect(releasePolicySource).toContain("tag: run.releaseTag");
-    expect(releasePolicySource).not.toContain("head_branch");
+    expect(releasePolicySource).toContain("run?.head_branch === targetTag");
     expect(releasePolicySource).toContain("current tag");
     expect(releasePolicySource).toContain("if (release.draft)");
     expect(releasePolicySource).toContain("for other tags failed");
@@ -525,7 +531,14 @@ describe("release workflows", () => {
     expect(recoveryHistory?.with?.script).toMatch(
       /join\(\s*process\.env\.GITHUB_WORKSPACE,\s*"trusted"/u,
     );
-    expect(recoveryHistory?.with?.script).toContain("assertActionCreatedReleaseBody");
+    expect(recoveryHistory?.with?.script).toContain("assertRecoveryReleaseBody({");
+    expect(recoveryHistory?.with?.script).toMatch(
+      /const\s*\{\s*assertRecoveryReleaseBody,/u,
+    );
+    expect(recoveryHistory?.with?.script).not.toContain("assertActionCreatedReleaseBody");
+    expect(recoveryHistory?.with?.script).toContain('event: "push"');
+    expect(recoveryHistory?.with?.script).not.toContain("release.target_commitish");
+    expect(recoveryHistory?.with?.script).toContain("annotatedTag.object.sha");
     expect(recoveryHistory?.with?.script).toContain("enforceEarlierPublicationSuccess");
     expect(recoveryHistory?.with?.script).toContain("parseReleaseTag(tag)");
     expect(recoveryHistory?.with?.script).not.toContain("run.display_title");

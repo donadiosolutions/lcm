@@ -7,6 +7,7 @@ import {
   RELEASE_DRAFT_MARKER,
   RELEASE_RUN_NAME_PREFIX,
   assertActionCreatedReleaseBody,
+  assertRecoveryReleaseBody,
   assertNpmDistTags,
   assertReleaseCanAdvanceDistTag,
   associateCommitsWithPullRequests,
@@ -502,6 +503,81 @@ test("renders tag-bound Highlights and omits empty release sections", () => {
     /not created/u,
   );
   assert.throws(() => renderReleaseNotes({ targetTag, highlights: [], categorized }), /at least one/u);
+});
+
+test("authenticates manual immutable recovery only through an exact failed draft run", () => {
+  const targetTag = "v1.4.3";
+  const expectedCommit = "1a104b5461d0a4cc6514b9ca2fb894658f8c30a4";
+  const publishedAt = "2026-08-07T21:24:02Z";
+  const body = "## Highlights\n\n- Security maintenance release.\n";
+  const failedRun = {
+    id: 31219621020,
+    event: "push",
+    status: "completed",
+    conclusion: "failure",
+    display_title: `release-tag:${targetTag}`,
+    head_branch: targetTag,
+    head_sha: expectedCommit,
+    updated_at: "2026-08-07T21:22:08Z",
+  };
+
+  assert.equal(
+    assertRecoveryReleaseBody({ body, targetTag, expectedCommit, publishedAt, draftRuns: [failedRun] }),
+    "failed-draft-run",
+  );
+  const markedBody = `${releaseDraftMarker(targetTag)}\n\n${body}`;
+  assert.equal(
+    assertRecoveryReleaseBody({
+      body: markedBody,
+      targetTag,
+      expectedCommit,
+      publishedAt,
+      draftRuns: [],
+    }),
+    "draft-marker",
+  );
+
+  for (const overrides of [
+    { conclusion: "cancelled" },
+    { display_title: "release-tag:v1.4.4" },
+    { head_branch: "main" },
+    { head_sha: "2".repeat(40) },
+    { updated_at: "2026-08-07T21:25:00Z" },
+  ]) {
+    assert.throws(
+      () =>
+        assertRecoveryReleaseBody({
+          body,
+          targetTag,
+          expectedCommit,
+          publishedAt,
+          draftRuns: [{ ...failedRun, ...overrides }],
+        }),
+      /exact failed draft run/u,
+    );
+  }
+  assert.throws(
+    () =>
+      assertRecoveryReleaseBody({
+        body,
+        targetTag,
+        expectedCommit,
+        publishedAt,
+        draftRuns: [{ ...failedRun, conclusion: "success" }],
+      }),
+    /requires its marker/u,
+  );
+  assert.throws(
+    () =>
+      assertRecoveryReleaseBody({
+        body: `${releaseDraftMarker("v1.4.4")}\n\n${body}`,
+        targetTag,
+        expectedCommit,
+        publishedAt,
+        draftRuns: [failedRun],
+      }),
+    /not created/u,
+  );
 });
 
 function publicationHistoryGithub({ releaseRuns = [], recoveryRuns = [], releases = new Map() }) {

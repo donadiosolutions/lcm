@@ -690,7 +690,7 @@ jobs:
               ),
             ).href;
             const {
-              assertActionCreatedReleaseBody,
+              assertRecoveryReleaseBody,
               enforceEarlierPublicationSuccess,
               parseReleaseTag,
             } = await import(policyUrl);
@@ -714,7 +714,6 @@ jobs:
             if (release.prerelease !== expectedPrerelease) {
               throw new Error(`Release prerelease state does not match ${tag}`);
             }
-            assertActionCreatedReleaseBody(release.body, tag);
 
             const { data: ref } = await github.rest.git.getRef({
               ...context.repo,
@@ -734,6 +733,21 @@ jobs:
             ) {
               throw new Error(`Release tag ${tag} failed identity, target, or signature verification`);
             }
+            const draftRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              ...context.repo,
+              workflow_id: "publish.yml",
+              event: "push",
+              status: "completed",
+              per_page: 100,
+            });
+            const releaseProvenance = assertRecoveryReleaseBody({
+              body: release.body,
+              targetTag: tag,
+              expectedCommit: annotatedTag.object.sha,
+              publishedAt: release.published_at,
+              draftRuns,
+            });
+            core.info(`Verified ${tag} recovery provenance via ${releaseProvenance}`);
             await enforceEarlierPublicationSuccess({
               github,
               owner: context.repo.owner,
