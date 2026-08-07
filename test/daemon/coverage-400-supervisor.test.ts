@@ -1748,11 +1748,11 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     expect(runner.calls.find(({ args }) => args[0] === "bootstrap")?.timeoutMs).toBe(100);
   });
 
-  it("caps every operation-scoped launchd probe and label-release retry command at the configured timeout", async () => {
+  it("caps operation-scoped launchd probes and label-release retries at the configured timeout", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
     const absent = { code: 113, stderr: "Could not find service" };
-    const configuredCommandTimeoutMs = 60_000;
+    const configuredCommandTimeoutMs = 100;
     const runner = runQueue([
       absent,
       { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
@@ -1768,7 +1768,7 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
       commandTimeoutMs: configuredCommandTimeoutMs,
       now: () => 0,
       sleep: async () => undefined,
-    }).start(value, { deadline: 120_000 })).resolves.toMatchObject({ managerPid: 901 });
+    }).start(value, { deadline: 1_000 })).resolves.toMatchObject({ managerPid: 901 });
     expect(runner.calls.map(({ args }) => args[0])).toEqual([
       "print",
       "bootstrap",
@@ -1782,13 +1782,12 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     );
   });
 
-  it("bounds terminal post-start cleanup and its exact stop/absence proof by the caller deadline", async () => {
+  it("bounds terminal post-start cleanup and its exact absence probe by the same caller deadline", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
     const absent = { code: 113, stderr: "Could not find service" };
     const terminal = { code: 0, stdout: launchdText(value, "exited", 0) };
-    const configuredCommandTimeoutMs = 60_000;
-    const runner = runQueue([
+    const queue = [
       absent,
       { code: 0, stdout: "bootstrapped" },
       terminal,
@@ -1796,19 +1795,30 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
       terminal,
       { code: 0, stdout: "bootout" },
       absent,
-      absent,
-      { code: 0, stdout: "bootstrapped" },
-      { code: 0, stdout: launchdText(value, "running", 902) },
-    ]);
+    ];
+    let currentTime = 0;
+    const calls: Array<{ command: string; args: readonly string[]; timeoutMs: number }> = [];
+    const run = vi.fn(async (command: string, args: readonly string[], options: { timeoutMs: number }) => {
+      calls.push({ command, args, timeoutMs: options.timeoutMs });
+      const result = queue.shift() ?? { code: 0, stdout: "", stderr: "" };
+      if (calls.length === 3) currentTime = 998;
+      return result;
+    });
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
     await expect(createSupervisor("launchd-user", {
-      run: runner.run,
+      run,
       platform: "darwin",
       uid: 501,
-      commandTimeoutMs: configuredCommandTimeoutMs,
-      now: () => 0,
-      sleep: async () => undefined,
-    }).start(value, { deadline: 120_000 })).resolves.toMatchObject({ managerPid: 902 });
-    expect(runner.calls.map(({ args }) => args[0])).toEqual([
+      commandTimeoutMs: 60_000,
+      now: () => currentTime,
+      sleep,
+    }).start(value, { deadline: 1_000 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+    expect(calls.map(({ args }) => args[0])).toEqual([
       "print",
       "bootstrap",
       "print",
@@ -1816,22 +1826,9 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
       "print",
       "bootout",
       "print",
-      "print",
-      "bootstrap",
-      "print",
     ]);
-    expect(runner.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([
-      configuredCommandTimeoutMs,
-      configuredCommandTimeoutMs,
-      configuredCommandTimeoutMs,
-      configuredCommandTimeoutMs,
-      configuredCommandTimeoutMs,
-      value.stopTimeoutMs,
-      value.stopTimeoutMs,
-      configuredCommandTimeoutMs,
-      configuredCommandTimeoutMs,
-      configuredCommandTimeoutMs,
-    ]);
+    expect(calls.map(({ timeoutMs }) => timeoutMs)).toEqual([1_000, 1_000, 1_000, 2, 2, 2, 2]);
+    expect(sleep).toHaveBeenCalledWith(2);
   });
 
   it("does not begin terminal post-start cleanup after its operation deadline expires", async () => {
@@ -1858,8 +1855,9 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "bootstrap", "print"]);
   });
 
-  it("preserves timeout classification for timed-out stop and reset-failed commands", async () => {
+  it("preserves timeout classification and configured caps for stop and reset-failed commands", async () => {
     const value = spec("systemd-user", root(), { stopTimeoutMs: 100 });
+    const configuredCommandTimeoutMs = 7;
     const timedOutStop = runQueue([
       { code: 0, stdout: systemdText(value, "active", 12) },
       { timedOut: true },
@@ -1867,10 +1865,13 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     await expect(createSupervisor("systemd-user", {
       run: timedOutStop.run,
       platform: "linux",
+      commandTimeoutMs: configuredCommandTimeoutMs,
     }).stopAndAwaitAbsent(value)).rejects.toMatchObject({
       name: "SupervisorCommandError",
       reason: "timeout",
     });
+    expect(timedOutStop.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([7, 7]);
+
     const timedOutReset = runQueue([
       { code: 0, stdout: systemdText(value, "failed") },
       { code: 0, stdout: "stopped" },
@@ -1879,10 +1880,12 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     await expect(createSupervisor("systemd-user", {
       run: timedOutReset.run,
       platform: "linux",
+      commandTimeoutMs: configuredCommandTimeoutMs,
     }).stopAndAwaitAbsent(value)).rejects.toMatchObject({
       name: "SupervisorCommandError",
       reason: "timeout",
     });
+    expect(timedOutReset.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([7, 7, 7]);
   });
 
   it("keeps default polling monotonic across wall-clock jumps", async () => {

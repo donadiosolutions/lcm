@@ -2242,8 +2242,12 @@ export function createSupervisor(
     return remaining;
   };
 
-  const operationTimeout = (deadline: number | undefined, fallback: number): number =>
-    deadline === undefined ? fallback : Math.min(fallback, remainingOperationTimeout(deadline));
+  const operationTimeout = (deadline: number | undefined, fallback: number): number => {
+    const configuredTimeout = Math.min(fallback, configuredCommandTimeoutMs);
+    return deadline === undefined
+      ? configuredTimeout
+      : Math.min(configuredTimeout, remainingOperationTimeout(deadline));
+  };
 
   const probeInternal = async (
     spec: SupervisorSpec,
@@ -2511,7 +2515,7 @@ export function createSupervisor(
           if (spec.credentialDirectory !== undefined) {
             const winnerSpec = differentRunningWinnerSpec(spec, after);
             if (winnerSpec !== undefined) {
-              const winner = await probe(winnerSpec);
+              const winner = await probeWithinOperation(winnerSpec, undefined, operationDeadline);
               if (
                 winner.kind === "registered-running-valid"
                 && winner.scopeDigest === winnerSpec.scopeDigest
