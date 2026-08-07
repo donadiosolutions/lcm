@@ -2300,7 +2300,7 @@ export function createSupervisor(
     deadline: number | undefined,
   ): Promise<SupervisorObservation> => deadline === undefined
     ? probeInternal(spec, capture)
-    : probeInternal(spec, capture, remainingOperationTimeout(deadline));
+    : probeInternal(spec, capture, operationTimeout(deadline, configuredCommandTimeoutMs));
 
   /**
    * launchd can report a bootout target absent before it has released the
@@ -2330,7 +2330,11 @@ export function createSupervisor(
           throw commandFailedError(sawMalformed ? "malformed-state" : "label-release-deadline");
         }
         const capture: SupervisorProbeCapture = {};
-        const observed = await probeInternal(spec, capture, remaining);
+        const observed = await probeInternal(
+          spec,
+          capture,
+          Math.min(configuredCommandTimeoutMs, remaining),
+        );
         if (observed.kind === "absent") return;
         if (capture.permissionFailure === true) throw commandFailedError("permission");
         if (observed.kind !== "ambiguous" || observed.reason !== "metadata-malformed") {
@@ -2362,7 +2366,11 @@ export function createSupervisor(
       await awaitExactAbsence();
       remaining = Math.floor(deadline - now());
       if (remaining <= 0) return result;
-      result = await runner.invoke("launchctl", args, remaining);
+      result = await runner.invoke(
+        "launchctl",
+        args,
+        Math.min(configuredCommandTimeoutMs, remaining),
+      );
     }
     return result;
   };
@@ -2495,7 +2503,7 @@ export function createSupervisor(
       // launch files when the manager proves that the exact spec is absent.
       let retiredExactTerminal = false;
       try {
-        const after = await probe(spec);
+        const after = await probeWithinOperation(spec, undefined, operationDeadline);
         if (after.kind === "absent") {
           if (kind === "launchd-user") cleanupPrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
           safeCredentialCleanup(spec);
@@ -2529,7 +2537,7 @@ export function createSupervisor(
               // Preserve this launch's staged credentials while retiring the
               // exact failed registration. They have not been admitted yet
               // and are required by the one bounded retry below.
-              await stopAndAwaitAbsentInternal(spec, false, undefined, false);
+              await stopAndAwaitAbsentInternal(spec, false, undefined, false, operationDeadline);
               retiredExactTerminal = true;
             } catch {
               // Preserve terminal evidence when stop/absence cannot be proven.
@@ -2654,7 +2662,7 @@ export function createSupervisor(
       stopArgs,
       operationTimeout(operationDeadline, spec.stopTimeoutMs),
     );
-    if (result.timedOut) throw commandFailedError();
+    if (result.timedOut) throw commandFailedError("timeout");
     const exactPriorObservation = current.kind === "registered-running-valid"
       || current.kind === "registered-not-running-valid"
       || (
@@ -2688,7 +2696,8 @@ export function createSupervisor(
       );
       const resetFailedIsNotFound = resetFailed.code !== 0
         && isNotFoundOutput(kind, resetFailed.code, `${resetFailed.stdout}\n${resetFailed.stderr}`);
-      if (resetFailed.timedOut || (resetFailed.code !== 0 && !resetFailedIsNotFound)) throw commandFailedError();
+      if (resetFailed.timedOut) throw commandFailedError("timeout");
+      if (resetFailed.code !== 0 && !resetFailedIsNotFound) throw commandFailedError();
     }
     const stopDeadline = operationDeadline === undefined
       ? now() + spec.stopTimeoutMs

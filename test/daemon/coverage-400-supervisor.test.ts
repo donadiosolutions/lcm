@@ -1748,6 +1748,143 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     expect(runner.calls.find(({ args }) => args[0] === "bootstrap")?.timeoutMs).toBe(100);
   });
 
+  it("caps every operation-scoped launchd probe and label-release retry command at the configured timeout", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const configuredCommandTimeoutMs = 60_000;
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 901) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: configuredCommandTimeoutMs,
+      now: () => 0,
+      sleep: async () => undefined,
+    }).start(value, { deadline: 120_000 })).resolves.toMatchObject({ managerPid: 901 });
+    expect(runner.calls.map(({ args }) => args[0])).toEqual([
+      "print",
+      "bootstrap",
+      "print",
+      "print",
+      "bootstrap",
+      "print",
+    ]);
+    expect(runner.calls.map(({ timeoutMs }) => timeoutMs)).toEqual(
+      Array(runner.calls.length).fill(configuredCommandTimeoutMs),
+    );
+  });
+
+  it("bounds terminal post-start cleanup and its exact stop/absence proof by the caller deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const terminal = { code: 0, stdout: launchdText(value, "exited", 0) };
+    const configuredCommandTimeoutMs = 60_000;
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      terminal,
+      terminal,
+      terminal,
+      { code: 0, stdout: "bootout" },
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 902) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: configuredCommandTimeoutMs,
+      now: () => 0,
+      sleep: async () => undefined,
+    }).start(value, { deadline: 120_000 })).resolves.toMatchObject({ managerPid: 902 });
+    expect(runner.calls.map(({ args }) => args[0])).toEqual([
+      "print",
+      "bootstrap",
+      "print",
+      "print",
+      "print",
+      "bootout",
+      "print",
+      "print",
+      "bootstrap",
+      "print",
+    ]);
+    expect(runner.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([
+      configuredCommandTimeoutMs,
+      configuredCommandTimeoutMs,
+      configuredCommandTimeoutMs,
+      configuredCommandTimeoutMs,
+      configuredCommandTimeoutMs,
+      value.stopTimeoutMs,
+      value.stopTimeoutMs,
+      configuredCommandTimeoutMs,
+      configuredCommandTimeoutMs,
+      configuredCommandTimeoutMs,
+    ]);
+  });
+
+  it("does not begin terminal post-start cleanup after its operation deadline expires", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const terminal = { code: 0, stdout: launchdText(value, "exited", 0) };
+    const runner = runQueue([absent, { code: 0, stdout: "bootstrapped" }, terminal]);
+    const now = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValue(1);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      now,
+    }).start(value, { deadline: 1 })).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "ambiguous-state",
+    });
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "bootstrap", "print"]);
+  });
+
+  it("preserves timeout classification for timed-out stop and reset-failed commands", async () => {
+    const value = spec("systemd-user", root(), { stopTimeoutMs: 100 });
+    const timedOutStop = runQueue([
+      { code: 0, stdout: systemdText(value, "active", 12) },
+      { timedOut: true },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: timedOutStop.run,
+      platform: "linux",
+    }).stopAndAwaitAbsent(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+    const timedOutReset = runQueue([
+      { code: 0, stdout: systemdText(value, "failed") },
+      { code: 0, stdout: "stopped" },
+      { timedOut: true },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: timedOutReset.run,
+      platform: "linux",
+    }).stopAndAwaitAbsent(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "timeout",
+    });
+  });
+
   it("keeps default polling monotonic across wall-clock jumps", async () => {
     const value = spec("systemd-user", root(), { stopTimeoutMs: 3 });
     const runner = runQueue([
