@@ -1782,6 +1782,55 @@ describe("supervisor coverage: stop deadlines and cleanup decisions", () => {
     );
   });
 
+  it.each([
+    { name: "permission", failure: { code: 1, stderr: "Operation not permitted" }, reason: "permission" },
+    { name: "timeout", failure: { timedOut: true }, reason: "timeout" },
+    { name: "transport", failure: { code: null }, reason: "transport" },
+  ])("keeps an authoritative $name failure despite a later terminal re-probe", async ({ failure, reason }) => {
+    const value = spec("launchd-user", root());
+    const absent = { code: 113, stderr: "Could not find service" };
+    const terminal = { code: 0, stdout: launchdText(value, "exited", 0) };
+    const runner = runQueue([absent, failure, terminal]);
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason,
+    });
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "bootstrap", "print"]);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it("retries one exact immediate-exit registration after a successful bootstrap", async () => {
+    const value = spec("launchd-user", root());
+    const absent = { code: 113, stderr: "Could not find service" };
+    const terminal = { code: 0, stdout: launchdText(value, "exited", 0) };
+    const running = { code: 0, stdout: launchdText(value, "running", 902) };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      terminal,
+      terminal,
+      terminal,
+      { code: 0, stdout: "bootout" },
+      absent,
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      running,
+    ]);
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep: async () => undefined,
+    }).start(value)).resolves.toMatchObject({ managerPid: 902 });
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
+  });
+
   it("bounds terminal post-start cleanup and its exact absence probe by the same caller deadline", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);

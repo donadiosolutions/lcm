@@ -2512,6 +2512,8 @@ export function createSupervisor(
       if (afterPermissionFailure) throw commandFailedError("permission");
       throw commandFailedError(observationFailureClass(after));
     } catch (error) {
+      const mayRecoverExactTerminal = error instanceof SupervisorCommandError
+        && error.reason === "ambiguous-state";
       // Never clean a concurrent winner. Only remove this nonce's private
       // launch files when the manager proves that the exact spec is absent.
       let retiredExactTerminal = false;
@@ -2537,6 +2539,8 @@ export function createSupervisor(
             }
           }
           if (
+            mayRecoverExactTerminal
+            &&
             after.kind === "registered-not-running-valid"
             && after.scopeDigest === spec.scopeDigest
             && after.name === spec.name
