@@ -104,9 +104,10 @@ commit has no PR.
 Release publication runs use GitHub's native `queue: max` concurrency mode: up
 to 100 runs wait in one global FIFO queue, so different release tags cannot race
 npm dist-tag validation and mutation. Once a queued run starts, it fails closed
-behind an earlier failed run for another tag unless a later run for that tag
-succeeds or its release was withdrawn to draft. A republished restored draft
-ignores its own tag's earlier failed attempt. Version-package runs use a
+behind an earlier failed run for another tag until a later tag-bound run
+succeeds, its release is withdrawn to draft, or its published GitHub Release
+has the exact package version in npm. A republished restored draft ignores its
+own tag's earlier failed attempt. Version-package runs use a
 separate native FIFO queue and block behind any failed manual beta/stable
 transition until that transition run succeeds on retry, preventing later
 automatic work from silently overtaking it.
