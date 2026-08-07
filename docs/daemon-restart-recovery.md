@@ -32,12 +32,21 @@ If launchd reports a spawned service that has crashed, run `lcm doctor` and
 `lcm daemon restart`; do not manually kill or boot out the job.
 
 On macOS, launchd can briefly retain a service label after reporting that exact
-job absent. If the next bootstrap fails with launchd's specific code-5
-input/output-error diagnostic, LCM automatically confirms absence, waits a
-bounded label-release interval, confirms absence again, and retries that exact
-bootstrap once. A repeated failure, a permission error, any other diagnostic,
-or manager state that is no longer absent remains an error; LCM does not broaden
-the retry or fall back to manual process signaling.
+job absent. If the next exact bootstrap returns launchd's numeric code 5
+(input/output error), LCM enters a bounded label-release check. Before every
+retry it confirms the exact label absent, waits the fixed two-second settle
+interval, and confirms the label absent again. If launchd repeats code 5, LCM
+may repeat that authenticated check only while the original five-second command
+deadline has budget. This handles label release that takes more than one settle
+interval without turning other failures into generic retries.
+
+The numeric result is used because launchd's accompanying human text varies by
+macOS version. Permission failures remain permission failures even if they use
+code 5. A timeout, transport failure, malformed or ambiguous manager response,
+registered label, permission error, other command result, or code 5 that lasts
+to the deadline stops immediately with a bounded failure classification. LCM
+never includes raw manager output, plist paths, or credentials in that error,
+and it never falls back to manual process signaling.
 
 Use these commands for normal operation:
 

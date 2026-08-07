@@ -851,11 +851,13 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
   });
 
-  it("preserves a repeated launchd bootstrap settling failure after one exact retry", async () => {
+  it("continues authenticated label-release settling after repeated numeric EIO results", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
     const absent = { code: 113, stderr: "Could not find service" };
-    const failed = { code: 5, stderr: "Bootstrap failed: 5: Input/output error" };
+    // launchctl's human text varies by macOS build; the exact bootstrap
+    // command and Darwin's numeric EIO result are the stable classification.
+    const failed = { code: 5, stderr: "launchd diagnostic unavailable" };
     const runner = runQueue([
       absent,
       failed,
@@ -873,13 +875,14 @@ describe("supervisor coverage: credentials and private launch files", () => {
       platform: "darwin",
       uid: 501,
       sleep,
-    }).start(value)).rejects.toThrow("manager command");
-    expect(sleep).toHaveBeenCalledOnce();
-    expect(sleep).toHaveBeenCalledWith(2_000);
-    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(2);
+    }).start(value)).resolves.toMatchObject({ managerPid: 546 });
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenNthCalledWith(1, 2_000);
+    expect(sleep).toHaveBeenNthCalledWith(2, 2_000);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(3);
   });
 
-  it("does not retry a launchd bootstrap failure without the label-release diagnostic", async () => {
+  it("keeps a numeric code-5 launchd permission failure authoritative", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
     const absent = { code: 113, stderr: "Could not find service" };
@@ -894,7 +897,10 @@ describe("supervisor coverage: credentials and private launch files", () => {
       platform: "darwin",
       uid: 501,
       sleep,
-    }).start(value)).rejects.toThrow("manager command");
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "permission",
+    });
     expect(sleep).not.toHaveBeenCalled();
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
@@ -940,7 +946,10 @@ describe("supervisor coverage: credentials and private launch files", () => {
       run: runner.run,
       platform: "darwin",
       uid: 501,
-    }).start(value)).rejects.toThrow("manager command");
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "ambiguous-state",
+    });
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
 
@@ -961,13 +970,17 @@ describe("supervisor coverage: credentials and private launch files", () => {
       platform: "darwin",
       uid: 501,
       sleep: async () => undefined,
-    }).start(value)).rejects.toThrow("manager command");
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "ambiguous-state",
+    });
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
 
   it.each([
     { name: "after the first absence proof", times: [0, 0, 1] },
     { name: "after the settling delay", times: [0, 0, 0, 1] },
+    { name: "after the second absence proof", times: [0, 0, 0, 0, 1] },
   ])("preserves a failed launchd bootstrap when the deadline expires $name", async ({ times }) => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);
@@ -989,6 +1002,65 @@ describe("supervisor coverage: credentials and private launch files", () => {
       now,
       sleep: async () => undefined,
     }).start(value)).rejects.toThrow("manager command");
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it("classifies an initial launchd bootstrap transport failure without retrying", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([absent, { code: null }, absent]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "transport",
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      name: "malformed manager state",
+      proof: { code: 0, stdout: "unparseable launchd response" },
+      reason: "malformed-state",
+    },
+    {
+      name: "manager transport failure",
+      proof: { code: null },
+      reason: "transport",
+    },
+    {
+      name: "manager command timeout",
+      proof: { timedOut: true },
+      reason: "timeout",
+    },
+  ])("keeps $name authoritative during label-release recovery", async ({ proof, reason }) => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 5, stderr: "diagnostic wording is not an authority" },
+      proof,
+      absent,
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason,
+    });
+    expect(sleep).not.toHaveBeenCalled();
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
   });
 
