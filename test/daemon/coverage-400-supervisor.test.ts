@@ -931,6 +931,40 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
   });
 
+  it("does not give absent launchd post-start polling a fresh timeout after its implicit deadline", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const runner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      absent,
+      absent,
+    ]);
+    let currentTime = 0;
+    const sleep = vi.fn(async (milliseconds: number) => {
+      currentTime += milliseconds;
+    });
+
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      commandTimeoutMs: 100,
+      now: () => currentTime,
+      sleep,
+    }).start(value)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "ambiguous-state",
+    });
+
+    expect(currentTime).toBe(100);
+    expect(sleep.mock.calls).toEqual([[50], [50]]);
+    expect(runner.calls.map(({ args }) => args[0])).toEqual(["print", "bootstrap", "print", "print"]);
+    expect(runner.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([100, 100, 100, 50]);
+    expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
+  });
+
   it("keeps persistent launchd metadata-malformed state bounded by the terminal operation deadline", async () => {
     const stateRoot = root();
     const value = spec("launchd-user", stateRoot);

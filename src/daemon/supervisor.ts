@@ -2444,6 +2444,7 @@ export function createSupervisor(
     // stopAndAwaitAbsent; unresolved stale data is preserved as evidence.
     const expectedLaunchEnvironmentDigest = managedLaunchEnvironmentDigest(spec, kind, runner.uid, runner.environment);
     let launchPath: string | undefined;
+    let postMutationDeadline: number | undefined;
     try {
       if (kind === "launchd-user") launchPath = writePrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
       const args = kind === "systemd-user"
@@ -2477,6 +2478,7 @@ export function createSupervisor(
       // systemd's activation fence below is the authenticated continuation
       // state, and every other observation remains fail closed.
       const pollDeadline = operationDeadline ?? now() + configuredCommandTimeoutMs;
+      postMutationDeadline = pollDeadline;
       const pollBudget = operationDeadline === undefined
         ? configuredCommandTimeoutMs
         : Math.max(0, Math.floor(pollDeadline - now()));
@@ -2490,13 +2492,16 @@ export function createSupervisor(
       let after: SupervisorObservation = Object.freeze({ kind: "absent", name: spec.name });
       let afterPermissionFailure = false;
       for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
-        if (
-          after.kind === "ambiguous"
-          && after.reason === "metadata-malformed"
-          && pollDeadline - now() <= 0
-        ) break;
+        // The first post-mutation observation retains the caller's direct
+        // operation semantics. Every continuation, including repeated
+        // absence, is bounded by the one poll deadline established above.
+        if (attempt > 0 && pollDeadline - now() <= 0) break;
         const capture: SupervisorProbeCapture = {};
-        after = await probeWithinOperation(spec, capture, operationDeadline);
+        after = await probeWithinOperation(
+          spec,
+          capture,
+          attempt === 0 ? operationDeadline : pollDeadline,
+        );
         afterPermissionFailure ||= capture.permissionFailure === true;
         const activation = isOwnedSystemdActivation(spec, capture, expectedLaunchEnvironmentDigest);
         const transientLaunchdMetadata = kind === "launchd-user"
@@ -2526,7 +2531,8 @@ export function createSupervisor(
       // launch files when the manager proves that the exact spec is absent.
       let retiredExactTerminal = false;
       try {
-        const after = await probeWithinOperation(spec, undefined, operationDeadline);
+        const cleanupDeadline = postMutationDeadline ?? operationDeadline;
+        const after = await probeWithinOperation(spec, undefined, cleanupDeadline);
         if (after.kind === "absent") {
           if (kind === "launchd-user") cleanupPrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
           safeCredentialCleanup(spec);
@@ -2534,7 +2540,7 @@ export function createSupervisor(
           if (spec.credentialDirectory !== undefined) {
             const winnerSpec = differentRunningWinnerSpec(spec, after);
             if (winnerSpec !== undefined) {
-              const winner = await probeWithinOperation(winnerSpec, undefined, operationDeadline);
+              const winner = await probeWithinOperation(winnerSpec, undefined, cleanupDeadline);
               if (
                 winner.kind === "registered-running-valid"
                 && winner.scopeDigest === winnerSpec.scopeDigest
@@ -2562,7 +2568,7 @@ export function createSupervisor(
               // Preserve this launch's staged credentials while retiring the
               // exact failed registration. They have not been admitted yet
               // and are required by the one bounded retry below.
-              await stopAndAwaitAbsentInternal(spec, false, undefined, false, operationDeadline);
+              await stopAndAwaitAbsentInternal(spec, false, undefined, false, cleanupDeadline);
               retiredExactTerminal = true;
             } catch {
               // Preserve terminal evidence when stop/absence cannot be proven.
