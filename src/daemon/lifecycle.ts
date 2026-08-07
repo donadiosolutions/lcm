@@ -3394,7 +3394,7 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
       admittedSpec?: SupervisorSpec,
       restarted = false,
     ): Promise<RestartDaemonResult> => {
-      const remainingSpawnTimeoutMs = Math.max(0, verificationDeadline - monotonicNow());
+      const remainingSpawnTimeoutMs = Math.max(0, Math.floor(verificationDeadline - monotonicNow()));
       const ensured = await ensure({
         ...ensureOptions,
         spawnTimeoutMs: remainingSpawnTimeoutMs,
