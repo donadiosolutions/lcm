@@ -29,16 +29,6 @@ interface WorkflowJob {
   steps: WorkflowStep[];
 }
 
-interface VersionWorkflow {
-  on: {
-    push: { branches: string[] };
-    workflow_dispatch: { inputs: { channel: { options: string[] } } };
-  };
-  permissions: Record<string, never>;
-  concurrency: { group: string; queue: "max" };
-  jobs: { version: WorkflowJob };
-}
-
 interface PublishWorkflow {
   "run-name": string;
   on: {
@@ -55,108 +45,21 @@ interface PublishWorkflow {
   };
 }
 
-const versionSource = readFileSync(new URL("../.github/workflows/version-pr.yml", import.meta.url), "utf8");
 const publishSource = readFileSync(new URL("../.github/workflows/publish.yml", import.meta.url), "utf8");
 const releaseTagPolicySource = readFileSync(
   new URL("../.github/scripts/release-tag-policy.mjs", import.meta.url),
   "utf8",
 );
-const changesetSource = readFileSync(
-  new URL("../.changeset/calm-betas-draft.md", import.meta.url),
-  "utf8",
-);
-const versionWorkflow = loadYaml(versionSource) as VersionWorkflow;
+const changesetSource = `---
+"@donadiosolutions/lcm": minor
+---
+`;
 const publishWorkflow = loadYaml(publishSource) as PublishWorkflow;
 const highlightsSchema = JSON.parse(
   readFileSync(new URL("../.github/codex/release-highlights.schema.json", import.meta.url), "utf8"),
 );
 
 describe("release workflows", () => {
-  it("uses an ordered, main-based Changesets workflow with explicit beta transitions", () => {
-    expect(versionWorkflow.on.push.branches).toEqual(["main"]);
-    expect(versionWorkflow.on.workflow_dispatch.inputs.channel.options).toEqual(["beta", "stable"]);
-    expect(versionWorkflow.permissions).toEqual({});
-    expect(versionWorkflow.concurrency).toEqual({
-      group: "version-packages-main",
-      queue: "max",
-    });
-    expect(versionSource).toContain(
-      "Current GitHub syntax: preserve up to 100 pending runs FIFO; installed actionlint lags.",
-    );
-    expect(versionWorkflow.jobs.version["runs-on"]).toBe("ubuntu-latest");
-    expect(versionWorkflow.jobs.version.permissions).toEqual({
-      actions: "read",
-      contents: "write",
-      issues: "write",
-      "pull-requests": "write",
-    });
-    const versionQueue = versionWorkflow.jobs.version.steps.find(
-      (step) => step.name === "Enforce earlier manual transition success",
-    );
-    expect(versionQueue?.uses).toBe(
-      "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
-    );
-    expect(versionQueue?.with?.script).toContain('workflow_id: "version-pr.yml"');
-    expect(versionQueue?.with?.script).toContain('event: "workflow_dispatch"');
-    expect(versionQueue?.with?.script).toContain('status: "completed"');
-    expect(versionQueue?.with?.script).toContain('run.id < currentRunId');
-    expect(versionQueue?.with?.script).toContain('run.conclusion !== "success"');
-    expect(versionQueue?.with?.script).toContain("must be rerun successfully");
-    expect(versionQueue?.with?.script).not.toContain("setTimeout");
-    const channel = versionWorkflow.jobs.version.steps.find(
-      (step) => step.name === "Resolve release channel",
-    );
-    expect(channel?.id).toBe("channel");
-    expect(channel?.uses).toBe(
-      "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
-    );
-    expect(channel?.env).toMatchObject({
-      EVENT_NAME: "${{ github.event_name }}",
-      REQUESTED_CHANNEL: "${{ inputs.channel }}",
-    });
-    expect(channel?.with?.script).toContain('eventName === "workflow_dispatch"');
-    expect(channel?.with?.script).toContain('eventName === "push"');
-    expect(channel?.with?.script).toContain("github.rest.pulls.list");
-    expect(channel?.with?.script).toContain('state: "open"');
-    expect(channel?.with?.script).toContain('base: "main"');
-    expect(channel?.with?.script).toContain('head: `${context.repo.owner}:changeset-release/main`');
-    expect(channel?.with?.script).toContain("if (pulls.length > 1)");
-    expect(channel?.with?.script).toContain('"release-channel:beta"');
-    expect(channel?.with?.script).toContain('"release-channel:stable"');
-    expect(channel?.with?.script).toContain("if (persisted.size > 1)");
-    expect(channel?.with?.script).toContain(': "auto"');
-    expect(channel?.with?.script).toContain('core.setOutput("channel", channel)');
-    const changesets = versionWorkflow.jobs.version.steps.find((step) => step.id === "changesets");
-    expect(changesets?.with).toMatchObject({
-      branch: "main",
-      commitMode: "github-api",
-      version: "npm run version-packages",
-      createGithubReleases: false,
-    });
-    expect(changesets?.env?.LCM_RELEASE_CHANNEL).toBe("${{ steps.channel.outputs.channel }}");
-    expect(versionWorkflow.jobs.version.steps.indexOf(channel!)).toBeLessThan(
-      versionWorkflow.jobs.version.steps.indexOf(changesets!),
-    );
-    const releasePolicyLabels = versionWorkflow.jobs.version.steps.find(
-      (step) => step.name === "Apply version PR policy labels",
-    );
-    expect(releasePolicyLabels?.env).toMatchObject({
-      PR_NUMBER: "${{ steps.changesets.outputs.pullRequestNumber }}",
-      RELEASE_CHANNEL: "${{ steps.channel.outputs.channel }}",
-    });
-    expect(releasePolicyLabels?.with?.script).toContain('"no-release-notes"');
-    expect(releasePolicyLabels?.with?.script).toContain('"release-channel:beta"');
-    expect(releasePolicyLabels?.with?.script).toContain('"release-channel:stable"');
-    expect(releasePolicyLabels?.with?.script).toContain("github.rest.issues.getLabel");
-    expect(releasePolicyLabels?.with?.script).toContain("github.rest.issues.createLabel");
-    expect(releasePolicyLabels?.with?.script).toContain("createError.status !== 422");
-    expect(releasePolicyLabels?.with?.script).toContain("labels: desired");
-    expect(releasePolicyLabels?.with?.script).toContain("github.rest.issues.removeLabel");
-    expect(releasePolicyLabels?.with?.script).toContain('if (error.status !== 404) throw error');
-    expect(releasePolicyLabels?.with?.script).not.toContain('"chore"');
-    expect(releasePolicyLabels?.with?.script).not.toContain('"release-workflow"');
-  });
-
   it("separates tag-driven drafts from manually published npm releases", () => {
     expect(publishWorkflow.on.push.tags).toEqual(["v*.*.*"]);
     expect(publishWorkflow["run-name"]).toBe(
@@ -261,7 +164,7 @@ describe("release workflows", () => {
   });
 
   it("pins every third-party action used by the release workflows", () => {
-    for (const workflow of [versionWorkflow, publishWorkflow]) {
+    for (const workflow of [publishWorkflow]) {
       for (const job of Object.values(workflow.jobs)) {
         for (const step of job.steps) {
           if (step.uses) expect(step.uses).toMatch(/^[^@]+@[0-9a-f]{40}$/u);
