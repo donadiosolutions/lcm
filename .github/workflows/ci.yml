@@ -390,7 +390,7 @@ jobs:
   codecov:
     name: Codecov upload
     needs: ci
-    if: ${{ github.event_name != 'merge_group' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ !cancelled() && github.event_name != 'merge_group' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
     runs-on: ubuntu-latest
     permissions:
       # Download the fixed report artifact produced by this workflow run.
@@ -460,7 +460,7 @@ jobs:
   codecov-fork:
     name: Codecov upload (fork)
     needs: ci
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: ubuntu-latest
     permissions:
       # Download the fixed report artifact produced by this workflow run.

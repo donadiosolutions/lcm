@@ -153,6 +153,13 @@ including Dependabot PRs. A mutually exclusive fork-PR job omits OIDC permission
 and uses Codecov's tokenless upload path. Both reporting jobs are skipped for
 `merge_group`; the synthetic commit runs the full coverage suite in CI while its
 separate merge-group workflow supplies the required `external-admission` check.
+Keep each upload job's job-level `if` as `!cancelled()` combined with, not
+replacing, its existing event/trust predicates, including the `merge_group`
+exclusion; retain `needs: ci` and `fail_ci_if_error: true` on every Codecov
+upload action. Uploads are attempted after non-cancelled aggregate `ci` failures
+while that required `ci` check remains red.
+Uploads cannot succeed if the reports were not produced or if the Codecov uploader
+or service fails.
 
 ## Defaults (predefined answers for brainstorming)
 
