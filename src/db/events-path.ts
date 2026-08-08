@@ -9,8 +9,10 @@ import {
 } from "../project-map.js";
 import { lcmHomeDir } from "../runtime-paths.js";
 import {
+  assertPrivateDirectory,
   atomicWritePrivateFileDurable,
   ensurePrivateDirectory,
+  openPrivateDirectory,
   OWNER_ONLY_FILE_MODES,
   readBoundedRegularFile,
 } from "../security-files.js";
@@ -25,6 +27,17 @@ type SidecarIdentityEvidence = Readonly<{
   canonical: string;
   id: string;
 }>;
+
+type ExistingEventsDbPathOptions = Readonly<{
+  /** @internal Test-only effective-user seam for deterministic ownership coverage. */
+  _effectiveUidForTesting?: () => number | undefined;
+  /** @internal Test-only directory-open seam for isolating evidence ownership. */
+  _openEventsDirectoryForTesting?: typeof openPrivateDirectory;
+}>;
+
+function effectiveUid(): number | undefined {
+  return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
 
 function identityEvidencePath(normalizedCwd: string): string {
   return join(eventsDir(), `${hashProjectPath(normalizedCwd)}.identity.json`);
@@ -49,18 +62,29 @@ function publishIdentityEvidence(cwd: string, identity: { id: string; canonical:
   );
 }
 
-function existingSidecarFromIdentityEvidence(cwd: string): string | undefined {
+function existingSidecarFromIdentityEvidence(
+  cwd: string,
+  expectedUid: number | undefined,
+): string | undefined {
   const normalizedCwd = normalizeProjectPath(cwd);
   const path = identityEvidencePath(normalizedCwd);
-  if (!existsSync(path)) return undefined;
 
+  let content: string;
   try {
-    const parsed: unknown = JSON.parse(readBoundedRegularFile(path, {
+    content = readBoundedRegularFile(path, {
       allowedRoot: eventsDir(),
       allowedModes: OWNER_ONLY_FILE_MODES,
+      expectedUid,
       maxBytes: MAX_IDENTITY_EVIDENCE_BYTES,
       requireSingleLink: true,
-    }));
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(content);
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
     const record = parsed as Record<string, unknown>;
     const keys = Object.keys(record).sort();
@@ -102,16 +126,53 @@ export function eventsDbPath(cwd: string): string {
  * exists. This must remain read-only because callers use it while recovering
  * unavailable working directories.
  */
-export function existingEventsDbPath(cwd: string): string | undefined {
+export function existingEventsDbPath(
+  cwd: string,
+  options: ExistingEventsDbPathOptions = {},
+): string | undefined {
   const identity = resolveExistingProjectIdentity(cwd);
-  if (identity) return join(eventsDir(), `${identity.id}.db`);
+  const directory = eventsDir();
+  const expectedUid = options._effectiveUidForTesting?.() ?? effectiveUid();
+  let handle: ReturnType<typeof openPrivateDirectory>;
+  try {
+    handle = (options._openEventsDirectoryForTesting ?? openPrivateDirectory)(
+      directory,
+      { expectedUid },
+    );
+  } catch {
+    return undefined;
+  }
 
-  const evidenced = existingSidecarFromIdentityEvidence(cwd);
-  if (evidenced) return evidenced;
+  const witness = handle.witness;
+  let failed = false;
+  let result: string | undefined;
+  try {
+    try {
+      assertPrivateDirectory(handle, directory, witness);
+      if (identity) {
+        result = join(directory, `${identity.id}.db`);
+      } else {
+        const evidenced = existingSidecarFromIdentityEvidence(cwd, expectedUid);
+        if (evidenced) {
+          result = evidenced;
+        } else {
+          // Legacy mapless sidecars use the exact normalized cwd hash. Return
+          // one only when it is already present; no identity is created.
+          const candidate = join(directory, `${hashProjectPath(normalizeProjectPath(cwd))}.db`);
+          result = existsSync(candidate) ? candidate : undefined;
+        }
+      }
+    } catch {
+      failed = true;
+    }
 
-  // Legacy mapless sidecars use the exact normalized cwd hash. Return it only
-  // when the sidecar is already present; no project identity is created by
-  // this fallback.
-  const candidate = join(eventsDir(), `${hashProjectPath(normalizeProjectPath(cwd))}.db`);
-  return existsSync(candidate) ? candidate : undefined;
+    try {
+      assertPrivateDirectory(handle, directory, witness);
+    } catch {
+      failed = true;
+    }
+    return failed ? undefined : result;
+  } finally {
+    handle.close();
+  }
 }

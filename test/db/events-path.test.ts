@@ -10,6 +10,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync,
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { tmpdir } from "node:os";
+import { openPrivateDirectory } from "../../src/security-files.js";
 
 describe("backend-independent local project identity", () => {
   let previousHome: string | undefined;
@@ -30,6 +31,34 @@ describe("backend-independent local project identity", () => {
     rmSync(home, { recursive: true, force: true });
     rmSync(project, { recursive: true, force: true });
   });
+
+  const prepareDeletedLinkedWorktree = (): {
+    primary: string;
+    linked: string;
+    anchorId: string;
+    anchorSidecar: string;
+    evidencePath: string;
+  } => {
+    const primary = mkdtempSync(join(tmpdir(), "lcm-events-path-primary-"));
+    const linked = mkdtempSync(join(tmpdir(), "lcm-events-path-linked-"));
+    const admin = join(primary, ".git", "worktrees", "linked");
+    mkdirSync(join(primary, ".git", "objects"), { recursive: true });
+    mkdirSync(admin, { recursive: true });
+    writeFileSync(join(primary, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(primary, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
+    writeFileSync(join(admin, "HEAD"), "ref: refs/heads/linked\n");
+    writeFileSync(join(admin, "commondir"), "../..\n");
+    writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`);
+    writeFileSync(join(admin, "gitdir"), `${join(linked, ".git")}\n`);
+
+    const anchorId = hashProjectPath(normalizeProjectIdentityPath(primary));
+    const anchorSidecar = eventsDbPath(linked);
+    const evidenceFiles = readdirSync(eventsDir()).filter((entry) => entry.endsWith(".identity.json"));
+    expect(evidenceFiles).toHaveLength(1);
+    const evidencePath = join(eventsDir(), evidenceFiles[0]!);
+    rmSync(linked, { recursive: true, force: true });
+    return { primary, linked, anchorId, anchorSidecar, evidencePath };
+  };
 
   it("keeps the sidecar ID stable while an existing map switches keys", () => {
     const canonical = normalizeProjectIdentityPath(project);
@@ -58,6 +87,7 @@ describe("backend-independent local project identity", () => {
     const unavailable = join(project, "gone");
     expect(existingEventsDbPath(unavailable)).toBeUndefined();
     expect(existingEventsDbPath("/lcm-events-path-missing-cwd")).toBeUndefined();
+    expect(existsSync(eventsDir())).toBe(false);
     expect(existsSync(projectMapPath())).toBe(false);
 
     const sidecarDir = join(home, ".lcm", "events");
@@ -93,33 +123,16 @@ describe("backend-independent local project identity", () => {
   });
 
   it("recovers the anchor sidecar after the entire linked-worktree root disappears", () => {
-    const primary = mkdtempSync(join(tmpdir(), "lcm-events-path-primary-"));
-    const linked = mkdtempSync(join(tmpdir(), "lcm-events-path-linked-"));
+    const { primary, linked, anchorId, anchorSidecar, evidencePath } = prepareDeletedLinkedWorktree();
     try {
-      const admin = join(primary, ".git", "worktrees", "linked");
-      mkdirSync(join(primary, ".git", "objects"), { recursive: true });
-      mkdirSync(admin, { recursive: true });
-      writeFileSync(join(primary, ".git", "HEAD"), "ref: refs/heads/main\n");
-      writeFileSync(join(primary, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
-      writeFileSync(join(admin, "HEAD"), "ref: refs/heads/linked\n");
-      writeFileSync(join(admin, "commondir"), "../..\n");
-      writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`);
-      writeFileSync(join(admin, "gitdir"), `${join(linked, ".git")}\n`);
-
       const unavailable = linked;
-      const anchorId = hashProjectPath(normalizeProjectIdentityPath(primary));
-      const anchorSidecar = eventsDbPath(unavailable);
       expect(anchorSidecar).toBe(join(
         eventsDir(),
         `${anchorId}.db`,
       ));
-      const evidenceFiles = readdirSync(eventsDir()).filter((entry) => entry.endsWith(".identity.json"));
-      expect(evidenceFiles).toHaveLength(1);
-      const evidencePath = join(eventsDir(), evidenceFiles[0]!);
       expect(statSync(evidencePath).mode & 0o777).toBe(0o600);
       expect(existsSync(projectMapPath())).toBe(false);
       expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
-      rmSync(linked, { recursive: true, force: true });
 
       expect(existsSync(linked)).toBe(false);
       expect(existingEventsDbPath(unavailable)).toBeUndefined();
@@ -156,6 +169,93 @@ describe("backend-independent local project identity", () => {
       expect(existsSync(projectMapPath())).toBe(false);
       expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
     } finally {
+      rmSync(primary, { recursive: true, force: true });
+      rmSync(linked, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects wrong-owner identity evidence without mutating recovery state", () => {
+    const { primary, linked, anchorSidecar, evidencePath } = prepareDeletedLinkedWorktree();
+    try {
+      writeFileSync(anchorSidecar, "");
+      const evidenceBefore = statSync(evidencePath);
+      const directoryBefore = statSync(eventsDir());
+      const effectiveUid = typeof process.getuid === "function" ? process.getuid() : 0;
+
+      expect(existingEventsDbPath(linked, {
+        _effectiveUidForTesting: () => effectiveUid + 1,
+        _openEventsDirectoryForTesting: (path: string) => openPrivateDirectory(path),
+      })).toBeUndefined();
+      expect(statSync(evidencePath)).toMatchObject({
+        uid: evidenceBefore.uid,
+        mode: evidenceBefore.mode,
+        size: evidenceBefore.size,
+        mtimeMs: evidenceBefore.mtimeMs,
+      });
+      expect(statSync(eventsDir())).toMatchObject({
+        uid: directoryBefore.uid,
+        mode: directoryBefore.mode,
+        mtimeMs: directoryBefore.mtimeMs,
+      });
+      expect(existingEventsDbPath(linked)).toBe(anchorSidecar);
+    } finally {
+      rmSync(primary, { recursive: true, force: true });
+      rmSync(linked, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects wrong-owner and unsafe-mode events directories without repair", () => {
+    const { primary, linked, anchorSidecar } = prepareDeletedLinkedWorktree();
+    try {
+      writeFileSync(anchorSidecar, "");
+      const effectiveUid = typeof process.getuid === "function" ? process.getuid() : 0;
+      const entries = readdirSync(eventsDir()).sort();
+
+      expect(existingEventsDbPath(linked, {
+        _effectiveUidForTesting: () => effectiveUid + 1,
+      })).toBeUndefined();
+      expect(statSync(eventsDir()).mode & 0o777).toBe(0o700);
+      expect(readdirSync(eventsDir()).sort()).toEqual(entries);
+
+      expect(existingEventsDbPath(linked, {
+        _openEventsDirectoryForTesting: (
+          path: string,
+          options: { readonly expectedUid?: number },
+        ) => {
+          const handle = openPrivateDirectory(path, options);
+          chmodSync(path, 0o755);
+          return handle;
+        },
+      })).toBeUndefined();
+      expect(statSync(eventsDir()).mode & 0o777).toBe(0o755);
+      expect(readdirSync(eventsDir()).sort()).toEqual(entries);
+
+      chmodSync(eventsDir(), 0o700);
+      chmodSync(eventsDir(), 0o755);
+      expect(existingEventsDbPath(linked)).toBeUndefined();
+      expect(statSync(eventsDir()).mode & 0o777).toBe(0o755);
+      expect(readdirSync(eventsDir()).sort()).toEqual(entries);
+
+      chmodSync(eventsDir(), 0o700);
+      expect(existingEventsDbPath(linked)).toBe(anchorSidecar);
+
+      const getuidDescriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+      Object.defineProperty(process, "getuid", {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: undefined,
+      });
+      try {
+        expect(existingEventsDbPath(linked)).toBe(anchorSidecar);
+      } finally {
+        if (getuidDescriptor) Object.defineProperty(process, "getuid", getuidDescriptor);
+        else Reflect.deleteProperty(process, "getuid");
+      }
+      expect(existsSync(projectMapPath())).toBe(false);
+      expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
+    } finally {
+      chmodSync(eventsDir(), 0o700);
       rmSync(primary, { recursive: true, force: true });
       rmSync(linked, { recursive: true, force: true });
     }
