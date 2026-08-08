@@ -13,6 +13,7 @@ import {
   appendFileSync,
   closeSync,
   fchmodSync,
+  fsyncSync,
   fstatSync,
   openSync,
   linkSync,
@@ -107,7 +108,7 @@ describe("private filesystem primitives", () => {
     writeFileSync(path, "secret", { mode: 0o600 });
     const hardlink = join(root, "hardlink");
     linkSync(path, hardlink);
-    expect(() => consumeBoundedRegularFile(path, { allowedRoot: root, maxBytes: 1024 })).toThrow("changed");
+    expect(() => consumeBoundedRegularFile(path, { allowedRoot: root, maxBytes: 1024 })).toThrow("multiple hard links");
     expect(existsSync(path)).toBe(true);
     expect(existsSync(hardlink)).toBe(true);
   });
@@ -1151,4 +1152,127 @@ describe("private filesystem primitives", () => {
     expect(() => writePrivateFileExclusive(path, "content", deps as never)).toThrow(denied);
     expect(deps.unlink).not.toHaveBeenCalled();
   });
+
+  it("unlinks the exclusive durable temp before the final parent sync and rejects ambiguous cleanup", () => {
+    const root = makeRoot();
+    const path = join(root, "durable-order");
+    const events: string[] = [];
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalUnlink = nodeFs.unlinkSync as (candidate: string) => void;
+    const originalFsync = nodeFs.fsyncSync as (fd: number) => void;
+
+    withPatchedFs("fsyncSync", ((fd: number) => {
+      events.push("fsync");
+      return originalFsync(fd);
+    }) as never, () => withPatchedFs("unlinkSync", ((candidate: string) => {
+      if (candidate.endsWith(".tmp")) events.push("unlink");
+      return originalUnlink(candidate);
+    }) as never, () => atomicWritePrivateFileDurable(path, "content", { requireAbsent: true })));
+    expect(events.slice(-2)).toEqual(["unlink", "fsync"]);
+    expect(fsStatSync(path).nlink).toBe(1);
+
+    const failurePath = join(root, "durable-cleanup-failure");
+    const failure = Object.assign(new Error("durable temp cleanup denied"), { code: "EACCES" });
+    expect(() => withPatchedFs("unlinkSync", ((candidate: string) => {
+      if (candidate.endsWith(".tmp")) throw failure;
+      return originalUnlink(candidate);
+    }) as never, () => atomicWritePrivateFileDurable(failurePath, "content", { requireAbsent: true })))
+      .toThrow(failure);
+    expect(fsStatSync(failurePath).nlink).toBe(2);
+  });
+
+  it("rejects lossy numeric identity during descriptor-bound consume", () => {
+    const root = makeRoot();
+    const path = join(root, "lossy-identity");
+    writeFileSync(path, "content", { mode: 0o600 });
+    const originalFstat = fstatSync;
+    const originalStat = statSync;
+    const originalLstat = lstatSync;
+    const exactDev = 9007199254740993n;
+    const exactIno = 9007199254740995n;
+    const replacementDev = 9007199254740992n;
+    const replacementIno = 9007199254740994n;
+    const lossyDev = Number(exactDev);
+    const lossyIno = Number(exactIno);
+
+    expect(() => withPatchedFs("fstatSync", ((fd: number, options?: unknown) => {
+      const stat = originalFstat(fd, options as never);
+      const bigint = (options as { bigint?: boolean } | undefined)?.bigint === true;
+      return Object.assign(stat, {
+        dev: bigint ? exactDev : lossyDev,
+        ino: bigint ? exactIno : lossyIno,
+      });
+    }) as never, () => withPatchedFs("statSync", ((candidate: string, options?: unknown) => {
+      const stat = originalStat(candidate, options as never);
+      if (candidate === path && !((options as { bigint?: boolean } | undefined)?.bigint === true)) {
+        return Object.assign(stat, { dev: lossyDev, ino: lossyIno });
+      }
+      return stat;
+    }) as never, () => withPatchedFs("lstatSync", ((candidate: string, options?: unknown) => {
+      const stat = originalLstat(candidate, options as never);
+      if (candidate === path) {
+        const bigint = (options as { bigint?: boolean } | undefined)?.bigint === true;
+        return Object.assign(stat, {
+          dev: bigint ? replacementDev : lossyDev,
+          ino: bigint ? replacementIno : lossyIno,
+        });
+      }
+      return stat;
+    }) as never, () => consumeBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 1024,
+    }))))).toThrow("file changed during consume");
+    expect(existsSync(path)).toBe(true);
+  });
+
+
+  it("fails closed on exact BigInt consume metadata mismatches", () => {
+    const root = makeRoot();
+    const path = join(root, "metadata-mismatch");
+    writeFileSync(path, "content", { mode: 0o600 });
+    const originalLstat = lstatSync;
+    const run = (
+      changes: Record<string, unknown>,
+      options: Partial<Parameters<typeof consumeBoundedRegularFile>[1]> = {},
+    ): string => withPatchedFs("lstatSync", ((candidate: string, rawOptions?: unknown) => {
+      const stat = originalLstat(candidate, rawOptions as never);
+      if (
+        candidate === path
+        && (rawOptions as { bigint?: boolean } | undefined)?.bigint === true
+      ) {
+        return Object.assign(stat, changes);
+      }
+      return stat;
+    }) as never, () => consumeBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 1024,
+      ...options,
+    }));
+    expect(() => run({ nlink: 2n })).toThrow("multiple hard links");
+    expect(() => run({
+      mode: BigInt(0o040755),
+    })).toThrow("regular file");
+    const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+    expect(() => run({ uid: BigInt(uid + 1) }, { expectedUid: uid })).toThrow("owner");
+    expect(() => run({
+      mode: (BigInt(fsStatSync(path).mode) & ~0o7777n) | 0o644n,
+    }, { allowedModes: [0o600] })).toThrow("mode");
+  });
+
+  it("fails closed when durable destination identity is not single-link", () => {
+    const root = makeRoot();
+    const path = join(root, "durable-identity-mismatch");
+    const originalLstat = lstatSync;
+    expect(() => withPatchedFs("lstatSync", ((candidate: string, rawOptions?: unknown) => {
+      const stat = originalLstat(candidate, rawOptions as never);
+      if (
+        candidate === path
+        && (rawOptions as { bigint?: boolean } | undefined)?.bigint === true
+      ) {
+        return Object.assign(stat, { nlink: 2n });
+      }
+      return stat;
+    }) as never, () => atomicWritePrivateFileDurable(path, "content", { requireAbsent: true }))).toThrow("single-link");
+  });
+
 });

@@ -273,6 +273,14 @@ type PrivateFileIdentity = PrivatePathIdentity & Readonly<{
 
 type BigIntFileStat = PrivatePathIdentity & Readonly<{
   isFile: () => boolean;
+  nlink: bigint;
+}>;
+
+type BigIntBoundedFileStat = PrivatePathIdentity & Readonly<{
+  isFile: () => boolean;
+  mode: bigint;
+  uid: bigint;
+  nlink: bigint;
 }>;
 
 function privatePathIdentity(path: string): PrivatePathIdentity {
@@ -319,6 +327,40 @@ function unlinkPrivateFileIfIdentityMatches(
   }
   if (!current.isFile() || current.dev !== expected.dev || current.ino !== expected.ino) return;
   unlink(path);
+}
+
+function validateBoundedBigIntFileMetadata(
+  stat: BigIntBoundedFileStat,
+  options: BoundedFileOptions,
+): void {
+  if (!stat.isFile()) throw new Error("path is not a regular file");
+  if (options.requireSingleLink && stat.nlink !== 1n) {
+    throw new Error("file has multiple hard links");
+  }
+  if (options.expectedUid !== undefined && stat.uid !== BigInt(options.expectedUid)) {
+    throw new Error("file owner is not trusted");
+  }
+  if (
+    options.allowedModes !== undefined
+    && !options.allowedModes.includes(Number(stat.mode & 0o7777n))
+  ) {
+    throw new Error("file mode is not trusted");
+  }
+}
+
+function assertPrivateFileSingleLink(
+  path: string,
+  expected: PrivateFileIdentity,
+): void {
+  const current = lstatSync(path, { bigint: true }) as unknown as BigIntFileStat;
+  if (
+    !current.isFile()
+    || current.nlink !== 1n
+    || current.dev !== expected.dev
+    || current.ino !== expected.ino
+  ) {
+    throw new Error("private durable publication did not produce a single-link destination");
+  }
 }
 
 /** Read a bounded regular file and its metadata from one descriptor. */
@@ -433,11 +475,17 @@ export function consumeBoundedRegularFile(path: string, options: BoundedFileOpti
     if (realpathSync(dirname(path)) !== expectedParent) {
       throw new Error("file parent changed during consume");
     }
-    const current = lstatSync(path);
-    if (current.isSymbolicLink() || current.nlink !== 1 || current.dev !== result.dev || current.ino !== result.ino) {
+    const currentParent = lstatSync(dirname(path), { bigint: true }) as unknown as PrivatePathIdentity;
+    const current = lstatSync(path, { bigint: true }) as unknown as BigIntBoundedFileStat;
+    if (
+      currentParent.dev.toString(10) !== result.parentDev
+      || currentParent.ino.toString(10) !== result.parentIno
+      || current.dev.toString(10) !== result.exactDev
+      || current.ino.toString(10) !== result.exactIno
+    ) {
       throw new Error("file changed during consume");
     }
-    validateBoundedFileMetadata(current, options);
+    validateBoundedBigIntFileMetadata(current, { ...options, requireSingleLink: true });
     unlinkSync(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return result.content;
@@ -806,7 +854,7 @@ export function atomicWritePrivateFileDurable(
   );
   let temporaryFd: number | undefined;
   let temporaryIdentity: PrivateFileIdentity | undefined;
-  let published = false;
+  let primaryError: unknown;
   try {
     temporaryFd = openSync(
       temporaryPath,
@@ -844,9 +892,16 @@ export function atomicWritePrivateFileDurable(
     } else {
       renameSync(temporaryPath, path);
     }
-    published = true;
+    if (options.requireAbsent && temporaryIdentity !== undefined) {
+      unlinkPrivateFileIfIdentityMatches(temporaryPath, temporaryIdentity);
+      assertPrivateFileSingleLink(path, temporaryIdentity);
+      temporaryIdentity = undefined;
+    }
     assertPrivateDirectory(parent, directory, parent.witness);
     fsyncSync(parent.fd);
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
     if (temporaryFd !== undefined) {
       try { closeSync(temporaryFd); } catch { /* preserve the original error */ }
@@ -855,7 +910,12 @@ export function atomicWritePrivateFileDurable(
       try {
         unlinkPrivateFileIfIdentityMatches(temporaryPath, temporaryIdentity);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !published) throw error;
+        if (
+          primaryError === undefined
+          || (error as NodeJS.ErrnoException).code !== "ENOENT"
+        ) {
+          throw error;
+        }
       }
     }
     parent.close();

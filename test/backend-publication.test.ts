@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -42,6 +42,11 @@ function recoveryFile(content: string, mode = 0o600): BackendPublicationRecovery
     mode,
     uid: typeof process.getuid === "function" ? process.getuid() : 0,
     gid: typeof process.getgid === "function" ? process.getgid() : 0,
+    nlink: "1",
+    dev: "1",
+    ino: "2",
+    parentDev: "3",
+    parentIno: "4",
   };
 }
 
@@ -121,6 +126,23 @@ function coordinator(
   observer?: (event: string, path: string) => void,
 ): BackendPublicationCoordinator {
   return new BackendPublicationCoordinator({ homeDir, driver, observer });
+}
+
+async function withPatchedFsAsync<T>(
+  name: string,
+  replacement: unknown,
+  callback: () => Promise<T>,
+): Promise<T> {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const original = nodeFs[name];
+  nodeFs[name] = replacement;
+  syncBuiltinESMExports();
+  try {
+    return await callback();
+  } finally {
+    nodeFs[name] = original;
+    syncBuiltinESMExports();
+  }
 }
 
 function inputFor(materialInput: BackendPublicationRecoveryMaterial) {
@@ -553,7 +575,7 @@ describe("BackendPublicationCoordinator", () => {
 
     const abortingRelease = await releasingFixture();
     const abortingCompleted = await coordinator(abortingRelease.home, abortingRelease.fake.driver).abort();
-    expect(abortingCompleted.phase).toBe("completed");
+    expect(abortingCompleted.phase).toBe("aborted");
 
     const alreadyReleased = await releasingFixture();
     alreadyReleased.setFence(fenceRecord({ releasedAt: "2026-08-06T12:01:00.000Z" }));
@@ -810,7 +832,7 @@ describe("BackendPublicationCoordinator", () => {
     }))).rejects.toMatchObject({ reason: "invalid-input" });
     await expect(coordinator(home, fake.driver).prepare(inputFor({
       ...input,
-      target: { ...input.target, config: { presence: "present", content: Buffer.alloc(4 * 1024 * 1024 + 1), mode: 0o600, uid: 0, gid: 0 } },
+      target: { ...input.target, config: { ...recoveryFile("x"), content: Buffer.alloc(4 * 1024 * 1024 + 1) } },
     }))).rejects.toMatchObject({ reason: "invalid-input" });
     expect(readBackendPublicationJournal(home)).toBeNull();
   });
@@ -825,6 +847,11 @@ describe("BackendPublicationCoordinator", () => {
       mode: 0o600,
       uid,
       gid,
+      nlink: "1",
+      dev: "1",
+      ino: "2",
+      parentDev: "3",
+      parentIno: "4",
     };
     const hugeMaterial: BackendPublicationRecoveryMaterial = {
       source: { config: huge, projectMap: huge },
@@ -1307,7 +1334,18 @@ describe("BackendPublicationCoordinator", () => {
       source: { config: null, projectMap: envelope.source.projectMap },
     }));
 
-    const present = { contentBase64: "", mode: 0o600, uid: 0, gid: 0, presence: "present" };
+    const present = {
+      contentBase64: "",
+      mode: 0o600,
+      uid: 0,
+      gid: 0,
+      nlink: "1",
+      dev: "1",
+      ino: "2",
+      parentDev: "3",
+      parentIno: "4",
+      presence: "present",
+    };
     for (const [label, value, reason] of [
       ["missing content", { mode: 0o600, uid: 0, gid: 0, presence: "present" }, "malformed-journal"],
       ["wrong presence", { ...present, presence: "other" }, "malformed-journal"],
@@ -1607,6 +1645,211 @@ describe("BackendPublicationCoordinator", () => {
     }));
     expect(() => readBackendPublicationJournal(duplicateRemote.home)).toThrow("canonically sorted");
   });
+
+  it("routes abort recovery through abort-release checkpoints after release crashes", async () => {
+    for (const checkpoint of ["before-release", "after-release"] as const) {
+      const home = makeHome();
+      const input = material();
+      const fake = makeDriver(input);
+      let fence: BackendPublicationFenceRecord | null = null;
+      fake.driver.acquireRemoteGuard = vi.fn(async () => {
+        fence = fenceRecord();
+        return fence;
+      });
+      fake.driver.readRemoteGuard = vi.fn(async () => fence);
+      fake.driver.releaseRemoteGuard = vi.fn(async () => {
+        if (fence !== null) fence = { ...fence, releasedAt: "2026-08-06T12:01:00.000Z" };
+      });
+      await coordinator(home, fake.driver).prepare(inputFor(input));
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (event === "before-release") throw new Error("crash:initial-release");
+      }).resume()).rejects.toThrow("crash:initial-release");
+      expect(readBackendPublicationJournal(home)?.phase).toBe("releasing");
+
+      const abortCall = checkpoint === "before-release"
+        ? coordinator(home, fake.driver, (event) => {
+          if (event === checkpoint) throw new Error("crash:abort-" + checkpoint);
+        }).abort()
+        : coordinator(home, fake.driver, (event) => {
+          if (event === checkpoint) throw new Error("crash:abort-" + checkpoint);
+        }).recoverPending({ disposition: "abort" });
+      await expect(abortCall).rejects.toThrow("crash:abort-" + checkpoint);
+      expect(readBackendPublicationJournal(home)?.phase).toBe("abort-releasing");
+
+      const recovered = await coordinator(home, fake.driver).abort();
+      expect(recovered.phase).toBe("aborted");
+      expect(fence?.releasedAt).not.toBeNull();
+      expect(existsSync(join(backendPublicationDirectory(home), "publication-1.material"))).toBe(false);
+    }
+  });
+
+  it("keeps abort-releasing durable until sealed material cleanup completes", async () => {
+    const { home, input, fake } = await preparedFixture();
+    await expect(coordinator(home, fake.driver, (event) => {
+      if (
+        event === "before-material-authenticate"
+        && readBackendPublicationJournal(home)?.phase === "abort-releasing"
+      ) throw new Error("crash:abort-cleanup");
+    }).abort()).rejects.toThrow("crash:abort-cleanup");
+    expect(readBackendPublicationJournal(home)?.phase).toBe("abort-releasing");
+    const materialPath = join(backendPublicationDirectory(home), "publication-1.material");
+    expect(existsSync(materialPath)).toBe(true);
+
+    const aborted = await coordinator(home, fake.driver).abort();
+    expect(aborted.phase).toBe("aborted");
+    expect(existsSync(materialPath)).toBe(false);
+    expect(fake.getState()).toEqual(sourceState(input));
+  });
+
+  it("replays an exact terminal archive and rejects a symlinked history directory", async () => {
+    const home = makeHome();
+    const input = material();
+    const first = makeDriver(input);
+    await coordinator(home, first.driver).prepare(inputFor(input));
+    const completed = await coordinator(home, first.driver).resume();
+    const journalPath = backendPublicationJournalPath(home);
+    const archivePath = join(
+      backendPublicationDirectory(home),
+      "history",
+      completed.publicationId + "." + completed.checksumSha256 + ".json",
+    );
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalUnlink = nodeFs.unlinkSync as (path: string) => void;
+    const unlinkFailure = Object.assign(new Error("crash:archive-consume"), { code: "EIO" });
+    let injected = false;
+    const second = makeDriver(input);
+    await expect(withPatchedFsAsync("unlinkSync", ((candidate: string) => {
+      if (!injected && candidate === journalPath) {
+        injected = true;
+        throw unlinkFailure;
+      }
+      return originalUnlink(candidate);
+    }) as never, async () => coordinator(home, second.driver).prepare({
+      ...inputFor(input),
+      publicationId: "publication-2",
+    }))).rejects.toThrow("crash:archive-consume");
+    expect(existsSync(archivePath)).toBe(true);
+    expect(readBackendPublicationJournal(home)?.phase).toBe("completed");
+    await expect(coordinator(home, second.driver).prepare({
+      ...inputFor(input),
+      publicationId: "publication-2",
+    })).resolves.toMatchObject({ phase: "prepared" });
+
+    const errorHome = makeHome();
+    const errorInput = material();
+    const errorFirst = makeDriver(errorInput);
+    await coordinator(errorHome, errorFirst.driver).prepare(inputFor(errorInput));
+    await coordinator(errorHome, errorFirst.driver).resume();
+    const errorNodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalLink = errorNodeFs.linkSync as (from: string, to: string) => void;
+    const archiveLinkFailure = new Error("archive link denied");
+    await expect(withPatchedFsAsync("linkSync", (() => {
+      throw archiveLinkFailure;
+    }) as never, async () => coordinator(errorHome, makeDriver(errorInput).driver).prepare({
+      ...inputFor(errorInput),
+      publicationId: "publication-2",
+    }))).rejects.toThrow(archiveLinkFailure);
+    errorNodeFs.linkSync = originalLink;
+
+    const symlinkHome = makeHome();
+    const symlinkInput = material();
+    const symlinkFirst = makeDriver(symlinkInput);
+    await coordinator(symlinkHome, symlinkFirst.driver).prepare(inputFor(symlinkInput));
+    await coordinator(symlinkHome, symlinkFirst.driver).resume();
+    const history = join(backendPublicationDirectory(symlinkHome), "history");
+    mkdirSync(history, { mode: 0o700 });
+    rmSync(history, { recursive: true });
+    const victim = join(symlinkHome, "history-victim");
+    mkdirSync(victim, { mode: 0o755 });
+    symlinkSync(victim, history, "dir");
+    await expect(coordinator(symlinkHome, makeDriver(symlinkInput).driver).prepare({
+      ...inputFor(symlinkInput),
+      publicationId: "publication-2",
+    })).rejects.toThrow();
+    expect(statSync(victim).mode & 0o777).toBe(0o755);
+  });
+
+  it("covers archive replay with missing uid evidence and rejects an unsafe archive path", async () => {
+    const home = makeHome();
+    const input = material();
+    const first = makeDriver(input);
+    await coordinator(home, first.driver).prepare(inputFor(input));
+    const completed = await coordinator(home, first.driver).resume();
+    const journalPath = backendPublicationJournalPath(home);
+    const second = makeDriver(input);
+    let injected = false;
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalUnlink = nodeFs.unlinkSync as (candidate: string) => void;
+    await expect(withPatchedFsAsync("unlinkSync", ((candidate: string) => {
+      if (!injected && candidate === journalPath) {
+        injected = true;
+        throw new Error("crash:archive-replay");
+      }
+      return originalUnlink(candidate);
+    }) as never, async () => coordinator(home, second.driver).prepare({
+      ...inputFor(input),
+      publicationId: "publication-2",
+    }))).rejects.toThrow("crash:archive-replay");
+
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    try {
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+      await expect(coordinator(home, second.driver).prepare({
+        ...inputFor(input),
+        publicationId: "publication-2",
+      })).resolves.toMatchObject({ phase: "prepared" });
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+
+    const unsafeHome = makeHome();
+    const unsafeInput = material();
+    const unsafeFirst = makeDriver(unsafeInput);
+    await coordinator(unsafeHome, unsafeFirst.driver).prepare(inputFor(unsafeInput));
+    const unsafeCompleted = await coordinator(unsafeHome, unsafeFirst.driver).resume();
+    const unsafeHistory = join(backendPublicationDirectory(unsafeHome), "history");
+    mkdirSync(unsafeHistory, { mode: 0o700 });
+    mkdirSync(join(
+      unsafeHistory,
+      unsafeCompleted.publicationId + "." + unsafeCompleted.checksumSha256 + ".json",
+    ));
+    await expect(coordinator(unsafeHome, makeDriver(unsafeInput).driver).prepare({
+      ...inputFor(unsafeInput),
+      publicationId: "publication-2",
+    })).rejects.toThrow("regular file");
+  });
+
+  it("requires exact identities for persisted state and does not match unresolved targets", async () => {
+    const input = material();
+    const exactSource: BackendPublicationStateWitness = {
+      config: { ...sourceState(input).config, dev: "9007199254740993", ino: "9007199254740995", parentDev: "7", parentIno: "11" },
+      projectMap: { ...sourceState(input).projectMap, dev: "9007199254740993", ino: "9007199254740997", parentDev: "7", parentIno: "11" },
+    };
+    const malformedHome = makeHome();
+    const malformed = makeDriver(input);
+    malformed.driver.observeLocalState = vi.fn(async () => exactSource);
+    await coordinator(malformedHome, malformed.driver).prepare(inputFor(input));
+    rewriteJournal(malformedHome, (journal) => ({
+      ...journal,
+      sourceState: {
+        ...(journal.sourceState as Record<string, unknown>),
+        config: { ...((journal.sourceState as Record<string, unknown>).config as Record<string, unknown>), dev: null },
+      },
+    }));
+    expect(() => readBackendPublicationJournal(malformedHome)).toThrow("present witness is malformed");
+
+    const matchingHome = makeHome();
+    const matching = makeDriver(input);
+    matching.driver.observeLocalState = vi.fn(async () => exactSource);
+    await coordinator(matchingHome, matching.driver).prepare(inputFor(input));
+    matching.driver.observeLocalState = vi.fn(async () => ({
+      config: { ...targetState(input).config, dev: "9007199254740993", ino: "9007199254740995", parentDev: "7", parentIno: "11" },
+      projectMap: { ...targetState(input).projectMap, dev: "9007199254740993", ino: "9007199254740997", parentDev: "7", parentIno: "11" },
+    }));
+    await expect(coordinator(matchingHome, matching.driver).resume()).rejects.toMatchObject({ reason: "unexpected-state" });
+  });
+
 });
 
 describe("revocable mutation permits", () => {

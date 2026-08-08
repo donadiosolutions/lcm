@@ -69,10 +69,10 @@ export type BackendPublicationFileWitness =
     uid: number;
     gid: number;
     nlink: string;
-    dev: string | null;
-    ino: string | null;
-    parentDev: string | null;
-    parentIno: string | null;
+    dev: string;
+    ino: string;
+    parentDev: string;
+    parentIno: string;
   }>;
 
 export type BackendPublicationStateWitness = Readonly<{
@@ -88,6 +88,11 @@ export type BackendPublicationRecoveryFile =
     mode: number;
     uid: number;
     gid: number;
+    nlink: string;
+    dev: string;
+    ino: string;
+    parentDev: string;
+    parentIno: string;
   }>;
 
 export type BackendPublicationRecoveryMaterial = Readonly<{
@@ -264,7 +269,16 @@ export function backendPublicationCanonicalSha256(value: unknown): string {
 
 function presentFileWitness(
   content: Uint8Array,
-  metadata: Readonly<{ mode: number; uid: number; gid: number }>,
+  metadata: Readonly<{
+    mode: number;
+    uid: number;
+    gid: number;
+    nlink: string;
+    dev: string;
+    ino: string;
+    parentDev: string;
+    parentIno: string;
+  }>,
 ): Extract<BackendPublicationFileWitness, { presence: "present" }> {
   const bytes = Buffer.from(content);
   let semanticSha256 = sha256(bytes);
@@ -282,11 +296,11 @@ function presentFileWitness(
     mode: metadata.mode,
     uid: metadata.uid,
     gid: metadata.gid,
-    nlink: "1",
-    dev: null,
-    ino: null,
-    parentDev: null,
-    parentIno: null,
+    nlink: metadata.nlink,
+    dev: metadata.dev,
+    ino: metadata.ino,
+    parentDev: metadata.parentDev,
+    parentIno: metadata.parentIno,
   };
 }
 
@@ -347,17 +361,15 @@ export function captureBackendPublicationFileWitness(
     mode: observed.mode,
     uid: observed.uid,
     gid: observed.gid,
+    nlink: observed.nlink,
+    dev: observed.exactDev,
+    ino: observed.exactIno,
+    parentDev: observed.parentDev,
+    parentIno: observed.parentIno,
   });
   return {
     content: observed.content,
-    witness: {
-      ...witness,
-      nlink: observed.nlink,
-      dev: observed.exactDev,
-      ino: observed.exactIno,
-      parentDev: observed.parentDev,
-      parentIno: observed.parentIno,
-    },
+    witness,
   };
 }
 
@@ -386,10 +398,10 @@ function assertWitnessShape(witness: BackendPublicationFileWitness, field: strin
     || !Number.isSafeInteger(witness.gid)
     || witness.gid < 0
     || !/^\d+$/u.test(witness.nlink)
-    || (witness.dev !== null && !/^\d+$/u.test(witness.dev))
-    || (witness.ino !== null && !/^\d+$/u.test(witness.ino))
-    || (witness.parentDev !== null && !/^\d+$/u.test(witness.parentDev))
-    || (witness.parentIno !== null && !/^\d+$/u.test(witness.parentIno))
+    || !/^\d+$/u.test(witness.dev)
+    || !/^\d+$/u.test(witness.ino)
+    || !/^\d+$/u.test(witness.parentDev)
+    || !/^\d+$/u.test(witness.parentIno)
   ) {
     return fail("malformed-journal", `${field} present witness is malformed`);
   }
@@ -424,7 +436,7 @@ function logicalWitnessMatches(
     return false;
   }
   for (const key of ["dev", "ino", "parentDev", "parentIno"] as const) {
-    if (expected[key] !== null && actual[key] !== expected[key]) {
+    if (actual[key] !== expected[key]) {
       return false;
     }
   }
@@ -468,6 +480,11 @@ function validateRecoveryFile(file: BackendPublicationRecoveryFile, field: strin
     || file.uid < 0
     || !Number.isSafeInteger(file.gid)
     || file.gid < 0
+    || file.nlink !== "1"
+    || !/^\d+$/u.test(file.dev)
+    || !/^\d+$/u.test(file.ino)
+    || !/^\d+$/u.test(file.parentDev)
+    || !/^\d+$/u.test(file.parentIno)
   ) {
     return fail("invalid-input", `${field} recovery file is invalid`);
   }
@@ -860,17 +877,32 @@ function archiveTerminalJournal(
     allowedModes: [0o600],
     requireSingleLink: true,
   }).content;
+  let historyHandle;
   try {
-    mkdirSync(history, { mode: 0o700 });
+    historyHandle = openPrivateDirectory(history);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if (!isMissing(error)) throw error;
+    mkdirSync(history, { mode: 0o700 });
+    historyHandle = openPrivateDirectory(history);
   }
-  chmodSync(history, 0o700);
-  atomicWritePrivateFileDurable(
-    join(history, `${journal.publicationId}.${journal.checksumSha256}.json`),
-    current,
-    { requireAbsent: true, maxExistingBytes: MAX_JOURNAL_BYTES },
-  );
+  historyHandle.close();
+  const archivePath = join(history, journal.publicationId + "." + journal.checksumSha256 + ".json");
+  try {
+    atomicWritePrivateFileDurable(archivePath, current, {
+      requireAbsent: true,
+      maxExistingBytes: MAX_JOURNAL_BYTES,
+    });
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "private file already exists") throw error;
+    readBoundedRegularFileWithStat(archivePath, {
+      allowedRoot: history,
+      maxBytes: MAX_JOURNAL_BYTES,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+      expectedRawSha256: sha256(current),
+    });
+  }
   consumeBoundedRegularFile(backendPublicationJournalPath(homeDir), {
     allowedRoot: directory,
     maxBytes: MAX_JOURNAL_BYTES,
@@ -892,6 +924,11 @@ function materialToJson(file: BackendPublicationRecoveryFile): Record<string, un
       mode: file.mode,
       uid: file.uid,
       gid: file.gid,
+      nlink: file.nlink,
+      dev: file.dev,
+      ino: file.ino,
+      parentDev: file.parentDev,
+      parentIno: file.parentIno,
     };
 }
 
@@ -903,12 +940,17 @@ function materialFromJson(value: unknown, field: string): BackendPublicationReco
     return { presence: "absent" };
   }
   if (
-    !exactKeys(value, ["contentBase64", "gid", "mode", "presence", "uid"])
+    !exactKeys(value, ["contentBase64", "dev", "gid", "ino", "mode", "nlink", "parentDev", "parentIno", "presence", "uid"])
     || value.presence !== "present"
     || typeof value.contentBase64 !== "string"
     || !Number.isSafeInteger(value.mode)
     || !Number.isSafeInteger(value.uid)
     || !Number.isSafeInteger(value.gid)
+    || typeof value.nlink !== "string"
+    || typeof value.dev !== "string"
+    || typeof value.ino !== "string"
+    || typeof value.parentDev !== "string"
+    || typeof value.parentIno !== "string"
   ) {
     return fail("malformed-journal", `${field} material is malformed`);
   }
@@ -922,6 +964,11 @@ function materialFromJson(value: unknown, field: string): BackendPublicationReco
     mode,
     uid,
     gid,
+    nlink: value.nlink as string,
+    dev: value.dev as string,
+    ino: value.ino as string,
+    parentDev: value.parentDev as string,
+    parentIno: value.parentIno as string,
   }, field);
   return {
     presence: "present",
@@ -929,6 +976,11 @@ function materialFromJson(value: unknown, field: string): BackendPublicationReco
     mode,
     uid,
     gid,
+    nlink: value.nlink as string,
+    dev: value.dev as string,
+    ino: value.ino as string,
+    parentDev: value.parentDev as string,
+    parentIno: value.parentIno as string,
   };
 }
 
@@ -1186,9 +1238,7 @@ export class BackendPublicationCoordinator {
     return this.#locked(async () => {
       const journal = readJournal(this.#homeDir);
       if (journal === null) return null;
-      if (options.disposition === "abort" && !["releasing", "released", "abort-releasing"].includes(journal.phase)) {
-        return this.#abortUnlocked();
-      }
+      if (options.disposition === "abort") return this.#abortUnlocked();
       return this.#resumeUnlocked();
     });
   }
@@ -1231,7 +1281,7 @@ export class BackendPublicationCoordinator {
       permit.assertActive();
       const actual = await callback({ ...context, file, expectedWitness, permit });
       permit.assertActive();
-      assertLogicalWitness(actual, expectedWitness, access);
+      assertContentWitness(actual, expectedWitness, access);
     });
   }
 
@@ -1260,13 +1310,17 @@ export class BackendPublicationCoordinator {
 
   async #releaseAll(journal: BackendPublicationJournal, aborting: boolean): Promise<BackendPublicationJournal> {
     const phase = aborting ? "abort-releasing" : "releasing" as const;
+    let current = aborting
+      ? transition(journal, phase, this.#homeDir, this.#observer)
+      : journal;
     if (
       this.#driver.releaseRemoteGuard === undefined
       || this.#driver.readRemoteGuard === undefined
     ) {
-      return transition(journal, aborting ? "aborted" : "released", this.#homeDir, this.#observer);
+      return aborting
+        ? current
+        : transition(current, "released", this.#homeDir, this.#observer);
     }
-    let current = journal;
     for (let index = 0; index < current.projects.length; index += 1) {
       let project = current.projects[index]!;
       let persisted = project.fence;
@@ -1322,7 +1376,9 @@ export class BackendPublicationCoordinator {
         projects: current.projects.map((entry, entryIndex) => entryIndex === index ? { ...entry, fence: authoritative } : entry),
       });
     }
-    return transition(current, aborting ? "aborted" : "released", this.#homeDir, this.#observer);
+    return aborting
+      ? transition(current, "abort-releasing", this.#homeDir, this.#observer)
+      : transition(current, "released", this.#homeDir, this.#observer);
   }
 
   async #publishMap(journal: BackendPublicationJournal): Promise<BackendPublicationJournal> {
@@ -1340,7 +1396,7 @@ export class BackendPublicationCoordinator {
       : journal;
     await this.#mutate(context, "publish-project-map", context.material.target.projectMap, journal.targetState.projectMap, (input) => this.#driver.publishProjectMap(input));
     const after = await this.#observe({ ...context, journal: publishing });
-    assertLogicalWitness(after.projectMap, journal.targetState.projectMap, "published project map");
+    assertContentWitness(after.projectMap, journal.targetState.projectMap, "published project map");
     return transition(publishing, "map-published", this.#homeDir, this.#observer, {
       publishedProjectMapSha256: journal.intendedProjectMapSha256,
       targetState: { ...journal.targetState, projectMap: after.projectMap },
@@ -1362,7 +1418,7 @@ export class BackendPublicationCoordinator {
       : journal;
     await this.#mutate(context, "publish-config", context.material.target.config, journal.targetState.config, (input) => this.#driver.publishConfig(input));
     const after = await this.#observe({ ...context, journal: publishing });
-    assertLogicalWitness(after.config, journal.targetState.config, "published config");
+    assertContentWitness(after.config, journal.targetState.config, "published config");
     return transition(publishing, "config-published", this.#homeDir, this.#observer, {
       publishedConfigSha256: journal.intendedConfigSha256,
       targetState: { ...journal.targetState, config: after.config },
@@ -1379,7 +1435,7 @@ export class BackendPublicationCoordinator {
         : journal;
       await this.#mutate(context, "restore-config", context.material.source.config, journal.sourceState.config, (input) => this.#driver.restoreConfig(input));
       const after = await this.#observe({ ...context, journal: restoring });
-      assertLogicalWitness(after.config, journal.sourceState.config, "restored config");
+      assertContentWitness(after.config, journal.sourceState.config, "restored config");
       return transition(restoring, "map-restoring", this.#homeDir, this.#observer);
     }
     return transition(journal, "map-restoring", this.#homeDir, this.#observer);
@@ -1393,7 +1449,7 @@ export class BackendPublicationCoordinator {
       const restoring = journal;
       await this.#mutate(context, "restore-project-map", context.material.source.projectMap, journal.sourceState.projectMap, (input) => this.#driver.restoreProjectMap(input));
       const after = await this.#observe({ ...context, journal: restoring });
-      assertLogicalWitness(after.projectMap, journal.sourceState.projectMap, "restored project map");
+      assertContentWitness(after.projectMap, journal.sourceState.projectMap, "restored project map");
     }
     return transition(journal, "abort-releasing", this.#homeDir, this.#observer);
   }
@@ -1449,29 +1505,34 @@ export class BackendPublicationCoordinator {
     let journal = readJournal(this.#homeDir);
     if (journal === null) return fail("publication-evidence-missing", "backend publication journal is missing");
     if (journal.phase === "completed" || journal.phase === "aborted") return journal;
-    if (["releasing", "released", "abort-releasing"].includes(journal.phase)) return this.#resumeUnlocked();
-    if (journal.phase === "preparing" && journal.recoveryReference === null) {
-      try {
-        const authenticated = authenticateMaterial(this.#homeDir, journal);
-        journal = transition(journal, "prepared", this.#homeDir, this.#observer, {
-          recoveryReference: authenticated.reference,
-        });
-      } catch (error) {
-        if (isMissing(error)) return transition(journal, "aborted", this.#homeDir, this.#observer);
-        throw error;
+    if (journal.phase === "abort-releasing") {
+      journal = await this.#releaseAll(journal, true);
+    } else {
+      if (journal.phase === "preparing" && journal.recoveryReference === null) {
+        try {
+          const authenticated = authenticateMaterial(this.#homeDir, journal);
+          journal = transition(journal, "prepared", this.#homeDir, this.#observer, {
+            recoveryReference: authenticated.reference,
+          });
+        } catch (error) {
+          if (isMissing(error)) return transition(journal, "aborted", this.#homeDir, this.#observer);
+          throw error;
+        }
       }
+      if (!["aborting", "config-restoring", "map-restoring"].includes(journal.phase)) {
+        journal = transition(journal, "aborting", this.#homeDir, this.#observer);
+      }
+      if (journal.phase === "aborting" || journal.phase === "config-restoring") {
+        journal = await this.#restoreConfig(journal);
+      }
+      // Every non-terminal path reaches map-restoring here: restoreConfig
+      // checkpoints it explicitly, while a recovered map-restoring journal is
+      // already at that checkpoint. Continue the abort state machine
+      // unconditionally so an unknown intermediate cannot be reported as safe.
+      journal = await this.#restoreMap(journal);
+      journal = await this.#releaseAll(journal, true);
     }
-    if (!["aborting", "config-restoring", "map-restoring"].includes(journal.phase)) {
-      journal = transition(journal, "aborting", this.#homeDir, this.#observer);
-    }
-    if (journal.phase === "aborting" || journal.phase === "config-restoring") journal = await this.#restoreConfig(journal);
-    // Every non-terminal path reaches map-restoring here: restoreConfig
-    // checkpoints it explicitly, while a recovered map-restoring journal is
-    // already at that checkpoint. Continue the abort state machine
-    // unconditionally so an unknown intermediate cannot be reported as safe.
-    journal = await this.#restoreMap(journal);
-    journal = await this.#releaseAll(journal, true);
     await this.#cleanupMaterial(journal);
-    return journal;
+    return transition(journal, "aborted", this.#homeDir, this.#observer);
   }
 }
