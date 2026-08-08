@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -29,7 +30,11 @@ const renameControl = vi.hoisted(() => ({
 
 const fsControl = vi.hoisted(() => ({
   fsyncError: undefined as NodeJS.ErrnoException | undefined,
+  missingSecureOpenFlags: false,
   fstatHook: undefined as ((path: string, stat: unknown) => unknown) | undefined,
+  closeHook: undefined as ((path: string, fd: number) => void) | undefined,
+  readlinkError: undefined as NodeJS.ErrnoException | undefined,
+  readlinkHook: undefined as ((path: string) => string | undefined) | undefined,
   statHook: undefined as ((path: string, stat: unknown) => unknown) | undefined,
   lstatHook: undefined as ((path: string, stat: unknown) => unknown) | undefined,
   lstatErrorPath: undefined as string | undefined,
@@ -41,6 +46,7 @@ const fsControl = vi.hoisted(() => ({
   fchmodHook: undefined as ((path: string, fd: number) => void) | undefined,
   writeHook: undefined as ((path: string, fd: number, content: Buffer) => void) | undefined,
   unlinkHook: undefined as ((path: string) => void) | undefined,
+  rmdirHook: undefined as ((path: string) => void) | undefined,
   openHook: undefined as ((path: string, fd: number) => void) | undefined,
   openErrorPath: undefined as string | undefined,
   openErrorPattern: undefined as string | undefined,
@@ -61,8 +67,12 @@ vi.mock("node:fs", async () => {
     constants: {
       ...actual.constants,
       O_DIRECTORY: undefined,
-      O_NOFOLLOW: undefined,
-      O_NONBLOCK: undefined,
+      get O_NOFOLLOW(): number | undefined {
+        return fsControl.missingSecureOpenFlags ? undefined : actual.constants.O_NOFOLLOW;
+      },
+      get O_NONBLOCK(): number | undefined {
+        return fsControl.missingSecureOpenFlags ? undefined : actual.constants.O_NONBLOCK;
+      },
     },
     openSync: (path: string, flags: number, mode?: number) => {
       if (fsControl.openErrorPath === path
@@ -80,6 +90,16 @@ vi.mock("node:fs", async () => {
       return hook === undefined
         ? stat
         : hook(fsControl.fdPaths.get(fd) ?? "", stat) as ReturnType<typeof actual.fstatSync>;
+    },
+    closeSync: (fd: number): void => {
+      fsControl.closeHook?.(fsControl.fdPaths.get(fd) ?? "", fd);
+      actual.closeSync(fd);
+    },
+    readlinkSync: (path: string): string => {
+      if (fsControl.readlinkError !== undefined) throw fsControl.readlinkError;
+      const result = fsControl.readlinkHook?.(path);
+      if (result !== undefined) return result;
+      return actual.readlinkSync(path);
     },
     statSync: (path: string, options?: { bigint?: boolean }) => {
       const stat = actual.statSync(path, options);
@@ -144,6 +164,10 @@ vi.mock("node:fs", async () => {
       actual.unlinkSync(path);
       fsControl.unlinkHook?.(path);
     },
+    rmdirSync: (path: string): void => {
+      fsControl.rmdirHook?.(path);
+      actual.rmdirSync(path);
+    },
     fsyncSync: (fd: number): void => {
       if (fsControl.fsyncError && actual.fstatSync(fd, { bigint: true }).isDirectory()) throw fsControl.fsyncError;
       actual.fsyncSync(fd);
@@ -182,7 +206,11 @@ afterEach(() => {
   renameControl.errorOnce = false;
   renameControl.afterActiveRootAppears = undefined;
   fsControl.fsyncError = undefined;
+  fsControl.missingSecureOpenFlags = false;
   fsControl.fstatHook = undefined;
+  fsControl.closeHook = undefined;
+  fsControl.readlinkError = undefined;
+  fsControl.readlinkHook = undefined;
   fsControl.statHook = undefined;
   fsControl.lstatHook = undefined;
   fsControl.lstatErrorPath = undefined;
@@ -194,6 +222,7 @@ afterEach(() => {
   fsControl.fchmodHook = undefined;
   fsControl.writeHook = undefined;
   fsControl.unlinkHook = undefined;
+  fsControl.rmdirHook = undefined;
   fsControl.openHook = undefined;
   fsControl.openErrorPath = undefined;
   fsControl.openErrorPattern = undefined;
@@ -215,6 +244,64 @@ function legacyHome(): { home: string; legacy: string; next: string } {
   mkdirSync(legacy, { recursive: true });
   writeFileSync(join(legacy, "value.txt"), "value");
   return { home, legacy, next: lcmHomeDir(home) };
+}
+
+function nestedLegacyHome(): {
+  paths: { home: string; legacy: string; next: string };
+  container: string;
+  replacementContainer: string;
+  retainedContainer: string;
+} {
+  const container = mkdtempSync(join(tmpdir(), "lcm-runtime-container-"));
+  const home = join(container, "home");
+  mkdirSync(home, { mode: 0o700 });
+  const legacy = legacyLcmHomeDir(home);
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, "value.txt"), "value");
+  const replacementContainer = mkdtempSync(join(tmpdir(), "lcm-runtime-replacement-container-"));
+  const replacementHome = join(replacementContainer, "home");
+  mkdirSync(replacementHome, { mode: 0o700 });
+  const retainedContainer = `${container}.retained`;
+  homes.push(container, replacementContainer, retainedContainer);
+  return {
+    paths: { home, legacy, next: lcmHomeDir(home) },
+    container,
+    replacementContainer,
+    retainedContainer,
+  };
+}
+
+function descriptorPathTargets(candidate: string, target: string): boolean {
+  if (candidate === target) return true;
+  const match = /^(\/proc\/self\/fd|\/dev\/fd)\/(\d+)(?:\/(.*))?$/u.exec(candidate);
+  if (match === null) return false;
+  let descriptorTarget: string;
+  try {
+    descriptorTarget = readlinkSync(`${match[1]}/${match[2]}`).replace(/ \(deleted\)$/u, "");
+  } catch {
+    return false;
+  }
+  return match[3] === undefined ? descriptorTarget === target : join(descriptorTarget, match[3]) === target;
+}
+
+function swapDirectoryPath(path: string, replacement: string, retainedOriginal: string): void {
+  renameSync(path, retainedOriginal);
+  renameSync(replacement, path);
+}
+
+function restoreDirectoryPath(path: string, replacement: string, retainedOriginal: string): void {
+  renameSync(path, replacement);
+  renameSync(retainedOriginal, path);
+}
+
+function replacementLegacyRoot(home: string, content = "replacement"): void {
+  const path = legacyLcmHomeDir(home);
+  mkdirSync(path, { mode: 0o700 });
+  writeFileSync(join(path, "value.txt"), content, { mode: 0o600 });
+}
+
+function armForRetaining(content: Buffer): boolean {
+  return content.toString().includes('"phase":"retaining"');
 }
 
 function canonical(value: unknown): string {
@@ -258,14 +345,20 @@ function treeWitness(root: string): Record<string, unknown> {
   };
 }
 
-function copyingJournal(home: string, source: string, staging: string): void {
+function copyingJournal(
+  home: string,
+  source: string,
+  staging: string,
+  phase: "copying" | "published" = "copying",
+  targetPath = staging,
+): void {
   const operationId = "0123456789abcdef0123456789abcdef0123456789abcdef";
   const stagingName = basename(staging);
   const sourceWitness = treeWitness(source);
-  const targetWitness = treeWitness(staging);
+  const targetWitness = treeWitness(targetPath);
   const payload = {
     version: 1,
-    phase: "copying",
+    phase,
     operationId,
     sourceName: ".lossless-claude",
     targetName: ".lcm",
@@ -278,7 +371,365 @@ function copyingJournal(home: string, source: string, staging: string): void {
   writeFileSync(join(home, ".lcm-legacy-migration.json"), `${canonical(journal)}\n`, { mode: 0o600 });
 }
 
+function retainedJournal(
+  home: string,
+  source: string,
+  target: string,
+  staging: string,
+  phase: "published" | "retaining",
+  retainedPath: string | null,
+): void {
+  const payload = {
+    version: 2,
+    phase,
+    operationId: "0123456789abcdef0123456789abcdef0123456789abcdef",
+    sourceName: ".lossless-claude",
+    targetName: ".lcm",
+    stagingName: basename(staging),
+    source: treeWitness(source),
+    target: treeWitness(target),
+    retained: retainedPath === null ? null : treeWitness(retainedPath),
+    targetBaseHash: null,
+  };
+  const journal = { ...payload, checksumSha256: createHash("sha256").update(canonical(payload)).digest("hex") };
+  writeFileSync(join(home, ".lcm-legacy-migration.json"), `${canonical(journal)}\n`, { mode: 0o600 });
+}
+
 describe("runtime home rename failures", () => {
+  it("fails closed when the platform has no descriptor namespace", () => {
+    const paths = legacyHome();
+    fsControl.readlinkError = Object.assign(new Error("descriptor namespace unavailable"), { code: "ENOENT" });
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("requires descriptor-relative filesystem access");
+    expect(existsSync(paths.legacy)).toBe(true);
+    expect(existsSync(paths.next)).toBe(false);
+  });
+
+  it("fails closed when no-follow or nonblocking descriptor flags are unavailable", () => {
+    const paths = legacyHome();
+    fsControl.missingSecureOpenFlags = true;
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("requires no-follow nonblocking descriptor access");
+    expect(existsSync(paths.legacy)).toBe(true);
+    expect(existsSync(paths.next)).toBe(false);
+  });
+
+  it("preserves an unexpected descriptor namespace error", () => {
+    const paths = legacyHome();
+    fsControl.readlinkError = Object.assign(new Error("descriptor namespace denied"), { code: "EACCES" });
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("descriptor namespace denied");
+  });
+
+  it("treats a macOS-style descriptor readlink EINVAL as an unavailable namespace", () => {
+    const paths = legacyHome();
+    fsControl.readlinkError = Object.assign(
+      new Error("macOS descriptor entries are not symbolic links"),
+      { code: "EINVAL" },
+    );
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(
+      "legacy migration requires descriptor-relative filesystem access",
+    );
+    expect(existsSync(paths.legacy)).toBe(true);
+    expect(existsSync(paths.next)).toBe(false);
+  });
+
+  it("opens the legacy root before a pathname-stat ABA can redirect its witness", () => {
+    const nested = nestedLegacyHome();
+    const { paths } = nested;
+    replacementLegacyRoot(join(nested.replacementContainer, "home"), "replacement-witness");
+    let swapped = false;
+    fsControl.lstatHook = (path, stat) => {
+      if (!swapped && descriptorPathTargets(path, paths.legacy)) {
+        swapDirectoryPath(nested.container, nested.replacementContainer, nested.retainedContainer);
+        swapped = true;
+      }
+      return stat;
+    };
+    fsControl.readdirHook = (path, options, entries) => {
+      if (swapped && (options as { withFileTypes?: boolean } | undefined)?.withFileTypes) {
+        restoreDirectoryPath(nested.container, nested.replacementContainer, nested.retainedContainer);
+        swapped = false;
+        fsControl.lstatHook = undefined;
+      }
+      return entries;
+    };
+
+    try {
+      expect(migrateLegacyHomeIfNeeded(paths.home)).toEqual({ migrated: true, from: paths.legacy, to: paths.next });
+      expect(readFileSync(join(paths.next, "value.txt"), "utf-8")).toBe("value");
+    } finally {
+      if (swapped) restoreDirectoryPath(nested.container, nested.replacementContainer, nested.retainedContainer);
+    }
+  });
+
+  it("keeps witness hashing bound to the authenticated directory during an ABA root swap", () => {
+    const nested = nestedLegacyHome();
+    const { paths } = nested;
+    replacementLegacyRoot(join(nested.replacementContainer, "home"), "replacement-witness");
+    let armed = true;
+    let swapped = false;
+    let sourceFileFstats = 0;
+    fsControl.readdirHook = (path, options, entries) => {
+      const sourceDirectory = descriptorPathTargets(path, paths.legacy);
+      if (armed && !swapped && sourceDirectory && (options as { withFileTypes?: boolean } | undefined)?.withFileTypes) {
+        swapDirectoryPath(nested.container, nested.replacementContainer, nested.retainedContainer);
+        swapped = true;
+      } else if (swapped && sourceDirectory && options === undefined) {
+        restoreDirectoryPath(nested.container, nested.replacementContainer, nested.retainedContainer);
+        swapped = false;
+        armed = false;
+      }
+      return entries;
+    };
+    fsControl.fstatHook = (path, stat) => {
+      if (swapped && path.endsWith("/value.txt") && ++sourceFileFstats === 2) {
+        restoreDirectoryPath(nested.container, nested.replacementContainer, nested.retainedContainer);
+        swapped = false;
+        armed = false;
+      }
+      return stat;
+    };
+
+    expect(migrateLegacyHomeIfNeeded(paths.home)).toEqual({
+      migrated: true,
+      from: paths.legacy,
+      to: paths.next,
+    });
+    expect(readFileSync(join(paths.next, "value.txt"), "utf-8")).toBe("value");
+  });
+
+  it("keeps recursive copy bound to the authenticated source during an ABA root swap", () => {
+    const nested = nestedLegacyHome();
+    const { paths } = nested;
+    replacementLegacyRoot(join(nested.replacementContainer, "home"), "replacement-copy");
+    let armed = false;
+    let swapped = false;
+    let sourceFileFstats = 0;
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (content.toString().includes('"phase":"copying"')) armed = true;
+    };
+    fsControl.readdirHook = (path, options, entries) => {
+      const sourceDirectory = descriptorPathTargets(path, paths.legacy);
+      if (armed && !swapped && sourceDirectory && (options as { withFileTypes?: boolean } | undefined)?.withFileTypes) {
+        swapDirectoryPath(nested.container, nested.replacementContainer, nested.retainedContainer);
+        swapped = true;
+      } else if (armed && swapped && options === undefined) {
+        restoreDirectoryPath(nested.container, nested.replacementContainer, nested.retainedContainer);
+        armed = false;
+      }
+      return entries;
+    };
+    fsControl.fstatHook = (path, stat) => {
+      if (armed && swapped && path.endsWith("/value.txt") && ++sourceFileFstats === 2) {
+        restoreDirectoryPath(nested.container, nested.replacementContainer, nested.retainedContainer);
+        swapped = false;
+        armed = false;
+      }
+      return stat;
+    };
+
+    expect(migrateLegacyHomeIfNeeded(paths.home)).toEqual({
+      migrated: true,
+      from: paths.legacy,
+      to: paths.next,
+    });
+    expect(readFileSync(join(paths.next, "value.txt"), "utf-8")).toBe("value");
+  });
+
+  it("rejects a staging target replaced before descriptor-bound recursive copy", () => {
+    const paths = legacyHome();
+    let armed = false;
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (!armed && content.toString().includes('"phase":"copying"')) {
+        const stagingName = readdirSync(paths.home).find((name) => name.endsWith(".partial"));
+        if (stagingName === undefined) throw new Error("test staging path is missing");
+        const staging = join(paths.home, stagingName);
+        rmSync(staging, { recursive: true, force: true });
+        writeFileSync(staging, "replacement", { mode: 0o600 });
+        armed = true;
+      }
+    };
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("migration target directory is not a directory");
+  });
+
+  it("rejects a source that becomes a regular file before descriptor-bound copy", () => {
+    const paths = legacyHome();
+    let armed = false;
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (!armed && content.toString().includes('"phase":"copying"')) {
+        rmSync(paths.legacy, { recursive: true, force: true });
+        writeFileSync(paths.legacy, "replacement", { mode: 0o600 });
+        armed = true;
+      }
+    };
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("legacy migration source is not a directory");
+  });
+
+  it("preserves an unexpected staging descriptor open failure", () => {
+    const paths = legacyHome();
+    let armed = false;
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (!armed && content.toString().includes('"phase":"copying"')) {
+        const stagingName = readdirSync(paths.home).find((name) => name.endsWith(".partial"));
+        if (stagingName === undefined) throw new Error("test staging path is missing");
+        fsControl.openErrorPath = join(paths.home, stagingName);
+        armed = true;
+      }
+    };
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("synthetic open failure");
+  });
+
+  it("retains outside data when the legacy root is substituted at the terminal boundary", () => {
+    const paths = legacyHome();
+    const outside = join(paths.home, "outside-removal-root");
+    mkdirSync(outside, { mode: 0o700 });
+    writeFileSync(join(outside, "value.txt"), "outside", { mode: 0o600 });
+    const retainedOriginal = join(paths.home, "retained-removal-root");
+    let substituted = false;
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (!substituted && content.toString().includes('"phase":"retained"')) {
+        substituted = true;
+        renameSync(paths.legacy, retainedOriginal);
+        symlinkSync(outside, paths.legacy);
+      }
+    };
+
+    expect(migrateLegacyHomeIfNeeded(paths.home)).toMatchObject({ migrated: true, to: paths.next });
+    expect(readFileSync(join(outside, "value.txt"), "utf-8")).toBe("outside");
+    expect(readFileSync(join(retainedOriginal, "value.txt"), "utf-8")).toBe("value");
+  });
+
+  it("does not revalidate a replaced legacy root after entering the terminal phase", () => {
+    const paths = legacyHome();
+    const replacement = join(paths.home, "replacement-removal-root");
+    const retainedOriginal = join(paths.home, "retained-removal-root");
+    mkdirSync(replacement, { mode: 0o700 });
+    writeFileSync(join(replacement, "value.txt"), "replacement", { mode: 0o600 });
+    let replaced = false;
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (!replaced && content.toString().includes('"phase":"retained"')) {
+        replaced = true;
+        renameSync(paths.legacy, retainedOriginal);
+        renameSync(replacement, paths.legacy);
+      }
+    };
+
+    expect(migrateLegacyHomeIfNeeded(paths.home)).toMatchObject({ migrated: true, to: paths.next });
+    expect(migrateLegacyHomeIfNeeded(paths.home)).toMatchObject({ migrated: true, to: paths.next });
+    expect(readFileSync(join(paths.legacy, "value.txt"), "utf-8")).toBe("replacement");
+  });
+
+  it("rejects a legacy root replaced during retained evidence copy", () => {
+    const paths = legacyHome();
+    const replacement = join(paths.home, "replacement-after-auth-root");
+    const retainedOriginal = join(paths.home, "retained-after-auth-root");
+    mkdirSync(replacement, { mode: 0o700 });
+    writeFileSync(join(replacement, "value.txt"), "replacement", { mode: 0o600 });
+    let armed = false;
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (armForRetaining(content)) armed = true;
+    };
+    fsControl.closeHook = (path) => {
+      if (armed && path === paths.legacy) {
+        armed = false;
+        renameSync(paths.legacy, retainedOriginal);
+        renameSync(replacement, paths.legacy);
+      }
+    };
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(/source changed|path changed|retaining root changed/);
+    expect(readFileSync(join(paths.legacy, "value.txt"), "utf-8")).toBe("replacement");
+  });
+
+  it("retains a replacement installed between the final child check and unlink", () => {
+    const paths = legacyHome();
+    const outside = join(paths.home, "outside-child");
+    mkdirSync(outside, { mode: 0o700 });
+    writeFileSync(join(outside, "value.txt"), "outside", { mode: 0o600 });
+    let substituted = false;
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (!substituted && content.toString().includes('"phase":"retained"')) {
+        substituted = true;
+        const retainedOriginal = join(paths.home, "retained-child-root");
+        renameSync(paths.legacy, retainedOriginal);
+        symlinkSync(outside, paths.legacy);
+      }
+    };
+
+    expect(migrateLegacyHomeIfNeeded(paths.home)).toMatchObject({ migrated: true, to: paths.next });
+    expect(readFileSync(join(outside, "value.txt"), "utf-8")).toBe("outside");
+  });
+
+  it("does not call rmdir after the final root check", () => {
+    const paths = legacyHome();
+    const outside = join(paths.home, "outside-empty-root");
+    mkdirSync(outside, { mode: 0o700 });
+    let armed = false;
+    let rmdirCalled = false;
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (content.toString().includes('"phase":"retained"')) armed = true;
+    };
+    fsControl.rmdirHook = (path) => {
+      if (armed && descriptorPathTargets(path, paths.legacy)) {
+        armed = false;
+        const retainedOriginal = join(paths.home, "retained-empty-root");
+        renameSync(paths.legacy, retainedOriginal);
+        renameSync(outside, paths.legacy);
+      }
+      rmdirCalled = true;
+    };
+
+    expect(migrateLegacyHomeIfNeeded(paths.home)).toEqual({
+      migrated: true,
+      from: paths.legacy,
+      to: paths.next,
+    });
+    expect(rmdirCalled).toBe(false);
+    expect(existsSync(outside)).toBe(true);
+  });
+
+  it("treats an already absent migration journal as idempotent cleanup", () => {
+    const paths = legacyHome();
+    const active = paths.next;
+    mkdirSync(active, { mode: 0o700 });
+    writeFileSync(join(active, "value.txt"), "value", { mode: 0o600 });
+    const journalPath = join(paths.home, ".lcm-legacy-migration.json");
+    const operationId = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    const staging = join(paths.home, ".lcm-legacy-migration-"
+      + createHash("sha256").update(`.lcm\0${operationId}`).digest("hex")
+      + ".partial");
+    copyingJournal(paths.home, paths.legacy, staging, "published", active);
+    rmSync(paths.legacy, { recursive: true, force: true });
+    let journalLstats = 0;
+    fsControl.lstatHook = (path, stat) => {
+      if (path === journalPath && ++journalLstats === 1) {
+        rmSync(journalPath, { force: true });
+        throw Object.assign(new Error("journal already removed"), { code: "ENOENT" });
+      }
+      return stat;
+    };
+
+    expect(migrateLegacyHomeIfNeeded(paths.home)).toMatchObject({ migrated: true, to: active });
+  });
+
+  it("publishes a bound copy while retaining authenticated source evidence for recovery", () => {
+    const paths = legacyHome();
+
+    expect(migrateLegacyHomeIfNeeded(paths.home)).toEqual({
+      migrated: true,
+      from: paths.legacy,
+      to: paths.next,
+    });
+    expect(readFileSync(join(paths.next, "value.txt"), "utf-8")).toBe("value");
+    expect(readFileSync(join(paths.legacy, "value.txt"), "utf-8")).toBe("value");
+    expect(existsSync(join(paths.home, ".lcm-legacy-migration.json"))).toBe(true);
+  });
+
   it("falls back to copy-and-remove for cross-device renames", () => {
     const paths = legacyHome();
     renameControl.error = Object.assign(new Error("cross-device"), { code: "EXDEV" });
@@ -288,7 +739,7 @@ describe("runtime home rename failures", () => {
       to: paths.next,
     });
     expect(readFileSync(join(paths.next, "value.txt"), "utf-8")).toBe("value");
-    expect(existsSync(paths.legacy)).toBe(false);
+    expect(existsSync(paths.legacy)).toBe(true);
   });
 
   it("rethrows non-cross-device rename failures", () => {
@@ -302,7 +753,7 @@ describe("runtime home rename failures", () => {
     fsControl.fsyncError = Object.assign(new Error("directory sync unsupported"), { code: "EINVAL" });
 
     expect(migrateLegacyHomeIfNeeded(paths.home).migrated).toBe(true);
-    expect(existsSync(paths.legacy)).toBe(false);
+    expect(existsSync(paths.legacy)).toBe(true);
   });
 
   it("fails closed on an unexpected durability error", () => {
@@ -380,15 +831,10 @@ describe("runtime home rename failures", () => {
   it("rejects a root changed between creation and publication handoff", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-handoff-"));
     homes.push(home);
-    let rootFstats = 0;
-    fsControl.fstatHook = (path, stat) => {
-      if (path === lcmHomeDir(home) && [8, 9].includes(++rootFstats)) {
-        const currentMode = (stat as { mode: bigint }).mode;
-        return Object.assign(stat as object, {
-          mode: (currentMode & ~0o7777n) | 0o755n,
-        });
-      }
-      return stat;
+    const root = lcmHomeDir(home);
+    let rootCloses = 0;
+    fsControl.closeHook = (path) => {
+      if (path === root && ++rootCloses === 2) chmodSync(root, 0o755);
     };
 
     expect(() => bootstrapLcmHome(home)).toThrow("changed before bootstrap handoff");
@@ -544,10 +990,27 @@ describe("runtime home rename failures", () => {
     const valuePath = join(paths.legacy, "value.txt");
     let calls = 0;
     fsControl.fstatHook = (path, stat) => {
-      if (path === valuePath && calls++ === 0) {
+      if (descriptorPathTargets(path, valuePath) && calls++ === 0) {
         return { ...(stat as object), ino: (stat as { ino: bigint }).ino + 1n };
       }
       return stat;
+    };
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("entry changed before descriptor validation");
+  });
+
+  it("rejects an entry whose pathname type differs from its opened descriptor", () => {
+    const paths = legacyHome();
+    const valuePath = join(paths.legacy, "value.txt");
+    fsControl.lstatHook = (path, stat) => {
+      if (!descriptorPathTargets(path, valuePath)) return stat;
+      return new Proxy(stat as object, {
+        get(target, property, receiver) {
+          if (property === "isDirectory") return () => true;
+          if (property === "isFile") return () => false;
+          return Reflect.get(target, property, receiver) as unknown;
+        },
+      });
     };
 
     expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("entry changed before descriptor validation");
@@ -558,7 +1021,7 @@ describe("runtime home rename failures", () => {
     const valuePath = join(paths.legacy, "value.txt");
     let calls = 0;
     fsControl.fstatHook = (path, stat) => {
-      if (path === valuePath && calls++ === 1) {
+      if (descriptorPathTargets(path, valuePath) && calls++ === 1) {
         return { ...(stat as object), mtimeNs: (stat as { mtimeNs: bigint }).mtimeNs + 1n };
       }
       return stat;
@@ -570,7 +1033,7 @@ describe("runtime home rename failures", () => {
   it("rejects an invalid directory entry name during witness construction", () => {
     const paths = legacyHome();
     fsControl.readdirHook = (path, options) => {
-      if (path === paths.legacy && (options as { withFileTypes?: boolean } | undefined)?.withFileTypes) {
+      if (descriptorPathTargets(path, paths.legacy) && (options as { withFileTypes?: boolean } | undefined)?.withFileTypes) {
         return [{ name: "." }];
       }
       return undefined;
@@ -583,7 +1046,7 @@ describe("runtime home rename failures", () => {
     const paths = legacyHome();
     let mutated = false;
     fsControl.readdirHook = (path, options, entries) => {
-      if (!mutated && path === paths.legacy && options === undefined) {
+      if (!mutated && descriptorPathTargets(path, paths.legacy) && options === undefined) {
         mutated = true;
         return [...(entries as string[]), "appeared-after-validation"];
       }
@@ -660,26 +1123,26 @@ describe("runtime home rename failures", () => {
     const valuePath = join(paths.legacy, "value.txt");
     let calls = 0;
     fsControl.fstatHook = (path, stat) => {
-      if (path === valuePath && calls++ === 4) {
+      if (descriptorPathTargets(path, valuePath) && calls++ === 4) {
         return { ...(stat as object), ino: (stat as { ino: bigint }).ino + 1n };
       }
       return stat;
     };
 
-    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("source changed before copy");
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(/source changed before copy|source changed before descriptor validation/);
   });
 
   it("rejects a source directory that changes before the copy walk", () => {
     const paths = legacyHome();
     let calls = 0;
     fsControl.fstatHook = (path, stat) => {
-      if (path === paths.legacy && calls++ === 4) {
+      if (descriptorPathTargets(path, paths.legacy) && calls++ === 4) {
         return { ...(stat as object), ino: (stat as { ino: bigint }).ino + 1n };
       }
       return stat;
     };
 
-    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("directory changed before copy");
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(/directory changed before copy|source changed before descriptor validation/);
   });
 
   it("rejects a target conflict during the copy walk", () => {
@@ -717,7 +1180,7 @@ describe("runtime home rename failures", () => {
     const paths = legacyHome();
     let noOptionReads = 0;
     fsControl.readdirHook = (path, options, entries) => {
-      if (path === paths.legacy && options === undefined && ++noOptionReads === 3) {
+      if (descriptorPathTargets(path, paths.legacy) && options === undefined && ++noOptionReads === 3) {
         return [...(entries as string[]), "appeared-after-copy"];
       }
       return entries;
@@ -734,7 +1197,7 @@ describe("runtime home rename failures", () => {
 
     expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("publish denied");
     expect(existsSync(paths.legacy)).toBe(true);
-    expect(existsSync(join(paths.home, ".lcm-legacy-migration.json"))).toBe(false);
+    expect(existsSync(join(paths.home, ".lcm-legacy-migration.json"))).toBe(true);
   });
 
   it("preserves temporary-journal evidence when cleanup itself is ambiguous", () => {
@@ -802,128 +1265,182 @@ describe("runtime home rename failures", () => {
     expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("staging witness changed at publish");
   });
 
-  it("rejects a source root that changes before exact removal", () => {
+  it("rejects a source root that changes before retained evidence copy", () => {
     const paths = legacyHome();
     let armed = false;
     fsControl.writeHook = (_path, _fd, content) => {
-      if (content.toString().includes('"phase":"removing"')) armed = true;
+      if (armForRetaining(content)) armed = true;
     };
     fsControl.lstatHook = (path, stat) => {
-      if (armed && path === paths.legacy) {
+      if (armed && descriptorPathTargets(path, paths.legacy)) {
         armed = false;
         return Object.assign(stat as object, { ino: (stat as { ino: bigint }).ino + 1n });
       }
       return stat;
     };
 
-    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("removal target changed");
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(/source changed|descriptor validation|path changed/);
   });
 
-  it("rejects a source root whose removal descriptor changes", () => {
+  it("rejects retained evidence whose full witness changes without changing its inode", () => {
+    const paths = legacyHome();
+    let published = false;
+    let sourceRootFstats = 0;
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (content.toString().includes('"phase":"published"')) published = true;
+    };
+    fsControl.fstatHook = (path, stat) => {
+      if (published && descriptorPathTargets(path, paths.legacy) && ++sourceRootFstats === 3) {
+        writeFileSync(join(paths.legacy, "value.txt"), "changed-with-same-inode", { mode: 0o600 });
+      }
+      return stat;
+    };
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(/source changed|retained evidence changed/);
+    expect(readFileSync(join(paths.legacy, "value.txt"), "utf-8")).toBe("changed-with-same-inode");
+  });
+
+  it("rejects a retaining root replaced after its journal witness is durable", () => {
+    const paths = legacyHome();
+    let replaced = false;
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (replaced || !content.toString().includes('"phase":"retaining"')) return;
+      const journal = JSON.parse(content.toString()) as { stagingName: string };
+      const retained = join(paths.home, journal.stagingName);
+      renameSync(retained, `${retained}.replaced`);
+      mkdirSync(retained, { mode: 0o700 });
+      replaced = true;
+    };
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("retaining root changed");
+  });
+
+  it("rejects an unrecorded retained root owned by an unexpected user", () => {
+    const paths = legacyHome();
+    mkdirSync(paths.next, { mode: 0o700 });
+    writeFileSync(join(paths.next, "value.txt"), "value", { mode: 0o600 });
+    const staging = join(paths.home, ".lcm-legacy-migration-"
+      + createHash("sha256").update(`.lcm\0${"0123456789abcdef0123456789abcdef0123456789abcdef"}`).digest("hex")
+      + ".partial");
+    mkdirSync(staging, { mode: 0o700 });
+    retainedJournal(paths.home, paths.legacy, paths.next, staging, "published", null);
+    const unexpectedUid = BigInt((typeof process.getuid === "function" ? process.getuid() : 0) + 1);
+    const withUnexpectedUid = (path: string, stat: unknown): unknown => descriptorPathTargets(path, staging)
+      ? Object.assign(stat as object, { uid: unexpectedUid })
+      : stat;
+    fsControl.fstatHook = withUnexpectedUid;
+    fsControl.lstatHook = withUnexpectedUid;
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("retained evidence path is not an empty private directory");
+  });
+
+  it("rejects a source root whose retained-copy descriptor changes", () => {
     const paths = legacyHome();
     let armed = false;
     fsControl.writeHook = (_path, _fd, content) => {
-      if (content.toString().includes('"phase":"removing"')) armed = true;
+      if (armForRetaining(content)) armed = true;
     };
     fsControl.fstatHook = (path, stat) => {
-      if (armed && path === paths.legacy) {
+      if (armed && descriptorPathTargets(path, paths.legacy)) {
         armed = false;
         return { ...(stat as object), ino: (stat as { ino: bigint }).ino + 1n };
       }
       return stat;
     };
 
-    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("removal target changed");
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(/source changed|descriptor validation/);
   });
 
-  it("rejects a source file whose removal descriptor changes", () => {
+  it("rejects a source file whose retained-copy descriptor changes", () => {
     const paths = legacyHome();
     const valuePath = join(paths.legacy, "value.txt");
     let armed = false;
     fsControl.writeHook = (_path, _fd, content) => {
-      if (content.toString().includes('"phase":"removing"')) armed = true;
+      if (armForRetaining(content)) armed = true;
     };
     fsControl.fstatHook = (path, stat) => {
-      if (armed && path === valuePath) {
+      if (armed && descriptorPathTargets(path, valuePath)) {
         armed = false;
         return { ...(stat as object), ino: (stat as { ino: bigint }).ino + 1n };
       }
       return stat;
     };
 
-    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("file changed during removal");
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(/source changed|descriptor validation/);
   });
 
-  it("rejects a source file that changes before its unlink", () => {
+  it("rejects a source file that changes during retained evidence copy", () => {
     const paths = legacyHome();
     const valuePath = join(paths.legacy, "value.txt");
     let armed = false;
     let childLstats = 0;
     fsControl.writeHook = (_path, _fd, content) => {
-      if (content.toString().includes('"phase":"removing"')) armed = true;
+      if (armForRetaining(content)) armed = true;
     };
     fsControl.lstatHook = (path, stat) => {
-      if (armed && path === valuePath && ++childLstats === 2) {
+      if (armed && descriptorPathTargets(path, valuePath) && ++childLstats === 2) {
         armed = false;
         return { ...(stat as object), ino: (stat as { ino: bigint }).ino + 1n };
       }
       return stat;
     };
 
-    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("file changed during removal");
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(/source changed|path changed during migration|descriptor validation/);
   });
 
-  it("rejects a symlink that appears during exact source removal", () => {
+  it("rejects a symlink that appears during retained evidence copy", () => {
     const paths = legacyHome();
     let armed = false;
     fsControl.writeHook = (_path, _fd, content) => {
-      if (content.toString().includes('"phase":"removing"')) armed = true;
+      if (armForRetaining(content)) armed = true;
     };
     fsControl.readdirHook = (path, options, entries) => {
-      if (armed && path === paths.legacy && options === undefined) {
+      if (armed && descriptorPathTargets(path, paths.legacy) && (options as { withFileTypes?: boolean } | undefined)?.withFileTypes) {
         armed = false;
         symlinkSync(join(paths.home, "outside"), join(paths.legacy, "0-link"));
-        return [...(entries as string[]), "0-link"];
+        return [...(entries as Array<{ name: string }>), { name: "0-link" }];
       }
       return entries;
     };
     writeFileSync(join(paths.home, "outside"), "outside");
 
-    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("symlink entry appeared");
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(/symlink entry appeared|symlink entries are not supported/);
   });
 
-  it("rejects an unsupported entry that appears during exact source removal", () => {
+  it("rejects an unsupported entry that appears during retained evidence copy", () => {
     const paths = legacyHome();
     let armed = false;
     fsControl.writeHook = (_path, _fd, content) => {
-      if (content.toString().includes('"phase":"removing"')) armed = true;
+      if (armForRetaining(content)) armed = true;
     };
     fsControl.readdirHook = (path, options, entries) => {
-      if (armed && path === paths.legacy && options === undefined) {
+      if (armed && descriptorPathTargets(path, paths.legacy) && (options as { withFileTypes?: boolean } | undefined)?.withFileTypes) {
         armed = false;
         const result = spawnSync("mkfifo", [join(paths.legacy, "0-pipe")], { encoding: "utf-8" });
         if (result.status !== 0) throw new Error(`mkfifo failed: ${result.stderr}`);
-        return [...(entries as string[]), "0-pipe"];
+        return [...(entries as Array<{ name: string }>), { name: "0-pipe" }];
       }
       return entries;
     };
 
-    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("unsupported removal entry");
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("unsupported legacy entry type");
   });
 
-  it("rejects a source directory that changes after an unlink", () => {
+  it("retains the source without unlinking after terminal evidence validation", () => {
     const paths = legacyHome();
     let armed = false;
     fsControl.writeHook = (_path, _fd, content) => {
-      if (content.toString().includes('"phase":"removing"')) armed = true;
+      if (content.toString().includes('"phase":"retained"')) armed = true;
     };
     fsControl.unlinkHook = (path) => {
-      if (armed && path === join(paths.legacy, "value.txt")) {
+      if (armed && descriptorPathTargets(path, join(paths.legacy, "value.txt"))) {
         armed = false;
         writeFileSync(join(paths.legacy, "late-entry"), "late", { mode: 0o600 });
       }
     };
 
-    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("directory changed during removal");
+    expect(migrateLegacyHomeIfNeeded(paths.home)).toMatchObject({ migrated: true, to: paths.next });
+    expect(readFileSync(join(paths.legacy, "value.txt"), "utf-8")).toBe("value");
+    expect(existsSync(join(paths.home, ".lcm-legacy-migration.json"))).toBe(true);
   });
 });

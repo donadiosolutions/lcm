@@ -94,15 +94,37 @@ describe("setup config leaf security", () => {
     expect(existsSync(join(home, ".lcm"))).toBe(false);
   });
 
-  it("refuses to create an active root while legacy state exists", () => {
+  it("directs Linux legacy state through authenticated migration", () => {
     const { home, bin } = fixture();
     mkdirSync(join(home, ".lossless-claude"), { mode: 0o700 });
+    const fakeUname = join(bin, "uname");
+    writeFileSync(fakeUname, "#!/usr/bin/env bash\nprintf 'Linux\\n'\n");
+    chmodSync(fakeUname, 0o755);
 
     const result = runSetup(home, bin);
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("legacy LCM state exists");
     expect(result.stderr).toContain("lcm install");
+    expect(existsSync(join(home, ".lcm"))).toBe(false);
+  });
+
+  it("gives macOS users safe pre-journal recovery instead of the lcm install dead end", () => {
+    const { home, bin } = fixture();
+    mkdirSync(join(home, ".lossless-claude"), { mode: 0o700 });
+    const fakeUname = join(bin, "uname");
+    writeFileSync(fakeUname, "#!/usr/bin/env bash\nprintf 'Darwin\\n'\n");
+    chmodSync(fakeUname, 0o755);
+
+    const result = runSetup(home, bin);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("On macOS");
+    expect(result.stderr).toContain("Back up and rename");
+    expect(result.stderr).toContain("do not recursively delete it");
+    expect(result.stderr).toContain(`Confirm ${join(home, ".lcm")} does not exist`);
+    expect(result.stderr).toContain("If it is absent, re-run setup");
+    expect(result.stderr).not.toContain("Run 'lcm install'");
     expect(existsSync(join(home, ".lcm"))).toBe(false);
   });
 

@@ -2420,6 +2420,7 @@ describe("same-user-systemd integration", () => {
     mkdirSync(runtimeDir, { recursive: true });
     mkdirSync(stateDir, { recursive: true });
     mkdirSync(credentialDir, { recursive: true });
+    chmodSync(stateDir, 0o700);
     const builtCliUrl = pathToFileURL(join(process.cwd(), "dist", "bin", "lcm.js")).href;
     writeFileSync(
       entrypoint,

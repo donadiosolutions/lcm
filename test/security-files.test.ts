@@ -95,14 +95,24 @@ describe("private filesystem primitives", () => {
     const replacement = join(root, "replacement");
     writeFileSync(path, "secret", { mode: 0o600 });
     writeFileSync(replacement, "replacement", { mode: 0o600 });
-    expect(() => consumeBoundedRegularFile(path, {
-      allowedRoot: root,
-      maxBytes: 1024,
-      _beforeUnlinkForTesting: () => {
-        rmSync(path);
-        symlinkSync(replacement, path);
-      },
-    })).toThrow("changed");
+    let consumeError: unknown;
+    try {
+      consumeBoundedRegularFile(path, {
+        allowedRoot: root,
+        maxBytes: 1024,
+        _beforeUnlinkForTesting: () => {
+          rmSync(path);
+          symlinkSync(replacement, path);
+        },
+      });
+    } catch (error) {
+      consumeError = error;
+    }
+    expect(consumeError).toBeInstanceOf(Error);
+    expect([
+      "file changed during consume",
+      "path is not a regular file",
+    ]).toContain((consumeError as Error).message);
     expect(readFileSync(path)).toEqual(readFileSync(replacement));
 
     rmSync(path);

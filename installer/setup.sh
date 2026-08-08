@@ -259,7 +259,21 @@ ensure_secure_lcm_root() {
 
   if [ -e "$LEGACY_CONFIG_DIR" ] || [ -L "$LEGACY_CONFIG_DIR" ]; then
     echo "Error: legacy LCM state exists at $LEGACY_CONFIG_DIR; refusing to create or update $CONFIG_DIR." >&2
-    echo "Run 'lcm install' to perform authenticated legacy migration, then re-run setup." >&2
+    case "$(uname -s)" in
+      Linux)
+        echo "Run 'lcm install' to perform authenticated legacy migration through /proc/self/fd, then re-run setup." >&2
+        ;;
+      Darwin)
+        echo "On macOS, lcm cannot perform this descriptor-bound legacy migration." >&2
+        echo "Back up and rename $LEGACY_CONFIG_DIR out of the migration path; do not recursively delete it." >&2
+        echo "Confirm $CONFIG_DIR does not exist; if it does, stop and preserve both directories. If it is absent, re-run setup." >&2
+        ;;
+      *)
+        echo "Automatic legacy migration requires Linux-compatible /proc/self/fd descriptor access." >&2
+        echo "Back up and rename $LEGACY_CONFIG_DIR out of the migration path; do not recursively delete it." >&2
+        echo "Confirm $CONFIG_DIR does not exist; if it does, stop and preserve both directories. If it is absent, re-run setup." >&2
+        ;;
+    esac
     exit 1
   fi
 

@@ -10,10 +10,10 @@ import {
   mkdirSync,
   openSync,
   readSync,
+  readlinkSync,
   readdirSync,
   renameSync,
   realpathSync,
-  rmdirSync,
   statSync,
   unlinkSync,
   writeSync,
@@ -38,7 +38,8 @@ const MAX_MIGRATION_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_MIGRATION_TREE_BYTES = 32 * 1024 * 1024;
 const MAX_MIGRATION_TREE_ENTRIES = 8_192;
 const MAX_MIGRATION_TREE_DEPTH = 32;
-const MIGRATION_JOURNAL_VERSION = 1 as const;
+const LEGACY_MIGRATION_JOURNAL_VERSION = 1 as const;
+const MIGRATION_JOURNAL_VERSION = 2 as const;
 const MIGRATION_JOURNAL_NAME = ".lcm-legacy-migration.json";
 const OPERATION_ID_PATTERN = /^[a-f0-9]{48}$/u;
 
@@ -68,6 +69,18 @@ type BigIntFileStat = Readonly<{
   ctimeNs: bigint;
 }>;
 
+type MigrationEntry = Readonly<{
+  fd: number;
+  descriptorPath: string;
+  path: string;
+  stat: BigIntFileStat;
+  kind: TreeEntryKind;
+  close: () => void;
+}>;
+
+type MigrationDirectory = MigrationEntry & Readonly<{ kind: "directory" }>;
+type MigrationFile = MigrationEntry & Readonly<{ kind: "file" }>;
+
 type DirectoryWitness = Readonly<{
   dev: string;
   ino: string;
@@ -92,11 +105,24 @@ type TreeWitness = Readonly<{
   hash: string;
 }>;
 
-type MigrationPhase = "planned" | "copying" | "published" | "removing";
+type MigrationPhase = "planned" | "copying" | "published" | "removing" | "retaining" | "retained";
 
 type MigrationJournalPayload = Readonly<{
   version: typeof MIGRATION_JOURNAL_VERSION;
   phase: MigrationPhase;
+  operationId: string;
+  sourceName: string;
+  targetName: string;
+  stagingName: string;
+  source: TreeWitness;
+  target: TreeWitness | null;
+  retained: TreeWitness | null;
+  targetBaseHash: string | null;
+}>;
+
+type LegacyMigrationJournalPayload = Readonly<{
+  version: typeof LEGACY_MIGRATION_JOURNAL_VERSION;
+  phase: Exclude<MigrationPhase, "retaining" | "retained">;
   operationId: string;
   sourceName: string;
   targetName: string;
@@ -109,6 +135,8 @@ type MigrationJournalPayload = Readonly<{
 type MigrationJournal = MigrationJournalPayload & Readonly<{
   checksumSha256: string;
 }>;
+
+type ReadyMigrationJournal = MigrationJournal & Readonly<{ target: TreeWitness }>;
 
 type HomeTopology = Readonly<{
   parent: OpenDirectory;
@@ -179,12 +207,103 @@ function syncDescriptorIfSupported(fd: number): void {
   }
 }
 
+function secureOpenFlags(): number {
+  if (typeof constants.O_NOFOLLOW !== "number" || typeof constants.O_NONBLOCK !== "number") {
+    throw new Error("legacy migration requires no-follow nonblocking descriptor access");
+  }
+  return constants.O_NOFOLLOW | constants.O_NONBLOCK;
+}
+
 function statIdentity(stat: BigIntFileStat): Identity {
   return { dev: String(stat.dev), ino: String(stat.ino) };
 }
 
 function sameIdentity(left: Identity, right: Identity): boolean {
   return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameTreeWitness(left: TreeWitness, right: TreeWitness): boolean {
+  return sameIdentity(left.identity, right.identity)
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.gid === right.gid
+    && left.hash === right.hash;
+}
+
+function sameTreeContent(left: TreeWitness, right: TreeWitness): boolean {
+  return left.uid === right.uid && left.gid === right.gid && left.hash === right.hash;
+}
+
+function descriptorPathFor(fd: number): string {
+  // Node has no portable openat(2) or fchdir(2) API. The Linux proc
+  // descriptor namespace is the only path form this walker treats as
+  // descriptor-relative. In particular, do not substitute /dev/fd: on macOS
+  // its entries are not readlink-able traversal links and descendant lookup
+  // through them is not supported.
+  const candidate = join("/proc/self/fd", String(fd));
+  try {
+    readlinkSync(candidate);
+    return candidate;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== "ENOENT" && code !== "ENOTDIR" && code !== "EINVAL") throw error;
+  }
+  throw new Error("legacy migration requires descriptor-relative filesystem access");
+}
+
+function openMigrationEntry(path: string, label: string): MigrationEntry {
+  let fd: number;
+  try {
+    fd = openSync(
+      path,
+      constants.O_RDONLY
+        | secureOpenFlags(),
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error("symlink entries are not supported in private LCM state");
+    }
+    throw error;
+  }
+  try {
+    const stat = fstatSync(fd, { bigint: true }) as unknown as BigIntFileStat;
+    const descriptorPath = descriptorPathFor(fd);
+    const pathStat = lstatSync(path, { bigint: true }) as unknown as BigIntFileStat;
+    if (!sameIdentity(statIdentity(stat), statIdentity(pathStat))) {
+      throw new Error(`${label} changed before descriptor validation`);
+    }
+    const kind = entryKind(stat);
+    if (entryKind(pathStat) !== kind) throw new Error(`${label} changed before descriptor validation`);
+    return {
+      fd,
+      descriptorPath,
+      path,
+      stat,
+      kind,
+      close: () => closeSync(fd),
+    };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function openMigrationDirectory(path: string, label: string): MigrationDirectory {
+  const entry = openMigrationEntry(path, label);
+  if (entry.kind !== "directory") {
+    entry.close();
+    throw new Error(`${label} is not a directory`);
+  }
+  return entry as MigrationDirectory;
+}
+
+function openMigrationEntryIfPresent(path: string, label: string): MigrationEntry | undefined {
+  try {
+    return openMigrationEntry(path, label);
+  } catch (error) {
+    if (isMissing(error)) return undefined;
+    throw error;
+  }
 }
 
 function modeOf(stat: BigIntFileStat): number {
@@ -215,7 +334,7 @@ function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function journalChecksum(payload: MigrationJournalPayload): string {
+function journalChecksum(payload: MigrationJournalPayload | LegacyMigrationJournalPayload): string {
   return sha256(canonicalJson(payload as unknown as CanonicalJson));
 }
 
@@ -256,8 +375,7 @@ function openDirectory(
     path,
     constants.O_RDONLY
       | (constants.O_DIRECTORY ?? 0)
-      | (constants.O_NOFOLLOW ?? 0)
-      | (constants.O_NONBLOCK ?? 0),
+      | secureOpenFlags(),
   );
   try {
     const stat = fstatSync(fd, { bigint: true }) as unknown as BigIntFileStat;
@@ -395,7 +513,6 @@ function assertSameStat(before: BigIntFileStat, after: BigIntFileStat, label: st
 function entryKind(stat: BigIntFileStat): TreeEntryKind {
   if (stat.isDirectory()) return "directory";
   if (stat.isFile()) return "file";
-  if (stat.isSymbolicLink()) throw new Error("symlink entries are not supported in private LCM state");
   throw new Error("unsupported legacy entry type");
 }
 
@@ -416,75 +533,82 @@ function readDescriptor(fd: number, maxBytes: number, budget: TreeBudget): Buffe
   return Buffer.concat(chunks, total);
 }
 
-function treeWitnessOf(rootPath: string): TreeWitness {
+function treeWitnessFromEntry(rootEntry: MigrationEntry): TreeWitness {
   const hash = createHash("sha256");
   const budget: TreeBudget = { bytes: 0, entries: 0 };
   let rootWitness: TreeWitness | undefined;
 
-  const visit = (path: string, relative: string, isRoot: boolean, depth: number): void => {
+  const visit = (entry: MigrationEntry, relative: string, isRoot: boolean, depth: number): void => {
     if (depth > MAX_MIGRATION_TREE_DEPTH) throw new Error("legacy migration tree is too deep");
     budget.entries += 1;
     if (budget.entries > MAX_MIGRATION_TREE_ENTRIES) throw new Error("legacy migration has too many entries");
 
-    const before = lstatSync(path, { bigint: true }) as unknown as BigIntFileStat;
-    const kind = entryKind(before);
-    const identity = statIdentity(before);
+    const opened = entry.stat;
+    const kind = entry.kind;
+    const identity = statIdentity(opened);
     updateHashPart(hash, "path", relative);
     updateHashPart(hash, "kind", kind);
-    if (!isRoot) updateHashPart(hash, "mode", String(modeOf(before)));
+    if (!isRoot) updateHashPart(hash, "mode", String(modeOf(opened)));
 
-    {
-      const fd = openSync(
-        path,
-        constants.O_RDONLY
-          | (kind === "directory" ? (constants.O_DIRECTORY ?? 0) : 0)
-          | (constants.O_NOFOLLOW ?? 0)
-          | (constants.O_NONBLOCK ?? 0),
-      );
-      try {
-        const opened = fstatSync(fd, { bigint: true }) as unknown as BigIntFileStat;
-        if (!sameIdentity(identity, statIdentity(opened)) || entryKind(opened) !== kind) {
-          throw new Error("legacy migration entry changed before descriptor validation");
-        }
-        if (isRoot) {
-          rootWitness = {
-            identity,
-            mode: modeOf(opened),
-            uid: Number(opened.uid),
-            gid: Number(opened.gid),
-            hash: "",
-          };
-        }
-        if (kind === "file") {
-          const content = readDescriptor(fd, MAX_MIGRATION_FILE_BYTES, budget);
-          updateHashPart(hash, "bytes", content);
-        } else {
-          const names = readdirSync(path, { withFileTypes: true })
-            .map((entry) => entry.name)
-            .sort();
-          for (const name of names) {
-            if (name === "." || name === ".." || name.includes("/")) {
-              throw new Error("legacy migration encountered an invalid entry name");
-            }
-            visit(join(path, name), relative ? `${relative}/${name}` : name, false, depth + 1);
-          }
-          const namesAfter = readdirSync(path).sort();
-          if (names.length !== namesAfter.length || names.some((name, index) => name !== namesAfter[index])) {
-            throw new Error("legacy migration directory entries changed during validation");
-          }
-        }
-        const afterFd = fstatSync(fd, { bigint: true }) as unknown as BigIntFileStat;
-        assertSameStat(opened, afterFd, "legacy migration descriptor");
-      } finally {
-        closeSync(fd);
-      }
-      const after = lstatSync(path, { bigint: true }) as unknown as BigIntFileStat;
-      assertSameStat(before, after, "legacy migration path");
+    if (isRoot) {
+      rootWitness = {
+        identity,
+        mode: modeOf(opened),
+        uid: Number(opened.uid),
+        gid: Number(opened.gid),
+        hash: "",
+      };
     }
+    if (kind === "file") {
+      const content = readDescriptor(entry.fd, MAX_MIGRATION_FILE_BYTES, budget);
+      updateHashPart(hash, "bytes", content);
+    } else {
+      const names = readdirSync(entry.descriptorPath, { withFileTypes: true })
+        .map((child) => child.name)
+        .sort();
+      for (const name of names) {
+        if (name === "." || name === ".." || name.includes("/")) {
+          throw new Error("legacy migration encountered an invalid entry name");
+        }
+        const child = openMigrationEntry(join(entry.descriptorPath, name), "legacy migration entry");
+        try {
+          visit(child, relative ? `${relative}/${name}` : name, false, depth + 1);
+        } finally {
+          child.close();
+        }
+      }
+      const namesAfter = readdirSync(entry.descriptorPath).sort();
+      if (names.length !== namesAfter.length || names.some((name, index) => name !== namesAfter[index])) {
+        throw new Error("legacy migration directory entries changed during validation");
+      }
+    }
+    const afterFd = fstatSync(entry.fd, { bigint: true }) as unknown as BigIntFileStat;
+    assertSameStat(opened, afterFd, "legacy migration descriptor");
+    const afterPath = lstatSync(entry.path, { bigint: true }) as unknown as BigIntFileStat;
+    assertSameStat(opened, afterPath, "legacy migration path");
   };
 
-  visit(rootPath, "", true, 0);
+  visit(rootEntry, "", true, 0);
   return { ...rootWitness!, hash: hash.digest("hex") };
+}
+
+function treeWitnessOf(rootPath: string): TreeWitness {
+  const root = openMigrationEntry(rootPath, "legacy migration entry");
+  try {
+    return treeWitnessFromEntry(root);
+  } finally {
+    root.close();
+  }
+}
+
+function treeWitnessIfPresent(rootPath: string): TreeWitness | undefined {
+  const root = openMigrationEntryIfPresent(rootPath, "legacy migration entry");
+  if (root === undefined) return undefined;
+  try {
+    return treeWitnessFromEntry(root);
+  } finally {
+    root.close();
+  }
 }
 
 function migrationJournalPath(homeDir: string): string {
@@ -512,13 +636,19 @@ function parseMigrationJournal(content: string): MigrationJournal {
     throw new Error("legacy migration journal is not an object");
   }
   const value = parsed as Record<string, unknown>;
-  const expectedKeys = ["checksumSha256", "operationId", "phase", "source", "sourceName", "stagingName", "target", "targetBaseHash", "targetName", "version"];
+  const legacy = value.version === LEGACY_MIGRATION_JOURNAL_VERSION;
+  const current = value.version === MIGRATION_JOURNAL_VERSION;
+  const expectedKeys = legacy || (!current && !("retained" in value))
+    ? ["checksumSha256", "operationId", "phase", "source", "sourceName", "stagingName", "target", "targetBaseHash", "targetName", "version"]
+    : ["checksumSha256", "operationId", "phase", "retained", "source", "sourceName", "stagingName", "target", "targetBaseHash", "targetName", "version"];
   const actualKeys = Object.keys(value).sort();
   if (actualKeys.length !== expectedKeys.length || actualKeys.some((key, index) => key !== expectedKeys.sort()[index])) {
     throw new Error("legacy migration journal has unexpected fields");
   }
-  if (value.version !== MIGRATION_JOURNAL_VERSION
-    || (value.phase !== "planned" && value.phase !== "copying" && value.phase !== "published" && value.phase !== "removing")
+  const phaseValid = value.phase === "planned" || value.phase === "copying" || value.phase === "published" || value.phase === "removing"
+    || (current && (value.phase === "retaining" || value.phase === "retained"));
+  if ((!legacy && !current)
+    || !phaseValid
     || typeof value.operationId !== "string" || !OPERATION_ID_PATTERN.test(value.operationId)
     || value.sourceName !== LEGACY_LCM_HOME_DIRNAME
     || value.targetName !== LCM_HOME_DIRNAME
@@ -529,12 +659,17 @@ function parseMigrationJournal(content: string): MigrationJournal {
   }
   const source = parseTreeWitness(value.source, "source");
   const target = value.target === null ? null : parseTreeWitness(value.target, "target");
+  const retained = legacy || value.retained === null ? null : parseTreeWitness(value.retained, "retained");
   if (value.targetBaseHash !== null && (typeof value.targetBaseHash !== "string" || !/^[a-f0-9]{64}$/u.test(value.targetBaseHash))) {
     throw new Error("legacy migration target base witness is malformed");
   }
-  const payload = {
-    version: MIGRATION_JOURNAL_VERSION,
-    phase: value.phase,
+  if (current
+    && (((value.phase === "planned" || value.phase === "copying" || value.phase === "removing") && retained !== null)
+      || ((value.phase === "retaining" || value.phase === "retained") && (retained === null || target === null)))) {
+    throw new Error("legacy migration journal retained evidence is invalid");
+  }
+  const common = {
+    phase: value.phase as MigrationPhase,
     operationId: value.operationId,
     sourceName: value.sourceName,
     targetName: value.targetName,
@@ -542,11 +677,19 @@ function parseMigrationJournal(content: string): MigrationJournal {
     source,
     target,
     targetBaseHash: value.targetBaseHash,
-  } as MigrationJournalPayload;
-  if (journalChecksum(payload) !== value.checksumSha256) {
+  };
+  const checksummedPayload = legacy
+    ? { ...common, version: LEGACY_MIGRATION_JOURNAL_VERSION } as LegacyMigrationJournalPayload
+    : { ...common, version: MIGRATION_JOURNAL_VERSION, retained } as MigrationJournalPayload;
+  if (journalChecksum(checksummedPayload) !== value.checksumSha256) {
     throw new Error("legacy migration journal checksum does not match");
   }
-  return { ...payload, checksumSha256: value.checksumSha256 };
+  return {
+    ...common,
+    version: MIGRATION_JOURNAL_VERSION,
+    retained,
+    checksumSha256: value.checksumSha256,
+  } as MigrationJournal;
 }
 
 function parseTreeWitness(value: unknown, label: string): TreeWitness {
@@ -630,8 +773,7 @@ function writeMigrationJournal(homeDir: string, journal: MigrationJournal, exclu
       constants.O_WRONLY
         | constants.O_CREAT
         | constants.O_EXCL
-        | (constants.O_NOFOLLOW ?? 0)
-        | (constants.O_NONBLOCK ?? 0),
+        | secureOpenFlags(),
       PRIVATE_FILE_MODE,
     );
     try {
@@ -664,7 +806,7 @@ function writeMigrationJournal(homeDir: string, journal: MigrationJournal, exclu
         // state durable without pretending that the update was atomic.
         const targetFd = openSync(
           path,
-          constants.O_WRONLY | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+          constants.O_WRONLY | constants.O_TRUNC | secureOpenFlags(),
         );
         try {
           writeBytesToDescriptor(targetFd, Buffer.from(journalContent(journal), "utf8"));
@@ -705,6 +847,7 @@ function makeJournal(source: TreeWitness): MigrationJournal {
     stagingName: basename(stagingPath("/tmp", operationId)),
     source,
     target: null,
+    retained: null,
     targetBaseHash: null,
   };
   return { ...payload, checksumSha256: journalChecksum(payload) };
@@ -717,23 +860,19 @@ function updateJournal(journal: MigrationJournal, patch: Partial<MigrationJourna
 
 function assertSourceMatches(path: string, expected: TreeWitness): TreeWitness {
   const current = treeWitnessOf(path);
-  if (!sameIdentity(current.identity, expected.identity) || current.hash !== expected.hash) {
+  if (!sameTreeWitness(current, expected)) {
     throw new Error("legacy source changed during migration");
   }
   return current;
 }
 
-function assertTargetMatches(path: string, expected: TreeWitness, requirePrivateRoot: boolean): TreeWitness {
+function assertTargetMatches(path: string, expected: TreeWitness): TreeWitness {
   const current = treeWitnessOf(path);
-  if (!sameIdentity(current.identity, expected.identity)
-    || current.hash !== expected.hash
-    || (requirePrivateRoot && current.mode !== PRIVATE_ROOT_MODE)) {
+  if (!sameTreeWitness(current, expected) || current.mode !== PRIVATE_ROOT_MODE) {
     throw new Error("active migration target changed during recovery");
   }
-  if (requirePrivateRoot) {
-    const root = openPrivateRoot(path);
-    root.close();
-  }
+  const root = openPrivateRoot(path);
+  root.close();
   return current;
 }
 
@@ -751,91 +890,97 @@ function tightenRootMode(path: string): void {
   }
 }
 
-function existingEntry(path: string): BigIntFileStat | undefined {
-  return lstatIfPresent(path);
-}
-
-function copyRegularEntry(sourcePath: string, targetPath: string, budget: TreeBudget): void {
-  const sourceBefore = lstatSync(sourcePath, { bigint: true }) as unknown as BigIntFileStat;
-  const sourceFd = openSync(sourcePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+function copyRegularEntry(source: MigrationFile, targetPath: string, budget: TreeBudget): void {
+  const content = readDescriptor(source.fd, MAX_MIGRATION_FILE_BYTES, budget);
+  assertSameStat(
+    source.stat,
+    fstatSync(source.fd, { bigint: true }) as unknown as BigIntFileStat,
+    "legacy migration source",
+  );
+  const targetFd = openSync(
+    targetPath,
+    constants.O_WRONLY
+      | constants.O_CREAT
+      | constants.O_EXCL
+      | secureOpenFlags(),
+    PRIVATE_FILE_MODE,
+  );
   try {
-    const sourceOpened = fstatSync(sourceFd, { bigint: true }) as unknown as BigIntFileStat;
-    if (!sameIdentity(statIdentity(sourceBefore), statIdentity(sourceOpened))) {
-      throw new Error("legacy migration source changed before copy");
-    }
-    const content = readDescriptor(sourceFd, MAX_MIGRATION_FILE_BYTES, budget);
-    assertSameStat(sourceOpened, fstatSync(sourceFd, { bigint: true }) as unknown as BigIntFileStat, "legacy migration source");
-    const targetFd = openSync(
-      targetPath,
-      constants.O_WRONLY
-        | constants.O_CREAT
-        | constants.O_EXCL
-        | (constants.O_NOFOLLOW ?? 0)
-        | (constants.O_NONBLOCK ?? 0),
-      PRIVATE_FILE_MODE,
-    );
-    try {
-      writeBytesToDescriptor(targetFd, content);
-      fchmodSync(targetFd, modeOf(sourceOpened));
-      syncDescriptorIfSupported(targetFd);
-    } finally {
-      closeSync(targetFd);
-    }
+    writeBytesToDescriptor(targetFd, content);
+    fchmodSync(targetFd, modeOf(source.stat));
+    syncDescriptorIfSupported(targetFd);
   } finally {
-    closeSync(sourceFd);
+    closeSync(targetFd);
   }
-  const after = lstatSync(sourcePath, { bigint: true }) as unknown as BigIntFileStat;
-  assertSameStat(sourceBefore, after, "legacy migration source");
+  const after = lstatSync(source.path, { bigint: true }) as unknown as BigIntFileStat;
+  assertSameStat(source.stat, after, "legacy migration source");
 }
 
-function copyDirectoryEntries(sourcePath: string, targetPath: string, budget: TreeBudget, depth: number): void {
+function copyDirectoryEntries(
+  sourceDirectory: MigrationDirectory,
+  targetDirectory: MigrationDirectory,
+  budget: TreeBudget,
+  depth: number,
+): void {
   if (depth > MAX_MIGRATION_TREE_DEPTH) throw new Error("legacy migration tree is too deep");
-  const sourceBefore = lstatSync(sourcePath, { bigint: true }) as unknown as BigIntFileStat;
-  const sourceFd = openSync(sourcePath, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
-  try {
-    const opened = fstatSync(sourceFd, { bigint: true }) as unknown as BigIntFileStat;
-    if (!sameIdentity(statIdentity(sourceBefore), statIdentity(opened))) throw new Error("legacy migration directory changed before copy");
-    const names = readdirSync(sourcePath, { withFileTypes: true }).map((entry) => entry.name).sort();
-    for (const name of names) {
-      const sourceChild = join(sourcePath, name);
-      const targetChild = join(targetPath, name);
-      const sourceStat = lstatSync(sourceChild, { bigint: true }) as unknown as BigIntFileStat;
-      const kind = entryKind(sourceStat);
-      const targetStat = existingEntry(targetChild);
-      if (targetStat !== undefined) {
-        const sourceWitness = treeWitnessOf(sourceChild);
-        const targetWitness = treeWitnessOf(targetChild);
-        if (sourceWitness.hash !== targetWitness.hash) throw new Error("legacy migration target conflicts with source");
+  const names = readdirSync(sourceDirectory.descriptorPath, { withFileTypes: true })
+    .map((entry) => entry.name)
+    .sort();
+  for (const name of names) {
+    const sourceChildPath = join(sourceDirectory.descriptorPath, name);
+    const targetChildPath = join(targetDirectory.descriptorPath, name);
+    const sourceChild = openMigrationEntry(sourceChildPath, "legacy migration source");
+    try {
+      const targetChild = openMigrationEntryIfPresent(targetChildPath, "legacy migration target");
+      if (targetChild !== undefined) {
+        try {
+          const sourceWitness = treeWitnessFromEntry(sourceChild);
+          const targetWitness = treeWitnessFromEntry(targetChild);
+          if (!sameTreeContent(sourceWitness, targetWitness) || sourceWitness.mode !== targetWitness.mode) {
+            throw new Error("legacy migration target conflicts with source");
+          }
+        } finally {
+          targetChild.close();
+        }
         continue;
       }
-      if (kind === "directory") {
-        mkdirSync(targetChild, { mode: PRIVATE_ROOT_MODE });
-        const targetDirectory = openDestinationDirectory(targetChild, "migration target directory");
+      if (sourceChild.kind === "directory") {
+        mkdirSync(targetChildPath, { mode: PRIVATE_ROOT_MODE });
+        const targetChildDirectory = openMigrationDirectory(targetChildPath, "migration target directory");
         try {
-          copyDirectoryEntries(sourceChild, targetChild, budget, depth + 1);
-          fchmodSync(targetDirectory.fd, modeOf(sourceStat));
-          syncDescriptorIfSupported(targetDirectory.fd);
+          copyDirectoryEntries(sourceChild as MigrationDirectory, targetChildDirectory, budget, depth + 1);
+          fchmodSync(targetChildDirectory.fd, modeOf(sourceChild.stat));
+          syncDescriptorIfSupported(targetChildDirectory.fd);
         } finally {
-          targetDirectory.close();
+          targetChildDirectory.close();
         }
       } else {
-        copyRegularEntry(sourceChild, targetChild, budget);
+        copyRegularEntry(sourceChild as MigrationFile, targetChildPath, budget);
       }
+    } finally {
+      sourceChild.close();
     }
-    const after = fstatSync(sourceFd, { bigint: true }) as unknown as BigIntFileStat;
-    assertSameStat(opened, after, "legacy migration directory");
-    const namesAfter = readdirSync(sourcePath).sort();
-    if (names.length !== namesAfter.length || names.some((name, index) => name !== namesAfter[index])) {
-      throw new Error("legacy migration directory entries changed after copy");
-    }
-  } finally {
-    closeSync(sourceFd);
   }
+  const after = fstatSync(sourceDirectory.fd, { bigint: true }) as unknown as BigIntFileStat;
+  assertSameStat(sourceDirectory.stat, after, "legacy migration directory");
+  const namesAfter = readdirSync(sourceDirectory.descriptorPath).sort();
+  if (names.length !== namesAfter.length || names.some((name, index) => name !== namesAfter[index])) {
+    throw new Error("legacy migration directory entries changed after copy");
+  }
+  const afterPath = lstatSync(sourceDirectory.path, { bigint: true }) as unknown as BigIntFileStat;
+  assertSameStat(sourceDirectory.stat, afterPath, "legacy migration source");
 }
 
 function copySourceToStaging(sourcePath: string, staging: string, source: TreeWitness): TreeWitness {
   const budget: TreeBudget = { bytes: 0, entries: 0 };
-  copyDirectoryEntries(sourcePath, staging, budget, 0);
+  const sourceDirectory = openMigrationDirectory(sourcePath, "legacy migration source");
+  const targetDirectory = openMigrationDirectory(staging, "migration target directory");
+  try {
+    copyDirectoryEntries(sourceDirectory, targetDirectory, budget, 0);
+  } finally {
+    sourceDirectory.close();
+    targetDirectory.close();
+  }
   const sourceAfter = assertSourceMatches(sourcePath, source);
   const stage = treeWitnessOf(staging);
   if (stage.hash !== sourceAfter.hash) throw new Error("legacy migration copy does not match source");
@@ -853,57 +998,23 @@ function copySourceToStaging(sourcePath: string, staging: string, source: TreeWi
   return verified;
 }
 
-function removeTreeExactly(path: string, expected: Identity): void {
-  const rootStat = lstatSync(path, { bigint: true }) as unknown as BigIntFileStat;
-  if (!rootStat.isDirectory() || !sameIdentity(statIdentity(rootStat), expected)) {
-    throw new Error("legacy migration removal target changed");
+function verifyTreeExactly(path: string, expected: TreeWitness, errorMessage: string): TreeWitness {
+  const current = treeWitnessOf(path);
+  if (!sameTreeWitness(current, expected)) {
+    throw new Error(errorMessage);
   }
-  const rootFd = openSync(path, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
-  try {
-    const opened = fstatSync(rootFd, { bigint: true }) as unknown as BigIntFileStat;
-    if (!sameIdentity(statIdentity(opened), expected)) throw new Error("legacy migration removal target changed");
-    const names = readdirSync(path).sort();
-    for (const name of names) {
-      const child = join(path, name);
-      const stat = lstatSync(child, { bigint: true }) as unknown as BigIntFileStat;
-      const childIdentity = statIdentity(stat);
-      if (stat.isDirectory()) {
-        removeTreeExactly(child, childIdentity);
-      } else if (stat.isFile()) {
-        const fd = openSync(child, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
-        try {
-          const openedChild = fstatSync(fd, { bigint: true }) as unknown as BigIntFileStat;
-          if (!sameIdentity(statIdentity(openedChild), childIdentity)) throw new Error("legacy migration file changed during removal");
-          const beforeUnlink = lstatSync(child, { bigint: true }) as unknown as BigIntFileStat;
-          if (!sameIdentity(statIdentity(beforeUnlink), childIdentity)) throw new Error("legacy migration file changed during removal");
-          unlinkSync(child);
-        } finally {
-          closeSync(fd);
-        }
-      } else if (stat.isSymbolicLink()) {
-        throw new Error("symlink entry appeared during legacy migration removal");
-      } else {
-        throw new Error("legacy migration encountered an unsupported removal entry");
-      }
-    }
-    const after = fstatSync(rootFd, { bigint: true }) as unknown as BigIntFileStat;
-    if (!sameIdentity(statIdentity(after), expected) || readdirSync(path).length !== 0) {
-      throw new Error("legacy migration directory changed during removal");
-    }
-  } finally {
-    closeSync(rootFd);
-  }
-  rmdirSync(path);
+  return current;
 }
 
 function publishStaging(
   homeDir: string,
   staging: string,
   target: string,
-  journal: MigrationJournal,
+  journal: ReadyMigrationJournal,
   admission: PublicationAdmission,
   finish: (published: MigrationJournal) => RuntimeHomeMigration,
 ): RuntimeHomeMigration {
+  let crossDevice = false;
   try {
     renameSync(staging, target);
   } catch (error) {
@@ -911,6 +1022,7 @@ function publishStaging(
     // A same-directory EXDEV indicates a platform shim or test adapter. Copy
     // through a newly authenticated target and retain the staging tree until
     // the target witness is complete.
+    crossDevice = true;
     mkdirSync(target, { mode: PRIVATE_ROOT_MODE });
   }
 
@@ -918,14 +1030,18 @@ function publishStaging(
   // Acquire the root-backed publication lock immediately at that boundary;
   // all witness advancement and source removal remain inside that lock.
   return admission.withFinalLock(() => {
-    if (journal.target !== null && lstatIfPresent(staging) !== undefined) {
-      const stage = lstatIfPresent(staging);
-      if (stage === undefined || !sameIdentity(statIdentity(stage), journal.target.identity)) {
-        throw new Error("legacy migration staging witness changed at publish");
+    if (crossDevice) {
+      verifyTreeExactly(staging, journal.target, "legacy migration staging witness changed at publish");
+      const sourceDirectory = openMigrationDirectory(staging, "migration staging directory");
+      const targetDirectory = openMigrationDirectory(target, "migration target directory");
+      try {
+        copyDirectoryEntries(sourceDirectory, targetDirectory, { bytes: 0, entries: 0 }, 0);
+      } finally {
+        sourceDirectory.close();
+        targetDirectory.close();
       }
-      copyDirectoryEntries(staging, target, { bytes: 0, entries: 0 }, 0);
       tightenRootMode(target);
-      removeTreeExactly(staging, journal.target.identity);
+      verifyTreeExactly(staging, journal.target, "legacy migration staging witness changed at publish");
     }
     const publishedCandidate = treeWitnessOf(target);
     if (publishedCandidate.hash !== journal.source.hash || publishedCandidate.mode !== PRIVATE_ROOT_MODE) {
@@ -935,24 +1051,98 @@ function publishStaging(
     privateTarget.close();
     const home = openDirectory(resolve(homeDir), "home directory");
     try { syncDescriptorIfSupported(home.fd); } finally { home.close(); }
-    const published = updateJournal(journal, { phase: "published", target: publishedCandidate });
+    const published = updateJournal(journal, {
+      phase: "published",
+      target: publishedCandidate,
+      retained: crossDevice ? journal.target : null,
+    });
     writeMigrationJournal(homeDir, published, false);
     return finish(published);
   });
 }
 
+function emptyDirectoryTreeHash(): string {
+  const hash = createHash("sha256");
+  updateHashPart(hash, "path", "");
+  updateHashPart(hash, "kind", "directory");
+  return hash.digest("hex");
+}
+
+function retainedCopyMatchesSource(retained: TreeWitness, source: TreeWitness): boolean {
+  const uid = currentUid();
+  return retained.hash === source.hash
+    && retained.mode === PRIVATE_ROOT_MODE
+    && (uid === undefined || retained.uid === uid);
+}
+
+function sameRootMetadata(left: TreeWitness, right: TreeWitness): boolean {
+  return sameIdentity(left.identity, right.identity)
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.gid === right.gid;
+}
+
 function finishPublishedMigration(homeDir: string, from: string, to: string, journal: MigrationJournal): RuntimeHomeMigration {
   const target = journal.target;
   if (target === null) throw new Error("legacy migration target witness is missing");
-  assertTargetMatches(to, target, true);
-  const source = lstatIfPresent(from);
-  if (source !== undefined) {
-    assertSourceMatches(from, journal.source);
-    const removing = updateJournal(journal, { phase: "removing" });
-    writeMigrationJournal(homeDir, removing, false);
-    removeTreeExactly(from, journal.source.identity);
+  assertTargetMatches(to, target);
+
+  const retainedPath = join(resolve(homeDir), journal.stagingName);
+  if (journal.phase === "published" && journal.retained !== null) {
+    const retained = verifyTreeExactly(
+      retainedPath,
+      journal.retained,
+      "legacy migration retained evidence changed",
+    );
+    if (!retainedCopyMatchesSource(retained, journal.source)) {
+      throw new Error("legacy migration retained evidence does not match source");
+    }
+    const terminal = updateJournal(journal, { phase: "retained", retained });
+    writeMigrationJournal(homeDir, terminal, false);
+    return { migrated: true, from, to };
   }
-  deleteMigrationJournal(homeDir);
+
+  let retained = treeWitnessIfPresent(retainedPath);
+  if (journal.phase === "retaining") {
+    if (retained === undefined || !sameRootMetadata(retained, journal.retained!)) {
+      throw new Error("legacy migration retaining root changed");
+    }
+  } else if (retained !== undefined && retainedCopyMatchesSource(retained, journal.source)) {
+    const terminal = updateJournal(journal, { phase: "retained", retained });
+    writeMigrationJournal(homeDir, terminal, false);
+    return { migrated: true, from, to };
+  } else {
+    if (retained !== undefined
+      && (retained.hash !== emptyDirectoryTreeHash()
+        || retained.mode !== PRIVATE_ROOT_MODE
+        || (currentUid() !== undefined && retained.uid !== currentUid()))) {
+      throw new Error("legacy migration retained evidence path is not an empty private directory");
+    }
+    const source = treeWitnessIfPresent(from);
+    if (source === undefined) {
+      deleteMigrationJournal(homeDir);
+      return { migrated: true, from, to };
+    }
+    if (!sameTreeWitness(source, journal.source)) throw new Error("legacy source changed during migration");
+    if (retained === undefined) {
+      mkdirSync(retainedPath, { mode: PRIVATE_ROOT_MODE });
+      retained = treeWitnessOf(retainedPath);
+    }
+    const retaining = updateJournal(journal, { phase: "retaining", retained });
+    writeMigrationJournal(homeDir, retaining, false);
+    journal = retaining;
+  }
+
+  retained = treeWitnessOf(retainedPath);
+  if (!sameRootMetadata(retained, journal.retained!)) {
+    throw new Error("legacy migration retaining root changed");
+  }
+  if (!retainedCopyMatchesSource(retained, journal.source)) {
+    const source = assertSourceMatches(from, journal.source);
+    retained = copySourceToStaging(from, retainedPath, source);
+  }
+  const terminal = updateJournal(journal, { phase: "retained", retained });
+  writeMigrationJournal(homeDir, terminal, false);
   return { migrated: true, from, to };
 }
 
@@ -967,10 +1157,22 @@ function resumeMigration(
   switch (journal.phase) {
     case "published":
     case "removing":
+    case "retaining":
       return admission.withFinalLock(() => finishPublishedMigration(homeDir, from, to, journal));
+    case "retained": {
+      const active = openPrivateRoot(to);
+      active.close();
+      return { migrated: true, from, to };
+    }
     case "planned": {
-      assertSourceMatches(from, journal.source);
       const active = lstatIfPresent(to);
+      const source = treeWitnessIfPresent(from);
+      if (source === undefined && active === undefined) {
+        throw new Error("legacy migration evidence has no authenticated source or target");
+      }
+      if (source === undefined || !sameTreeWitness(source, journal.source)) {
+        throw new Error("legacy source changed during migration");
+      }
       if (active !== undefined) {
         throw new Error("legacy migration found an unauthenticated active root");
       }
@@ -987,42 +1189,37 @@ function resumeMigration(
       });
       writeMigrationJournal(homeDir, copying, false);
       try {
-        copySourceToStaging(from, staging, journal.source);
+        const staged = copySourceToStaging(from, staging, source);
+        const ready = updateJournal(copying, { target: staged });
+        writeMigrationJournal(homeDir, ready, false);
         return publishStaging(
           homeDir,
           staging,
           to,
-          copying,
+          ready as ReadyMigrationJournal,
           admission,
           (published) => finishPublishedMigration(homeDir, from, to, published),
         );
       } catch (error) {
-        // Clean only the operation-owned staging inode. If any identity check
-        // is ambiguous, retain it and the journal for operator recovery.
-        try {
-          const current = lstatIfPresent(staging);
-          if (current !== undefined && copying.target !== null && sameIdentity(statIdentity(current), copying.target.identity)) {
-            removeTreeExactly(staging, copying.target.identity);
-            deleteMigrationJournal(homeDir);
-          }
-        } catch { /* preserve the journal and source on ambiguous cleanup */ }
+        // Retain the operation-owned staging inode and journal. Its recorded
+        // root witness permits deterministic descriptor-bound resumption.
         throw error;
       }
     }
     case "copying": {
       assertSourceMatches(from, journal.source);
-      const stagingStat = lstatIfPresent(staging);
-      if (stagingStat === undefined || journal.target === null || !sameIdentity(statIdentity(stagingStat), journal.target.identity)) {
+      const stagingWitness = treeWitnessIfPresent(staging);
+      if (stagingWitness === undefined || journal.target === null || !sameRootMetadata(stagingWitness, journal.target)) {
         throw new Error("legacy migration staging witness is missing or changed");
       }
-      assertTargetMatches(staging, journal.target, false);
-      const copying = updateJournal(journal, { phase: "copying" });
-      copySourceToStaging(from, staging, journal.source);
+      const staged = copySourceToStaging(from, staging, journal.source);
+      const copying = updateJournal(journal, { phase: "copying", target: staged });
+      writeMigrationJournal(homeDir, copying, false);
       return publishStaging(
         homeDir,
         staging,
         to,
-        copying,
+        copying as ReadyMigrationJournal,
         admission,
         (published) => finishPublishedMigration(homeDir, from, to, published),
       );
@@ -1038,26 +1235,29 @@ function migrateLegacyHomeUnlocked(
   const from = legacyLcmHomeDir(homeDir);
   const to = lcmHomeDir(homeDir);
   const journal = readMigrationJournal(homeDir);
-  const legacy = lstatIfPresent(from);
-  const active = lstatIfPresent(to);
 
   if (journal !== null) {
-    if (legacy === undefined && active === undefined) {
-      throw new Error("legacy migration evidence has no authenticated source or target");
-    }
     return resumeMigration(homeDir, journal, admission);
   }
 
-  if (legacy === undefined) {
+  const sourceEntry = openMigrationEntryIfPresent(from, "legacy LCM home");
+  const active = lstatIfPresent(to);
+  if (sourceEntry === undefined) {
     if (active !== undefined) {
       const root = openPrivateRoot(to);
       root.close();
     }
     return { migrated: false, from, to };
   }
-  const source = treeWitnessOf(from);
-  if (!legacy.isDirectory() || legacy.isSymbolicLink() || !ownerMatches(legacy)) {
+  if (sourceEntry.kind !== "directory" || !ownerMatches(sourceEntry.stat)) {
+    sourceEntry.close();
     throw new Error("legacy LCM home is not a trusted directory");
+  }
+  let source: TreeWitness;
+  try {
+    source = treeWitnessFromEntry(sourceEntry);
+  } finally {
+    sourceEntry.close();
   }
   if (active !== undefined) {
     // This includes an empty active root. Without a journal proving that the
@@ -1067,17 +1267,10 @@ function migrateLegacyHomeUnlocked(
   assertRootParent(topology, homeDir);
   const planned = makeJournal(source);
   writeMigrationJournal(homeDir, planned, true);
-  try {
-    return resumeMigration(homeDir, planned, admission);
-  } catch (error) {
-    // The journal is deliberately retained if the operation reached an
-    // ambiguous boundary. Safe pre-publication failures may remove it.
-    if ((error as Error).message.includes("changed during migration")
-      || (error as Error).message.includes("does not match source")) {
-      try { deleteMigrationJournal(homeDir); } catch { /* retain evidence */ }
-    }
-    throw error;
-  }
+  // Keep the journal for every post-publication or ambiguous failure. The
+  // source and any operation-owned staging tree are retained for recovery;
+  // no pathname cleanup is safe after a hostile substitution boundary.
+  return resumeMigration(homeDir, planned, admission);
 }
 
 function bootstrapLockPath(homeDir: string): string {
@@ -1098,8 +1291,7 @@ function acquireBootstrapLock(homeDir: string, topology: HomeTopology): Bootstra
       constants.O_WRONLY
         | constants.O_CREAT
         | constants.O_EXCL
-        | (constants.O_NOFOLLOW ?? 0)
-        | (constants.O_NONBLOCK ?? 0),
+        | secureOpenFlags(),
       PRIVATE_FILE_MODE,
     );
   } catch (error) {

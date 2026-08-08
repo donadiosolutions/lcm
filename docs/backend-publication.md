@@ -244,11 +244,85 @@ The installer refuses to establish an active root while the legacy
 so two roots cannot silently become competing authorities. Legacy migration is
 copy-first: it records a journal, verifies bounded regular files and
 directories, rejects symlinks, writes a staging tree, performs the final
-publication-lock handoff, and retains the source until the published target is
-authenticated. Source and target identities, hashes, ownership, and modes are
-rechecked at each boundary. A changed or ambiguous source is preserved with
-its journal for recovery. This migration establishes the secure local root; it
-does not perform PostgreSQL migration or backend cutover.
+publication-lock handoff, and retains evidence after the published target is
+authenticated. Before migration returns, it records a terminal `retained`
+journal containing the exact witness for a full copy under the unpredictable
+`stagingName`. Same-device publication still renames the original staging tree
+into `~/.lcm/` and then creates the retained copy; the cross-device fallback
+keeps its authenticated staging copy. Source, staging, and target identities,
+hashes, ownership, and modes are rechecked at each non-terminal boundary.
+
+The terminal journal deliberately does not rehash mutable `~/.lcm/` content on
+later startups. Normal database, daemon, transcript, and configuration writes
+therefore cannot freeze startup against the publication-time hash. Startup
+still requires `~/.lcm/` to be a trusted private root, but later changes or
+operator removal of the retained source/copy do not reopen migration or create
+a legacy/active conflict while the terminal journal remains. This migration
+establishes the secure local root; it does not perform PostgreSQL migration or
+backend cutover.
+
+Legacy migration requires a descriptor namespace that supports the descendant
+traversal used by the Node implementation. Linux uses
+`/proc/self/fd/<fd>`. macOS's `/dev/fd/<fd>` entries are not treated as an
+equivalent: `readlink(2)` may return `EINVAL`, and appending child components
+is not a portable operation there. macOS therefore fails closed with
+`legacy migration requires descriptor-relative filesystem access` rather than
+claiming to support a traversal primitive that Node does not expose. The
+same fail-closed behavior applies to any platform without the Linux-compatible
+descriptor namespace, or without no-follow and nonblocking open flags; no
+legacy bytes are hashed or copied in that case.
+
+### Recovering from a macOS pre-journal refusal
+
+This recovery procedure applies only when macOS reports
+`legacy migration requires descriptor-relative filesystem access`,
+`~/.lcm-legacy-migration.json` is absent, and `~/.lcm` was not present before
+the refused command. The refusal occurs before migration hashes or copies
+legacy bytes and before it creates a journal or staging tree.
+
+1. Stop every LCM daemon, CLI, hook, and MCP process using this home.
+2. Confirm that `~/.lcm-legacy-migration.json` is absent and that the refused
+   command did not create `~/.lcm`. If `~/.lcm` exists, stop: preserve both
+   directories and do not use this pre-journal procedure.
+3. Back up `~/.lossless-claude` with your normal backup tool. Do not
+   recursively delete it.
+4. Choose a backup destination that does not already exist, then rename the
+   legacy directory out of the migration path. For example:
+
+   ```sh
+   mv "$HOME/.lossless-claude" "$HOME/.lossless-claude.pre-lcm-backup"
+   ```
+
+5. Rerun the command that was refused, or rerun `lcm install` when completing
+   an installation. LCM now creates fresh `~/.lcm` state; it does not import
+   the renamed backup automatically. Retain the backup until you have reviewed
+   and preserved any legacy data you still need.
+
+The retained-evidence cleanup below is a different procedure. It applies only
+after a successful migration has written a journal whose phase is
+`retained`; it must not be used for this pre-journal macOS refusal.
+
+### Cleaning up retained legacy migration evidence
+
+Node does not expose atomic descriptor-relative recursive unlink/rmdir APIs, so
+LCM does not automatically delete the legacy tree or retained copy. Cleanup is
+an explicit operator action:
+
+1. Stop the daemon and any CLI, hook, or MCP process using this home.
+2. Open `~/.lcm-legacy-migration.json` and require `"phase":"retained"`.
+   Record its exact `stagingName`; do not substitute a glob or a similarly
+   named path.
+3. Verify that the live `~/.lcm/` state is the state you intend to keep.
+4. Remove the legacy `~/.lossless-claude` directory and the exact
+   `~/<stagingName>` retained-copy path. Either may already be absent or may
+   have been changed after migration; the terminal state does not trust or
+   revalidate them during startup.
+5. Remove `~/.lcm-legacy-migration.json` **last**, then restart LCM.
+
+Removing the journal first while the legacy directory remains intentionally
+produces the normal fail-closed legacy/active coexistence error. Do not copy
+retained files back into `~/.lcm/`; they are recovery evidence, not a mutable
+second authority.
 
 ## Operator-visible failure behavior
 
