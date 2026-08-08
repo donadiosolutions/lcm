@@ -96,6 +96,18 @@ describe("dispatchHook", () => {
     expect(callOrder).toEqual(["heal", "handler"]);
   });
 
+  it("does not repair hook settings before UserPromptSubmit owns durable enqueue", async () => {
+    vi.mocked(validateAndFixHooks).mockClear();
+    vi.mocked(handleUserPromptSubmit).mockResolvedValue({ exitCode: 0, stdout: "" });
+
+    await dispatchHook("user-prompt", JSON.stringify({
+      session_id: "test-session",
+      prompt: "remember this",
+    }));
+
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+  });
+
   it("skips validateAndFixHooks for Codex hook payloads", async () => {
     vi.mocked(validateAndFixHooks).mockClear();
     vi.mocked(handlePreCompact).mockResolvedValue({ exitCode: 0, stdout: "" });

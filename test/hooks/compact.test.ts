@@ -18,6 +18,8 @@ vi.mock("../../src/hooks/session-end.js", () => ({
 vi.mock("../../src/hooks/publication-fence.js", () => ({
   assertHookPublicationFence: vi.fn(),
   isBackendPublicationJournalError: (error: unknown) => error instanceof BackendPublicationJournalError,
+  isBackendPublicationEvidenceMissing: (error: unknown) =>
+    error instanceof BackendPublicationJournalError && error.reason === "publication-evidence-missing",
 }));
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({

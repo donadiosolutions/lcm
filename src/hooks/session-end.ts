@@ -11,7 +11,7 @@ import { safeLogError } from "./hook-errors.js";
 import { configPath as defaultConfigPath, daemonPidPath, daemonTokenPath, lcmHomeDir } from "../runtime-paths.js";
 import { readAuthToken } from "../daemon/auth.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
-import { selectStorageBackend } from "../storage/backend.js";
+import { selectStorageBackend, StorageBackendUnavailableError } from "../storage/backend.js";
 import {
   clearDaemonNotice,
   maybeEmitDaemonNotice,
@@ -21,6 +21,7 @@ import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remed
 import {
   assertHookPublicationFence,
   assertHookPublicationFenceToken,
+  isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
   type HookPublicationLockToken,
   withHookPublicationFence,
@@ -153,8 +154,14 @@ export async function handleSessionEnd(
     try {
       selectStorageBackend(storage);
     } catch (error) {
-      if (isBackendPublicationJournalError(error)) throw error;
-      await safeLogError("SessionEnd", error, {});
+      if (isBackendPublicationJournalError(error) && !isBackendPublicationEvidenceMissing(error)) throw error;
+      await safeLogError(
+        "SessionEnd",
+        isBackendPublicationEvidenceMissing(error) && storage.backend === "postgresql"
+          ? new StorageBackendUnavailableError("postgresql")
+          : error,
+        {},
+      );
       return { exitCode: 0, stdout: "" };
     }
 

@@ -20,6 +20,7 @@ import { appendLocalHookEvents } from "./local-enqueue.js";
 import {
   assertHookPublicationFence,
   assertHookRootEstablished,
+  isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
 } from "./publication-fence.js";
 
@@ -149,10 +150,21 @@ export async function handleUserPromptSubmit(
 
         // Project metadata is a selected-state consumer and must follow the
         // durable local enqueue, including when the publication is unresolved.
+        assertHookPublicationFence();
         ensureProjectDir(cwd);
+
+        // Hook repair mutates settings and therefore belongs after durable
+        // local admission. It has its own short fence; dispatch must not run
+        // it before this handler reaches the enqueue boundary.
+        const { validateAndFixHooks } = await import("./auto-heal.js");
+        assertHookPublicationFence();
+        validateAndFixHooks();
       }
     } catch (e) {
-      if (isBackendPublicationJournalError(e)) throw e;
+      if (isBackendPublicationJournalError(e)) {
+        if (isBackendPublicationEvidenceMissing(e)) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+        throw e;
+      }
       await safeLogError("UserPromptSubmit", e, {
         cwd: input.cwd ?? process.env.CLAUDE_PROJECT_DIR,
         sessionId: input.session_id,
@@ -163,8 +175,9 @@ export async function handleUserPromptSubmit(
     let daemonPort = port;
     let effectiveClient = client;
     if (effectiveStorage === undefined || daemonPort === undefined || effectiveClient === undefined) {
-      // loadHookConfig owns its own publication/config lock. Do not retain a
-      // broader publication lock while invoking it or the daemon lifecycle.
+      // loadHookConfig owns its own publication/config lock. Re-admit before
+      // invoking it, but do not retain a broader lock over the read.
+      assertHookPublicationFence();
       const config = loadHookConfig(defaultConfigPath());
       effectiveStorage ??= config.storage;
       daemonPort ??= config.daemonPort;
@@ -176,16 +189,21 @@ export async function handleUserPromptSubmit(
     );
 
     try {
+      assertHookPublicationFence();
       selectStorageBackend(selectedStorage);
     } catch (error) {
-      if (isBackendPublicationJournalError(error)) throw error;
+      if (isBackendPublicationJournalError(error)) {
+        if (isBackendPublicationEvidenceMissing(error)) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+        throw error;
+      }
       emitAdmissionNotice(undefined, "ambiguous");
       return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
     }
     let ensureResult: EnsureResultWithRefusal;
     try {
       // ensureDaemon performs its own before/after lifecycle admission and
-      // must not be called while another publication lock is retained.
+      // must not run while another publication lock is retained.
+      assertHookPublicationFence();
       ensureResult = await ensureDaemon({
         port: selectedPort,
         pidFilePath: daemonPidPath(),
@@ -194,7 +212,10 @@ export async function handleUserPromptSubmit(
         enforceUserManagerParent: true,
       });
     } catch (error) {
-      if (isBackendPublicationJournalError(error)) throw error;
+      if (isBackendPublicationJournalError(error)) {
+        if (isBackendPublicationEvidenceMissing(error)) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+        throw error;
+      }
       emitAdmissionNotice(undefined, "ambiguous");
       return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
     }
@@ -233,7 +254,10 @@ export async function handleUserPromptSubmit(
     const hint = buildMemoryContext(result.hints, result.ids ?? [])!;
     return { exitCode: 0, stdout: `${hint}\n${LEARNING_INSTRUCTION}` };
   } catch (error) {
-    if (isBackendPublicationJournalError(error)) throw error;
+    if (isBackendPublicationJournalError(error)) {
+      if (isBackendPublicationEvidenceMissing(error)) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+      throw error;
+    }
     return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
   }
 }

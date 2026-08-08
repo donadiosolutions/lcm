@@ -30,9 +30,53 @@ describe("hook publication fence", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it("uses the coordinator consumer lock and token semantics", () => {
+    const consumerLock = vi.spyOn(backendPublication, "withBackendPublicationConsumerLock");
+
+    expect(() => withHookPublicationFence((lockToken) => {
+      backendPublication.assertBackendPublicationConsumerAccess({
+        homeDir: home,
+        lockToken,
+      });
+    })).not.toThrow();
+
+    expect(consumerLock).toHaveBeenCalledWith(home, expect.any(Function));
+  });
+
+  it("fails closed when publication evidence remains without a journal", () => {
+    const directory = backendPublicationDirectory();
+    mkdirSync(directory, { mode: 0o700 });
+    writeFileSync(join(directory, "orphan.material"), "orphan", { mode: 0o600 });
+
+    expect(() => assertHookPublicationFence()).toThrow("publication evidence is incomplete");
+  });
+
+  it("passes explicit absent config and project-map observations to approved evidence APIs", () => {
+    const configAccess = vi.spyOn(backendPublication, "assertBackendPublicationConfigAccess");
+    const projectMapAccess = vi.spyOn(backendPublication, "assertBackendPublicationProjectMapAccess");
+
+    expect(() => assertHookPublicationFence()).not.toThrow();
+
+    expect(configAccess).toHaveBeenCalledWith(
+      join(home, ".lcm", "config.json"),
+      "sqlite",
+      null,
+      undefined,
+      expect.anything(),
+    );
+    expect(projectMapAccess).toHaveBeenCalledWith(expect.objectContaining({
+      homeDir: home,
+      content: null,
+      map: {},
+      present: false,
+      lockToken: expect.anything(),
+    }));
   });
 
   it("authenticates the established root and exposes a short-lived direct-action token", () => {
@@ -89,13 +133,16 @@ describe("hook publication fence", () => {
   });
 
   it("fails closed for an unresolved publication journal", () => {
-    const read = vi.spyOn(backendPublication, "readBackendPublicationJournal").mockReturnValue({
-      phase: "preparing",
-    } as never);
+    const publicationError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "backend publication is unresolved",
+    );
+    const access = vi.spyOn(backendPublication, "assertBackendPublicationConsumerAccess")
+      .mockImplementation(() => { throw publicationError; });
     try {
-      expect(() => assertHookPublicationFence()).toThrow("backend publication is unresolved");
+      expect(() => assertHookPublicationFence()).toThrow(publicationError);
     } finally {
-      read.mockRestore();
+      access.mockRestore();
     }
   });
 

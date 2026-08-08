@@ -1,38 +1,31 @@
-import { homedir } from "node:os";
 import { join } from "node:path";
 import {
-  BackendPublicationJournalError,
-  readBackendPublicationJournal,
+  assertBackendPublicationConsumerAccess,
+  assertBackendPublicationConfigAccess,
+  assertBackendPublicationProjectMapAccess,
+  backendPublicationHomeForConfigPath,
+  withBackendPublicationConsumerLock,
+  withBackendPublicationConsumerLockAsync,
+  type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
-import {
-  withPrivateMutationLock,
-  withPrivateMutationLockAsync,
-} from "../private-mutation-lock.js";
-import { lcmHomeDir } from "../runtime-paths.js";
+import { configPath as defaultConfigPath, lcmHomeDir } from "../runtime-paths.js";
 import {
   assertPrivateDirectory,
   openPrivateDirectory,
+  OWNER_ONLY_FILE_MODES,
+  readBoundedRegularFile,
   type PrivateDirectoryHandle,
   type PrivateDirectoryWitness,
 } from "../security-files.js";
+import { BackendPublicationJournalError } from "../storage/backend-publication.js";
 
-/** A non-authorizing handle for one retained hook publication-lock operation. */
-export type HookPublicationLockToken = object;
+const MAX_HOOK_EVIDENCE_BYTES = 4 * 1024 * 1024;
 
-const activeTokens = new WeakMap<HookPublicationLockToken, { active: boolean }>();
+/** The hook token is the coordinator's token, not a parallel hook authority. */
+export type HookPublicationLockToken = BackendPublicationLockToken;
 
-function publicationLockPath(): string {
-  // Keep the consumer admission lock outside ~/.lcm. This lets a hook verify
-  // an already-established root without creating publication state as a side
-  // effect, and matches the publication coordinator's shared lock boundary.
-  return join(homedir(), ".lcm.backend-publication.lock");
-}
-
-function assertEstablishedLcmRoot(): void {
-  // Bootstrap/install owns root creation. Hook admission is read-only and must
-  // fail before any lock or child directory can be created.
-  const root = openPrivateDirectory(lcmHomeDir());
-  root.close();
+function isMissing(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
 }
 
 function assertStableRoot(
@@ -52,37 +45,106 @@ function assertStableRoot(
   }
 }
 
-function assertPublicationState(): void {
-  const journal = readBackendPublicationJournal();
-  if (journal === null) return;
-  if (journal.phase !== "completed" && journal.phase !== "aborted") {
+function readObservedFile(path: string, root: string): string | null {
+  try {
+    return readBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: MAX_HOOK_EVIDENCE_BYTES,
+      allowedModes: OWNER_ONLY_FILE_MODES,
+    });
+  } catch (error) {
+    if (isMissing(error)) return null;
+    throw error;
+  }
+}
+
+function configBackend(content: string | null): "sqlite" | "postgresql" {
+  if (content === null) return "sqlite";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
     throw new BackendPublicationJournalError(
-      "unresolved-publication",
-      "backend publication is unresolved; recover it before consuming local state",
+      "unexpected-state",
+      "config cannot be authenticated as publication evidence",
+      { cause: error },
+    );
+  }
+  if (
+    parsed !== null
+    && typeof parsed === "object"
+    && !Array.isArray(parsed)
+    && "storage" in parsed
+    && parsed.storage !== null
+    && typeof parsed.storage === "object"
+    && !Array.isArray(parsed.storage)
+    && "backend" in parsed.storage
+    && parsed.storage.backend === "postgresql"
+  ) {
+    return "postgresql";
+  }
+  return "sqlite";
+}
+
+function projectMapValue(content: string | null): unknown {
+  if (content === null) return {};
+  try {
+    return JSON.parse(content);
+  } catch (error) {
+    throw new BackendPublicationJournalError(
+      "unexpected-state",
+      "project map cannot be authenticated as publication evidence",
+      { cause: error },
     );
   }
 }
 
-function newToken(): HookPublicationLockToken {
-  const token = {};
-  activeTokens.set(token, { active: true });
-  return token;
-}
-
-function revokeToken(token: HookPublicationLockToken): void {
-  const state = activeTokens.get(token);
-  if (state) state.active = false;
-}
-
-function assertActiveToken(token: HookPublicationLockToken): void {
-  const state = activeTokens.get(token);
-  if (state === undefined || !state.active) {
+function hookPublicationHome(): string {
+  const homeDir = backendPublicationHomeForConfigPath(defaultConfigPath());
+  if (homeDir === undefined) {
     throw new BackendPublicationJournalError(
-      "permit-mismatch",
-      "backend publication lock token is not active",
+      "unsafe-storage",
+      "hook publication evidence requires the canonical LCM config path",
     );
   }
-  assertPublicationState();
+  return homeDir;
+}
+
+/**
+ * Authenticate the selected terminal state while the coordinator lock token
+ * is live. Passing null is intentional: it records an observed absent file;
+ * undefined would omit the exact-content check altogether.
+ */
+function assertHookPublicationEvidence(lockToken: HookPublicationLockToken): void {
+  const root = lcmHomeDir();
+  const configPath = defaultConfigPath();
+  const homeDir = hookPublicationHome();
+  const configContent = readObservedFile(configPath, root);
+  const projectMapPath = join(root, "map.json");
+  const projectMapContent = readObservedFile(projectMapPath, root);
+
+  assertBackendPublicationConsumerAccess({ homeDir, lockToken });
+  assertBackendPublicationConfigAccess(
+    configPath,
+    configBackend(configContent),
+    configContent,
+    undefined,
+    lockToken,
+  );
+  assertBackendPublicationProjectMapAccess({
+    homeDir,
+    content: projectMapContent,
+    map: projectMapValue(projectMapContent),
+    present: projectMapContent !== null,
+    lockToken,
+  });
+}
+
+function assertEstablishedLcmRoot(): void {
+  // Bootstrap/install owns root creation. Hook admission is read-only and must
+  // fail before any lock or child directory can be created.
+  const root = openPrivateDirectory(lcmHomeDir());
+  root.close();
 }
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
@@ -98,9 +160,9 @@ export function assertHookRootEstablished(): void {
 }
 
 /**
- * Fence one direct synchronous hook action. The callback must consume the
- * token at its direct action boundary; the lock is never retained over a
- * promise or network I/O.
+ * Fence one direct synchronous hook action with the coordinator's consumer
+ * lock. The callback must stay short and consume the live coordinator token
+ * at its direct action boundary; network work must not retain the lock.
  */
 export function withHookPublicationFence<T>(
   callback: (lockToken: HookPublicationLockToken) => T,
@@ -109,30 +171,20 @@ export function withHookPublicationFence<T>(
   const rootHandle = openPrivateDirectory(rootPath);
   const rootWitness = rootHandle.witness;
   try {
-    return withPrivateMutationLock(
-      publicationLockPath(),
-      "backend publication consumer",
-      () => {
-        assertStableRoot(rootHandle, rootPath, rootWitness);
-        assertPublicationState();
-        const token = newToken();
-        try {
-          const result = callback(token);
-          if (isThenable(result)) {
-            revokeToken(token);
-            throw new BackendPublicationJournalError(
-              "unsafe-storage",
-              "synchronous hook publication callback returned a promise",
-            );
-          }
-          assertStableRoot(rootHandle, rootPath, rootWitness);
-          assertPublicationState();
-          return result;
-        } finally {
-          revokeToken(token);
-        }
-      },
-    );
+    return withBackendPublicationConsumerLock(hookPublicationHome(), (lockToken) => {
+      assertStableRoot(rootHandle, rootPath, rootWitness);
+      assertHookPublicationEvidence(lockToken);
+      const result = callback(lockToken);
+      if (isThenable(result)) {
+        throw new BackendPublicationJournalError(
+          "unsafe-storage",
+          "synchronous hook publication callback returned a promise",
+        );
+      }
+      assertStableRoot(rootHandle, rootPath, rootWitness);
+      assertHookPublicationEvidence(lockToken);
+      return result;
+    });
   } finally {
     try {
       assertStableRoot(rootHandle, rootPath, rootWitness);
@@ -142,7 +194,7 @@ export function withHookPublicationFence<T>(
   }
 }
 
-/** Async counterpart for hook boundaries that must retain admission across local async work. */
+/** Async counterpart for short local hook actions that need a live token. */
 export async function withHookPublicationFenceAsync<T>(
   callback: (lockToken: HookPublicationLockToken) => Promise<T> | T,
 ): Promise<T> {
@@ -150,21 +202,15 @@ export async function withHookPublicationFenceAsync<T>(
   const rootHandle = openPrivateDirectory(rootPath);
   const rootWitness = rootHandle.witness;
   try {
-    return await withPrivateMutationLockAsync(
-      publicationLockPath(),
-      "backend publication consumer",
-      async () => {
+    return await withBackendPublicationConsumerLockAsync(
+      hookPublicationHome(),
+      async (lockToken) => {
         assertStableRoot(rootHandle, rootPath, rootWitness);
-        assertPublicationState();
-        const token = newToken();
-        try {
-          const result = await callback(token);
-          assertStableRoot(rootHandle, rootPath, rootWitness);
-          assertPublicationState();
-          return result;
-        } finally {
-          revokeToken(token);
-        }
+        assertHookPublicationEvidence(lockToken);
+        const result = await callback(lockToken);
+        assertStableRoot(rootHandle, rootPath, rootWitness);
+        assertHookPublicationEvidence(lockToken);
+        return result;
       },
     );
   } finally {
@@ -178,12 +224,12 @@ export async function withHookPublicationFenceAsync<T>(
 
 /** Consume a short admission check without retaining the lock over I/O. */
 export function assertHookPublicationFence(): void {
-  withHookPublicationFence((lockToken) => assertActiveToken(lockToken));
+  withHookPublicationFence((lockToken) => assertHookPublicationFenceToken(lockToken));
 }
 
 /** Validate a token at a direct action seam such as an unreffed HTTP request. */
 export function assertHookPublicationFenceToken(lockToken: HookPublicationLockToken): void {
-  assertActiveToken(lockToken);
+  assertHookPublicationEvidence(lockToken);
 }
 
 /** Publication errors are control-flow failures and must not be downgraded. */
@@ -191,6 +237,10 @@ export function isBackendPublicationJournalError(
   error: unknown,
 ): error is BackendPublicationJournalError {
   return error instanceof BackendPublicationJournalError;
+}
+
+export function isBackendPublicationEvidenceMissing(error: unknown): boolean {
+  return isBackendPublicationJournalError(error) && error.reason === "publication-evidence-missing";
 }
 
 export function rethrowBackendPublicationJournalError(error: unknown): void {

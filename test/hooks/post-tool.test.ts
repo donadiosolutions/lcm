@@ -12,6 +12,7 @@ import * as localEnqueue from "../../src/hooks/local-enqueue.js";
 import * as projectModule from "../../src/daemon/project.js";
 import * as hookErrors from "../../src/hooks/hook-errors.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import * as backendPublication from "../../src/storage/backend-publication.js";
 
 // Mock eventsDbPath to use temp directory
 vi.mock("../../src/db/events-path.js", () => ({
@@ -101,6 +102,42 @@ describe("handlePostToolUse", () => {
       expect(append).toHaveBeenCalledWith(expect.objectContaining({ cwd: inputCwd }));
     } finally {
       append.mockRestore();
+      ensure.mockRestore();
+    }
+  });
+
+  it("fences PostTool project metadata with the coordinator consumer lock after enqueue", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-fenced-project-cwd-"));
+    extraDirs.push(inputCwd);
+    const event = { type: "decision", category: "decision", data: "Use SQLite?", priority: 1 } as const;
+    const order: string[] = [];
+    const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents").mockResolvedValue([event]);
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockImplementation(async () => {
+      order.push("enqueue");
+      return { inserted: 1, pendingCount: 1 };
+    });
+    const consumerLock = vi.spyOn(backendPublication, "withBackendPublicationConsumerLock");
+    const ensure = vi.spyOn(projectModule, "ensureProjectDir").mockImplementation(() => {
+      order.push("project");
+      return inputCwd;
+    });
+
+    try {
+      await expect(handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Use SQLite?" },
+        tool_response: "yes",
+      }))).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(order).toEqual(["enqueue", "project"]);
+      expect(consumerLock).toHaveBeenCalled();
+      expect(append.mock.invocationCallOrder[0]).toBeLessThan(consumerLock.mock.invocationCallOrder[0]!);
+      expect(consumerLock.mock.invocationCallOrder[0]).toBeLessThan(ensure.mock.invocationCallOrder[0]!);
+    } finally {
+      scrub.mockRestore();
+      append.mockRestore();
+      consumerLock.mockRestore();
       ensure.mockRestore();
     }
   });
@@ -239,7 +276,7 @@ describe("handlePostToolUse", () => {
     writeFileSync(join(configDir, "config.json"), JSON.stringify({
       storage: { backend: "postgresql" },
       security: { sensitivePatterns: ["SQLite"] },
-    }));
+    }), { mode: 0o600 });
 
     await handlePostToolUse(JSON.stringify({
       session_id: "test-session",
