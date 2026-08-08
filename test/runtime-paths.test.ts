@@ -9,6 +9,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -544,8 +545,10 @@ describe("runtime paths", () => {
       target: treeWitness(replacedActive),
       retained: replacedWitness,
     });
-    rmSync(replacedRetained, { recursive: true });
+    renameSync(replacedRetained, `${replacedRetained}.replaced`);
     mkdirSync(replacedRetained, { mode: 0o700 });
+    const replacementWitness = treeWitness(replacedRetained);
+    expect(replacementWitness.identity).not.toEqual(replacedWitness.identity);
     expect(() => migrateLegacyHomeIfNeeded(replacedHome)).toThrow("retaining root changed");
   });
 
