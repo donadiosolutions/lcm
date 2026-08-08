@@ -40,6 +40,7 @@ import {
   setRemoteProjectBinding,
   showProjectMapEntry,
 } from "../src/project-map.js";
+import * as projectMapModule from "../src/project-map.js";
 import { clearGitProjectAnchorCache, resolveGitProjectAnchor } from "../src/git-project.js";
 import { clearWorktreeReconciliationCache } from "../src/worktree-reconciliation.js";
 import {
@@ -942,6 +943,7 @@ describe("identity service", () => {
   });
 
   it("lists local projects offline and enriches PostgreSQL listings", async () => {
+    const listMap = vi.spyOn(projectMapModule, "listProjectMapEntries");
     const path = makeProject("list");
     const secondPath = makeProject("list-second");
     resolveProjectIdentity(path);
@@ -958,11 +960,36 @@ describe("identity service", () => {
         },
       ]),
     });
+    expect(listMap).toHaveBeenCalledWith(home);
     expect(deps.openSession).not.toHaveBeenCalled();
 
     repository.listProjects = vi.fn(async () => [remoteProject(PROJECT_A)]);
     const listed = await listProjects(POSTGRESQL_CONFIG, deps);
     expect(listed.remote).toEqual([expect.objectContaining({ projectId: PROJECT_A })]);
+  });
+
+  it("refuses local project reads before publication admission", async () => {
+    const listMap = vi.spyOn(projectMapModule, "listProjectMapEntries");
+    const showMap = vi.spyOn(projectMapModule, "showProjectMapEntry");
+    const assertPublication = vi.fn(() => {
+      throw new BackendPublicationJournalError("unresolved-publication", "publication remains unresolved");
+    });
+    const refusedDeps = { ...deps, _assertBackendPublication: assertPublication };
+
+    await expect(listProjects(SQLITE_CONFIG, refusedDeps)).rejects.toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "unresolved-publication",
+    });
+    await expect(showProject(SQLITE_CONFIG, undefined, refusedDeps)).rejects.toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "unresolved-publication",
+    });
+
+    expect(listMap).not.toHaveBeenCalled();
+    expect(showMap).not.toHaveBeenCalled();
+    expect(deps.openSession).not.toHaveBeenCalled();
+    listMap.mockRestore();
+    showMap.mockRestore();
   });
 
   it("shows local projects offline and validates remote bindings online", async () => {

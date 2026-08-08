@@ -630,9 +630,10 @@ export async function listProjects(
   config: ResolvedStorageConfig,
   dependencyOverrides?: Partial<IdentityServiceDependencies>,
 ): Promise<ProjectListing> {
-  const local = localProjectListing(listProjectMapEntries());
-  if (config.backend === "sqlite") return { local };
   const deps = dependencies(dependencyOverrides);
+  assertIdentityPublication(config, deps);
+  const local = localProjectListing(listProjectMapEntries(deps.homeDir));
+  if (config.backend === "sqlite") return { local };
   const remote = await withSession(config, deps, (repository) => repository.listProjects());
   return { local, remote };
 }
@@ -647,9 +648,10 @@ export async function showProject(
   readonly transient?: boolean;
   readonly remote?: RemoteProject;
 }> {
+  const deps = dependencies(dependencyOverrides);
+  assertIdentityPublication(config, deps);
   const shown = showProjectMapEntry(target);
   if (config.backend === "sqlite" || !shown.entry.remoteProjectId) return shown;
-  const deps = dependencies(dependencyOverrides);
   const remote = await withSession(
     config,
     deps,

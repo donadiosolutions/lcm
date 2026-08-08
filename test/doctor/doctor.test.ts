@@ -12,6 +12,7 @@ import {
   hashProjectPath,
   normalizeProjectPath,
 } from "../../src/project-map.js";
+import * as projectMapModule from "../../src/project-map.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
@@ -30,6 +31,8 @@ const mockCollectDetailedEventStats = vi.mocked(collectDetailedEventStats);
 beforeEach(() => {
   vi.mocked(ensureDaemon).mockReset();
   vi.mocked(ensureDaemon).mockResolvedValue({ connected: false });
+  mockCollectEventStats.mockClear();
+  mockCollectDetailedEventStats.mockClear();
   mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null });
   mockCollectDetailedEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null, projects: [], recentErrors: [] });
 });
@@ -211,6 +214,53 @@ describe("runDoctor project map checks", () => {
       expect(results.find((result) => result.name === "project-map")?.status).toBe("skip");
     } finally {
       rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["malformed config", "{"],
+    ["oversized config", "x".repeat(4 * 1024 * 1024 + 1)],
+  ] as const)("authenticates publication and blocks repair for %s", async (_label, content) => {
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
+    const assertPublication = vi.fn(() => {
+      throw new BackendPublicationJournalError("unresolved-publication", "publication remains unresolved");
+    });
+    const base = minimalDeps();
+    try {
+      const results = await runDoctor({
+        ...base,
+        readFileSync: (path: string) => path.endsWith("config.json") ? content : base.readFileSync(path),
+        _assertBackendPublication: assertPublication,
+      });
+      expect(assertPublication).toHaveBeenCalledOnce();
+      expect(validateProjectMap).not.toHaveBeenCalled();
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({ status: "fail" });
+      expect(results.find((result) => result.name === "project-map")).toMatchObject({ status: "skip" });
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "skip" });
+      expect(base.writeFileSync).not.toHaveBeenCalled();
+      expect(base.mkdirSync).not.toHaveBeenCalled();
+      expect(ensureDaemon).not.toHaveBeenCalled();
+    } finally {
+      validateProjectMap.mockRestore();
+    }
+  });
+
+  it("blocks passive-learning collection and pruning on terminal publication witness mismatch", async () => {
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
+    const assertPublication = vi.fn(() => {
+      throw new BackendPublicationJournalError("unexpected-state", "terminal publication witness mismatch");
+    });
+    try {
+      const results = await runDoctor(minimalDeps({ _assertBackendPublication: assertPublication }));
+      expect(validateProjectMap).not.toHaveBeenCalled();
+      expect(mockCollectEventStats).not.toHaveBeenCalled();
+      expect(mockCollectDetailedEventStats).not.toHaveBeenCalled();
+      expect(results.find((result) => result.name === "events-capture")).toMatchObject({
+        status: "skip",
+        message: expect.stringContaining("publication admission"),
+      });
+    } finally {
+      validateProjectMap.mockRestore();
     }
   });
 

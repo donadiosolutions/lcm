@@ -10,6 +10,12 @@ vi.mock("../../src/daemon/lifecycle.js", () => ({
 
 const LCM_BLOCK = "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
 const BINARY = join(process.cwd(), "dist", "lcm.mjs");
+let homeCounter = 0;
+
+function doctorHome(): string {
+  homeCounter += 1;
+  return `/tmp/lcm-doctor-hooks-${process.pid}-${homeCounter}`;
+}
 
 function baseReadFileSync(p: string, settings: string) {
   if (p.endsWith("config.json")) return JSON.stringify({ llm: { provider: "claude-process" } });
@@ -23,6 +29,7 @@ describe("doctor hook validation", () => {
   it("repairs hooks when they are absent from settings.json", async () => {
     const settings = JSON.stringify({ mcpServers: { "lcm": {} } });
     const writeFileSync = vi.fn();
+    const home = doctorHome();
     const results = await runDoctor({
       existsSync: () => true,
       readFileSync: (p: string) => baseReadFileSync(p, settings),
@@ -30,13 +37,13 @@ describe("doctor hook validation", () => {
       mkdirSync: vi.fn(),
       spawnSync: () => ({ status: 0, stdout: "/usr/local/bin/lcm\n", stderr: "" }),
       fetch: vi.fn().mockResolvedValue({ ok: false }),
-      homedir: "/tmp/test-home",
+      homedir: home,
       platform: "darwin",
     });
     const hookResult = results.find(r => r.name === "hooks");
     expect(hookResult).toMatchObject({ status: "warn", fixApplied: true });
     const settingsWrite = writeFileSync.mock.calls.find(([path]) =>
-      path === "/tmp/test-home/.claude/settings.json"
+      path === `${home}/.claude/settings.json`
     );
     const written = JSON.parse(settingsWrite![1]);
     expect(Object.keys(written.hooks)).toEqual(REQUIRED_HOOKS.map(({ event }) => event));
@@ -47,6 +54,7 @@ describe("doctor hook validation", () => {
       ...mergeClaudeSettings({}, BINARY),
       mcpServers: { lcm: { type: "stdio", command: process.execPath, args: [BINARY, "mcp"] } },
     });
+    const home = doctorHome();
     const results = await runDoctor({
       existsSync: () => true,
       readFileSync: (p: string) => baseReadFileSync(p, settings),
@@ -54,7 +62,7 @@ describe("doctor hook validation", () => {
       mkdirSync: vi.fn(),
       spawnSync: () => ({ status: 0, stdout: "/usr/local/bin/lcm\n", stderr: "" }),
       fetch: vi.fn().mockResolvedValue({ ok: false }),
-      homedir: "/tmp/test-home",
+      homedir: home,
       platform: "darwin",
     });
     const mcpResult = results.find(r => r.name === "mcp-lcm");
@@ -65,6 +73,7 @@ describe("doctor hook validation", () => {
   it("re-adds mcpServers.lcm when missing from settings.json", async () => {
     const settings = JSON.stringify({ ...mergeClaudeSettings({}, BINARY), theme: "dark", mcpServers: {} });
     const writtenFiles = new Map<string, string>();
+    const home = doctorHome();
     const results = await runDoctor({
       existsSync: () => true,
       readFileSync: (p: string) => baseReadFileSync(p, settings),
@@ -72,14 +81,14 @@ describe("doctor hook validation", () => {
       mkdirSync: vi.fn(),
       spawnSync: () => ({ status: 0, stdout: "/usr/local/bin/lcm\n", stderr: "" }),
       fetch: vi.fn().mockResolvedValue({ ok: false }),
-      homedir: "/tmp/test-home",
+      homedir: home,
       platform: "darwin",
     });
     const mcpResult = results.find(r => r.name === "mcp-lcm");
     expect(mcpResult?.status).toBe("warn");
     expect(mcpResult?.message).toContain("missing or stale");
     // doctor should have written the entry back to settings.json
-    const settingsWritten = writtenFiles.get("/tmp/test-home/.claude/settings.json");
+    const settingsWritten = writtenFiles.get(`${home}/.claude/settings.json`);
     expect(settingsWritten).toBeDefined();
     const written = JSON.parse(settingsWritten!);
     expect(written.mcpServers?.lcm).toBeDefined();
@@ -93,6 +102,7 @@ describe("doctor hook validation", () => {
       mcpServers: { unrelated: { command: "other" } },
     });
     const writeFileSync = vi.fn();
+    const home = doctorHome();
     const results = await runDoctor({
       existsSync: () => true,
       readFileSync: (p: string) => baseReadFileSync(p, settings),
@@ -100,7 +110,7 @@ describe("doctor hook validation", () => {
       mkdirSync: vi.fn(),
       spawnSync: () => ({ status: 0, stdout: "/usr/local/bin/lcm\n", stderr: "" }),
       fetch: vi.fn().mockResolvedValue({ ok: false }),
-      homedir: "/tmp/test-home",
+      homedir: home,
       platform: "darwin",
     });
 
@@ -116,6 +126,7 @@ describe("doctor hook validation", () => {
       ...mergeClaudeSettings({}, BINARY),
       mcpServers: { lcm: { command: "/old/lcm", args: ["mcp"] } },
     });
+    const home = doctorHome();
     const results = await runDoctor({
       existsSync: () => true,
       readFileSync: (p: string) => baseReadFileSync(p, settings),
@@ -123,7 +134,7 @@ describe("doctor hook validation", () => {
       mkdirSync: vi.fn(),
       spawnSync: () => ({ status: 0, stdout: "/usr/local/bin/lcm\n", stderr: "" }),
       fetch: vi.fn().mockResolvedValue({ ok: false }),
-      homedir: "/tmp/test-home",
+      homedir: home,
       platform: "darwin",
     });
     expect(results.find(r => r.name === "hooks")?.status).toBe("pass");
@@ -131,6 +142,7 @@ describe("doctor hook validation", () => {
   });
 
   it("stringifies a non-Error Claude settings read failure", async () => {
+    const home = doctorHome();
     const results = await runDoctor({
       existsSync: () => true,
       readFileSync: (p: string) => {
@@ -141,7 +153,7 @@ describe("doctor hook validation", () => {
       mkdirSync: vi.fn(),
       spawnSync: () => ({ status: 0, stdout: "/usr/local/bin/lcm\n", stderr: "" }),
       fetch: vi.fn().mockResolvedValue({ ok: false }),
-      homedir: "/tmp/test-home",
+      homedir: home,
       platform: "darwin",
     });
     expect(results.find(r => r.name === "hooks")?.message).toContain("plain settings failure");
@@ -152,6 +164,7 @@ describe("doctor hook validation", () => {
     "fails closed for a non-object settings root: %s",
     async (settings) => {
       const writtenFiles = new Map<string, string>();
+      const home = doctorHome();
       const results = await runDoctor({
         existsSync: () => true,
         readFileSync: (p: string) => baseReadFileSync(p, settings),
@@ -159,13 +172,13 @@ describe("doctor hook validation", () => {
         mkdirSync: vi.fn(),
         spawnSync: () => ({ status: 0, stdout: "/usr/local/bin/lcm\n", stderr: "" }),
         fetch: vi.fn().mockResolvedValue({ ok: false }),
-        homedir: "/tmp/test-home",
+        homedir: home,
         platform: "darwin",
       });
 
       expect(results.find(r => r.name === "hooks")?.status).toBe("fail");
       expect(results.find(r => r.name === "mcp-lcm")?.status).toBe("fail");
-      expect(writtenFiles.has("/tmp/test-home/.claude/settings.json")).toBe(false);
+      expect(writtenFiles.has(`${home}/.claude/settings.json`)).toBe(false);
     },
   );
 });

@@ -38,6 +38,7 @@ const mocks = vi.hoisted(() => ({
   configFails: false,
   eventsFail: false,
   publicationBlocked: false,
+  storageUnavailable: false,
   entries: [] as Array<{ name: string; directory: boolean; dbExists: boolean }>,
   close: vi.fn<(project: string) => void>(),
   migrate: vi.fn<(db: FakeDatabaseState) => void>(),
@@ -96,6 +97,9 @@ vi.mock("../src/storage/backend.js", async importOriginal => {
       if (mocks.publicationBlocked) {
         throw new BackendPublicationJournalError("unresolved-publication", "publication blocked");
       }
+      if (mocks.storageUnavailable) {
+        throw new actual.StorageBackendUnavailableError("postgresql");
+      }
       return { backend: "sqlite" };
     }),
   };
@@ -139,6 +143,7 @@ vi.mock("node:sqlite", () => ({
 }));
 
 import { collectStats, formatNumber, formatRatio, printStats } from "../src/stats.js";
+import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 
 type Stats = Parameters<typeof printStats>[0];
 
@@ -158,6 +163,7 @@ describe("stats service coverage", () => {
     mocks.configFails = false;
     mocks.eventsFail = false;
     mocks.publicationBlocked = false;
+    mocks.storageUnavailable = false;
     mocks.entries = [];
     projects.clear();
     mocks.getRecallStats.mockReturnValue({ memoriesSurfaced: 0, memoriesActedUpon: 0, recallPrecision: null, topRecalled: [] });
@@ -182,6 +188,21 @@ describe("stats service coverage", () => {
       reason: "unresolved-publication",
     });
     expect(mocks.collectEvents).not.toHaveBeenCalled();
+  });
+
+  it("rethrows unavailable PostgreSQL selection before an empty aggregate", async () => {
+    mocks.storageUnavailable = true;
+    mocks.baseExists = false;
+    await expect(collectStats()).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+    expect(mocks.collectEvents).not.toHaveBeenCalled();
+  });
+
+  it("rethrows unavailable PostgreSQL selection before populated project reads", async () => {
+    mocks.storageUnavailable = true;
+    mocks.entries = [{ name: "alpha", directory: true, dbExists: true }];
+    await expect(collectStats()).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+    expect(mocks.collectEvents).not.toHaveBeenCalled();
+    expect(mocks.migrate).not.toHaveBeenCalled();
   });
 
   it("aggregates valid projects while skipping directories, missing databases, empty projects, and corrupt databases", async () => {
@@ -282,6 +303,7 @@ describe("stats service coverage", () => {
       staleCount: 0, conversationDetails: [],
     }, true);
     expect(log.mock.calls.flat().join("\n")).not.toContain("Compression");
+    printStats(base, false);
     log.mockRestore();
   });
 });

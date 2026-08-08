@@ -9,7 +9,7 @@ import { PromotedStore } from "./db/promoted.js";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 import { sanitizeTerminalText } from "./terminal-sanitize.js";
-import { selectStorageBackendForConfig } from "./storage/backend.js";
+import { selectStorageBackendForConfig, StorageBackendUnavailableError } from "./storage/backend.js";
 import { BackendPublicationJournalError } from "./storage/backend-publication.js";
 
 export type { RecallStats };
@@ -352,7 +352,7 @@ export async function collectStats(): Promise<OverallStats> {
     const config = loadDaemonConfig(configFile);
     selectStorageBackendForConfig(configFile, config.storage);
   } catch (error) {
-    if (error instanceof BackendPublicationJournalError) throw error;
+    if (error instanceof BackendPublicationJournalError || error instanceof StorageBackendUnavailableError) throw error;
     // Preserve the existing fallback for malformed configuration diagnostics.
   }
 

@@ -22,4 +22,6 @@ export interface DoctorDeps {
   _testMcpHandshake?: () => Promise<CheckResult>;
   /** Internal seam for testing backend-publication admission independently. */
   _assertBackendPublication?: (homeDir: string, backend: "sqlite" | "postgresql") => void;
+  /** Internal bounded config-read seam used by deterministic doctor tests. */
+  _readBoundedConfig?: (path: string, maxBytes: number) => string;
 }
