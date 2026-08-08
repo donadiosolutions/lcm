@@ -162,7 +162,8 @@ material reference is authenticated before that sequence advances; the
 missing-material `preparing -> aborted` shortcut performs no cleanup.
 
 `resume()` and default `recoverPending()` advance through the forward groups.
-If the journal is in `aborting`, `config-restoring`, or `map-restoring`, resume
+If the journal is in `aborting`, `config-restoring`, `map-restoring`, or
+`abort-releasing`, resume
 delegates to the abort state machine instead. `recoverPending({ disposition:
 "abort" })` selects that abort grouping explicitly. Terminal `completed` and
 `aborted` journals are returned as-is. Once remote release starts, recovery
