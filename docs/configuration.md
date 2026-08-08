@@ -228,14 +228,19 @@ project identity operations are enabled by #84. The conversation adapter from
 The native-transcript adapter from #86 is available to explicit programmatic
 backfill and conformance; it does not add a daemon route or CLI command. Normal
 transcript activation remains #224, and the remaining storage/domain
-repositories stay staged until the #92 cutover. A valid `postgresql` selection
-therefore starts the managed daemon, but other
-storage-backed routes remain unavailable and return a sanitized `503` until
-those repositories are activated. Managed start/restart recognizes that authenticated staged response
-as daemon readiness; it does not treat PostgreSQL storage as ready and never
-falls back to SQLite after an explicit PostgreSQL selection. The internal readiness contract also requires
+repositories stay staged until the #92 cutover; neither issue is implemented.
+PostgreSQL selection remains unavailable to normal production configuration,
+the daemon, and the CLI. SQLite is the only selectable production backend.
+Staged programmatic callers may exercise the PostgreSQL runtime and adapters,
+but those callers do not activate normal storage routes. The staged readiness
+contract keeps storage unavailable and returns sanitized `503` responses for
+storage-backed routes; it never falls back to SQLite after an explicit future
+selection. The internal readiness contract also requires
 the parity extensions at their current default versions in the `public` schema;
 see the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md#required-extensions-and-postgresql-version).
+The separate [backend publication safety guide](backend-publication.md)
+describes the secure `~/.lcm` root, publication journal, PostgreSQL admission
+fence, and the `503`/doctor behavior when publication evidence is unresolved.
 
 The installed no-override PreCompact command (`lcm compact --hook`) is a
 best-effort exception to that fail-closed admission path. Before dispatch, its
@@ -255,7 +260,10 @@ restart may retain the authenticated staged process described above, but its
 storage routes remain fail-closed. The hook behavior therefore does not provide
 SQLite fallback or make the PostgreSQL repository backend available.
 
-Store only non-secret pool and timeout settings in `~/.lcm/config.json`:
+The following is the reserved PostgreSQL configuration shape for direct
+development and conformance only; it is not an instruction to activate
+PostgreSQL in a production installation. Store only non-secret pool and
+timeout settings in `~/.lcm/config.json`:
 
 ```json
 {
@@ -285,15 +293,21 @@ configuration commands:
 ```bash
 export LCM_POSTGRES_URL='postgresql://USER:PASSWORD@HOST:25060/DATABASE'
 export LCM_POSTGRES_CA_FILE='/absolute/path/to/ca-certificate.crt'
+# Used only by a staged development/conformance caller; this does not activate
+# normal PostgreSQL daemon or CLI routes.
 lcm daemon restart
 ```
 
 ### Provisioning a PostgreSQL database
 
-Provisioning is an explicit administrator workflow. First create a UTF-8
-PostgreSQL 18 database, preload `pg_stat_statements`, install the required
-extensions in `public`, and configure `storage.backend` as shown above. Use a
-dedicated migration role that owns the database and any existing `lcm` schema;
+Provisioning is an explicit administrator workflow for staged development,
+direct programmatic repositories, and conformance. It does not make
+PostgreSQL selection available or activate normal daemon/CLI routing. First
+create a UTF-8 PostgreSQL 18 database, preload `pg_stat_statements`, install
+the required extensions in `public`, and configure `storage.backend` as shown
+above only for that staged workflow. Keep production installations on SQLite
+until #92 and #224 are implemented. Use a dedicated migration role that owns
+the database and any existing `lcm` schema;
 do not use the restricted runtime role for DDL. Then apply the migrations
 packaged with the installed LCM version:
 
@@ -365,10 +379,12 @@ the staged programmatic primitives described in
 [PostgreSQL cross-machine coordination](../src/storage/postgresql/reference/postgresql-coordination.md); it does
 not enable the application backend or start a worker.
 
-Finally restore `LCM_POSTGRES_URL` to the restricted runtime-role URL, run
-`lcm machine register`, pair projects explicitly, and restart the daemon.
-Never leave the daemon or identity commands configured with migration-owner
-credentials. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for
+Finally, for a staged direct or conformance workflow, restore
+`LCM_POSTGRES_URL` to the restricted runtime-role URL, run `lcm machine
+register`, and pair projects explicitly. Do not treat a daemon restart as
+PostgreSQL activation: #92 and #224 are not implemented, and normal
+PostgreSQL selection remains unavailable. Never leave identity commands
+configured with migration-owner credentials. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for
 the exact extension, role, ownership, ACL, backup, and recovery contracts.
 
 The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,
