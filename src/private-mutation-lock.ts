@@ -554,3 +554,83 @@ export async function withPrivateMutationLockAsync<T>(
     );
   }
 }
+
+/** Raised when an asynchronous callback tries to use a revoked authority. */
+export class PrivateMutationPermitRevokedError extends Error {
+  constructor(readonly label: string) {
+    super(`${label} mutation permit is no longer active`);
+    this.name = "PrivateMutationPermitRevokedError";
+  }
+}
+
+/**
+ * An explicit, non-inheritable authority for one asynchronous mutation.
+ *
+ * The permit is deliberately an object passed to callbacks instead of an
+ * AsyncLocalStorage value.  A callback retained by a child promise therefore
+ * observes revocation rather than inheriting a stale path-based authority.
+ */
+export class PrivateMutationPermit {
+  readonly #label: string;
+  #active = true;
+
+  constructor(label: string) {
+    if (label.length === 0) throw new Error("mutation permit label is required");
+    this.#label = label;
+  }
+
+  get active(): boolean {
+    return this.#active;
+  }
+
+  assertActive(): void {
+    if (!this.#active) throw new PrivateMutationPermitRevokedError(this.#label);
+  }
+
+  revoke(): void {
+    this.#active = false;
+  }
+}
+
+/** Run a callback with a unique explicit permit and revoke it on return. */
+export async function withRevocablePrivateMutationPermit<T>(
+  label: string,
+  callback: (permit: PrivateMutationPermit) => T | Promise<T>,
+): Promise<T> {
+  const permit = new PrivateMutationPermit(label);
+  try {
+    permit.assertActive();
+    return await callback(permit);
+  } finally {
+    permit.revoke();
+  }
+}
+
+/**
+ * Acquire multiple private mutation locks in canonical lexical order.
+ * Duplicate paths are collapsed so callers cannot deadlock themselves by
+ * declaring the same resource through two project aliases.
+ */
+export async function withPrivateMutationLocksAsync<T>(
+  lockPaths: readonly string[],
+  label: string,
+  callback: () => Promise<T> | T,
+  observer: PrivateMutationLockObserver = NOOP_PRIVATE_MUTATION_LOCK_OBSERVER,
+  operations: PrivateMutationLockOperations = DEFAULT_PRIVATE_MUTATION_LOCK_OPERATIONS,
+): Promise<T> {
+  const paths = [...new Set(lockPaths)].sort((left, right) => left.localeCompare(right));
+  let index = 0;
+  const acquireNext = async (): Promise<T> => {
+    const path = paths[index];
+    if (path === undefined) return callback();
+    index += 1;
+    return withPrivateMutationLockAsync(
+      path,
+      `${label} ${path}`,
+      acquireNext,
+      observer,
+      operations,
+    );
+  };
+  return acquireNext();
+}

@@ -13,8 +13,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   PrivateMutationLockContentionError,
+  PrivateMutationPermitRevokedError,
   trustedProcessBirthExecutableForTesting,
   withPrivateMutationLock,
+  withPrivateMutationLocksAsync,
+  withRevocablePrivateMutationPermit,
 } from "../src/private-mutation-lock.js";
 import { deleteRegularFile } from "../src/security-files.js";
 
@@ -33,6 +36,29 @@ function makeLock(): { lockPath: string; strandedPath: string } {
     lockPath: join(root, "mutation.lock"),
     strandedPath: join(root, "stranded.lock"),
   };
+}
+
+function ownerContent(
+  nonce: string,
+  overrides: Partial<{
+    pid: number;
+    processStartTime: string | null;
+    createdAtMs: number;
+  }> = {},
+): string {
+  return `${JSON.stringify({
+    version: 1,
+    pid: process.pid,
+    processStartTime: "0",
+    nonce,
+    createdAtMs: 1,
+    ...overrides,
+  })}\n`;
+}
+
+function currentProcessStartTime(): string {
+  const stat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
+  return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? "";
 }
 
 function strandOwnedLock(
@@ -238,6 +264,334 @@ describe("private mutation lock release recovery", () => {
       nonce: replacement.nonce,
     });
   });
+
+  it("reclaims a stale owner through a descriptor-safe successor claim", () => {
+    const { lockPath } = makeLock();
+    const stale = ownerContent("a".repeat(32));
+    writeFileSync(lockPath, stale, { mode: 0o600 });
+    const events: string[] = [];
+
+    expect(withPrivateMutationLock(
+      lockPath,
+      "stale",
+      () => "reclaimed",
+      (event) => events.push(event),
+    )).toBe("reclaimed");
+    expect(events).toEqual(expect.arrayContaining([
+      "before-claim-mkdir",
+      "after-claim-mkdir",
+      "before-reclaim-owner-publish",
+      "before-claim-removal-read",
+      "before-stale-lock-read",
+      "before-stale-lock-delete",
+      "before-successor-lock-create",
+      "before-claim-release-read",
+      "before-claim-release-delete",
+    ]));
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("reclaims a stale claim after moving its old tombstone aside", () => {
+    const { lockPath } = makeLock();
+    const nonce = "7".repeat(32);
+    writeFileSync(lockPath, ownerContent(nonce), { mode: 0o600 });
+    const claimPath = `${lockPath}.reclaim-${nonce}`;
+    mkdirSync(claimPath);
+    writeFileSync(join(claimPath, "owner.json"), ownerContent("8".repeat(32)), { mode: 0o600 });
+
+    expect(withPrivateMutationLock(lockPath, "stale-claim", () => "reclaimed"))
+      .toBe("reclaimed");
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("rejects malformed and invalid existing lock owners", () => {
+    const malformed = makeLock();
+    writeFileSync(malformed.lockPath, "{", { mode: 0o600 });
+    expect(() => withPrivateMutationLock(malformed.lockPath, "malformed", () => undefined))
+      .toThrow("lock is malformed");
+
+    const invalid = makeLock();
+    writeFileSync(invalid.lockPath, JSON.stringify({ version: 2 }), { mode: 0o600 });
+    expect(() => withPrivateMutationLock(invalid.lockPath, "invalid", () => undefined))
+      .toThrow("lock has an invalid owner");
+  });
+
+  it("fails closed when process birth evidence is unavailable or probing is ambiguous", () => {
+    const unavailable = makeLock();
+    writeFileSync(unavailable.lockPath, ownerContent("b".repeat(32)), { mode: 0o600 });
+    const unavailableObserver = (event: string): void => {
+      if (event === "before-process-stat-read") throw new Error("stat unavailable");
+    };
+    expect(() => withPrivateMutationLock(
+      unavailable.lockPath,
+      "unavailable",
+      () => undefined,
+      unavailableObserver,
+    )).toThrow(/owner state is ambiguous/u);
+
+    const ambiguous = makeLock();
+    writeFileSync(ambiguous.lockPath, ownerContent("c".repeat(32)), { mode: 0o600 });
+    const ambiguousObserver = (event: string): void => {
+      if (event === "before-process-probe") throw new Error("probe unavailable");
+    };
+    expect(() => withPrivateMutationLock(
+      ambiguous.lockPath,
+      "ambiguous",
+      () => undefined,
+      ambiguousObserver,
+    )).toThrow(/owner state is ambiguous/u);
+  });
+
+  it("handles an unreadable reclaim owner and a failed stale-claim rename", () => {
+    const unreadable = makeLock();
+    const unreadableNonce = "9".repeat(32);
+    writeFileSync(unreadable.lockPath, ownerContent(unreadableNonce), { mode: 0o600 });
+    const unreadableClaim = `${unreadable.lockPath}.reclaim-${unreadableNonce}`;
+    mkdirSync(unreadableClaim);
+    mkdirSync(join(unreadableClaim, "owner.json"));
+    expect(() => withPrivateMutationLock(unreadable.lockPath, "unreadable-claim", () => undefined))
+      .toThrow("regular file");
+
+    const renameFailure = makeLock();
+    const renameNonce = "a".repeat(32);
+    writeFileSync(renameFailure.lockPath, ownerContent(renameNonce), { mode: 0o600 });
+    const renameClaim = `${renameFailure.lockPath}.reclaim-${renameNonce}`;
+    mkdirSync(renameClaim);
+    writeFileSync(join(renameClaim, "owner.json"), ownerContent("b".repeat(32)), { mode: 0o600 });
+    expect(() => withPrivateMutationLock(renameFailure.lockPath, "rename-failure", () => undefined, (event) => {
+      if (event === "before-claim-rename") throw new Error("rename unavailable");
+    })).toThrow("changed during stale-owner recovery");
+  });
+
+  it("reclaims an owner whose PID has disappeared", () => {
+    const { lockPath } = makeLock();
+    writeFileSync(lockPath, ownerContent("c".repeat(32), { pid: 999_999_999 }), { mode: 0o600 });
+    expect(withPrivateMutationLock(lockPath, "dead-owner", () => "reclaimed"))
+      .toBe("reclaimed");
+  });
+
+  it("retries an owner read that disappears once and succeeds", () => {
+    const { lockPath } = makeLock();
+    writeFileSync(lockPath, ownerContent("d".repeat(32)), { mode: 0o600 });
+    let disappeared = false;
+
+    expect(withPrivateMutationLock(lockPath, "retry", () => "ok", (event, path) => {
+      if (event === "before-main-lock-owner-read" && !disappeared) {
+        disappeared = true;
+        rmSync(path);
+      }
+    })).toBe("ok");
+    expect(disappeared).toBe(true);
+  });
+
+  it("reports repeated owner disappearance instead of spinning", () => {
+    const { lockPath } = makeLock();
+    writeFileSync(lockPath, ownerContent("e".repeat(32)), { mode: 0o600 });
+    const observer = (event: string, path: string): void => {
+      if (event === "before-main-lock-publish" && !existsSync(path)) {
+        writeFileSync(path, ownerContent("f".repeat(32)), { mode: 0o600 });
+      }
+      if (event === "before-main-lock-owner-read") rmSync(path);
+    };
+
+    expect(() => withPrivateMutationLock(lockPath, "repeat", () => undefined, observer))
+      .toThrow("changed repeatedly");
+  });
+
+  it("handles missing process start fields and the Windows birth-command path", () => {
+    const missingField = makeLock();
+    writeFileSync(missingField.lockPath, ownerContent("d".repeat(32)), { mode: 0o600 });
+    expect(() => withPrivateMutationLock(missingField.lockPath, "missing-start", () => undefined, (event, _path, mutable) => {
+      if (event === "after-process-stat-read" && mutable) mutable.value = ")";
+    })).toThrow(/owner state is ambiguous/u);
+
+    const windows = makeLock();
+    writeFileSync(windows.lockPath, ownerContent("e".repeat(32)), { mode: 0o600 });
+    const previousRoot = process.env.SystemRoot;
+    process.env.SystemRoot = "C:\\Windows";
+    try {
+      expect(() => withPrivateMutationLock(windows.lockPath, "windows", () => undefined, (event, _path, mutable) => {
+        if (event === "platform" && mutable) mutable.value = "win32";
+      })).toThrow(/owner state is ambiguous/u);
+    } finally {
+      if (previousRoot === undefined) delete process.env.SystemRoot;
+      else process.env.SystemRoot = previousRoot;
+    }
+  });
+
+  it("covers release ownership, disappearance, and cleanup failure branches", () => {
+    const mismatch = makeLock();
+    expect(() => withPrivateMutationLock(mismatch.lockPath, "release-mismatch", () => "ok", (event, path) => {
+      if (event === "before-main-lock-release-read") {
+        writeFileSync(path, ownerContent("f".repeat(32)), { mode: 0o600 });
+      }
+    })).toThrow("ownership changed during cleanup");
+
+    const missingAfterSuccess = makeLock();
+    const releaseFailure = new Error("release failed after disappearance");
+    expect(() => withPrivateMutationLock(missingAfterSuccess.lockPath, "release-missing-success", () => "ok", (event, path) => {
+      if (event === "before-main-lock-release-read") {
+        rmSync(path);
+        throw releaseFailure;
+      }
+    })).toThrow(releaseFailure);
+
+    const primary = new Error("callback failed");
+    const missingAfterFailure = makeLock();
+    let thrown: unknown;
+    try {
+      withPrivateMutationLock(missingAfterFailure.lockPath, "release-missing-failure", () => {
+        throw primary;
+      }, (event, path) => {
+        if (event === "before-main-lock-release-read") {
+          rmSync(path);
+          throw releaseFailure;
+        }
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBe(primary);
+
+    const deleteFalse = makeLock();
+    expect(() => withPrivateMutationLock(deleteFalse.lockPath, "release-delete-false", () => "ok", undefined, {
+      deleteRegularFile: () => false,
+    })).toThrow("disappeared before release");
+  });
+});
+
+describe("private mutation lock reclamation boundaries", () => {
+  it("distinguishes a missing, live, and ambiguous reclaim claim", () => {
+    const missing = makeLock();
+    writeFileSync(missing.lockPath, ownerContent("1".repeat(32)), { mode: 0o600 });
+    mkdirSync(`${missing.lockPath}.reclaim-${"1".repeat(32)}`);
+    expect(() => withPrivateMutationLock(missing.lockPath, "missing-claim", () => undefined))
+      .toThrow("changed during acquisition");
+
+    const live = makeLock();
+    writeFileSync(live.lockPath, ownerContent("2".repeat(32)), { mode: 0o600 });
+    const liveClaim = `${live.lockPath}.reclaim-${"2".repeat(32)}`;
+    mkdirSync(liveClaim);
+    writeFileSync(join(liveClaim, "owner.json"), ownerContent("3".repeat(32), {
+      processStartTime: currentProcessStartTime(),
+    }), { mode: 0o600 });
+    expect(() => withPrivateMutationLock(live.lockPath, "live-claim", () => undefined))
+      .toThrow(PrivateMutationLockContentionError);
+    expect(() => withPrivateMutationLock(live.lockPath, "live-claim", () => undefined))
+      .toThrow(/owned by live PID/u);
+
+    const ambiguous = makeLock();
+    writeFileSync(ambiguous.lockPath, ownerContent("4".repeat(32)), { mode: 0o600 });
+    const ambiguousClaim = `${ambiguous.lockPath}.reclaim-${"4".repeat(32)}`;
+    mkdirSync(ambiguousClaim);
+    writeFileSync(join(ambiguousClaim, "owner.json"), ownerContent("5".repeat(32), {
+      processStartTime: null,
+    }), { mode: 0o600 });
+    expect(() => withPrivateMutationLock(ambiguous.lockPath, "ambiguous-claim", () => undefined))
+      .toThrow(/owner state is ambiguous/u);
+  });
+
+  it("cleans a partial claim when owner publication fails", () => {
+    const { lockPath } = makeLock();
+    const nonce = "6".repeat(32);
+    writeFileSync(lockPath, ownerContent(nonce), { mode: 0o600 });
+    const observer = (event: string, path: string): void => {
+      if (event === "before-reclaim-owner-publish") {
+        writeFileSync(path, ownerContent("7".repeat(32)), { mode: 0o600 });
+      }
+    };
+
+    expect(() => withPrivateMutationLock(lockPath, "claim-owner", () => undefined, observer))
+      .toThrow("claim owner already exists");
+  });
+
+  it("reports claim directory creation failures and removes an empty partial claim", () => {
+    const denied = makeLock();
+    const deniedNonce = "8".repeat(32);
+    writeFileSync(denied.lockPath, ownerContent(deniedNonce), { mode: 0o600 });
+    const error = Object.assign(new Error("claim mkdir denied"), { code: "EACCES" });
+    expect(() => withPrivateMutationLock(denied.lockPath, "claim-mkdir", () => undefined, (event) => {
+      if (event === "before-claim-mkdir") throw error;
+    })).toThrow(error);
+
+    const partial = makeLock();
+    const partialNonce = "9".repeat(32);
+    writeFileSync(partial.lockPath, ownerContent(partialNonce), { mode: 0o600 });
+    const partialClaim = `${partial.lockPath}.reclaim-${partialNonce}`;
+    expect(() => withPrivateMutationLock(partial.lockPath, "claim-partial", () => undefined, (event) => {
+      if (event === "after-claim-mkdir") throw new Error("claim observer failed");
+    })).toThrow("claim observer failed");
+    expect(existsSync(partialClaim)).toBe(false);
+  });
+
+  it("fails closed when a stale claim is renamed concurrently", () => {
+    const { lockPath } = makeLock();
+    const nonce = "a".repeat(32);
+    writeFileSync(lockPath, ownerContent(nonce), { mode: 0o600 });
+    const claimPath = `${lockPath}.reclaim-${nonce}`;
+    mkdirSync(claimPath);
+    writeFileSync(join(claimPath, "owner.json"), ownerContent("b".repeat(32)), { mode: 0o600 });
+    expect(() => withPrivateMutationLock(lockPath, "claim-race", () => undefined, (event, path) => {
+      if (event === "after-claim-rename") {
+        mkdirSync(path);
+        writeFileSync(join(path, "owner.json"), ownerContent("b".repeat(32)), { mode: 0o600 });
+      }
+    })).toThrow("claimed concurrently");
+  });
+
+  it("preserves a successor when reclaim evidence is changed or disappears", () => {
+    const changedClaim = makeLock();
+    const changedNonce = "c".repeat(32);
+    writeFileSync(changedClaim.lockPath, ownerContent(changedNonce), { mode: 0o600 });
+    expect(() => withPrivateMutationLock(changedClaim.lockPath, "claim-changed", () => undefined, (event, path) => {
+      if (event === "before-claim-removal-read") writeFileSync(path, ownerContent("d".repeat(32)), { mode: 0o600 });
+    })).toThrow("reclamation ownership changed before release");
+
+    const changedLock = makeLock();
+    const changedLockNonce = "e".repeat(32);
+    writeFileSync(changedLock.lockPath, ownerContent(changedLockNonce), { mode: 0o600 });
+    expect(() => withPrivateMutationLock(changedLock.lockPath, "lock-changed", () => undefined, (event, path) => {
+      if (event === "before-stale-lock-read") writeFileSync(path, ownerContent("f".repeat(32)), { mode: 0o600 });
+    })).toThrow("changed while checking");
+
+    const disappeared = makeLock();
+    const disappearedNonce = "1".repeat(32);
+    writeFileSync(disappeared.lockPath, ownerContent(disappearedNonce), { mode: 0o600 });
+    expect(() => withPrivateMutationLock(disappeared.lockPath, "lock-disappeared", () => undefined, undefined, {
+      deleteRegularFile(path) {
+        if (path === disappeared.lockPath) return false;
+        return deleteRegularFile(path);
+      },
+    })).toThrow("disappeared during stale-owner recovery");
+  });
+
+  it("suppresses reclaim cleanup failures after publishing an authoritative successor", () => {
+    const mismatch = makeLock();
+    const mismatchNonce = "2".repeat(32);
+    writeFileSync(mismatch.lockPath, ownerContent(mismatchNonce), { mode: 0o600 });
+    expect(withPrivateMutationLock(mismatch.lockPath, "claim-release-mismatch", () => "ok", (event, path) => {
+      if (event === "before-claim-release-read") writeFileSync(path, ownerContent("3".repeat(32)), { mode: 0o600 });
+    })).toBe("ok");
+
+    const deleteFailure = makeLock();
+    const deleteFailureNonce = "4".repeat(32);
+    writeFileSync(deleteFailure.lockPath, ownerContent(deleteFailureNonce), { mode: 0o600 });
+    expect(withPrivateMutationLock(deleteFailure.lockPath, "claim-release-delete", () => "ok", undefined, {
+      deleteRegularFile(path) {
+        if (path.endsWith("owner.json")) return false;
+        return deleteRegularFile(path);
+      },
+    })).toBe("ok");
+  });
+
+  it("reports successor publication races", () => {
+    const { lockPath } = makeLock();
+    const nonce = "5".repeat(32);
+    writeFileSync(lockPath, ownerContent(nonce), { mode: 0o600 });
+    expect(() => withPrivateMutationLock(lockPath, "successor-race", () => undefined, (event, path) => {
+      if (event === "before-successor-lock-create") writeFileSync(path, ownerContent("6".repeat(32)), { mode: 0o600 });
+    })).toThrow("claimed concurrently");
+  });
 });
 
 describe("private mutation lock process-birth helpers", () => {
@@ -347,5 +701,45 @@ describe("private mutation lock process-birth helpers", () => {
       )).toThrowError(/owner state is ambiguous/u);
       return "protected";
     }, observer)).toBe("protected");
+  });
+
+  it("acquires multiple mutation locks in sorted order and collapses duplicates", async () => {
+    const { lockPath } = makeLock();
+    const root = join(lockPath, "..");
+    const first = join(root, "a.lock");
+    const second = join(root, "b.lock");
+    const published: string[] = [];
+    await expect(withPrivateMutationLocksAsync(
+      [second, first, second],
+      "ordered",
+      () => "done",
+      (event, path) => {
+        if (event === "before-main-lock-publish") published.push(path);
+      },
+    )).resolves.toBe("done");
+    expect(published).toEqual([first, second]);
+    await expect(withPrivateMutationLocksAsync([], "empty", () => 42)).resolves.toBe(42);
+  });
+
+  it("revokes explicit permits instead of leaking authority into child work", async () => {
+    let retained: { assertActive: () => void } | undefined;
+    await withRevocablePrivateMutationPermit("ordered", (permit) => {
+      retained = permit;
+      permit.assertActive();
+    });
+    expect(() => retained?.assertActive()).toThrow(PrivateMutationPermitRevokedError);
+  });
+
+  it("requires a permit label and reports its active state", async () => {
+    await expect(withRevocablePrivateMutationPermit("", () => undefined))
+      .rejects.toThrow("label is required");
+    let active = false;
+    let permit: { active: boolean } | undefined;
+    await withRevocablePrivateMutationPermit("active", (current) => {
+      permit = current;
+      active = current.active;
+    });
+    expect(active).toBe(true);
+    expect(permit?.active).toBe(false);
   });
 });
