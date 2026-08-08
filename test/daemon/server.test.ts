@@ -433,7 +433,7 @@ describe("daemon server", () => {
     const hash = hashProjectPath(normalizeProjectPath(project));
     mkdirSync(join(homedir(), ".lcm"), { recursive: true });
     const mapPath = projectMapPath();
-    writeFileSync(mapPath, JSON.stringify({ [hash]: { canonical: project, aliases: [] } }));
+    writeFileSync(mapPath, JSON.stringify({ [hash]: { canonical: project, aliases: [] } }), { mode: 0o600 });
 
     daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0, idleTimeoutMs: 0 } }));
 
@@ -468,7 +468,7 @@ describe("daemon server", () => {
     mkdirSync(join(homedir(), ".lcm"), { recursive: true });
     writeFileSync(projectMapPath(), JSON.stringify({
       [hash]: { canonical: normalizeProjectPath(canonical), aliases: [normalizeProjectPath(alias)] },
-    }, null, 2) + "\n");
+    }, null, 2) + "\n", { mode: 0o600 });
     clearProjectMapCache();
 
     const cwds = projectTranscriptScanCwds(hash, normalizeProjectPath(canonical));
@@ -526,7 +526,7 @@ describe("daemon server", () => {
     writeFileSync(join(homedir(), ".lcm", "projects", hash, "meta.json"), JSON.stringify({ cwd: normalizedCanonical }, null, 2) + "\n");
     writeFileSync(projectMapPath(), JSON.stringify({
       [hash]: { canonical: normalizedCanonical, aliases: [normalizedAlias] },
-    }, null, 2) + "\n");
+    }, null, 2) + "\n", { mode: 0o600 });
     clearProjectMapCache();
 
     const sessionsDir = join(homedir(), ".claude", "projects", claudeProjectDirName(normalizedAlias));
