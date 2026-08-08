@@ -21,8 +21,8 @@ import type { RecallFeedback, RecallStats } from "../../db/recall.js";
 import { StorageOperationError } from "../errors.js";
 import { sessionInstructionsScopeHash } from "../session-instructions.js";
 import type {
-  PostgreSqlOperationContext,
   PostgreSqlQueryExecutor,
+  PostgreSqlTransactionOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
 import {
@@ -43,7 +43,7 @@ type RepositoryDomain =
   | "redaction-admin"
   | "coordination";
 
-type RepositoryContext = PostgreSqlOperationContext & {
+type RepositoryContext = PostgreSqlTransactionOptions & {
   readonly domain: RepositoryDomain;
   readonly projectId: string;
 };
@@ -534,12 +534,7 @@ class RepositoryAccess {
   ): Promise<T> {
     const root = this.rootExecutor();
     return root
-      ? root.transaction(async (transaction) => {
-          await transaction.query({
-            text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-          }, this.context(operation));
-          return callback(transaction);
-        }, this.context(operation))
+      ? root.transaction(callback, this.context(operation))
       : this.scopedSerialized(operation, async (executor) => {
           const isolation = await executor.query<IsolationRow>({
             text: `SELECT pg_catalog.current_setting(

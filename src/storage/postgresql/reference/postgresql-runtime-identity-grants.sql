@@ -9,15 +9,17 @@
 BEGIN;
 
 GRANT USAGE ON SCHEMA lcm TO :"lcm_runtime_role";
+-- Project-scoped operations fail closed while backend publication is unresolved.
+GRANT SELECT ON TABLE lcm.fenced_leases TO :"lcm_runtime_role";
 GRANT SELECT ON TABLE lcm.machines TO :"lcm_runtime_role";
 GRANT INSERT (identity_key, display_name),
       UPDATE (display_name, last_seen_at)
 ON TABLE lcm.machines TO :"lcm_runtime_role";
 
 GRANT SELECT, DELETE ON TABLE lcm.projects TO :"lcm_runtime_role";
--- identity_key is an opaque random 32-byte value generated once per remote
--- project creation. It is not a local path hash and remains immutable.
-GRANT INSERT (identity_key, display_name)
+-- The runtime allocates project_id before the transaction so the complete
+-- project scope can be admitted before any project row is written.
+GRANT INSERT (project_id, identity_key, display_name)
 ON TABLE lcm.projects TO :"lcm_runtime_role";
 
 GRANT SELECT, DELETE ON TABLE lcm.project_aliases TO :"lcm_runtime_role";

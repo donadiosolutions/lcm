@@ -196,7 +196,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
         projects_delete: true,
         projects_insert_identity_key: true,
         projects_insert_display_name: true,
-        projects_insert_project_id: false,
+        projects_insert_project_id: true,
         projects_update_identity_key: false,
         aliases_select: true,
         aliases_insert: false,
@@ -238,8 +238,9 @@ describe("PostgreSQL 18 machine and project identities", () => {
           values: [grantedMachine.machineId],
         },
         {
-          text: `INSERT INTO lcm.projects (project_id, identity_key, display_name)
-                 VALUES ($1, $2, $3)`,
+          text: `INSERT INTO lcm.projects
+                   (project_id, identity_key, display_name, created_at)
+                 VALUES ($1, $2, $3, statement_timestamp())`,
           values: [
             "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9091",
             "e".repeat(64),

@@ -416,11 +416,8 @@ describe("PostgreSQL native transcript repository", () => {
       operation: "ingestBatch",
       projectId,
     });
-    expect(db.query.mock.calls.slice(0, 2).map(([config]) => config.text))
-      .toEqual([
-        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-        expect.stringContaining("INSERT INTO lcm.ingest_checkpoints"),
-      ]);
+    expect(db.query.mock.calls[0]?.[0].text)
+      .toContain("INSERT INTO lcm.ingest_checkpoints");
     for (const [config, options] of db.query.mock.calls) {
       expect(options).toMatchObject({
         domain: "native-transcripts",
@@ -1197,7 +1194,7 @@ describe("PostgreSQL native transcript repository", () => {
     ).rejects.toMatchObject({
       name: "PostgreSqlNativeTranscriptCheckpointConflictError",
     });
-    expect(unexpectedCreation.query).toHaveBeenCalledTimes(2);
+    expect(unexpectedCreation.query).toHaveBeenCalledTimes(1);
   });
 
   it("uses the durable revision to reject a value-equal ABA checkpoint", async () => {
