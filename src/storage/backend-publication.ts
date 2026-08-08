@@ -443,13 +443,30 @@ function logicalWitnessMatches(
   return true;
 }
 
+function contentWitnessMatches(
+  actual: BackendPublicationFileWitness,
+  expected: BackendPublicationFileWitness,
+): boolean {
+  const fields = ["presence", "rawSha256", "semanticSha256", "byteLength", "mode", "uid", "gid", "nlink"] as const;
+  return !fields.some((key) => actual[key] !== expected[key]);
+}
+
+function mutationWitnessMatches(
+  actual: BackendPublicationFileWitness,
+  expected: BackendPublicationFileWitness,
+): boolean {
+  return actual.presence === "present"
+    && expected.presence === "present"
+    && contentWitnessMatches(actual, expected)
+    && !logicalWitnessMatches(actual, expected);
+}
+
 function assertContentWitness(
   actual: BackendPublicationFileWitness,
   expected: BackendPublicationFileWitness,
   field: string,
 ): void {
-  const fields = ["presence", "rawSha256", "semanticSha256", "byteLength", "mode", "uid", "gid", "nlink"] as const;
-  if (fields.some((key) => actual[key] !== expected[key])) {
+  if (!contentWitnessMatches(actual, expected)) {
     return fail("unexpected-state", `${field} content witness does not match`);
   }
 }
@@ -1126,7 +1143,7 @@ function transition(
   phase: BackendPublicationPhase,
   homeDir: string | undefined,
   observer: BackendPublicationObserver,
-  updates: Partial<Pick<BackendPublicationJournal, "publishedConfigSha256" | "publishedProjectMapSha256" | "projects" | "recoveryReference" | "targetState">> = {},
+  updates: Partial<Pick<BackendPublicationJournal, "publishedConfigSha256" | "publishedProjectMapSha256" | "projects" | "recoveryReference" | "sourceState" | "targetState">> = {},
 ): BackendPublicationJournal {
   const next = withChecksum({
     ...journal,
@@ -1390,6 +1407,12 @@ export class BackendPublicationCoordinator {
         targetState: { ...journal.targetState, projectMap: observed.projectMap },
       });
     }
+    if (journal.phase === "map-publishing" && mutationWitnessMatches(observed.projectMap, journal.targetState.projectMap)) {
+      return transition(journal, "map-published", this.#homeDir, this.#observer, {
+        publishedProjectMapSha256: journal.intendedProjectMapSha256,
+        targetState: { ...journal.targetState, projectMap: observed.projectMap },
+      });
+    }
     assertLogicalWitness(observed.projectMap, journal.sourceState.projectMap, "source project map");
     const publishing = journal.phase === "guarded"
       ? transition(journal, "map-publishing", this.#homeDir, this.#observer)
@@ -1412,6 +1435,12 @@ export class BackendPublicationCoordinator {
         targetState: { ...journal.targetState, config: observed.config },
       });
     }
+    if (journal.phase === "config-publishing" && mutationWitnessMatches(observed.config, journal.targetState.config)) {
+      return transition(journal, "config-published", this.#homeDir, this.#observer, {
+        publishedConfigSha256: journal.intendedConfigSha256,
+        targetState: { ...journal.targetState, config: observed.config },
+      });
+    }
     assertLogicalWitness(observed.config, journal.sourceState.config, "source config");
     const publishing = journal.phase === "map-published"
       ? transition(journal, "config-publishing", this.#homeDir, this.#observer)
@@ -1428,6 +1457,11 @@ export class BackendPublicationCoordinator {
   async #restoreConfig(journal: BackendPublicationJournal): Promise<BackendPublicationJournal> {
     const context = await this.#materialContext(journal);
     const observed = await this.#observe(context);
+    if (journal.phase === "config-restoring" && mutationWitnessMatches(observed.config, journal.sourceState.config)) {
+      return transition(journal, "map-restoring", this.#homeDir, this.#observer, {
+        sourceState: { ...journal.sourceState, config: observed.config },
+      });
+    }
     if (!logicalWitnessMatches(observed.config, journal.sourceState.config)) {
       assertLogicalWitness(observed.config, journal.targetState.config, "config before restore");
       const restoring = journal.phase === "aborting"
@@ -1444,6 +1478,11 @@ export class BackendPublicationCoordinator {
   async #restoreMap(journal: BackendPublicationJournal): Promise<BackendPublicationJournal> {
     const context = await this.#materialContext(journal);
     const observed = await this.#observe(context);
+    if (journal.phase === "map-restoring" && mutationWitnessMatches(observed.projectMap, journal.sourceState.projectMap)) {
+      return transition(journal, "abort-releasing", this.#homeDir, this.#observer, {
+        sourceState: { ...journal.sourceState, projectMap: observed.projectMap },
+      });
+    }
     if (!logicalWitnessMatches(observed.projectMap, journal.sourceState.projectMap)) {
       assertLogicalWitness(observed.projectMap, journal.targetState.projectMap, "project map before restore");
       const restoring = journal;

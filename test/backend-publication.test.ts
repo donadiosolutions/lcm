@@ -85,6 +85,7 @@ function projectInput() {
 function makeDriver(input: BackendPublicationRecoveryMaterial): {
   driver: BackendPublicationDriver;
   getState: () => BackendPublicationStateWitness;
+  setState: (state: BackendPublicationStateWitness) => void;
   calls: string[];
 } {
   let state = sourceState(input);
@@ -117,7 +118,7 @@ function makeDriver(input: BackendPublicationRecoveryMaterial): {
       return sourceState(input).projectMap;
     }),
   };
-  return { driver, getState: () => state, calls };
+  return { driver, getState: () => state, setState: (next) => { state = next; }, calls };
 }
 
 function coordinator(
@@ -405,6 +406,186 @@ describe("BackendPublicationCoordinator", () => {
       expect(readBackendPublicationJournal(home)?.phase).toBe(checkpoint);
       expect((await coordinator(home, fake.driver).resume()).phase).toBe("completed");
     }
+  });
+
+  it("adopts an identity-changing map publication after a crash before its witness checkpoint", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    await coordinator(home, fake.driver).prepare(inputFor(input));
+    const originalPublishMap = fake.driver.publishProjectMap;
+    const changedTargetMap = {
+      ...targetState(input).projectMap,
+      dev: "101",
+      ino: "102",
+      parentDev: "103",
+      parentIno: "104",
+    };
+    fake.driver.publishProjectMap = async (mutation) => {
+      await originalPublishMap(mutation);
+      fake.setState({ ...fake.getState(), projectMap: changedTargetMap });
+      throw new Error("crash:after-map-identity");
+    };
+
+    await expect(coordinator(home, fake.driver).resume()).rejects.toThrow("crash:after-map-identity");
+    expect(readBackendPublicationJournal(home)?.phase).toBe("map-publishing");
+
+    fake.driver.publishProjectMap = vi.fn(async () => {
+      throw new Error("replayed map publication");
+    });
+    const completed = await coordinator(home, fake.driver).resume();
+    expect(completed.phase).toBe("completed");
+    expect(completed.targetState.projectMap).toMatchObject({
+      dev: "101",
+      ino: "102",
+      parentDev: "103",
+      parentIno: "104",
+    });
+    expect(fake.calls).toEqual(["publish-map", "publish-config"]);
+  });
+
+  it("adopts an identity-changing config publication after a crash before its witness checkpoint", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    await coordinator(home, fake.driver).prepare(inputFor(input));
+    const originalPublishConfig = fake.driver.publishConfig;
+    const changedTargetConfig = {
+      ...targetState(input).config,
+      dev: "111",
+      ino: "112",
+      parentDev: "113",
+      parentIno: "114",
+    };
+    fake.driver.publishConfig = async (mutation) => {
+      await originalPublishConfig(mutation);
+      fake.setState({ ...fake.getState(), config: changedTargetConfig });
+      throw new Error("crash:after-config-identity");
+    };
+
+    await expect(coordinator(home, fake.driver).resume()).rejects.toThrow("crash:after-config-identity");
+    expect(readBackendPublicationJournal(home)?.phase).toBe("config-publishing");
+
+    fake.driver.publishConfig = vi.fn(async () => {
+      throw new Error("replayed config publication");
+    });
+    const completed = await coordinator(home, fake.driver).resume();
+    expect(completed.phase).toBe("completed");
+    expect(completed.targetState.config).toMatchObject({
+      dev: "111",
+      ino: "112",
+      parentDev: "113",
+      parentIno: "114",
+    });
+    expect(fake.calls).toEqual(["publish-map", "publish-config"]);
+  });
+
+  it("adopts an identity-changing config restoration after a crash before its witness checkpoint", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    await coordinator(home, fake.driver).prepare(inputFor(input));
+    const originalPublishConfig = fake.driver.publishConfig;
+    fake.driver.publishConfig = async (mutation) => {
+      await originalPublishConfig(mutation);
+      throw new Error("crash:after-config");
+    };
+    await expect(coordinator(home, fake.driver).resume()).rejects.toThrow("crash:after-config");
+    expect(readBackendPublicationJournal(home)?.phase).toBe("config-publishing");
+
+    const originalRestoreConfig = fake.driver.restoreConfig;
+    const changedSourceConfig = {
+      ...sourceState(input).config,
+      dev: "201",
+      ino: "202",
+      parentDev: "203",
+      parentIno: "204",
+    };
+    fake.driver.restoreConfig = async (mutation) => {
+      await originalRestoreConfig(mutation);
+      fake.setState({ ...fake.getState(), config: changedSourceConfig });
+      throw new Error("crash:after-config-restore-identity");
+    };
+    await expect(coordinator(home, fake.driver).abort()).rejects.toThrow("crash:after-config-restore-identity");
+    expect(readBackendPublicationJournal(home)?.phase).toBe("config-restoring");
+
+    fake.driver.restoreConfig = vi.fn(async () => {
+      throw new Error("replayed config restoration");
+    });
+    const aborted = await coordinator(home, fake.driver).abort();
+    expect(aborted.phase).toBe("aborted");
+    expect(aborted.sourceState.config).toMatchObject({
+      dev: "201",
+      ino: "202",
+      parentDev: "203",
+      parentIno: "204",
+    });
+    expect(fake.calls).toEqual(["publish-map", "publish-config", "restore-config", "restore-map"]);
+  });
+
+  it("adopts an identity-changing project-map restoration after a crash before its witness checkpoint", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    await coordinator(home, fake.driver).prepare(inputFor(input));
+    const originalPublishConfig = fake.driver.publishConfig;
+    fake.driver.publishConfig = async (mutation) => {
+      await originalPublishConfig(mutation);
+      throw new Error("crash:after-config");
+    };
+    await expect(coordinator(home, fake.driver).resume()).rejects.toThrow("crash:after-config");
+
+    const originalRestoreMap = fake.driver.restoreProjectMap;
+    const changedSourceMap = {
+      ...sourceState(input).projectMap,
+      dev: "211",
+      ino: "212",
+      parentDev: "213",
+      parentIno: "214",
+    };
+    fake.driver.restoreProjectMap = async (mutation) => {
+      await originalRestoreMap(mutation);
+      fake.setState({ ...fake.getState(), projectMap: changedSourceMap });
+      throw new Error("crash:after-map-restore-identity");
+    };
+    await expect(coordinator(home, fake.driver).abort()).rejects.toThrow("crash:after-map-restore-identity");
+    expect(readBackendPublicationJournal(home)?.phase).toBe("map-restoring");
+
+    fake.driver.restoreProjectMap = vi.fn(async () => {
+      throw new Error("replayed map restoration");
+    });
+    const aborted = await coordinator(home, fake.driver).abort();
+    expect(aborted.phase).toBe("aborted");
+    expect(aborted.sourceState.projectMap).toMatchObject({
+      dev: "211",
+      ino: "212",
+      parentDev: "213",
+      parentIno: "214",
+    });
+    expect(fake.calls).toEqual(["publish-map", "publish-config", "restore-config", "restore-map"]);
+  });
+
+  it("rejects a third or tampered state at an identity-changing publication seam", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    await coordinator(home, fake.driver).prepare(inputFor(input));
+    const originalPublishMap = fake.driver.publishProjectMap;
+    fake.driver.publishProjectMap = async (mutation) => {
+      await originalPublishMap(mutation);
+      fake.setState({
+        ...fake.getState(),
+        projectMap: {
+          ...targetState(input).projectMap,
+          rawSha256: "f".repeat(64),
+          semanticSha256: "e".repeat(64),
+        },
+      });
+      throw new Error("crash:after-map-tamper");
+    };
+
+    await expect(coordinator(home, fake.driver).resume()).rejects.toThrow("crash:after-map-tamper");
+    await expect(coordinator(home, fake.driver).resume()).rejects.toMatchObject({ reason: "unexpected-state" });
   });
 
   it("checkpoints remote fences and resumes forward after a release crash", async () => {
