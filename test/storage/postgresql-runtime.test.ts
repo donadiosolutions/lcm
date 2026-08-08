@@ -224,7 +224,29 @@ describe("PostgreSQL runtime", () => {
     ]);
   });
 
-  it("rejects unsorted, duplicate, mismatched, omitted, and enlarged scopes", async () => {
+  it("allows projectless raw queries inside an admitted project transaction", async () => {
+    const f = fixtures(undefined, { acquireMutationGuard: vi.fn(async () => undefined) });
+
+    await f.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "PROJECTLESS RAW QUERY" }, {
+        domain: "migrations",
+        operation: "projectlessRawQuery",
+      });
+    }, {
+      domain: "transaction",
+      operation: "project-scoped-root",
+      projectId: "project-a",
+    });
+
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      { text: "PROJECTLESS RAW QUERY" },
+      "COMMIT",
+    ]);
+  });
+
+  it("rejects unsorted, duplicate, mismatched, and enlarged scopes", async () => {
     const acquireMutationGuard = vi.fn(async () => undefined);
     const f = fixtures(undefined, { acquireMutationGuard });
     for (const options of [
@@ -242,17 +264,6 @@ describe("PostgreSQL runtime", () => {
     }
     const f2 = fixtures(undefined, { acquireMutationGuard });
     await expect(f2.runtime.transaction(async (transaction) => {
-      await transaction.query({ text: "omitted" }, {
-        domain: "sessions",
-        operation: "omitted",
-      });
-    }, {
-      domain: "transaction",
-      operation: "root",
-      projectIds: ["a", "b"],
-    })).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
-    const f3 = fixtures(undefined, { acquireMutationGuard });
-    await expect(f3.runtime.transaction(async (transaction) => {
       await transaction.query({ text: "enlarged" }, {
         domain: "sessions",
         operation: "enlarged",
@@ -263,7 +274,7 @@ describe("PostgreSQL runtime", () => {
       operation: "root",
       projectIds: ["a", "b"],
     })).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
-    expect(acquireMutationGuard).toHaveBeenCalledTimes(4);
+    expect(acquireMutationGuard).toHaveBeenCalledTimes(2);
   });
 
   it("rejects malformed scope values and transaction-only options in child queries", async () => {

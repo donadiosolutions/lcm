@@ -143,7 +143,7 @@ function snapshotScopedQueryOptions(
     throw transactionScopeError(context, fallbackProjectId);
   }
   const requested = normalizedProjectScope(context);
-  const projectless = admittedProjectIds.size === 0 && requested.length === 0;
+  const projectless = requested.length === 0;
   const subset = requested.length > 0
     && requested.every((projectId) => admittedProjectIds.has(projectId));
   if (!projectless && !subset) {
