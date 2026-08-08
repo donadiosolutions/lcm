@@ -963,7 +963,7 @@ describe("promote-events route", () => {
     secondDb.close();
 
     const now = vi.spyOn(Date, "now");
-    now.mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(30_001);
+    now.mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(30_001);
 
     const handler = createPromoteAllEventsHandler(makeConfig());
     const { res, getBody } = mockRes();

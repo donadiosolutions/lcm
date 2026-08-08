@@ -105,6 +105,7 @@ const base = (): EnsureDaemonOptions => ({
   _spawnOverride: vi.fn(() => ({ pid: undefined, once: vi.fn(), unref: vi.fn() })) as unknown as SpawnOverride,
   _monotonicNowOverride: (): number => 0,
   _skipHealthWait: true,
+  _assertBackendPublication: () => undefined,
 });
 
 const writePidLeaf = (pid: number): void => {

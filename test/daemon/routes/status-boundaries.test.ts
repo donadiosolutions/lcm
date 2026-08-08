@@ -4,6 +4,7 @@ import { loadDaemonConfig } from "../../../src/daemon/config.js";
 const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => false),
   read: vi.fn(() => "{}"),
+  realpath: vi.fn((path: string) => path),
   getConnection: vi.fn(),
   get: vi.fn(() => undefined as { count: number } | undefined),
   close: vi.fn(),
@@ -11,7 +12,12 @@ const mocks = vi.hoisted(() => ({
   send: vi.fn(),
 }));
 
-vi.mock("node:fs", () => ({ existsSync: mocks.exists, readFileSync: mocks.read }));
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
+  existsSync: mocks.exists,
+  readFileSync: mocks.read,
+  realpathSync: mocks.realpath,
+}));
 vi.mock("../../../src/db/connection.js", () => ({
   getLcmConnection: mocks.getConnection,
   closeLcmConnection: mocks.close,

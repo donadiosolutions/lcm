@@ -100,6 +100,20 @@ vi.mock("node:fs", async importOriginal => ({
   readdirSync: vi.fn(() => state.entries),
   mkdirSync: vi.fn(), writeFileSync: vi.fn(), unlinkSync: vi.fn(),
 }));
+vi.mock("../../src/storage/backend-publication.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/storage/backend-publication.js")>();
+  return {
+    ...actual,
+    assertBackendPublicationConsumerAccess: vi.fn(({ backend }: { readonly backend?: string }) => {
+      if (backend === "postgresql") {
+        throw new actual.BackendPublicationJournalError(
+          "publication-evidence-missing",
+          "test publication admission blocked",
+        );
+      }
+    }),
+  };
+});
 vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/runtime-paths.js")>()),
   configPath: () => `${state.runtimeHome}/.lcm/config.json`,

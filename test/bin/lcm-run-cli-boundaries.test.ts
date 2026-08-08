@@ -99,6 +99,13 @@ vi.mock("node:fs", async importOriginal => ({
   writeFileSync: state.writeFile,
   unlinkSync: state.unlink,
 }));
+vi.mock("../../src/storage/backend-publication.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/storage/backend-publication.js")>();
+  return {
+    ...actual,
+    assertBackendPublicationConsumerAccess: vi.fn(() => undefined),
+  };
+});
 vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/runtime-paths.js")>()),
   configPath: () => "/lcm/.lcm/config.json", daemonPidPath: () => "/lcm/daemon.pid",

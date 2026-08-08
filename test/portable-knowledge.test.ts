@@ -61,6 +61,7 @@ beforeEach(() => {
   tempHome = mkdtempSync(join(tmpdir(), "lcm-portable-home-"));
   process.env.HOME = tempHome;
   process.env.USERPROFILE = tempHome;
+  mkdirSync(join(tempHome, ".lcm"), { mode: 0o700 });
   clearProjectMapCache();
   clearGitProjectAnchorCache();
   clearWorktreeReconciliationCache();
@@ -101,10 +102,11 @@ function seedProject(
 ) {
   const projId = toProjectId(cwd);
   const projDir = join(baseDir, "projects", projId);
-  mkdirSync(projDir, { recursive: true });
-  writeFileSync(join(projDir, "meta.json"), JSON.stringify({ cwd }));
+  mkdirSync(projDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(projDir, "meta.json"), JSON.stringify({ cwd }), { mode: 0o600 });
 
   const dbPath = join(projDir, "db.sqlite");
+  writeFileSync(dbPath, "", { mode: 0o600 });
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA busy_timeout = 5000");
   runLcmMigrations(db);
@@ -127,10 +129,10 @@ function seedProject(
 
 function configurePostgreSqlBackend(): void {
   const home = lcmHomeDir();
-  mkdirSync(home, { recursive: true });
+  mkdirSync(home, { recursive: true, mode: 0o700 });
   const caPath = join(home, "postgres-ca.crt");
-  writeFileSync(caPath, "trusted-ca");
-  writeFileSync(join(home, "config.json"), JSON.stringify({ storage: { backend: "postgresql" } }));
+  writeFileSync(caPath, "trusted-ca", { mode: 0o600 });
+  writeFileSync(join(home, "config.json"), JSON.stringify({ storage: { backend: "postgresql" } }), { mode: 0o600 });
   vi.stubEnv("LCM_POSTGRES_URL", "postgresql://user:password@db.example.com/lcm");
   vi.stubEnv("LCM_POSTGRES_CA_FILE", caPath);
 }
@@ -262,7 +264,7 @@ describe("portable-knowledge — export", () => {
     }]);
     writeFileSync(projectMapPath(), `${JSON.stringify({
       [sourceHash]: { canonical: linked, aliases: [] },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`, { mode: 0o600 });
     clearProjectMapCache();
 
     const result = await exportKnowledge(linked, {
@@ -438,7 +440,7 @@ describe("portable-knowledge — import", () => {
     }]);
     writeFileSync(projectMapPath(), `${JSON.stringify({
       [sourceHash]: { canonical: linked, aliases: [] },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`, { mode: 0o600 });
     clearProjectMapCache();
     const doc = makeDoc([{
       content: "Imported after reconciliation",
@@ -503,7 +505,7 @@ describe("portable-knowledge — import", () => {
     const mapPath = projectMapPath();
     writeFileSync(mapPath, `${JSON.stringify({
       [sourceHash]: { canonical: linked, aliases: [] },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`, { mode: 0o600 });
     clearProjectMapCache();
     const mapBefore = readFileSync(mapPath, "utf8");
 

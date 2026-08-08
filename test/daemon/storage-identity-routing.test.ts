@@ -140,8 +140,16 @@ describe("daemon storage identity routing", () => {
     expect(UNBOUND_POSTGRESQL_PROJECT_MESSAGE).not.toContain(cwd);
   });
 
-  it("validates PostgreSQL identity before constructing the unavailable default factory", async () => {
+  it("validates PostgreSQL identity before opening the unavailable default factory", async () => {
     resolveProjectIdentity(cwd);
+    const realCreateStorageBackendFactory = storageFactoryModule.createStorageBackendFactory;
+    vi.spyOn(storageFactoryModule, "createStorageBackendFactory").mockImplementation(
+      (storageConfig, homeDir) => realCreateStorageBackendFactory(
+        storageConfig,
+        homeDir,
+        () => undefined,
+      ),
+    );
     const response = {
       writeHead: vi.fn(),
       end: vi.fn(),

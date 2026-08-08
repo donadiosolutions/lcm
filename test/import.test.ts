@@ -853,6 +853,14 @@ describe("importSessions — provider: codex", () => {
     return dir;
   }
 
+  function writePrivateMapFixture(home: string, content: string): string {
+    const lcmHome = join(home, ".lcm");
+    mkdirSync(lcmHome, { recursive: true, mode: 0o700 });
+    const mapPath = join(lcmHome, "map.json");
+    writeFileSync(mapPath, content, { mode: 0o600 });
+    return mapPath;
+  }
+
   function makeGitProject(remote: string, register = true): string {
     const project = makeTmpDir();
     execFileSync("git", ["init", "-q"], { cwd: project });
@@ -1093,9 +1101,7 @@ describe("importSessions — provider: codex", () => {
     vi.stubEnv("HOME", home);
     const cwd = makeTmpDir();
     const codexDir = makeTmpDir();
-    const mapPath = join(homedir(), ".lcm", "map.json");
-    mkdirSync(join(home, ".lcm"), { recursive: true });
-    writeFileSync(mapPath, "{}\n");
+    const mapPath = writePrivateMapFixture(home, "{}\n");
     const before = readFileSync(mapPath, "utf8");
     const result = await importSessions(makeMockClient(async () => ({ ingested: 1, totalTokens: 1 })), {
       provider: "codex",
@@ -1121,9 +1127,7 @@ describe("importSessions — provider: codex", () => {
       makeCodexResponseItemLine("user", "dry run"),
     ].join("\n"));
 
-    const mapPath = join(homedir(), ".lcm", "map.json");
-    mkdirSync(join(home, ".lcm"), { recursive: true });
-    writeFileSync(mapPath, "{}\n");
+    const mapPath = writePrivateMapFixture(home, "{}\n");
     const before = readFileSync(mapPath, "utf8");
     const result = await importSessions(makeMockClient(async () => ({ ingested: 1, totalTokens: 1 })), {
       provider: "codex",

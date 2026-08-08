@@ -1896,6 +1896,7 @@ describe("run-owned lifecycle resources", () => {
       _testScope: scope,
       _skipSpawn: true,
       _listeningPortsOverride: () => [48_321],
+      _assertBackendPublication: () => undefined,
     })).resolves.toMatchObject({
       connected: false,
       spawned: false,
@@ -1926,6 +1927,7 @@ describe("run-owned lifecycle resources", () => {
       ...scopedOptions(fixture),
       validateBeforeRestart,
       _ensureDaemonOverride: replacement,
+      _assertBackendPublication: () => undefined,
     })).resolves.toMatchObject({
       connected: false,
       restarted: false,

@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => {
     runDoctor: vi.fn(),
     formatResultsPlain: vi.fn(),
     storageBackend: "sqlite" as "sqlite" | "postgresql",
+    publicationBlocked: false,
     configError: undefined as unknown,
   };
 });
@@ -69,6 +70,14 @@ vi.mock("../src/storage/backend-publication.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../src/storage/backend-publication.js")>();
   return {
     ...actual,
+    assertBackendPublicationConsumerAccess: vi.fn(() => {
+      if (mocks.publicationBlocked) {
+        throw new actual.BackendPublicationJournalError(
+          "publication-evidence-missing",
+          "test publication admission blocked",
+        );
+      }
+    }),
     readBackendPublicationJournal: vi.fn(() => ({
       phase: "completed",
       sourceBackend: "sqlite",
@@ -99,6 +108,7 @@ describe("MCP service coverage", () => {
     mocks.ensureDaemon.mockResolvedValue({ connected: true, port: 4321, spawned: false });
     mocks.post.mockResolvedValue({ ok: true });
     mocks.storageBackend = "sqlite";
+    mocks.publicationBlocked = false;
     mocks.configError = undefined;
     await startMcpServer();
   });
@@ -144,6 +154,7 @@ describe("MCP service coverage", () => {
     expect(mocks.post).toHaveBeenCalledOnce();
 
     mocks.storageBackend = "postgresql";
+    mocks.publicationBlocked = true;
     await expect(call("lcm_search", { query: "postgresql" })).resolves.toMatchObject({
       isError: true,
       content: [{ text: expect.stringContaining("backend publication admission blocked") }],

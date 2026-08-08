@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => true),
   read: vi.fn(() => "{}"),
   write: vi.fn(),
+  realpath: vi.fn((path: string) => path),
   getConnection: vi.fn(),
   closeConnection: vi.fn(),
   sessionGet: vi.fn(() => undefined),
@@ -34,7 +35,13 @@ const db = {
   prepare: () => ({ get: mocks.sessionGet }),
 };
 
-vi.mock("node:fs", () => ({ existsSync: mocks.exists, readFileSync: mocks.read, writeFileSync: mocks.write }));
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
+  existsSync: mocks.exists,
+  readFileSync: mocks.read,
+  writeFileSync: mocks.write,
+  realpathSync: mocks.realpath,
+}));
 vi.mock("../../../src/db/connection.js", () => ({
   getLcmConnection: mocks.getConnection,
   closeLcmConnection: mocks.closeConnection,
