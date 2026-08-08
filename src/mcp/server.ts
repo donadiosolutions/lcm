@@ -21,10 +21,12 @@ import {
   selectStorageBackend,
   selectStorageBackendForConfig,
   assertStorageBackendPublication,
-  backendPublicationHomeForConfigPath,
   StorageBackendUnavailableError,
 } from "../storage/backend.js";
-import { BackendPublicationJournalError } from "../storage/backend-publication.js";
+import {
+  BackendPublicationJournalError,
+  backendPublicationHomeForConfigPath,
+} from "../storage/backend-publication.js";
 import { isDaemonTransportFailure } from "../daemon/http-url.js";
 import { sanitizeHookErrorDiagnostic } from "../hooks/hook-error-diagnostic.js";
 

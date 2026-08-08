@@ -322,7 +322,6 @@ describe("runDoctor project map checks", () => {
 
   it("admits an absent config when the terminal publication witness is absent", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-missing-config-absent-"));
-    writeCompletedPublicationJournal(home, null);
     try {
       const results = await runDoctor(minimalDeps({
         homedir: home,
@@ -418,6 +417,7 @@ describe("runDoctor project map checks", () => {
     ["checksum-mismatch", "authenticated publication state is invalid or unsafe"],
     ["unexpected-state", "authenticated publication state is invalid or unsafe"],
     ["permit-mismatch", "authenticated publication state is invalid or unsafe"],
+    ["backend-mismatch", "authenticated publication state is invalid or unsafe"],
     ["invalid-input", "authenticated publication state is invalid or unsafe"],
   ] as const)("renders the %s publication admission message", async (reason, message) => {
     const results = await runDoctor(minimalDeps({
@@ -601,7 +601,7 @@ describe("runDoctor project map checks", () => {
       mkdirSync(canonical, { recursive: true });
       const hash = hashProjectPath(normalizeProjectPath(canonical));
       const mapPath = join(home, ".lcm", "map.json");
-      writeFileSync(mapPath, JSON.stringify({ [hash]: { canonical, aliases: [] } }));
+      writeFileSync(mapPath, JSON.stringify({ [hash]: { canonical, aliases: [] } }), { mode: 0o600 });
 
       const results = await runDoctor(minimalDeps({ homedir: home, cwd: "/tmp/nonexistent-project-xyz" }));
       const check = results.find((r) => r.name === "project-map");
@@ -665,7 +665,7 @@ describe("runDoctor project map checks", () => {
       writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({
         [firstHash]: { canonical: first, aliases: [shared] },
         [secondHash]: { canonical: second, aliases: [shared] },
-      }, null, 2) + "\n");
+      }, null, 2) + "\n", { mode: 0o600 });
 
       const results = await runDoctor(minimalDeps({ homedir: home, cwd: "/tmp/nonexistent-project-xyz" }));
       const check = results.find((r) => r.name === "project-map");

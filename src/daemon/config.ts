@@ -7,7 +7,7 @@ import { MANAGED_CREDENTIAL_NAMES } from "./managed-credentials.js";
 import {
   assertBackendPublicationConfigAccess,
   withBackendPublicationConfigLock,
-} from "../storage/backend.js";
+} from "../storage/backend-publication.js";
 
 export { sanitizeUrlForDisplay } from "../url-display.js";
 
@@ -1605,6 +1605,7 @@ function loadDaemonConfigWithHooks(
       configPath,
       config.storage.backend,
       observedContent,
+      undefined,
       lockToken,
     );
     return config;
