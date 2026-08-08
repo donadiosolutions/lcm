@@ -25,19 +25,20 @@ tests, and the native-transcript adapter is available to explicit
 programmatic backfill and conformance. The promoted-memory, recall,
 redaction-administration, and coordination adapters are available to direct
 programmatic callers and conformance under the same staged boundary. None is
-selected by normal daemon or CLI composition. With PostgreSQL selected, the
-daemon still opens its loopback listener. Public `/health` remains a
-storage-free `200` liveness response identifying the selected `postgresql`
-backend. Authenticated `/health` returns HTTP `503`, backend `postgresql`, and
-storage status `unavailable`; authenticated storage-backed routes also return
-fixed sanitized `503` responses. Lifecycle admission verifies the public
+selected by normal daemon or CLI composition. PostgreSQL selection remains
+unavailable to normal production configuration: issues #92 (authoritative
+backend activation) and #224 (normal daemon/CLI transcript routing) are not
+implemented. The publication boundary is nevertheless the prerequisite for
+those future paths. For staged callers, a valid terminal publication witness
+allows the storage-free public health contract to identify the staged backend;
+an unresolved or inconsistent publication blocks both public and authenticated
+health with fixed sanitized `503` responses, while authenticated storage-backed
+routes remain storage-unavailable. Lifecycle admission verifies the public
 process and listener identity before sending the local token, then recognizes
 the authenticated staged response without treating its storage as ready or
-falling back to SQLite. Issue #92 activates PostgreSQL as authoritative after
-the adapter gates pass, while issue #224 owns normal daemon/CLI transcript
-routing. The local SQLite hook outbox and the metadata-only transcript
-quarantine are not general caches and remain local after that activation. See
-the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
+falling back to SQLite. The local SQLite hook outbox and the metadata-only
+transcript quarantine remain local and are not general caches or activation
+paths. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
 integrity, indexes, retention, extension policy, and recovery implications.
 
 ## Storage repository architecture
