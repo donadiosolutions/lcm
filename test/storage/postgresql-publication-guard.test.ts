@@ -236,6 +236,49 @@ describe("PostgreSQL publication admission", () => {
     );
   });
 
+  it("re-evaluates takeover expiry after the publication row lock wait", async () => {
+    const statements: string[] = [];
+    const expiredAfterWait = leaseRow({
+      expired: true,
+      expiresAt: "2026-08-01T00:00:02.000Z",
+    });
+    const e = executor({
+      transactionQuery: (config) => {
+        statements.push(config.text);
+        if (config.text.includes("FOR UPDATE")) {
+          return result([leaseRow({ expired: false })]);
+        }
+        if (config.text.includes("fencing_token = DEFAULT")) {
+          return result([leaseRow({ token: "8" })]);
+        }
+        return result([expiredAfterWait]);
+      },
+    });
+    await expect(new PostgreSqlBackendPublicationGuard(e).acquire({
+      ...validAcquire,
+      expectedFencingToken: 7n,
+    })).resolves.toMatchObject({
+      fencingToken: 8n,
+      databaseExpired: false,
+    });
+    expect(statements[0]).toContain("FOR UPDATE");
+    expect(statements[0]).not.toContain("statement_timestamp");
+    expect(statements.some((statement) => statement.includes("statement_timestamp")))
+      .toBe(true);
+    await expect(new PostgreSqlBackendPublicationGuard(executor({
+      transactionQuery: (config) => config.text.includes("FOR UPDATE")
+        ? result([leaseRow()])
+        : result([]),
+    })).acquire({ ...validAcquire, expectedFencingToken: 7n }))
+      .rejects.toMatchObject({ reason: "invalid-row" });
+    await expect(new PostgreSqlBackendPublicationGuard(executor({
+      transactionQuery: (config) => config.text.includes("FOR UPDATE")
+        ? result([leaseRow()])
+        : result([]),
+    })).renew({ ...validMutation, ttlMs: 60_000 }))
+      .rejects.toMatchObject({ reason: "fence-mismatch" });
+  });
+
   it("handles active, conflicting, released, and takeover acquire states", async () => {
     await expect(new PostgreSqlBackendPublicationGuard(executor({
       transactionQuery: (config) => config.text.includes("FOR UPDATE")
@@ -245,7 +288,7 @@ describe("PostgreSQL publication admission", () => {
     const active = executor({
       transactionQuery: (config) => config.text.includes("FOR UPDATE")
         ? result([leaseRow()])
-        : result([]),
+        : result([leaseRow()]),
     });
     await expect(new PostgreSqlBackendPublicationGuard(active).acquire(validAcquire))
       .resolves.toMatchObject({ fencingToken: 7n });
@@ -271,7 +314,7 @@ describe("PostgreSQL publication admission", () => {
       const e = executor({
         transactionQuery: (config) => config.text.includes("FOR UPDATE")
           ? result(entry.rows)
-          : result([]),
+          : result(entry.rows),
       });
       await expect(new PostgreSqlBackendPublicationGuard(e).acquire({
         ...validAcquire,
@@ -285,14 +328,14 @@ describe("PostgreSQL publication admission", () => {
     await expect(new PostgreSqlBackendPublicationGuard(executor({
       transactionQuery: (config) => config.text.includes("FOR UPDATE")
         ? result([expired])
-        : result([]),
+        : result([expired]),
     })).acquire(validAcquire)).rejects.toMatchObject({ reason: "fence-expired" });
 
     const recovered = executor({
       transactionQuery: (config) => {
         if (config.text.includes("FOR UPDATE")) return result([expired]);
         if (config.text.includes("fencing_token = DEFAULT")) return result([leaseRow({ token: "8" })]);
-        throw new Error(`unexpected SQL ${config.text}`);
+        return result([expired]);
       },
     });
     await expect(new PostgreSqlBackendPublicationGuard(recovered).acquire({
@@ -304,7 +347,7 @@ describe("PostgreSQL publication admission", () => {
       transactionQuery: (config) => {
         if (config.text.includes("FOR UPDATE")) return result([expired]);
         if (config.text.includes("fencing_token = DEFAULT")) return result([]);
-        return result([]);
+        return result([expired]);
       },
     })).acquire({ ...validAcquire, expectedFencingToken: 7n }))
       .rejects.toMatchObject({ reason: "fence-mismatch" });
@@ -317,7 +360,7 @@ describe("PostgreSQL publication admission", () => {
         if (config.text.includes("fencing_token = DEFAULT")) {
           return result([leaseRow({ token: "8" })]);
         }
-        return result([]);
+        return result([leaseRow({ releasedAt: "2026-08-01T00:02:00.000Z" })]);
       },
     });
     await expect(new PostgreSqlBackendPublicationGuard(released).acquire(validAcquire))

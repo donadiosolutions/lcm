@@ -219,7 +219,18 @@ function context(
   };
 }
 
-function selectLeaseSql(lock: boolean): string {
+function lockLeaseSql(): string {
+  return `SELECT project_id, owner_machine_id, owner_process_id, operation,
+                 fencing_token, acquired_at, renewed_at, expires_at,
+                 released_at
+          FROM lcm.fenced_leases
+          WHERE project_id = $1::pg_catalog.uuid
+            AND resource_type = $2::pg_catalog.text
+            AND resource_key = $3::pg_catalog.text
+          FOR UPDATE`;
+}
+
+function selectLeaseSql(): string {
   return `SELECT project_id, owner_machine_id, owner_process_id, operation,
                  fencing_token, acquired_at, renewed_at, expires_at,
                  released_at,
@@ -227,7 +238,7 @@ function selectLeaseSql(lock: boolean): string {
           FROM lcm.fenced_leases
           WHERE project_id = $1::pg_catalog.uuid
             AND resource_type = $2::pg_catalog.text
-            AND resource_key = $3::pg_catalog.text${lock ? "\n          FOR UPDATE" : ""}`;
+            AND resource_key = $3::pg_catalog.text`;
 }
 
 function leaseKeyValues(projectId: string): string[] {
@@ -455,14 +466,13 @@ export class PostgreSqlBackendPublicationGuard {
         normalized.projectId,
         async (transaction) => {
           const existing = await transaction.query<PublicationRow>({
-            text: selectLeaseSql(true),
+            text: lockLeaseSql(),
             values: leaseKeyValues(normalized.projectId),
           }, context(normalized.projectId, operation, input.signal));
           if (existing.rows.length > 1) {
             return publicationError(normalized.projectId, operation, "invalid-row");
           }
-          const current = existing.rows[0];
-          if (current === undefined) {
+          if (existing.rows[0] === undefined) {
             if (normalized.expectedFencingToken !== undefined) {
               return publicationError(
                 normalized.projectId,
@@ -501,6 +511,15 @@ export class PostgreSqlBackendPublicationGuard {
             candidate = exactFence(inserted.rows[0]!, normalized, operation);
             return candidate;
           }
+
+          const currentResult = await transaction.query<PublicationRow>({
+            text: selectLeaseSql(),
+            values: leaseKeyValues(normalized.projectId),
+          }, context(normalized.projectId, operation, input.signal));
+          if (currentResult.rows.length !== 1) {
+            return publicationError(normalized.projectId, operation, "invalid-row");
+          }
+          const current = currentResult.rows[0]!;
 
           const currentFence = storedFenceFromRow(
             current,
@@ -743,7 +762,7 @@ export class PostgreSqlBackendPublicationGuard {
     const evidence = evidenceSha256(input.evidenceSha256, projectId, operation);
     const result = await this.executor.projectPublicationReadback<PublicationRow>(
       {
-        text: selectLeaseSql(false),
+        text: selectLeaseSql(),
         values: leaseKeyValues(projectId),
       },
       context(projectId, operation, input.signal),
@@ -771,18 +790,29 @@ export class PostgreSqlBackendPublicationGuard {
     return this.executor.projectPublicationTransaction(
       normalized.projectId,
       async (transaction) => {
-        const result = await transaction.query<PublicationRow>(
-          query,
+        const locked = await transaction.query<PublicationRow>(
+          { text: lockLeaseSql(), values: leaseKeyValues(normalized.projectId) },
           context(normalized.projectId, operation, signal),
         );
-        if (result.rows.length !== 1) {
+        if (locked.rows.length !== 1) {
           return publicationError(
             normalized.projectId,
             operation,
             "fence-mismatch",
           );
         }
-        const fence = exactFence(result.rows[0]!, normalized, operation);
+        const mutation = await transaction.query<PublicationRow>(
+          query,
+          context(normalized.projectId, operation, signal),
+        );
+        if (mutation.rows.length !== 1) {
+          return publicationError(
+            normalized.projectId,
+            operation,
+            "fence-mismatch",
+          );
+        }
+        const fence = exactFence(mutation.rows[0]!, normalized, operation);
         observeCandidate(fence);
         return fence;
       },
