@@ -284,8 +284,7 @@ function recoverConfiguredPort(content: string): number {
   }
 }
 
-function backendCandidate(content: string | undefined): "sqlite" | "postgresql" {
-  if (content === undefined) return "sqlite";
+function backendCandidate(content: string): "sqlite" | "postgresql" {
   try {
     const parsed = JSON.parse(content) as { storage?: { backend?: unknown } };
     return parsed.storage?.backend === "postgresql" ? "postgresql" : "sqlite";
@@ -298,7 +297,7 @@ function authenticateConfigPublication(
   configPathValue: string,
   deps: DoctorDeps,
   backend: "sqlite" | "postgresql",
-  observedContent: string | undefined,
+  observedContent: string | null,
   lockToken: object,
 ): BackendPublicationJournalError | undefined {
   try {
@@ -330,7 +329,7 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
           resolvedConfigPath,
           deps,
           "sqlite",
-          undefined,
+          null,
           lockToken,
         );
         return {
@@ -366,13 +365,18 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
       const validationError = error instanceof ConfigValidationError
         ? error
         : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
-      publicationError = authenticateConfigPublication(
-        resolvedConfigPath,
-        deps,
-        backendCandidate(content),
-        content,
-        lockToken,
-      );
+      publicationError = content === undefined
+        ? new BackendPublicationJournalError(
+            "unsafe-storage",
+            "backend publication admission is blocked because config bytes could not be observed safely",
+          )
+        : authenticateConfigPublication(
+            resolvedConfigPath,
+            deps,
+            backendCandidate(content),
+            content,
+            lockToken,
+          );
       return {
         port: typeof content === "string" ? recoverConfiguredPort(content) : DEFAULT_DAEMON_PORT,
         storageBackend: "unavailable",
