@@ -10,6 +10,20 @@ type Component = {
   paths: string[];
 };
 
+type OwnershipPathDescriptor =
+  | { kind: "directory-prefix"; path: string }
+  | { kind: "exact-file-regex"; path: string };
+
+type ValidatedOwnershipPath =
+  | { kind: "directory-prefix"; path: string }
+  | { kind: "exact-file-regex"; path: string; matcher: RegExp };
+
+type ValidatedComponent = {
+  component_id: string;
+  name: string;
+  ownershipPaths: readonly ValidatedOwnershipPath[];
+};
+
 type CodecovConfig = {
   comment?: {
     layout?: unknown;
@@ -285,6 +299,9 @@ const forbiddenConfigKeys = new Set([
   "statuses",
 ]);
 
+const safeDirectoryPrefixPattern = /^(?:bin|installer|src)(?:\/[A-Za-z0-9._-]+)*\/$/;
+const safeExactFilePattern = /^\^(?:bin|installer|src)\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\\\.ts\$$/;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -321,13 +338,52 @@ function collectRepositoryFiles(): string[] {
   return visit(projectRoot, "").sort();
 }
 
-function matchesOwnershipPath(file: string, path: string): boolean {
-  return path.endsWith("/") ? file.startsWith(path) : new RegExp(path).test(file);
+function isSafeOwnershipPath(path: string): boolean {
+  return safeDirectoryPrefixPattern.test(path) || safeExactFilePattern.test(path);
 }
 
-function filesMatchedByComponent(component: Component, files: string[]): string[] {
-  return files.filter((file) => component.paths.some((path) => matchesOwnershipPath(file, path)));
+function classifyOwnershipPath(path: string): OwnershipPathDescriptor {
+  if (safeDirectoryPrefixPattern.test(path)) {
+    return { kind: "directory-prefix", path };
+  }
+  if (safeExactFilePattern.test(path)) {
+    return { kind: "exact-file-regex", path };
+  }
+
+  throw new Error(`Unsafe Codecov ownership path: ${path}`);
 }
+
+function validateComponents(components: readonly Component[]): ValidatedComponent[] {
+  // Classify every raw path before compiling any exact-file regular expression.
+  const classifiedComponents = components.map((component) => ({
+    component_id: component.component_id,
+    name: component.name,
+    ownershipPaths: component.paths.map(classifyOwnershipPath),
+  }));
+
+  return classifiedComponents.map((component) => ({
+    ...component,
+    ownershipPaths: component.ownershipPaths.map((path) =>
+      path.kind === "directory-prefix" ? path : { ...path, matcher: new RegExp(path.path) },
+    ),
+  }));
+}
+
+function matchesOwnershipPath(file: string, path: ValidatedOwnershipPath): boolean {
+  return path.kind === "directory-prefix" ? file.startsWith(path.path) : path.matcher.test(file);
+}
+
+function filesMatchedByComponent(component: ValidatedComponent, files: readonly string[]): string[] {
+  return files.filter((file) => component.ownershipPaths.some((path) => matchesOwnershipPath(file, path)));
+}
+
+const repositoryFiles = Object.freeze(collectRepositoryFiles());
+const productionFiles = Object.freeze(
+  repositoryFiles.filter((file) => /^(?:bin|installer|src)\/.*\.ts$/.test(file)),
+);
+const nonProductionTypeScript = Object.freeze(
+  repositoryFiles.filter((file) => file.endsWith(".ts") && !productionFiles.includes(file)),
+);
 
 function forbiddenKeysIn(value: unknown, location = "config"): string[] {
   if (Array.isArray(value)) {
@@ -372,17 +428,12 @@ describe("Codecov configuration", () => {
     expect(new Set(ownershipPaths).size).toBe(ownershipPaths.length);
 
     for (const path of ownershipPaths) {
-      const safeDirectoryPrefix = /^(?:bin|installer|src)(?:\/[A-Za-z0-9._-]+)*\/$/;
-      const safeExactFileRegex = /^\^(?:bin|installer|src)\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\\\.ts\$$/;
-      expect(safeDirectoryPrefix.test(path) || safeExactFileRegex.test(path)).toBe(true);
+      expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    const productionFiles = collectRepositoryFiles().filter(
-      (file) => /^(?:bin|installer|src)\/.*\.ts$/.test(file),
-    );
     expect(productionFiles).toHaveLength(186);
 
-    for (const component of components) {
+    for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
     }
   });
@@ -394,18 +445,22 @@ describe("Codecov configuration", () => {
       return;
     }
 
-    const components = configuredComponents(config);
-    const productionFiles = collectRepositoryFiles().filter(
-      (file) => /^(?:bin|installer|src)\/.*\.ts$/.test(file),
-    );
+    const components = validateComponents(configuredComponents(config));
     const ownershipCounts = new Map(
       productionFiles.map((file) => [
         file,
-        components.filter((component) => filesMatchedByComponent(component, [file]).length > 0).length,
+        components.filter((component) =>
+          component.ownershipPaths.some((path) => matchesOwnershipPath(file, path)),
+        ).length,
       ]),
     );
+    const unownedFiles = productionFiles.filter((file) => ownershipCounts.get(file) === 0);
+    const multiplyOwnedFiles = [...ownershipCounts.entries()]
+      .filter(([, ownerCount]) => ownerCount > 1)
+      .map(([file, ownerCount]) => ({ file, ownerCount }));
 
-    expect([...ownershipCounts.values()].every((count) => count === 1)).toBe(true);
+    expect(unownedFiles).toEqual([]);
+    expect(multiplyOwnedFiles).toEqual([]);
     expect(ownershipCounts.size).toBe(186);
   });
 
@@ -416,12 +471,7 @@ describe("Codecov configuration", () => {
       return;
     }
 
-    const components = configuredComponents(config);
-    const files = collectRepositoryFiles();
-    const productionFiles = new Set(
-      files.filter((file) => /^(?:bin|installer|src)\/.*\.ts$/.test(file)),
-    );
-    const nonProductionTypeScript = files.filter((file) => file.endsWith(".ts") && !productionFiles.has(file));
+    const components = validateComponents(configuredComponents(config));
     const nonProductionMatches = components.flatMap((component) =>
       filesMatchedByComponent(component, nonProductionTypeScript).map((file) => `${component.component_id}:${file}`),
     );
