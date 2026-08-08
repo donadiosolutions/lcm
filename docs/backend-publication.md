@@ -93,17 +93,81 @@ The exact path is derived from the configured home for isolated installations;
 the default is under `~/.lcm`. Files are bounded, private, checksum-protected,
 and opened through descriptor- and ownership-aware filesystem seams.
 
-The operator-visible journal progression is forward-only:
+The implementation persists exactly these 16 phase literals:
 
-1. **`preparing`** — a deterministic journal is written before recovery
-   material is sealed. The material contains bounded source and target copies
-   of configuration and project-map state.
-2. **Authenticated checkpoints** — the journal records exact witnesses for
-   bytes, canonical semantics, ownership, mode, link count, and filesystem
-   identity while it acquires fences, publishes the state, and releases the
-   fences with authoritative readback.
-3. **Terminal `completed` or `aborted`** — the final authenticated record is
-   retained and terminal history is archived.
+`preparing`, `prepared`, `acquiring`, `guarded`, `map-publishing`,
+`map-published`, `config-publishing`, `config-published`, `releasing`,
+`released`, `aborting`, `config-restoring`, `map-restoring`,
+`abort-releasing`, `aborted`, and `completed`.
+
+The normal forward sequence is:
+
+```text
+preparing
+  -> prepared
+  -> acquiring       (one persisted checkpoint per project, when remote fences are enabled)
+  -> guarded
+  -> map-publishing
+  -> map-published
+  -> config-publishing
+  -> config-published
+  -> releasing       (one persisted checkpoint per project, when remote fences are enabled)
+  -> released
+  -> completed
+```
+
+The phase groups have distinct recovery meanings:
+
+- **Preparation:** `preparing -> prepared` writes the deterministic journal,
+  seals the material, authenticates it, and records the material reference.
+- **Admission:** `prepared -> acquiring -> guarded` acquires each project
+  fence in sorted project order. With no remote-guard driver, the coordinator
+  checkpoints directly to `guarded`; otherwise `acquiring` is rewritten for
+  each project as its authoritative fence is persisted.
+- **Publication:** `guarded -> map-publishing -> map-published ->
+config-publishing -> config-published` publishes the project map before the
+  configuration. A recovered `*-publishing` phase rechecks witnesses and
+  completes the mutation only when the expected state is not already present.
+- **Release/finalization:** `config-published -> releasing -> released ->
+completed` releases every project fence with authoritative readback, then
+  retains the completed material and writes the terminal journal. With no
+  remote-guard driver, `config-published` checkpoints directly to `released`.
+
+The abort sequence is a separate forward-only state machine, never a rewind.
+When abort starts from the initial material-backed journal, its complete
+sequence is:
+
+```text
+preparing -> prepared -> aborting
+  -> config-restoring   (when configuration needs restoration)
+  -> map-restoring
+  -> abort-releasing    (one persisted checkpoint per project)
+  -> aborted
+```
+
+For an already in-flight journal, the sequence starts at its current phase and
+enters `aborting`; `config-restoring` is omitted when the configuration is
+already at its source witness. An abort begins from any non-terminal phase. If
+a `preparing` journal has no material to authenticate, it can instead take the
+short sequence `preparing -> aborted`.
+
+If a configuration witness is
+already at its source state, recovery may checkpoint from `aborting` directly
+to `map-restoring`; otherwise it persists `config-restoring`, restores the
+configuration, and then persists `map-restoring`. The project map is restored
+or re-authenticated before `abort-releasing` releases remote fences and reads
+each release back. Material cleanup occurs before terminal `aborted` is
+written. A `preparing` journal with an existing material reference is
+authenticated before that sequence advances.
+
+`resume()` and default `recoverPending()` advance through the forward groups.
+If the journal is in `aborting`, `config-restoring`, or `map-restoring`, resume
+delegates to the abort state machine instead. `recoverPending({ disposition:
+"abort" })` selects that abort grouping explicitly. Terminal `completed` and
+`aborted` journals are returned as-is. Once remote release starts, recovery
+never moves to an earlier phase; all valid forward paths converge on
+`released` before finalization, and all abort paths converge on
+`abort-releasing` before cleanup and `aborted`.
 
 The coordinator writes the deterministic `preparing` journal before it seals
 the recovery material. Writes use atomic replacement and directory durability
@@ -112,24 +176,48 @@ only for the known platform error codes. Other durability failures fail
 closed.
 
 The internal coordinator exposes `prepare`, `resume`, `abort`, and
-`recoverPending` seams for the activation workflow. Once remote release has
-begun, recovery only moves forward. Mutation permits are tied to the permit
-object and revoked when their callback ends, so an inherited asynchronous
-callback cannot reuse authority after a phase change or release.
+`recoverPending` seams for the activation workflow. Mutation permits are tied
+to the permit object and revoked when their callback ends, so an inherited
+asynchronous callback cannot reuse authority after a phase change or release.
 
 If a process dies at any checkpoint, the journal and material are recovery
 evidence. Do not edit, delete, rename, or bulk-clean the directory. The current
 command surface does not provide a general journal-editing command. Run
 `lcm doctor`, preserve its sanitized output, and let the owning publication
 recovery flow resume or abort the authenticated journal; rerun `lcm doctor`
-and `lcm daemon restart` after the flow reaches a terminal state. An ambiguous
-filesystem or database result is intentionally retained for inspection rather
-than silently repaired.
+after the flow reaches a terminal state. Do not use `lcm daemon restart` to
+activate the staged PostgreSQL target: normal PostgreSQL daemon/CLI activation
+and any associated restart remain deferred to the unimplemented #92 and #224
+work. An ambiguous filesystem or database result is intentionally retained for
+inspection rather than silently repaired.
 
 Consumers accept only an authenticated terminal journal with matching
 configuration, project-map, target-backend, recovery-material, and remote-fence
 witnesses. Missing evidence, unknown residue, checksum drift, active remote
 fences in a terminal record, and backend mismatch all remain blocked.
+
+## Hard limits and rejection behavior
+
+The persistence boundary is deliberately bounded. The implementation applies
+these exact limits, including when it reads an existing artifact, writes a
+checkpoint, archives terminal history, or authenticates recovery material:
+
+| Artifact or identifier                                 | Exact limit                                                                             | Rejection behavior                                                                                                                                                                                     |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `journal.json` and archived journal records            | At most 1,048,576 bytes (1 MiB)                                                         | Oversized, unsafe, non-regular, wrong-mode, multi-link, or unreadable files fail closed; malformed JSON/shape and checksum drift are rejected as malformed or checksum-mismatch evidence.              |
+| Sealed `<publication-id>.material` envelope            | At most 8,388,608 bytes (8 MiB)                                                         | Oversized input is rejected as invalid; an oversized or tampered existing material file is rejected during bounded read/authentication and cannot advance a journal.                                   |
+| Each present recovery file inside material             | Non-empty and at most 4,194,304 bytes (4 MiB)                                           | Oversized, empty, or invalid-metadata recovery files are rejected as invalid input; the material is not sealed or accepted.                                                                            |
+| `publicationId`                                        | 1–128 characters; first character `[A-Za-z0-9]`, remaining characters `[A-Za-z0-9._:-]` | Invalid input is rejected. Persisted IDs and material references that do not match the same pattern are malformed evidence.                                                                            |
+| `localProjectId` and `remoteProjectId` at prepare time | 1–256 characters each; each side must be unique                                         | Empty, oversized, or duplicate project coverage is rejected as invalid input. Persisted project arrays must also be non-empty, unique, and sorted by `localProjectId`, or they are malformed evidence. |
+| PostgreSQL guard `projectId` and `machineId`           | Strict UUIDv7 textual identifiers; inputs are normalized to lowercase                   | Non-UUIDv7 values are rejected by the guard as `invalid-input`; invalid stored rows fail closed as `invalid-row`.                                                                                      |
+| Publication lease `ttlMs`                              | Positive safe integer, no more than 86,400,000 ms (24 hours)                            | Zero, negative, fractional, unsafe, or over-24-hour TTLs are rejected by the guard as `invalid-input`; lease timestamps must also remain internally ordered.                                           |
+
+The material reference is additionally required to be exactly
+`<publicationId>.material`; arbitrary paths and path traversal are rejected as
+malformed journal evidence. The PostgreSQL guard uses the same 1–128-character
+publication-ID grammar and rejects any target backend other than `sqlite` or
+`postgresql`. A lease never receives a TTL longer than 24 hours, even when a
+caller supplies a larger value.
 
 ## Establishing `~/.lcm` safely
 

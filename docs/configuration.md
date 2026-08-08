@@ -293,10 +293,12 @@ configuration commands:
 ```bash
 export LCM_POSTGRES_URL='postgresql://USER:PASSWORD@HOST:25060/DATABASE'
 export LCM_POSTGRES_CA_FILE='/absolute/path/to/ca-certificate.crt'
-# Used only by a staged development/conformance caller; this does not activate
-# normal PostgreSQL daemon or CLI routes.
-lcm daemon restart
 ```
+
+These environment values are for the staged direct programmatic and
+conformance paths only. Do not run `lcm daemon restart` for this PostgreSQL
+shape: normal PostgreSQL daemon/CLI activation and any associated restart are
+deferred to the unimplemented #92 and #224 work.
 
 ### Provisioning a PostgreSQL database
 
@@ -401,8 +403,10 @@ environment variables. The CA and URL are the only TLS and endpoint authority.
 For DigitalOcean Managed PostgreSQL 18 Standard Edition, download the cluster
 CA certificate from the database's **Connection Details** page, save it in a
 private user-readable location, and use the displayed connection string without
-its TLS query parameters. Restart the daemon after changing the backend, URL,
-CA file, pool size, or timeouts. On Linux, the managed user-systemd launch sends
+its TLS query parameters. These PostgreSQL values are consumed only by the
+staged direct programmatic and conformance paths while #92 and #224 remain
+unimplemented; do not restart the normal daemon or treat this section as
+activation guidance. On Linux, the managed user-systemd launch sends
 `LCM_POSTGRES_URL` through `LoadCredential`; the non-secret CA pathname is
 propagated as a normal environment value. `lcm config get storage --effective`
 shows the CA path and tuning values but replaces the URL with `[REDACTED]`.
