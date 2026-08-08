@@ -11,9 +11,13 @@ import type { StorageBackendSelection } from "../storage/backend.js";
 import { selectStorageBackend } from "../storage/backend.js";
 import {
   deleteRegularFile,
+  assertPrivateDirectory,
   ensurePrivateDirectory,
+  openPrivateDirectory,
   PRIVATE_FILE_MODE,
   readBoundedRegularFile,
+  type PrivateDirectoryHandle,
+  type PrivateDirectoryWitness,
 } from "../security-files.js";
 import {
   clearDaemonNotice,
@@ -21,6 +25,28 @@ import {
   sanitizeDaemonRefusalReason,
 } from "./daemon-notice.js";
 import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remediation.js";
+import {
+  assertHookPublicationFence,
+  isBackendPublicationEvidenceMissing,
+  isBackendPublicationJournalError,
+} from "./publication-fence.js";
+
+function assertStableRoot(
+  handle: PrivateDirectoryHandle,
+  path: string,
+  expected: PrivateDirectoryWitness,
+): void {
+  const actual = assertPrivateDirectory(handle, path);
+  if (
+    actual.mode !== expected.mode
+    || actual.uid !== expected.uid
+    || actual.gid !== expected.gid
+    || actual.dev !== expected.dev
+    || actual.ino !== expected.ino
+  ) {
+    throw new Error("private directory witness changed");
+  }
+}
 
 type EnsureResultWithRefusal = Readonly<{ connected: boolean; refusalReason?: unknown }>;
 
@@ -162,7 +188,12 @@ export async function handleSessionStart(
   let ensureResult: EnsureResultWithRefusal;
   try {
     selectStorageBackend(storage);
-  } catch {
+  } catch (error) {
+    if (isBackendPublicationEvidenceMissing(error)) {
+      emitAdmissionNotice(undefined, "ambiguous");
+      return { exitCode: 0, stdout: "" };
+    }
+    if (isBackendPublicationJournalError(error)) throw error;
     emitAdmissionNotice(undefined, "ambiguous");
     return { exitCode: 0, stdout: "" };
   }
@@ -180,7 +211,12 @@ export async function handleSessionStart(
       expectedStorageBackend: storage.backend,
       enforceUserManagerParent: true,
     });
-  } catch {
+  } catch (error) {
+    if (isBackendPublicationEvidenceMissing(error)) {
+      emitAdmissionNotice(undefined, "ambiguous");
+      return { exitCode: 0, stdout: "" };
+    }
+    if (isBackendPublicationJournalError(error)) throw error;
     emitAdmissionNotice(undefined, "ambiguous");
     return { exitCode: 0, stdout: "" };
   }
@@ -197,24 +233,40 @@ export async function handleSessionStart(
       const { SQLiteLocalHookOutboxFactory } = await import("../storage/local-hook-outbox.js");
       const { eventsDbPath } = await import("../db/events-path.js");
       const cwd = input.cwd ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+      const rootPath = lcmHomeDir();
+      const rootHandle = openPrivateDirectory(rootPath);
+      const rootWitness = rootHandle.witness;
       const outboxFactory = new SQLiteLocalHookOutboxFactory();
-      const eventsDb = await outboxFactory.open(eventsDbPath(cwd));
       try {
-        await eventsDb.pruneProcessed(7);
-        await eventsDb.pruneUnprocessed(10_000, 30);
-        await eventsDb.pruneErrorLog(30);
-        const unprocessed = await eventsDb.getUnprocessed(1);
-        if (unprocessed.length > 0) {
-          const { firePromoteEventsRequest } = await import("./session-end.js");
-          firePromoteEventsRequest(daemonPort, { cwd });
+        assertStableRoot(rootHandle, rootPath, rootWitness);
+        const eventsDb = await outboxFactory.open(eventsDbPath(cwd));
+        try {
+          await eventsDb.pruneProcessed(7);
+          await eventsDb.pruneUnprocessed(10_000, 30);
+          await eventsDb.pruneErrorLog(30);
+          const unprocessed = await eventsDb.getUnprocessed(1);
+          if (unprocessed.length > 0) {
+            const { firePromoteEventsRequest } = await import("./session-end.js");
+            firePromoteEventsRequest(daemonPort, { cwd });
+          }
+        } finally {
+          await outboxFactory.close();
         }
       } finally {
-        await outboxFactory.close();
+        try {
+          assertStableRoot(rootHandle, rootPath, rootWitness);
+        } finally {
+          rootHandle.close();
+        }
       }
-    } catch {
+    } catch (error) {
+      if (isBackendPublicationJournalError(error)) throw error;
       // Silent fail — scavenge is best-effort
     }
 
+    // The client owns its network lifecycle; perform only a short admission
+    // check immediately before the request and do not retain the lock over it.
+    assertHookPublicationFence();
     const result = await client.post<{ context: string; insights?: Array<{ content: string; confidence: number; tags: string[] }> }>("/restore", input);
     let stdout = result.context || "";
 
@@ -230,7 +282,8 @@ export async function handleSessionStart(
     }
 
     return { exitCode: 0, stdout };
-  } catch {
+  } catch (error) {
+    if (isBackendPublicationJournalError(error)) throw error;
     return { exitCode: 0, stdout: "" };
   }
 }

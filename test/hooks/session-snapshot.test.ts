@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { SnapshotDeps } from "../../src/hooks/session-snapshot.js";
 
+vi.mock("../../src/hooks/publication-fence.js", () => ({
+  assertHookPublicationFence: vi.fn(),
+  assertHookRootEstablished: vi.fn(),
+  isBackendPublicationJournalError: () => false,
+}));
+
 function makeDeps(overrides: Partial<SnapshotDeps> = {}): SnapshotDeps {
   return {
     statSync: vi.fn().mockReturnValue(null),

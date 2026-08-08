@@ -7,6 +7,12 @@ import { tmpdir } from "node:os";
 import { projectMetaPath } from "../../src/daemon/project.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
+import * as eventScrubbing from "../../src/hooks/event-scrubbing.js";
+import * as localEnqueue from "../../src/hooks/local-enqueue.js";
+import * as projectModule from "../../src/daemon/project.js";
+import * as hookErrors from "../../src/hooks/hook-errors.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import * as backendPublication from "../../src/storage/backend-publication.js";
 
 // Mock eventsDbPath to use temp directory
 vi.mock("../../src/db/events-path.js", () => ({
@@ -40,6 +46,7 @@ describe("handlePostToolUse", () => {
     homeDir = mkdtempSync(join(tmpdir(), "post-tool-home-"));
     originalHome = process.env.HOME;
     process.env.HOME = homeDir;
+    mkdirSync(join(homeDir, ".lcm"), { mode: 0o700 });
     extraDirs = [];
     process.env.TEST_EVENTS_DIR = dir;
   });
@@ -69,6 +76,117 @@ describe("handlePostToolUse", () => {
     const result = await handlePostToolUse(stdin);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("");
+  });
+
+  it("enqueues before selected project metadata and rethrows publication failures after durability", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-order-cwd-"));
+    extraDirs.push(inputCwd);
+    const order: string[] = [];
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockImplementation(async () => {
+      order.push("enqueue");
+      return { inserted: 1, pendingCount: 1 };
+    });
+    const ensure = vi.spyOn(projectModule, "ensureProjectDir").mockImplementation(() => {
+      order.push("project");
+      throw new BackendPublicationJournalError("unresolved-publication", "publication unresolved");
+    });
+    try {
+      await expect(handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Use SQLite?" },
+        tool_response: "yes",
+      }))).rejects.toBeInstanceOf(BackendPublicationJournalError);
+      expect(order).toEqual(["enqueue", "project"]);
+      expect(append).toHaveBeenCalledWith(expect.objectContaining({ cwd: inputCwd }));
+    } finally {
+      append.mockRestore();
+      ensure.mockRestore();
+    }
+  });
+
+  it("fences PostTool project metadata with the coordinator consumer lock after enqueue", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-fenced-project-cwd-"));
+    extraDirs.push(inputCwd);
+    const event = { type: "decision", category: "decision", data: "Use SQLite?", priority: 1 } as const;
+    const order: string[] = [];
+    const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents").mockResolvedValue([event]);
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockImplementation(async () => {
+      order.push("enqueue");
+      return { inserted: 1, pendingCount: 1 };
+    });
+    const consumerLock = vi.spyOn(backendPublication, "withBackendPublicationConsumerLock");
+    const ensure = vi.spyOn(projectModule, "ensureProjectDir").mockImplementation(() => {
+      order.push("project");
+      return inputCwd;
+    });
+
+    try {
+      await expect(handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Use SQLite?" },
+        tool_response: "yes",
+      }))).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(order).toEqual(["enqueue", "project"]);
+      expect(consumerLock).toHaveBeenCalled();
+      expect(append.mock.invocationCallOrder[0]).toBeLessThan(consumerLock.mock.invocationCallOrder[0]!);
+      expect(consumerLock.mock.invocationCallOrder[0]).toBeLessThan(ensure.mock.invocationCallOrder[0]!);
+    } finally {
+      scrub.mockRestore();
+      append.mockRestore();
+      consumerLock.mockRestore();
+      ensure.mockRestore();
+    }
+  });
+
+  it("uses built-in scrubbing when publication-aware scrubbing is unavailable", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-scrub-cwd-"));
+    extraDirs.push(inputCwd);
+    const event = { type: "decision", category: "decision", data: "Use SQLite?", priority: 1 } as const;
+    const publicationError = new BackendPublicationJournalError("malformed-journal", "publication journal is malformed");
+    const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents")
+      .mockRejectedValueOnce(publicationError)
+      .mockResolvedValueOnce([event]);
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockResolvedValue({ inserted: 1, pendingCount: 1 });
+    const ensure = vi.spyOn(projectModule, "ensureProjectDir").mockImplementation(() => inputCwd);
+    try {
+      await expect(handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Use SQLite?" },
+        tool_response: "yes",
+      }))).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(scrub).toHaveBeenLastCalledWith(expect.any(Array), inputCwd, []);
+      expect(append).toHaveBeenCalledWith(expect.objectContaining({ events: [event] }));
+    } finally {
+      scrub.mockRestore();
+      append.mockRestore();
+      ensure.mockRestore();
+    }
+  });
+
+  it("logs ordinary scrubbing failures without treating them as publication control flow", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-scrub-error-cwd-"));
+    extraDirs.push(inputCwd);
+    const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents").mockRejectedValueOnce(new Error("scrub failed"));
+    const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValueOnce(undefined);
+    try {
+      await expect(handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Use SQLite?" },
+        tool_response: "yes",
+      }))).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(log).toHaveBeenCalledWith("PostToolUse", expect.any(Error), { cwd: inputCwd });
+    } finally {
+      scrub.mockRestore();
+      log.mockRestore();
+    }
   });
 
   it("returns empty stdout (PostToolUse hooks don't produce output)", async () => {
@@ -154,11 +272,11 @@ describe("handlePostToolUse", () => {
     const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-postgresql-cwd-"));
     extraDirs.push(inputCwd);
     const configDir = join(homeDir, ".lcm");
-    mkdirSync(configDir);
+    mkdirSync(configDir, { recursive: true });
     writeFileSync(join(configDir, "config.json"), JSON.stringify({
       storage: { backend: "postgresql" },
       security: { sensitivePatterns: ["SQLite"] },
-    }));
+    }), { mode: 0o600 });
 
     await handlePostToolUse(JSON.stringify({
       session_id: "test-session",

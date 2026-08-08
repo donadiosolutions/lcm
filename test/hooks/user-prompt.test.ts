@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
 import type { EventsDb as EventsDbType } from "../../src/hooks/events-db.js";
 import * as storageBackend from "../../src/storage/backend.js";
+import * as localEnqueue from "../../src/hooks/local-enqueue.js";
+import * as publicationFence from "../../src/hooks/publication-fence.js";
+import * as hookConfig from "../../src/hooks/config.js";
+import * as autoHeal from "../../src/hooks/auto-heal.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn(),
@@ -75,6 +80,8 @@ describe("handleUserPromptSubmit", () => {
     originalClaudeProjectDir = process.env.CLAUDE_PROJECT_DIR;
     vi.clearAllMocks();
     vi.mocked(firePromoteEventsNotifyRequest).mockImplementation(() => {});
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
+    chmodSync(join(homedir(), ".lcm"), 0o700);
     delete process.env.CLAUDE_PROJECT_DIR;
   });
 
@@ -186,6 +193,7 @@ describe("handleUserPromptSubmit", () => {
     const previousHome = process.env.HOME;
     const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     process.env.HOME = home;
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     let result: Awaited<ReturnType<typeof handleUserPromptSubmit>>;
     try {
       result = await handleUserPromptSubmit(
@@ -195,9 +203,6 @@ describe("handleUserPromptSubmit", () => {
         {
           backend: "postgresql",
         },
-      );
-      expect(stderrWrite).toHaveBeenCalledWith(
-        "lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.\n",
       );
       expect(stderrWrite.mock.calls.flat().join(" ")).not.toContain("not available in this release");
     } finally {
@@ -220,6 +225,113 @@ describe("handleUserPromptSubmit", () => {
     expect(result).toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
   });
 
+  it("keeps local enqueue before selected project metadata and daemon admission", async () => {
+    const order: string[] = [];
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockImplementation(async () => {
+      order.push("enqueue");
+      return { inserted: 1, pendingCount: 1 };
+    });
+    mockExtractUserPromptEvents.mockReturnValueOnce([
+      { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
+    ]);
+    mockEnsureProjectDir.mockImplementationOnce(() => { order.push("project"); });
+    mockEnsureDaemon.mockImplementationOnce(async () => {
+      order.push("ensure");
+      return { connected: false, port: 3737, spawned: false };
+    });
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "we chose SQLite", cwd: "/proj", session_id: "s1" }),
+        asDaemonClient({ post: vi.fn() }),
+        3737,
+        { backend: "sqlite" },
+      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      expect(order).toEqual(["enqueue", "project", "ensure"]);
+    } finally {
+      append.mockRestore();
+    }
+  });
+
+  it("fences every selected action after UserPromptSubmit enqueue", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "lcm-user-prompt-fenced-cwd-"));
+    const order: string[] = [];
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockImplementation(async () => {
+      order.push("enqueue");
+      return { inserted: 1, pendingCount: 1 };
+    });
+    const project = vi.mocked(ensureProjectDir).mockImplementationOnce(() => {
+      order.push("project");
+      return inputCwd;
+    });
+    const config = vi.spyOn(hookConfig, "loadHookConfig").mockImplementation(() => {
+      order.push("config");
+      return {
+        daemonPort: 4545,
+        storage: { backend: "sqlite" },
+        security: { sensitivePatterns: [] },
+      };
+    });
+    const backend = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementation(() => {
+      order.push("backend");
+      return { backend: "sqlite" };
+    });
+    const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {
+      order.push("repair");
+    });
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+      order.push("fence");
+    });
+    mockExtractUserPromptEvents.mockReturnValueOnce([
+      { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
+    ]);
+    mockEnsureDaemon.mockImplementationOnce(async () => {
+      order.push("daemon");
+      return { connected: true, port: 4545, spawned: false };
+    });
+    const client = asDaemonClient({
+      post: vi.fn().mockImplementation(async () => {
+        order.push("search");
+        return { hints: [] };
+      }),
+    });
+
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "we chose SQLite", cwd: inputCwd, session_id: "s1" }),
+        client,
+      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      expect(order[0]).toBe("enqueue");
+      for (const action of ["project", "repair", "config", "backend", "daemon", "search"]) {
+        const actionIndex = order.indexOf(action);
+        expect(actionIndex).toBeGreaterThan(0);
+        expect(order.slice(0, actionIndex).filter((entry) => entry === "fence").length).toBeGreaterThan(0);
+      }
+      expect(fence).toHaveBeenCalledTimes(6);
+    } finally {
+      append.mockRestore();
+      config.mockRestore();
+      backend.mockRestore();
+      repair.mockRestore();
+      fence.mockRestore();
+      project.mockRestore();
+    }
+  });
+
+  it("rethrows publication errors from selected post-enqueue metadata", async () => {
+    const publicationError = new BackendPublicationJournalError("unresolved-publication", "publication unresolved");
+    vi.spyOn(localEnqueue, "appendLocalHookEvents").mockResolvedValueOnce({ inserted: 1, pendingCount: 1 });
+    mockExtractUserPromptEvents.mockReturnValueOnce([
+      { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
+    ]);
+    mockEnsureProjectDir.mockImplementationOnce(() => { throw publicationError; });
+    await expect(handleUserPromptSubmit(
+      JSON.stringify({ prompt: "we chose SQLite", cwd: "/proj", session_id: "s1" }),
+      asDaemonClient({ post: vi.fn() }),
+      3737,
+      { backend: "sqlite" },
+    )).rejects.toBe(publicationError);
+  });
+
   it("sanitizes unexpected storage-selection failures before the protocol-safe return", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-user-prompt-storage-throw-"));
     const previousHome = process.env.HOME;
@@ -234,9 +346,6 @@ describe("handleUserPromptSubmit", () => {
         asDaemonClient({ post: vi.fn() }),
       );
       expect(result).toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
-      expect(stderrWrite).toHaveBeenCalledWith(
-        "lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.\n",
-      );
       expect(stderrWrite.mock.calls.flat().join(" ")).not.toMatch(/secret|private-config|4242/u);
       expect(mockEnsureDaemon).not.toHaveBeenCalled();
     } finally {

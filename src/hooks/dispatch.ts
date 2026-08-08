@@ -1,5 +1,8 @@
 import { validateAndFixHooks } from "./auto-heal.js";
 import { configPath as defaultConfigPath } from "../runtime-paths.js";
+import {
+  rethrowBackendPublicationJournalError,
+} from "./publication-fence.js";
 
 export const HOOK_COMMANDS = ["compact", "post-tool", "restore", "session-end", "session-snapshot", "user-prompt"] as const;
 export type HookCommand = typeof HOOK_COMMANDS[number];
@@ -47,7 +50,8 @@ export async function dispatchHook(
         }
         if (command === "session-snapshot") verifiedSnapshotPort = endpoint!.port;
       }
-    } catch {
+    } catch (error) {
+      rethrowBackendPublicationJournalError(error);
       // Most hooks retain their existing best-effort behavior, but snapshots
       // must never send transcript data or credentials to an unverified port.
       if (command === "session-snapshot") return { exitCode: 0, stdout: "" };
@@ -55,8 +59,16 @@ export async function dispatchHook(
   }
 
   const hookClient = hookClientFromPayload(stdinText) ?? process.env.LCM_CLIENT;
-  if (hookClient !== "codex") {
+  if (command !== "user-prompt" && hookClient !== "codex") {
     validateAndFixHooks();
+  }
+
+  // UserPromptSubmit owns its own ordering: it must append the local event
+  // before loading the selected backend/configuration or booting the daemon.
+  // Its handler loads the config lazily inside the publication fence.
+  if (command === "user-prompt") {
+    const { handleUserPromptSubmit } = await import("./user-prompt.js");
+    return handleUserPromptSubmit(stdinText);
   }
 
   const { DaemonClient } = await import("../daemon/client.js");
@@ -85,10 +97,6 @@ export async function dispatchHook(
       return verifiedSnapshotPort === undefined
         ? handleSessionSnapshot(stdinText)
         : handleSessionSnapshot(stdinText, { verifiedPort: verifiedSnapshotPort });
-    }
-    case "user-prompt": {
-      const { handleUserPromptSubmit } = await import("./user-prompt.js");
-      return handleUserPromptSubmit(stdinText, client, port, config.storage);
     }
     default:
       throw new Error(`Unknown hook command: ${command}`);
