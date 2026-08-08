@@ -1126,11 +1126,12 @@ async function createDaemonClientOrExit(
 ): Promise<DaemonClient> {
   const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
-  const { selectStorageBackend } = await import("../src/storage/backend.js");
+  const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
 
   migrateLegacyHomeIfNeeded();
-  const config = loadDaemonConfig(defaultConfigPath());
-  if (options.preflightStorage !== false) selectStorageBackend(config.storage);
+  const configFile = defaultConfigPath();
+  const config = loadDaemonConfig(configFile);
+  if (options.preflightStorage !== false) selectStorageBackendForConfig(configFile, config.storage);
   const port = config.daemon?.port ?? 3737;
   const pidFilePath = daemonPidPath();
   const tokenPath = daemonTokenPath();
@@ -1258,6 +1259,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       };
       const daemon = await createDaemon(config, {
         tokenPath,
+        publicationConfigPath: join(lcDir, "config.json"),
         ...(internalDaemonTestIdentity
           ? { _testIdentity: internalDaemonTestIdentity }
           : {}),
@@ -1397,9 +1399,10 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         const { batchCompact } = await import("../src/batch-compact.js");
         const { loadDaemonConfig } = await import("../src/daemon/config.js");
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
-        const { selectStorageBackend } = await import("../src/storage/backend.js");
-        const config = loadDaemonConfig(defaultConfigPath());
-        selectStorageBackend(config.storage);
+        const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
+        const configFile = defaultConfigPath();
+        const config = loadDaemonConfig(configFile);
+        selectStorageBackendForConfig(configFile, config.storage);
         const requestPolicy = resolveCompactRequestPolicyOverride(config, opts);
         const effectiveProvider = resolveManualCompactProvider(config.llm.provider);
         const supportedEfforts = reasoningEffortsForProvider(effectiveProvider, config.llm.apiMode);
@@ -1825,8 +1828,9 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
 
       const verbose: boolean = opts.verbose ?? false;
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
-      const { selectStorageBackend } = await import("../src/storage/backend.js");
-      selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
+      const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
+      const configFile = defaultConfigPath();
+      selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
       const { collectStats, printStats } = await import("../src/stats.js");
       printStats(await collectStats(), verbose);
     });
@@ -2365,7 +2369,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
       const { DaemonClient } = await import("../src/daemon/client.js");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
-      const { selectStorageBackend } = await import("../src/storage/backend.js");
+      const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
       const { NinjaRenderer } = await import("../src/cli/pipeline-runner.js");
       const { makeProgressState } = await import("../src/cli/progress-state.js");
       const { join } = await import("node:path");
@@ -2389,8 +2393,9 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
         }
       }
 
-      const config = loadDaemonConfig(defaultConfigPath());
-      selectStorageBackend(config.storage);
+      const configFile = defaultConfigPath();
+      const config = loadDaemonConfig(configFile);
+      selectStorageBackendForConfig(configFile, config.storage);
       const port = config.daemon?.port ?? 3737;
       const pidFilePath = daemonPidPath();
       const daemonResult = await ensureDaemon({
@@ -2488,12 +2493,13 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
 
       const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
-      const { selectStorageBackend } = await import("../src/storage/backend.js");
+      const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
 
-      const config = loadDaemonConfig(defaultConfigPath());
-      selectStorageBackend(config.storage);
+      const configFile = defaultConfigPath();
+      const config = loadDaemonConfig(configFile);
+      selectStorageBackendForConfig(configFile, config.storage);
       const port = config.daemon?.port ?? 3737;
       const pidFilePath = daemonPidPath();
       const daemonResult = await ensureDaemon({
@@ -2595,8 +2601,9 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       }
 
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
-      const { selectStorageBackend } = await import("../src/storage/backend.js");
-      selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
+      const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
+      const configFile = defaultConfigPath();
+      selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
       const { exportKnowledge } = await import("../src/portable-knowledge.js");
       const { homedir } = await import("node:os");
       const { join } = await import("node:path");
@@ -2680,8 +2687,9 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       }
 
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
-      const { selectStorageBackend } = await import("../src/storage/backend.js");
-      selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
+      const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
+      const configFile = defaultConfigPath();
+      selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
       const { importKnowledge } = await import("../src/portable-knowledge.js");
       const { readFileSync } = await import("node:fs");
 

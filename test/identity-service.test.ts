@@ -17,6 +17,7 @@ import {
   createProject,
   linkProject,
   listProjects,
+  openPostgreSqlIdentitySession,
   ProjectIdentityReconciliationError,
   recoverMachine,
   registerMachine,
@@ -63,6 +64,8 @@ import {
   machineIdentityPath,
 } from "../src/machine-identity.js";
 import { withPrivateMutationLockAsync } from "../src/private-mutation-lock.js";
+import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import { PostgreSqlRuntime } from "../src/storage/postgresql/runtime.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const MACHINE_B = "018f22c4-6d2a-7f10-9a4c-6b8d3e5f9013";
@@ -330,7 +333,70 @@ describe("identity service", () => {
     deps = {
       homeDir: home,
       openSession: vi.fn(async () => ({ repository, close })),
+      _assertBackendPublication: () => undefined,
     };
+  });
+
+  it("fails closed for PostgreSQL identity selection without publication evidence", async () => {
+    await expect(registerMachine(
+      POSTGRESQL_CONFIG,
+      {},
+      { ...deps, _assertBackendPublication: undefined },
+    )).rejects.toMatchObject({
+      name: BackendPublicationJournalError.name,
+      reason: "publication-evidence-missing",
+    });
+  });
+
+  it("closes an unhealthy PostgreSQL identity runtime while preserving its health error", async () => {
+    const caPath = join(home, "postgres-ca.pem");
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const config: ResolvedStorageConfig = {
+      ...POSTGRESQL_CONFIG,
+      postgresql: { ...POSTGRESQL_CONFIG.postgresql, caFile: caPath },
+    };
+    const health = vi.spyOn(PostgreSqlRuntime.prototype, "health").mockResolvedValue({
+      status: "unavailable",
+      backend: "postgresql",
+      error: new Error("health failure"),
+    } as never);
+    const runtimeClose = vi.spyOn(PostgreSqlRuntime.prototype, "close").mockRejectedValue(new Error("cleanup failure"));
+    await expect(openPostgreSqlIdentitySession(config)).rejects.toThrow("health failure");
+    expect(health).toHaveBeenCalledOnce();
+    expect(runtimeClose).toHaveBeenCalledOnce();
+  });
+
+  it("returns a PostgreSQL identity session after healthy runtime admission", async () => {
+    const caPath = join(home, "postgres-ca.pem");
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const config: ResolvedStorageConfig = {
+      ...POSTGRESQL_CONFIG,
+      postgresql: { ...POSTGRESQL_CONFIG.postgresql, caFile: caPath },
+    };
+    vi.spyOn(PostgreSqlRuntime.prototype, "health").mockResolvedValue({
+      status: "healthy",
+      backend: "postgresql",
+    } as never);
+    const runtimeClose = vi.spyOn(PostgreSqlRuntime.prototype, "close").mockResolvedValue(undefined);
+    const session = await openPostgreSqlIdentitySession(config);
+    expect(session.repository).toBeDefined();
+    await session.close();
+    expect(runtimeClose).toHaveBeenCalledOnce();
+  });
+
+  it("uses the bounded fallback when unhealthy PostgreSQL health has no error", async () => {
+    const caPath = join(home, "postgres-ca.pem");
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const config: ResolvedStorageConfig = {
+      ...POSTGRESQL_CONFIG,
+      postgresql: { ...POSTGRESQL_CONFIG.postgresql, caFile: caPath },
+    };
+    vi.spyOn(PostgreSqlRuntime.prototype, "health").mockResolvedValue({
+      status: "unavailable",
+      backend: "postgresql",
+    } as never);
+    vi.spyOn(PostgreSqlRuntime.prototype, "close").mockResolvedValue(undefined);
+    await expect(openPostgreSqlIdentitySession(config)).rejects.toThrow("PostgreSQL identity storage is unavailable");
   });
 
   afterEach(() => {
@@ -1401,6 +1467,7 @@ describe("identity service", () => {
     const otherDeps: Partial<IdentityServiceDependencies> = {
       homeDir: otherHome,
       openSession: deps.openSession,
+      _assertBackendPublication: () => undefined,
     };
     const originalCreate = repository.createProject.getMockImplementation()!;
     repository.createProject = vi.fn(async (input) => {
@@ -2101,6 +2168,7 @@ describe("identity service", () => {
       deps = {
         homeDir: home,
         openSession: vi.fn(async () => ({ repository, close })),
+        _assertBackendPublication: () => undefined,
       };
     }
   });
@@ -3453,6 +3521,7 @@ describe("identity service", () => {
       deps = {
         homeDir: home,
         openSession: vi.fn(async () => ({ repository, close })),
+        _assertBackendPublication: () => undefined,
       };
     }
   });

@@ -20,4 +20,6 @@ export interface DoctorDeps {
   managedDaemonPath?: string;
   /** Internal deterministic seam for exercising MCP handshake failures. */
   _testMcpHandshake?: () => Promise<CheckResult>;
+  /** Internal seam for testing backend-publication admission independently. */
+  _assertBackendPublication?: (homeDir: string, backend: "sqlite" | "postgresql") => void;
 }

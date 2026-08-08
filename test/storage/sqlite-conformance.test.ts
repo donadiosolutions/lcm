@@ -8,6 +8,7 @@ import {
   createStorageBackendFactory,
   UnavailablePostgreSqlStorageBackendFactory,
 } from "../../src/storage/factory.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 import { normalizeStorageError, StorageOperationError } from "../../src/storage/errors.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import { SqliteExecutor } from "../../src/storage/sqlite/executor.js";
@@ -532,7 +533,7 @@ describe("SQLite storage backend conformance", () => {
 
   it("selects SQLite and exposes a cause-free staged PostgreSQL boundary", async () => {
     expect(createStorageBackendFactory({ backend: "sqlite" })).toBeInstanceOf(SqliteStorageBackendFactory);
-    const factory = createStorageBackendFactory({
+    const postgresqlConfig = {
       backend: "postgresql",
       postgresql: {
         poolMax: 5,
@@ -542,7 +543,10 @@ describe("SQLite storage backend conformance", () => {
         url: "postgresql://example.test/lcm",
         caFile: "/safe/ca.pem",
       },
-    });
+    } as const;
+    expect(() => createStorageBackendFactory(postgresqlConfig)).toThrow(BackendPublicationJournalError);
+
+    const factory = new UnavailablePostgreSqlStorageBackendFactory();
     expect(factory).toBeInstanceOf(UnavailablePostgreSqlStorageBackendFactory);
     expect(factory.backend).toBe("postgresql");
     expect(factory.capabilities).toEqual({

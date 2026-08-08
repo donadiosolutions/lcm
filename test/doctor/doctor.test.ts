@@ -12,6 +12,7 @@ import {
   hashProjectPath,
   normalizeProjectPath,
 } from "../../src/project-map.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn().mockResolvedValue({ connected: false }),
@@ -74,6 +75,7 @@ function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
     }),
     homedir: "/tmp/test-home",
     platform: "darwin",
+    _assertBackendPublication: () => undefined,
     ...overrides,
   };
 }
@@ -190,6 +192,57 @@ describe("runDoctor Claude integration ownership", () => {
 });
 
 describe("runDoctor project map checks", () => {
+  it("reports blocked publication admission without attempting repair", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-publication-blocked-"));
+    try {
+      const publicationDir = join(home, ".lcm", "backend-publication");
+      mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _assertBackendPublication: undefined,
+      }));
+
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("Backend publication admission is blocked"),
+      });
+      expect(results.find((result) => result.name === "version")?.status).toBe("pass");
+      expect(results.find((result) => result.name === "project-map")?.status).toBe("skip");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["publication-evidence-missing", "completed publication evidence is missing"],
+    ["unresolved-publication", "a backend publication is unresolved"],
+    ["unsafe-storage", "authenticated publication state is invalid or unsafe"],
+    ["malformed-journal", "authenticated publication state is invalid or unsafe"],
+    ["checksum-mismatch", "authenticated publication state is invalid or unsafe"],
+    ["unexpected-state", "authenticated publication state is invalid or unsafe"],
+    ["permit-mismatch", "authenticated publication state is invalid or unsafe"],
+    ["invalid-input", "authenticated publication state is invalid or unsafe"],
+  ] as const)("renders the %s publication admission message", async (reason, message) => {
+    const results = await runDoctor(minimalDeps({
+      _assertBackendPublication: () => {
+        throw new BackendPublicationJournalError(reason, "test publication refusal");
+      },
+    }));
+    expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+      status: "fail",
+      message: expect.stringContaining(message),
+    });
+  });
+
+  it("rethrows unexpected publication admission failures", async () => {
+    await expect(runDoctor(minimalDeps({
+      _assertBackendPublication: () => {
+        throw new Error("unexpected publication failure");
+      },
+    }))).rejects.toThrow("unexpected publication failure");
+  });
+
   it("renders blocked reconciliation guidance without retrying through project patterns", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-blocked-reconciliation-"));
     try {

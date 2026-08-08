@@ -4,7 +4,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { DaemonClient } from "../daemon/client.js";
-import { loadDaemonConfig, type ResolvedStorageConfig } from "../daemon/config.js";
+import { loadDaemonConfig, type DaemonConfig, type ResolvedStorageConfig } from "../daemon/config.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
 import { configPath as defaultConfigPath, daemonPidPath } from "../runtime-paths.js";
 import { PKG_VERSION } from "../daemon/version.js";
@@ -17,7 +17,14 @@ import { lcmSearchTool } from "./tools/lcm-search.js";
 import { lcmStoreTool } from "./tools/lcm-store.js";
 import { lcmStatsTool } from "./tools/lcm-stats.js";
 import { lcmDoctorTool } from "./tools/lcm-doctor.js";
-import { selectStorageBackend, StorageBackendUnavailableError } from "../storage/backend.js";
+import {
+  selectStorageBackend,
+  selectStorageBackendForConfig,
+  assertStorageBackendPublication,
+  backendPublicationHomeForConfigPath,
+  StorageBackendUnavailableError,
+} from "../storage/backend.js";
+import { BackendPublicationJournalError } from "../storage/backend-publication.js";
 import { isDaemonTransportFailure } from "../daemon/http-url.js";
 import { sanitizeHookErrorDiagnostic } from "../hooks/hook-error-diagnostic.js";
 
@@ -95,7 +102,8 @@ function redactQuotedMcpAssignments(value: string, redactionKeyMarker: string, r
 
 const LOCAL_TOOLS: Record<string, (args: Record<string, unknown>) => Promise<string>> = {
   lcm_stats: async (args) => {
-    selectStorageBackend(loadDaemonConfig(defaultConfigPath()).storage);
+    const configFile = defaultConfigPath();
+    selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
     const { collectStats, formatNumber } = await import("../stats.js");
     const stats = await collectStats();
     const verbose = args.verbose === true;
@@ -204,8 +212,27 @@ export type DaemonRequestOpts = {
   spawnArgs?: string[];
   expectedEntrypoint?: string;
   expectedVersion?: string;
+  /** Canonical config path used for fresh request-time publication admission. */
+  publicationConfigPath?: string;
   _ensureDaemon?: typeof ensureDaemon;
 };
+
+function assertMcpStorageAdmission(
+  configPath: string,
+  expectedBackend?: ResolvedStorageConfig["backend"],
+): DaemonConfig {
+  const config = loadDaemonConfig(configPath);
+  if (expectedBackend !== undefined && config.storage.backend !== expectedBackend) {
+    throw new BackendPublicationJournalError(
+      "unexpected-state",
+      "MCP request backend differs from the authenticated config backend",
+    );
+  }
+  const homeDir = backendPublicationHomeForConfigPath(configPath);
+  assertStorageBackendPublication({ backend: config.storage.backend, homeDir });
+  selectStorageBackend({ backend: config.storage.backend, homeDir });
+  return config;
+}
 
 /**
  * Keep MCP failures useful without crossing the process/configuration boundary
@@ -213,6 +240,9 @@ export type DaemonRequestOpts = {
  * fixed, user-facing diagnostic and contains no request or host data.
  */
 function safeMcpError(err: unknown): string {
+  if (err instanceof BackendPublicationJournalError) {
+    return "lcm error: backend publication admission blocked; complete or recover the publication before retrying";
+  }
   if (err instanceof StorageBackendUnavailableError) {
     return `lcm error: ${err.message}`;
   }
@@ -250,7 +280,11 @@ export async function handleDaemonRequest(
   opts: DaemonRequestOpts,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
   try {
-    selectStorageBackend(opts.storage);
+    if (opts.publicationConfigPath === undefined) {
+      selectStorageBackend(opts.storage);
+    } else {
+      assertMcpStorageAdmission(opts.publicationConfigPath, opts.storage.backend);
+    }
   } catch (err) {
     return { content: [{ type: "text", text: safeMcpError(err) }], isError: true };
   }
@@ -275,8 +309,8 @@ export async function handleDaemonRequest(
 }
 
 export async function startMcpServer(): Promise<void> {
-  const config = loadDaemonConfig(defaultConfigPath());
-  selectStorageBackend(config.storage);
+  const publicationConfigPath = defaultConfigPath();
+  const config = assertMcpStorageAdmission(publicationConfigPath);
   const port = config.daemon.port;
   const pidFilePath = daemonPidPath();
 
@@ -330,19 +364,14 @@ export async function startMcpServer(): Promise<void> {
     const route = TOOL_ROUTES[req.params.name];
     if (!route) return { content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }], isError: true };
     const body = { ...filteredArgs, cwd: process.env.PWD ?? process.cwd() };
-    let requestConfig: ReturnType<typeof loadDaemonConfig>;
-    try {
-      requestConfig = loadDaemonConfig(defaultConfigPath());
-    } catch (err) {
-      return { content: [{ type: "text", text: safeMcpError(err) }], isError: true };
-    }
     return handleDaemonRequest(client, route, body, {
       port, pidFilePath,
       spawnCommand: process.execPath,
       spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
       expectedEntrypoint: lcmBin,
       expectedVersion: PKG_VERSION,
-      storage: requestConfig.storage,
+      storage: config.storage,
+      publicationConfigPath,
     });
   });
 

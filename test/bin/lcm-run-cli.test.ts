@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfigValidationError } from "../../src/daemon/config.js";
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
@@ -101,7 +102,7 @@ vi.mock("node:fs", async importOriginal => ({
 }));
 vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/runtime-paths.js")>()),
-  configPath: () => `${state.runtimeHome}/config.json`,
+  configPath: () => `${state.runtimeHome}/.lcm/config.json`,
   daemonPidPath: () => state.runtimePidPath,
   daemonTokenPath: () => state.runtimeTokenPath,
   lcmHomeDir: () => state.runtimeHome,
@@ -427,7 +428,7 @@ describe("runCli daemon-backed and utility actions", () => {
   ])("rejects daemon-backed command %# before lifecycle mutation when PostgreSQL is selected", async (...args) => {
     state.storageBackend = "postgresql";
 
-    await expect(runCli(["node", "lcm", ...args])).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+    await expect(runCli(["node", "lcm", ...args])).rejects.toBeInstanceOf(BackendPublicationJournalError);
     expect(state.ensureDaemon).not.toHaveBeenCalled();
     expect(state.health).not.toHaveBeenCalled();
     expect(state.get).not.toHaveBeenCalled();
@@ -456,7 +457,7 @@ describe("runCli orchestration actions", () => {
   it("refuses normal stats when the effective backend is unavailable", async () => {
     state.loadConfig.mockReturnValueOnce({ storage: { backend: "postgresql" } });
 
-    await expect(runCli(["node", "lcm", "stats"])).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+    await expect(runCli(["node", "lcm", "stats"])).rejects.toBeInstanceOf(BackendPublicationJournalError);
   });
 
   it.each(["start", "restart"])("runs managed daemon %s with staged PostgreSQL storage", async (action) => {
@@ -492,7 +493,7 @@ describe("runCli orchestration actions", () => {
       expect((await invoke(["compact", "--hook", "--timeout-ms", "2000"]))?.message).toBe("exit:0");
       expect(state.loadConfig).not.toHaveBeenCalled();
       expect(state.loadPolicyConfig).toHaveBeenCalledOnce();
-      expect(state.loadPolicyConfig).toHaveBeenLastCalledWith("/lcm/config.json");
+      expect(state.loadPolicyConfig).toHaveBeenLastCalledWith("/lcm/.lcm/config.json");
       expect(JSON.parse(state.dispatchHook.mock.calls.at(-1)![1])).toMatchObject({
         request_timeout_ms: 2000,
       });
@@ -542,8 +543,8 @@ describe("runCli orchestration actions", () => {
     const portable = await import("../../src/portable-knowledge.js");
     state.storageBackend = "postgresql";
 
-    expect(await invoke(["export", "--all"])).toBeInstanceOf(StorageBackendUnavailableError);
-    expect(await invoke(["import-knowledge", "input.json"])).toBeInstanceOf(StorageBackendUnavailableError);
+    expect(await invoke(["export", "--all"])).toBeInstanceOf(BackendPublicationJournalError);
+    expect(await invoke(["import-knowledge", "input.json"])).toBeInstanceOf(BackendPublicationJournalError);
     expect(portable.exportKnowledge).not.toHaveBeenCalled();
     expect(portable.importKnowledge).not.toHaveBeenCalled();
   });
@@ -555,7 +556,7 @@ describe("runCli orchestration actions", () => {
   ])("rejects direct daemon command %# before lifecycle or daemon network activity", async (...args) => {
     state.storageBackend = "postgresql";
 
-    expect(await invoke(args)).toBeInstanceOf(StorageBackendUnavailableError);
+    expect(await invoke(args)).toBeInstanceOf(BackendPublicationJournalError);
     expect(state.ensureDaemon).not.toHaveBeenCalled();
     expect(state.post).not.toHaveBeenCalled();
     expect(state.get).not.toHaveBeenCalled();
@@ -1029,6 +1030,7 @@ describe("runCli failure and alternate presentation branches", () => {
         expect.any(Object),
         {
           tokenPath: `${state.runtimeHome}/daemon.token`,
+          publicationConfigPath: `${state.runtimeHome}/config.json`,
           _testIdentity: {
             ownerId: "cli-owned",
             entrypoint,

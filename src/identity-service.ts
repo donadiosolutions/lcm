@@ -58,6 +58,7 @@ import { PostgreSqlCommitOutcomeUnknownError } from "./storage/postgresql/errors
 import { PostgreSqlRuntime } from "./storage/postgresql/runtime.js";
 import { quoteShellArgument } from "./shell-quote.js";
 import { reconcileWorktrees } from "./worktree-reconciliation.js";
+import { assertStorageBackendPublication } from "./storage/backend.js";
 
 export interface IdentityRepository {
   registerMachine(identityKey: string, displayName: string): Promise<RegisteredMachine>;
@@ -154,6 +155,11 @@ export interface IdentitySession {
 export interface IdentityServiceDependencies {
   readonly openSession: (config: ResolvedStorageConfig) => Promise<IdentitySession>;
   readonly homeDir?: string;
+  /** @internal Test-only boundary for exercising identity flows independently of publication fixtures. */
+  readonly _assertBackendPublication?: (
+    config: ResolvedStorageConfig,
+    homeDir?: string,
+  ) => void;
   /** @internal Deterministic retry seam for remote identity lock tests. */
   readonly waitForRemoteIdentityLock?: (delayMs: number) => Promise<void>;
   /** @internal Bounded retry override for remote identity lock tests. */
@@ -221,6 +227,17 @@ function dependencies(
   overrides?: Partial<IdentityServiceDependencies>,
 ): IdentityServiceDependencies {
   return { ...DEFAULT_DEPENDENCIES, ...overrides };
+}
+
+function assertIdentityPublication(
+  config: ResolvedStorageConfig,
+  deps: IdentityServiceDependencies,
+): void {
+  if (deps._assertBackendPublication !== undefined) {
+    deps._assertBackendPublication(config, deps.homeDir);
+    return;
+  }
+  assertStorageBackendPublication({ backend: config.backend, homeDir: deps.homeDir });
 }
 
 function withProjectIdentityMutationLock<T>(
@@ -487,6 +504,7 @@ async function withSession<T>(
   callback: (repository: IdentityRepository) => Promise<T>,
 ): Promise<T> {
   requirePostgreSqlConfig(config);
+  assertIdentityPublication(config, deps);
   const session = await deps.openSession(config);
   try {
     return await callback(session.repository);
@@ -513,8 +531,9 @@ export async function registerMachine(
   options: { readonly displayName?: string } = {},
   dependencyOverrides?: Partial<IdentityServiceDependencies>,
 ): Promise<{ readonly identity: MachineIdentity; readonly created: boolean }> {
-  requirePostgreSqlConfig(config);
   const deps = dependencies(dependencyOverrides);
+  requirePostgreSqlConfig(config);
+  assertIdentityPublication(config, deps);
   const requestedDisplayName = options.displayName === undefined
     ? undefined
     : normalizeMachineDisplayName(options.displayName);
@@ -570,8 +589,9 @@ export async function recoverMachine(
 ): Promise<MachineIdentityRecoveryResult> {
   const normalizedMachineId = normalizeUuidV7(machineId);
   if (!normalizedMachineId) throw new Error(`invalid PostgreSQL machine UUIDv7: ${machineId}`);
-  requirePostgreSqlConfig(config);
   const deps = dependencies(dependencyOverrides);
+  requirePostgreSqlConfig(config);
+  assertIdentityPublication(config, deps);
   return withRemoteIdentityMutationLock(deps.homeDir, () => (
     withSession(config, deps, async (repository) => {
       const registered = await repository.recoverMachine(normalizedMachineId);
@@ -722,8 +742,9 @@ export async function createProject(
   dependencyOverrides?: Partial<IdentityServiceDependencies>,
 ): Promise<{ readonly local: ProjectIdentity; readonly remote: RemoteProject }> {
   requirePostgreSqlConfig(config);
-  const projectPath = assertProjectDirectory(path);
   const deps = dependencies(dependencyOverrides);
+  assertIdentityPublication(config, deps);
+  const projectPath = assertProjectDirectory(path);
   const displayName = normalizeProjectDisplayName(
     options.displayName ?? defaultProjectDisplayName(projectPath),
   );
@@ -1327,6 +1348,7 @@ export async function linkProject(
 }> {
   const projectPath = assertProjectDirectory(path);
   const deps = dependencies(dependencyOverrides);
+  assertIdentityPublication(config, deps);
   const remoteProjectId = normalizeUuidV7(target);
   if (remoteProjectId) {
     requirePostgreSqlConfig(config);
@@ -1495,6 +1517,7 @@ export async function unlinkProject(
 }> {
   const projectPath = resolve(path);
   const deps = dependencies(dependencyOverrides);
+  assertIdentityPublication(config, deps);
   return withProjectIdentityMutationLock(deps.homeDir, async () => {
     const shown = showReconciledLocalProject(projectPath, deps);
     if (shown.transient || !shown.entry.remoteProjectId) {

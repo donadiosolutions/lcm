@@ -56,6 +56,10 @@ import {
   mapDaemonRefusalToRemediation,
   type DaemonRefusalReason,
 } from "../daemon/remediation.js";
+import {
+  assertStorageBackendPublication,
+} from "../storage/backend.js";
+import { BackendPublicationJournalError } from "../storage/backend-publication.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -98,6 +102,53 @@ interface DoctorConfig {
 
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
 const DAEMON_HEALTH_DEADLINE_MS = 2000;
+
+function publicationAdmissionMessage(
+  reason: BackendPublicationJournalError["reason"],
+): string {
+  switch (reason) {
+    case "publication-evidence-missing":
+      return "Backend publication admission is blocked: completed publication evidence is missing. Complete or recover the backend publication, then rerun lcm doctor.";
+    case "unresolved-publication":
+      return "Backend publication admission is blocked: a backend publication is unresolved. Complete or abort the pending publication, then rerun lcm doctor.";
+    case "unsafe-storage":
+    case "malformed-journal":
+    case "checksum-mismatch":
+    case "unexpected-state":
+    case "permit-mismatch":
+    case "invalid-input":
+      return "Backend publication admission is blocked: authenticated publication state is invalid or unsafe. Stop automatic repair and inspect the installation before retrying.";
+  }
+}
+
+function checkBackendPublicationAdmission(
+  results: CheckResult[],
+  deps: DoctorDeps,
+  config: DoctorConfig,
+): boolean {
+  if (config.storage === undefined || config.validationError !== undefined) return false;
+  const backend = config.storageBackend === "sqlite" || config.storageBackend === "postgresql"
+    ? config.storageBackend
+    : undefined;
+  if (backend === undefined) return false;
+  try {
+    if (deps._assertBackendPublication !== undefined) {
+      deps._assertBackendPublication(deps.homedir, backend);
+    } else {
+      assertStorageBackendPublication({ backend, homeDir: deps.homedir });
+    }
+    return false;
+  } catch (error) {
+    if (!(error instanceof BackendPublicationJournalError)) throw error;
+    results.push({
+      name: "backend-publication",
+      category: "Storage",
+      status: "fail",
+      message: publicationAdmissionMessage(error.reason),
+    });
+    return true;
+  }
+}
 
 type DaemonStorageReadiness = "ready" | "unavailable" | "unverified";
 
@@ -744,6 +795,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   const options = normalizeDoctorOptions(doctorOptions);
   const results: CheckResult[] = [];
   const config = loadConfig(deps);
+  const publicationBlocked = checkBackendPublicationAdmission(results, deps, config);
   const remediationScope = daemonRemediationScope(deps.homedir);
 
   // ── Stack info ──
@@ -784,8 +836,13 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   }
 
   // ── Project path aliases ──
-  checkProjectMap(results, deps);
-  checkWorktreeReconciliations(results, deps);
+  if (publicationBlocked) {
+    results.push({ name: "project-map", category: "Project Map", status: "skip", message: "Skipped because backend publication admission is blocked" });
+    results.push({ name: "worktree-reconciliation", category: "Project Map", status: "skip", message: "Skipped because backend publication admission is blocked" });
+  } else {
+    checkProjectMap(results, deps);
+    checkWorktreeReconciliations(results, deps);
+  }
 
   // ── Daemon ──
   let daemonHealthy = false;
@@ -798,16 +855,26 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     clearDaemonNotice(remediationScope);
   };
   let initialHealthPid: number | undefined;
-  try {
-    const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
-    if (h) {
-      daemonHealthy = true;
-      daemonVersion = h.version;
-      initialHealthPid = h.pid;
-    }
-  } catch {}
+  if (!publicationBlocked) {
+    try {
+      const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
+      if (h) {
+        daemonHealthy = true;
+        daemonVersion = h.version;
+        initialHealthPid = h.pid;
+      }
+    } catch {}
+  }
 
-  if (config.validationError || config.storageBackend === "unavailable") {
+  if (publicationBlocked) {
+    results.push({
+      name: "daemon",
+      category: "Daemon",
+      status: "skip",
+      message: "Automatic daemon start, restart, and repair skipped because backend publication admission is blocked",
+      fixApplied: false,
+    });
+  } else if (config.validationError || config.storageBackend === "unavailable") {
     results.push(daemonHealthy
       ? {
           name: "daemon", category: "Daemon", status: "warn",
