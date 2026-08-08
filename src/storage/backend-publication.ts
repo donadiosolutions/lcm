@@ -2451,7 +2451,7 @@ export class BackendPublicationCoordinator {
     let journal = readJournal(this.#homeDir);
     if (journal === null) return fail("publication-evidence-missing", "backend publication journal is missing");
     if (journal.phase === "completed" || journal.phase === "aborted") return journal;
-    if (["aborting", "config-restoring", "map-restoring"].includes(journal.phase)) {
+    if (["aborting", "config-restoring", "map-restoring", "abort-releasing"].includes(journal.phase)) {
       return this.#abortUnlocked();
     }
     if (journal.phase === "preparing") {

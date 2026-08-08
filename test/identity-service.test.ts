@@ -1881,7 +1881,7 @@ describe("identity service", () => {
         aliases: [],
         remoteProjectId: PROJECT_A,
       },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`, { mode: 0o600 });
     clearProjectMapCache();
     repository.createProject.mockClear();
     vi.mocked(deps.openSession!).mockClear();
@@ -1906,10 +1906,10 @@ describe("identity service", () => {
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
     const alias = makeProject("legacy-local-link-alias");
-    mkdirSync(join(home, ".lcm"), { recursive: true });
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
     writeFileSync(projectMapPath(), `${JSON.stringify({
       [sourceHash]: { canonical: linked, aliases: [] },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`, { mode: 0o600 });
     clearProjectMapCache();
 
     await expect(linkProject(SQLITE_CONFIG, linked, alias, {}, deps))
@@ -1928,7 +1928,7 @@ describe("identity service", () => {
         canonical: unlinkRepository.linked,
         aliases: [unlinkAlias],
       },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`, { mode: 0o600 });
     clearProjectMapCache();
     clearWorktreeReconciliationCache();
 
@@ -1968,7 +1968,7 @@ describe("identity service", () => {
         aliases: [],
         remoteProjectId: PROJECT_B,
       },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`, { mode: 0o600 });
     clearProjectMapCache();
     const mapBefore = readFileSync(mapPath, "utf8");
     repository.replaceProjectAliases.mockClear();
