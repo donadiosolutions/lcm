@@ -1945,39 +1945,45 @@ describe("BackendPublicationCoordinator", () => {
     expect(fake.getState()).toEqual(sourceState(input));
   });
 
-  it("resumes a parked abort-releasing journal to aborted after releasing remote fences", async () => {
+  it("resumes a parked active-fence abort-releasing journal to aborted", async () => {
     const { home, input, fake, getFence } = await releasingFixture();
     await expect(coordinator(home, fake.driver, (event) => {
       if (
-        event === "before-material-authenticate"
+        event === "before-release"
         && readBackendPublicationJournal(home)?.phase === "abort-releasing"
-      ) throw new Error("crash:abort-resume");
-    }).abort()).rejects.toThrow("crash:abort-resume");
+      ) throw new Error("crash:abort-before-release-resume");
+    }).abort()).rejects.toThrow("crash:abort-before-release-resume");
     expect(readBackendPublicationJournal(home)?.phase).toBe("abort-releasing");
+    expect(getFence()?.releasedAt).toBeNull();
+    const materialPath = join(backendPublicationDirectory(home), "publication-1.material");
+    expect(existsSync(materialPath)).toBe(true);
 
     const recovered = await coordinator(home, fake.driver).resume();
     expect(recovered.phase).toBe("aborted");
     expect(recovered.phase).not.toBe("completed");
     expect(getFence()?.releasedAt).not.toBeNull();
-    expect(existsSync(join(backendPublicationDirectory(home), "publication-1.material"))).toBe(false);
+    expect(existsSync(materialPath)).toBe(false);
     expect(fake.getState()).toEqual(sourceState(input));
   });
 
-  it("recovers a parked abort-releasing journal to aborted without a disposition", async () => {
+  it("recovers a parked active-fence abort-releasing journal without a disposition", async () => {
     const { home, input, fake, getFence } = await releasingFixture();
     await expect(coordinator(home, fake.driver, (event) => {
       if (
-        event === "before-material-authenticate"
+        event === "before-release"
         && readBackendPublicationJournal(home)?.phase === "abort-releasing"
-      ) throw new Error("crash:abort-default-recover");
-    }).abort()).rejects.toThrow("crash:abort-default-recover");
+      ) throw new Error("crash:abort-before-release-default-recover");
+    }).abort()).rejects.toThrow("crash:abort-before-release-default-recover");
     expect(readBackendPublicationJournal(home)?.phase).toBe("abort-releasing");
+    expect(getFence()?.releasedAt).toBeNull();
+    const materialPath = join(backendPublicationDirectory(home), "publication-1.material");
+    expect(existsSync(materialPath)).toBe(true);
 
     const recovered = await coordinator(home, fake.driver).recoverPending();
     expect(recovered?.phase).toBe("aborted");
     expect(recovered?.phase).not.toBe("completed");
     expect(getFence()?.releasedAt).not.toBeNull();
-    expect(existsSync(join(backendPublicationDirectory(home), "publication-1.material"))).toBe(false);
+    expect(existsSync(materialPath)).toBe(false);
     expect(fake.getState()).toEqual(sourceState(input));
   });
 
