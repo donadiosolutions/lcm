@@ -27,6 +27,7 @@ import {
 import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remediation.js";
 import {
   assertHookPublicationFence,
+  isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
 } from "./publication-fence.js";
 
@@ -188,6 +189,10 @@ export async function handleSessionStart(
   try {
     selectStorageBackend(storage);
   } catch (error) {
+    if (isBackendPublicationEvidenceMissing(error)) {
+      emitAdmissionNotice(undefined, "ambiguous");
+      return { exitCode: 0, stdout: "" };
+    }
     if (isBackendPublicationJournalError(error)) throw error;
     emitAdmissionNotice(undefined, "ambiguous");
     return { exitCode: 0, stdout: "" };
@@ -207,6 +212,10 @@ export async function handleSessionStart(
       enforceUserManagerParent: true,
     });
   } catch (error) {
+    if (isBackendPublicationEvidenceMissing(error)) {
+      emitAdmissionNotice(undefined, "ambiguous");
+      return { exitCode: 0, stdout: "" };
+    }
     if (isBackendPublicationJournalError(error)) throw error;
     emitAdmissionNotice(undefined, "ambiguous");
     return { exitCode: 0, stdout: "" };

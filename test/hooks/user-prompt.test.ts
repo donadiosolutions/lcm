@@ -7,6 +7,9 @@ import type { DaemonClient } from "../../src/daemon/client.js";
 import type { EventsDb as EventsDbType } from "../../src/hooks/events-db.js";
 import * as storageBackend from "../../src/storage/backend.js";
 import * as localEnqueue from "../../src/hooks/local-enqueue.js";
+import * as publicationFence from "../../src/hooks/publication-fence.js";
+import * as hookConfig from "../../src/hooks/config.js";
+import * as autoHeal from "../../src/hooks/auto-heal.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
@@ -246,6 +249,71 @@ describe("handleUserPromptSubmit", () => {
       expect(order).toEqual(["enqueue", "project", "ensure"]);
     } finally {
       append.mockRestore();
+    }
+  });
+
+  it("fences every selected action after UserPromptSubmit enqueue", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "lcm-user-prompt-fenced-cwd-"));
+    const order: string[] = [];
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockImplementation(async () => {
+      order.push("enqueue");
+      return { inserted: 1, pendingCount: 1 };
+    });
+    const project = vi.mocked(ensureProjectDir).mockImplementationOnce(() => {
+      order.push("project");
+      return inputCwd;
+    });
+    const config = vi.spyOn(hookConfig, "loadHookConfig").mockImplementation(() => {
+      order.push("config");
+      return {
+        daemonPort: 4545,
+        storage: { backend: "sqlite" },
+        security: { sensitivePatterns: [] },
+      };
+    });
+    const backend = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementation(() => {
+      order.push("backend");
+      return { backend: "sqlite" };
+    });
+    const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {
+      order.push("repair");
+    });
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+      order.push("fence");
+    });
+    mockExtractUserPromptEvents.mockReturnValueOnce([
+      { type: "decision", category: "decision", data: "use SQLite", priority: 1 },
+    ]);
+    mockEnsureDaemon.mockImplementationOnce(async () => {
+      order.push("daemon");
+      return { connected: true, port: 4545, spawned: false };
+    });
+    const client = asDaemonClient({
+      post: vi.fn().mockImplementation(async () => {
+        order.push("search");
+        return { hints: [] };
+      }),
+    });
+
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "we chose SQLite", cwd: inputCwd, session_id: "s1" }),
+        client,
+      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      expect(order[0]).toBe("enqueue");
+      for (const action of ["project", "repair", "config", "backend", "daemon", "search"]) {
+        const actionIndex = order.indexOf(action);
+        expect(actionIndex).toBeGreaterThan(0);
+        expect(order.slice(0, actionIndex).filter((entry) => entry === "fence").length).toBeGreaterThan(0);
+      }
+      expect(fence).toHaveBeenCalledTimes(6);
+    } finally {
+      append.mockRestore();
+      config.mockRestore();
+      backend.mockRestore();
+      repair.mockRestore();
+      fence.mockRestore();
+      project.mockRestore();
     }
   });
 

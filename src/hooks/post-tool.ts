@@ -4,6 +4,8 @@ import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
 import { appendLocalHookEvents } from "./local-enqueue.js";
 import {
+  assertHookPublicationFence,
+  isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
 } from "./publication-fence.js";
 
@@ -75,11 +77,19 @@ export async function handlePostToolUse(
       sourceHook: "PostToolUse",
     });
 
-    // Project metadata is a selected-state consumer, so it is deliberately
-    // opened only after local durability. ensureProjectDir owns its own
-    // project-map/publication boundary; wrapping it here would self-contention
-    // on the same interprocess consumer lock.
-    ensureProjectDir(resolvedCwd);
+    // Project metadata is a selected-state consumer. Re-admit immediately
+    // before its own coordinator-aware operation; do not retain this lock over
+    // project-map reconciliation.
+    try {
+      assertHookPublicationFence();
+      ensureProjectDir(resolvedCwd);
+    } catch (error) {
+      // A staged backend without terminal publication evidence blocks all
+      // selected-state consumers, but the already-durable local event remains
+      // the successful PostToolUse outcome.
+      if (isBackendPublicationEvidenceMissing(error)) return { exitCode: 0, stdout: "" };
+      throw error;
+    }
 
     // PostToolUse payloads are untrusted. Persist events locally and let the
     // daemon's bounded background scan process them; never use a payload port

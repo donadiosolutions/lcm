@@ -59,7 +59,7 @@ export async function dispatchHook(
   }
 
   const hookClient = hookClientFromPayload(stdinText) ?? process.env.LCM_CLIENT;
-  if (hookClient !== "codex") {
+  if (command !== "user-prompt" && hookClient !== "codex") {
     validateAndFixHooks();
   }
 

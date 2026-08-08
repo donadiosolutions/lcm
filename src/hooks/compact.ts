@@ -8,7 +8,7 @@ import { daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { fenceContent } from "../daemon/content-fence.js";
 import { safeLogError } from "./hook-errors.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
-import { selectStorageBackend } from "../storage/backend.js";
+import { selectStorageBackend, StorageBackendUnavailableError } from "../storage/backend.js";
 import {
   clearDaemonNotice,
   maybeEmitDaemonNotice,
@@ -17,6 +17,7 @@ import {
 import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remediation.js";
 import {
   assertHookPublicationFence,
+  isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
 } from "./publication-fence.js";
 
@@ -56,8 +57,16 @@ export async function handlePreCompact(
   try {
     selectStorageBackend(storage);
   } catch (error) {
-    if (isBackendPublicationJournalError(error)) return { exitCode: 0, stdout: "" };
-    await safeLogError("PreCompact", error, {});
+    if (isBackendPublicationJournalError(error) && !isBackendPublicationEvidenceMissing(error)) {
+      return { exitCode: 0, stdout: "" };
+    }
+    await safeLogError(
+      "PreCompact",
+      isBackendPublicationEvidenceMissing(error) && storage.backend === "postgresql"
+        ? new StorageBackendUnavailableError("postgresql")
+        : error,
+      {},
+    );
     return { exitCode: 0, stdout: "" };
   }
   try {
