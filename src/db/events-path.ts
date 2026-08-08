@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { localProjectIdentity } from "../daemon/project.js";
 import {
   hashProjectPath,
@@ -8,21 +8,78 @@ import {
   resolveExistingProjectIdentity,
 } from "../project-map.js";
 import { lcmHomeDir } from "../runtime-paths.js";
+import {
+  atomicWritePrivateFileDurable,
+  ensurePrivateDirectory,
+  OWNER_ONLY_FILE_MODES,
+  readBoundedRegularFile,
+} from "../security-files.js";
 
-function normalizeOrphanIdentityPath(cwd: string): string {
-  const normalized = normalizeProjectIdentityPath(cwd);
-  if (existsSync(cwd)) return normalized;
+const IDENTITY_EVIDENCE_VERSION = 1;
+const MAX_IDENTITY_EVIDENCE_BYTES = 4 * 1024;
+const PROJECT_ID_PATTERN = /^[a-f0-9]{64}$/u;
 
-  let ancestor = resolve(cwd);
-  while (!existsSync(ancestor)) {
-    ancestor = dirname(ancestor);
-  }
+type SidecarIdentityEvidence = Readonly<{
+  version: typeof IDENTITY_EVIDENCE_VERSION;
+  cwd: string;
+  canonical: string;
+  id: string;
+}>;
+
+function identityEvidencePath(normalizedCwd: string): string {
+  return join(eventsDir(), `${hashProjectPath(normalizedCwd)}.identity.json`);
+}
+
+function publishIdentityEvidence(cwd: string, identity: { id: string; canonical: string }): void {
+  const normalizedCwd = normalizeProjectPath(cwd);
+  if (hashProjectPath(normalizedCwd) === identity.id) return;
+
+  const canonical = normalizeProjectIdentityPath(identity.canonical);
+  const evidence: SidecarIdentityEvidence = {
+    version: IDENTITY_EVIDENCE_VERSION,
+    cwd: normalizedCwd,
+    canonical,
+    id: identity.id,
+  };
+  ensurePrivateDirectory(eventsDir());
+  atomicWritePrivateFileDurable(
+    identityEvidencePath(normalizedCwd),
+    `${JSON.stringify(evidence)}\n`,
+    { maxExistingBytes: MAX_IDENTITY_EVIDENCE_BYTES },
+  );
+}
+
+function existingSidecarFromIdentityEvidence(cwd: string): string | undefined {
+  const normalizedCwd = normalizeProjectPath(cwd);
+  const path = identityEvidencePath(normalizedCwd);
+  if (!existsSync(path)) return undefined;
 
   try {
-    const ancestorIdentity = normalizeProjectIdentityPath(ancestor);
-    return ancestorIdentity === normalizeProjectPath(ancestor) ? normalized : ancestorIdentity;
+    const parsed: unknown = JSON.parse(readBoundedRegularFile(path, {
+      allowedRoot: eventsDir(),
+      allowedModes: OWNER_ONLY_FILE_MODES,
+      maxBytes: MAX_IDENTITY_EVIDENCE_BYTES,
+      requireSingleLink: true,
+    }));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const record = parsed as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    if (keys.join(",") !== "canonical,cwd,id,version") return undefined;
+    if (
+      record.version !== IDENTITY_EVIDENCE_VERSION
+      || record.cwd !== normalizedCwd
+      || typeof record.canonical !== "string"
+      || resolve(record.canonical) !== record.canonical
+      || typeof record.id !== "string"
+      || !PROJECT_ID_PATTERN.test(record.id)
+      || hashProjectPath(record.canonical) !== record.id
+    ) {
+      return undefined;
+    }
+    const candidate = join(eventsDir(), `${record.id}.db`);
+    return existsSync(candidate) ? candidate : undefined;
   } catch {
-    return normalized;
+    return undefined;
   }
 }
 
@@ -35,7 +92,9 @@ export function eventSequenceDbPath(homeDir?: string): string {
 }
 
 export function eventsDbPath(cwd: string): string {
-  return join(eventsDir(), `${localProjectIdentity(cwd).id}.db`);
+  const identity = localProjectIdentity(cwd);
+  publishIdentityEvidence(cwd, identity);
+  return join(eventsDir(), `${identity.id}.db`);
 }
 
 /**
@@ -47,10 +106,12 @@ export function existingEventsDbPath(cwd: string): string | undefined {
   const identity = resolveExistingProjectIdentity(cwd);
   if (identity) return join(eventsDir(), `${identity.id}.db`);
 
-  // A sidecar may outlive its map and metadata. Use the same Git-anchor-aware
-  // normalization as sidecar creation, but return the hash only when the
-  // sidecar is already present; no project identity is created by this
-  // fallback.
-  const candidate = join(eventsDir(), `${hashProjectPath(normalizeOrphanIdentityPath(cwd))}.db`);
+  const evidenced = existingSidecarFromIdentityEvidence(cwd);
+  if (evidenced) return evidenced;
+
+  // Legacy mapless sidecars use the exact normalized cwd hash. Return it only
+  // when the sidecar is already present; no project identity is created by
+  // this fallback.
+  const candidate = join(eventsDir(), `${hashProjectPath(normalizeProjectPath(cwd))}.db`);
   return existsSync(candidate) ? candidate : undefined;
 }

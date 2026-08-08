@@ -6,7 +6,7 @@ import {
   existingEventsDbPath,
 } from "../../src/db/events-path.js";
 import { hashProjectPath, normalizeProjectIdentityPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { tmpdir } from "node:os";
@@ -92,7 +92,7 @@ describe("backend-independent local project identity", () => {
     expect(existsSync(projectMapPath())).toBe(false);
   });
 
-  it("recovers the anchor sidecar after a linked-worktree cwd disappears", () => {
+  it("recovers the anchor sidecar after the entire linked-worktree root disappears", () => {
     const primary = mkdtempSync(join(tmpdir(), "lcm-events-path-primary-"));
     const linked = mkdtempSync(join(tmpdir(), "lcm-events-path-linked-"));
     try {
@@ -106,19 +106,55 @@ describe("backend-independent local project identity", () => {
       writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`);
       writeFileSync(join(admin, "gitdir"), `${join(linked, ".git")}\n`);
 
-      const unavailable = join(linked, "gone");
-      mkdirSync(unavailable);
+      const unavailable = linked;
+      const anchorId = hashProjectPath(normalizeProjectIdentityPath(primary));
       const anchorSidecar = eventsDbPath(unavailable);
       expect(anchorSidecar).toBe(join(
         eventsDir(),
-        `${hashProjectPath(normalizeProjectIdentityPath(primary))}.db`,
+        `${anchorId}.db`,
       ));
-      mkdirSync(eventsDir(), { recursive: true, mode: 0o700 });
-      writeFileSync(anchorSidecar, "");
-      rmSync(unavailable, { recursive: true, force: true });
-
-      expect(existingEventsDbPath(unavailable)).toBe(anchorSidecar);
+      const evidenceFiles = readdirSync(eventsDir()).filter((entry) => entry.endsWith(".identity.json"));
+      expect(evidenceFiles).toHaveLength(1);
+      const evidencePath = join(eventsDir(), evidenceFiles[0]!);
+      expect(statSync(evidencePath).mode & 0o777).toBe(0o600);
       expect(existsSync(projectMapPath())).toBe(false);
+      expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
+      rmSync(linked, { recursive: true, force: true });
+
+      expect(existsSync(linked)).toBe(false);
+      expect(existingEventsDbPath(unavailable)).toBeUndefined();
+      writeFileSync(anchorSidecar, "");
+      expect(existingEventsDbPath(unavailable)).toBe(anchorSidecar);
+
+      for (const invalidEvidence of [
+        "[]",
+        JSON.stringify({
+          version: 1,
+          cwd: unavailable,
+          canonical: primary,
+          id: anchorId,
+          unexpected: true,
+        }),
+        JSON.stringify({
+          version: 2,
+          cwd: unavailable,
+          canonical: primary,
+          id: anchorId,
+        }),
+        "{",
+      ]) {
+        writeFileSync(evidencePath, invalidEvidence);
+        expect(existingEventsDbPath(unavailable)).toBeUndefined();
+      }
+
+      const legacySidecar = join(
+        eventsDir(),
+        `${hashProjectPath(normalizeProjectPath(unavailable))}.db`,
+      );
+      writeFileSync(legacySidecar, "");
+      expect(existingEventsDbPath(unavailable)).toBe(legacySidecar);
+      expect(existsSync(projectMapPath())).toBe(false);
+      expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
     } finally {
       rmSync(primary, { recursive: true, force: true });
       rmSync(linked, { recursive: true, force: true });
