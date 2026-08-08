@@ -43,6 +43,7 @@ import {
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
   writePrivateFileExclusive,
+  OWNER_ONLY_FILE_MODES,
 } from "../src/security-files.js";
 
 const roots: string[] = [];
@@ -294,6 +295,29 @@ describe("private filesystem primitives", () => {
     expect(statSync(path).mode & 0o777).toBe(0o400);
     expect(() => atomicWritePrivateFileDurable(path, "invalid", { finalMode: 0o644 }))
       .toThrow("owner-only");
+  });
+
+  it("defines exactly the owner-readable private regular-file mode domain", () => {
+    expect(OWNER_ONLY_FILE_MODES).toEqual([0o400, 0o500, 0o600, 0o700]);
+  });
+
+  it.each([
+    0o000,
+    0o100,
+    0o200,
+    0o300,
+    0o640,
+    0o604,
+    0o644,
+    0o1000,
+    0o2000,
+    0o4000,
+    0o7000,
+  ])("rejects non-owner-readable durable final mode %o", (mode) => {
+    const root = makeRoot();
+    expect(() => atomicWritePrivateFileDurable(join(root, `invalid-${mode}`), "content", {
+      finalMode: mode,
+    })).toThrow("owner-only");
   });
 
   it("covers durable exclusive publication races and injected I/O failures", () => {

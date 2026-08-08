@@ -6,7 +6,7 @@ import {
   type SecurityConfig,
   type StorageBackend,
 } from "./daemon/config.js";
-import { readBoundedRegularFile } from "./security-files.js";
+import { OWNER_ONLY_FILE_MODES, readBoundedRegularFile } from "./security-files.js";
 import {
   assertBackendPublicationConfigAccess,
   withBackendPublicationConfigLock,
@@ -26,6 +26,7 @@ function readStoredConfig(path: string): {
     const content = readBoundedRegularFile(path, {
       allowedRoot: dirname(path),
       maxBytes: 4 * 1024 * 1024,
+      allowedModes: OWNER_ONLY_FILE_MODES,
     });
     return {
       content,

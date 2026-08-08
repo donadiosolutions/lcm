@@ -16,9 +16,11 @@ import {
   atomicWritePrivateFileDurable,
   consumeBoundedRegularFile,
   assertPrivateDirectory,
+  OWNER_ONLY_FILE_MODES,
   openPrivateDirectory,
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
+  isOwnerOnlyFileMode,
 } from "../security-files.js";
 import type { StorageBackendName } from "./contracts.js";
 
@@ -407,6 +409,7 @@ export function captureBackendPublicationFileWitness(
       allowedRoot,
       maxBytes,
       expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      allowedModes: OWNER_ONLY_FILE_MODES,
       requireSingleLink: true,
     });
   } catch (error) {
@@ -446,9 +449,7 @@ function assertWitnessShape(witness: BackendPublicationFileWitness, field: strin
     || !HASH_PATTERN.test(witness.semanticSha256)
     || !Number.isSafeInteger(witness.byteLength)
     || witness.byteLength <= 0
-    || !Number.isSafeInteger(witness.mode)
-    || witness.mode < 0
-    || witness.mode > 0o7777
+    || !isOwnerOnlyFileMode(witness.mode)
     || !Number.isSafeInteger(witness.uid)
     || witness.uid < 0
     || !Number.isSafeInteger(witness.gid)
@@ -545,10 +546,7 @@ function validateRecoveryFile(file: BackendPublicationRecoveryFile, field: strin
     !(file.content instanceof Uint8Array)
     || file.content.byteLength === 0
     || file.content.byteLength > MAX_RECOVERY_FILE_BYTES
-    || !Number.isSafeInteger(file.mode)
-    || file.mode < 0
-    || file.mode > 0o7777
-    || (file.mode & 0o077) !== 0
+    || !isOwnerOnlyFileMode(file.mode)
     || !Number.isSafeInteger(file.uid)
     || file.uid < 0
     || !Number.isSafeInteger(file.gid)
@@ -1325,6 +1323,7 @@ function readStateContent(path: string, root: string): string | null {
       allowedRoot: root,
       maxBytes: MAX_RECOVERY_FILE_BYTES,
       expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      allowedModes: OWNER_ONLY_FILE_MODES,
       requireSingleLink: true,
     }).content;
   } catch (error) {

@@ -14,6 +14,10 @@ interface SensitiveConfig {
   };
 }
 
+function writeConfigFile(path: string, content: string): void {
+  writeFileSync(path, content, { mode: 0o600 });
+}
+
 vi.mock("../src/daemon/project.js", async () => {
   const { createHash: hash } = await import("node:crypto");
   const { join: j } = await import("node:path");
@@ -147,7 +151,7 @@ describe("lcm sensitive", () => {
   });
 
   it("list: shows global user patterns from config.json", async () => {
-    writeFileSync(configPath, JSON.stringify({ security: { sensitivePatterns: ["CORP_TOKEN_.*"] } }, null, 2));
+    writeConfigFile(configPath, JSON.stringify({ security: { sensitivePatterns: ["CORP_TOKEN_.*"] } }, null, 2));
     const r = await handleSensitive(["list"], cwd, configPath);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("[user]      CORP_TOKEN_.*");
@@ -158,7 +162,7 @@ describe("lcm sensitive", () => {
       storage: { backend: "postgresql" },
       security: { sensitivePatterns: ["POSTGRES_SECRET_.*"] },
     });
-    writeFileSync(configPath, content);
+    writeConfigFile(configPath, content);
     await completePostgreSqlPublication(configPath, content);
 
     const r = await handleSensitive(["list"], cwd, configPath);
@@ -168,7 +172,7 @@ describe("lcm sensitive", () => {
   });
 
   it("list: preserves the empty-pattern fallback for invalid persisted configuration", async () => {
-    writeFileSync(configPath, JSON.stringify({ storage: { backend: "invalid" } }));
+    writeConfigFile(configPath, JSON.stringify({ storage: { backend: "invalid" } }));
 
     const r = await handleSensitive(["list"], cwd, configPath);
 
@@ -197,7 +201,7 @@ describe("lcm sensitive", () => {
   });
 
   it("add --global: appends to config.json sensitivePatterns", async () => {
-    writeFileSync(configPath, JSON.stringify({ security: { sensitivePatterns: [] } }, null, 2));
+    writeConfigFile(configPath, JSON.stringify({ security: { sensitivePatterns: [] } }, null, 2));
     const r = await handleSensitive(["add", "--global", "CORP_SECRET_.*"], cwd, configPath);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("Added global pattern: CORP_SECRET_.*");
@@ -206,7 +210,7 @@ describe("lcm sensitive", () => {
   });
 
   it("add --global: is idempotent — does not duplicate", async () => {
-    writeFileSync(configPath, JSON.stringify({ security: { sensitivePatterns: ["CORP_SECRET_.*"] } }, null, 2));
+    writeConfigFile(configPath, JSON.stringify({ security: { sensitivePatterns: ["CORP_SECRET_.*"] } }, null, 2));
     const r = await handleSensitive(["add", "--global", "CORP_SECRET_.*"], cwd, configPath);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("already present");
@@ -218,7 +222,7 @@ describe("lcm sensitive", () => {
     "add --global: treats storage shape %j as local-only",
     async (storage) => {
       const content = JSON.stringify({ storage, security: { sensitivePatterns: [] } });
-      writeFileSync(configPath, content);
+      writeConfigFile(configPath, content);
       if ((storage as { backend?: unknown } | null)?.backend === "postgresql") {
         await completePostgreSqlPublication(configPath, content);
       }
@@ -231,7 +235,7 @@ describe("lcm sensitive", () => {
     ["invalid JSON", "{"],
     ["not a JSON object", "[]"],
   ])("add --global: refuses a config with %s", async (message: string, content: string): Promise<void> => {
-    writeFileSync(configPath, content);
+    writeConfigFile(configPath, content);
     const r = await handleSensitive(["add", "--global", "CORP_SECRET_.*"], cwd, configPath);
     expect(r).toMatchObject({ exitCode: 1 });
     expect(r.stdout).toContain(message);
@@ -246,7 +250,7 @@ describe("lcm sensitive", () => {
       security: { sensitivePatterns: ["CORP_SECRET_.*"] },
     });
 
-    writeFileSync(configPath, JSON.stringify({ security: { sensitivePatterns: "invalid" } }));
+    writeConfigFile(configPath, JSON.stringify({ security: { sensitivePatterns: "invalid" } }));
     await expect(handleSensitive(["add", "--global", "SECOND_.*"], cwd, configPath))
       .resolves.toMatchObject({ exitCode: 0 });
     const repairedConfig = JSON.parse(readFileSync(configPath, "utf-8")) as SensitiveConfig;
@@ -329,7 +333,7 @@ describe("lcm sensitive", () => {
   });
 
   it("test: skips invalid global and project patterns", async (): Promise<void> => {
-    writeFileSync(configPath, JSON.stringify({ security: { sensitivePatterns: ["[invalid"] } }));
+    writeConfigFile(configPath, JSON.stringify({ security: { sensitivePatterns: ["[invalid"] } }));
     writeFileSync(join(pDir, "sensitive-patterns.txt"), "[also-invalid\n");
     await expect(handleSensitive(["test", "ordinary"], cwd, configPath)).resolves.toMatchObject({
       exitCode: 0,
@@ -339,7 +343,7 @@ describe("lcm sensitive", () => {
 
   it("test: reports matching gitleaks and user patterns", async (): Promise<void> => {
     const githubToken = `ghp_${"A".repeat(36)}`;
-    writeFileSync(configPath, JSON.stringify({ security: { sensitivePatterns: ["CORP_[A-Z]+"] } }));
+    writeConfigFile(configPath, JSON.stringify({ security: { sensitivePatterns: ["CORP_[A-Z]+"] } }));
     writeFileSync(join(pDir, "sensitive-patterns.txt"), "PROJECT_[A-Z]+\n");
     const r = await handleSensitive(["test", `token=${githubToken} CORP_ALPHA PROJECT_BETA`], cwd, configPath);
     expect(r.stdout).toContain("[gitleaks:");
@@ -352,7 +356,7 @@ describe("lcm sensitive", () => {
       storage: { backend: "postgresql" },
       security: { sensitivePatterns: ["POSTGRES_SECRET_[A-Z]+"] },
     });
-    writeFileSync(configPath, content);
+    writeConfigFile(configPath, content);
     await completePostgreSqlPublication(configPath, content);
 
     const r = await handleSensitive(["test", "value=POSTGRES_SECRET_ALPHA"], cwd, configPath);
@@ -403,7 +407,7 @@ describe("lcm sensitive", () => {
     ["current project", [] as string[]],
     ["all projects", ["--all"]],
   ])("purge --yes: rejects PostgreSQL before deleting %s data", async (_label, extraArgs) => {
-    writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" } }));
+    writeConfigFile(configPath, JSON.stringify({ storage: { backend: "postgresql" } }));
     const allProjects = join(tempBase, "all-projects");
     if (extraArgs.includes("--all")) {
       mkdirSync(allProjects, { recursive: true });
@@ -430,7 +434,7 @@ describe("lcm sensitive", () => {
       },
     })],
   ])("purge --yes: preserves all targets when config contains %s", async (_label, content) => {
-    writeFileSync(configPath, content);
+    writeConfigFile(configPath, content);
     writeFileSync(join(pDir, "data"), "current");
     const allProjects = join(tempBase, "all-projects");
     mkdirSync(allProjects, { recursive: true });
@@ -447,7 +451,7 @@ describe("lcm sensitive", () => {
   });
 
   it("uses the isolated default config path when none is supplied", async (): Promise<void> => {
-    writeFileSync(configPath, JSON.stringify({ security: { sensitivePatterns: ["DEFAULT_PATH_UNIQUE_.*"] } }));
+    writeConfigFile(configPath, JSON.stringify({ security: { sensitivePatterns: ["DEFAULT_PATH_UNIQUE_.*"] } }));
     const result = await handleSensitive(["list"], cwd);
     expect(result).toMatchObject({ exitCode: 0 });
     expect(result.stdout).toContain("[user]      DEFAULT_PATH_UNIQUE_.*");

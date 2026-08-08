@@ -66,6 +66,10 @@ function writeLiveProjectMapLock(nonce: string): string {
   return lockPath;
 }
 
+function writeProjectMap(content: string): void {
+  writeFileSync(projectMapPath(), content, { mode: 0o600 });
+}
+
 function finishFakeTimerWatcherTest(
   primaryError: { value: unknown } | undefined,
   watchers: readonly (ReturnType<typeof watchProjectMap> | undefined)[],
@@ -420,7 +424,7 @@ describe("project map", () => {
     const second = makeDir("remote-ambiguous-second");
     const firstHash = hashProjectPath(first);
     const secondHash = hashProjectPath(second);
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [], remoteProjectId },
       [secondHash]: { canonical: second, aliases: [], remoteProjectId },
     }));
@@ -1157,7 +1161,7 @@ describe("project map", () => {
     const local = resolveProjectIdentity(canonical);
     addProjectAlias(alias, { hash: local.id });
     const expectedEntry = showProjectMapEntry(local.id).entry;
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [local.id]: {
         canonical: alias,
         aliases: [canonical],
@@ -1178,7 +1182,7 @@ describe("project map", () => {
 
     expect(() => clearRemoteProjectBinding(canonical, remoteProjectId, {
       _afterLockForTesting: () => {
-        writeFileSync(projectMapPath(), JSON.stringify({
+        writeProjectMap(JSON.stringify({
           [local.id]: {
             canonical,
             aliases: [],
@@ -1191,7 +1195,7 @@ describe("project map", () => {
 
     expect(() => clearRemoteProjectBinding(canonical, replacement, {
       _afterLockForTesting: () => {
-        writeFileSync(projectMapPath(), "{}\n");
+        writeProjectMap("{}\n");
       },
     })).toThrow("project is not mapped");
     expect(listProjectMapEntries()[local.id]).toBeUndefined();
@@ -1380,7 +1384,7 @@ describe("project map", () => {
     writeFileSync(join(homedir(), ".lcm", "projects", hash, "meta.json"), JSON.stringify({ cwd: canonical }));
     const identity = resolveProjectIdentity(canonical, {
       _beforeMetadataMutationLockForTesting: () => {
-        writeFileSync(projectMapPath(), `${JSON.stringify({
+        writeProjectMap(`${JSON.stringify({
           [hash]: { canonical, aliases: [] },
         })}\n`);
       },
@@ -1394,7 +1398,7 @@ describe("project map", () => {
     const hash = hashProjectPath(normalizeProjectPath(canonical));
     const identity = resolveProjectIdentity(canonical, {
       _beforeMissingIdentityLockForTesting: () => {
-        writeFileSync(projectMapPath(), `${JSON.stringify({
+        writeProjectMap(`${JSON.stringify({
           [hash]: { canonical, aliases: [] },
         })}\n`);
       },
@@ -1461,7 +1465,7 @@ describe("project map", () => {
   });
 
   it("reports invalid JSON without rewriting the map", () => {
-    writeFileSync(projectMapPath(), "{not-json");
+    writeProjectMap("{not-json");
 
     const validation = validateProjectMap({ fix: true });
 
@@ -1471,7 +1475,7 @@ describe("project map", () => {
   });
 
   it("reports a stable validation error when parsing throws a non-Error value", (): void => {
-    writeFileSync(projectMapPath(), "{not-json");
+    writeProjectMap("{not-json");
     vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
       throw "parse failed";
     });
@@ -1485,7 +1489,7 @@ describe("project map", () => {
   it("does not overwrite invalid map edits from a stale cache", () => {
     const canonical = makeDir("cached-canonical");
     resolveProjectIdentity(canonical);
-    writeFileSync(projectMapPath(), "{not-json");
+    writeProjectMap("{not-json");
 
     const unseen = makeDir("unseen-while-invalid");
 
@@ -1534,7 +1538,7 @@ describe("project map", () => {
     const options = {
       hash: local.id,
       get expectedEntry() {
-        writeFileSync(projectMapPath(), "{not-json");
+        writeProjectMap("{not-json");
         return expectedEntry;
       },
     };
@@ -1598,7 +1602,7 @@ describe("project map", () => {
 
   it("rejects relative canonical paths in manually edited maps", () => {
     const hash = hashProjectPath("/absolute-project");
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [hash]: { canonical: "relative-project", aliases: [] },
     }));
 
@@ -1611,7 +1615,7 @@ describe("project map", () => {
   it("rejects relative aliases in manually edited maps", () => {
     const canonical = makeDir("absolute-canonical");
     const hash = hashProjectPath(normalizeProjectPath(canonical));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [hash]: { canonical, aliases: ["relative-alias"] },
     }));
 
@@ -1629,7 +1633,7 @@ describe("project map", () => {
     ["bad aliases", { ["a".repeat(64)]: { canonical: "/tmp/project", aliases: [""] } }],
     ["bad remote ID", { ["a".repeat(64)]: { canonical: "/tmp/project", aliases: [], remoteProjectId: "bad" } }],
   ])("rejects invalid map schema: %s", (_label: string, map: unknown) => {
-    writeFileSync(projectMapPath(), JSON.stringify(map));
+    writeProjectMap(JSON.stringify(map));
 
     const validation = validateProjectMap({ fix: true });
 
@@ -1641,7 +1645,7 @@ describe("project map", () => {
   it("reformats valid compact JSON and creates a backup", () => {
     const canonical = makeDir("compact");
     const hash = hashProjectPath(normalizeProjectPath(canonical));
-    writeFileSync(projectMapPath(), JSON.stringify({ [hash]: { canonical, aliases: [] } }));
+    writeProjectMap(JSON.stringify({ [hash]: { canonical, aliases: [] } }));
 
     const validation = validateProjectMap({ fix: true });
 
@@ -1657,7 +1661,7 @@ describe("project map", () => {
     const canonical = makeDir("dedupe");
     const alias = makeDir("dedupe-alias");
     const hash = hashProjectPath(normalizeProjectPath(canonical));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [hash]: { canonical, aliases: [alias, alias, canonical] },
     }));
 
@@ -1674,7 +1678,7 @@ describe("project map", () => {
     const shared = makeDir("shared");
     const firstHash = hashProjectPath(normalizeProjectPath(first));
     const secondHash = hashProjectPath(normalizeProjectPath(second));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [shared] },
       [secondHash]: { canonical: second, aliases: [shared] },
     }));
@@ -1757,7 +1761,7 @@ describe("project map", () => {
     const shared = makeDir("identity-shared");
     const firstHash = hashProjectPath(normalizeProjectPath(first));
     const secondHash = hashProjectPath(normalizeProjectPath(second));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [shared] },
       [secondHash]: { canonical: second, aliases: [shared] },
     }, null, 2) + "\n");
@@ -1769,7 +1773,7 @@ describe("project map", () => {
   it("preserves a remote binding on a legacy hash entry whose canonical path drifted", () => {
     const target = makeDir("identity-drift-target");
     const hash = hashProjectPath(normalizeProjectPath(target));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [hash]: {
         canonical: makeDir("identity-drift-canonical"),
         aliases: [],
@@ -1790,7 +1794,7 @@ describe("project map", () => {
     const shared = makeDir("identity-alias-canonical-collision");
     const firstHash = hashProjectPath(normalizeProjectPath(first));
     const secondHash = hashProjectPath(normalizeProjectPath(shared));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [shared] },
       [secondHash]: { canonical: shared, aliases: [] },
     }, null, 2) + "\n");
@@ -1823,7 +1827,7 @@ describe("project map", () => {
     const alias = makeDir("nonadopt-alias");
     const firstHash = hashProjectPath(normalizeProjectPath(first));
     const secondHash = hashProjectPath(normalizeProjectPath(second));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [alias] },
       [secondHash]: { canonical: second, aliases: [] },
     }, null, 2) + "\n");
@@ -1843,7 +1847,7 @@ describe("project map", () => {
     const canonical = makeDir("ambiguous-canonical");
     const firstHash = hashProjectPath(`${normalizeProjectPath(canonical)}-first`);
     const secondHash = hashProjectPath(`${normalizeProjectPath(canonical)}-second`);
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical, aliases: [] },
       [secondHash]: { canonical, aliases: [] },
     }, null, 2) + "\n");
@@ -1960,7 +1964,7 @@ describe("project map", () => {
     const alias = makeDir("reload-invalid-alias");
     const hash = projectId(canonical);
     addProjectAlias(alias, { canonical });
-    writeFileSync(projectMapPath(), "{not-json");
+    writeProjectMap("{not-json");
     const changedAt = new Date(Date.now() + 1_000);
     utimesSync(projectMapPath(), changedAt, changedAt);
 
@@ -1974,7 +1978,7 @@ describe("project map", () => {
     const shared = makeDir("remove-shared");
     const firstHash = hashProjectPath(normalizeProjectPath(first));
     const secondHash = hashProjectPath(normalizeProjectPath(second));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [shared] },
       [secondHash]: { canonical: second, aliases: [shared] },
     }, null, 2) + "\n");
@@ -2028,7 +2032,7 @@ describe("project map", () => {
     const shared = makeDir("show-ambiguous-shared");
     const firstHash = hashProjectPath(`${shared}-first`);
     const secondHash = hashProjectPath(`${shared}-second`);
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: makeDir("show-ambiguous-first"), aliases: [shared] },
       [secondHash]: { canonical: makeDir("show-ambiguous-second"), aliases: [shared] },
     }));
@@ -2064,7 +2068,7 @@ describe("project map", () => {
     const target = makeDir("hash-collision-target");
     const id = hashProjectPath(normalizeProjectPath(target));
     const other = makeDir("hash-collision-other");
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [id]: { canonical: other, aliases: [] },
     }));
     clearProjectMapCache();
@@ -2273,14 +2277,14 @@ describe("project map", () => {
   it("reloads map watches for directory creation, deletion, and file changes", async () => {
     const directoryWatcher = watchProjectMap();
     writeFileSync(join(homedir(), ".lcm", "unrelated"), "ignored");
-    writeFileSync(projectMapPath(), "{}\n");
+    writeProjectMap("{}\n");
     rmSync(projectMapPath());
     await new Promise((resolve) => setTimeout(resolve, 100));
     directoryWatcher.close();
 
-    writeFileSync(projectMapPath(), "{}\n");
+    writeProjectMap("{}\n");
     const fileWatcher = watchProjectMap();
-    writeFileSync(projectMapPath(), "{ }\n");
+    writeProjectMap("{ }\n");
     await new Promise((resolve) => setTimeout(resolve, 100));
     fileWatcher.close();
 

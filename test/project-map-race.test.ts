@@ -31,7 +31,7 @@ describe("project map file races", () => {
     mkdirSync(canonical, { recursive: true });
     const mapPath = join(tempHome, ".lcm", "map.json");
     mkdirSync(join(tempHome, ".lcm"), { recursive: true });
-    writeFileSync(mapPath, "{}\n", "utf-8");
+    writeFileSync(mapPath, "{}\n", { encoding: "utf-8", mode: 0o600 });
 
     const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
     let disappeared = false;

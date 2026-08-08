@@ -209,6 +209,7 @@ function readMapFile(path: string): { content: string; mtimeMs: number | null } 
     return readBoundedRegularFileWithStat(path, {
       allowedRoot: dirname(path),
       maxBytes: MAX_PROJECT_MAP_BYTES,
+      allowedModes: OWNER_ONLY_FILE_MODES,
     });
   } catch (err) {
     if (isEnoent(err)) return null;
@@ -302,6 +303,7 @@ function createBackupIfNeeded(path: string, homeDir?: string): string | undefine
     content = readBoundedRegularFile(path, {
       allowedRoot: dirname(path),
       maxBytes: MAX_PROJECT_MAP_BYTES,
+      allowedModes: OWNER_ONLY_FILE_MODES,
     });
   } catch (error) {
     if (isEnoent(error)) return undefined;

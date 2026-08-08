@@ -110,6 +110,7 @@ function readConfigContent(configPath: string): {
     const content = readBoundedRegularFile(configPath, {
       allowedRoot: dirname(configPath),
       maxBytes: MAX_CONFIG_BYTES,
+      allowedModes: OWNER_ONLY_FILE_MODES,
     });
     return { content, observedContent: content };
   } catch (error) {

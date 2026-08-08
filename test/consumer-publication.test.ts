@@ -25,7 +25,7 @@ import {
 } from "../src/storage/backend-publication.js";
 import { applyBackendPublicationConfigFile } from "../src/config-manager.js";
 import { applyBackendPublicationProjectMapFile } from "../src/project-map.js";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -424,13 +424,16 @@ describe("local backend-publication consumer seam", () => {
     expect(readFileSync(join(home, ".lcm", "map.json"), "utf8")).toBe(sourceMap);
   });
 
-  it("preserves authenticated owner-only modes through publish and abort replay", async () => {
+  it.each([0o400, 0o500, 0o600, 0o700])(
+    "preserves authenticated owner-readable mode %o through config/map publish and abort replay",
+    async (mode) => {
     const published = fixture();
     const publishedMaterial: BackendPublicationRecoveryMaterial = {
       ...published.material,
       target: {
         ...published.material.target,
-        config: file(published.targetConfig, 0o400),
+        config: file(published.targetConfig, mode),
+        projectMap: file(published.targetMap, mode),
       },
     };
     const publisher = new BackendPublicationCoordinator({
@@ -445,14 +448,16 @@ describe("local backend-publication consumer seam", () => {
       projects: [],
     });
     await expect(publisher.resume()).resolves.toMatchObject({ phase: "completed" });
-    expect(statSync(join(published.home, ".lcm", "config.json")).mode & 0o777).toBe(0o400);
+    expect(statSync(join(published.home, ".lcm", "config.json")).mode & 0o777).toBe(mode);
+    expect(statSync(join(published.home, ".lcm", "map.json")).mode & 0o777).toBe(mode);
 
     const aborted = fixture();
     const abortedMaterial: BackendPublicationRecoveryMaterial = {
       ...aborted.material,
       target: {
         ...aborted.material.target,
-        config: file(aborted.targetConfig, 0o400),
+        config: file(aborted.targetConfig, mode),
+        projectMap: file(aborted.targetMap, mode),
       },
     };
     const aborter = new BackendPublicationCoordinator({
@@ -469,6 +474,47 @@ describe("local backend-publication consumer seam", () => {
     await expect(aborter.resume()).rejects.toThrow("injected config publication failure");
     await expect(aborter.abort()).resolves.toMatchObject({ phase: "aborted" });
     expect(statSync(join(aborted.home, ".lcm", "config.json")).mode & 0o777).toBe(0o600);
+    expect(statSync(join(aborted.home, ".lcm", "map.json")).mode & 0o777).toBe(0o600);
+    },
+  );
+
+  it.each([
+    0o000,
+    0o100,
+    0o200,
+    0o300,
+    0o640,
+    0o604,
+    0o644,
+    0o1000,
+    0o2000,
+    0o4000,
+    0o7000,
+  ])("rejects recovery material %o mode before publication and leaves no journal", async (mode) => {
+    const values = fixture();
+    const invalidMaterial: BackendPublicationRecoveryMaterial = {
+      ...values.material,
+      source: {
+        ...values.material.source,
+        config: file(values.sourceConfig, mode),
+        projectMap: file(values.sourceMap, mode),
+      },
+    };
+    const coordinator = new BackendPublicationCoordinator({
+      homeDir: values.home,
+      driver: driverFor(values.home),
+    });
+
+    await expect(coordinator.prepare({
+      publicationId: `consumer-invalid-mode-${mode}`,
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      material: invalidMaterial,
+      projects: [],
+    })).rejects.toMatchObject({ reason: "invalid-input" });
+    expect(readBackendPublicationJournal(values.home)).toBeNull();
+    expect(existsSync(join(values.home, ".lcm", "backend-publication", `consumer-invalid-mode-${mode}.material`)))
+      .toBe(false);
   });
 
   it("fails closed when the map changes to unrelated content before abort restoration", async () => {

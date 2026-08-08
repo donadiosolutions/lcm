@@ -962,6 +962,41 @@ describe("BackendPublicationCoordinator", () => {
     }
   });
 
+  it("rejects captured regular files outside the owner-readable mode domain", async () => {
+    const home = makeHome();
+    const directory = backendPublicationDirectory(home);
+    mkdirSync(directory, { mode: 0o700 });
+    const path = join(directory, "group-readable");
+    writeFileSync(path, "observed", { mode: 0o640 });
+
+    expect(() => captureBackendPublicationFileWitness(path, directory)).toThrow("mode is not trusted");
+  });
+
+  it.each([
+    0o000,
+    0o100,
+    0o200,
+    0o300,
+    0o640,
+    0o604,
+    0o644,
+    0o1000,
+    0o2000,
+    0o4000,
+    0o7000,
+  ])("rejects journal witness mode %o before authentication", async (mode) => {
+    await expectJournalReadFailure((journal) => ({
+      ...journal,
+      sourceState: {
+        ...(journal.sourceState as Record<string, unknown>),
+        config: {
+          ...((journal.sourceState as { config: Record<string, unknown> }).config),
+          mode,
+        },
+      },
+    }));
+  });
+
   it("supports runtimes without a getuid syscall", async () => {
     const home = makeHome();
     const input = material();

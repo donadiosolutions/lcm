@@ -24,10 +24,8 @@ import { basename, dirname, join, sep } from "node:path";
 
 export const PRIVATE_DIRECTORY_MODE = 0o700;
 export const PRIVATE_FILE_MODE = 0o600;
+/** Exact modes that keep a regular file readable by its owner only. */
 export const OWNER_ONLY_FILE_MODES: readonly number[] = Object.freeze([
-  0o100,
-  0o200,
-  0o300,
   0o400,
   0o500,
   0o600,

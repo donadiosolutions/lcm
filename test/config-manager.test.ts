@@ -23,7 +23,7 @@ function makeConfig(content: unknown): { directory: string; configPath: string }
   const directory = mkdtempSync(join(tmpdir(), "lcm-config-manager-"));
   tempDirs.push(directory);
   const configPath = join(directory, "config.json");
-  writeFileSync(configPath, `${JSON.stringify(content, null, 2)}\n`);
+  writeFileSync(configPath, `${JSON.stringify(content, null, 2)}\n`, { mode: 0o600 });
   return { directory, configPath };
 }
 

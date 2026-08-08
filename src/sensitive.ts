@@ -10,7 +10,7 @@ import { loadStoredConfigProjection } from "./config-projection.js";
 import { selectStorageBackend } from "./storage/backend.js";
 import { validateRegex } from "./store/regex-safety.js";
 import { configPath as runtimeConfigPath, projectsDir as runtimeProjectsDir } from "./runtime-paths.js";
-import { atomicWritePrivateFile, readBoundedRegularFile } from "./security-files.js";
+import { atomicWritePrivateFile, OWNER_ONLY_FILE_MODES, readBoundedRegularFile } from "./security-files.js";
 import {
   assertBackendPublicationConfigAccess,
   assertBackendPublicationConfigMutation,
@@ -157,6 +157,7 @@ async function sensitiveAdd(
         content = readBoundedRegularFile(configPath, {
           allowedRoot: dirname(configPath),
           maxBytes: 4 * 1024 * 1024,
+          allowedModes: OWNER_ONLY_FILE_MODES,
         });
         let parsed: unknown;
         try {
