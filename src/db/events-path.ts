@@ -1,12 +1,30 @@
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { localProjectIdentity } from "../daemon/project.js";
 import {
   hashProjectPath,
+  normalizeProjectIdentityPath,
   normalizeProjectPath,
   resolveExistingProjectIdentity,
 } from "../project-map.js";
 import { lcmHomeDir } from "../runtime-paths.js";
+
+function normalizeOrphanIdentityPath(cwd: string): string {
+  const normalized = normalizeProjectIdentityPath(cwd);
+  if (existsSync(cwd)) return normalized;
+
+  let ancestor = resolve(cwd);
+  while (!existsSync(ancestor)) {
+    ancestor = dirname(ancestor);
+  }
+
+  try {
+    const ancestorIdentity = normalizeProjectIdentityPath(ancestor);
+    return ancestorIdentity === normalizeProjectPath(ancestor) ? normalized : ancestorIdentity;
+  } catch {
+    return normalized;
+  }
+}
 
 export function eventsDir(homeDir?: string): string {
   return join(lcmHomeDir(homeDir), "events");
@@ -29,9 +47,10 @@ export function existingEventsDbPath(cwd: string): string | undefined {
   const identity = resolveExistingProjectIdentity(cwd);
   if (identity) return join(eventsDir(), `${identity.id}.db`);
 
-  // A sidecar may outlive its map and metadata. The legacy deterministic hash
-  // remains safe to probe as long as it is returned only when the sidecar is
-  // already present; no project identity is created by this fallback.
-  const candidate = join(eventsDir(), `${hashProjectPath(normalizeProjectPath(cwd))}.db`);
+  // A sidecar may outlive its map and metadata. Use the same Git-anchor-aware
+  // normalization as sidecar creation, but return the hash only when the
+  // sidecar is already present; no project identity is created by this
+  // fallback.
+  const candidate = join(eventsDir(), `${hashProjectPath(normalizeOrphanIdentityPath(cwd))}.db`);
   return existsSync(candidate) ? candidate : undefined;
 }

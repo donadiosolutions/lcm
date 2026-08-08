@@ -57,14 +57,72 @@ describe("backend-independent local project identity", () => {
   it("keeps the existing-only probe read-only while recovering an orphaned sidecar", () => {
     const unavailable = join(project, "gone");
     expect(existingEventsDbPath(unavailable)).toBeUndefined();
+    expect(existingEventsDbPath("/lcm-events-path-missing-cwd")).toBeUndefined();
     expect(existsSync(projectMapPath())).toBe(false);
 
     const sidecarDir = join(home, ".lcm", "events");
     mkdirSync(sidecarDir, { recursive: true, mode: 0o700 });
+    const existingSidecar = join(sidecarDir, `${hashProjectPath(normalizeProjectIdentityPath(project))}.db`);
+    writeFileSync(existingSidecar, "");
+    expect(existingEventsDbPath(project)).toBe(existingSidecar);
+
+    const mappedId = "b".repeat(64);
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [mappedId]: { canonical: project, aliases: [] },
+    }), { mode: 0o600 });
+    chmodSync(projectMapPath(), 0o600);
+    expect(existingEventsDbPath(project)).toBe(join(sidecarDir, `${mappedId}.db`));
+    rmSync(projectMapPath(), { force: true });
+
     const sidecar = join(sidecarDir, `${hashProjectPath(normalizeProjectPath(unavailable))}.db`);
     writeFileSync(sidecar, "");
     expect(existingEventsDbPath(unavailable)).toBe(sidecar);
+
+    const malformedGitMarker = join(project, ".git");
+    writeFileSync(malformedGitMarker, "not-a-gitdir\n");
+    const malformedUnavailable = join(project, "malformed-gone");
+    const malformedSidecar = join(
+      sidecarDir,
+      `${hashProjectPath(normalizeProjectPath(malformedUnavailable))}.db`,
+    );
+    writeFileSync(malformedSidecar, "");
+    expect(existingEventsDbPath(malformedUnavailable)).toBe(malformedSidecar);
+    rmSync(malformedGitMarker, { force: true });
+
     expect(existsSync(projectMapPath())).toBe(false);
+  });
+
+  it("recovers the anchor sidecar after a linked-worktree cwd disappears", () => {
+    const primary = mkdtempSync(join(tmpdir(), "lcm-events-path-primary-"));
+    const linked = mkdtempSync(join(tmpdir(), "lcm-events-path-linked-"));
+    try {
+      const admin = join(primary, ".git", "worktrees", "linked");
+      mkdirSync(join(primary, ".git", "objects"), { recursive: true });
+      mkdirSync(admin, { recursive: true });
+      writeFileSync(join(primary, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(primary, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
+      writeFileSync(join(admin, "HEAD"), "ref: refs/heads/linked\n");
+      writeFileSync(join(admin, "commondir"), "../..\n");
+      writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`);
+      writeFileSync(join(admin, "gitdir"), `${join(linked, ".git")}\n`);
+
+      const unavailable = join(linked, "gone");
+      mkdirSync(unavailable);
+      const anchorSidecar = eventsDbPath(unavailable);
+      expect(anchorSidecar).toBe(join(
+        eventsDir(),
+        `${hashProjectPath(normalizeProjectIdentityPath(primary))}.db`,
+      ));
+      mkdirSync(eventsDir(), { recursive: true, mode: 0o700 });
+      writeFileSync(anchorSidecar, "");
+      rmSync(unavailable, { recursive: true, force: true });
+
+      expect(existingEventsDbPath(unavailable)).toBe(anchorSidecar);
+      expect(existsSync(projectMapPath())).toBe(false);
+    } finally {
+      rmSync(primary, { recursive: true, force: true });
+      rmSync(linked, { recursive: true, force: true });
+    }
   });
 });
 
