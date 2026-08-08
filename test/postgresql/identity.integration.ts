@@ -830,6 +830,7 @@ describe("PostgreSQL 18 machine and project identities", () => {
       try {
         await expect(createIdentityProject(config, projectPath, {}, {
           homeDir: home,
+          _assertBackendPublication: () => undefined,
           openSession: async () => ({
             repository: facade,
             close: async () => undefined,

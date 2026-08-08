@@ -903,7 +903,7 @@ describe("PostgreSQL 18 conversation repository", () => {
     });
   });
 
-  it("fails scoped contention operations closed after a prior REPEATABLE READ statement", async () => {
+  it("admits scoped contention operations after a hostile REPEATABLE READ default", async () => {
     await withPostgreSqlTestDatabase("conversation-scoped-isolation", async (database) => {
       await grantConversationRuntimePrivileges(database);
       const projectId = await createProject(database, "Conversation scoped isolation");
@@ -919,51 +919,50 @@ describe("PostgreSQL 18 conversation repository", () => {
         tokenCount: 1,
       });
 
+      const configured = await database.runtime.query<{
+        default_transaction_isolation: string;
+      }>({
+        text: "SHOW default_transaction_isolation",
+      }, { domain: "conversations", operation: "inspectScopedIsolationDefault" });
+      expect(configured.rows[0]?.default_transaction_isolation).toBe("repeatable read");
+
       await database.runtime.transaction(async (transaction) => {
-        await transaction.query({ text: "SELECT 1" }, {
+        const isolation = await transaction.query<{ transaction_isolation: string }>({
+          text: `SELECT pg_catalog.current_setting(
+                  'transaction_isolation'
+                ) AS transaction_isolation`,
+        }, {
           domain: "conversations",
-          operation: "establishScopedRepeatableReadSnapshot",
+          operation: "observeAdmittedScopedIsolation",
           projectId,
         });
+        expect(isolation.rows[0]?.transaction_isolation).toBe("read committed");
+
         const scoped = new PostgreSqlConversationRepository(
           transaction as PostgreSqlConversationScopedExecutor,
           projectId,
         );
-        for (const [operation, invoke] of [
-          [
-            "getOrCreateConversation",
-            () => scoped.getOrCreateConversation("scoped-isolation-new"),
-          ],
-          [
-            "appendMessages",
-            () => scoped.appendMessages(conversation.conversationId, [{
-              role: "assistant",
-              content: "must not append",
-              tokenCount: 1,
-            }]),
-          ],
-        ] as const) {
-          const error = await invoke().catch((caught: unknown) => caught);
-          expect(error).toMatchObject({
-            backend: "postgresql",
-            domain: "conversations",
-            field: "transaction_isolation",
-            operation,
-            projectId,
-          });
-          expect(error).not.toHaveProperty("cause");
-        }
+        await expect(scoped.getOrCreateConversation("scoped-isolation-new"))
+          .resolves.toMatchObject({ sessionId: "scoped-isolation-new" });
+        await expect(scoped.appendMessages(conversation.conversationId, [{
+          role: "assistant",
+          content: "must append",
+          tokenCount: 1,
+        }])).resolves.toMatchObject([{ seq: 1 }]);
         await scoped.markConversationBootstrapped(conversation.conversationId);
       }, {
         domain: "conversations",
-        operation: "rejectScopedRepeatableReadContention",
+        operation: "admitScopedRepeatableReadContention",
         projectId,
       });
 
       expect(await repository.getConversationBySessionId("scoped-isolation-new"))
-        .toBeNull();
+        .toMatchObject({ sessionId: "scoped-isolation-new" });
       expect(await repository.getMessages(conversation.conversationId))
-        .toMatchObject([{ content: "existing", seq: 0 }]);
+        .toMatchObject([
+          { content: "existing", seq: 0 },
+          { content: "must append", seq: 1 },
+        ]);
       expect(await repository.getConversation(conversation.conversationId))
         .toMatchObject({ bootstrappedAt: expect.any(Date) });
     }, { defaultTransactionIsolation: "REPEATABLE READ" });
