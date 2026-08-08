@@ -14,6 +14,7 @@ import {
   LLM_API_MODES,
   LLM_REASONING_EFFORTS,
   OPENAI_REASONING_EFFORTS,
+  __configTestUtils,
   loadDaemonConfig,
   parseDaemonConfig,
   parseLlmRequestPolicyConfig,
@@ -22,6 +23,39 @@ import {
   resolveLlmRequestPolicy,
   deepMerge,
 } from "../../src/daemon/config.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+
+it("fails closed when config admission observes an unresolved publication", () => {
+  const home = mkdtempSync(join(tmpdir(), "lcm-config-publication-"));
+  try {
+    const lcmDir = join(home, ".lcm");
+    mkdirSync(join(lcmDir, "backend-publication"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(lcmDir, "backend-publication", "journal.json"), "{", { mode: 0o600 });
+
+    expect(() => loadDaemonConfig(join(lcmDir, "config.json"))).toThrow(BackendPublicationJournalError);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+it("exposes the bounded-read seam with the observed config bytes", () => {
+  const home = mkdtempSync(join(tmpdir(), "lcm-config-read-seam-"));
+  try {
+    const lcmDir = join(home, ".lcm");
+    mkdirSync(lcmDir, { mode: 0o700 });
+    const path = join(lcmDir, "config.json");
+    writeFileSync(path, "{}", { mode: 0o600 });
+    let observed: string | null = null;
+    const config = __configTestUtils.loadAfterBoundedRead(path, (content, observedContent) => {
+      expect(content).toBe("{}");
+      observed = observedContent;
+    });
+    expect(config.storage.backend).toBe("sqlite");
+    expect(observed).toBe("{}");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 describe("known configuration schema validation", () => {
   it.each([
@@ -269,6 +303,48 @@ describe("loadDaemonConfig", () => {
       expect(c.llm.apiKey).toBe("sk-openai-credential");
     } finally {
       removeTrustedCredentialDir(credentialsDir);
+    }
+  });
+
+  it("rejects duplicate systemd markers and resolves the Claude OAuth credential name", (context: TestContext): void => {
+    const credentialsDir = makeTrustedCredentialDir(context);
+    if (credentialsDir === undefined) return;
+    try {
+      const tokenPath = join(credentialsDir, "CLAUDE_CODE_OAUTH_TOKEN");
+      writeFileSync(tokenPath, "oauth-credential", { mode: 0o400 });
+      sealTrustedCredentialDir(credentialsDir);
+      expect(resolveDaemonConfigEnv({
+        CREDENTIALS_DIRECTORY: credentialsDir,
+        LCM_SYSTEMD_CRED_IDS: "CLAUDE_CODE_OAUTH_TOKEN,CLAUDE_CODE_OAUTH_TOKEN",
+      }).LCM_SYSTEMD_CRED_IDS).toBe("CLAUDE_CODE_OAUTH_TOKEN,CLAUDE_CODE_OAUTH_TOKEN");
+      expect(resolveDaemonConfigEnv({
+        CREDENTIALS_DIRECTORY: credentialsDir,
+        LCM_SYSTEMD_CRED_IDS: "CLAUDE_CODE_OAUTH_TOKEN",
+      }).CLAUDE_CODE_OAUTH_TOKEN).toBe("oauth-credential");
+    } finally {
+      removeTrustedCredentialDir(credentialsDir);
+    }
+  });
+
+  it("rejects an untrusted runtime directory before reading systemd credentials", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-config-runtime-mode-"));
+    const runtimeRoot = join(root, "runtime");
+    const credentialsDir = join(runtimeRoot, "credentials", "service");
+    mkdirSync(runtimeRoot, { mode: 0o755 });
+    mkdirSync(join(runtimeRoot, "credentials"), { mode: 0o755 });
+    mkdirSync(credentialsDir, { mode: 0o700 });
+    chmodSync(runtimeRoot, 0o755);
+    chmodSync(credentialsDir, 0o700);
+    try {
+      const resolved = resolveDaemonConfigEnv({
+        CREDENTIALS_DIRECTORY: credentialsDir,
+        XDG_RUNTIME_DIR: runtimeRoot,
+        LCM_SYSTEMD_CRED_IDS: "OPENAI_API_KEY",
+      });
+      expect(resolved.CREDENTIALS_DIRECTORY).toBe(credentialsDir);
+      expect(resolved.OPENAI_API_KEY).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

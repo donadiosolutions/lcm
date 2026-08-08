@@ -1,9 +1,13 @@
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
 import { consumeBoundedRegularFile, readBoundedRegularFile } from "../security-files.js";
 import { hasUrlQueryComponent, sanitizeUrlForDisplay } from "../url-display.js";
 import { MANAGED_CREDENTIAL_NAMES } from "./managed-credentials.js";
+import {
+  assertBackendPublicationConfigAccess,
+  withBackendPublicationConfigLock,
+} from "../storage/backend.js";
 
 export { sanitizeUrlForDisplay } from "../url-display.js";
 
@@ -248,6 +252,7 @@ const DEFAULTS: DaemonConfigDefaults = {
 };
 
 const DENIED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 const SYSTEMD_CREDENTIAL_ENV_NAMES = [
   "ANTHROPIC_API_KEY",
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -1568,18 +1573,53 @@ export function parseDaemonConfig(
   return merged;
 }
 
-export function loadDaemonConfig(configPath: string, overrides?: unknown, env?: Record<string, string | undefined>): DaemonConfig {
+type ConfigLoadTestHooks = Readonly<{
+  afterBoundedRead?: (content: string, observedContent: string | null) => void;
+}>;
+
+function loadDaemonConfigWithHooks(
+  configPath: string,
+  overrides?: unknown,
+  env?: Record<string, string | undefined>,
+  hooks?: ConfigLoadTestHooks,
+): DaemonConfig {
   const rawEnv = env ?? process.env;
   const resolvedEnv = resolveDaemonConfigEnv(rawEnv);
-  let content: string;
-  try {
-    content = readFileSync(configPath, "utf-8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    content = "{}";
-  }
-  return parseDaemonConfig(content, overrides, resolvedEnv);
+  return withBackendPublicationConfigLock(configPath, (lockToken) => {
+    let content: string;
+    let observedContent: string | null;
+    try {
+      content = readBoundedRegularFile(configPath, {
+        allowedRoot: dirname(configPath),
+        maxBytes: MAX_CONFIG_BYTES,
+      });
+      observedContent = content;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      content = "{}";
+      observedContent = null;
+    }
+    hooks?.afterBoundedRead?.(content, observedContent);
+    const config = parseDaemonConfig(content, overrides, resolvedEnv);
+    assertBackendPublicationConfigAccess(
+      configPath,
+      config.storage.backend,
+      observedContent,
+      lockToken,
+    );
+    return config;
+  });
+}
+
+export function loadDaemonConfig(configPath: string, overrides?: unknown, env?: Record<string, string | undefined>): DaemonConfig {
+  return loadDaemonConfigWithHooks(configPath, overrides, env);
 }
 
 /** Internal pure seams used by configuration boundary tests. */
-export const __configTestUtils = { migrateLegacyPromotionThresholds };
+export const __configTestUtils = {
+  migrateLegacyPromotionThresholds,
+  loadAfterBoundedRead: (
+    configPath: string,
+    afterBoundedRead: ConfigLoadTestHooks["afterBoundedRead"],
+  ): DaemonConfig => loadDaemonConfigWithHooks(configPath, undefined, undefined, { afterBoundedRead }),
+};

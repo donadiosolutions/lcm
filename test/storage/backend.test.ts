@@ -1,15 +1,38 @@
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   selectStorageBackend,
-  StorageBackendUnavailableError,
+  selectStorageBackendForConfig,
 } from "../../src/storage/backend.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 describe("storage backend selection", () => {
   it("selects SQLite", () => {
     expect(selectStorageBackend({ backend: "sqlite" })).toEqual({ backend: "sqlite" });
   });
 
-  it("fails explicitly for PostgreSQL until repository support lands", () => {
+  it("binds direct selection to the canonical config publication home", () => {
+    expect(() => selectStorageBackendForConfig("/tmp/config.json", { backend: "sqlite" }))
+      .toThrowError(expect.objectContaining({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+      }));
+
+    const home = mkdtempSync(join(tmpdir(), "lcm-storage-selection-"));
+    try {
+      mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+      expect(selectStorageBackendForConfig(
+        join(home, ".lcm", "config.json"),
+        { backend: "sqlite" },
+      )).toEqual({ backend: "sqlite" });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed for PostgreSQL without completed publication evidence", () => {
     const config = {
       backend: "postgresql" as const,
       postgresql: {
@@ -21,12 +44,14 @@ describe("storage backend selection", () => {
         caFile: "/tmp/ca.crt",
       },
     };
-    expect(() => selectStorageBackend(config)).toThrow(StorageBackendUnavailableError);
+    expect(() => selectStorageBackend(config)).toThrow(BackendPublicationJournalError);
     try {
       selectStorageBackend(config);
     } catch (error) {
-      expect(error).toMatchObject({ name: "StorageBackendUnavailableError" });
-      expect((error as Error).message).toContain("not available in this release");
+      expect(error).toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "publication-evidence-missing",
+      });
       expect((error as Error).message).not.toContain("secret");
     }
   });

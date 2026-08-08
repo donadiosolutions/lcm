@@ -1,6 +1,6 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { DaemonConfig } from "./config.js";
+import { loadDaemonConfig, type DaemonConfig } from "./config.js";
 import { sanitizeError } from "./safe-error.js";
 import { stagedPostgreSqlUnavailablePayload } from "./staged-postgresql.js";
 import { readAuthToken } from "./auth.js";
@@ -34,9 +34,14 @@ import {
   isDaemonLifecycleTestIdentity,
   isVitestWorkerEntrypoint,
 } from "./lifecycle-scope.js";
-import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
+import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
 import { createStorageBackendFactory } from "../storage/index.js";
+import {
+  assertStorageBackendPublication,
+  backendPublicationHomeForConfigPath,
+} from "../storage/backend.js";
+import { BackendPublicationJournalError } from "../storage/backend-publication.js";
 export { PKG_VERSION };
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
@@ -57,6 +62,10 @@ export type DaemonOptions = {
   _testIdentity?: DaemonLifecycleTestIdentity;
   /** @internal Deterministic auth-token read seam for preflight ordering tests. */
   _readAuthToken?: typeof readAuthToken;
+  /** Canonical daemon config path used for request-time publication admission. */
+  publicationConfigPath?: string;
+  /** @internal Test-only publication admission seam. */
+  _assertBackendPublication?: (homeDir: string | undefined, backend: DaemonConfig["storage"]["backend"]) => void;
 };
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -121,6 +130,24 @@ function stagedPostgreSqlUnavailableHandler(operation: string): RouteHandler {
   };
 }
 
+/** Revalidate config/publication state before each route or scheduled scan. */
+function assertDaemonRequestStorageAdmission(
+  startupConfig: DaemonConfig,
+  publicationConfigPath: string,
+): void {
+  const requestConfig = loadDaemonConfig(publicationConfigPath);
+  if (requestConfig.storage.backend !== startupConfig.storage.backend) {
+    throw new BackendPublicationJournalError(
+      "unexpected-state",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+  }
+  assertStorageBackendPublication({
+    backend: requestConfig.storage.backend,
+    homeDir: backendPublicationHomeForConfigPath(publicationConfigPath),
+  });
+}
+
 async function settleCleanup(callback: () => void | Promise<void>): Promise<void> {
   try {
     await callback();
@@ -157,7 +184,22 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   if (options?.tokenPath && serverToken === null) {
     throw new Error(`Auth token file specified but could not be read: ${options.tokenPath}`);
   }
-  const storageFactory = createStorageBackendFactory(config.storage);
+  const publicationConfigPath = options?.publicationConfigPath ?? defaultConfigPath();
+  const publicationHome = backendPublicationHomeForConfigPath(publicationConfigPath);
+  const assertRequestAdmission = (): void => {
+    if (options?._assertBackendPublication !== undefined) {
+      options._assertBackendPublication(publicationHome, config.storage.backend);
+      return;
+    }
+    assertDaemonRequestStorageAdmission(config, publicationConfigPath);
+  };
+  const storageFactory = createStorageBackendFactory(
+    config.storage,
+    publicationHome,
+    options?._assertBackendPublication === undefined
+      ? undefined
+      : ({ homeDir, backend }) => options._assertBackendPublication!(homeDir, backend),
+  );
   const sqliteStorage = config.storage.backend === "sqlite";
   let constructedProcessor: PassiveEventProcessor | undefined;
   let constructedWatcher: ReturnType<typeof watchProjectMap> | undefined;
@@ -311,11 +353,19 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   };
 
   let activeIngestScan: Promise<void> | undefined;
-  const runTranscriptScan = (): Promise<void> => {
+  const runScheduledTranscriptScan = (): Promise<void> => {
     if (activeIngestScan) return activeIngestScan;
     const scan = Promise.resolve()
-      .then(() => (options?._scanForTranscripts ?? scanForTranscripts)())
-      .catch(() => undefined)
+      .then(() => {
+        assertRequestAdmission();
+        return (options?._scanForTranscripts ?? scanForTranscripts)();
+      })
+      .catch((error: unknown) => {
+        if (error instanceof BackendPublicationJournalError) {
+          console.warn("[lcm] periodic transcript scan blocked by backend publication admission");
+        }
+        return undefined;
+      })
       .finally(() => {
         activeIngestScan = undefined;
         constructedIngestScan = undefined;
@@ -326,7 +376,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   };
 
   const ingestInterval = sqliteStorage
-    ? setInterval(runTranscriptScan, INGEST_INTERVAL_MS)
+    ? setInterval(runScheduledTranscriptScan, INGEST_INTERVAL_MS)
     : undefined;
   constructedIngestInterval = ingestInterval;
   ingestInterval?.unref(); // don't prevent process exit
@@ -348,8 +398,17 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       }
     }
     try {
-      await handler(req, res, req.method !== "GET" ? await readBody(req) : "");
+      const body = req.method !== "GET" ? await readBody(req) : "";
+      assertRequestAdmission();
+      await handler(req, res, body);
     } catch (err: unknown) {
+      if (err instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
+        });
+        return;
+      }
       const status = (err as { statusCode?: number })?.statusCode ?? 500;
       const message = status === 413 ? "payload too large" : sanitizeError(err instanceof Error ? err.message : "internal error");
       sendJson(res, status, { error: message });

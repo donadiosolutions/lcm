@@ -4,10 +4,11 @@ import { runLcmMigrations } from "./db/migration.js";
 import { closeLcmConnection, getLcmConnection } from "./db/connection.js";
 import type { ProgressPhaseError, ProgressState } from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
-import { projectsDir as lcmProjectsDir } from "./runtime-paths.js";
+import { configPath, projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
-import type { LlmApiMode, LlmInvocationRequestPolicy, LlmReasoningEffort, LlmRetryPolicy } from "./daemon/config.js";
+import { loadDaemonConfig, type LlmApiMode, type LlmInvocationRequestPolicy, type LlmReasoningEffort, type LlmRetryPolicy } from "./daemon/config.js";
 import { MANUAL_COMPACT_FRESH_TAIL_COUNT } from "./compaction.js";
+import { selectStorageBackendForConfig } from "./storage/backend.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -245,6 +246,8 @@ function discoverUncompacted(minTokens: number, readOnly = false, cwdFilter?: st
 }
 
 export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedConversation[] {
+  const configFile = configPath();
+  selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
   return discoverUncompacted(minTokens, readOnly, cwdFilter, replay).conversations;
 }
 
@@ -263,6 +266,8 @@ export async function batchCompact(opts: {
   /** Called with state patches as each session is processed — used by the ninja renderer */
   onProgress?: (patch: Partial<ProgressState>) => void;
 }): Promise<BatchCompactResult> {
+  const configFile = configPath();
+  selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
   const discovery = discoverUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay);
   const conversations = discovery.conversations;
   const onProgress = opts.onProgress;

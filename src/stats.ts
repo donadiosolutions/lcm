@@ -9,6 +9,8 @@ import { PromotedStore } from "./db/promoted.js";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 import { sanitizeTerminalText } from "./terminal-sanitize.js";
+import { selectStorageBackendForConfig, StorageBackendUnavailableError } from "./storage/backend.js";
+import { BackendPublicationJournalError } from "./storage/backend-publication.js";
 
 export type { RecallStats };
 
@@ -342,6 +344,17 @@ export function printStats(stats: OverallStats, verbose: boolean): void {
 
 export async function collectStats(): Promise<OverallStats> {
   const baseDir = lcmProjectsDir();
+
+  // Admission must happen before the empty-project fast path. Otherwise an
+  // unresolved publication could be hidden by an installation with no projects.
+  try {
+    const configFile = defaultConfigPath();
+    const config = loadDaemonConfig(configFile);
+    selectStorageBackendForConfig(configFile, config.storage);
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError || error instanceof StorageBackendUnavailableError) throw error;
+    // Preserve the existing fallback for malformed configuration diagnostics.
+  }
 
   const emptyRecallStats: RecallStats = {
     memoriesSurfaced: 0, memoriesActedUpon: 0, recallPrecision: null, topRecalled: [],

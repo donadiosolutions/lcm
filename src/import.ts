@@ -5,7 +5,9 @@ import type { DaemonClient } from "./daemon/client.js";
 import { formatNumber, formatRatio } from "./stats.js";
 import type { ProgressState } from "./cli/progress-state.js";
 import type { TranscriptClient } from "./transcript-provider.js";
-import { lcmHomeDir } from "./runtime-paths.js";
+import { configPath, lcmHomeDir } from "./runtime-paths.js";
+import { loadDaemonConfig } from "./daemon/config.js";
+import { selectStorageBackendForConfig } from "./storage/backend.js";
 import { projectId } from "./daemon/project.js";
 import {
   hashProjectPath,
@@ -282,6 +284,10 @@ export async function importSessions(
   client: DaemonClient,
   options: ImportOptions = {}
 ): Promise<ImportResult> {
+  // Admission precedes transcript discovery, including an empty-catalogue
+  // no-op, so unresolved publication state cannot be hidden by a quiet import.
+  const configFile = configPath();
+  selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
   const provider: ImportProvider = options.provider ?? "claude";
   const result: ImportResult = {
     imported: 0,

@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { mkdirSync, rmSync } from "node:fs";
 import type { RecallStats } from "../src/stats.js";
 
 interface FakeDatabaseState {
@@ -36,6 +37,8 @@ const mocks = vi.hoisted(() => ({
   baseExists: true,
   configFails: false,
   eventsFail: false,
+  publicationBlocked: false,
+  storageUnavailable: false,
   entries: [] as Array<{ name: string; directory: boolean; dbExists: boolean }>,
   close: vi.fn<(project: string) => void>(),
   migrate: vi.fn<(db: FakeDatabaseState) => void>(),
@@ -43,6 +46,7 @@ const mocks = vi.hoisted(() => ({
   loadConfig: vi.fn<(path: string) => void>(),
   findStale: vi.fn<(args: FakeStaleQuery) => unknown[]>(),
   getRecallStats: vi.fn<() => RecallStats>(),
+  publicationHome: `/tmp/lcm-stats-services-${process.pid}`,
 }));
 
 const projects = new Map<string, {
@@ -51,23 +55,55 @@ const projects = new Map<string, {
   conversations: ConversationRow[];
 }>();
 
-vi.mock("node:fs", () => ({
-  existsSync: (path: string) => path === "/coverage/projects"
-    ? mocks.baseExists
-    : mocks.entries.some((entry) => path === `/coverage/projects/${entry.name}/db.sqlite` && entry.dbExists),
-  readdirSync: () => mocks.entries.map((entry) => ({ name: entry.name, isDirectory: () => entry.directory })),
-}));
+vi.mock("node:fs", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    existsSync: (path: string) => {
+      if (path === "/coverage/projects") return mocks.baseExists;
+      if (path.startsWith("/coverage/projects/")) {
+        return mocks.entries.some((entry) => path === `/coverage/projects/${entry.name}/db.sqlite` && entry.dbExists);
+      }
+      return actual.existsSync(path);
+    },
+    readdirSync: (path: string, options?: unknown) => path === "/coverage/projects"
+      ? mocks.entries.map((entry) => ({ name: entry.name, isDirectory: () => entry.directory }))
+      : Reflect.apply(actual.readdirSync, actual, options === undefined ? [path] : [path, options]),
+  };
+});
 vi.mock("../src/runtime-paths.js", () => ({
-  configPath: () => "/coverage/config.json",
+  configPath: () => `${mocks.publicationHome}/.lcm/config.json`,
   projectsDir: () => "/coverage/projects",
 }));
 vi.mock("../src/daemon/config.js", () => ({
-  loadDaemonConfig: (path: string): { restoration: { staleAfterDays: number; staleSurfacingWithoutUseLimit: number } } => {
+  loadDaemonConfig: (path: string): {
+    restoration: { staleAfterDays: number; staleSurfacingWithoutUseLimit: number };
+    storage: { backend: "sqlite" };
+  } => {
     mocks.loadConfig(path);
     if (mocks.configFails) throw new Error("config broken");
-    return { restoration: { staleAfterDays: 12, staleSurfacingWithoutUseLimit: 3 } };
+    return {
+      restoration: { staleAfterDays: 12, staleSurfacingWithoutUseLimit: 3 },
+      storage: { backend: "sqlite" },
+    };
   },
 }));
+vi.mock("../src/storage/backend.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/storage/backend.js")>();
+  const { BackendPublicationJournalError } = await import("../src/storage/backend-publication.js");
+  return {
+    ...actual,
+    selectStorageBackendForConfig: vi.fn(() => {
+      if (mocks.publicationBlocked) {
+        throw new BackendPublicationJournalError("unresolved-publication", "publication blocked");
+      }
+      if (mocks.storageUnavailable) {
+        throw new actual.StorageBackendUnavailableError("postgresql");
+      }
+      return { backend: "sqlite" };
+    }),
+  };
+});
 vi.mock("../src/db/migration.js", () => ({
   runLcmMigrations: (db: FakeDatabaseState): void => mocks.migrate(db),
 }));
@@ -107,15 +143,27 @@ vi.mock("node:sqlite", () => ({
 }));
 
 import { collectStats, formatNumber, formatRatio, printStats } from "../src/stats.js";
+import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 
 type Stats = Parameters<typeof printStats>[0];
 
 describe("stats service coverage", () => {
+  beforeAll(() => {
+    mkdirSync(mocks.publicationHome, { recursive: true, mode: 0o700 });
+    mkdirSync(`${mocks.publicationHome}/.lcm`, { mode: 0o700 });
+  });
+
+  afterAll(() => {
+    rmSync(mocks.publicationHome, { recursive: true, force: true });
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.baseExists = true;
     mocks.configFails = false;
     mocks.eventsFail = false;
+    mocks.publicationBlocked = false;
+    mocks.storageUnavailable = false;
     mocks.entries = [];
     projects.clear();
     mocks.getRecallStats.mockReturnValue({ memoriesSurfaced: 0, memoriesActedUpon: 0, recallPrecision: null, topRecalled: [] });
@@ -131,6 +179,30 @@ describe("stats service coverage", () => {
     mocks.baseExists = false;
     expect(await collectStats()).toMatchObject({ projects: 0, messages: 0, staleCount: 0 });
     expect(mocks.collectEvents).not.toHaveBeenCalled();
+  });
+
+  it("rethrows publication admission failures before collecting an empty aggregate", async () => {
+    mocks.publicationBlocked = true;
+    await expect(collectStats()).rejects.toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "unresolved-publication",
+    });
+    expect(mocks.collectEvents).not.toHaveBeenCalled();
+  });
+
+  it("rethrows unavailable PostgreSQL selection before an empty aggregate", async () => {
+    mocks.storageUnavailable = true;
+    mocks.baseExists = false;
+    await expect(collectStats()).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+    expect(mocks.collectEvents).not.toHaveBeenCalled();
+  });
+
+  it("rethrows unavailable PostgreSQL selection before populated project reads", async () => {
+    mocks.storageUnavailable = true;
+    mocks.entries = [{ name: "alpha", directory: true, dbExists: true }];
+    await expect(collectStats()).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+    expect(mocks.collectEvents).not.toHaveBeenCalled();
+    expect(mocks.migrate).not.toHaveBeenCalled();
   });
 
   it("aggregates valid projects while skipping directories, missing databases, empty projects, and corrupt databases", async () => {
@@ -231,6 +303,7 @@ describe("stats service coverage", () => {
       staleCount: 0, conversationDetails: [],
     }, true);
     expect(log.mock.calls.flat().join("\n")).not.toContain("Compression");
+    printStats(base, false);
     log.mockRestore();
   });
 });

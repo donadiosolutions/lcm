@@ -7,6 +7,7 @@ import type {
   StorageIdentityContext,
 } from "./contracts.js";
 import { StorageOperationError } from "./errors.js";
+import { assertStorageBackendPublication } from "./backend.js";
 import { SqliteStorageBackendFactory } from "./sqlite/factory.js";
 
 const unavailablePostgreSqlCapabilities: StorageCapabilities = Object.freeze({
@@ -74,7 +75,10 @@ export class UnavailablePostgreSqlStorageBackendFactory implements StorageBacken
 
 export function createStorageBackendFactory(
   config: ResolvedStorageConfig,
+  homeDir?: string,
+  publicationCheck: (config: { backend: ResolvedStorageConfig["backend"]; homeDir?: string }) => void = assertStorageBackendPublication,
 ): StorageBackendFactory {
+  publicationCheck({ backend: config.backend, homeDir });
   if (config.backend === "postgresql") {
     return new UnavailablePostgreSqlStorageBackendFactory();
   }
