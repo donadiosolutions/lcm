@@ -2,14 +2,129 @@ import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, normalize, join as pathJoin, dirname, basename, parse } from "node:path";
 import { lcmHomeDir } from "../runtime-paths.js";
-import { resolveProjectIdentity, type ProjectIdentity } from "../project-map.js";
-import { atomicWritePrivateFile, ensurePrivateDirectory, readBoundedRegularFile } from "../security-files.js";
+import {
+  hashProjectPath,
+  normalizeProjectIdentityPath,
+  projectMapPath,
+  resolveProjectIdentity,
+  type ProjectIdentity,
+} from "../project-map.js";
+import {
+  atomicWritePrivateFile,
+  assertPrivateDirectory,
+  ensurePrivateDirectory,
+  openPrivateDirectory,
+  readBoundedRegularFile,
+  type PrivateDirectoryHandle,
+  type PrivateDirectoryWitness,
+} from "../security-files.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import { resolveStorageIdentityContext } from "../storage/identity-context.js";
 import type { ResolvedStorageConfig } from "./config.js";
 import { ensureWorktreeProjectReconciled } from "../worktree-reconciliation.js";
 
 const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
+const MAX_PROJECT_MAP_COMPATIBILITY_BYTES = 4 * 1024 * 1024;
+const PROJECT_HASH_PATTERN = /^[a-f0-9]{64}$/u;
+
+function assertStablePrivateRoot(
+  handle: PrivateDirectoryHandle,
+  path: string,
+  expected: PrivateDirectoryWitness,
+): void {
+  const actual = assertPrivateDirectory(handle, path);
+  if (
+    actual.mode !== expected.mode
+    || actual.uid !== expected.uid
+    || actual.gid !== expected.gid
+    || actual.dev !== expected.dev
+    || actual.ino !== expected.ino
+  ) {
+    throw new Error("private directory witness changed");
+  }
+}
+
+export type LocalProjectIdentity = Readonly<{
+  id: string;
+  canonical: string;
+}>;
+
+function parseLocalProjectMapCompatibility(
+  cwd: string,
+  homeDir?: string,
+): LocalProjectIdentity {
+  const canonical = normalizeProjectIdentityPath(cwd);
+  const fallback: LocalProjectIdentity = {
+    id: hashProjectPath(canonical),
+    canonical,
+  };
+
+  // Hook durability cannot depend on project-map reconciliation or backend
+  // publication state. A read-only compatibility snapshot is useful only for
+  // preserving the sidecar ID of an already-mapped alias/worktree; malformed,
+  // missing, or concurrently changing metadata always falls back to the
+  // established path hash and still permits local enqueue.
+  try {
+    const path = projectMapPath(homeDir);
+    const content = readBoundedRegularFile(path, {
+      allowedRoot: lcmHomeDir(homeDir),
+      maxBytes: MAX_PROJECT_MAP_COMPATIBILITY_BYTES,
+    });
+    const value: unknown = JSON.parse(content);
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return fallback;
+
+    const matches: LocalProjectIdentity[] = [];
+    for (const [id, entry] of Object.entries(value)) {
+      if (!PROJECT_HASH_PATTERN.test(id) || entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        continue;
+      }
+      const candidate = entry as { canonical?: unknown; aliases?: unknown };
+      if (typeof candidate.canonical !== "string" || !Array.isArray(candidate.aliases)) continue;
+      const paths = [candidate.canonical, ...candidate.aliases.filter((alias): alias is string => typeof alias === "string")];
+      if (!paths.some((pathValue) => {
+        try {
+          return normalizeProjectIdentityPath(pathValue) === canonical;
+        } catch {
+          return false;
+        }
+      })) continue;
+      matches.push({
+        id,
+        canonical: resolve(candidate.canonical),
+      });
+    }
+    if (matches.length !== 1) return fallback;
+    const matched = matches[0]!;
+    // Map keys are historical storage names and may be replaced atomically
+    // during worktree reconciliation. Derive the hook ID from the stable
+    // canonical path so an old/new map pair cannot make eventsDbPath oscillate.
+    return {
+      id: hashProjectPath(normalizeProjectIdentityPath(matched.canonical)),
+      canonical: matched.canonical,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Resolve the backend-independent identity used by hook sidecars.
+ *
+ * This deliberately never calls resolveProjectIdentity, project-map
+ * reconciliation, storage selection, or daemon bootstrap. It keeps the
+ * historical SHA-256 path identity for new projects and consults only a
+ * bounded read-only map snapshot to preserve IDs for existing aliases and
+ * linked worktrees.
+ */
+export function localProjectIdentity(cwd: string, homeDir?: string): LocalProjectIdentity {
+  return parseLocalProjectMapCompatibility(cwd, homeDir);
+}
+
+export const localProjectId = (cwd: string, homeDir?: string): string =>
+  localProjectIdentity(cwd, homeDir).id;
+
+export const localProjectDir = (cwd: string, homeDir?: string): string =>
+  join(lcmHomeDir(homeDir), "projects", localProjectId(cwd, homeDir));
 
 export function projectIdentity(cwd: string): ProjectIdentity;
 export function projectIdentity(
@@ -134,22 +249,37 @@ export function isSafeTranscriptPath(transcriptPath: string, cwd: string): strin
 
 /** Ensures the snapshotted project dir exists and writes its canonical cwd to meta.json. */
 export const ensureProjectDirForIdentity = (identity: ProjectIdentity): string => {
-  const dir = join(lcmHomeDir(), "projects", identity.id);
-  ensurePrivateDirectory(lcmHomeDir());
-  ensurePrivateDirectory(join(lcmHomeDir(), "projects"));
-  ensurePrivateDirectory(dir);
-  const metaPath = join(dir, "meta.json");
-  let meta: Record<string, unknown> = { cwd: identity.canonical };
+  const rootPath = lcmHomeDir();
+  const rootHandle = openPrivateDirectory(rootPath);
+  const rootWitness = rootHandle.witness;
   try {
-    const existing = JSON.parse(readBoundedRegularFile(metaPath, {
-      allowedRoot: dir,
-      maxBytes: MAX_PROJECT_METADATA_BYTES,
-    })) as Record<string, unknown>;
-    if (existing.cwd === identity.canonical) return dir;
-    meta = { ...existing, cwd: identity.canonical };
-  } catch { /* keep default */ }
-  atomicWritePrivateFile(metaPath, JSON.stringify(meta, null, 2) + "\n");
-  return dir;
+    assertStablePrivateRoot(rootHandle, rootPath, rootWitness);
+    const dir = join(rootPath, "projects", identity.id);
+    ensurePrivateDirectory(join(rootPath, "projects"));
+    ensurePrivateDirectory(dir);
+    const metaPath = join(dir, "meta.json");
+    let meta: Record<string, unknown> = { cwd: identity.canonical };
+    try {
+      const existing = JSON.parse(readBoundedRegularFile(metaPath, {
+        allowedRoot: dir,
+        maxBytes: MAX_PROJECT_METADATA_BYTES,
+      })) as Record<string, unknown>;
+      if (existing.cwd === identity.canonical) {
+        assertStablePrivateRoot(rootHandle, rootPath, rootWitness);
+        return dir;
+      }
+      meta = { ...existing, cwd: identity.canonical };
+    } catch { /* keep default */ }
+    atomicWritePrivateFile(metaPath, JSON.stringify(meta, null, 2) + "\n");
+    assertStablePrivateRoot(rootHandle, rootPath, rootWitness);
+    return dir;
+  } finally {
+    try {
+      assertStablePrivateRoot(rootHandle, rootPath, rootWitness);
+    } finally {
+      rootHandle.close();
+    }
+  }
 };
 
 /** Ensures the current project dir exists and writes cwd to meta.json. */

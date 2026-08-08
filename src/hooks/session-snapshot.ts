@@ -4,6 +4,11 @@ import { homedir } from "node:os";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
 import { daemonJsonRequest, normalizeDaemonPort } from "../daemon/http-url.js";
 import { configPath as defaultConfigPath, daemonTokenPath, tmpDir as lcmTmpDir } from "../runtime-paths.js";
+import {
+  assertHookPublicationFence,
+  assertHookRootEstablished,
+  isBackendPublicationJournalError,
+} from "./publication-fence.js";
 
 export interface SnapshotDeps {
   statSync: (path: string) => { mtimeMs: number } | null;
@@ -34,6 +39,10 @@ export async function handleSessionSnapshot(
     const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
 
     const safeSessionId = session_id.replace(/[^a-zA-Z0-9_-]/g, "_");
+    // Bootstrap/install owns root creation. Authenticate the established root
+    // before creating the cursor directory so a missing or unsafe root cannot
+    // be created as a hook side effect.
+    assertHookRootEstablished();
     const cursorDir = lcmTmpDir();
     mkdirSync(cursorDir, { recursive: true, mode: 0o700 });
     const cursorPath = join(cursorDir, `snap-${safeSessionId}.json`);
@@ -63,6 +72,7 @@ export async function handleSessionSnapshot(
     let ingestResult: { totalTokens?: number } | undefined;
     const _post = deps?.post;
     if (_post) {
+      assertHookPublicationFence();
       ingestResult = await _post("/ingest", { session_id, cwd, transcript_path, client: clientName }) as { totalTokens?: number };
     } else {
       const { loadDaemonConfig } = await import("../daemon/config.js");
@@ -85,6 +95,7 @@ export async function handleSessionSnapshot(
         headers["Authorization"] = `Bearer ${token}`;
       }
 
+      assertHookPublicationFence();
       ingestResult = await daemonJsonRequest<{ totalTokens?: number }>(port, "/ingest", {
         method: "POST",
         headers,
@@ -108,7 +119,8 @@ export async function handleSessionSnapshot(
             client: "codex",
           });
         }
-      } catch {
+      } catch (error) {
+        if (isBackendPublicationJournalError(error)) throw error;
         // Best-effort only
       }
     }
@@ -128,12 +140,14 @@ export async function handleSessionSnapshot(
       const port = deps?.verifiedPort ?? normalizeDaemonPort(_config.daemon?.port ?? 3737);
       const { firePromoteEventsRequest } = await import("./session-end.js");
       firePromoteEventsRequest(port, { cwd: input.cwd });
-    } catch {
+    } catch (error) {
+      if (isBackendPublicationJournalError(error)) throw error;
       // Best-effort only
     }
 
     return { exitCode: 0, stdout: "" };
-  } catch {
+  } catch (error) {
+    if (isBackendPublicationJournalError(error)) throw error;
     return { exitCode: 0, stdout: "" };
   }
 }

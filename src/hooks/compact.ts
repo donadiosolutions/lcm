@@ -15,6 +15,10 @@ import {
   sanitizeDaemonRefusalReason,
 } from "./daemon-notice.js";
 import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remediation.js";
+import {
+  assertHookPublicationFence,
+  isBackendPublicationJournalError,
+} from "./publication-fence.js";
 
 type EnsureResultWithRefusal = Readonly<{ connected: boolean; refusalReason?: unknown }>;
 
@@ -52,6 +56,7 @@ export async function handlePreCompact(
   try {
     selectStorageBackend(storage);
   } catch (error) {
+    if (isBackendPublicationJournalError(error)) return { exitCode: 0, stdout: "" };
     await safeLogError("PreCompact", error, {});
     return { exitCode: 0, stdout: "" };
   }
@@ -63,7 +68,8 @@ export async function handlePreCompact(
       expectedStorageBackend: storage.backend,
       enforceUserManagerParent: true,
     });
-  } catch {
+  } catch (error) {
+    if (isBackendPublicationJournalError(error)) return { exitCode: 0, stdout: "" };
     emitAdmissionNotice(undefined, "ambiguous");
     return { exitCode: 0, stdout: "" };
   }
@@ -76,6 +82,9 @@ export async function handlePreCompact(
   try {
     const input = JSON.parse(stdin || "{}");
     const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
+    // Check immediately before the daemon request, then release the lock so
+    // the daemon's own config/lifecycle admission cannot self-contention.
+    assertHookPublicationFence();
     const result = await client.post<{ summary: string; latestSummaryContent?: string }>("/compact", {
       ...input,
       client: clientName,
@@ -84,7 +93,8 @@ export async function handlePreCompact(
     try {
       const { firePromoteEventsRequest } = await import("./session-end.js");
       firePromoteEventsRequest(daemonPort, { cwd: input.cwd });
-    } catch {
+    } catch (error) {
+      if (isBackendPublicationJournalError(error)) return { exitCode: 0, stdout: "" };
       // Silent fail — PreCompact must not delay session
     }
 
@@ -98,7 +108,8 @@ export async function handlePreCompact(
     }
 
     return { exitCode: 0, stdout: parts.join("\n\n") };
-  } catch {
+  } catch (error) {
+    if (isBackendPublicationJournalError(error)) return { exitCode: 0, stdout: "" };
     return { exitCode: 0, stdout: "" };
   }
 }

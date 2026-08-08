@@ -1,9 +1,11 @@
 // src/hooks/post-tool.ts
 import { extractPostToolEvents } from "./extractors.js";
-import { eventsDbPath } from "../db/events-path.js";
 import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
-import { SQLiteLocalHookOutboxFactory } from "../storage/local-hook-outbox.js";
+import { appendLocalHookEvents } from "./local-enqueue.js";
+import {
+  isBackendPublicationJournalError,
+} from "./publication-fence.js";
 
 interface PostToolHookInput {
   session_id?: unknown;
@@ -55,24 +57,35 @@ export async function handlePostToolUse(
     const resolvedCwd = resolveHookCwd(input.cwd);
     cwd = resolvedCwd;
     const { scrubExtractedEvents } = await import("./event-scrubbing.js");
-    const events = await scrubExtractedEvents(extractedEvents, resolvedCwd);
-    ensureProjectDir(resolvedCwd);
-    const dbPath = eventsDbPath(resolvedCwd);
-    const outboxFactory = new SQLiteLocalHookOutboxFactory();
-    const db = await outboxFactory.open(dbPath);
-
+    let events;
     try {
-      for (const event of events) {
-        await db.insertEvent(session_id, event, "PostToolUse");
-      }
-
-      // PostToolUse payloads are untrusted. Persist events locally and let the
-      // daemon's bounded background scan process them; never use a payload port
-      // for a token-bearing request.
-    } finally {
-      await outboxFactory.close();
+      events = await scrubExtractedEvents(extractedEvents, resolvedCwd);
+    } catch (error) {
+      if (!isBackendPublicationJournalError(error)) throw error;
+      // A malformed or unresolved publication cannot prevent the original
+      // event from reaching the durable local outbox. Built-in scrubbing is
+      // still applied while the publication error remains control flow.
+      events = await scrubExtractedEvents(extractedEvents, resolvedCwd, []);
     }
+
+    await appendLocalHookEvents({
+      cwd: resolvedCwd,
+      sessionId: session_id,
+      events,
+      sourceHook: "PostToolUse",
+    });
+
+    // Project metadata is a selected-state consumer, so it is deliberately
+    // opened only after local durability. ensureProjectDir owns its own
+    // project-map/publication boundary; wrapping it here would self-contention
+    // on the same interprocess consumer lock.
+    ensureProjectDir(resolvedCwd);
+
+    // PostToolUse payloads are untrusted. Persist events locally and let the
+    // daemon's bounded background scan process them; never use a payload port
+    // for a token-bearing request.
   } catch (error) {
+    if (isBackendPublicationJournalError(error)) throw error;
     await safeLogError("PostToolUse", error, { cwd });
   }
 

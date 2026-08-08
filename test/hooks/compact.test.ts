@@ -1,9 +1,24 @@
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handlePreCompact } from "../../src/hooks/compact.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
+import * as storageBackend from "../../src/storage/backend.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+
+const promotionState = vi.hoisted(() => ({ error: undefined as Error | undefined }));
+
+vi.mock("../../src/hooks/session-end.js", () => ({
+  firePromoteEventsRequest: vi.fn(() => {
+    if (promotionState.error) throw promotionState.error;
+  }),
+}));
+
+vi.mock("../../src/hooks/publication-fence.js", () => ({
+  assertHookPublicationFence: vi.fn(),
+  isBackendPublicationJournalError: (error: unknown) => error instanceof BackendPublicationJournalError,
+}));
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn(),
@@ -24,13 +39,47 @@ function mockDaemonClient(post: ReturnType<typeof vi.fn>): DaemonClient {
 }
 
 describe("handlePreCompact", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    promotionState.error = undefined;
+  });
+
+  it("keeps installed PreCompact best-effort when publication selection is unavailable", async () => {
+    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementationOnce(() => {
+      throw new BackendPublicationJournalError("malformed-journal", "publication journal is malformed");
+    });
+    try {
+      await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()), 3737, { backend: "postgresql" }))
+        .resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
+      expect(mockSafeLogError).not.toHaveBeenCalled();
+    } finally {
+      select.mockRestore();
+    }
+  });
+
+  it("keeps the compact result best-effort when post-compaction admission fails", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    promotionState.error = new BackendPublicationJournalError("unresolved-publication", "publication unresolved");
+    try {
+      await expect(handlePreCompact("{}", mockDaemonClient(vi.fn().mockResolvedValue({ summary: "done" }))))
+        .resolves.toEqual({ exitCode: 0, stdout: "" });
+    } finally {
+      promotionState.error = undefined;
+    }
+  });
+
   it("treats an unavailable PostgreSQL backend as a benign hook miss", async () => {
     const post = vi.fn();
     await expect(handlePreCompact("{}", mockDaemonClient(post), 3737, {
       backend: "postgresql",
     })).resolves.toEqual({ exitCode: 0, stdout: "" });
     expect(mockEnsureDaemon).not.toHaveBeenCalled();
-    expect(mockSafeLogError).toHaveBeenCalledWith("PreCompact", expect.objectContaining({ name: "StorageBackendUnavailableError" }), {});
+    expect(mockSafeLogError).toHaveBeenCalledWith(
+      "PreCompact",
+      expect.objectContaining({ name: "StorageBackendUnavailableError" }),
+      {},
+    );
     expect(post).not.toHaveBeenCalled();
   });
 

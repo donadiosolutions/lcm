@@ -1,11 +1,12 @@
 import type { DaemonClient } from "../daemon/client.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
+import { loadHookConfig } from "./config.js";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { safeLogError } from "./hook-errors.js";
 import { buildMemoryContext } from "./memory-context.js";
-import { daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
+import { configPath as defaultConfigPath, daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { firePromoteEventsNotifyRequest } from "./session-end.js";
 import {
   clearDaemonNotice,
@@ -15,6 +16,12 @@ import {
 import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remediation.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
 import { selectStorageBackend } from "../storage/backend.js";
+import { appendLocalHookEvents } from "./local-enqueue.js";
+import {
+  assertHookPublicationFence,
+  assertHookRootEstablished,
+  isBackendPublicationJournalError,
+} from "./publication-fence.js";
 
 type PromptSearchResponse = {
   hints: string[];
@@ -88,73 +95,106 @@ lcm_store(text: "Acted on memory <id> — <one-line how>", tags: ["signal:memory
 
 export async function handleUserPromptSubmit(
   stdin: string,
-  client: DaemonClient,
+  client?: DaemonClient,
   port?: number,
-  storage: StorageBackendSelection = { backend: "sqlite" },
+  storage?: StorageBackendSelection,
 ): Promise<{ exitCode: number; stdout: string }> {
-  const daemonPort = port ?? 3737;
   try {
     const input = JSON.parse(stdin || "{}");
     if (!input.prompt || typeof input.prompt !== "string" || !input.prompt.trim()) {
       return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
     }
     const cwd = resolveHookCwd(input.cwd);
+    try {
+      // Missing topology is an operator/bootstrap failure, not an unresolved
+      // publication state. Stop before selection/daemon admission in that
+      // case; an established root still permits local enqueue during a
+      // publication transition.
+      assertHookRootEstablished();
+    } catch {
+      return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+    }
     let notification: PromoteEventsNotification | undefined;
 
     // Sidecar event extraction — must happen before prompt-search, must never throw
     try {
       const { extractUserPromptEvents } = await import("./extractors.js");
-      const { SQLiteLocalHookOutboxFactory } = await import("../storage/local-hook-outbox.js");
-      const { eventsDbPath } = await import("../db/events-path.js");
       const { ensureProjectDir } = await import("../daemon/project.js");
 
       const prompt = String(input.prompt);
       const { scrubExtractedEvents } = await import("./event-scrubbing.js");
-      const events = await scrubExtractedEvents(extractUserPromptEvents(prompt), cwd);
+      const extractedEvents = extractUserPromptEvents(prompt);
+      let events;
+      try {
+        events = await scrubExtractedEvents(extractedEvents, cwd);
+      } catch (error) {
+        if (!isBackendPublicationJournalError(error)) throw error;
+        events = await scrubExtractedEvents(extractedEvents, cwd, []);
+      }
 
       if (events.length > 0 && input.session_id && typeof input.session_id === "string") {
+        const enqueueResult = await appendLocalHookEvents({
+          cwd,
+          sessionId: input.session_id,
+          events,
+          sourceHook: "UserPromptSubmit",
+        });
+        const priority = Math.min(...events.map(event => event.priority));
+        notification = {
+          cwd,
+          priority,
+          pendingCount: enqueueResult.pendingCount,
+          sourceHook: "UserPromptSubmit",
+        };
+
+        // Project metadata is a selected-state consumer and must follow the
+        // durable local enqueue, including when the publication is unresolved.
         ensureProjectDir(cwd);
-        const outboxFactory = new SQLiteLocalHookOutboxFactory();
-        const db = await outboxFactory.open(eventsDbPath(cwd));
-        try {
-          for (const event of events) {
-            await db.insertEvent(input.session_id, event, "UserPromptSubmit");
-          }
-          const priority = Math.min(...events.map(event => event.priority));
-          const pendingCount = (await db.getHealthStats()).unprocessed;
-          notification = {
-            cwd,
-            priority,
-            pendingCount,
-            sourceHook: "UserPromptSubmit",
-          };
-        } finally {
-          await outboxFactory.close();
-        }
       }
     } catch (e) {
+      if (isBackendPublicationJournalError(e)) throw e;
       await safeLogError("UserPromptSubmit", e, {
         cwd: input.cwd ?? process.env.CLAUDE_PROJECT_DIR,
         sessionId: input.session_id,
       });
     }
 
+    let effectiveStorage = storage;
+    let daemonPort = port;
+    let effectiveClient = client;
+    if (effectiveStorage === undefined || daemonPort === undefined || effectiveClient === undefined) {
+      // loadHookConfig owns its own publication/config lock. Do not retain a
+      // broader publication lock while invoking it or the daemon lifecycle.
+      const config = loadHookConfig(defaultConfigPath());
+      effectiveStorage ??= config.storage;
+      daemonPort ??= config.daemonPort;
+    }
+    const selectedStorage = effectiveStorage ?? { backend: "sqlite" };
+    const selectedPort = daemonPort ?? 3737;
+    effectiveClient ??= new (await import("../daemon/client.js")).DaemonClient(
+      `http://127.0.0.1:${selectedPort}`,
+    );
+
     try {
-      selectStorageBackend(storage);
-    } catch {
+      selectStorageBackend(selectedStorage);
+    } catch (error) {
+      if (isBackendPublicationJournalError(error)) throw error;
       emitAdmissionNotice(undefined, "ambiguous");
       return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
     }
     let ensureResult: EnsureResultWithRefusal;
     try {
+      // ensureDaemon performs its own before/after lifecycle admission and
+      // must not be called while another publication lock is retained.
       ensureResult = await ensureDaemon({
-      port: daemonPort,
-      pidFilePath: daemonPidPath(),
-      spawnTimeoutMs: 5000,
-      expectedStorageBackend: storage.backend,
-      enforceUserManagerParent: true,
+        port: selectedPort,
+        pidFilePath: daemonPidPath(),
+        spawnTimeoutMs: 5000,
+        expectedStorageBackend: selectedStorage.backend,
+        enforceUserManagerParent: true,
       });
-    } catch {
+    } catch (error) {
+      if (isBackendPublicationJournalError(error)) throw error;
       emitAdmissionNotice(undefined, "ambiguous");
       return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
     }
@@ -166,8 +206,9 @@ export async function handleUserPromptSubmit(
 
     if (notification) {
       try {
-        firePromoteEventsNotifyRequest(daemonPort, notification);
+        firePromoteEventsNotifyRequest(selectedPort, notification);
       } catch (e) {
+        if (isBackendPublicationJournalError(e)) throw e;
         await safeLogError("UserPromptSubmit", e, {
           cwd,
           sessionId: input.session_id,
@@ -175,7 +216,10 @@ export async function handleUserPromptSubmit(
       }
     }
 
-    const result = await client.post<PromptSearchResponse>("/prompt-search", {
+    // Re-admit immediately before the daemon request; never hold the file
+    // lock over a network call whose server may independently read config.
+    assertHookPublicationFence();
+    const result = await effectiveClient.post<PromptSearchResponse>("/prompt-search", {
       query: input.prompt,
       cwd,
       session_id: input.session_id,
@@ -188,7 +232,8 @@ export async function handleUserPromptSubmit(
 
     const hint = buildMemoryContext(result.hints, result.ids ?? [])!;
     return { exitCode: 0, stdout: `${hint}\n${LEARNING_INSTRUCTION}` };
-  } catch {
+  } catch (error) {
+    if (isBackendPublicationJournalError(error)) throw error;
     return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
   }
 }

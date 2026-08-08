@@ -116,7 +116,6 @@ describe("dispatchHook", () => {
       ["compact", handlePreCompact],
       ["restore", handleSessionStart],
       ["session-end", handleSessionEnd],
-      ["user-prompt", handleUserPromptSubmit],
     ] as const;
     for (const [cmd, handler] of mapping) {
       vi.mocked(handler).mockClear();
@@ -124,6 +123,11 @@ describe("dispatchHook", () => {
       expect(handler).toHaveBeenCalledTimes(1);
       expect(handler).toHaveBeenCalledWith('{"test":true}', expect.anything(), expect.any(Number), sqliteStorage);
     }
+
+    vi.mocked(handleUserPromptSubmit).mockClear();
+    await dispatchHook("user-prompt", '{"test":true}');
+    expect(handleUserPromptSubmit).toHaveBeenCalledTimes(1);
+    expect(handleUserPromptSubmit).toHaveBeenCalledWith('{"test":true}');
 
     // session-snapshot takes only (stdinText, deps?) — no client/port
     vi.mocked(handleSessionSnapshot).mockClear();
@@ -138,7 +142,6 @@ describe("dispatchHook", () => {
       ["compact", handlePreCompact],
       ["restore", handleSessionStart],
       ["session-end", handleSessionEnd],
-      ["user-prompt", handleUserPromptSubmit],
     ] as const;
     vi.mocked(loadHookConfig).mockReturnValue(configWithDaemon({ port: 3737 }, postgresqlStorage));
 
@@ -153,6 +156,9 @@ describe("dispatchHook", () => {
           postgresqlStorage,
         );
       }
+      vi.mocked(handleUserPromptSubmit).mockClear();
+      await dispatchHook("user-prompt", '{"test":true}');
+      expect(handleUserPromptSubmit).toHaveBeenCalledWith('{"test":true}');
     } finally {
       vi.mocked(loadHookConfig).mockReturnValue(configWithDaemon({ port: 3737 }));
     }

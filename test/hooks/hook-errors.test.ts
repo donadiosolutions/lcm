@@ -1,8 +1,8 @@
 // test/hooks/hook-errors.test.ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 
 // Mock eventsDbPath to use temp dir.
 // Paths under /dev/null/... are kept as-is so DB creation fails and triggers the circuit breaker.
@@ -30,6 +30,8 @@ describe("safeLogError", () => {
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "hook-errors-test-"));
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
+    chmodSync(join(homedir(), ".lcm"), 0o700);
     mockEventsDir = join(tempDir, "events");
     _setLogPathForTesting(join(tempDir, "events.log"));
     _resetCircuitBreaker();

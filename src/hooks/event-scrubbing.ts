@@ -1,7 +1,7 @@
 import type { ExtractedEvent } from "./extractors.js";
 import { statSync } from "node:fs";
 import { loadHookConfig } from "./config.js";
-import { projectDir } from "../daemon/project.js";
+import { localProjectDir } from "../daemon/project.js";
 import { configPath } from "../runtime-paths.js";
 import { ScrubEngine } from "../scrub.js";
 
@@ -71,7 +71,10 @@ export async function scrubExtractedEvents(
 ): Promise<ExtractedEvent[]> {
   const patterns = globalPatterns
     ?? loadHookConfig(configPath()).security.sensitivePatterns;
-  const scrubber = await getScrubber(patterns, projectDir(cwd));
+  // Hook capture must not enter backend-selected project-map reconciliation.
+  // The local sidecar identity remains stable for ordinary projects and uses
+  // the compatibility snapshot for already-mapped aliases/worktrees.
+  const scrubber = await getScrubber(patterns, localProjectDir(cwd));
   return events.map((event) => ({
     ...event,
     data: scrubber.scrub(event.data),

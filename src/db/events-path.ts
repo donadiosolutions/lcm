@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { projectPaths } from "../daemon/project.js";
+import { localProjectIdentity } from "../daemon/project.js";
 import {
   hashProjectPath,
   normalizeProjectPath,
@@ -17,7 +17,7 @@ export function eventSequenceDbPath(homeDir?: string): string {
 }
 
 export function eventsDbPath(cwd: string): string {
-  return join(eventsDir(), `${projectPaths(cwd).id}.db`);
+  return join(eventsDir(), `${localProjectIdentity(cwd).id}.db`);
 }
 
 /**

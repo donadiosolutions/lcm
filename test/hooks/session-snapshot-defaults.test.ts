@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => ({
   daemonJsonRequest: vi.fn(),
   fireCompactRequest: vi.fn(),
   firePromoteEventsRequest: vi.fn(),
+  assertHookPublicationFence: vi.fn(),
+  assertHookRootEstablished: vi.fn(),
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -33,6 +35,12 @@ vi.mock("../../src/daemon/http-url.js", () => ({
 vi.mock("../../src/hooks/session-end.js", () => ({
   fireCompactRequest: mocks.fireCompactRequest,
   firePromoteEventsRequest: mocks.firePromoteEventsRequest,
+}));
+
+vi.mock("../../src/hooks/publication-fence.js", () => ({
+  assertHookPublicationFence: mocks.assertHookPublicationFence,
+  assertHookRootEstablished: mocks.assertHookRootEstablished,
+  isBackendPublicationJournalError: () => false,
 }));
 
 import { handleSessionSnapshot } from "../../src/hooks/session-snapshot.js";
@@ -68,6 +76,8 @@ describe("handleSessionSnapshot default integrations", () => {
     expect(mocks.writeFileSync).toHaveBeenCalledWith(expect.stringContaining("snap-unsafe_session.json"), expect.any(String));
     expect(mocks.chmodSync).toHaveBeenCalledWith(expect.any(String), 0o600);
     expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(4545, { cwd: "/project" });
+    expect(mocks.assertHookRootEstablished.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.mkdirSync.mock.invocationCallOrder[0]);
   });
 
   it("reuses the verified port for ingest, compact, and promotion after config changes", async () => {
