@@ -59,8 +59,8 @@ import {
 import {
   assertBackendPublicationConfigAccess,
   withBackendPublicationConfigLock,
-} from "../storage/backend.js";
-import { BackendPublicationJournalError } from "../storage/backend-publication.js";
+  BackendPublicationJournalError,
+} from "../storage/backend-publication.js";
 import { readBoundedRegularFile } from "../security-files.js";
 
 const COLORS = {
@@ -124,6 +124,7 @@ function publicationAdmissionMessage(
     case "checksum-mismatch":
     case "unexpected-state":
     case "permit-mismatch":
+    case "backend-mismatch":
     case "invalid-input":
       return "Backend publication admission is blocked: authenticated publication state is invalid or unsafe. Stop automatic repair and inspect the installation before retrying.";
   }
@@ -308,6 +309,7 @@ function authenticateConfigPublication(
         configPathValue,
         backend,
         observedContent,
+        undefined,
         lockToken,
       );
     }
@@ -320,72 +322,82 @@ function authenticateConfigPublication(
 
 function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
-  return withBackendPublicationConfigLock(resolvedConfigPath, (lockToken) => {
-    let content: string | undefined;
-    let publicationError: BackendPublicationJournalError | undefined;
-    try {
-      if (!deps.existsSync(resolvedConfigPath)) {
+  try {
+    return withBackendPublicationConfigLock(resolvedConfigPath, (lockToken) => {
+      let content: string | undefined;
+      let publicationError: BackendPublicationJournalError | undefined;
+      try {
+        if (!deps.existsSync(resolvedConfigPath)) {
+          publicationError = authenticateConfigPublication(
+            resolvedConfigPath,
+            deps,
+            "sqlite",
+            null,
+            lockToken,
+          );
+          return {
+            port: DEFAULT_DAEMON_PORT,
+            storageBackend: "sqlite",
+            storage: { backend: "sqlite" },
+            summarizer: "disabled",
+            publicationError,
+          };
+        }
+        content = deps._readBoundedConfig!(resolvedConfigPath, MAX_CONFIG_BYTES);
+        const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
         publicationError = authenticateConfigPublication(
           resolvedConfigPath,
           deps,
-          "sqlite",
-          null,
+          config.storage.backend,
+          content,
           lockToken,
         );
         return {
-          port: DEFAULT_DAEMON_PORT,
-          storageBackend: "sqlite",
-          storage: { backend: "sqlite" },
+          port: config.daemon.port,
+          storageBackend: config.storage.backend,
+          storage: config.storage,
+          summarizer: config.llm.provider,
+          apiMode: config.llm.apiMode,
+          reasoningEffort: config.llm.reasoningEffort,
+          fastMode: config.llm.fastMode,
+          requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
+          retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
+          publicationError,
+        };
+      } catch (error) {
+        const validationError = error instanceof ConfigValidationError
+          ? error
+          : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
+        publicationError = content === undefined
+          ? new BackendPublicationJournalError(
+              "unsafe-storage",
+              "backend publication admission is blocked because config bytes could not be observed safely",
+            )
+          : authenticateConfigPublication(
+              resolvedConfigPath,
+              deps,
+              backendCandidate(content),
+              content,
+              lockToken,
+            );
+        return {
+          port: typeof content === "string" ? recoverConfiguredPort(content) : DEFAULT_DAEMON_PORT,
+          storageBackend: "unavailable",
           summarizer: "disabled",
+          validationError,
           publicationError,
         };
       }
-      content = deps._readBoundedConfig!(resolvedConfigPath, MAX_CONFIG_BYTES);
-      const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
-      publicationError = authenticateConfigPublication(
-        resolvedConfigPath,
-        deps,
-        config.storage.backend,
-        content,
-        lockToken,
-      );
-      return {
-        port: config.daemon.port,
-        storageBackend: config.storage.backend,
-        storage: config.storage,
-        summarizer: config.llm.provider,
-        apiMode: config.llm.apiMode,
-        reasoningEffort: config.llm.reasoningEffort,
-        fastMode: config.llm.fastMode,
-        requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
-        retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
-        publicationError,
-      };
-    } catch (error) {
-      const validationError = error instanceof ConfigValidationError
-        ? error
-        : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
-      publicationError = content === undefined
-        ? new BackendPublicationJournalError(
-            "unsafe-storage",
-            "backend publication admission is blocked because config bytes could not be observed safely",
-          )
-        : authenticateConfigPublication(
-            resolvedConfigPath,
-            deps,
-            backendCandidate(content),
-            content,
-            lockToken,
-          );
-      return {
-        port: typeof content === "string" ? recoverConfiguredPort(content) : DEFAULT_DAEMON_PORT,
-        storageBackend: "unavailable",
-        summarizer: "disabled",
-        validationError,
-        publicationError,
-      };
-    }
-  });
+    });
+  } catch (error) {
+    if (!(error instanceof BackendPublicationJournalError)) throw error;
+    return {
+      port: DEFAULT_DAEMON_PORT,
+      storageBackend: "unavailable",
+      summarizer: "disabled",
+      publicationError: error,
+    };
+  }
 }
 
 function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {

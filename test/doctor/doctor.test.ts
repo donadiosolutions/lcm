@@ -322,7 +322,6 @@ describe("runDoctor project map checks", () => {
 
   it("admits an absent config when the terminal publication witness is absent", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-missing-config-absent-"));
-    writeCompletedPublicationJournal(home, null);
     try {
       const results = await runDoctor(minimalDeps({
         homedir: home,
@@ -418,6 +417,7 @@ describe("runDoctor project map checks", () => {
     ["checksum-mismatch", "authenticated publication state is invalid or unsafe"],
     ["unexpected-state", "authenticated publication state is invalid or unsafe"],
     ["permit-mismatch", "authenticated publication state is invalid or unsafe"],
+    ["backend-mismatch", "authenticated publication state is invalid or unsafe"],
     ["invalid-input", "authenticated publication state is invalid or unsafe"],
   ] as const)("renders the %s publication admission message", async (reason, message) => {
     const results = await runDoctor(minimalDeps({

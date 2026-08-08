@@ -1,18 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
+const assertBackendPublicationConsumerAccess = vi.hoisted(() => vi.fn());
+
 vi.mock("../../src/storage/backend-publication.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../../src/storage/backend-publication.js")>();
   return {
     ...actual,
-    readBackendPublicationJournal: vi.fn(() => ({
-      version: 2,
-      publicationId: "publication-1",
-      sourceBackend: "sqlite",
-      targetBackend: "postgresql",
-      phase: "completed",
-      sourceState: {},
-      targetState: {},
-    } as never)),
+    assertBackendPublicationConsumerAccess,
   };
 });
 

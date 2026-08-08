@@ -1,25 +1,16 @@
-import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
-
-const state = vi.hoisted(() => ({ journal: null as unknown }));
-
-vi.mock("../../src/storage/backend-publication.js", async importOriginal => {
-  const actual = await importOriginal<typeof import("../../src/storage/backend-publication.js")>();
-  return {
-    ...actual,
-    readBackendPublicationJournal: vi.fn(() => state.journal as never),
-  };
-});
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   assertBackendPublicationConfigAccess,
-  assertStorageBackendPublication,
   backendPublicationHomeForConfigPath,
-  selectStorageBackendForConfig,
   withBackendPublicationConfigLock,
+} from "../../src/storage/backend-publication.js";
+import {
+  assertStorageBackendPublication,
+  selectStorageBackendForConfig,
   withStorageBackendConsumerLock,
   withStorageBackendConsumerLockAsync,
 } from "../../src/storage/backend.js";
@@ -39,28 +30,6 @@ function configPath(home: string): string {
   return join(home, ".lcm", "config.json");
 }
 
-function journalFor(options: {
-  phase: "completed" | "aborted" | "preparing";
-  sourceBackend?: "sqlite" | "postgresql";
-  targetBackend?: "sqlite" | "postgresql";
-  sourceContent?: string | null;
-  targetContent?: string | null;
-}): unknown {
-  const witness = (content: string | null | undefined) => ({
-    rawSha256: content === undefined || content === null
-      ? null
-      : createHash("sha256").update(content).digest("hex"),
-    byteLength: content === undefined || content === null ? 0 : Buffer.byteLength(content),
-  });
-  return {
-    phase: options.phase,
-    sourceBackend: options.sourceBackend ?? "sqlite",
-    targetBackend: options.targetBackend ?? "sqlite",
-    sourceState: { config: witness(options.sourceContent) },
-    targetState: { config: witness(options.targetContent) },
-  };
-}
-
 function expectReason(action: () => unknown, reason: BackendPublicationJournalError["reason"]): void {
   expect(action).toThrowError(expect.objectContaining({
     name: "BackendPublicationJournalError",
@@ -69,7 +38,6 @@ function expectReason(action: () => unknown, reason: BackendPublicationJournalEr
 }
 
 afterEach(() => {
-  state.journal = null;
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
 
@@ -114,13 +82,13 @@ describe("backend publication consumer admission", () => {
     const missingRootHome = makeHome(false);
     rmSync(join(missingRootHome, ".lcm"), { recursive: true, force: true });
     expect(withBackendPublicationConfigLock(configPath(missingRootHome), lockToken => {
-      assertBackendPublicationConfigAccess(configPath(missingRootHome), "sqlite", undefined, lockToken);
+      assertBackendPublicationConfigAccess(configPath(missingRootHome), "sqlite", undefined, undefined, lockToken);
       return "missing-root";
     })).toBe("missing-root");
 
     const existingRootHome = makeHome();
     expect(withBackendPublicationConfigLock(configPath(existingRootHome), lockToken => {
-      assertBackendPublicationConfigAccess(configPath(existingRootHome), "sqlite", undefined, lockToken);
+      assertBackendPublicationConfigAccess(configPath(existingRootHome), "sqlite", undefined, undefined, lockToken);
       return "existing-root";
     })).toBe("existing-root");
 
@@ -150,22 +118,18 @@ describe("backend publication consumer admission", () => {
       assertStorageBackendPublication({ backend: "sqlite", homeDir: otherHome }, lockToken)), "permit-mismatch");
   });
 
-  it("enforces journal phase, backend, and config-byte witnesses", () => {
+  it("uses the canonical coordinator token position for config admission", () => {
     const home = makeHome();
     const path = configPath(home);
-
-    state.journal = journalFor({ phase: "preparing" });
-    expectReason(() => assertBackendPublicationConfigAccess(path, "sqlite"), "unresolved-publication");
-
-    state.journal = journalFor({ phase: "completed", targetBackend: "postgresql" });
-    expectReason(() => assertBackendPublicationConfigAccess(path, "sqlite"), "unexpected-state");
-
-    state.journal = journalFor({ phase: "completed", targetContent: "config" });
-    expectReason(() => assertBackendPublicationConfigAccess(path, "sqlite", "changed"), "unexpected-state");
-    expect(() => assertBackendPublicationConfigAccess(path, "sqlite", "config")).not.toThrow();
-
-    state.journal = journalFor({ phase: "aborted", sourceContent: null });
-    expect(() => assertBackendPublicationConfigAccess(path, "sqlite", null)).not.toThrow();
-    expectReason(() => assertBackendPublicationConfigAccess(path, "sqlite", "config"), "unexpected-state");
+    expect(withBackendPublicationConfigLock(path, lockToken => {
+      expect(() => assertBackendPublicationConfigAccess(
+        path,
+        "sqlite",
+        undefined,
+        undefined,
+        lockToken,
+      )).not.toThrow();
+      return "canonical";
+    })).toBe("canonical");
   });
 });

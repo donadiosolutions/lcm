@@ -37,11 +37,11 @@ import {
 import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
 import { createStorageBackendFactory } from "../storage/index.js";
+import { assertStorageBackendPublication } from "../storage/backend.js";
 import {
-  assertStorageBackendPublication,
+  BackendPublicationJournalError,
   backendPublicationHomeForConfigPath,
-} from "../storage/backend.js";
-import { BackendPublicationJournalError } from "../storage/backend-publication.js";
+} from "../storage/backend-publication.js";
 export { PKG_VERSION };
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
