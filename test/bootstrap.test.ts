@@ -1,14 +1,31 @@
-import { describe, it, expect, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { afterAll, describe, it, expect, vi } from "vitest";
+import { chmodSync, existsSync as fsExistsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EnsureCoreDeps } from "../src/bootstrap.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../src/daemon/config.js";
 import { canonicalHookCommand, mergeClaudeSettings } from "../src/installer/settings.js";
 
+const defaultDaemon = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true }));
+const homeMock = vi.hoisted(() => ({ homeDir: "" }));
+vi.mock("../src/daemon/lifecycle.js", () => ({ ensureDaemon: defaultDaemon }));
+vi.mock("node:os", async () => {
+  const actual = await vi.importActual<typeof import("node:os")>("node:os");
+  return { ...actual, homedir: () => homeMock.homeDir };
+});
+const publicationHome = mkdtempSync(join(tmpdir(), "lcm-bootstrap-test-"));
+homeMock.homeDir = publicationHome;
+const publicationRoot = join(publicationHome, ".lcm");
+mkdirSync(publicationRoot, { mode: 0o700 });
+mkdirSync(join(publicationHome, ".claude"), { mode: 0o700 });
+
+afterAll(() => {
+  rmSync(publicationHome, { recursive: true, force: true });
+});
+
 function makeDeps(overrides: Partial<EnsureCoreDeps> = {}): EnsureCoreDeps {
   return {
-    configPath: "/tmp/test-config.json",
+    configPath: join(publicationRoot, "config.json"),
     settingsPath: "/tmp/test-settings.json",
     existsSync: vi.fn().mockReturnValue(false),
     readFileSync: vi.fn().mockReturnValue("{}"),
@@ -21,6 +38,28 @@ function makeDeps(overrides: Partial<EnsureCoreDeps> = {}): EnsureCoreDeps {
 }
 
 describe("ensureCore", () => {
+  it("uses the default secure-root, durable writer, and daemon seams", async () => {
+    const runtimeRoot = join(homedir(), ".lcm");
+    const configPath = join(runtimeRoot, "config.json");
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    rmSync(configPath, { force: true });
+    writeFileSync(settingsPath, "{}", { mode: 0o600 });
+    chmodSync(runtimeRoot, 0o700);
+    defaultDaemon.mockClear();
+
+    try {
+      const { ensureCore } = await import("../src/bootstrap.js");
+      await expect(ensureCore()).resolves.toBe(true);
+      expect(defaultDaemon).toHaveBeenCalledWith(expect.objectContaining({
+        expectedStorageBackend: "sqlite",
+        enforceUserManagerParent: true,
+      }));
+    } finally {
+      rmSync(configPath, { force: true });
+      rmSync(settingsPath, { force: true });
+    }
+  });
+
   it("creates config.json with defaults when missing", async () => {
     const deps = makeDeps();
     const { ensureCore } = await import("../src/bootstrap.js");
@@ -98,9 +137,12 @@ describe("ensureCore", () => {
 
   it("rejects PostgreSQL before invoking the daemon lifecycle", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-bootstrap-postgres-"));
-    const configPath = join(dir, "config.json");
+    const root = join(dir, ".lcm");
+    mkdirSync(root, { mode: 0o700 });
+    const configPath = join(root, "config.json");
     const caFile = join(dir, "ca.pem");
     writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" } }));
+    chmodSync(configPath, 0o600);
     writeFileSync(caFile, "test-ca");
     const previousUrl = process.env.LCM_POSTGRES_URL;
     const previousCa = process.env.LCM_POSTGRES_CA_FILE;
@@ -116,13 +158,32 @@ describe("ensureCore", () => {
 
     try {
       const { ensureCoreEndpoint } = await import("../src/bootstrap.js");
-      await expect(ensureCoreEndpoint(deps)).rejects.toThrow("postgresql storage backend is not available");
+      await expect(ensureCoreEndpoint(deps)).rejects.toThrow("publication evidence");
       expect(deps.ensureDaemon).not.toHaveBeenCalled();
     } finally {
       if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
       else process.env.LCM_POSTGRES_URL = previousUrl;
       if (previousCa === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
       else process.env.LCM_POSTGRES_CA_FILE = previousCa;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a non-canonical config path before daemon startup", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-bootstrap-noncanonical-"));
+    const configPath = join(dir, "config.json");
+    const deps = makeDeps({
+      configPath,
+      existsSync: fsExistsSync,
+      writeFileSync: (path, data) => writeFileSync(path, data),
+      mkdirSync: (path, options) => mkdirSync(path, options),
+    });
+
+    try {
+      await expect(import("../src/bootstrap.js").then(({ ensureCoreEndpoint }) => ensureCoreEndpoint(deps)))
+        .rejects.toThrow("canonical LCM configuration path");
+      expect(deps.ensureDaemon).not.toHaveBeenCalled();
+    } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -164,6 +225,24 @@ describe("ensureCore", () => {
 });
 
 describe("ensureBootstrapped", () => {
+  it("uses default flag inspection and durable bootstrap dependencies", async () => {
+    const runtimeRoot = join(homedir(), ".lcm");
+    const configPath = join(runtimeRoot, "config.json");
+    const flagPath = join(runtimeRoot, "tmp", "bootstrapped-default-bootstrap.flag");
+    rmSync(configPath, { force: true });
+    rmSync(flagPath, { force: true });
+    chmodSync(runtimeRoot, 0o700);
+
+    try {
+      const { ensureBootstrapped } = await import("../src/bootstrap.js");
+      await expect(ensureBootstrapped("default-bootstrap")).resolves.toBe(true);
+      expect(fsExistsSync(flagPath)).toBe(true);
+    } finally {
+      rmSync(configPath, { force: true });
+      rmSync(flagPath, { force: true });
+    }
+  });
+
   it("skips ensureCore when flag file exists", async () => {
     const coreDeps = makeDeps();
     const { ensureBootstrapped } = await import("../src/bootstrap.js");

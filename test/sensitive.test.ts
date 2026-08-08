@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
@@ -31,7 +31,7 @@ vi.mock("../src/runtime-paths.js", async (): Promise<typeof import("../src/runti
   const { join: j } = await import("node:path");
   return {
     ...actual,
-    configPath: (): string => j(_projectBase.current, "config.json"),
+    configPath: (): string => j(_projectBase.current, ".lcm", "config.json"),
     projectsDir: (): string => j(_projectBase.current, "all-projects"),
   };
 });
@@ -39,8 +39,58 @@ vi.mock("../src/runtime-paths.js", async (): Promise<typeof import("../src/runti
 import { handleSensitive } from "../src/sensitive.js";
 import { NATIVE_PATTERNS } from "../src/scrub.js";
 import { GITLEAKS_PATTERNS } from "../src/generated-patterns.js";
-import { StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import {
+  BackendPublicationCoordinator,
+  backendPublicationMaterialWitness,
+  type BackendPublicationDriver,
+  type BackendPublicationRecoveryFile,
+  type BackendPublicationRecoveryMaterial,
+} from "../src/storage/backend-publication.js";
 import { ConfigValidationError } from "../src/daemon/config.js";
+
+function recoveryFile(content: string): BackendPublicationRecoveryFile {
+  return {
+    presence: "present",
+    content: Buffer.from(content),
+    mode: 0o600,
+    uid: typeof process.getuid === "function" ? process.getuid() : 0,
+    gid: typeof process.getgid === "function" ? process.getgid() : 0,
+    nlink: "1",
+    dev: "1",
+    ino: "2",
+    parentDev: "3",
+    parentIno: "4",
+  };
+}
+
+async function completePostgreSqlPublication(configPath: string, content: string): Promise<void> {
+  chmodSync(configPath, 0o600);
+  const config = recoveryFile(content);
+  const absent = { presence: "absent" } as const;
+  const material: BackendPublicationRecoveryMaterial = {
+    source: { config, projectMap: absent },
+    target: { config, projectMap: absent },
+  };
+  const state = backendPublicationMaterialWitness(material);
+  const driver: BackendPublicationDriver = {
+    observeLocalState: async () => state,
+    publishProjectMap: async ({ expectedWitness }) => expectedWitness,
+    publishConfig: async ({ expectedWitness }) => expectedWitness,
+    restoreConfig: async ({ expectedWitness }) => expectedWitness,
+    restoreProjectMap: async ({ expectedWitness }) => expectedWitness,
+  };
+  const homeDir = join(configPath, "..", "..");
+  const coordinator = new BackendPublicationCoordinator({ homeDir, driver });
+  await coordinator.prepare({
+    publicationId: "sensitive-postgresql",
+    sourceBackend: "sqlite",
+    targetBackend: "postgresql",
+    material,
+    projects: [],
+  });
+  await coordinator.resume();
+}
 
 describe("lcm sensitive", () => {
   let tempBase: string;
@@ -53,7 +103,8 @@ describe("lcm sensitive", () => {
     _projectBase.current = tempBase;
     cwd = join(tempBase, "project");
     mkdirSync(cwd, { recursive: true });
-    configPath = join(tempBase, "config.json");
+    configPath = join(tempBase, ".lcm", "config.json");
+    mkdirSync(join(tempBase, ".lcm"), { mode: 0o700 });
 
     const hash = createHash("sha256").update(cwd).digest("hex");
     pDir = join(tempBase, "projects", hash);
@@ -90,6 +141,11 @@ describe("lcm sensitive", () => {
     expect(r.stdout).toContain("(none)");
   });
 
+  it("list: fails closed when the project pattern path is not a regular file", async () => {
+    mkdirSync(join(pDir, "sensitive-patterns.txt"));
+    await expect(handleSensitive(["list"], cwd, configPath)).rejects.toThrow();
+  });
+
   it("list: shows global user patterns from config.json", async () => {
     writeFileSync(configPath, JSON.stringify({ security: { sensitivePatterns: ["CORP_TOKEN_.*"] } }, null, 2));
     const r = await handleSensitive(["list"], cwd, configPath);
@@ -98,10 +154,12 @@ describe("lcm sensitive", () => {
   });
 
   it("list: loads persisted global patterns for PostgreSQL without runtime secrets", async () => {
-    writeFileSync(configPath, JSON.stringify({
+    const content = JSON.stringify({
       storage: { backend: "postgresql" },
       security: { sensitivePatterns: ["POSTGRES_SECRET_.*"] },
-    }));
+    });
+    writeFileSync(configPath, content);
+    await completePostgreSqlPublication(configPath, content);
 
     const r = await handleSensitive(["list"], cwd, configPath);
 
@@ -155,6 +213,19 @@ describe("lcm sensitive", () => {
     const cfg = JSON.parse(readFileSync(configPath, "utf-8"));
     expect(cfg.security.sensitivePatterns.filter((p: string) => p === "CORP_SECRET_.*")).toHaveLength(1);
   });
+
+  it.each([null, [], { backend: "sqlite" }, { backend: "postgresql" }])(
+    "add --global: treats storage shape %j as local-only",
+    async (storage) => {
+      const content = JSON.stringify({ storage, security: { sensitivePatterns: [] } });
+      writeFileSync(configPath, content);
+      if ((storage as { backend?: unknown } | null)?.backend === "postgresql") {
+        await completePostgreSqlPublication(configPath, content);
+      }
+      await expect(handleSensitive(["add", "--global", "LOCAL_SECRET_.*"], cwd, configPath))
+        .resolves.toMatchObject({ exitCode: 0 });
+    },
+  );
 
   it.each([
     ["invalid JSON", "{"],
@@ -223,6 +294,25 @@ describe("lcm sensitive", () => {
     expect(r.stdout).toContain("Pattern not found");
   });
 
+  it("remove: treats a project pattern file disappearing after preflight as already removed", async () => {
+    const patternsFile = join(pDir, "sensitive-patterns.txt");
+    writeFileSync(patternsFile, "PAT_A\n");
+    const securityFiles = await import("../src/security-files.js");
+    const originalRead = securityFiles.readBoundedRegularFile;
+    const readSpy = vi.spyOn(securityFiles, "readBoundedRegularFile");
+    readSpy.mockImplementation((path, options) => {
+      if (path === patternsFile && readSpy.mock.calls.filter(([candidate]) => candidate === patternsFile).length === 2) {
+        throw Object.assign(new Error("file disappeared"), { code: "ENOENT" });
+      }
+      return originalRead(path, options);
+    });
+    await expect(handleSensitive(["remove", "PAT_A"], cwd, configPath)).resolves.toMatchObject({
+      exitCode: 0,
+      stdout: expect.stringContaining("Removed project pattern"),
+    });
+    expect(readFileSync(patternsFile, "utf8")).toBe("\n");
+  });
+
   // --- test ---
 
   it("test: shows [REDACTED] for matching input", async () => {
@@ -258,10 +348,12 @@ describe("lcm sensitive", () => {
   });
 
   it("test: scrubs with persisted global patterns for PostgreSQL without runtime secrets", async () => {
-    writeFileSync(configPath, JSON.stringify({
+    const content = JSON.stringify({
       storage: { backend: "postgresql" },
       security: { sensitivePatterns: ["POSTGRES_SECRET_[A-Z]+"] },
-    }));
+    });
+    writeFileSync(configPath, content);
+    await completePostgreSqlPublication(configPath, content);
 
     const r = await handleSensitive(["test", "value=POSTGRES_SECRET_ALPHA"], cwd, configPath);
 
@@ -321,7 +413,10 @@ describe("lcm sensitive", () => {
     }
 
     await expect(handleSensitive(["purge", ...extraArgs, "--yes"], cwd, configPath))
-      .rejects.toBeInstanceOf(StorageBackendUnavailableError);
+      .rejects.toMatchObject({
+        name: BackendPublicationJournalError.name,
+        reason: "publication-evidence-missing",
+      });
     expect(existsSync(extraArgs.includes("--all") ? allProjects : pDir)).toBe(true);
   });
 

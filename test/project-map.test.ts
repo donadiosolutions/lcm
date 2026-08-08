@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -17,6 +18,7 @@ import {
   projectMapPath,
   projectMapEntryHasStoredData,
   isProjectHash,
+  readProjectMapSnapshot,
   reloadProjectMapCache,
   removeProjectAlias,
   resolveProjectIdentity,
@@ -28,6 +30,11 @@ import {
 import { eventsDbPath } from "../src/db/events-path.js";
 import { projectDbPath, projectId, projectMetaPath } from "../src/daemon/project.js";
 import { clearGitProjectAnchorCache } from "../src/git-project.js";
+import {
+  BackendPublicationJournalError,
+  backendPublicationDirectory,
+  backendPublicationJournalPath,
+} from "../src/storage/backend-publication.js";
 
 function resetLcmHome(): void {
   rmSync(join(homedir(), ".lcm"), { recursive: true, force: true });
@@ -128,6 +135,21 @@ describe("project map", () => {
     }, null, 2) + "\n");
   });
 
+  it("reads a metadata-enriched project-map snapshot without publishing it", () => {
+    const canonical = makeDir("snapshot-project");
+    const identity = resolveProjectIdentity(canonical);
+    const snapshot = readProjectMapSnapshot();
+    expect(snapshot[identity.id]?.canonical).toBe(normalizeProjectPath(canonical));
+    expect(readProjectMapSnapshot()[identity.id]?.canonical).toBe(normalizeProjectPath(canonical));
+    utimesSync(projectMapPath(), new Date(0), new Date(0));
+    expect(resolveProjectIdentity(canonical).id).toBe(identity.id);
+    clearProjectMapCache();
+    expect(existsSync(projectMapPath())).toBe(true);
+    expect(readProjectMapSnapshot()[identity.id]?.canonical).toBe(normalizeProjectPath(canonical));
+    expect(listProjectMapEntries()[identity.id]?.canonical).toBe(normalizeProjectPath(canonical));
+    expect(resolveProjectIdentity(canonical).id).toBe(identity.id);
+  });
+
   it("does not lose a concurrent remote binding while auto-creating an entry", () => {
     const canonical = makeDir("automatic-entry-binding-race");
 
@@ -141,6 +163,18 @@ describe("project map", () => {
     expect(resolved.remoteProjectId).toBe(remoteProjectId);
     expect(resolveProjectIdentity(canonical).remoteProjectId).toBe(remoteProjectId);
     expect(listProjectMapEntries()[resolved.id].remoteProjectId).toBe(remoteProjectId);
+  });
+
+  it("rethrows publication errors while creating a missing identity", () => {
+    const canonical = makeDir("publication-error-missing-identity");
+    expect(() => resolveProjectIdentity(canonical, {
+      _beforeMissingIdentityLockForTesting: () => {
+        chmodSync(join(homedir(), ".lcm"), 0o700);
+        const directory = backendPublicationDirectory();
+        mkdirSync(directory, { mode: 0o700 });
+        writeFileSync(backendPublicationJournalPath(), "{", { mode: 0o600 });
+      },
+    })).toThrow("backend publication journal");
   });
 
   it("resolves canonical and alias paths to the same project paths", () => {
@@ -422,7 +456,7 @@ describe("project map", () => {
 
     expect(bound).toMatchObject({ hash: local.id, changed: true });
     expect(nestedError).toBeInstanceOf(Error);
-    expect((nestedError as Error).message).toContain("project map mutation is already in progress");
+    expect((nestedError as Error).message).toContain("backend publication mutation is already in progress");
     expect(existsSync(lockPath)).toBe(false);
 
     writeFileSync(lockPath, liveOwner, { mode: 0o600 });
@@ -1101,7 +1135,7 @@ describe("project map", () => {
       },
     });
 
-    expect((nestedError as Error).message).toContain("project map mutation is already in progress");
+    expect((nestedError as Error).message).toContain("backend publication mutation is already in progress");
     expect(() => setRemoteProjectBinding(remoteProjectId, {
       hash: local.id,
       expectedEntry,
@@ -1337,6 +1371,35 @@ describe("project map", () => {
 
     expect(identity.id).toBe(hash);
     expect(listProjectMapEntries()[hash]?.canonical).toBe(normalizeProjectPath(canonical));
+  });
+
+  it("retains the current cache when metadata is backfilled before the mutation lock", () => {
+    const canonical = makeDir("from-meta-lock-race");
+    const hash = hashProjectPath(normalizeProjectPath(canonical));
+    mkdirSync(join(homedir(), ".lcm", "projects", hash), { recursive: true });
+    writeFileSync(join(homedir(), ".lcm", "projects", hash, "meta.json"), JSON.stringify({ cwd: canonical }));
+    const identity = resolveProjectIdentity(canonical, {
+      _beforeMetadataMutationLockForTesting: () => {
+        writeFileSync(projectMapPath(), `${JSON.stringify({
+          [hash]: { canonical, aliases: [] },
+        })}\n`);
+      },
+    });
+    expect(identity.id).toBe(hash);
+    expect(listProjectMapEntries()[hash]?.canonical).toBe(normalizeProjectPath(canonical));
+  });
+
+  it("returns a raced missing identity discovered during the locked reload", () => {
+    const canonical = makeDir("missing-identity-lock-race");
+    const hash = hashProjectPath(normalizeProjectPath(canonical));
+    const identity = resolveProjectIdentity(canonical, {
+      _beforeMissingIdentityLockForTesting: () => {
+        writeFileSync(projectMapPath(), `${JSON.stringify({
+          [hash]: { canonical, aliases: [] },
+        })}\n`);
+      },
+    });
+    expect(identity).toMatchObject({ id: hash, canonical: normalizeProjectPath(canonical) });
   });
 
   it("backfills metadata directly while an alias mutation already owns the lock", () => {
@@ -2007,6 +2070,129 @@ describe("project map", () => {
     clearProjectMapCache();
 
     expect(resolveProjectIdentity(target)).toEqual({ id, canonical: normalizeProjectPath(other) });
+  });
+
+  it("fails closed when watcher admission raises a publication error", () => {
+    resolveProjectIdentity(makeDir("watch-publication-arm"));
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalExists = nodeFs.existsSync;
+    const publicationError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "watcher publication state is unresolved",
+    );
+    try {
+      nodeFs.existsSync = ((path: unknown, ...args: unknown[]) => {
+        if (String(path) === projectMapPath()) throw publicationError;
+        return (originalExists as (...input: unknown[]) => unknown)(path, ...args);
+      });
+      syncBuiltinESMExports();
+      expect(() => watchProjectMap()).toThrow("watcher publication state is unresolved");
+    } finally {
+      nodeFs.existsSync = originalExists;
+      syncBuiltinESMExports();
+    }
+  });
+
+  it("continues when watcher arm encounters an ordinary filesystem error", () => {
+    resolveProjectIdentity(makeDir("watch-ordinary-arm-error"));
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalExists = nodeFs.existsSync;
+    const ordinaryError = new Error("watcher arm unavailable");
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    try {
+      nodeFs.existsSync = ((path: unknown, ...args: unknown[]) => {
+        if (String(path) === projectMapPath()) throw ordinaryError;
+        return (originalExists as (...input: unknown[]) => unknown)(path, ...args);
+      });
+      syncBuiltinESMExports();
+      watcher = watchProjectMap();
+      expect(watcher).toBeDefined();
+    } finally {
+      watcher?.close();
+      nodeFs.existsSync = originalExists;
+      syncBuiltinESMExports();
+    }
+  });
+
+  it("fails closed when a publication error occurs during watcher rearm", () => {
+    resolveProjectIdentity(makeDir("watch-publication-rearm"));
+    const lockPath = writeLiveProjectMapLock("4".repeat(32));
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalExists = nodeFs.existsSync;
+    const publicationError = new BackendPublicationJournalError(
+      "publication-evidence-missing",
+      "watcher publication evidence disappeared",
+    );
+    let mapChecks = 0;
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    let primaryError: { value: unknown } | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      nodeFs.existsSync = ((path: unknown, ...args: unknown[]) => {
+        if (String(path) === projectMapPath()) {
+          mapChecks += 1;
+          if (mapChecks === 2) throw publicationError;
+        }
+        return (originalExists as (...input: unknown[]) => unknown)(path, ...args);
+      });
+      syncBuiltinESMExports();
+      watcher = watchProjectMap();
+      expect(vi.getTimerCount()).toBe(1);
+      expect(() => vi.advanceTimersByTime(25)).toThrow("watcher publication evidence disappeared");
+    } catch (error) {
+      primaryError = { value: error };
+    } finally {
+      nodeFs.existsSync = originalExists;
+      syncBuiltinESMExports();
+      finishFakeTimerWatcherTest(primaryError, [watcher], lockPath);
+    }
+  });
+
+  it("rethrows an ordinary filesystem error during watcher rearm", () => {
+    resolveProjectIdentity(makeDir("watch-ordinary-rearm"));
+    const lockPath = writeLiveProjectMapLock("6".repeat(32));
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalExists = nodeFs.existsSync;
+    const ordinaryError = new Error("watcher rearm unavailable");
+    let mapChecks = 0;
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      nodeFs.existsSync = ((path: unknown, ...args: unknown[]) => {
+        if (String(path) === projectMapPath()) {
+          mapChecks += 1;
+          if (mapChecks === 2) throw ordinaryError;
+        }
+        return (originalExists as (...input: unknown[]) => unknown)(path, ...args);
+      });
+      syncBuiltinESMExports();
+      watcher = watchProjectMap();
+      expect(() => vi.advanceTimersByTime(25)).toThrow("watcher rearm unavailable");
+    } finally {
+      watcher?.close();
+      rmSync(lockPath, { force: true });
+      nodeFs.existsSync = originalExists;
+      syncBuiltinESMExports();
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes a watcher when reload observes unresolved publication evidence", () => {
+    resolveProjectIdentity(makeDir("watch-publication-reload"));
+    const lockPath = writeLiveProjectMapLock("5".repeat(32));
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    let primaryError: { value: unknown } | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      watcher = watchProjectMap();
+      mkdirSync(backendPublicationDirectory(), { mode: 0o700 });
+      writeFileSync(backendPublicationJournalPath(), "{", { mode: 0o600 });
+      expect(() => vi.advanceTimersByTime(25)).toThrow("backend publication journal");
+    } catch (error) {
+      primaryError = { value: error };
+    } finally {
+      finishFakeTimerWatcherTest(primaryError, [watcher], lockPath);
+    }
   });
 
   it("cancels a pending map-watch reload when closed", () => {

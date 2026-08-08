@@ -1,5 +1,5 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { rmSync, existsSync } from "node:fs";
+import { writeFile, mkdir } from "node:fs/promises";
+import { mkdirSync, rmSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 
@@ -10,15 +10,44 @@ import { loadStoredConfigProjection } from "./config-projection.js";
 import { selectStorageBackend } from "./storage/backend.js";
 import { validateRegex } from "./store/regex-safety.js";
 import { configPath as runtimeConfigPath, projectsDir as runtimeProjectsDir } from "./runtime-paths.js";
+import { atomicWritePrivateFile, readBoundedRegularFile } from "./security-files.js";
+import {
+  assertBackendPublicationConfigAccess,
+  assertBackendPublicationConfigMutation,
+  backendPublicationHomeForConfigPath,
+  BackendPublicationJournalError,
+  withBackendPublicationConfigLock,
+  withBackendPublicationConsumerLockAsync,
+} from "./storage/backend-publication.js";
 
 function defaultConfigPath(): string {
   return runtimeConfigPath();
 }
 
+const MAX_SENSITIVE_PATTERN_BYTES = 1024 * 1024;
+
+function loadProjectPatternsBounded(patternsFile: string): string[] {
+  let content: string;
+  try {
+    content = readBoundedRegularFile(patternsFile, {
+      allowedRoot: dirname(patternsFile),
+      maxBytes: MAX_SENSITIVE_PATTERN_BYTES,
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  return content
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+
 function loadGlobalUserPatterns(configPath: string): string[] {
   try {
     return loadStoredConfigProjection(configPath).security.sensitivePatterns;
-  } catch {
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) throw error;
     // Pattern inspection remains available when persisted configuration is invalid.
     return [];
   }
@@ -40,7 +69,7 @@ export async function handleSensitive(
       return sensitiveAdd(argv.slice(1), cwd, resolvedConfigPath);
     }
     case "remove": {
-      return sensitiveRemove(argv.slice(1), cwd);
+      return sensitiveRemove(argv.slice(1), cwd, resolvedConfigPath);
     }
     case "test": {
       return sensitiveTest(argv.slice(1), cwd, resolvedConfigPath);
@@ -65,7 +94,10 @@ async function sensitiveList(
   const globalUserPatterns = loadGlobalUserPatterns(configPath);
 
   const patternsFile = join(projectDir(cwd), "sensitive-patterns.txt");
-  const projectPatterns = await ScrubEngine.loadProjectPatterns(patternsFile);
+  const projectPatterns = await withBackendPublicationConsumerLockAsync(
+    backendPublicationHomeForConfigPath(configPath),
+    () => loadProjectPatternsBounded(patternsFile),
+  );
 
   const lines: string[] = [];
   const syncDate = readGitleaksSyncDate();
@@ -118,73 +150,105 @@ async function sensitiveAdd(
   }
 
   if (isGlobal) {
-    // Read config.json, add to security.sensitivePatterns
-    let raw: any = {};
-    try {
-      const content = await readFile(configPath, "utf-8");
-      let parsed: unknown;
+    return withBackendPublicationConfigLock(configPath, (lockToken) => {
+      let raw: Record<string, unknown> = {};
+      let content: string | null = null;
       try {
-        parsed = JSON.parse(content);
-      } catch {
-        // Corrupt JSON — refuse to overwrite and destroy existing settings.
-        return {
-          exitCode: 1,
-          stdout: `Error: ${configPath} contains invalid JSON. Fix the file manually before adding patterns.\n`,
-        };
+        content = readBoundedRegularFile(configPath, {
+          allowedRoot: dirname(configPath),
+          maxBytes: 4 * 1024 * 1024,
+        });
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(content);
+        } catch {
+          return {
+            exitCode: 1,
+            stdout: `Error: ${configPath} contains invalid JSON. Fix the file manually before adding patterns.\n`,
+          };
+        }
+        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+          raw = parsed as Record<string, unknown>;
+        } else {
+          return {
+            exitCode: 1,
+            stdout: `Error: ${configPath} is not a JSON object. Fix the file manually before adding patterns.\n`,
+          };
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-      // Guard against non-object JSON values (arrays, primitives).
-      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-        raw = parsed;
-      } else {
-        return {
-          exitCode: 1,
-          stdout: `Error: ${configPath} is not a JSON object. Fix the file manually before adding patterns.\n`,
-        };
+      const currentSecurity = raw.security;
+      const security: Record<string, unknown> = currentSecurity !== null
+        && typeof currentSecurity === "object"
+        && !Array.isArray(currentSecurity)
+        ? currentSecurity as Record<string, unknown>
+        : {};
+      raw.security = security;
+      const patterns = Array.isArray(security.sensitivePatterns)
+        ? security.sensitivePatterns.filter((value): value is string => typeof value === "string")
+        : [];
+      security.sensitivePatterns = patterns;
+      const currentBackend = (
+        raw.storage !== null
+        && typeof raw.storage === "object"
+        && !Array.isArray(raw.storage)
+        && (raw.storage as Record<string, unknown>).backend === "postgresql"
+      ) ? "postgresql" : "sqlite";
+      assertBackendPublicationConfigAccess(configPath, currentBackend, content, undefined, lockToken);
+      if (patterns.includes(pattern)) {
+        return { exitCode: 0, stdout: `Pattern already present (global): ${pattern}\n` };
       }
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-      // File doesn't exist yet — start fresh with empty object.
-    }
-    if (!raw.security) raw.security = {};
-    if (!Array.isArray(raw.security.sensitivePatterns)) {
-      raw.security.sensitivePatterns = [];
-    }
-    if (raw.security.sensitivePatterns.includes(pattern)) {
-      return { exitCode: 0, stdout: `Pattern already present (global): ${pattern}\n` };
-    }
-    raw.security.sensitivePatterns.push(pattern);
-    await mkdir(dirname(configPath), { recursive: true });
-    await writeFile(configPath, JSON.stringify(raw, null, 2) + "\n", "utf-8");
-    return { exitCode: 0, stdout: `Added global pattern: ${pattern}\n` };
+      patterns.push(pattern);
+      const candidateContent = `${JSON.stringify(raw, null, 2)}\n`;
+      assertBackendPublicationConfigMutation(
+        configPath,
+        currentBackend,
+        currentBackend,
+        candidateContent,
+        content,
+        undefined,
+        lockToken,
+      );
+      mkdirSync(dirname(configPath), { recursive: true });
+      atomicWritePrivateFile(configPath, candidateContent);
+      return { exitCode: 0, stdout: `Added global pattern: ${pattern}\n` };
+    });
   }
 
   // Project-local
   const pDir = projectDir(cwd);
-  await mkdir(pDir, { recursive: true });
   const patternsFile = join(pDir, "sensitive-patterns.txt");
-
-  const existing = await ScrubEngine.loadProjectPatterns(patternsFile);
-  if (existing.includes(pattern)) {
-    return { exitCode: 0, stdout: `Pattern already present (project): ${pattern}\n` };
-  }
-
-  // Append to file
-  const line = pattern + "\n";
-  try {
-    const current = await readFile(patternsFile, "utf-8");
-    const normalized = current.length > 0 && !current.endsWith("\n") ? current + "\n" : current;
-    await writeFile(patternsFile, normalized + line, "utf-8");
-  } catch {
-    // File doesn't exist yet
-    await writeFile(patternsFile, line, "utf-8");
-  }
-
-  return { exitCode: 0, stdout: `Added project pattern: ${pattern}\n` };
+  return withBackendPublicationConsumerLockAsync(
+    backendPublicationHomeForConfigPath(configPath),
+    async () => {
+      await mkdir(pDir, { recursive: true });
+      const existing = loadProjectPatternsBounded(patternsFile);
+      if (existing.includes(pattern)) {
+        return { exitCode: 0, stdout: `Pattern already present (project): ${pattern}\n` };
+      }
+      const line = pattern + "\n";
+      try {
+        const current = readBoundedRegularFile(patternsFile, {
+          allowedRoot: dirname(patternsFile),
+          maxBytes: MAX_SENSITIVE_PATTERN_BYTES,
+        });
+        const normalized = current.length > 0 && !current.endsWith("\n") ? current + "\n" : current;
+        await writeFile(patternsFile, normalized + line, "utf-8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        // File doesn't exist yet
+        await writeFile(patternsFile, line, "utf-8");
+      }
+      return { exitCode: 0, stdout: `Added project pattern: ${pattern}\n` };
+    },
+  );
 }
 
 async function sensitiveRemove(
   args: string[],
   cwd: string,
+  configPath: string,
 ): Promise<{ exitCode: number; stdout: string }> {
   const pattern = args.find((a) => !a.startsWith("--"));
   if (!pattern) {
@@ -195,7 +259,10 @@ async function sensitiveRemove(
   }
 
   const patternsFile = join(projectDir(cwd), "sensitive-patterns.txt");
-  const existing = await ScrubEngine.loadProjectPatterns(patternsFile);
+  const existing = await withBackendPublicationConsumerLockAsync(
+    backendPublicationHomeForConfigPath(configPath),
+    () => loadProjectPatternsBounded(patternsFile),
+  );
 
   if (!existing.includes(pattern)) {
     return {
@@ -205,18 +272,26 @@ async function sensitiveRemove(
   }
 
   // Read the raw file and remove only lines matching the pattern, preserving comments and blanks
-  let raw = "";
-  try {
-    raw = await readFile(patternsFile, "utf-8");
-  } catch {
-    // file disappeared between load and remove — treat as already removed
-  }
-  const updatedLines = raw
-    .split("\n")
-    .filter((line) => line.trim() !== pattern);
-  // Ensure single trailing newline
-  const updatedContent = updatedLines.join("\n").replace(/\n+$/, "") + "\n";
-  await writeFile(patternsFile, updatedContent, "utf-8");
+  await withBackendPublicationConsumerLockAsync(
+    backendPublicationHomeForConfigPath(configPath),
+    async () => {
+      let raw = "";
+      try {
+        raw = readBoundedRegularFile(patternsFile, {
+          allowedRoot: dirname(patternsFile),
+          maxBytes: MAX_SENSITIVE_PATTERN_BYTES,
+        });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        // file disappeared between load and remove — treat as already removed
+      }
+      const updatedLines = raw
+        .split("\n")
+        .filter((line) => line.trim() !== pattern);
+      const updatedContent = updatedLines.join("\n").replace(/\n+$/, "") + "\n";
+      await writeFile(patternsFile, updatedContent, "utf-8");
+    },
+  );
 
   return { exitCode: 0, stdout: `Removed project pattern: ${pattern}\n` };
 }
@@ -243,7 +318,10 @@ async function sensitiveTest(
   const lines: string[] = [];
 
   // Find which patterns matched
-  const projectPatterns = await ScrubEngine.loadProjectPatterns(patternsFile);
+  const projectPatterns = await withBackendPublicationConsumerLockAsync(
+    backendPublicationHomeForConfigPath(configPath),
+    () => loadProjectPatternsBounded(patternsFile),
+  );
 
   const matched: string[] = [];
 
@@ -319,21 +397,31 @@ async function sensitivePurge(
 
   if (purgeAll) {
     const allProjectsDir = runtimeProjectsDir();
-    if (existsSync(allProjectsDir)) {
-      rmSync(allProjectsDir, { recursive: true, force: true });
-      return {
-        exitCode: 0,
-        stdout: `Purged all project data: ${allProjectsDir}\n`,
-      };
-    }
-    return { exitCode: 0, stdout: "No project data to purge.\n" };
+    return withBackendPublicationConsumerLockAsync(
+      backendPublicationHomeForConfigPath(configPath),
+      () => {
+        if (existsSync(allProjectsDir)) {
+          rmSync(allProjectsDir, { recursive: true, force: true });
+          return {
+            exitCode: 0,
+            stdout: `Purged all project data: ${allProjectsDir}\n`,
+          };
+        }
+        return { exitCode: 0, stdout: "No project data to purge.\n" };
+      },
+    );
   }
 
   // Current project only
   const pDir = projectDir(cwd);
-  if (existsSync(pDir)) {
-    rmSync(pDir, { recursive: true, force: true });
-    return { exitCode: 0, stdout: `Purged project data: ${pDir}\n` };
-  }
-  return { exitCode: 0, stdout: "No project data to purge.\n" };
+  return withBackendPublicationConsumerLockAsync(
+    backendPublicationHomeForConfigPath(configPath),
+    () => {
+      if (existsSync(pDir)) {
+        rmSync(pDir, { recursive: true, force: true });
+        return { exitCode: 0, stdout: `Purged project data: ${pDir}\n` };
+      }
+      return { exitCode: 0, stdout: "No project data to purge.\n" };
+    },
+  );
 }

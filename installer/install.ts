@@ -3,8 +3,17 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "node:child_process";
 import { ensureCore } from "../src/bootstrap.js";
-import { lcmHomeDir } from "../src/runtime-paths.js";
-import { atomicWritePrivateFile } from "../src/security-files.js";
+import { bootstrapLcmHome, lcmHomeDir } from "../src/runtime-paths.js";
+import { atomicWritePrivateFile, atomicWritePrivateFileDurable, readBoundedRegularFile } from "../src/security-files.js";
+import { parseStoredConfig } from "../src/daemon/config.js";
+import {
+  assertBackendPublicationConfigAccess,
+  assertBackendPublicationConfigMutation,
+  assertBackendPublicationConsumerAccess,
+  backendPublicationHomeForConfigPath,
+  withBackendPublicationConfigLock,
+  type BackendPublicationLockToken,
+} from "../src/storage/backend-publication.js";
 import { packageExecutable, packageRootFor } from "../src/runtime-root.js";
 import {
   hasCanonicalClaudeMcpEntry,
@@ -29,6 +38,9 @@ export interface ServiceDeps {
   chmodSync?: (path: string, mode: number) => void;
   lstatSync?: typeof lstatSync;
   atomicWritePrivateFile?: typeof atomicWritePrivateFile;
+  atomicWritePrivateFileDurable?: typeof atomicWritePrivateFileDurable;
+  readBoundedRegularFile?: typeof readBoundedRegularFile;
+  ensureLcmHome?: (homeDir: string) => void;
   readdirSync?: typeof readdirSync;
   copyFileSync?: typeof copyFileSync;
   rmSync?: typeof rmSync;
@@ -223,8 +235,6 @@ async function readlinePrompt(question: string): Promise<string> {
   }
 }
 
-export { readlinePrompt as _readlinePromptForTesting };
-
 const defaultDeps: ServiceDeps = {
   spawnSync: spawnSync as ServiceDeps["spawnSync"],
   readFileSync: readFileSync as ServiceDeps["readFileSync"],
@@ -235,6 +245,9 @@ const defaultDeps: ServiceDeps = {
   lstatSync,
   rmSync,
   atomicWritePrivateFile,
+  atomicWritePrivateFileDurable,
+  readBoundedRegularFile,
+  ensureLcmHome: (homeDir) => { bootstrapLcmHome(homeDir); },
   promptUser: readlinePrompt,
 };
 
@@ -251,6 +264,76 @@ function safeConfigExists(deps: ServiceDeps, path: string): boolean {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
+}
+
+const MAX_INSTALL_CONFIG_BYTES = 4 * 1024 * 1024;
+
+function readInstallConfig(deps: ServiceDeps, path: string): string {
+  if (deps.readBoundedRegularFile !== undefined) {
+    return deps.readBoundedRegularFile(path, {
+      allowedRoot: dirname(path),
+      maxBytes: MAX_INSTALL_CONFIG_BYTES,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+    });
+  }
+  // Explicit test dependencies may only expose a string reader. Keep that
+  // compatibility seam bounded, while production always uses the descriptor
+  // reader above before allocating the full config string.
+  const content = deps.readFileSync(path, "utf-8");
+  if (Buffer.byteLength(content, "utf8") > MAX_INSTALL_CONFIG_BYTES) {
+    throw new Error("configuration file exceeds the 4 MiB safety limit");
+  }
+  return content;
+}
+
+type InstallConfigState = Readonly<{
+  exists: boolean;
+  content: string | null;
+}>;
+
+function inspectInstallConfig(
+  deps: ServiceDeps,
+  path: string,
+  lockToken?: BackendPublicationLockToken,
+): InstallConfigState {
+  if (!safeConfigExists(deps, path)) {
+    return { exists: false, content: null };
+  }
+  const content = readInstallConfig(deps, path);
+  const stored = parseStoredConfig(content);
+  const backend = (
+    stored.storage as { backend?: string } | undefined
+  )?.backend === "postgresql" ? "postgresql" : "sqlite";
+  assertBackendPublicationConfigAccess(path, backend, content, undefined, lockToken);
+  return { exists: true, content };
+}
+
+function prepareInstallConfig(deps: ServiceDeps, path: string): InstallConfigState {
+  const homeDir = backendPublicationHomeForConfigPath(path);
+  if (deps.ensureLcmHome === undefined) {
+    // Unit/dry-run dependencies intentionally do not authenticate or mutate
+    // the real home. Their config existence seam is sufficient for the
+    // installer orchestration tests.
+    return { exists: safeConfigExists(deps, path), content: null };
+  }
+  if (homeDir === undefined) {
+    return inspectInstallConfig(deps, path);
+  }
+  return withBackendPublicationConfigLock(path, (lockToken) => {
+    if (!safeConfigExists(deps, path)) {
+      assertBackendPublicationConsumerAccess({ homeDir, lockToken });
+      return { exists: false, content: null };
+    }
+    const content = readInstallConfig(deps, path);
+    const stored = parseStoredConfig(content);
+    const backend = (
+      stored.storage as { backend?: string } | undefined
+    )?.backend === "postgresql" ? "postgresql" : "sqlite";
+    assertBackendPublicationConfigAccess(path, backend, content, undefined, lockToken);
+    return { exists: true, content };
+  });
 }
 
 function readMergedClaudeSettings(
@@ -472,8 +555,6 @@ export function ensureLcmMd(
 
 export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   const lcDir = lcmHomeDir();
-  deps.mkdirSync(lcDir, { recursive: true, mode: 0o700 });
-  deps.chmodSync?.(lcDir, 0o700);
 
   const configPath = join(lcDir, "config.json");
   const settingsPath = join(homedir(), ".claude", "settings.json");
@@ -482,23 +563,65 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     throw new Error("Could not resolve an absolute npm-installed lcm executable path");
   }
 
+  // The installer is the operator-assisted root creator. Production deps use
+  // descriptor-bound topology authentication; test/dry-run deps can inject a
+  // no-op seam without causing the installer to mutate the real home.
+  deps.ensureLcmHome?.(homedir());
+  if (deps.ensureLcmHome === undefined) {
+    // Compatibility seam for explicit test dependencies. The production
+    // default never takes this recursive/pathname creation branch.
+    deps.mkdirSync(lcDir, { recursive: true, mode: 0o700 });
+    deps.chmodSync?.(lcDir, 0o700);
+  }
+
   // Validate settings before making any migration or installation changes.
   readMergedClaudeSettings(deps, settingsPath, lcmBin);
 
   // 1-3. Core setup (config + settings cleanup + daemon)
   // ensureCore handles: creating config.json, merging settings.json hooks, and starting daemon
   // For install, we inject summarizer config into the default config if creating fresh
-  if (!safeConfigExists(deps, configPath)) {
+  const initialConfig = prepareInstallConfig(deps, configPath);
+  if (!initialConfig.exists) {
     const summarizerConfig = await pickSummarizer(deps);
     const { daemonConfigForPersistence, loadDaemonConfig } = await import("../src/daemon/config.js");
     const defaults = loadDaemonConfig("/nonexistent");
     defaults.llm = { ...defaults.llm, ...summarizerConfig };
-    deps.mkdirSync(dirname(configPath), { recursive: true });
     const serialized = JSON.stringify(daemonConfigForPersistence(defaults), null, 2);
-    if (deps.atomicWritePrivateFile) deps.atomicWritePrivateFile(configPath, serialized);
-    else deps.writeFileSync(configPath, serialized);
-    try { deps.chmodSync?.(configPath, 0o600); } catch { /* best-effort */ }
-    console.log(`Created ${configPath}`);
+    const create = (lockToken?: BackendPublicationLockToken): boolean => {
+      if (safeConfigExists(deps, configPath)) return false;
+      if (lockToken !== undefined) {
+        assertBackendPublicationConfigMutation(
+          configPath,
+          "sqlite",
+          "sqlite",
+          serialized,
+          null,
+          undefined,
+          lockToken,
+        );
+      }
+      try {
+        if (deps.atomicWritePrivateFileDurable !== undefined) {
+          deps.atomicWritePrivateFileDurable(configPath, serialized, { requireAbsent: true });
+        } else {
+          // Explicit dependency injection only. The default path has already
+          // authenticated the root and uses the durable writer above.
+          deps.mkdirSync(dirname(configPath), { recursive: true });
+          if (deps.atomicWritePrivateFile) deps.atomicWritePrivateFile(configPath, serialized);
+          else deps.writeFileSync(configPath, serialized);
+          try { deps.chmodSync?.(configPath, 0o600); } catch { /* best-effort */ }
+        }
+      } catch (error) {
+        if (safeConfigExists(deps, configPath)) return false;
+        throw error;
+      }
+      return true;
+    };
+    const created = deps.ensureLcmHome !== undefined
+      && backendPublicationHomeForConfigPath(configPath) !== undefined
+      ? withBackendPublicationConfigLock(configPath, (lockToken) => create(lockToken))
+      : create();
+    if (created) console.log(`Created ${configPath}`);
   }
 
   // ensureCore will:
@@ -512,6 +635,8 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     readFileSync: deps.readFileSync,
     writeFileSync: deps.writeFileSync,
     mkdirSync: deps.mkdirSync,
+    atomicWritePrivateFileDurable: deps.atomicWritePrivateFileDurable,
+    ensureRuntimeHome: deps.ensureLcmHome,
     binaryPath: lcmBin,
     ensureDaemon: deps.ensureDaemon ?? (async (opts) => {
       const { ensureDaemon } = await import("../src/daemon/lifecycle.js");

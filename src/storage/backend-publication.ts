@@ -2,17 +2,20 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   mkdirSync,
+  readdirSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import {
   PrivateMutationPermit,
+  withPrivateMutationLock,
   withPrivateMutationLockAsync,
   withRevocablePrivateMutationPermit,
 } from "../private-mutation-lock.js";
 import {
   atomicWritePrivateFileDurable,
   consumeBoundedRegularFile,
+  assertPrivateDirectory,
   openPrivateDirectory,
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
@@ -167,6 +170,7 @@ export type BackendPublicationFileMutationContext = BackendPublicationDriverCont
   file: BackendPublicationRecoveryFile;
   expectedWitness: BackendPublicationFileWitness;
   permit: PrivateMutationPermit;
+  mutationAccess: BackendPublicationPermitAccess;
 }>;
 
 export type BackendPublicationRemoteContext = Readonly<{
@@ -224,7 +228,8 @@ export class BackendPublicationJournalError extends Error {
       | "unexpected-state"
       | "unresolved-publication"
       | "publication-evidence-missing"
-      | "permit-mismatch",
+      | "permit-mismatch"
+      | "backend-mismatch",
     message: string,
     options?: ErrorOptions,
   ) {
@@ -234,6 +239,36 @@ export class BackendPublicationJournalError extends Error {
 }
 
 const NOOP_OBSERVER: BackendPublicationObserver = () => undefined;
+
+export type BackendPublicationPermitAccess =
+  | "read-recovery"
+  | "publish-project-map"
+  | "publish-config"
+  | "restore-config"
+  | "restore-project-map";
+
+type BackendPublicationPermitMetadata = Readonly<{
+  homeDir: string | undefined;
+  publicationId: string;
+  checksumSha256: string;
+  phase: BackendPublicationPhase;
+  access: BackendPublicationPermitAccess;
+  expectedWitness?: BackendPublicationFileWitness;
+}>;
+
+/**
+ * Active publication authorities are keyed by the permit object itself.
+ * No path or ambient async context is sufficient to authorize a mutation.
+ */
+const activePublicationPermits = new WeakMap<PrivateMutationPermit, BackendPublicationPermitMetadata>();
+
+/** A non-authorizing handle for one retained publication-lock operation. */
+export type BackendPublicationLockToken = object;
+
+const activePublicationLockTokens = new WeakMap<BackendPublicationLockToken, {
+  readonly homeDir: string | undefined;
+  active: boolean;
+}>();
 
 function fail(reason: BackendPublicationJournalError["reason"], message: string): never {
   throw new BackendPublicationJournalError(reason, message);
@@ -575,7 +610,10 @@ export function backendPublicationHistoryDirectory(homeDir?: string): string {
 }
 
 function backendPublicationLockPath(homeDir?: string): string {
-  return join(backendPublicationDirectory(homeDir), "journal.lock");
+  // Keep the admission lock one level above the optional .lcm root so
+  // first-boot consumers can acquire the same admission point without
+  // creating .lcm or backend-publication.
+  return join(homeDir ?? homedir(), ".lcm.backend-publication.lock");
 }
 
 function ensurePublicationDirectory(homeDir?: string): void {
@@ -840,6 +878,818 @@ function readJournal(homeDir?: string): BackendPublicationJournal | null {
 
 export function readBackendPublicationJournal(homeDir?: string): BackendPublicationJournal | null {
   return readJournal(homeDir);
+}
+
+function backendPublicationEvidenceExists(homeDir?: string): boolean {
+  const directory = backendPublicationDirectory(homeDir);
+  let handle;
+  try {
+    handle = openPrivateDirectory(directory);
+  } catch (error) {
+    if (isMissing(error)) return false;
+    return fail("unsafe-storage", `backend publication directory cannot be opened: ${(error as Error).message}`);
+  }
+  try {
+    assertPrivateDirectory(handle, directory, handle.witness);
+    const entries = readdirSync(directory);
+    if (entries.length === 0) return false;
+    for (const entry of entries) {
+      if (
+        entry !== "journal.json"
+        && entry !== "history"
+        && !MATERIAL_PATH_PATTERN.test(entry)
+      ) {
+        return fail("unsafe-storage", `backend publication directory contains unknown residue: ${entry}`);
+      }
+    }
+    return true;
+  } finally {
+    handle.close();
+  }
+}
+
+function assertTerminalPublicationEvidence(
+  journal: BackendPublicationJournal,
+  homeDir?: string,
+): void {
+  if (journal.phase !== "completed" && journal.phase !== "aborted") {
+    return fail("unresolved-publication", "backend publication is unresolved; recover it before consuming local state");
+  }
+  if (journal.recoveryReference === null) {
+    return fail("malformed-journal", "terminal backend publication has no recovery reference");
+  }
+  for (const project of journal.projects) {
+    if (project.fence !== null && activeFence(project.fence)) {
+      return fail("malformed-journal", "terminal backend publication retains an active remote fence");
+    }
+  }
+  try {
+    authenticateMaterial(homeDir, journal);
+  } catch (error) {
+    // Aborted publications remove their recovery material after the journal
+    // reaches its terminal state. The journal checksum and state witnesses
+    // are the retained authenticated evidence in that case.
+    if (
+      journal.phase !== "aborted"
+      || !isMissing(error)
+    ) throw error;
+  }
+  if (
+    journal.phase === "completed"
+    && (
+      journal.publishedConfigSha256 !== journal.intendedConfigSha256
+      || journal.publishedProjectMapSha256 !== journal.intendedProjectMapSha256
+    )
+  ) {
+    return fail("malformed-journal", "completed backend publication lacks intended-state witnesses");
+  }
+}
+
+function readConsumerPublicationJournal(homeDir?: string): BackendPublicationJournal | null {
+  const journal = readJournal(homeDir);
+  if (journal === null) {
+    if (backendPublicationEvidenceExists(homeDir)) {
+      return fail("publication-evidence-missing", "backend publication evidence is incomplete");
+    }
+    return null;
+  }
+  assertTerminalPublicationEvidence(journal, homeDir);
+  return journal;
+}
+
+function permitMetadata(
+  permit: PrivateMutationPermit | undefined,
+  homeDir: string | undefined,
+  journal?: BackendPublicationJournal,
+): BackendPublicationPermitMetadata {
+  if (permit === undefined) return fail("permit-mismatch", "backend publication permit is required");
+  try {
+    permit.assertActive();
+  } catch (error) {
+    return fail("permit-mismatch", (error as Error).message);
+  }
+  const metadata = activePublicationPermits.get(permit);
+  if (
+    metadata === undefined
+    || resolve(join(metadata.homeDir ?? homedir(), ".lcm")) !== rootPath(homeDir)
+    || (journal !== undefined && (
+      metadata.publicationId !== journal.publicationId
+      || metadata.checksumSha256 !== journal.checksumSha256
+      || metadata.phase !== journal.phase
+    ))
+  ) {
+    return fail("permit-mismatch", "backend publication permit does not match durable state");
+  }
+  return metadata;
+}
+
+export function assertBackendPublicationPermit(
+  permit: PrivateMutationPermit,
+  homeDir?: string,
+  journal?: BackendPublicationJournal,
+): void {
+  permitMetadata(permit, homeDir, journal);
+}
+
+function assertBackendPublicationConsumerAccessUnlocked(options: {
+  readonly backend?: StorageBackendName;
+  readonly homeDir?: string;
+  readonly permit?: PrivateMutationPermit;
+  readonly lockToken?: BackendPublicationLockToken;
+} = {}): void {
+  const journal = readJournal(options.homeDir);
+  if (journal === null) {
+    if (backendPublicationEvidenceExists(options.homeDir)) {
+      return fail("publication-evidence-missing", "backend publication evidence is incomplete");
+    }
+    if (options.backend === "postgresql") {
+      return fail("publication-evidence-missing", "PostgreSQL selection has no completed backend publication evidence");
+    }
+    if (options.permit !== undefined) {
+      return fail("permit-mismatch", "backend publication permit has no durable journal");
+    }
+    return;
+  }
+  if (options.permit !== undefined) {
+    permitMetadata(options.permit, options.homeDir, journal);
+    return;
+  }
+  assertTerminalPublicationEvidence(journal, options.homeDir);
+  const expected = journal.phase === "completed" ? journal.targetBackend : journal.sourceBackend;
+  if (options.backend !== undefined && options.backend !== expected) {
+    return fail("backend-mismatch", "stored backend does not match the completed publication journal");
+  }
+}
+
+type ConsumerLockOptions = Readonly<{
+  readonly permit?: PrivateMutationPermit;
+  readonly allowUnresolved?: boolean;
+  readonly lockToken?: BackendPublicationLockToken;
+}>;
+
+function assertLockToken(
+  token: BackendPublicationLockToken,
+  homeDir: string | undefined,
+): void {
+  const state = activePublicationLockTokens.get(token);
+  if (state === undefined || !state.active || state.homeDir !== homeDir) {
+    return fail("permit-mismatch", "backend publication lock token is not active");
+  }
+}
+
+function newLockToken(homeDir: string | undefined): BackendPublicationLockToken {
+  const token = {};
+  activePublicationLockTokens.set(token, { homeDir, active: true });
+  return token;
+}
+
+function revokeLockToken(token: BackendPublicationLockToken): void {
+  activePublicationLockTokens.get(token)!.active = false;
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return typeof value === "object"
+    && value !== null
+    && "then" in value
+    && typeof (value as { then?: unknown }).then === "function";
+}
+
+function requireSynchronousResult<T>(
+  value: T,
+  token?: BackendPublicationLockToken,
+  permit?: PrivateMutationPermit,
+): T {
+  if (!isThenable(value)) return value;
+  if (token !== undefined) revokeLockToken(token);
+  permit?.revoke();
+  return fail("unsafe-storage", "synchronous backend publication consumer callback returned a promise");
+}
+
+function checkRetainedConsumerDirectories(
+  homeDir: string | undefined,
+  rootHandle: ReturnType<typeof openPrivateDirectory>,
+  publicationHandle: ReturnType<typeof openPrivateDirectory> | undefined,
+): void {
+  // nlink changes as ordinary consumers create/remove LCM children. The
+  // retained descriptor and no-follow pathname check still bind dev/ino;
+  // requiring the original nlink would reject legitimate map/config work.
+  assertPrivateDirectory(rootHandle, rootPath(homeDir));
+  if (publicationHandle !== undefined) {
+    assertPrivateDirectory(
+      publicationHandle,
+      backendPublicationDirectory(homeDir),
+    );
+  }
+}
+
+function openOptionalPublicationDirectory(homeDir?: string): ReturnType<typeof openPrivateDirectory> | undefined {
+  try {
+    return openPrivateDirectory(backendPublicationDirectory(homeDir));
+  } catch (error) {
+    if (isMissing(error)) return undefined;
+    return fail("unsafe-storage", `backend publication directory cannot be opened: ${(error as Error).message}`);
+  }
+}
+
+function openOptionalRootDirectory(homeDir?: string): ReturnType<typeof openPrivateDirectory> | undefined {
+  try {
+    return openPrivateDirectory(rootPath(homeDir));
+  } catch (error) {
+    if (isMissing(error)) return undefined;
+    // Older ordinary SQLite installations may have a non-private .lcm root.
+    // Do not repair it during a read-only publication preflight. If the
+    // publication directory exists, however, its authenticated root is part
+    // of the evidence and the unsafe mode must fail closed.
+    if ((error as Error).message.includes("private directory mode is not trusted")) {
+      try {
+        const publication = openPrivateDirectory(backendPublicationDirectory(homeDir));
+        publication.close();
+        return fail("unsafe-storage", "backend publication root is not private");
+      } catch (publicationError) {
+        if (isMissing(publicationError)) return undefined;
+        return fail(
+          "unsafe-storage",
+          "backend publication directory cannot be opened: " + (publicationError as Error).message,
+        );
+      }
+    }
+    return fail("unsafe-storage", `private LCM root cannot be opened: ${(error as Error).message}`);
+  }
+}
+
+function consumerLockCallback<T>(
+  homeDir: string | undefined,
+  callback: (token: BackendPublicationLockToken) => T,
+  options: ConsumerLockOptions,
+): T {
+  if (options.permit !== undefined) {
+    assertBackendPublicationPermit(options.permit, homeDir);
+    return requireSynchronousResult(callback({}), undefined, options.permit);
+  }
+  let rootHandle = openOptionalRootDirectory(homeDir);
+  let publicationHandle = rootHandle === undefined
+    ? undefined
+    : openOptionalPublicationDirectory(homeDir);
+  const refreshDirectories = (): void => {
+    rootHandle ??= openOptionalRootDirectory(homeDir);
+    if (rootHandle !== undefined && publicationHandle === undefined) {
+      publicationHandle = openOptionalPublicationDirectory(homeDir);
+    }
+  };
+  const run = (): T => {
+    refreshDirectories();
+    const token = newLockToken(homeDir);
+    if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
+    if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
+    try {
+      const result = requireSynchronousResult(callback(token), token, options.permit);
+      refreshDirectories();
+      if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
+      if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
+      return result;
+    } finally {
+      revokeLockToken(token);
+    }
+  };
+  try {
+    return withPrivateMutationLock(backendPublicationLockPath(homeDir), "backend publication", run);
+  } finally {
+    publicationHandle?.close();
+    rootHandle?.close();
+  }
+}
+
+/** Serialize a synchronous local consumer without creating publication roots. */
+export function withBackendPublicationConsumerLock<T>(
+  homeDir: string | undefined,
+  callback: (token: BackendPublicationLockToken) => T,
+  options: ConsumerLockOptions = {},
+): T {
+  if (options.lockToken !== undefined) assertLockToken(options.lockToken, homeDir);
+  if (options.lockToken !== undefined && options.permit === undefined) {
+    return requireSynchronousResult(callback(options.lockToken));
+  }
+  return consumerLockCallback(homeDir, callback, options);
+}
+
+/** Async counterpart used by watcher and sensitive-file boundaries. */
+export async function withBackendPublicationConsumerLockAsync<T>(
+  homeDir: string | undefined,
+  callback: (token: BackendPublicationLockToken) => Promise<T> | T,
+  options: ConsumerLockOptions = {},
+): Promise<T> {
+  if (options.lockToken !== undefined) assertLockToken(options.lockToken, homeDir);
+  if (options.lockToken !== undefined && options.permit === undefined) {
+    return callback(options.lockToken);
+  }
+  if (options.permit !== undefined) {
+    assertBackendPublicationPermit(options.permit, homeDir);
+    return callback({});
+  }
+  let rootHandle = openOptionalRootDirectory(homeDir);
+  let publicationHandle = rootHandle === undefined
+    ? undefined
+    : openOptionalPublicationDirectory(homeDir);
+  const refreshDirectories = (): void => {
+    rootHandle ??= openOptionalRootDirectory(homeDir);
+    if (rootHandle !== undefined && publicationHandle === undefined) {
+      publicationHandle = openOptionalPublicationDirectory(homeDir);
+    }
+  };
+  const run = async (): Promise<T> => {
+    refreshDirectories();
+    const token = newLockToken(homeDir);
+    if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
+    if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
+    try {
+      const result = await callback(token);
+      refreshDirectories();
+      if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
+      if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
+      return result;
+    } finally {
+      revokeLockToken(token);
+    }
+  };
+  try {
+    return await withPrivateMutationLockAsync(backendPublicationLockPath(homeDir), "backend publication", run);
+  } finally {
+    publicationHandle?.close();
+    rootHandle?.close();
+  }
+}
+
+export function assertBackendPublicationConsumerAccess(options: {
+  readonly backend?: StorageBackendName;
+  readonly homeDir?: string;
+  readonly permit?: PrivateMutationPermit;
+  readonly lockToken?: BackendPublicationLockToken;
+} = {}): void {
+  if (options.permit !== undefined) {
+    assertBackendPublicationPermit(options.permit, options.homeDir);
+    return assertBackendPublicationConsumerAccessUnlocked(options);
+  }
+  if (options.lockToken !== undefined) {
+    assertLockToken(options.lockToken, options.homeDir);
+    return assertBackendPublicationConsumerAccessUnlocked(options);
+  }
+  return withBackendPublicationConsumerLock(
+    options.homeDir,
+    (token) => assertBackendPublicationConsumerAccessUnlocked({ ...options, lockToken: token }),
+  );
+}
+
+/** Serialize the canonical config file after publication admission. */
+export function withBackendPublicationConfigLock<T>(
+  configPath: string,
+  callback: (token: BackendPublicationLockToken) => T,
+  permit?: PrivateMutationPermit,
+): T {
+  const homeDir = backendPublicationHomeForConfigPath(configPath);
+  if (homeDir === undefined) return requireSynchronousResult(callback({}), undefined, permit);
+  return withBackendPublicationConsumerLock(homeDir, (token) =>
+    withPrivateMutationLock(`${resolve(configPath)}.lock`, "config file", () =>
+      requireSynchronousResult(callback(token), token, permit)),
+  { permit });
+}
+
+/** Async config lock variant for coordinator callbacks. */
+export async function withBackendPublicationConfigLockAsync<T>(
+  configPath: string,
+  callback: (token: BackendPublicationLockToken) => Promise<T> | T,
+  permit?: PrivateMutationPermit,
+): Promise<T> {
+  const homeDir = backendPublicationHomeForConfigPath(configPath);
+  if (homeDir === undefined) return callback({});
+  return withBackendPublicationConsumerLockAsync(homeDir, (token) =>
+    withPrivateMutationLockAsync(`${resolve(configPath)}.lock`, "config file", async () => callback(token)),
+  { permit });
+}
+
+/** Derive the home directory only for the canonical ~/.lcm/config.json shape. */
+export function backendPublicationHomeForConfigPath(configPath: string): string | undefined {
+  const canonical = resolve(configPath);
+  const lcmRoot = resolve(join(canonical, ".."));
+  return basename(canonical) === "config.json" && basename(lcmRoot) === ".lcm"
+    ? resolve(join(lcmRoot, ".."))
+    : undefined;
+}
+
+/** Capture descriptor-bound config and project-map witnesses from the LCM root. */
+export function captureBackendPublicationState(homeDir?: string): BackendPublicationStateWitness {
+  const root = rootPath(homeDir);
+  const rootHandle = openPrivateDirectory(root);
+  try {
+    assertPrivateDirectory(rootHandle, root, rootHandle.witness);
+    return {
+      config: captureBackendPublicationFileWitness(
+        join(root, "config.json"),
+        root,
+        MAX_RECOVERY_FILE_BYTES,
+      ).witness,
+      projectMap: captureBackendPublicationFileWitness(
+        join(root, "map.json"),
+        root,
+        MAX_RECOVERY_FILE_BYTES,
+      ).witness,
+    };
+  } finally {
+    rootHandle.close();
+  }
+}
+
+function readStateContent(path: string, root: string): string | null {
+  try {
+    return readBoundedRegularFileWithStat(path, {
+      allowedRoot: root,
+      maxBytes: MAX_RECOVERY_FILE_BYTES,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      requireSingleLink: true,
+    }).content;
+  } catch (error) {
+    if (isMissing(error)) return null;
+    throw error;
+  }
+}
+
+export function backendPublicationConfigSha256(homeDir?: string): string {
+  const root = rootPath(homeDir);
+  const content = readStateContent(join(root, "config.json"), root);
+  return sha256(content ?? "{}");
+}
+
+export function backendPublicationProjectMapSha256(homeDir?: string): string {
+  const root = rootPath(homeDir);
+  const content = readStateContent(join(root, "map.json"), root) ?? "{}";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    return fail("unexpected-state", "project map cannot be bound to backend publication evidence");
+  }
+  return backendPublicationCanonicalSha256(parsed);
+}
+
+function assertRawContentWitness(
+  actual: BackendPublicationFileWitness,
+  content: string | null,
+  field: string,
+): void {
+  if (content === null) {
+    assertLogicalWitness(actual, ABSENT_WITNESS, field);
+    return;
+  }
+  if (
+    actual.presence !== "present"
+    || actual.rawSha256 !== sha256(content)
+    || actual.byteLength !== Buffer.byteLength(content)
+  ) {
+    return fail("unexpected-state", `${field} bytes do not match the descriptor-bound witness`);
+  }
+}
+
+function currentConfigWitness(homeDir: string | undefined, content: string | null): BackendPublicationFileWitness {
+  const current = captureBackendPublicationState(homeDir).config;
+  assertRawContentWitness(current, content, "current config");
+  return current;
+}
+
+function currentProjectMapWitness(homeDir: string | undefined, content: string): BackendPublicationFileWitness {
+  const current = captureBackendPublicationState(homeDir).projectMap;
+  assertRawContentWitness(current, content, "current project map");
+  return current;
+}
+
+function mutationPermitFor(
+  permit: PrivateMutationPermit | undefined,
+  homeDir: string | undefined,
+  journal: BackendPublicationJournal,
+  access: BackendPublicationPermitAccess,
+): BackendPublicationPermitMetadata {
+  const metadata = permitMetadata(permit, homeDir, journal);
+  if (metadata.access !== access) {
+    return fail("permit-mismatch", `backend publication permit is not valid for ${access}`);
+  }
+  return metadata;
+}
+
+function assertCandidateWitness(
+  candidate: string | null,
+  expected: BackendPublicationFileWitness | undefined,
+  field: string,
+  semantic = false,
+): void {
+  if (expected === undefined) return;
+  if (candidate === null) {
+    assertLogicalWitness(ABSENT_WITNESS, expected, field);
+    return;
+  }
+  let semanticSha256: string | undefined;
+  if (semantic) {
+    try {
+      semanticSha256 = backendPublicationCanonicalSha256(JSON.parse(candidate));
+    } catch {
+      return fail("unexpected-state", `${field} semantic JSON is invalid`);
+    }
+  }
+  if (
+    expected.presence !== "present"
+    || expected.rawSha256 !== sha256(candidate)
+    || expected.byteLength !== Buffer.byteLength(candidate)
+    || (semantic && expected.semanticSha256 !== semanticSha256)
+  ) {
+    return fail("unexpected-state", `${field} bytes do not match authenticated publication material`);
+  }
+}
+
+function assertBackendPublicationConfigAccessUnlocked(
+  configPath: string,
+  homeDir: string,
+  backend: StorageBackendName,
+  content: string | null | undefined,
+  permit?: PrivateMutationPermit,
+): void {
+  const journal = permit === undefined
+    ? readConsumerPublicationJournal(homeDir)
+    : readJournal(homeDir);
+  if (journal === null) {
+    if (backend === "postgresql") {
+      return fail("publication-evidence-missing", "PostgreSQL selection has no completed backend publication evidence");
+    }
+    return;
+  }
+  if (permit !== undefined) {
+    permitMetadata(permit, homeDir, journal);
+  } else if (
+    backend !== (journal.phase === "completed" ? journal.targetBackend : journal.sourceBackend)
+  ) {
+    return fail("backend-mismatch", "stored backend does not match completed publication evidence");
+  }
+  if (content !== undefined) currentConfigWitness(homeDir, content);
+}
+
+export function assertBackendPublicationConfigAccess(
+  configPath: string,
+  backend: StorageBackendName,
+  content?: string | null,
+  permit?: PrivateMutationPermit,
+  lockToken?: BackendPublicationLockToken,
+): void {
+  const homeDir = backendPublicationHomeForConfigPath(configPath);
+  if (homeDir === undefined) return;
+  if (permit !== undefined) {
+    return assertBackendPublicationConfigAccessUnlocked(configPath, homeDir, backend, content, permit);
+  }
+  if (lockToken !== undefined) {
+    assertLockToken(lockToken, homeDir);
+    return assertBackendPublicationConfigAccessUnlocked(configPath, homeDir, backend, content, permit);
+  }
+  return withBackendPublicationConsumerLock(
+    homeDir,
+    (token) => assertBackendPublicationConfigAccessUnlocked(configPath, homeDir, backend, content, permit),
+  );
+}
+
+function assertBackendPublicationConfigMutationUnlocked(
+  configPath: string,
+  homeDir: string,
+  currentBackend: StorageBackendName,
+  candidateBackend: StorageBackendName,
+  candidateContent: string | null,
+  currentContent: string | null | undefined,
+  permit?: PrivateMutationPermit,
+): void {
+  const journal = readJournal(homeDir);
+  if (currentContent !== undefined) currentConfigWitness(homeDir, currentContent);
+  if (journal === null) {
+    if (backendPublicationEvidenceExists(homeDir)) {
+      return fail("publication-evidence-missing", "backend publication evidence is incomplete");
+    }
+    if (currentBackend !== candidateBackend && candidateBackend === "postgresql") {
+      return fail("publication-evidence-missing", "PostgreSQL backend selection requires publication control");
+    }
+    return;
+  }
+  if (journal.phase === "completed" || journal.phase === "aborted") {
+    const expected = journal.phase === "completed" ? journal.targetBackend : journal.sourceBackend;
+    if (candidateBackend !== expected) return fail("backend-mismatch", "configuration mutation conflicts with publication evidence");
+    return;
+  }
+  const access = ["map-published", "config-publishing"].includes(journal.phase)
+    ? "publish-config"
+    : ["aborting", "config-restoring"].includes(journal.phase)
+      ? "restore-config"
+      : ["map-restoring", "abort-releasing"].includes(journal.phase)
+        ? "restore-project-map"
+        : null;
+  if (access !== "publish-config" && access !== "restore-config") {
+    return fail("permit-mismatch", "configuration mutation is not valid in the durable publication phase");
+  }
+  const metadata = mutationPermitFor(permit, homeDir, journal, access);
+  const expectedBackend = access === "publish-config" ? journal.targetBackend : journal.sourceBackend;
+  if (candidateBackend !== expectedBackend) {
+    return fail("backend-mismatch", "configuration candidate backend conflicts with publication evidence");
+  }
+  assertCandidateWitness(candidateContent, metadata.expectedWitness, "candidate config");
+}
+
+export function assertBackendPublicationConfigMutation(
+  configPath: string,
+  currentBackend: StorageBackendName,
+  candidateBackend: StorageBackendName,
+  candidateContent: string | null,
+  currentContent?: string | null,
+  permit?: PrivateMutationPermit,
+  lockToken?: BackendPublicationLockToken,
+): void {
+  const homeDir = backendPublicationHomeForConfigPath(configPath);
+  if (homeDir === undefined) return;
+  if (permit !== undefined) {
+    return assertBackendPublicationConfigMutationUnlocked(
+      configPath,
+      homeDir,
+      currentBackend,
+      candidateBackend,
+      candidateContent,
+      currentContent,
+      permit,
+    );
+  }
+  if (lockToken !== undefined) {
+    assertLockToken(lockToken, homeDir);
+    return assertBackendPublicationConfigMutationUnlocked(
+      configPath,
+      homeDir,
+      currentBackend,
+      candidateBackend,
+      candidateContent,
+      currentContent,
+      permit,
+    );
+  }
+  return withBackendPublicationConsumerLock(
+    homeDir,
+    (token) => assertBackendPublicationConfigMutationUnlocked(
+      configPath,
+      homeDir,
+      currentBackend,
+      candidateBackend,
+      candidateContent,
+      currentContent,
+      permit,
+    ),
+  );
+}
+
+function assertBackendPublicationProjectMapMutationUnlocked(
+  map: unknown,
+  homeDir: string | undefined,
+  candidateContent: string | null | undefined,
+  permit?: PrivateMutationPermit,
+): void {
+  const journal = readJournal(homeDir);
+  if (journal === null) {
+    if (backendPublicationEvidenceExists(homeDir)) return fail("publication-evidence-missing", "backend publication evidence is incomplete");
+    return;
+  }
+  if (journal.phase === "completed" || journal.phase === "aborted") return;
+  const access = ["guarded", "map-publishing"].includes(journal.phase)
+    ? "publish-project-map"
+    : journal.phase === "map-restoring"
+      ? "restore-project-map"
+      : null;
+  if (access === null) return fail("permit-mismatch", "project-map mutation is not valid in the durable publication phase");
+  const metadata = mutationPermitFor(permit, homeDir, journal, access);
+  if (candidateContent !== undefined) {
+    assertCandidateWitness(candidateContent, metadata.expectedWitness, "candidate project map", true);
+  } else if (
+    metadata.expectedWitness?.presence === "present"
+    && metadata.expectedWitness.semanticSha256 !== backendPublicationCanonicalSha256(map)
+  ) {
+    return fail("unexpected-state", "project-map semantics do not match authenticated publication material");
+  }
+}
+
+export function assertBackendPublicationProjectMapMutation(
+  map: unknown,
+  homeDir?: string,
+  candidateContent?: string | null,
+  permit?: PrivateMutationPermit,
+  lockToken?: BackendPublicationLockToken,
+): void {
+  if (permit !== undefined) {
+    return assertBackendPublicationProjectMapMutationUnlocked(map, homeDir, candidateContent, permit);
+  }
+  if (lockToken !== undefined) {
+    assertLockToken(lockToken, homeDir);
+    return assertBackendPublicationProjectMapMutationUnlocked(map, homeDir, candidateContent, permit);
+  }
+  return withBackendPublicationConsumerLock(
+    homeDir,
+    () => assertBackendPublicationProjectMapMutationUnlocked(map, homeDir, candidateContent, permit),
+  );
+}
+
+function assertBackendPublicationProjectMapAccessUnlocked(input: {
+  readonly homeDir?: string;
+  readonly content: string | null;
+  readonly map: unknown;
+  readonly present: boolean;
+  readonly permit?: PrivateMutationPermit;
+}): void {
+  if (input.present !== (input.content !== null)) {
+    return fail("unexpected-state", "project-map presence and content disagree");
+  }
+  const journal = input.permit === undefined
+    ? readConsumerPublicationJournal(input.homeDir)
+    : readJournal(input.homeDir);
+  if (journal === null) return;
+  if (input.content === null) {
+    assertLogicalWitness(captureBackendPublicationState(input.homeDir).projectMap, ABSENT_WITNESS, "current project map");
+  } else {
+    const current = currentProjectMapWitness(input.homeDir, input.content);
+    if (current.semanticSha256 !== backendPublicationCanonicalSha256(input.map)) {
+      return fail("unexpected-state", "project-map bytes and parsed semantics disagree");
+    }
+  }
+}
+
+export function assertBackendPublicationProjectMapAccess(input: {
+  readonly homeDir?: string;
+  readonly content: string | null;
+  readonly map: unknown;
+  readonly present: boolean;
+  readonly permit?: PrivateMutationPermit;
+  readonly lockToken?: BackendPublicationLockToken;
+}): void {
+  if (input.permit !== undefined) {
+    assertBackendPublicationPermit(input.permit, input.homeDir);
+    return assertBackendPublicationProjectMapAccessUnlocked(input);
+  }
+  if (input.lockToken !== undefined) {
+    assertLockToken(input.lockToken, input.homeDir);
+    return assertBackendPublicationProjectMapAccessUnlocked(input);
+  }
+  return withBackendPublicationConsumerLock(
+    input.homeDir,
+    () => assertBackendPublicationProjectMapAccessUnlocked(input),
+  );
+}
+
+/** Issue an explicit permit for a guarded coordinator callback. */
+export async function withBackendPublicationPermit<T>(
+  input: Readonly<{
+    publicationId: string;
+    expectedChecksumSha256: string;
+    access: BackendPublicationPermitAccess;
+    stateSha256?: string;
+    homeDir?: string;
+  }>,
+  callback: (permit: PrivateMutationPermit) => T | Promise<T>,
+): Promise<T> {
+  return withBackendPublicationConsumerLockAsync(
+    input.homeDir,
+    async () => {
+      const journal = readJournal(input.homeDir);
+      if (
+        journal === null
+        || journal.publicationId !== input.publicationId
+        || journal.checksumSha256 !== input.expectedChecksumSha256
+        || journal.phase === "completed"
+        || journal.phase === "aborted"
+      ) {
+        return fail("permit-mismatch", "backend publication recovery permit does not match durable state");
+      }
+      const allowed: Readonly<Record<BackendPublicationPermitAccess, readonly BackendPublicationPhase[]>> = {
+        "read-recovery": ["preparing", "prepared", "acquiring", "guarded", "map-publishing", "map-published", "config-publishing", "config-published", "aborting", "config-restoring", "map-restoring", "abort-releasing", "releasing", "released"],
+        "publish-project-map": ["guarded"],
+        "publish-config": ["map-published"],
+        "restore-config": ["aborting", "config-restoring"],
+        "restore-project-map": ["map-restoring", "abort-releasing"],
+      };
+      if (!allowed[input.access].includes(journal.phase)) {
+        return fail("permit-mismatch", "backend publication recovery permit phase is invalid");
+      }
+      if (input.access !== "read-recovery" && input.stateSha256 !== undefined && !HASH_PATTERN.test(input.stateSha256)) {
+        return fail("permit-mismatch", "backend publication recovery permit state witness is invalid");
+      }
+      return withRevocablePrivateMutationPermit(`backend publication ${input.access}`, async (permit) => {
+        activePublicationPermits.set(permit, {
+          homeDir: input.homeDir,
+          publicationId: journal.publicationId,
+          checksumSha256: journal.checksumSha256,
+          phase: journal.phase,
+          access: input.access,
+        });
+        try {
+          return await callback(permit);
+        } finally {
+          activePublicationPermits.delete(permit);
+        }
+      });
+    },
+    { allowUnresolved: true },
+  );
 }
 
 function writeJournal(
@@ -1261,11 +2111,13 @@ export class BackendPublicationCoordinator {
   }
 
   async #locked<T>(callback: () => Promise<T>): Promise<T> {
-    ensurePublicationDirectory(this.#homeDir);
     return withPrivateMutationLockAsync(
       backendPublicationLockPath(this.#homeDir),
       "backend publication",
-      callback,
+      async () => {
+        ensurePublicationDirectory(this.#homeDir);
+        return callback();
+      },
     );
   }
 
@@ -1295,10 +2147,28 @@ export class BackendPublicationCoordinator {
     callback: (input: BackendPublicationFileMutationContext) => Promise<BackendPublicationFileWitness>,
   ): Promise<void> {
     await withRevocablePrivateMutationPermit(`backend publication ${access}`, async (permit) => {
-      permit.assertActive();
-      const actual = await callback({ ...context, file, expectedWitness, permit });
-      permit.assertActive();
-      assertContentWitness(actual, expectedWitness, access);
+      activePublicationPermits.set(permit, {
+        homeDir: context.homeDir,
+        publicationId: context.journal.publicationId,
+        checksumSha256: context.journal.checksumSha256,
+        phase: context.journal.phase,
+        access,
+        expectedWitness,
+      });
+      try {
+        permit.assertActive();
+        const actual = await callback({
+          ...context,
+          file,
+          expectedWitness,
+          permit,
+          mutationAccess: access,
+        });
+        permit.assertActive();
+        assertContentWitness(actual, expectedWitness, access);
+      } finally {
+        activePublicationPermits.delete(permit);
+      }
     });
   }
 
@@ -1417,7 +2287,13 @@ export class BackendPublicationCoordinator {
     const publishing = journal.phase === "guarded"
       ? transition(journal, "map-publishing", this.#homeDir, this.#observer)
       : journal;
-    await this.#mutate(context, "publish-project-map", context.material.target.projectMap, journal.targetState.projectMap, (input) => this.#driver.publishProjectMap(input));
+    await this.#mutate(
+      { ...context, journal: publishing },
+      "publish-project-map",
+      context.material.target.projectMap,
+      journal.targetState.projectMap,
+      (input) => this.#driver.publishProjectMap(input),
+    );
     const after = await this.#observe({ ...context, journal: publishing });
     assertContentWitness(after.projectMap, journal.targetState.projectMap, "published project map");
     return transition(publishing, "map-published", this.#homeDir, this.#observer, {
@@ -1445,7 +2321,13 @@ export class BackendPublicationCoordinator {
     const publishing = journal.phase === "map-published"
       ? transition(journal, "config-publishing", this.#homeDir, this.#observer)
       : journal;
-    await this.#mutate(context, "publish-config", context.material.target.config, journal.targetState.config, (input) => this.#driver.publishConfig(input));
+    await this.#mutate(
+      { ...context, journal: publishing },
+      "publish-config",
+      context.material.target.config,
+      journal.targetState.config,
+      (input) => this.#driver.publishConfig(input),
+    );
     const after = await this.#observe({ ...context, journal: publishing });
     assertContentWitness(after.config, journal.targetState.config, "published config");
     return transition(publishing, "config-published", this.#homeDir, this.#observer, {
@@ -1463,11 +2345,19 @@ export class BackendPublicationCoordinator {
       });
     }
     if (!logicalWitnessMatches(observed.config, journal.sourceState.config)) {
-      assertLogicalWitness(observed.config, journal.targetState.config, "config before restore");
+      if (!mutationWitnessMatches(observed.config, journal.targetState.config)) {
+        assertLogicalWitness(observed.config, journal.targetState.config, "config before restore");
+      }
       const restoring = journal.phase === "aborting"
         ? transition(journal, "config-restoring", this.#homeDir, this.#observer)
         : journal;
-      await this.#mutate(context, "restore-config", context.material.source.config, journal.sourceState.config, (input) => this.#driver.restoreConfig(input));
+      await this.#mutate(
+        { ...context, journal: restoring },
+        "restore-config",
+        context.material.source.config,
+        journal.sourceState.config,
+        (input) => this.#driver.restoreConfig(input),
+      );
       const after = await this.#observe({ ...context, journal: restoring });
       assertContentWitness(after.config, journal.sourceState.config, "restored config");
       return transition(restoring, "map-restoring", this.#homeDir, this.#observer);
@@ -1484,9 +2374,17 @@ export class BackendPublicationCoordinator {
       });
     }
     if (!logicalWitnessMatches(observed.projectMap, journal.sourceState.projectMap)) {
-      assertLogicalWitness(observed.projectMap, journal.targetState.projectMap, "project map before restore");
+      if (!mutationWitnessMatches(observed.projectMap, journal.targetState.projectMap)) {
+        assertLogicalWitness(observed.projectMap, journal.targetState.projectMap, "project map before restore");
+      }
       const restoring = journal;
-      await this.#mutate(context, "restore-project-map", context.material.source.projectMap, journal.sourceState.projectMap, (input) => this.#driver.restoreProjectMap(input));
+      await this.#mutate(
+        { ...context, journal: restoring },
+        "restore-project-map",
+        context.material.source.projectMap,
+        journal.sourceState.projectMap,
+        (input) => this.#driver.restoreProjectMap(input),
+      );
       const after = await this.#observe({ ...context, journal: restoring });
       assertContentWitness(after.projectMap, journal.sourceState.projectMap, "restored project map");
     }

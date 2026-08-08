@@ -40,6 +40,7 @@ import { projectDbPath, projectIdentity } from "../src/daemon/project.js";
 import { recoverMachineIdentity } from "../src/machine-identity.js";
 import type { ResolvedStorageConfig } from "../src/daemon/config.js";
 import { EventsDb } from "../src/hooks/events-db.js";
+import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 
 const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
   backend: "postgresql",
@@ -5205,12 +5206,37 @@ describe("worktree reconciliation", () => {
         expect(() => setRemoteProjectBinding(
           "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
           { hash: targetHash },
-        )).toThrow("project map mutation is already in progress");
+        )).toThrow("backend publication mutation is already in progress");
         throw new Error("abort after verified map fence");
       },
     })).toThrow("abort after verified map fence");
     expect(existsSync(sourcePath)).toBe(true);
     expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+  });
+
+  it("rethrows publication errors without converting reconciliation state to blocked", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    makeDatabase(sourcePath, "publication-error", "content", sourceHash);
+    const publicationError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "reconciliation publication state is unresolved",
+    );
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event === "before-source-main-merge") throw publicationError;
+      },
+    })).toThrow("reconciliation publication state is unresolved");
+    expect(listWorktreeReconciliationJournals()).toEqual(expect.any(Array));
   });
 
   it("handles bounded catalogue entries, non-Git paths, and catalogue failures", () => {
