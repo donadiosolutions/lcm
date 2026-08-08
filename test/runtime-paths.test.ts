@@ -8,6 +8,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -246,7 +247,9 @@ describe("runtime paths", () => {
   });
 
   it("uses actual platform semantics for nested legacy migration", () => {
-    const home = makeHome();
+    const home = realpathSync(makeHome());
+    expect(existsSync(home)).toBe(true);
+    expect(realpathSync(home)).toBe(home);
     const legacy = legacyLcmHomeDir(home);
     const nested = join(legacy, "projects", "nested");
     mkdirSync(nested, { recursive: true, mode: 0o750 });
