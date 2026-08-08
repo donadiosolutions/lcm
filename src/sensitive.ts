@@ -394,12 +394,14 @@ async function sensitivePurge(
     };
   }
 
-  selectStorageBackend(loadStoredConfigProjection(configPath).storage);
+  const publicationHome = backendPublicationHomeForConfigPath(configPath);
+  const storage = loadStoredConfigProjection(configPath).storage;
+  selectStorageBackend({ ...storage, homeDir: publicationHome });
 
   if (purgeAll) {
     const allProjectsDir = runtimeProjectsDir();
     return withBackendPublicationConsumerLockAsync(
-      backendPublicationHomeForConfigPath(configPath),
+      publicationHome,
       () => {
         if (existsSync(allProjectsDir)) {
           rmSync(allProjectsDir, { recursive: true, force: true });
@@ -416,7 +418,7 @@ async function sensitivePurge(
   // Current project only
   const pDir = projectDir(cwd);
   return withBackendPublicationConsumerLockAsync(
-    backendPublicationHomeForConfigPath(configPath),
+    publicationHome,
     () => {
       if (existsSync(pDir)) {
         rmSync(pDir, { recursive: true, force: true });

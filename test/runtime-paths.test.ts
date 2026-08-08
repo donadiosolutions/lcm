@@ -31,6 +31,7 @@ import {
   tmpDir,
 } from "../src/runtime-paths.js";
 import { legacyLcmHomeDirname } from "../src/legacy-names.js";
+import { processStartTime as trustedProcessStartTime } from "../src/private-mutation-lock.js";
 
 const homes: string[] = [];
 
@@ -41,6 +42,34 @@ function makeHome(): string {
   const home = mkdtempSync(join(tmpdir(), "lcm-runtime-paths-"));
   homes.push(home);
   return home;
+}
+
+function processStartTime(pid = process.pid): string | null {
+  try {
+    const content = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = content.lastIndexOf(")");
+    if (commandEnd < 0) return null;
+    return content.slice(commandEnd + 2).trim().split(/\s+/u)[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writeBootstrapLock(
+  home: string,
+  owner: { pid: number; processStartTime: string | null },
+  nonce = "0123456789abcdef0123456789abcdef",
+): string {
+  const content = `${JSON.stringify({
+    version: 1,
+    pid: owner.pid,
+    processStartTime: owner.processStartTime,
+    nonce,
+  })}\n`;
+  const path = join(home, ".lcm-root-bootstrap.lock");
+  writeFileSync(path, content, { mode: 0o600 });
+  chmodSync(path, 0o600);
+  return content;
 }
 
 function canonical(value: unknown): string {
@@ -160,6 +189,80 @@ describe("runtime paths", () => {
       to: lcmHomeDir(home),
     });
     expect(bootstrapLcmHome(home)).toMatchObject({ created: false, migrated: false });
+  });
+
+  it("uses the trusted non-Linux process-birth witness", () => {
+    const expected = "darwin-birth-witness";
+    const observed = trustedProcessStartTime(process.pid, (event, _path, mutable) => {
+      if (event === "platform" && mutable) mutable.value = "darwin";
+      if (event === "after-process-birth-command" && mutable) mutable.value = expected;
+    });
+
+    expect(observed).toBe(expected);
+  });
+
+  it("accepts a trusted non-numeric process-birth witness and reclaims on mismatch", () => {
+    const home = makeHome();
+    const content = writeBootstrapLock(home, {
+      pid: process.pid,
+      processStartTime: "darwin-birth-witness",
+    });
+
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(false);
+    expect(content).toContain('"processStartTime":"darwin-birth-witness"');
+  });
+
+  it("recovers a bootstrap lock left by a definitively dead owner", () => {
+    const home = makeHome();
+    const lockPath = join(home, ".lcm-root-bootstrap.lock");
+    writeFileSync(lockPath, JSON.stringify({
+      version: 1,
+      pid: process.pid + 1_000_000,
+      processStartTime: "1",
+      nonce: "0123456789abcdef0123456789abcdef",
+    }) + "\n", { mode: 0o600 });
+    chmodSync(lockPath, 0o600);
+
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
+    expect(existsSync(lockPath)).toBe(false);
+    expect(statSync(lcmHomeDir(home)).mode & 0o777).toBe(0o700);
+  });
+
+  it("preserves a bootstrap lock owned by a live matching process", () => {
+    const home = makeHome();
+    const content = writeBootstrapLock(home, {
+      pid: process.pid,
+      processStartTime: processStartTime(),
+    });
+
+    expect(() => bootstrapLcmHome(home)).toThrow(
+      processStartTime() === null ? "owner state is ambiguous" : "already in progress",
+    );
+    expect(readFileSync(join(home, ".lcm-root-bootstrap.lock"), "utf8")).toBe(content);
+  });
+
+  it("reclaims a bootstrap lock whose live PID has a mismatched start witness", () => {
+    const home = makeHome();
+    const content = writeBootstrapLock(home, {
+      pid: process.pid,
+      processStartTime: "0",
+    });
+
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(false);
+    expect(content).toContain('"processStartTime":"0"');
+  });
+
+  it("fails closed for an unavailable PID start witness", () => {
+    const home = makeHome();
+    const content = writeBootstrapLock(home, {
+      pid: process.pid,
+      processStartTime: null,
+    });
+
+    expect(() => bootstrapLcmHome(home)).toThrow("owner state is ambiguous");
+    expect(readFileSync(join(home, ".lcm-root-bootstrap.lock"), "utf8")).toBe(content);
   });
 
   it("rejects an existing active root with a non-private mode", () => {

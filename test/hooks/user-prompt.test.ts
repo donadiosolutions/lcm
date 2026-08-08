@@ -159,6 +159,150 @@ describe("handleUserPromptSubmit", () => {
     expect(result.stdout).not.toContain("<memory-context>");
   });
 
+  it("repairs non-Codex hooks for an eventless prompt after publication admission", async () => {
+    const order: string[] = [];
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+      order.push("fence");
+    });
+    const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {
+      order.push("repair");
+    });
+    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
+    mockExtractUserPromptEvents.mockReturnValueOnce([]);
+    mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj", session_id: "s1" }),
+        asDaemonClient({ post: vi.fn() }),
+        3737,
+        { backend: "sqlite" },
+      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      expect(order).toEqual(["fence", "repair", "fence", "fence"]);
+    } finally {
+      fence.mockRestore();
+      repair.mockRestore();
+      select.mockRestore();
+    }
+  });
+
+  it("repairs non-Codex hooks when events have no session to enqueue", async () => {
+    const event = { type: "decision", category: "decision", data: "choice", priority: 1 };
+    const order: string[] = [];
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents");
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+      order.push("fence");
+    });
+    const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {
+      order.push("repair");
+    });
+    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
+    mockExtractUserPromptEvents.mockReturnValueOnce([event]);
+    mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        asDaemonClient({ post: vi.fn() }),
+        3737,
+        { backend: "sqlite" },
+      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      expect(append).not.toHaveBeenCalled();
+      expect(order).toEqual(["fence", "repair", "fence", "fence"]);
+    } finally {
+      append.mockRestore();
+      fence.mockRestore();
+      repair.mockRestore();
+      select.mockRestore();
+    }
+  });
+
+  it.each([
+    ["payload", { client: "codex" }, undefined],
+    ["environment", {}, "codex"],
+  ])("does not repair hooks for a Codex UserPromptSubmit identified by %s", async (_source, clientInput, envClient) => {
+    const previousClient = process.env.LCM_CLIENT;
+    if (envClient === undefined) delete process.env.LCM_CLIENT;
+    else process.env.LCM_CLIENT = envClient;
+    const event = { type: "decision", category: "decision", data: "choice", priority: 1 };
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents")
+      .mockResolvedValueOnce({ inserted: 1, pendingCount: 1 });
+    const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {});
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
+    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
+    mockExtractUserPromptEvents.mockReturnValueOnce([event]);
+    mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj", session_id: "s1", ...clientInput }),
+        asDaemonClient({ post: vi.fn() }),
+        3737,
+        { backend: "sqlite" },
+      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      expect(append).toHaveBeenCalledTimes(1);
+      expect(repair).not.toHaveBeenCalled();
+    } finally {
+      append.mockRestore();
+      repair.mockRestore();
+      fence.mockRestore();
+      select.mockRestore();
+      if (previousClient === undefined) delete process.env.LCM_CLIENT;
+      else process.env.LCM_CLIENT = previousClient;
+    }
+  });
+
+  it("does not repair hooks after local enqueue fails", async () => {
+    const event = { type: "decision", category: "decision", data: "choice", priority: 1 };
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents")
+      .mockRejectedValueOnce(new Error("enqueue failed"));
+    const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {});
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
+    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
+    mockExtractUserPromptEvents.mockReturnValueOnce([event]);
+    mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj", session_id: "s1" }),
+        asDaemonClient({ post: vi.fn() }),
+        3737,
+        { backend: "sqlite" },
+      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      expect(append).toHaveBeenCalledTimes(1);
+      expect(repair).not.toHaveBeenCalled();
+    } finally {
+      append.mockRestore();
+      repair.mockRestore();
+      fence.mockRestore();
+      select.mockRestore();
+    }
+  });
+
+  it("does not repair hooks when post-enqueue publication admission is blocked", async () => {
+    const event = { type: "decision", category: "decision", data: "choice", priority: 1 };
+    const publicationError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "publication remains unresolved",
+    );
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents")
+      .mockResolvedValueOnce({ inserted: 1, pendingCount: 1 });
+    const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {});
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence")
+      .mockImplementationOnce(() => { throw publicationError; });
+    mockExtractUserPromptEvents.mockReturnValueOnce([event]);
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj", session_id: "s1" }),
+        asDaemonClient({ post: vi.fn() }),
+        3737,
+        { backend: "sqlite" },
+      )).rejects.toBe(publicationError);
+      expect(append).toHaveBeenCalledTimes(1);
+      expect(repair).not.toHaveBeenCalled();
+    } finally {
+      append.mockRestore();
+      repair.mockRestore();
+      fence.mockRestore();
+    }
+  });
+
   it("returns learning-instruction when daemon unreachable", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: false, port: 3737, spawned: false });
     const client = { health: vi.fn(), post: vi.fn() };

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -320,6 +320,90 @@ describe("BackendPublicationCoordinator", () => {
       ...inputFor(input),
       publicationId: "publication-3",
     })).resolves.toMatchObject({ phase: "prepared" });
+  });
+
+  it("retains terminal journal evidence when observation fails after history is archived", async () => {
+    const home = makeHome();
+    const input = material();
+    const first = makeDriver(input);
+    await coordinator(home, first.driver).prepare(inputFor(input));
+    const completed = await coordinator(home, first.driver).resume();
+    const archivePath = join(
+      backendPublicationDirectory(home),
+      "history",
+      completed.publicationId + "." + completed.checksumSha256 + ".json",
+    );
+
+    const second = makeDriver(input);
+    second.driver.observeLocalState = vi.fn(async () => {
+      throw new Error("crash:observe-after-archive");
+    });
+    const nextInput = { ...inputFor(input), publicationId: "publication-2" };
+    await expect(coordinator(home, second.driver).prepare(nextInput))
+      .rejects.toThrow("crash:observe-after-archive");
+
+    expect(readBackendPublicationJournal(home)).toMatchObject({
+      phase: "completed",
+      publicationId: "publication-1",
+    });
+    expect(existsSync(archivePath)).toBe(true);
+    expect(() => assertBackendPublicationConsumerAccess({ homeDir: home, backend: "postgresql" })).not.toThrow();
+
+    second.driver.observeLocalState = vi.fn(async () => sourceState(input));
+    await expect(coordinator(home, second.driver).prepare(nextInput))
+      .resolves.toMatchObject({ phase: "prepared", publicationId: "publication-2" });
+    expect(existsSync(archivePath)).toBe(true);
+  });
+
+  it("leaves the prior terminal journal active when replacement publication fails", async () => {
+    const home = makeHome();
+    const input = material();
+    const first = makeDriver(input);
+    await coordinator(home, first.driver).prepare(inputFor(input));
+    const completed = await coordinator(home, first.driver).resume();
+    const archivePath = join(
+      backendPublicationDirectory(home),
+      "history",
+      completed.publicationId + "." + completed.checksumSha256 + ".json",
+    );
+    const second = makeDriver(input);
+    const nextInput = { ...inputFor(input), publicationId: "publication-2" };
+
+    await expect(coordinator(home, second.driver, (event) => {
+      if (event === "before-journal-write") throw new Error("crash:before-replacement");
+    }).prepare(nextInput)).rejects.toThrow("crash:before-replacement");
+
+    expect(readBackendPublicationJournal(home)).toMatchObject({
+      phase: "completed",
+      publicationId: "publication-1",
+    });
+    expect(existsSync(archivePath)).toBe(true);
+    await expect(coordinator(home, second.driver).prepare(nextInput))
+      .resolves.toMatchObject({ phase: "prepared", publicationId: "publication-2" });
+  });
+
+  it("keeps a durably published preparing replacement after the post-write crash boundary", async () => {
+    const home = makeHome();
+    const input = material();
+    const first = makeDriver(input);
+    await coordinator(home, first.driver).prepare(inputFor(input));
+    const completed = await coordinator(home, first.driver).resume();
+    const archivePath = join(
+      backendPublicationDirectory(home),
+      "history",
+      completed.publicationId + "." + completed.checksumSha256 + ".json",
+    );
+    const second = makeDriver(input);
+    await expect(coordinator(home, second.driver, (event) => {
+      if (event === "after-journal-write") throw new Error("crash:after-replacement");
+    }).prepare({ ...inputFor(input), publicationId: "publication-2" }))
+      .rejects.toThrow("crash:after-replacement");
+
+    expect(readBackendPublicationJournal(home)).toMatchObject({
+      phase: "preparing",
+      publicationId: "publication-2",
+    });
+    expect(existsSync(archivePath)).toBe(true);
   });
 
   it("resumes idempotently from already-published local state and retains material", async () => {
@@ -1116,7 +1200,7 @@ describe("BackendPublicationCoordinator", () => {
     await coordinator(home, fake.driver).prepare(inputFor(input));
     const publishMap = fake.driver.publishProjectMap;
     fake.driver.publishProjectMap = async (mutation) => {
-      const witness = await publishMap(mutation);
+      await publishMap(mutation);
       throw new Error("crash:after-map");
     };
     await expect(coordinator(home, fake.driver).resume()).rejects.toThrow("crash:after-map");
@@ -1168,7 +1252,7 @@ describe("BackendPublicationCoordinator", () => {
     await coordinator(home, fake.driver).prepare(inputFor(input));
     const originalPublishConfig = fake.driver.publishConfig;
     fake.driver.publishConfig = async (mutation) => {
-      const result = await originalPublishConfig(mutation);
+      await originalPublishConfig(mutation);
       throw new Error("crash:after-config");
     };
     await expect(coordinator(home, fake.driver).resume()).rejects.toThrow("crash:after-config");
@@ -1947,6 +2031,47 @@ describe("BackendPublicationCoordinator", () => {
     expect(fake.getState()).toEqual(sourceState(input));
   });
 
+  it("replays abort cleanup after material deletion before the aborted checkpoint", async () => {
+    const { home, input, fake } = await preparedFixture();
+    const materialPath = join(backendPublicationDirectory(home), "publication-1.material");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalUnlink = nodeFs.unlinkSync as (path: string) => void;
+    const crash = Object.assign(new Error("crash:after-material-delete"), { code: "EIO" });
+    let injected = false;
+
+    await expect(withPatchedFsAsync("unlinkSync", ((candidate: string) => {
+      if (!injected && candidate === materialPath) {
+        injected = true;
+        originalUnlink(candidate);
+        throw crash;
+      }
+      return originalUnlink(candidate);
+    }) as never, async () => coordinator(home, fake.driver).abort()))
+      .rejects.toThrow("crash:after-material-delete");
+    expect(readBackendPublicationJournal(home)?.phase).toBe("abort-releasing");
+    expect(existsSync(materialPath)).toBe(false);
+
+    const aborted = await coordinator(home, fake.driver).abort();
+    expect(aborted.phase).toBe("aborted");
+    expect(existsSync(materialPath)).toBe(false);
+    await expect(coordinator(home, fake.driver).recoverPending()).resolves.toEqual(aborted);
+    expect(fake.getState()).toEqual(sourceState(input));
+  });
+
+  it("fails closed when abort material is missing or tampered before cleanup", async () => {
+    const missing = await preparedFixture();
+    const missingPath = join(backendPublicationDirectory(missing.home), "publication-1.material");
+    rmSync(missingPath);
+    await expect(coordinator(missing.home, missing.fake.driver).abort()).rejects.toThrow();
+    expect(readBackendPublicationJournal(missing.home)?.phase).toBe("aborting");
+
+    const tampered = await preparedFixture();
+    const tamperedPath = join(backendPublicationDirectory(tampered.home), "publication-1.material");
+    writeFileSync(tamperedPath, "tampered", { mode: 0o600 });
+    await expect(coordinator(tampered.home, tampered.fake.driver).abort())
+      .rejects.toMatchObject({ reason: "checksum-mismatch" });
+  });
+
   it("resumes a parked active-fence abort-releasing journal to aborted", async () => {
     const { home, input, fake, getFence } = await releasingFixture();
     await expect(coordinator(home, fake.driver, (event) => {
@@ -2025,27 +2150,18 @@ describe("BackendPublicationCoordinator", () => {
     const first = makeDriver(input);
     await coordinator(home, first.driver).prepare(inputFor(input));
     const completed = await coordinator(home, first.driver).resume();
-    const journalPath = backendPublicationJournalPath(home);
     const archivePath = join(
       backendPublicationDirectory(home),
       "history",
       completed.publicationId + "." + completed.checksumSha256 + ".json",
     );
-    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
-    const originalUnlink = nodeFs.unlinkSync as (path: string) => void;
-    const unlinkFailure = Object.assign(new Error("crash:archive-consume"), { code: "EIO" });
-    let injected = false;
     const second = makeDriver(input);
-    await expect(withPatchedFsAsync("unlinkSync", ((candidate: string) => {
-      if (!injected && candidate === journalPath) {
-        injected = true;
-        throw unlinkFailure;
-      }
-      return originalUnlink(candidate);
-    }) as never, async () => coordinator(home, second.driver).prepare({
+    await expect(coordinator(home, second.driver, (event) => {
+      if (event === "before-journal-write") throw new Error("crash:before-replacement-replay");
+    }).prepare({
       ...inputFor(input),
       publicationId: "publication-2",
-    }))).rejects.toThrow("crash:archive-consume");
+    })).rejects.toThrow("crash:before-replacement-replay");
     expect(existsSync(archivePath)).toBe(true);
     expect(readBackendPublicationJournal(home)?.phase).toBe("completed");
     await expect(coordinator(home, second.driver).prepare({
@@ -2068,6 +2184,11 @@ describe("BackendPublicationCoordinator", () => {
       publicationId: "publication-2",
     }))).rejects.toThrow(archiveLinkFailure);
     errorNodeFs.linkSync = originalLink;
+    expect(readBackendPublicationJournal(errorHome)?.phase).toBe("completed");
+    await expect(coordinator(errorHome, makeDriver(errorInput).driver).prepare({
+      ...inputFor(errorInput),
+      publicationId: "publication-2",
+    })).resolves.toMatchObject({ phase: "prepared" });
 
     const symlinkHome = makeHome();
     const symlinkInput = material();
@@ -2092,22 +2213,14 @@ describe("BackendPublicationCoordinator", () => {
     const input = material();
     const first = makeDriver(input);
     await coordinator(home, first.driver).prepare(inputFor(input));
-    const completed = await coordinator(home, first.driver).resume();
-    const journalPath = backendPublicationJournalPath(home);
+    await coordinator(home, first.driver).resume();
     const second = makeDriver(input);
-    let injected = false;
-    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
-    const originalUnlink = nodeFs.unlinkSync as (candidate: string) => void;
-    await expect(withPatchedFsAsync("unlinkSync", ((candidate: string) => {
-      if (!injected && candidate === journalPath) {
-        injected = true;
-        throw new Error("crash:archive-replay");
-      }
-      return originalUnlink(candidate);
-    }) as never, async () => coordinator(home, second.driver).prepare({
+    await expect(coordinator(home, second.driver, (event) => {
+      if (event === "before-journal-write") throw new Error("crash:archive-replay");
+    }).prepare({
       ...inputFor(input),
       publicationId: "publication-2",
-    }))).rejects.toThrow("crash:archive-replay");
+    })).rejects.toThrow("crash:archive-replay");
 
     const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
     try {
@@ -2171,6 +2284,96 @@ describe("BackendPublicationCoordinator", () => {
 });
 
 describe("revocable mutation permits", () => {
+  it("authenticates a normal 0755 HOME without tightening it for first-boot admission", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-consumer-normal-home-"));
+    roots.push(home);
+    chmodSync(home, 0o755);
+
+    withBackendPublicationConsumerLock(home, () => {
+      expect(statSync(home).mode & 0o7777).toBe(0o755);
+    });
+    expect(statSync(home).mode & 0o7777).toBe(0o755);
+  });
+
+  it("rejects unsafe or non-canonical HOME lock parents", () => {
+    const unsafeParent = mkdtempSync(join(tmpdir(), "lcm-consumer-unsafe-parent-"));
+    roots.push(unsafeParent);
+    chmodSync(unsafeParent, 0o755);
+    const unsafe = join(unsafeParent, "home");
+    mkdirSync(unsafe, { mode: 0o700 });
+    chmodSync(unsafe, 0o775);
+    expect(() => withBackendPublicationConsumerLock(unsafe, () => undefined)).toThrow();
+
+    const missingParent = mkdtempSync(join(tmpdir(), "lcm-consumer-missing-parent-"));
+    roots.push(missingParent);
+    expect(() => withBackendPublicationConsumerLock(join(missingParent, "missing"), () => undefined)).toThrow();
+
+    const actual = mkdtempSync(join(tmpdir(), "lcm-consumer-canonical-home-"));
+    const linkParent = mkdtempSync(join(tmpdir(), "lcm-consumer-canonical-parent-"));
+    const canonicalParent = mkdtempSync(join(tmpdir(), "lcm-consumer-canonical-target-"));
+    roots.push(actual, linkParent, canonicalParent);
+    const linked = join(linkParent, "home");
+    symlinkSync(actual, linked, "dir");
+    expect(() => withBackendPublicationConsumerLock(linked, () => undefined)).toThrow();
+    const parentLink = join(linkParent, "parent");
+    symlinkSync(canonicalParent, parentLink, "dir");
+    const canonicalSub = join(canonicalParent, "sub");
+    mkdirSync(canonicalSub, { mode: 0o700 });
+    const nonCanonicalHome = join(parentLink, "sub", "home");
+    mkdirSync(nonCanonicalHome, { mode: 0o700 });
+    expect(() => withBackendPublicationConsumerLock(nonCanonicalHome, () => undefined))
+      .toThrow("path is not canonical");
+
+    const stickyParentHome = mkdtempSync("/tmp/lcm-consumer-sticky-parent-");
+    roots.push(stickyParentHome);
+    withBackendPublicationConsumerLock(stickyParentHome, () => undefined);
+  });
+
+  it("fails closed when a retained HOME lock parent changes during validation", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-consumer-race-home-"));
+    roots.push(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; [key: string]: unknown };
+
+    await withPatchedFsAsync("statSync", ((candidate: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(candidate, options);
+      if (candidate === home) return { ...observed, dev: observed.dev + 1n };
+      return observed;
+    }) as never, async () => {
+      expect(() => withBackendPublicationConsumerLock(home, () => undefined))
+        .toThrow("changed during validation");
+    });
+
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    try {
+      Object.defineProperty(process, "getuid", { value: () => -1, configurable: true });
+      expect(() => withBackendPublicationConsumerLock(home, () => undefined))
+        .toThrow("lock parent is not trusted");
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+
+    const nodeFsForOwner = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalFstat = nodeFsForOwner.fstatSync as (
+      fd: number,
+      options?: { bigint?: boolean },
+    ) => { uid: bigint; [key: string]: unknown };
+    let fstatCalls = 0;
+    await withPatchedFsAsync("fstatSync", ((fd: number, options?: { bigint?: boolean }) => {
+      const observed = originalFstat(fd, options);
+      fstatCalls += 1;
+      if (fstatCalls === 1) Object.defineProperty(observed, "uid", { value: observed.uid + 1n });
+      return observed;
+    }) as never, async () => {
+      expect(() => withBackendPublicationConsumerLock(home, () => undefined))
+        .toThrow("lock parent is not trusted");
+    });
+  });
+
   it("does not create a local publication root for an absent-root consumer preflight", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-consumer-absent-root-"));
     roots.push(home);

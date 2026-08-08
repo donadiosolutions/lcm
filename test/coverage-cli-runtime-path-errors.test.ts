@@ -60,6 +60,11 @@ const fsControl = vi.hoisted(() => ({
   fdPaths: new Map<number, string>(),
 }));
 
+const processControl = vi.hoisted(() => ({
+  procStat: undefined as string | undefined,
+  procStatError: undefined as Error | undefined,
+}));
+
 vi.mock("node:fs", async () => {
   const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
   return {
@@ -190,6 +195,23 @@ vi.mock("node:fs", async () => {
     },
   };
 });
+
+vi.mock("../src/security-files.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/security-files.js")>("../src/security-files.js");
+  return {
+    ...actual,
+    readBoundedRegularFile: (...args: Parameters<typeof actual.readBoundedRegularFile>): string => {
+      const [path] = args;
+      if (path.startsWith("/proc/") && processControl.procStatError !== undefined) {
+        throw processControl.procStatError;
+      }
+      if (path.startsWith("/proc/") && processControl.procStat !== undefined) {
+        return processControl.procStat;
+      }
+      return actual.readBoundedRegularFile(...args);
+    },
+  };
+});
 import {
   bootstrapLcmHome,
   legacyLcmHomeDir,
@@ -234,6 +256,8 @@ afterEach(() => {
   fsControl.lstatCalls.clear();
   fsControl.writeZero = false;
   fsControl.fdPaths.clear();
+  processControl.procStat = undefined;
+  processControl.procStatError = undefined;
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
 
@@ -244,6 +268,60 @@ function legacyHome(): { home: string; legacy: string; next: string } {
   mkdirSync(legacy, { recursive: true });
   writeFileSync(join(legacy, "value.txt"), "value");
   return { home, legacy, next: lcmHomeDir(home) };
+}
+
+function processStartTime(pid = process.pid): string | null {
+  try {
+    const content = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = content.lastIndexOf(")");
+    if (commandEnd < 0) return null;
+    return content.slice(commandEnd + 2).trim().split(/\s+/u)[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writeBootstrapLock(
+  home: string,
+  owner: { pid: number; processStartTime: string | null },
+  nonce = "0123456789abcdef0123456789abcdef",
+): string {
+  const content = `${JSON.stringify({
+    version: 1,
+    pid: owner.pid,
+    processStartTime: owner.processStartTime,
+    nonce,
+  })}\n`;
+  const path = join(home, ".lcm-root-bootstrap.lock");
+  writeFileSync(path, content, { mode: 0o600 });
+  chmodSync(path, 0o600);
+  return content;
+}
+
+function writeBootstrapReclaimClaim(
+  home: string,
+  staleContent: string,
+  owner: { pid: number; processStartTime: string | null },
+  overrides: Record<string, unknown> = {},
+): string {
+  const lockPath = join(home, ".lcm-root-bootstrap.lock");
+  const stale = JSON.parse(staleContent) as { nonce: string };
+  const stat = lstatSync(lockPath, { bigint: true });
+  const payload = {
+    version: 1,
+    pid: owner.pid,
+    processStartTime: owner.processStartTime,
+    nonce: "abcdef0123456789abcdef0123456789",
+    sourceDev: String(stat.dev),
+    sourceIno: String(stat.ino),
+    sourceContentSha256: createHash("sha256").update(staleContent).digest("hex"),
+    ...overrides,
+  };
+  const path = `${lockPath}.reclaim-${stale.nonce}`;
+  const content = `${JSON.stringify(payload)}\n`;
+  writeFileSync(path, content, { mode: 0o600 });
+  chmodSync(path, 0o600);
+  return path;
 }
 
 function nestedLegacyHome(): {
@@ -864,6 +942,52 @@ describe("runtime home rename failures", () => {
     expect(() => bootstrapLcmHome(home)).toThrow("synthetic open failure");
   });
 
+  it("cleans up a newly opened bootstrap lock that fails metadata authentication", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-new-meta-"));
+    homes.push(home);
+    const lockPath = join(home, ".lcm-root-bootstrap.lock");
+    fsControl.fstatHook = (path, stat) => path === lockPath
+      ? Object.assign(stat as object, { mode: 0o644n })
+      : stat;
+
+    expect(() => bootstrapLcmHome(home)).toThrow("new bootstrap lock did not authenticate");
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("reports a bootstrap lock content change during owned release", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-release-content-"));
+    homes.push(home);
+    const lockPath = join(home, ".lcm-root-bootstrap.lock");
+    let tampered = false;
+    fsControl.writeHook = (path) => {
+      if (!tampered && path === lockPath) {
+        tampered = true;
+        writeFileSync(path, "tampered\n", { mode: 0o600 });
+        chmodSync(path, 0o600);
+      }
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("changed before release");
+    expect(readFileSync(lockPath, "utf8")).toBe("tampered\n");
+  });
+
+  it("reports a bootstrap lock read failure during owned release", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-release-read-"));
+    homes.push(home);
+    const lockPath = join(home, ".lcm-root-bootstrap.lock");
+    let armed = false;
+    fsControl.writeHook = (path) => {
+      if (path === lockPath) {
+        armed = true;
+        fsControl.openErrorPath = lockPath;
+      }
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("changed before release");
+    expect(armed).toBe(true);
+    expect(existsSync(lockPath)).toBe(true);
+  });
+
   it("fails closed when the newly created root does not retain private metadata", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-meta-"));
     homes.push(home);
@@ -898,7 +1022,448 @@ describe("runtime home rename failures", () => {
     homes.push(home);
     writeFileSync(join(home, ".lcm-root-bootstrap.lock"), "another process\n", { mode: 0o600 });
 
-    expect(() => bootstrapLcmHome(home)).toThrow("already in progress");
+    expect(() => bootstrapLcmHome(home)).toThrow("could not be authenticated");
+  });
+
+  it("rejects a bootstrap lock with tampered owner metadata", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-tampered-"));
+    homes.push(home);
+    writeFileSync(join(home, ".lcm-root-bootstrap.lock"), `${JSON.stringify({
+      version: 1,
+      pid: process.pid + 1_000_000,
+      processStartTime: "1",
+      nonce: "0123456789abcdef0123456789abcdef",
+      extra: true,
+    })}\n`, { mode: 0o600 });
+
+    expect(() => bootstrapLcmHome(home)).toThrow("unexpected fields");
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it.each([
+    ["a non-object JSON value", "null"],
+    ["an invalid owner nonce", JSON.stringify({
+      version: 1,
+      pid: process.pid + 1_000_000,
+      processStartTime: "1",
+      nonce: "bad",
+    })],
+  ])("rejects %s in bootstrap owner metadata", (_label, serialized) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-owner-invalid-"));
+    homes.push(home);
+    writeFileSync(join(home, ".lcm-root-bootstrap.lock"), `${serialized}\n`, { mode: 0o600 });
+
+    expect(() => bootstrapLcmHome(home)).toThrow("metadata");
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it("rejects an oversized bootstrap lock without reading owner metadata", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-oversized-"));
+    homes.push(home);
+    writeFileSync(join(home, ".lcm-root-bootstrap.lock"), "x".repeat(1025), { mode: 0o600 });
+
+    expect(() => bootstrapLcmHome(home)).toThrow("exceeds the configured size limit");
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it("rejects a symlink bootstrap lock without touching its target", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-symlink-"));
+    homes.push(home);
+    const outside = join(home, "outside-lock");
+    writeFileSync(outside, "outside", { mode: 0o600 });
+    symlinkSync(outside, join(home, ".lcm-root-bootstrap.lock"));
+
+    expect(() => bootstrapLcmHome(home)).toThrow("could not be authenticated");
+    expect(readFileSync(outside, "utf8")).toBe("outside");
+  });
+
+  it("rejects a bootstrap lock with a non-owner-only mode", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-mode-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    chmodSync(join(home, ".lcm-root-bootstrap.lock"), 0o644);
+
+    expect(() => bootstrapLcmHome(home)).toThrow("file mode is not trusted");
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it("fails closed when the owner liveness permission probe is denied", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-permission-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid, processStartTime: "1" });
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+    });
+
+    try {
+      expect(() => bootstrapLcmHome(home)).toThrow("owner state is ambiguous");
+      expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it("fails closed when process-start metadata is malformed or unavailable", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-process-stat-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid, processStartTime: "1" });
+    processControl.procStat = "malformed) process stat";
+
+    expect(() => bootstrapLcmHome(home)).toThrow("owner state is ambiguous");
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it("fails closed when process stat has no command terminator", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-process-stat-shape-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid, processStartTime: "1" });
+    processControl.procStat = "malformed process stat";
+
+    expect(() => bootstrapLcmHome(home)).toThrow("owner state is ambiguous");
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it("records an unavailable process-start witness without reclaiming a lock", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-process-stat-error-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid, processStartTime: "1" });
+    processControl.procStatError = new Error("process stat unavailable");
+
+    expect(() => bootstrapLcmHome(home)).toThrow("owner state is ambiguous");
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it("can reclaim the same definitively stale lock record again after replay", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-replay-"));
+    homes.push(home);
+    const content = writeBootstrapLock(home, {
+      pid: process.pid + 1_000_000,
+      processStartTime: "1",
+    });
+
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
+    writeFileSync(join(home, ".lcm-root-bootstrap.lock"), content, { mode: 0o600 });
+    chmodSync(join(home, ".lcm-root-bootstrap.lock"), 0o600);
+
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: false, migrated: false });
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(false);
+  });
+
+  it("removes a dead recovery claim before taking over its stale lock", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-dead-claim-"));
+    homes.push(home);
+    const stale = writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = writeBootstrapReclaimClaim(home, stale, {
+      pid: process.pid + 1_000_001,
+      processStartTime: "1",
+    });
+
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
+    expect(existsSync(claimPath)).toBe(false);
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(false);
+  });
+
+  it("stops after repeated stale recovery-claim replacement", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-repeat-"));
+    homes.push(home);
+    const stale = writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = writeBootstrapReclaimClaim(home, stale, {
+      pid: process.pid + 1_000_001,
+      processStartTime: "1",
+    });
+    const claimContent = readFileSync(claimPath, "utf8");
+    let recreated = false;
+    fsControl.unlinkHook = (path) => {
+      if (!recreated && path === claimPath) {
+        recreated = true;
+        writeFileSync(claimPath, claimContent, { mode: 0o600 });
+        chmodSync(claimPath, 0o600);
+      }
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("changed repeatedly");
+    expect(existsSync(claimPath)).toBe(false);
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it.each([
+    ["malformed", "{"],
+    ["non-object", "null"],
+    ["unexpected fields", JSON.stringify({ extra: true })],
+  ])("fails closed for %s recovery-claim metadata", (_label, serialized) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-malformed-"));
+    homes.push(home);
+    const stale = writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = writeBootstrapReclaimClaim(home, stale, {
+      pid: process.pid + 1_000_001,
+      processStartTime: "1",
+    });
+    writeFileSync(claimPath, `${serialized}\n`, { mode: 0o600 });
+    chmodSync(claimPath, 0o600);
+
+    expect(() => bootstrapLcmHome(home)).toThrow("claim");
+    expect(existsSync(claimPath)).toBe(true);
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it("fails closed for a recovery claim with mismatched source evidence", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-mismatch-"));
+    homes.push(home);
+    const stale = writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = writeBootstrapReclaimClaim(home, stale, {
+      pid: process.pid + 1_000_001,
+      processStartTime: "1",
+    }, { sourceDev: "999999999" });
+
+    expect(() => bootstrapLcmHome(home)).toThrow("does not match the stale lock");
+    expect(existsSync(claimPath)).toBe(true);
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it("rejects recovery claims with malformed source metadata", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-source-"));
+    homes.push(home);
+    const stale = writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = writeBootstrapReclaimClaim(home, stale, {
+      pid: process.pid + 1_000_001,
+      processStartTime: "1",
+    }, { sourceContentSha256: "bad" });
+
+    expect(() => bootstrapLcmHome(home)).toThrow("source metadata is invalid");
+    expect(existsSync(claimPath)).toBe(true);
+  });
+
+  it("fails closed when a recovery claim owner has ambiguous liveness", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-ambiguous-"));
+    homes.push(home);
+    const stale = writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = writeBootstrapReclaimClaim(home, stale, {
+      pid: process.pid,
+      processStartTime: null,
+    });
+
+    expect(() => bootstrapLcmHome(home)).toThrow("reclaim owner state is ambiguous");
+    expect(existsSync(claimPath)).toBe(true);
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it("propagates a reclaim-claim open failure without changing the stale lock", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-open-"));
+    homes.push(home);
+    const stale = writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = `${join(home, ".lcm-root-bootstrap.lock")}.reclaim-0123456789abcdef0123456789abcdef`;
+    fsControl.openErrorPath = claimPath;
+
+    expect(() => bootstrapLcmHome(home)).toThrow("synthetic open failure");
+    expect(existsSync(claimPath)).toBe(false);
+    expect(readFileSync(join(home, ".lcm-root-bootstrap.lock"), "utf8")).toBe(stale);
+  });
+
+  it("cleans a reclaim claim after its durable write makes no progress", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-write-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    fsControl.writeZero = true;
+
+    expect(() => bootstrapLcmHome(home)).toThrow("made no progress");
+    expect(readdirSync(home).some((entry) => entry.includes(".reclaim-"))).toBe(false);
+  });
+
+  it("fails closed when a newly created reclaim claim does not authenticate", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-meta-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = `${join(home, ".lcm-root-bootstrap.lock")}.reclaim-0123456789abcdef0123456789abcdef`;
+    fsControl.fstatHook = (path, stat) => path === claimPath
+      ? Object.assign(stat as object, { mode: 0o644n })
+      : stat;
+
+    expect(() => bootstrapLcmHome(home)).toThrow("new bootstrap reclaim claim did not authenticate");
+    expect(existsSync(claimPath)).toBe(false);
+  });
+
+  it("cleans an operation-owned claim after its topology changes", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-topology-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    let claimWritten = false;
+    fsControl.writeHook = (path) => {
+      if (path.includes(".lcm-root-bootstrap.lock.reclaim-")) claimWritten = true;
+    };
+    fsControl.statHook = (path, stat) => claimWritten && path === home
+      ? Object.assign(stat as object, { ino: (stat as { ino: bigint }).ino + 1n })
+      : stat;
+
+    expect(() => bootstrapLcmHome(home)).toThrow("home directory changed during validation");
+    expect(readdirSync(home).some((entry) => entry.includes(".reclaim-"))).toBe(false);
+  });
+
+  it("preserves missing claim evidence when claim creation loses its pathname", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-missing-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    let claimPath = "";
+    let claimWritten = false;
+    fsControl.writeHook = (path) => {
+      if (path.includes(".lcm-root-bootstrap.lock.reclaim-")) {
+        claimPath = path;
+        claimWritten = true;
+        rmSync(path, { force: true });
+      }
+    };
+    fsControl.statHook = (path, stat) => claimWritten && path === home
+      ? Object.assign(stat as object, { ino: (stat as { ino: bigint }).ino + 1n })
+      : stat;
+
+    expect(() => bootstrapLcmHome(home)).toThrow("home directory changed during validation");
+    expect(claimPath).not.toBe("");
+    expect(existsSync(claimPath)).toBe(false);
+  });
+
+  it("preserves a recovery claim replaced during exact removal", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-replace-"));
+    homes.push(home);
+    const stale = writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = writeBootstrapReclaimClaim(home, stale, {
+      pid: process.pid + 1_000_001,
+      processStartTime: "1",
+    });
+    let claimFstats = 0;
+    fsControl.fstatHook = (path, stat) => {
+      if (path === claimPath && ++claimFstats === 6) {
+        rmSync(claimPath, { force: true });
+        writeFileSync(claimPath, "replacement claim\n", { mode: 0o600 });
+        chmodSync(claimPath, 0o600);
+      }
+      return stat;
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("bootstrap reclaim claim");
+    expect(readFileSync(claimPath, "utf8")).toBe("replacement claim\n");
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
+  });
+
+  it("preserves a replacement recreated after a recovery claim unlink", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-unlink-race-"));
+    homes.push(home);
+    const stale = writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = writeBootstrapReclaimClaim(home, stale, {
+      pid: process.pid + 1_000_001,
+      processStartTime: "1",
+    });
+    let replaced = false;
+    fsControl.unlinkHook = (path) => {
+      if (!replaced && path === claimPath) {
+        replaced = true;
+        writeFileSync(claimPath, "replacement claim\n", { mode: 0o600 });
+        chmodSync(claimPath, 0o600);
+      }
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("bootstrap reclaim claim");
+    expect(readFileSync(claimPath, "utf8")).toBe("replacement claim\n");
+  });
+
+  it("rejects a concurrent successor after stale-lock removal", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-successor-race-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const competitor = `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      processStartTime: processStartTime(),
+      nonce: "fedcba9876543210fedcba9876543210",
+    })}\n`;
+    fsControl.unlinkHook = (path) => {
+      if (path === join(home, ".lcm-root-bootstrap.lock")) {
+        writeFileSync(path, competitor, { mode: 0o600 });
+        chmodSync(path, 0o600);
+      }
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("claimed concurrently");
+    expect(readFileSync(join(home, ".lcm-root-bootstrap.lock"), "utf8")).toBe(competitor);
+  });
+
+  it("preserves the claim when successor publication fails and claim cleanup is ambiguous", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-successor-failure-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = `${join(home, ".lcm-root-bootstrap.lock")}.reclaim-0123456789abcdef0123456789abcdef`;
+    fsControl.unlinkHook = (path) => {
+      if (path === join(home, ".lcm-root-bootstrap.lock")) {
+        fsControl.openErrorPath = path;
+        fsControl.openErrorPattern = ".reclaim-";
+      }
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("synthetic open failure");
+    expect(existsSync(claimPath)).toBe(true);
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(false);
+  });
+
+  it("continues with a published successor when claim cleanup is ambiguous", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-claim-published-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const claimPath = `${join(home, ".lcm-root-bootstrap.lock")}.reclaim-0123456789abcdef0123456789abcdef`;
+    fsControl.unlinkHook = (path) => {
+      if (path === join(home, ".lcm-root-bootstrap.lock")) {
+        fsControl.openErrorPattern = ".reclaim-";
+      }
+    };
+
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(false);
+    expect(existsSync(claimPath)).toBe(true);
+  });
+
+  it("preserves a replacement between stale authentication and successor claim", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-replacement-"));
+    homes.push(home);
+    const lockPath = join(home, ".lcm-root-bootstrap.lock");
+    writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    const replacement = `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      processStartTime: processStartTime(),
+      nonce: "fedcba9876543210fedcba9876543210",
+    })}\n`;
+    let replaced = false;
+    fsControl.writeHook = (path) => {
+      if (!replaced && path.includes(".lcm-root-bootstrap.lock.reclaim-")) {
+        replaced = true;
+        rmSync(lockPath, { force: true });
+        writeFileSync(lockPath, replacement, { mode: 0o600 });
+        chmodSync(lockPath, 0o600);
+      }
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("changed during stale-owner recovery");
+    expect(readFileSync(lockPath, "utf8")).toBe(replacement);
+    expect(readdirSync(home).some((entry) => entry.includes(".reclaim-"))).toBe(false);
+  });
+
+  it("serializes two stale-lock contenders through one live reclaim claim", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-contenders-"));
+    homes.push(home);
+    writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
+    let contenderError: unknown;
+    let entered = false;
+    fsControl.writeHook = (path) => {
+      if (!entered && path.includes(".lcm-root-bootstrap.lock.reclaim-")) {
+        entered = true;
+        try {
+          bootstrapLcmHome(home);
+        } catch (error) {
+          contenderError = error;
+        }
+      }
+    };
+
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
+    expect(contenderError).toMatchObject({ message: expect.stringContaining("recovery is already in progress") });
+    expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(false);
   });
 
   it("fails closed when the bootstrap lock changes before release", () => {

@@ -21,12 +21,17 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { legacyLcmHomeDirname } from "./legacy-names.js";
+import { processStartTime } from "./private-mutation-lock.js";
 import {
   assertBackendPublicationConsumerAccess,
   withBackendPublicationConsumerLock,
   type BackendPublicationLockToken,
 } from "./storage/backend-publication.js";
-import { readBoundedRegularFile } from "./security-files.js";
+import {
+  consumeBoundedRegularFile,
+  readBoundedRegularFile,
+  readBoundedRegularFileWithStat,
+} from "./security-files.js";
 
 export const LCM_HOME_DIRNAME = ".lcm";
 export const LEGACY_LCM_HOME_DIRNAME = legacyLcmHomeDirname();
@@ -38,6 +43,7 @@ const MAX_MIGRATION_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_MIGRATION_TREE_BYTES = 32 * 1024 * 1024;
 const MAX_MIGRATION_TREE_ENTRIES = 8_192;
 const MAX_MIGRATION_TREE_DEPTH = 32;
+const MAX_BOOTSTRAP_LOCK_BYTES = 1024;
 const LEGACY_MIGRATION_JOURNAL_VERSION = 1 as const;
 const MIGRATION_JOURNAL_VERSION = 2 as const;
 const MIGRATION_JOURNAL_NAME = ".lcm-legacy-migration.json";
@@ -1277,17 +1283,214 @@ function bootstrapLockPath(homeDir: string): string {
   return join(resolve(homeDir), ".lcm-root-bootstrap.lock");
 }
 
+type BootstrapLockOwner = Readonly<{
+  version: 1;
+  pid: number;
+  processStartTime: string | null;
+  nonce: string;
+}>;
+
+type BootstrapLockSnapshot = Readonly<{
+  content: string;
+  identity: Identity;
+}>;
+
+type BootstrapReclaimClaim = BootstrapLockOwner & Readonly<{
+  staleDev: string;
+  staleIno: string;
+  staleContentSha256: string;
+}>;
+
+type BootstrapReclaimSnapshot = BootstrapLockSnapshot & Readonly<{
+  claim: BootstrapReclaimClaim;
+}>;
+
 type BootstrapLock = Readonly<{
   close: () => void;
 }>;
 
-function acquireBootstrapLock(homeDir: string, topology: HomeTopology): BootstrapLock {
-  assertRootParent(topology, homeDir);
-  const path = bootstrapLockPath(homeDir);
+function bootstrapLockError(detail: string): Error {
+  return new Error(
+    `LCM root bootstrap lock could not be authenticated; automatic recovery was not attempted (${detail}); inspect the lock metadata and running processes before retrying`,
+  );
+}
+
+function parseBootstrapOwnerFields(record: Record<string, unknown>, label: string): BootstrapLockOwner {
+  const version = record.version;
+  const pid = record.pid;
+  const processStartTime = record.processStartTime;
+  const nonce = record.nonce;
+  if (
+    version !== 1
+    || typeof pid !== "number"
+    || !Number.isSafeInteger(pid)
+    || pid <= 0
+    || (processStartTime !== null
+      && (typeof processStartTime !== "string" || processStartTime.length === 0))
+    || typeof nonce !== "string"
+    || !/^[a-f0-9]{32}$/u.test(nonce)
+  ) {
+    throw new Error(`${label} owner metadata is invalid`);
+  }
+  return { version: 1, pid, processStartTime, nonce };
+}
+
+function parseBootstrapLockOwner(content: string, label: string): BootstrapLockOwner {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    throw bootstrapLockError(`${label} metadata is malformed`);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw bootstrapLockError(`${label} metadata is malformed`);
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  const expected = ["nonce", "pid", "processStartTime", "version"];
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw bootstrapLockError(`${label} owner metadata has unexpected fields`);
+  }
+  return parseBootstrapOwnerFields(record, label);
+}
+
+function parseBootstrapReclaimClaim(content: string, label: string): BootstrapReclaimClaim {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    throw new Error(`${label} metadata is malformed`);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} metadata is malformed`);
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  const expected = [
+    "nonce",
+    "pid",
+    "processStartTime",
+    "sourceContentSha256",
+    "sourceDev",
+    "sourceIno",
+    "version",
+  ];
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw new Error(`${label} claim metadata has unexpected fields`);
+  }
+  const owner = parseBootstrapOwnerFields(record, label);
+  const staleDev = record.sourceDev;
+  const staleIno = record.sourceIno;
+  const staleContentSha256 = record.sourceContentSha256;
+  if (
+    typeof staleDev !== "string"
+    || !/^\d+$/u.test(staleDev)
+    || typeof staleIno !== "string"
+    || !/^\d+$/u.test(staleIno)
+    || typeof staleContentSha256 !== "string"
+    || !/^[a-f0-9]{64}$/u.test(staleContentSha256)
+  ) {
+    throw new Error(`${label} source metadata is invalid`);
+  }
+  return { ...owner, staleDev, staleIno, staleContentSha256 };
+}
+
+function readBootstrapFileSnapshot(
+  path: string,
+  homeDir: string,
+  label: string,
+): BootstrapLockSnapshot {
+  try {
+    const result = readBoundedRegularFileWithStat(path, {
+      allowedRoot: resolve(homeDir),
+      maxBytes: MAX_BOOTSTRAP_LOCK_BYTES,
+      expectedUid: currentUid(),
+      allowedModes: [PRIVATE_FILE_MODE],
+      requireSingleLink: true,
+    });
+    return {
+      content: result.content,
+      identity: { dev: result.exactDev, ino: result.exactIno },
+    };
+  } catch (error) {
+    throw bootstrapLockError(`${label}: ${String(error)}`);
+  }
+}
+
+function readBootstrapLock(
+  path: string,
+  homeDir: string,
+): BootstrapLockSnapshot & Readonly<{ owner: BootstrapLockOwner }> {
+  const snapshot = readBootstrapFileSnapshot(path, homeDir, "existing lock");
+  return { ...snapshot, owner: parseBootstrapLockOwner(snapshot.content, "bootstrap lock") };
+}
+
+function readBootstrapReclaim(
+  path: string,
+  homeDir: string,
+): BootstrapReclaimSnapshot {
+  const snapshot = readBootstrapFileSnapshot(path, homeDir, "reclaim claim");
+  return { ...snapshot, claim: parseBootstrapReclaimClaim(snapshot.content, "bootstrap reclaim claim") };
+}
+
+function sameBootstrapFile(
+  left: BootstrapLockSnapshot,
+  right: BootstrapLockSnapshot,
+): boolean {
+  return sameIdentity(left.identity, right.identity) && left.content === right.content;
+}
+
+function bootstrapOwnerState(owner: BootstrapLockOwner): "live" | "stale" | "ambiguous" {
+  try {
+    process.kill(owner.pid, 0);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | undefined)?.code === "ESRCH" ? "stale" : "ambiguous";
+  }
+  if (owner.processStartTime === null) return "ambiguous";
+  const observedStartTime = processStartTime(owner.pid);
+  if (observedStartTime === null) return "ambiguous";
+  if (observedStartTime !== owner.processStartTime) return "stale";
+  return "live";
+}
+
+function bootstrapLockContent(): Readonly<{ content: string; owner: BootstrapLockOwner }> {
+  const owner: BootstrapLockOwner = {
+    version: 1,
+    pid: process.pid,
+    processStartTime: processStartTime(process.pid),
+    nonce: randomBytes(16).toString("hex"),
+  };
+  return { content: `${JSON.stringify(owner)}\n`, owner };
+}
+
+function bootstrapReclaimClaimPath(lockPath: string, owner: BootstrapLockOwner): string {
+  return `${lockPath}.reclaim-${owner.nonce}`;
+}
+
+function bootstrapReclaimContent(
+  owner: BootstrapLockOwner,
+  stale: BootstrapLockSnapshot,
+): string {
+  return `${JSON.stringify({
+    ...owner,
+    sourceDev: stale.identity.dev,
+    sourceIno: stale.identity.ino,
+    sourceContentSha256: sha256(stale.content),
+  })}\n`;
+}
+
+function createBootstrapReclaimClaim(
+  homeDir: string,
+  topology: HomeTopology,
+  lockPath: string,
+  stale: BootstrapLockSnapshot,
+  successor: Readonly<{ content: string; owner: BootstrapLockOwner }>,
+): BootstrapReclaimSnapshot | undefined {
+  const claimPath = bootstrapReclaimClaimPath(lockPath, parseBootstrapLockOwner(stale.content, "bootstrap lock"));
   let fd: number;
   try {
     fd = openSync(
-      path,
+      claimPath,
       constants.O_WRONLY
         | constants.O_CREAT
         | constants.O_EXCL
@@ -1295,21 +1498,119 @@ function acquireBootstrapLock(homeDir: string, topology: HomeTopology): Bootstra
       PRIVATE_FILE_MODE,
     );
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error("LCM root bootstrap is already in progress; retry after it completes");
-    }
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined;
     throw error;
   }
+
+  let claimIdentity: Identity | undefined;
+  const content = bootstrapReclaimContent(successor.owner, stale);
+  try {
+    const stat = fstatSync(fd, { bigint: true }) as unknown as BigIntFileStat;
+    claimIdentity = statIdentity(stat);
+    if (!stat.isFile() || !ownerMatches(stat) || modeOf(stat) !== PRIVATE_FILE_MODE || stat.nlink !== 1n) {
+      throw new Error("new bootstrap reclaim claim did not authenticate");
+    }
+    writeBytesToDescriptor(fd, Buffer.from(content, "utf8"));
+    syncDescriptorIfSupported(fd);
+    assertRootParent(topology, homeDir);
+    syncDescriptorIfSupported(topology.home.fd);
+    closeSync(fd);
+    return {
+      content,
+      identity: claimIdentity,
+      claim: parseBootstrapReclaimClaim(content, "bootstrap reclaim claim"),
+    };
+  } catch (error) {
+    try { closeSync(fd); } catch { /* preserve the primary error */ }
+    try {
+      const current = lstatIfPresent(claimPath);
+      if (current !== undefined && claimIdentity !== undefined && sameIdentity(statIdentity(current), claimIdentity)) {
+        unlinkSync(claimPath);
+      }
+    } catch { /* preserve evidence if cleanup is ambiguous */ }
+    throw error;
+  }
+}
+
+function removeExactBootstrapFile(
+  path: string,
+  homeDir: string,
+  expected: BootstrapLockSnapshot,
+  label: string,
+): void {
+  consumeBoundedRegularFile(path, {
+    allowedRoot: resolve(homeDir),
+    maxBytes: MAX_BOOTSTRAP_LOCK_BYTES,
+    expectedUid: currentUid(),
+    allowedModes: [PRIVATE_FILE_MODE],
+    requireSingleLink: true,
+    expectedRawSha256: sha256(expected.content),
+    _beforeUnlinkForTesting: () => {
+      const current = readBootstrapFileSnapshot(path, homeDir, label);
+      if (!sameBootstrapFile(current, expected)) {
+        throw new Error(`${label} changed during exact removal`);
+      }
+    }
+  });
+}
+
+function acquireBootstrapReclaimClaim(
+  homeDir: string,
+  topology: HomeTopology,
+  lockPath: string,
+  stale: BootstrapLockSnapshot,
+  successor: Readonly<{ content: string; owner: BootstrapLockOwner }>,
+): BootstrapReclaimSnapshot {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const created = createBootstrapReclaimClaim(homeDir, topology, lockPath, stale, successor);
+    if (created !== undefined) return created;
+
+    const claimPath = bootstrapReclaimClaimPath(lockPath, parseBootstrapLockOwner(stale.content, "bootstrap lock"));
+    const existing = readBootstrapReclaim(claimPath, homeDir);
+    if (
+      existing.claim.staleDev !== stale.identity.dev
+      || existing.claim.staleIno !== stale.identity.ino
+      || existing.claim.staleContentSha256 !== sha256(stale.content)
+    ) {
+      throw new Error("bootstrap reclaim claim does not match the stale lock; retry the operation");
+    }
+    const state = bootstrapOwnerState(existing.claim);
+    if (state === "live") {
+      throw new Error("LCM root bootstrap stale-lock recovery is already in progress; retry after it completes");
+    }
+    if (state === "ambiguous") {
+      throw new Error("LCM root bootstrap reclaim owner state is ambiguous; automatic recovery was not attempted; inspect the claim and running processes before retrying");
+    }
+    removeExactBootstrapFile(claimPath, homeDir, existing, "bootstrap reclaim claim");
+  }
+  throw new Error("LCM root bootstrap stale-lock recovery changed repeatedly; retry the operation");
+}
+
+function openOwnedBootstrapLock(
+  homeDir: string,
+  topology: HomeTopology,
+  path: string,
+  content: string,
+): BootstrapLock {
+  const fd = openSync(
+    path,
+    constants.O_WRONLY
+      | constants.O_CREAT
+      | constants.O_EXCL
+      | secureOpenFlags(),
+    PRIVATE_FILE_MODE,
+  );
   let lockIdentity: Identity | undefined;
   try {
     const stat = fstatSync(fd, { bigint: true }) as unknown as BigIntFileStat;
     const identity = statIdentity(stat);
     lockIdentity = identity;
-    writeBytesToDescriptor(fd, Buffer.from(JSON.stringify({
-      pid: process.pid,
-      nonce: randomBytes(16).toString("hex"),
-      version: 1,
-    }) + "\n", "utf8"));
+    fchmodSync(fd, PRIVATE_FILE_MODE);
+    const checked = fstatSync(fd, { bigint: true }) as unknown as BigIntFileStat;
+    if (!checked.isFile() || !ownerMatches(checked) || modeOf(checked) !== PRIVATE_FILE_MODE || checked.nlink !== 1n) {
+      throw new Error("new bootstrap lock did not authenticate");
+    }
+    writeBytesToDescriptor(fd, Buffer.from(content, "utf8"));
     syncDescriptorIfSupported(fd);
     assertRootParent(topology, homeDir);
     return {
@@ -1319,6 +1620,13 @@ function acquireBootstrapLock(homeDir: string, topology: HomeTopology): Bootstra
         if (current === undefined || !sameIdentity(statIdentity(current), identity)) {
           throw new Error("LCM root bootstrap lock changed before release");
         }
+        let currentContent: string;
+        try {
+          currentContent = readBootstrapFileSnapshot(path, homeDir, "bootstrap lock").content;
+        } catch {
+          throw new Error("LCM root bootstrap lock changed before release");
+        }
+        if (currentContent !== content) throw new Error("LCM root bootstrap lock changed before release");
         unlinkSync(path);
         syncDescriptorIfSupported(topology.home.fd);
       },
@@ -1333,6 +1641,71 @@ function acquireBootstrapLock(homeDir: string, topology: HomeTopology): Bootstra
     } catch { /* preserve evidence if cleanup is ambiguous */ }
     throw error;
   }
+}
+
+function reclaimBootstrapLock(
+  homeDir: string,
+  topology: HomeTopology,
+  path: string,
+  stale: BootstrapLockSnapshot,
+  successor: Readonly<{ content: string; owner: BootstrapLockOwner }>,
+): BootstrapLock {
+  const claim = acquireBootstrapReclaimClaim(homeDir, topology, path, stale, successor);
+  let successorPublished = false;
+  try {
+    assertRootParent(topology, homeDir);
+    const current = readBootstrapLock(path, homeDir);
+    if (!sameBootstrapFile(current, stale)) {
+      throw new Error("bootstrap lock changed during stale-owner recovery; retry the operation");
+    }
+    removeExactBootstrapFile(path, homeDir, stale, "stale bootstrap lock");
+    let lock: BootstrapLock;
+    try {
+      lock = openOwnedBootstrapLock(homeDir, topology, path, successor.content);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === "EEXIST") {
+        throw new Error("LCM root bootstrap lock was claimed concurrently; retry the operation");
+      }
+      throw error;
+    }
+    successorPublished = true;
+    return lock;
+  } finally {
+    try {
+      removeExactBootstrapFile(
+        bootstrapReclaimClaimPath(path, parseBootstrapLockOwner(stale.content, "bootstrap lock")),
+        homeDir,
+        claim,
+        "bootstrap reclaim claim",
+      );
+      syncDescriptorIfSupported(topology.home.fd);
+    } catch (error) {
+      // A published successor is authoritative; preserve the claim as evidence
+      // rather than reporting acquisition failure after the protected lock exists.
+      if (!successorPublished) throw error;
+    }
+  }
+}
+
+function acquireBootstrapLock(homeDir: string, topology: HomeTopology): BootstrapLock {
+  assertRootParent(topology, homeDir);
+  const path = bootstrapLockPath(homeDir);
+  const successor = bootstrapLockContent();
+  try {
+    return openOwnedBootstrapLock(homeDir, topology, path, successor.content);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+
+  const existing = readBootstrapLock(path, homeDir);
+  const state = bootstrapOwnerState(existing.owner);
+  if (state === "live") {
+    throw new Error("LCM root bootstrap is already in progress; retry after it completes");
+  }
+  if (state === "ambiguous") {
+    throw new Error("LCM root bootstrap owner state is ambiguous; automatic recovery was not attempted; inspect the lock metadata and running processes before retrying");
+  }
+  return reclaimBootstrapLock(homeDir, topology, path, existing, successor);
 }
 
 function withPublicationAdmission<T>(homeDir: string, callback: (admission: PublicationAdmission) => T): T {

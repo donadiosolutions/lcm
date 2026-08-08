@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -114,6 +115,14 @@ describe("project map", () => {
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
     resetLcmHome();
+  });
+
+  it("keeps project-map publication lock scopes free of shadowed token parameters", () => {
+    expect(() => execFileSync(
+      join(process.cwd(), "node_modules/.bin/eslint"),
+      ["src/project-map.ts", "--rule", "no-shadow:error"],
+      { stdio: "pipe" },
+    )).not.toThrow();
   });
 
   afterEach(() => {

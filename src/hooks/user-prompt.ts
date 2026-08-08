@@ -116,6 +116,10 @@ export async function handleUserPromptSubmit(
       return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
     }
     let notification: PromoteEventsNotification | undefined;
+    // Hook repair is allowed when no local enqueue is needed, and only after
+    // a required enqueue completes. A failed enqueue must not be followed by
+    // settings mutation that was intended to occur after durable admission.
+    let hookRepairAllowed = true;
 
     // Sidecar event extraction — must happen before prompt-search, must never throw
     try {
@@ -134,12 +138,14 @@ export async function handleUserPromptSubmit(
       }
 
       if (events.length > 0 && input.session_id && typeof input.session_id === "string") {
+        hookRepairAllowed = false;
         const enqueueResult = await appendLocalHookEvents({
           cwd,
           sessionId: input.session_id,
           events,
           sourceHook: "UserPromptSubmit",
         });
+        hookRepairAllowed = true;
         const priority = Math.min(...events.map(event => event.priority));
         notification = {
           cwd,
@@ -152,13 +158,6 @@ export async function handleUserPromptSubmit(
         // durable local enqueue, including when the publication is unresolved.
         assertHookPublicationFence();
         ensureProjectDir(cwd);
-
-        // Hook repair mutates settings and therefore belongs after durable
-        // local admission. It has its own short fence; dispatch must not run
-        // it before this handler reaches the enqueue boundary.
-        const { validateAndFixHooks } = await import("./auto-heal.js");
-        assertHookPublicationFence();
-        validateAndFixHooks();
       }
     } catch (e) {
       if (isBackendPublicationJournalError(e)) {
@@ -169,6 +168,18 @@ export async function handleUserPromptSubmit(
         cwd: input.cwd ?? process.env.CLAUDE_PROJECT_DIR,
         sessionId: input.session_id,
       });
+    }
+
+    // UserPromptSubmit is excluded from dispatcher-level repair so local
+    // events can cross their durable boundary first. Repair every non-Codex
+    // invocation here, after the optional enqueue/no-enqueue decision and its
+    // explicit success state, with a short publication fence immediately
+    // before the settings mutation.
+    const hookClient = typeof input.client === "string" ? input.client : process.env.LCM_CLIENT;
+    if (hookRepairAllowed && hookClient !== "codex") {
+      assertHookPublicationFence();
+      const { validateAndFixHooks } = await import("./auto-heal.js");
+      validateAndFixHooks();
     }
 
     let effectiveStorage = storage;

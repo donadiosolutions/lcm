@@ -85,9 +85,9 @@ export function trustedProcessBirthExecutableForTesting(
   return trustedProcessBirthExecutable(currentPlatform, systemRoot);
 }
 
-function processStartTime(
+export function processStartTime(
   pid: number,
-  observer: PrivateMutationLockObserver,
+  observer: PrivateMutationLockObserver = NOOP_PRIVATE_MUTATION_LOCK_OBSERVER,
 ): string | null {
   const currentPlatform = { value: platform() };
   observer("platform", "", currentPlatform);

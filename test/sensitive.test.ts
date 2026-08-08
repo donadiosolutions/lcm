@@ -52,6 +52,8 @@ import {
   type BackendPublicationRecoveryMaterial,
 } from "../src/storage/backend-publication.js";
 import { ConfigValidationError } from "../src/daemon/config.js";
+import * as backendPublication from "../src/storage/backend-publication.js";
+import * as storageBackend from "../src/storage/backend.js";
 
 function recoveryFile(content: string): BackendPublicationRecoveryFile {
   return {
@@ -380,6 +382,27 @@ describe("lcm sensitive", () => {
     const r = await handleSensitive(["purge", "--yes"], cwd, configPath);
     expect(r.exitCode).toBe(0);
     expect(existsSync(pDir)).toBe(false);
+  });
+
+  it("purge --yes: binds selection and the consumer lock to an alternate canonical home", async () => {
+    writeConfigFile(configPath, JSON.stringify({ storage: { backend: "sqlite" } }));
+    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementation((config) => {
+      if (config.homeDir !== tempBase) throw new Error("ambient publication home conflict");
+      return { backend: "sqlite" };
+    });
+    const consumerLock = vi.spyOn(backendPublication, "withBackendPublicationConsumerLockAsync");
+    try {
+      await expect(handleSensitive(["purge", "--yes"], cwd, configPath)).resolves.toMatchObject({
+        exitCode: 0,
+        stdout: expect.stringContaining("Purged project data"),
+      });
+      expect(select).toHaveBeenCalledWith({ backend: "sqlite", homeDir: tempBase });
+      expect(consumerLock).toHaveBeenCalledWith(tempBase, expect.any(Function));
+      expect(existsSync(pDir)).toBe(false);
+    } finally {
+      select.mockRestore();
+      consumerLock.mockRestore();
+    }
   });
 
   it("purge --yes: succeeds when project data is already absent", async (): Promise<void> => {

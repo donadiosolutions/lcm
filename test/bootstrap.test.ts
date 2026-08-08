@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { EnsureCoreDeps } from "../src/bootstrap.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../src/daemon/config.js";
 import { canonicalHookCommand, mergeClaudeSettings } from "../src/installer/settings.js";
+import * as storageBackend from "../src/storage/backend.js";
 
 const defaultDaemon = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true }));
 const homeMock = vi.hoisted(() => ({ homeDir: "" }));
@@ -178,6 +179,31 @@ describe("ensureCore", () => {
       if (previousCa === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
       else process.env.LCM_POSTGRES_CA_FILE = previousCa;
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("binds alternate canonical config admission to its own publication home", async () => {
+    const alternateHome = mkdtempSync(join(tmpdir(), "lcm-bootstrap-alternate-home-"));
+    const alternateRoot = join(alternateHome, ".lcm");
+    const alternateConfigPath = join(alternateRoot, "config.json");
+    mkdirSync(alternateRoot, { mode: 0o700 });
+    writeFileSync(alternateConfigPath, JSON.stringify({ storage: { backend: "sqlite" } }), { mode: 0o600 });
+    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementation((config) => {
+      if (config.homeDir !== alternateHome) throw new Error("ambient publication home conflict");
+      return { backend: "sqlite" };
+    });
+    const deps = makeDeps({
+      configPath: alternateConfigPath,
+      existsSync: fsExistsSync,
+    });
+
+    try {
+      await expect((await import("../src/bootstrap.js")).ensureCoreEndpoint(deps))
+        .resolves.toMatchObject({ connected: true });
+      expect(select).toHaveBeenCalledWith({ backend: "sqlite", homeDir: alternateHome });
+    } finally {
+      select.mockRestore();
+      rmSync(alternateHome, { recursive: true, force: true });
     }
   });
 

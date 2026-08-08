@@ -239,6 +239,20 @@ open flags where the platform provides them. Configuration reads and writes
 are bounded and descriptor-aware; a config symlink, non-regular file, or
 oversized file is rejected before mutation.
 
+Bootstrap admission also uses an owner-only, bounded lock file in the home
+directory. A lock record created by the current runtime includes the owner PID,
+nonce, and process-start witness. If a later bootstrap finds that record and the
+owner probe returns `ESRCH`, it may automatically recover the stale lock only
+after authenticating the file and binding a successor claim to the exact lock
+identity and bytes. This is intended to recover from a process that was killed
+or crashed while the root was absent. A live PID, PID reuse, missing or
+unsupported process-start data, permission errors, malformed or tampered
+metadata, oversized files, wrong modes, hard links, and symlink substitutions
+remain fail-closed and preserve the lock as evidence. If recovery reports
+ambiguous owner state, inspect the lock metadata and the recorded process state
+with normal filesystem/process diagnostics, then retry after the ambiguity is
+resolved. Do not delete, chmod, replace, or repair the bootstrap lock by hand.
+
 The installer refuses to establish an active root while the legacy
 `~/.lossless-claude` state directory exists. An explicit migration is required
 so two roots cannot silently become competing authorities. Legacy migration is

@@ -34,8 +34,6 @@ import {
   assertBackendPublicationProjectMapAccess,
   assertBackendPublicationProjectMapMutation,
   assertBackendPublicationPermit,
-  backendPublicationCanonicalSha256,
-  backendPublicationHomeForConfigPath,
   BackendPublicationJournalError,
   captureBackendPublicationState,
   withBackendPublicationConsumerLock,
@@ -108,11 +106,11 @@ function withProjectMapMutationLock<T>(
   permit?: PrivateMutationPermit,
 ): T {
   const lockPath = projectMapMutationLockPath(homeDir);
-  return withBackendPublicationConsumerLock(homeDir, (publicationLockToken) =>
+  return withBackendPublicationConsumerLock(homeDir, (activePublicationLockToken) =>
     withPrivateMutationLock(lockPath, "project map", () => {
       activeProjectMapMutationLocks.add(lockPath);
       try {
-        return callback(publicationLockToken);
+        return callback(activePublicationLockToken);
       } finally {
         activeProjectMapMutationLocks.delete(lockPath);
       }

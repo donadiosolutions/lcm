@@ -158,7 +158,7 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
   }
 
   // 3. Start daemon if not running
-  selectStorageBackend(config.storage);
+  selectStorageBackend({ ...config.storage, homeDir: publicationHome });
   const result = await deps.ensureDaemon({
     port: config.daemon.port,
     pidFilePath: join(dirname(deps.configPath), "daemon.pid"),
