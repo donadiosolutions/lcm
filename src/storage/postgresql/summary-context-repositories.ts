@@ -18,6 +18,7 @@ import { StorageOperationError } from "../errors.js";
 import type {
   PostgreSqlOperationContext,
   PostgreSqlQueryExecutor,
+  PostgreSqlTransactionOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
 import {
@@ -75,7 +76,7 @@ export interface PostgreSqlSummaryContextRepositoryOptions {
 
 type MutationDomain = "summaries" | "context";
 
-type MutationContext = PostgreSqlOperationContext & {
+type MutationContext = PostgreSqlTransactionOptions & {
   readonly domain: MutationDomain;
   readonly projectId: string;
   readonly signal?: AbortSignal;
@@ -85,7 +86,7 @@ export interface PostgreSqlSummaryContextExecutor
 extends PostgreSqlQueryExecutor {
   transaction<T>(
     callback: (transaction: PostgreSqlTransactionScopeExecutor) => Promise<T>,
-    options: PostgreSqlOperationContext & {
+    options: PostgreSqlTransactionOptions & {
       readonly projectId: string;
       readonly signal?: AbortSignal;
     },
@@ -850,12 +851,7 @@ class RepositoryCore {
         while (true) {
           try {
             return await root.transaction(
-              async (transaction) => {
-                await transaction.query({
-                  text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-                }, this.context(domain, operation));
-                return callback(transaction);
-              },
+              callback,
               this.context(domain, operation),
             );
           } catch (error) {
@@ -900,10 +896,6 @@ class RepositoryCore {
     ): Promise<T> => {
       if (nested) {
         await this.assertReadCommitted(transaction, domain, operation);
-      } else {
-        await transaction.query({
-          text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-        }, this.context(domain, operation));
       }
       await this.acquireConversationLock(
         transaction,

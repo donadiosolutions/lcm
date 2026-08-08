@@ -1100,16 +1100,14 @@ export class PostgreSqlPassiveEventRepository {
       && typeof this.executor.transaction === "function"
     ) {
       const transactional = this.executor as PostgreSqlCoordinationExecutor;
-      return transactional.transaction(async (transaction) => {
-        await transaction.query({
-          text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-        }, this.options(operation, signal));
+      return transactional.transaction((transaction) => {
         return callback(transaction, transaction);
       }, {
         domain: "coordination",
         operation,
         projectId: this.projectId,
         machineId: this.machineId,
+        transactionMode: "read-committed-read-write",
         ...(signal === undefined ? {} : { signal }),
       });
     }

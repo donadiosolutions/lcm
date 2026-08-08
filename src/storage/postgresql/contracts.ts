@@ -13,12 +13,22 @@ export interface PostgreSqlConnectionSettings {
 export interface PostgreSqlOperationContext {
   readonly domain: StorageDomain;
   readonly operation: string;
+  /** Singleton shorthand for a one-project scope. */
   readonly projectId?: string;
+  /** Complete, lower-case, strictly sorted, unique project scope. */
+  readonly projectIds?: readonly string[];
   readonly machineId?: string;
 }
 
 export interface PostgreSqlQueryOptions extends PostgreSqlOperationContext {
   readonly signal?: AbortSignal;
+}
+
+export type PostgreSqlTransactionMode = "read-committed-read-write";
+
+/** Options accepted only when establishing a root transaction. */
+export interface PostgreSqlTransactionOptions extends PostgreSqlQueryOptions {
+  readonly transactionMode?: PostgreSqlTransactionMode;
 }
 
 export interface PostgreSqlQueryExecutor {
