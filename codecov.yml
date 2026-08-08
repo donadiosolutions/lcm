@@ -85,6 +85,7 @@ component_management:
       name: "Unit - Storage Abstractions"
       paths:
         - "^src/storage/backend\\.ts$"
+        - "^src/storage/backend-publication\\.ts$"
         - "^src/storage/capabilities\\.ts$"
         - "^src/storage/contracts\\.ts$"
         - "^src/storage/errors\\.ts$"
@@ -174,6 +175,7 @@ component_management:
       name: "Integration - PostgreSQL Coordination"
       paths:
         - "^src/storage/postgresql/coordination\\.ts$"
+        - "^src/storage/postgresql/publication-guard\\.ts$"
     - component_id: "integration-postgresql-identity"
       name: "Integration - PostgreSQL Identity"
       paths:

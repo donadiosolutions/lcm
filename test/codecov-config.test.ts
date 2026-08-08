@@ -129,6 +129,7 @@ const expectedComponents = [
     name: "Unit - Storage Abstractions",
     paths: [
       "^src/storage/backend\\.ts$",
+      "^src/storage/backend-publication\\.ts$",
       "^src/storage/capabilities\\.ts$",
       "^src/storage/contracts\\.ts$",
       "^src/storage/errors\\.ts$",
@@ -245,7 +246,10 @@ const expectedComponents = [
   {
     component_id: "integration-postgresql-coordination",
     name: "Integration - PostgreSQL Coordination",
-    paths: ["^src/storage/postgresql/coordination\\.ts$"],
+    paths: [
+      "^src/storage/postgresql/coordination\\.ts$",
+      "^src/storage/postgresql/publication-guard\\.ts$",
+    ],
   },
   {
     component_id: "integration-postgresql-identity",
@@ -431,7 +435,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(186);
+    expect(productionFiles).toHaveLength(190);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -461,7 +465,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(186);
+    expect(ownershipCounts.size).toBe(190);
   });
 
   test("does not match non-production TypeScript files", () => {
