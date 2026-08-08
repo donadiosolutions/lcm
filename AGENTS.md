@@ -18,6 +18,20 @@ See [WORKFLOW.md](./WORKFLOW.md) for the full development workflow.
   untested production wrappers to satisfy the gate. Cover behavior through
   observable public seams and deterministic failure injection.
 
+## Codecov Components Maintenance
+
+- Update `codecov.yml` and `test/codecov-config.test.ts` atomically whenever
+  production TypeScript, features, or components are added, removed, moved,
+  materially changed, or otherwise make classification stale.
+- Require complete exclusive ownership and accurate stable IDs/names/paths: every
+  covered production TypeScript file belongs to exactly one component.
+- Do not freeze the taxonomy at its current count; intentional additions/removals
+  must update the literal map and count atomically.
+- Forbid Codecov flags, statuses, ignore/coverage exclusions, report-only runs,
+  or reporting-topology changes without an explicit design change.
+- Preserve the existing 100% line, branch, function, and statement gate enforced
+  by a fresh `npm run test:ci` over the complete collected scope.
+
 ## PR Review And Merge
 
 - Before merging a PR, check whether it changes user-facing behavior or should appear in npm release notes.
