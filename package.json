@@ -55,7 +55,7 @@
     "@hono/node-server": "2.0.12",
     "@sinclair/typebox": "0.34.52",
     "commander": "15.0.0",
-    "js-yaml": "5.2.2",
+    "js-yaml": "5.2.3",
     "pg": "8.22.0",
     "safe-regex": "2.1.1"
   },
@@ -64,22 +64,22 @@
     "@changesets/cli": "2.31.1",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@types/js-yaml": "4.0.9",
-    "@types/node": "26.1.1",
-    "@types/pg": "8.20.0",
+    "@types/node": "26.1.2",
+    "@types/pg": "8.20.3",
     "@types/safe-regex": "1.1.6",
     "@vitest/coverage-v8": "4.1.10",
     "body-parser": "2.3.0",
     "esbuild": "0.28.1",
     "eslint": "10.8.0",
-    "fast-uri": "3.1.5",
-    "openai": "6.49.0",
-    "typescript": "6.0.3",
+    "fast-uri": "4.1.2",
+    "openai": "7.3.0",
+    "typescript": "7.0.2",
     "typescript-eslint": "8.65.0",
     "vitest": "4.1.10"
   },
   "peerDependencies": {
     "@anthropic-ai/sdk": "0.115.0",
-    "openai": "6.49.0"
+    "openai": "7.3.0"
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/sdk": {
