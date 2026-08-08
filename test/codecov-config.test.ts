@@ -442,7 +442,7 @@ describe("Codecov configuration", () => {
 });
 
 describe("Codecov maintenance guidance", () => {
-  test("requires the Codecov files to be updated atomically when classification can stale", () => {
+  test("requires the Codecov files to be updated atomically when classification can become stale", () => {
     const agents = readFileSync(join(projectRoot, "AGENTS.md"), "utf8");
 
     expect(agents).toMatch(
