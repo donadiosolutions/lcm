@@ -141,7 +141,7 @@ sequence is:
 preparing -> prepared -> aborting
   -> config-restoring   (when configuration needs restoration)
   -> map-restoring
-  -> abort-releasing    (one persisted checkpoint per project)
+  -> abort-releasing    (one persisted checkpoint per project with a persisted remote fence)
   -> aborted
 ```
 
@@ -156,9 +156,10 @@ already at its source state, recovery may checkpoint from `aborting` directly
 to `map-restoring`; otherwise it persists `config-restoring`, restores the
 configuration, and then persists `map-restoring`. The project map is restored
 or re-authenticated before `abort-releasing` releases remote fences and reads
-each release back. Material cleanup occurs before terminal `aborted` is
-written. A `preparing` journal with an existing material reference is
-authenticated before that sequence advances.
+each release back. For material-backed abort paths, material cleanup occurs
+before terminal `aborted` is written. A `preparing` journal with an existing
+material reference is authenticated before that sequence advances; the
+missing-material `preparing -> aborted` shortcut performs no cleanup.
 
 `resume()` and default `recoverPending()` advance through the forward groups.
 If the journal is in `aborting`, `config-restoring`, or `map-restoring`, resume
@@ -166,8 +167,10 @@ delegates to the abort state machine instead. `recoverPending({ disposition:
 "abort" })` selects that abort grouping explicitly. Terminal `completed` and
 `aborted` journals are returned as-is. Once remote release starts, recovery
 never moves to an earlier phase; all valid forward paths converge on
-`released` before finalization, and all abort paths converge on
-`abort-releasing` before cleanup and `aborted`.
+`released` before finalization, and material-backed abort paths converge on
+`abort-releasing` before material cleanup and `aborted` only when recovery
+material is available. The missing-material `preparing -> aborted` shortcut is
+already terminal and performs no material cleanup.
 
 The coordinator writes the deterministic `preparing` journal before it seals
 the recovery material. Writes use atomic replacement and directory durability
@@ -202,15 +205,15 @@ The persistence boundary is deliberately bounded. The implementation applies
 these exact limits, including when it reads an existing artifact, writes a
 checkpoint, archives terminal history, or authenticates recovery material:
 
-| Artifact or identifier                                 | Exact limit                                                                             | Rejection behavior                                                                                                                                                                                     |
-| ------------------------------------------------------ | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `journal.json` and archived journal records            | At most 1,048,576 bytes (1 MiB)                                                         | Oversized, unsafe, non-regular, wrong-mode, multi-link, or unreadable files fail closed; malformed JSON/shape and checksum drift are rejected as malformed or checksum-mismatch evidence.              |
-| Sealed `<publication-id>.material` envelope            | At most 8,388,608 bytes (8 MiB)                                                         | Oversized input is rejected as invalid; an oversized or tampered existing material file is rejected during bounded read/authentication and cannot advance a journal.                                   |
-| Each present recovery file inside material             | Non-empty and at most 4,194,304 bytes (4 MiB)                                           | Oversized, empty, or invalid-metadata recovery files are rejected as invalid input; the material is not sealed or accepted.                                                                            |
-| `publicationId`                                        | 1–128 characters; first character `[A-Za-z0-9]`, remaining characters `[A-Za-z0-9._:-]` | Invalid input is rejected. Persisted IDs and material references that do not match the same pattern are malformed evidence.                                                                            |
-| `localProjectId` and `remoteProjectId` at prepare time | 1–256 characters each; each side must be unique                                         | Empty, oversized, or duplicate project coverage is rejected as invalid input. Persisted project arrays must also be non-empty, unique, and sorted by `localProjectId`, or they are malformed evidence. |
-| PostgreSQL guard `projectId` and `machineId`           | Strict UUIDv7 textual identifiers; inputs are normalized to lowercase                   | Non-UUIDv7 values are rejected by the guard as `invalid-input`; invalid stored rows fail closed as `invalid-row`.                                                                                      |
-| Publication lease `ttlMs`                              | Positive safe integer, no more than 86,400,000 ms (24 hours)                            | Zero, negative, fractional, unsafe, or over-24-hour TTLs are rejected by the guard as `invalid-input`; lease timestamps must also remain internally ordered.                                           |
+| Artifact or identifier                                 | Exact limit                                                                             | Rejection behavior                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `journal.json` and archived journal records            | At most 1,048,576 bytes (1 MiB)                                                         | Oversized, unsafe, non-regular, wrong-mode, multi-link, or unreadable files fail closed; malformed JSON/shape and checksum drift are rejected as malformed or checksum-mismatch evidence.                                                                                                 |
+| Sealed `<publication-id>.material` envelope            | At most 8,388,608 bytes (8 MiB)                                                         | Oversized input is rejected as invalid; an oversized or tampered existing material file is rejected during bounded read/authentication and cannot advance a journal.                                                                                                                      |
+| Each present recovery file inside material             | Non-empty and at most 4,194,304 bytes (4 MiB)                                           | Oversized, empty, or invalid-metadata recovery files are rejected as invalid input; the material is not sealed or accepted.                                                                                                                                                               |
+| `publicationId`                                        | 1–128 characters; first character `[A-Za-z0-9]`, remaining characters `[A-Za-z0-9._:-]` | Invalid input is rejected. Persisted IDs and material references that do not match the same pattern are malformed evidence.                                                                                                                                                               |
+| `localProjectId` and `remoteProjectId` at prepare time | 1–256 characters each; each side must be unique                                         | Each supplied identifier must be non-empty and no longer than 256 characters; duplicate local or remote IDs are rejected as invalid input. Empty project arrays are accepted. Persisted arrays must be unique and canonically sorted by `localProjectId`, or they are malformed evidence. |
+| PostgreSQL guard `projectId` and `machineId`           | Strict UUIDv7 textual identifiers; inputs are normalized to lowercase                   | Non-UUIDv7 values are rejected by the guard as `invalid-input`; invalid stored rows fail closed as `invalid-row`.                                                                                                                                                                         |
+| Publication lease `ttlMs`                              | Positive safe integer, no more than 86,400,000 ms (24 hours)                            | Zero, negative, fractional, unsafe, or over-24-hour TTLs are rejected by the guard as `invalid-input`; lease timestamps must also remain internally ordered.                                                                                                                              |
 
 The material reference is additionally required to be exactly
 `<publicationId>.material`; arbitrary paths and path traversal are rejected as
