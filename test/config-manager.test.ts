@@ -12,6 +12,10 @@ import {
   parseConfigValue,
   setConfigValue,
 } from "../src/config-manager.js";
+import {
+  loadStoredConfigProjection,
+  loadStoredLlmRequestPolicyConfig,
+} from "../src/config-projection.js";
 
 const tempDirs: string[] = [];
 
@@ -19,7 +23,7 @@ function makeConfig(content: unknown): { directory: string; configPath: string }
   const directory = mkdtempSync(join(tmpdir(), "lcm-config-manager-"));
   tempDirs.push(directory);
   const configPath = join(directory, "config.json");
-  writeFileSync(configPath, `${JSON.stringify(content, null, 2)}\n`);
+  writeFileSync(configPath, `${JSON.stringify(content, null, 2)}\n`, { mode: 0o600 });
   return { directory, configPath };
 }
 
@@ -157,6 +161,40 @@ describe("config manager paths and values", () => {
         safeLabel: "visible",
       },
     });
+  });
+});
+
+describe("local config projections", () => {
+  it("projects persisted local settings and hook-only LLM policy", () => {
+    const { configPath } = makeConfig({
+      daemon: { port: 4123 },
+      llm: { provider: "disabled" },
+      storage: { backend: "sqlite" },
+      security: { sensitivePatterns: ["PROJECT_SECRET"], notify_on_filter: true },
+    });
+    expect(loadStoredConfigProjection(configPath)).toEqual({
+      daemonPort: 4123,
+      storage: { backend: "sqlite" },
+      security: { sensitivePatterns: ["PROJECT_SECRET"], notify_on_filter: true },
+    });
+    expect(loadStoredLlmRequestPolicyConfig(configPath, {})).toMatchObject({
+      llm: { provider: "disabled" },
+    });
+  });
+
+  it("uses bounded empty-file fallbacks only for missing files", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-config-projection-missing-"));
+    tempDirs.push(directory);
+    const missingPath = join(directory, "missing.json");
+    expect(loadStoredConfigProjection(missingPath)).toEqual({
+      daemonPort: 3737,
+      storage: { backend: "sqlite" },
+      security: { sensitivePatterns: [] },
+    });
+    expect(loadStoredLlmRequestPolicyConfig(missingPath, {})).toMatchObject({
+      llm: { provider: "auto" },
+    });
+    expect(() => loadStoredConfigProjection(directory)).toThrow();
   });
 });
 
@@ -341,6 +379,27 @@ describe("getConfigValue", () => {
 });
 
 describe("setConfigValue", () => {
+  it("preserves an explicitly selected PostgreSQL backend while setting a local value", () => {
+    const { directory, configPath } = makeConfig({
+      llm: { provider: "disabled" },
+      storage: {
+        backend: "postgresql",
+      },
+    });
+    const caFile = join(directory, "ca.pem");
+    writeFileSync(caFile, "test-ca\n");
+    expect(setConfigValue({
+      configPath,
+      path: "hooks.disableAutoCompact",
+      value: "true",
+      json: true,
+      env: {
+        LCM_POSTGRES_URL: "postgresql://user:secret@db.example/lcm",
+        LCM_POSTGRES_CA_FILE: caFile,
+      },
+    })).toBe(true);
+  });
+
   it("uses the process environment when an explicit environment is omitted", () => {
     vi.stubEnv("LCM_SUMMARY_PROVIDER", "disabled");
     const { configPath } = makeConfig({ version: 1 });

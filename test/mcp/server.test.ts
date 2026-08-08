@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { __lcmMcpTestHooks, getMcpToolDefinitions, handleDaemonRequest } from "../../src/mcp/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 
@@ -82,6 +84,30 @@ describe("handleDaemonRequest", () => {
     const res = await handleDaemonRequest(client, "/search", { q: "foo" }, opts);
     expect(res.isError).toBeUndefined();
     expect(res.content[0].text).toContain('"result": "ok"');
+  });
+
+  it("refuses a request whose publication scope is not canonical", async () => {
+    const home = mkdtempSync(join("/tmp", "lcm-mcp-publication-"));
+    const publicationDir = join(home, ".lcm", "backend-publication");
+    mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
+    const client = { post: vi.fn().mockResolvedValue({ result: "should not run" }) };
+    try {
+      const res = await handleDaemonRequest(
+        client,
+        "/search",
+        { q: "foo" },
+        { ...opts, publicationConfigPath: join(home, ".lcm", "config.json") },
+      );
+
+      expect(res).toMatchObject({
+        isError: true,
+        content: [{ type: "text", text: "lcm error: backend publication admission blocked; complete or recover the publication before retrying" }],
+      });
+      expect(client.post).not.toHaveBeenCalled();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("does not retry on daemon HTTP errors (non-network)", async () => {
@@ -420,7 +446,7 @@ describe("startMcpServer", () => {
     } as never);
     const { startMcpServer } = await import("../../src/mcp/server.js");
 
-    await expect(startMcpServer()).rejects.toThrow("postgresql storage backend is not available");
+    await expect(startMcpServer()).rejects.toThrow("PostgreSQL selection has no completed backend publication evidence");
     expect(ensureDaemonMcpMock).not.toHaveBeenCalled();
   });
 
@@ -499,7 +525,7 @@ describe("handleDaemonRequest spawn opts propagation", () => {
     await expect(handleDaemonRequest(client, "/search", { q: "foo" }, optsWithSpawn))
       .resolves.toMatchObject({
         isError: true,
-        content: [{ text: expect.stringContaining("postgresql storage backend is not available") }],
+        content: [{ text: "lcm error: backend publication admission blocked; complete or recover the publication before retrying" }],
       });
 
     expect(ensureDaemonSpy).not.toHaveBeenCalled();

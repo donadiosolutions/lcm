@@ -28,7 +28,7 @@ import { lcmHomeDir } from "./runtime-paths.js";
 import { resolveProjectIdentity } from "./project-map.js";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { configPath } from "./runtime-paths.js";
-import { selectStorageBackend } from "./storage/backend.js";
+import { selectStorageBackendForConfig } from "./storage/backend.js";
 import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
 
 export const EXPORT_VERSION = 1;
@@ -107,8 +107,9 @@ export async function exportKnowledge(
   cwd: string,
   opts: ExportOptions = {},
 ): Promise<ExportResult> {
-  const config = loadDaemonConfig(configPath());
-  selectStorageBackend(config.storage);
+  const configFile = configPath();
+  const config = loadDaemonConfig(configFile);
+  selectStorageBackendForConfig(configFile, config.storage);
   const baseDir = opts._lcmBaseDir ?? defaultBaseDir();
   const project = resolvePortableProject(cwd, baseDir);
   const dbPath = project.dbPath;
@@ -210,8 +211,9 @@ export async function importKnowledge(
   doc: ExportDocument,
   opts: ImportOptions = {},
 ): Promise<ImportResult> {
-  const config = loadDaemonConfig(configPath());
-  selectStorageBackend(config.storage);
+  const configFile = configPath();
+  const config = loadDaemonConfig(configFile);
+  selectStorageBackendForConfig(configFile, config.storage);
   if (doc.version !== EXPORT_VERSION) {
     throw new Error(`Unsupported export version: ${doc.version} (expected ${EXPORT_VERSION})`);
   }

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,11 @@ import {
   hashProjectPath,
   normalizeProjectPath,
 } from "../../src/project-map.js";
+import * as projectMapModule from "../../src/project-map.js";
+import {
+  BackendPublicationJournalError,
+  backendPublicationCanonicalSha256,
+} from "../../src/storage/backend-publication.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn().mockResolvedValue({ connected: false }),
@@ -29,6 +35,8 @@ const mockCollectDetailedEventStats = vi.mocked(collectDetailedEventStats);
 beforeEach(() => {
   vi.mocked(ensureDaemon).mockReset();
   vi.mocked(ensureDaemon).mockResolvedValue({ connected: false });
+  mockCollectEventStats.mockClear();
+  mockCollectDetailedEventStats.mockClear();
   mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null });
   mockCollectDetailedEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null, projects: [], recentErrors: [] });
 });
@@ -74,8 +82,85 @@ function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
     }),
     homedir: "/tmp/test-home",
     platform: "darwin",
+    _assertBackendPublication: () => undefined,
     ...overrides,
   };
+}
+
+function publicationFileWitness(content: string | null): Record<string, unknown> {
+  if (content === null) {
+    return {
+      presence: "absent",
+      rawSha256: null,
+      semanticSha256: null,
+      byteLength: 0,
+      mode: null,
+      uid: null,
+      gid: null,
+      nlink: null,
+      dev: null,
+      ino: null,
+      parentDev: null,
+      parentIno: null,
+    };
+  }
+  return {
+    presence: "present",
+    rawSha256: createHash("sha256").update(content).digest("hex"),
+    semanticSha256: backendPublicationCanonicalSha256(JSON.parse(content)),
+    byteLength: Buffer.byteLength(content),
+    mode: 0o600,
+    uid: 0,
+    gid: 0,
+    nlink: "1",
+    dev: "1",
+    ino: "1",
+    parentDev: "1",
+    parentIno: "1",
+  };
+}
+
+function writeCompletedPublicationJournal(home: string, targetConfig: string | null): void {
+  const publicationDir = join(home, ".lcm", "backend-publication");
+  mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
+  const sourceConfig = "{}";
+  const absentProjectMap = publicationFileWitness(null);
+  const payload = {
+    version: 2,
+    publicationId: "doctor-sentinel-test",
+    sourceBackend: "postgresql",
+    targetBackend: "sqlite",
+    phase: "completed",
+    createdAt: "2026-08-08T00:00:00.000Z",
+    updatedAt: "2026-08-08T00:00:00.000Z",
+    expectedConfigSha256: createHash("sha256").update(sourceConfig).digest("hex"),
+    expectedProjectMapSha256: backendPublicationCanonicalSha256({}),
+    intendedConfigSha256: targetConfig === null
+      ? createHash("sha256").update("{}").digest("hex")
+      : createHash("sha256").update(targetConfig).digest("hex"),
+    intendedProjectMapSha256: backendPublicationCanonicalSha256({}),
+    publishedConfigSha256: null,
+    publishedProjectMapSha256: null,
+    recoveryReference: null,
+    sourceState: {
+      config: publicationFileWitness(sourceConfig),
+      projectMap: absentProjectMap,
+    },
+    targetState: {
+      config: publicationFileWitness(targetConfig),
+      projectMap: absentProjectMap,
+    },
+    projects: [],
+  };
+  const journal = {
+    ...payload,
+    checksumSha256: backendPublicationCanonicalSha256(payload),
+  };
+  writeFileSync(
+    join(publicationDir, "journal.json"),
+    `${JSON.stringify(journal)}\n`,
+    { mode: 0o600 },
+  );
 }
 
 function makeTrustedCredentialDir(context: TestContext): string | undefined {
@@ -190,6 +275,170 @@ describe("runDoctor Claude integration ownership", () => {
 });
 
 describe("runDoctor project map checks", () => {
+  it("reports blocked publication admission without attempting repair", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-publication-blocked-"));
+    try {
+      const publicationDir = join(home, ".lcm", "backend-publication");
+      mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _assertBackendPublication: undefined,
+      }));
+
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("Backend publication admission is blocked"),
+      });
+      expect(results.find((result) => result.name === "version")?.status).toBe("pass");
+      expect(results.find((result) => result.name === "project-map")?.status).toBe("skip");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks repair when an absent config fails a completed byte witness", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-missing-config-witness-"));
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
+    writeCompletedPublicationJournal(home, "{}");
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        existsSync: (path: string) => !path.endsWith("config.json"),
+        _assertBackendPublication: undefined,
+      }));
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("Backend publication admission is blocked"),
+      });
+      expect(results.find((result) => result.name === "project-map")).toMatchObject({ status: "skip" });
+      expect(results.find((result) => result.name === "events-capture")).toMatchObject({ status: "skip" });
+      expect(validateProjectMap).not.toHaveBeenCalled();
+    } finally {
+      validateProjectMap.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("admits an absent config when the terminal publication witness is absent", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-missing-config-absent-"));
+    writeCompletedPublicationJournal(home, null);
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        existsSync: (path: string) => !path.endsWith("config.json"),
+        _assertBackendPublication: undefined,
+      }));
+      expect(results.find((result) => result.name === "backend-publication")).toBeUndefined();
+      expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["oversized", "unreadable"] as const)("blocks repair with an explicit admission result for %s config", async (_label) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-untrusted-config-"));
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
+    writeCompletedPublicationJournal(home, null);
+    try {
+      const boundedRead: (path: string, maxBytes: number) => string = _label === "oversized"
+        ? () => { throw new Error("file exceeds the configured size limit"); }
+        : () => { throw new Error("config read refused"); };
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _assertBackendPublication: undefined,
+        _readBoundedConfig: boundedRead,
+      }));
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("Backend publication admission is blocked"),
+      });
+      expect(results.find((result) => result.name === "project-map")).toMatchObject({ status: "skip" });
+      expect(results.find((result) => result.name === "events-capture")).toMatchObject({ status: "skip" });
+      expect(validateProjectMap).not.toHaveBeenCalled();
+    } finally {
+      validateProjectMap.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["malformed config", "{"],
+    ["oversized config", "x".repeat(4 * 1024 * 1024 + 1)],
+  ] as const)("authenticates publication and blocks repair for %s", async (_label, content) => {
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
+    const assertPublication = vi.fn(() => {
+      throw new BackendPublicationJournalError("unresolved-publication", "publication remains unresolved");
+    });
+    const base = minimalDeps();
+    try {
+      const results = await runDoctor({
+        ...base,
+        readFileSync: (path: string) => path.endsWith("config.json") ? content : base.readFileSync(path),
+        _assertBackendPublication: assertPublication,
+      });
+      if (_label === "malformed config") expect(assertPublication).toHaveBeenCalledOnce();
+      else expect(assertPublication).not.toHaveBeenCalled();
+      expect(validateProjectMap).not.toHaveBeenCalled();
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({ status: "fail" });
+      expect(results.find((result) => result.name === "project-map")).toMatchObject({ status: "skip" });
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "skip" });
+      expect(base.writeFileSync).not.toHaveBeenCalled();
+      expect(base.mkdirSync).not.toHaveBeenCalled();
+      expect(ensureDaemon).not.toHaveBeenCalled();
+    } finally {
+      validateProjectMap.mockRestore();
+    }
+  });
+
+  it("blocks passive-learning collection and pruning on terminal publication witness mismatch", async () => {
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
+    const assertPublication = vi.fn(() => {
+      throw new BackendPublicationJournalError("unexpected-state", "terminal publication witness mismatch");
+    });
+    try {
+      const results = await runDoctor(minimalDeps({ _assertBackendPublication: assertPublication }));
+      expect(validateProjectMap).not.toHaveBeenCalled();
+      expect(mockCollectEventStats).not.toHaveBeenCalled();
+      expect(mockCollectDetailedEventStats).not.toHaveBeenCalled();
+      expect(results.find((result) => result.name === "events-capture")).toMatchObject({
+        status: "skip",
+        message: expect.stringContaining("publication admission"),
+      });
+    } finally {
+      validateProjectMap.mockRestore();
+    }
+  });
+
+  it.each([
+    ["publication-evidence-missing", "completed publication evidence is missing"],
+    ["unresolved-publication", "a backend publication is unresolved"],
+    ["unsafe-storage", "authenticated publication state is invalid or unsafe"],
+    ["malformed-journal", "authenticated publication state is invalid or unsafe"],
+    ["checksum-mismatch", "authenticated publication state is invalid or unsafe"],
+    ["unexpected-state", "authenticated publication state is invalid or unsafe"],
+    ["permit-mismatch", "authenticated publication state is invalid or unsafe"],
+    ["invalid-input", "authenticated publication state is invalid or unsafe"],
+  ] as const)("renders the %s publication admission message", async (reason, message) => {
+    const results = await runDoctor(minimalDeps({
+      _assertBackendPublication: () => {
+        throw new BackendPublicationJournalError(reason, "test publication refusal");
+      },
+    }));
+    expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+      status: "fail",
+      message: expect.stringContaining(message),
+    });
+  });
+
+  it("rethrows unexpected publication admission failures", async () => {
+    await expect(runDoctor(minimalDeps({
+      _assertBackendPublication: () => {
+        throw new Error("unexpected publication failure");
+      },
+    }))).rejects.toThrow("unexpected publication failure");
+  });
+
   it("renders blocked reconciliation guidance without retrying through project patterns", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-blocked-reconciliation-"));
     try {

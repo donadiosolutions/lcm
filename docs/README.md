@@ -28,6 +28,9 @@ detail you need.
 
 - [Managed daemon recovery](daemon-restart-recovery.md) — diagnose and recover
   the user-managed daemon safely.
+- [Backend publication safety](backend-publication.md) — understand secure
+  `~/.lcm` establishment, publication recovery, PostgreSQL admission, and
+  fail-closed operator behavior.
 - [Optional FTS5 setup](fts5.md) — enable faster ranked local full-text search
   when the active Node.js runtime does not include FTS5.
 - [VS Code and Codex setup](vscode-codex.md) — connect LCM to Codex or GitHub

@@ -7,12 +7,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BackendPublicationCoordinator,
   BackendPublicationJournalError,
+  assertBackendPublicationConsumerAccess,
   backendPublicationDirectory,
   backendPublicationJournalPath,
   backendPublicationCanonicalSha256,
   backendPublicationMaterialWitness,
   captureBackendPublicationFileWitness,
   readBackendPublicationJournal,
+  withBackendPublicationConfigLock,
+  withBackendPublicationConsumerLock,
   type BackendPublicationDriver,
   type BackendPublicationFenceRecord,
   type BackendPublicationRecoveryFile,
@@ -442,6 +445,31 @@ describe("BackendPublicationCoordinator", () => {
       parentIno: "104",
     });
     expect(fake.calls).toEqual(["publish-map", "publish-config"]);
+  });
+
+  it("aborts an identity-changing map publication before its witness checkpoint", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    await coordinator(home, fake.driver).prepare(inputFor(input));
+    const originalPublishMap = fake.driver.publishProjectMap;
+    const changedTargetMap = {
+      ...targetState(input).projectMap,
+      dev: "121",
+      ino: "122",
+      parentDev: "123",
+      parentIno: "124",
+    };
+    fake.driver.publishProjectMap = async (mutation) => {
+      await originalPublishMap(mutation);
+      fake.setState({ ...fake.getState(), projectMap: changedTargetMap });
+      throw new Error("crash:after-map-identity-abort");
+    };
+
+    await expect(coordinator(home, fake.driver).resume()).rejects.toThrow("crash:after-map-identity-abort");
+    const aborted = await coordinator(home, fake.driver).abort();
+    expect(aborted.phase).toBe("aborted");
+    expect(fake.calls).toEqual(["publish-map", "restore-map"]);
   });
 
   it("adopts an identity-changing config publication after a crash before its witness checkpoint", async () => {
@@ -932,6 +960,41 @@ describe("BackendPublicationCoordinator", () => {
       if (uidDescriptor === undefined) delete (process as { getuid?: unknown }).getuid;
       else Object.defineProperty(process, "getuid", uidDescriptor);
     }
+  });
+
+  it("rejects captured regular files outside the owner-readable mode domain", async () => {
+    const home = makeHome();
+    const directory = backendPublicationDirectory(home);
+    mkdirSync(directory, { mode: 0o700 });
+    const path = join(directory, "group-readable");
+    writeFileSync(path, "observed", { mode: 0o640 });
+
+    expect(() => captureBackendPublicationFileWitness(path, directory)).toThrow("mode is not trusted");
+  });
+
+  it.each([
+    0o000,
+    0o100,
+    0o200,
+    0o300,
+    0o640,
+    0o604,
+    0o644,
+    0o1000,
+    0o2000,
+    0o4000,
+    0o7000,
+  ])("rejects journal witness mode %o before authentication", async (mode) => {
+    await expectJournalReadFailure((journal) => ({
+      ...journal,
+      sourceState: {
+        ...(journal.sourceState as Record<string, unknown>),
+        config: {
+          ...((journal.sourceState as { config: Record<string, unknown> }).config),
+          mode,
+        },
+      },
+    }));
   });
 
   it("supports runtimes without a getuid syscall", async () => {
@@ -2034,6 +2097,49 @@ describe("BackendPublicationCoordinator", () => {
 });
 
 describe("revocable mutation permits", () => {
+  it("does not create a local publication root for an absent-root consumer preflight", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-consumer-absent-root-"));
+    roots.push(home);
+    let callbackCalled = false;
+
+    withBackendPublicationConsumerLock(home, () => {
+      callbackCalled = true;
+      expect(existsSync(join(home, ".lcm"))).toBe(false);
+    });
+
+    expect(callbackCalled).toBe(true);
+    expect(existsSync(join(home, ".lcm"))).toBe(false);
+  });
+
+  it("rejects a promise-returning synchronous consumer callback before releasing its token", async () => {
+    const home = makeHome();
+    let continuation: Promise<void> | undefined;
+
+    expect(() => withBackendPublicationConsumerLock(home, (token) => {
+      continuation = Promise.resolve().then(() => {
+        assertBackendPublicationConsumerAccess({ homeDir: home, lockToken: token });
+      });
+      return continuation;
+    })).toThrow("synchronous backend publication consumer callback returned a promise");
+
+    await expect(continuation).rejects.toMatchObject({ reason: "permit-mismatch" });
+  });
+
+  it("rejects a promise returned through the synchronous config seam and revokes its token", async () => {
+    const home = makeHome();
+    const configPath = join(home, ".lcm", "config.json");
+    let continuation: Promise<void> | undefined;
+
+    expect(() => withBackendPublicationConfigLock(configPath, (token) => {
+      continuation = Promise.resolve().then(() => {
+        assertBackendPublicationConsumerAccess({ homeDir: home, lockToken: token });
+      });
+      return continuation;
+    })).toThrow("synchronous backend publication consumer callback returned a promise");
+
+    await expect(continuation).rejects.toMatchObject({ reason: "permit-mismatch" });
+  });
+
   it("rejects inherited asynchronous work after the owning callback returns", async () => {
     let retained: { assertActive: () => void } | undefined;
     await withRevocablePrivateMutationPermit("test", (permit) => {

@@ -101,7 +101,7 @@ vi.mock("node:fs", async importOriginal => ({
 }));
 vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/runtime-paths.js")>()),
-  configPath: () => "/lcm/config.json", daemonPidPath: () => "/lcm/daemon.pid",
+  configPath: () => "/lcm/.lcm/config.json", daemonPidPath: () => "/lcm/daemon.pid",
   daemonTokenPath: () => "/lcm/daemon.token", lcmHomeDir: () => "/lcm",
   migrateLegacyHomeIfNeeded: vi.fn(), projectsDir: () => "/lcm/projects",
 }));

@@ -1,9 +1,23 @@
 import { afterEach, describe, it, expect } from "vitest";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  bootstrapLcmHome,
   configPath,
   daemonPidPath,
   daemonTokenPath,
@@ -21,11 +35,85 @@ const homes: string[] = [];
 afterEach(() => {
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
-
 function makeHome(): string {
   const home = mkdtempSync(join(tmpdir(), "lcm-runtime-paths-"));
   homes.push(home);
   return home;
+}
+
+function canonical(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((entry) => canonical(entry)).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(",")}}`;
+}
+
+function migrationJournal(home: string, overrides: Record<string, unknown> = {}): void {
+  const operationId = "0123456789abcdef0123456789abcdef0123456789abcdef";
+  const stagingName = `.lcm-legacy-migration-${createHash("sha256")
+    .update(`.lcm\0${operationId}`)
+    .digest("hex")}.partial`;
+  const { checksumSha256: requestedChecksum, ...payloadOverrides } = overrides;
+  const payload: Record<string, unknown> = {
+    version: 1,
+    phase: "planned",
+    operationId,
+    sourceName: legacyLcmHomeDirname(),
+    targetName: ".lcm",
+    stagingName,
+    source: { identity: { dev: "1", ino: "2" }, mode: 700, uid: 0, gid: 0, hash: "a".repeat(64) },
+    target: null,
+    targetBaseHash: null,
+    ...payloadOverrides,
+  };
+  const journal = {
+    ...payload,
+    checksumSha256: typeof requestedChecksum === "string"
+      ? requestedChecksum
+      : createHash("sha256").update(canonical(payload)).digest("hex"),
+  };
+  writeFileSync(join(home, ".lcm-legacy-migration.json"), `${canonical(journal)}\n`, { mode: 0o600 });
+  chmodSync(join(home, ".lcm-legacy-migration.json"), 0o600);
+}
+
+function treeWitness(root: string): Record<string, unknown> {
+  const hash = createHash("sha256");
+  const update = (label: string, value: string | Buffer): void => {
+    const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
+    hash.update(`${label}\0${bytes.byteLength}\0`);
+    hash.update(bytes);
+  };
+  const visit = (path: string, relative: string, rootEntry: boolean): void => {
+    const stat = lstatSync(path, { bigint: true });
+    const directory = stat.isDirectory();
+    update("path", relative);
+    update("kind", directory ? "directory" : "file");
+    if (!rootEntry) update("mode", String(Number(stat.mode & 0o7777n)));
+    if (directory) {
+      for (const name of readdirSync(path).sort()) {
+        visit(join(path, name), relative ? `${relative}/${name}` : name, false);
+      }
+    } else {
+      update("bytes", readFileSync(path));
+    }
+  };
+  const stat = lstatSync(root, { bigint: true });
+  visit(root, "", true);
+  return {
+    identity: { dev: String(stat.dev), ino: String(stat.ino) },
+    mode: Number(stat.mode & 0o7777n),
+    uid: Number(stat.uid),
+    gid: Number(stat.gid),
+    hash: hash.digest("hex"),
+  };
+}
+
+function migrationStagingPath(home: string): string {
+  const operationId = "0123456789abcdef0123456789abcdef0123456789abcdef";
+  const digest = createHash("sha256").update(`.lcm\0${operationId}`).digest("hex");
+  return join(home, `.lcm-legacy-migration-${digest}.partial`);
 }
 
 describe("runtime paths", () => {
@@ -54,7 +142,46 @@ describe("runtime paths", () => {
       from: legacyLcmHomeDir(home),
       to: lcmHomeDir(home),
     });
+    expect(existsSync(lcmHomeDir(home))).toBe(false);
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
     expect(statSync(lcmHomeDir(home)).mode & 0o777).toBe(0o700);
+  });
+
+  it("accepts and reuses an existing exact private root", () => {
+    const home = makeHome();
+    mkdirSync(lcmHomeDir(home), { mode: 0o700 });
+
+    expect(migrateLegacyHomeIfNeeded(home)).toEqual({
+      migrated: false,
+      from: legacyLcmHomeDir(home),
+      to: lcmHomeDir(home),
+    });
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: false, migrated: false });
+  });
+
+  it("rejects an existing active root with a non-private mode", () => {
+    const home = makeHome();
+    mkdirSync(lcmHomeDir(home), { mode: 0o755 });
+    chmodSync(lcmHomeDir(home), 0o755);
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("exact mode 0700");
+  });
+
+  it("rejects an active root that is a regular file", () => {
+    const home = makeHome();
+    writeFileSync(lcmHomeDir(home), "not a directory");
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow();
+  });
+
+  it("rejects an active root symlink without following it", () => {
+    const home = makeHome();
+    const outside = join(home, "outside");
+    mkdirSync(outside, { mode: 0o700 });
+    symlinkSync(outside, lcmHomeDir(home));
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow();
+    expect(existsSync(join(outside, "config.json"))).toBe(false);
   });
 
   it("migrates an existing legacy home when the new home is absent", () => {
@@ -71,7 +198,211 @@ describe("runtime paths", () => {
     expect(readFileSync(join(next, "config.json"), "utf-8")).toBe(JSON.stringify({ version: 1 }));
   });
 
-  it("does not migrate when the new home already has lcm data", () => {
+  it("copies nested legacy directories and preserves their safe modes", () => {
+    const home = makeHome();
+    const legacy = legacyLcmHomeDir(home);
+    const nested = join(legacy, "projects", "nested");
+    mkdirSync(nested, { recursive: true, mode: 0o750 });
+    chmodSync(join(legacy, "projects"), 0o750);
+    chmodSync(nested, 0o750);
+    writeFileSync(join(nested, "state.json"), '{"ok":true}\n', { mode: 0o640 });
+
+    expect(migrateLegacyHomeIfNeeded(home).migrated).toBe(true);
+    expect(readFileSync(join(lcmHomeDir(home), "projects", "nested", "state.json"), "utf-8"))
+      .toBe('{"ok":true}\n');
+    expect(statSync(join(lcmHomeDir(home), "projects", "nested")).mode & 0o777).toBe(0o750);
+  });
+
+  it("rejects a legacy root that is not a directory", () => {
+    const home = makeHome();
+    writeFileSync(legacyLcmHomeDir(home), "legacy file");
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("legacy LCM home is not a trusted directory");
+    expect(existsSync(lcmHomeDir(home))).toBe(false);
+  });
+
+  it.each(["{", "null", "[]"])("rejects a malformed migration journal: %s", (content) => {
+    const home = makeHome();
+    writeFileSync(join(home, ".lcm-legacy-migration.json"), content, { mode: 0o600 });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("legacy migration journal");
+  });
+
+  it("rejects a migration journal with unexpected fields", () => {
+    const home = makeHome();
+    migrationJournal(home, { extra: true });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("unexpected fields");
+  });
+
+  it.each([
+    ["version", 2],
+    ["phase", "unknown"],
+    ["operationId", "bad"],
+    ["sourceName", "wrong"],
+    ["targetName", "wrong"],
+    ["stagingName", "wrong"],
+  ])("rejects invalid migration journal field %s", (field, value) => {
+    const home = makeHome();
+    migrationJournal(home, { [field]: value });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("journal fields are invalid");
+  });
+
+  it("rejects a malformed migration journal checksum", () => {
+    const home = makeHome();
+    migrationJournal(home, { checksumSha256: "bad" });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("checksum is malformed");
+  });
+
+  it("rejects a malformed migration target base witness", () => {
+    const home = makeHome();
+    migrationJournal(home, { targetBaseHash: "bad" });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("target base witness is malformed");
+  });
+
+  it.each([
+    ["source", null, "source witness is malformed"],
+    ["target", {}, "target witness has unexpected fields"],
+  ])("rejects a malformed %s migration witness", (field, value, message) => {
+    const home = makeHome();
+    migrationJournal(home, { [field]: value });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow(message);
+  });
+
+  it("rejects a migration witness with unexpected fields", () => {
+    const home = makeHome();
+    migrationJournal(home, { source: { identity: { dev: "1", ino: "2" }, mode: 700, uid: 0, gid: 0, hash: "a".repeat(64), extra: true } });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("source witness has unexpected fields");
+  });
+
+  it.each([
+    ["hash", "bad"],
+    ["mode", -1],
+    ["uid", -1],
+    ["gid", -1],
+  ])("rejects invalid migration witness field %s", (field, value) => {
+    const home = makeHome();
+    migrationJournal(home, {
+      source: { identity: { dev: "1", ino: "2" }, mode: 700, uid: 0, gid: 0, hash: "a".repeat(64), [field]: value },
+    });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("source witness fields are invalid");
+  });
+
+  it("rejects malformed and unexpected migration witness identities", () => {
+    const malformed = makeHome();
+    migrationJournal(malformed, { source: { identity: null, mode: 700, uid: 0, gid: 0, hash: "a".repeat(64) } });
+    expect(() => migrateLegacyHomeIfNeeded(malformed)).toThrow("witness identity is malformed");
+
+    const unexpected = makeHome();
+    migrationJournal(unexpected, {
+      source: { identity: { dev: "1", ino: "2", extra: "3" }, mode: 700, uid: 0, gid: 0, hash: "a".repeat(64) },
+    });
+    expect(() => migrateLegacyHomeIfNeeded(unexpected)).toThrow("witness identity has unexpected fields");
+
+    const invalid = makeHome();
+    migrationJournal(invalid, { source: { identity: { dev: "bad", ino: "2" }, mode: 700, uid: 0, gid: 0, hash: "a".repeat(64) } });
+    expect(() => migrateLegacyHomeIfNeeded(invalid)).toThrow("source witness fields are invalid");
+  });
+
+  it("rejects a migration journal whose checksum does not match its payload", () => {
+    const home = makeHome();
+    migrationJournal(home, { checksumSha256: "0".repeat(64) });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("checksum does not match");
+  });
+
+  it("fails closed when valid migration evidence has no roots to authenticate", () => {
+    const home = makeHome();
+    migrationJournal(home);
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("no authenticated source or target");
+  });
+
+  it("rejects a source whose authenticated witness no longer matches", () => {
+    const home = makeHome();
+    const legacy = legacyLcmHomeDir(home);
+    mkdirSync(legacy, { mode: 0o700 });
+    writeFileSync(join(legacy, "state"), "current");
+    const source = treeWitness(legacy);
+    source.hash = "b".repeat(64);
+    migrationJournal(home, { source });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("legacy source changed during migration");
+  });
+
+  it("rejects a published target whose authenticated witness no longer matches", () => {
+    const home = makeHome();
+    const active = lcmHomeDir(home);
+    mkdirSync(active, { mode: 0o700 });
+    const target = treeWitness(active);
+    (target.identity as Record<string, unknown>).ino = "999999999";
+    migrationJournal(home, { phase: "published", target });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("active migration target changed during recovery");
+  });
+
+  it("rejects published evidence without a target witness", () => {
+    const home = makeHome();
+    mkdirSync(lcmHomeDir(home), { mode: 0o700 });
+    migrationJournal(home, { phase: "published" });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("target witness is missing");
+  });
+
+  it("refuses planned evidence when an unauthenticated active root is present", () => {
+    const home = makeHome();
+    const legacy = legacyLcmHomeDir(home);
+    mkdirSync(legacy, { mode: 0o700 });
+    writeFileSync(join(legacy, "state"), "current");
+    mkdirSync(lcmHomeDir(home), { mode: 0o700 });
+    migrationJournal(home, { source: treeWitness(legacy) });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("unauthenticated active root");
+  });
+
+  it("rejects copying evidence when its staging tree is absent", () => {
+    const home = makeHome();
+    const legacy = legacyLcmHomeDir(home);
+    mkdirSync(legacy, { mode: 0o700 });
+    writeFileSync(join(legacy, "state"), "current");
+    migrationJournal(home, { phase: "copying", source: treeWitness(legacy), target: treeWitness(legacy) });
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("staging witness is missing or changed");
+  });
+
+  it.each(["published", "removing"])("finishes a %s journal when the target is authenticated", (phase) => {
+    const home = makeHome();
+    const active = lcmHomeDir(home);
+    mkdirSync(active, { mode: 0o700 });
+    writeFileSync(join(active, "state"), "published");
+    migrationJournal(home, { phase, target: treeWitness(active) });
+
+    expect(migrateLegacyHomeIfNeeded(home)).toEqual({ migrated: true, from: legacyLcmHomeDir(home), to: active });
+    expect(existsSync(join(home, ".lcm-legacy-migration.json"))).toBe(false);
+  });
+
+  it("resumes a copying journal through publication and source removal", () => {
+    const home = makeHome();
+    const legacy = legacyLcmHomeDir(home);
+    const staging = migrationStagingPath(home);
+    mkdirSync(legacy, { mode: 0o700 });
+    mkdirSync(staging, { mode: 0o700 });
+    writeFileSync(join(legacy, "state"), "current");
+    writeFileSync(join(staging, "state"), "current");
+    migrationJournal(home, { phase: "copying", source: treeWitness(legacy), target: treeWitness(staging) });
+
+    expect(migrateLegacyHomeIfNeeded(home).migrated).toBe(true);
+    expect(existsSync(legacy)).toBe(false);
+    expect(readFileSync(join(lcmHomeDir(home), "state"), "utf-8")).toBe("current");
+  });
+
+  it("fails closed when the new home already has lcm data", () => {
     const home = makeHome();
     const legacy = legacyLcmHomeDir(home);
     const next = lcmHomeDir(home);
@@ -80,9 +411,7 @@ describe("runtime paths", () => {
     writeFileSync(join(legacy, "config.json"), "legacy");
     writeFileSync(join(next, "config.json"), "new");
 
-    const result = migrateLegacyHomeIfNeeded(home);
-
-    expect(result).toEqual({ migrated: false, from: legacy, to: next });
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("coexist");
     expect(readFileSync(join(next, "config.json"), "utf-8")).toBe("new");
     expect(readFileSync(join(legacy, "config.json"), "utf-8")).toBe("legacy");
   });
@@ -94,10 +423,10 @@ describe("runtime paths", () => {
     mkdirSync(legacy, { recursive: true });
     mkdirSync(join(next, name), { recursive: true });
 
-    expect(migrateLegacyHomeIfNeeded(home)).toEqual({ migrated: false, from: legacy, to: next });
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("coexist");
   });
 
-  it("merges legacy contents when the new home already contains unrelated files", () => {
+  it("fails closed when the new home contains unrelated files beside legacy state", () => {
     const home = makeHome();
     const legacy = legacyLcmHomeDir(home);
     const next = lcmHomeDir(home);
@@ -106,15 +435,12 @@ describe("runtime paths", () => {
     writeFileSync(join(legacy, "config.json"), "legacy");
     writeFileSync(join(next, "daemon.pid"), "new");
 
-    const result = migrateLegacyHomeIfNeeded(home);
-
-    expect(result).toEqual({ migrated: true, from: legacy, to: next });
-    expect(existsSync(legacy)).toBe(false);
-    expect(readFileSync(join(next, "config.json"), "utf-8")).toBe("legacy");
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("coexist");
     expect(readFileSync(join(next, "daemon.pid"), "utf-8")).toBe("new");
+    expect(readFileSync(join(legacy, "config.json"), "utf-8")).toBe("legacy");
   });
 
-  it("preserves duplicate targets while merging a legacy home", () => {
+  it("fails closed when legacy and active roots have duplicate targets", () => {
     const home = makeHome();
     const legacy = legacyLcmHomeDir(home);
     const next = lcmHomeDir(home);
@@ -123,7 +449,85 @@ describe("runtime paths", () => {
     writeFileSync(join(legacy, "shared.txt"), "legacy");
     writeFileSync(join(next, "shared.txt"), "current");
 
-    expect(migrateLegacyHomeIfNeeded(home).migrated).toBe(true);
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("coexist");
     expect(readFileSync(join(next, "shared.txt"), "utf-8")).toBe("current");
+    expect(readFileSync(join(legacy, "shared.txt"), "utf-8")).toBe("legacy");
+  });
+
+  it("rejects a writable sticky actual home instead of trusting its root-owned exception", () => {
+    const home = makeHome();
+    chmodSync(home, 0o1777);
+    expect(() => bootstrapLcmHome(home)).toThrow(/unsafe writable mode|owner is not trusted/);
+    expect(existsSync(lcmHomeDir(home))).toBe(false);
+  });
+
+  it("rejects a symlinked home path before creating the private root", () => {
+    const container = makeHome();
+    const realHome = join(container, "real-home");
+    const linkedHome = join(container, "linked-home");
+    mkdirSync(realHome, { mode: 0o700 });
+    symlinkSync(realHome, linkedHome);
+
+    expect(() => bootstrapLcmHome(linkedHome)).toThrow();
+    expect(existsSync(lcmHomeDir(realHome))).toBe(false);
+  });
+
+  it("rejects a home path reached through a symlinked parent", () => {
+    const container = makeHome();
+    const realParent = join(container, "real-parent");
+    const linkedParent = join(container, "linked-parent");
+    const realHome = join(realParent, "sub", "home");
+    mkdirSync(realHome, { recursive: true, mode: 0o700 });
+    symlinkSync(realParent, linkedParent);
+
+    expect(() => bootstrapLcmHome(join(linkedParent, "sub", "home"))).toThrow("non-canonical");
+    expect(existsSync(lcmHomeDir(realHome))).toBe(false);
+  });
+
+  it("rejects an unsafe home parent before root creation", () => {
+    const container = makeHome();
+    const home = join(container, "home");
+    mkdirSync(home, { mode: 0o700 });
+    chmodSync(container, 0o733);
+
+    expect(() => bootstrapLcmHome(home)).toThrow("unsafe writable mode");
+    expect(existsSync(lcmHomeDir(home))).toBe(false);
+  });
+
+  it("continues on systems without a getuid syscall", () => {
+    const home = makeHome();
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+    try {
+      expect(migrateLegacyHomeIfNeeded(home).migrated).toBe(false);
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: () => number }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
+  it("rejects a home owned by an unexpected user", () => {
+    const home = makeHome();
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    Object.defineProperty(process, "getuid", { configurable: true, value: () => 999999 });
+    try {
+      expect(() => bootstrapLcmHome(home)).toThrow("owner is not trusted");
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: () => number }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
+  it("rejects symlink entries in legacy private state", () => {
+    const home = makeHome();
+    const legacy = legacyLcmHomeDir(home);
+    mkdirSync(legacy, { mode: 0o700 });
+    const target = join(home, "outside-state");
+    writeFileSync(target, "outside");
+    symlinkSync(target, join(legacy, "link"));
+
+    expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("symlink entries");
+    expect(existsSync(legacy)).toBe(true);
+    expect(existsSync(lcmHomeDir(home))).toBe(false);
   });
 });

@@ -46,6 +46,11 @@ import {
   PrivateMutationLockContentionError,
   withPrivateMutationLock,
 } from "./private-mutation-lock.js";
+import {
+  withBackendPublicationConsumerLock,
+  BackendPublicationJournalError,
+  type BackendPublicationLockToken,
+} from "./storage/backend-publication.js";
 import { historicalWorktreeEntriesForProject } from "./codex-project-resolution.js";
 import {
   allocateLocalHookEventSequences,
@@ -1914,8 +1919,17 @@ export function reconcileWorktrees(
     readonly _maxDiscoveryEntries?: number;
     /** @internal Inject catalogue races and failures deterministically. */
     readonly _discoveryObserver?: (path: string) => void;
+    /** @internal Token held by a caller that already has publication admission. */
+    readonly _publicationLockToken?: BackendPublicationLockToken;
   } = {},
 ): WorktreeReconciliationResult {
+  if (opts._publicationLockToken === undefined) {
+    return withBackendPublicationConsumerLock(opts.homeDir, (publicationLockToken) =>
+      reconcileWorktrees(path, {
+        ...opts,
+        _publicationLockToken: publicationLockToken,
+      }));
+  }
   const anchor = resolveGitProjectAnchor(path);
   const canonical = anchor?.canonical ?? resolve(path);
   const targetHash = hashProjectPath(canonical);
@@ -1933,7 +1947,7 @@ export function reconcileWorktrees(
   const sourceBusyTimeoutMs = normalizeSourceBusyTimeoutMs(opts._sourceBusyTimeoutMs);
   if (!opts.dryRun) {
     const fastJournal = readJournal(journalFile);
-    const fastMap = listProjectMapEntries(opts.homeDir);
+    const fastMap = listProjectMapEntries(opts.homeDir, opts._publicationLockToken);
     if (
       fastJournal?.phase === "completed"
       && resolve(fastJournal.canonical) === canonical
@@ -2199,7 +2213,7 @@ export function reconcileWorktrees(
         journal.phase = "archived";
         writeJournal(journalFile, journal);
       }
-      const currentMap = listProjectMapEntries(opts.homeDir);
+      const currentMap = listProjectMapEntries(opts.homeDir, opts._publicationLockToken);
       const targetEntry = currentMap[targetHash];
       const sourcesRemain = pendingSourceHashes.some((hash) => currentMap[hash] !== undefined);
       if (!sourcesRemain && targetEntry) {
@@ -2222,6 +2236,7 @@ export function reconcileWorktrees(
           aliases,
           expectedRemoteProjectId: journal.remoteProjectId ?? null,
           homeDir: opts.homeDir,
+          _publicationLockToken: opts._publicationLockToken,
           onBackupCreated: (backupPath) => {
             journal.backupPaths.push(backupPath);
             writeJournal(journalFile, journal);
@@ -2232,7 +2247,7 @@ export function reconcileWorktrees(
       journal.pendingSourceHashes = [];
       journal.phase = "completed";
       const publishedMapDiscovery = reconciliationDiscovery(
-        listProjectMapEntries(opts.homeDir),
+        listProjectMapEntries(opts.homeDir, opts._publicationLockToken),
         targetHash,
         opts._codexDir,
         opts._maxDiscoveryEntries,
@@ -2246,6 +2261,7 @@ export function reconcileWorktrees(
       writeJournal(journalFile, journal);
       return resultFromJournal(journal, journalFile);
     } catch (error) {
+      if (error instanceof BackendPublicationJournalError) throw error;
       journal.blockedFrom = journal.phase === "merged" || journal.phase === "archived"
         ? journal.phase
         : journal.blockedFrom ?? "planned";
@@ -2260,6 +2276,7 @@ export function reconcileWorktrees(
     try {
       return executeLocked(map);
     } catch (error) {
+      if (error instanceof BackendPublicationJournalError) throw error;
       if (opts.dryRun) throw error;
       const current = readJournal(journalFile);
       if (current && resolve(current.canonical) !== canonical) throw error;
@@ -2298,7 +2315,7 @@ export function reconcileWorktrees(
     }
   };
 
-  if (opts.dryRun) return execute(readProjectMapSnapshot(opts.homeDir));
+  if (opts.dryRun) return execute(readProjectMapSnapshot(opts.homeDir, opts._publicationLockToken));
   const lockWaitMs = opts._lockWaitMs ?? 5_000;
   const retryDelayMs = opts._lockRetryDelayMs ?? 50;
   const deadline = Date.now() + lockWaitMs;
@@ -2308,7 +2325,11 @@ export function reconcileWorktrees(
       return withPrivateMutationLock(
         reconciliationLockPath(targetHash, opts.homeDir),
         "worktree reconciliation",
-        () => withProjectMapReconciliationLock(execute, opts.homeDir),
+        () => withProjectMapReconciliationLock(
+          execute,
+          opts.homeDir,
+          opts._publicationLockToken,
+        ),
       );
     } catch (error) {
       if (!(error instanceof PrivateMutationLockContentionError) || Date.now() >= deadline) {
@@ -2338,10 +2359,23 @@ export function ensureWorktreeProjectReconciled(
     readonly _maxDiscoveryEntries?: number;
     /** @internal Observe catalogue walks for deterministic tests. */
     readonly _discoveryObserver?: (path: string) => void;
+    /** @internal Token held by a caller that already has publication admission. */
+    readonly _publicationLockToken?: BackendPublicationLockToken;
   } = {},
 ): WorktreeReconciliationResult {
+  if (opts._publicationLockToken === undefined) {
+    return withBackendPublicationConsumerLock(undefined, (publicationLockToken) =>
+      ensureWorktreeProjectReconciled(cwd, identity, {
+        ...opts,
+        _publicationLockToken: publicationLockToken,
+      }));
+  }
   const anchor = identity ? undefined : resolveGitProjectAnchor(cwd);
-  if (!identity && !anchor) return reconcileWorktrees(cwd);
+  if (!identity && !anchor) {
+    return reconcileWorktrees(cwd, {
+      _publicationLockToken: opts._publicationLockToken,
+    });
+  }
   const project = identity ?? {
     id: hashProjectPath(anchor!.canonical),
     canonical: anchor!.canonical,
@@ -2372,7 +2406,7 @@ export function ensureWorktreeProjectReconciled(
   }
   if (identity) {
     const before = reconciliationDiscovery(
-      listProjectMapEntries(),
+      listProjectMapEntries(undefined, opts._publicationLockToken),
       project.id,
       opts._codexDir,
       opts._maxDiscoveryEntries,
@@ -2408,11 +2442,12 @@ export function ensureWorktreeProjectReconciled(
     _codexDir: opts._codexDir,
     _maxDiscoveryEntries: opts._maxDiscoveryEntries,
     _discoveryObserver: opts._discoveryObserver,
+    _publicationLockToken: opts._publicationLockToken,
   });
   const publishedDiscovery = result.journalPath
     ? readJournal(result.journalPath)?.discovery
     : reconciliationDiscovery(
-        listProjectMapEntries(),
+        listProjectMapEntries(undefined, opts._publicationLockToken),
         result.targetHash,
         opts._codexDir,
         opts._maxDiscoveryEntries,
@@ -2440,10 +2475,12 @@ export function clearWorktreeReconciliationCache(): void {
 }
 
 export function listWorktreeReconciliationJournals(homeDir?: string): ReconciliationJournal[] {
-  const root = reconciliationDir(homeDir);
-  if (!existsSync(root)) return [];
-  return readdirSync(root, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && /^[a-f0-9]{64}\.json$/u.test(entry.name))
-    .map((entry) => readJournal(join(root, entry.name)))
-    .filter((journal): journal is ReconciliationJournal => journal !== null);
+  return withBackendPublicationConsumerLock(homeDir, () => {
+    const root = reconciliationDir(homeDir);
+    if (!existsSync(root)) return [];
+    return readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && /^[a-f0-9]{64}\.json$/u.test(entry.name))
+      .map((entry) => readJournal(join(root, entry.name)))
+      .filter((journal): journal is ReconciliationJournal => journal !== null);
+  });
 }

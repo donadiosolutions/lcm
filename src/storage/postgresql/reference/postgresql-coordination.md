@@ -15,9 +15,22 @@ coordinate direct programmatic callers that share one PostgreSQL 18 database:
 
 This feature does not change SQLite coordination, select PostgreSQL through
 `ProjectStorage`, automatically start the drain worker, or activate PostgreSQL
-for normal daemon data routes. Those routes remain gated by #92 and #224.
+for normal daemon data routes. PostgreSQL selection remains unavailable; those
+routes remain gated by #92 and #224, which are not implemented.
 The `lcm events` status, validation, quarantine, and replay commands are staged
 operator surfaces only.
+
+The separate [backend publication safety guide](../../../../docs/backend-publication.md)
+covers chore #408's shared admission boundary. Every project-scoped PostgreSQL
+query or transaction declares its complete, canonically sorted project scope
+and establishes `READ COMMITTED`/`READ WRITE` before admission. Shared mutation
+admission takes the project publication advisory lock and reads the reserved
+`backend-publication`/`selection` row in `lcm.fenced_leases`; an unreleased row
+fails closed. The `PostgreSqlRuntime.backendPublicationGuard()` exposes exact
+acquire, renew, release, and read operations for the exclusive publication
+path. It uses PostgreSQL database time, monotonic fencing tokens, and
+authoritative readback after uncertain commits. No schema object, broad
+privilege, `MAINTAIN`, or full-table lock is used as a substitute.
 
 ## Provision runtime access
 
@@ -54,6 +67,16 @@ privileges are not row-level authorization: LCM is a single-user,
 multi-machine system, and the runtime role is trusted for the database.
 Repository methods still bind every operation to one validated project UUID,
 so application callers cannot accidentally coordinate another project.
+
+The coordination script is the only reviewed runtime grant script that gives
+the same configured runtime role the publication guard lease DML and
+fencing-sequence `USAGE`. The other project-domain scripts add only `SELECT`
+on `fenced_leases` for shared mutation admission. This split is intentional:
+the runtime role can observe an unresolved publication through the domain
+scripts, and receives acquire, renew, release, takeover, or cleanup authority
+only when the coordination script is applied. Runtime privilege readiness
+accepts only the documented owner-granted, non-grantable shape and fails closed
+on broader or missing access.
 
 After changing grants, rerun `lcm postgres migrate` with the migration role.
 Readiness accepts this exact non-grantable privilege shape and rejects broader,

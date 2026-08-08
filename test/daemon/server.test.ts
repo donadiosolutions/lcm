@@ -10,6 +10,7 @@ import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
 import { projectDbPath, projectDir } from "../../src/daemon/project.js";
 import { recoverMachineIdentity } from "../../src/machine-identity.js";
 import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 import {
   clearProjectMapCache,
   hashProjectPath,
@@ -47,6 +48,114 @@ describe("daemon server", () => {
     else process.env.HOME = originalHome;
     if (originalUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = originalUserProfile;
+  });
+
+  it("refuses daemon construction when publication evidence is malformed", async () => {
+    const publicationDir = join(tempHome!, ".lcm", "backend-publication");
+    mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
+
+    await expect(createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0 } })))
+      .rejects.toBeInstanceOf(BackendPublicationJournalError);
+  });
+
+  it("blocks request and scheduled-scan consumers on fresh publication admission", async () => {
+    const lcmDir = join(tempHome!, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    const scanForTranscripts = vi.fn(async () => undefined);
+    let scheduledScan: (() => unknown) | undefined;
+    const realSetInterval = globalThis.setInterval;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 10 * 60 * 1000 && typeof handler === "function") {
+        scheduledScan = () => handler(...args);
+      }
+      return realSetInterval(handler, timeout, ...args);
+    }) as typeof setInterval);
+    daemon = await createDaemon(loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }), {
+      publicationConfigPath: configPath,
+      _scanForTranscripts: scanForTranscripts,
+    });
+
+    const publicationDir = join(lcmDir, "backend-publication");
+    mkdirSync(publicationDir, { mode: 0o700 });
+    writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
+    const response = await fetch(`http://127.0.0.1:${daemon.address().port}/status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await scheduledScan?.();
+    expect(warn).toHaveBeenCalledWith("[lcm] periodic transcript scan blocked by backend publication admission");
+    expect(scanForTranscripts).not.toHaveBeenCalled();
+  });
+
+  it("rejects a request when the freshly loaded backend differs from startup", async () => {
+    const configPath = join(tempHome!, "request-config.json");
+    const caPath = join(tempHome!, "postgres-ca.pem");
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const previousUrl = process.env.LCM_POSTGRES_URL;
+    const previousCa = process.env.LCM_POSTGRES_CA_FILE;
+    process.env.LCM_POSTGRES_URL = "postgresql://user:secret@db.example.test/lcm";
+    process.env.LCM_POSTGRES_CA_FILE = caPath;
+    daemon = await createDaemon(loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }), {
+      publicationConfigPath: configPath,
+    });
+    try {
+      writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" } }), { mode: 0o600 });
+      expect(loadDaemonConfig(configPath).storage.backend).toBe("postgresql");
+      const response = await fetch(`http://127.0.0.1:${daemon.address().port}/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual({
+        status: "blocked",
+        error: "backend publication admission blocked",
+      });
+    } finally {
+      if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousUrl;
+      if (previousCa === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousCa;
+    }
+  });
+
+  it("rejects malformed daemon test identities before authenticating", async () => {
+    await expect(createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0 } }), {
+      _testIdentity: { ownerId: "only-owner" } as never,
+    })).rejects.toThrow("Daemon test identity is incomplete or malformed");
+
+    const tokenPath = join(tempHome!, "daemon.token");
+    ensureAuthToken(tokenPath);
+    await expect(createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0 } }), {
+      tokenPath,
+    })).rejects.toThrow("Refusing to authenticate a Vitest worker as a daemon entrypoint");
+  });
+
+  it("omits an owner id from public authenticated health when none is configured", async () => {
+    const previousEntrypoint = process.argv[1];
+    process.argv[1] = join(tempHome!, "daemon.mjs");
+    const tokenPath = join(tempHome!, "daemon.token");
+    ensureAuthToken(tokenPath);
+    try {
+      daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0 } }), { tokenPath });
+      const response = await fetch(`http://127.0.0.1:${daemon.address().port}/health`);
+      expect(response.status).toBe(200);
+      expect(await response.json()).not.toHaveProperty("ownerId");
+    } finally {
+      process.argv[1] = previousEntrypoint;
+    }
   });
 
   it("starts and responds to /health", async () => {
@@ -104,7 +213,10 @@ describe("daemon server", () => {
       },
     );
     config.restoration.promptSearchMaxResults = 0;
-    daemon = await createDaemon(config, { _scanForTranscripts: scanForTranscripts });
+    daemon = await createDaemon(config, {
+      _scanForTranscripts: scanForTranscripts,
+      _assertBackendPublication: () => undefined,
+    });
     const port = daemon.address().port;
 
     expect(setIntervalSpy).not.toHaveBeenCalledWith(expect.any(Function), 10 * 60 * 1000);
@@ -494,7 +606,11 @@ describe("daemon auth", () => {
     ensureAuthToken(tokenPath);
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    const daemon = await createDaemon(config, { tokenPath, _testIdentity: testIdentity });
+    const daemon = await createDaemon(config, {
+      tokenPath,
+      _testIdentity: testIdentity,
+      _assertBackendPublication: () => undefined,
+    });
     const port = daemon.address().port;
     try {
       const res = await fetch(`http://127.0.0.1:${port}/store`, {
@@ -577,7 +693,11 @@ describe("daemon auth", () => {
         LCM_POSTGRES_CA_FILE: caPath,
       },
     );
-    const daemon = await createDaemon(config, { tokenPath, _testIdentity: testIdentity });
+    const daemon = await createDaemon(config, {
+      tokenPath,
+      _testIdentity: testIdentity,
+      _assertBackendPublication: () => undefined,
+    });
     const port = daemon.address().port;
     try {
       const publicResponse = await fetch(`http://127.0.0.1:${port}/health`);
