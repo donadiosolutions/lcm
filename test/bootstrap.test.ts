@@ -80,6 +80,18 @@ describe("ensureCore", () => {
     expect(effective.llm.retry).toEqual(DEFAULT_LLM_RETRY_POLICY);
   });
 
+  it("keeps bounded config admission fail-closed when process ownership is unavailable", async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+    try {
+      const { ensureCore } = await import("../src/bootstrap.js");
+      await expect(ensureCore(makeDeps())).resolves.toBe(true);
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
   it("uses the packaged runtime when no binary path is injected", async () => {
     const deps = makeDeps({ binaryPath: undefined });
     const { ensureCore } = await import("../src/bootstrap.js");
@@ -166,6 +178,24 @@ describe("ensureCore", () => {
       if (previousCa === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
       else process.env.LCM_POSTGRES_CA_FILE = previousCa;
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an oversized config before parsing it through an unbounded loader", async () => {
+    const configPath = join(publicationRoot, "config.json");
+    const oversized = `{"llm":{"model":"${"x".repeat(4 * 1024 * 1024)}"}}`;
+    writeFileSync(configPath, oversized, { mode: 0o600 });
+    const deps = makeDeps({
+      configPath,
+      existsSync: fsExistsSync,
+    });
+
+    try {
+      const { ensureCoreEndpoint } = await import("../src/bootstrap.js");
+      await expect(ensureCoreEndpoint(deps)).rejects.toThrow("size limit");
+      expect(deps.ensureDaemon).not.toHaveBeenCalled();
+    } finally {
+      rmSync(configPath, { force: true });
     }
   });
 

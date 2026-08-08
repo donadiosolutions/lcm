@@ -281,6 +281,21 @@ describe("private filesystem primitives", () => {
     })).toThrow();
   });
 
+  it("fsyncs an authenticated owner-only final mode before durable publication", () => {
+    const root = makeRoot();
+    const path = join(root, "owner-readonly.json");
+
+    atomicWritePrivateFileDurable(path, "readonly", {
+      requireAbsent: true,
+      finalMode: 0o400,
+    });
+
+    expect(readFileSync(path, "utf8")).toBe("readonly");
+    expect(statSync(path).mode & 0o777).toBe(0o400);
+    expect(() => atomicWritePrivateFileDurable(path, "invalid", { finalMode: 0o644 }))
+      .toThrow("owner-only");
+  });
+
   it("covers durable exclusive publication races and injected I/O failures", () => {
     const root = makeRoot();
     const race = join(root, "race");

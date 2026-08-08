@@ -4,7 +4,12 @@ import { dirname, isAbsolute, join } from "node:path";
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "node:child_process";
 import { ensureCore } from "../src/bootstrap.js";
 import { bootstrapLcmHome, lcmHomeDir } from "../src/runtime-paths.js";
-import { atomicWritePrivateFile, atomicWritePrivateFileDurable, readBoundedRegularFile } from "../src/security-files.js";
+import {
+  atomicWritePrivateFile,
+  atomicWritePrivateFileDurable,
+  OWNER_ONLY_FILE_MODES,
+  readBoundedRegularFile,
+} from "../src/security-files.js";
 import { parseStoredConfig } from "../src/daemon/config.js";
 import {
   assertBackendPublicationConfigAccess,
@@ -274,7 +279,7 @@ function readInstallConfig(deps: ServiceDeps, path: string): string {
       allowedRoot: dirname(path),
       maxBytes: MAX_INSTALL_CONFIG_BYTES,
       expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
-      allowedModes: [0o600],
+      allowedModes: OWNER_ONLY_FILE_MODES,
       requireSingleLink: true,
     });
   }
@@ -609,7 +614,7 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
           deps.mkdirSync(dirname(configPath), { recursive: true });
           if (deps.atomicWritePrivateFile) deps.atomicWritePrivateFile(configPath, serialized);
           else deps.writeFileSync(configPath, serialized);
-          try { deps.chmodSync?.(configPath, 0o600); } catch { /* best-effort */ }
+          try { (deps.chmodSync ?? chmodSync)(configPath, 0o600); } catch { /* best-effort */ }
         }
       } catch (error) {
         if (safeConfigExists(deps, configPath)) return false;

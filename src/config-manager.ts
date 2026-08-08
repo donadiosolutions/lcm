@@ -38,6 +38,7 @@ import {
   consumeBoundedRegularFile,
   readBoundedRegularFile,
   syncPrivateDirectory,
+  OWNER_ONLY_FILE_MODES,
 } from "./security-files.js";
 
 const DENIED_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
@@ -320,20 +321,20 @@ export async function applyBackendPublicationConfigFile(
           allowedRoot: dirname(configPath),
           maxBytes: 4 * 1024 * 1024,
           expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
-          allowedModes: [0o600],
+          allowedModes: OWNER_ONLY_FILE_MODES,
           requireSingleLink: true,
           expectedRawSha256: before.rawSha256,
         });
         syncPrivateDirectory(dirname(configPath));
       }
     } else {
+      const recoveryFile = input.file as Extract<BackendPublicationRecoveryFile, { presence: "present" }>;
       atomicWritePrivateFileDurable(configPath, candidateContent, {
         requireAbsent: before.presence === "absent",
         expectedContentSha256: before.presence === "present" ? before.rawSha256 : null,
         maxExistingBytes: 4 * 1024 * 1024,
+        finalMode: recoveryFile.mode,
       });
-      const recoveryFile = input.file as Extract<BackendPublicationRecoveryFile, { presence: "present" }>;
-      chmodSync(configPath, recoveryFile.mode);
       syncPrivateDirectory(dirname(configPath));
     }
     const after = captureBackendPublicationState(input.homeDir).config;

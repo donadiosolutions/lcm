@@ -24,6 +24,19 @@ import { basename, dirname, join, sep } from "node:path";
 
 export const PRIVATE_DIRECTORY_MODE = 0o700;
 export const PRIVATE_FILE_MODE = 0o600;
+export const OWNER_ONLY_FILE_MODES: readonly number[] = Object.freeze([
+  0o100,
+  0o200,
+  0o300,
+  0o400,
+  0o500,
+  0o600,
+  0o700,
+]);
+
+export function isOwnerOnlyFileMode(mode: number): boolean {
+  return Number.isSafeInteger(mode) && OWNER_ONLY_FILE_MODES.includes(mode);
+}
 
 /** Exact identity/security evidence for a retained private directory descriptor. */
 export type PrivateDirectoryWitness = Readonly<{
@@ -795,6 +808,8 @@ export type DurablePrivateWriteOptions = Readonly<{
   expectedContentSha256?: string | null;
   /** Bound the precondition read independently of the replacement size. */
   maxExistingBytes?: number;
+  /** Authenticated owner-only mode to place on the temporary descriptor before publication. */
+  finalMode?: number;
   /** @internal Deterministic temporary-name seam for tests. */
   random?: (size: number) => Buffer;
 }>;
@@ -817,6 +832,10 @@ export function atomicWritePrivateFileDurable(
   content: string | Uint8Array,
   options: DurablePrivateWriteOptions = {},
 ): void {
+  const finalMode = options.finalMode ?? PRIVATE_FILE_MODE;
+  if (!isOwnerOnlyFileMode(finalMode)) {
+    throw new Error("private durable publication mode must be owner-only");
+  }
   const directory = dirname(path);
   const parent = openPrivateDirectory(directory);
   const parentIdentity: PrivatePathIdentity = {
@@ -830,7 +849,7 @@ export function atomicWritePrivateFileDurable(
         allowedRoot: directory,
         maxBytes: options.maxExistingBytes ?? Math.max(Buffer.byteLength(content), 1) + 1,
         expectedUid: currentUid(),
-        allowedModes: [PRIVATE_FILE_MODE],
+        allowedModes: OWNER_ONLY_FILE_MODES,
         requireSingleLink: true,
       });
       return sha256Bytes(observed.content);
@@ -863,7 +882,7 @@ export function atomicWritePrivateFileDurable(
         | constants.O_EXCL
         | constants.O_NOFOLLOW
         | constants.O_NONBLOCK,
-      PRIVATE_FILE_MODE,
+      finalMode,
     );
     temporaryIdentity = privateFileIdentity(
       fstatSync(temporaryFd, { bigint: true }) as unknown as PrivatePathIdentity,
@@ -876,7 +895,7 @@ export function atomicWritePrivateFileDurable(
       if (written <= 0) throw new Error("private durable write made no progress");
       offset += written;
     }
-    fchmodSync(temporaryFd, PRIVATE_FILE_MODE);
+    fchmodSync(temporaryFd, finalMode);
     fsyncSync(temporaryFd);
     closeSync(temporaryFd);
     temporaryFd = undefined;

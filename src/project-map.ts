@@ -16,6 +16,7 @@ import {
   atomicWritePrivateFileDurable,
   consumeBoundedRegularFile,
   ensurePrivateDirectory,
+  OWNER_ONLY_FILE_MODES,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
@@ -410,7 +411,7 @@ export async function applyBackendPublicationProjectMapFile(
           allowedRoot: dirname(path),
           maxBytes: 4 * 1024 * 1024,
           expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
-          allowedModes: [0o600],
+          allowedModes: OWNER_ONLY_FILE_MODES,
           requireSingleLink: true,
           expectedRawSha256: before.rawSha256,
         });
@@ -419,13 +420,13 @@ export async function applyBackendPublicationProjectMapFile(
       cache = { path, mtimeMs: null, map: emptyMap(), metadataPopulated: false };
     } else {
       ensurePrivateDirectory(dirname(path));
+      const recoveryFile = input.file as Extract<BackendPublicationRecoveryFile, { presence: "present" }>;
       atomicWritePrivateFileDurable(path, state.content, {
         requireAbsent: before.presence === "absent",
         expectedContentSha256: before.presence === "present" ? before.rawSha256 : null,
         maxExistingBytes: 4 * 1024 * 1024,
+        finalMode: recoveryFile.mode,
       });
-      const recoveryFile = input.file as Extract<BackendPublicationRecoveryFile, { presence: "present" }>;
-      chmodSync(path, recoveryFile.mode);
       syncPrivateDirectory(dirname(path));
       cache = {
         path,

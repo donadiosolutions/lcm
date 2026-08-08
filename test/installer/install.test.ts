@@ -28,6 +28,7 @@ import { dirname, join } from "node:path";
 import { legacyLcmCommand, legacyLcmMcpServerName } from "../../src/legacy-names.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../../src/daemon/config.js";
 import { removeManagedClaudeHooks } from "../../src/installer/settings.js";
+import { OWNER_ONLY_FILE_MODES } from "../../src/security-files.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -735,7 +736,7 @@ describe("install", () => {
       expect(bounded).toHaveBeenCalledWith(configPath, expect.objectContaining({
         allowedRoot: root,
         maxBytes: 4 * 1024 * 1024,
-        allowedModes: [0o600],
+        allowedModes: OWNER_ONLY_FILE_MODES,
         requireSingleLink: true,
       }));
     } finally {
@@ -1137,7 +1138,7 @@ describe("install", () => {
     const commandsSourceDir = fs.mkdtempSync(join(home, "commands-source-"));
     try {
       fs.mkdirSync(lcmDir, { recursive: true });
-      fs.writeFileSync(join(lcmDir, "config.json"), "{}");
+      fs.writeFileSync(join(lcmDir, "config.json"), "{}", { mode: 0o600 });
       fs.mkdirSync(join(cacheDir, "1.3.0"), { recursive: true });
       fs.mkdirSync(join(cacheDir, "1.4.0"), { recursive: true });
       fs.writeFileSync(join(commandsSourceDir, "command.md"), "command");

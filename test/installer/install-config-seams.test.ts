@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { OWNER_ONLY_FILE_MODES } from "../../src/security-files.js";
 
 const bootstrapMock = vi.hoisted(() => ({
   ensureCore: vi.fn().mockResolvedValue(true),
@@ -60,7 +61,7 @@ describe("installer config reader compatibility seams", () => {
     expect(bounded).toHaveBeenCalledWith(
       expect.stringContaining(".lcm-coverage-alt/config.json"),
       expect.objectContaining({
-        allowedModes: [0o600],
+        allowedModes: OWNER_ONLY_FILE_MODES,
         requireSingleLink: true,
       }),
     );

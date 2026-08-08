@@ -25,7 +25,7 @@ import {
 } from "../src/storage/backend-publication.js";
 import { applyBackendPublicationConfigFile } from "../src/config-manager.js";
 import { applyBackendPublicationProjectMapFile } from "../src/project-map.js";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,11 +41,11 @@ function makeHome(): string {
   return home;
 }
 
-function file(content: string): BackendPublicationRecoveryFile {
+function file(content: string, mode = 0o600): BackendPublicationRecoveryFile {
   return {
     presence: "present",
     content: Buffer.from(content),
-    mode: 0o600,
+    mode,
     uid: typeof process.getuid === "function" ? process.getuid() : 0,
     gid: typeof process.getgid === "function" ? process.getgid() : 0,
     nlink: "1",
@@ -424,6 +424,53 @@ describe("local backend-publication consumer seam", () => {
     expect(readFileSync(join(home, ".lcm", "map.json"), "utf8")).toBe(sourceMap);
   });
 
+  it("preserves authenticated owner-only modes through publish and abort replay", async () => {
+    const published = fixture();
+    const publishedMaterial: BackendPublicationRecoveryMaterial = {
+      ...published.material,
+      target: {
+        ...published.material.target,
+        config: file(published.targetConfig, 0o400),
+      },
+    };
+    const publisher = new BackendPublicationCoordinator({
+      homeDir: published.home,
+      driver: driverFor(published.home),
+    });
+    await publisher.prepare({
+      publicationId: "consumer-owner-readonly-publish",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      material: publishedMaterial,
+      projects: [],
+    });
+    await expect(publisher.resume()).resolves.toMatchObject({ phase: "completed" });
+    expect(statSync(join(published.home, ".lcm", "config.json")).mode & 0o777).toBe(0o400);
+
+    const aborted = fixture();
+    const abortedMaterial: BackendPublicationRecoveryMaterial = {
+      ...aborted.material,
+      target: {
+        ...aborted.material.target,
+        config: file(aborted.targetConfig, 0o400),
+      },
+    };
+    const aborter = new BackendPublicationCoordinator({
+      homeDir: aborted.home,
+      driver: driverFor(aborted.home, true),
+    });
+    await aborter.prepare({
+      publicationId: "consumer-owner-readonly-abort",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      material: abortedMaterial,
+      projects: [],
+    });
+    await expect(aborter.resume()).rejects.toThrow("injected config publication failure");
+    await expect(aborter.abort()).resolves.toMatchObject({ phase: "aborted" });
+    expect(statSync(join(aborted.home, ".lcm", "config.json")).mode & 0o777).toBe(0o600);
+  });
+
   it("fails closed when the map changes to unrelated content before abort restoration", async () => {
     const { home, material } = fixture();
     const coordinator = new BackendPublicationCoordinator({
@@ -581,6 +628,7 @@ describe("local backend-publication consumer seam", () => {
       publicationId: journal.publicationId,
       expectedChecksumSha256: journal.checksumSha256,
       access: "publish-config",
+      expectedWitness: journal.targetState.config,
       homeDir: values.home,
     }, async (permit) => {
       if (journal.recoveryReference === null) throw new Error("test journal reference is absent");
@@ -626,6 +674,7 @@ describe("local backend-publication consumer seam", () => {
       publicationId: journal.publicationId,
       expectedChecksumSha256: journal.checksumSha256,
       access: "publish-project-map",
+      expectedWitness: journal.targetState.projectMap,
       homeDir: values.home,
     }, async (permit) => {
       if (journal.recoveryReference === null) throw new Error("test journal reference is absent");
@@ -795,12 +844,14 @@ describe("local backend-publication consumer seam", () => {
       publicationId: mapPublished.publicationId,
       expectedChecksumSha256: mapPublished.checksumSha256,
       access: "publish-project-map",
+      expectedWitness: mapPublished.targetState.projectMap,
       homeDir: home,
     }, () => undefined)).rejects.toMatchObject({ reason: "permit-mismatch" });
     await expect(withBackendPublicationPermit({
       publicationId: mapPublished.publicationId,
       expectedChecksumSha256: mapPublished.checksumSha256,
       access: "publish-config",
+      expectedWitness: mapPublished.targetState.config,
       stateSha256: "invalid",
       homeDir: home,
     }, () => undefined)).rejects.toMatchObject({ reason: "permit-mismatch" });
@@ -823,6 +874,7 @@ describe("local backend-publication consumer seam", () => {
       publicationId: mapPublished.publicationId,
       expectedChecksumSha256: mapPublished.checksumSha256,
       access: "publish-config",
+      expectedWitness: mapPublished.targetState.config,
       homeDir: home,
     }, (permit) => {
       expect(() => assertBackendPublicationConfigMutation(
@@ -879,6 +931,7 @@ describe("local backend-publication consumer seam", () => {
       publicationId: aborting.publicationId,
       expectedChecksumSha256: aborting.checksumSha256,
       access: "restore-config",
+      expectedWitness: aborting.sourceState.config,
       homeDir: restorePhases.home,
     }, (permit) => {
       expect(() => assertBackendPublicationConfigMutation(
@@ -913,6 +966,7 @@ describe("local backend-publication consumer seam", () => {
       publicationId: guardedJournal.publicationId,
       expectedChecksumSha256: guardedJournal.checksumSha256,
       access: "publish-project-map",
+      expectedWitness: guardedJournal.targetState.projectMap,
       homeDir: guarded.home,
     }, (permit) => {
       expect(() => assertBackendPublicationProjectMapMutation(
@@ -953,6 +1007,47 @@ describe("local backend-publication consumer seam", () => {
         .toThrow("no longer active");
     })).resolves.toBeUndefined();
     expect(revokedPermit?.active).toBe(false);
+  });
+
+  it("requires mutation permits to bind an exact authenticated expected witness", async () => {
+    const pending = await pendingFixture();
+    const mapPublished = rewriteJournal(pending.home, (current) => ({ ...current, phase: "map-published" }));
+    const missingWitness = {
+      publicationId: mapPublished.publicationId,
+      expectedChecksumSha256: mapPublished.checksumSha256,
+      access: "publish-config" as const,
+      homeDir: pending.home,
+    } as never;
+    await expect(withBackendPublicationPermit(missingWitness, () => undefined))
+      .rejects.toMatchObject({ reason: "permit-mismatch" });
+
+    await expect(withBackendPublicationPermit({
+      publicationId: mapPublished.publicationId,
+      expectedChecksumSha256: mapPublished.checksumSha256,
+      access: "publish-config",
+      expectedWitness: {
+        ...mapPublished.targetState.config,
+        rawSha256: "0".repeat(64),
+      },
+      homeDir: pending.home,
+    }, () => undefined)).rejects.toMatchObject({ reason: "permit-mismatch" });
+
+    await withBackendPublicationPermit({
+      publicationId: mapPublished.publicationId,
+      expectedChecksumSha256: mapPublished.checksumSha256,
+      access: "publish-config",
+      expectedWitness: mapPublished.targetState.config,
+      homeDir: pending.home,
+    }, (permit) => {
+      expect(() => assertBackendPublicationConfigMutation(
+        join(pending.home, ".lcm", "config.json"),
+        "sqlite",
+        "postgresql",
+        '{"storage":{"backend":"postgresql"}}\n',
+        pending.sourceConfig,
+        permit,
+      )).not.toThrow();
+    });
   });
 
   it("keeps ordinary SQLite mutations safe without evidence and rejects PostgreSQL activation", async () => {

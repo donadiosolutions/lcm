@@ -3,7 +3,11 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { mergeClaudeSettings } from "./installer/settings.js";
 import { packageExecutable } from "./runtime-root.js";
-import { daemonConfigForPersistence, loadDaemonConfig } from "./daemon/config.js";
+import {
+  daemonConfigForPersistence,
+  parseDaemonConfig,
+  resolveDaemonConfigEnv,
+} from "./daemon/config.js";
 import {
   bootstrapLcmHome,
   configPath as defaultConfigPath,
@@ -16,8 +20,14 @@ import {
   backendPublicationHomeForConfigPath,
   withBackendPublicationConfigLock,
 } from "./storage/backend-publication.js";
-import { atomicWritePrivateFileDurable } from "./security-files.js";
+import {
+  atomicWritePrivateFileDurable,
+  OWNER_ONLY_FILE_MODES,
+  readBoundedRegularFileWithStat,
+} from "./security-files.js";
 import { selectStorageBackend } from "./storage/backend.js";
+
+const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 
 export interface EnsureCoreDeps {
   configPath: string;
@@ -80,9 +90,9 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
   // 1. Authenticate publication state, then create config.json with
   // defaults if missing. Production defaults use the descriptor-bound durable
   // writer; injected dependencies retain the historical seam for tests.
-  withBackendPublicationConfigLock(deps.configPath, (lockToken) => {
+  const config = withBackendPublicationConfigLock(deps.configPath, (lockToken) => {
     if (!deps.existsSync(deps.configPath)) {
-      const defaults = loadDaemonConfig("/nonexistent");
+      const defaults = parseDaemonConfig("{}", {}, resolveDaemonConfigEnv(process.env));
       const content = JSON.stringify(daemonConfigForPersistence(defaults), null, 2);
       if (deps.ensureRuntimeHome !== undefined) {
         assertBackendPublicationConfigMutation(
@@ -107,16 +117,32 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
         } catch {}
       }
     }
-  });
 
-  // loadDaemonConfig performs the bounded descriptor read and publication
-  // witness check. Do not pre-read the whole file through an injected string
-  // seam: that would allocate unbounded input before the safety limit runs.
-  const config = loadDaemonConfig(deps.configPath);
-  assertBackendPublicationConfigAccess(
-    deps.configPath,
-    config.storage.backend,
-  );
+    let content = "{}";
+    let observedContent: string | null = null;
+    try {
+      const observed = readBoundedRegularFileWithStat(deps.configPath, {
+        allowedRoot: dirname(deps.configPath),
+        maxBytes: MAX_CONFIG_BYTES,
+        expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+        allowedModes: OWNER_ONLY_FILE_MODES,
+        requireSingleLink: true,
+      });
+      content = observed.content;
+      observedContent = observed.content;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const parsed = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
+    assertBackendPublicationConfigAccess(
+      deps.configPath,
+      parsed.storage.backend,
+      observedContent,
+      undefined,
+      lockToken,
+    );
+    return parsed;
+  });
 
   // 2. Clean stale/duplicate hooks from settings.json (fixes #94)
   // Only rewrite settings.json if mergeClaudeSettings actually changed the data

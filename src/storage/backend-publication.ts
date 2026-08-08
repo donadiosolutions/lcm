@@ -247,6 +247,23 @@ export type BackendPublicationPermitAccess =
   | "restore-config"
   | "restore-project-map";
 
+type BackendPublicationMutationPermitAccess = Exclude<BackendPublicationPermitAccess, "read-recovery">;
+
+type BackendPublicationPermitInput = Readonly<{
+  publicationId: string;
+  expectedChecksumSha256: string;
+  access: "read-recovery";
+  stateSha256?: string;
+  homeDir?: string;
+}> | Readonly<{
+  publicationId: string;
+  expectedChecksumSha256: string;
+  access: BackendPublicationMutationPermitAccess;
+  expectedWitness: BackendPublicationFileWitness;
+  stateSha256?: string;
+  homeDir?: string;
+}>;
+
 type BackendPublicationPermitMetadata = Readonly<{
   homeDir: string | undefined;
   publicationId: string;
@@ -254,6 +271,10 @@ type BackendPublicationPermitMetadata = Readonly<{
   phase: BackendPublicationPhase;
   access: BackendPublicationPermitAccess;
   expectedWitness?: BackendPublicationFileWitness;
+}>;
+
+type BackendPublicationMutationPermitMetadata = BackendPublicationPermitMetadata & Readonly<{
+  expectedWitness: BackendPublicationFileWitness;
 }>;
 
 /**
@@ -1364,22 +1385,34 @@ function mutationPermitFor(
   permit: PrivateMutationPermit | undefined,
   homeDir: string | undefined,
   journal: BackendPublicationJournal,
-  access: BackendPublicationPermitAccess,
-): BackendPublicationPermitMetadata {
+  access: BackendPublicationMutationPermitAccess,
+): BackendPublicationMutationPermitMetadata {
   const metadata = permitMetadata(permit, homeDir, journal);
   if (metadata.access !== access) {
     return fail("permit-mismatch", `backend publication permit is not valid for ${access}`);
   }
-  return metadata;
+  return metadata as BackendPublicationMutationPermitMetadata;
+}
+
+function expectedWitnessForMutationAccess(
+  journal: BackendPublicationJournal,
+  access: BackendPublicationMutationPermitAccess,
+): BackendPublicationFileWitness {
+  const witnesses: Readonly<Record<BackendPublicationMutationPermitAccess, BackendPublicationFileWitness>> = {
+    "publish-project-map": journal.targetState.projectMap,
+    "publish-config": journal.targetState.config,
+    "restore-config": journal.sourceState.config,
+    "restore-project-map": journal.sourceState.projectMap,
+  };
+  return witnesses[access];
 }
 
 function assertCandidateWitness(
   candidate: string | null,
-  expected: BackendPublicationFileWitness | undefined,
+  expected: BackendPublicationFileWitness,
   field: string,
   semantic = false,
 ): void {
-  if (expected === undefined) return;
   if (candidate === null) {
     assertLogicalWitness(ABSENT_WITNESS, expected, field);
     return;
@@ -1638,13 +1671,7 @@ export function assertBackendPublicationProjectMapAccess(input: {
 
 /** Issue an explicit permit for a guarded coordinator callback. */
 export async function withBackendPublicationPermit<T>(
-  input: Readonly<{
-    publicationId: string;
-    expectedChecksumSha256: string;
-    access: BackendPublicationPermitAccess;
-    stateSha256?: string;
-    homeDir?: string;
-  }>,
+  input: BackendPublicationPermitInput,
   callback: (permit: PrivateMutationPermit) => T | Promise<T>,
 ): Promise<T> {
   return withBackendPublicationConsumerLockAsync(
@@ -1670,7 +1697,18 @@ export async function withBackendPublicationPermit<T>(
       if (!allowed[input.access].includes(journal.phase)) {
         return fail("permit-mismatch", "backend publication recovery permit phase is invalid");
       }
-      if (input.access !== "read-recovery" && input.stateSha256 !== undefined && !HASH_PATTERN.test(input.stateSha256)) {
+      const expectedWitness = input.access === "read-recovery"
+        ? undefined
+        : input.expectedWitness;
+      if (input.access !== "read-recovery") {
+        if (expectedWitness === undefined) {
+          return fail("permit-mismatch", "backend publication mutation permit requires an exact expected witness");
+        }
+        if (!sameValue(expectedWitness, expectedWitnessForMutationAccess(journal, input.access))) {
+          return fail("permit-mismatch", "backend publication mutation permit witness does not match durable state");
+        }
+      }
+      if (input.stateSha256 !== undefined && !HASH_PATTERN.test(input.stateSha256)) {
         return fail("permit-mismatch", "backend publication recovery permit state witness is invalid");
       }
       return withRevocablePrivateMutationPermit(`backend publication ${input.access}`, async (permit) => {
@@ -1680,6 +1718,7 @@ export async function withBackendPublicationPermit<T>(
           checksumSha256: journal.checksumSha256,
           phase: journal.phase,
           access: input.access,
+          expectedWitness,
         });
         try {
           return await callback(permit);
