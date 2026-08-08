@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -12,8 +13,10 @@ import {
   appendFileSync,
   closeSync,
   fchmodSync,
+  fstatSync,
   openSync,
   linkSync,
+  lstatSync,
   realpathSync,
   statSync as fsStatSync,
   unlinkSync,
@@ -21,18 +24,23 @@ import {
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, parse, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   atomicWritePrivateFile,
+  atomicWritePrivateFileDurable,
   atomicWritePrivateFileExclusive,
+  assertPrivateDirectory,
   copyRegularFilePrivateExclusive,
   consumeBoundedRegularFile,
   deleteRegularFile,
   ensurePrivateDirectory,
+  openPrivateDirectory,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
+  syncPrivateDirectory,
   writePrivateFileExclusive,
 } from "../src/security-files.js";
 
@@ -46,6 +54,19 @@ function makeRoot(): string {
   const root = mkdtempSync(join(tmpdir(), "lcm-security-files-"));
   roots.push(root);
   return root;
+}
+
+function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T): T {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const original = nodeFs[name];
+  nodeFs[name] = replacement;
+  syncBuiltinESMExports();
+  try {
+    return callback();
+  } finally {
+    nodeFs[name] = original;
+    syncBuiltinESMExports();
+  }
 }
 
 describe("private filesystem primitives", () => {
@@ -122,6 +143,244 @@ describe("private filesystem primitives", () => {
     ensurePrivateDirectory(path);
 
     expect(statSync(path).mode & 0o777).toBe(0o700);
+  });
+
+  it("retains and revalidates a strict private directory descriptor", () => {
+    const root = makeRoot();
+    const path = join(root, "retained");
+    mkdirSync(path, { mode: 0o700 });
+
+    const handle = openPrivateDirectory(path);
+    expect(handle.witness.mode).toBe(0o700);
+    expect(handle.witness.dev).toMatch(/^\d+$/u);
+    expect(assertPrivateDirectory(handle, path, handle.witness)).toEqual(handle.witness);
+    syncPrivateDirectory(path);
+    handle.close();
+    handle.close();
+
+    chmodSync(path, 0o755);
+    expect(() => openPrivateDirectory(path)).toThrow("mode");
+  });
+
+  it("rejects a non-directory descriptor, an unexpected owner, and a changed witness", () => {
+    const root = makeRoot();
+    const file = join(root, "file");
+    const directory = join(root, "directory");
+    writeFileSync(file, "file", { mode: 0o600 });
+    mkdirSync(directory, { mode: 0o700 });
+
+    const fileFd = openSync(file, "r");
+    try {
+      expect(() => assertPrivateDirectory({
+        fd: fileFd,
+        witness: {} as never,
+        close: () => undefined,
+      }, file)).toThrow("not a directory");
+    } finally {
+      closeSync(fileFd);
+    }
+
+    const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+    expect(() => openPrivateDirectory(directory, { expectedUid: uid + 1 })).toThrow("owner");
+    const handle = openPrivateDirectory(directory);
+    try {
+      expect(() => assertPrivateDirectory(handle, directory, {
+        ...handle.witness,
+        ino: `${handle.witness.ino}0`,
+      })).toThrow("witness changed");
+    } finally {
+      handle.close();
+    }
+  });
+
+  it("uses caller-provided directory operations", () => {
+    const path = join(makeRoot(), "custom");
+    const calls: string[] = [];
+    ensurePrivateDirectory(path, {
+      mkdir: (directory, options) => {
+        calls.push(`mkdir:${directory}:${options.mode.toString(8)}:${options.recursive}`);
+        mkdirSync(directory, options);
+      },
+      chmod: (directory, mode) => {
+        calls.push(`chmod:${directory}:${mode.toString(8)}`);
+        chmodSync(directory, mode);
+      },
+    });
+    expect(calls).toEqual([
+      `mkdir:${path}:700:true`,
+      `chmod:${path}:700`,
+    ]);
+
+    const noUidPath = join(makeRoot(), "no-uid");
+    mkdirSync(noUidPath, { mode: 0o700 });
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    try {
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+      const handle = openPrivateDirectory(noUidPath);
+      handle.close();
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
+  it("detects a directory identity change during open validation", () => {
+    const root = makeRoot();
+    const path = join(root, "retained");
+    const replacement = join(root, "replacement");
+    mkdirSync(path, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const originalRealpath = realpathSync;
+    let realpathCalls = 0;
+    expect(() => withPatchedFs(
+      "realpathSync",
+      ((candidate: string) => {
+        realpathCalls += 1;
+        return realpathCalls === 1 ? originalRealpath(replacement) : originalRealpath(candidate);
+      }) as typeof realpathSync,
+      () => openPrivateDirectory(path),
+    )).toThrow("changed during validation");
+  });
+
+  it("rejects a retained directory after pathname replacement and rejects symlinked roots", () => {
+    const root = makeRoot();
+    const path = join(root, "retained");
+    const replacement = join(root, "replacement");
+    mkdirSync(path, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const handle = openPrivateDirectory(path);
+    renameSync(path, join(root, "retained-original"));
+    mkdirSync(path, { mode: 0o700 });
+    expect(() => assertPrivateDirectory(handle, path)).toThrow("changed");
+    handle.close();
+
+    rmSync(path, { recursive: true });
+    symlinkSync(replacement, path, "dir");
+    expect(() => openPrivateDirectory(path)).toThrow();
+  });
+
+  it("durably publishes an exclusive file and binds replacements to their observed bytes", () => {
+    const root = makeRoot();
+    const path = join(root, "durable.json");
+    atomicWritePrivateFileDurable(path, "first", { requireAbsent: true });
+    expect(readFileSync(path, "utf8")).toBe("first");
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(() => atomicWritePrivateFileDurable(path, "second", { requireAbsent: true }))
+      .toThrow("already exists");
+    expect(() => atomicWritePrivateFileDurable(path, "second", {
+      expectedContentSha256: "0".repeat(64),
+    })).toThrow("changed before");
+
+    const digest = createHash("sha256").update("first").digest("hex");
+    atomicWritePrivateFileDurable(path, "second", { expectedContentSha256: digest });
+    expect(readFileSync(path, "utf8")).toBe("second");
+    expect(() => atomicWritePrivateFileDurable(path, "third", {
+      expectedContentSha256: digest,
+      maxExistingBytes: 1,
+    })).toThrow();
+  });
+
+  it("covers durable exclusive publication races and injected I/O failures", () => {
+    const root = makeRoot();
+    const race = join(root, "race");
+    expect(() => atomicWritePrivateFileDurable(race, "content", {
+      requireAbsent: true,
+      random: () => {
+        writeFileSync(race, "winner", { mode: 0o600 });
+        return Buffer.alloc(12, 0x11);
+      },
+    })).toThrow("created concurrently");
+
+    const linkFailure = join(root, "link-failure");
+    const linkError = Object.assign(new Error("link denied"), { code: "EACCES" });
+    expect(() => withPatchedFs(
+      "linkSync",
+      (() => { throw linkError; }) as typeof linkSync,
+      () => atomicWritePrivateFileDurable(linkFailure, "content", { requireAbsent: true }),
+    )).toThrow(linkError);
+
+    const zeroProgress = join(root, "zero-progress");
+    expect(() => withPatchedFs(
+      "writeSync",
+      (() => 0) as typeof writeSync,
+      () => atomicWritePrivateFileDurable(zeroProgress, "content"),
+    )).toThrow("no progress");
+
+    const closeFailure = join(root, "close-failure");
+    const originalClose = closeSync;
+    let closeCalls = 0;
+    expect(() => withPatchedFs(
+      "closeSync",
+      ((fd: number) => {
+        closeCalls += 1;
+        if (closeCalls === 1) throw new Error("temporary close failed");
+        return originalClose(fd);
+      }) as typeof closeSync,
+      () => atomicWritePrivateFileDurable(closeFailure, "content"),
+    )).toThrow("temporary close failed");
+
+    const cleanupFailure = join(root, "cleanup-failure");
+    const writeFailure = new Error("durable write failed");
+    const originalUnlink = unlinkSync;
+    expect(() => withPatchedFs(
+      "writeSync",
+      (() => { throw writeFailure; }) as typeof writeSync,
+      () => withPatchedFs(
+        "unlinkSync",
+        ((path: string) => {
+          if (path.includes("cleanup-failure")) {
+            throw Object.assign(new Error("cleanup denied"), { code: "EACCES" });
+          }
+          return originalUnlink(path);
+        }) as typeof unlinkSync,
+        () => atomicWritePrivateFileDurable(cleanupFailure, "content"),
+      ),
+    )).toThrow("cleanup denied");
+
+    const publishedCleanup = join(root, "published-cleanup");
+    expect(() => withPatchedFs(
+      "unlinkSync",
+      ((path: string) => {
+        if (path.includes("published-cleanup")) {
+          throw Object.assign(new Error("published cleanup denied"), { code: "EACCES" });
+        }
+        return originalUnlink(path);
+      }) as typeof unlinkSync,
+      () => atomicWritePrivateFileDurable(publishedCleanup, "content"),
+    )).not.toThrow();
+    expect(readFileSync(publishedCleanup, "utf8")).toBe("content");
+
+    const cleanupEnoent = join(root, "cleanup-enoent");
+    const cleanupWriteFailure = new Error("write failed before cleanup");
+    const originalFstat = fstatSync;
+    expect(() => withPatchedFs(
+      "writeSync",
+      (() => { throw cleanupWriteFailure; }) as typeof writeSync,
+      () => withPatchedFs(
+        "unlinkSync",
+        (() => { throw Object.assign(new Error("already gone"), { code: "ENOENT" }); }) as typeof unlinkSync,
+        () => atomicWritePrivateFileDurable(cleanupEnoent, "content"),
+      ),
+    )).toThrow(cleanupWriteFailure);
+
+    const identityUnavailable = join(root, "identity-unavailable");
+    let bigintFstatCalls = 0;
+    const identityFailure = new Error("temporary identity unavailable");
+    expect(() => withPatchedFs(
+      "fstatSync",
+      ((fd: number, options?: unknown) => {
+        if ((options as { bigint?: boolean } | undefined)?.bigint === true) {
+          bigintFstatCalls += 1;
+          if (bigintFstatCalls === 2) throw identityFailure;
+        }
+        return originalFstat(fd, options as never);
+      }) as typeof fstatSync,
+      () => atomicWritePrivateFileDurable(identityUnavailable, "content"),
+    )).toThrow(identityFailure);
+
+    const binary = join(root, "binary");
+    atomicWritePrivateFileDurable(binary, new Uint8Array([0x62, 0x69, 0x6e, 0x61, 0x72, 0x79]));
+    expect(readFileSync(binary, "utf8")).toBe("binary");
   });
 
   it("atomically replaces files and symlinks with private regular files", () => {
@@ -305,6 +564,152 @@ describe("private filesystem primitives", () => {
     expect(existsSync(destination)).toBe(false);
   });
 
+  it("leaves an attacker replacement untouched during failed exclusive cleanup", () => {
+    const root = makeRoot();
+    const source = join(root, "machine.json");
+    const destination = join(root, "oldmachines", "machine.json");
+    const replacement = join(root, "replacement.json");
+    writeFileSync(source, "identity", { mode: 0o600 });
+
+    expect(() => copyRegularFilePrivateExclusive(source, destination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        fchmod: (() => {
+          writeFileSync(replacement, "attacker", { mode: 0o600 });
+          renameSync(replacement, destination);
+          throw new Error("copy failed after replacement");
+        }) as typeof fchmodSync,
+      },
+    })).toThrow("copy failed after replacement");
+    expect(readFileSync(destination, "utf8")).toBe("attacker");
+
+    const writeDestination = join(root, "write-exclusive");
+    const writeReplacement = join(root, "write-replacement");
+    const unlink = vi.fn();
+    expect(() => writePrivateFileExclusive(writeDestination, "content", {
+      open: openSync,
+      write: (() => {
+        writeFileSync(writeReplacement, "attacker", { mode: 0o600 });
+        renameSync(writeReplacement, writeDestination);
+        throw new Error("write failed after replacement");
+      }) as typeof writeFileSync,
+      sync: vi.fn(),
+      close: closeSync,
+      unlink,
+    })).toThrow("write failed after replacement");
+    expect(readFileSync(writeDestination, "utf8")).toBe("attacker");
+    expect(unlink).not.toHaveBeenCalled();
+  });
+
+  it("covers identity-gated cleanup races and unobservable cleanup errors", () => {
+    const root = makeRoot();
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    writeFileSync(source, "source", { mode: 0o600 });
+    const cleanupError = Object.assign(new Error("cleanup stat denied"), { code: "EACCES" });
+    expect(() => copyRegularFilePrivateExclusive(source, destination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        fchmod: (() => { throw new Error("copy failed"); }) as typeof fchmodSync,
+        lstat: (() => { throw cleanupError; }) as never,
+      },
+    })).toThrow("copy failed");
+
+    const directoryDestination = join(root, "directory-destination");
+    expect(() => copyRegularFilePrivateExclusive(source, directoryDestination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        fchmod: (() => {
+          rmSync(directoryDestination);
+          mkdirSync(directoryDestination, { mode: 0o700 });
+          throw new Error("copy failed with directory replacement");
+        }) as typeof fchmodSync,
+      },
+    })).toThrow("copy failed with directory replacement");
+    expect(statSync(directoryDestination).isDirectory()).toBe(true);
+
+    const missingTemp = join(root, "missing-temp");
+    expect(() => atomicWritePrivateFileExclusive(missingTemp, "content", {
+      random: () => Buffer.alloc(12, 0x31),
+      link: (from: string) => {
+        unlinkSync(from);
+        throw new Error("link failed after temp disappearance");
+      },
+    })).toThrow("link failed after temp disappearance");
+
+    const missingParentDestination = join(root, "missing-parent", "destination");
+    expect(() => copyRegularFilePrivateExclusive(source, missingParentDestination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        fchmod: (() => {
+          rmSync(join(root, "missing-parent"), { recursive: true });
+          throw new Error("copy failed after parent disappearance");
+        }) as typeof fchmodSync,
+      },
+    })).toThrow("copy failed after parent disappearance");
+
+    const swappedParentDestination = join(root, "swapped-parent", "destination");
+    expect(() => copyRegularFilePrivateExclusive(source, swappedParentDestination, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        fchmod: (() => {
+          renameSync(join(root, "swapped-parent"), join(root, "swapped-parent-original"));
+          mkdirSync(join(root, "swapped-parent"), { mode: 0o700 });
+          throw new Error("copy failed after parent replacement");
+        }) as typeof fchmodSync,
+      },
+    })).toThrow("copy failed after parent replacement");
+    expect(existsSync(swappedParentDestination)).toBe(false);
+
+    const deniedParentDestination = join(root, "denied-parent", "destination");
+    const parentStatFailure = Object.assign(new Error("parent stat denied"), { code: "EACCES" });
+    const originalLstat = lstatSync;
+    let deniedParentStatCalls = 0;
+    expect(() => withPatchedFs(
+      "lstatSync",
+      ((candidate: string, options?: unknown) => {
+        if (candidate === join(root, "denied-parent")) {
+          deniedParentStatCalls += 1;
+          if (deniedParentStatCalls === 2) throw parentStatFailure;
+        }
+        return originalLstat(candidate, options as never);
+      }) as typeof lstatSync,
+      () => copyRegularFilePrivateExclusive(source, deniedParentDestination, {
+        allowedRoot: root,
+        _operationsForTesting: {
+          fchmod: (() => { throw new Error("copy failed after parent stat error"); }) as typeof fchmodSync,
+        },
+      }),
+    )).toThrow("copy failed after parent stat error");
+
+    const destinationStatFailure = join(root, "destination-stat-failure");
+    let destinationFstatCalls = 0;
+    expect(() => copyRegularFilePrivateExclusive(source, destinationStatFailure, {
+      allowedRoot: root,
+      _operationsForTesting: {
+        fstat: ((fd: number, options?: unknown) => {
+          destinationFstatCalls += 1;
+          if (destinationFstatCalls === 2) throw new Error("destination identity unavailable");
+          return fstatSync(fd, options as never);
+        }) as typeof fstatSync,
+      },
+    })).toThrow("destination identity unavailable");
+    expect(existsSync(destinationStatFailure)).toBe(true);
+
+    const writeStatFailure = join(root, "write-stat-failure");
+    const writeIdentityFailure = new Error("write identity unavailable");
+    const writeUnlink = vi.fn();
+    expect(() => writePrivateFileExclusive(writeStatFailure, "content", {
+      open: openSync,
+      fstat: (() => { throw writeIdentityFailure; }) as typeof fstatSync,
+      write: writeFileSync,
+      sync: vi.fn(),
+      close: closeSync,
+      unlink: writeUnlink,
+    })).toThrow(writeIdentityFailure);
+    expect(writeUnlink).not.toHaveBeenCalled();
+  });
+
   it("suppresses source-close errors after success or while preserving a copy failure", () => {
     const root = makeRoot();
     const source = join(root, "machine.json");
@@ -388,6 +793,17 @@ describe("private filesystem primitives", () => {
       requireSingleLink: true,
     })).toThrow("hard links");
     unlinkSync(hardlink);
+
+    expect(() => readBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 100,
+      expectedRawSha256: "0".repeat(64),
+    })).toThrow("content hash");
+    expect(readBoundedRegularFile(path, {
+      allowedRoot: root,
+      maxBytes: 100,
+      expectedRawSha256: createHash("sha256").update("original").digest("hex"),
+    })).toBe("original");
 
     expect(() => readBoundedRegularFile(path, {
       allowedRoot: root,
@@ -708,15 +1124,15 @@ describe("private filesystem primitives", () => {
     const path = join(root, "partial-exclusive");
     const failure = new Error("write failed");
     const deps = {
-      open: vi.fn(() => 23),
+      open: vi.fn((filePath: string, flags: string | number, mode?: number) => openSync(filePath, flags, mode)),
       write: vi.fn(() => { throw failure; }),
       sync: vi.fn(),
-      close: vi.fn(),
+      close: vi.fn((fd: number) => closeSync(fd)),
       unlink: vi.fn(),
     };
 
     expect(() => writePrivateFileExclusive(path, "content", deps as never)).toThrow(failure);
-    expect(deps.close).toHaveBeenCalledWith(23);
+    expect(deps.close).toHaveBeenCalledOnce();
     expect(deps.unlink).toHaveBeenCalledWith(path);
   });
 
