@@ -737,6 +737,8 @@ describe("BackendPublicationCoordinator", () => {
     await expect(coordinator(tokenHome, token.driver).resume()).rejects.toMatchObject({ reason: "unexpected-state" });
   });
 
+  // This matrix performs repeated durable journal/fsync setup and exceeds Vitest's 5s
+  // default under V8 coverage.
   it("fails closed for every uncertain or conflicting remote release witness", async () => {
     const missing = await releasingFixture();
     missing.fake.driver.readRemoteGuard = vi.fn(async () => null);
@@ -905,7 +907,7 @@ describe("BackendPublicationCoordinator", () => {
     });
     successor.fake.driver.releaseRemoteGuard = vi.fn(async () => undefined);
     expect((await coordinator(successor.home, successor.fake.driver).recoverPending())?.phase).toBe("completed");
-  });
+  }, 15_000);
 
   it("releases remote fences while aborting before local publication", async () => {
     const home = makeHome();
