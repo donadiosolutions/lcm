@@ -184,9 +184,11 @@ export async function handleUserPromptSubmit(
     }
     const selectedStorage = effectiveStorage ?? { backend: "sqlite" };
     const selectedPort = daemonPort ?? 3737;
-    effectiveClient ??= new (await import("../daemon/client.js")).DaemonClient(
-      `http://127.0.0.1:${selectedPort}`,
-    );
+    if (effectiveClient === undefined) {
+      effectiveClient = new (await import("../daemon/client.js")).DaemonClient(
+        `http://127.0.0.1:${selectedPort}`,
+      );
+    }
 
     try {
       assertHookPublicationFence();

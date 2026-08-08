@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 const mocks = vi.hoisted(() => ({
   statSync: vi.fn(),
@@ -12,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   firePromoteEventsRequest: vi.fn(),
   assertHookPublicationFence: vi.fn(),
   assertHookRootEstablished: vi.fn(),
+  isBackendPublicationJournalError: vi.fn(),
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -40,7 +42,7 @@ vi.mock("../../src/hooks/session-end.js", () => ({
 vi.mock("../../src/hooks/publication-fence.js", () => ({
   assertHookPublicationFence: mocks.assertHookPublicationFence,
   assertHookRootEstablished: mocks.assertHookRootEstablished,
-  isBackendPublicationJournalError: () => false,
+  isBackendPublicationJournalError: mocks.isBackendPublicationJournalError,
 }));
 
 import { handleSessionSnapshot } from "../../src/hooks/session-snapshot.js";
@@ -55,6 +57,7 @@ const payload = {
 describe("handleSessionSnapshot default integrations", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.isBackendPublicationJournalError.mockReturnValue(false);
     mocks.statSync.mockImplementation(() => { throw new Error("missing"); });
     mocks.readFileSync.mockReturnValue("token-value\n");
     mocks.loadDaemonConfig.mockReturnValue({
@@ -124,6 +127,26 @@ describe("handleSessionSnapshot default integrations", () => {
     mocks.fireCompactRequest.mockImplementationOnce(() => { throw new Error("compact failed"); });
     mocks.firePromoteEventsRequest.mockImplementationOnce(() => { throw new Error("promote failed"); });
     await expect(handleSessionSnapshot(JSON.stringify(payload))).resolves.toEqual({ exitCode: 0, stdout: "" });
+  });
+
+  it("rethrows a publication journal error from auto-compact", async () => {
+    const publicationError = new BackendPublicationJournalError(
+      "malformed-journal",
+      "publication journal is malformed",
+    );
+    mocks.isBackendPublicationJournalError.mockReturnValue(true);
+    mocks.fireCompactRequest.mockImplementationOnce(() => { throw publicationError; });
+    await expect(handleSessionSnapshot(JSON.stringify(payload))).rejects.toBe(publicationError);
+  });
+
+  it("rethrows a publication journal error from promote-events", async () => {
+    const publicationError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "publication remains unresolved",
+    );
+    mocks.isBackendPublicationJournalError.mockReturnValue(true);
+    mocks.firePromoteEventsRequest.mockImplementationOnce(() => { throw publicationError; });
+    await expect(handleSessionSnapshot(JSON.stringify(payload))).rejects.toBe(publicationError);
   });
 
   it("uses default interval and throttles through the real stat wrapper", async () => {

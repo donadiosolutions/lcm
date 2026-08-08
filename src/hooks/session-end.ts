@@ -149,7 +149,7 @@ export async function handleSessionEnd(
       redactedCategories?: string[];
     };
     disableCompact: boolean;
-  }> | null;
+  }>;
   try {
     try {
       selectStorageBackend(storage);
@@ -224,7 +224,6 @@ export async function handleSessionEnd(
     return { exitCode: 0, stdout: "" };
   }
 
-  if (admitted === null) return { exitCode: 0, stdout: "" };
   const { input, clientName, ingestResult, disableCompact } = admitted;
   if (!disableCompact) {
     fireCompactRequest(daemonPort, {

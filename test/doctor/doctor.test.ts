@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
@@ -630,6 +630,32 @@ describe("runDoctor project map checks", () => {
     }
   });
 
+  it("uses the sole matching project-map entry for pattern diagnostics", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-patterns-"));
+    try {
+      const cwd = join(home, "project");
+      const hash = hashProjectPath(normalizeProjectPath(cwd));
+      const projectDir = join(home, ".lcm", "projects", hash);
+      mkdirSync(cwd, { recursive: true });
+      mkdirSync(projectDir, { recursive: true });
+      writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({
+        [hash]: { canonical: cwd, aliases: [] },
+      }), { mode: 0o600 });
+      writeFileSync(join(projectDir, "sensitive-patterns.txt"), "DOCTOR_PROJECT_PATTERN\n", { mode: 0o600 });
+      clearProjectMapCache();
+
+      const results = await runDoctor(minimalDeps({ homedir: home, cwd }));
+
+      expect(results.find((result) => result.name === "user-patterns")).toMatchObject({
+        status: "pass",
+        message: expect.stringContaining("1 project"),
+      });
+    } finally {
+      clearProjectMapCache();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("reports project map auto-fix write failures without aborting doctor", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-write-fail-"));
     try {
@@ -688,6 +714,24 @@ describe("runDoctor daemon version mismatch", () => {
       }));
       expect(results.find((result) => result.name === "daemon")?.message).toContain(
         "lcm daemon unavailable (not-running)",
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uses a lexical remediation scope when the home directory is not created", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-missing-home-"));
+    const uncreatedHome = home;
+    symlinkSync(join(home, "missing-lcm"), join(home, ".lcm"));
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: uncreatedHome,
+        cwd: "/tmp/nonexistent-project-xyz",
+      }));
+
+      expect(results.find((result) => result.name === "daemon")?.message).toContain(
+        "backend publication admission is blocked",
       );
     } finally {
       rmSync(home, { recursive: true, force: true });

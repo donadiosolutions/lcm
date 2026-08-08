@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import {
   assertHookPublicationFence,
   assertHookRootEstablished,
+  isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
   rethrowBackendPublicationJournalError,
   withHookPublicationFence,
@@ -17,6 +18,7 @@ import {
   backendPublicationJournalPath,
 } from "../../src/storage/backend-publication.js";
 import * as backendPublication from "../../src/storage/backend-publication.js";
+import * as securityFiles from "../../src/security-files.js";
 
 describe("hook publication fence", () => {
   let previousHome: string | undefined;
@@ -77,6 +79,70 @@ describe("hook publication fence", () => {
       present: false,
       lockToken: expect.anything(),
     }));
+  });
+
+  it("fails closed when config evidence is not a regular file", () => {
+    mkdirSync(join(home, ".lcm", "config.json"), { mode: 0o700 });
+
+    expect(() => assertHookPublicationFence()).toThrow("regular file");
+  });
+
+  it("fails closed when config evidence is not valid JSON", () => {
+    writeFileSync(join(home, ".lcm", "config.json"), "{", { mode: 0o600 });
+
+    expect(() => assertHookPublicationFence()).toThrow(BackendPublicationJournalError);
+  });
+
+  it("treats an explicitly selected non-PostgreSQL config as SQLite evidence", () => {
+    writeFileSync(
+      join(home, ".lcm", "config.json"),
+      JSON.stringify({ storage: { backend: "sqlite" } }),
+      { mode: 0o600 },
+    );
+
+    expect(() => assertHookPublicationFence()).not.toThrow();
+  });
+
+  it("classifies an explicitly selected PostgreSQL config before admission", () => {
+    writeFileSync(
+      join(home, ".lcm", "config.json"),
+      JSON.stringify({ storage: { backend: "postgresql" } }),
+      { mode: 0o600 },
+    );
+
+    expect(() => assertHookPublicationFence()).toThrow("PostgreSQL selection");
+  });
+
+  it("fails closed when the project map is not valid JSON", () => {
+    writeFileSync(join(home, ".lcm", "map.json"), "{", { mode: 0o600 });
+
+    expect(() => assertHookPublicationFence()).toThrow(BackendPublicationJournalError);
+  });
+
+  it("fails closed when the config path cannot identify the canonical LCM home", () => {
+    const homeForConfig = vi.spyOn(backendPublication, "backendPublicationHomeForConfigPath")
+      .mockReturnValue(undefined);
+    try {
+      expect(() => assertHookPublicationFence()).toThrow("canonical LCM config path");
+    } finally {
+      homeForConfig.mockRestore();
+    }
+  });
+
+  it("fails closed when the retained root witness changes at the hook boundary", () => {
+    const originalAssert = securityFiles.assertPrivateDirectory;
+    let calls = 0;
+    const assert = vi.spyOn(securityFiles, "assertPrivateDirectory").mockImplementation((handle, path, expected) => {
+      const actual = originalAssert(handle, path, expected);
+      calls += 1;
+      return calls === 2 ? { ...actual, ino: `${actual.ino}-changed` } : actual;
+    });
+    try {
+      expect(() => withHookPublicationFence(() => undefined))
+        .toThrow("private directory witness changed");
+    } finally {
+      assert.mockRestore();
+    }
   });
 
   it("authenticates the established root and exposes a short-lived direct-action token", () => {
@@ -148,8 +214,15 @@ describe("hook publication fence", () => {
 
   it("classifies and rethrows only publication journal errors", () => {
     const publicationError = new BackendPublicationJournalError("malformed-journal", "bad journal");
+    const missingEvidence = new BackendPublicationJournalError(
+      "publication-evidence-missing",
+      "missing evidence",
+    );
     expect(isBackendPublicationJournalError(publicationError)).toBe(true);
     expect(isBackendPublicationJournalError(new Error("ordinary"))).toBe(false);
+    expect(isBackendPublicationEvidenceMissing(missingEvidence)).toBe(true);
+    expect(isBackendPublicationEvidenceMissing(publicationError)).toBe(false);
+    expect(isBackendPublicationEvidenceMissing(new Error("ordinary"))).toBe(false);
     expect(() => rethrowBackendPublicationJournalError(new Error("ordinary"))).not.toThrow();
     expect(() => rethrowBackendPublicationJournalError(publicationError)).toThrow(publicationError);
   });

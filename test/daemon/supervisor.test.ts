@@ -2615,6 +2615,45 @@ describe("launchd-user supervisor", () => {
     }
   });
 
+  it("preserves the ENOENT boundary when an existing launchd plist disappears during read", async () => {
+    const root = makeRoot();
+    const spec = makeSpec("launchd-user", root);
+    const initial = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrap" },
+      { code: 0, stdout: launchdPrintText(spec, "running", 543) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: initial.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 543 });
+
+    const plist = join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
+    expect(existsSync(plist)).toBe(true);
+    let removed = false;
+    const retry = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 113, stderr: "Could not find service" },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: retry.run,
+      platform: "darwin",
+      uid: 501,
+      _plistRaceForTesting: (path, phase) => {
+        if (!removed && phase === "before-open") {
+          rmSync(path, { force: true });
+          removed = true;
+          const error = new Error("simulated launchd plist disappearance") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+      },
+    }).start(spec)).rejects.toThrow("manager command");
+    expect(removed).toBe(true);
+    expect(existsSync(plist)).toBe(false);
+  });
+
   it.each([
     ["without postgres CA", undefined],
     ["with postgres CA", "/etc/lcm/postgres-ca.crt"],

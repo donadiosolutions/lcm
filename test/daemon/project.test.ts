@@ -44,6 +44,16 @@ describe("secure project-root handoff", () => {
     expect(localProjectIdentity("/project", home).id).toMatch(/^[a-f0-9]{64}$/u);
   });
 
+  it("falls back when the compatibility snapshot is not an object", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    writeFileSync(join(home, ".lcm", "map.json"), "null");
+
+    const identity = localProjectIdentity("/project", home);
+
+    expect(identity.canonical).toBe("/project");
+    expect(identity.id).toBe(localProjectIdentity("/project", join(home, "other-home")).id);
+  });
+
   it("fails closed when the retained root witness changes during metadata publication", () => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     const originalAssert = securityFiles.assertPrivateDirectory;

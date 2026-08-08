@@ -1,6 +1,14 @@
 // test/hooks/hook-errors.test.ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  existsSync,
+} from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 
@@ -24,6 +32,8 @@ import { EventsDb } from "../../src/hooks/events-db.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
 import { MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH } from "../../src/hooks/hook-error-diagnostic.js";
 import { lcmPath } from "../../src/runtime-paths.js";
+import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbox.js";
+import * as securityFiles from "../../src/security-files.js";
 
 describe("safeLogError", () => {
   let tempDir: string;
@@ -53,6 +63,83 @@ describe("safeLogError", () => {
     expect(rows[0].hook).toBe("PostToolUse");
     expect(rows[0].error).toBe("test error");
     db.close();
+  });
+
+  it("returns silently when the LCM root has not been bootstrapped", async () => {
+    rmSync(join(homedir(), ".lcm"), { recursive: true, force: true });
+
+    await expect(safeLogError("PostToolUse", new Error("root absent"), {}))
+      .resolves.toBeUndefined();
+  });
+
+  it("swallows a retained-root witness change before diagnostic admission", async () => {
+    const originalAssert = securityFiles.assertPrivateDirectory;
+    const assert = vi.spyOn(securityFiles, "assertPrivateDirectory").mockImplementation((handle, path, expected) => {
+      const actual = originalAssert(handle, path, expected);
+      return { ...actual, ino: `${actual.ino}-changed` };
+    });
+    try {
+      await expect(safeLogError("PostToolUse", new Error("unstable root"), {}))
+        .resolves.toBeUndefined();
+      expect(existsSync(join(tempDir, "events.log"))).toBe(false);
+    } finally {
+      assert.mockRestore();
+    }
+  });
+
+  it("swallows a database failure when the retained root is replaced", async () => {
+    const root = join(homedir(), ".lcm");
+    const oldRoot = join(tempDir, ".lcm.hook-errors-old");
+    const cwd = join(tempDir, "project");
+    mkdirSync(cwd);
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open")
+      .mockImplementation(async () => {
+        renameSync(root, oldRoot);
+        mkdirSync(root, { mode: 0o700 });
+        throw new Error("sidecar unavailable");
+      });
+    try {
+      await expect(safeLogError("PostToolUse", new Error("db root race"), { cwd }))
+        .resolves.toBeUndefined();
+      expect(existsSync(join(tempDir, "events.log"))).toBe(false);
+    } finally {
+      open.mockRestore();
+      if (existsSync(oldRoot)) {
+        rmSync(root, { recursive: true, force: true });
+        renameSync(oldRoot, root);
+      }
+    }
+  });
+
+  it("opens the database circuit after a stable sidecar failure", async () => {
+    const cwd = join(tempDir, "project-circuit");
+    mkdirSync(cwd);
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open")
+      .mockRejectedValueOnce(new Error("sidecar unavailable"));
+    try {
+      await safeLogError("PostToolUse", new Error("db fallback"), { cwd });
+      expect(readFileSync(join(tempDir, "events.log"), "utf-8")).toContain("db fallback");
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  it("swallows a flat-file failure when the retained root is replaced", async () => {
+    const logPath = join(tempDir, "events.log");
+    mkdirSync(logPath, { mode: 0o700 });
+    const originalAssert = securityFiles.assertPrivateDirectory;
+    let calls = 0;
+    const assert = vi.spyOn(securityFiles, "assertPrivateDirectory").mockImplementation((handle, path, expected) => {
+      const actual = originalAssert(handle, path, expected);
+      calls += 1;
+      return calls === 3 ? { ...actual, ino: `${actual.ino}-changed` } : actual;
+    });
+    try {
+      await expect(safeLogError("PostToolUse", new Error("file root race"), {}))
+        .resolves.toBeUndefined();
+    } finally {
+      assert.mockRestore();
+    }
   });
 
   it("Layer 1: skips DB when cwd is undefined, falls to Layer 2", async () => {

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,9 @@ import {
 } from "../../src/hooks/event-scrubbing.js";
 import { projectDir } from "../../src/daemon/project.js";
 import { ScrubEngine } from "../../src/scrub.js";
+import * as hookConfig from "../../src/hooks/config.js";
+import * as runtimePaths from "../../src/runtime-paths.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -96,5 +99,77 @@ describe("passive event scrubbing", () => {
       type: "decision", category: "decision", data: `token sk-${"a".repeat(24)}`, priority: 1,
     }], cwd);
     expect(events[0].data).toContain("[REDACTED]");
+  });
+
+  it("rethrows ordinary persisted-configuration failures", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-config-error-"));
+    dirs.push(cwd);
+    const load = vi.spyOn(hookConfig, "loadHookConfig").mockImplementation(() => {
+      throw new Error("configuration read failed");
+    });
+    await expect(scrubExtractedEvents([{ type: "decision", category: "decision", data: "safe", priority: 1 }], cwd))
+      .rejects.toThrow("configuration read failed");
+    expect(load).toHaveBeenCalledOnce();
+  });
+
+  it("uses private persisted patterns when publication-aware configuration is unavailable", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-config-fallback-"));
+    const configRoot = mkdtempSync(join(tmpdir(), "lcm-event-config-fallback-root-"));
+    dirs.push(cwd, configRoot);
+    const persistedPath = join(configRoot, "config.json");
+    writeFileSync(persistedPath, JSON.stringify({ security: { sensitivePatterns: ["FALLBACK-[0-9]+", 42] } }), { mode: 0o600 });
+    chmodSync(persistedPath, 0o600);
+    const path = vi.spyOn(runtimePaths, "configPath").mockReturnValue(persistedPath);
+    const load = vi.spyOn(hookConfig, "loadHookConfig").mockImplementation(() => {
+      throw new BackendPublicationJournalError("unresolved-publication", "publication unresolved");
+    });
+    const events = await scrubExtractedEvents([{
+      type: "decision",
+      category: "decision",
+      data: "keep FALLBACK-123",
+      priority: 1,
+      tags: ["FALLBACK-456"],
+    }], cwd);
+    expect(events[0]).toMatchObject({ data: "keep [REDACTED]", tags: ["[REDACTED]"] });
+    expect(path).toHaveBeenCalled();
+    expect(load).toHaveBeenCalledWith(persistedPath);
+  });
+
+  it("uses no persisted patterns when the fallback configuration has a non-array pattern value", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-config-non-array-"));
+    const configRoot = mkdtempSync(join(tmpdir(), "lcm-event-config-non-array-root-"));
+    dirs.push(cwd, configRoot);
+    const persistedPath = join(configRoot, "config.json");
+    writeFileSync(persistedPath, JSON.stringify({ security: { sensitivePatterns: "not-an-array" } }), { mode: 0o600 });
+    chmodSync(persistedPath, 0o600);
+    vi.spyOn(runtimePaths, "configPath").mockReturnValue(persistedPath);
+    vi.spyOn(hookConfig, "loadHookConfig").mockImplementation(() => {
+      throw new BackendPublicationJournalError("unresolved-publication", "publication unresolved");
+    });
+    const events = await scrubExtractedEvents([{
+      type: "decision",
+      category: "decision",
+      data: "keep FALLBACK-123",
+      priority: 1,
+    }], cwd);
+    expect(events[0].data).toBe("keep FALLBACK-123");
+  });
+
+  it("fails closed to no persisted patterns when the fallback configuration cannot be read", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-config-missing-"));
+    const configRoot = mkdtempSync(join(tmpdir(), "lcm-event-config-missing-root-"));
+    dirs.push(cwd, configRoot);
+    const missingPath = join(configRoot, "missing.json");
+    vi.spyOn(runtimePaths, "configPath").mockReturnValue(missingPath);
+    vi.spyOn(hookConfig, "loadHookConfig").mockImplementation(() => {
+      throw new BackendPublicationJournalError("unresolved-publication", "publication unresolved");
+    });
+    const events = await scrubExtractedEvents([{
+      type: "decision",
+      category: "decision",
+      data: "safe",
+      priority: 1,
+    }], cwd);
+    expect(events[0].data).toBe("safe");
   });
 });
