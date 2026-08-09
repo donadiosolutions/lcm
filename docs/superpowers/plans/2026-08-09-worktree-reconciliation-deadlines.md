@@ -20,7 +20,7 @@
 
 ---
 
-### Task 1: Prove the inherited-deadline failure
+### Task 1: Prove the inherited deadline and add explicit bounds
 
 **Files:**
 - Inspect: `test/worktree-reconciliation.test.ts`
@@ -28,7 +28,7 @@
 
 **Interfaces:**
 - Consumes: Vitest's optional third `it(name, callback, timeout)` argument.
-- Produces: A red baseline showing that all four callbacks currently inherit the CLI timeout.
+- Produces: A red baseline showing that all four callbacks inherit the CLI timeout, followed by the four explicit 15-second contracts.
 
 - [ ] **Step 1: Define the exact selection**
 
@@ -78,19 +78,7 @@ npm exec -- vitest run "$T" --testNamePattern="$F" --testTimeout=1 --reporter=do
 
 Expected: all four fail with `Test timed out in 1ms`. This proves that the test callbacks inherit the global/CLI deadline.
 
-### Task 2: Give the four cases the existing process-test deadline
-
-**Files:**
-- Modify: `test/worktree-reconciliation.test.ts:2446`
-- Modify: `test/worktree-reconciliation.test.ts:4728`
-- Modify: `test/worktree-reconciliation.test.ts:5811`
-- Modify: `test/worktree-reconciliation.test.ts:6015`
-
-**Interfaces:**
-- Consumes: `FULL_SUITE_PROCESS_TEST_TIMEOUT_MS`, already defined as `15_000` in the same test file.
-- Produces: Four callbacks with an explicit 15-second per-test contract.
-
-- [ ] **Step 1: Add the timeout to each callback**
+- [ ] **Step 4: Add the timeout to each callback**
 
 Change only each selected test's closing call from:
 
@@ -106,7 +94,7 @@ to:
 
 Do not change fixture helpers, file modes, production code, or any other test timeout.
 
-- [ ] **Step 2: Verify GREEN against the same one-millisecond CLI timeout**
+- [ ] **Step 5: Verify GREEN against the same one-millisecond CLI timeout**
 
 ```bash
 umask 0022
@@ -115,7 +103,7 @@ npm exec -- vitest run "$T" --testNamePattern="$F" --testTimeout=1 --reporter=do
 
 Expected: four tests pass because their explicit 15-second deadline overrides the inherited one-millisecond value.
 
-- [ ] **Step 3: Verify the AST contract**
+- [ ] **Step 6: Verify the AST contract**
 
 Repeat Task 1 Step 2 with the final assertion changed to:
 
@@ -125,21 +113,21 @@ if (found.length !== 4 || found.some(({ timeout }) => timeout !== "FULL_SUITE_PR
 
 Expected: all four entries use exactly `FULL_SUITE_PROCESS_TEST_TIMEOUT_MS`.
 
-- [ ] **Step 4: Commit the focused patch**
+- [ ] **Step 7: Commit the focused patch**
 
 ```bash
 git add test/worktree-reconciliation.test.ts
 git commit --signoff -m "test: bound reconciliation regressions"
 ```
 
-### Task 3: Prove determinism under the reported conditions
+### Task 2: Prove determinism under the reported conditions
 
 **Files:**
 - Verify: `test/worktree-reconciliation.test.ts`
 - Generated and untracked during coverage: `coverage/`, `test-report.junit.xml`
 
 **Interfaces:**
-- Consumes: The four explicit deadlines from Task 2.
+- Consumes: The four explicit deadlines from Task 1.
 - Produces: Repetition, umask, concurrent-load, and complete-coverage evidence.
 
 - [ ] **Step 1: Run twenty isolated repetitions under `umask 0022`**
@@ -200,7 +188,7 @@ git diff --check
 
 Expected: all commands exit zero; `npm run test:ci` reports 100% in all four dimensions and all per-file thresholds pass.
 
-### Task 4: Review, publish, and close #555/#563
+### Task 3: Review, publish, and close #555/#563
 
 **Files:**
 - Review: `docs/superpowers/specs/2026-08-09-open-bug-triage-design.md`
@@ -213,7 +201,7 @@ Expected: all commands exit zero; `npm run test:ci` reports 100% in all four dim
 
 - [ ] **Step 1: Run the required MoM review sequence**
 
-Dispatch independent max-effort GLM and Kimi reviewers over `origin/main..HEAD`. Give both complete reports to a medium-effort Opus reviewer. Return every Critical or Important finding to a max-effort Luna implementer, then rerun Task 3 after fixes.
+Dispatch independent max-effort GLM and Kimi reviewers over `origin/main..HEAD`. Give both complete reports to a medium-effort Opus reviewer. Return every Critical or Important finding to a max-effort Luna implementer, then rerun Task 2 after fixes.
 
 - [ ] **Step 2: Push and open the PR**
 
