@@ -17,7 +17,7 @@ The initial query returned twelve open bugs.
 | --- | --- | --- |
 | #555 | Reproducible test-deadline defect | Fix with #563 in the worktree-reconciliation PR. |
 | #557 | Fixed by merged PR #554 | Close with fixing-commit, ancestry, current-main, and focused-test evidence. |
-| #558 | Historical flake with no proven root cause | Investigate independently; close only with proof or fix in its own cohesive PR unless it shares a proven root cause with another PR. |
+| #558 | Historical report lacks actionable failure evidence and is not reproducible | Close `not_planned` with the complete forensic record and an explicit reopening condition. |
 | #559 | Fixed by merged PR #554 | Close with fixing-commit, ancestry, current-main, and focused-test evidence. |
 | #560 | Fixed by merged PR #554 | Close with fixing-commit, ancestry, current-main, and focused-test evidence. |
 | #561 | Fixed by merged PR #554 | Close with fixing-commit, ancestry, current-main, and focused-test evidence. |
@@ -35,8 +35,8 @@ then-current protected branch.
 
 ## PR Boundaries
 
-Four implementation PRs are the minimum known cohesive set. A fifth PR is
-allowed only if #558 proves to require an independent code change.
+Four implementation PRs are the minimum cohesive set. Issue #558 is resolved
+through evidence-backed triage rather than a speculative implementation PR.
 
 ### PR 1: Worktree-Reconciliation Test Determinism (#555, #563)
 
@@ -125,25 +125,32 @@ The policy remains fail closed for unassociated or ambiguous commits.
 Update release documentation. This repairs repository publication automation
 rather than package runtime behavior, so it does not receive a Changeset.
 
-## Issue #558 Investigation
+## Issue #558 Forensic Disposition
 
 The reported `identity-service` path-divergence case passed immediately after
-the historical failure and has passed ten consecutive focused current-main
-processes. That does not establish a root cause. A Luna exploration worker must
-compare the failing head with current main, inspect fixture state and cleanup,
-run the exact case repeatedly under complete-suite contention, and identify the
-specific assertion/failure mode from any retained logs or session memory.
+the historical failure. The retained transcript records only the failing test
+name and its approximately 134 ms duration; it does not retain Vitest's
+expected/received block, the received exception, or a failing JUnit record.
+The exact test body and uncertain-restoration control flow are unchanged from
+the reported head to current main, so no later commit can honestly be credited
+as a fix.
 
-Permitted outcomes are:
+The dedicated Luna investigation found no reproducible defect after forty
+independent exact-case processes, eight concurrent exact-case processes, four
+concurrent complete identity-file processes, and the coordinator's complete
+6,025-test baseline. The control path has no clock, randomness, or retry, and
+the available artifacts cannot distinguish an unexpected return from a
+different exception, filesystem error, or harness failure. This combination
+is stronger than a finite pass streak alone: the report lacks the minimum
+failure evidence needed to define a falsifiable bug, while extensive stress
+failed to regenerate that evidence.
 
-1. A proven current-main fix with identified commit and regression behavior:
-   close with the same evidence standard as #557/#559/#560/#561/#565.
-2. A root cause shared with PR 1: add a TDD fix to PR 1 only if the shared seam
-   is concrete and the PR remains cohesive.
-3. An independent root cause: create the conditional fifth PR.
-
-Finite pass streaks, a single full-suite pass, and inability to reproduce are
-not by themselves closure evidence.
+Close #558 as `not_planned` with the complete forensic record. The closure must
+invite reopening when a recurrence includes the Vitest failure block or JUnit
+testcase output and the exact commit/environment. Do not add retries, timeouts,
+coverage exclusions, diagnostic production code, or a speculative fix. If the
+issue is reopened with actionable evidence, it starts a fresh systematic
+root-cause investigation and may receive an independent PR.
 
 ## Development and Review Method
 
