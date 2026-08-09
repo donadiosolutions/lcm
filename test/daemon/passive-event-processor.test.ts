@@ -9,6 +9,7 @@ import {
   createPromoteEventsNotifyHandler,
   PassiveEventProcessor,
   PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+  type BackgroundPublicationAdmission,
 } from "../../src/daemon/passive-event-processor.js";
 import type { PromoteResult, promoteEventsForCwd } from "../../src/daemon/routes/promote-events.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
@@ -30,6 +31,7 @@ type ScheduledTimer = {
 };
 
 const request = {} as IncomingMessage;
+const testPublicationAdmission: BackgroundPublicationAdmission = async operation => operation({});
 
 function makeConfig() {
   return loadDaemonConfig("/nonexistent", { daemon: { port: 0 }, llm: { provider: "disabled" } });
@@ -90,6 +92,7 @@ function timerDeps(): {
     timers,
     intervals,
     deps: {
+      withPublicationAdmission: testPublicationAdmission,
       setTimeout,
       clearTimeout,
       setInterval,
@@ -373,6 +376,7 @@ describe("PassiveEventProcessor", () => {
       "/tmp",
       undefined,
       storageFactory,
+      expect.any(Object),
     );
   });
 

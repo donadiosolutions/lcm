@@ -80,7 +80,10 @@ import {
   createPromoteEventsNotifyHandler,
   PassiveEventProcessor,
   PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+  type BackgroundPublicationAdmission,
 } from "../../../src/daemon/passive-event-processor.js";
+
+const testPublicationAdmission: BackgroundPublicationAdmission = async operation => operation({});
 
 function event(overrides: Partial<EventRow>): EventRow {
   return {
@@ -202,6 +205,7 @@ describe("promote-events unit boundaries", () => {
         setInterval: vi.fn() as never,
         clearInterval: vi.fn() as never,
         safeLogError: mocks.log,
+        withPublicationAdmission: testPublicationAdmission,
       },
     );
     const notifyResponse = {} as never;

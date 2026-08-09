@@ -25,10 +25,10 @@ export interface PassiveEventNotification {
   sourceHook?: string;
 }
 
-interface PassiveEventProcessorDeps {
+export interface PassiveEventProcessorDeps {
   promoteEventsForCwd?: typeof promoteEventsForCwd;
   storageFactory?: StorageBackendFactory;
-  withPublicationAdmission?: BackgroundPublicationAdmission;
+  withPublicationAdmission: BackgroundPublicationAdmission;
   collectEventSidecars?: typeof collectEventSidecars;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
@@ -41,14 +41,14 @@ type TimeoutHandle = ReturnType<typeof setTimeout>;
 type IntervalHandle = ReturnType<typeof setInterval>;
 
 export type BackgroundPublicationAdmission = <T>(
-  operation: (publicationLockToken: BackendPublicationLockToken | undefined) => Promise<T> | T,
+  operation: (publicationLockToken: BackendPublicationLockToken) => Promise<T> | T,
 ) => Promise<T>;
 
 type PromoteOneBatch = (
   config: DaemonConfig,
   cwd: string,
-  sidecarPath?: string,
-  publicationLockToken?: BackendPublicationLockToken,
+  sidecarPath: string | undefined,
+  publicationLockToken: BackendPublicationLockToken,
 ) => Promise<PromoteResult>;
 
 export class PassiveEventProcessor {
@@ -73,17 +73,12 @@ export class PassiveEventProcessor {
   constructor(
     private readonly config: DaemonConfig,
     private readonly defaults = PASSIVE_EVENT_PROCESSOR_DEFAULTS,
-    deps: PassiveEventProcessorDeps = {},
+    deps: PassiveEventProcessorDeps,
   ) {
     const promoteOneBatch = deps.promoteEventsForCwd ?? promoteEventsForCwd;
-    this.promoteOneBatch = (config, cwd, sidecarPath, publicationLockToken) => {
-      if (publicationLockToken === undefined) {
-        return promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory);
-      }
-      return promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory, publicationLockToken);
-    };
-    this.withPublicationAdmission = deps.withPublicationAdmission
-      ?? (async operation => operation(undefined));
+    this.promoteOneBatch = (config, cwd, sidecarPath, publicationLockToken) =>
+      promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory, publicationLockToken);
+    this.withPublicationAdmission = deps.withPublicationAdmission;
     this.scanSidecars = deps.collectEventSidecars ?? collectEventSidecars;
     this.setTimer = deps.setTimeout ?? setTimeout;
     this.clearTimer = deps.clearTimeout ?? clearTimeout;

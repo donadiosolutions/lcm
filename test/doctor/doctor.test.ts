@@ -31,8 +31,12 @@ vi.mock("../../src/db/events-stats.js", () => ({
 import { collectDetailedEventStats, collectEventStats } from "../../src/db/events-stats.js";
 const mockCollectEventStats = vi.mocked(collectEventStats);
 const mockCollectDetailedEventStats = vi.mocked(collectDetailedEventStats);
+let defaultDoctorHome: string;
 
 beforeEach(() => {
+  defaultDoctorHome = mkdtempSync(join(tmpdir(), "lcm-doctor-default-home-"));
+  chmodSync(defaultDoctorHome, 0o700);
+  mkdirSync(join(defaultDoctorHome, ".lcm"), { recursive: true, mode: 0o700 });
   vi.mocked(ensureDaemon).mockReset();
   vi.mocked(ensureDaemon).mockResolvedValue({ connected: false });
   mockCollectEventStats.mockClear();
@@ -43,6 +47,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  rmSync(defaultDoctorHome, { recursive: true, force: true });
 });
 
 function buildSettingsJson(): string {
@@ -80,12 +85,22 @@ function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
       status: "pass",
       message: "lcm: 7/7 tools",
     }),
-    homedir: "/tmp/test-home",
+    homedir: defaultDoctorHome,
     platform: "darwin",
     _assertBackendPublication: () => undefined,
     ...overrides,
   };
 }
+
+describe("doctor test fixture isolation", () => {
+  it("uses an owned existing home for default dependencies", () => {
+    const deps = minimalDeps();
+
+    expect(deps.homedir).not.toBe("/tmp/test-home");
+    expect(existsSync(deps.homedir)).toBe(true);
+    expect(existsSync(join(deps.homedir, ".lcm"))).toBe(true);
+  });
+});
 
 function publicationFileWitness(content: string | null): Record<string, unknown> {
   if (content === null) {
@@ -219,7 +234,7 @@ describe("runDoctor lcm-md check", () => {
     const check = results.find((r) => r.name === "lcm-md");
     expect(check?.status).toBe("warn");
     expect(check?.fixApplied).toBe(true);
-    expect(written["/tmp/test-home/.claude/lcm.md"]).toBeDefined();
+    expect(written[join(defaultDoctorHome, ".claude", "lcm.md")]).toBeDefined();
   });
 });
 
@@ -1275,7 +1290,7 @@ describe("runDoctor summarizer modes", () => {
         return { status: 0, stdout: "", stderr: "" };
       }),
       fetch: vi.fn().mockResolvedValue({ ok: false }),
-      homedir: "/tmp/test-home",
+      homedir: defaultDoctorHome,
       platform: "darwin",
     });
 
