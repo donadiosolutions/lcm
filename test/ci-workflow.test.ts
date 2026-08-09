@@ -9,6 +9,7 @@ interface WorkflowStep {
   name?: string;
   run?: string;
   uses?: string;
+  if?: string;
   env?: Record<string, string>;
   with?: Record<string, unknown>;
 }
@@ -219,6 +220,28 @@ describe("CI workflow", () => {
     expect(workflow.jobs["codecov-fork"].needs).toBe("ci");
   });
 
+  it("publishes the single test report artifact after the core test run", () => {
+    const steps = workflow.jobs.core.steps;
+    const testCiSteps = steps.filter((step) => step.run === "npm run test:ci");
+    expect(testCiSteps).toHaveLength(1);
+
+    const uploadSteps = steps.filter((step) => step.name === "Upload Vitest reports");
+    expect(uploadSteps).toHaveLength(1);
+    const uploadStep = uploadSteps[0];
+    expect(uploadStep).toBeDefined();
+    expect(steps.indexOf(uploadStep!)).toBeGreaterThan(steps.indexOf(testCiSteps[0]!));
+    expect(uploadStep).toMatchObject({
+      name: "Upload Vitest reports",
+      if: "${{ !cancelled() }}",
+      uses: "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+      with: {
+        name: "vitest-reports",
+        path: "coverage/\ntest-report.junit.xml\n",
+        "if-no-files-found": "warn",
+      },
+    });
+  });
+
   it("runs the pinned Linux user-systemd integration with exact scoped cleanup", () => {
     const job = workflow.jobs["linux-systemd"];
     const checkout = job.steps.find((step) => step.name === "Checkout");
@@ -234,7 +257,7 @@ describe("CI workflow", () => {
     });
     expect(node).toEqual({
       name: "Set up Node.js 25.9.0",
-      uses: "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+      uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
       with: { "node-version": "25.9.0", cache: "npm" },
     });
     expect(install?.run).toBe("npm ci");
@@ -309,7 +332,7 @@ describe("CI workflow", () => {
     );
     expect(node).toEqual({
       name: "Set up Node.js 25.9.0",
-      uses: "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+      uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
       with: { "node-version": "25.9.0", cache: "npm" },
     });
     expect(install?.run).toBe("npm ci");
@@ -568,7 +591,7 @@ describe("CI workflow", () => {
 
   it("separates trusted OIDC uploads from tokenless fork uploads", () => {
     expect(workflow.jobs.codecov.if).toBe(
-      "${{ github.event_name != 'merge_group' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}",
+      "${{ !cancelled() && github.event_name != 'merge_group' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}",
     );
     expect(workflow.jobs.codecov.permissions).toEqual({
       actions: "read",
@@ -576,7 +599,7 @@ describe("CI workflow", () => {
       "id-token": "write",
     });
     expect(workflow.jobs["codecov-fork"].if).toBe(
-      "${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}",
+      "${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}",
     );
     expect(workflow.jobs["codecov-fork"].permissions).toEqual({
       actions: "read",

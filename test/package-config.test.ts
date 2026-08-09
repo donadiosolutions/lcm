@@ -86,7 +86,7 @@ describe("package.json", () => {
     expect(pkg.dependencies).not.toHaveProperty("fast-uri");
     expect(pkg.devDependencies).toHaveProperty("@modelcontextprotocol/sdk", "1.30.0");
     expect(pkg.devDependencies).toHaveProperty("body-parser", "2.3.0");
-    expect(pkg.devDependencies).toHaveProperty("fast-uri", "3.1.5");
+    expect(pkg.devDependencies).toHaveProperty("fast-uri", "4.1.2");
     expect(pkg.dependencies).toHaveProperty("@hono/node-server", "2.0.12");
     expect(pkg.scripts).toHaveProperty(
       "verify:consumer-topology",
