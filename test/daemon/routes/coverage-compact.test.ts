@@ -386,7 +386,7 @@ describe("compact route coverage", () => {
       canonical: first.canonical,
       remoteProjectId: first.remoteProjectId,
       machineId: "machine-id",
-    });
+    }, undefined);
   });
 
   it.each([

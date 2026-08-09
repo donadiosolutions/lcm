@@ -102,7 +102,7 @@ describe("daemon storage identity routing", () => {
       canonical: cwd,
       remoteProjectId: PROJECT_ID,
       machineId: MACHINE_ID,
-    });
+    }, undefined);
     expect(response.writeHead).toHaveBeenCalledWith(200, {
       "Content-Type": "application/json",
     });

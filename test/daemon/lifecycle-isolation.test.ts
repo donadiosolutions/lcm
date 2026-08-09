@@ -2056,9 +2056,10 @@ describe("run-owned lifecycle resources", () => {
   it("keeps two independent scopes from discovering or cleaning each other", async () => {
     const left = createFixture("parallel-left");
     const right = createFixture("parallel-right");
+    const monotonicNow = () => 0;
     const [leftResult, rightResult] = await Promise.all([
-      ensureDaemon(scopedOptions(left)),
-      ensureDaemon(scopedOptions(right)),
+      ensureDaemon({ ...scopedOptions(left), _monotonicNowOverride: monotonicNow }),
+      ensureDaemon({ ...scopedOptions(right), _monotonicNowOverride: monotonicNow }),
     ]);
     expect(leftResult.startMethod).toBe("systemd-user");
     expect(rightResult.startMethod).toBe("systemd-user");

@@ -2288,6 +2288,30 @@ describe("project map", () => {
     }
   });
 
+  it("defers watcher rearm while a live backend publication mutation owns the lock", async () => {
+    let releaseMutation: (() => void) | undefined;
+    const mutation = withBackendPublicationConsumerLockAsync(undefined, () => new Promise<void>((resolve) => {
+      releaseMutation = resolve;
+    }));
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    let primaryError: { value: unknown } | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      watcher = watchProjectMap();
+      expect(vi.getTimerCount()).toBe(1);
+      expect(() => vi.advanceTimersByTime(25)).not.toThrow();
+      expect(vi.getTimerCount()).toBe(1);
+    } catch (error) {
+      primaryError = { value: error };
+    } finally {
+      watcher?.close();
+      releaseMutation?.();
+      await mutation;
+      vi.useRealTimers();
+      if (primaryError) throw primaryError.value;
+    }
+  });
+
   it("surfaces unsafe startup locks without throwing from a delayed reload", () => {
     const canonical = makeDir("watch-unsafe-writer");
     resolveProjectIdentity(canonical);

@@ -1409,6 +1409,10 @@ export function watchProjectMap(): { close: () => void } {
           !existsSync(path) || watchPath === path);
         if (shouldRearm) arm();
       } catch (error) {
+        if (error instanceof PrivateMutationLockContentionError) {
+          scheduleReload(watchPath);
+          return;
+        }
         if (error instanceof BackendPublicationJournalError) {
           closed = true;
           watcher?.close();

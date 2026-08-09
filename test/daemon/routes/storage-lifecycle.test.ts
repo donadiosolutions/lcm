@@ -38,7 +38,7 @@ describe("route storage cleanup", () => {
     await expect(openExistingProject(factory, identity)).resolves.toBeNull();
     factory.openExistingProject.mockResolvedValueOnce(project);
     await expect(openExistingProject(factory, identity)).resolves.toBe(project);
-    expect(factory.openExistingProject).toHaveBeenCalledWith(identity);
+    expect(factory.openExistingProject).toHaveBeenCalledWith(identity, undefined);
   });
 
   it("recognizes only typed failures from the staged PostgreSQL factory", async () => {
