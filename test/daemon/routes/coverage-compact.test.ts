@@ -46,8 +46,13 @@ const state = vi.hoisted(() => ({
   scrubber: vi.fn(async () => ({ scrubWithCounts: (content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }) })),
   openProject: vi.fn(),
   projectClose: vi.fn(async () => undefined),
+  projectHealth: vi.fn(async () => ({ status: "healthy" })),
   factoryClose: vi.fn(async () => undefined),
   openProjectError: undefined as unknown,
+  compactionStorageProbe: undefined as ((storage: {
+    health: () => Promise<unknown>;
+    close: () => Promise<void>;
+  }) => Promise<void>) | undefined,
 }));
 
 vi.mock("../../../src/daemon/config.js", async (importOriginal) => {
@@ -176,6 +181,7 @@ vi.mock("../../../src/storage/index.js", () => ({
           }
         },
         close: state.projectClose,
+        health: state.projectHealth,
       };
     },
     close: state.factoryClose,
@@ -183,7 +189,17 @@ vi.mock("../../../src/storage/index.js", () => ({
 }));
 vi.mock("../../../src/compaction.js", () => ({
   MANUAL_COMPACT_FRESH_TAIL_COUNT: 8,
-  CompactionEngine: class { compact = async () => state.compactResult; },
+  CompactionEngine: class {
+    constructor(private readonly storage: {
+      health: () => Promise<unknown>;
+      close: () => Promise<void>;
+    }) {}
+
+    compact = async () => {
+      await state.compactionStorageProbe?.(this.storage);
+      return state.compactResult;
+    };
+  },
 }));
 vi.mock("node:fs", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:fs")>()),
@@ -294,8 +310,10 @@ describe("compact route coverage", () => {
     state.scrubber.mockClear();
     state.openProject.mockClear();
     state.projectClose.mockClear();
+    state.projectHealth.mockClear();
     state.factoryClose.mockClear();
     state.openProjectError = undefined;
+    state.compactionStorageProbe = undefined;
   });
 
   it("formats million-token and zero-input compactions", () => {
@@ -870,6 +888,48 @@ describe("compact route coverage", () => {
     await firstCall;
   });
 
+  it("sanitizes a PostgreSQL duplicate publication admission failure", async () => {
+    let release!: () => void;
+    state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
+    state.openProjectError = new BackendPublicationJournalError(
+      "unexpected-state",
+      "private duplicate admission details",
+    );
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const handler = createCompactHandler(value);
+    const first = response();
+    const firstCall = handler(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "postgres-duplicate-publication-failure", cwd: "/tmp" }),
+    );
+    const duplicate = response();
+    await handler(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "postgres-duplicate-publication-failure", cwd: "/tmp" }),
+    );
+
+    expect(duplicate.json()).toEqual({
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    state.openProjectError = undefined;
+    release();
+    await firstCall;
+  });
+
   it("classifies a storage identity failure after PostgreSQL admission", async () => {
     state.paths.mockImplementation((cwd: string) => ({
       id: "pid",
@@ -930,6 +990,37 @@ describe("compact route coverage", () => {
     const body = await call(JSON.stringify({ session_id: "compacted", cwd: "/tmp" }));
     expect(body.actionTaken).toBe(true);
     expect(body.summary).toContain("compaction complete");
+  });
+
+  it("admits ProjectStorage health and preserves raw close cleanup through CompactionEngine", async () => {
+    const admissionCalls = vi.fn();
+    state.compactionStorageProbe = async storage => {
+      const beforeHealth = admissionCalls.mock.calls.length;
+      await expect(storage.health()).resolves.toEqual({ status: "healthy" });
+      expect(admissionCalls).toHaveBeenCalledTimes(beforeHealth + 1);
+
+      const afterHealth = admissionCalls.mock.calls.length;
+      await storage.close();
+      expect(admissionCalls).toHaveBeenCalledTimes(afterHealth);
+    };
+    const context: RouteExecutionContext = {
+      withPublicationAdmission: async operation => {
+        admissionCalls();
+        return operation({});
+      },
+    };
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "compaction-storage-health-close", cwd: "/tmp" }),
+      context,
+    );
+
+    expect(output.json()).toMatchObject({ actionTaken: false });
+    expect(state.projectHealth).toHaveBeenCalledOnce();
+    expect(state.projectClose).toHaveBeenCalledTimes(2);
   });
 
   it("uses the non-Error internal-failure fallback", async () => {

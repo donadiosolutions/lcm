@@ -136,6 +136,56 @@ describe("daemon route publication admission", () => {
     }
   });
 
+  it("reuses the retained publication token for nested custom-route admission", async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-route-nested-admission-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    const lcmDir = join(tempHome, ".lcm");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    const configPath = join(lcmDir, "config.json");
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    let daemon: DaemonInstance | undefined;
+    let outerToken: object | undefined;
+    let nestedToken: object | undefined;
+
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, {
+        daemon: { port: 0, idleTimeoutMs: 0 },
+      }), { publicationConfigPath: configPath });
+      daemon.registerRoute("POST", "/nested-admission", async (_req, res, _body, context) => {
+        outerToken = context?.publicationLockToken;
+        const withPublicationAdmission = context?.withPublicationAdmission;
+        expect(withPublicationAdmission).toBeDefined();
+        nestedToken = await withPublicationAdmission!(token => {
+          expect(token).toBe(outerToken);
+          return token;
+        });
+        expect(nestedToken).toBe(outerToken);
+        res.writeHead(200);
+        res.end(JSON.stringify({ sameToken: nestedToken === outerToken }));
+      }, "mutating");
+
+      const response = await fetch(`http://127.0.0.1:${daemon.address().port}/nested-admission`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ sameToken: true });
+      expect(nestedToken).toBe(outerToken);
+    } finally {
+      if (daemon) await daemon.stop();
+      rmSync(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
   it("retains mutation admission in flight, releases it on every exit, and leaves reads concurrent", async () => {
     const originalHome = process.env.HOME;
     const originalUserProfile = process.env.USERPROFILE;
