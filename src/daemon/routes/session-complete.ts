@@ -8,7 +8,7 @@ import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFa
 import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
 
 export function createSessionCompleteHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
-  return async (_req, res, body) => {
+  return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
     const { session_id } = input;
     if (!session_id || !input.cwd) {
@@ -26,9 +26,14 @@ export function createSessionCompleteHandler(config: DaemonConfig, storageFactor
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
     try {
-      const identity = projectIdentity(cwd, config.storage);
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await activeFactory.openProject(identity);
+      const identity = projectIdentity(cwd, config.storage, context?.publicationLockToken);
+      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+        config.storage,
+        undefined,
+        undefined,
+        context?.publicationLockToken,
+      ));
+      project = await activeFactory.openProject(identity, context?.publicationLockToken);
       await project.transaction(async (repositories) => {
         const messageCount = await repositories.conversations.getMessageCountBySessionId(session_id);
         await repositories.coordination.recordSessionIngest(session_id, messageCount);

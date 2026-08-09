@@ -233,11 +233,11 @@ describe("importSessions", () => {
   const dirs: string[] = [];
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     for (const dir of dirs) {
       rmSync(dir, { recursive: true, force: true });
     }
     dirs.length = 0;
-    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
 
@@ -840,6 +840,7 @@ describe("importSessions — provider: codex", () => {
   const dirs: string[] = [];
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     for (const dir of dirs) {
       rmSync(dir, { recursive: true, force: true });
     }

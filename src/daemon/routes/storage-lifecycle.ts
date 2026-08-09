@@ -12,6 +12,7 @@ import {
   type StagedPostgreSqlUnavailableResponse,
 } from "../staged-postgresql.js";
 import { sanitizeError } from "../safe-error.js";
+import type { BackendPublicationLockToken } from "../../storage/backend-publication.js";
 
 interface AsyncClosable {
   close(): Promise<void> | void;
@@ -55,8 +56,9 @@ export async function closeRouteStorage(
 export async function openExistingProject(
   factory: StorageBackendFactory,
   identity: StorageIdentityContext,
+  publicationLockToken?: BackendPublicationLockToken,
 ): Promise<ProjectStorage | null> {
-  return factory.openExistingProject(identity);
+  return factory.openExistingProject(identity, publicationLockToken);
 }
 
 export function stagedPostgreSqlUnavailableResponse(

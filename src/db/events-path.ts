@@ -16,6 +16,7 @@ import {
   OWNER_ONLY_FILE_MODES,
   readBoundedRegularFile,
 } from "../security-files.js";
+import type { BackendPublicationLockToken } from "../storage/backend-publication.js";
 
 const IDENTITY_EVIDENCE_VERSION = 1;
 const MAX_IDENTITY_EVIDENCE_BYTES = 4 * 1024;
@@ -29,6 +30,7 @@ type SidecarIdentityEvidence = Readonly<{
 }>;
 
 type ExistingEventsDbPathOptions = Readonly<{
+  publicationLockToken?: BackendPublicationLockToken;
   /** @internal Test-only effective-user seam for deterministic ownership coverage. */
   _effectiveUidForTesting?: () => number | undefined;
   /** @internal Test-only directory-open seam for isolating evidence ownership. */
@@ -130,7 +132,7 @@ export function existingEventsDbPath(
   cwd: string,
   options: ExistingEventsDbPathOptions = {},
 ): string | undefined {
-  const identity = resolveExistingProjectIdentity(cwd);
+  const identity = resolveExistingProjectIdentity(cwd, options.publicationLockToken);
   const directory = eventsDir();
   const expectedUid = options._effectiveUidForTesting?.() ?? effectiveUid();
   let handle: ReturnType<typeof openPrivateDirectory>;

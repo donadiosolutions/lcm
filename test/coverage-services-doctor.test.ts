@@ -1,8 +1,8 @@
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { dirname, join } from "node:path";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 type FakeStdin = EventEmitter & {
   write: ReturnType<typeof vi.fn>;
@@ -90,11 +90,14 @@ import type { CheckResult, DoctorDeps } from "../src/doctor/types.js";
 function isolatedPath(name: string): string {
   const runtimeHome = process.env.HOME;
   if (!runtimeHome) throw new Error("Vitest runtime HOME is not configured");
-  return join(runtimeHome, name);
+  const fixtureRoot = join(runtimeHome, "lcm-doctor-service-fixtures");
+  mkdirSync(fixtureRoot, { recursive: true, mode: 0o700 });
+  return join(fixtureRoot, name);
 }
 
 const DOCTOR_HOME = isolatedPath("coverage-services-doctor-home");
 const DOCTOR_CWD = isolatedPath("coverage-services-doctor-project");
+const DOCTOR_FIXTURE_ROOT = dirname(DOCTOR_HOME);
 
 function makeDeps(options: {
   config?: unknown;
@@ -141,6 +144,7 @@ function makeDeps(options: {
     platform: "linux",
     cwd: DOCTOR_CWD,
     managedDaemonPath: options.managedDaemonPath,
+    _assertBackendPublication: () => undefined,
   };
 }
 
@@ -161,6 +165,9 @@ function healthyDeps(): DoctorDeps {
 
 describe("doctor service coverage", () => {
   beforeEach(() => {
+    rmSync(DOCTOR_HOME, { recursive: true, force: true });
+    mkdirSync(DOCTOR_HOME, { recursive: true, mode: 0o700 });
+    mkdirSync(join(DOCTOR_HOME, ".lcm"), { recursive: true, mode: 0o700 });
     vi.useRealTimers();
     vi.clearAllMocks();
     mocks.ensureDaemon.mockResolvedValue({ connected: false });
@@ -176,8 +183,14 @@ describe("doctor service coverage", () => {
   });
 
   afterEach(() => {
+    rmSync(DOCTOR_HOME, { recursive: true, force: true });
+    rmSync(DOCTOR_CWD, { recursive: true, force: true });
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  afterAll(() => {
+    rmSync(DOCTOR_FIXTURE_ROOT, { recursive: true, force: true });
   });
 
   it.each([
@@ -713,8 +726,8 @@ describe("doctor service coverage", () => {
   it("executes default filesystem, process, and directory dependency wrappers in an isolated home", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-default-deps-"));
     try {
-      mkdirSync(join(home, ".lcm"), { recursive: true });
-      writeFileSync(join(home, ".lcm", "config.json"), JSON.stringify({ llm: { provider: "auto" } }));
+      mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(home, ".lcm", "config.json"), JSON.stringify({ llm: { provider: "auto" } }), { mode: 0o600 });
       mkdirSync(join(home, ".claude"), { recursive: true });
       writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ mcpServers: { lcm: {} } }));
       mocks.spawnSync.mockReturnValue({ status: 1, stdout: "", stderr: "missing" });
@@ -722,6 +735,7 @@ describe("doctor service coverage", () => {
         homedir: home,
         cwd: join(home, "project"),
         fetch: vi.fn().mockResolvedValue({ ok: false }) as typeof fetch,
+        _assertBackendPublication: () => undefined,
       });
       expect(results.find((result) => result.name === "claude-process")?.status).toBe("fail");
       expect(results.find((result) => result.name === "codex-process")?.status).toBe("fail");

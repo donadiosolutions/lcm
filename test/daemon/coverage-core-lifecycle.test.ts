@@ -625,6 +625,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
         _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
         _spawnOverride: vi.fn(() => ({ pid: undefined, once: vi.fn(), unref: vi.fn() })) as never, _skipHealthWait: true,
         _monotonicNowOverride: (): number => 0,
+        _assertBackendPublication: () => undefined,
       });
       expect(result.warning).not.toContain("credential setup failed");
     } finally {

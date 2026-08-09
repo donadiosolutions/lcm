@@ -1,7 +1,9 @@
-import { describe, it, expect, vi } from "vitest";
-import { runDoctor } from "../../src/doctor/doctor.js";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { mkdirSync, rmSync } from "node:fs";
+import { runDoctor as runDoctorProduction } from "../../src/doctor/doctor.js";
 import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js";
 import { join } from "node:path";
+import type { DoctorDeps } from "../../src/doctor/types.js";
 
 // Mock ensureDaemon to prevent spawning real processes when daemon appears down
 vi.mock("../../src/daemon/lifecycle.js", () => ({
@@ -11,11 +13,25 @@ vi.mock("../../src/daemon/lifecycle.js", () => ({
 const LCM_BLOCK = "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
 const BINARY = join(process.cwd(), "dist", "lcm.mjs");
 let homeCounter = 0;
+const homes: string[] = [];
 
 function doctorHome(): string {
   homeCounter += 1;
-  return `/tmp/lcm-doctor-hooks-${process.pid}-${homeCounter}`;
+  const home = `/tmp/lcm-doctor-hooks-${process.pid}-${homeCounter}`;
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+  homes.push(home);
+  return home;
 }
+
+function runDoctor(deps: Omit<DoctorDeps, "_assertBackendPublication">): ReturnType<typeof runDoctorProduction> {
+  return runDoctorProduction({ ...deps, _assertBackendPublication: () => undefined });
+}
+
+afterEach(() => {
+  for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
+  vi.restoreAllMocks();
+});
 
 function baseReadFileSync(p: string, settings: string) {
   if (p.endsWith("config.json")) return JSON.stringify({ llm: { provider: "claude-process" } });

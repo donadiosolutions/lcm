@@ -1,4 +1,5 @@
 import type { ProjectIdentity } from "../project-map.js";
+import type { BackendPublicationLockToken } from "./backend-publication.js";
 import type {
   AppendMessageInput,
   ConversationId,
@@ -408,10 +409,19 @@ export interface StorageIdentityContext extends ProjectIdentity {
 export interface StorageBackendFactory {
   readonly backend: StorageBackendName;
   readonly capabilities: StorageCapabilities;
-  projectExists(identity: StorageIdentityContext): Promise<boolean>;
+  projectExists(
+    identity: StorageIdentityContext,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<boolean>;
   /** Open an already-present project without creating backend state. */
-  openExistingProject(identity: StorageIdentityContext): Promise<ProjectStorage | null>;
-  openProject(identity: StorageIdentityContext): Promise<ProjectStorage>;
+  openExistingProject(
+    identity: StorageIdentityContext,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<ProjectStorage | null>;
+  openProject(
+    identity: StorageIdentityContext,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<ProjectStorage>;
   health(): Promise<StorageHealth>;
   close(): Promise<void>;
 }

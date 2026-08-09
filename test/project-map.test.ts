@@ -35,6 +35,7 @@ import {
   BackendPublicationJournalError,
   backendPublicationDirectory,
   backendPublicationJournalPath,
+  withBackendPublicationConsumerLockAsync,
 } from "../src/storage/backend-publication.js";
 
 function resetLcmHome(): void {
@@ -146,6 +147,34 @@ describe("project map", () => {
     expect(content).toBe(JSON.stringify({
       [identity.id]: { canonical: normalizeProjectPath(canonical), aliases: [] },
     }, null, 2) + "\n");
+  });
+
+  it("publishes a missing project identity with the caller's retained publication token", async () => {
+    const canonical = makeDir("retained-publication-token");
+
+    const identity = await withBackendPublicationConsumerLockAsync(tempHome, async (publicationLockToken) =>
+      resolveProjectIdentity(canonical, { _publicationLockToken: publicationLockToken })
+    );
+
+    expect(readProjectMapSnapshot()[identity.id]).toEqual({
+      canonical: normalizeProjectPath(canonical),
+      aliases: [],
+    });
+  });
+
+  it("rejects a retained project-map token from a different publication root", async () => {
+    const canonical = makeDir("mismatched-retained-publication-token");
+    const otherHome = mkdtempSync(join(tmpdir(), "lcm-project-map-other-home-"));
+    mkdirSync(join(otherHome, ".lcm"), { recursive: true, mode: 0o700 });
+
+    try {
+      await expect(withBackendPublicationConsumerLockAsync(otherHome, async (publicationLockToken) => {
+        expect(() => resolveProjectIdentity(canonical, { _publicationLockToken: publicationLockToken }))
+          .toThrowError(expect.objectContaining({ reason: "permit-mismatch" }));
+      })).resolves.toBeUndefined();
+    } finally {
+      rmSync(otherHome, { recursive: true, force: true });
+    }
   });
 
   it("reads a metadata-enriched project-map snapshot without publishing it", () => {

@@ -313,9 +313,37 @@ describe("promote-events unit boundaries", () => {
       JSON.stringify({ cwd: "/cwd" }),
     );
 
-    expect(mocks.openProject).toHaveBeenCalledWith({ id: "pid", canonical: "/cwd" });
+    expect(mocks.openProject).toHaveBeenCalledWith(
+      { id: "pid", canonical: "/cwd" },
+      undefined,
+    );
     expect(mocks.closeProject).toHaveBeenCalledOnce();
     expect(mocks.closeFactory).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, expect.objectContaining({
+      message: "no unprocessed events",
+    }));
+  });
+
+  it("threads a retained publication token through sidecar lookup and project open", async () => {
+    const publicationLockToken = {};
+    const injectedFactory = { openProject: mocks.openProject, close: mocks.closeFactory } as never;
+    const response = {} as never;
+
+    await createPromoteEventsHandler(config, injectedFactory)(
+      {} as never,
+      response,
+      JSON.stringify({ cwd: "/cwd" }),
+      { publicationLockToken },
+    );
+
+    expect(mocks.existingEventsPath).toHaveBeenCalledWith(
+      "/cwd",
+      { publicationLockToken },
+    );
+    expect(mocks.openProject).toHaveBeenCalledWith(
+      { id: "pid", canonical: "/cwd" },
+      publicationLockToken,
+    );
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, expect.objectContaining({
       message: "no unprocessed events",
     }));

@@ -23,7 +23,7 @@ export function createPromoteHandler(
   config: DaemonConfig,
   storageFactory?: StorageBackendFactory,
 ): RouteHandler {
-  return async (_req, res, body) => {
+  return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
     const { dry_run = false } = input;
 
@@ -40,7 +40,7 @@ export function createPromoteHandler(
       return;
     }
 
-    const paths = projectPaths(cwd);
+    const paths = projectPaths(cwd, context?.publicationLockToken);
     const dbPath = paths.dbPath;
 
     let processed = 0;
@@ -51,9 +51,18 @@ export function createPromoteHandler(
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
     try {
-        const identity = projectIdentity(cwd, config.storage);
-        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-        project = await openExistingProject(activeFactory, identity) ?? undefined;
+        const identity = projectIdentity(cwd, config.storage, context?.publicationLockToken);
+        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+          config.storage,
+          undefined,
+          undefined,
+          context?.publicationLockToken,
+        ));
+        project = await openExistingProject(
+          activeFactory,
+          identity,
+          context?.publicationLockToken,
+        ) ?? undefined;
         if (!project) {
           sendJson(res, 200, { processed: 0, promoted: 0 });
           return;

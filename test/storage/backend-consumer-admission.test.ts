@@ -7,6 +7,8 @@ import {
   assertBackendPublicationConfigAccess,
   backendPublicationHomeForConfigPath,
   withBackendPublicationConfigLock,
+  withBackendPublicationConsumerLock,
+  withBackendPublicationConsumerLockAsync,
 } from "../../src/storage/backend-publication.js";
 import {
   assertStorageBackendPublication,
@@ -76,6 +78,47 @@ describe("backend publication consumer admission", () => {
       assertStorageBackendPublication({ backend: "sqlite", homeDir: withoutDirectory }, lockToken);
       return "unlocked";
     })).resolves.toBe("unlocked");
+  });
+
+  it("reuses the exact live token for the same canonical home and revokes retained continuations", async () => {
+    const home = makeHome();
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    let retainedUse: (() => object) | undefined;
+    let releaseDetached!: () => void;
+    const detachedGate = new Promise<void>((resolve) => {
+      releaseDetached = resolve;
+    });
+    let detachedUse: Promise<object> | undefined;
+    try {
+      await expect(withBackendPublicationConsumerLockAsync(home, async (outerToken) => {
+        retainedUse = () => withBackendPublicationConsumerLock(
+          undefined,
+          (nestedToken) => nestedToken,
+          { lockToken: outerToken },
+        );
+        expect(retainedUse()).toBe(outerToken);
+        detachedUse = detachedGate.then(() => withBackendPublicationConsumerLock(
+          undefined,
+          (nestedToken) => nestedToken,
+          { lockToken: outerToken },
+        ));
+      })).resolves.toBeUndefined();
+
+      expectReason(() => retainedUse!(), "permit-mismatch");
+      releaseDetached();
+      await expect(detachedUse).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "permit-mismatch",
+      });
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
   });
 
   it("serializes canonical config reads and activates the callback token", () => {

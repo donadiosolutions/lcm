@@ -180,7 +180,7 @@ const compactingNow = new Set<string>();
 export function createCompactHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   const getSummarizer = makeSummarizerCache(config);
 
-  return async (_req, res, body) => {
+  return async (_req, res, body, context) => {
     let parsed: unknown;
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
@@ -273,10 +273,15 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
     const effectiveRequestTimeoutMs = effectiveRequestPolicy?.requestTimeoutMs ?? null;
     const effectiveRetry = effectiveProvider === "openai" ? effectiveRequestPolicy!.retry : null;
 
-    activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+    activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+      config.storage,
+      undefined,
+      undefined,
+      context?.publicationLockToken,
+    ));
     let admittedIdentity: StorageIdentityContext & { readonly localProjectId: string };
     try {
-      admittedIdentity = projectIdentity(cwd, config.storage);
+      admittedIdentity = projectIdentity(cwd, config.storage, context?.publicationLockToken);
     } catch (err) {
       const storageFailure = storageRouteFailureResponse(
         activeFactory,
@@ -308,7 +313,10 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
     if (compactingNow.has(session_id)) {
       if (config.storage.backend === "postgresql") {
         try {
-          const project = await activeFactory.openProject(admittedIdentity);
+          const project = await activeFactory.openProject(
+            admittedIdentity,
+            context?.publicationLockToken,
+          );
           await closeRouteStorage(project, undefined);
         } catch (err) {
           const storageFailure = storageRouteFailureResponse(
@@ -351,7 +359,10 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
       );
       if (!summarize) {
         if (config.storage.backend === "postgresql") {
-          const project = await activeFactory.openProject(admittedIdentity);
+          const project = await activeFactory.openProject(
+            admittedIdentity,
+            context?.publicationLockToken,
+          );
           await closeRouteStorage(project, undefined);
         }
         sendJson(res, 200, {
@@ -375,7 +386,10 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
           : {}),
       };
       let project: ProjectStorage | undefined;
-      project = await activeFactory.openProject(admittedIdentity);
+      project = await activeFactory.openProject(
+        admittedIdentity,
+        context?.publicationLockToken,
+      );
       const pid = admittedIdentity.localProjectId;
       const result = await enqueue(pid, async () => {
         try {

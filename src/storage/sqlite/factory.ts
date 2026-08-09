@@ -20,6 +20,7 @@ import { normalizeStorageError, StorageOperationError } from "../errors.js";
 import { sqliteExecutorFor } from "./executor.js";
 import { assertSqliteReady, SqliteReadinessRollbackError } from "./health.js";
 import { SqliteProjectStorage } from "./project-storage.js";
+import type { BackendPublicationLockToken } from "../backend-publication.js";
 
 export class SqliteStorageBackendFactory implements StorageBackendFactory {
   readonly backend = "sqlite" as const;
@@ -35,10 +36,13 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     detectFeatures?: (db: ReturnType<typeof getLcmConnection>) => LcmDbFeatures;
   } = {}) {}
 
-  async projectExists(identity: ProjectIdentity): Promise<boolean> {
+  async projectExists(
+    identity: ProjectIdentity,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<boolean> {
     this.assertOpen(identity, "projectExists");
     try {
-      const paths = this.resolveProject(identity);
+      const paths = this.resolveProject(identity, publicationLockToken);
       this.assertIdentity(identity, paths.id, "projectExists");
       return inspectExistingLcmDatabasePath(paths.dbPath) !== null;
     } catch (error) {
@@ -50,18 +54,25 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     }
   }
 
-  async openProject(identity: ProjectIdentity): Promise<ProjectStorage> {
-    return (await this.openResolvedProject(identity, "openProject", true))!;
+  async openProject(
+    identity: ProjectIdentity,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<ProjectStorage> {
+    return (await this.openResolvedProject(identity, "openProject", true, publicationLockToken))!;
   }
 
-  async openExistingProject(identity: ProjectIdentity): Promise<ProjectStorage | null> {
-    return this.openResolvedProject(identity, "openExistingProject", false);
+  async openExistingProject(
+    identity: ProjectIdentity,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<ProjectStorage | null> {
+    return this.openResolvedProject(identity, "openExistingProject", false, publicationLockToken);
   }
 
   private async openResolvedProject(
     identity: ProjectIdentity,
     operation: "openProject" | "openExistingProject",
     createIfMissing: boolean,
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<ProjectStorage | null> {
     this.assertOpen(identity, operation);
     let finishOpen!: () => void;
@@ -70,9 +81,11 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     let dbPath: string | undefined;
     let db: ReturnType<typeof getLcmConnection> | undefined;
     try {
-      const paths = this.resolveProject(identity);
+      const paths = this.resolveProject(identity, publicationLockToken);
       this.assertIdentity(identity, paths.id, operation);
-      if (createIfMissing && !this.options.resolveProject) ensureProjectDir(identity.canonical);
+      if (createIfMissing && !this.options.resolveProject) {
+        ensureProjectDir(identity.canonical, publicationLockToken);
+      }
       dbPath = paths.dbPath;
       db = createIfMissing
         ? getLcmConnection(paths.dbPath)
@@ -207,8 +220,12 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     throw new StorageOperationError("STORAGE_CLOSED", "sqlite", identity.id, "factory", operation);
   }
 
-  private resolveProject(identity: ProjectIdentity): { id: string; dbPath: string } {
-    return this.options.resolveProject?.(identity) ?? projectPaths(identity.canonical);
+  private resolveProject(
+    identity: ProjectIdentity,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): { id: string; dbPath: string } {
+    return this.options.resolveProject?.(identity)
+      ?? projectPaths(identity.canonical, publicationLockToken);
   }
 
   private assertIdentity(identity: ProjectIdentity, resolvedId: string, operation: string): void {

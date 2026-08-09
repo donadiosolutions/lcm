@@ -297,7 +297,7 @@ const activePublicationPermits = new WeakMap<PrivateMutationPermit, BackendPubli
 export type BackendPublicationLockToken = object;
 
 const activePublicationLockTokens = new WeakMap<BackendPublicationLockToken, {
-  readonly homeDir: string | undefined;
+  readonly rootPath: string;
   active: boolean;
 }>();
 
@@ -1227,14 +1227,14 @@ function assertLockToken(
   homeDir: string | undefined,
 ): void {
   const state = activePublicationLockTokens.get(token);
-  if (state === undefined || !state.active || state.homeDir !== homeDir) {
+  if (state === undefined || !state.active || state.rootPath !== rootPath(homeDir)) {
     return fail("permit-mismatch", "backend publication lock token is not active");
   }
 }
 
 function newLockToken(homeDir: string | undefined): BackendPublicationLockToken {
   const token = {};
-  activePublicationLockTokens.set(token, { homeDir, active: true });
+  activePublicationLockTokens.set(token, { rootPath: rootPath(homeDir), active: true });
   return token;
 }
 

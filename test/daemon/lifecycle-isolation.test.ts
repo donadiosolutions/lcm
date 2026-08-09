@@ -738,6 +738,7 @@ describe("daemon lifecycle test-scope validation", () => {
         ...options,
         pidFilePath: ownedPidPath,
         _hermeticTestSeams: seams,
+        _assertBackendPublication: () => undefined,
       })).resolves.toMatchObject({
         connected: false,
         spawned: false,
@@ -748,6 +749,7 @@ describe("daemon lifecycle test-scope validation", () => {
         pidFilePath: ownedPidPath,
         _hermeticTestSeams: seams,
         validateBeforeRestart,
+        _assertBackendPublication: () => undefined,
       })).resolves.toMatchObject({
         connected: false,
         spawned: false,
@@ -920,6 +922,7 @@ describe("daemon lifecycle test-scope validation", () => {
       ...restartCase.options,
       _hermeticTestSeams: restartCase.seams,
       validateBeforeRestart,
+      _assertBackendPublication: () => undefined,
     })).resolves.toMatchObject({
       connected: false,
       spawned: false,
@@ -946,6 +949,7 @@ describe("daemon lifecycle test-scope validation", () => {
     await expect(ensureDaemon({
       ...ensureCase.options,
       _hermeticTestSeams: seams,
+      _assertBackendPublication: () => undefined,
     })).rejects.toThrow("PID state is not a canonical owned file");
     expect(fetch).toHaveBeenCalledOnce();
     expect(seams.spawn).not.toHaveBeenCalled();

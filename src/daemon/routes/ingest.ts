@@ -44,7 +44,7 @@ function resolveMessages(input: { client?: unknown; messages?: unknown; provider
 }
 
 export function createIngestHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
-  return async (_req, res, body) => {
+  return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
     const { session_id } = input;
 
@@ -61,7 +61,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       return;
     }
 
-    const paths = projectPaths(cwd);
+    const paths = projectPaths(cwd, context?.publicationLockToken);
     let sqliteMessages: ParsedMessage[] | undefined;
     if (config.storage.backend === "sqlite") {
       sqliteMessages = resolveMessages(input, cwd);
@@ -75,12 +75,17 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
     try {
-      const identity = projectIdentity(cwd, config.storage);
+      const identity = projectIdentity(cwd, config.storage, context?.publicationLockToken);
       let resolvedMessages: ParsedMessage[];
       if (config.storage.backend === "postgresql") {
         activeFactory = storageFactory
-          ?? (ownedFactory = createStorageBackendFactory(config.storage));
-        project = await activeFactory.openProject(identity);
+          ?? (ownedFactory = createStorageBackendFactory(
+            config.storage,
+            undefined,
+            undefined,
+            context?.publicationLockToken,
+          ));
+        project = await activeFactory.openProject(identity, context?.publicationLockToken);
         resolvedMessages = resolveMessages(input, cwd);
       } else {
         resolvedMessages = sqliteMessages as ParsedMessage[];
@@ -89,14 +94,19 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         sendJson(res, 200, { ingested: 0, totalTokens: 0 });
         return;
       }
-      ensureProjectDir(cwd);
+      ensureProjectDir(cwd, context?.publicationLockToken);
       const scrubber = await ScrubEngine.forProject(
         config.security?.sensitivePatterns ?? [],
         paths.dir,
       );
       if (!project) {
-        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-        project = await activeFactory.openProject(identity);
+        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+          config.storage,
+          undefined,
+          undefined,
+          context?.publicationLockToken,
+        ));
+        project = await activeFactory.openProject(identity, context?.publicationLockToken);
       }
       const ingest = await project.transaction(async (repositories) => {
         const row = await repositories.coordination.getSessionIngest(session_id);

@@ -19,6 +19,7 @@ import {
   type PrivateDirectoryWitness,
 } from "../security-files.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
+import type { BackendPublicationLockToken } from "../storage/backend-publication.js";
 import { resolveStorageIdentityContext } from "../storage/identity-context.js";
 import type { ResolvedStorageConfig } from "./config.js";
 import { ensureWorktreeProjectReconciled } from "../worktree-reconciliation.js";
@@ -130,13 +131,21 @@ export function projectIdentity(cwd: string): ProjectIdentity;
 export function projectIdentity(
   cwd: string,
   config: ResolvedStorageConfig,
+  publicationLockToken?: BackendPublicationLockToken,
 ): StorageIdentityContext & { readonly localProjectId: string };
 export function projectIdentity(
   cwd: string,
   config?: ResolvedStorageConfig,
+  publicationLockToken?: BackendPublicationLockToken,
 ): ProjectIdentity | StorageIdentityContext {
-  if (config) ensureWorktreeProjectReconciled(cwd);
-  const local = resolveProjectIdentity(cwd);
+  if (config) {
+    ensureWorktreeProjectReconciled(cwd, undefined, {
+      _publicationLockToken: publicationLockToken,
+    });
+  }
+  const local = resolveProjectIdentity(cwd, {
+    _publicationLockToken: publicationLockToken,
+  });
   return config ? resolveStorageIdentityContext(config, local) : local;
 }
 
@@ -146,12 +155,19 @@ export const projectId = (cwd: string): string =>
 export const projectCanonicalPath = (cwd: string): string =>
   projectIdentity(cwd).canonical;
 
-export function projectPaths(cwd: string): ProjectIdentity & { dir: string; dbPath: string; metaPath: string } {
-  ensureWorktreeProjectReconciled(cwd);
+export function projectPaths(
+  cwd: string,
+  publicationLockToken?: BackendPublicationLockToken,
+): ProjectIdentity & { dir: string; dbPath: string; metaPath: string } {
+  ensureWorktreeProjectReconciled(cwd, undefined, {
+    _publicationLockToken: publicationLockToken,
+  });
   // Reconciliation may atomically replace a legacy worktree hash while this
   // call is in flight. Resolve again after the commit point before deriving
   // any storage paths.
-  const identity = projectIdentity(cwd);
+  const identity = resolveProjectIdentity(cwd, {
+    _publicationLockToken: publicationLockToken,
+  });
   const dir = join(lcmHomeDir(), "projects", identity.id);
   return {
     ...identity,
@@ -161,8 +177,8 @@ export function projectPaths(cwd: string): ProjectIdentity & { dir: string; dbPa
   };
 }
 
-export const projectDir = (cwd: string): string =>
-  projectPaths(cwd).dir;
+export const projectDir = (cwd: string, publicationLockToken?: BackendPublicationLockToken): string =>
+  projectPaths(cwd, publicationLockToken).dir;
 
 export const projectDbPath = (cwd: string): string =>
   projectPaths(cwd).dbPath;
@@ -283,7 +299,11 @@ export const ensureProjectDirForIdentity = (identity: ProjectIdentity): string =
 };
 
 /** Ensures the current project dir exists and writes cwd to meta.json. */
-export const ensureProjectDir = (cwd: string): string => {
-  ensureWorktreeProjectReconciled(cwd);
-  return ensureProjectDirForIdentity(resolveProjectIdentity(cwd));
+export const ensureProjectDir = (cwd: string, publicationLockToken?: BackendPublicationLockToken): string => {
+  ensureWorktreeProjectReconciled(cwd, undefined, {
+    _publicationLockToken: publicationLockToken,
+  });
+  return ensureProjectDirForIdentity(resolveProjectIdentity(cwd, {
+    _publicationLockToken: publicationLockToken,
+  }));
 };

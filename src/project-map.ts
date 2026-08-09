@@ -736,6 +736,8 @@ export function resolveProjectIdentity(
     readonly _beforeMetadataLockForTesting?: () => void;
     readonly _beforeMetadataMutationLockForTesting?: () => void;
     readonly _beforeMissingIdentityLockForTesting?: () => void;
+    /** @internal Token held by a caller that already has publication admission. */
+    readonly _publicationLockToken?: BackendPublicationLockToken;
   } = {},
 ): ProjectIdentity {
   // These hooks model another process winning the race before this consumer
@@ -744,13 +746,18 @@ export function resolveProjectIdentity(
   // reentrant capability.
   opts._beforeMetadataLockForTesting?.();
   opts._beforeMissingEntryLockForTesting?.();
-  return withBackendPublicationConsumerLock(
-    undefined,
-    (token) => resolveProjectIdentityUnlocked(cwd, {
+  const resolveWithToken = (token: BackendPublicationLockToken): ProjectIdentity =>
+    resolveProjectIdentityUnlocked(cwd, {
       ...opts,
       _beforeMetadataLockForTesting: undefined,
       _beforeMissingEntryLockForTesting: undefined,
-    }, token),
+    }, token);
+  if (opts._publicationLockToken !== undefined) {
+    return resolveWithToken(opts._publicationLockToken);
+  }
+  return withBackendPublicationConsumerLock(
+    undefined,
+    resolveWithToken,
   );
 }
 
@@ -793,8 +800,11 @@ export function readProjectMapSnapshot(
  * project-map entry. It is used by recovery paths that may receive a cwd that
  * has disappeared since its last event was captured.
  */
-export function resolveExistingProjectIdentity(cwd: string): ProjectIdentity | null {
-  const map = readProjectMapSnapshot();
+export function resolveExistingProjectIdentity(
+  cwd: string,
+  publicationLockToken?: BackendPublicationLockToken,
+): ProjectIdentity | null {
+  const map = readProjectMapSnapshot(undefined, publicationLockToken);
   let gitAnchor: ReturnType<typeof resolveGitProjectAnchor> = null;
   try {
     gitAnchor = resolveGitProjectAnchor(cwd);
