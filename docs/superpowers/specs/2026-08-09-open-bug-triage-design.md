@@ -38,7 +38,7 @@ then-current protected branch.
 Four implementation PRs are the minimum cohesive set. Issue #558 is resolved
 through evidence-backed triage rather than a speculative implementation PR.
 
-### PR 1: Worktree-Reconciliation Test Determinism (#555, #563)
+### PR 1: Full-Suite Test Determinism (#555, #563, #586)
 
 The four reported real-filesystem/SQLite reconciliation cases perform enough
 setup, migration, archival, fencing, and durability work that five seconds is
@@ -53,6 +53,15 @@ The four tests are:
 - `journals each archive rename and resumes from the failed phase`
 - `fails closed if a source vanishes after discovery or a retired path is recreated`
 - `rejects retired paths recreated between archival and fence publication`
+
+Concurrent verification of that patch discovered #586: the compact-route test
+`accepts previous_summary and returns latestSummaryContent` starts a real
+daemon, ingests 100 messages into real SQLite storage, and performs real
+compaction with a mock summarizer, but also inherits the five-second default.
+Two concurrent coverage suites independently timed it out at 5,529 ms and
+5,521 ms while the uncontended canonical suite passed. Give that case an
+explicit 15,000 ms per-test deadline in the same test-determinism PR. Preserve
+its real behavior and do not change production or the global timeout.
 
 Commit `ce0de35be1373c93313c66917653455129415494` is prior partial work that
 changes only the last two tests. It is evidence, not a complete patch. The
@@ -179,8 +188,9 @@ verification.
 Each implementation PR must satisfy all applicable gates before merge:
 
 - Focused regressions pass, including repeated isolated-process execution for
-  timing-sensitive tests. PR 1 runs all four cases at least twenty times under
-  isolated, `umask 0022`, and concurrent load conditions.
+  timing-sensitive tests. PR 1 runs the four reconciliation cases and the
+  compact-route case at least twenty times under isolated conditions, then
+  proves the complete suite under concurrent coverage load and `umask 0022`.
 - A fresh `npm run test:ci` passes with 100% statements, branches, functions,
   and lines over the complete configured production scope and every per-file
   threshold.
