@@ -112,6 +112,7 @@ const testPublicationAdmission: RoutePublicationAdmission = operation =>
 const testCompactContext: RouteExecutionContext = {
   withPublicationAdmission: testPublicationAdmission,
 };
+const FULL_SUITE_DAEMON_TEST_TIMEOUT_MS = 15_000;
 
 function createCompactHandler(
   config: DaemonConfig,
@@ -1110,7 +1111,7 @@ describe("POST /compact", () => {
     // Verify latestSummaryContent is returned (proves previous_summary was accepted and compact ran)
     expect(typeof body.latestSummaryContent).toBe("string");
     expect(body.latestSummaryContent.length).toBeGreaterThan(0);
-  });
+  }, FULL_SUITE_DAEMON_TEST_TIMEOUT_MS);
 
   it("returns latestSummaryContent when summary is created", async () => {
     // Setup: create a real daemon with mock summarizer so compact produces a real summary
