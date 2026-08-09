@@ -156,6 +156,7 @@ describe("daemon route publication admission", () => {
       }), { publicationConfigPath: configPath });
       daemon.registerRoute("POST", "/nested-admission", async (_req, res, _body, context) => {
         outerToken = context?.publicationLockToken;
+        expect(outerToken).toBeDefined();
         const withPublicationAdmission = context?.withPublicationAdmission;
         expect(withPublicationAdmission).toBeDefined();
         nestedToken = await withPublicationAdmission!(token => {

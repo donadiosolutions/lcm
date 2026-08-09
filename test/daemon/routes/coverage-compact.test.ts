@@ -52,6 +52,7 @@ const state = vi.hoisted(() => ({
   compactionStorageProbe: undefined as ((storage: {
     health: () => Promise<unknown>;
     close: () => Promise<void>;
+    largeFiles: { scalar: string };
   }) => Promise<void>) | undefined,
 }));
 
@@ -163,7 +164,7 @@ vi.mock("../../../src/storage/index.js", () => ({
         conversations,
         summaries,
         context,
-        largeFiles: {},
+        largeFiles: { scalar: "large-files-scalar" },
         promotedMemory: {},
         recall: {},
         redactionAdmin: { upsertCounts: async () => undefined },
@@ -193,6 +194,7 @@ vi.mock("../../../src/compaction.js", () => ({
     constructor(private readonly storage: {
       health: () => Promise<unknown>;
       close: () => Promise<void>;
+      largeFiles: { scalar: string };
     }) {}
 
     compact = async () => {
@@ -978,6 +980,30 @@ describe("compact route coverage", () => {
     expect(body.summary).toBe("No compaction needed.");
   });
 
+  it("sanitizes a publication failure during metadata persistence after compaction", async () => {
+    const privateDetail = "private meta persistence details";
+    const compactCompleted = vi.fn();
+    state.compactionStorageProbe = async () => {
+      compactCompleted();
+    };
+    state.metaError = new BackendPublicationJournalError("unexpected-state", privateDetail);
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "meta-publication-failure", cwd: "/tmp" }),
+      testCompactContext,
+    );
+
+    expect(compactCompleted).toHaveBeenCalledOnce();
+    expect(output.json()).toEqual({
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(JSON.stringify(output.json())).not.toContain(privateDetail);
+  });
+
   it("falls back to the latest existing summary", async () => {
     state.summaries = [{ content: "older", depth: 1 }, { content: "latest", depth: 2 }];
     const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp" }));
@@ -1021,6 +1047,22 @@ describe("compact route coverage", () => {
     expect(output.json()).toMatchObject({ actionTaken: false });
     expect(state.projectHealth).toHaveBeenCalledOnce();
     expect(state.projectClose).toHaveBeenCalledTimes(2);
+  });
+
+  it("passes scalar repository properties through admitted compaction storage", async () => {
+    state.compactionStorageProbe = async storage => {
+      expect(storage.largeFiles.scalar).toBe("large-files-scalar");
+    };
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "compaction-storage-scalar", cwd: "/tmp" }),
+      testCompactContext,
+    );
+
+    expect(output.json()).toMatchObject({ actionTaken: false });
   });
 
   it("uses the non-Error internal-failure fallback", async () => {

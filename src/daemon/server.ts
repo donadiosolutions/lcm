@@ -373,17 +373,15 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       return operation(publicationLockToken);
     });
   const withRequestPublicationAdmission = (
-    retainedToken?: BackendPublicationLockToken,
-  ): RoutePublicationAdmission => retainedToken === undefined
-    ? withBackgroundPublicationAdmission
-    : async operation => withBackendPublicationConsumerLockAsync(
-      publicationHome,
-      async publicationLockToken => {
-        assertRequestAdmission(publicationLockToken);
-        return operation(publicationLockToken);
-      },
-      { lockToken: retainedToken },
-    );
+    retainedToken: BackendPublicationLockToken,
+  ): RoutePublicationAdmission => async operation => withBackendPublicationConsumerLockAsync(
+    publicationHome,
+    async publicationLockToken => {
+      assertRequestAdmission(publicationLockToken);
+      return operation(publicationLockToken);
+    },
+    { lockToken: retainedToken },
+  );
   const storageFactory = createStorageBackendFactory(
     config.storage,
     publicationHome,
