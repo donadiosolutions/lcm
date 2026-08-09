@@ -30,6 +30,7 @@ import {
   createPromoteEventsNotifyHandler,
   PASSIVE_EVENT_PROCESSOR_DEFAULTS,
   PassiveEventProcessor,
+  type BackgroundPublicationAdmission,
 } from "./passive-event-processor.js";
 import { createStatsHandler } from "./routes/stats.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
@@ -87,7 +88,7 @@ export type DaemonOptions = {
   /** @internal Deterministic idle-timer seams for lifecycle tests. */
   _clearTimeout?: typeof clearTimeout;
   /** @internal Deterministic periodic-ingest seam for lifecycle tests. */
-  _scanForTranscripts?: () => Promise<void>;
+  _scanForTranscripts?: (withPublicationAdmission: BackgroundPublicationAdmission) => Promise<void>;
   /** @internal Deterministic packaged-runtime identity seam for health tests. */
   _runtimeDigest?: string;
   /** @internal Explicit owned daemon identity for lifecycle isolation tests. */
@@ -356,6 +357,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }
     assertDaemonRequestStorageAdmission(config, publicationConfigPath, lockToken);
   };
+  const withBackgroundPublicationAdmission: BackgroundPublicationAdmission = async operation =>
+    withBackendPublicationConsumerLockAsync(publicationHome, async publicationLockToken => {
+      assertRequestAdmission(publicationLockToken);
+      return operation(publicationLockToken);
+    });
   const storageFactory = createStorageBackendFactory(
     config.storage,
     publicationHome,
@@ -447,7 +453,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const passiveEventProcessor = new PassiveEventProcessor(
     config,
     PASSIVE_EVENT_PROCESSOR_DEFAULTS,
-    { storageFactory },
+    { storageFactory, withPublicationAdmission: withBackgroundPublicationAdmission },
   );
   constructedProcessor = passiveEventProcessor;
   registerBuiltInRoute("POST", "/promote-events", createPromoteEventsHandler(config, storageFactory), "mutating");
@@ -481,7 +487,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const INGEST_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
   const ingestHandler = createIngestHandler(config, storageFactory);
 
-  const scanForTranscripts = async () => {
+  const scanForTranscripts = async (withPublicationAdmission: BackgroundPublicationAdmission) => {
     try {
       const { readdirSync, existsSync, readFileSync } = await import("node:fs");
       const { join } = await import("node:path");
@@ -519,15 +525,18 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
               end: (data: string) => { response.body = data; },
             } as unknown as ServerResponse;
 
-            await ingestHandler(mockReq, mockRes, JSON.stringify({
-              session_id: sessionId,
-              cwd: scanCwd,
-              transcript_path: transcriptPath,
-            }));
+            await withPublicationAdmission(async publicationLockToken => {
+              await ingestHandler(mockReq, mockRes, JSON.stringify({
+                session_id: sessionId,
+                cwd: scanCwd,
+                transcript_path: transcriptPath,
+              }), { publicationLockToken });
+            });
           }
         }
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof BackendPublicationJournalError) throw error;
       // non-fatal: periodic scan failure shouldn't crash daemon
     }
   };
@@ -537,8 +546,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     if (activeIngestScan) return activeIngestScan;
     const scan = Promise.resolve()
       .then(() => {
-        assertRequestAdmission();
-        return (options?._scanForTranscripts ?? scanForTranscripts)();
+        return (options?._scanForTranscripts ?? scanForTranscripts)(withBackgroundPublicationAdmission);
       })
       .catch((error: unknown) => {
         if (error instanceof BackendPublicationJournalError) {

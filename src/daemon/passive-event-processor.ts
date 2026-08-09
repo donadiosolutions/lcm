@@ -6,6 +6,7 @@ import { EVENTS_UNPROCESSED_BATCH_LIMIT } from "../hooks/events-db.js";
 import { collectEventSidecars } from "../db/event-sidecars.js";
 import { promoteEventsForCwd, type PromoteResult } from "./routes/promote-events.js";
 import type { StorageBackendFactory } from "../storage/index.js";
+import type { BackendPublicationLockToken } from "../storage/backend-publication.js";
 
 export const PASSIVE_EVENT_PROCESSOR_DEFAULTS = {
   priorityDelayMs: 250,
@@ -27,6 +28,7 @@ export interface PassiveEventNotification {
 interface PassiveEventProcessorDeps {
   promoteEventsForCwd?: typeof promoteEventsForCwd;
   storageFactory?: StorageBackendFactory;
+  withPublicationAdmission?: BackgroundPublicationAdmission;
   collectEventSidecars?: typeof collectEventSidecars;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
@@ -38,8 +40,20 @@ interface PassiveEventProcessorDeps {
 type TimeoutHandle = ReturnType<typeof setTimeout>;
 type IntervalHandle = ReturnType<typeof setInterval>;
 
+export type BackgroundPublicationAdmission = <T>(
+  operation: (publicationLockToken: BackendPublicationLockToken | undefined) => Promise<T> | T,
+) => Promise<T>;
+
+type PromoteOneBatch = (
+  config: DaemonConfig,
+  cwd: string,
+  sidecarPath?: string,
+  publicationLockToken?: BackendPublicationLockToken,
+) => Promise<PromoteResult>;
+
 export class PassiveEventProcessor {
-  private readonly promoteOneBatch: typeof promoteEventsForCwd;
+  private readonly promoteOneBatch: PromoteOneBatch;
+  private readonly withPublicationAdmission: BackgroundPublicationAdmission;
   private readonly scanSidecars: typeof collectEventSidecars;
   private readonly setTimer: typeof setTimeout;
   private readonly clearTimer: typeof clearTimeout;
@@ -62,10 +76,14 @@ export class PassiveEventProcessor {
     deps: PassiveEventProcessorDeps = {},
   ) {
     const promoteOneBatch = deps.promoteEventsForCwd ?? promoteEventsForCwd;
-    this.promoteOneBatch = deps.storageFactory
-      ? (config, cwd, sidecarPath) =>
-          promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory)
-      : promoteOneBatch;
+    this.promoteOneBatch = (config, cwd, sidecarPath, publicationLockToken) => {
+      if (publicationLockToken === undefined) {
+        return promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory);
+      }
+      return promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory, publicationLockToken);
+    };
+    this.withPublicationAdmission = deps.withPublicationAdmission
+      ?? (async operation => operation(undefined));
     this.scanSidecars = deps.collectEventSidecars ?? collectEventSidecars;
     this.setTimer = deps.setTimeout ?? setTimeout;
     this.clearTimer = deps.clearTimeout ?? clearTimeout;
@@ -150,7 +168,8 @@ export class PassiveEventProcessor {
           continue;
         }
         try {
-          await this.promoteOneBatch(this.config, sidecar.cwd, sidecar.path);
+          await this.withPublicationAdmission(publicationLockToken =>
+            this.promoteOneBatch(this.config, sidecar.cwd!, sidecar.path, publicationLockToken));
         } catch (error) {
           await this.logError("passive-event-processor", error, { cwd: sidecar.cwd });
         }
@@ -215,7 +234,8 @@ export class PassiveEventProcessor {
     for (let batch = 0; batch < this.defaults.backgroundBatchLimit; batch++) {
       let result: PromoteResult;
       try {
-        result = await this.promoteOneBatch(this.config, cwd);
+        result = await this.withPublicationAdmission(publicationLockToken =>
+          this.promoteOneBatch(this.config, cwd, undefined, publicationLockToken));
       } catch (error) {
         await this.logError("passive-event-processor", error, { cwd });
         return;

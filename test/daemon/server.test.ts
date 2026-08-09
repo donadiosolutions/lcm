@@ -4,13 +4,25 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { claudeProjectDirName, createDaemon, projectTranscriptScanCwds, type DaemonInstance } from "../../src/daemon/server.js";
+import {
+  claudeProjectDirName,
+  createDaemon,
+  projectTranscriptScanCwds,
+  type DaemonInstance,
+} from "../../src/daemon/server.js";
+import type { BackgroundPublicationAdmission } from "../../src/daemon/passive-event-processor.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
+import * as projectModule from "../../src/daemon/project.js";
 import { projectDbPath, projectDir } from "../../src/daemon/project.js";
 import { recoverMachineIdentity } from "../../src/machine-identity.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
-import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import {
+  BackendPublicationJournalError,
+  withBackendPublicationConfigLockAsync,
+} from "../../src/storage/backend-publication.js";
+import { SqliteProjectStorage } from "../../src/storage/sqlite/project-storage.js";
 import {
   clearProjectMapCache,
   hashProjectPath,
@@ -24,6 +36,17 @@ const testIdentity = {
   ownerId: "server-tests",
   entrypoint: "/lcm-tests/server-daemon.mjs",
 } as const;
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(resolvePromise => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
 
 describe("daemon server", () => {
   const originalHome = process.env.HOME;
@@ -64,7 +87,9 @@ describe("daemon server", () => {
     const configPath = join(lcmDir, "config.json");
     mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
     writeFileSync(configPath, "{}", { mode: 0o600 });
-    const scanForTranscripts = vi.fn(async () => undefined);
+    const scanForTranscripts = vi.fn(async (withPublicationAdmission: BackgroundPublicationAdmission) => {
+      await withPublicationAdmission(async () => undefined);
+    });
     let scheduledScan: (() => unknown) | undefined;
     const realSetInterval = globalThis.setInterval;
     vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
@@ -95,7 +120,84 @@ describe("daemon server", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await scheduledScan?.();
     expect(warn).toHaveBeenCalledWith("[lcm] periodic transcript scan blocked by backend publication admission");
-    expect(scanForTranscripts).not.toHaveBeenCalled();
+    expect(scanForTranscripts).toHaveBeenCalledOnce();
+  });
+
+  it("revalidates an alternate canonical publication config after transcript discovery", async () => {
+    const alternateHome = mkdtempSync(join(tmpdir(), "lcm-daemon-alternate-home-"));
+    const defaultLcmDir = join(tempHome!, ".lcm");
+    const alternateLcmDir = join(alternateHome, ".lcm");
+    const defaultConfigPath = join(defaultLcmDir, "config.json");
+    const alternateConfigPath = join(alternateLcmDir, "config.json");
+    mkdirSync(defaultLcmDir, { recursive: true, mode: 0o700 });
+    mkdirSync(join(alternateLcmDir, "backend-publication"), { recursive: true, mode: 0o700 });
+    writeFileSync(defaultConfigPath, "{}\n", { mode: 0o600 });
+    writeFileSync(alternateConfigPath, "{}\n", { mode: 0o600 });
+    const caPath = join(tempHome!, "alternate-postgres-ca.pem");
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const previousPostgresUrl = process.env.LCM_POSTGRES_URL;
+    const previousPostgresCa = process.env.LCM_POSTGRES_CA_FILE;
+    process.env.LCM_POSTGRES_URL = "postgresql://user:secret@db.example.test/lcm";
+    process.env.LCM_POSTGRES_CA_FILE = caPath;
+
+    let scheduledScan: (() => unknown) | undefined;
+    const realSetInterval = globalThis.setInterval;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 10 * 60 * 1000 && typeof handler === "function") {
+        scheduledScan = () => handler(...args);
+      }
+      return realSetInterval(handler, timeout, ...args);
+    }) as typeof setInterval);
+
+    const discovered = deferred<void>();
+    const releaseDiscovery = deferred<void>();
+    let mutations = 0;
+    const scanForTranscripts = vi.fn(async (withPublicationAdmission?: BackgroundPublicationAdmission) => {
+      discovered.resolve();
+      await releaseDiscovery.promise;
+      if (withPublicationAdmission === undefined) {
+        mutations++;
+        return;
+      }
+      await withPublicationAdmission(async () => {
+        mutations++;
+      });
+    });
+    let scan: unknown;
+
+    try {
+      daemon = await createDaemon(loadDaemonConfig(defaultConfigPath, {
+        daemon: { port: 0, idleTimeoutMs: 0 },
+      }), {
+        publicationConfigPath: alternateConfigPath,
+        _scanForTranscripts: scanForTranscripts,
+      });
+      expect(scheduledScan).toBeDefined();
+      scan = scheduledScan?.();
+      await discovered.promise;
+      await expect(withBackendPublicationConfigLockAsync(alternateConfigPath, async () => undefined))
+        .resolves.toBeUndefined();
+
+      writeFileSync(alternateConfigPath, JSON.stringify({ storage: { backend: "postgresql" } }) + "\n", { mode: 0o600 });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      releaseDiscovery.resolve();
+      await scan;
+
+      expect(mutations).toBe(0);
+      expect(warn).toHaveBeenCalledWith("[lcm] periodic transcript scan blocked by backend publication admission");
+    } finally {
+      releaseDiscovery.resolve();
+      if (scan && typeof (scan as Promise<unknown>).then === "function") await scan;
+      if (daemon) {
+        await daemon.stop();
+        daemon = undefined;
+      }
+      rmSync(alternateHome, { recursive: true, force: true });
+      if (previousPostgresUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousPostgresUrl;
+      if (previousPostgresCa === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousPostgresCa;
+    }
   });
 
   it("rejects a request when the freshly loaded backend differs from startup", async () => {
@@ -522,6 +624,9 @@ describe("daemon server", () => {
     const normalizedCanonical = normalizeProjectPath(canonical);
     const normalizedAlias = normalizeProjectPath(alias);
     const hash = hashProjectPath(normalizedCanonical);
+    const configPath = join(homedir(), ".lcm", "config.json");
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
     mkdirSync(join(homedir(), ".lcm", "projects", hash), { recursive: true });
     writeFileSync(join(homedir(), ".lcm", "projects", hash, "meta.json"), JSON.stringify({ cwd: normalizedCanonical }, null, 2) + "\n");
     writeFileSync(projectMapPath(), JSON.stringify({
@@ -529,23 +634,68 @@ describe("daemon server", () => {
     }, null, 2) + "\n", { mode: 0o600 });
     clearProjectMapCache();
 
-    const sessionsDir = join(homedir(), ".claude", "projects", claudeProjectDirName(normalizedAlias));
-    mkdirSync(sessionsDir, { recursive: true });
-    writeFileSync(join(sessionsDir, "ignored.txt"), "not a transcript");
-    writeFileSync(join(sessionsDir, "alias-session.jsonl"), [
+    const canonicalSessionsDir = join(homedir(), ".claude", "projects", claudeProjectDirName(normalizedCanonical));
+    const aliasSessionsDir = join(homedir(), ".claude", "projects", claudeProjectDirName(normalizedAlias));
+    mkdirSync(canonicalSessionsDir, { recursive: true });
+    mkdirSync(aliasSessionsDir, { recursive: true });
+    writeFileSync(join(aliasSessionsDir, "ignored.txt"), "not a transcript");
+    writeFileSync(join(canonicalSessionsDir, "canonical-session.jsonl"), [
+      JSON.stringify({ message: { role: "user", content: [{ type: "text", text: "Canonical scan question" }] } }),
+      JSON.stringify({ message: { role: "assistant", content: [{ type: "text", text: "Canonical scan answer" }] } }),
+    ].join("\n") + "\n");
+    writeFileSync(join(aliasSessionsDir, "alias-session.jsonl"), [
       JSON.stringify({ message: { role: "user", content: [{ type: "text", text: "Alias scan question" }] } }),
       JSON.stringify({ message: { role: "assistant", content: [{ type: "text", text: "Alias scan answer" }] } }),
     ].join("\n") + "\n");
 
-    daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0, idleTimeoutMs: 0 } }));
+    const observedTokens: Array<object | undefined> = [];
+    const originalProjectPaths = projectModule.projectPaths;
+    vi.spyOn(projectModule, "projectPaths").mockImplementation((cwd, publicationLockToken) => {
+      if (observedTokens.at(-1) !== publicationLockToken) observedTokens.push(publicationLockToken);
+      return originalProjectPaths(cwd, publicationLockToken);
+    });
+    const transactionStarted = [deferred<object | undefined>(), deferred<object | undefined>()];
+    const releaseTransaction = [deferred<void>(), deferred<void>()];
+    let transactionIndex = 0;
+    const originalTransaction = SqliteProjectStorage.prototype.transaction;
+    const transactionSpy = vi.spyOn(SqliteProjectStorage.prototype, "transaction").mockImplementation(async function (callback) {
+      const index = transactionIndex++;
+      transactionStarted[index]?.resolve(observedTokens[index]);
+      await releaseTransaction[index]?.promise;
+      return originalTransaction.call(this, callback);
+    });
+
+    daemon = await createDaemon(loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }), {
+      publicationConfigPath: configPath,
+    });
     expect(scanForTranscripts).toBeDefined();
 
-    await scanForTranscripts?.();
+    const scan = scanForTranscripts?.();
+    try {
+      const firstToken = await transactionStarted[0].promise;
+      expect(firstToken).toEqual(expect.any(Object));
+      await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
+        .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+      releaseTransaction[0].resolve();
+
+      const secondToken = await transactionStarted[1].promise;
+      expect(secondToken).toEqual(expect.any(Object));
+      expect(secondToken).not.toBe(firstToken);
+      await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
+        .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+      releaseTransaction[1].resolve();
+      await scan;
+    } finally {
+      releaseTransaction[0].resolve();
+      releaseTransaction[1].resolve();
+      await scan;
+    }
+    expect(transactionSpy).toHaveBeenCalledTimes(2);
 
     const db = new DatabaseSync(projectDbPath(normalizedCanonical));
     try {
       const row = db.prepare("SELECT COUNT(*) AS count FROM messages").get() as { count: number };
-      expect(row.count).toBe(2);
+      expect(row.count).toBe(4);
     } finally {
       db.close();
       rmSync(canonical, { recursive: true, force: true });
