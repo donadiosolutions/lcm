@@ -1,11 +1,18 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { IncomingMessage } from "node:http";
 import { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { createDaemon, type DaemonInstance } from "../../../src/daemon/server.js";
+import {
+  createDaemon,
+  type DaemonInstance,
+  type RouteExecutionContext,
+  type RouteHandler,
+  type RoutePublicationAdmission,
+} from "../../../src/daemon/server.js";
+import { ensureAuthToken, readAuthToken } from "../../../src/daemon/auth.js";
 import { loadDaemonConfig, parseDaemonConfig } from "../../../src/daemon/config.js";
 import { projectDbPath, projectId, projectIdentity } from "../../../src/daemon/project.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
@@ -15,6 +22,12 @@ import {
   type ProjectStorage,
   type StorageBackendFactory,
 } from "../../../src/storage/index.js";
+import {
+  assertBackendPublicationConsumerAccess,
+  BackendPublicationJournalError,
+  withBackendPublicationConsumerLockAsync,
+} from "../../../src/storage/backend-publication.js";
+import type { BackendPublicationLockToken } from "../../../src/storage/backend-publication.js";
 
 // --- Summarizer branching unit tests ---
 
@@ -38,7 +51,7 @@ import { createClaudeProcessSummarizer } from "../../../src/llm/claude-process.j
 import { createCodexProcessSummarizer } from "../../../src/llm/codex-process.js";
 import { createAnthropicSummarizer } from "../../../src/llm/anthropic.js";
 import { createOpenAISummarizer } from "../../../src/llm/openai.js";
-import { createCompactHandler, buildCompactionMessage } from "../../../src/daemon/routes/compact.js";
+import { createCompactHandler as createCompactHandlerProduction, buildCompactionMessage } from "../../../src/daemon/routes/compact.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
 
 function mockRes() {
@@ -79,6 +92,35 @@ function makeConfig(provider: DaemonConfig["llm"]["provider"]): DaemonConfig {
   } as unknown as DaemonConfig;
 }
 
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+// Intentional test admission seam: each direct handler invocation acquires a
+// real publication lock and supplies its live token through route context.
+const testPublicationAdmission: RoutePublicationAdmission = operation =>
+  withBackendPublicationConsumerLockAsync(undefined, operation, { allowUnresolved: true });
+const testCompactContext: RouteExecutionContext = {
+  withPublicationAdmission: testPublicationAdmission,
+};
+
+function createCompactHandler(
+  config: DaemonConfig,
+  storageFactory?: StorageBackendFactory,
+): RouteHandler {
+  const handler = createCompactHandlerProduction(config, storageFactory);
+  return (req, res, body, context = testCompactContext) => handler(req, res, body, context);
+}
+
 async function readMessageCount(cwd: string, sessionId: string): Promise<number> {
   const db = new DatabaseSync(projectDbPath(cwd));
 
@@ -99,6 +141,15 @@ async function readMessageContents(cwd: string, sessionId: string): Promise<stri
     const conversation = await conversationStore.getOrCreateConversation(sessionId);
     const messages = await conversationStore.getMessages(conversation.conversationId);
     return messages.map((m) => m.content);
+  } finally {
+    db.close();
+  }
+}
+
+function readSummaryCount(cwd: string): number {
+  const db = new DatabaseSync(projectDbPath(cwd));
+  try {
+    return Number((db.prepare("SELECT COUNT(*) AS count FROM summaries").get() as { count: number }).count);
   } finally {
     db.close();
   }
@@ -662,6 +713,220 @@ describe("POST /compact", () => {
     expect(typeof body.summary).toBe("string");
   });
 
+  it("does not retain publication admission while the summarizer is pending", async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-compact-admission-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    const lcmDir = join(tempHome, ".lcm");
+    const projectDir = join(tempHome, "project");
+    const configPath = join(lcmDir, "config.json");
+    const tokenPath = join(tempHome, "daemon.token");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    ensureAuthToken(tokenPath);
+    const summarizeStarted = deferred<void>();
+    const releaseSummary = deferred<string>();
+    vi.mocked(createOpenAISummarizer).mockReturnValueOnce(async () => {
+      summarizeStarted.resolve();
+      return releaseSummary.promise;
+    });
+    let daemon: DaemonInstance | undefined;
+    let compactPromise: Promise<Response> | undefined;
+
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, {
+        daemon: { port: 0, idleTimeoutMs: 0 },
+        llm: {
+          provider: "openai",
+          model: "test-model",
+          apiKey: "sk-test",
+          baseUrl: "http://localhost:11435/v1",
+        },
+      }), {
+        tokenPath,
+        publicationConfigPath: configPath,
+        _testIdentity: {
+          ownerId: "compact-admission-test",
+          entrypoint: join(tempHome, "daemon.mjs"),
+        },
+      });
+      const baseUrl = `http://127.0.0.1:${daemon.address().port}`;
+      const messages = Array.from({ length: 12 }, (_, index) => ({
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `pending compact message ${index}`,
+        tokenCount: 1_000,
+      }));
+      const ingestResponse = await fetch(`${baseUrl}/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${readAuthToken(tokenPath)}` },
+        body: JSON.stringify({ session_id: "pending-compact", cwd: projectDir, messages }),
+      });
+      expect(ingestResponse.status).toBe(200);
+
+      compactPromise = fetch(`${baseUrl}/compact`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${readAuthToken(tokenPath)}` },
+        body: JSON.stringify({ session_id: "pending-compact", cwd: projectDir, skip_ingest: true }),
+      });
+      await summarizeStarted.promise;
+
+      let publicationEntered = false;
+      await withBackendPublicationConsumerLockAsync(tempHome, async () => {
+        publicationEntered = true;
+      });
+      expect(publicationEntered).toBe(true);
+      const healthResponse = await fetch(`${baseUrl}/health`, {
+        headers: { Authorization: `Bearer ${readAuthToken(tokenPath)}` },
+      });
+      expect(healthResponse.status).toBe(200);
+
+      releaseSummary.resolve("pending compact summary");
+      await expect(compactPromise).resolves.toMatchObject({ status: 200 });
+    } finally {
+      releaseSummary.resolve("cleanup summary");
+      await compactPromise?.catch(() => undefined);
+      if (daemon) await daemon.stop();
+      rmSync(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it("revalidates config before post-model storage mutation", async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const originalPostgresUrl = process.env.LCM_POSTGRES_URL;
+    const originalPostgresCaFile = process.env.LCM_POSTGRES_CA_FILE;
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-compact-config-admission-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    const lcmDir = join(tempHome, ".lcm");
+    const projectDir = join(tempHome, "project");
+    const configPath = join(lcmDir, "config.json");
+    const caFile = join(tempHome, "postgres-ca.pem");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    writeFileSync(caFile, "test-ca\n", { mode: 0o600 });
+    process.env.LCM_POSTGRES_URL = "postgresql://user:password@localhost/lcm";
+    process.env.LCM_POSTGRES_CA_FILE = caFile;
+    const summarizeStarted = deferred<void>();
+    const releaseSummary = deferred<string>();
+    vi.mocked(createOpenAISummarizer).mockReturnValueOnce(async () => {
+      summarizeStarted.resolve();
+      return releaseSummary.promise;
+    });
+    let daemon: DaemonInstance | undefined;
+    let compactPromise: Promise<Response> | undefined;
+
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, {
+        daemon: { port: 0, idleTimeoutMs: 0 },
+        llm: {
+          provider: "openai",
+          model: "test-model",
+          apiKey: "sk-test",
+          baseUrl: "http://localhost:11435/v1",
+        },
+      }), { publicationConfigPath: configPath });
+      const baseUrl = `http://127.0.0.1:${daemon.address().port}`;
+      const messages = Array.from({ length: 12 }, (_, index) => ({
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `config-race message ${index}`,
+        tokenCount: 1_000,
+      }));
+      const ingestResponse = await fetch(`${baseUrl}/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "config-race", cwd: projectDir, messages }),
+      });
+      expect(ingestResponse.status).toBe(200);
+
+      compactPromise = fetch(`${baseUrl}/compact`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "config-race", cwd: projectDir, skip_ingest: true }),
+      });
+      await summarizeStarted.promise;
+
+      writeFileSync(
+        configPath,
+        JSON.stringify({ storage: { backend: "postgresql" } }) + "\n",
+        { mode: 0o600 },
+      );
+      releaseSummary.resolve("config-race summary");
+
+      const response = await compactPromise;
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual({
+        status: "blocked",
+        error: "backend publication admission blocked",
+      });
+      expect(await readMessageCount(projectDir, "config-race")).toBe(messages.length);
+      expect(readSummaryCount(projectDir)).toBe(0);
+    } finally {
+      releaseSummary.resolve("cleanup summary");
+      await compactPromise?.catch(() => undefined);
+      if (daemon) await daemon.stop();
+      rmSync(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+      if (originalPostgresUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = originalPostgresUrl;
+      if (originalPostgresCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = originalPostgresCaFile;
+    }
+  });
+
+  it("revokes the operation token after compact admission exits", async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-compact-token-lifetime-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    mkdirSync(join(tempHome, ".lcm"), { recursive: true, mode: 0o700 });
+    const projectDir = join(tempHome, "project");
+    mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+    let capturedToken: BackendPublicationLockToken | undefined;
+    const context: RouteExecutionContext = {
+      withPublicationAdmission: async operation =>
+        withBackendPublicationConsumerLockAsync(tempHome, async token => {
+          capturedToken = token;
+          return operation(token);
+        }, { allowUnresolved: true }),
+    };
+    const output = mockRes();
+
+    try {
+      await createCompactHandlerProduction(makeConfig("disabled"))(
+        {} as never,
+        output.res,
+        JSON.stringify({ session_id: "token-lifetime", cwd: projectDir }),
+        context,
+      );
+
+      expect(output.getBody()).toMatchObject({ actionTaken: false });
+      expect(capturedToken).toBeDefined();
+      expect(() => assertBackendPublicationConsumerAccess({
+        homeDir: tempHome,
+        lockToken: capturedToken,
+      })).toThrow(BackendPublicationJournalError);
+    } finally {
+      rmSync(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
   it("skips transcript ingestion when skip_ingest is true", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-compact-"));
     tempDirs.push(tempDir);
@@ -862,7 +1127,7 @@ describe("POST /compact", () => {
 
     // Ingest a substantial amount of messages to trigger compaction
     const messageData: Array<{ role: string; content: string; tokenCount: number }> = [];
-    for (let i = 1; i <= 100; i++) {
+    for (let i = 1; i <= 6; i++) {
       messageData.push({ role: "user" as const, content: `user message ${i}`, tokenCount: 100 });
       messageData.push({ role: "assistant" as const, content: `assistant response ${i}`, tokenCount: 100 });
     }

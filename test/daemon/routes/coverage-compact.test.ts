@@ -42,8 +42,10 @@ const state = vi.hoisted(() => ({
   ensureProject: vi.fn(),
   queuedKeys: [] as string[],
   beforeQueuedWork: undefined as (() => void) | undefined,
+  transactionActive: false,
   scrubber: vi.fn(async () => ({ scrubWithCounts: (content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }) })),
   openProject: vi.fn(),
+  projectClose: vi.fn(async () => undefined),
   openProjectError: undefined as unknown,
 }));
 
@@ -155,12 +157,24 @@ vi.mock("../../../src/storage/index.js", () => ({
         conversations,
         summaries,
         context,
+        largeFiles: {},
+        promotedMemory: {},
+        recall: {},
         redactionAdmin: { upsertCounts: async () => undefined },
+        lexicalSearch: {},
+        coordination: {},
       };
       return {
         ...repositories,
-        transaction: async (callback: (value: typeof repositories) => Promise<unknown>) => callback(repositories),
-        close: async () => undefined,
+        transaction: async (callback: (value: typeof repositories) => Promise<unknown>) => {
+          state.transactionActive = true;
+          try {
+            return await callback(repositories);
+          } finally {
+            state.transactionActive = false;
+          }
+        },
+        close: state.projectClose,
       };
     },
     close: async () => undefined,
@@ -181,9 +195,35 @@ vi.mock("node:fs", async (importOriginal) => ({
 }));
 
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
-import { buildCompactionMessage, createCompactHandler } from "../../../src/daemon/routes/compact.js";
+import {
+  buildCompactionMessage,
+  createCompactHandler as createCompactHandlerProduction,
+} from "../../../src/daemon/routes/compact.js";
+import type {
+  RouteExecutionContext,
+  RouteHandler,
+  RoutePublicationAdmission,
+} from "../../../src/daemon/server.js";
+import type { StorageBackendFactory } from "../../../src/storage/index.js";
 import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
+import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
+
+// Intentional unit-test admission seam: the production route receives a live
+// token from the daemon server; this mocked boundary supplies an explicit
+// token-shaped authority while project/storage modules are mocked below.
+const testPublicationAdmission: RoutePublicationAdmission = async operation => operation({});
+const testCompactContext: RouteExecutionContext = {
+  withPublicationAdmission: testPublicationAdmission,
+};
+
+function createCompactHandler(
+  value: ReturnType<typeof loadDaemonConfig>,
+  factory?: StorageBackendFactory,
+): RouteHandler {
+  const handler = createCompactHandlerProduction(value, factory);
+  return (req, res, body, context = testCompactContext) => handler(req, res, body, context);
+}
 
 function config() {
   const value = loadDaemonConfig("/does-not-exist");
@@ -249,8 +289,10 @@ describe("compact route coverage", () => {
     state.ensureProject.mockReturnValue("/tmp/project");
     state.queuedKeys = [];
     state.beforeQueuedWork = undefined;
+    state.transactionActive = false;
     state.scrubber.mockClear();
     state.openProject.mockClear();
+    state.projectClose.mockClear();
     state.openProjectError = undefined;
   });
 
@@ -295,6 +337,82 @@ describe("compact route coverage", () => {
       .toBeLessThan(state.scrubber.mock.invocationCallOrder[0]);
   });
 
+  it("closes a project when admission fails after opening it", async () => {
+    const closeAfterAdmissionFailure = vi.fn(async () => undefined);
+    const repositories = {
+      conversations: {},
+      summaries: {},
+      context: {},
+      largeFiles: {},
+      promotedMemory: {},
+      recall: {},
+      redactionAdmin: {},
+      lexicalSearch: {},
+      coordination: {},
+    };
+    const factory = {
+      openProject: vi.fn(async () => ({
+        ...repositories,
+        transaction: async () => undefined,
+        close: closeAfterAdmissionFailure,
+      })),
+      close: vi.fn(async () => undefined),
+    } as unknown as StorageBackendFactory;
+    let admissions = 0;
+    const context: RouteExecutionContext = {
+      withPublicationAdmission: async operation => {
+        admissions += 1;
+        const value = await operation({});
+        if (admissions === 2) {
+          throw new BackendPublicationJournalError(
+            "unexpected-state",
+            "admission changed after project open",
+          );
+        }
+        return value;
+      },
+    };
+    const output = response();
+
+    await createCompactHandler(config(), factory)(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "open-admission-failure", cwd: "/tmp" }),
+      context,
+    );
+
+    expect(output.json()).toEqual({
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(closeAfterAdmissionFailure).toHaveBeenCalledOnce();
+  });
+
+  it("keeps transcript transaction repositories inside one admission", async () => {
+    state.existingMeta = true;
+    state.messages = [{ role: "user", content: "transcript", tokenCount: 1 }];
+    const admissionCalls = vi.fn();
+    const context: RouteExecutionContext = {
+      withPublicationAdmission: async operation => {
+        admissionCalls();
+        if (state.transactionActive) throw new Error("nested publication admission");
+        return operation({});
+      },
+    };
+    const output = response();
+
+    await createCompactHandler(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "transaction-scope", cwd: "/tmp", transcript_path: "/tmp/transcript" }),
+      context,
+    );
+
+    expect(output.json()).toMatchObject({ actionTaken: false });
+    expect(admissionCalls).toHaveBeenCalled();
+    expect(state.transactionActive).toBe(false);
+  });
+
   it.each([
     [
       "local project directory",
@@ -315,8 +433,23 @@ describe("compact route coverage", () => {
   ) => {
     const closeProject = vi.fn(async () => undefined);
     const closeFactory = vi.fn(async () => undefined);
+    const repositories = {
+      conversations: {},
+      summaries: {},
+      context: {},
+      largeFiles: {},
+      promotedMemory: {},
+      recall: {},
+      redactionAdmin: {},
+      lexicalSearch: {},
+      coordination: {},
+    };
     const sharedFactory = {
-      openProject: vi.fn(async () => ({ close: closeProject })),
+      openProject: vi.fn(async () => ({
+        ...repositories,
+        transaction: async () => undefined,
+        close: closeProject,
+      })),
       close: closeFactory,
     };
     failSetup();
@@ -333,7 +466,7 @@ describe("compact route coverage", () => {
     expect(closeFactory).not.toHaveBeenCalled();
   });
 
-  it("uses one local and remote identity snapshot across queued execution", async () => {
+  it("revalidates local and remote identity before queued storage setup", async () => {
     const first = {
       id: "local-hash-a",
       canonical: "/work/project",
@@ -350,7 +483,7 @@ describe("compact route coverage", () => {
       dbPath: "/lcm/projects/local-hash-b/db.sqlite",
       metaPath: "/lcm/projects/local-hash-b/meta.json",
     };
-    state.paths.mockReturnValueOnce(first);
+    state.paths.mockReturnValueOnce(first).mockReturnValueOnce(first);
     state.ensureProject.mockReturnValue(first.dir);
     state.beforeQueuedWork = () => {
       state.paths.mockReturnValue(concurrent);
@@ -370,23 +503,23 @@ describe("compact route coverage", () => {
     await expect(call(JSON.stringify({
       session_id: "queued-snapshot",
       cwd: first.canonical,
-    }), value)).resolves.toMatchObject({ actionTaken: false });
-
-    expect(state.paths).toHaveBeenCalledOnce();
-    expect(state.queuedKeys).toEqual([first.id]);
-    expect(state.ensureProject).toHaveBeenCalledWith({
-      id: first.id,
-      canonical: first.canonical,
-      remoteProjectId: first.remoteProjectId,
+    }), value)).resolves.toEqual({
+      status: "blocked",
+      error: "backend publication admission blocked",
     });
-    expect(state.scrubber).toHaveBeenCalledWith([], first.dir);
+
+    expect(state.paths).toHaveBeenCalledTimes(3);
+    expect(state.queuedKeys).toEqual([first.id]);
+    expect(state.ensureProject).not.toHaveBeenCalled();
+    expect(state.scrubber).not.toHaveBeenCalled();
+    expect(state.projectClose).toHaveBeenCalledOnce();
     expect(state.openProject).toHaveBeenCalledWith({
       id: first.remoteProjectId,
       localProjectId: first.id,
       canonical: first.canonical,
       remoteProjectId: first.remoteProjectId,
       machineId: "machine-id",
-    }, undefined);
+    }, expect.any(Object));
   });
 
   it.each([
@@ -400,6 +533,40 @@ describe("compact route coverage", () => {
 
   it("uses the empty-body fallback", async () => {
     expect(await call("")).toEqual({ error: "session_id must be a non-empty string" });
+  });
+
+  it("fails closed when no route admission context is supplied", async () => {
+    const output = response();
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "missing-admission", cwd: "/tmp" }),
+    );
+    expect(output.json()).toEqual({
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+  });
+
+  it("sanitizes an initial publication admission failure", async () => {
+    const output = response();
+    const context: RouteExecutionContext = {
+      withPublicationAdmission: async () => {
+        throw new BackendPublicationJournalError("unexpected-state", "private publication details");
+      },
+    };
+
+    await createCompactHandler(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "initial-admission-failure", cwd: "/tmp" }),
+      context,
+    );
+
+    expect(output.json()).toEqual({
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
   });
 
   it("uses the non-Error cwd fallback", async () => {

@@ -56,8 +56,13 @@ import {
 } from "../storage/backend-publication.js";
 export { PKG_VERSION };
 
+export type RoutePublicationAdmission = <T>(
+  operation: (publicationLockToken: BackendPublicationLockToken) => Promise<T> | T,
+) => Promise<T>;
+
 export type RouteExecutionContext = Readonly<{
   publicationLockToken?: BackendPublicationLockToken;
+  withPublicationAdmission?: RoutePublicationAdmission;
 }>;
 export type RouteHandler = (
   req: IncomingMessage,
@@ -66,7 +71,12 @@ export type RouteHandler = (
   context?: RouteExecutionContext,
 ) => Promise<void>;
 export type RouteAdmission = "read" | "mutating";
-type RegisteredRoute = Readonly<{ handler: RouteHandler; admission: RouteAdmission }>;
+type BuiltInRoutePublicationMode = "retained" | "operation-scoped";
+type RegisteredRoute = Readonly<{
+  handler: RouteHandler;
+  admission: RouteAdmission;
+  publicationMode: BuiltInRoutePublicationMode;
+}>;
 export type DaemonInstance = {
   address: () => AddressInfo;
   stop: () => Promise<void>;
@@ -362,6 +372,18 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       assertRequestAdmission(publicationLockToken);
       return operation(publicationLockToken);
     });
+  const withRequestPublicationAdmission = (
+    retainedToken?: BackendPublicationLockToken,
+  ): RoutePublicationAdmission => retainedToken === undefined
+    ? withBackgroundPublicationAdmission
+    : async operation => withBackendPublicationConsumerLockAsync(
+      publicationHome,
+      async publicationLockToken => {
+        assertRequestAdmission(publicationLockToken);
+        return operation(publicationLockToken);
+      },
+      { lockToken: retainedToken },
+    );
   const storageFactory = createStorageBackendFactory(
     config.storage,
     publicationHome,
@@ -383,9 +405,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     path: string,
     handler: RouteHandler,
     admission: RouteAdmission,
+    publicationMode: BuiltInRoutePublicationMode = "retained",
   ): void => {
     const key = `${method} ${path}`;
-    routes.set(key, { handler, admission });
+    routes.set(key, { handler, admission, publicationMode });
     options?._onBuiltInRouteRegistered?.(key, admission);
   };
 
@@ -438,7 +461,13 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       }),
     });
   }, "read");
-  registerBuiltInRoute("POST", "/compact", createCompactHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute(
+    "POST",
+    "/compact",
+    createCompactHandler(config, storageFactory),
+    "mutating",
+    "operation-scoped",
+  );
   registerBuiltInRoute("POST", "/promote", createPromoteHandler(config, storageFactory), "mutating");
   registerBuiltInRoute("POST", "/restore", createRestoreHandler(config, storageFactory), "mutating");
   registerBuiltInRoute("POST", "/grep", createGrepHandler(config, storageFactory), "read");
@@ -589,11 +618,18 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     try {
       const body = req.method !== "GET" ? await readBody(req) : "";
       if (route.admission === "mutating") {
+        if (route.publicationMode === "operation-scoped") {
+          await route.handler(req, res, body, {
+            withPublicationAdmission: withBackgroundPublicationAdmission,
+          });
+          return;
+        }
         bufferedResponse = new BufferedServerResponse(res);
         await withBackendPublicationConsumerLockAsync(publicationHome, async (lockToken) => {
           assertRequestAdmission(lockToken);
           await route.handler(req, bufferedResponse as unknown as ServerResponse, body, {
             publicationLockToken: lockToken,
+            withPublicationAdmission: withRequestPublicationAdmission(lockToken),
           });
         });
         bufferedResponse.flush();
@@ -703,7 +739,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           const admission = existing?.admission === "mutating"
             ? "mutating"
             : requestedAdmission ?? inheritedAdmission;
-          routes.set(key, { handler, admission });
+          routes.set(key, { handler, admission, publicationMode: "retained" });
         },
         get idleTriggered() { return idleTriggered; },
       });
