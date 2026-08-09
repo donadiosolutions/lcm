@@ -56,6 +56,12 @@ import {
   mapDaemonRefusalToRemediation,
   type DaemonRefusalReason,
 } from "../daemon/remediation.js";
+import {
+  assertBackendPublicationConfigAccess,
+  withBackendPublicationConfigLock,
+  BackendPublicationJournalError,
+} from "../storage/backend-publication.js";
+import { readBoundedRegularFile } from "../security-files.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -80,6 +86,10 @@ function defaultDeps(): DoctorDeps {
     fetch: globalThis.fetch,
     homedir: homedir(),
     platform: platform(),
+    _readBoundedConfig: (path, maxBytes) => readBoundedRegularFile(path, {
+      allowedRoot: dirname(path),
+      maxBytes,
+    }),
   };
 }
 
@@ -94,10 +104,48 @@ interface DoctorConfig {
   requestTimeoutMs?: number;
   retry?: LlmRetryPolicy;
   validationError?: ConfigValidationError;
+  publicationError?: BackendPublicationJournalError;
 }
 
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
 const DAEMON_HEALTH_DEADLINE_MS = 2000;
+const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
+
+function publicationAdmissionMessage(
+  reason: BackendPublicationJournalError["reason"],
+): string {
+  switch (reason) {
+    case "publication-evidence-missing":
+      return "Backend publication admission is blocked: completed publication evidence is missing. Complete or recover the backend publication, then rerun lcm doctor.";
+    case "unresolved-publication":
+      return "Backend publication admission is blocked: a backend publication is unresolved. Complete or abort the pending publication, then rerun lcm doctor.";
+    case "unsafe-storage":
+    case "malformed-journal":
+    case "checksum-mismatch":
+    case "unexpected-state":
+    case "permit-mismatch":
+    case "backend-mismatch":
+    case "invalid-input":
+      return "Backend publication admission is blocked: authenticated publication state is invalid or unsafe. Stop automatic repair and inspect the installation before retrying.";
+  }
+}
+
+function checkBackendPublicationAdmission(
+  results: CheckResult[],
+  config: DoctorConfig,
+): boolean {
+  if (config.publicationError !== undefined) {
+    const error = config.publicationError;
+    results.push({
+      name: "backend-publication",
+      category: "Storage",
+      status: "fail",
+      message: publicationAdmissionMessage(error.reason),
+    });
+    return true;
+  }
+  return false;
+}
 
 type DaemonStorageReadiness = "ready" | "unavailable" | "unverified";
 
@@ -237,36 +285,117 @@ function recoverConfiguredPort(content: string): number {
   }
 }
 
+function backendCandidate(content: string): "sqlite" | "postgresql" {
+  try {
+    const parsed = JSON.parse(content) as { storage?: { backend?: unknown } };
+    return parsed.storage?.backend === "postgresql" ? "postgresql" : "sqlite";
+  } catch {
+    return "sqlite";
+  }
+}
+
+function authenticateConfigPublication(
+  configPathValue: string,
+  deps: DoctorDeps,
+  backend: "sqlite" | "postgresql",
+  observedContent: string | null,
+  lockToken: object,
+): BackendPublicationJournalError | undefined {
+  try {
+    if (deps._assertBackendPublication !== undefined) {
+      deps._assertBackendPublication(deps.homedir, backend);
+    } else {
+      assertBackendPublicationConfigAccess(
+        configPathValue,
+        backend,
+        observedContent,
+        undefined,
+        lockToken,
+      );
+    }
+    return undefined;
+  } catch (error) {
+    if (!(error instanceof BackendPublicationJournalError)) throw error;
+    return error;
+  }
+}
+
 function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
-  if (!deps.existsSync(resolvedConfigPath)) {
-    return { port: DEFAULT_DAEMON_PORT, storageBackend: "sqlite", storage: { backend: "sqlite" }, summarizer: "disabled" };
-  }
-
-  let content: string | undefined;
   try {
-    content = deps.readFileSync(resolvedConfigPath, "utf-8");
-    const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
-    return {
-      port: config.daemon.port,
-      storageBackend: config.storage.backend,
-      storage: config.storage,
-      summarizer: config.llm.provider,
-      apiMode: config.llm.apiMode,
-      reasoningEffort: config.llm.reasoningEffort,
-      fastMode: config.llm.fastMode,
-      requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
-      retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
-    };
+    return withBackendPublicationConfigLock(resolvedConfigPath, (lockToken) => {
+      let content: string | undefined;
+      let publicationError: BackendPublicationJournalError | undefined;
+      try {
+        if (!deps.existsSync(resolvedConfigPath)) {
+          publicationError = authenticateConfigPublication(
+            resolvedConfigPath,
+            deps,
+            "sqlite",
+            null,
+            lockToken,
+          );
+          return {
+            port: DEFAULT_DAEMON_PORT,
+            storageBackend: "sqlite",
+            storage: { backend: "sqlite" },
+            summarizer: "disabled",
+            publicationError,
+          };
+        }
+        content = deps._readBoundedConfig!(resolvedConfigPath, MAX_CONFIG_BYTES);
+        const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
+        publicationError = authenticateConfigPublication(
+          resolvedConfigPath,
+          deps,
+          config.storage.backend,
+          content,
+          lockToken,
+        );
+        return {
+          port: config.daemon.port,
+          storageBackend: config.storage.backend,
+          storage: config.storage,
+          summarizer: config.llm.provider,
+          apiMode: config.llm.apiMode,
+          reasoningEffort: config.llm.reasoningEffort,
+          fastMode: config.llm.fastMode,
+          requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
+          retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
+          publicationError,
+        };
+      } catch (error) {
+        const validationError = error instanceof ConfigValidationError
+          ? error
+          : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
+        publicationError = content === undefined
+          ? new BackendPublicationJournalError(
+              "unsafe-storage",
+              "backend publication admission is blocked because config bytes could not be observed safely",
+            )
+          : authenticateConfigPublication(
+              resolvedConfigPath,
+              deps,
+              backendCandidate(content),
+              content,
+              lockToken,
+            );
+        return {
+          port: typeof content === "string" ? recoverConfiguredPort(content) : DEFAULT_DAEMON_PORT,
+          storageBackend: "unavailable",
+          summarizer: "disabled",
+          validationError,
+          publicationError,
+        };
+      }
+    });
   } catch (error) {
-    const validationError = error instanceof ConfigValidationError
-      ? error
-      : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
+    if (!(error instanceof BackendPublicationJournalError)) throw error;
     return {
-      port: typeof content === "string" ? recoverConfiguredPort(content) : DEFAULT_DAEMON_PORT,
+      port: DEFAULT_DAEMON_PORT,
       storageBackend: "unavailable",
       summarizer: "disabled",
-      validationError,
+      publicationError: error,
     };
   }
 }
@@ -601,7 +730,20 @@ async function checkPassiveLearning(
   options: Required<DoctorRunOptions>,
   daemonHealthy: boolean,
   daemonStorageReadiness: DaemonStorageReadiness,
+  repairBlocked: boolean,
+  publicationBlocked: boolean,
 ): Promise<void> {
+  if (repairBlocked) {
+    results.push({
+      name: "events-capture",
+      category: "Passive Learning",
+      status: "skip",
+      message: publicationBlocked
+        ? "Skipped because backend publication admission is blocked"
+        : "Skipped because configuration validation failed; automatic passive-learning repair is disabled",
+    });
+    return;
+  }
   const statsOptions = { timeoutMs: 2000, maxDbs: options.eventsMaxDbs, pruneOrphanSidecars: true };
   const stats = options.verbose
     ? await collectDetailedEventStats(statsOptions)
@@ -740,10 +882,28 @@ async function checkPassiveLearning(
 }
 
 export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: boolean | DoctorRunOptions = false): Promise<CheckResult[]> {
-  const deps = { ...defaultDeps(), ...overrides };
+  const mergedDeps = { ...defaultDeps(), ...overrides };
+  const deps = {
+    ...mergedDeps,
+    _readBoundedConfig: overrides?._readBoundedConfig
+      ?? (overrides?.readFileSync === undefined
+        ? mergedDeps._readBoundedConfig
+        : (path: string, maxBytes: number) => {
+          const content = mergedDeps.readFileSync(path, "utf-8");
+          if (Buffer.byteLength(content, "utf8") > maxBytes) {
+            throw new Error("file exceeds the configured size limit");
+          }
+          return content;
+        }),
+  };
   const options = normalizeDoctorOptions(doctorOptions);
   const results: CheckResult[] = [];
   const config = loadConfig(deps);
+  const publicationBlocked = checkBackendPublicationAdmission(results, config);
+  const repairBlocked = publicationBlocked || config.validationError !== undefined;
+  const repairSkipMessage = publicationBlocked
+    ? "Skipped because backend publication admission is blocked"
+    : "Skipped because configuration validation failed; automatic repair is disabled";
   const remediationScope = daemonRemediationScope(deps.homedir);
 
   // ── Stack info ──
@@ -784,8 +944,13 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   }
 
   // ── Project path aliases ──
-  checkProjectMap(results, deps);
-  checkWorktreeReconciliations(results, deps);
+  if (repairBlocked) {
+    results.push({ name: "project-map", category: "Project Map", status: "skip", message: repairSkipMessage });
+    results.push({ name: "worktree-reconciliation", category: "Project Map", status: "skip", message: repairSkipMessage });
+  } else {
+    checkProjectMap(results, deps);
+    checkWorktreeReconciliations(results, deps);
+  }
 
   // ── Daemon ──
   let daemonHealthy = false;
@@ -798,16 +963,26 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     clearDaemonNotice(remediationScope);
   };
   let initialHealthPid: number | undefined;
-  try {
-    const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
-    if (h) {
-      daemonHealthy = true;
-      daemonVersion = h.version;
-      initialHealthPid = h.pid;
-    }
-  } catch {}
+  if (!publicationBlocked) {
+    try {
+      const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
+      if (h) {
+        daemonHealthy = true;
+        daemonVersion = h.version;
+        initialHealthPid = h.pid;
+      }
+    } catch {}
+  }
 
-  if (config.validationError || config.storageBackend === "unavailable") {
+  if (publicationBlocked) {
+    results.push({
+      name: "daemon",
+      category: "Daemon",
+      status: "skip",
+      message: "Automatic daemon start, restart, and repair skipped because backend publication admission is blocked",
+      fixApplied: false,
+    });
+  } else if (config.validationError || config.storageBackend === "unavailable") {
     results.push(daemonHealthy
       ? {
           name: "daemon", category: "Daemon", status: "warn",
@@ -965,6 +1140,11 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   }
 
   // ── Settings ──
+  if (repairBlocked) {
+    for (const name of ["hooks", "mcp-lcm", "lcm-md"] as const) {
+      results.push({ name, category: "Settings", status: "skip", message: repairSkipMessage });
+    }
+  } else {
   const settingsPath = join(deps.homedir, ".claude", "settings.json");
   const claudeSettingsExists = deps.existsSync(settingsPath);
   let settingsData: unknown = {};
@@ -1105,6 +1285,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       results.push({ name: "lcm-md", category: "Settings", status: "fail", message: `lcm.md repair failed: ${err instanceof Error ? err.message : String(err)} — run: lcm install` });
     }
   }
+  }
 
   // ── Summarizer (conditional) ──
   const effectiveDaemonPath = deps.managedDaemonPath
@@ -1206,7 +1387,14 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   // ── Passive Learning ──
   // The hooks check above always reports pass or warn, so passive-learning
   // diagnostics are always applicable by the time this point is reached.
-  await checkPassiveLearning(results, options, daemonHealthy, daemonStorageReadiness);
+  await checkPassiveLearning(
+    results,
+    options,
+    daemonHealthy,
+    daemonStorageReadiness,
+    repairBlocked,
+    publicationBlocked,
+  );
 
   return results;
 }

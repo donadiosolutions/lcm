@@ -17,6 +17,8 @@ import { runLcmMigrations } from "../../../src/db/migration.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
 import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
+import { withBackendPublicationConsumerLockAsync } from "../../../src/storage/backend-publication.js";
+import { createStorageBackendFactory } from "../../../src/storage/index.js";
 import { recoverMachineIdentity } from "../../../src/machine-identity.js";
 import {
   clearProjectMapCache,
@@ -210,6 +212,39 @@ describe("promote-events route", () => {
     expect(call.confidence).toBe(0.5);
     expect(call.tags).toContain("type:preference");
     expect(call.tags).toContain("source:passive-capture");
+  });
+
+  it("reuses the retained publication token through the single-project route", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent(
+      "retained-single",
+      { type: "decision", category: "decision", data: "retain single permit", priority: 1 },
+      "PostToolUse",
+    );
+    edb.close();
+    setupProjectDb(dir).close();
+
+    const output = mockRes();
+    const config = makeConfig();
+    const factory = createStorageBackendFactory(config.storage);
+    try {
+      await withBackendPublicationConsumerLockAsync(homeDir, async (publicationLockToken) => {
+        await createPromoteEventsHandler(config, factory)(
+          request,
+          output.res,
+          JSON.stringify({ cwd: dir }),
+          { publicationLockToken },
+        );
+      });
+    } finally {
+      await factory.close();
+    }
+
+    expect(output.res.writeHead).toHaveBeenCalledWith(
+      200,
+      { "Content-Type": "application/json" },
+    );
+    expect(output.getBody()).toMatchObject({ promoted: 1, errors: 0 });
   });
 
   it("scrubs legacy sidecar secrets before promotion", async () => {
@@ -923,6 +958,51 @@ describe("promote-events route", () => {
     expect(result.projects[0].cwd).toBe(projectCwd);
   });
 
+  it("reuses the retained publication token through the all-project drain route", async () => {
+    const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-retained-token-"));
+    extraDirs.push(projectCwd);
+    const projectSidecarPath = join(dir, `${projectId(projectCwd)}.db`);
+    ensureProjectDir(projectCwd);
+    vi.mocked(eventsDbPath).mockImplementation((cwd: string) =>
+      cwd === projectCwd ? projectSidecarPath : sidecarPath
+    );
+
+    const edb = new EventsDb(projectSidecarPath);
+    edb.insertEvent(
+      "retained-all",
+      { type: "decision", category: "decision", data: "retain all permit", priority: 1 },
+      "PostToolUse",
+    );
+    edb.close();
+    setupProjectDb(projectCwd).close();
+
+    const output = mockRes();
+    const config = makeConfig();
+    const factory = createStorageBackendFactory(config.storage);
+    try {
+      await withBackendPublicationConsumerLockAsync(homeDir, async (publicationLockToken) => {
+        await createPromoteAllEventsHandler(config, factory)(
+          request,
+          output.res,
+          "",
+          { publicationLockToken },
+        );
+      });
+    } finally {
+      await factory.close();
+    }
+
+    expect(output.res.writeHead).toHaveBeenCalledWith(
+      200,
+      { "Content-Type": "application/json" },
+    );
+    expect(output.getBody()).toMatchObject({
+      promoted: 1,
+      processedProjects: 1,
+      failedProjects: 0,
+    });
+  });
+
   it("drains the sidecar path found during the scan", async () => {
     const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-scanned-sidecar-"));
     extraDirs.push(projectCwd);
@@ -963,7 +1043,7 @@ describe("promote-events route", () => {
     secondDb.close();
 
     const now = vi.spyOn(Date, "now");
-    now.mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(30_001);
+    now.mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(30_001);
 
     const handler = createPromoteAllEventsHandler(makeConfig());
     const { res, getBody } = mockRes();

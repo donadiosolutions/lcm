@@ -9,6 +9,8 @@
 BEGIN;
 
 GRANT USAGE ON SCHEMA lcm TO :"lcm_runtime_role";
+-- Project-scoped operations fail closed while backend publication is unresolved.
+GRANT SELECT ON TABLE lcm.fenced_leases TO :"lcm_runtime_role";
 -- Message inserts evaluate the stored generated search_document expression
 -- under the runtime role. PUBLIC execution is intentionally revoked.
 GRANT EXECUTE ON FUNCTION lcm.normalize_search_text(text)

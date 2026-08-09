@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
-import { dirname, isAbsolute, join, posix, win32 } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "./version.js";
 import type { StorageBackend } from "./config.js";
@@ -63,12 +63,48 @@ import {
   lifecycleScopeOwnsExactStatePaths,
   lifecycleScopeUnitName,
 } from "./lifecycle-scope.js";
+import {
+  assertStorageBackendPublication,
+  withStorageBackendConsumerLock,
+} from "../storage/backend.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
 type SetTimeoutFn = (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
 type ClearTimeoutFn = (timeout: ReturnType<typeof setTimeout>) => void;
 type CleanupFn = () => void | Promise<void>;
+
+function publicationHomeForPidPath(pidFilePath: string): string | undefined {
+  const pidPath = resolve(pidFilePath);
+  const stateRoot = dirname(pidPath);
+  return basename(pidPath) === "daemon.pid" && basename(stateRoot) === ".lcm"
+    ? dirname(stateRoot)
+    : undefined;
+}
+
+function publicationHomeForLifecycle(
+  opts: Pick<EnsureDaemonOptions, "pidFilePath" | "_testScope" | "_hermeticTestSeams">,
+): string | undefined {
+  return opts._hermeticTestSeams?.homeDir
+    ?? opts._testScope?.homeDir
+    ?? publicationHomeForPidPath(opts.pidFilePath);
+}
+
+function assertLifecycleBackendPublication(
+  opts: Pick<EnsureDaemonOptions, "pidFilePath" | "expectedStorageBackend" | "_testScope" | "_hermeticTestSeams" | "_assertBackendPublication">,
+): void {
+  const homeDir = publicationHomeForLifecycle(opts);
+  if (opts._assertBackendPublication !== undefined) {
+    opts._assertBackendPublication(homeDir, opts.expectedStorageBackend ?? "sqlite");
+    return;
+  }
+  withStorageBackendConsumerLock(homeDir, (lockToken) => {
+    assertStorageBackendPublication({
+      backend: opts.expectedStorageBackend ?? "sqlite",
+      homeDir,
+    }, lockToken);
+  });
+}
 
 /** Bounded, non-sensitive reasons surfaced to callers when lifecycle refuses. */
 export type DaemonLifecycleRefusalReason =
@@ -157,6 +193,8 @@ export type EnsureDaemonOptions = {
   _testScope?: DaemonLifecycleTestScope;
   /** @internal Complete hermetic side-effect boundary for production-mode lifecycle tests. */
   _hermeticTestSeams?: DaemonLifecycleHermeticTestSeams;
+  /** @internal Test-only publication admission seam. */
+  _assertBackendPublication?: (homeDir: string | undefined, backend: StorageBackend) => void;
   /** @internal Inject only the manager transport environment for lifecycle tests. */
   _managerTransportEnvironmentOverride?: NodeJS.ProcessEnv;
   /** @internal Deterministic per-start nonce seam for lifecycle tests. */
@@ -1425,6 +1463,16 @@ function managerTransportEnvironment(
 }
 
 export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDaemonResult> {
+  validateSpawnTimeout(opts.spawnTimeoutMs);
+  // Keep publication admission short. The child performs its own config
+  // admission, so retaining the lock over spawn and health waits would deadlock.
+  assertLifecycleBackendPublication(opts);
+  const result = await ensureDaemonUnlocked(opts);
+  assertLifecycleBackendPublication(opts);
+  return result;
+}
+
+async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDaemonResult> {
   validateSpawnTimeout(opts.spawnTimeoutMs);
 
   const hasTestScopeProperty = Object.prototype.hasOwnProperty.call(opts, "_testScope");
@@ -3115,6 +3163,14 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
  * when validation and restart need to be kept in one operation.
  */
 export async function restartDaemon(opts: RestartDaemonOptions): Promise<RestartDaemonResult> {
+  validateSpawnTimeout(opts.spawnTimeoutMs);
+  assertLifecycleBackendPublication(opts);
+  const result = await restartDaemonUnlocked(opts);
+  assertLifecycleBackendPublication(opts);
+  return result;
+}
+
+async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<RestartDaemonResult> {
   validateSpawnTimeout(opts.spawnTimeoutMs);
   const hasTestScopeProperty = Object.prototype.hasOwnProperty.call(opts, "_testScope");
   if (hasTestScopeProperty && !isDaemonLifecycleTestScope(opts._testScope)) {

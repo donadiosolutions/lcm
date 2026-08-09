@@ -1,5 +1,6 @@
-import { expect, it, vi } from "vitest";
-import { join } from "node:path";
+import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
+import { mkdirSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const mergeClaudeSettingsMock = vi.hoisted(() => vi.fn(() => ({})));
 
@@ -22,8 +23,28 @@ import type { DoctorDeps } from "../src/doctor/types.js";
 function isolatedPath(name: string): string {
   const runtimeHome = process.env.HOME;
   if (!runtimeHome) throw new Error("Vitest runtime HOME is not configured");
-  return join(runtimeHome, name);
+  const fixtureRoot = join(runtimeHome, "lcm-doctor-normalization-fixtures");
+  mkdirSync(fixtureRoot, { recursive: true, mode: 0o700 });
+  return join(fixtureRoot, name);
 }
+
+const NORMALIZATION_HOME = isolatedPath("coverage-services-doctor-normalization-home");
+const NORMALIZATION_CWD = isolatedPath("coverage-services-doctor-normalization-project");
+const NORMALIZATION_FIXTURE_ROOT = dirname(NORMALIZATION_HOME);
+
+beforeEach(() => {
+  rmSync(NORMALIZATION_HOME, { recursive: true, force: true });
+  mkdirSync(NORMALIZATION_HOME, { recursive: true, mode: 0o700 });
+  mkdirSync(join(NORMALIZATION_HOME, ".lcm"), { recursive: true, mode: 0o700 });
+});
+
+afterEach(() => {
+  rmSync(NORMALIZATION_HOME, { recursive: true, force: true });
+});
+
+afterAll(() => {
+  rmSync(NORMALIZATION_FIXTURE_ROOT, { recursive: true, force: true });
+});
 
 it("normalizes a merge result without an MCP servers object", async () => {
   const written: string[] = [];
@@ -41,9 +62,10 @@ it("normalizes a merge result without an MCP servers object", async () => {
     mkdirSync: vi.fn(),
     spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }),
     fetch: vi.fn().mockResolvedValue({ ok: false }) as typeof fetch,
-    homedir: isolatedPath("coverage-services-doctor-normalization-home"),
+    homedir: NORMALIZATION_HOME,
     platform: "linux",
-    cwd: isolatedPath("coverage-services-doctor-normalization-project"),
+    cwd: NORMALIZATION_CWD,
+    _assertBackendPublication: () => undefined,
   };
 
   mergeClaudeSettingsMock.mockReturnValueOnce({});

@@ -6,6 +6,7 @@ set -euo pipefail
 
 CONFIG_DIR="$HOME/.lcm"
 CONFIG_FILE="$CONFIG_DIR/config.json"
+LEGACY_CONFIG_DIR="$HOME/.lossless-claude"
 
 # ── Dry-run support (used by installer/dry-run-deps.ts) ──
 
@@ -138,85 +139,46 @@ else
   fi
 fi
 
-# ── Write config.json ──
-# Uses node for proper JSON encoding.
-# Merges into any existing config file: parses the JSON, updates the "llm"
-# block, and rewrites the whole file (reformats + normalises key order).
-# Existing non-llm keys are always preserved.
+# ── Validate config and establish the secure root ──
+# Validation happens before root creation so a symlink or oversized file is
+# reported without touching the user's existing state. The actual update is
+# delegated to the guarded `lcm config set` path below; setup never performs a
+# broad JSON rewrite itself.
 
-mkdir -p -m 700 "$CONFIG_DIR"
-chmod 700 "$CONFIG_DIR"
-
-node - "$PROVIDER" "$MODEL" "$API_KEY" "$BASE_URL" "$CONFIG_FILE" <<'NODE'
+node - "$CONFIG_FILE" <<'NODE'
 const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const [provider, model, apiKey, baseUrl, configFile] = process.argv.slice(2);
-
-const llm = { provider };
-if (model)   llm.model   = model;
-if (apiKey)  llm.apiKey  = apiKey;
-if (baseUrl) llm.baseUrl = baseUrl;
-
-function atomicWritePrivateFile(file, content) {
-  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${crypto.randomBytes(12).toString('hex')}.tmp`);
-  let fd;
-  try {
-    fd = fs.openSync(temp, 'wx', 0o600);
-    fs.writeFileSync(fd, content, 'utf8');
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = undefined;
-    fs.renameSync(temp, file);
-    fs.chmodSync(file, 0o600);
-  } finally {
-    if (fd !== undefined) try { fs.closeSync(fd); } catch (_) {}
-    fs.rmSync(temp, { force: true });
-  }
-}
-
-let configExists = false;
+const configFile = process.argv[2];
+let fd;
 try {
   const stat = fs.lstatSync(configFile);
   if (stat.isSymbolicLink()) throw new Error(`refusing to use symlink config path: ${configFile}`);
   if (!stat.isFile()) throw new Error(`config path is not a regular file: ${configFile}`);
-  configExists = true;
-} catch (err) {
-  if (err.code !== 'ENOENT') {
-    console.error(`Error: ${err.message}`);
-    process.exit(1);
-  }
-}
-
-// If config doesn't exist, atomically write a fresh file.
-if (!configExists) {
-  atomicWritePrivateFile(configFile, JSON.stringify({ llm }, null, 2) + '\n');
-  process.exit(0);
-}
-
-// Load existing config. Fail loudly on parse errors to prevent data loss.
-let raw;
-let configFd;
-try {
-  configFd = fs.openSync(configFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-  if (!fs.fstatSync(configFd).isFile()) throw new Error('config path is not a regular file');
+  fd = fs.openSync(configFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  const descriptorStat = fs.fstatSync(fd);
+  if (!descriptorStat.isFile()) throw new Error('config path is not a regular file');
   const maxConfigBytes = 1024 * 1024;
   const chunks = [];
   const buffer = Buffer.allocUnsafe(64 * 1024);
   let total = 0;
   while (total <= maxConfigBytes) {
-    const bytesRead = fs.readSync(configFd, buffer, 0, Math.min(buffer.length, maxConfigBytes + 1 - total), null);
+    const bytesRead = fs.readSync(fd, buffer, 0, Math.min(buffer.length, maxConfigBytes + 1 - total), null);
     if (bytesRead === 0) break;
     chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
     total += bytesRead;
   }
   if (total > maxConfigBytes) throw new Error('config file exceeds 1 MiB');
-  raw = Buffer.concat(chunks, total).toString('utf8');
-  JSON.parse(raw); // validate
+  JSON.parse(Buffer.concat(chunks, total).toString('utf8'));
 } catch (err) {
+  if (err && err.code === 'ENOENT') process.exit(0);
   if (err instanceof SyntaxError) {
     console.error(`Error: Failed to parse existing config at ${configFile}.`);
     console.error('The file contains invalid JSON. Fix or remove it, then re-run setup.');
+  } else if (err instanceof Error && err.message.startsWith('refusing to use symlink config path:')) {
+    console.error(`Error: ${err.message}`);
+    console.error('Remove the symlink or replace it with a regular config file, then re-run setup.');
+  } else if (err instanceof Error && err.message.startsWith('config path is not a regular file')) {
+    console.error(`Error: ${err.message}`);
+    console.error('Replace it with a regular config file, then re-run setup.');
   } else if (err instanceof Error && err.message === 'config file exceeds 1 MiB') {
     console.error(`Error: Existing config at ${configFile} exceeds the 1 MiB safety limit.`);
     console.error('Reduce the config file size, then re-run setup.');
@@ -226,23 +188,172 @@ try {
   }
   process.exit(1);
 } finally {
-  if (configFd !== undefined) fs.closeSync(configFd);
+  if (fd !== undefined) fs.closeSync(fd);
+}
+NODE
+
+stat_owner() {
+  if stat -c '%u' "$1" >/dev/null 2>&1; then
+    stat -c '%u' "$1"
+  else
+    stat -f '%u' "$1"
+  fi
 }
 
-// Parse the existing config, set the llm block, and write back.
-// Using JSON.parse+stringify is the only safe way to update config.json
-// without risking corruption from partial regex matches on nested structures.
-// Key order in the output follows insertion order: existing keys first, llm last.
-let parsed;
-try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
-if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-  console.error('Error: ' + configFile + ' is not a JSON object. Cannot merge llm block.');
+stat_mode() {
+  if stat -c '%a' "$1" >/dev/null 2>&1; then
+    stat -c '%a' "$1"
+  else
+    stat -f '%Lp' "$1"
+  fi
+}
+
+validate_home_directory() {
+  if [ ! -d "$HOME" ] || [ -L "$HOME" ]; then
+    echo "Error: HOME must be an existing non-symlink directory." >&2
+    exit 1
+  fi
+
+  local home_owner home_mode home_mode_value
+  home_owner="$(stat_owner "$HOME")"
+  home_mode="$(stat_mode "$HOME")"
+  if [ "$home_owner" != "$(id -u)" ] || ! [[ "$home_mode" =~ ^[0-7]{3,4}$ ]]; then
+    echo "Error: HOME must be owned by the current user with a readable mode." >&2
+    exit 1
+  fi
+  home_mode_value=$((8#$home_mode))
+  if (( home_mode_value & 022 )); then
+    echo "Error: HOME must not be group- or world-writable: $HOME" >&2
+    exit 1
+  fi
+  if [ -L "$HOME" ]; then
+    echo "Error: HOME changed to a symlink during validation." >&2
+    exit 1
+  fi
+}
+
+validate_private_root() {
+  if [ -L "$CONFIG_DIR" ]; then
+    echo "Error: refusing to use symlink LCM root: $CONFIG_DIR" >&2
+    exit 1
+  fi
+  if [ ! -d "$CONFIG_DIR" ]; then
+    echo "Error: LCM root is not a directory: $CONFIG_DIR" >&2
+    exit 1
+  fi
+  local root_owner root_mode
+  root_owner="$(stat_owner "$CONFIG_DIR")"
+  root_mode="$(stat_mode "$CONFIG_DIR")"
+  if [ "$root_owner" != "$(id -u)" ] || [ "$root_mode" != "700" ]; then
+    echo "Error: LCM root must be owned by the current user with mode 0700: $CONFIG_DIR" >&2
+    exit 1
+  fi
+  if [ -L "$CONFIG_DIR" ] || [ ! -d "$CONFIG_DIR" ]; then
+    echo "Error: LCM root changed during validation: $CONFIG_DIR" >&2
+    exit 1
+  fi
+}
+
+ensure_secure_lcm_root() {
+  validate_home_directory
+
+  if [ -e "$LEGACY_CONFIG_DIR" ] || [ -L "$LEGACY_CONFIG_DIR" ]; then
+    echo "Error: legacy LCM state exists at $LEGACY_CONFIG_DIR; refusing to create or update $CONFIG_DIR." >&2
+    case "$(uname -s)" in
+      Linux)
+        echo "Run 'lcm install' to perform authenticated legacy migration through /proc/self/fd, then re-run setup." >&2
+        ;;
+      Darwin)
+        echo "On macOS, lcm cannot perform this descriptor-bound legacy migration." >&2
+        echo "Back up and rename $LEGACY_CONFIG_DIR out of the migration path; do not recursively delete it." >&2
+        echo "Confirm $CONFIG_DIR does not exist; if it does, stop and preserve both directories. If it is absent, re-run setup." >&2
+        ;;
+      *)
+        echo "Automatic legacy migration requires Linux-compatible /proc/self/fd descriptor access." >&2
+        echo "Back up and rename $LEGACY_CONFIG_DIR out of the migration path; do not recursively delete it." >&2
+        echo "Confirm $CONFIG_DIR does not exist; if it does, stop and preserve both directories. If it is absent, re-run setup." >&2
+        ;;
+    esac
+    exit 1
+  fi
+
+  if [ -e "$CONFIG_DIR" ] || [ -L "$CONFIG_DIR" ]; then
+    validate_private_root
+    return
+  fi
+
+  # Non-recursive creation is intentional: HOME was authenticated above and
+  # no intermediate pathname may be silently created or repaired. The umask
+  # also protects the short interval before exact mode revalidation.
+  umask 077
+  mkdir "$CONFIG_DIR"
+  validate_private_root
+}
+
+ensure_secure_lcm_root
+
+# Re-open both authenticated directories through descriptors before publishing
+# configuration. Some platforms/filesystems reject directory fsync; those
+# explicit unsupported errors are treated as best-effort after identity and
+# owner/mode validation, while all other open, witness, or fsync failures fail
+# closed.
+node - "$CONFIG_DIR" "$HOME" <<'NODE'
+const fs = require('fs');
+const [rootPath, homePath] = process.argv.slice(2);
+const unsupportedDirectorySync = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP']);
+const flags = fs.constants.O_RDONLY
+  | (fs.constants.O_DIRECTORY || 0)
+  | (fs.constants.O_NOFOLLOW || 0)
+  | (fs.constants.O_NONBLOCK || 0);
+const uid = typeof process.getuid === 'function' ? BigInt(process.getuid()) : undefined;
+
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function syncDirectory(path, label, privateRoot) {
+  let fd;
+  try {
+    fd = fs.openSync(path, flags);
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (!opened.isDirectory()) throw new Error(`${label} is not a directory`);
+    const current = fs.statSync(path, { bigint: true });
+    if (!sameIdentity(opened, current)) throw new Error(`${label} changed during durable validation`);
+    if (uid !== undefined && opened.uid !== uid) throw new Error(`${label} owner changed during durable validation`);
+    const mode = Number(opened.mode & 0o7777n);
+    if (privateRoot ? mode !== 0o700 : (mode & 0o022) !== 0) {
+      throw new Error(`${label} mode changed during durable validation`);
+    }
+    try {
+      fs.fsyncSync(fd);
+    } catch (error) {
+      if (!unsupportedDirectorySync.has(error && error.code)) throw error;
+    }
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+try {
+  syncDirectory(rootPath, 'LCM root', true);
+  syncDirectory(homePath, 'HOME directory', false);
+} catch (error) {
+  console.error(`Error: failed to durably validate the LCM root topology: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 }
-const config = { ...parsed, llm };
-const newRaw = JSON.stringify(config, null, 2) + '\n';
-atomicWritePrivateFile(configFile, newRaw);
 NODE
+
+LLM_JSON="$(node - "$PROVIDER" "$MODEL" "$API_KEY" "$BASE_URL" <<'NODE'
+const [provider, model, apiKey, baseUrl] = process.argv.slice(2);
+const llm = { provider };
+if (model) llm.model = model;
+if (apiKey) llm.apiKey = apiKey;
+if (baseUrl) llm.baseUrl = baseUrl;
+process.stdout.write(JSON.stringify(llm));
+NODE
+)"
+
+lcm config set llm "$LLM_JSON" --json >/dev/null
 
 if [ -t 0 ]; then
   echo "  ▸ Config written to ${CONFIG_FILE}"

@@ -1,16 +1,17 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { createHash } from "node:crypto";
 import {
+  chmodSync as fsChmodSync,
   existsSync,
   cpSync,
-  mkdirSync,
+  mkdirSync as fsMkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
   symlinkSync,
-  writeFileSync,
+  writeFileSync as fsWriteFileSync,
 } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -40,6 +41,7 @@ import { projectDbPath, projectIdentity } from "../src/daemon/project.js";
 import { recoverMachineIdentity } from "../src/machine-identity.js";
 import type { ResolvedStorageConfig } from "../src/daemon/config.js";
 import { EventsDb } from "../src/hooks/events-db.js";
+import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 
 const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
   backend: "postgresql",
@@ -57,6 +59,24 @@ const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const CACHE_RECONCILIATION_TIMEOUT_MS = 10_000;
 // Full-suite child-process contention can exceed Vitest's 5-second default.
 const FULL_SUITE_PROCESS_TEST_TIMEOUT_MS = 15_000;
+const PRIVATE_DIRECTORY_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+
+// Current-main readers intentionally reject ambient umask modes. Keep every
+// ordinary fixture private; a test that exercises an unsafe mode must apply
+// its chmod override after this helper creates the secure baseline.
+function makePrivateFixtureDirectory(
+  path: string,
+  options: { readonly recursive?: boolean } = {},
+): void {
+  fsMkdirSync(path, { ...options, mode: PRIVATE_DIRECTORY_MODE });
+  fsChmodSync(path, PRIVATE_DIRECTORY_MODE);
+}
+
+function writePrivateFixtureFile(path: string, content: string): void {
+  fsWriteFileSync(path, content, { mode: PRIVATE_FILE_MODE });
+  fsChmodSync(path, PRIVATE_FILE_MODE);
+}
 
 function git(cwd: string, ...args: string[]): void {
   execFileSync("git", args, { cwd, stdio: "ignore" });
@@ -65,12 +85,12 @@ function git(cwd: string, ...args: string[]): void {
 function makeRepository(root: string): { main: string; linked: string } {
   const main = join(root, "main");
   const linked = join(root, "linked");
-  mkdirSync(main);
+  makePrivateFixtureDirectory(main);
   git(main, "init", "-q");
   git(main, "config", "user.email", "test@example.invalid");
   git(main, "config", "user.name", "LCM Test");
   git(main, "remote", "add", "origin", "https://example.invalid/lcm.git");
-  writeFileSync(join(main, "README.md"), "test\n");
+  writePrivateFixtureFile(join(main, "README.md"), "test\n");
   git(main, "add", "README.md");
   git(main, "commit", "-qm", "initial");
   git(main, "worktree", "add", "-qb", "linked", linked);
@@ -78,7 +98,7 @@ function makeRepository(root: string): { main: string; linked: string } {
 }
 
 function makeDatabase(path: string, sessionId: string, content: string, projectId: string): void {
-  mkdirSync(join(path, ".."), { recursive: true });
+  makePrivateFixtureDirectory(join(path, ".."), { recursive: true });
   const db = new DatabaseSync(path);
   runLcmMigrations(db);
   db.prepare(
@@ -207,7 +227,7 @@ type InstructionCacheFixtureRow = {
 };
 
 function makeMigratedDatabase(path: string): DatabaseSync {
-  mkdirSync(join(path, ".."), { recursive: true });
+  makePrivateFixtureDirectory(join(path, ".."), { recursive: true });
   const db = new DatabaseSync(path);
   runLcmMigrations(db);
   return db;
@@ -292,7 +312,7 @@ function makeInstructionCacheReconciliation(
   const canonical = resolveGitProjectAnchor(main)!.canonical;
   const targetHash = hashProjectPath(canonical);
   const sourceHash = hashProjectPath(linked);
-  writeFileSync(projectMapPath(), `${JSON.stringify({
+  writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
     [targetHash]: { canonical, aliases: [] },
     [sourceHash]: { canonical: linked, aliases: [] },
   }, null, 2)}\n`);
@@ -331,7 +351,7 @@ function makeLegacyInstructionReconciliation(
   const canonical = resolveGitProjectAnchor(main)!.canonical;
   const targetHash = hashProjectPath(canonical);
   const sourceHash = hashProjectPath(linked);
-  writeFileSync(projectMapPath(), `${JSON.stringify({
+  writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
     [targetHash]: { canonical, aliases: [] },
     [sourceHash]: { canonical: linked, aliases: [] },
   }, null, 2)}\n`);
@@ -348,7 +368,7 @@ function makeLegacyInstructionReconciliation(
 }
 
 function makeEvents(path: string, sessionId: string): void {
-  mkdirSync(join(path, ".."), { recursive: true });
+  makePrivateFixtureDirectory(join(path, ".."), { recursive: true });
   const db = new DatabaseSync(path);
   db.exec(`
     CREATE TABLE schema_version(version INTEGER NOT NULL);
@@ -394,7 +414,7 @@ function makeEvents(path: string, sessionId: string): void {
 }
 
 function makeEventsV1(path: string, sessionId: string): void {
-  mkdirSync(join(path, ".."), { recursive: true });
+  makePrivateFixtureDirectory(join(path, ".."), { recursive: true });
   const db = new DatabaseSync(path);
   db.exec(`
     CREATE TABLE schema_version(version INTEGER NOT NULL);
@@ -419,7 +439,7 @@ function makeLegacyEvents(
   sessionId: string,
   schemaVersion: "missing" | "empty" | { readonly value: number | string | null },
 ): void {
-  mkdirSync(join(path, ".."), { recursive: true });
+  makePrivateFixtureDirectory(join(path, ".."), { recursive: true });
   const db = new DatabaseSync(path);
   if (schemaVersion !== "missing") {
     db.exec("CREATE TABLE schema_version(version)");
@@ -511,7 +531,7 @@ function makeEventsReconciliation(root: string): {
   const canonical = resolveGitProjectAnchor(main)!.canonical;
   const targetHash = hashProjectPath(canonical);
   const sourceHash = hashProjectPath(linked);
-  writeFileSync(projectMapPath(), `${JSON.stringify({
+  writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
     [targetHash]: { canonical, aliases: [] },
     [sourceHash]: { canonical: linked, aliases: [] },
   }, null, 2)}\n`);
@@ -925,7 +945,7 @@ describe("worktree reconciliation", () => {
     home = mkdtempSync(join(tmpdir(), "lcm-worktree-reconcile-"));
     process.env.HOME = home;
     process.env.USERPROFILE = home;
-    mkdirSync(join(home, ".lcm"), { recursive: true });
+    makePrivateFixtureDirectory(join(home, ".lcm"), { recursive: true });
     clearProjectMapCache();
     clearGitProjectAnchorCache();
     clearWorktreeReconciliationCache();
@@ -949,7 +969,7 @@ describe("worktree reconciliation", () => {
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
     const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [], remoteProjectId },
       [sourceHash]: { canonical: linked, aliases: [], remoteProjectId },
     }, null, 2)}\n`);
@@ -961,8 +981,8 @@ describe("worktree reconciliation", () => {
     makeDatabase(join(sourceDir, "db.sqlite"), "linked", "linked content", sourceHash);
     makeEvents(join(home, ".lcm", "events", `${targetHash}.db`), "main");
     makeEvents(join(home, ".lcm", "events", `${sourceHash}.db`), "linked");
-    writeFileSync(join(targetDir, "sensitive-patterns.txt"), "MAIN_PATTERN\n");
-    writeFileSync(join(sourceDir, "sensitive-patterns.txt"), "LINKED_PATTERN\n");
+    writePrivateFixtureFile(join(targetDir, "sensitive-patterns.txt"), "MAIN_PATTERN\n");
+    writePrivateFixtureFile(join(sourceDir, "sensitive-patterns.txt"), "LINKED_PATTERN\n");
 
     const preview = reconcileWorktrees(linked, { dryRun: true });
     expect(preview).toMatchObject({
@@ -1024,7 +1044,7 @@ describe("worktree reconciliation", () => {
     const journal = JSON.parse(readFileSync(journalPath, "utf8"));
     journal.phase = "planned";
     journal.backupPaths = [];
-    writeFileSync(journalPath, JSON.stringify(journal));
+    writePrivateFixtureFile(journalPath, JSON.stringify(journal));
     expect(reconcileWorktrees(linked, { now: new Date("2026-07-26T12:00:00Z") }).status)
       .toBe("completed");
     expect(reconcileWorktrees(linked).status).toBe("completed");
@@ -1034,21 +1054,21 @@ describe("worktree reconciliation", () => {
     retried.close();
 
     rmSync(sourceDir, { recursive: true, force: true });
-    writeFileSync(
+    writePrivateFixtureFile(
       sourceDir,
       `${JSON.stringify({ version: 1, hash: sourceHash, kind: "project" })}\n`,
     );
     const restoredEventsPath = join(home, ".lcm", "events", `${sourceHash}.db`);
     rmSync(restoredEventsPath, { recursive: true, force: true });
-    mkdirSync(restoredEventsPath);
-    writeFileSync(
+    makePrivateFixtureDirectory(restoredEventsPath);
+    writePrivateFixtureFile(
       join(restoredEventsPath, "fence.json"),
       `${JSON.stringify({ version: 1, hash: sourceHash, kind: "events" })}\n`,
     );
     const completedJournal = JSON.parse(readFileSync(journalPath, "utf8"));
     completedJournal.phase = "merged";
     completedJournal.pendingSourceHashes = [sourceHash];
-    writeFileSync(journalPath, JSON.stringify(completedJournal));
+    writePrivateFixtureFile(journalPath, JSON.stringify(completedJournal));
     expect(reconcileWorktrees(linked).status).toBe("completed");
   }, 15_000);
 
@@ -1057,7 +1077,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceAHash = hashProjectPath(linkedA);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceAHash]: { canonical: linkedA, aliases: [] },
     }, null, 2)}\n`);
@@ -1065,7 +1085,7 @@ describe("worktree reconciliation", () => {
     const sourceADir = join(home, ".lcm", "projects", sourceAHash);
     makeDatabase(join(sourceADir, "db.sqlite"), "generation-a", "content a", sourceAHash);
     makeEvents(join(home, ".lcm", "events", `${sourceAHash}.db`), "generation-a");
-    writeFileSync(join(sourceADir, "sensitive-patterns.txt"), "GENERATION_A\n");
+    writePrivateFixtureFile(join(sourceADir, "sensitive-patterns.txt"), "GENERATION_A\n");
 
     expect(reconcileWorktrees(main, {
       now: new Date("2026-07-25T12:00:00Z"),
@@ -1075,7 +1095,7 @@ describe("worktree reconciliation", () => {
     git(main, "worktree", "add", "-qb", "linked-b", linkedB);
     const sourceBHash = hashProjectPath(linkedB);
     const targetEntry = listProjectMapEntries()[targetHash]!;
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: targetEntry,
       [sourceBHash]: { canonical: linkedB, aliases: [] },
     }, null, 2)}\n`);
@@ -1083,7 +1103,7 @@ describe("worktree reconciliation", () => {
     const sourceBDir = join(home, ".lcm", "projects", sourceBHash);
     makeDatabase(join(sourceBDir, "db.sqlite"), "generation-b", "content b", sourceBHash);
     makeEvents(join(home, ".lcm", "events", `${sourceBHash}.db`), "generation-b");
-    writeFileSync(join(sourceBDir, "sensitive-patterns.txt"), "GENERATION_B\n");
+    writePrivateFixtureFile(join(sourceBDir, "sensitive-patterns.txt"), "GENERATION_B\n");
 
     let crashed = false;
     expect(() => reconcileWorktrees(main, {
@@ -1144,13 +1164,13 @@ describe("worktree reconciliation", () => {
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
     const mapPath = projectMapPath();
-    writeFileSync(mapPath, `${JSON.stringify({
+    writePrivateFixtureFile(mapPath, `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
     makeDatabase(join(sourceDir, "db.sqlite"), "legacy-metadata", "content", sourceHash);
-    writeFileSync(join(sourceDir, "meta.json"), JSON.stringify({ cwd: linked }));
+    writePrivateFixtureFile(join(sourceDir, "meta.json"), JSON.stringify({ cwd: linked }));
     const mapBefore = readFileSync(mapPath, "utf8");
 
     expect(reconcileWorktrees(main, { dryRun: true })).toMatchObject({
@@ -1174,7 +1194,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -1263,7 +1283,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -1327,7 +1347,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -1394,7 +1414,7 @@ describe("worktree reconciliation", () => {
     const cloneHash = hashProjectPath(cloneCanonical);
     const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
     const mapPath = projectMapPath();
-    writeFileSync(mapPath, `${JSON.stringify({
+    writePrivateFixtureFile(mapPath, `${JSON.stringify({
       [cloneHash]: {
         canonical: cloneCanonical,
         aliases: [canonical],
@@ -1437,7 +1457,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: {
         canonical,
         aliases: [],
@@ -1462,7 +1482,7 @@ describe("worktree reconciliation", () => {
       reason: expect.stringContaining("conflicting PostgreSQL project bindings"),
     }]);
 
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: {
         canonical,
         aliases: [],
@@ -1493,7 +1513,7 @@ describe("worktree reconciliation", () => {
     });
     rmSync(join(home, ".lcm", "reconciliations"), { recursive: true, force: true });
     const targetHash = hashProjectPath(main);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: {
         canonical: main,
         aliases: [],
@@ -1509,7 +1529,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -1541,7 +1561,7 @@ describe("worktree reconciliation", () => {
     );
     const legacyBlocked = JSON.parse(readFileSync(blockedJournalPath, "utf8"));
     delete legacyBlocked.blockedFrom;
-    writeFileSync(blockedJournalPath, JSON.stringify(legacyBlocked));
+    writePrivateFixtureFile(blockedJournalPath, JSON.stringify(legacyBlocked));
     expect(reconcileWorktrees(linked)).toMatchObject({ status: "completed" });
     expect(listWorktreeReconciliationJournals()).toMatchObject([{
       phase: "completed",
@@ -1553,7 +1573,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -1578,7 +1598,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -1605,15 +1625,15 @@ describe("worktree reconciliation", () => {
     const codexDir = join(home, ".codex");
     const tokenDir = join(codexDir, "worktrees", "deadbeef");
     const deletedWorktree = join(tokenDir, "lcm");
-    mkdirSync(tokenDir, { recursive: true });
+    makePrivateFixtureDirectory(tokenDir, { recursive: true });
     git(main, "worktree", "add", "-qb", "historical", deletedWorktree);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(deletedWorktree);
     const unrelated = join(home, "unrelated");
-    mkdirSync(unrelated);
+    makePrivateFixtureDirectory(unrelated);
     const unrelatedHash = hashProjectPath(unrelated);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: deletedWorktree, aliases: [] },
       [unrelatedHash]: { canonical: unrelated, aliases: [] },
@@ -1627,8 +1647,8 @@ describe("worktree reconciliation", () => {
     );
     git(main, "worktree", "remove", "--force", deletedWorktree);
     const archived = join(codexDir, "archived_sessions");
-    mkdirSync(archived, { recursive: true });
-    writeFileSync(join(archived, "historical.jsonl"), `${JSON.stringify({
+    makePrivateFixtureDirectory(archived, { recursive: true });
+    writePrivateFixtureFile(join(archived, "historical.jsonl"), `${JSON.stringify({
       type: "session_meta",
       payload: {
         id: "historical",
@@ -1636,11 +1656,11 @@ describe("worktree reconciliation", () => {
         git: { repository_url: "https://example.invalid/lcm.git" },
       },
     })}\n`);
-    writeFileSync(join(archived, "no-cwd.jsonl"), `${JSON.stringify({
+    writePrivateFixtureFile(join(archived, "no-cwd.jsonl"), `${JSON.stringify({
       type: "session_meta",
       payload: { id: "no-cwd", git: { repository_url: "https://example.invalid/lcm.git" } },
     })}\n`);
-    writeFileSync(join(archived, "wrong-repository.jsonl"), `${JSON.stringify({
+    writePrivateFixtureFile(join(archived, "wrong-repository.jsonl"), `${JSON.stringify({
       type: "session_meta",
       payload: {
         id: "wrong-repository",
@@ -1648,7 +1668,7 @@ describe("worktree reconciliation", () => {
         git: { repository_url: "https://example.invalid/other.git" },
       },
     })}\n`);
-    writeFileSync(join(archived, "missing-tombstone.jsonl"), `${JSON.stringify({
+    writePrivateFixtureFile(join(archived, "missing-tombstone.jsonl"), `${JSON.stringify({
       type: "session_meta",
       payload: {
         id: "missing-tombstone",
@@ -1681,7 +1701,7 @@ describe("worktree reconciliation", () => {
     const tokenDir = join(codexDir, "worktrees", "late-token");
     const deletedWorktree = join(tokenDir, "lcm");
     const sourceBHash = hashProjectPath(deletedWorktree);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceAHash]: { canonical: linked, aliases: [] },
       [sourceBHash]: { canonical: deletedWorktree, aliases: [] },
@@ -1705,10 +1725,10 @@ describe("worktree reconciliation", () => {
       _observer: (event) => {
         if (introduced || event !== "after-merge-before-archive") return;
         introduced = true;
-        mkdirSync(tokenDir, { recursive: true });
+        makePrivateFixtureDirectory(tokenDir, { recursive: true });
         const archived = join(codexDir, "archived_sessions");
-        mkdirSync(archived, { recursive: true });
-        writeFileSync(join(archived, "late.jsonl"), `${JSON.stringify({
+        makePrivateFixtureDirectory(archived, { recursive: true });
+        writePrivateFixtureFile(join(archived, "late.jsonl"), `${JSON.stringify({
           type: "session_meta",
           payload: {
             id: "late",
@@ -1762,7 +1782,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -1800,13 +1820,13 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const targetDir = join(home, ".lcm", "projects", targetHash);
-    mkdirSync(targetDir, { recursive: true });
-    writeFileSync(join(targetDir, "meta.json"), JSON.stringify({
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
+    writePrivateFixtureFile(join(targetDir, "meta.json"), JSON.stringify({
       cwd: linked,
       lastIngest: "2026-07-25T00:00:00.000Z",
       custom: { retained: true },
@@ -1831,15 +1851,15 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const targetDir = join(home, ".lcm", "projects", targetHash);
-    mkdirSync(targetDir, { recursive: true });
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
     const metaPath = join(targetDir, "meta.json");
     const metadata = `${JSON.stringify({ cwd: canonical, retained: "exact" })}\n`;
-    writeFileSync(metaPath, metadata);
+    writePrivateFixtureFile(metaPath, metadata);
     makeDatabase(
       join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
       "metadata-noop",
@@ -1856,12 +1876,12 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const targetDir = join(home, ".lcm", "projects", targetHash);
-    mkdirSync(join(targetDir, "meta.json"), { recursive: true });
+    makePrivateFixtureDirectory(join(targetDir, "meta.json"), { recursive: true });
     makeDatabase(
       join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
       "metadata-directory",
@@ -1882,13 +1902,13 @@ describe("worktree reconciliation", () => {
       const canonical = resolveGitProjectAnchor(main)!.canonical;
       const targetHash = hashProjectPath(canonical);
       const sourceHash = hashProjectPath(linked);
-      writeFileSync(projectMapPath(), `${JSON.stringify({
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
         [sourceHash]: { canonical: linked, aliases: [] },
       }, null, 2)}\n`);
       clearProjectMapCache();
       const targetDir = join(home, ".lcm", "projects", targetHash);
-      mkdirSync(targetDir, { recursive: true });
-      writeFileSync(join(targetDir, "meta.json"), metadata);
+      makePrivateFixtureDirectory(targetDir, { recursive: true });
+      writePrivateFixtureFile(join(targetDir, "meta.json"), metadata);
       makeDatabase(
         join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
         `metadata-${createHash("sha256").update(metadata).digest("hex").slice(0, 8)}`,
@@ -1909,7 +1929,7 @@ describe("worktree reconciliation", () => {
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
     const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [sourceHash]: {
         canonical: linked,
         aliases: [],
@@ -1963,7 +1983,7 @@ describe("worktree reconciliation", () => {
     const sourceHash = hashProjectPath(linked);
     const secondSourceHash = hashProjectPath(secondLinked);
     const mapPath = projectMapPath();
-    writeFileSync(mapPath, `${JSON.stringify({
+    writePrivateFixtureFile(mapPath, `${JSON.stringify({
       [sourceHash]: {
         canonical: linked,
         aliases: [],
@@ -1998,7 +2018,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [sourceHash]: { canonical: linked, aliases: [canonical] },
     }, null, 2)}\n`);
     clearProjectMapCache();
@@ -2428,7 +2448,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -2452,7 +2472,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -2478,7 +2498,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -2540,7 +2560,7 @@ describe("worktree reconciliation", () => {
       const canonical = resolveGitProjectAnchor(main)!.canonical;
       const targetHash = hashProjectPath(canonical);
       const sourceHash = hashProjectPath(linked);
-      writeFileSync(projectMapPath(), `${JSON.stringify({
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
         [targetHash]: { canonical, aliases: [] },
         [sourceHash]: { canonical: linked, aliases: [] },
       }, null, 2)}\n`);
@@ -2589,7 +2609,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -3623,7 +3643,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -3690,7 +3710,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -3714,19 +3734,19 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
-    mkdirSync(join(sourceEvents, ".."), { recursive: true });
+    makePrivateFixtureDirectory(join(sourceEvents, ".."), { recursive: true });
     for (const suffix of ["", "-wal", "-shm"]) {
-      writeFileSync(`${sourceEvents}${suffix}`, suffix || "db");
+      writePrivateFixtureFile(`${sourceEvents}${suffix}`, suffix || "db");
     }
     const reconciliationRoot = join(home, ".lcm", "reconciliations");
-    mkdirSync(reconciliationRoot, { recursive: true });
-    writeFileSync(join(reconciliationRoot, `${targetHash}.json`), JSON.stringify({
+    makePrivateFixtureDirectory(reconciliationRoot, { recursive: true });
+    writePrivateFixtureFile(join(reconciliationRoot, `${targetHash}.json`), JSON.stringify({
       version: 1,
       targetHash,
       canonical,
@@ -3756,7 +3776,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -3825,7 +3845,7 @@ describe("worktree reconciliation", () => {
       const canonical = resolveGitProjectAnchor(main)!.canonical;
       const targetHash = hashProjectPath(canonical);
       const sourceHash = hashProjectPath(linked);
-      writeFileSync(projectMapPath(), `${JSON.stringify({
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
         [targetHash]: { canonical, aliases: [] },
         [sourceHash]: { canonical: linked, aliases: [] },
       }, null, 2)}\n`);
@@ -3838,14 +3858,14 @@ describe("worktree reconciliation", () => {
         "oldevents",
         `${sourceHash}-2026-07-25T12-00-00-000Z.db${suffix}`,
       );
-      mkdirSync(join(sourceEvents, ".."), { recursive: true });
-      mkdirSync(join(destination, ".."), { recursive: true });
-      writeFileSync(`${sourceEvents}${suffix}`, `recreated${suffix}`);
-      writeFileSync(destination, `preserved${suffix}`);
+      makePrivateFixtureDirectory(join(sourceEvents, ".."), { recursive: true });
+      makePrivateFixtureDirectory(join(destination, ".."), { recursive: true });
+      writePrivateFixtureFile(`${sourceEvents}${suffix}`, `recreated${suffix}`);
+      writePrivateFixtureFile(destination, `preserved${suffix}`);
       const destinationInode = statSync(destination).ino;
       const reconciliationRoot = join(home, ".lcm", "reconciliations");
-      mkdirSync(reconciliationRoot, { recursive: true });
-      writeFileSync(join(reconciliationRoot, `${targetHash}.json`), JSON.stringify({
+      makePrivateFixtureDirectory(reconciliationRoot, { recursive: true });
+      writePrivateFixtureFile(join(reconciliationRoot, `${targetHash}.json`), JSON.stringify({
         version: 1,
         targetHash,
         canonical,
@@ -3897,7 +3917,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -3911,14 +3931,14 @@ describe("worktree reconciliation", () => {
       "oldevents",
       `${sourceHash}-2026-07-25T12-00-00-000Z.db-wal`,
     );
-    mkdirSync(join(sourceSidecar, ".."), { recursive: true });
-    mkdirSync(join(destination, ".."), { recursive: true });
-    if (state === "invalid source") mkdirSync(sourceSidecar);
-    else writeFileSync(sourceSidecar, "source wal");
-    if (state === "invalid destination") mkdirSync(destination);
+    makePrivateFixtureDirectory(join(sourceSidecar, ".."), { recursive: true });
+    makePrivateFixtureDirectory(join(destination, ".."), { recursive: true });
+    if (state === "invalid source") makePrivateFixtureDirectory(sourceSidecar);
+    else writePrivateFixtureFile(sourceSidecar, "source wal");
+    if (state === "invalid destination") makePrivateFixtureDirectory(destination);
     const reconciliationRoot = join(home, ".lcm", "reconciliations");
-    mkdirSync(reconciliationRoot, { recursive: true });
-    writeFileSync(join(reconciliationRoot, `${targetHash}.json`), JSON.stringify({
+    makePrivateFixtureDirectory(reconciliationRoot, { recursive: true });
+    writePrivateFixtureFile(join(reconciliationRoot, `${targetHash}.json`), JSON.stringify({
       version: 1,
       targetHash,
       canonical,
@@ -3942,7 +3962,7 @@ describe("worktree reconciliation", () => {
           && event === "before-source-archive-rename"
           && detailPath === destination
         ) {
-          writeFileSync(destination, "raced backup");
+          writePrivateFixtureFile(destination, "raced backup");
         }
       },
     })).toThrow(expectedError);
@@ -3958,18 +3978,18 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
-    mkdirSync(join(sourceEvents, ".."), { recursive: true });
-    writeFileSync(sourceEvents, "event evidence");
+    makePrivateFixtureDirectory(join(sourceEvents, ".."), { recursive: true });
+    writePrivateFixtureFile(sourceEvents, "event evidence");
     const archiveAt = "2026-07-25T12:00:00.000Z";
     const reconciliationRoot = join(home, ".lcm", "reconciliations");
-    mkdirSync(reconciliationRoot, { recursive: true });
-    writeFileSync(join(reconciliationRoot, `${targetHash}.json`), JSON.stringify({
+    makePrivateFixtureDirectory(reconciliationRoot, { recursive: true });
+    writePrivateFixtureFile(join(reconciliationRoot, `${targetHash}.json`), JSON.stringify({
       version: 1,
       targetHash,
       canonical,
@@ -4009,25 +4029,25 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    mkdirSync(sourceDir, { recursive: true });
-    writeFileSync(join(home, "outside.db"), "not sqlite");
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
+    writePrivateFixtureFile(join(home, "outside.db"), "not sqlite");
     symlinkSync(join(home, "outside.db"), join(sourceDir, "db.sqlite"));
     expect(() => reconcileWorktrees(linked)).toThrow("refusing to reconcile symlink");
 
     rmSync(join(home, ".lcm", "reconciliations"), { recursive: true, force: true });
-    mkdirSync(join(home, ".lcm", "reconciliations"), { recursive: true });
-    writeFileSync(
+    makePrivateFixtureDirectory(join(home, ".lcm", "reconciliations"), { recursive: true });
+    writePrivateFixtureFile(
       join(home, ".lcm", "reconciliations", `${targetHash}.json`),
       "{}",
     );
     expect(() => reconcileWorktrees(linked)).toThrow("journal is malformed");
-    writeFileSync(
+    writePrivateFixtureFile(
       join(home, ".lcm", "reconciliations", `${targetHash}.json`),
       JSON.stringify({
         version: 1,
@@ -4044,9 +4064,9 @@ describe("worktree reconciliation", () => {
     expect(() => reconcileWorktrees(linked)).toThrow(
       "journal does not match the requested project",
     );
-    writeFileSync(join(home, ".lcm", "reconciliations", "ignored.txt"), "{}");
-    mkdirSync(join(home, ".lcm", "reconciliations", `${"f".repeat(64)}.json`));
-    writeFileSync(
+    writePrivateFixtureFile(join(home, ".lcm", "reconciliations", "ignored.txt"), "{}");
+    makePrivateFixtureDirectory(join(home, ".lcm", "reconciliations", `${"f".repeat(64)}.json`));
+    writePrivateFixtureFile(
       join(home, ".lcm", "reconciliations", `${"e".repeat(64)}.json`),
       "{}",
     );
@@ -4058,14 +4078,14 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    mkdirSync(sourceDir, { recursive: true });
-    writeFileSync(join(sourceDir, "sensitive-patterns.txt"), "\n");
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
+    writePrivateFixtureFile(join(sourceDir, "sensitive-patterns.txt"), "\n");
 
     expect(reconcileWorktrees(linked)).toMatchObject({ status: "completed" });
     expect(readFileSync(
@@ -4079,14 +4099,14 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    mkdirSync(sourceDir, { recursive: true });
-    writeFileSync(
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
+    writePrivateFixtureFile(
       join(sourceDir, "sensitive-patterns.txt"),
       "# source heading\n  SOURCE_PATTERN  \n",
     );
@@ -4103,18 +4123,18 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const targetDir = join(home, ".lcm", "projects", targetHash);
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    mkdirSync(targetDir, { recursive: true });
-    mkdirSync(sourceDir, { recursive: true });
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
     const targetPath = join(targetDir, "sensitive-patterns.txt");
-    writeFileSync(targetPath, "# target heading\n  DUPLICATE  ");
-    writeFileSync(
+    writePrivateFixtureFile(targetPath, "# target heading\n  DUPLICATE  ");
+    writePrivateFixtureFile(
       join(sourceDir, "sensitive-patterns.txt"),
       "# source heading\nDUPLICATE\n  NEW_PATTERN  \n\n",
     );
@@ -4129,18 +4149,18 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const targetDir = join(home, ".lcm", "projects", targetHash);
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    mkdirSync(targetDir, { recursive: true });
-    mkdirSync(sourceDir, { recursive: true });
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
     const targetPath = join(targetDir, "sensitive-patterns.txt");
-    writeFileSync(targetPath, "# keep formatting\n  SAME_PATTERN  \n");
-    writeFileSync(
+    writePrivateFixtureFile(targetPath, "# keep formatting\n  SAME_PATTERN  \n");
+    writePrivateFixtureFile(
       join(sourceDir, "sensitive-patterns.txt"),
       "# ignored\nSAME_PATTERN\n\n",
     );
@@ -4156,13 +4176,13 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const root = join(home, ".lcm", "reconciliations");
-    mkdirSync(root, { recursive: true });
-    writeFileSync(join(root, `${targetHash}.json`), JSON.stringify({
+    makePrivateFixtureDirectory(root, { recursive: true });
+    writePrivateFixtureFile(join(root, `${targetHash}.json`), JSON.stringify({
       version: 1,
       targetHash,
       canonical,
@@ -4189,7 +4209,7 @@ describe("worktree reconciliation", () => {
     const root = join(home, ".lcm", "reconciliations");
     const path = join(root, `${"a".repeat(64)}.json`);
     expect(listWorktreeReconciliationJournals()).toEqual([]);
-    mkdirSync(root, { recursive: true });
+    makePrivateFixtureDirectory(root, { recursive: true });
     const valid = {
       version: 1,
       targetHash: "a".repeat(64),
@@ -4243,10 +4263,10 @@ describe("worktree reconciliation", () => {
       { ...valid, phase: "unknown" },
     ];
     for (const journal of malformed) {
-      writeFileSync(path, JSON.stringify(journal));
+      writePrivateFixtureFile(path, JSON.stringify(journal));
       expect(() => listWorktreeReconciliationJournals()).toThrow("journal is malformed");
     }
-    writeFileSync(path, "{");
+    writePrivateFixtureFile(path, "{");
     expect(() => listWorktreeReconciliationJournals()).toThrow(SyntaxError);
   });
 
@@ -4254,8 +4274,8 @@ describe("worktree reconciliation", () => {
     const root = join(home, ".lcm", "reconciliations");
     const targetHash = "a".repeat(64);
     const path = join(root, `${targetHash}.json`);
-    mkdirSync(root, { recursive: true });
-    writeFileSync(path, JSON.stringify({
+    makePrivateFixtureDirectory(root, { recursive: true });
+    writePrivateFixtureFile(path, JSON.stringify({
       version: 1,
       targetHash,
       canonical: "/project",
@@ -4297,13 +4317,13 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
-    mkdirSync(join(sourcePath, ".."), { recursive: true });
+    makePrivateFixtureDirectory(join(sourcePath, ".."), { recursive: true });
     const source = new DatabaseSync(sourcePath);
     source.exec(`
       CREATE TABLE conversations (
@@ -4325,7 +4345,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -4367,7 +4387,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -4417,7 +4437,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -4453,7 +4473,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -4475,7 +4495,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
@@ -4491,7 +4511,7 @@ describe("worktree reconciliation", () => {
       },
     }]);
 
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -4523,7 +4543,7 @@ describe("worktree reconciliation", () => {
     const targetHash = hashProjectPath(canonical);
     const deleted = join(home, ".codex", "worktrees", "late-token", "lcm");
     const sourceHash = hashProjectPath(deleted);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: deleted, aliases: [] },
     }, null, 2)}\n`);
@@ -4548,7 +4568,7 @@ describe("worktree reconciliation", () => {
     }).status).toBe("not-needed");
     expect(scans).toBe(1);
 
-    mkdirSync(deleted, { recursive: true });
+    makePrivateFixtureDirectory(deleted, { recursive: true });
     expect(reconcileWorktrees(main, {
       _codexDir: join(home, ".codex"),
       _historicalResolver: historical,
@@ -4556,7 +4576,7 @@ describe("worktree reconciliation", () => {
     expect(scans).toBe(2);
 
     const lock = join(home, ".lcm", "reconciliations", `${targetHash}.lock`);
-    writeFileSync(lock, "malformed lock that must remain unread\n");
+    writePrivateFixtureFile(lock, "malformed lock that must remain unread\n");
     expect(reconcileWorktrees(main, {
       _codexDir: join(home, ".codex"),
       _historicalResolver: () => {
@@ -4570,7 +4590,7 @@ describe("worktree reconciliation", () => {
   it("never reuses an incomplete catalogue fingerprint", () => {
     const { main } = makeRepository(home);
     const codexDir = join(home, ".codex");
-    mkdirSync(join(codexDir, "worktrees"), { recursive: true });
+    makePrivateFixtureDirectory(join(codexDir, "worktrees"), { recursive: true });
     let scans = 0;
     const historical = () => {
       scans += 1;
@@ -4600,7 +4620,7 @@ describe("worktree reconciliation", () => {
     const targetHash = hashProjectPath(canonical);
     const remounted = join(home, "remounted-worktree");
     const sourceHash = hashProjectPath(remounted);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: remounted, aliases: [] },
     }, null, 2)}\n`);
@@ -4613,9 +4633,9 @@ describe("worktree reconciliation", () => {
     );
     const codexDir = join(home, ".codex");
     const sessions = join(codexDir, "sessions", "2026", "07", "25");
-    mkdirSync(sessions, { recursive: true });
+    makePrivateFixtureDirectory(sessions, { recursive: true });
     const transcript = join(sessions, "session.jsonl");
-    writeFileSync(transcript, "first\n");
+    writePrivateFixtureFile(transcript, "first\n");
     let scans = 0;
     const historical = () => {
       scans += 1;
@@ -4625,7 +4645,7 @@ describe("worktree reconciliation", () => {
       _codexDir: codexDir,
       _historicalResolver: historical,
     }).status).toBe("not-needed");
-    writeFileSync(transcript, "first\nsecond\n");
+    writePrivateFixtureFile(transcript, "first\nsecond\n");
     expect(reconcileWorktrees(main, {
       _codexDir: codexDir,
       _historicalResolver: historical,
@@ -4653,8 +4673,8 @@ describe("worktree reconciliation", () => {
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
     const alternateHome = join(home, "alternate-home");
-    mkdirSync(join(alternateHome, ".lcm"), { recursive: true });
-    writeFileSync(projectMapPath(alternateHome), `${JSON.stringify({
+    makePrivateFixtureDirectory(join(alternateHome, ".lcm"), { recursive: true });
+    writePrivateFixtureFile(projectMapPath(alternateHome), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -4679,7 +4699,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -4710,7 +4730,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -4756,7 +4776,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -4794,20 +4814,20 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    mkdirSync(sourceDir, { recursive: true });
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
     const sourcePatterns = join(sourceDir, "sensitive-patterns.txt");
-    writeFileSync(sourcePatterns, "ORIGINAL_PATTERN\n");
+    writePrivateFixtureFile(sourcePatterns, "ORIGINAL_PATTERN\n");
 
     expect(() => reconcileWorktrees(main, {
       _observer: (event) => {
         if (event === "after-merge-before-archive") {
-          writeFileSync(sourcePatterns, "CHANGED_PATTERN\n");
+          writePrivateFixtureFile(sourcePatterns, "CHANGED_PATTERN\n");
         }
       },
     })).toThrow("patterns component changed after the reconciliation snapshot");
@@ -4830,26 +4850,26 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const targetDir = join(home, ".lcm", "projects", targetHash);
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    mkdirSync(targetDir, { recursive: true });
-    mkdirSync(sourceDir, { recursive: true });
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
     const targetPatterns = join(targetDir, "sensitive-patterns.txt");
     const sourcePatterns = join(sourceDir, "sensitive-patterns.txt");
-    writeFileSync(targetPatterns, "TARGET_PATTERN\n");
-    writeFileSync(sourcePatterns, "ORIGINAL_PATTERN\n");
+    writePrivateFixtureFile(targetPatterns, "TARGET_PATTERN\n");
+    writePrivateFixtureFile(sourcePatterns, "ORIGINAL_PATTERN\n");
     let mutated = false;
 
     expect(() => reconcileWorktrees(main, {
       _observer: (event) => {
         if (!mutated && event === "before-source-patterns-merge") {
           mutated = true;
-          writeFileSync(sourcePatterns, "CHANGED_PATTERN\n");
+          writePrivateFixtureFile(sourcePatterns, "CHANGED_PATTERN\n");
         }
       },
     })).toThrow("patterns component changed after the reconciliation snapshot");
@@ -4863,7 +4883,7 @@ describe("worktree reconciliation", () => {
       reason: expect.stringContaining("patterns component changed"),
     }]);
 
-    writeFileSync(sourcePatterns, "ORIGINAL_PATTERN\n");
+    writePrivateFixtureFile(sourcePatterns, "ORIGINAL_PATTERN\n");
     expect(reconcileWorktrees(main).status).toBe("completed");
     expect(readFileSync(targetPatterns, "utf8"))
       .toBe("TARGET_PATTERN\nORIGINAL_PATTERN\n");
@@ -4889,24 +4909,24 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const targetDir = join(home, ".lcm", "projects", targetHash);
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    mkdirSync(targetDir, { recursive: true });
-    mkdirSync(sourceDir, { recursive: true });
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
     const targetPatterns = join(targetDir, "sensitive-patterns.txt");
     const sourcePatterns = join(sourceDir, "sensitive-patterns.txt");
-    writeFileSync(targetPatterns, "TARGET_PATTERN\n");
-    if (initial !== undefined) writeFileSync(sourcePatterns, initial);
+    writePrivateFixtureFile(targetPatterns, "TARGET_PATTERN\n");
+    if (initial !== undefined) writePrivateFixtureFile(sourcePatterns, initial);
 
     expect(() => reconcileWorktrees(main, {
       _observer: (event) => {
         if (event !== "before-source-patterns-merge") return;
-        if (initial === undefined) writeFileSync(sourcePatterns, "LATE_PATTERN\n");
+        if (initial === undefined) writePrivateFixtureFile(sourcePatterns, "LATE_PATTERN\n");
         else rmSync(sourcePatterns);
       },
     })).toThrow(expectedError);
@@ -4920,15 +4940,15 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    mkdirSync(sourceDir, { recursive: true });
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
     const sourcePatterns = join(sourceDir, "sensitive-patterns.txt");
-    writeFileSync(sourcePatterns, "ORIGINAL_PATTERN\n");
+    writePrivateFixtureFile(sourcePatterns, "ORIGINAL_PATTERN\n");
     let mutated = false;
 
     expect(() => reconcileWorktrees(main, {
@@ -4940,7 +4960,7 @@ describe("worktree reconciliation", () => {
           && detailPath?.includes("oldprojects")
         ) {
           mutated = true;
-          writeFileSync(sourcePatterns, "LATE_PATTERN\n");
+          writePrivateFixtureFile(sourcePatterns, "LATE_PATTERN\n");
         }
       },
     })).toThrow("archived patterns component changed during worktree reconciliation");
@@ -4985,15 +5005,15 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    mkdirSync(sourceDir, { recursive: true });
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
     const sourcePatterns = join(sourceDir, "sensitive-patterns.txt");
-    if (initial !== undefined) writeFileSync(sourcePatterns, initial);
+    if (initial !== undefined) writePrivateFixtureFile(sourcePatterns, initial);
 
     expect(() => reconcileWorktrees(main, {
       _observer: (event, _source, detailPath) => {
@@ -5001,7 +5021,7 @@ describe("worktree reconciliation", () => {
           event !== "before-source-archive-rename"
           || !detailPath?.includes("oldprojects")
         ) return;
-        if (initial === undefined) writeFileSync(sourcePatterns, "LATE_PATTERN\n");
+        if (initial === undefined) writePrivateFixtureFile(sourcePatterns, "LATE_PATTERN\n");
         else rmSync(sourcePatterns);
       },
     })).toThrow(expectedError);
@@ -5019,7 +5039,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -5056,7 +5076,7 @@ describe("worktree reconciliation", () => {
       const canonical = resolveGitProjectAnchor(main)!.canonical;
       const targetHash = hashProjectPath(canonical);
       const sourceHash = hashProjectPath(linked);
-      writeFileSync(projectMapPath(), `${JSON.stringify({
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
         [targetHash]: { canonical, aliases: [] },
         [sourceHash]: { canonical: linked, aliases: [] },
       }, null, 2)}\n`);
@@ -5081,16 +5101,16 @@ describe("worktree reconciliation", () => {
         `${sourceHash}.db.lcm-fence-pending`,
       );
       if (markerState === "valid") {
-        writeFileSync(
+        writePrivateFixtureFile(
           join(prepared, "fence.json"),
           `${JSON.stringify({ version: 1, hash: sourceHash, kind: "events" })}\n`,
         );
       } else if (markerState === "unreadable") {
-        mkdirSync(join(prepared, "fence.json"));
+        makePrivateFixtureDirectory(join(prepared, "fence.json"));
       } else if (markerState === "malformed") {
-        writeFileSync(join(prepared, "fence.json"), "{");
+        writePrivateFixtureFile(join(prepared, "fence.json"), "{");
       } else {
-        writeFileSync(join(prepared, "unexpected"), "unexpected");
+        writePrivateFixtureFile(join(prepared, "unexpected"), "unexpected");
       }
 
       if (markerState === "valid") {
@@ -5107,7 +5127,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -5141,7 +5161,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -5153,7 +5173,7 @@ describe("worktree reconciliation", () => {
       sourceHash,
     );
     const lock = join(home, ".lcm", "reconciliations", `${targetHash}.lock`);
-    mkdirSync(join(lock, ".."), { recursive: true });
+    makePrivateFixtureDirectory(join(lock, ".."), { recursive: true });
     const holder = spawn(process.execPath, [
       "-e",
       `
@@ -5191,7 +5211,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -5205,7 +5225,7 @@ describe("worktree reconciliation", () => {
         expect(() => setRemoteProjectBinding(
           "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
           { hash: targetHash },
-        )).toThrow("project map mutation is already in progress");
+        )).toThrow("backend publication mutation is already in progress");
         throw new Error("abort after verified map fence");
       },
     })).toThrow("abort after verified map fence");
@@ -5213,9 +5233,34 @@ describe("worktree reconciliation", () => {
     expect(listProjectMapEntries()).toHaveProperty(sourceHash);
   });
 
+  it("rethrows publication errors without converting reconciliation state to blocked", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    makeDatabase(sourcePath, "publication-error", "content", sourceHash);
+    const publicationError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "reconciliation publication state is unresolved",
+    );
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event === "before-source-main-merge") throw publicationError;
+      },
+    })).toThrow("reconciliation publication state is unresolved");
+    expect(listWorktreeReconciliationJournals()).toEqual(expect.any(Array));
+  });
+
   it("handles bounded catalogue entries, non-Git paths, and catalogue failures", () => {
     const nonGit = join(home, "not-git");
-    mkdirSync(nonGit);
+    makePrivateFixtureDirectory(nonGit);
     expect(reconcileWorktrees(nonGit)).toMatchObject({
       status: "not-needed",
       canonical: nonGit,
@@ -5231,12 +5276,12 @@ describe("worktree reconciliation", () => {
     const { main } = makeRepository(home);
     const codexDir = join(home, ".codex");
     const worktrees = join(codexDir, "worktrees");
-    mkdirSync(worktrees, { recursive: true });
-    writeFileSync(join(worktrees, "plain"), "plain");
+    makePrivateFixtureDirectory(worktrees, { recursive: true });
+    writePrivateFixtureFile(join(worktrees, "plain"), "plain");
     symlinkSync(join(worktrees, "plain"), join(worktrees, "link"));
-    mkdirSync(join(worktrees, "one", "two", "three"), { recursive: true });
+    makePrivateFixtureDirectory(join(worktrees, "one", "two", "three"), { recursive: true });
     symlinkSync(join(worktrees, "plain"), join(codexDir, "sessions"));
-    writeFileSync(join(codexDir, "archived_sessions"), "plain");
+    writePrivateFixtureFile(join(codexDir, "archived_sessions"), "plain");
     expect(reconcileWorktrees(main, {
       dryRun: true,
       _codexDir: codexDir,
@@ -5264,8 +5309,8 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const regularFile = join(home, "regular-file");
-    writeFileSync(regularFile, "not a directory");
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(regularFile, "not a directory");
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [join(regularFile, "child")] },
     }, null, 2)}\n`);
     clearProjectMapCache();
@@ -5280,8 +5325,8 @@ describe("worktree reconciliation", () => {
     const regularFile = join(home, "foreign-regular-file");
     const foreign = join(regularFile, "child");
     const foreignHash = hashProjectPath(foreign);
-    writeFileSync(regularFile, "not a directory");
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(regularFile, "not a directory");
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [foreignHash]: { canonical: foreign, aliases: [] },
     }, null, 2)}\n`);
@@ -5298,7 +5343,7 @@ describe("worktree reconciliation", () => {
       _nowMs: 0,
     }).status).toBe("not-needed");
     rmSync(regularFile);
-    mkdirSync(foreign, { recursive: true });
+    makePrivateFixtureDirectory(foreign, { recursive: true });
     expect(ensureWorktreeProjectReconciled(main, identity, {
       _cacheTtlMs: 10,
       _nowMs: 20,
@@ -5314,12 +5359,12 @@ describe("worktree reconciliation", () => {
     const sourceHash = hashProjectPath(linked);
     const regularFile = join(home, "related-regular-file");
     const invalidAlias = join(regularFile, "child");
-    writeFileSync(regularFile, "not a directory");
+    writePrivateFixtureFile(regularFile, "not a directory");
     const mapBefore = `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [invalidAlias] },
     }, null, 2)}\n`;
-    writeFileSync(projectMapPath(), mapBefore);
+    writePrivateFixtureFile(projectMapPath(), mapBefore);
     clearProjectMapCache();
     const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
     makeDatabase(sourcePath, "related-enotdir", "source", sourceHash);
@@ -5345,11 +5390,11 @@ describe("worktree reconciliation", () => {
     const identity = { id: targetHash, canonical };
     const foreign = join(home, "foreign-malformed");
     const foreignGitTarget = join(home, "foreign-git-target");
-    mkdirSync(foreign);
-    mkdirSync(foreignGitTarget);
+    makePrivateFixtureDirectory(foreign);
+    makePrivateFixtureDirectory(foreignGitTarget);
     symlinkSync(foreignGitTarget, join(foreign, ".git"));
     const foreignHash = hashProjectPath(foreign);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [foreignHash]: { canonical: foreign, aliases: [] },
     }, null, 2)}\n`);
@@ -5386,8 +5431,8 @@ describe("worktree reconciliation", () => {
   it("continues to reject malformed Git metadata for the current project", () => {
     const current = join(home, "current-malformed");
     const gitTarget = join(home, "current-git-target");
-    mkdirSync(current);
-    mkdirSync(gitTarget);
+    makePrivateFixtureDirectory(current);
+    makePrivateFixtureDirectory(gitTarget);
     symlinkSync(gitTarget, join(current, ".git"));
 
     expect(() => reconcileWorktrees(current)).toThrow(/refusing symlink/u);
@@ -5401,9 +5446,9 @@ describe("worktree reconciliation", () => {
     const targetHash = hashProjectPath(canonical);
     const file = join(home, "map-file");
     const link = join(home, "map-link");
-    writeFileSync(file, "file");
+    writePrivateFixtureFile(file, "file");
     symlinkSync(file, link);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: {
         canonical,
         aliases: [file, link, join(home, "missing-map-path")],
@@ -5418,7 +5463,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const identity = { id: targetHash, canonical };
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
@@ -5448,7 +5493,7 @@ describe("worktree reconciliation", () => {
     const journalPath = first.journalPath!;
     const journal = JSON.parse(readFileSync(journalPath, "utf8"));
     journal.updatedAt = "2026-07-26T00:00:00.000Z";
-    writeFileSync(journalPath, JSON.stringify(journal));
+    writePrivateFixtureFile(journalPath, JSON.stringify(journal));
     expect(ensureWorktreeProjectReconciled(main, identity, {
       _cacheTtlMs: 1_000,
       _nowMs: 200,
@@ -5476,7 +5521,7 @@ describe("worktree reconciliation", () => {
       },
     }).status).toBe("completed");
     expect(existsSync(journalPath)).toBe(false);
-    writeFileSync(journalPath, journalBeforeGuardRace);
+    writePrivateFixtureFile(journalPath, journalBeforeGuardRace);
     const afterExpiration = catalogueWalks;
     expect(afterExpiration).toBeGreaterThan(afterJournalChange);
     expect(ensureWorktreeProjectReconciled(main, identity, {
@@ -5496,7 +5541,7 @@ describe("worktree reconciliation", () => {
     const afterStableExpiration = catalogueWalks;
     expect(afterStableExpiration).toBeGreaterThan(afterGuardRecovery);
 
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [linked] },
     }, null, 2)}\n`);
     clearProjectMapCache();
@@ -5540,7 +5585,7 @@ describe("worktree reconciliation", () => {
     const tokenDir = join(codexDir, "worktrees", "cache-late-token");
     const deletedWorktree = join(tokenDir, "lcm");
     const sourceHash = hashProjectPath(deletedWorktree);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: deletedWorktree, aliases: [] },
     }, null, 2)}\n`);
@@ -5562,10 +5607,10 @@ describe("worktree reconciliation", () => {
       _discoveryObserver: discoveryObserver,
     }).status).toBe("not-needed");
     const afterInitial = catalogueWalks;
-    mkdirSync(tokenDir, { recursive: true });
+    makePrivateFixtureDirectory(tokenDir, { recursive: true });
     const archived = join(codexDir, "archived_sessions");
-    mkdirSync(archived, { recursive: true });
-    writeFileSync(join(archived, "cache-late.jsonl"), `${JSON.stringify({
+    makePrivateFixtureDirectory(archived, { recursive: true });
+    writePrivateFixtureFile(join(archived, "cache-late.jsonl"), `${JSON.stringify({
       type: "session_meta",
       payload: {
         id: "cache-late",
@@ -5619,9 +5664,9 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const identity = { id: hashProjectPath(canonical), canonical };
     const worktrees = join(home, ".codex", "worktrees");
-    mkdirSync(worktrees, { recursive: true });
+    makePrivateFixtureDirectory(worktrees, { recursive: true });
     for (let index = 0; index < 50_000; index += 1) {
-      mkdirSync(join(worktrees, `entry-${index}`));
+      makePrivateFixtureDirectory(join(worktrees, `entry-${index}`));
     }
     expect(ensureWorktreeProjectReconciled(main, identity).status).toBe("not-needed");
     expect(ensureWorktreeProjectReconciled(main, identity).status).toBe("not-needed");
@@ -5632,7 +5677,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -5682,7 +5727,7 @@ describe("worktree reconciliation", () => {
     const sourceHash = hashProjectPath(linked);
     const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
     const root = join(home, ".lcm", "reconciliations");
-    mkdirSync(root, { recursive: true });
+    makePrivateFixtureDirectory(root, { recursive: true });
     const baseJournal = {
       version: 1,
       targetHash,
@@ -5694,14 +5739,14 @@ describe("worktree reconciliation", () => {
       phase: "planned",
       backupPaths: [],
     };
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
     }, null, 2)}\n`);
-    writeFileSync(join(root, `${targetHash}.json`), JSON.stringify(baseJournal));
+    writePrivateFixtureFile(join(root, `${targetHash}.json`), JSON.stringify(baseJournal));
     clearProjectMapCache();
     expect(() => reconcileWorktrees(main)).toThrow("source disappeared before merge");
 
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [], remoteProjectId },
       [sourceHash]: { canonical: linked, aliases: [], remoteProjectId },
     }, null, 2)}\n`);
@@ -5717,8 +5762,8 @@ describe("worktree reconciliation", () => {
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
     const root = join(home, ".lcm", "reconciliations");
-    mkdirSync(root, { recursive: true });
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    makePrivateFixtureDirectory(root, { recursive: true });
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: {
         canonical,
         aliases: [],
@@ -5726,7 +5771,7 @@ describe("worktree reconciliation", () => {
       },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
-    writeFileSync(join(root, `${targetHash}.json`), JSON.stringify({
+    writePrivateFixtureFile(join(root, `${targetHash}.json`), JSON.stringify({
       version: 1,
       targetHash,
       canonical,
@@ -5768,7 +5813,7 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -5788,7 +5833,7 @@ describe("worktree reconciliation", () => {
     expect(() => reconcileWorktrees(main, {
       _observer: (event, source) => {
         if (event === "before-project-path-fence") {
-          writeFileSync(source!.projectDir, "raced");
+          writePrivateFixtureFile(source!.projectDir, "raced");
         }
       },
     })).toThrow("legacy project path was recreated");
@@ -5799,7 +5844,7 @@ describe("worktree reconciliation", () => {
     expect(() => reconcileWorktrees(main, {
       _observer: (event, source) => {
         if (event === "before-events-path-fence") {
-          mkdirSync(source!.eventsPath, { recursive: true });
+          makePrivateFixtureDirectory(source!.eventsPath, { recursive: true });
         }
       },
     })).toThrow("legacy events path was recreated");
@@ -5812,8 +5857,8 @@ describe("worktree reconciliation", () => {
     const sourceHash = hashProjectPath(linked);
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
     const root = join(home, ".lcm", "reconciliations");
-    mkdirSync(root, { recursive: true });
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    makePrivateFixtureDirectory(root, { recursive: true });
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
@@ -5832,12 +5877,12 @@ describe("worktree reconciliation", () => {
       backupPaths: [],
       sourceComponents: {},
     };
-    writeFileSync(journalPath, JSON.stringify(base));
+    writePrivateFixtureFile(journalPath, JSON.stringify(base));
     clearProjectMapCache();
     expect(() => reconcileWorktrees(main)).toThrow("lacks a component snapshot");
 
-    writeFileSync(join(sourceDir, "sensitive-patterns.txt"), "PATTERN\n");
-    writeFileSync(journalPath, JSON.stringify({
+    writePrivateFixtureFile(join(sourceDir, "sensitive-patterns.txt"), "PATTERN\n");
+    writePrivateFixtureFile(journalPath, JSON.stringify({
       ...base,
       sourceComponents: { [sourceHash]: { projectDb: true, eventsDb: false, patterns: true } },
     }));
@@ -5845,7 +5890,7 @@ describe("worktree reconciliation", () => {
 
     rmSync(join(sourceDir, "db.sqlite"));
     rmSync(join(sourceDir, "sensitive-patterns.txt"));
-    writeFileSync(journalPath, JSON.stringify({
+    writePrivateFixtureFile(journalPath, JSON.stringify({
       ...base,
       phase: "planned",
       sourceComponents: { [sourceHash]: { projectDb: true, eventsDb: false, patterns: false } },
@@ -5853,8 +5898,8 @@ describe("worktree reconciliation", () => {
     expect(() => reconcileWorktrees(main)).toThrow("component disappeared before merge");
 
     makeDatabase(join(sourceDir, "db.sqlite"), "snapshot", "content", sourceHash);
-    writeFileSync(join(sourceDir, "sensitive-patterns.txt"), "PATTERN\n");
-    writeFileSync(journalPath, JSON.stringify({
+    writePrivateFixtureFile(join(sourceDir, "sensitive-patterns.txt"), "PATTERN\n");
+    writePrivateFixtureFile(journalPath, JSON.stringify({
       ...base,
       phase: "planned",
       sourceComponents: { [sourceHash]: { projectDb: true, eventsDb: false, patterns: true } },
@@ -5872,12 +5917,12 @@ describe("worktree reconciliation", () => {
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
     makeDatabase(join(sourceDir, "db.sqlite"), "merged-snapshot", "content", sourceHash);
     makeEvents(join(home, ".lcm", "events", `${sourceHash}.db`), "merged-snapshot");
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
-    mkdirSync(join(home, ".lcm", "reconciliations"), { recursive: true });
-    writeFileSync(join(home, ".lcm", "reconciliations", `${targetHash}.json`), JSON.stringify({
+    makePrivateFixtureDirectory(join(home, ".lcm", "reconciliations"), { recursive: true });
+    writePrivateFixtureFile(join(home, ".lcm", "reconciliations", `${targetHash}.json`), JSON.stringify({
       version: 1,
       targetHash,
       canonical,
@@ -5901,13 +5946,13 @@ describe("worktree reconciliation", () => {
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
-    writeFileSync(projectMapPath(), `${JSON.stringify({
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [] },
       [sourceHash]: { canonical: linked, aliases: [] },
     }, null, 2)}\n`);
     clearProjectMapCache();
     const root = join(home, ".lcm", "reconciliations");
-    mkdirSync(root, { recursive: true });
+    makePrivateFixtureDirectory(root, { recursive: true });
     const journalPath = join(root, `${targetHash}.json`);
     const journal = {
       version: 1,
@@ -5925,9 +5970,9 @@ describe("worktree reconciliation", () => {
       },
     };
     const sourceDir = join(home, ".lcm", "projects", sourceHash);
-    mkdirSync(join(sourceDir, ".."), { recursive: true });
-    writeFileSync(sourceDir, "invalid project fence");
-    writeFileSync(journalPath, JSON.stringify(journal));
+    makePrivateFixtureDirectory(join(sourceDir, ".."), { recursive: true });
+    writePrivateFixtureFile(sourceDir, "invalid project fence");
+    writePrivateFixtureFile(journalPath, JSON.stringify(journal));
     expect(() => reconcileWorktrees(main)).toThrow("invalid legacy project state path");
 
     rmSync(sourceDir, { force: true });
@@ -5941,28 +5986,28 @@ describe("worktree reconciliation", () => {
       "symlinked",
     ]) {
       rmSync(eventsPath, { recursive: true, force: true });
-      mkdirSync(eventsPath, { recursive: true });
+      makePrivateFixtureDirectory(eventsPath, { recursive: true });
       if (markerState === "unreadable") {
-        mkdirSync(join(eventsPath, "fence.json"));
+        makePrivateFixtureDirectory(join(eventsPath, "fence.json"));
       } else if (markerState === "malformed") {
-        writeFileSync(join(eventsPath, "fence.json"), "{");
+        writePrivateFixtureFile(join(eventsPath, "fence.json"), "{");
       } else if (markerState === "unexpected-entry") {
-        writeFileSync(
+        writePrivateFixtureFile(
           join(eventsPath, "fence.json"),
           `${JSON.stringify({ version: 1, hash: sourceHash, kind: "events" })}\n`,
         );
-        writeFileSync(join(eventsPath, "unexpected"), "entry");
+        writePrivateFixtureFile(join(eventsPath, "unexpected"), "entry");
       } else if (markerState === "oversized") {
-        writeFileSync(join(eventsPath, "fence.json"), "x".repeat(1025));
+        writePrivateFixtureFile(join(eventsPath, "fence.json"), "x".repeat(1025));
       } else if (markerState === "symlinked") {
         const markerTarget = join(home, `${sourceHash}-fence-target`);
-        writeFileSync(
+        writePrivateFixtureFile(
           markerTarget,
           `${JSON.stringify({ version: 1, hash: sourceHash, kind: "events" })}\n`,
         );
         symlinkSync(markerTarget, join(eventsPath, "fence.json"));
       }
-      writeFileSync(journalPath, JSON.stringify(journal));
+      writePrivateFixtureFile(journalPath, JSON.stringify(journal));
       expect(() => reconcileWorktrees(main)).toThrow("invalid legacy events state path");
     }
   });
@@ -5970,12 +6015,12 @@ describe("worktree reconciliation", () => {
   it("rejects retired paths recreated between archival and fence publication", () => {
     const setup = (suffix: string) => {
       const root = join(home, suffix);
-      mkdirSync(root);
+      makePrivateFixtureDirectory(root);
       const { main, linked } = makeRepository(root);
       const canonical = resolveGitProjectAnchor(main)!.canonical;
       const targetHash = hashProjectPath(canonical);
       const sourceHash = hashProjectPath(linked);
-      writeFileSync(projectMapPath(), `${JSON.stringify({
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
         [targetHash]: { canonical, aliases: [] },
         [sourceHash]: { canonical: linked, aliases: [] },
       }, null, 2)}\n`);
@@ -5991,21 +6036,21 @@ describe("worktree reconciliation", () => {
     expect(() => reconcileWorktrees(projectRace.main, {
       _observer: (event, source, detailPath) => {
         if (event === "after-source-archive-rename" && detailPath?.includes("oldevents")) {
-          writeFileSync(source!.projectDir, "recreated after archive");
+          writePrivateFixtureFile(source!.projectDir, "recreated after archive");
         }
       },
     })).toThrow("legacy project path remained writable");
 
     rmSync(join(home, ".lcm"), { recursive: true, force: true });
-    mkdirSync(join(home, ".lcm"), { recursive: true });
+    makePrivateFixtureDirectory(join(home, ".lcm"), { recursive: true });
     clearProjectMapCache();
     clearWorktreeReconciliationCache();
     const eventsRace = setup("events-path-race");
     expect(() => reconcileWorktrees(eventsRace.main, {
       _observer: (event, source) => {
         if (event === "before-project-path-fence") {
-          mkdirSync(source!.eventsPath, { recursive: true });
-          writeFileSync(join(source!.eventsPath, "fence.json"), "recreated after archive");
+          makePrivateFixtureDirectory(source!.eventsPath, { recursive: true });
+          writePrivateFixtureFile(join(source!.eventsPath, "fence.json"), "recreated after archive");
         }
       },
     })).toThrow("legacy events path remained writable");

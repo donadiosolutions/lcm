@@ -17,6 +17,7 @@ import {
   createProject,
   linkProject,
   listProjects,
+  openPostgreSqlIdentitySession,
   ProjectIdentityReconciliationError,
   recoverMachine,
   registerMachine,
@@ -39,6 +40,7 @@ import {
   setRemoteProjectBinding,
   showProjectMapEntry,
 } from "../src/project-map.js";
+import * as projectMapModule from "../src/project-map.js";
 import { clearGitProjectAnchorCache, resolveGitProjectAnchor } from "../src/git-project.js";
 import { clearWorktreeReconciliationCache } from "../src/worktree-reconciliation.js";
 import {
@@ -63,6 +65,8 @@ import {
   machineIdentityPath,
 } from "../src/machine-identity.js";
 import { withPrivateMutationLockAsync } from "../src/private-mutation-lock.js";
+import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import { PostgreSqlRuntime } from "../src/storage/postgresql/runtime.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const MACHINE_B = "018f22c4-6d2a-7f10-9a4c-6b8d3e5f9013";
@@ -330,7 +334,70 @@ describe("identity service", () => {
     deps = {
       homeDir: home,
       openSession: vi.fn(async () => ({ repository, close })),
+      _assertBackendPublication: () => undefined,
     };
+  });
+
+  it("fails closed for PostgreSQL identity selection without publication evidence", async () => {
+    await expect(registerMachine(
+      POSTGRESQL_CONFIG,
+      {},
+      { ...deps, _assertBackendPublication: undefined },
+    )).rejects.toMatchObject({
+      name: BackendPublicationJournalError.name,
+      reason: "publication-evidence-missing",
+    });
+  });
+
+  it("closes an unhealthy PostgreSQL identity runtime while preserving its health error", async () => {
+    const caPath = join(home, "postgres-ca.pem");
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const config: ResolvedStorageConfig = {
+      ...POSTGRESQL_CONFIG,
+      postgresql: { ...POSTGRESQL_CONFIG.postgresql, caFile: caPath },
+    };
+    const health = vi.spyOn(PostgreSqlRuntime.prototype, "health").mockResolvedValue({
+      status: "unavailable",
+      backend: "postgresql",
+      error: new Error("health failure"),
+    } as never);
+    const runtimeClose = vi.spyOn(PostgreSqlRuntime.prototype, "close").mockRejectedValue(new Error("cleanup failure"));
+    await expect(openPostgreSqlIdentitySession(config)).rejects.toThrow("health failure");
+    expect(health).toHaveBeenCalledOnce();
+    expect(runtimeClose).toHaveBeenCalledOnce();
+  });
+
+  it("returns a PostgreSQL identity session after healthy runtime admission", async () => {
+    const caPath = join(home, "postgres-ca.pem");
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const config: ResolvedStorageConfig = {
+      ...POSTGRESQL_CONFIG,
+      postgresql: { ...POSTGRESQL_CONFIG.postgresql, caFile: caPath },
+    };
+    vi.spyOn(PostgreSqlRuntime.prototype, "health").mockResolvedValue({
+      status: "healthy",
+      backend: "postgresql",
+    } as never);
+    const runtimeClose = vi.spyOn(PostgreSqlRuntime.prototype, "close").mockResolvedValue(undefined);
+    const session = await openPostgreSqlIdentitySession(config);
+    expect(session.repository).toBeDefined();
+    await session.close();
+    expect(runtimeClose).toHaveBeenCalledOnce();
+  });
+
+  it("uses the bounded fallback when unhealthy PostgreSQL health has no error", async () => {
+    const caPath = join(home, "postgres-ca.pem");
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const config: ResolvedStorageConfig = {
+      ...POSTGRESQL_CONFIG,
+      postgresql: { ...POSTGRESQL_CONFIG.postgresql, caFile: caPath },
+    };
+    vi.spyOn(PostgreSqlRuntime.prototype, "health").mockResolvedValue({
+      status: "unavailable",
+      backend: "postgresql",
+    } as never);
+    vi.spyOn(PostgreSqlRuntime.prototype, "close").mockResolvedValue(undefined);
+    await expect(openPostgreSqlIdentitySession(config)).rejects.toThrow("PostgreSQL identity storage is unavailable");
   });
 
   afterEach(() => {
@@ -876,6 +943,7 @@ describe("identity service", () => {
   });
 
   it("lists local projects offline and enriches PostgreSQL listings", async () => {
+    const listMap = vi.spyOn(projectMapModule, "listProjectMapEntries");
     const path = makeProject("list");
     const secondPath = makeProject("list-second");
     resolveProjectIdentity(path);
@@ -892,11 +960,36 @@ describe("identity service", () => {
         },
       ]),
     });
+    expect(listMap).toHaveBeenCalledWith(home);
     expect(deps.openSession).not.toHaveBeenCalled();
 
     repository.listProjects = vi.fn(async () => [remoteProject(PROJECT_A)]);
     const listed = await listProjects(POSTGRESQL_CONFIG, deps);
     expect(listed.remote).toEqual([expect.objectContaining({ projectId: PROJECT_A })]);
+  });
+
+  it("refuses local project reads before publication admission", async () => {
+    const listMap = vi.spyOn(projectMapModule, "listProjectMapEntries");
+    const showMap = vi.spyOn(projectMapModule, "showProjectMapEntry");
+    const assertPublication = vi.fn(() => {
+      throw new BackendPublicationJournalError("unresolved-publication", "publication remains unresolved");
+    });
+    const refusedDeps = { ...deps, _assertBackendPublication: assertPublication };
+
+    await expect(listProjects(SQLITE_CONFIG, refusedDeps)).rejects.toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "unresolved-publication",
+    });
+    await expect(showProject(SQLITE_CONFIG, undefined, refusedDeps)).rejects.toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "unresolved-publication",
+    });
+
+    expect(listMap).not.toHaveBeenCalled();
+    expect(showMap).not.toHaveBeenCalled();
+    expect(deps.openSession).not.toHaveBeenCalled();
+    listMap.mockRestore();
+    showMap.mockRestore();
   });
 
   it("shows local projects offline and validates remote bindings online", async () => {
@@ -1401,6 +1494,7 @@ describe("identity service", () => {
     const otherDeps: Partial<IdentityServiceDependencies> = {
       homeDir: otherHome,
       openSession: deps.openSession,
+      _assertBackendPublication: () => undefined,
     };
     const originalCreate = repository.createProject.getMockImplementation()!;
     repository.createProject = vi.fn(async (input) => {
@@ -1787,7 +1881,7 @@ describe("identity service", () => {
         aliases: [],
         remoteProjectId: PROJECT_A,
       },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`, { mode: 0o600 });
     clearProjectMapCache();
     repository.createProject.mockClear();
     vi.mocked(deps.openSession!).mockClear();
@@ -1812,10 +1906,10 @@ describe("identity service", () => {
     const targetHash = hashProjectPath(canonical);
     const sourceHash = hashProjectPath(linked);
     const alias = makeProject("legacy-local-link-alias");
-    mkdirSync(join(home, ".lcm"), { recursive: true });
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
     writeFileSync(projectMapPath(), `${JSON.stringify({
       [sourceHash]: { canonical: linked, aliases: [] },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`, { mode: 0o600 });
     clearProjectMapCache();
 
     await expect(linkProject(SQLITE_CONFIG, linked, alias, {}, deps))
@@ -1834,7 +1928,7 @@ describe("identity service", () => {
         canonical: unlinkRepository.linked,
         aliases: [unlinkAlias],
       },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`, { mode: 0o600 });
     clearProjectMapCache();
     clearWorktreeReconciliationCache();
 
@@ -1874,7 +1968,7 @@ describe("identity service", () => {
         aliases: [],
         remoteProjectId: PROJECT_B,
       },
-    }, null, 2)}\n`);
+    }, null, 2)}\n`, { mode: 0o600 });
     clearProjectMapCache();
     const mapBefore = readFileSync(mapPath, "utf8");
     repository.replaceProjectAliases.mockClear();
@@ -2101,6 +2195,7 @@ describe("identity service", () => {
       deps = {
         homeDir: home,
         openSession: vi.fn(async () => ({ repository, close })),
+        _assertBackendPublication: () => undefined,
       };
     }
   });
@@ -3453,6 +3548,7 @@ describe("identity service", () => {
       deps = {
         homeDir: home,
         openSession: vi.fn(async () => ({ repository, close })),
+        _assertBackendPublication: () => undefined,
       };
     }
   });

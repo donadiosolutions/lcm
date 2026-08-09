@@ -679,7 +679,7 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
           operation: "verifyLargeFileIsolationDefault",
           projectId,
         })).resolves.toMatchObject({
-          rows: [{ transaction_isolation: "repeatable read" }],
+          rows: [{ transaction_isolation: "read committed" }],
         });
         await database.migrator.query({
           text: `CREATE FUNCTION public.require_large_file_read_committed()
@@ -719,32 +719,36 @@ describe("PostgreSQL 18 summary, context, and large-file repositories", () => {
         })).resolves.toMatchObject({ fileId: "root-read-committed" });
 
         await database.runtime.transaction(async (transaction) => {
-          await transaction.query({ text: "SELECT 1" }, {
+          const isolation = await transaction.query<{
+            transaction_isolation: string;
+          }>({
+            text: `SELECT pg_catalog.current_setting(
+                     'transaction_isolation'
+                   ) AS transaction_isolation`,
+          }, {
             domain: "large-files",
-            operation: "establishLargeFileRepeatableReadSnapshot",
+            operation: "verifyScopedLargeFileIsolation",
             projectId,
           });
+          expect(isolation.rows).toEqual([
+            { transaction_isolation: "read committed" },
+          ]);
           const scoped = new PostgreSqlLargeFileRepository(
             transaction,
             projectId,
           );
           await expect(scoped.insertLargeFile({
-            fileId: "scoped-repeatable-read",
+            fileId: "scoped-read-committed",
             conversationId,
-            storageUri: "lcm://isolation/scoped",
-          })).rejects.toMatchObject({
-            domain: "large-files",
-            field: "transaction_isolation",
-            operation: "insertLargeFile",
-            projectId,
-          });
+            storageUri: "lcm://isolation/scoped-read-committed",
+          })).resolves.toMatchObject({ fileId: "scoped-read-committed" });
         }, {
           domain: "large-files",
-          operation: "rejectScopedLargeFileRepeatableRead",
+          operation: "insertScopedLargeFileReadCommitted",
           projectId,
         });
-        await expect(repository.getLargeFile("scoped-repeatable-read"))
-          .resolves.toBeNull();
+        await expect(repository.getLargeFile("scoped-read-committed"))
+          .resolves.toMatchObject({ fileId: "scoped-read-committed" });
       },
       { defaultTransactionIsolation: "REPEATABLE READ" },
     );

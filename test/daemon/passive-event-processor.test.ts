@@ -1,17 +1,29 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import type { EventSidecarSummary, collectEventSidecars } from "../../src/db/event-sidecars.js";
 import {
   createPromoteEventsNotifyHandler,
   PassiveEventProcessor,
   PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+  type BackgroundPublicationAdmission,
 } from "../../src/daemon/passive-event-processor.js";
 import type { PromoteResult, promoteEventsForCwd } from "../../src/daemon/routes/promote-events.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import {
+  assertBackendPublicationConsumerAccess,
+  BackendPublicationJournalError,
+  withBackendPublicationConfigLockAsync,
+  withBackendPublicationConsumerLockAsync,
+} from "../../src/storage/backend-publication.js";
 
 type CollectEventSidecars = typeof collectEventSidecars;
 type PromoteEventsForCwd = typeof promoteEventsForCwd;
 type PassiveEventProcessorDeps = NonNullable<ConstructorParameters<typeof PassiveEventProcessor>[2]>;
+type PublicationAdmission = <T>(operation: (publicationLockToken: object) => Promise<T> | T) => Promise<T>;
 type ScheduledTimer = {
   callback: () => void;
   ms: number;
@@ -19,9 +31,19 @@ type ScheduledTimer = {
 };
 
 const request = {} as IncomingMessage;
+const testPublicationAdmission: BackgroundPublicationAdmission = async operation => operation({});
 
 function makeConfig() {
   return loadDaemonConfig("/nonexistent", { daemon: { port: 0 }, llm: { provider: "disabled" } });
+}
+
+function publicationFixture(): { home: string; configPath: string } {
+  const home = mkdtempSync(join(tmpdir(), "lcm-passive-publication-"));
+  const lcmDir = join(home, ".lcm");
+  mkdirSync(join(lcmDir, "backend-publication"), { recursive: true, mode: 0o700 });
+  const configPath = join(lcmDir, "config.json");
+  writeFileSync(configPath, "{}\n", { mode: 0o600 });
+  return { home, configPath };
 }
 
 function mockRes() {
@@ -70,6 +92,7 @@ function timerDeps(): {
     timers,
     intervals,
     deps: {
+      withPublicationAdmission: testPublicationAdmission,
       setTimeout,
       clearTimeout,
       setInterval,
@@ -353,6 +376,229 @@ describe("PassiveEventProcessor", () => {
       "/tmp",
       undefined,
       storageFactory,
+      expect.any(Object),
+    );
+  });
+
+  it("holds live admission for a notified promotion batch and revokes its token after completion", async () => {
+    const { home, configPath } = publicationFixture();
+    const { deps } = timerDeps();
+    let releasePromotion: () => void = () => undefined;
+    let markPromotionStarted!: () => void;
+    const promotionStarted = new Promise<void>(resolve => { markPromotionStarted = resolve; });
+    let capturedToken: object | undefined;
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(async (
+      _config,
+      _cwd,
+      _sidecarPath,
+      _storageFactory,
+      publicationLockToken,
+    ) => {
+      capturedToken = publicationLockToken;
+      markPromotionStarted();
+      await new Promise<void>(resolve => {
+        releasePromotion = resolve;
+      });
+      return { promoted: 0, skipped: 0, correlated: 0, errors: 0, message: "no unprocessed events" };
+    });
+    const withPublicationAdmission: PublicationAdmission = async operation =>
+      withBackendPublicationConsumerLockAsync(home, operation);
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      promoteEventsForCwd,
+      withPublicationAdmission,
+    } as never);
+
+    try {
+      processor.notify({ cwd: "/tmp", priority: 1 });
+      await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined)).resolves.toBeUndefined();
+
+      const drain = processor.flushOnce();
+      await promotionStarted;
+      expect(capturedToken).toEqual(expect.any(Object));
+      await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
+        .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+      expect(promoteEventsForCwd).toHaveBeenCalledWith(
+        expect.any(Object),
+        "/tmp",
+        undefined,
+        undefined,
+        capturedToken,
+      );
+
+      let shutdownComplete = false;
+      const shutdown = processor.stopAndWait().then(() => { shutdownComplete = true; });
+      await Promise.resolve();
+      expect(shutdownComplete).toBe(false);
+      releasePromotion();
+      await Promise.all([drain, shutdown]);
+      await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined)).resolves.toBeUndefined();
+      expect(() => assertBackendPublicationConsumerAccess({
+        homeDir: home,
+        lockToken: capturedToken,
+      })).toThrowError(expect.objectContaining({ reason: "permit-mismatch" }));
+    } finally {
+      releasePromotion();
+      processor.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("holds live admission for an independent sweep batch only after sidecar scanning", async () => {
+    const { home, configPath } = publicationFixture();
+    const { deps } = timerDeps();
+    let releaseScan: () => void = () => undefined;
+    let markScanFinished!: () => void;
+    const scanFinished = new Promise<void>(resolve => { markScanFinished = resolve; });
+    let releasePromotion: () => void = () => undefined;
+    let markPromotionStarted!: () => void;
+    const promotionStarted = new Promise<void>(resolve => { markPromotionStarted = resolve; });
+    let capturedToken: object | undefined;
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockImplementation(async () => {
+      markScanFinished();
+      await new Promise<void>(resolve => {
+        releaseScan = resolve;
+      });
+      return [sidecar({ cwd: "/tmp", path: "/events/tmp.db", unprocessed: 1 })];
+    });
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(async (
+      _config,
+      _cwd,
+      _sidecarPath,
+      _storageFactory,
+      publicationLockToken,
+    ) => {
+      capturedToken = publicationLockToken;
+      markPromotionStarted();
+      await new Promise<void>(resolve => {
+        releasePromotion = resolve;
+      });
+      return { promoted: 1, skipped: 0, correlated: 0, errors: 0 };
+    });
+    const withPublicationAdmission: PublicationAdmission = async operation =>
+      withBackendPublicationConsumerLockAsync(home, operation);
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      collectEventSidecars,
+      promoteEventsForCwd,
+      withPublicationAdmission,
+    } as never);
+
+    try {
+      const sweep = processor.runSweep();
+      await scanFinished;
+      await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined)).resolves.toBeUndefined();
+      releaseScan();
+      await promotionStarted;
+      expect(capturedToken).toEqual(expect.any(Object));
+      await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
+        .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+      expect(promoteEventsForCwd).toHaveBeenCalledWith(
+        expect.any(Object),
+        "/tmp",
+        "/events/tmp.db",
+        undefined,
+        capturedToken,
+      );
+      releasePromotion();
+      await sweep;
+    } finally {
+      releaseScan();
+      releasePromotion();
+      processor.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("logs a notified admission failure and continues with the next queued project", async () => {
+    const { deps } = timerDeps();
+    const blockedCwd = mkdtempSync(join(tmpdir(), "lcm-passive-blocked-"));
+    const healthyCwd = mkdtempSync(join(tmpdir(), "lcm-passive-healthy-"));
+    const admissionFailure = new BackendPublicationJournalError("unexpected-state", "blocked");
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockResolvedValue({
+      promoted: 0,
+      skipped: 0,
+      correlated: 0,
+      errors: 0,
+      message: "no unprocessed events",
+    });
+    let admissionCalls = 0;
+    const withPublicationAdmission: PublicationAdmission = async operation => {
+      admissionCalls++;
+      if (admissionCalls === 1) throw admissionFailure;
+      return operation({});
+    };
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      promoteEventsForCwd,
+      withPublicationAdmission,
+    } as never);
+
+    try {
+      processor.notify({ cwd: blockedCwd, priority: 1 });
+      processor.notify({ cwd: healthyCwd, priority: 1 });
+      await processor.flushOnce();
+
+      expect(deps.safeLogError).toHaveBeenCalledWith(
+        "passive-event-processor",
+        admissionFailure,
+        { cwd: blockedCwd },
+      );
+      expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+      expect(promoteEventsForCwd).toHaveBeenCalledWith(
+        expect.any(Object),
+        healthyCwd,
+        undefined,
+        undefined,
+        expect.any(Object),
+      );
+    } finally {
+      processor.stop();
+      rmSync(blockedCwd, { recursive: true, force: true });
+      rmSync(healthyCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("logs a sweep admission failure and continues with later sidecars", async () => {
+    const { deps } = timerDeps();
+    const admissionFailure = new BackendPublicationJournalError("unexpected-state", "blocked");
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/blocked", path: "/events/blocked.db", unprocessed: 1 }),
+      sidecar({ cwd: "/healthy", path: "/events/healthy.db", unprocessed: 1 }),
+    ]);
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockResolvedValue({
+      promoted: 1,
+      skipped: 0,
+      correlated: 0,
+      errors: 0,
+    });
+    let admissionCalls = 0;
+    const withPublicationAdmission: PublicationAdmission = async operation => {
+      admissionCalls++;
+      if (admissionCalls === 1) throw admissionFailure;
+      return operation({});
+    };
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      collectEventSidecars,
+      promoteEventsForCwd,
+      withPublicationAdmission,
+    } as never);
+
+    await processor.runSweep();
+
+    expect(deps.safeLogError).toHaveBeenCalledWith(
+      "passive-event-processor",
+      admissionFailure,
+      { cwd: "/blocked" },
+    );
+    expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+    expect(promoteEventsForCwd).toHaveBeenCalledWith(
+      expect.any(Object),
+      "/healthy",
+      "/events/healthy.db",
+      undefined,
+      expect.any(Object),
     );
   });
 

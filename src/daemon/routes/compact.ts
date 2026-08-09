@@ -17,7 +17,7 @@ import {
 } from "../project.js";
 import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
-import type { RouteHandler } from "../server.js";
+import type { RouteHandler, RoutePublicationAdmission } from "../server.js";
 import { CompactionEngine, MANUAL_COMPACT_FRESH_TAIL_COUNT } from "../../compaction.js";
 import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
 import { ScrubEngine } from "../../scrub.js";
@@ -29,10 +29,14 @@ import {
 } from "../summarizer.js";
 import { validateCwd } from "../validate-cwd.js";
 import {
+  BackendPublicationJournalError,
+} from "../../storage/backend-publication.js";
+import {
   createStorageBackendFactory,
   type ProjectStorage,
   type StorageBackendFactory,
   type StorageIdentityContext,
+  type TransactionRepositories,
 } from "../../storage/index.js";
 import {
   closeRouteStorage,
@@ -176,11 +180,75 @@ export const JUST_COMPACTED_TTL_MS = 30_000;
 // Guard against concurrent compactions for the same session
 const compactingNow = new Set<string>();
 
+const PROJECT_REPOSITORY_KEYS = [
+  "conversations",
+  "summaries",
+  "context",
+  "largeFiles",
+  "promotedMemory",
+  "recall",
+  "redactionAdmin",
+  "lexicalSearch",
+  "coordination",
+] as const satisfies readonly (keyof ProjectStorage)[];
+
+function admittedRepository<T extends object>(
+  repository: T,
+  withPublicationAdmission: RoutePublicationAdmission,
+): T {
+  return new Proxy(repository, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => withPublicationAdmission(
+        () => Reflect.apply(value, target, args),
+      );
+    },
+  });
+}
+
+/**
+ * Keep model work outside publication admission while fencing every storage
+ * method. Transactions deliberately pass the backend's transaction-scoped
+ * repositories through unchanged so their callbacks remain inside one
+ * admission instead of trying to reacquire the same lock.
+ */
+function admittedProjectStorage(
+  project: ProjectStorage,
+  withPublicationAdmission: RoutePublicationAdmission,
+): ProjectStorage {
+  const repositories = Object.fromEntries(
+    PROJECT_REPOSITORY_KEYS.map((key) => [
+      key,
+      admittedRepository(project[key] as object, withPublicationAdmission),
+    ]),
+  ) as Pick<ProjectStorage, typeof PROJECT_REPOSITORY_KEYS[number]>;
+  return {
+    ...project,
+    ...repositories,
+    transaction: <T>(callback: (repositories: TransactionRepositories) => Promise<T>): Promise<T> =>
+      withPublicationAdmission<T>(() => project.transaction<T>(callback)),
+    health: () => withPublicationAdmission(() => project.health()),
+    // Cleanup must remain possible after an admission failure.
+    close: () => project.close(),
+  };
+}
+
+function sameStorageIdentity(
+  expected: StorageIdentityContext & { readonly localProjectId: string },
+  actual: StorageIdentityContext & { readonly localProjectId: string },
+): boolean {
+  return expected.id === actual.id
+    && expected.localProjectId === actual.localProjectId
+    && expected.canonical === actual.canonical
+    && expected.remoteProjectId === actual.remoteProjectId;
+}
+
 
 export function createCompactHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   const getSummarizer = makeSummarizerCache(config);
 
-  return async (_req, res, body) => {
+  return async (_req, res, body, context) => {
     let parsed: unknown;
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
@@ -211,6 +279,15 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
       cwd = validateCwd(input.cwd);
     } catch (err) {
       sendJson(res, 400, { error: err instanceof Error ? err.message : "invalid cwd" });
+      return;
+    }
+
+    const withPublicationAdmission = context?.withPublicationAdmission;
+    if (withPublicationAdmission === undefined) {
+      sendJson(res, 503, {
+        status: "blocked",
+        error: "backend publication admission blocked",
+      });
       return;
     }
 
@@ -273,62 +350,119 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
     const effectiveRequestTimeoutMs = effectiveRequestPolicy?.requestTimeoutMs ?? null;
     const effectiveRetry = effectiveProvider === "openai" ? effectiveRequestPolicy!.retry : null;
 
-    activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
     let admittedIdentity: StorageIdentityContext & { readonly localProjectId: string };
     try {
-      admittedIdentity = projectIdentity(cwd, config.storage);
+      const initialAdmission = await withPublicationAdmission(async publicationLockToken => {
+        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+          config.storage,
+          undefined,
+          undefined,
+          publicationLockToken,
+        ));
+        const identity = projectIdentity(cwd, config.storage, publicationLockToken);
+        return {
+          identity,
+          stagedFailure: stagedPostgreSqlFactoryUnavailableResponse(activeFactory, "compact"),
+        };
+      });
+      admittedIdentity = initialAdmission.identity;
+      if (initialAdmission.stagedFailure) {
+        sendJson(res, 503, initialAdmission.stagedFailure);
+        await closeRouteStorage(undefined, ownedFactory);
+        return;
+      }
     } catch (err) {
-      const storageFailure = storageRouteFailureResponse(
-        activeFactory,
-        err,
-        "compact",
-      );
-      if (storageFailure) {
-        sendJson(res, storageFailure.status, storageFailure.body);
-      } else {
-        sendJson(res, 500, {
-          error: err instanceof Error ? err.message : "compact failed",
+      if (err instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
         });
+      } else {
+        const storageFailure = storageRouteFailureResponse(
+          activeFactory,
+          err,
+          "compact",
+        );
+        if (storageFailure) {
+          sendJson(res, storageFailure.status, storageFailure.body);
+        } else {
+          sendJson(res, 500, {
+            error: err instanceof Error ? err.message : "compact failed",
+          });
+        }
       }
       await closeRouteStorage(undefined, ownedFactory);
       return;
     }
-    const stagedFailure = stagedPostgreSqlFactoryUnavailableResponse(
-      activeFactory,
-      "compact",
-    );
-    if (stagedFailure) {
-      sendJson(res, 503, stagedFailure);
-      await closeRouteStorage(undefined, ownedFactory);
-      return;
-    }
+    const localIdentity = {
+      id: admittedIdentity.localProjectId,
+      canonical: admittedIdentity.canonical,
+      ...(admittedIdentity.remoteProjectId
+        ? { remoteProjectId: admittedIdentity.remoteProjectId }
+        : {}),
+    };
+    const withProjectAdmission: RoutePublicationAdmission = async operation =>
+      withPublicationAdmission(async publicationLockToken => {
+        const currentIdentity = projectIdentity(cwd, config.storage, publicationLockToken);
+        if (!sameStorageIdentity(admittedIdentity, currentIdentity)) {
+          throw new BackendPublicationJournalError(
+            "unexpected-state",
+            "compact project identity changed during publication admission",
+          );
+        }
+        return operation(publicationLockToken);
+      });
+    const openProjectWithAdmission = async (): Promise<ProjectStorage> => {
+      let openedProject: ProjectStorage | undefined;
+      try {
+        return await withProjectAdmission(async publicationLockToken => {
+          const project = await activeFactory!.openProject(admittedIdentity, publicationLockToken);
+          openedProject = project;
+          return project;
+        });
+      } catch (error) {
+        // The admission wrapper can fail after its operation returns while it
+        // revalidates publication state. Keep cleanup possible in that case.
+        await closeRouteStorage(openedProject, undefined);
+        throw error;
+      }
+    };
 
     // Guard must be checked and set synchronously (before any await) to prevent
     // concurrent requests from racing through the has() check before add() runs.
     if (compactingNow.has(session_id)) {
-      if (config.storage.backend === "postgresql") {
-        try {
-          const project = await activeFactory.openProject(admittedIdentity);
-          await closeRouteStorage(project, undefined);
-        } catch (err) {
-          const storageFailure = storageRouteFailureResponse(
-            activeFactory,
-            err,
-            "compact",
-          );
-          if (storageFailure) {
-            sendJson(res, storageFailure.status, storageFailure.body);
-          } else {
-            sendJson(res, 500, {
-              error: err instanceof Error ? err.message : "compact failed",
-            });
+      try {
+        if (config.storage.backend === "postgresql") {
+          try {
+            const duplicateProject = await openProjectWithAdmission();
+            await closeRouteStorage(duplicateProject, undefined);
+          } catch (err) {
+            if (err instanceof BackendPublicationJournalError) {
+              sendJson(res, 503, {
+                status: "blocked",
+                error: "backend publication admission blocked",
+              });
+            } else {
+              const storageFailure = storageRouteFailureResponse(
+                activeFactory,
+                err,
+                "compact",
+              );
+              if (storageFailure) {
+                sendJson(res, storageFailure.status, storageFailure.body);
+              } else {
+                sendJson(res, 500, {
+                  error: err instanceof Error ? err.message : "compact failed",
+                });
+              }
+            }
+            return;
           }
-          return;
-        } finally {
-          await closeRouteStorage(undefined, ownedFactory);
         }
+        sendJson(res, 200, { skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
+      } finally {
+        await closeRouteStorage(undefined, ownedFactory);
       }
-      sendJson(res, 200, { skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
       return;
     }
     compactingNow.add(session_id);
@@ -351,8 +485,8 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
       );
       if (!summarize) {
         if (config.storage.backend === "postgresql") {
-          const project = await activeFactory.openProject(admittedIdentity);
-          await closeRouteStorage(project, undefined);
+          const stagedProject = await openProjectWithAdmission();
+          await closeRouteStorage(stagedProject, undefined);
         }
         sendJson(res, 200, {
           actionTaken: false,
@@ -367,32 +501,27 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         });
         return;
       }
-      const localIdentity = {
-        id: admittedIdentity.localProjectId,
-        canonical: admittedIdentity.canonical,
-        ...(admittedIdentity.remoteProjectId
-          ? { remoteProjectId: admittedIdentity.remoteProjectId }
-          : {}),
-      };
       let project: ProjectStorage | undefined;
-      project = await activeFactory.openProject(admittedIdentity);
+      project = await openProjectWithAdmission();
+      const admittedProject = admittedProjectStorage(project, withProjectAdmission);
       const pid = admittedIdentity.localProjectId;
       const result = await enqueue(pid, async () => {
         try {
-          const localProjectDir = ensureProjectDirForIdentity(localIdentity);
+          const localProjectDir = await withProjectAdmission(() =>
+            ensureProjectDirForIdentity(localIdentity));
 
           const scrubber = await ScrubEngine.forProject(
             config.security?.sensitivePatterns ?? [],
             localProjectDir,
           );
 
-          const conversation = await project.conversations.getOrCreateConversation(session_id);
+          const conversation = await admittedProject.conversations.getOrCreateConversation(session_id);
 
           // Ingest new messages from the transcript into the DB.
           const safeTranscriptPath = transcript_path ? isSafeTranscriptPath(transcript_path, cwd) : false;
           if (!skip_ingest && safeTranscriptPath && existsSync(safeTranscriptPath)) {
             const parsed = parseTranscriptForClient(safeTranscriptPath, normalizeTranscriptClient(client));
-            await project.transaction(async (repositories) => {
+            await admittedProject.transaction(async (repositories) => {
               const storedCount = await repositories.conversations.getMessageCount(
                 conversation.conversationId,
               );
@@ -424,7 +553,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
           }
 
           // Check if there's anything to compact
-          const tokenCount = await project.context.getContextTokenCount(conversation.conversationId);
+          const tokenCount = await admittedProject.context.getContextTokenCount(conversation.conversationId);
 
           if (tokenCount === 0) {
             return {
@@ -440,7 +569,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
             };
           }
 
-          const engine = new CompactionEngine(project, {
+          const engine = new CompactionEngine(admittedProject, {
             contextThreshold: 0.75,
             freshTailCount: MANUAL_COMPACT_FRESH_TAIL_COUNT,
             leafMinFanout: 3,
@@ -462,8 +591,8 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
           });
 
           // Gather stats for the compaction message (always, regardless of actionTaken)
-          const allSummaries = await project.summaries.getSummariesByConversation(conversation.conversationId);
-          const finalMsgCount = await project.conversations.getMessageCount(conversation.conversationId);
+          const allSummaries = await admittedProject.summaries.getSummariesByConversation(conversation.conversationId);
+          const finalMsgCount = await admittedProject.conversations.getMessageCount(conversation.conversationId);
           const maxDepth = allSummaries.length > 0 ? Math.max(...allSummaries.map((s) => s.depth)) : 0;
 
           // Promotion is now handled by the standalone /promote route
@@ -471,17 +600,22 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
 
           // Update meta.json
           try {
-            const metaPath = join(localProjectDir, "meta.json");
-            let meta: Record<string, unknown> = {};
-            try {
-              meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-            }
-            meta.cwd = localIdentity.canonical;
-            meta.lastCompact = new Date().toISOString();
-            writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
-          } catch { /* non-fatal */ }
+            await withProjectAdmission(() => {
+              const metaPath = join(localProjectDir, "meta.json");
+              let meta: Record<string, unknown> = {};
+              try {
+                meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+              }
+              meta.cwd = localIdentity.canonical;
+              meta.lastCompact = new Date().toISOString();
+              writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
+            });
+          } catch (error) {
+            if (error instanceof BackendPublicationJournalError) throw error;
+            // Meta persistence remains best-effort for ordinary filesystem failures.
+          }
 
           // Set justCompacted flag
           justCompactedMap.set(session_id, Date.now());
@@ -499,7 +633,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
 
           let latestSummaryContent: string | undefined;
           if (compactResult.createdSummaryId) {
-            const summaryRecord = await project.summaries.getSummary(compactResult.createdSummaryId);
+            const summaryRecord = await admittedProject.summaries.getSummary(compactResult.createdSummaryId);
             latestSummaryContent = summaryRecord?.content;
           } else if (allSummaries.length > 0) {
             // Fall back to the most recent existing summary when no new summary was created
@@ -527,6 +661,13 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
 
       sendJson(res, 200, result);
     } catch (err) {
+      if (err instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
+        });
+        return;
+      }
       const storageFailure = storageRouteFailureResponse(activeFactory, err, "compact");
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);

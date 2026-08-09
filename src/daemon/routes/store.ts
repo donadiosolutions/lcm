@@ -48,7 +48,7 @@ export function createStoreHandler(
   config: DaemonConfig,
   storageFactory?: StorageBackendFactory,
 ): RouteHandler {
-  return async (_req, res, body) => {
+  return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
     const { text, tags = [], metadata = {} } = input;
 
@@ -79,8 +79,13 @@ export function createStoreHandler(
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
     try {
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      const identity = projectIdentity(projectPath, config.storage);
+      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+        config.storage,
+        undefined,
+        undefined,
+        context?.publicationLockToken,
+      ));
+      const identity = projectIdentity(projectPath, config.storage, context?.publicationLockToken);
       const stagedFailure = stagedPostgreSqlFactoryUnavailableResponse(
         activeFactory,
         "store",
@@ -89,8 +94,8 @@ export function createStoreHandler(
         sendJson(res, 503, stagedFailure);
         return;
       }
-      project = await activeFactory.openProject(identity);
-      const scrubber = await getScrubEngine(config, projectDir(projectPath));
+      project = await activeFactory.openProject(identity, context?.publicationLockToken);
+      const scrubber = await getScrubEngine(config, projectDir(projectPath, context?.publicationLockToken));
       const scrubbedText = scrubber.scrub(text);
       const scrubbedTags = tags.map((tag: string) => scrubber.scrub(tag));
 

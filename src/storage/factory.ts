@@ -7,7 +7,9 @@ import type {
   StorageIdentityContext,
 } from "./contracts.js";
 import { StorageOperationError } from "./errors.js";
+import { assertStorageBackendPublication } from "./backend.js";
 import { SqliteStorageBackendFactory } from "./sqlite/factory.js";
+import type { BackendPublicationLockToken } from "./backend-publication.js";
 
 const unavailablePostgreSqlCapabilities: StorageCapabilities = Object.freeze({
   transactions: false,
@@ -29,15 +31,24 @@ export class UnavailablePostgreSqlStorageBackendFactory implements StorageBacken
   readonly capabilities = unavailablePostgreSqlCapabilities;
   private closed = false;
 
-  projectExists(identity: StorageIdentityContext): Promise<boolean> {
+  projectExists(
+    identity: StorageIdentityContext,
+    _publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<boolean> {
     return Promise.reject(this.unavailable(identity, "projectExists"));
   }
 
-  openExistingProject(identity: StorageIdentityContext): Promise<ProjectStorage | null> {
+  openExistingProject(
+    identity: StorageIdentityContext,
+    _publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<ProjectStorage | null> {
     return Promise.reject(this.unavailable(identity, "openExistingProject"));
   }
 
-  openProject(identity: StorageIdentityContext): Promise<ProjectStorage> {
+  openProject(
+    identity: StorageIdentityContext,
+    _publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<ProjectStorage> {
     return Promise.reject(this.unavailable(identity, "openProject"));
   }
 
@@ -74,7 +85,14 @@ export class UnavailablePostgreSqlStorageBackendFactory implements StorageBacken
 
 export function createStorageBackendFactory(
   config: ResolvedStorageConfig,
+  homeDir?: string,
+  publicationCheck: (
+    config: { backend: ResolvedStorageConfig["backend"]; homeDir?: string },
+    publicationLockToken?: BackendPublicationLockToken,
+  ) => void = assertStorageBackendPublication,
+  publicationLockToken?: BackendPublicationLockToken,
 ): StorageBackendFactory {
+  publicationCheck({ backend: config.backend, homeDir }, publicationLockToken);
   if (config.backend === "postgresql") {
     return new UnavailablePostgreSqlStorageBackendFactory();
   }

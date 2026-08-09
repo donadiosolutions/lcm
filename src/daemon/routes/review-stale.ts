@@ -23,7 +23,7 @@ export type StaleCandidate = {
 };
 
 export function createReviewStaleHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
-  return async (_req, res, body) => {
+  return async (_req, res, body, context) => {
     let input: Record<string, unknown>;
     try {
       input = JSON.parse(body || "{}") as Record<string, unknown>;
@@ -49,9 +49,18 @@ export function createReviewStaleHandler(config: DaemonConfig, storageFactory?: 
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
     try {
-      const identity = projectIdentity(cwd, config.storage);
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await openExistingProject(activeFactory, identity) ?? undefined;
+      const identity = projectIdentity(cwd, config.storage, context?.publicationLockToken);
+      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+        config.storage,
+        undefined,
+        undefined,
+        context?.publicationLockToken,
+      ));
+      project = await openExistingProject(
+        activeFactory,
+        identity,
+        context?.publicationLockToken,
+      ) ?? undefined;
       if (!project) {
         sendJson(res, 200, { stale: [], total: 0 });
         return;

@@ -9,6 +9,8 @@
 BEGIN;
 
 GRANT USAGE ON SCHEMA lcm TO :"lcm_runtime_role";
+-- Project-scoped reads still inspect the reserved publication row.
+GRANT SELECT ON TABLE lcm.fenced_leases TO :"lcm_runtime_role";
 
 -- Trigram filtering and ranking use the extension's schema-qualified functions.
 -- Grant the exact extension namespace/function access so the script also works

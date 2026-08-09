@@ -11,6 +11,7 @@ import { StorageOperationError } from "../../src/storage/errors.js";
 import type {
   PostgreSqlConnectionSettings,
   PostgreSqlQueryExecutor,
+  PostgreSqlQueryOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "../../src/storage/postgresql/contracts.js";
 import {
@@ -114,10 +115,26 @@ function healthFixtures(
 type QueryCallback = (error: Error | null, value?: QueryResult<QueryResultRow>) => void;
 type QueryWithCallback = Query<QueryResultRow, unknown[]> & { callback: QueryCallback };
 
-function fixtures(queryImplementation?: (input: unknown) => unknown) {
+function fixtures(
+  queryImplementation?: (input: unknown) => unknown,
+  admission?: Partial<Pick<
+    PostgreSqlRuntimeDependencies,
+    "acquireMutationGuard" | "acquirePublicationLock"
+  >>,
+) {
   let poolError: (() => void) | undefined;
   const release = vi.fn();
-  const query = vi.fn((input: unknown) => queryImplementation?.(input) ?? result([]));
+  const query = vi.fn((input: unknown) => {
+    if (
+      typeof input === "object"
+      && input !== null
+      && "text" in input
+      && input.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE"
+    ) {
+      return result([]);
+    }
+    return queryImplementation?.(input) ?? result([]);
+  });
   const poolClient = { query, release } as unknown as PoolClient;
   const connect = vi.fn(async () => poolClient);
   const end = vi.fn(async () => undefined);
@@ -138,6 +155,9 @@ function fixtures(queryImplementation?: (input: unknown) => unknown) {
     createPool: vi.fn(() => pool),
     createClient: vi.fn(() => cancelClient),
     buildConfig,
+    acquireMutationGuard: vi.fn(async () => undefined),
+    acquirePublicationLock: vi.fn(async () => undefined),
+    ...admission,
   };
   const runtime = new PostgreSqlRuntime(SETTINGS, dependencies);
   return {
@@ -164,6 +184,323 @@ describe("PostgreSQL runtime", () => {
     expect(client).toBeDefined();
     await pool.end();
     await client.end();
+  });
+
+  it("normalizes complete scopes and admits every project before callbacks", async () => {
+    const admitted: string[] = [];
+    const acquireMutationGuard = vi.fn(async (
+      executor: PostgreSqlQueryExecutor,
+      projectId: string,
+      options: PostgreSqlQueryOptions,
+    ) => {
+      admitted.push(projectId);
+      await executor.query({ text: `GUARD ${projectId}` }, options);
+    });
+    const f = fixtures(
+      (input) => typeof input === "string" ? result([]) : result([]),
+      { acquireMutationGuard },
+    );
+    const callback = vi.fn(async (transaction: PostgreSqlTransactionScopeExecutor) => {
+      await transaction.query({ text: "BUSINESS" }, {
+        domain: "sessions",
+        operation: "business",
+        projectIds: ["project-a"],
+      });
+    });
+    await f.runtime.transaction(callback, {
+      domain: "transaction",
+      operation: "multi-project",
+      projectIds: ["project-a", "PROJECT-B"],
+    });
+    expect(admitted).toEqual(["project-a", "project-b"]);
+    expect(callback).toHaveBeenCalledOnce();
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      { text: "GUARD project-a" },
+      { text: "GUARD project-b" },
+      { text: "BUSINESS" },
+      "COMMIT",
+    ]);
+  });
+
+  it("allows projectless raw queries inside an admitted project transaction", async () => {
+    const f = fixtures(undefined, { acquireMutationGuard: vi.fn(async () => undefined) });
+
+    await f.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "PROJECTLESS RAW QUERY" }, {
+        domain: "migrations",
+        operation: "projectlessRawQuery",
+      });
+    }, {
+      domain: "transaction",
+      operation: "project-scoped-root",
+      projectId: "project-a",
+    });
+
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      { text: "PROJECTLESS RAW QUERY" },
+      "COMMIT",
+    ]);
+  });
+
+  it("rejects unsorted, duplicate, mismatched, and enlarged scopes", async () => {
+    const acquireMutationGuard = vi.fn(async () => undefined);
+    const f = fixtures(undefined, { acquireMutationGuard });
+    for (const options of [
+      { domain: "transaction", operation: "unsorted", projectIds: ["b", "a"] },
+      { domain: "transaction", operation: "duplicate", projectIds: ["a", "a"] },
+      {
+        domain: "transaction",
+        operation: "mismatch",
+        projectId: "a",
+        projectIds: ["b"],
+      },
+    ]) {
+      await expect(f.runtime.transaction(async () => undefined, options))
+        .rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+    }
+    const f2 = fixtures(undefined, { acquireMutationGuard });
+    await expect(f2.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "enlarged" }, {
+        domain: "sessions",
+        operation: "enlarged",
+        projectIds: ["a", "c"],
+      });
+    }, {
+      domain: "transaction",
+      operation: "root",
+      projectIds: ["a", "b"],
+    })).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+    expect(acquireMutationGuard).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects malformed scope values and transaction-only options in child queries", async () => {
+    const f = fixtures(undefined, { acquireMutationGuard: vi.fn(async () => undefined) });
+    for (const options of [
+      { domain: "transaction", operation: "empty", projectId: "" },
+      { domain: "transaction", operation: "number", projectId: 1 as never },
+      { domain: "transaction", operation: "scope-number", projectIds: "a" as never },
+      { domain: "transaction", operation: "scope-empty", projectIds: [""] },
+    ]) {
+      await expect(f.runtime.transaction(async () => undefined, options))
+        .rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+    }
+    await expect(f.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "invalid-child" }, {
+        domain: "sessions",
+        operation: "invalid-child",
+        projectId: "a",
+        transactionMode: "read-committed-read-write",
+      } as never);
+    }, {
+      domain: "transaction",
+      operation: "child-mode",
+      projectIds: ["a"],
+    })).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+    await expect(f.runtime.transaction(async () => undefined, {
+      domain: "transaction",
+      operation: "invalid-mode",
+      transactionMode: "unsupported" as never,
+    })).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+
+    await expect(fixtures().runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "omitted project scope" }, {
+        domain: "sessions",
+        operation: "omitted project scope",
+        projectIds: ["a"],
+        machineId: "machine-a",
+      });
+    }, { domain: "transaction", operation: "projectless-root" }))
+      .rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+  });
+
+  it("allows a strict projectless transaction and snapshots optional root metadata", async () => {
+    const f = fixtures(undefined, { acquireMutationGuard: vi.fn(async () => undefined) });
+    await f.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "projectless" }, {
+        domain: "sessions",
+        operation: "projectless",
+      });
+    }, {
+      domain: "transaction",
+      operation: "projectless-root",
+      machineId: "machine-root",
+    });
+    const withMetadata = fixtures(undefined, { acquireMutationGuard: vi.fn(async () => undefined) });
+    await withMetadata.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "metadata" }, {
+        domain: "sessions",
+        operation: "metadata",
+        projectId: "a",
+        machineId: "machine-child",
+      });
+    }, {
+      domain: "transaction",
+      operation: "metadata-root",
+      projectId: "a",
+      machineId: "machine-root",
+    });
+    const abortedChild = new AbortController();
+    abortedChild.abort();
+    const abortedScope = fixtures(undefined, { acquireMutationGuard: vi.fn(async () => undefined) });
+    await expect(abortedScope.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "aborted-child" }, {
+        domain: "sessions",
+        operation: "aborted-child",
+        projectId: "a",
+        signal: abortedChild.signal,
+      });
+    }, {
+      domain: "transaction",
+      operation: "aborted-root",
+      projectId: "a",
+    })).rejects.toMatchObject({ operation: "aborted-child" });
+  });
+
+  it("exposes publication control with direct readback and fails closed without its lock hook", async () => {
+    const f = fixtures((input) => typeof input === "string" ? result([]) : result([]), {
+      acquirePublicationLock: undefined,
+    });
+    const guard = f.runtime.backendPublicationGuard();
+    await expect(guard.read({
+      projectId: "018f0000-0000-7000-8000-000000000001",
+      targetBackend: "postgresql",
+      evidenceSha256: "a".repeat(64),
+    })).resolves.toBeNull();
+    await expect(guard.acquire({
+      projectId: "018f0000-0000-7000-8000-000000000001",
+      machineId: "018f0000-0000-7000-8000-000000000002",
+      publicationId: "publication",
+      targetBackend: "postgresql",
+      evidenceSha256: "a".repeat(64),
+      ttlMs: 1_000,
+    })).rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+
+    const publicationSignal = new AbortController().signal;
+    const missingLock = fixtures(
+      (input) => {
+        if (
+          typeof input === "object"
+          && input !== null
+          && "text" in input
+          && input.text === "PUBLICATION LOCK FAILURE"
+        ) {
+          throw new Error("publication lock failure");
+        }
+        return result([]);
+      },
+      {
+        acquirePublicationLock: vi.fn(async (
+          executor,
+          _projectId,
+          options,
+        ) => {
+          await executor.query({ text: "PUBLICATION LOCK FAILURE" }, options);
+        }),
+      },
+    );
+    await expect(missingLock.runtime.backendPublicationGuard().acquire({
+      projectId: "018f0000-0000-7000-8000-000000000001",
+      machineId: "018f0000-0000-7000-8000-000000000002",
+      publicationId: "publication",
+      targetBackend: "postgresql",
+      evidenceSha256: "a".repeat(64),
+      ttlMs: 1_000,
+      signal: publicationSignal,
+    })).rejects.toMatchObject({ operation: "acquireBackendPublication" });
+
+    const noSignalLock = fixtures(undefined, {
+      acquirePublicationLock: vi.fn(async () => {
+        throw new Error("no-signal publication lock failure");
+      }),
+    });
+    await expect(noSignalLock.runtime.backendPublicationGuard().acquire({
+      projectId: "018f0000-0000-7000-8000-000000000001",
+      machineId: "018f0000-0000-7000-8000-000000000002",
+      publicationId: "publication",
+      targetBackend: "postgresql",
+      evidenceSha256: "a".repeat(64),
+      ttlMs: 1_000,
+    })).rejects.toMatchObject({ operation: "acquireBackendPublication" });
+
+    const successfulPublication = fixtures(undefined, {
+      acquirePublicationLock: vi.fn(async () => undefined),
+    });
+    await expect(successfulPublication.runtime.backendPublicationGuard().acquire({
+      projectId: "018f0000-0000-7000-8000-000000000001",
+      machineId: "018f0000-0000-7000-8000-000000000002",
+      publicationId: "publication",
+      targetBackend: "postgresql",
+      evidenceSha256: "a".repeat(64),
+      ttlMs: 1_000,
+    })).rejects.toMatchObject({ reason: "invalid-row" });
+
+    const admittedSignal = new AbortController().signal;
+    const admitted = fixtures(undefined, {
+      acquireMutationGuard: vi.fn(async () => undefined),
+    });
+    await admitted.runtime.transaction(async () => undefined, {
+      domain: "transaction",
+      operation: "signal-admission",
+      projectId: "a",
+      signal: admittedSignal,
+    });
+  });
+
+  it("records failures raised while acquiring shared admission", async () => {
+    const acquireMutationGuard = vi.fn(async (executor: PostgreSqlQueryExecutor, _projectId: string, options: PostgreSqlQueryOptions) => {
+      await executor.query({ text: "GUARD FAILURE" }, options);
+    });
+    const f = fixtures((input) => {
+      if (
+        typeof input === "object"
+        && input !== null
+        && "text" in input
+        && input.text === "GUARD FAILURE"
+      ) {
+        throw Object.assign(new Error("guard failed"), { code: "23505" });
+      }
+      return result([]);
+    }, { acquireMutationGuard });
+    await expect(f.runtime.transaction(async () => undefined, {
+      domain: "transaction",
+      operation: "guard-failure",
+      projectId: "a",
+    })).rejects.toMatchObject({ operation: "guard-failure", retryable: false });
+  });
+
+  it("auto-admits project-scoped queries while leaving projectless health queries direct", async () => {
+    const acquireMutationGuard = vi.fn(async (
+      executor: PostgreSqlQueryExecutor,
+      _projectId: string,
+      options: PostgreSqlQueryOptions,
+    ) => {
+      await executor.query({ text: "GUARD" }, options);
+    });
+    const f = fixtures(
+      (input) => typeof input === "string" ? result([]) : result([{ value: 1 }]),
+      { acquireMutationGuard },
+    );
+    await expect(f.runtime.query({ text: "SELECT scoped" }, {
+      domain: "sessions",
+      operation: "scoped",
+      projectId: "a",
+    })).resolves.toMatchObject({ rows: [{ value: 1 }] });
+    await expect(f.runtime.query({ text: "SELECT projectless" }, {
+      domain: "factory",
+      operation: "health",
+    })).resolves.toMatchObject({ rows: [{ value: 1 }] });
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      { text: "GUARD" },
+      { text: "SELECT scoped" },
+      "COMMIT",
+      { text: "SELECT projectless" },
+    ]);
   });
 
   it("constructs one bounded pool and runs parameterized queries", async () => {
@@ -220,11 +557,16 @@ describe("PostgreSQL runtime", () => {
     await expect(f.runtime.transaction(async (transaction) => {
       expect(transaction.transactionScope).toBe("active");
       const selected = await transaction.query<{ value: number }>({ text: "SELECT 2 AS value" }, {
-        domain: "sessions", operation: "inside",
+        domain: "sessions", operation: "inside", projectId: "project",
       });
       return selected.rows[0].value;
     }, { projectId: "project", domain: "transaction", operation: "commit" })).resolves.toBe(2);
-    expect(f.query.mock.calls.map(([input]) => input)).toEqual(["BEGIN", { text: "SELECT 2 AS value" }, "COMMIT"]);
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      { text: "SELECT 2 AS value" },
+      "COMMIT",
+    ]);
     expect(f.release).toHaveBeenCalledWith(false);
 
     const failed = fixtures((input) => typeof input === "string" ? result([]) : result([]));
@@ -244,7 +586,11 @@ describe("PostgreSQL runtime", () => {
         domain: "sessions",
         operation: "queryFailure",
       }),
-      { domain: "transaction", operation: "outerQueryFailure" },
+      {
+        domain: "transaction",
+        operation: "outerQueryFailure",
+        projectId: "query-project",
+      },
     )).rejects.toMatchObject({
       projectId: "query-project",
       domain: "sessions",
@@ -875,7 +1221,11 @@ describe("PostgreSQL runtime", () => {
         operation: "caughtFailure",
       }).catch(() => undefined);
       return "must not resolve";
-    }, { projectId: "outer-project", domain: "transaction", operation: "caughtFailureOuter" }))
+    }, {
+      projectIds: ["outer-project", "query-project"],
+      domain: "transaction",
+      operation: "caughtFailureOuter",
+    }))
       .rejects.toMatchObject({
         code: "STORAGE_OPERATION_FAILED",
         projectId: "query-project",
@@ -916,6 +1266,7 @@ describe("PostgreSQL runtime", () => {
       void transaction.query({ text: "UPDATE values_table SET value = 2" }, {
         domain: "sessions",
         operation: "unawaitedSuccess",
+        projectId: "outer-project",
       });
       return "committed";
     }, { projectId: "outer-project", domain: "transaction", operation: "drainSuccess" });
@@ -937,6 +1288,7 @@ describe("PostgreSQL runtime", () => {
     await expect(pending).resolves.toBe("committed");
     expect(f.query.mock.calls.map(([input]) => input)).toEqual([
       "BEGIN",
+      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
       { text: "UPDATE values_table SET value = 2" },
       "COMMIT",
     ]);
@@ -977,7 +1329,11 @@ describe("PostgreSQL runtime", () => {
         operation: "unawaitedFailure",
       }).catch(() => undefined);
       throw new Error("callback secret");
-    }, { projectId: "outer-project", domain: "transaction", operation: "callbackFailure" });
+    }, {
+      projectIds: ["outer-project", "query-project"],
+      domain: "transaction",
+      operation: "callbackFailure",
+    });
 
     await vi.waitFor(() => expect(f.query).toHaveBeenCalledWith({ text: "INSERT INTO values_table VALUES (4)" }));
     expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
@@ -1183,7 +1539,11 @@ describe("PostgreSQL runtime", () => {
     await f.runtime.transaction(async (transaction) => {
       retained = transaction;
     }, { projectId: "outer-project", domain: "transaction", operation: "retain" });
-    expect(f.query.mock.calls.map(([input]) => input)).toEqual(["BEGIN", "COMMIT"]);
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      "COMMIT",
+    ]);
 
     await expect(retained.query({ text: "SELECT 1" }, {
       projectId: "query-project", domain: "sessions", operation: "escaped",
@@ -1199,7 +1559,11 @@ describe("PostgreSQL runtime", () => {
       code: "STORAGE_TRANSACTION_SCOPE",
       projectId: "outer-project",
     });
-    expect(f.query.mock.calls.map(([input]) => input)).toEqual(["BEGIN", "COMMIT"]);
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([
+      "BEGIN",
+      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      "COMMIT",
+    ]);
   });
 
   it("fences queries queued behind a failed transaction query before they execute", async () => {
@@ -1211,7 +1575,7 @@ describe("PostgreSQL runtime", () => {
     let withoutProject!: Promise<unknown>;
     await expect(f.runtime.transaction(async (transaction) => {
       const failed = transaction.query({ text: "INSERT INTO first_table VALUES (1)" }, {
-        domain: "transaction", operation: "failed",
+        domain: "transaction", operation: "failed", projectId: "outer-project",
       });
       withProject = transaction.query({ text: "SELECT 1" }, {
         projectId: "queued-project", domain: "sessions", operation: "queuedWithProject",
@@ -1222,7 +1586,11 @@ describe("PostgreSQL runtime", () => {
       void withProject.catch(() => undefined);
       void withoutProject.catch(() => undefined);
       return failed;
-    }, { projectId: "outer-project", domain: "transaction", operation: "queueFailure" }))
+    }, {
+      projectIds: ["outer-project", "queued-project"],
+      domain: "transaction",
+      operation: "queueFailure",
+    }))
       .rejects.toMatchObject({ operation: "failed" });
 
     await expect(withProject).rejects.toMatchObject({

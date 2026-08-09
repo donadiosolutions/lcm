@@ -1,8 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
-import { createPromoteEventsNotifyHandler, PassiveEventProcessor, PASSIVE_EVENT_PROCESSOR_DEFAULTS } from "../../src/daemon/passive-event-processor.js";
+import {
+  createPromoteEventsNotifyHandler,
+  PassiveEventProcessor,
+  PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+  type BackgroundPublicationAdmission,
+} from "../../src/daemon/passive-event-processor.js";
 
 const config = () => loadDaemonConfig("/missing", { daemon: { port: 0 }, llm: { provider: "disabled" } });
+const testPublicationAdmission: BackgroundPublicationAdmission = async operation => operation({});
 
 function harness(overrides: Record<string, unknown> = {}) {
   const timers: Array<{ callback: () => void; ms: number; unref?: () => void }> = [];
@@ -14,15 +20,27 @@ function harness(overrides: Record<string, unknown> = {}) {
     setTimeout: vi.fn((callback: () => void, ms: number) => { const h = { callback, ms, unref: vi.fn() }; timers.push(h); return h; }),
     clearTimeout: vi.fn(),
     setInterval: vi.fn((callback: () => void, ms: number) => { const h = { callback, ms, unref: vi.fn() }; intervals.push(h); return h; }),
-    clearInterval: vi.fn(), safeLogError: log, ...overrides,
+    clearInterval: vi.fn(), safeLogError: log,
+    withPublicationAdmission: testPublicationAdmission,
+    ...overrides,
   };
   return { processor: new PassiveEventProcessor(config(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, deps as never), deps, timers, intervals, log };
 }
 
 describe("passive event processor boundary coverage", () => {
-  it("uses production dependencies when no test seams are supplied", () => {
-    const processor = new PassiveEventProcessor(config());
+  it("uses production dependencies with an explicit test admission seam", () => {
+    const processor = new PassiveEventProcessor(config(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      withPublicationAdmission: testPublicationAdmission,
+    });
     processor.stop();
+  });
+
+  it("fails closed when the publication admission seam is absent", () => {
+    expect(() => new PassiveEventProcessor(
+      config(),
+      PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+      undefined as never,
+    )).toThrow(TypeError);
   });
 
   it("ignores work after stop and logs rejected periodic and startup sweeps", async () => {

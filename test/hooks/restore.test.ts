@@ -7,8 +7,20 @@ import {
   sessionLockPathForTesting,
   tryAcquireSessionLockForTesting,
 } from "../../src/hooks/restore.js";
+import { eventsDbPath } from "../../src/db/events-path.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
 import * as storageBackend from "../../src/storage/backend.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+
+const securityFilesMock = vi.hoisted(() => ({
+  assertPrivateDirectory: vi.fn(),
+}));
+
+vi.mock("../../src/security-files.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/security-files.js")>();
+  securityFilesMock.assertPrivateDirectory.mockImplementation(actual.assertPrivateDirectory);
+  return { ...actual, assertPrivateDirectory: securityFilesMock.assertPrivateDirectory };
+});
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn(),
@@ -99,12 +111,45 @@ describe("handleSessionStart", () => {
     }
   });
 
+  it("rethrows publication journal errors during storage selection", async () => {
+    const publicationError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "publication remains unresolved",
+    );
+    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend")
+      .mockImplementationOnce(() => { throw publicationError; });
+    try {
+      await expect(handleSessionStart("{}", { post: vi.fn() })).rejects.toBe(publicationError);
+    } finally {
+      selectStorageBackend.mockRestore();
+    }
+  });
+
   it("fails open when daemon admission throws", async () => {
     mockEnsureDaemon.mockRejectedValueOnce(new Error("admission failed"));
     await expect(handleSessionStart("{}", { post: vi.fn() })).resolves.toEqual({
       exitCode: 0,
       stdout: "",
     });
+  });
+
+  it("fails open when daemon admission reports missing publication evidence", async () => {
+    mockEnsureDaemon.mockRejectedValueOnce(new BackendPublicationJournalError(
+      "publication-evidence-missing",
+      "publication evidence is absent",
+    ));
+    const client = { post: vi.fn() };
+    await expect(handleSessionStart("{}", client)).resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it("rethrows unresolved publication from daemon admission", async () => {
+    const publicationError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "publication remains unresolved",
+    );
+    mockEnsureDaemon.mockRejectedValueOnce(publicationError);
+    await expect(handleSessionStart("{}", { post: vi.fn() })).rejects.toBe(publicationError);
   });
 
   it("outputs context and exits 0 on success", async () => {
@@ -290,6 +335,60 @@ describe("handleSessionStart", () => {
     };
     await handleSessionStart(JSON.stringify({ session_id: "s4", cwd: "/proj" }), client);
     expect(mockFirePromote).toHaveBeenCalledWith(3737, { cwd: "/proj" });
+  });
+
+  it("continues after an ordinary scavenge witness change", async () => {
+    let admissionComplete = false;
+    let scavengeProbeUsed = false;
+    const originalAssert = securityFilesMock.assertPrivateDirectory.getMockImplementation()!;
+    const assert = securityFilesMock.assertPrivateDirectory.mockImplementation((handle, path, expected) => {
+      const actual = originalAssert(handle, path, expected);
+      if (admissionComplete && !scavengeProbeUsed) {
+        scavengeProbeUsed = true;
+        return { ...actual, mode: actual.mode === 0o700 ? 0o755 : 0o700 };
+      }
+      return actual;
+    });
+    mockEnsureDaemon.mockImplementationOnce(async () => {
+      admissionComplete = true;
+      return { connected: true, port: 3737, spawned: false };
+    });
+    const client = { post: vi.fn().mockResolvedValue({ context: "context after scavenge" }) };
+    try {
+      await expect(handleSessionStart(JSON.stringify({ session_id: "witness-restore", cwd: "/proj" }), client))
+        .resolves.toEqual({ exitCode: 0, stdout: "context after scavenge" });
+    } finally {
+      assert.mockImplementation(originalAssert);
+      rmSync(sessionLockPathForTesting("witness-restore"), { force: true });
+    }
+  });
+
+  it("swallows an ordinary scavenge error before restoring", async () => {
+    vi.mocked(eventsDbPath).mockImplementationOnce(function () { throw new Error("scavenge failed"); });
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = { post: vi.fn().mockResolvedValue({ context: "context after failed scavenge" }) };
+    try {
+      await expect(handleSessionStart(JSON.stringify({ session_id: "ordinary-scavenge", cwd: "/proj" }), client))
+        .resolves.toEqual({ exitCode: 0, stdout: "context after failed scavenge" });
+    } finally {
+      rmSync(sessionLockPathForTesting("ordinary-scavenge"), { force: true });
+    }
+  });
+
+  it("rethrows a publication journal error from scavenge", async () => {
+    const publicationError = new BackendPublicationJournalError(
+      "malformed-journal",
+      "publication journal is malformed",
+    );
+    vi.mocked(eventsDbPath).mockImplementationOnce(function () { throw publicationError; });
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    try {
+      await expect(handleSessionStart(JSON.stringify({ session_id: "journal-scavenge", cwd: "/proj" }), {
+        post: vi.fn(),
+      })).rejects.toBe(publicationError);
+    } finally {
+      rmSync(sessionLockPathForTesting("journal-scavenge"), { force: true });
+    }
   });
 
   it("fails closed when an existing lock has an invalid owner pid", async () => {

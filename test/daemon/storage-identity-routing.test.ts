@@ -3,7 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DaemonConfig, ResolvedStorageConfig } from "../../src/daemon/config.js";
-import { createCompactHandler } from "../../src/daemon/routes/compact.js";
+import {
+  createCompactHandler as createCompactHandlerProduction,
+} from "../../src/daemon/routes/compact.js";
+import type {
+  RouteExecutionContext,
+  RouteHandler,
+  RoutePublicationAdmission,
+} from "../../src/daemon/server.js";
 import { createIngestHandler } from "../../src/daemon/routes/ingest.js";
 import { createStoreHandler } from "../../src/daemon/routes/store.js";
 import {
@@ -23,6 +30,21 @@ import type {
 import * as storageFactoryModule from "../../src/storage/factory.js";
 import { UnavailablePostgreSqlStorageBackendFactory } from "../../src/storage/factory.js";
 import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
+import { withBackendPublicationConsumerLockAsync } from "../../src/storage/backend-publication.js";
+
+const testPublicationAdmission: RoutePublicationAdmission = operation =>
+  withBackendPublicationConsumerLockAsync(process.env.HOME, operation, { allowUnresolved: true });
+const testCompactContext: RouteExecutionContext = {
+  withPublicationAdmission: testPublicationAdmission,
+};
+
+function createCompactHandler(
+  config: DaemonConfig,
+  factory?: StorageBackendFactory,
+): RouteHandler {
+  const handler = createCompactHandlerProduction(config, factory);
+  return (req, res, body, context = testCompactContext) => handler(req, res, body, context);
+}
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const PROJECT_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
@@ -102,7 +124,7 @@ describe("daemon storage identity routing", () => {
       canonical: cwd,
       remoteProjectId: PROJECT_ID,
       machineId: MACHINE_ID,
-    });
+    }, undefined);
     expect(response.writeHead).toHaveBeenCalledWith(200, {
       "Content-Type": "application/json",
     });
@@ -140,8 +162,16 @@ describe("daemon storage identity routing", () => {
     expect(UNBOUND_POSTGRESQL_PROJECT_MESSAGE).not.toContain(cwd);
   });
 
-  it("validates PostgreSQL identity before constructing the unavailable default factory", async () => {
+  it("validates PostgreSQL identity before opening the unavailable default factory", async () => {
     resolveProjectIdentity(cwd);
+    const realCreateStorageBackendFactory = storageFactoryModule.createStorageBackendFactory;
+    vi.spyOn(storageFactoryModule, "createStorageBackendFactory").mockImplementation(
+      (storageConfig, homeDir) => realCreateStorageBackendFactory(
+        storageConfig,
+        homeDir,
+        () => undefined,
+      ),
+    );
     const response = {
       writeHead: vi.fn(),
       end: vi.fn(),

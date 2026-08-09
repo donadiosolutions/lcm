@@ -69,6 +69,7 @@ vi.mock("../../../src/security-files.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../../src/security-files.js")>()),
   readBoundedRegularFile: (path: string) => {
     state.instructionPaths.push(path);
+    if (path === "/does-not-exist") return "{}";
     if (state.instructionContent !== undefined) return state.instructionContent;
     throw Object.assign(new Error("missing"), { code: "ENOENT" });
   },

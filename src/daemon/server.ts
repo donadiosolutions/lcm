@@ -1,6 +1,13 @@
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type OutgoingHttpHeaders,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import type { AddressInfo } from "node:net";
-import type { DaemonConfig } from "./config.js";
+import { dirname } from "node:path";
+import { parseDaemonConfig, resolveDaemonConfigEnv, type DaemonConfig } from "./config.js";
 import { sanitizeError } from "./safe-error.js";
 import { stagedPostgreSqlUnavailablePayload } from "./staged-postgresql.js";
 import { readAuthToken } from "./auth.js";
@@ -23,6 +30,7 @@ import {
   createPromoteEventsNotifyHandler,
   PASSIVE_EVENT_PROCESSOR_DEFAULTS,
   PassiveEventProcessor,
+  type BackgroundPublicationAdmission,
 } from "./passive-event-processor.js";
 import { createStatsHandler } from "./routes/stats.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
@@ -34,13 +42,53 @@ import {
   isDaemonLifecycleTestIdentity,
   isVitestWorkerEntrypoint,
 } from "./lifecycle-scope.js";
-import { projectsDir as lcmProjectsDir } from "../runtime-paths.js";
+import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
 import { createStorageBackendFactory } from "../storage/index.js";
+import { assertStorageBackendPublication } from "../storage/backend.js";
+import { readBoundedRegularFile } from "../security-files.js";
+import {
+  assertBackendPublicationConfigAccess,
+  BackendPublicationJournalError,
+  backendPublicationHomeForConfigPath,
+  type BackendPublicationLockToken,
+  withBackendPublicationConsumerLockAsync,
+} from "../storage/backend-publication.js";
 export { PKG_VERSION };
 
-export type RouteHandler = (req: IncomingMessage, res: ServerResponse, body: string) => Promise<void>;
-export type DaemonInstance = { address: () => AddressInfo; stop: () => Promise<void>; registerRoute: (method: string, path: string, handler: RouteHandler) => void; idleTriggered: boolean };
+export type RoutePublicationAdmission = <T>(
+  operation: (publicationLockToken: BackendPublicationLockToken) => Promise<T> | T,
+) => Promise<T>;
+
+export type RouteExecutionContext = Readonly<{
+  publicationLockToken?: BackendPublicationLockToken;
+  withPublicationAdmission?: RoutePublicationAdmission;
+}>;
+export type RouteHandler = (
+  req: IncomingMessage,
+  res: ServerResponse,
+  body: string,
+  context?: RouteExecutionContext,
+) => Promise<void>;
+export type RouteAdmission = "read" | "mutating";
+type BuiltInRoutePublicationMode = "retained" | "operation-scoped";
+type RegisteredRoute = Readonly<{
+  handler: RouteHandler;
+  admission: RouteAdmission;
+  publicationMode: BuiltInRoutePublicationMode;
+}>;
+export type DaemonInstance = {
+  address: () => AddressInfo;
+  stop: () => Promise<void>;
+  /**
+   * Runtime overrides inherit a built-in route's admission classification.
+   * New routes are short-admitted by default and may opt into retained
+   * mutation admission with the optional fourth argument. Existing mutators
+   * cannot be downgraded by an override.
+   */
+  registerRoute: (method: string, path: string, handler: RouteHandler, admission?: RouteAdmission) => void;
+  idleTriggered: boolean;
+};
 export type DaemonOptions = {
   proxyManager?: ProxyManager;
   onIdle?: () => void;
@@ -50,16 +98,24 @@ export type DaemonOptions = {
   /** @internal Deterministic idle-timer seams for lifecycle tests. */
   _clearTimeout?: typeof clearTimeout;
   /** @internal Deterministic periodic-ingest seam for lifecycle tests. */
-  _scanForTranscripts?: () => Promise<void>;
+  _scanForTranscripts?: (withPublicationAdmission: BackgroundPublicationAdmission) => Promise<void>;
   /** @internal Deterministic packaged-runtime identity seam for health tests. */
   _runtimeDigest?: string;
   /** @internal Explicit owned daemon identity for lifecycle isolation tests. */
   _testIdentity?: DaemonLifecycleTestIdentity;
   /** @internal Deterministic auth-token read seam for preflight ordering tests. */
   _readAuthToken?: typeof readAuthToken;
+  /** Canonical daemon config path used for request-time publication admission. */
+  publicationConfigPath?: string;
+  /** @internal Test-only publication admission seam. */
+  _assertBackendPublication?: (homeDir: string | undefined, backend: DaemonConfig["storage"]["backend"]) => void;
+  /** @internal Test-only observer for the closed built-in route registry. */
+  _onBuiltInRouteRegistered?: (key: string, admission: RouteAdmission) => void;
 };
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_REQUEST_CONFIG_BYTES = 4 * 1024 * 1024;
+const MAX_MUTATING_RESPONSE_BYTES = MAX_BODY_BYTES;
 
 export function claudeProjectDirName(cwd: string): string {
   const sanitized = cwd
@@ -110,6 +166,112 @@ export function sendJson(res: ServerResponse, status: number, data: unknown): vo
   res.end(body);
 }
 
+type BufferedHeaderValue = number | string | string[];
+type BufferedHeader = Readonly<{ name: string; value: BufferedHeaderValue }>;
+
+function responseHeadersSentError(): Error & { code: string } {
+  return Object.assign(new Error("Cannot set headers after they are sent to the client"), {
+    code: "ERR_HTTP_HEADERS_SENT",
+  });
+}
+
+function responseWriteAfterEndError(): Error & { code: string } {
+  return Object.assign(new Error("write after end"), { code: "ERR_STREAM_WRITE_AFTER_END" });
+}
+
+/**
+ * Mutating handlers run under a retained publication permit. Their response
+ * must not reach the client until that permit's post-callback revalidation has
+ * completed, so this bounded response mirrors the response methods used by
+ * route handlers while keeping the real transport untouched.
+ */
+class BufferedServerResponse {
+  private readonly headers = new Map<string, BufferedHeader>();
+  private readonly chunks: Buffer[] = [];
+  private bodyBytes = 0;
+  private started = false;
+  private ended = false;
+  private statusCode = 200;
+
+  public constructor(private readonly actual: ServerResponse) {}
+
+  public setHeader(name: string, value: number | string | readonly string[]): this {
+    if (this.started) throw responseHeadersSentError();
+    const normalizedValue: BufferedHeaderValue = typeof value === "string" || typeof value === "number"
+      ? value
+      : [...value];
+    this.headers.set(name.toLowerCase(), { name, value: normalizedValue });
+    return this;
+  }
+
+  public getHeader(name: string): BufferedHeaderValue | undefined {
+    return this.headers.get(name.toLowerCase())?.value;
+  }
+
+  public removeHeader(name: string): void {
+    if (this.started) throw responseHeadersSentError();
+    this.headers.delete(name.toLowerCase());
+  }
+
+  public writeHead(statusCode: number, headers?: OutgoingHttpHeaders): this {
+    if (this.started) throw responseHeadersSentError();
+    if (!Number.isInteger(statusCode) || statusCode < 100 || statusCode > 999) {
+      throw new RangeError(`Invalid status code: ${statusCode}`);
+    }
+    this.statusCode = statusCode;
+    for (const [name, value] of Object.entries(headers ?? {})) {
+      if (value !== undefined) this.setHeader(name, value);
+    }
+    this.started = true;
+    return this;
+  }
+
+  public write(
+    chunk: string | Uint8Array,
+    encoding?: BufferEncoding,
+  ): boolean {
+    if (this.ended) throw responseWriteAfterEndError();
+    const bufferedChunk = typeof chunk === "string" ? Buffer.from(chunk, encoding) : Buffer.from(chunk);
+    if (this.bodyBytes + bufferedChunk.byteLength > MAX_MUTATING_RESPONSE_BYTES) {
+      throw Object.assign(new Error("mutating response exceeds the response size limit"), { statusCode: 500 });
+    }
+    this.chunks.push(bufferedChunk);
+    this.bodyBytes += bufferedChunk.byteLength;
+    this.started = true;
+    return true;
+  }
+
+  public end(chunk?: string | Uint8Array, encoding?: BufferEncoding): this {
+    if (this.ended) throw responseWriteAfterEndError();
+    if (chunk !== undefined) this.write(chunk, encoding);
+    this.started = true;
+    this.ended = true;
+    return this;
+  }
+
+  public discard(): void {
+    this.headers.clear();
+    this.chunks.length = 0;
+    this.bodyBytes = 0;
+  }
+
+  public flush(): void {
+    const headers: OutgoingHttpHeaders = {};
+    for (const { name, value } of this.headers.values()) headers[name] = value;
+    this.actual.writeHead(this.statusCode, headers);
+    this.actual.end(Buffer.concat(this.chunks));
+  }
+}
+
+function isResponseWritable(res: ServerResponse): boolean {
+  return !res.headersSent && !res.writableEnded && !res.destroyed && res.writable !== false;
+}
+
+function sendJsonIfWritable(res: ServerResponse, status: number, data: unknown): void {
+  if (!isResponseWritable(res)) return;
+  sendJson(res, status, data);
+}
+
 function clearIdleTimer(timer: ReturnType<typeof setTimeout> | null, clearTimer: typeof clearTimeout): null {
   if (timer) clearTimer(timer);
   return null;
@@ -119,6 +281,45 @@ function stagedPostgreSqlUnavailableHandler(operation: string): RouteHandler {
   return async (_req, res) => {
     sendJson(res, 503, stagedPostgreSqlUnavailablePayload(operation));
   };
+}
+
+/** Revalidate config/publication state before each route or scheduled scan. */
+function assertDaemonRequestStorageAdmission(
+  startupConfig: DaemonConfig,
+  publicationConfigPath: string,
+  lockToken?: BackendPublicationLockToken,
+): void {
+  let content: string;
+  let observedContent: string | null;
+  try {
+    content = readBoundedRegularFile(publicationConfigPath, {
+      allowedRoot: dirname(publicationConfigPath),
+      maxBytes: MAX_REQUEST_CONFIG_BYTES,
+    });
+    observedContent = content;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    content = "{}";
+    observedContent = null;
+  }
+  const requestConfig = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
+  if (requestConfig.storage.backend !== startupConfig.storage.backend) {
+    throw new BackendPublicationJournalError(
+      "unexpected-state",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+  }
+  assertBackendPublicationConfigAccess(
+    publicationConfigPath,
+    requestConfig.storage.backend,
+    observedContent,
+    undefined,
+    lockToken,
+  );
+  assertStorageBackendPublication({
+    backend: requestConfig.storage.backend,
+    homeDir: backendPublicationHomeForConfigPath(publicationConfigPath),
+  }, lockToken);
 }
 
 async function settleCleanup(callback: () => void | Promise<void>): Promise<void> {
@@ -157,7 +358,37 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   if (options?.tokenPath && serverToken === null) {
     throw new Error(`Auth token file specified but could not be read: ${options.tokenPath}`);
   }
-  const storageFactory = createStorageBackendFactory(config.storage);
+  const publicationConfigPath = options?.publicationConfigPath ?? defaultConfigPath();
+  const publicationHome = backendPublicationHomeForConfigPath(publicationConfigPath);
+  const assertRequestAdmission = (lockToken?: BackendPublicationLockToken): void => {
+    if (options?._assertBackendPublication !== undefined) {
+      options._assertBackendPublication(publicationHome, config.storage.backend);
+      return;
+    }
+    assertDaemonRequestStorageAdmission(config, publicationConfigPath, lockToken);
+  };
+  const withBackgroundPublicationAdmission: BackgroundPublicationAdmission = async operation =>
+    withBackendPublicationConsumerLockAsync(publicationHome, async publicationLockToken => {
+      assertRequestAdmission(publicationLockToken);
+      return operation(publicationLockToken);
+    });
+  const withRequestPublicationAdmission = (
+    retainedToken: BackendPublicationLockToken,
+  ): RoutePublicationAdmission => async operation => withBackendPublicationConsumerLockAsync(
+    publicationHome,
+    async publicationLockToken => {
+      assertRequestAdmission(publicationLockToken);
+      return operation(publicationLockToken);
+    },
+    { lockToken: retainedToken },
+  );
+  const storageFactory = createStorageBackendFactory(
+    config.storage,
+    publicationHome,
+    options?._assertBackendPublication === undefined
+      ? undefined
+      : ({ homeDir, backend }) => options._assertBackendPublication!(homeDir, backend),
+  );
   const sqliteStorage = config.storage.backend === "sqlite";
   let constructedProcessor: PassiveEventProcessor | undefined;
   let constructedWatcher: ReturnType<typeof watchProjectMap> | undefined;
@@ -165,7 +396,19 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   let constructedIngestScan: Promise<void> | undefined;
   let startupCleanupStarted = false;
   try {
-  const routes = new Map<string, RouteHandler>();
+  const routes = new Map<string, RegisteredRoute>();
+
+  const registerBuiltInRoute = (
+    method: string,
+    path: string,
+    handler: RouteHandler,
+    admission: RouteAdmission,
+    publicationMode: BuiltInRoutePublicationMode = "retained",
+  ): void => {
+    const key = `${method} ${path}`;
+    routes.set(key, { handler, admission, publicationMode });
+    options?._onBuiltInRouteRegistered?.(key, admission);
+  };
 
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let idleTriggered = false;
@@ -183,7 +426,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }, idleTimeoutMs);
   }
 
-  routes.set("GET /health", async (req, res) => {
+  registerBuiltInRoute("GET", "/health", async (req, res) => {
     if (serverToken && req.headers.authorization === undefined) {
       sendJson(res, 200, {
         status: "ok",
@@ -215,42 +458,54 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         },
       }),
     });
-  });
-  routes.set("POST /compact", createCompactHandler(config, storageFactory));
-  routes.set("POST /promote", createPromoteHandler(config, storageFactory));
-  routes.set("POST /restore", createRestoreHandler(config, storageFactory));
-  routes.set("POST /grep", createGrepHandler(config, storageFactory));
-  routes.set("POST /search", createSearchHandler(config, storageFactory));
-  routes.set("POST /expand", createExpandHandler(config, storageFactory));
-  routes.set("POST /describe", createDescribeHandler(config, storageFactory));
-  routes.set("POST /store", createStoreHandler(config, storageFactory));
-  routes.set("POST /recent", createRecentHandler(config, storageFactory));
-  routes.set("POST /ingest", createIngestHandler(config, storageFactory));
-  routes.set("POST /prompt-search", createPromptSearchHandler(config, storageFactory));
-  routes.set("POST /session-complete", createSessionCompleteHandler(config, storageFactory));
+  }, "read");
+  registerBuiltInRoute(
+    "POST",
+    "/compact",
+    createCompactHandler(config, storageFactory),
+    "mutating",
+    "operation-scoped",
+  );
+  registerBuiltInRoute("POST", "/promote", createPromoteHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute("POST", "/restore", createRestoreHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute("POST", "/grep", createGrepHandler(config, storageFactory), "read");
+  registerBuiltInRoute("POST", "/search", createSearchHandler(config, storageFactory), "read");
+  registerBuiltInRoute("POST", "/expand", createExpandHandler(config, storageFactory), "read");
+  registerBuiltInRoute("POST", "/describe", createDescribeHandler(config, storageFactory), "read");
+  registerBuiltInRoute("POST", "/store", createStoreHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute("POST", "/recent", createRecentHandler(config, storageFactory), "read");
+  registerBuiltInRoute("POST", "/ingest", createIngestHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute("POST", "/prompt-search", createPromptSearchHandler(config, storageFactory), "read");
+  registerBuiltInRoute("POST", "/session-complete", createSessionCompleteHandler(config, storageFactory), "mutating");
   const passiveEventProcessor = new PassiveEventProcessor(
     config,
     PASSIVE_EVENT_PROCESSOR_DEFAULTS,
-    { storageFactory },
+    { storageFactory, withPublicationAdmission: withBackgroundPublicationAdmission },
   );
   constructedProcessor = passiveEventProcessor;
-  routes.set("POST /promote-events", createPromoteEventsHandler(config, storageFactory));
-  routes.set("POST /promote-events/all", createPromoteAllEventsHandler(config, storageFactory));
-  routes.set(
-    "POST /promote-events/notify",
+  registerBuiltInRoute("POST", "/promote-events", createPromoteEventsHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute("POST", "/promote-events/all", createPromoteAllEventsHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute(
+    "POST",
+    "/promote-events/notify",
     sqliteStorage
       ? createPromoteEventsNotifyHandler(passiveEventProcessor)
       : stagedPostgreSqlUnavailableHandler("promote-events-notify"),
+    "read",
   );
-  routes.set(
-    "GET /stats",
+  registerBuiltInRoute(
+    "GET",
+    "/stats",
     sqliteStorage ? createStatsHandler() : stagedPostgreSqlUnavailableHandler("stats"),
+    "read",
   );
-  routes.set(
-    "GET /stats/pool",
+  registerBuiltInRoute(
+    "GET",
+    "/stats/pool",
     sqliteStorage ? createPoolStatsHandler() : stagedPostgreSqlUnavailableHandler("pool stats"),
+    "read",
   );
-  routes.set("POST /review-stale", createReviewStaleHandler(config, storageFactory));
+  registerBuiltInRoute("POST", "/review-stale", createReviewStaleHandler(config, storageFactory), "mutating");
   // Status handler is registered after listen() when we know the actual port
   const projectMapWatcher = watchProjectMap();
   constructedWatcher = projectMapWatcher;
@@ -259,7 +514,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const INGEST_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
   const ingestHandler = createIngestHandler(config, storageFactory);
 
-  const scanForTranscripts = async () => {
+  const scanForTranscripts = async (withPublicationAdmission: BackgroundPublicationAdmission) => {
     try {
       const { readdirSync, existsSync, readFileSync } = await import("node:fs");
       const { join } = await import("node:path");
@@ -297,25 +552,35 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
               end: (data: string) => { response.body = data; },
             } as unknown as ServerResponse;
 
-            await ingestHandler(mockReq, mockRes, JSON.stringify({
-              session_id: sessionId,
-              cwd: scanCwd,
-              transcript_path: transcriptPath,
-            }));
+            await withPublicationAdmission(async publicationLockToken => {
+              await ingestHandler(mockReq, mockRes, JSON.stringify({
+                session_id: sessionId,
+                cwd: scanCwd,
+                transcript_path: transcriptPath,
+              }), { publicationLockToken });
+            });
           }
         }
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof BackendPublicationJournalError) throw error;
       // non-fatal: periodic scan failure shouldn't crash daemon
     }
   };
 
   let activeIngestScan: Promise<void> | undefined;
-  const runTranscriptScan = (): Promise<void> => {
+  const runScheduledTranscriptScan = (): Promise<void> => {
     if (activeIngestScan) return activeIngestScan;
     const scan = Promise.resolve()
-      .then(() => (options?._scanForTranscripts ?? scanForTranscripts)())
-      .catch(() => undefined)
+      .then(() => {
+        return (options?._scanForTranscripts ?? scanForTranscripts)(withBackgroundPublicationAdmission);
+      })
+      .catch((error: unknown) => {
+        if (error instanceof BackendPublicationJournalError) {
+          console.warn("[lcm] periodic transcript scan blocked by backend publication admission");
+        }
+        return undefined;
+      })
       .finally(() => {
         activeIngestScan = undefined;
         constructedIngestScan = undefined;
@@ -326,7 +591,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   };
 
   const ingestInterval = sqliteStorage
-    ? setInterval(runTranscriptScan, INGEST_INTERVAL_MS)
+    ? setInterval(runScheduledTranscriptScan, INGEST_INTERVAL_MS)
     : undefined;
   constructedIngestInterval = ingestInterval;
   ingestInterval?.unref(); // don't prevent process exit
@@ -334,8 +599,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const server: Server = createServer(async (req, res) => {
     resetIdleTimer();
     const key = `${req.method} ${req.url?.split("?")[0]}`;
-    const handler = routes.get(key);
-    if (!handler) { sendJson(res, 404, { error: "not found" }); return; }
+    const route = routes.get(key);
+    if (!route) { sendJson(res, 404, { error: "not found" }); return; }
     // Public health is intentionally storage-free. Supplying credentials opts
     // into authenticated diagnostics and therefore must fail closed.
     if (serverToken) {
@@ -347,9 +612,52 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         return;
       }
     }
+    let bufferedResponse: BufferedServerResponse | undefined;
     try {
-      await handler(req, res, req.method !== "GET" ? await readBody(req) : "");
+      const body = req.method !== "GET" ? await readBody(req) : "";
+      if (route.admission === "mutating") {
+        if (route.publicationMode === "operation-scoped") {
+          await route.handler(req, res, body, {
+            withPublicationAdmission: withBackgroundPublicationAdmission,
+          });
+          return;
+        }
+        bufferedResponse = new BufferedServerResponse(res);
+        await withBackendPublicationConsumerLockAsync(publicationHome, async (lockToken) => {
+          assertRequestAdmission(lockToken);
+          await route.handler(req, bufferedResponse as unknown as ServerResponse, body, {
+            publicationLockToken: lockToken,
+            withPublicationAdmission: withRequestPublicationAdmission(lockToken),
+          });
+        });
+        bufferedResponse.flush();
+        bufferedResponse = undefined;
+      } else {
+        assertRequestAdmission();
+        await route.handler(req, res, body);
+      }
     } catch (err: unknown) {
+      if (bufferedResponse !== undefined) {
+        bufferedResponse.discard();
+        if (err instanceof BackendPublicationJournalError) {
+          sendJsonIfWritable(res, 503, {
+            status: "blocked",
+            error: "backend publication admission blocked",
+          });
+          return;
+        }
+        const status = (err as { statusCode?: number })?.statusCode ?? 500;
+        const message = status === 413 ? "payload too large" : sanitizeError(err instanceof Error ? err.message : "internal error");
+        sendJsonIfWritable(res, status, { error: message });
+        return;
+      }
+      if (err instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
+        });
+        return;
+      }
       const status = (err as { statusCode?: number })?.statusCode ?? 500;
       const message = status === 413 ? "payload too large" : sanitizeError(err instanceof Error ? err.message : "internal error");
       sendJson(res, status, { error: message });
@@ -397,11 +705,13 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const actualPort = addr.port;
 
       // Now that we know the actual port, register the status handler
-      routes.set(
-        "POST /status",
+      registerBuiltInRoute(
+        "POST",
+        "/status",
         sqliteStorage
           ? createStatusHandler(config, startTime, actualPort)
           : stagedPostgreSqlUnavailableHandler("status"),
+        "read",
       );
       if (sqliteStorage) passiveEventProcessor.start();
       else passiveEventProcessor.stop();
@@ -420,7 +730,15 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           await settleCleanup(() => new Promise<void>((r) => server.close(() => r())));
           await storageFactory.close();
         },
-        registerRoute: (method, path, handler) => routes.set(`${method} ${path}`, handler),
+        registerRoute: (method, path, handler, requestedAdmission) => {
+          const key = `${method} ${path}`;
+          const existing = routes.get(key);
+          const inheritedAdmission = existing?.admission ?? "read";
+          const admission = existing?.admission === "mutating"
+            ? "mutating"
+            : requestedAdmission ?? inheritedAdmission;
+          routes.set(key, { handler, admission, publicationMode: "retained" });
+        },
         get idleTriggered() { return idleTriggered; },
       });
     };

@@ -418,10 +418,14 @@ describe("lifecycle procfs and parent warnings", () => {
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "20"); ensureAuthToken(join(dir, "daemon.token"));
     proc(procRoot, 10, "Uid:\t1000\nPPid:\t1\n", "systemd --user");
     proc(procRoot, 20, daemonStatus, command);
+    const fetch = fetchHealthy(20);
+    // observeHttpHealth owns a real wall-clock deadline not controlled by
+    // _monotonicNowOverride, so pin performance.now for this 1 ms fixture.
+    vi.spyOn(performance, "now").mockReturnValue(0);
     const result = await ensureDaemon({
       port: 1, pidFilePath: pidPath, spawnTimeoutMs: 1, enforceUserManagerParent: true,
       expectedVersion: "1",
-      _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(20) as never,
+      _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetch as never,
       _isProcessAliveOverride: () => alive, _listeningPortsOverride: () => [1], _skipSpawn: true,
       _monotonicNowOverride: (): number => 0,
       _supervisorOverride: unavailableSupervisor(),
@@ -429,6 +433,9 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(result.connected).toBe(connected);
     if (warning) expect(result.warning).toContain(warning);
     else expect(result.warning).toBeUndefined();
+    if (_name === "parent") {
+      expect(fetch).toHaveBeenCalledTimes(3);
+    }
   });
 
   it("handles an unavailable current uid and a missing daemon cmdline", async () => {
@@ -618,6 +625,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
         _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
         _spawnOverride: vi.fn(() => ({ pid: undefined, once: vi.fn(), unref: vi.fn() })) as never, _skipHealthWait: true,
         _monotonicNowOverride: (): number => 0,
+        _assertBackendPublication: () => undefined,
       });
       expect(result.warning).not.toContain("credential setup failed");
     } finally {

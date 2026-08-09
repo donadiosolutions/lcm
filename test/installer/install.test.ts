@@ -14,10 +14,21 @@ import {
   type ServiceDeps,
 } from "../../installer/install.js";
 import { homedir } from "node:os";
+import { tmpdir } from "node:os";
+import {
+  chmodSync,
+  existsSync as fsExistsSync,
+  mkdirSync as fsMkdirSync,
+  mkdtempSync,
+  readFileSync as fsReadFileSync,
+  rmSync as fsRmSync,
+  writeFileSync as fsWriteFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { legacyLcmCommand, legacyLcmMcpServerName } from "../../src/legacy-names.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../../src/daemon/config.js";
 import { removeManagedClaudeHooks } from "../../src/installer/settings.js";
+import { OWNER_ONLY_FILE_MODES } from "../../src/security-files.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -277,7 +288,6 @@ describe("mergeClaudeSettings", () => {
     ]);
   });
 });
-
 describe("Claude MCP entry ownership", () => {
   const binary = "/opt/npm/bin/lcm";
   const node = "/opt/node/bin/node";
@@ -701,6 +711,96 @@ describe("install", () => {
     expect(atomicWritePrivateFile).not.toHaveBeenCalled();
   });
 
+  it("uses the bounded config reader inside the canonical publication lock", async () => {
+    const previousHome = process.env.HOME;
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-bounded-config-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    process.env.HOME = home;
+    fsMkdirSync(root, { mode: 0o700 });
+    chmodSync(root, 0o700);
+    fsWriteFileSync(configPath, "{}", { mode: 0o600 });
+    try {
+      const bounded = vi.fn((path: string) => fsReadFileSync(path, "utf-8"));
+      const deps = makeDeps({
+        existsSync: fsExistsSync,
+        readFileSync: fsReadFileSync,
+        writeFileSync: fsWriteFileSync,
+        mkdirSync: fsMkdirSync,
+        ensureLcmHome: vi.fn(),
+        readBoundedRegularFile: bounded as ServiceDeps["readBoundedRegularFile"],
+        ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
+      });
+
+      await expect(install(deps)).resolves.not.toThrow();
+      expect(bounded).toHaveBeenCalledWith(configPath, expect.objectContaining({
+        allowedRoot: root,
+        maxBytes: 4 * 1024 * 1024,
+        allowedModes: OWNER_ONLY_FILE_MODES,
+        requireSingleLink: true,
+      }));
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("creates a missing canonical config under the publication lock", async () => {
+    const previousHome = process.env.HOME;
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-canonical-create-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    process.env.HOME = home;
+    fsMkdirSync(root, { mode: 0o700 });
+    chmodSync(root, 0o700);
+    try {
+      const deps = makeDeps({
+        existsSync: fsExistsSync,
+        readFileSync: fsReadFileSync,
+        writeFileSync: fsWriteFileSync,
+        mkdirSync: fsMkdirSync,
+        ensureLcmHome: vi.fn(),
+        ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
+      });
+
+      await expect(install(deps)).resolves.not.toThrow();
+      expect(fsExistsSync(configPath)).toBe(true);
+      expect(JSON.parse(fsReadFileSync(configPath, "utf-8")).llm.provider).toBe("auto");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a canonical PostgreSQL config without completed publication evidence", async () => {
+    const previousHome = process.env.HOME;
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-canonical-postgres-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    process.env.HOME = home;
+    fsMkdirSync(root, { mode: 0o700 });
+    chmodSync(root, 0o700);
+    fsWriteFileSync(configPath, '{"storage":{"backend":"postgresql"}}', { mode: 0o600 });
+    try {
+      const deps = makeDeps({
+        existsSync: fsExistsSync,
+        readFileSync: fsReadFileSync,
+        writeFileSync: fsWriteFileSync,
+        mkdirSync: fsMkdirSync,
+        ensureLcmHome: vi.fn(),
+      });
+
+      await expect(install(deps)).rejects.toThrow("publication evidence");
+      expect(deps.ensureDaemon).not.toHaveBeenCalled();
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("fails installation when the LCM data root cannot be secured", async () => {
     const deps = makeDeps({
       chmodSync: vi.fn(() => { throw new Error("chmod failed"); }),
@@ -1028,7 +1128,9 @@ describe("install", () => {
   it("uses default filesystem operations for cache cleanup and command copies", async () => {
     const fs = await import("node:fs");
     const { legacyLcmSlug } = await import("../../src/legacy-names.js");
-    const home = homedir();
+    const previousHome = process.env.HOME;
+    const home = fs.mkdtempSync(join(tmpdir(), "lcm-installer-filesystem-"));
+    process.env.HOME = home;
     const lcmDir = join(home, ".lcm");
     const cacheDir = join(home, ".claude", "plugins", "cache", legacyLcmSlug(), "lcm");
     const claudeDir = join(home, ".claude");
@@ -1036,7 +1138,7 @@ describe("install", () => {
     const commandsSourceDir = fs.mkdtempSync(join(home, "commands-source-"));
     try {
       fs.mkdirSync(lcmDir, { recursive: true });
-      fs.writeFileSync(join(lcmDir, "config.json"), "{}");
+      fs.writeFileSync(join(lcmDir, "config.json"), "{}", { mode: 0o600 });
       fs.mkdirSync(join(cacheDir, "1.3.0"), { recursive: true });
       fs.mkdirSync(join(cacheDir, "1.4.0"), { recursive: true });
       fs.writeFileSync(join(commandsSourceDir, "command.md"), "command");
@@ -1067,13 +1169,9 @@ describe("install", () => {
       expect(fs.readFileSync(join(commandsDestDir, "command.md"), "utf-8")).toBe("command");
       await install(deps);
     } finally {
-      fs.rmSync(lcmDir, { recursive: true, force: true });
-      fs.rmSync(cacheDir, { recursive: true, force: true });
-      fs.rmSync(commandsDestDir, { recursive: true, force: true });
-      for (const file of ["settings.json", "lcm.md", "CLAUDE.md"]) {
-        fs.rmSync(join(claudeDir, file), { force: true });
-      }
-      fs.rmSync(commandsSourceDir, { recursive: true, force: true });
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      fs.rmSync(home, { recursive: true, force: true });
     }
   });
 });

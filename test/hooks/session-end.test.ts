@@ -6,6 +6,9 @@ import { handleSessionEnd } from "../../src/hooks/session-end.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { loadDaemonConfig, type DaemonConfig } from "../../src/daemon/config.js";
 import { safeLogError } from "../../src/hooks/hook-errors.js";
+import * as storageBackend from "../../src/storage/backend.js";
+import * as daemonNotice from "../../src/hooks/daemon-notice.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn().mockResolvedValue({ connected: true, port: 3737, spawned: false }),
@@ -85,6 +88,59 @@ describe("handleSessionEnd", () => {
     expect(mockHttpReq.end).not.toHaveBeenCalled();
   });
 
+  it("converts missing publication evidence into the PostgreSQL unavailable diagnostic", async () => {
+    const publicationError = new BackendPublicationJournalError(
+      "publication-evidence-missing",
+      "publication evidence is absent",
+    );
+    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend")
+      .mockImplementationOnce(() => { throw publicationError; });
+    try {
+      await expect(handleSessionEnd("{}", createMockClient({ ingested: 1 }), 3737, {
+        backend: "postgresql",
+      })).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(safeLogError).toHaveBeenCalledWith(
+        "SessionEnd",
+        expect.objectContaining({ name: "StorageBackendUnavailableError" }),
+        {},
+      );
+    } finally {
+      selectStorageBackend.mockRestore();
+    }
+  });
+
+  it("preserves missing publication evidence for a SQLite selection", async () => {
+    const publicationError = new BackendPublicationJournalError(
+      "publication-evidence-missing",
+      "publication evidence is absent",
+    );
+    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend")
+      .mockImplementationOnce(() => { throw publicationError; });
+    try {
+      await expect(handleSessionEnd("{}", createMockClient({ ingested: 1 }))).resolves.toEqual({
+        exitCode: 0,
+        stdout: "",
+      });
+      expect(safeLogError).toHaveBeenCalledWith("SessionEnd", publicationError, {});
+    } finally {
+      selectStorageBackend.mockRestore();
+    }
+  });
+
+  it("rethrows an unresolved publication from backend selection", async () => {
+    const publicationError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "publication remains unresolved",
+    );
+    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend")
+      .mockImplementationOnce(() => { throw publicationError; });
+    try {
+      await expect(handleSessionEnd("{}", createMockClient({ ingested: 1 }))).rejects.toBe(publicationError);
+    } finally {
+      selectStorageBackend.mockRestore();
+    }
+  });
+
   it("fails open when daemon admission throws", async () => {
     const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
     vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("admission failed"));
@@ -92,6 +148,16 @@ describe("handleSessionEnd", () => {
       exitCode: 0,
       stdout: "",
     });
+  });
+
+  it("rethrows an unresolved publication from daemon admission", async () => {
+    const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+    const publicationError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "publication remains unresolved",
+    );
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(publicationError);
+    await expect(handleSessionEnd("{}", createMockClient({ ingested: 1 }))).rejects.toBe(publicationError);
   });
 
   it("calls /ingest with parsed stdin", async () => {
@@ -352,6 +418,33 @@ describe("handleSessionEnd", () => {
     });
     await expect(handleSessionEnd("{}", createRejectingClient(new Error("failed"))))
       .resolves.toEqual({ exitCode: 0, stdout: "" });
+  });
+
+  it("rethrows a publication journal error from ingest", async () => {
+    const publicationError = new BackendPublicationJournalError(
+      "malformed-journal",
+      "publication journal is malformed",
+    );
+    await expect(handleSessionEnd("{}", createRejectingClient(publicationError))).rejects.toBe(publicationError);
+  });
+
+  it("fails open when remediation notice emission throws", async () => {
+    const notice = vi.spyOn(daemonNotice, "maybeEmitDaemonNotice")
+      .mockImplementationOnce(() => { throw new Error("notice failed"); });
+    const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: false,
+      port: 3737,
+      spawned: false,
+    });
+    try {
+      await expect(handleSessionEnd("{}", createMockClient({ ingested: 0 }))).resolves.toEqual({
+        exitCode: 0,
+        stdout: "",
+      });
+    } finally {
+      notice.mockRestore();
+    }
   });
 
   it("emits bounded remediation when the canonical state root is absent", async () => {

@@ -94,7 +94,7 @@ export function createRestoreHandler(
   config: DaemonConfig,
   storageFactory?: StorageBackendFactory,
 ): RouteHandler {
-  return async (_req, res, body) => {
+  return async (_req, res, body, routeContext) => {
     let project: ProjectStorage | undefined;
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
@@ -129,7 +129,7 @@ export function createRestoreHandler(
         if (storageIdentity) return storageIdentity;
         try {
           const before = resolveGitProjectAnchor(cwd!);
-          const identity = projectIdentity(cwd!, config.storage);
+          const identity = projectIdentity(cwd!, config.storage, routeContext?.publicationLockToken);
           const after = resolveGitProjectAnchor(cwd!);
           if (!anchorsMatch(before, after)) {
             throw new Error("Git worktree topology changed during storage admission");
@@ -154,10 +154,19 @@ export function createRestoreHandler(
         const identity = resolveRouteIdentity()!;
         activeFactory = storageFactory
           ?? ownedFactory
-          ?? (ownedFactory = createStorageBackendFactory(config.storage));
+          ?? (ownedFactory = createStorageBackendFactory(
+            config.storage,
+            undefined,
+            undefined,
+            routeContext?.publicationLockToken,
+          ));
         project = createIfMissing
-          ? await activeFactory.openProject(identity)
-          : await openExistingProject(activeFactory, identity) ?? undefined;
+          ? await activeFactory.openProject(identity, routeContext?.publicationLockToken)
+          : await openExistingProject(
+              activeFactory,
+              identity,
+              routeContext?.publicationLockToken,
+            ) ?? undefined;
         return project ?? null;
       };
       const rethrowStorageAdmissionFailure = (error: unknown): void => {

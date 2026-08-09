@@ -37,7 +37,7 @@ describe("loadHookConfig", () => {
         sensitivePatterns: ["PRIVATE-[0-9]+"],
         notify_on_filter: false,
       },
-    }));
+    }), { mode: 0o600 });
 
     expect(loadHookConfig(path)).toEqual({
       daemonPort: 4545,
@@ -67,7 +67,7 @@ describe("loadHookConfig", () => {
         requestTimeoutMs: 120_000,
         retry: { maxAttempts: 4, initialDelayMs: 500 },
       },
-    }));
+    }), { mode: 0o600 });
 
     expect(loadStoredLlmRequestPolicyConfig(path, { LCM_SUMMARY_PROVIDER: "codex" })).toEqual({
       llm: {

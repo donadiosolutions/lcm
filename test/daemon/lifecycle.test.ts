@@ -12,6 +12,7 @@ import {
 } from "../../src/daemon/lifecycle.js";
 import type { DaemonLifecycleHermeticTestSeams } from "../../src/daemon/lifecycle-scope.js";
 import { createDaemon } from "../../src/daemon/server.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 const tempDirs: string[] = [];
 type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
@@ -109,7 +110,7 @@ function withHermeticLifecycleSeams(
   ]) {
     mkdirSync(directory, { recursive: true });
   }
-  return { ...options, _hermeticTestSeams: seams };
+  return { ...options, _hermeticTestSeams: seams, _assertBackendPublication: () => undefined };
 }
 
 function ensureDaemon(
@@ -163,6 +164,20 @@ function createOwnedDaemonFixture(prefix: string, pid = 200): {
 }
 
 describe("ensureDaemon", () => {
+  it("refuses startup before inspecting PID state when publication admission is blocked", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-lifecycle-publication-"));
+    tempDirs.push(home);
+    const publicationDir = join(home, ".lcm", "backend-publication");
+    mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
+
+    await expect(ensureDaemonProduction({
+      port: 3737,
+      pidFilePath: join(home, ".lcm", "daemon.pid"),
+      spawnTimeoutMs: 1_000,
+    })).rejects.toBeInstanceOf(BackendPublicationJournalError);
+  });
+
   it("fails closed without inspecting or mutating PID state when the expected version is unknown", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-unknown-version-"));
     tempDirs.push(tempDir);

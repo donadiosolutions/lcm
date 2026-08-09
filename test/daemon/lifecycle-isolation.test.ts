@@ -738,6 +738,7 @@ describe("daemon lifecycle test-scope validation", () => {
         ...options,
         pidFilePath: ownedPidPath,
         _hermeticTestSeams: seams,
+        _assertBackendPublication: () => undefined,
       })).resolves.toMatchObject({
         connected: false,
         spawned: false,
@@ -748,6 +749,7 @@ describe("daemon lifecycle test-scope validation", () => {
         pidFilePath: ownedPidPath,
         _hermeticTestSeams: seams,
         validateBeforeRestart,
+        _assertBackendPublication: () => undefined,
       })).resolves.toMatchObject({
         connected: false,
         spawned: false,
@@ -920,6 +922,7 @@ describe("daemon lifecycle test-scope validation", () => {
       ...restartCase.options,
       _hermeticTestSeams: restartCase.seams,
       validateBeforeRestart,
+      _assertBackendPublication: () => undefined,
     })).resolves.toMatchObject({
       connected: false,
       spawned: false,
@@ -946,6 +949,7 @@ describe("daemon lifecycle test-scope validation", () => {
     await expect(ensureDaemon({
       ...ensureCase.options,
       _hermeticTestSeams: seams,
+      _assertBackendPublication: () => undefined,
     })).rejects.toThrow("PID state is not a canonical owned file");
     expect(fetch).toHaveBeenCalledOnce();
     expect(seams.spawn).not.toHaveBeenCalled();
@@ -1896,6 +1900,7 @@ describe("run-owned lifecycle resources", () => {
       _testScope: scope,
       _skipSpawn: true,
       _listeningPortsOverride: () => [48_321],
+      _assertBackendPublication: () => undefined,
     })).resolves.toMatchObject({
       connected: false,
       spawned: false,
@@ -1926,6 +1931,7 @@ describe("run-owned lifecycle resources", () => {
       ...scopedOptions(fixture),
       validateBeforeRestart,
       _ensureDaemonOverride: replacement,
+      _assertBackendPublication: () => undefined,
     })).resolves.toMatchObject({
       connected: false,
       restarted: false,
@@ -2050,9 +2056,10 @@ describe("run-owned lifecycle resources", () => {
   it("keeps two independent scopes from discovering or cleaning each other", async () => {
     const left = createFixture("parallel-left");
     const right = createFixture("parallel-right");
+    const monotonicNow = () => 0;
     const [leftResult, rightResult] = await Promise.all([
-      ensureDaemon(scopedOptions(left)),
-      ensureDaemon(scopedOptions(right)),
+      ensureDaemon({ ...scopedOptions(left), _monotonicNowOverride: monotonicNow }),
+      ensureDaemon({ ...scopedOptions(right), _monotonicNowOverride: monotonicNow }),
     ]);
     expect(leftResult.startMethod).toBe("systemd-user");
     expect(rightResult.startMethod).toBe("systemd-user");
@@ -2418,6 +2425,7 @@ describe("same-user-systemd integration", () => {
     mkdirSync(runtimeDir, { recursive: true });
     mkdirSync(stateDir, { recursive: true });
     mkdirSync(credentialDir, { recursive: true });
+    chmodSync(stateDir, 0o700);
     const builtCliUrl = pathToFileURL(join(process.cwd(), "dist", "bin", "lcm.js")).href;
     writeFileSync(
       entrypoint,

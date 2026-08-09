@@ -77,7 +77,7 @@ describe("foundation leaf-module boundaries", (): void => {
   it("covers non-object config traversal, non-string masking, and undefined formatting", (): void => {
     const directory = createTemporaryDirectory("lcm-config-leaf-");
     const configPath = join(directory, "config.json");
-    writeFileSync(configPath, JSON.stringify({ extension: { scalar: 1 }, list: [1] }));
+    writeFileSync(configPath, JSON.stringify({ extension: { scalar: 1 }, list: [1] }), { mode: 0o600 });
 
     expect((): unknown => getConfigValue({ configPath, path: "extension.scalar.child" })).toThrow("does not exist");
     expect((): unknown => getConfigValue({ configPath: directory, path: "llm" })).toThrow();

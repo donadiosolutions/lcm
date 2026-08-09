@@ -413,6 +413,7 @@ describe("PostgreSQL work coordination", () => {
 
   it.each([
     [{ resourceType: "", resourceKey: "41", operation: "compact", timeoutMs: 1 }, "resource_type"],
+    [{ resourceType: "backend-publication", resourceKey: "selection", operation: "compact", timeoutMs: 1 }, "resource_type"],
     [{ resourceType: "bad:namespace", resourceKey: "41", operation: "compact", timeoutMs: 1 }, "resource_type"],
     [{ resourceType: "conversation", resourceKey: "", operation: "compact", timeoutMs: 1 }, "resource_key"],
     [{ resourceType: "conversation", resourceKey: "41", operation: "", timeoutMs: 1 }, "operation"],
@@ -802,11 +803,11 @@ describe("PostgreSQL work coordination", () => {
       operation: "compact",
       ttlMs: 60_000,
     })).resolves.toMatchObject({ fencingToken: 9007199254740993n });
-    expect(db.query.mock.calls[1][0].text).toContain("FOR UPDATE");
-    expect(db.query.mock.calls[2][0].text).toContain(
+    expect(db.query.mock.calls[0][0].text).toContain("FOR UPDATE");
+    expect(db.query.mock.calls[1][0].text).toContain(
       "expires_at <= pg_catalog.statement_timestamp()",
     );
-    expect(db.query.mock.calls[2][0].text).toContain(
+    expect(db.query.mock.calls[1][0].text).toContain(
       "fencing_token = DEFAULT",
     );
   });
@@ -925,6 +926,7 @@ describe("PostgreSQL work coordination", () => {
 
   it.each([
     [{ resourceType: "", resourceKey: "key", processId: "p", operation: "o", ttlMs: 1 }, "resource_type"],
+    [{ resourceType: "backend-publication", resourceKey: "selection", processId: "p", operation: "o", ttlMs: 1 }, "resource_type"],
     [{ resourceType: "type", resourceKey: "", processId: "p", operation: "o", ttlMs: 1 }, "resource_key"],
     [{ resourceType: "type", resourceKey: "key", processId: "", operation: "o", ttlMs: 1 }, "owner_process_id"],
     [{ resourceType: "type", resourceKey: "key", processId: "p", operation: "", ttlMs: 1 }, "lease_operation"],
@@ -940,6 +942,7 @@ describe("PostgreSQL work coordination", () => {
 
   it.each([
     [{ resourceType: "", resourceKey: "key", processId: "p", operation: "o", fencingToken: 1n }, "resource_type"],
+    [{ resourceType: "backend-publication", resourceKey: "selection", processId: "p", operation: "o", fencingToken: 1n }, "resource_type"],
     [{ resourceType: "type", resourceKey: "key", processId: "", operation: "o", fencingToken: 1n }, "owner_process_id"],
     [{ resourceType: "type", resourceKey: "key", processId: "p", operation: "", fencingToken: 1n }, "lease_operation"],
     [{ resourceType: "type", resourceKey: "key", processId: "p", operation: "o", fencingToken: 0n }, "fencing_token"],
@@ -1058,7 +1061,7 @@ describe("PostgreSQL work coordination", () => {
       "released",
     ]);
     expect(db.query.mock.calls[0][0]).toMatchObject({
-      values: [projectId, 3],
+      values: [projectId, "backend-publication", 3],
     });
   });
 
@@ -1090,8 +1093,8 @@ describe("PostgreSQL work coordination", () => {
       projectId,
       deletedCount: 9007199254740993n,
     });
-    expect(db.query.mock.calls[1][0]).toMatchObject({
-      values: [projectId, 30_000, 50],
+    expect(db.query.mock.calls[0][0]).toMatchObject({
+      values: [projectId, 30_000, 50, "backend-publication"],
     });
   });
 
@@ -1145,7 +1148,7 @@ describe("PostgreSQL work coordination", () => {
       claimedAt: "2026-07-29T10:00:02.000Z",
       claimedBy: "drain-1",
     }]);
-    expect(db.query.mock.calls[1][0]).toMatchObject({
+    expect(db.query.mock.calls[0][0]).toMatchObject({
       values: [projectId, "drain-1", 10, 30_000],
     });
   });
@@ -1225,7 +1228,9 @@ describe("PostgreSQL work coordination", () => {
         oldestClaimedAt: "2026-07-29T10:00:00.000Z",
       },
     });
-    expect(db.query.mock.calls[0][0]).toMatchObject({ values: [projectId] });
+    expect(db.query.mock.calls[0][0]).toMatchObject({
+      values: [projectId, "backend-publication"],
+    });
   });
 
   it("fails closed unless diagnostics return exactly one aggregate row", async () => {

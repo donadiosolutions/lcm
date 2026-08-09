@@ -11,13 +11,21 @@ import { safeLogError } from "./hook-errors.js";
 import { configPath as defaultConfigPath, daemonPidPath, daemonTokenPath, lcmHomeDir } from "../runtime-paths.js";
 import { readAuthToken } from "../daemon/auth.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
-import { selectStorageBackend } from "../storage/backend.js";
+import { selectStorageBackend, StorageBackendUnavailableError } from "../storage/backend.js";
 import {
   clearDaemonNotice,
   maybeEmitDaemonNotice,
   sanitizeDaemonRefusalReason,
 } from "./daemon-notice.js";
 import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remediation.js";
+import {
+  assertHookPublicationFence,
+  assertHookPublicationFenceToken,
+  isBackendPublicationEvidenceMissing,
+  isBackendPublicationJournalError,
+  type HookPublicationLockToken,
+  withHookPublicationFence,
+} from "./publication-fence.js";
 
 type EnsureResultWithRefusal = Readonly<{ connected: boolean; refusalReason?: unknown }>;
 
@@ -47,7 +55,13 @@ function getDaemonToken(): string | null {
   return readAuthToken(daemonTokenPath());
 }
 
-function fireLocalPostRequest(port: number, path: string, body: Record<string, unknown>): void {
+function fireLocalPostRequestRaw(
+  port: number,
+  path: string,
+  body: Record<string, unknown>,
+  lockToken: HookPublicationLockToken,
+): void {
+  assertHookPublicationFenceToken(lockToken);
   const json = JSON.stringify(body);
   const token = getDaemonToken();
   const headers: Record<string, string> = {
@@ -88,15 +102,15 @@ export function fireCompactRequest(
   port: number,
   body: Record<string, unknown>,
 ): void {
-  fireLocalPostRequest(port, "/compact", body);
+  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/compact", body, lockToken));
 }
 
 export function firePromoteRequest(port: number, body: Record<string, unknown>): void {
-  fireLocalPostRequest(port, "/promote", body);
+  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/promote", body, lockToken));
 }
 
 export function firePromoteEventsRequest(port: number, body: Record<string, unknown>): void {
-  fireLocalPostRequest(port, "/promote-events", body);
+  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/promote-events", body, lockToken));
 }
 
 /**
@@ -110,11 +124,11 @@ export function firePromoteEventsRequest(port: number, body: Record<string, unkn
  * request/response client.
  */
 export function firePromoteEventsNotifyRequest(port: number, body: Record<string, unknown>): void {
-  fireLocalPostRequest(port, "/promote-events/notify", body);
+  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/promote-events/notify", body, lockToken));
 }
 
 export function fireSessionCompleteRequest(port: number, body: Record<string, unknown>): void {
-  fireLocalPostRequest(port, "/session-complete", body);
+  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/session-complete", body, lockToken));
 }
 
 export async function handleSessionEnd(
@@ -125,86 +139,108 @@ export async function handleSessionEnd(
 ): Promise<{ exitCode: number; stdout: string }> {
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
-  let ensureResult: EnsureResultWithRefusal;
-  try {
-    selectStorageBackend(storage);
-  } catch (error) {
-    await safeLogError("SessionEnd", error, {});
-    return { exitCode: 0, stdout: "" };
-  }
-  try {
-    ensureResult = await ensureDaemon({
-      port: daemonPort,
-      pidFilePath,
-      spawnTimeoutMs: 5000,
-      expectedStorageBackend: storage.backend,
-      enforceUserManagerParent: true,
-    });
-  } catch {
-    emitAdmissionNotice(undefined, "ambiguous");
-    return { exitCode: 0, stdout: "" };
-  }
-  if (!ensureResult.connected) {
-    emitAdmissionNotice(ensureResult, "not-running");
-    return { exitCode: 0, stdout: "" };
-  }
-  clearAdmissionNotice();
-
-  try {
-    const input = JSON.parse(stdin || "{}");
-    const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
-    const ingestResult = await client.post<{
+  let admitted: Readonly<{
+    input: Record<string, unknown>;
+    clientName: string;
+    ingestResult: {
       ingested: number;
       totalTokens?: number;
       redacted?: number;
       redactedCategories?: string[];
-    }>("/ingest", { ...input, client: clientName });
-
-    const configPath = defaultConfigPath();
-    const config = loadDaemonConfig(configPath);
-    const disableCompact = config.hooks?.disableAutoCompact ?? false;
-
-    // Notify user when sensitive data was filtered (default: on)
-    const notifyOnFilter = config.security?.notify_on_filter !== false;
-    if (notifyOnFilter && ingestResult.redacted && ingestResult.redacted > 0) {
-      const categories = ingestResult.redactedCategories
-        ?.map((category) => category.trim())
-        .filter(Boolean)
-        .join(", ") || "unknown";
-      process.stderr.write(
-        `⚠️  lcm: filtered sensitive data from history (pattern: ${categories})\n`,
+    };
+    disableCompact: boolean;
+  }>;
+  try {
+    try {
+      selectStorageBackend(storage);
+    } catch (error) {
+      if (isBackendPublicationJournalError(error) && !isBackendPublicationEvidenceMissing(error)) throw error;
+      await safeLogError(
+        "SessionEnd",
+        isBackendPublicationEvidenceMissing(error) && storage.backend === "postgresql"
+          ? new StorageBackendUnavailableError("postgresql")
+          : error,
+        {},
       );
+      return { exitCode: 0, stdout: "" };
     }
 
-    if (!disableCompact) {
-      // Fire-and-forget via unreffed http.request — does not block the event loop.
-      // The daemon receives and compacts independently after the hook process exits.
-      fireCompactRequest(daemonPort, {
-        session_id: input.session_id,
-        cwd: input.cwd,
-        skip_ingest: true,
-        client: clientName,
+    let ensureResult: EnsureResultWithRefusal;
+    try {
+      // The lifecycle owns its own before/after publication admission. Do not
+      // retain the interprocess lock across spawn, signal, or health waits.
+      ensureResult = await ensureDaemon({
+        port: daemonPort,
+        pidFilePath,
+        spawnTimeoutMs: 5000,
+        expectedStorageBackend: storage.backend,
+        enforceUserManagerParent: true,
       });
+    } catch (error) {
+      if (isBackendPublicationJournalError(error)) throw error;
+      emitAdmissionNotice(undefined, "ambiguous");
+      return { exitCode: 0, stdout: "" };
     }
-
-    // Always promote
-    firePromoteRequest(daemonPort, { cwd: input.cwd });
-
-    // Promote events for passive learning
-    firePromoteEventsRequest(daemonPort, { cwd: input.cwd });
-
-    if (clientName === "claude") {
-      // Record session completion in manifest. Codex Stop is turn-scoped, so
-      // marking complete there would block later turn snapshots for the session.
-      fireSessionCompleteRequest(daemonPort, {
-        session_id: input.session_id,
-        cwd: input.cwd,
-        message_count: ingestResult.ingested ?? 0,
-      });
+    if (!ensureResult.connected) {
+      emitAdmissionNotice(ensureResult, "not-running");
+      return { exitCode: 0, stdout: "" };
     }
+    clearAdmissionNotice();
 
-    return { exitCode: 0, stdout: "" };
-  } catch {
+    try {
+      const input = JSON.parse(stdin || "{}") as Record<string, unknown>;
+      const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
+      // The daemon client owns its own admission at the lifecycle boundary;
+      // perform a fresh read-only check without holding it across the request.
+      assertHookPublicationFence();
+      const ingestResult = await client.post<{
+        ingested: number;
+        totalTokens?: number;
+        redacted?: number;
+        redactedCategories?: string[];
+      }>("/ingest", { ...input, client: clientName });
+
+      const config = loadDaemonConfig(defaultConfigPath());
+      const disableCompact = config.hooks?.disableAutoCompact ?? false;
+
+      // Notify user when sensitive data was filtered (default: on)
+      const notifyOnFilter = config.security?.notify_on_filter !== false;
+      if (notifyOnFilter && ingestResult.redacted && ingestResult.redacted > 0) {
+        const categories = ingestResult.redactedCategories
+          ?.map((category) => category.trim())
+          .filter(Boolean)
+          .join(", ") || "unknown";
+        process.stderr.write(
+          `⚠️  lcm: filtered sensitive data from history (pattern: ${categories})\n`,
+        );
+      }
+      admitted = { input, clientName, ingestResult, disableCompact };
+    } catch (error) {
+      if (isBackendPublicationJournalError(error)) throw error;
+      return { exitCode: 0, stdout: "" };
+    }
+  } catch (error) {
+    if (isBackendPublicationJournalError(error)) throw error;
     return { exitCode: 0, stdout: "" };
   }
+
+  const { input, clientName, ingestResult, disableCompact } = admitted;
+  if (!disableCompact) {
+    fireCompactRequest(daemonPort, {
+      session_id: input.session_id,
+      cwd: input.cwd,
+      skip_ingest: true,
+      client: clientName,
+    });
+  }
+  firePromoteRequest(daemonPort, { cwd: input.cwd });
+  firePromoteEventsRequest(daemonPort, { cwd: input.cwd });
+  if (clientName === "claude") {
+    fireSessionCompleteRequest(daemonPort, {
+      session_id: input.session_id,
+      cwd: input.cwd,
+      message_count: ingestResult.ingested ?? 0,
+    });
+  }
+  return { exitCode: 0, stdout: "" };
 }

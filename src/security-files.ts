@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -24,6 +24,155 @@ import { basename, dirname, join, sep } from "node:path";
 
 export const PRIVATE_DIRECTORY_MODE = 0o700;
 export const PRIVATE_FILE_MODE = 0o600;
+/** Exact modes that keep a regular file readable by its owner only. */
+export const OWNER_ONLY_FILE_MODES: readonly number[] = Object.freeze([
+  0o400,
+  0o500,
+  0o600,
+  0o700,
+]);
+
+export function isOwnerOnlyFileMode(mode: number): boolean {
+  return Number.isSafeInteger(mode) && OWNER_ONLY_FILE_MODES.includes(mode);
+}
+
+/** Exact identity/security evidence for a retained private directory descriptor. */
+export type PrivateDirectoryWitness = Readonly<{
+  mode: number;
+  uid: number;
+  gid: number;
+  nlink: string;
+  dev: string;
+  ino: string;
+}>;
+
+export type PrivateDirectoryHandle = Readonly<{
+  fd: number;
+  witness: PrivateDirectoryWitness;
+  close: () => void;
+}>;
+
+type BigIntDirectoryStat = Readonly<{
+  isDirectory: () => boolean;
+  mode: bigint;
+  uid: bigint;
+  gid: bigint;
+  nlink: bigint;
+  dev: bigint;
+  ino: bigint;
+}>;
+
+function directoryStat(fd: number): BigIntDirectoryStat {
+  return fstatSync(fd, { bigint: true }) as unknown as BigIntDirectoryStat;
+}
+
+function privateDirectoryWitness(stat: BigIntDirectoryStat): PrivateDirectoryWitness {
+  return {
+    mode: Number(stat.mode & 0o7777n),
+    uid: Number(stat.uid),
+    gid: Number(stat.gid),
+    nlink: stat.nlink.toString(10),
+    dev: stat.dev.toString(10),
+    ino: stat.ino.toString(10),
+  };
+}
+
+function assertPrivateDirectoryStat(
+  stat: BigIntDirectoryStat,
+  expectedUid: number | undefined,
+): void {
+  if (!stat.isDirectory()) throw new Error("path is not a directory");
+  const mode = Number(stat.mode & 0o7777n);
+  if (mode !== PRIVATE_DIRECTORY_MODE) {
+    throw new Error("private directory mode is not trusted");
+  }
+  if (
+    expectedUid !== undefined
+    && (!Number.isSafeInteger(expectedUid) || Number(stat.uid) !== expectedUid)
+  ) {
+    throw new Error("private directory owner is not trusted");
+  }
+}
+
+function currentUid(): number | undefined {
+  return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+/**
+ * Open and retain a private directory without following a symlink at the
+ * final component.  The descriptor is checked before the pathname is used
+ * again, and the pathname is required to still identify that same inode.
+ */
+export function openPrivateDirectory(
+  path: string,
+  options: {
+    readonly expectedUid?: number;
+  } = {},
+): PrivateDirectoryHandle {
+  const fd = openSync(
+    path,
+    constants.O_RDONLY
+      | constants.O_DIRECTORY
+      | constants.O_NOFOLLOW
+      | constants.O_NONBLOCK,
+  );
+  let closed = false;
+  try {
+    const stat = directoryStat(fd);
+    const expectedUid = options.expectedUid ?? currentUid();
+    assertPrivateDirectoryStat(stat, expectedUid);
+    const canonicalPath = realpathSync(path);
+    const pathStat = statSync(canonicalPath, { bigint: true }) as unknown as BigIntDirectoryStat;
+    if (pathStat.dev !== stat.dev || pathStat.ino !== stat.ino) {
+      throw new Error("private directory changed during validation");
+    }
+    const witness = privateDirectoryWitness(stat);
+    return {
+      fd,
+      witness,
+      close: () => {
+        if (!closed) {
+          closed = true;
+          closeSync(fd);
+        }
+      },
+    };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+/** Revalidate a retained private directory descriptor and its pathname. */
+export function assertPrivateDirectory(
+  handle: PrivateDirectoryHandle,
+  path: string,
+  expected?: PrivateDirectoryWitness,
+): PrivateDirectoryWitness {
+  const stat = directoryStat(handle.fd);
+  assertPrivateDirectoryStat(stat, currentUid());
+  const canonicalPath = realpathSync(path);
+  const pathStat = statSync(canonicalPath, { bigint: true }) as unknown as BigIntDirectoryStat;
+  if (pathStat.dev !== stat.dev || pathStat.ino !== stat.ino) {
+    throw new Error("private directory changed during validation");
+  }
+  const actual = privateDirectoryWitness(stat);
+  if (expected !== undefined && JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error("private directory witness changed");
+  }
+  return actual;
+}
+
+/** Flush a private directory through a descriptor with strict open flags. */
+export function syncPrivateDirectory(path: string): void {
+  const handle = openPrivateDirectory(path);
+  try {
+    assertPrivateDirectory(handle, path, handle.witness);
+    fsyncSync(handle.fd);
+  } finally {
+    handle.close();
+  }
+}
 
 export type PrivateDirectoryOperations = Readonly<{
   mkdir?: (path: string, options: { recursive: boolean; mode: number }) => void;
@@ -52,6 +201,8 @@ export type BoundedFileOptions = {
   allowedModes?: readonly number[];
   /** Reject files with more than one hard link when enabled. */
   requireSingleLink?: boolean;
+  /** Require the bytes read from the retained descriptor to match exactly. */
+  expectedRawSha256?: string;
   /** @internal Deterministic race seam for descriptor-bound tests. */
   _afterStatForTesting?: () => void;
   /** @internal Deterministic content-change seam before the bounded read. */
@@ -69,6 +220,14 @@ export type BoundedFileResult = {
   mtimeMs: number;
   dev: number;
   ino: number;
+  mode: number;
+  uid: number;
+  gid: number;
+  nlink: string;
+  parentDev: string;
+  parentIno: string;
+  exactDev: string;
+  exactIno: string;
 };
 
 function readDescriptorBounded(fd: number, maxBytes: number): string {
@@ -113,6 +272,108 @@ function boundedFileMetadataChanged(before: Stats, after: Stats): boolean {
     || before.ctimeMs !== after.ctimeMs;
 }
 
+type PrivatePathIdentity = Readonly<{
+  dev: bigint;
+  ino: bigint;
+}>;
+
+type PrivateFileIdentity = PrivatePathIdentity & Readonly<{
+  parentDev: bigint;
+  parentIno: bigint;
+}>;
+
+type BigIntFileStat = PrivatePathIdentity & Readonly<{
+  isFile: () => boolean;
+  nlink: bigint;
+}>;
+
+type BigIntBoundedFileStat = PrivatePathIdentity & Readonly<{
+  isFile: () => boolean;
+  mode: bigint;
+  uid: bigint;
+  nlink: bigint;
+}>;
+
+function privatePathIdentity(path: string): PrivatePathIdentity {
+  return lstatSync(path, { bigint: true }) as unknown as PrivatePathIdentity;
+}
+
+function privateFileIdentity(
+  stat: PrivatePathIdentity,
+  parent: PrivatePathIdentity,
+): PrivateFileIdentity {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    parentDev: parent.dev,
+    parentIno: parent.ino,
+  };
+}
+
+/**
+ * Remove a cleanup path only while it still names the inode retained by the
+ * caller.  A replacement is left untouched: cleanup cannot turn an attacker
+ * controlled pathname into an unrelated deletion target.
+ */
+function unlinkPrivateFileIfIdentityMatches(
+  path: string,
+  expected: PrivateFileIdentity,
+  unlink: (path: string) => void = unlinkSync,
+  lstat: (path: string) => BigIntFileStat = (candidate) => lstatSync(candidate, { bigint: true }) as unknown as BigIntFileStat,
+): void {
+  let currentParent: PrivatePathIdentity;
+  try {
+    currentParent = privatePathIdentity(dirname(path));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (currentParent.dev !== expected.parentDev || currentParent.ino !== expected.parentIno) return;
+  let current: BigIntFileStat;
+  try {
+    current = lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (!current.isFile() || current.dev !== expected.dev || current.ino !== expected.ino) return;
+  unlink(path);
+}
+
+function validateBoundedBigIntFileMetadata(
+  stat: BigIntBoundedFileStat,
+  options: BoundedFileOptions,
+): void {
+  if (!stat.isFile()) throw new Error("path is not a regular file");
+  if (options.requireSingleLink && stat.nlink !== 1n) {
+    throw new Error("file has multiple hard links");
+  }
+  if (options.expectedUid !== undefined && stat.uid !== BigInt(options.expectedUid)) {
+    throw new Error("file owner is not trusted");
+  }
+  if (
+    options.allowedModes !== undefined
+    && !options.allowedModes.includes(Number(stat.mode & 0o7777n))
+  ) {
+    throw new Error("file mode is not trusted");
+  }
+}
+
+function assertPrivateFileSingleLink(
+  path: string,
+  expected: PrivateFileIdentity,
+): void {
+  const current = lstatSync(path, { bigint: true }) as unknown as BigIntFileStat;
+  if (
+    !current.isFile()
+    || current.nlink !== 1n
+    || current.dev !== expected.dev
+    || current.ino !== expected.ino
+  ) {
+    throw new Error("private durable publication did not produce a single-link destination");
+  }
+}
+
 /** Read a bounded regular file and its metadata from one descriptor. */
 export function readBoundedRegularFileWithStat(path: string, options: BoundedFileOptions): BoundedFileResult {
   if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0) {
@@ -125,10 +386,12 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
     throw new Error("file is outside the permitted root");
   }
 
-  const initialPath = lstatSync(path);
-  options._beforeOpenForTesting?.();
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
+    // The descriptor is opened before any path-based race seam or validation
+    // work.  Subsequent pathname checks are witnesses only; bytes are read
+    // from this retained descriptor, never by reopening the path.
+    options._beforeOpenForTesting?.();
     const stat = fstatSync(fd);
     validateBoundedFileMetadata(stat, options);
     options._afterStatForTesting?.();
@@ -144,12 +407,15 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
     if (current.dev !== stat.dev || current.ino !== stat.ino) {
       throw new Error("file changed during validation");
     }
-    if (initialPath.dev !== stat.dev || initialPath.ino !== stat.ino) {
-      throw new Error("file changed during validation");
-    }
     if (stat.size > options.maxBytes) throw new Error("file exceeds the configured size limit");
     options._beforeReadForTesting?.();
     const content = readDescriptorBounded(fd, options.maxBytes);
+    if (
+      options.expectedRawSha256 !== undefined
+      && createHash("sha256").update(content).digest("hex") !== options.expectedRawSha256
+    ) {
+      throw new Error("file content hash does not match expected witness");
+    }
     const finalPath = realpathSync(path);
     if (!isContainedPath(allowedRoot, finalPath)) {
       throw new Error("file is outside the permitted root");
@@ -164,16 +430,37 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
     if (boundedFileMetadataChanged(stat, afterRead)) {
       throw new Error("file changed during validation");
     }
+    const exactStat = directoryStat(fd) as unknown as Readonly<{
+      mode: bigint;
+      uid: bigint;
+      gid: bigint;
+      nlink: bigint;
+      dev: bigint;
+      ino: bigint;
+    }>;
+    const finalParent = statSync(dirname(finalPath), { bigint: true }) as unknown as Readonly<{
+      dev: bigint;
+      ino: bigint;
+    }>;
     const result: BoundedFileResult = {
       content,
       mtimeMs: stat.mtimeMs,
-      // Keep inode identity internal to the consume helper. Non-enumerable
-      // fields preserve the historical result shape for callers/tests.
       dev: stat.dev,
       ino: stat.ino,
+      mode: Number(exactStat.mode & 0o7777n),
+      uid: Number(exactStat.uid),
+      gid: Number(exactStat.gid),
+      nlink: exactStat.nlink.toString(10),
+      parentDev: finalParent.dev.toString(10),
+      parentIno: finalParent.ino.toString(10),
+      exactDev: exactStat.dev.toString(10),
+      exactIno: exactStat.ino.toString(10),
     };
-    Object.defineProperty(result, "dev", { value: stat.dev, enumerable: false });
-    Object.defineProperty(result, "ino", { value: stat.ino, enumerable: false });
+    // Preserve the historical enumerable result shape while exposing exact
+    // metadata to descriptor-bound consumers through non-enumerable fields.
+    for (const key of ["dev", "ino", "mode", "uid", "gid", "nlink", "parentDev", "parentIno", "exactDev", "exactIno"] as const) {
+      Object.defineProperty(result, key, { value: result[key], enumerable: false });
+    }
     return result;
   } finally {
     closeSync(fd);
@@ -199,11 +486,17 @@ export function consumeBoundedRegularFile(path: string, options: BoundedFileOpti
     if (realpathSync(dirname(path)) !== expectedParent) {
       throw new Error("file parent changed during consume");
     }
-    const current = lstatSync(path);
-    if (current.isSymbolicLink() || current.nlink !== 1 || current.dev !== result.dev || current.ino !== result.ino) {
+    const currentParent = lstatSync(dirname(path), { bigint: true }) as unknown as PrivatePathIdentity;
+    const current = lstatSync(path, { bigint: true }) as unknown as BigIntBoundedFileStat;
+    if (
+      currentParent.dev.toString(10) !== result.parentDev
+      || currentParent.ino.toString(10) !== result.parentIno
+      || current.dev.toString(10) !== result.exactDev
+      || current.ino.toString(10) !== result.exactIno
+    ) {
       throw new Error("file changed during consume");
     }
-    validateBoundedFileMetadata(current, options);
+    validateBoundedBigIntFileMetadata(current, { ...options, requireSingleLink: true });
     unlinkSync(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return result.content;
@@ -234,9 +527,14 @@ export function atomicWritePrivateFile(
     `.${basename(path)}.${(operations.random ?? randomBytes)(12).toString("hex")}.tmp`,
   );
   let ownsTempPath = false;
+  let tempIdentity: PrivateFileIdentity | undefined;
   try {
     const fd = (operations.open ?? openSync)(tempPath, "wx", PRIVATE_FILE_MODE);
     ownsTempPath = true;
+    tempIdentity = privateFileIdentity(
+      fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
+      privatePathIdentity(directory),
+    );
     try {
       (operations.write ?? writeFileSync)(fd, content, "utf-8");
       (operations.fchmod ?? fchmodSync)(fd, PRIVATE_FILE_MODE);
@@ -247,7 +545,13 @@ export function atomicWritePrivateFile(
     (operations.rename ?? renameSync)(tempPath, path);
     ownsTempPath = false;
   } finally {
-    if (ownsTempPath) (operations.remove ?? rmSync)(tempPath, { force: true });
+    if (ownsTempPath && tempIdentity !== undefined) {
+      unlinkPrivateFileIfIdentityMatches(
+        tempPath,
+        tempIdentity,
+        (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+      );
+    }
   }
 }
 
@@ -268,6 +572,7 @@ export function copyRegularFilePrivateExclusive(
       readonly close: typeof closeSync;
       readonly fchmod: typeof fchmodSync;
       readonly fstat: typeof fstatSync;
+      readonly lstat: typeof lstatSync;
       readonly open: typeof openSync;
       readonly read: typeof readSync;
       readonly realpath: typeof realpathSync;
@@ -282,6 +587,7 @@ export function copyRegularFilePrivateExclusive(
     close: closeSync,
     fchmod: fchmodSync,
     fstat: fstatSync,
+    lstat: lstatSync,
     open: openSync,
     read: readSync,
     realpath: realpathSync,
@@ -303,6 +609,7 @@ export function copyRegularFilePrivateExclusive(
 
   const sourceFd = io.open(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW);
   let destinationFd: number | undefined;
+  let destinationIdentity: PrivateFileIdentity | undefined;
   try {
     const sourceStat = io.fstat(sourceFd);
     if (!sourceStat.isFile()) throw new Error("path is not a regular file");
@@ -324,6 +631,10 @@ export function copyRegularFilePrivateExclusive(
       }
       throw error;
     }
+    destinationIdentity = privateFileIdentity(
+      io.fstat(destinationFd, { bigint: true }) as unknown as PrivatePathIdentity,
+      privatePathIdentity(dirname(destinationPath)),
+    );
     const buffer = Buffer.allocUnsafe(chunkBytes);
     for (;;) {
       const bytesRead = io.read(sourceFd, buffer, 0, buffer.length, null);
@@ -349,7 +660,16 @@ export function copyRegularFilePrivateExclusive(
   } catch (error) {
     if (destinationFd !== undefined) {
       try { io.close(destinationFd); } catch { /* preserve the original failure */ }
-      try { io.unlink(destinationPath); } catch { /* preserve the original failure */ }
+      if (destinationIdentity !== undefined) {
+        try {
+          unlinkPrivateFileIfIdentityMatches(
+            destinationPath,
+            destinationIdentity,
+            io.unlink,
+            (candidate) => io.lstat(candidate, { bigint: true }) as unknown as BigIntFileStat,
+          );
+        } catch { /* preserve the original failure */ }
+      }
     }
     throw error;
   } finally {
@@ -362,6 +682,7 @@ export function copyRegularFilePrivateExclusive(
 /** Create a private file only when the final destination does not already exist. */
 type ExclusiveWriteDeps = {
   open: typeof openSync;
+  fstat?: typeof fstatSync;
   write: typeof writeFileSync;
   sync: typeof fsyncSync;
   close: typeof closeSync;
@@ -382,8 +703,13 @@ export function writePrivateFileExclusive(
   };
   ensurePrivateDirectory(dirname(path));
   let fd: number | undefined;
+  let fileIdentity: PrivateFileIdentity | undefined;
   try {
     fd = io.open(path, "wx", PRIVATE_FILE_MODE);
+    fileIdentity = privateFileIdentity(
+      (io.fstat ?? fstatSync)(fd, { bigint: true }) as unknown as PrivatePathIdentity,
+      privatePathIdentity(dirname(path)),
+    );
     io.write(fd, content, "utf-8");
     io.sync(fd);
     io.close(fd);
@@ -393,7 +719,9 @@ export function writePrivateFileExclusive(
     const created = fd !== undefined;
     if (fd !== undefined) {
       try { io.close(fd); } catch { /* preserve the original failure */ }
-      try { io.unlink(path); } catch { /* preserve the original failure */ }
+      if (fileIdentity !== undefined) {
+        try { unlinkPrivateFileIfIdentityMatches(path, fileIdentity, io.unlink); } catch { /* preserve the original failure */ }
+      }
     }
     if (!created && (error as NodeJS.ErrnoException).code === "EEXIST") return false;
     throw error;
@@ -425,10 +753,15 @@ export function atomicWritePrivateFileExclusive(
     `.${basename(path)}.${(operations.random ?? randomBytes)(12).toString("hex")}.tmp`,
   );
   let ownsTempPath = false;
+  let tempIdentity: PrivateFileIdentity | undefined;
   let published = false;
   try {
     const fd = openSync(tempPath, "wx", PRIVATE_FILE_MODE);
     ownsTempPath = true;
+    tempIdentity = privateFileIdentity(
+      fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
+      privatePathIdentity(directory),
+    );
     try {
       writeFileSync(fd, content, "utf-8");
       fsyncSync(fd);
@@ -449,9 +782,13 @@ export function atomicWritePrivateFileExclusive(
     published = true;
     return true;
   } finally {
-    if (ownsTempPath) {
+    if (ownsTempPath && tempIdentity !== undefined) {
       try {
-        (operations.remove ?? rmSync)(tempPath, { force: true });
+        unlinkPrivateFileIfIdentityMatches(
+          tempPath,
+          tempIdentity,
+          (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+        );
       } catch (error) {
         // Once the destination is published it is complete and private. A
         // best-effort temporary-link cleanup failure must not report lock
@@ -459,6 +796,146 @@ export function atomicWritePrivateFileExclusive(
         if (!published) throw error;
       }
     }
+  }
+}
+
+export type DurablePrivateWriteOptions = Readonly<{
+  /** Require the destination to be absent rather than replacing it. */
+  requireAbsent?: boolean;
+  /** Bind replacement to the content observed by the caller while locked. */
+  expectedContentSha256?: string | null;
+  /** Bound the precondition read independently of the replacement size. */
+  maxExistingBytes?: number;
+  /** Authenticated owner-only mode to place on the temporary descriptor before publication. */
+  finalMode?: number;
+  /** @internal Deterministic temporary-name seam for tests. */
+  random?: (size: number) => Buffer;
+}>;
+
+function sha256Bytes(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+/**
+ * Publish a bounded private file durably in one directory.
+ *
+ * The parent is retained and revalidated for the complete operation.  The
+ * temporary inode is fully written, mode-tightened, and fsynced before it is
+ * linked or renamed into place; the parent is then fsynced as well.  Callers
+ * that replace an existing file should supply the hash observed under their
+ * mutation lock so an external edit fails closed before publication.
+ */
+export function atomicWritePrivateFileDurable(
+  path: string,
+  content: string | Uint8Array,
+  options: DurablePrivateWriteOptions = {},
+): void {
+  const finalMode = options.finalMode ?? PRIVATE_FILE_MODE;
+  if (!isOwnerOnlyFileMode(finalMode)) {
+    throw new Error("private durable publication mode must be owner-only");
+  }
+  const directory = dirname(path);
+  const parent = openPrivateDirectory(directory);
+  const parentIdentity: PrivatePathIdentity = {
+    dev: BigInt(parent.witness.dev),
+    ino: BigInt(parent.witness.ino),
+  };
+  const expected = options.expectedContentSha256;
+  const current = (() => {
+    try {
+      const observed = readBoundedRegularFileWithStat(path, {
+        allowedRoot: directory,
+        maxBytes: options.maxExistingBytes ?? Math.max(Buffer.byteLength(content), 1) + 1,
+        expectedUid: currentUid(),
+        allowedModes: OWNER_ONLY_FILE_MODES,
+        requireSingleLink: true,
+      });
+      return sha256Bytes(observed.content);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  })();
+  if (expected !== undefined && current !== expected) {
+    parent.close();
+    throw new Error("private file changed before durable publication");
+  }
+  if (options.requireAbsent && current !== null) {
+    parent.close();
+    throw new Error("private file already exists");
+  }
+
+  const temporaryPath = join(
+    directory,
+    `.${basename(path)}.${(options.random ?? randomBytes)(12).toString("hex")}.tmp`,
+  );
+  let temporaryFd: number | undefined;
+  let temporaryIdentity: PrivateFileIdentity | undefined;
+  let primaryError: unknown;
+  try {
+    temporaryFd = openSync(
+      temporaryPath,
+      constants.O_WRONLY
+        | constants.O_CREAT
+        | constants.O_EXCL
+        | constants.O_NOFOLLOW
+        | constants.O_NONBLOCK,
+      finalMode,
+    );
+    temporaryIdentity = privateFileIdentity(
+      fstatSync(temporaryFd, { bigint: true }) as unknown as PrivatePathIdentity,
+      parentIdentity,
+    );
+    const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const written = writeSync(temporaryFd, bytes, offset, bytes.length - offset, null);
+      if (written <= 0) throw new Error("private durable write made no progress");
+      offset += written;
+    }
+    fchmodSync(temporaryFd, finalMode);
+    fsyncSync(temporaryFd);
+    closeSync(temporaryFd);
+    temporaryFd = undefined;
+    if (options.requireAbsent) {
+      try {
+        linkSync(temporaryPath, path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          throw new Error("private file was created concurrently");
+        }
+        throw error;
+      }
+    } else {
+      renameSync(temporaryPath, path);
+    }
+    if (options.requireAbsent && temporaryIdentity !== undefined) {
+      unlinkPrivateFileIfIdentityMatches(temporaryPath, temporaryIdentity);
+      assertPrivateFileSingleLink(path, temporaryIdentity);
+      temporaryIdentity = undefined;
+    }
+    assertPrivateDirectory(parent, directory, parent.witness);
+    fsyncSync(parent.fd);
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    if (temporaryFd !== undefined) {
+      try { closeSync(temporaryFd); } catch { /* preserve the original error */ }
+    }
+    if (temporaryIdentity !== undefined) {
+      try {
+        unlinkPrivateFileIfIdentityMatches(temporaryPath, temporaryIdentity);
+      } catch (error) {
+        if (
+          primaryError === undefined
+          || (error as NodeJS.ErrnoException).code !== "ENOENT"
+        ) {
+          throw error;
+        }
+      }
+    }
+    parent.close();
   }
 }
 

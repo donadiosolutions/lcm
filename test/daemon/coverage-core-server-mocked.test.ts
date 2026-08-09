@@ -423,4 +423,35 @@ describe("mocked server states unavailable from Node HTTP", () => {
     expect(state.stopProcessor).toHaveBeenCalledOnce();
     expect(state.closeFactory).toHaveBeenCalledOnce();
   });
+
+  it.each([
+    ["ended", { headersSent: false, writableEnded: true, destroyed: false, writable: true }],
+    ["destroyed", { headersSent: false, writableEnded: false, destroyed: true, writable: true }],
+    ["not writable", { headersSent: false, writableEnded: false, destroyed: false, writable: false }],
+  ])("does not write a buffered fallback to a %s transport", async (_label, transportState) => {
+    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }));
+    daemon.registerRoute("POST", "/custom-buffered-failure", async (_req, res) => {
+      res.end("discarded");
+      throw new Error("handler failed after ending the buffer");
+    }, "mutating");
+    const response = {
+      ...transportState,
+      writeHead: vi.fn(),
+      end: vi.fn(),
+    };
+    const request = {
+      method: "POST",
+      url: "/custom-buffered-failure",
+      headers: {},
+      async *[Symbol.asyncIterator]() { yield Buffer.from("{}"); },
+    };
+
+    try {
+      await state.listener?.(request, response);
+      expect(response.writeHead).not.toHaveBeenCalled();
+      expect(response.end).not.toHaveBeenCalled();
+    } finally {
+      await daemon.stop();
+    }
+  });
 });

@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -17,6 +19,7 @@ import {
   projectMapPath,
   projectMapEntryHasStoredData,
   isProjectHash,
+  readProjectMapSnapshot,
   reloadProjectMapCache,
   removeProjectAlias,
   resolveProjectIdentity,
@@ -28,6 +31,12 @@ import {
 import { eventsDbPath } from "../src/db/events-path.js";
 import { projectDbPath, projectId, projectMetaPath } from "../src/daemon/project.js";
 import { clearGitProjectAnchorCache } from "../src/git-project.js";
+import {
+  BackendPublicationJournalError,
+  backendPublicationDirectory,
+  backendPublicationJournalPath,
+  withBackendPublicationConsumerLockAsync,
+} from "../src/storage/backend-publication.js";
 
 function resetLcmHome(): void {
   rmSync(join(homedir(), ".lcm"), { recursive: true, force: true });
@@ -57,6 +66,10 @@ function writeLiveProjectMapLock(nonce: string): string {
     createdAtMs: Date.now(),
   })}\n`, { mode: 0o600 });
   return lockPath;
+}
+
+function writeProjectMap(content: string): void {
+  writeFileSync(projectMapPath(), content, { mode: 0o600 });
 }
 
 function finishFakeTimerWatcherTest(
@@ -105,6 +118,14 @@ describe("project map", () => {
     resetLcmHome();
   });
 
+  it("keeps project-map publication lock scopes free of shadowed token parameters", () => {
+    expect(() => execFileSync(
+      join(process.cwd(), "node_modules/.bin/eslint"),
+      ["src/project-map.ts", "--rule", "no-shadow:error"],
+      { stdio: "pipe" },
+    )).not.toThrow();
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
     clearProjectMapCache();
@@ -128,6 +149,49 @@ describe("project map", () => {
     }, null, 2) + "\n");
   });
 
+  it("publishes a missing project identity with the caller's retained publication token", async () => {
+    const canonical = makeDir("retained-publication-token");
+
+    const identity = await withBackendPublicationConsumerLockAsync(tempHome, async (publicationLockToken) =>
+      resolveProjectIdentity(canonical, { _publicationLockToken: publicationLockToken })
+    );
+
+    expect(readProjectMapSnapshot()[identity.id]).toEqual({
+      canonical: normalizeProjectPath(canonical),
+      aliases: [],
+    });
+  });
+
+  it("rejects a retained project-map token from a different publication root", async () => {
+    const canonical = makeDir("mismatched-retained-publication-token");
+    const otherHome = mkdtempSync(join(tmpdir(), "lcm-project-map-other-home-"));
+    mkdirSync(join(otherHome, ".lcm"), { recursive: true, mode: 0o700 });
+
+    try {
+      await expect(withBackendPublicationConsumerLockAsync(otherHome, async (publicationLockToken) => {
+        expect(() => resolveProjectIdentity(canonical, { _publicationLockToken: publicationLockToken }))
+          .toThrowError(expect.objectContaining({ reason: "permit-mismatch" }));
+      })).resolves.toBeUndefined();
+    } finally {
+      rmSync(otherHome, { recursive: true, force: true });
+    }
+  });
+
+  it("reads a metadata-enriched project-map snapshot without publishing it", () => {
+    const canonical = makeDir("snapshot-project");
+    const identity = resolveProjectIdentity(canonical);
+    const snapshot = readProjectMapSnapshot();
+    expect(snapshot[identity.id]?.canonical).toBe(normalizeProjectPath(canonical));
+    expect(readProjectMapSnapshot()[identity.id]?.canonical).toBe(normalizeProjectPath(canonical));
+    utimesSync(projectMapPath(), new Date(0), new Date(0));
+    expect(resolveProjectIdentity(canonical).id).toBe(identity.id);
+    clearProjectMapCache();
+    expect(existsSync(projectMapPath())).toBe(true);
+    expect(readProjectMapSnapshot()[identity.id]?.canonical).toBe(normalizeProjectPath(canonical));
+    expect(listProjectMapEntries()[identity.id]?.canonical).toBe(normalizeProjectPath(canonical));
+    expect(resolveProjectIdentity(canonical).id).toBe(identity.id);
+  });
+
   it("does not lose a concurrent remote binding while auto-creating an entry", () => {
     const canonical = makeDir("automatic-entry-binding-race");
 
@@ -141,6 +205,18 @@ describe("project map", () => {
     expect(resolved.remoteProjectId).toBe(remoteProjectId);
     expect(resolveProjectIdentity(canonical).remoteProjectId).toBe(remoteProjectId);
     expect(listProjectMapEntries()[resolved.id].remoteProjectId).toBe(remoteProjectId);
+  });
+
+  it("rethrows publication errors while creating a missing identity", () => {
+    const canonical = makeDir("publication-error-missing-identity");
+    expect(() => resolveProjectIdentity(canonical, {
+      _beforeMissingIdentityLockForTesting: () => {
+        chmodSync(join(homedir(), ".lcm"), 0o700);
+        const directory = backendPublicationDirectory();
+        mkdirSync(directory, { mode: 0o700 });
+        writeFileSync(backendPublicationJournalPath(), "{", { mode: 0o600 });
+      },
+    })).toThrow("backend publication journal");
   });
 
   it("resolves canonical and alias paths to the same project paths", () => {
@@ -386,7 +462,7 @@ describe("project map", () => {
     const second = makeDir("remote-ambiguous-second");
     const firstHash = hashProjectPath(first);
     const secondHash = hashProjectPath(second);
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [], remoteProjectId },
       [secondHash]: { canonical: second, aliases: [], remoteProjectId },
     }));
@@ -422,7 +498,7 @@ describe("project map", () => {
 
     expect(bound).toMatchObject({ hash: local.id, changed: true });
     expect(nestedError).toBeInstanceOf(Error);
-    expect((nestedError as Error).message).toContain("project map mutation is already in progress");
+    expect((nestedError as Error).message).toContain("backend publication mutation is already in progress");
     expect(existsSync(lockPath)).toBe(false);
 
     writeFileSync(lockPath, liveOwner, { mode: 0o600 });
@@ -1101,7 +1177,7 @@ describe("project map", () => {
       },
     });
 
-    expect((nestedError as Error).message).toContain("project map mutation is already in progress");
+    expect((nestedError as Error).message).toContain("backend publication mutation is already in progress");
     expect(() => setRemoteProjectBinding(remoteProjectId, {
       hash: local.id,
       expectedEntry,
@@ -1123,7 +1199,7 @@ describe("project map", () => {
     const local = resolveProjectIdentity(canonical);
     addProjectAlias(alias, { hash: local.id });
     const expectedEntry = showProjectMapEntry(local.id).entry;
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [local.id]: {
         canonical: alias,
         aliases: [canonical],
@@ -1144,7 +1220,7 @@ describe("project map", () => {
 
     expect(() => clearRemoteProjectBinding(canonical, remoteProjectId, {
       _afterLockForTesting: () => {
-        writeFileSync(projectMapPath(), JSON.stringify({
+        writeProjectMap(JSON.stringify({
           [local.id]: {
             canonical,
             aliases: [],
@@ -1157,7 +1233,7 @@ describe("project map", () => {
 
     expect(() => clearRemoteProjectBinding(canonical, replacement, {
       _afterLockForTesting: () => {
-        writeFileSync(projectMapPath(), "{}\n");
+        writeProjectMap("{}\n");
       },
     })).toThrow("project is not mapped");
     expect(listProjectMapEntries()[local.id]).toBeUndefined();
@@ -1339,6 +1415,35 @@ describe("project map", () => {
     expect(listProjectMapEntries()[hash]?.canonical).toBe(normalizeProjectPath(canonical));
   });
 
+  it("retains the current cache when metadata is backfilled before the mutation lock", () => {
+    const canonical = makeDir("from-meta-lock-race");
+    const hash = hashProjectPath(normalizeProjectPath(canonical));
+    mkdirSync(join(homedir(), ".lcm", "projects", hash), { recursive: true });
+    writeFileSync(join(homedir(), ".lcm", "projects", hash, "meta.json"), JSON.stringify({ cwd: canonical }));
+    const identity = resolveProjectIdentity(canonical, {
+      _beforeMetadataMutationLockForTesting: () => {
+        writeProjectMap(`${JSON.stringify({
+          [hash]: { canonical, aliases: [] },
+        })}\n`);
+      },
+    });
+    expect(identity.id).toBe(hash);
+    expect(listProjectMapEntries()[hash]?.canonical).toBe(normalizeProjectPath(canonical));
+  });
+
+  it("returns a raced missing identity discovered during the locked reload", () => {
+    const canonical = makeDir("missing-identity-lock-race");
+    const hash = hashProjectPath(normalizeProjectPath(canonical));
+    const identity = resolveProjectIdentity(canonical, {
+      _beforeMissingIdentityLockForTesting: () => {
+        writeProjectMap(`${JSON.stringify({
+          [hash]: { canonical, aliases: [] },
+        })}\n`);
+      },
+    });
+    expect(identity).toMatchObject({ id: hash, canonical: normalizeProjectPath(canonical) });
+  });
+
   it("backfills metadata directly while an alias mutation already owns the lock", () => {
     const canonical = makeDir("from-meta-during-alias");
     const alias = makeDir("from-meta-during-alias-alias");
@@ -1398,7 +1503,7 @@ describe("project map", () => {
   });
 
   it("reports invalid JSON without rewriting the map", () => {
-    writeFileSync(projectMapPath(), "{not-json");
+    writeProjectMap("{not-json");
 
     const validation = validateProjectMap({ fix: true });
 
@@ -1408,7 +1513,7 @@ describe("project map", () => {
   });
 
   it("reports a stable validation error when parsing throws a non-Error value", (): void => {
-    writeFileSync(projectMapPath(), "{not-json");
+    writeProjectMap("{not-json");
     vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
       throw "parse failed";
     });
@@ -1422,7 +1527,7 @@ describe("project map", () => {
   it("does not overwrite invalid map edits from a stale cache", () => {
     const canonical = makeDir("cached-canonical");
     resolveProjectIdentity(canonical);
-    writeFileSync(projectMapPath(), "{not-json");
+    writeProjectMap("{not-json");
 
     const unseen = makeDir("unseen-while-invalid");
 
@@ -1471,7 +1576,7 @@ describe("project map", () => {
     const options = {
       hash: local.id,
       get expectedEntry() {
-        writeFileSync(projectMapPath(), "{not-json");
+        writeProjectMap("{not-json");
         return expectedEntry;
       },
     };
@@ -1535,7 +1640,7 @@ describe("project map", () => {
 
   it("rejects relative canonical paths in manually edited maps", () => {
     const hash = hashProjectPath("/absolute-project");
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [hash]: { canonical: "relative-project", aliases: [] },
     }));
 
@@ -1548,7 +1653,7 @@ describe("project map", () => {
   it("rejects relative aliases in manually edited maps", () => {
     const canonical = makeDir("absolute-canonical");
     const hash = hashProjectPath(normalizeProjectPath(canonical));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [hash]: { canonical, aliases: ["relative-alias"] },
     }));
 
@@ -1566,7 +1671,7 @@ describe("project map", () => {
     ["bad aliases", { ["a".repeat(64)]: { canonical: "/tmp/project", aliases: [""] } }],
     ["bad remote ID", { ["a".repeat(64)]: { canonical: "/tmp/project", aliases: [], remoteProjectId: "bad" } }],
   ])("rejects invalid map schema: %s", (_label: string, map: unknown) => {
-    writeFileSync(projectMapPath(), JSON.stringify(map));
+    writeProjectMap(JSON.stringify(map));
 
     const validation = validateProjectMap({ fix: true });
 
@@ -1578,7 +1683,7 @@ describe("project map", () => {
   it("reformats valid compact JSON and creates a backup", () => {
     const canonical = makeDir("compact");
     const hash = hashProjectPath(normalizeProjectPath(canonical));
-    writeFileSync(projectMapPath(), JSON.stringify({ [hash]: { canonical, aliases: [] } }));
+    writeProjectMap(JSON.stringify({ [hash]: { canonical, aliases: [] } }));
 
     const validation = validateProjectMap({ fix: true });
 
@@ -1594,7 +1699,7 @@ describe("project map", () => {
     const canonical = makeDir("dedupe");
     const alias = makeDir("dedupe-alias");
     const hash = hashProjectPath(normalizeProjectPath(canonical));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [hash]: { canonical, aliases: [alias, alias, canonical] },
     }));
 
@@ -1611,7 +1716,7 @@ describe("project map", () => {
     const shared = makeDir("shared");
     const firstHash = hashProjectPath(normalizeProjectPath(first));
     const secondHash = hashProjectPath(normalizeProjectPath(second));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [shared] },
       [secondHash]: { canonical: second, aliases: [shared] },
     }));
@@ -1694,7 +1799,7 @@ describe("project map", () => {
     const shared = makeDir("identity-shared");
     const firstHash = hashProjectPath(normalizeProjectPath(first));
     const secondHash = hashProjectPath(normalizeProjectPath(second));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [shared] },
       [secondHash]: { canonical: second, aliases: [shared] },
     }, null, 2) + "\n");
@@ -1706,7 +1811,7 @@ describe("project map", () => {
   it("preserves a remote binding on a legacy hash entry whose canonical path drifted", () => {
     const target = makeDir("identity-drift-target");
     const hash = hashProjectPath(normalizeProjectPath(target));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [hash]: {
         canonical: makeDir("identity-drift-canonical"),
         aliases: [],
@@ -1727,7 +1832,7 @@ describe("project map", () => {
     const shared = makeDir("identity-alias-canonical-collision");
     const firstHash = hashProjectPath(normalizeProjectPath(first));
     const secondHash = hashProjectPath(normalizeProjectPath(shared));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [shared] },
       [secondHash]: { canonical: shared, aliases: [] },
     }, null, 2) + "\n");
@@ -1760,7 +1865,7 @@ describe("project map", () => {
     const alias = makeDir("nonadopt-alias");
     const firstHash = hashProjectPath(normalizeProjectPath(first));
     const secondHash = hashProjectPath(normalizeProjectPath(second));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [alias] },
       [secondHash]: { canonical: second, aliases: [] },
     }, null, 2) + "\n");
@@ -1780,7 +1885,7 @@ describe("project map", () => {
     const canonical = makeDir("ambiguous-canonical");
     const firstHash = hashProjectPath(`${normalizeProjectPath(canonical)}-first`);
     const secondHash = hashProjectPath(`${normalizeProjectPath(canonical)}-second`);
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical, aliases: [] },
       [secondHash]: { canonical, aliases: [] },
     }, null, 2) + "\n");
@@ -1897,7 +2002,7 @@ describe("project map", () => {
     const alias = makeDir("reload-invalid-alias");
     const hash = projectId(canonical);
     addProjectAlias(alias, { canonical });
-    writeFileSync(projectMapPath(), "{not-json");
+    writeProjectMap("{not-json");
     const changedAt = new Date(Date.now() + 1_000);
     utimesSync(projectMapPath(), changedAt, changedAt);
 
@@ -1911,7 +2016,7 @@ describe("project map", () => {
     const shared = makeDir("remove-shared");
     const firstHash = hashProjectPath(normalizeProjectPath(first));
     const secondHash = hashProjectPath(normalizeProjectPath(second));
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: first, aliases: [shared] },
       [secondHash]: { canonical: second, aliases: [shared] },
     }, null, 2) + "\n");
@@ -1965,7 +2070,7 @@ describe("project map", () => {
     const shared = makeDir("show-ambiguous-shared");
     const firstHash = hashProjectPath(`${shared}-first`);
     const secondHash = hashProjectPath(`${shared}-second`);
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [firstHash]: { canonical: makeDir("show-ambiguous-first"), aliases: [shared] },
       [secondHash]: { canonical: makeDir("show-ambiguous-second"), aliases: [shared] },
     }));
@@ -2001,12 +2106,135 @@ describe("project map", () => {
     const target = makeDir("hash-collision-target");
     const id = hashProjectPath(normalizeProjectPath(target));
     const other = makeDir("hash-collision-other");
-    writeFileSync(projectMapPath(), JSON.stringify({
+    writeProjectMap(JSON.stringify({
       [id]: { canonical: other, aliases: [] },
     }));
     clearProjectMapCache();
 
     expect(resolveProjectIdentity(target)).toEqual({ id, canonical: normalizeProjectPath(other) });
+  });
+
+  it("fails closed when watcher admission raises a publication error", () => {
+    resolveProjectIdentity(makeDir("watch-publication-arm"));
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalExists = nodeFs.existsSync;
+    const publicationError = new BackendPublicationJournalError(
+      "unresolved-publication",
+      "watcher publication state is unresolved",
+    );
+    try {
+      nodeFs.existsSync = ((path: unknown, ...args: unknown[]) => {
+        if (String(path) === projectMapPath()) throw publicationError;
+        return (originalExists as (...input: unknown[]) => unknown)(path, ...args);
+      });
+      syncBuiltinESMExports();
+      expect(() => watchProjectMap()).toThrow("watcher publication state is unresolved");
+    } finally {
+      nodeFs.existsSync = originalExists;
+      syncBuiltinESMExports();
+    }
+  });
+
+  it("continues when watcher arm encounters an ordinary filesystem error", () => {
+    resolveProjectIdentity(makeDir("watch-ordinary-arm-error"));
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalExists = nodeFs.existsSync;
+    const ordinaryError = new Error("watcher arm unavailable");
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    try {
+      nodeFs.existsSync = ((path: unknown, ...args: unknown[]) => {
+        if (String(path) === projectMapPath()) throw ordinaryError;
+        return (originalExists as (...input: unknown[]) => unknown)(path, ...args);
+      });
+      syncBuiltinESMExports();
+      watcher = watchProjectMap();
+      expect(watcher).toBeDefined();
+    } finally {
+      watcher?.close();
+      nodeFs.existsSync = originalExists;
+      syncBuiltinESMExports();
+    }
+  });
+
+  it("fails closed when a publication error occurs during watcher rearm", () => {
+    resolveProjectIdentity(makeDir("watch-publication-rearm"));
+    const lockPath = writeLiveProjectMapLock("4".repeat(32));
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalExists = nodeFs.existsSync;
+    const publicationError = new BackendPublicationJournalError(
+      "publication-evidence-missing",
+      "watcher publication evidence disappeared",
+    );
+    let mapChecks = 0;
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    let primaryError: { value: unknown } | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      nodeFs.existsSync = ((path: unknown, ...args: unknown[]) => {
+        if (String(path) === projectMapPath()) {
+          mapChecks += 1;
+          if (mapChecks === 2) throw publicationError;
+        }
+        return (originalExists as (...input: unknown[]) => unknown)(path, ...args);
+      });
+      syncBuiltinESMExports();
+      watcher = watchProjectMap();
+      expect(vi.getTimerCount()).toBe(1);
+      expect(() => vi.advanceTimersByTime(25)).toThrow("watcher publication evidence disappeared");
+    } catch (error) {
+      primaryError = { value: error };
+    } finally {
+      nodeFs.existsSync = originalExists;
+      syncBuiltinESMExports();
+      finishFakeTimerWatcherTest(primaryError, [watcher], lockPath);
+    }
+  });
+
+  it("rethrows an ordinary filesystem error during watcher rearm", () => {
+    resolveProjectIdentity(makeDir("watch-ordinary-rearm"));
+    const lockPath = writeLiveProjectMapLock("6".repeat(32));
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalExists = nodeFs.existsSync;
+    const ordinaryError = new Error("watcher rearm unavailable");
+    let mapChecks = 0;
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      nodeFs.existsSync = ((path: unknown, ...args: unknown[]) => {
+        if (String(path) === projectMapPath()) {
+          mapChecks += 1;
+          if (mapChecks === 2) throw ordinaryError;
+        }
+        return (originalExists as (...input: unknown[]) => unknown)(path, ...args);
+      });
+      syncBuiltinESMExports();
+      watcher = watchProjectMap();
+      expect(() => vi.advanceTimersByTime(25)).toThrow("watcher rearm unavailable");
+    } finally {
+      watcher?.close();
+      rmSync(lockPath, { force: true });
+      nodeFs.existsSync = originalExists;
+      syncBuiltinESMExports();
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes a watcher when reload observes unresolved publication evidence", () => {
+    resolveProjectIdentity(makeDir("watch-publication-reload"));
+    const lockPath = writeLiveProjectMapLock("5".repeat(32));
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    let primaryError: { value: unknown } | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      watcher = watchProjectMap();
+      mkdirSync(backendPublicationDirectory(), { mode: 0o700 });
+      writeFileSync(backendPublicationJournalPath(), "{", { mode: 0o600 });
+      expect(() => vi.advanceTimersByTime(25)).toThrow("backend publication journal");
+    } catch (error) {
+      primaryError = { value: error };
+    } finally {
+      finishFakeTimerWatcherTest(primaryError, [watcher], lockPath);
+    }
   });
 
   it("cancels a pending map-watch reload when closed", () => {
@@ -2060,6 +2288,30 @@ describe("project map", () => {
     }
   });
 
+  it("defers watcher rearm while a live backend publication mutation owns the lock", async () => {
+    let releaseMutation: (() => void) | undefined;
+    const mutation = withBackendPublicationConsumerLockAsync(undefined, () => new Promise<void>((resolve) => {
+      releaseMutation = resolve;
+    }));
+    let watcher: ReturnType<typeof watchProjectMap> | undefined;
+    let primaryError: { value: unknown } | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      watcher = watchProjectMap();
+      expect(vi.getTimerCount()).toBe(1);
+      expect(() => vi.advanceTimersByTime(25)).not.toThrow();
+      expect(vi.getTimerCount()).toBe(1);
+    } catch (error) {
+      primaryError = { value: error };
+    } finally {
+      watcher?.close();
+      releaseMutation?.();
+      await mutation;
+      vi.useRealTimers();
+      if (primaryError) throw primaryError.value;
+    }
+  });
+
   it("surfaces unsafe startup locks without throwing from a delayed reload", () => {
     const canonical = makeDir("watch-unsafe-writer");
     resolveProjectIdentity(canonical);
@@ -2087,14 +2339,14 @@ describe("project map", () => {
   it("reloads map watches for directory creation, deletion, and file changes", async () => {
     const directoryWatcher = watchProjectMap();
     writeFileSync(join(homedir(), ".lcm", "unrelated"), "ignored");
-    writeFileSync(projectMapPath(), "{}\n");
+    writeProjectMap("{}\n");
     rmSync(projectMapPath());
     await new Promise((resolve) => setTimeout(resolve, 100));
     directoryWatcher.close();
 
-    writeFileSync(projectMapPath(), "{}\n");
+    writeProjectMap("{}\n");
     const fileWatcher = watchProjectMap();
-    writeFileSync(projectMapPath(), "{ }\n");
+    writeProjectMap("{ }\n");
     await new Promise((resolve) => setTimeout(resolve, 100));
     fileWatcher.close();
 

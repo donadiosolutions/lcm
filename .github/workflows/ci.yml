@@ -192,6 +192,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Probe descriptor-relative runtime migration
+        run: npx vitest run test/runtime-paths.test.ts --testNamePattern "uses actual platform semantics for nested legacy migration"
+
       - name: Run launchd integration path
         env:
           LCM_LAUNCHD_INTEGRATION: "1"

@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => {
     runDoctor: vi.fn(),
     formatResultsPlain: vi.fn(),
     storageBackend: "sqlite" as "sqlite" | "postgresql",
+    publicationBlocked: false,
     configError: undefined as unknown,
   };
 });
@@ -62,9 +63,30 @@ vi.mock("../src/daemon/client.js", () => ({
 }));
 vi.mock("../src/daemon/version.js", () => ({ PKG_VERSION: "coverage-version" }));
 vi.mock("../src/runtime-paths.js", () => ({
-  configPath: () => "/tmp/config.json",
-  daemonPidPath: () => "/tmp/daemon.pid",
+  configPath: () => "/tmp/.lcm/config.json",
+  daemonPidPath: () => "/tmp/.lcm/daemon.pid",
 }));
+vi.mock("../src/storage/backend-publication.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/storage/backend-publication.js")>();
+  return {
+    ...actual,
+    assertBackendPublicationConsumerAccess: vi.fn(() => {
+      if (mocks.publicationBlocked) {
+        throw new actual.BackendPublicationJournalError(
+          "publication-evidence-missing",
+          "test publication admission blocked",
+        );
+      }
+    }),
+    readBackendPublicationJournal: vi.fn(() => ({
+      phase: "completed",
+      sourceBackend: "sqlite",
+      targetBackend: mocks.storageBackend,
+      sourceState: {},
+      targetState: {},
+    } as never)),
+  };
+});
 vi.mock("../src/stats.js", () => ({ collectStats: mocks.collectStats, formatNumber: (n: number) => `n${n}` }));
 vi.mock("../src/doctor/doctor.js", () => ({ runDoctor: mocks.runDoctor, formatResultsPlain: mocks.formatResultsPlain }));
 
@@ -86,6 +108,7 @@ describe("MCP service coverage", () => {
     mocks.ensureDaemon.mockResolvedValue({ connected: true, port: 4321, spawned: false });
     mocks.post.mockResolvedValue({ ok: true });
     mocks.storageBackend = "sqlite";
+    mocks.publicationBlocked = false;
     mocks.configError = undefined;
     await startMcpServer();
   });
@@ -131,9 +154,10 @@ describe("MCP service coverage", () => {
     expect(mocks.post).toHaveBeenCalledOnce();
 
     mocks.storageBackend = "postgresql";
+    mocks.publicationBlocked = true;
     await expect(call("lcm_search", { query: "postgresql" })).resolves.toMatchObject({
       isError: true,
-      content: [{ text: expect.stringContaining("postgresql storage backend is not available") }],
+      content: [{ text: expect.stringContaining("backend publication admission blocked") }],
     });
     expect(mocks.post).toHaveBeenCalledOnce();
     expect(mocks.ensureDaemon).toHaveBeenCalledOnce();

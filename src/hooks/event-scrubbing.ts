@@ -1,9 +1,14 @@
 import type { ExtractedEvent } from "./extractors.js";
 import { statSync } from "node:fs";
+import { dirname } from "node:path";
 import { loadHookConfig } from "./config.js";
-import { projectDir } from "../daemon/project.js";
+import { localProjectDir } from "../daemon/project.js";
 import { configPath } from "../runtime-paths.js";
 import { ScrubEngine } from "../scrub.js";
+import {
+  isBackendPublicationJournalError,
+} from "./publication-fence.js";
+import { OWNER_ONLY_FILE_MODES, readBoundedRegularFile } from "../security-files.js";
 
 interface ScrubCacheEntry {
   engine: ScrubEngine;
@@ -51,6 +56,27 @@ async function getScrubber(patterns: string[], projDir: string): Promise<ScrubEn
   return engine;
 }
 
+function persistedSensitivePatterns(): string[] {
+  try {
+    return loadHookConfig(configPath()).security.sensitivePatterns;
+  } catch (error) {
+    if (!isBackendPublicationJournalError(error)) throw error;
+    try {
+      const content = readBoundedRegularFile(configPath(), {
+        allowedRoot: dirname(configPath()),
+        maxBytes: 4 * 1024 * 1024,
+        allowedModes: OWNER_ONLY_FILE_MODES,
+      });
+      const parsed = JSON.parse(content) as { security?: { sensitivePatterns?: unknown } };
+      return Array.isArray(parsed.security?.sensitivePatterns)
+        ? parsed.security.sensitivePatterns.filter((pattern): pattern is string => typeof pattern === "string")
+        : [];
+    } catch {
+      return [];
+    }
+  }
+}
+
 export function clearEventScrubberCacheForTesting(): void {
   scrubCache.clear();
   scrubCacheMax = SCRUB_CACHE_MAX;
@@ -69,9 +95,11 @@ export async function scrubExtractedEvents(
   cwd: string,
   globalPatterns?: string[],
 ): Promise<ExtractedEvent[]> {
-  const patterns = globalPatterns
-    ?? loadHookConfig(configPath()).security.sensitivePatterns;
-  const scrubber = await getScrubber(patterns, projectDir(cwd));
+  const patterns = globalPatterns ?? persistedSensitivePatterns();
+  // Hook capture must not enter backend-selected project-map reconciliation.
+  // The local sidecar identity remains stable for ordinary projects and uses
+  // the compatibility snapshot for already-mapped aliases/worktrees.
+  const scrubber = await getScrubber(patterns, localProjectDir(cwd));
   return events.map((event) => ({
     ...event,
     data: scrubber.scrub(event.data),

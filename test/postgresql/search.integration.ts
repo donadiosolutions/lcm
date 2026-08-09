@@ -1283,6 +1283,10 @@ describe("PostgreSQL 18 lexical search", () => {
               statement_timeout: "30s",
               usable: 1,
             });
+          }, {
+            domain: "lexical-search",
+            operation: "callerSnapshotSearch",
+            projectId,
           });
         }
       );
@@ -1523,6 +1527,10 @@ describe("PostgreSQL 18 lexical search", () => {
               expectFallbackRelationNeverExecuted(plan, testCase.relationName);
             }
           }
+        }, {
+          domain: "lexical-search",
+          operation: "fallbackGateTransaction",
+          projectId,
         });
       }
     );
@@ -2057,6 +2065,10 @@ describe("PostgreSQL 18 lexical search", () => {
             }
           );
           regexDialectState = dialectFailure.rows[0];
+        }, {
+          domain: "lexical-search",
+          operation: "callerTimeoutTransaction",
+          projectId,
         });
       } finally {
         await barrierHolderRuntime.close();

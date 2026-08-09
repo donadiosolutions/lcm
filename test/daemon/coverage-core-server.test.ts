@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
-import { createDaemon, readBody, sendJson, type DaemonInstance } from "../../src/daemon/server.js";
+import { claudeProjectDirName, createDaemon, readBody, sendJson, type DaemonInstance } from "../../src/daemon/server.js";
 import { clearProjectMapCache } from "../../src/project-map.js";
 
 let home: string;
@@ -148,6 +148,23 @@ describe("periodic transcript scan boundaries", () => {
     mkdirSync(join(projects, "bad-meta")); writeFileSync(join(projects, "bad-meta", "meta.json"), "{");
     mkdirSync(join(projects, "no-cwd")); writeFileSync(join(projects, "no-cwd", "meta.json"), "{}");
     mkdirSync(join(projects, "no-sessions")); writeFileSync(join(projects, "no-sessions", "meta.json"), JSON.stringify({ cwd: "/tmp" }));
+    await expect(scan!()).resolves.toBeUndefined();
+
+    const blockedProject = join(projects, "blocked");
+    mkdirSync(blockedProject);
+    writeFileSync(join(blockedProject, "meta.json"), JSON.stringify({ cwd: home }));
+    const sessionsDir = join(home, ".claude", "projects", claudeProjectDirName(home));
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "blocked-session.jsonl"), "{}\n");
+    const publicationDir = join(home, ".lcm", "backend-publication");
+    mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(scan!()).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith("[lcm] periodic transcript scan blocked by backend publication admission");
+
+    rmSync(projects, { recursive: true, force: true });
+    writeFileSync(projects, "not a directory");
     await expect(scan!()).resolves.toBeUndefined();
   });
 });
