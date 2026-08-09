@@ -7,7 +7,7 @@ import {
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import { dirname } from "node:path";
-import { loadDaemonConfig, parseDaemonConfig, resolveDaemonConfigEnv, type DaemonConfig } from "./config.js";
+import { parseDaemonConfig, resolveDaemonConfigEnv, type DaemonConfig } from "./config.js";
 import { sanitizeError } from "./safe-error.js";
 import { stagedPostgreSqlUnavailablePayload } from "./staged-postgresql.js";
 import { readAuthToken } from "./auth.js";
