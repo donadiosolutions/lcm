@@ -46,6 +46,7 @@ const state = vi.hoisted(() => ({
   scrubber: vi.fn(async () => ({ scrubWithCounts: (content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }) })),
   openProject: vi.fn(),
   projectClose: vi.fn(async () => undefined),
+  factoryClose: vi.fn(async () => undefined),
   openProjectError: undefined as unknown,
 }));
 
@@ -177,7 +178,7 @@ vi.mock("../../../src/storage/index.js", () => ({
         close: state.projectClose,
       };
     },
-    close: async () => undefined,
+    close: state.factoryClose,
   }),
 }));
 vi.mock("../../../src/compaction.js", () => ({
@@ -293,6 +294,7 @@ describe("compact route coverage", () => {
     state.scrubber.mockClear();
     state.openProject.mockClear();
     state.projectClose.mockClear();
+    state.factoryClose.mockClear();
     state.openProjectError = undefined;
   });
 
@@ -621,6 +623,36 @@ describe("compact route coverage", () => {
     expect(second.json()).toEqual({ skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
     release();
     await firstCall;
+  });
+
+  it("closes an owned factory on the duplicate early return", async () => {
+    let release!: () => void;
+    state.summarizerGate = new Promise<void>((resolve) => { release = resolve; });
+    const handler = createCompactHandler(config());
+    const first = response();
+    const firstCall = handler(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "owned-factory-duplicate", cwd: "/tmp" }),
+    );
+
+    const duplicate = response();
+    await handler(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "owned-factory-duplicate", cwd: "/tmp" }),
+    );
+
+    expect(duplicate.json()).toEqual({
+      skipped: true,
+      actionTaken: false,
+      summary: "Compaction already in progress for this session.",
+    });
+    expect(state.factoryClose).toHaveBeenCalledOnce();
+
+    release();
+    await firstCall;
+    expect(state.factoryClose).toHaveBeenCalledTimes(2);
   });
 
   it("admits PostgreSQL identity before returning the duplicate shortcut", async () => {

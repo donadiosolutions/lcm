@@ -431,34 +431,38 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
     // Guard must be checked and set synchronously (before any await) to prevent
     // concurrent requests from racing through the has() check before add() runs.
     if (compactingNow.has(session_id)) {
-      if (config.storage.backend === "postgresql") {
-        try {
-          const duplicateProject = await openProjectWithAdmission();
-          await closeRouteStorage(duplicateProject, undefined);
-        } catch (err) {
-          if (err instanceof BackendPublicationJournalError) {
-            sendJson(res, 503, {
-              status: "blocked",
-              error: "backend publication admission blocked",
-            });
-          } else {
-            const storageFailure = storageRouteFailureResponse(
-              activeFactory,
-              err,
-              "compact",
-            );
-            if (storageFailure) {
-              sendJson(res, storageFailure.status, storageFailure.body);
-            } else {
-              sendJson(res, 500, {
-                error: err instanceof Error ? err.message : "compact failed",
+      try {
+        if (config.storage.backend === "postgresql") {
+          try {
+            const duplicateProject = await openProjectWithAdmission();
+            await closeRouteStorage(duplicateProject, undefined);
+          } catch (err) {
+            if (err instanceof BackendPublicationJournalError) {
+              sendJson(res, 503, {
+                status: "blocked",
+                error: "backend publication admission blocked",
               });
+            } else {
+              const storageFailure = storageRouteFailureResponse(
+                activeFactory,
+                err,
+                "compact",
+              );
+              if (storageFailure) {
+                sendJson(res, storageFailure.status, storageFailure.body);
+              } else {
+                sendJson(res, 500, {
+                  error: err instanceof Error ? err.message : "compact failed",
+                });
+              }
             }
+            return;
           }
-          return;
         }
+        sendJson(res, 200, { skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
+      } finally {
+        await closeRouteStorage(undefined, ownedFactory);
       }
-      sendJson(res, 200, { skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
       return;
     }
     compactingNow.add(session_id);
