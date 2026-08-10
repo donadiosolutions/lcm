@@ -4,6 +4,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 
 ## Primary concerns
 
+- Generated Markdown EOF normalization must remove only terminal CR/LF sequences and append one LF; never use general trailing-whitespace trimming because Markdown spaces may be semantic.
+
 ### Database connection pattern (highest priority)
 
 - All SQLite access MUST use `getLcmConnection()` and `closeLcmConnection()` from the shared connection module. Flag any `new DatabaseSync(...)` instantiated directly in route handlers or utility files.

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -184,6 +184,29 @@ describe('installConnector — Codex native hooks', () => {
 
   afterEach(() => {
     process.env.HOME = originalHome;
+  });
+
+  it.each([
+    ['preserves trailing spaces before a terminal newline', 'Heading  \n', 'Heading  \n'],
+    ['preserves a trailing tab before a terminal newline', 'Heading\t\r\n', 'Heading\t\n'],
+    ['normalizes repeated mixed newline sequences', 'Heading\r\n\n\r\n', 'Heading\n'],
+    ['normalizes empty and newline-only content', '', '\n'],
+    ['normalizes LF-only content', '\n', '\n'],
+    ['normalizes CRLF-only content', '\r\n', '\n'],
+    ['normalizes CR-only content', '\r', '\n'],
+  ])('%s', async (_description, input, expected) => {
+    vi.resetModules();
+    vi.doMock('../../src/connectors/template-service.js', () => ({
+      generateContent: () => input,
+    }));
+
+    try {
+      const { installConnector: installMockedConnector } = await import('../../src/connectors/installer.js');
+      const result = installMockedConnector('codex', 'skill', tmpDir);
+      expect(readFileSync(result.path, 'utf-8')).toBe(expected);
+    } finally {
+      vi.doUnmock('../../src/connectors/template-service.js');
+    }
   });
 
   it('reinstalls the Codex skill byte-identically to the canonical template', () => {

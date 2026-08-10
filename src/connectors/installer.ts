@@ -107,6 +107,10 @@ function removeMarkers(content: string): string {
   return `${before}\n${after}`.trim();
 }
 
+function normalizeMarkdownEof(content: string): string {
+  return content.replace(/(?:\r\n|\r|\n)+$/, '') + '\n';
+}
+
 // Strategy 1: Markdown targets (rules, skill)
 function installMarkdown(content: string, filePath: string, writeMode: 'append' | 'overwrite'): void {
   mkdirSync(dirname(filePath), { recursive: true });
@@ -121,7 +125,7 @@ function installMarkdown(content: string, filePath: string, writeMode: 'append' 
     const cleaned = removeMarkers(existing);
     writeFileSync(filePath, cleaned + (cleaned.endsWith('\n') || cleaned === '' ? '' : '\n') + content + '\n');
   } else {
-    writeFileSync(filePath, content.trimEnd() + '\n');
+    writeFileSync(filePath, normalizeMarkdownEof(content));
   }
 }
 
