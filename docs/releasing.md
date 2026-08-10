@@ -93,13 +93,34 @@ Stable notes always compare with the latest stable release, so the final release
 contains every change already previewed across its betas. Draft releases are
 ignored until they are manually published.
 
-Every included commit must map to a merged `main` pull request. Major package
-Changesets and any conventional title with a breaking marker, such as `feat!:`
-or `refactor(storage)!:`, appear under Breaking changes. Conventional
+Every included commit must map to an exact merged pull request. A normal
+release commit maps to a merged `main` pull request; maintenance release
+commits follow the topology below. Major package Changesets and any
+conventional title with a breaking marker, such as `feat!:` or
+`refactor(storage)!:`, appear under Breaking changes. Conventional
 `feat:`/`feature:` titles select Features and `fix:` titles select Fixes;
 scopes such as `feat(cli):` are supported. All remaining PRs appear under
 Extra notes. The workflow fails instead of substituting commit hashes when a
-commit has no PR.
+commit has no exact PR.
+
+### Maintenance release provenance
+
+A maintenance release commit must be the exact merge commit of one merged PR
+targeting `maintenance/MAJOR.MINOR.x` in this repository. That maintenance
+merge must reach `main` through exactly one merged forward-port PR targeting
+`main`. Both merges must be genuine two-parent commits whose first parent is
+the target branch and whose second parent is the PR head.
+
+The maintenance merge commit must be reachable from the forward-port merge's
+second-parent history and absent from its first-parent history. This proves
+that the forward port introduced the maintenance commit to `main`; a squash,
+rebase, or cherry-pick forward port is invalid. The workflow fails closed when
+the forward-port evidence is missing, ambiguous, or does not preserve this
+ancestry.
+
+Release notes attribute the maintenance PR, including its Changesets. The
+forward-port PR is provenance evidence only and is not listed as the release
+change.
 
 Release publication runs use GitHub's native `queue: max` concurrency mode: up
 to 100 runs wait in one global FIFO queue, so different release tags cannot race
