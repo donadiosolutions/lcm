@@ -143,11 +143,16 @@ function findSameMarkerBlocks(
     generatedPairs.push(isGeneratedLcmBlock(content, candidates[index].line, candidates[index + 1].line));
   }
 
+  const selectedPairs: boolean[] = [];
+  for (let index = generatedPairs.length - 1; index >= 0; index -= 1) {
+    if (generatedPairs[index] && !selectedPairs[index + 1]) selectedPairs[index] = true;
+  }
+
   const blocks: ManagedBlock[] = [];
   for (let index = 0; index < candidates.length; index += 1) {
     const start = candidates[index].line;
     const nextSameMarker = candidates[index + 1]?.line;
-    if (generatedPairs[index] && !generatedPairs[index + 1] && nextSameMarker) {
+    if (selectedPairs[index] && nextSameMarker) {
       blocks.push(managedBlock(start, nextSameMarker));
     }
 

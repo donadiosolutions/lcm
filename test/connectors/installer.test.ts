@@ -310,7 +310,7 @@ describe('installConnector — rules (markdown append)', () => {
     expect(readFileSync(rulesPath, 'utf-8')).toBe(`${retained}\n`);
   });
 
-  it('selects the final candidate in an adjacent same-marker chain', async () => {
+  it('selects a right-biased maximum set of non-overlapping adjacent candidates', async () => {
     const rulesPath = join(tmpDir, 'CLAUDE.md');
     const existing = [
       LCM_MARKERS.START,
@@ -325,10 +325,6 @@ describe('installConnector — rules (markdown append)', () => {
       LCM_MARKERS.START,
     ].join('\n');
     const expected = [
-      LCM_MARKERS.START,
-      '# Workflow Instruction',
-      'User-authored before the chain',
-      LCM_MARKERS.START,
       '# Workflow Instruction',
       'Ambiguous user-authored middle',
       generatedRulesContent('\n'),
@@ -344,6 +340,38 @@ describe('installConnector — rules (markdown append)', () => {
     });
 
     expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+  });
+
+  it('heals two closed blocks around a user heading gap in one reinstall', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = [
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'FIRST_OLD_BLOCK',
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'User-authored heading gap',
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'SECOND_OLD_BLOCK',
+      LCM_MARKERS.START,
+    ].join('\n');
+    const expected = [
+      '# Workflow Instruction',
+      'User-authored heading gap',
+      generatedRulesContent('\n'),
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      const firstInstall = readFileSync(rulesPath, 'utf-8');
+      expect(firstInstall).toBe(expected);
+
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(firstInstall);
+    });
   });
 
   it.each([
