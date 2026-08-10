@@ -171,6 +171,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Set `persist-credentials: false` on checkout steps in read-only workflows.
 - Release-run recovery must read the canonical event tag from the workflow's strict `run-name`; do not infer historical tags from `head_branch`, a commit SHA, or another mutable/ref-derived field.
 - Release ancestry depends on merging protected pull requests with merge commits. Keep release and maintenance commits as ancestors of `main`; do not squash or rebase those pull requests.
+- Do not treat a GitHub pull request `base.sha`/OID as the merge commit's first-parent authority. Validate the exact merged PR and required base ref, canonical exact `merge_commit_sha`, exactly two canonical Git parents, and require `head.sha` as the second parent.
+- Fallback and resolver paths require explicit eligibility guards from exact input evidence; ineligible inputs must preserve canonical diagnostics and avoid deeper remote/Git work, while eligible candidates still reach the resolver for fail-closed full-evidence validation.
 - Normal and recovery npm publication must share the trusted tarball helper, require exactly one regular `.tgz`, pass npm an absolute filesystem path, and never invoke npm through a shell.
 - Post-publish registry retries must read a complete exact-version/version-list/dist-tag snapshot each time and retry only incomplete propagation. Malformed or conflicting metadata, authorization failures, and unexpected npm process results fail immediately.
 - Persist manual Changesets beta/stable intent on the single open `changeset-release/main` PR with exactly one internal release-channel label, and fail closed on duplicate PRs or conflicting channel labels.

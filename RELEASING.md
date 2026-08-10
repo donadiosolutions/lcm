@@ -84,6 +84,24 @@ version PRs are labeled `no-release-notes` automatically.
    regular `.tgz`, resolves its absolute filesystem path, and invokes npm
    without a shell. Betas use `--tag beta`; stable releases use `--tag latest`.
 
+### Maintenance release provenance
+
+For a release prepared from a maintenance line, the release commit must be the
+exact two-parent merge commit of one merged PR targeting
+`maintenance/MAJOR.MINOR.x` in this repository. That maintenance merge must
+reach `main` through exactly one merged forward-port PR targeting `main`, also
+merged as a two-parent commit with the target branch as its first parent and
+the PR head as its second parent.
+
+The maintenance merge commit must be an ancestor of the forward-port's second
+parent and must not be an ancestor of its first parent. This proves that the
+forward port introduced the maintenance commit to `main`. Squash, rebase, and
+cherry-pick forward ports do not preserve this topology and are rejected. The
+release check also rejects missing or ambiguous forward-port evidence.
+
+Release notes use the maintenance PR and its Changesets. The forward-port PR
+is provenance evidence only; it is not attributed as a release change.
+
 GitHub changes the release from draft to public before it emits the
 `release: published` event, so this gate cannot be fully transactional across
 GitHub and npm. If trusted preflight or either last-moment publication guard

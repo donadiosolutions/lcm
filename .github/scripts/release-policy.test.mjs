@@ -8,6 +8,7 @@ import {
   RELEASE_RUN_NAME_PREFIX,
   assertActionCreatedReleaseBody,
   assertRecoveryReleaseBody,
+  assertExactPullRequestMerge,
   assertNpmDistTags,
   assertReleaseCanAdvanceDistTag,
   associateCommitsWithPullRequests,
@@ -346,28 +347,68 @@ test("categorizes and deduplicates PRs while preserving every included PR", () =
 test("maps release commits to merged main PRs and rejects direct commits", () => {
   const first = "a".repeat(40);
   const second = "b".repeat(40);
-  const third = "c".repeat(40);
   const firstPr = pr(1, [], { merge_commit_sha: first });
   const secondPr = pr(2, [], { merge_commit_sha: second });
-  const singleFallbackPr = pr(3, [], { merge_commit_sha: "d".repeat(40) });
   const associations = new Map([
     [first, [firstPr]],
     [second, [secondPr, firstPr]],
-    [third, [singleFallbackPr]],
   ]);
   assert.deepEqual(
-    associateCommitsWithPullRequests([first, second, third], associations).map(
+    associateCommitsWithPullRequests([first, second], associations).map(
       ({ number }) => number,
     ),
-    [1, 2, 3],
+    [1, 2],
   );
   assert.throws(
     () => associateCommitsWithPullRequests(["c".repeat(40)], new Map()),
-    /no PR found/u,
+    /no exact merged main PR/u,
   );
 });
 
-test("rejects ambiguous commit associations without an exact merge SHA match", () => {
+test("rejects a sole non-exact main PR association", () => {
+  const commit = "c".repeat(40);
+  const associations = new Map([
+    [
+      commit,
+      [
+        pr(10, [], {
+          merge_commit_sha: "d".repeat(40),
+        }),
+      ],
+    ],
+  ]);
+
+  assert.throws(
+    () => associateCommitsWithPullRequests([commit], associations),
+    /no exact merged main PR/u,
+  );
+});
+
+test("rejects ambiguous exact main PR associations and names every match", () => {
+  const commit = "e".repeat(40);
+  const associations = new Map([
+    [
+      commit,
+      [
+        pr(12, [], { merge_commit_sha: commit }),
+        pr(34, [], { merge_commit_sha: commit }),
+      ],
+    ],
+  ]);
+
+  assert.throws(
+    () => associateCommitsWithPullRequests([commit], associations),
+    (error) => {
+      assert.match(error.message, new RegExp(commit, "u"));
+      assert.match(error.message, /#12/u);
+      assert.match(error.message, /#34/u);
+      assert.match(error.message, /ambiguous exact merged main PR associations/u);
+      return true;
+    },
+  );
+});
+
+test("rejects multiple non-exact main PR associations without an exact merge SHA", () => {
   const commit = "e".repeat(40);
   const associations = new Map([
     [
@@ -381,18 +422,600 @@ test("rejects ambiguous commit associations without an exact merge SHA match", (
 
   assert.throws(
     () => associateCommitsWithPullRequests([commit], associations),
-    (error) => {
-      assert.match(error.message, new RegExp(commit, "u"));
-      assert.match(error.message, /#12, #34/u);
-      assert.match(error.message, /ambiguous merged main PR associations/u);
-      return true;
+    /no exact merged main PR/u,
+  );
+});
+
+test("preserves the canonical main error for an ordinary missing-main association", async () => {
+  const commit = "f".repeat(40);
+  const associationEndpoint = () => {};
+  const calls = {
+    fullPullRequestLookups: 0,
+    mainForwardPortEnumeration: 0,
+    ancestryQueries: 0,
+  };
+  const github = {
+    paginate: async (endpoint) => {
+      assert.equal(endpoint, associationEndpoint);
+      return [];
     },
+    rest: {
+      repos: {
+        listPullRequestsAssociatedWithCommit: associationEndpoint,
+      },
+      pulls: {
+        get: async () => {
+          calls.fullPullRequestLookups += 1;
+          throw new Error("maintenance full-PR lookup must not start");
+        },
+        listFiles: () => {},
+      },
+    },
+  };
+  const runGit = (args) => {
+    if (args[0] === "rev-list" && args.at(-1) === `${BASE_TAG}..${TARGET_TAG}`) {
+      return commit;
+    }
+    calls.mainForwardPortEnumeration += 1;
+    throw new Error("maintenance Git work must not start");
+  };
+  const isAncestor = () => {
+    calls.ancestryQueries += 1;
+    throw new Error("maintenance ancestry work must not start");
+  };
+
+  await assert.rejects(
+    () =>
+      collectReleasePullRequests({
+        github,
+        owner: "donadiosolutions",
+        repo: "lcm",
+        baseTag: BASE_TAG,
+        targetTag: TARGET_TAG,
+        cwd: "/workspace",
+        runGit,
+        isAncestor,
+      }),
+    new RegExp(`no exact merged main PR found for ${commit}`, "u"),
+  );
+  assert.deepEqual(calls, {
+    fullPullRequestLookups: 0,
+    mainForwardPortEnumeration: 0,
+    ancestryQueries: 0,
+  });
+});
+
+test("validates merge parent shape and pull request head identity", () => {
+  const commit = "a".repeat(40);
+  const baseSha = "b".repeat(40);
+  const headSha = "c".repeat(40);
+  const mergePr = (overrides = {}) => pr(42, [], {
+    base: { ref: "main", sha: baseSha },
+    head: { ref: "feature/42", sha: headSha },
+    merge_commit_sha: commit,
+    ...overrides,
+  });
+  const cases = [
+    {
+      name: "accepts an exact two-parent merge",
+      pr: mergePr({
+        base: { ref: "main", sha: baseSha.toUpperCase() },
+        head: { ref: "feature/42", sha: headSha.toUpperCase() },
+        merge_commit_sha: commit.toUpperCase(),
+      }),
+      parentOutput: `${baseSha.toUpperCase()} ${headSha.toUpperCase()}`,
+      expected: "pass",
+    },
+    {
+      name: "rejects a squash or rebase with one parent",
+      pr: mergePr(),
+      parentOutput: baseSha,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects an octopus merge with three parents",
+      pr: mergePr(),
+      parentOutput: `${baseSha} ${headSha} ${"d".repeat(40)}`,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects reversed parent order",
+      pr: mergePr(),
+      parentOutput: `${headSha} ${baseSha}`,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects a mismatched merge SHA",
+      pr: mergePr({ merge_commit_sha: "d".repeat(40) }),
+      parentOutput: `${baseSha} ${headSha}`,
+      expected: /not the exact main merge/u,
+    },
+    {
+      name: "accepts exact merge evidence when GitHub base SHA differs from first parent",
+      pr: mergePr({ base: { ref: "main", sha: "d".repeat(40) } }),
+      parentOutput: `${baseSha} ${headSha}`,
+      expected: "pass",
+    },
+    {
+      name: "rejects a mismatched head SHA",
+      pr: mergePr({ head: { ref: "feature/42", sha: "d".repeat(40) } }),
+      parentOutput: `${baseSha} ${headSha}`,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects a non-string head SHA",
+      pr: mergePr({ head: { ref: "feature/42", sha: null } }),
+      parentOutput: baseSha + " " + headSha,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects a noncanonical head SHA",
+      pr: mergePr({ head: { ref: "feature/42", sha: "not-a-sha" } }),
+      parentOutput: baseSha + " " + headSha,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects a mismatched base ref",
+      pr: mergePr({ base: { ref: "maintenance/1.4.x", sha: baseSha } }),
+      parentOutput: `${baseSha} ${headSha}`,
+      expected: /not the exact main merge/u,
+    },
+    {
+      name: "rejects an unmerged pull request",
+      pr: mergePr({ merged_at: null }),
+      parentOutput: `${baseSha} ${headSha}`,
+      expected: /not the exact main merge/u,
+    },
+    {
+      name: "rejects malformed parent output",
+      pr: mergePr(),
+      parentOutput: "not-a-sha",
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects non-string parent output",
+      pr: mergePr(),
+      parentOutput: undefined,
+      expected: /merge parent identity is invalid/u,
+    },
+  ];
+
+  for (const testCase of cases) {
+    const runGit = () => testCase.parentOutput;
+    if (testCase.expected === "pass") {
+      const result = assertExactPullRequestMerge(testCase.pr, commit.toUpperCase(), {
+        runGit,
+        cwd: "/workspace",
+        requiredBase: "main",
+      });
+      assert.equal(result.pr, testCase.pr, testCase.name);
+      assert.deepEqual(result.parents, [baseSha, headSha], testCase.name);
+      assert.equal(Object.isFrozen(result), true, testCase.name);
+      assert.equal(Object.isFrozen(result.parents), true, testCase.name);
+    } else {
+      assert.throws(
+        () => assertExactPullRequestMerge(testCase.pr, commit, {
+          runGit,
+          cwd: "/workspace",
+          requiredBase: "main",
+        }),
+        (error) => {
+          assert.match(error.message, testCase.expected, testCase.name);
+          return true;
+        },
+        testCase.name,
+      );
+    }
+  }
+});
+
+const MAINTENANCE_REPOSITORY = "donadiosolutions/lcm";
+const C = "1a104b5461d0a4cc6514b9ca2fb894658f8c30a4";
+const B = "f6927a0cbded8b96eb9244a23c1bf6b66c43a262";
+const H = "7e73785c0756bdf2ced7e948bfcb8ad4f4b30461";
+const F = "22ef3a6b2d1d4a916a43fbd74fa5f50efefd2f72";
+const MAINTENANCE_BASE = "4bd87d59ae84892ae82133fcdbdfc7d74c30982a";
+const MAINTENANCE_HEAD = "565f0d8f0514d72cec79fb74b54b06f56ea6c86c";
+const TARGET_TAG = "v1.4.3";
+const BASE_TAG = "v1.4.1";
+
+function topologyPullRequest({
+  number,
+  commit,
+  baseRef,
+  baseSha,
+  headSha,
+  baseRepository = MAINTENANCE_REPOSITORY,
+  mergedAt = "2026-08-07T21:24:02Z",
+  ...overrides
+}) {
+  return pr(number, [], {
+    title: `Change ${number}`,
+    merged_at: mergedAt,
+    merge_commit_sha: commit,
+    base: { ref: baseRef, sha: baseSha, repo: { full_name: baseRepository } },
+    head: { ref: `feature/${number}`, sha: headSha },
+    ...overrides,
+  });
+}
+
+const defaultMaintenancePullRequest = topologyPullRequest({
+  number: 566,
+  commit: C,
+  baseRef: "maintenance/1.4.x",
+  baseSha: MAINTENANCE_BASE,
+  headSha: MAINTENANCE_HEAD,
+});
+const defaultForwardPortPullRequest = topologyPullRequest({
+  number: 568,
+  commit: F,
+  baseRef: "main",
+  baseSha: B,
+  headSha: H,
+});
+
+function createMaintenanceFixture({
+  releasePullRequests = [defaultMaintenancePullRequest],
+  forwardCandidates = [F],
+  forwardParents = new Map([[F, `${B} ${H}`]]),
+  forwardAssociationsByCommit = new Map([[F, [defaultForwardPortPullRequest]]]),
+  fullPullRequests,
+  ancestorResults = new Map([
+    [`${C}:${H}`, true],
+    [`${C}:${B}`, false],
+  ]),
+  mainRef = "origin/main",
+  associationFailureCommit,
+  mainRevListFailure,
+} = {}) {
+  const associationEndpoint = () => {};
+  const filesEndpoint = () => {};
+  const associationsByCommit = new Map([
+    [C, releasePullRequests],
+    ...forwardAssociationsByCommit,
+  ]);
+  const allAssociatedPullRequests = [
+    ...releasePullRequests,
+    ...[...forwardAssociationsByCommit.values()].flat(),
+  ];
+  const pullRequests = new Map(
+    (fullPullRequests ?? allAssociatedPullRequests).map((pullRequest) => [
+      pullRequest.number,
+      pullRequest,
+    ]),
+  );
+
+  const runGit = (args, cwd) => {
+    assert.equal(cwd, "/workspace");
+    if (args[0] === "rev-list" && args.at(-1) === `${BASE_TAG}..${TARGET_TAG}`) {
+      return C;
+    }
+    if (args[0] === "rev-list" && args.at(-1) === `${BASE_TAG}..${mainRef}`) {
+      if (mainRevListFailure) throw new Error(mainRevListFailure);
+      return forwardCandidates.join("\n");
+    }
+    if (args[0] === "show") {
+      const commit = args.at(-1);
+      if (commit === C) return `${MAINTENANCE_BASE} ${MAINTENANCE_HEAD}`;
+      if (forwardParents.has(commit)) return forwardParents.get(commit);
+    }
+    throw new Error(`Unexpected Git command: ${args.join(" ")}`);
+  };
+
+  const github = {
+    paginate: async (endpoint, parameters) => {
+      if (endpoint === associationEndpoint) {
+        if (parameters.commit_sha === associationFailureCommit) {
+          throw new Error("GitHub API unavailable");
+        }
+        return associationsByCommit.get(parameters.commit_sha) ?? [];
+      }
+      if (endpoint === filesEndpoint) return [];
+      throw new Error("Unexpected paginated GitHub endpoint");
+    },
+    rest: {
+      repos: {
+        listPullRequestsAssociatedWithCommit: associationEndpoint,
+      },
+      pulls: {
+        get: async ({ pull_number }) => {
+          const pullRequest = pullRequests.get(pull_number);
+          if (!pullRequest) throw new Error(`Unknown pull request #${pull_number}`);
+          return { data: pullRequest };
+        },
+        listFiles: filesEndpoint,
+      },
+    },
+  };
+
+  const isAncestor = (ancestor, descendant, cwd) => {
+    assert.equal(cwd, "/workspace");
+    const result = ancestorResults.get(`${ancestor}:${descendant}`);
+    if (result instanceof Error) throw result;
+    if (typeof result !== "boolean") {
+      throw new Error(`Unexpected ancestry query: ${ancestor} ${descendant}`);
+    }
+    return result;
+  };
+
+  return {
+    github,
+    owner: "donadiosolutions",
+    repo: "lcm",
+    baseTag: BASE_TAG,
+    targetTag: TARGET_TAG,
+    cwd: "/workspace",
+    runGit,
+    isAncestor,
+    mainRef,
+  };
+}
+
+test("maintenance release provenance accepts the real #569 topology", async () => {
+  const entries = await collectReleasePullRequests(createMaintenanceFixture());
+
+  assert.deepEqual(entries.map(({ pr: releasePullRequest }) => releasePullRequest.number), [566]);
+  assert.equal(entries[0].pr.merge_commit_sha, C);
+  assert.notEqual(entries[0].pr.number, 568);
+});
+
+test("exact maintenance candidates still enter the resolver for full-PR validation", async () => {
+  const malformedFullPullRequest = {
+    ...defaultMaintenancePullRequest,
+    merge_commit_sha: "6".repeat(40),
+  };
+
+  await assert.rejects(
+    () => collectReleasePullRequests(createMaintenanceFixture({
+      fullPullRequests: [malformedFullPullRequest, defaultForwardPortPullRequest],
+    })),
+    /not the exact maintenance\/1\.4\.x merge/u,
+  );
+});
+
+test("maintenance release provenance uses the injected main ref and ancestry predicate", async () => {
+  const entries = await collectReleasePullRequests(createMaintenanceFixture({
+    mainRef: "refs/remotes/upstream/main",
+  }));
+
+  assert.deepEqual(entries.map(({ pr: releasePullRequest }) => releasePullRequest.number), [566]);
+});
+
+test("maintenance release provenance rejects an exact maintenance PR without a forward port", async () => {
+  await assert.rejects(
+    () => collectReleasePullRequests(createMaintenanceFixture({ forwardCandidates: [] })),
+    /no valid main forward port/u,
+  );
+});
+
+test("maintenance release provenance rejects a maintenance PR on the wrong line", async () => {
+  const wrongLine = topologyPullRequest({
+    number: 566,
+    commit: C,
+    baseRef: "maintenance/1.5.x",
+    baseSha: MAINTENANCE_BASE,
+    headSha: MAINTENANCE_HEAD,
+  });
+  await assert.rejects(
+    () => collectReleasePullRequests(createMaintenanceFixture({
+      releasePullRequests: [wrongLine],
+      fullPullRequests: [wrongLine, defaultForwardPortPullRequest],
+    })),
+    /no exact merged main PR/u,
+  );
+});
+
+for (const [description, overrides] of [
+  ["an unmerged maintenance PR", { merged_at: null }],
+  ["a draft maintenance PR", { draft: true }],
+  ["a maintenance PR from another repository", {
+    base: {
+      ref: "maintenance/1.4.x",
+      sha: MAINTENANCE_BASE,
+      repo: { full_name: "other-owner/other-repo" },
+    },
+  }],
+]) {
+  test(`maintenance release provenance rejects ${description}`, async () => {
+    const invalidMaintenance = {
+      ...defaultMaintenancePullRequest,
+      ...overrides,
+    };
+    await assert.rejects(
+      () => collectReleasePullRequests(createMaintenanceFixture({
+        releasePullRequests: [invalidMaintenance],
+        fullPullRequests: [invalidMaintenance, defaultForwardPortPullRequest],
+      })),
+      /no exact merged main PR/u,
+    );
+  });
+}
+
+for (const [description, parentOutput, expected, options = {}] of [
+  ["a one-parent forward-port merge", B, /merge parent identity is invalid/u],
+  ["a three-parent forward-port merge", `${B} ${H} ${"d".repeat(40)}`, /merge parent identity is invalid/u],
+  ["a reversed-parent forward-port merge", `${H} ${B}`, /no valid main forward port/u],
+  [
+    "a forward-port whose GitHub base SHA differs from its first parent",
+    `${"e".repeat(40)} ${H}`,
+    "pass",
+    {
+      ancestorResults: new Map([
+        [`${C}:${"e".repeat(40)}`, false],
+        [`${C}:${H}`, true],
+      ]),
+    },
+  ],
+]) {
+  test(`maintenance release provenance ${expected === "pass" ? "accepts" : "rejects"} ${description}`, async () => {
+    const collect = () => collectReleasePullRequests(createMaintenanceFixture({
+      ...options,
+      forwardParents: new Map([[F, parentOutput]]),
+    }));
+    if (expected === "pass") {
+      await assert.doesNotReject(collect);
+      return;
+    }
+    await assert.rejects(
+      collect,
+      expected,
+    );
+  });
+}
+
+test("maintenance release provenance rejects a forward port with first-parent ancestry", async () => {
+  await assert.rejects(
+    () => collectReleasePullRequests(createMaintenanceFixture({
+      ancestorResults: new Map([
+        [`${C}:${H}`, true],
+        [`${C}:${B}`, true],
+      ]),
+    })),
+    /no valid main forward port/u,
+  );
+});
+
+test("maintenance release provenance rejects a forward port without second-parent ancestry", async () => {
+  await assert.rejects(
+    () => collectReleasePullRequests(createMaintenanceFixture({
+      ancestorResults: new Map([
+        [`${C}:${H}`, false],
+        [`${C}:${B}`, false],
+      ]),
+    })),
+    /no valid main forward port/u,
+  );
+});
+
+test("maintenance release provenance rejects two valid forward ports", async () => {
+  const secondForwardCommit = "3".repeat(40);
+  const secondBase = "4".repeat(40);
+  const secondHead = "5".repeat(40);
+  const secondForwardPort = topologyPullRequest({
+    number: 569,
+    commit: secondForwardCommit,
+    baseRef: "main",
+    baseSha: secondBase,
+    headSha: secondHead,
+  });
+  await assert.rejects(
+    () => collectReleasePullRequests(createMaintenanceFixture({
+      forwardCandidates: [F, secondForwardCommit],
+      forwardParents: new Map([
+        [F, `${B} ${H}`],
+        [secondForwardCommit, `${secondBase} ${secondHead}`],
+      ]),
+      forwardAssociationsByCommit: new Map([
+        [F, [defaultForwardPortPullRequest]],
+        [secondForwardCommit, [secondForwardPort]],
+      ]),
+      fullPullRequests: [
+        defaultMaintenancePullRequest,
+        defaultForwardPortPullRequest,
+        secondForwardPort,
+      ],
+      ancestorResults: new Map([
+        [`${C}:${H}`, true],
+        [`${C}:${B}`, false],
+        [`${C}:${secondHead}`, true],
+        [`${C}:${secondBase}`, false],
+      ]),
+    })),
+    /ambiguous main forward ports/u,
+  );
+});
+
+for (const [description, fixtureOptions, expected] of [
+  [
+    "a non-exact maintenance association",
+    { releasePullRequests: [{ ...defaultMaintenancePullRequest, merge_commit_sha: "6".repeat(40) }] },
+    /no exact merged main PR/u,
+  ],
+  [
+    "multiple exact maintenance associations",
+    {
+      releasePullRequests: [
+        defaultMaintenancePullRequest,
+        { ...defaultMaintenancePullRequest, number: 567 },
+      ],
+    },
+    /ambiguous exact maintenance PR/u,
+  ],
+  [
+    "a non-exact forward-port association",
+    {
+      forwardAssociationsByCommit: new Map([[F, [{
+        ...defaultForwardPortPullRequest,
+        merge_commit_sha: "7".repeat(40),
+      }]]]),
+    },
+    /no exact merged main forward-port PR/u,
+  ],
+  [
+    "multiple exact forward-port associations",
+    {
+      forwardAssociationsByCommit: new Map([[F, [
+        defaultForwardPortPullRequest,
+        { ...defaultForwardPortPullRequest, number: 570 },
+      ]]]),
+    },
+    /ambiguous exact main forward-port PR/u,
+  ],
+]) {
+  test(`maintenance release provenance rejects ${description}`, async () => {
+    await assert.rejects(
+      () => collectReleasePullRequests(createMaintenanceFixture({
+        ...fixtureOptions,
+        fullPullRequests: [
+          defaultMaintenancePullRequest,
+          defaultForwardPortPullRequest,
+          ...(fixtureOptions.releasePullRequests ?? []),
+          ...(fixtureOptions.forwardAssociationsByCommit?.get(F) ?? []),
+        ],
+      })),
+      expected,
+    );
+  });
+}
+
+test("maintenance release provenance fails closed on a GitHub lookup failure", async () => {
+  await assert.rejects(
+    () => collectReleasePullRequests(createMaintenanceFixture({
+      associationFailureCommit: F,
+    })),
+    /GitHub API unavailable/u,
+  );
+});
+
+test("maintenance release provenance fails closed on a Git command failure", async () => {
+  await assert.rejects(
+    () => collectReleasePullRequests(createMaintenanceFixture({
+      mainRevListFailure: "Git command unavailable",
+    })),
+    /Git command unavailable/u,
+  );
+});
+
+test("maintenance release provenance fails closed on an ancestry query failure", async () => {
+  await assert.rejects(
+    () => collectReleasePullRequests(createMaintenanceFixture({
+      ancestorResults: new Map([
+        [`${C}:${H}`, new Error("Git ancestry unavailable")],
+      ]),
+    })),
+    /Git ancestry unavailable/u,
   );
 });
 
 test("paginates every commit-to-PR association lookup", async () => {
   const commit = "a".repeat(40);
-  const associatedPullRequest = pr(1, [], { merge_commit_sha: commit });
+  const baseSha = "b".repeat(40);
+  const headSha = "c".repeat(40);
+  const associatedPullRequest = pr(1, [], {
+    base: { ref: "main", sha: baseSha },
+    head: { ref: "feature/1", sha: headSha },
+    merge_commit_sha: commit,
+  });
   const associationEndpoint = () => {
     throw new Error("association endpoint must be called through github.paginate");
   };
@@ -400,11 +1023,18 @@ test("paginates every commit-to-PR association lookup", async () => {
     throw new Error("files endpoint must be called through github.paginate");
   };
   const paginateCalls = [];
+  const events = [];
   const github = {
     paginate: async (endpoint, parameters) => {
       paginateCalls.push({ endpoint, parameters });
-      if (endpoint === associationEndpoint) return [associatedPullRequest];
-      if (endpoint === filesEndpoint) return [];
+      if (endpoint === associationEndpoint) {
+        events.push("associated PRs");
+        return [associatedPullRequest];
+      }
+      if (endpoint === filesEndpoint) {
+        events.push("files");
+        return [];
+      }
       throw new Error("unexpected paginated endpoint");
     },
     rest: {
@@ -412,7 +1042,10 @@ test("paginates every commit-to-PR association lookup", async () => {
         listPullRequestsAssociatedWithCommit: associationEndpoint,
       },
       pulls: {
-        get: async () => ({ data: associatedPullRequest }),
+        get: async () => {
+          events.push("full PR");
+          return { data: associatedPullRequest };
+        },
         listFiles: filesEndpoint,
       },
     },
@@ -426,6 +1059,11 @@ test("paginates every commit-to-PR association lookup", async () => {
    */
   const runGit = (args, cwd) => {
     gitCalls.push({ args, cwd });
+    if (args[0] === "show") {
+      events.push("merge parents");
+      return `${baseSha} ${headSha}`;
+    }
+    events.push("commit list");
     return commit;
   };
 
@@ -445,7 +1083,12 @@ test("paginates every commit-to-PR association lookup", async () => {
       args: ["rev-list", "--first-parent", "--reverse", "v1.4.1..v1.5.0"],
       cwd: "/workspace",
     },
+    {
+      args: ["show", "-s", "--format=%P", commit],
+      cwd: "/workspace",
+    },
   ]);
+  assert.deepEqual(events, ["commit list", "associated PRs", "full PR", "merge parents", "files"]);
   assert.equal(paginateCalls[0].endpoint, associationEndpoint);
   assert.deepEqual(paginateCalls[0].parameters, {
     owner: "donadiosolutions",
