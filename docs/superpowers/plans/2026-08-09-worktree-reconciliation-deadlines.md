@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Close #555, #563, and #586 by giving five process-heavy real-storage tests explicit full-suite deadlines.
+**Goal:** Close #555, #563, #586, #587, #588, and #589 by making six load-sensitive tests deterministic without changing production behavior.
 
-**Architecture:** This is a test-contract correction only. Reuse the existing `FULL_SUITE_PROCESS_TEST_TIMEOUT_MS` constant for the four real Git/SQLite/filesystem cases, and add one local 15-second compact-route test constant for the real daemon/SQLite case. Do not change production code, fixtures, Vitest configuration, or global timeout policy.
+**Architecture:** This is a test-contract correction only. Bound five process-heavy real storage/daemon cases with focused per-test deadlines, and replace one real-wall-clock idle assertion with the daemon's existing deterministic timer seams. Do not change production code, fixtures, Vitest configuration, or global timeout policy.
 
 **Tech Stack:** TypeScript, Vitest 4.1.10, Node.js 25.9.0, SQLite, Git.
 
@@ -183,11 +183,176 @@ git add test/daemon/routes/compact.test.ts
 git commit --signoff -m "test: bound compact summary regression"
 ```
 
-### Task 3: Prove determinism under the reported conditions
+### Task 3: Replace the daemon idle wall-clock race (#587)
+
+**Files:**
+- Modify: `test/daemon/server.test.ts:730`
+
+**Interfaces:**
+- Consumes: `createDaemon` options `_setTimeout` and `_clearTimeout`.
+- Produces: Deterministic assertions over timer cancellation, active handle count, request completion, and idle callback behavior.
+
+- [ ] **Step 1: Preserve RED evidence**
+
+Run two focused processes concurrently before editing:
+
+```bash
+set +e
+npm exec -- vitest run test/daemon/server.test.ts \
+  -t "resets idle timer on request" --reporter=dot > /tmp/lcm-587-a.log 2>&1 & a=$!
+npm exec -- vitest run test/daemon/server.test.ts \
+  -t "resets idle timer on request" --reporter=dot > /tmp/lcm-587-b.log 2>&1 & b=$!
+wait "$a"; a_status=$?
+wait "$b"; b_status=$?
+set -e
+printf 'a=%s b=%s\n' "$a_status" "$b_status"
+```
+
+Expected under contention: at least one process reproduces line 745 `expected true to be false`. If host timing does not reproduce in that attempt, use the preserved #587 concurrent-suite evidence as RED and do not introduce arbitrary load loops.
+
+- [ ] **Step 2: Replace the real sleeps with a local scheduler**
+
+Inside the test, define entries with an opaque handle, callback, and active flag. Implement `_setTimeout` by recording an active entry and returning its handle; implement `_clearTimeout` by marking the matching entry inactive. Cast the two functions to `typeof setTimeout` and `typeof clearTimeout` only at the injected test seam.
+
+Create the daemon with:
+
+```ts
+const daemon = await createDaemon(config, {
+  onIdle: () => { idleCalled = true; },
+  _setTimeout: setIdleTimeout,
+  _clearTimeout: clearIdleTimeout,
+});
+```
+
+For each health request, consume the response:
+
+```ts
+const first = await fetch(`http://127.0.0.1:${port}/health`);
+await first.text();
+const second = await fetch(`http://127.0.0.1:${port}/health`);
+await second.text();
+```
+
+Assert that three timers were scheduled (startup plus two request resets), two prior handles were cleared, exactly one entry remains active, and neither idle flag is set. Manually invoke the active callback and assert both `idleCalled` and `daemon.idleTriggered` become true. Put `await daemon.stop()` in `finally`.
+
+- [ ] **Step 3: Verify GREEN**
+
+```bash
+npm exec -- vitest run test/daemon/server.test.ts \
+  -t "resets idle timer on request"
+npm exec -- vitest run test/daemon/server.test.ts
+```
+
+Expected: focused and complete file pass without real waits in the changed case.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add test/daemon/server.test.ts
+git commit --signoff -m "test(daemon): make idle reset deterministic"
+```
+
+### Task 4: Bound the recall statistics fixture (#588)
+
+**Files:**
+- Modify: `test/db/recall.test.ts:162`
+
+**Interfaces:**
+- Consumes: Vitest's per-test timeout argument.
+- Produces: `FULL_SUITE_RECALL_TEST_TIMEOUT_MS = 15_000` on the one real migration/write fixture.
+
+- [ ] **Step 1: Verify inherited-timeout RED**
+
+```bash
+npm exec -- vitest run test/db/recall.test.ts \
+  -t "returns top 5 recalled sorted by act count" \
+  --testTimeout=1 --reporter=dot
+```
+
+Expected: one `Test timed out in 1ms` failure.
+
+- [ ] **Step 2: Add the focused deadline**
+
+Near the test file's temporary-directory helpers, add:
+
+```ts
+const FULL_SUITE_RECALL_TEST_TIMEOUT_MS = 15_000;
+```
+
+Pass that constant as the selected `it` call's timeout. Change no fixture rows, query, assertion, production source, or global setting.
+
+- [ ] **Step 3: Verify GREEN and the complete file**
+
+```bash
+npm exec -- vitest run test/db/recall.test.ts \
+  -t "returns top 5 recalled sorted by act count" \
+  --testTimeout=1 --reporter=dot
+npm exec -- vitest run test/db/recall.test.ts
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add test/db/recall.test.ts
+git commit --signoff -m "test: bound recall statistics fixture"
+```
+
+### Task 5: Match the portable import deadline to its export sibling (#589)
+
+**Files:**
+- Modify: `test/portable-knowledge.test.ts:431`
+
+**Interfaces:**
+- Consumes: Vitest test options object `{ timeout: 10_000 }` used by the sibling legacy export test.
+- Produces: The same 10-second test-owned deadline for legacy import reconciliation.
+
+- [ ] **Step 1: Verify inherited-timeout RED**
+
+```bash
+npm exec -- vitest run test/portable-knowledge.test.ts \
+  -t "reconciles a legacy linked-worktree store before importing portable knowledge" \
+  --testTimeout=1 --reporter=dot
+```
+
+Expected: one `Test timed out in 1ms` failure.
+
+- [ ] **Step 2: Add the sibling-matching timeout**
+
+Change only the test declaration to:
+
+```ts
+it(
+  "reconciles a legacy linked-worktree store before importing portable knowledge",
+  { timeout: 10_000 },
+  async () => {
+```
+
+Preserve the callback and every assertion exactly.
+
+- [ ] **Step 3: Verify GREEN and the complete file**
+
+```bash
+npm exec -- vitest run test/portable-knowledge.test.ts \
+  -t "reconciles a legacy linked-worktree store before importing portable knowledge" \
+  --testTimeout=1 --reporter=dot
+npm exec -- vitest run test/portable-knowledge.test.ts
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add test/portable-knowledge.test.ts
+git commit --signoff -m "test: bound portable import reconciliation"
+```
+
+### Task 6: Prove determinism under the reported conditions
 
 **Files:**
 - Verify: `test/worktree-reconciliation.test.ts`
 - Verify: `test/daemon/routes/compact.test.ts`
+- Verify: `test/daemon/server.test.ts`
+- Verify: `test/db/recall.test.ts`
+- Verify: `test/portable-knowledge.test.ts`
 - Generated and untracked during coverage: `coverage/`, `test-report.junit.xml`
 
 **Interfaces:**
@@ -219,7 +384,24 @@ done
 
 Expected: 20/20 processes pass the exact compact-route case.
 
-- [ ] **Step 3: Run two concurrent complete coverage suites**
+- [ ] **Step 3: Run twenty isolated repetitions of each newly repaired case**
+
+```bash
+set -Eeuo pipefail
+for n in $(seq 1 20); do
+  npm exec -- vitest run test/daemon/server.test.ts \
+    -t "resets idle timer on request" --reporter=dot
+  npm exec -- vitest run test/db/recall.test.ts \
+    -t "returns top 5 recalled sorted by act count" --reporter=dot
+  npm exec -- vitest run test/portable-knowledge.test.ts \
+    -t "reconciles a legacy linked-worktree store before importing portable knowledge" \
+    --reporter=dot
+done
+```
+
+Expected: 20/20 processes pass each exact case.
+
+- [ ] **Step 4: Run two concurrent complete coverage suites**
 
 Use separate temporary report directories so the two processes do not race on coverage or JUnit output:
 
@@ -253,7 +435,7 @@ tail -30 "$ROOT/b.log"
 
 Expected: both suites exit zero and each reports 100% statements, branches, functions, and lines.
 
-- [ ] **Step 4: Run the canonical repository gates fresh**
+- [ ] **Step 5: Run the canonical repository gates fresh**
 
 ```bash
 npm run test:ci
@@ -265,7 +447,7 @@ git diff --check
 
 Expected: all commands exit zero; `npm run test:ci` reports 100% in all four dimensions and all per-file thresholds pass.
 
-### Task 4: Review, publish, and close #555/#563/#586
+### Task 7: Review, publish, and close #555/#563/#586/#587/#588/#589
 
 **Files:**
 - Review: `docs/superpowers/specs/2026-08-09-open-bug-triage-design.md`
@@ -278,11 +460,11 @@ Expected: all commands exit zero; `npm run test:ci` reports 100% in all four dim
 
 - [ ] **Step 1: Run the required MoM review sequence**
 
-Dispatch independent max-effort GLM and Kimi reviewers over `origin/main..HEAD`. Give both complete reports to a medium-effort Opus reviewer. Return every Critical or Important finding to a max-effort Luna implementer, then rerun Task 3 after fixes.
+Dispatch independent max-effort GLM and Kimi reviewers over `origin/main..HEAD`. Give both complete reports to a medium-effort Opus reviewer. Return every Critical or Important finding to a max-effort Luna implementer, then rerun Task 6 after fixes.
 
 - [ ] **Step 2: Push and open the PR**
 
-The PR title is `Bound full-suite storage regression deadlines`. Its body must explain the four reconciliation cases plus the compact-route case, their inherited 5-second root cause, isolated-process and concurrent-coverage evidence, no production/global-timeout change, no Changeset decision, and include `Closes #555`, `Closes #563`, and `Closes #586`.
+The PR title is `Stabilize full-suite storage and timer regressions`. Its body must explain the five inherited-deadline cases plus the deterministic idle-timer rewrite, isolated-process and concurrent-coverage evidence, no production/global-timeout change, no Changeset decision, and include `Closes #555`, `Closes #563`, `Closes #586`, `Closes #587`, `Closes #588`, and `Closes #589`.
 
 - [ ] **Step 3: Complete CI and Copilot review**
 

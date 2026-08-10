@@ -38,7 +38,7 @@ then-current protected branch.
 Four implementation PRs are the minimum cohesive set. Issue #558 is resolved
 through evidence-backed triage rather than a speculative implementation PR.
 
-### PR 1: Full-Suite Test Determinism (#555, #563, #586)
+### PR 1: Full-Suite Test Determinism (#555, #563, #586, #587, #588, #589)
 
 The four reported real-filesystem/SQLite reconciliation cases perform enough
 setup, migration, archival, fencing, and durability work that five seconds is
@@ -62,6 +62,25 @@ Two concurrent coverage suites independently timed it out at 5,529 ms and
 5,521 ms while the uncontended canonical suite passed. Give that case an
 explicit 15,000 ms per-test deadline in the same test-determinism PR. Preserve
 its real behavior and do not change production or the global timeout.
+
+The next concurrent verification exposed three further test-owned defects:
+
+- #587 uses real 200 ms sleeps around a 300 ms daemon idle timer. Under load,
+  the server can receive the second request after the first real timer fires.
+  Replace wall-clock sleeps with the existing `_setTimeout`/`_clearTimeout`
+  seams, consume each real health response, assert cancellation/one-active-timer
+  state, and manually fire the active callback.
+- #588 runs complete real SQLite migrations and writes 35 promoted rows before
+  testing recall ordering. The query itself is sub-millisecond, but two
+  coverage processes took 5,201-5,256 ms. Give only that test 15,000 ms.
+- #589 performs real Git/worktree creation, SQLite migration and merge,
+  fencing, archival, journal/map publication, and portable import. Two coverage
+  processes took 5,967-6,065 ms. Give it the same 10,000 ms deadline already
+  used by its sibling legacy-worktree export test.
+
+These remain test-only corrections. Do not modify daemon timer behavior,
+recall queries, portable-knowledge production code, fixtures, or the global
+timeout.
 
 Commit `ce0de35be1373c93313c66917653455129415494` is prior partial work that
 changes only the last two tests. It is evidence, not a complete patch. The
