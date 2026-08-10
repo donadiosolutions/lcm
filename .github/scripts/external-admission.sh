@@ -7,26 +7,51 @@ if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   exit 1
 fi
 
-resolve_eligible_pr_number() {
-  jq -r --arg sha "$HEAD_SHA" '
-    [.[]
-      | select(.state == "open")
-      | select(.draft == false)
-      | select(.base.ref == "main")
-      | select(.head.sha == $sha)]
-    | if length == 1 then .[0].number else empty end
-  '
+fetch_base_branch() {
+  local base_ref="$1"
+  local encoded_ref
+  encoded_ref="$(jq -rn --arg value "$base_ref" '$value|@uri')"
+  gh api -H "X-GitHub-Api-Version: 2022-11-28" \
+    "repos/$REPOSITORY/branches/$encoded_ref"
 }
 
-pull_request_eligibility() {
-  jq -r --arg sha "$HEAD_SHA" '
-    if (
-      .state == "open" and
-      .draft == false and
-      .base.ref == "main" and
-      .head.sha == $sha
-    ) then "true" else "false" end
-  '
+evaluate_pull_request() {
+  local pull_request="$1"
+  local base_ref branch protected
+  base_ref="$(jq -r '.base.ref // empty' <<<"$pull_request")" || return $?
+  if [[ -n "$base_ref" ]]; then
+    branch="$(fetch_base_branch "$base_ref")" || return $?
+  else
+    branch='{"protected":false}'
+  fi
+  protected="$(jq -r '.protected == true' <<<"$branch")" || return $?
+  node .github/scripts/external-admission-policy.mjs evaluate-pr \
+    "$HEAD_SHA" "$REPOSITORY" "$protected" <<<"$pull_request"
+}
+
+resolve_eligible_pr_number() {
+  local pull_requests="$1"
+  local pull_request pull_request_number evaluation eligible
+  local eligible_number=""
+  local eligible_count=0
+  local pull_request_entries
+
+  pull_request_entries="$(jq -c '.[]' <<<"$pull_requests")" || return $?
+  while IFS= read -r pull_request; do
+    [[ -n "$pull_request" ]] || continue
+    pull_request_number="$(jq -r '.number // empty' <<<"$pull_request")" || return $?
+    [[ -n "$pull_request_number" ]] || continue
+    evaluation="$(evaluate_pull_request "$pull_request")" || return $?
+    eligible="$(jq -r '.eligible' <<<"$evaluation")" || return $?
+    if [[ "$eligible" == true ]]; then
+      eligible_number="$pull_request_number"
+      eligible_count=$((eligible_count + 1))
+    fi
+  done <<<"$pull_request_entries"
+
+  if (( eligible_count == 1 )); then
+    printf '%s\n' "$eligible_number"
+  fi
 }
 
 post_admission_status() {
@@ -102,6 +127,19 @@ exit_pending() {
   exit 0
 }
 
+exit_failure() {
+  local description="$1"
+  local message="$2"
+  if ! post_admission_status failure "$description"; then
+    echo "Failed to publish terminal external admission failure." >&2
+    trap - EXIT INT TERM
+    exit 1
+  fi
+  echo "$message"
+  trap - EXIT INT TERM
+  exit 0
+}
+
 validate_required_snapshot() {
   local phase="$1"
   local fingerprint_variable="$2"
@@ -131,10 +169,9 @@ validate_required_snapshot() {
   ci_check_run_id="$(jq -r '.ciCheckRunId' <<<"$evaluation")"
   dco_check_run_id="$(jq -r '.dcoCheckRunId' <<<"$evaluation")"
   ci_run_id="$(jq -r '.ciRunId' <<<"$evaluation")"
-  if [[ "$EVENT_SOURCE" == workflow_run && "$EVENT_WORKFLOW_RUN_ID" != "$ci_run_id" ]]; then
-    exit_pending \
-      "Completed CI event does not match the latest aggregate check" \
-      "$phase CI event run $EVENT_WORKFLOW_RUN_ID does not match latest run $ci_run_id; admission remains pending."
+  if [[ "$EVENT_SOURCE" == workflow_run && -n "$EVENT_WORKFLOW_RUN_ID" \
+    && "$EVENT_WORKFLOW_RUN_ID" != "$ci_run_id" ]]; then
+    echo "$phase workflow event run $EVENT_WORKFLOW_RUN_ID is stale; canonical CI run $ci_run_id is authoritative, and the event does not authorize state." >&2
   fi
 
   ci_run="$(gh api \
@@ -159,19 +196,20 @@ validate_required_snapshot() {
 }
 
 matching_prs="$(fetch_associated_pull_requests)"
-PR_NUMBER="$(resolve_eligible_pr_number <<<"$matching_prs")"
+PR_NUMBER="$(resolve_eligible_pr_number "$matching_prs")"
 if [[ -z "$PR_NUMBER" ]]; then
-  echo "CI/DCO admission result does not identify exactly one eligible pull request; admission remains pending."
-  trap - EXIT INT TERM
-  exit 0
+  exit_failure \
+    "Pull request is not uniquely eligible for admission" \
+    "CI/DCO admission result does not identify exactly one eligible pull request; admission failed."
 fi
 
 pull_request="$(fetch_pull_request "$PR_NUMBER")"
-pull_request_eligible="$(pull_request_eligibility <<<"$pull_request")"
+pull_request_evaluation="$(evaluate_pull_request "$pull_request")"
+pull_request_eligible="$(jq -r '.eligible' <<<"$pull_request_evaluation")"
 if [[ "$pull_request_eligible" != true ]]; then
-  exit_pending \
-    "Pull request is no longer eligible for admission" \
-    "Pull request is no longer an eligible main-branch admission candidate; admission remains pending."
+  exit_failure \
+    "Pull request is not uniquely eligible for admission" \
+    "Pull request is no longer eligible for admission; admission failed."
 fi
 
 post_admission_status pending "Waiting for trusted CI and DCO"
@@ -179,18 +217,19 @@ initial_admission_fingerprint=""
 validate_required_snapshot "Initial" initial_admission_fingerprint
 
 current_matching_prs="$(fetch_associated_pull_requests)"
-current_pr_number="$(resolve_eligible_pr_number <<<"$current_matching_prs")"
+current_pr_number="$(resolve_eligible_pr_number "$current_matching_prs")"
 if [[ "$current_pr_number" != "$PR_NUMBER" ]]; then
-  exit_pending \
-    "Pull request is no longer uniquely eligible for admission" \
-    "Pull request eligibility changed during evaluation; admission remains pending."
+  exit_failure \
+    "Pull request is not uniquely eligible for admission" \
+    "Pull request eligibility changed during evaluation; admission failed."
 fi
 current_pull_request="$(fetch_pull_request "$current_pr_number")"
-current_pull_request_eligible="$(pull_request_eligibility <<<"$current_pull_request")"
+current_pull_request_evaluation="$(evaluate_pull_request "$current_pull_request")"
+current_pull_request_eligible="$(jq -r '.eligible' <<<"$current_pull_request_evaluation")"
 if [[ "$current_pull_request_eligible" != true ]]; then
-  exit_pending \
-    "Pull request is no longer eligible for admission" \
-    "Pull request eligibility changed during evaluation; admission remains pending."
+  exit_failure \
+    "Pull request is not uniquely eligible for admission" \
+    "Pull request eligibility changed during evaluation; admission failed."
 fi
 current_admission_fingerprint=""
 validate_required_snapshot "Current" current_admission_fingerprint
@@ -209,18 +248,19 @@ if [[ "$final_admission_fingerprint" != "$initial_admission_fingerprint" ]]; the
 fi
 
 final_matching_prs="$(fetch_associated_pull_requests)"
-final_pr_number="$(resolve_eligible_pr_number <<<"$final_matching_prs")"
+final_pr_number="$(resolve_eligible_pr_number "$final_matching_prs")"
 if [[ "$final_pr_number" != "$PR_NUMBER" ]]; then
-  exit_pending \
-    "Pull request is no longer uniquely eligible for admission" \
-    "Final pull request association changed; admission remains pending."
+  exit_failure \
+    "Pull request is not uniquely eligible for admission" \
+    "Final pull request association changed; admission failed."
 fi
 final_pull_request="$(fetch_pull_request "$final_pr_number")"
-final_pull_request_eligible="$(pull_request_eligibility <<<"$final_pull_request")"
+final_pull_request_evaluation="$(evaluate_pull_request "$final_pull_request")"
+final_pull_request_eligible="$(jq -r '.eligible' <<<"$final_pull_request_evaluation")"
 if [[ "$final_pull_request_eligible" != true ]]; then
-  exit_pending \
-    "Pull request is no longer eligible for admission" \
-    "Final pull request eligibility changed; admission remains pending."
+  exit_failure \
+    "Pull request is not uniquely eligible for admission" \
+    "Final pull request eligibility changed; admission failed."
 fi
 
 post_admission_status success "CI and DCO passed"

@@ -283,7 +283,7 @@ if [[ "$*" == *"/statuses/"* ]]; then
   exit 0
 fi
 if [[ "$*" == *"/commits/"*"/pulls?per_page=100"* ]]; then
-  printf '%s\\n' '[{"number":123,"state":"open","draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+  printf '%s\\n' '[{"number":123,"state":"open","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
   exit 0
 fi
 if [[ "$*" == *"/pulls/123"* ]]; then
@@ -292,10 +292,14 @@ if [[ "$*" == *"/pulls/123"* ]]; then
     exit 0
   fi
   if [[ "$FAIL_ADMISSION_COMMAND" == valid-ineligible ]]; then
-    printf '%s\\n' '{"state":"closed","draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+    printf '%s\\n' '{"number":123,"state":"closed","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
     exit 0
   fi
-  printf '%s\\n' '{"state":"open","draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+  printf '%s\\n' '{"number":123,"state":"open","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+  exit 0
+fi
+if [[ "$*" == *"/branches/"* ]]; then
+  printf '%s\\n' '{"protected":true}'
   exit 0
 fi
 if [[ "$*" == *"check-runs?filter=latest&per_page=100"* ]]; then
@@ -326,6 +330,10 @@ if [[ "$2" == "evaluate-ci-run" ]]; then
   printf '%s\\n' '{"state":"completed","ready":true}'
   exit 0
 fi
+if [[ "$2" == "evaluate-pr" ]]; then
+  printf '%s\\n' '{"eligible":true}'
+  exit 0
+fi
 exit 99
 `);
       chmodSync(nodePath, 0o755);
@@ -333,35 +341,28 @@ exit 99
     if (["validator-jq", "eligibility-jq", "checks-ready-jq", "ci-ready-jq"].includes(command)) {
       writeFileSync(jqPath, `#!/usr/bin/env bash
 set -euo pipefail
+if [[ "$1" == "-rn" ]]; then
+  exec /usr/bin/jq "$@"
+fi
 call_count=0
 if [[ -f "$JQ_CALL_LOG" ]]; then
   read -r call_count < "$JQ_CALL_LOG"
 fi
 call_count=$((call_count + 1))
 printf '%s\\n' "$call_count" > "$JQ_CALL_LOG"
-if [[ "$FAIL_ADMISSION_COMMAND" == eligibility-jq && "$call_count" == 3 ]]; then
+if [[ "$FAIL_ADMISSION_COMMAND" == eligibility-jq && "$call_count" == 4 ]]; then
   exit 73
 fi
-if [[ "$FAIL_ADMISSION_COMMAND" == validator-jq && "$call_count" -ge 4 ]]; then
+if [[ "$FAIL_ADMISSION_COMMAND" == validator-jq && "$call_count" == 8 ]]; then
   exit 72
 fi
-if [[ "$FAIL_ADMISSION_COMMAND" == checks-ready-jq && "$call_count" == 6 ]]; then
+if [[ "$FAIL_ADMISSION_COMMAND" == checks-ready-jq && "$call_count" == 10 ]]; then
   exit 74
 fi
-if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$call_count" == 11 ]]; then
+if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$call_count" == 15 ]]; then
   exit 75
 fi
-case "$call_count" in
-  1) cat ;;
-  2) printf '%s\\n' 123 ;;
-  3|6|11) printf '%s\\n' true ;;
-  4) printf '%s\\n' '[]' ;;
-  5|10) printf '%s\\n' '' ;;
-  7) printf '%s\\n' 1 ;;
-  8) printf '%s\\n' 2 ;;
-  9) printf '%s\\n' 3 ;;
-  *) exit 99 ;;
-esac
+exec /usr/bin/jq "$@"
 `);
       chmodSync(jqPath, 0o755);
     }
@@ -389,7 +390,285 @@ esac
   }
 }
 
+type AdmissionScenario =
+  | "stale-workflow-run"
+  | "in-progress-workflow-run"
+  | "no-unique-pr"
+  | "protected-main"
+  | "protected-maintenance"
+  | "unprotected-maintenance"
+  | "invalid-or-changed-base";
+
+type AdmissionEligibilityVariant =
+  | "unsupported-base"
+  | "wrong-base-repository"
+  | "protection-changed";
+
+function makeAdmissionPullRequest({
+  baseRef = "main",
+  baseRepository = REPOSITORY,
+  draft = false,
+  state = "open",
+  headSha = HEAD_SHA,
+} = {}) {
+ return {
+    number: 123,
+   state,
+   draft,
+    head: { sha: headSha },
+    base: { ref: baseRef, repo: { full_name: baseRepository } },
+  };
+}
+
+function runAdmissionScenario(
+  scenario: AdmissionScenario,
+  eligibilityVariant: AdmissionEligibilityVariant = "wrong-base-repository",
+) {
+  const directory = mkdtempSync(join(tmpdir(), "external-admission-scenario-"));
+  const ghPath = join(directory, "gh");
+  const branchCallsPath = join(directory, "branch-calls.log");
+  const branchRequestsPath = join(directory, "branch-requests.log");
+  const statusLogPath = join(directory, "statuses.log");
+  const headSha = "a".repeat(40);
+  const ciRunId = "123";
+  const ciCheckRun = {
+    id: 10,
+    name: "ci",
+    head_sha: headSha,
+    app: { id: 15368, slug: "github-actions" },
+    status: "completed",
+    conclusion: "success",
+    details_url: `https://example.test/${REPOSITORY}/actions/runs/${ciRunId}/job/456`,
+  };
+  const dcoCheckRun = {
+    id: 11,
+    name: "DCO",
+    head_sha: headSha,
+    app: { id: 1861, slug: "dco" },
+    status: "completed",
+    conclusion: "success",
+  };
+  const ciRun = {
+    id: Number(ciRunId),
+    event: "pull_request",
+    path: ".github/workflows/ci.yml",
+    head_sha: headSha,
+    status: "completed",
+    conclusion: "success",
+    repository: { full_name: REPOSITORY },
+  };
+  let associatedPullRequests = [makeAdmissionPullRequest()];
+  let pullRequest = makeAdmissionPullRequest();
+  let branchProtectionSequence = ["true"];
+  let eventSource = "repository_dispatch";
+  let eventWorkflowRunId = "";
+  let eventWorkflowRunAction = "";
+
+  switch (scenario) {
+    case "stale-workflow-run":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "99";
+      eventWorkflowRunAction = "completed";
+      break;
+    case "in-progress-workflow-run":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "99";
+      eventWorkflowRunAction = "in_progress";
+      break;
+    case "no-unique-pr":
+      associatedPullRequests = [];
+      break;
+    case "protected-main":
+      break;
+    case "protected-maintenance":
+      pullRequest = makeAdmissionPullRequest({ baseRef: "maintenance/1.4.x" });
+      associatedPullRequests = [pullRequest];
+      break;
+    case "unprotected-maintenance":
+      pullRequest = makeAdmissionPullRequest({ baseRef: "maintenance/1.4.x" });
+      associatedPullRequests = [pullRequest];
+      branchProtectionSequence = ["false"];
+      break;
+    case "invalid-or-changed-base":
+      pullRequest = makeAdmissionPullRequest({ baseRef: "maintenance/1.x" });
+      associatedPullRequests = [pullRequest];
+      branchProtectionSequence = ["true"];
+      break;
+  }
+
+  if (scenario === "invalid-or-changed-base") {
+    switch (eligibilityVariant) {
+      case "unsupported-base":
+        associatedPullRequests = [makeAdmissionPullRequest({ baseRef: "maintenance/1.x" })];
+        pullRequest = makeAdmissionPullRequest({ baseRef: "maintenance/1.x" });
+        branchProtectionSequence = ["true"];
+        break;
+      case "wrong-base-repository":
+        associatedPullRequests = [makeAdmissionPullRequest({ baseRef: "main" })];
+        pullRequest = makeAdmissionPullRequest({
+          baseRef: "main",
+          baseRepository: "other/repository",
+        });
+        branchProtectionSequence = ["true"];
+        break;
+      case "protection-changed":
+        associatedPullRequests = [makeAdmissionPullRequest({ baseRef: "main" })];
+        pullRequest = makeAdmissionPullRequest({ baseRef: "main" });
+        branchProtectionSequence = ["true", "true", "true", "true", "true", "false"];
+        break;
+    }
+  }
+
+  try {
+    writeFileSync(ghPath, `#!/usr/bin/env bash
+set -euo pipefail
+endpoint=""
+for argument in "$@"; do
+  if [[ "$argument" == repos/* ]]; then endpoint="$argument"; fi
+done
+if [[ "$endpoint" == repos/*/statuses/* ]]; then
+  state=""
+  description=""
+  for argument in "$@"; do
+    case "$argument" in
+      state=*) state="\${argument#state=}" ;;
+      description=*) description="\${argument#description=}" ;;
+    esac
+  done
+  printf '%s\t%s\n' "$state" "$description" >> "$STATUS_LOG"
+  exit 0
+fi
+if [[ "$endpoint" == repos/*/commits/*/pulls?per_page=100 ]]; then
+  printf '%s\n' "$ASSOCIATED_PRS_JSON"
+  exit 0
+fi
+if [[ "$endpoint" == repos/*/pulls/123 ]]; then
+  printf '%s\n' "$PULL_REQUEST_JSON"
+  exit 0
+fi
+if [[ "$endpoint" == repos/*/branches/* ]]; then
+  call_count=0
+  if [[ -f "$BRANCH_CALLS" ]]; then read -r call_count < "$BRANCH_CALLS"; fi
+  call_count=$((call_count + 1))
+  printf '%s\n' "$call_count" > "$BRANCH_CALLS"
+  printf '%s\n' "$endpoint" >> "$BRANCH_REQUESTS"
+  IFS=',' read -r -a protection <<< "$BRANCH_PROTECTION_SEQUENCE"
+  index=$((call_count - 1))
+  if (( index >= \${#protection[@]} )); then index=\${#protection[@]}-1; fi
+  printf '{"protected":%s}\n' "\${protection[index]}"
+  exit 0
+fi
+if [[ "$endpoint" == *"check-runs?filter=latest&per_page=100" ]]; then
+  printf '%s\n' "$CHECK_RUN_PAGES_JSON"
+  exit 0
+fi
+if [[ "$endpoint" == repos/*/actions/runs/* ]]; then
+  printf '%s\n' "$CI_RUN_JSON"
+  exit 0
+fi
+printf 'unexpected fake-gh endpoint: %s\n' "$endpoint" >&2
+exit 99
+`);
+    chmodSync(ghPath, 0o755);
+    writeFileSync(branchCallsPath, "0\n");
+    writeFileSync(branchRequestsPath, "");
+    writeFileSync(statusLogPath, "");
+
+    const result = spawnSync("bash", [evaluatorPath], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ASSOCIATED_PRS_JSON: JSON.stringify(associatedPullRequests),
+        BRANCH_CALLS: branchCallsPath,
+        BRANCH_REQUESTS: branchRequestsPath,
+        BRANCH_PROTECTION_SEQUENCE: branchProtectionSequence.join(","),
+        CHECK_RUN_PAGES_JSON: JSON.stringify([{ check_runs: [ciCheckRun, dcoCheckRun] }]),
+        CI_RUN_JSON: JSON.stringify(ciRun),
+        EVENT_HEAD_SHA: headSha,
+        EVENT_SOURCE: eventSource,
+        EVENT_WORKFLOW_RUN_ACTION: eventWorkflowRunAction,
+        EVENT_WORKFLOW_RUN_ID: eventWorkflowRunId,
+        PATH: `${directory}:${process.env.PATH ?? ""}`,
+        PULL_REQUEST_JSON: JSON.stringify(pullRequest),
+        REPOSITORY,
+        RUN_URL: "https://example.test/run/1",
+        SERVER_URL: "https://example.test",
+        STATUS_LOG: statusLogPath,
+      },
+    });
+    return {
+      result,
+      statuses: readFileSync(statusLogPath, "utf8").trim().split("\n").filter(Boolean),
+      branchCalls: Number(readFileSync(branchCallsPath, "utf8").trim()),
+      branchRequests: readFileSync(branchRequestsPath, "utf8").trim().split("\n").filter(Boolean),
+    };
+  } finally {
+    rmSync(directory, { force: true, recursive: true });
+  }
+}
+
 describe("external admission workflow", () => {
+  it("uses the latest canonical CI run when a workflow event ID is stale", () => {
+    const { result, statuses } = runAdmissionScenario("stale-workflow-run");
+    expect(result.status, `${result.stdout}\n${result.stderr}\n${statuses.join("\n")}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(result.stderr).toContain("does not authorize state");
+  });
+
+  it("reconciles a non-completed trusted workflow event against current success", () => {
+    const { result, statuses } = runAdmissionScenario("in-progress-workflow-run");
+    expect(result.status).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+  });
+
+  it("terminalizes an exact head with no unique eligible pull request", () => {
+    const { result, statuses } = runAdmissionScenario("no-unique-pr");
+    expect(result.status).toBe(0);
+    expect(statuses).toHaveLength(1);
+    expect(statuses[0]?.split("\t", 1)[0]).toBe("failure");
+    expect(statuses[0]).toContain("not uniquely eligible");
+  });
+
+  it("admits an exact-head pull request on protected main", () => {
+    const { result, statuses, branchCalls, branchRequests } =
+      runAdmissionScenario("protected-main");
+    expect(result.status).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(branchCalls).toBeGreaterThan(1);
+    expect(branchRequests.every((request) => request.endsWith("/branches/main"))).toBe(true);
+  });
+
+  it("admits an exact-head pull request on protected maintenance/1.4.x", () => {
+    const { result, statuses, branchCalls, branchRequests } =
+      runAdmissionScenario("protected-maintenance");
+    expect(result.status).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(branchCalls).toBeGreaterThan(1);
+    expect(branchRequests.every((request) => request.endsWith("/branches/maintenance%2F1.4.x")))
+      .toBe(true);
+  });
+
+  it("terminalizes an unprotected maintenance/1.4.x pull request", () => {
+    const { result, statuses } = runAdmissionScenario("unprotected-maintenance");
+    expect(result.status).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+    expect(statuses.at(-1)).toContain("not uniquely eligible");
+  });
+
+  it("terminalizes unsupported, mismatched, and changed base eligibility", () => {
+    for (const variant of [
+      "unsupported-base",
+      "wrong-base-repository",
+      "protection-changed",
+    ] as const) {
+      const { result, statuses } = runAdmissionScenario("invalid-or-changed-base", variant);
+      expect(result.status, variant).toBe(0);
+      expect(statuses.at(-1)?.split("\t", 1)[0], variant).toBe("failure");
+      expect(statuses.at(-1), variant).toContain("not uniquely eligible");
+      expect(statuses.at(-1), variant).not.toMatch(/^pending\t/u);
+    }
+  });
+
   it("uses DCO, trusted CI, and default-branch reconciliation with least privilege", () => {
     expect(workflow.on).toEqual({
       check_run: { types: ["created", "rerequested", "completed"] },
@@ -573,12 +852,20 @@ describe("external admission workflow", () => {
     expect(evaluator).not.toContain('if [[ "$(jq -r \'.ready\'');
 
     expect(evaluator).not.toContain("pull_request_is_eligible");
+    expect(evaluator).not.toContain("pull_request_eligibility");
+    for (const variable of [
+      "pull_request_evaluation",
+      "current_pull_request_evaluation",
+      "final_pull_request_evaluation",
+    ]) {
+      expect(evaluator).toContain(`${variable}="$(evaluate_pull_request`);
+    }
     for (const variable of [
       "pull_request_eligible",
       "current_pull_request_eligible",
       "final_pull_request_eligible",
     ]) {
-      expect(evaluator).toContain(`${variable}="$(pull_request_eligibility <<<"$`);
+      expect(evaluator).toContain(`${variable}="$(jq -r '.eligible'`);
       expect(evaluator).toContain(`if [[ "$${variable}" != true ]]; then`);
     }
 
@@ -604,11 +891,17 @@ describe("external admission workflow", () => {
         "ci-ready-jq": 75,
       }[command]);
       if (command === "valid-ineligible") {
-        expect(result.stdout).toContain("admission remains pending");
+        expect(result.stdout).toContain("admission failed");
       } else {
         expect(result.stdout).not.toContain("admission remains pending");
       }
-      if (command === "eligibility-jq" || command === "malformed-eligibility") {
+      if (
+        command === "node"
+        || command === "validator-jq"
+        || command === "eligibility-jq"
+        || command === "malformed-eligibility"
+        || command === "valid-ineligible"
+      ) {
         expect(statuses).not.toContain("state=pending");
       } else {
         expect(statuses).toContain("state=pending");
@@ -616,8 +909,7 @@ describe("external admission workflow", () => {
       if (command === "checks-ready-jq" || command === "ci-ready-jq") {
         expect(statuses.match(/state=pending/gu)).toHaveLength(1);
       }
-      if (command === "valid-ineligible") expect(statuses).not.toContain("state=failure");
-      else expect(statuses).toContain("state=failure");
+      expect(statuses).toContain("state=failure");
       expect(statuses).not.toContain("state=success");
     }
   });
