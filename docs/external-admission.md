@@ -65,10 +65,9 @@ and the `external-admission` status on `HEAD_SHA`.
 ## Expected status behavior
 
 - **Pending:** the workflow posts pending before PR association or policy
-  evaluation. It remains pending only when the current required CI or DCO
-  evidence is incomplete, transient, or changes during the three-snapshot
-  evaluation. A missing, ambiguous, invalid, or ineligible PR/base/check result
-  is not an incomplete check and must become a terminal failure.
+  evaluation. It remains pending when the current authenticated CI or DCO
+  evidence is missing, incomplete, transient, or changes during the
+  three-snapshot evaluation.
 - **Success:** three consecutive fresh snapshots prove authenticated CI and DCO
   success on the same exact head, while live base protection and pull-request
   eligibility remain valid. Exactly one open, non-draft pull request in the
@@ -76,9 +75,9 @@ and the `external-admission` status on `HEAD_SHA`.
   `maintenance/X.Y.x`. The CI check must resolve to a successful terminal
   `pull_request` run of `.github/workflows/ci.yml` for the same repository and
   SHA.
-- **Failure:** a required check or CI provenance is invalid or terminally
-  unsuccessful; the pull request is missing, ambiguous, ineligible, or targets
-  an unsupported or unprotected base; or evaluation encounters an API or policy
+- **Failure:** pull-request or base evidence is missing, ambiguous, invalid, or
+  ineligible; a required check is terminally unsuccessful; CI provenance is
+  invalid or terminally unsuccessful; or evaluation encounters an API or policy
   error. Inspect the linked workflow run before retrying.
 
 An invalid or missing SHA fails before a status can be safely written. The
