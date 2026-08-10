@@ -208,27 +208,29 @@ export function associateCommitsWithPullRequests(commits, associations) {
 
   for (const commit of commits) {
     const sha = commit.toLowerCase();
-    const candidates = (associations.get(commit) ?? associations.get(sha) ?? []).filter(
-      (pr) => pr.merged_at && pr.base?.ref === "main",
+    const candidates = associations.get(commit) ?? associations.get(sha) ?? [];
+    const exact = candidates.filter(
+      (pr) =>
+        pr.merged_at &&
+        pr.base?.ref === "main" &&
+        pr.merge_commit_sha?.toLowerCase() === sha,
     );
-    const exact = candidates.filter((pr) => pr.merge_commit_sha?.toLowerCase() === sha);
-    if (exact.length > 0) {
-      selected.push(...exact);
-    } else if (candidates.length === 1) {
-      selected.push(candidates[0]);
-    } else if (candidates.length === 0) {
+    if (exact.length === 1) {
+      selected.push(exact[0]);
+    } else if (exact.length === 0) {
       missing.push(commit);
     } else {
-      const candidateNumbers = candidates.map(({ number }) => `#${number}`).join(", ");
+      const exactNumbers = exact.map(({ number }) => `#${number}`).join(", ");
       throw new Error(
-        `Release commit ${commit} has ambiguous merged main PR associations ` +
-          `(${candidateNumbers}); none has a matching merge commit SHA`,
+        `Release commit ${commit} has ambiguous exact merged main PR associations ` +
+          `(${exactNumbers})`,
       );
     }
   }
   if (missing.length > 0) {
     throw new Error(
-      `Every release commit must belong to a merged main PR; no PR found for ${missing.join(", ")}`,
+      `Every release commit must belong to an exact merged main PR; ` +
+        `no exact merged main PR found for ${missing.join(", ")}`,
     );
   }
   return selected;

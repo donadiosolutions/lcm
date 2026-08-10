@@ -346,28 +346,68 @@ test("categorizes and deduplicates PRs while preserving every included PR", () =
 test("maps release commits to merged main PRs and rejects direct commits", () => {
   const first = "a".repeat(40);
   const second = "b".repeat(40);
-  const third = "c".repeat(40);
   const firstPr = pr(1, [], { merge_commit_sha: first });
   const secondPr = pr(2, [], { merge_commit_sha: second });
-  const singleFallbackPr = pr(3, [], { merge_commit_sha: "d".repeat(40) });
   const associations = new Map([
     [first, [firstPr]],
     [second, [secondPr, firstPr]],
-    [third, [singleFallbackPr]],
   ]);
   assert.deepEqual(
-    associateCommitsWithPullRequests([first, second, third], associations).map(
+    associateCommitsWithPullRequests([first, second], associations).map(
       ({ number }) => number,
     ),
-    [1, 2, 3],
+    [1, 2],
   );
   assert.throws(
     () => associateCommitsWithPullRequests(["c".repeat(40)], new Map()),
-    /no PR found/u,
+    /no exact merged main PR/u,
   );
 });
 
-test("rejects ambiguous commit associations without an exact merge SHA match", () => {
+test("rejects a sole non-exact main PR association", () => {
+  const commit = "c".repeat(40);
+  const associations = new Map([
+    [
+      commit,
+      [
+        pr(10, [], {
+          merge_commit_sha: "d".repeat(40),
+        }),
+      ],
+    ],
+  ]);
+
+  assert.throws(
+    () => associateCommitsWithPullRequests([commit], associations),
+    /no exact merged main PR/u,
+  );
+});
+
+test("rejects ambiguous exact main PR associations and names every match", () => {
+  const commit = "e".repeat(40);
+  const associations = new Map([
+    [
+      commit,
+      [
+        pr(12, [], { merge_commit_sha: commit }),
+        pr(34, [], { merge_commit_sha: commit }),
+      ],
+    ],
+  ]);
+
+  assert.throws(
+    () => associateCommitsWithPullRequests([commit], associations),
+    (error) => {
+      assert.match(error.message, new RegExp(commit, "u"));
+      assert.match(error.message, /#12/u);
+      assert.match(error.message, /#34/u);
+      assert.match(error.message, /ambiguous exact merged main PR associations/u);
+      return true;
+    },
+  );
+});
+
+test("rejects multiple non-exact main PR associations without an exact merge SHA", () => {
   const commit = "e".repeat(40);
   const associations = new Map([
     [
@@ -381,12 +421,7 @@ test("rejects ambiguous commit associations without an exact merge SHA match", (
 
   assert.throws(
     () => associateCommitsWithPullRequests([commit], associations),
-    (error) => {
-      assert.match(error.message, new RegExp(commit, "u"));
-      assert.match(error.message, /#12, #34/u);
-      assert.match(error.message, /ambiguous merged main PR associations/u);
-      return true;
-    },
+    /no exact merged main PR/u,
   );
 });
 
