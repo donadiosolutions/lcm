@@ -5,6 +5,8 @@ import {
   CHECK_IDENTITIES,
   evaluateAdmissionChecks,
   evaluateCiActionsRun,
+  evaluateEventFreshness,
+  evaluatePullRequestEligibility,
   flattenCheckRunPages,
   parseActionsRunId,
   runPolicyCommand,
@@ -12,6 +14,16 @@ import {
 
 const HEAD_SHA = "a".repeat(40);
 const REPOSITORY = "donadiosolutions/lcm";
+const eligibleMain = {
+  state: "open",
+  draft: false,
+  head: { sha: HEAD_SHA },
+  base: { ref: "main", repo: { full_name: REPOSITORY } },
+};
+const eligibleMaintenance = {
+  ...eligibleMain,
+  base: { ref: "maintenance/1.4.x", repo: { full_name: REPOSITORY } },
+};
 
 function check(identity, overrides = {}) {
   return {
@@ -54,6 +66,62 @@ test("defines only the authenticated CI and DCO identities", () => {
     appId: 15368,
     appSlug: "github-actions",
   });
+});
+
+test("admits only open exact-head PRs on protected repository bases", () => {
+  assert.deepEqual(evaluatePullRequestEligibility({
+    pullRequest: eligibleMain,
+    headSha: HEAD_SHA,
+    repository: REPOSITORY,
+    baseProtected: true,
+  }), { eligible: true });
+
+  assert.deepEqual(evaluatePullRequestEligibility({
+    pullRequest: eligibleMaintenance,
+    headSha: HEAD_SHA,
+    repository: REPOSITORY,
+    baseProtected: true,
+  }), { eligible: true });
+
+  const rejectedCases = [
+    ["maintenance/1.x", "unsupported-base", {
+      ...eligibleMain,
+      base: { ref: "maintenance/1.x", repo: { full_name: REPOSITORY } },
+    }],
+    ["maintenance/1.4", "unsupported-base", {
+      ...eligibleMain,
+      base: { ref: "maintenance/1.4", repo: { full_name: REPOSITORY } },
+    }],
+    ["maintenance/security", "unsupported-base", {
+      ...eligibleMain,
+      base: { ref: "maintenance/security", repo: { full_name: REPOSITORY } },
+    }],
+    ["release/1.4.x", "unsupported-base", {
+      ...eligibleMain,
+      base: { ref: "release/1.4.x", repo: { full_name: REPOSITORY } },
+    }],
+    ["unprotected maintenance branch", "unprotected-base", eligibleMaintenance, false],
+    ["wrong base repository", "repository-mismatch", {
+      ...eligibleMain,
+      base: { ref: "main", repo: { full_name: "other/repository" } },
+    }],
+    ["wrong head SHA", "ineligible-pr", {
+      ...eligibleMain,
+      head: { sha: "b".repeat(40) },
+    }],
+    ["draft", "ineligible-pr", { ...eligibleMain, draft: true }],
+    ["closed", "ineligible-pr", { ...eligibleMain, state: "closed" }],
+    ["malformed input", "ineligible-pr", null],
+  ];
+
+  for (const [name, reason, pullRequest, baseProtected = true] of rejectedCases) {
+    assert.deepEqual(evaluatePullRequestEligibility({
+      pullRequest,
+      headSha: HEAD_SHA,
+      repository: REPOSITORY,
+      baseProtected,
+    }), { eligible: false, reason }, name);
+  }
 });
 
 test("flattens every check-run page and rejects malformed pages", () => {
@@ -241,6 +309,145 @@ test("accepts only terminal CI success and rejects terminal non-success", () => 
   }), { state: "missing", ready: false, terminalFailure: "ci-run" });
 });
 
+test("enforces arbitrary-precision freshness lower bounds for trusted events", () => {
+  const hugeVisibleId = "9007199254740992";
+  const hugeEventId = "9007199254740993";
+  const cases = [
+    [
+      "older CI requested event is superseded by newer visible evidence",
+      {
+        eventSource: "workflow_run",
+        workflowRunAction: "requested",
+        workflowRunId: "99",
+        ciRunId: "100",
+      },
+      { ready: true },
+    ],
+    [
+      "equal completed CI event can reconcile current evidence",
+      {
+        eventSource: "workflow_run",
+        workflowRunAction: "completed",
+        workflowRunId: "100",
+        ciRunId: "100",
+      },
+      { ready: true },
+    ],
+    [
+      "equal requested CI event remains pending",
+      {
+        eventSource: "workflow_run",
+        workflowRunAction: "requested",
+        workflowRunId: "100",
+        ciRunId: "100",
+      },
+      { ready: false, pending: true, reason: "event-freshness" },
+    ],
+    [
+      "equal in-progress CI event remains pending",
+      {
+        eventSource: "workflow_run",
+        workflowRunAction: "in_progress",
+        workflowRunId: "100",
+        ciRunId: "100",
+      },
+      { ready: false, pending: true, reason: "event-freshness" },
+    ],
+    [
+      "newer CI event remains pending until its run is visible",
+      {
+        eventSource: "workflow_run",
+        workflowRunAction: "completed",
+        workflowRunId: hugeEventId,
+        ciRunId: hugeVisibleId,
+      },
+      { ready: false, pending: true, reason: "event-freshness" },
+    ],
+    [
+      "older DCO created event is superseded by newer visible evidence",
+      {
+        eventSource: "check_run",
+        checkRunAction: "created",
+        checkRunId: "99",
+        dcoCheckRunId: "100",
+      },
+      { ready: true },
+    ],
+    [
+      "equal DCO created event remains pending",
+      {
+        eventSource: "check_run",
+        checkRunAction: "created",
+        checkRunId: "100",
+        dcoCheckRunId: "100",
+      },
+      { ready: false, pending: true, reason: "event-freshness" },
+    ],
+    [
+      "equal DCO rerequested event remains pending",
+      {
+        eventSource: "check_run",
+        checkRunAction: "rerequested",
+        checkRunId: "100",
+        dcoCheckRunId: "100",
+      },
+      { ready: false, pending: true, reason: "event-freshness" },
+    ],
+    [
+      "equal completed DCO event can reconcile current evidence",
+      {
+        eventSource: "check_run",
+        checkRunAction: "completed",
+        checkRunId: "100",
+        dcoCheckRunId: "100",
+      },
+      { ready: true },
+    ],
+    [
+      "newer DCO event remains pending until its check is visible",
+      {
+        eventSource: "check_run",
+        checkRunAction: "completed",
+        checkRunId: hugeEventId,
+        dcoCheckRunId: hugeVisibleId,
+      },
+      { ready: false, pending: true, reason: "event-freshness" },
+    ],
+    [
+      "recovery dispatch has no event freshness lower bound",
+      { eventSource: "repository_dispatch" },
+      { ready: true },
+    ],
+  ];
+
+  for (const [name, input, expected] of cases) {
+    assert.deepEqual(evaluateEventFreshness(input), expected, name);
+  }
+});
+
+test("fails closed for malformed or unauthenticated freshness metadata", () => {
+  const malformedCases = [
+    { eventSource: "workflow_run", workflowRunAction: "completed", workflowRunId: "0", ciRunId: "1" },
+    { eventSource: "workflow_run", workflowRunAction: "unknown", workflowRunId: "1", ciRunId: "1" },
+    { eventSource: "check_run", checkRunAction: "completed", checkRunId: "not-an-id", dcoCheckRunId: "1" },
+    { eventSource: "check_run", checkRunAction: "unknown", checkRunId: "1", dcoCheckRunId: "1" },
+    { eventSource: "unexpected", workflowRunAction: "completed", workflowRunId: "1", ciRunId: "1" },
+  ];
+
+  for (const input of malformedCases) {
+    assert.deepEqual(evaluateEventFreshness(input), {
+      ready: false,
+      terminalFailure: "event-freshness",
+    }, JSON.stringify(input));
+  }
+
+  assert.deepEqual(evaluateEventFreshness({
+    eventSource: "workflow_run",
+    workflowRunAction: "completed",
+    workflowRunId: "1",
+  }), { ready: false, pending: true, reason: "event-freshness" });
+});
+
 test("honors an explicit canonical CI workflow path override", () => {
   assert.deepEqual(evaluateCiActionsRun(actionsRun({ path: ".github/workflows/trusted-ci.yml" }), {
     runId: "123",
@@ -306,6 +513,21 @@ test("exposes the complete policy through deterministic CLI commands", () => {
     ["0", HEAD_SHA, REPOSITORY],
     JSON.stringify(actionsRun()),
   )), { state: "invalid", ready: false, terminalFailure: "ci-run-metadata" });
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "evaluate-pr",
+    [HEAD_SHA, REPOSITORY, "true"],
+    JSON.stringify(eligibleMain),
+  )), { eligible: true });
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "evaluate-pr",
+    [HEAD_SHA, REPOSITORY, "false"],
+    JSON.stringify(eligibleMaintenance),
+  )), { eligible: false, reason: "unprotected-base" });
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "evaluate-freshness",
+    ["workflow_run", "completed", "100", "", "", "100", ""],
+    "{}",
+  )), { ready: true });
 
   assert.throws(() => runPolicyCommand("unknown", [], "{}"), /unknown policy command/u);
   assert.throws(() => runPolicyCommand("evaluate-checks", [], "{}"), /unknown policy command/u);

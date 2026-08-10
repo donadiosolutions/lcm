@@ -62,12 +62,41 @@ interface CiWorkflow {
   };
 }
 
+interface CodeqlWorkflow {
+  name: string;
+  on: {
+    push?: { branches: string[] };
+    schedule?: Array<{ cron: string }>;
+    workflow_dispatch?: null;
+    pull_request: { branches: string[] };
+    merge_group: { types: string[] };
+  };
+  permissions: Record<string, string>;
+  concurrency: {
+    group: string;
+    "cancel-in-progress": boolean;
+  };
+  jobs: {
+    analyze: {
+      permissions: Record<string, string>;
+      steps: WorkflowStep[];
+    };
+  };
+}
+
 const source = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+const codeqlSource = readFileSync(new URL("../.github/workflows/codeql.yml", import.meta.url), "utf8");
+const codeqlExtendedSource = readFileSync(
+  new URL("../.github/workflows/codeql-extended.yml", import.meta.url),
+  "utf8",
+);
 const launchdIntegrationSource = readFileSync(
   new URL("./daemon/lifecycle-launchd.integration.test.ts", import.meta.url),
   "utf8",
 );
 const workflow = loadYaml(source) as CiWorkflow;
+const codeqlWorkflow = loadYaml(codeqlSource) as CodeqlWorkflow;
+const codeqlExtendedWorkflow = loadYaml(codeqlExtendedSource) as CodeqlWorkflow;
 const launchdEvidenceRun =
   workflow.jobs["macos-launchd"].steps.find((step) => step.name === "Run launchd integration path")?.run ?? "";
 const launchdFixtureToken = "11111111-1111-1111-1111-111111111111";
@@ -174,6 +203,56 @@ const expectedCodecovRunSteps = [
 ];
 
 describe("CI workflow", () => {
+  it("runs both CodeQL workflows for protected main and maintenance pull requests", () => {
+    expect(codeqlWorkflow.on).toEqual({
+      push: { branches: ["main"] },
+      pull_request: { branches: ["main", "maintenance/**"] },
+      merge_group: { types: ["checks_requested"] },
+    });
+    expect(codeqlExtendedWorkflow.on).toEqual({
+      schedule: [{ cron: "17 5 * * 1" }],
+      workflow_dispatch: null,
+      pull_request: { branches: ["main", "maintenance/**"] },
+      merge_group: { types: ["checks_requested"] },
+    });
+  });
+
+  it("preserves the CodeQL action pins, permissions, and concurrency contracts", () => {
+    for (const workflowUnderTest of [codeqlWorkflow, codeqlExtendedWorkflow]) {
+      expect(workflowUnderTest.permissions).toEqual({
+        actions: "read",
+        contents: "read",
+      });
+      expect(workflowUnderTest.concurrency).toEqual({
+        group: "codeql-${{ github.workflow }}-${{ github.ref }}",
+        "cancel-in-progress": true,
+      });
+      expect(workflowUnderTest.jobs.analyze.permissions).toEqual({
+        actions: "read",
+        contents: "read",
+        "security-events": "write",
+      });
+      expect(
+        workflowUnderTest.jobs.analyze.steps
+          .filter((step) => step.uses !== undefined)
+          .map((step) => ({ name: step.name, uses: step.uses })),
+      ).toEqual([
+        {
+          name: "Checkout",
+          uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        },
+        {
+          name: "Initialize CodeQL",
+          uses: "github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38",
+        },
+        {
+          name: "Analyze",
+          uses: "github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38",
+        },
+      ]);
+    }
+  });
+
   it("seeds the environment and gates the stable check on every required suite", () => {
     expect(workflow.jobs.environment).toMatchObject({
       name: "Initialize CI environment",

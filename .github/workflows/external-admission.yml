@@ -116,7 +116,6 @@ jobs:
       # The evaluator and policy must come from the workflow revision, never
       # from the untrusted pull-request head whose admission evidence they evaluate.
       - name: Check out trusted admission evaluator
-        if: ${{ (github.event_name == 'repository_dispatch' && github.event.action == 'external-admission-reconcile' && github.event.client_payload.head_sha != '') || github.event.action == 'completed' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
@@ -127,19 +126,23 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Set up Node.js
-        if: ${{ (github.event_name == 'repository_dispatch' && github.event.action == 'external-admission-reconcile' && github.event.client_payload.head_sha != '') || github.event.action == 'completed' }}
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22.20.0"
 
       - name: Evaluate external admission snapshot
-        if: ${{ (github.event_name == 'repository_dispatch' && github.event.action == 'external-admission-reconcile' && github.event.client_payload.head_sha != '') || github.event.action == 'completed' }}
         env:
           EVENT_HEAD_SHA: >-
             ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.head_sha ||
                 github.event_name == 'workflow_run' && github.event.workflow_run.head_sha ||
                 github.event.check_run.head_sha }}
           EVENT_SOURCE: ${{ github.event_name }}
+          EVENT_WORKFLOW_RUN_ACTION: >-
+            ${{ github.event_name == 'workflow_run' && github.event.action || '' }}
           EVENT_WORKFLOW_RUN_ID: >-
             ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+          EVENT_CHECK_RUN_ACTION: >-
+            ${{ github.event_name == 'check_run' && github.event.action || '' }}
+          EVENT_CHECK_RUN_ID: >-
+            ${{ github.event_name == 'check_run' && github.event.check_run.id || '' }}
         run: bash .github/scripts/external-admission.sh

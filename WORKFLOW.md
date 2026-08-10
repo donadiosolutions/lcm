@@ -19,15 +19,33 @@ This document is a living record. **Update it whenever you learn something:**
 ## Branch Strategy
 
 ```text
-feature/docs branches → main (default, protected)
+ordinary feat/docs/fix branches → main (default, protected)
+maintenance fix branches        → maintenance/<major>.<minor>.x (protected)
 ```
 
-- **`main`** — Default branch. All PRs target main. Protected: pull requests, required checks, and reviews are required; no force push. Pushing a matching stable `vX.Y.Z` or beta `vX.Y.Z-beta.N` tag triggers draft-release creation.
-- **Feature branches** — `feat/TOPIC`, `docs/TOPIC`, `fix/TOPIC`. Always branch from main and use an isolated worktree for each concurrent change.
+- **`main`** — Default target for ordinary feature, documentation, and fix
+  pull requests. It is protected: pull requests, required checks, and reviews
+  are required; no force push. Pushing a matching stable `vX.Y.Z` or beta
+  `vX.Y.Z-beta.N` tag triggers draft-release creation.
+- **`maintenance/<major>.<minor>.x`** — Target for fixes to an existing
+  maintenance line. Create the topic branch from that exact maintenance branch
+  and target the pull request back to it. The maintenance branch must be
+  protected before external admission can accept the pull request, with the
+  required CI and CodeQL checks enabled for pull requests targeting that
+  maintenance namespace.
+- **Topic branches** — Use `feat/TOPIC`, `docs/TOPIC`, or `fix/TOPIC` as
+  appropriate, based on the selected target branch, and use an isolated worktree
+  for each concurrent change.
+
+Ordinary and maintenance pull requests follow the same protected flow: every
+required exact-head check and review must pass, and the pull request must merge
+with a merge commit. Use `main` as `TARGET_BRANCH` for ordinary work or the
+selected protected `maintenance/<major>.<minor>.x` branch for a maintenance fix
+in every sync, branch, rebase, and pull-request target operation below.
 
 Independent changes may be developed in parallel on isolated branches and
 worktrees. Dependent work must wait for its upstream PR to merge, then fetch
-and rebase onto the new `main` before it is merged.
+and rebase onto the updated target branch before it is merged.
 
 The repository does not use a merge queue. Merge protected pull requests
 directly with merge commits only after every required exact-head check and
@@ -39,31 +57,37 @@ The required `external-admission` status separates pull-request admission from
 merge-group validation for DCO, which does not report on synthetic queue
 commits. Authenticated DCO `check_run` events and lifecycle events from the
 canonical `.github/workflows/ci.yml` workflow drive `external-admission.yml`;
-pull-request lifecycle events do not start this write-capable workflow. DCO and
-CI start or rerun events revoke stale admission and exit immediately. Their
-completion events evaluate a current exact-SHA snapshot and exit instead of
-occupying a runner while polling. A default-branch
-`external-admission-reconcile` repository dispatch with the exact PR head SHA
-provides fail-closed reconciliation if an event is delayed or lost; see the
+pull-request lifecycle events do not start this write-capable workflow. Every
+accepted DCO event, canonical CI event, or default-branch
+`external-admission-reconcile` dispatch is a wake-up for the stateless reducer:
+it evaluates the latest exact-head snapshot and exits instead of polling on a
+runner. A workflow or check-run event ID is wake-up context only, never state
+authority; the reducer selects the latest authenticated CI and DCO evidence
+for the exact head. Recovery dispatch with the exact PR head SHA provides
+fail-closed reconciliation if an event is delayed or lost; see the
 [external-admission recovery guide](docs/external-admission.md).
 
 Every eligible pull request requires authenticated DCO and exact-head canonical
-CI. Only `pull_request` runs of `.github/workflows/ci.yml` for the exact
-repository and head SHA can satisfy admission; push and synthetic merge-group
-runs are rejected before a runner starts. An aggregate `ci` check may succeed
-while a trailing workflow job is still running, so documented transient run
-states remain pending until the next trusted event. Provenance mismatches and
-terminal non-success results fail.
+CI. Only one open, non-draft pull request in the exact repository, targeting a
+protected `main` or protected `maintenance/X.Y.x` base, can satisfy admission.
+Only `pull_request` runs of `.github/workflows/ci.yml` for the exact repository
+and head SHA can satisfy its CI requirement; push and synthetic merge-group runs
+are rejected before a runner starts. The reducer reads live base protection and
+revalidates base and pull-request eligibility before success. An aggregate `ci`
+check may succeed while a trailing workflow job is still running, so incomplete
+current checks remain pending until the next trusted event. Invalid, ambiguous,
+ineligible, or terminally unsuccessful evidence is a terminal failure.
 
-Every valid event replaces stale successful admission with `pending` before
-checkout or PR association. The handler admits only one open, non-draft,
-main-targeting PR at the exact event SHA and repeats PR eligibility, latest
-authenticated CI and DCO evaluation, and CI-run provenance validation before
-success. Commit-associated PRs and check runs are paginated and flattened. The
-executable evaluator and policy are sparsely checked out from the trusted
-workflow revision with persisted credentials disabled. Although a
-`workflow_run` handler receives a write-capable token, it never downloads CI
-artifacts or caches and never checks out or executes PR-controlled content.
+Every accepted event replaces stale successful admission with `pending` before
+checkout or PR association, then evaluates the latest exact-head snapshot.
+Commit-associated PRs and check runs are paginated and flattened. The reducer
+revalidates live base protection, PR uniqueness and eligibility, authenticated
+CI and DCO evidence, and CI-run provenance at the initial, current, and final
+snapshots before success. The executable evaluator and policy are sparsely
+checked out from the trusted workflow revision with persisted credentials
+disabled. Although a `workflow_run` handler receives a write-capable token, the
+evaluator never downloads CI artifacts or caches and never checks out or
+executes PR-controlled content.
 
 The initial transition from the legacy review-provider policy required one
 documented maintainer bootstrap because the default-branch evaluator could not
@@ -104,8 +128,8 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
 | `external-admission.yml`             | Authenticated DCO checks, canonical PR CI lifecycle, default-branch exact-SHA repository dispatch | Statelessly require exact-head canonical CI and DCO for every eligible pull request |
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
-| `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
-| `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
+| `codeql.yml`                         | Push to main + PRs targeting main or `maintenance/**` + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
+| `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main or `maintenance/**` + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
 | `version-pr.yml`                     | Push to main + manual `beta`/`stable` dispatch                                      | Auto-create version PRs and enter or exit Changesets beta mode                          |
 | `publish.yml`                        | Stable/beta tag pushes + GitHub release publication                                  | Create draft releases from tags; publish npm only after manual draft publication        |
 
@@ -186,8 +210,8 @@ or service fails.
 
 ## Phase 2: Spec Review via PR
 
-1. **Sync first:** `git checkout main && git pull --ff-only origin main` before branching — stale local bases cause Copilot to review unrelated code
-2. Create a `docs/TOPIC` branch from main
+1. **Sync first:** Set `TARGET_BRANCH` according to Branch Strategy, then run `git checkout "$TARGET_BRANCH" && git pull --ff-only origin "$TARGET_BRANCH"` before branching — stale local bases cause Copilot to review unrelated code
+2. Create a `docs/TOPIC` branch from the selected target branch
 3. Ensure only documentation files are in the diff — specs, plans, workflow docs
 4. Push and open PR
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
@@ -197,10 +221,10 @@ or service fails.
 
 ## Phase 3: Implementation (Sonnet subagents)
 
-1. **Sync first:** `git checkout main && git pull --ff-only origin main` to get latest (including merged specs)
+1. **Sync first:** Set `TARGET_BRANCH` according to Branch Strategy, then run `git checkout "$TARGET_BRANCH" && git pull --ff-only origin "$TARGET_BRANCH"` to get the latest target (including merged specs)
 2. Dispatch `model: sonnet` subagents with `isolation: worktree` for each task in the plan
 3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
-4. **Sequential tasks** → launch the dependent branch only after the upstream PR merges, then branch from the updated `main`. If a downstream branch already exists on the old upstream tip, enter its isolated worktree, set `OLD_UPSTREAM_TIP` to that commit, and replay only its downstream commits with `git fetch origin main && git rebase --onto origin/main "${OLD_UPSTREAM_TIP}"`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
+4. **Sequential tasks** → launch the dependent branch only after the upstream PR merges, then branch from the updated target branch. If a downstream branch already exists on the old upstream tip, enter its isolated worktree, set `TARGET_BRANCH` and `OLD_UPSTREAM_TIP`, and replay only its downstream commits with `git fetch origin "$TARGET_BRANCH" && git rebase --onto "origin/$TARGET_BRANCH" "${OLD_UPSTREAM_TIP}"`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
 5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
 6. After subagent completes: review the diff, push, open PR, request Copilot review
 
@@ -288,9 +312,9 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
 
 ### Common Pitfalls
 
-- **Stale diff**: Always sync main before creating branches. If main has unpushed local commits, the PR diff includes unrelated code and Copilot reviews the wrong things.
+- **Stale diff**: Always sync the selected target branch before creating topic branches. If that target has unpushed local commits, the PR diff includes unrelated code and Copilot reviews the wrong things.
 - **@copilot in comments**: Opens a new PR instead of triggering review. Always use the reviewers API.
 - **REST API 422 for Copilot bot**: The `requested_reviewers` REST endpoint rejects bot slugs. Use `gh pr edit --add-reviewer` instead.
 - **Empty commits don't trigger Copilot**: Copilot only reviews on substantive diffs. Use `gh pr edit` re-request instead.
-- **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Set `CLEAN_BRANCH` to the new branch name and `DOCS_COMMIT_SHA` to the documentation commit, then use `git checkout -B "${CLEAN_BRANCH}" origin/main && git cherry-pick "${DOCS_COMMIT_SHA}"`.
-- **Sequential PR chains**: Create PR B from updated `main` only after PR A lands. If PR B already contains commits based on PR A's old tip, enter PR B's isolated worktree, set `OLD_PR_A_TIP` to that commit, and replay only its own commits with `git fetch origin main && git rebase --onto origin/main "${OLD_PR_A_TIP}"`. Omit the branch argument so Git rebases the branch already checked out in that worktree instead of attempting a conflicting cross-worktree checkout.
+- **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Set `TARGET_BRANCH` according to Branch Strategy, `CLEAN_BRANCH` to the new branch name, and `DOCS_COMMIT_SHA` to the documentation commit, then use `git checkout -B "${CLEAN_BRANCH}" "origin/${TARGET_BRANCH}" && git cherry-pick "${DOCS_COMMIT_SHA}"`.
+- **Sequential PR chains**: Create PR B from the updated target branch only after PR A lands. If PR B already contains commits based on PR A's old tip, enter PR B's isolated worktree, set `TARGET_BRANCH` and `OLD_PR_A_TIP`, and replay only its own commits with `git fetch origin "$TARGET_BRANCH" && git rebase --onto "origin/$TARGET_BRANCH" "${OLD_PR_A_TIP}"`. Omit the branch argument so Git rebases the branch already checked out in that worktree instead of attempting a conflicting cross-worktree checkout.
