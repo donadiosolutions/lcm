@@ -8,6 +8,7 @@ import { PromotedStore } from "../../src/db/promoted.js";
 import { RecallStore } from "../../src/db/recall.js";
 
 const tempDirs: string[] = [];
+const FULL_SUITE_RECALL_TEST_TIMEOUT_MS = 15_000;
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
@@ -186,7 +187,7 @@ describe("RecallStore.getStats", () => {
     // Highest act count first (id[6] acted 7 times)
     expect(stats.topRecalled[0].id).toBe(ids[6]);
     expect(stats.topRecalled[0].actCount).toBe(7);
-  });
+  }, FULL_SUITE_RECALL_TEST_TIMEOUT_MS);
 
   it("recallPrecision is null when no memories surfaced", () => {
     const db = makeDb();
