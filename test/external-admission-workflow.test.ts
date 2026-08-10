@@ -265,7 +265,7 @@ const job = workflow.jobs["external-admission-evaluator"];
 const evaluatorInvocation =
   job.steps.find((step) => step.name === "Evaluate external admission snapshot")?.run ?? "";
 function runWithFailingAdmissionCommand(
-  command: "gh" | "node" | "validator-jq" | "eligibility-jq" | "checks-ready-jq" | "ci-ready-jq" | "malformed-eligibility" | "valid-ineligible",
+  command: "gh" | "node" | "validator-jq" | "eligibility-jq" | "checks-ready-jq" | "ci-ready-jq" | "unknown-policy-command" | "malformed-eligibility" | "valid-ineligible",
 ) {
   const directory = mkdtempSync(join(tmpdir(), "external-admission-"));
   const ghPath = join(directory, "gh");
@@ -320,6 +320,20 @@ exit 99
       writeFileSync(nodePath, "#!/usr/bin/env bash\nexit 71\n");
       chmodSync(nodePath, 0o755);
     }
+    if (command === "unknown-policy-command") {
+      writeFileSync(nodePath, `#!/usr/bin/env bash
+if [[ "$2" == "evaluate-freshness" ]]; then
+  printf '%s\\n' '{"ready":true}'
+  exit 0
+fi
+exit 99
+`);
+      chmodSync(nodePath, 0o755);
+      const result = spawnSync(nodePath, ["external-admission-policy.mjs", "unknown-policy-command"], {
+        encoding: "utf8",
+      });
+      return { result, statuses: "" };
+    }
     if (["validator-jq", "checks-ready-jq", "ci-ready-jq"].includes(command)) {
       writeFileSync(nodePath, `#!/usr/bin/env bash
 if [[ "$2" == "evaluate-checks" ]]; then
@@ -328,6 +342,10 @@ if [[ "$2" == "evaluate-checks" ]]; then
 fi
 if [[ "$2" == "evaluate-ci-run" ]]; then
   printf '%s\\n' '{"state":"completed","ready":true}'
+  exit 0
+fi
+if [[ "$2" == "evaluate-freshness" ]]; then
+  printf '%s\\n' '{"ready":true}'
   exit 0
 fi
 if [[ "$2" == "evaluate-pr" ]]; then
@@ -360,11 +378,15 @@ fi
 if [[ "$FAIL_ADMISSION_COMMAND" == validator-jq && "$call_count" == 10 ]]; then
   exit 72
 fi
-if [[ "$FAIL_ADMISSION_COMMAND" == checks-ready-jq && "$call_count" == 12 ]]; then
-  exit 74
-fi
-if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$call_count" == 17 ]]; then
+if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$call_count" == 22 ]]; then
   exit 75
+fi
+if [[ "$FAIL_ADMISSION_COMMAND" == checks-ready-jq && "$1" == "-r" && "$2" == ".ready" ]]; then
+  input="$(cat)"
+  if [[ "$input" == *'"states"'* ]]; then
+    exit 74
+  fi
+  exec /usr/bin/jq "$@" <<<"$input"
 fi
 exec /usr/bin/jq "$@"
 `);
@@ -396,12 +418,20 @@ exec /usr/bin/jq "$@"
 
 type AdmissionScenario =
   | "stale-workflow-run"
+  | "newer-workflow-run"
   | "in-progress-workflow-run"
+  | "equal-in-progress-workflow-run"
+  | "equal-dco-created"
+  | "equal-dco-rerequested"
+  | "equal-dco-completed"
   | "no-unique-pr"
   | "protected-main"
   | "protected-maintenance"
   | "unprotected-maintenance"
-  | "invalid-or-changed-base";
+  | "invalid-or-changed-base"
+  | "transient-base"
+  | "mixed-deleted-base"
+  | "duplicate-base-candidates";
 
 type AdmissionEligibilityVariant =
   | "unsupported-base"
@@ -410,6 +440,7 @@ type AdmissionEligibilityVariant =
   | "protection-deleted";
 
 function makeAdmissionPullRequest({
+  number = 123,
   baseRef = "main",
   baseRepository = REPOSITORY,
   draft = false,
@@ -417,7 +448,7 @@ function makeAdmissionPullRequest({
   headSha = HEAD_SHA,
 } = {}) {
  return {
-    number: 123,
+    number,
    state,
    draft,
     head: { sha: headSha },
@@ -465,10 +496,13 @@ function runAdmissionScenario(
   let associatedPullRequests = [makeAdmissionPullRequest()];
   let pullRequest = makeAdmissionPullRequest();
   let branchProtectionSequence = ["true"];
+  let branchDeletedSuffix = "";
   let branchLookupMustNotHappen = false;
   let eventSource = "repository_dispatch";
   let eventWorkflowRunId = "";
   let eventWorkflowRunAction = "";
+  let eventCheckRunId = "";
+  let eventCheckRunAction = "";
 
   switch (scenario) {
     case "stale-workflow-run":
@@ -476,10 +510,35 @@ function runAdmissionScenario(
       eventWorkflowRunId = "99";
       eventWorkflowRunAction = "completed";
       break;
+    case "newer-workflow-run":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "124";
+      eventWorkflowRunAction = "completed";
+      break;
     case "in-progress-workflow-run":
       eventSource = "workflow_run";
       eventWorkflowRunId = "99";
       eventWorkflowRunAction = "in_progress";
+      break;
+    case "equal-in-progress-workflow-run":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = ciRunId;
+      eventWorkflowRunAction = "in_progress";
+      break;
+    case "equal-dco-created":
+      eventSource = "check_run";
+      eventCheckRunId = "11";
+      eventCheckRunAction = "created";
+      break;
+    case "equal-dco-rerequested":
+      eventSource = "check_run";
+      eventCheckRunId = "11";
+      eventCheckRunAction = "rerequested";
+      break;
+    case "equal-dco-completed":
+      eventSource = "check_run";
+      eventCheckRunId = "11";
+      eventCheckRunAction = "completed";
       break;
     case "no-unique-pr":
       associatedPullRequests = [];
@@ -530,9 +589,26 @@ function runAdmissionScenario(
       case "protection-deleted":
         associatedPullRequests = [makeAdmissionPullRequest({ baseRef: "main" })];
         pullRequest = makeAdmissionPullRequest({ baseRef: "main" });
-        branchProtectionSequence = ["deleted"];
+        branchDeletedSuffix = "main";
         break;
     }
+  } else if (scenario === "transient-base") {
+    branchProtectionSequence = ["503"];
+  } else if (scenario === "mixed-deleted-base") {
+    associatedPullRequests = [
+      makeAdmissionPullRequest({ number: 122, baseRef: "maintenance/1.4.x" }),
+      makeAdmissionPullRequest({ number: 123, baseRef: "main" }),
+    ];
+    pullRequest = makeAdmissionPullRequest({ number: 123, baseRef: "main" });
+    branchProtectionSequence = ["deleted", "true"];
+    branchDeletedSuffix = "maintenance%2F1.4.x";
+  } else if (scenario === "duplicate-base-candidates") {
+    associatedPullRequests = [
+      makeAdmissionPullRequest({ number: 122, baseRef: "main" }),
+      makeAdmissionPullRequest({ number: 123, baseRef: "main" }),
+    ];
+    pullRequest = makeAdmissionPullRequest({ number: 123, baseRef: "main" });
+    branchProtectionSequence = ["true"];
   }
 
   try {
@@ -562,7 +638,7 @@ if [[ "$endpoint" == repos/*/pulls/123 ]]; then
   printf '%s\n' "$PULL_REQUEST_JSON"
   exit 0
 fi
-if [[ "$endpoint" == repos/*/branches/* ]]; then
+  if [[ "$endpoint" == repos/*/branches/* ]]; then
   call_count=0
   if [[ -f "$BRANCH_CALLS" ]]; then read -r call_count < "$BRANCH_CALLS"; fi
   call_count=$((call_count + 1))
@@ -572,12 +648,20 @@ if [[ "$endpoint" == repos/*/branches/* ]]; then
     printf 'unexpected branch metadata lookup: %s\n' "$endpoint" >&2
     exit 98
   fi
+  if [[ -n "$BRANCH_DELETED_SUFFIX" && "$endpoint" == *"/branches/$BRANCH_DELETED_SUFFIX" ]]; then
+    printf 'HTTP/2 404 Not Found\nContent-Type: application/json\n\n{"message":"Not Found"}\n'
+    exit 1
+  fi
   IFS=',' read -r -a protection <<< "$BRANCH_PROTECTION_SEQUENCE"
   index=$((call_count - 1))
   if (( index >= \${#protection[@]} )); then index=\${#protection[@]}-1; fi
   if [[ "\${protection[index]}" == deleted ]]; then
-    printf 'branch metadata not found: %s\n' "$endpoint" >&2
-    exit 22
+    printf 'HTTP/2 404 Not Found\nContent-Type: application/json\n\n{"message":"Not Found"}\n'
+    exit 1
+  fi
+  if [[ "\${protection[index]}" == 503 ]]; then
+    printf 'HTTP/2 503 Service Unavailable\nContent-Type: application/json\n\n{"message":"Service Unavailable"}\n'
+    exit 1
   fi
   printf '{"protected":%s}\n' "\${protection[index]}"
   exit 0
@@ -604,6 +688,7 @@ exit 99
         ...process.env,
         ASSOCIATED_PRS_JSON: JSON.stringify(associatedPullRequests),
         BRANCH_CALLS: branchCallsPath,
+        BRANCH_DELETED_SUFFIX: branchDeletedSuffix,
         BRANCH_LOOKUP_MUST_NOT_HAPPEN: String(branchLookupMustNotHappen),
         BRANCH_REQUESTS: branchRequestsPath,
         BRANCH_PROTECTION_SEQUENCE: branchProtectionSequence.join(","),
@@ -611,6 +696,8 @@ exit 99
         CI_RUN_JSON: JSON.stringify(ciRun),
         EVENT_HEAD_SHA: headSha,
         EVENT_SOURCE: eventSource,
+        EVENT_CHECK_RUN_ACTION: eventCheckRunAction,
+        EVENT_CHECK_RUN_ID: eventCheckRunId,
         EVENT_WORKFLOW_RUN_ACTION: eventWorkflowRunAction,
         EVENT_WORKFLOW_RUN_ID: eventWorkflowRunId,
         PATH: `${directory}:${process.env.PATH ?? ""}`,
@@ -642,6 +729,36 @@ describe("external admission workflow", () => {
 
   it("reconciles a non-completed trusted workflow event against current success", () => {
     const { result, statuses } = runAdmissionScenario("in-progress-workflow-run");
+    expect(result.status).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+  });
+
+  it("keeps a newer CI event pending until its run is visible", () => {
+    const { result, statuses } = runAdmissionScenario("newer-workflow-run");
+    expect(result.status).toBe(0);
+    expect(statuses.some((status) => status.startsWith("pending\t"))).toBe(true);
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it("keeps an equal in-progress CI event pending", () => {
+    const { result, statuses } = runAdmissionScenario("equal-in-progress-workflow-run");
+    expect(result.status).toBe(0);
+    expect(statuses.some((status) => status.startsWith("pending\t"))).toBe(true);
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it.each([
+    ["equal-dco-created", "created"],
+    ["equal-dco-rerequested", "rerequested"],
+  ] as const)("keeps an equal DCO %s event pending", (scenario) => {
+    const { result, statuses } = runAdmissionScenario(scenario);
+    expect(result.status).toBe(0);
+    expect(statuses.some((status) => status.startsWith("pending\t"))).toBe(true);
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it("reconciles an equal completed DCO event against current evidence", () => {
+    const { result, statuses } = runAdmissionScenario("equal-dco-completed");
     expect(result.status).toBe(0);
     expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
   });
@@ -707,12 +824,36 @@ describe("external admission workflow", () => {
       .toBe(true);
 
     const deleted = runAdmissionScenario("invalid-or-changed-base", "protection-deleted");
-    expect(deleted.result.status).not.toBe(0);
+    expect(deleted.result.status).toBe(0);
     expect(deleted.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
-    expect(deleted.statuses.at(-1)).toContain("External admission failed");
+    expect(deleted.statuses.at(-1)).toContain("not uniquely eligible");
     expect(deleted.branchCalls).toBeGreaterThan(0);
     expect(deleted.branchRequests.every((request) => request.endsWith("/branches/main")))
       .toBe(true);
+  });
+
+  it("keeps transient supported-base API failures pending", () => {
+    const { result, statuses } = runAdmissionScenario("transient-base");
+    expect(result.status).toBe(0);
+    expect(statuses).toHaveLength(1);
+    expect(statuses[0]?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it("ignores a deleted historical base when one valid PR remains", () => {
+    const { result, statuses, branchRequests } = runAdmissionScenario("mixed-deleted-base");
+    const evidence = `${result.stdout}\n${result.stderr}\n${statuses.join("\n")}\n${branchRequests.join("\n")}`;
+    expect(result.status, evidence).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0], evidence).toBe("success");
+  });
+
+  it("caches duplicate base protection lookups within one PR snapshot", () => {
+    const { result, statuses, branchCalls, branchRequests } =
+      runAdmissionScenario("duplicate-base-candidates");
+    const evidence = `${result.stdout}\n${result.stderr}\n${statuses.join("\n")}\n${branchRequests.join("\n")}`;
+    expect(result.status, evidence).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0], evidence).toBe("failure");
+    expect(branchCalls, evidence).toBe(1);
   });
 
   it("uses DCO, trusted CI, and default-branch reconciliation with least privilege", () => {
@@ -868,6 +1009,9 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain('"$HEAD_SHA" "$REPOSITORY" "$SERVER_URL"');
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-ci-run");
     expect(evaluator).toContain('if [[ "$EVENT_SOURCE" == workflow_run');
+    expect(evaluator).toContain("EVENT_WORKFLOW_RUN_ACTION");
+    expect(evaluator).toContain("EVENT_CHECK_RUN_ACTION");
+    expect(evaluator).toContain("EVENT_CHECK_RUN_ID");
     expect(evaluator).toContain('printf -v "$fingerprint_variable" \'%s\' "$ci_check_run_id:$dco_check_run_id:$ci_run_id"');
     expect(evaluator).toContain('validate_required_snapshot "Initial" initial_admission_fingerprint');
     expect(evaluator).toContain('validate_required_snapshot "Current" current_admission_fingerprint');
@@ -904,7 +1048,7 @@ describe("external admission workflow", () => {
       "current_pull_request_evaluation",
       "final_pull_request_evaluation",
     ]) {
-      expect(evaluator).toContain(`${variable}="$(evaluate_pull_request`);
+      expect(evaluator).toContain(`${variable}="$PULL_REQUEST_EVALUATION"`);
     }
     for (const variable of [
       "pull_request_eligible",
@@ -926,6 +1070,7 @@ describe("external admission workflow", () => {
       "valid-ineligible",
     ] as const) {
       const { result, statuses } = runWithFailingAdmissionCommand(command);
+      const evidence = `${command}\n${result.stdout}\n${result.stderr}\n${statuses}`;
       if (command === "valid-ineligible") expect(result.status).toBe(0);
       else if (command === "malformed-eligibility") expect(result.status).not.toBe(0);
       else expect(result.status).toBe({
@@ -939,7 +1084,7 @@ describe("external admission workflow", () => {
       if (command === "valid-ineligible") {
         expect(result.stdout).toContain("admission failed");
       } else {
-        expect(result.stdout).not.toContain("admission remains pending");
+        expect(result.stdout, evidence).not.toContain("admission remains pending");
       }
       if (
         command === "node"
@@ -948,16 +1093,21 @@ describe("external admission workflow", () => {
         || command === "malformed-eligibility"
         || command === "valid-ineligible"
       ) {
-        expect(statuses).not.toContain("state=pending");
+        expect(statuses, evidence).not.toContain("state=pending");
       } else {
-        expect(statuses).toContain("state=pending");
+        expect(statuses, evidence).toContain("state=pending");
       }
       if (command === "checks-ready-jq" || command === "ci-ready-jq") {
-        expect(statuses.match(/state=pending/gu)).toHaveLength(1);
+        expect(statuses.match(/state=pending/gu), evidence).toHaveLength(1);
       }
-      expect(statuses).toContain("state=failure");
-      expect(statuses).not.toContain("state=success");
+      expect(statuses, evidence).toContain("state=failure");
+      expect(statuses, evidence).not.toContain("state=success");
     }
+  });
+
+  it("keeps unknown fake policy commands fail-closed", () => {
+    const { result } = runWithFailingAdmissionCommand("unknown-policy-command");
+    expect(result.status).toBe(99);
   });
 
   it("preserves fail-closed cancellation, failure, and stale-success handling", () => {
@@ -1005,5 +1155,12 @@ describe("external admission workflow", () => {
       expect(content).not.toMatch(new RegExp(`grep${"tile"}`, "iu"));
     }
     expect(existsSync(new URL(`grep${"tile"}.json`, root))).toBe(false);
+  });
+
+  it("documents immutable configuration and freshness/transient semantics", () => {
+    expect(documentation).toMatch(/## Configuration\n/iu);
+    expect(documentation).toMatch(/no user-configurable options/iu);
+    expect(documentation).toMatch(/freshness lower bound/iu);
+    expect(documentation).toMatch(/transient.*branch.*pending/isu);
   });
 });

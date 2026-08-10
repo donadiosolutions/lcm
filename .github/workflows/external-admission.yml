@@ -137,6 +137,12 @@ jobs:
                 github.event_name == 'workflow_run' && github.event.workflow_run.head_sha ||
                 github.event.check_run.head_sha }}
           EVENT_SOURCE: ${{ github.event_name }}
+          EVENT_WORKFLOW_RUN_ACTION: >-
+            ${{ github.event_name == 'workflow_run' && github.event.action || '' }}
           EVENT_WORKFLOW_RUN_ID: >-
             ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+          EVENT_CHECK_RUN_ACTION: >-
+            ${{ github.event_name == 'check_run' && github.event.action || '' }}
+          EVENT_CHECK_RUN_ID: >-
+            ${{ github.event_name == 'check_run' && github.event.check_run.id || '' }}
         run: bash .github/scripts/external-admission.sh

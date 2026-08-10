@@ -5,8 +5,10 @@ head only after authenticated CI and DCO checks succeed. Normal admission is
 automatic: every accepted authenticated DCO `check_run` event, canonical
 pull-request CI `workflow_run` event, or default-branch recovery dispatch wakes
 the reducer, which evaluates the latest exact-head snapshot without polling on
-a runner. Event and workflow-run IDs are wake-ups, not state authority; the
-latest authenticated evidence for the exact head determines the result.
+a runner. Event IDs are never state authority. An accepted CI or DCO event ID
+also imposes a freshness lower bound: older visible evidence may be superseded,
+but newer or equal non-terminal event evidence remains pending until the
+corresponding current check or run is visible.
 
 DCO can also report against GitHub synthetic commits with an empty suite branch
 or a `gh-readonly-queue/` ref. External admission requires a non-empty suite
@@ -29,6 +31,14 @@ replace, or manufacture any required check.
   head SHA are required.
 - The workflow itself grants only `actions: read`, `checks: read`,
   `contents: read`, `pull-requests: read`, and `statuses: write`.
+
+## Configuration
+
+There are no user-configurable options. The accepted event identities,
+freshness rules, status context, protected-base patterns, and trusted evaluator
+behavior are repository policy. Changing them requires a reviewed workflow or
+policy change; `PR_NUMBER` and `HEAD_SHA` in the recovery example are one-shot
+operator variables, not configuration settings.
 
 ## Find and dispatch the exact PR head SHA
 
@@ -67,7 +77,11 @@ and the `external-admission` status on `HEAD_SHA`.
 - **Pending:** the workflow posts pending before PR association or policy
   evaluation. It remains pending when the current authenticated CI or DCO
   evidence is missing, incomplete, transient, or changes during the
-  three-snapshot evaluation.
+  three-snapshot evaluation. A newer event ID than the visible evidence, an
+  equal `requested`/`in_progress` CI event, or an equal DCO `created` or
+  `rerequested` event also remains pending. Transient branch-protection API
+  failures such as network errors, rate limits, and HTTP 5xx responses remain
+  pending so recovery can retry them.
 - **Success:** three consecutive fresh snapshots prove authenticated CI and DCO
   success on the same exact head, while live base protection and pull-request
   eligibility remain valid. Exactly one open, non-draft pull request in the
@@ -76,9 +90,12 @@ and the `external-admission` status on `HEAD_SHA`.
   `pull_request` run of `.github/workflows/ci.yml` for the same repository and
   SHA.
 - **Failure:** pull-request or base evidence is missing, ambiguous, invalid, or
-  ineligible; a required check is terminally unsuccessful; CI provenance is
-  invalid or terminally unsuccessful; or evaluation encounters an API or policy
-  error. Inspect the linked workflow run before retrying.
+  ineligible; a supported `main` or maintenance base returns HTTP 404 because
+  it was deleted; a required check is terminally unsuccessful; CI provenance is
+  invalid or terminally unsuccessful; or evaluation encounters a malformed or
+  non-transient API or policy error. A deleted historical candidate is ignored
+  only when another unique eligible pull request remains. Inspect the linked
+  workflow run before retrying.
 
 An invalid or missing SHA fails before a status can be safely written. The
 workflow normalizes a valid hexadecimal payload SHA to lowercase before status
@@ -96,11 +113,12 @@ as code.
 
 Every accepted event revokes stale admission before checkout or PR association,
 then evaluates the latest exact-head snapshot. Stale event IDs are wake-up
-context only; they cannot authorize state or override the latest authenticated
-CI/DCO evidence. The evaluator paginates commit-associated pull requests and
+context only; accepted CI/DCO IDs additionally impose the freshness lower bound
+described above. The evaluator paginates commit-associated pull requests and
 check runs, authenticates exact check names and application identities, reads
-live base-branch protection, and revalidates PR eligibility, required checks,
-and CI provenance immediately before success. The evaluator never downloads CI
+live base-branch protection, caches each base-ref lookup only within one
+snapshot resolution, and revalidates PR eligibility, required checks, and CI
+provenance immediately before success. The evaluator never downloads CI
 artifacts or caches and never checks out or executes pull-request-controlled
 content.
 
