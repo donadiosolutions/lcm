@@ -88,7 +88,11 @@ template with exactly one final newline, and rules connectors remove and
 reappend their managed block without changing the established LF or CRLF style.
 Rules installs also tolerate unmatched standalone `<!-- lcm -->` lines: they
 preserve user-authored and inline comment text while keeping the generated
-managed block at one copy across repeated installs.
+managed block at one copy across repeated installs. If a target contains
+duplicate generated blocks, including a mix of current and legacy marker
+pairs, reinstalling removes every recognized block and writes one canonical
+block in the established LF or CRLF style. Ambiguous nested or unmatched
+marker lines remain untouched.
 
 To import existing Codex sessions into LCM:
 

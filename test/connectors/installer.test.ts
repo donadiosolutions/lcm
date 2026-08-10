@@ -29,6 +29,14 @@ function generatedRulesContent(eol: TestMarkdownEol): string {
   ].join(eol);
 }
 
+function legacyRulesContent(eol: TestMarkdownEol): string {
+  return [
+    LEGACY_LCM_MARKERS.START,
+    'Legacy generated content',
+    LEGACY_LCM_MARKERS.END,
+  ].join(eol);
+}
+
 async function withMockedGeneratedContent<T>(
   content: string,
   callback: (install: typeof installConnector) => T | Promise<T>,
@@ -175,6 +183,200 @@ describe('installConnector — rules (markdown append)', () => {
     const content = readFileSync(rulesPath, 'utf-8');
     expect(content).toBe(expected);
     expect(countOccurrences(content, '# Workflow Instruction')).toBe(1);
+  });
+
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('heals duplicate same-marker blocks in one reinstall while preserving user content (%s)', async (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const firstOldBlock = generatedRulesContent(eol).replace('Generated  \t', 'FIRST_OLD_BLOCK');
+    const secondOldBlock = generatedRulesContent(eol).replace('Generated  \t', 'SECOND_OLD_BLOCK');
+    const existing = [
+      'Before  \t',
+      firstOldBlock,
+      'User-authored  \t',
+      secondOldBlock,
+      'After\t',
+      '',
+    ].join(eol);
+    const expected = [
+      'Before  \t',
+      'User-authored  \t',
+      'After\t',
+      generatedRulesContent(eol),
+      '',
+    ].join(eol);
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent(eol), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+    expect(countOccurrences(readFileSync(rulesPath, 'utf-8'), '# Workflow Instruction')).toBe(1);
+  });
+
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('heals a mix of same-marker and legacy blocks in one reinstall (%s)', async (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = [
+      'Before',
+      legacyRulesContent(eol),
+      'Between',
+      generatedRulesContent(eol).replace('Generated  \t', 'OLD_LCM_BLOCK'),
+      'After',
+      '',
+    ].join(eol);
+    const expected = [
+      'Before',
+      'Between',
+      'After',
+      generatedRulesContent(eol),
+      '',
+    ].join(eol);
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent(eol), (install) => {
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+  });
+
+  it('preserves ambiguous and user-authored marker lines while removing a later generated block', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = [
+      'inline <!-- lcm --> text',
+      `  ${LCM_MARKERS.START}`,
+      'unmatched same-marker content',
+      `  ${LEGACY_LCM_MARKERS.START}`,
+      'unmatched legacy content',
+      generatedRulesContent('\n'),
+    ].join('\n');
+    const expected = [
+      'inline <!-- lcm --> text',
+      `  ${LCM_MARKERS.START}`,
+      'unmatched same-marker content',
+      `  ${LEGACY_LCM_MARKERS.START}`,
+      'unmatched legacy content',
+      generatedRulesContent('\n'),
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+  });
+
+  it('pairs legacy markers across another standalone marker line', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        'Before',
+        LEGACY_LCM_MARKERS.START,
+        'Legacy managed content',
+        LCM_MARKERS.START,
+        'Legacy content continues',
+        LEGACY_LCM_MARKERS.END,
+        'After',
+        '',
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('Before\nAfter\n');
+  });
+
+  it('skips an unmatched legacy end marker before pairing a later block', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        LEGACY_LCM_MARKERS.END,
+        LEGACY_LCM_MARKERS.START,
+        'Legacy managed content',
+        LEGACY_LCM_MARKERS.END,
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`${LEGACY_LCM_MARKERS.END}\n`);
+  });
+
+  it('advances past a nested legacy start after selecting the earliest end', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        'Before',
+        LEGACY_LCM_MARKERS.START,
+        'Outer content',
+        LEGACY_LCM_MARKERS.START,
+        'Nested content',
+        LEGACY_LCM_MARKERS.END,
+        LEGACY_LCM_MARKERS.END,
+        'After',
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(
+      `Before\n${LEGACY_LCM_MARKERS.END}\nAfter\n`,
+    );
+  });
+
+  it('discards an overlapping inner LCM candidate after retaining an outer legacy block', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        'Before',
+        LEGACY_LCM_MARKERS.START,
+        'Legacy wrapper',
+        LCM_MARKERS.START,
+        '# Workflow Instruction',
+        'Current managed content',
+        LCM_MARKERS.END,
+        LEGACY_LCM_MARKERS.END,
+        'After',
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('Before\nAfter\n');
+  });
+
+  it('heals a marker-dense duplicate residue without quadratic candidate pairing', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const strayMarkers = Array.from({ length: 4_000 }, () => LCM_MARKERS.START).join('\n');
+    const existing = [
+      strayMarkers,
+      generatedRulesContent('\n').replace('Generated  \t', 'FIRST_OLD_BLOCK'),
+      generatedRulesContent('\n').replace('Generated  \t', 'SECOND_OLD_BLOCK'),
+      'User content',
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      const firstInstall = readFileSync(rulesPath, 'utf-8');
+      expect(firstInstall).toContain(strayMarkers);
+      expect(countOccurrences(firstInstall, '# Workflow Instruction')).toBe(1);
+
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(firstInstall);
+    });
   });
 
   it('is idempotent — install twice, markers appear once', () => {
@@ -683,6 +885,37 @@ describe('removeConnector — rules', () => {
 
     expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
     expect(readFileSync(rulesPath, 'utf-8')).toBe(`${LCM_MARKERS.START}\n`);
+  });
+
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('removes every recognized block at file boundaries while preserving the user section (%s)', (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        generatedRulesContent(eol),
+        '',
+        'Keep  \t',
+        '',
+        legacyRulesContent(eol),
+      ].join(eol),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`Keep  \t${eol}`);
+  });
+
+  it('deletes the file when all duplicate recognized blocks are removed', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [generatedRulesContent('\n'), generatedRulesContent('\n'), ''].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(existsSync(rulesPath)).toBe(false);
   });
 
   it('removes a generated same-marker block at the file boundaries', () => {

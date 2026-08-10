@@ -6,6 +6,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 
 - Generated Markdown EOF and append-mode managed-block normalization must remove only terminal CR/LF sequences and preserve one established EOL style: use CRLF when the retained document or generated content uses CRLF, otherwise LF. Normalize the generated block and separator to that style, emit exactly one final line break, and never use general trailing-whitespace trimming because Markdown spaces may be semantic.
 - Standalone managed-marker scanning must use a linear, non-overlapping line walk that does not consume the next line's prefix. Match only a complete line with optional spaces/tabs around a marker, preserve `lineStart`/`lineEnd` semantics for block removal, and keep unmatched or inline marker text as user content while repeated installs remain idempotent.
+- Managed-block cleanup must discover all non-overlapping recognized current and legacy blocks in one linear pass, remove them in one retained-segment pass, and pair same-marker LCM blocks only from adjacent compatible marker lines. Pair distinct legacy START/END markers with monotonic earliest-start/first-later-end pointers, merge candidate ranges deterministically, and discard overlaps so malformed or nested states cannot cause double deletion. Reinstalling a duplicate mix must converge to one canonical generated block in one run and then remain byte-idempotent.
 
 ### Database connection pattern (highest priority)
 
