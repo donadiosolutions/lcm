@@ -732,20 +732,52 @@ describe("daemon idle timeout", () => {
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
     config.daemon.idleTimeoutMs = 300;
-    const daemon = await createDaemon(config, { onIdle: () => { idleCalled = true; } });
-    const port = daemon.address().port;
+    const idleTimers: Array<{
+      handle: ReturnType<typeof setTimeout>;
+      callback: () => void;
+      active: boolean;
+    }> = [];
+    const setIdleTimeout = ((handler: TimerHandler) => {
+      const entry = {
+        handle: Symbol("idle-timeout") as unknown as ReturnType<typeof setTimeout>,
+        callback: handler as () => void,
+        active: true,
+      };
+      idleTimers.push(entry);
+      return entry.handle;
+    }) as typeof setTimeout;
+    const clearIdleTimeout = ((handle: ReturnType<typeof setTimeout>) => {
+      const entry = idleTimers.find(entry => entry.handle === handle);
+      if (entry) {
+        entry.active = false;
+      }
+    }) as typeof clearTimeout;
+    const daemon = await createDaemon(config, {
+      onIdle: () => { idleCalled = true; },
+      _setTimeout: setIdleTimeout,
+      _clearTimeout: clearIdleTimeout,
+    });
 
-    // Make requests to keep alive
-    await fetch(`http://127.0.0.1:${port}/health`);
-    await new Promise(r => setTimeout(r, 200));
-    await fetch(`http://127.0.0.1:${port}/health`);
-    await new Promise(r => setTimeout(r, 200));
+    try {
+      const port = daemon.address().port;
+      const first = await fetch(`http://127.0.0.1:${port}/health`);
+      await first.text();
+      const second = await fetch(`http://127.0.0.1:${port}/health`);
+      await second.text();
 
-    // Should still be alive (timer reset each time)
-    expect(idleCalled).toBe(false);
-    expect(daemon.idleTriggered).toBe(false);
+      expect(idleTimers).toHaveLength(3);
+      expect(idleTimers.filter(entry => !entry.active)).toHaveLength(2);
+      const activeTimers = idleTimers.filter(entry => entry.active);
+      expect(activeTimers).toHaveLength(1);
+      expect(idleCalled).toBe(false);
+      expect(daemon.idleTriggered).toBe(false);
 
-    await daemon.stop();
+      activeTimers[0]!.callback();
+      expect(idleCalled).toBe(true);
+      expect(daemon.idleTriggered).toBe(true);
+    } finally {
+      await daemon.stop();
+    }
   });
 });
 

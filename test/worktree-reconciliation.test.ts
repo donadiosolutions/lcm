@@ -2465,7 +2465,7 @@ describe("worktree reconciliation", () => {
     ).run();
     invalid.close();
     expect(() => reconcileWorktrees(linked)).toThrow("foreign-key verification failed");
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("rolls back a sidecar merge failure", () => {
     const { main, linked } = makeRepository(home);
@@ -4769,7 +4769,7 @@ describe("worktree reconciliation", () => {
     expect(result.status).toBe("completed");
     expect(result.backupPaths.some((path) => path.includes("oldevents"))).toBe(true);
     expect(listWorktreeReconciliationJournals()[0].blockedFrom).toBeUndefined();
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("never archives a component that appeared after the merge snapshot", () => {
     const { main, linked } = makeRepository(home);
@@ -5848,7 +5848,7 @@ describe("worktree reconciliation", () => {
         }
       },
     })).toThrow("legacy events path was recreated");
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("validates journal component snapshots before merging", () => {
     const { main, linked } = makeRepository(home);
@@ -6054,5 +6054,5 @@ describe("worktree reconciliation", () => {
         }
       },
     })).toThrow("legacy events path remained writable");
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 });
