@@ -211,7 +211,7 @@ export function associateCommitsWithPullRequests(commits, associations) {
     const candidates = associations.get(commit) ?? associations.get(sha) ?? [];
     const exact = candidates.filter(
       (pr) =>
-        pr.merged_at &&
+        isMergedPullRequest(pr) &&
         pr.base?.ref === "main" &&
         pr.merge_commit_sha?.toLowerCase() === sha,
     );
@@ -240,8 +240,40 @@ function defaultRunGit(args, cwd) {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
+function defaultIsAncestor(ancestor, descendant, cwd) {
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+      cwd,
+      stdio: "ignore",
+    });
+    return true;
+  } catch (error) {
+    if (error?.status === 1) return false;
+    throw error;
+  }
+}
+
 function normalizeSha(value) {
   return typeof value === "string" ? value.toLowerCase() : undefined;
+}
+
+function isCanonicalSha(value) {
+  return typeof value === "string" && /^[0-9a-f]{40}$/u.test(value);
+}
+
+function readMergeParents(runGit, commit, cwd, description) {
+  const parentOutput = runGit(["show", "-s", "--format=%P", commit], cwd);
+  if (typeof parentOutput !== "string") {
+    throw new Error(`${description} merge parent identity is invalid`);
+  }
+  const parents = parentOutput
+    .split(/\s+/u)
+    .filter(Boolean)
+    .map(normalizeSha);
+  if (parents.length !== 2 || parents.some((parent) => !isCanonicalSha(parent))) {
+    throw new Error(`${description} merge parent identity is invalid`);
+  }
+  return parents;
 }
 
 export function assertExactPullRequestMerge(
@@ -251,9 +283,9 @@ export function assertExactPullRequestMerge(
 ) {
   const sha = normalizeSha(commit);
   if (
-    !sha ||
+    !isCanonicalSha(sha) ||
     typeof requiredBase !== "string" ||
-    !pr?.merged_at ||
+    !isMergedPullRequest(pr) ||
     pr.base?.ref !== requiredBase ||
     normalizeSha(pr.merge_commit_sha) !== sha
   ) {
@@ -262,22 +294,188 @@ export function assertExactPullRequestMerge(
     );
   }
 
-  const parentOutput = runGit(["show", "-s", "--format=%P", commit], cwd);
-  if (typeof parentOutput !== "string") {
-    throw new Error(`Pull request #${pr.number} merge parent identity is invalid`);
-  }
-  const parents = parentOutput
-    .split(/\s+/u)
-    .filter(Boolean)
-    .map(normalizeSha);
+  const parents = readMergeParents(runGit, commit, cwd, `Pull request #${pr.number}`);
   if (
-    parents.length !== 2 ||
     parents[0] !== normalizeSha(pr.base?.sha) ||
     parents[1] !== normalizeSha(pr.head?.sha)
   ) {
     throw new Error(`Pull request #${pr.number} merge parent identity is invalid`);
   }
   return Object.freeze({ pr, parents: Object.freeze(parents) });
+}
+
+function isMergedPullRequest(pr) {
+  return typeof pr?.merged_at === "string" && pr.merged_at.length > 0 && pr.draft !== true;
+}
+
+function isInRepository(pr, repository) {
+  return pr?.base?.repo?.full_name === repository;
+}
+
+function exactPullRequestCandidates(pullRequests, commit, requiredBase, repository) {
+  const sha = normalizeSha(commit);
+  return pullRequests.filter(
+    (pullRequest) =>
+      isMergedPullRequest(pullRequest) &&
+      pullRequest.base?.ref === requiredBase &&
+      normalizeSha(pullRequest.merge_commit_sha) === sha &&
+      isInRepository(pullRequest, repository),
+  );
+}
+
+function formatPullRequestNumbers(pullRequests) {
+  return pullRequests.map(({ number }) => `#${number}`).join(", ");
+}
+
+async function listAssociatedPullRequests(github, owner, repo, commit) {
+  const pullRequests = await github.paginate(
+    github.rest.repos.listPullRequestsAssociatedWithCommit,
+    {
+      owner,
+      repo,
+      commit_sha: commit,
+      per_page: 100,
+    },
+  );
+  if (!Array.isArray(pullRequests)) {
+    throw new Error(`GitHub returned invalid pull request associations for ${commit}`);
+  }
+  return pullRequests;
+}
+
+export async function resolveMaintenanceReleasePullRequest({
+  github,
+  owner,
+  repo,
+  baseTag,
+  targetTag,
+  commit,
+  associatedPullRequests,
+  cwd = process.cwd(),
+  runGit = defaultRunGit,
+  mainRef = "origin/main",
+  isAncestor = defaultIsAncestor,
+}) {
+  if (!Array.isArray(associatedPullRequests)) {
+    throw new TypeError("Maintenance pull request associations must be an array");
+  }
+  if (typeof mainRef !== "string" || mainRef.length === 0) {
+    throw new TypeError("mainRef must be a non-empty string");
+  }
+  if (typeof isAncestor !== "function") {
+    throw new TypeError("isAncestor must be a function");
+  }
+
+  const { major, minor } = parseReleaseTag(targetTag);
+  const repository = `${owner}/${repo}`;
+  const maintenanceBranch = `maintenance/${major}.${minor}.x`;
+  const maintenanceCandidates = exactPullRequestCandidates(
+    associatedPullRequests,
+    commit,
+    maintenanceBranch,
+    repository,
+  );
+  if (maintenanceCandidates.length === 0) {
+    throw new Error(
+      `Maintenance release commit ${commit} has no exact merged maintenance PR on ` +
+        `${maintenanceBranch} in ${repository}`,
+    );
+  }
+  if (maintenanceCandidates.length > 1) {
+    throw new Error(
+      `Maintenance release commit ${commit} has ambiguous exact maintenance PR associations ` +
+        `(${formatPullRequestNumbers(maintenanceCandidates)})`,
+    );
+  }
+
+  const maintenanceCandidate = maintenanceCandidates[0];
+  const { data: maintenancePullRequest } = await github.rest.pulls.get({
+    owner,
+    repo,
+    pull_number: maintenanceCandidate.number,
+  });
+  if (!isInRepository(maintenancePullRequest, repository)) {
+    throw new Error(
+      `Maintenance PR #${maintenanceCandidate.number} is not an exact merged PR in ${repository}`,
+    );
+  }
+  assertExactPullRequestMerge(maintenancePullRequest, commit, {
+    runGit,
+    cwd,
+    requiredBase: maintenanceBranch,
+  });
+
+  const output = runGit(
+    ["rev-list", "--first-parent", "--merges", "--reverse", `${baseTag}..${mainRef}`],
+    cwd,
+  );
+  if (typeof output !== "string") {
+    throw new Error(`Unable to enumerate main forward-port merges for ${commit}`);
+  }
+  const forwardPortCommits = output.split(/\s+/u).filter(Boolean);
+  const validForwardPorts = [];
+  for (const forwardPortCommit of forwardPortCommits) {
+    const parents = readMergeParents(runGit, forwardPortCommit, cwd, "Forward-port");
+    const inSecondParent = isAncestor(commit, parents[1], cwd);
+    const inFirstParent = isAncestor(commit, parents[0], cwd);
+    if (typeof inSecondParent !== "boolean" || typeof inFirstParent !== "boolean") {
+      throw new Error(`Forward-port ancestry evidence for ${forwardPortCommit} is invalid`);
+    }
+    if (!inSecondParent || inFirstParent) continue;
+
+    const forwardPortAssociations = await listAssociatedPullRequests(
+      github,
+      owner,
+      repo,
+      forwardPortCommit,
+    );
+    const forwardPortCandidates = exactPullRequestCandidates(
+      forwardPortAssociations,
+      forwardPortCommit,
+      "main",
+      repository,
+    );
+    if (forwardPortCandidates.length === 0) {
+      throw new Error(
+        `Forward-port ${forwardPortCommit} has no exact merged main forward-port PR in ${repository}`,
+      );
+    }
+    if (forwardPortCandidates.length > 1) {
+      throw new Error(
+        `Forward-port ${forwardPortCommit} has ambiguous exact main forward-port PR associations ` +
+          `(${formatPullRequestNumbers(forwardPortCandidates)})`,
+      );
+    }
+
+    const forwardPortCandidate = forwardPortCandidates[0];
+    const { data: forwardPortPullRequest } = await github.rest.pulls.get({
+      owner,
+      repo,
+      pull_number: forwardPortCandidate.number,
+    });
+    if (!isInRepository(forwardPortPullRequest, repository)) {
+      throw new Error(
+        `Forward-port PR #${forwardPortCandidate.number} is not an exact merged PR in ${repository}`,
+      );
+    }
+    assertExactPullRequestMerge(forwardPortPullRequest, forwardPortCommit, {
+      runGit,
+      cwd,
+      requiredBase: "main",
+    });
+    validForwardPorts.push(forwardPortPullRequest);
+  }
+
+  if (validForwardPorts.length === 0) {
+    throw new Error(`Maintenance release commit ${commit} has no valid main forward port`);
+  }
+  if (validForwardPorts.length > 1) {
+    throw new Error(
+      `Maintenance release commit ${commit} has ambiguous main forward ports ` +
+        `(${formatPullRequestNumbers(validForwardPorts)})`,
+    );
+  }
+  return maintenancePullRequest;
 }
 
 export async function collectReleasePullRequests({
@@ -288,6 +486,8 @@ export async function collectReleasePullRequests({
   targetTag,
   cwd = process.cwd(),
   runGit = defaultRunGit,
+  mainRef = "origin/main",
+  isAncestor = defaultIsAncestor,
 }) {
   const output = runGit(
     ["rev-list", "--first-parent", "--reverse", `${baseTag}..${targetTag}`],
@@ -296,30 +496,59 @@ export async function collectReleasePullRequests({
   const commits = output.length === 0 ? [] : output.split(/\r?\n/u).filter(Boolean);
   const associations = new Map();
   for (const commit of commits) {
-    const pullRequests = await github.paginate(
-      github.rest.repos.listPullRequestsAssociatedWithCommit,
-      {
-        owner,
-        repo,
-        commit_sha: commit,
-        per_page: 100,
-      },
-    );
+    const pullRequests = await listAssociatedPullRequests(github, owner, repo, commit);
     associations.set(commit, pullRequests);
   }
 
-  const associated = associateCommitsWithPullRequests(commits, associations);
-  const uniqueNumbers = [...new Set(associated.map(({ number }) => number))];
-  const selectedCommits = new Map(
-    associated.map((selected, index) => [selected.number, commits[index]]),
-  );
+  const selected = [];
+  for (const commit of commits) {
+    const pullRequests = associations.get(commit) ?? [];
+    const exactMain = pullRequests.filter(
+      (pullRequest) =>
+        isMergedPullRequest(pullRequest) &&
+        pullRequest.base?.ref === "main" &&
+        normalizeSha(pullRequest.merge_commit_sha) === normalizeSha(commit),
+    );
+    if (exactMain.length > 1) {
+      const exactNumbers = exactMain.map(({ number }) => `#${number}`).join(", ");
+      throw new Error(
+        `Release commit ${commit} has ambiguous exact merged main PR associations ` +
+          `(${exactNumbers})`,
+      );
+    }
+    if (exactMain.length === 1) {
+      selected.push({ commit, pr: exactMain[0], requiredBase: "main" });
+      continue;
+    }
+    const maintenancePullRequest = await resolveMaintenanceReleasePullRequest({
+      github,
+      owner,
+      repo,
+      baseTag,
+      targetTag,
+      commit,
+      associatedPullRequests: pullRequests,
+      cwd,
+      runGit,
+      mainRef,
+      isAncestor,
+    });
+    selected.push({
+      commit,
+      pr: maintenancePullRequest,
+      requiredBase: maintenancePullRequest.base.ref,
+    });
+  }
+
+  const uniqueSelections = [...new Map(selected.map((selection) => [selection.pr.number, selection])).values()];
   const entries = [];
-  for (const pull_number of uniqueNumbers) {
+  for (const selection of uniqueSelections) {
+    const pull_number = selection.pr.number;
     const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
-    assertExactPullRequestMerge(pr, selectedCommits.get(pull_number), {
+    assertExactPullRequestMerge(pr, selection.commit, {
       runGit,
       cwd,
-      requiredBase: "main",
+      requiredBase: selection.requiredBase,
     });
     const files = await github.paginate(github.rest.pulls.listFiles, {
       owner,
