@@ -165,6 +165,30 @@ describe('installConnector — rules (markdown append)', () => {
   });
 
   it.each([
+    ['current', generatedRulesContent('\r\n')],
+    ['legacy', legacyRulesContent('\r\n')],
+  ])('uses retained LF content instead of a stale CRLF %s block on reinstall', async (_description, staleBlock) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      ['Before  \t', staleBlock, 'After\t', ''].join('\n'),
+    );
+    const expected = [
+      'Before  \t',
+      'After\t',
+      generatedRulesContent('\n'),
+      '',
+    ].join('\n');
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+    expect(readFileSync(rulesPath, 'utf-8')).not.toContain('\r\n');
+  });
+
+  it.each([
     ['LF', '\n' as TestMarkdownEol],
     ['CRLF', '\r\n' as TestMarkdownEol],
   ])('keeps repeated installs fixed-point with an unmatched %s marker', async (_description, eol) => {
@@ -260,6 +284,66 @@ describe('installConnector — rules (markdown append)', () => {
 
     expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
     expect(countOccurrences(readFileSync(rulesPath, 'utf-8'), '# Workflow Instruction')).toBe(1);
+  });
+
+  it('preserves an unmatched marker and user-authored bytes while preferring the later candidate', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const retained = [
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'User-authored lines  \t',
+      'More user-authored bytes\t',
+    ].join('\n');
+    const expectedInstalled = `${retained}\n${generatedRulesContent('\n')}\n`;
+    writeFileSync(rulesPath, retained);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      const firstInstall = readFileSync(rulesPath, 'utf-8');
+      expect(firstInstall).toBe(expectedInstalled);
+
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(firstInstall);
+    });
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`${retained}\n`);
+  });
+
+  it('selects the final candidate in an adjacent same-marker chain', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = [
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'User-authored before the chain',
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'Ambiguous user-authored middle',
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'Canonical generated content',
+      LCM_MARKERS.START,
+    ].join('\n');
+    const expected = [
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'User-authored before the chain',
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'Ambiguous user-authored middle',
+      generatedRulesContent('\n'),
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
   });
 
   it.each([
@@ -968,6 +1052,21 @@ describe('removeConnector — rules', () => {
 
     expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
     expect(readFileSync(rulesPath, 'utf-8')).toBe('Before  \t\r\nAfter\t\r\n');
+  });
+
+  it.each([
+    ['current', generatedRulesContent('\r\n')],
+    ['legacy', legacyRulesContent('\r\n')],
+  ])('uses retained LF content instead of a stale CRLF %s block on removal', (_description, staleBlock) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      ['Before  \t', staleBlock, 'After\t', ''].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('Before  \t\nAfter\t\n');
+    expect(readFileSync(rulesPath, 'utf-8')).not.toContain('\r\n');
   });
 
   it('recognizes adjacent standalone same-marker lines when removing a managed block', () => {

@@ -138,11 +138,16 @@ function findSameMarkerBlocks(
     if (line.marker === marker) candidates.push({ line, markerIndex });
   }
 
+  const generatedPairs: boolean[] = [];
+  for (let index = 0; index + 1 < candidates.length; index += 1) {
+    generatedPairs.push(isGeneratedLcmBlock(content, candidates[index].line, candidates[index + 1].line));
+  }
+
   const blocks: ManagedBlock[] = [];
   for (let index = 0; index < candidates.length; index += 1) {
     const start = candidates[index].line;
     const nextSameMarker = candidates[index + 1]?.line;
-    if (nextSameMarker && isGeneratedLcmBlock(content, start, nextSameMarker)) {
+    if (generatedPairs[index] && !generatedPairs[index + 1] && nextSameMarker) {
       blocks.push(managedBlock(start, nextSameMarker));
     }
 
@@ -300,24 +305,24 @@ function removeMarkers(content: string): string {
   const blocks = findManagedBlocks(content);
   if (blocks.length === 0) return content;
 
-  const eol = establishedMarkdownEol(content);
-  const retained: string[] = [];
+  const retainedRaw: string[] = [];
   let cursor = 0;
-
-  for (let index = 0; index < blocks.length; index += 1) {
-    const block = blocks[index];
-    let before = trimMarkdownLineBreaksAtEnd(content.slice(cursor, block.startIdx));
-    if (index > 0) before = trimMarkdownLineBreaksAtStart(before);
-    if (before) retained.push(before);
+  for (const block of blocks) {
+    retainedRaw.push(content.slice(cursor, block.startIdx));
     cursor = block.endIdx + block.endLength;
   }
+  retainedRaw.push(content.slice(cursor));
 
-  const after = trimMarkdownLineBreaksAtEnd(
-    trimMarkdownLineBreaksAtStart(content.slice(cursor)),
-  );
-  if (after) retained.push(after);
+  const eol = establishedMarkdownEol(...retainedRaw);
+  const retained: string[] = [];
+  for (let index = 0; index < retainedRaw.length; index += 1) {
+    let segment = trimMarkdownLineBreaksAtEnd(retainedRaw[index]);
+    if (index > 0) segment = trimMarkdownLineBreaksAtStart(segment);
+    if (segment) retained.push(segment);
+  }
 
-  return normalizeMarkdownLineEndings(retained.join(eol), eol);
+  if (retained.length === 0) return '';
+  return `${normalizeMarkdownLineEndings(retained.join(eol), eol)}${eol}`;
 }
 
 function normalizeMarkdownEof(content: string, eol: MarkdownEol = establishedMarkdownEol(content)): string {
@@ -326,7 +331,7 @@ function normalizeMarkdownEof(content: string, eol: MarkdownEol = establishedMar
 
 function appendMarkdown(existing: string, content: string): string {
   const cleaned = removeMarkers(existing);
-  const eol = establishedMarkdownEol(existing, cleaned, content);
+  const eol = establishedMarkdownEol(cleaned, content);
   const normalizedExisting = normalizeMarkdownLineEndings(trimMarkdownLineBreaksAtEnd(cleaned), eol);
   const normalizedContent = normalizeMarkdownEof(content, eol);
   if (!normalizedExisting) return normalizedContent;
@@ -554,7 +559,7 @@ export function removeConnector(agentIdOrName: string, type?: ConnectorType, cwd
   try { content = readFileSync(resolvedPath, 'utf-8'); } catch { return false; }
   if (!hasManagedBlock(content)) return false;
   const cleaned = removeMarkers(content);
-  const eol = establishedMarkdownEol(content);
+  const eol = establishedMarkdownEol(cleaned);
   if (cleaned.trim() === '') {
     unlinkSync(resolvedPath);
   } else {
