@@ -84,18 +84,17 @@ lcm connectors install codex --type rules
 
 Reinstalling generated Markdown connectors is byte-idempotent: the Codex skill
 `.codex/skills/lcm-memory/SKILL.md` remains byte-identical to its canonical
-template with exactly one final newline, and rules connectors remove and
-reappend their managed block without changing the established LF or CRLF style.
-Rules installs also tolerate unmatched standalone `<!-- lcm -->` lines: they
-preserve user-authored and inline comment text while keeping the generated
-managed block at one copy across repeated installs. A current marker followed
-only by one or more workflow-instruction header lines is treated as a
-recoverable partial generated block, but other unmatched marker lines remain
-untouched. If a target contains duplicate generated blocks, including a mix of
-current and legacy marker pairs, reinstalling removes every recognized block
-and unions any overlapping or touching recognized ranges before writing one
-canonical block in the established LF or CRLF style. Ambiguous nested marker
-lines and unmatched markers outside those recognized ranges remain untouched.
+template with exactly one final newline, and normal rules append installs remove
+and reappend their managed block without changing the established LF or CRLF
+style. One-run healing is limited to recognized current or legacy managed
+blocks, the maximal union of their overlapping or touching recognized ranges,
+and a current marker followed only by one or more exact `# Workflow Instruction`
+lines as a recoverable header-only partial region. These recognized regions are
+replaced with one canonical block in the established style. Arbitrary
+ambiguous or malformed unmatched marker/header combinations are preserved
+conservatively and may require a second reinstall to become byte-stable; user-
+authored Markdown outside recognized regions, including heading lines, is never
+removed by this recovery behavior.
 
 To import existing Codex sessions into LCM:
 
