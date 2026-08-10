@@ -53,6 +53,10 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
   `finally` block so failed assertions cannot leak fake time into later tests.
 - Test doubles for platform APIs must preserve relevant no-op and error semantics; for example, a fake `clearTimeout` should no-op for unknown handles while mutating only a matched handle, with assertions retaining coverage of known-handle behavior.
 
+### External admission preflight
+
+- Run pure pull-request identity and supported-base shape validation before remote branch metadata lookups. Query live protection only for otherwise-eligible supported bases; preserve deterministic rejection reasons and fail closed on supported-base API failures.
+
 ### Search ranking compatibility
 
 - Fallback lexical-search ranks and sentinel scores must remain compatible with every consumer, including deduplication thresholds, prompt-search minimum scores, and result ordering. Require regressions that both surface relevant fallback matches and prevent false deduplication merges, while preserving native FTS ranking behavior unchanged.

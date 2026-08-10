@@ -331,6 +331,10 @@ if [[ "$2" == "evaluate-ci-run" ]]; then
   exit 0
 fi
 if [[ "$2" == "evaluate-pr" ]]; then
+  if [[ "$5" == false ]]; then
+    printf '%s\\n' '{"eligible":false,"reason":"unprotected-base"}'
+    exit 0
+  fi
   printf '%s\\n' '{"eligible":true}'
   exit 0
 fi
@@ -350,16 +354,16 @@ if [[ -f "$JQ_CALL_LOG" ]]; then
 fi
 call_count=$((call_count + 1))
 printf '%s\\n' "$call_count" > "$JQ_CALL_LOG"
-if [[ "$FAIL_ADMISSION_COMMAND" == eligibility-jq && "$call_count" == 4 ]]; then
+if [[ "$FAIL_ADMISSION_COMMAND" == eligibility-jq && "$call_count" == 5 ]]; then
   exit 73
 fi
-if [[ "$FAIL_ADMISSION_COMMAND" == validator-jq && "$call_count" == 8 ]]; then
+if [[ "$FAIL_ADMISSION_COMMAND" == validator-jq && "$call_count" == 10 ]]; then
   exit 72
 fi
-if [[ "$FAIL_ADMISSION_COMMAND" == checks-ready-jq && "$call_count" == 10 ]]; then
+if [[ "$FAIL_ADMISSION_COMMAND" == checks-ready-jq && "$call_count" == 12 ]]; then
   exit 74
 fi
-if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$call_count" == 15 ]]; then
+if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$call_count" == 17 ]]; then
   exit 75
 fi
 exec /usr/bin/jq "$@"
@@ -402,7 +406,8 @@ type AdmissionScenario =
 type AdmissionEligibilityVariant =
   | "unsupported-base"
   | "wrong-base-repository"
-  | "protection-changed";
+  | "protection-changed"
+  | "protection-deleted";
 
 function makeAdmissionPullRequest({
   baseRef = "main",
@@ -460,6 +465,7 @@ function runAdmissionScenario(
   let associatedPullRequests = [makeAdmissionPullRequest()];
   let pullRequest = makeAdmissionPullRequest();
   let branchProtectionSequence = ["true"];
+  let branchLookupMustNotHappen = false;
   let eventSource = "repository_dispatch";
   let eventWorkflowRunId = "";
   let eventWorkflowRunAction = "";
@@ -502,19 +508,29 @@ function runAdmissionScenario(
         associatedPullRequests = [makeAdmissionPullRequest({ baseRef: "maintenance/1.x" })];
         pullRequest = makeAdmissionPullRequest({ baseRef: "maintenance/1.x" });
         branchProtectionSequence = ["true"];
+        branchLookupMustNotHappen = true;
         break;
       case "wrong-base-repository":
-        associatedPullRequests = [makeAdmissionPullRequest({ baseRef: "main" })];
+        associatedPullRequests = [makeAdmissionPullRequest({
+          baseRef: "main",
+          baseRepository: "other/repository",
+        })];
         pullRequest = makeAdmissionPullRequest({
           baseRef: "main",
           baseRepository: "other/repository",
         });
         branchProtectionSequence = ["true"];
+        branchLookupMustNotHappen = true;
         break;
       case "protection-changed":
         associatedPullRequests = [makeAdmissionPullRequest({ baseRef: "main" })];
         pullRequest = makeAdmissionPullRequest({ baseRef: "main" });
         branchProtectionSequence = ["true", "true", "true", "true", "true", "false"];
+        break;
+      case "protection-deleted":
+        associatedPullRequests = [makeAdmissionPullRequest({ baseRef: "main" })];
+        pullRequest = makeAdmissionPullRequest({ baseRef: "main" });
+        branchProtectionSequence = ["deleted"];
         break;
     }
   }
@@ -552,9 +568,17 @@ if [[ "$endpoint" == repos/*/branches/* ]]; then
   call_count=$((call_count + 1))
   printf '%s\n' "$call_count" > "$BRANCH_CALLS"
   printf '%s\n' "$endpoint" >> "$BRANCH_REQUESTS"
+  if [[ "$BRANCH_LOOKUP_MUST_NOT_HAPPEN" == true ]]; then
+    printf 'unexpected branch metadata lookup: %s\n' "$endpoint" >&2
+    exit 98
+  fi
   IFS=',' read -r -a protection <<< "$BRANCH_PROTECTION_SEQUENCE"
   index=$((call_count - 1))
   if (( index >= \${#protection[@]} )); then index=\${#protection[@]}-1; fi
+  if [[ "\${protection[index]}" == deleted ]]; then
+    printf 'branch metadata not found: %s\n' "$endpoint" >&2
+    exit 22
+  fi
   printf '{"protected":%s}\n' "\${protection[index]}"
   exit 0
 fi
@@ -580,6 +604,7 @@ exit 99
         ...process.env,
         ASSOCIATED_PRS_JSON: JSON.stringify(associatedPullRequests),
         BRANCH_CALLS: branchCallsPath,
+        BRANCH_LOOKUP_MUST_NOT_HAPPEN: String(branchLookupMustNotHappen),
         BRANCH_REQUESTS: branchRequestsPath,
         BRANCH_PROTECTION_SEQUENCE: branchProtectionSequence.join(","),
         CHECK_RUN_PAGES_JSON: JSON.stringify([{ check_runs: [ciCheckRun, dcoCheckRun] }]),
@@ -655,18 +680,39 @@ describe("external admission workflow", () => {
     expect(statuses.at(-1)).toContain("not uniquely eligible");
   });
 
-  it("terminalizes unsupported, mismatched, and changed base eligibility", () => {
+  it("preflights unsupported and mismatched bases before branch metadata lookup", () => {
     for (const variant of [
       "unsupported-base",
       "wrong-base-repository",
-      "protection-changed",
     ] as const) {
-      const { result, statuses } = runAdmissionScenario("invalid-or-changed-base", variant);
+      const { result, statuses, branchCalls, branchRequests } =
+        runAdmissionScenario("invalid-or-changed-base", variant);
       expect(result.status, variant).toBe(0);
       expect(statuses.at(-1)?.split("\t", 1)[0], variant).toBe("failure");
       expect(statuses.at(-1), variant).toContain("not uniquely eligible");
       expect(statuses.at(-1), variant).not.toMatch(/^pending\t/u);
+      expect(branchCalls, variant).toBe(0);
+      expect(branchRequests, variant).toEqual([]);
+      expect(result.stderr, variant).not.toContain("unexpected branch metadata lookup");
     }
+  });
+
+  it("fails closed when supported-base protection changes or disappears", () => {
+    const changed = runAdmissionScenario("invalid-or-changed-base", "protection-changed");
+    expect(changed.result.status).toBe(0);
+    expect(changed.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+    expect(changed.statuses.at(-1)).toContain("not uniquely eligible");
+    expect(changed.branchCalls).toBeGreaterThan(0);
+    expect(changed.branchRequests.every((request) => request.endsWith("/branches/main")))
+      .toBe(true);
+
+    const deleted = runAdmissionScenario("invalid-or-changed-base", "protection-deleted");
+    expect(deleted.result.status).not.toBe(0);
+    expect(deleted.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+    expect(deleted.statuses.at(-1)).toContain("External admission failed");
+    expect(deleted.branchCalls).toBeGreaterThan(0);
+    expect(deleted.branchRequests.every((request) => request.endsWith("/branches/main")))
+      .toBe(true);
   });
 
   it("uses DCO, trusted CI, and default-branch reconciliation with least privilege", () => {

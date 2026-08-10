@@ -17,7 +17,23 @@ fetch_base_branch() {
 
 evaluate_pull_request() {
   local pull_request="$1"
-  local base_ref branch protected
+  local base_ref branch protected preflight_evaluation preflight_reason
+  preflight_evaluation="$(node .github/scripts/external-admission-policy.mjs evaluate-pr \
+    "$HEAD_SHA" "$REPOSITORY" false <<<"$pull_request")" || return $?
+  preflight_reason="$(jq -r '.reason // empty' <<<"$preflight_evaluation")" || return $?
+  case "$preflight_reason" in
+    ineligible-pr|repository-mismatch|unsupported-base)
+      printf '%s\n' "$preflight_evaluation"
+      return 0
+      ;;
+    unprotected-base)
+      ;;
+    *)
+      echo "Invalid pull request preflight evaluation." >&2
+      return 1
+      ;;
+  esac
+
   base_ref="$(jq -r '.base.ref // empty' <<<"$pull_request")" || return $?
   if [[ -n "$base_ref" ]]; then
     branch="$(fetch_base_branch "$base_ref")" || return $?
