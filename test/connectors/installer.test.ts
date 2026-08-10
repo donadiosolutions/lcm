@@ -156,6 +156,27 @@ describe('installConnector — rules (markdown append)', () => {
     expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
   });
 
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('keeps repeated installs fixed-point with an unmatched %s marker', async (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = ['# User-authored rules', LCM_MARKERS.START].join(eol);
+    writeFileSync(rulesPath, existing);
+    const expected = `${existing}${eol}${generatedRulesContent(eol)}${eol}`;
+
+    await withMockedGeneratedContent(generatedRulesContent(eol), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    const content = readFileSync(rulesPath, 'utf-8');
+    expect(content).toBe(expected);
+    expect(countOccurrences(content, '# Workflow Instruction')).toBe(1);
+  });
+
   it('is idempotent — install twice, markers appear once', () => {
     installConnector('claude-code', 'rules', tmpDir);
     installConnector('claude-code', 'rules', tmpDir);
@@ -647,6 +668,51 @@ describe('removeConnector — rules', () => {
     expect(readFileSync(rulesPath, 'utf-8')).toBe('Before  \t\r\nAfter\t\r\n');
   });
 
+  it('recognizes adjacent standalone same-marker lines when removing a managed block', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        LCM_MARKERS.START,
+        LCM_MARKERS.START,
+        '# Workflow Instruction',
+        'managed content',
+        LCM_MARKERS.END,
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`${LCM_MARKERS.START}\n`);
+  });
+
+  it('removes a generated same-marker block at the file boundaries', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [LCM_MARKERS.START, '# Workflow Instruction', LCM_MARKERS.END].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(existsSync(rulesPath)).toBe(false);
+  });
+
+  it('recognizes whitespace-indented standalone marker lines', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        'Before',
+        ` \t${LCM_MARKERS.START}`,
+        '# Workflow Instruction',
+        `\t${LCM_MARKERS.END}`,
+        'After',
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('Before\nAfter\n');
+  });
+
   it('returns false when file does not exist', () => {
     const removed = removeConnector('claude-code', 'rules', tmpDir);
     expect(removed).toBe(false);
@@ -668,6 +734,19 @@ describe('removeConnector — rules', () => {
       'Keep this user-authored block.',
       '<!-- lcm -->',
       '',
+    ].join('\n');
+    writeFileSync(rulesPath, original);
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(false);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(original);
+  });
+
+  it('preserves inline and unmatched legacy markers as user content', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const original = [
+      'inline <!-- lcm --> text',
+      `  ${LEGACY_LCM_MARKERS.START}`,
+      'unmatched legacy marker content',
     ].join('\n');
     writeFileSync(rulesPath, original);
 

@@ -51,19 +51,45 @@ type MarkerLine = {
 
 type MarkdownEol = '\n' | '\r\n';
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function findStandaloneMarkerLines(content: string, marker: string): MarkerLine[] {
   const lines: MarkerLine[] = [];
-  const pattern = new RegExp(`(^|\\r?\\n)[ \\t]*${escapeRegExp(marker)}[ \\t]*(?:\\r?\\n|$)`, 'g');
-  for (let match = pattern.exec(content); match; match = pattern.exec(content)) {
-    const lineStart = match.index + match[1].length;
-    lines.push({
-      lineStart,
-      lineEnd: match.index + match[0].length,
-    });
+  let lineStart = 0;
+  while (lineStart <= content.length) {
+    let lineContentEnd = lineStart;
+    while (lineContentEnd < content.length) {
+      const character = content.charCodeAt(lineContentEnd);
+      if (character === 0x0a || character === 0x0d) break;
+      lineContentEnd += 1;
+    }
+
+    let markerStart = lineStart;
+    while (markerStart < lineContentEnd) {
+      const character = content.charCodeAt(markerStart);
+      if (character !== 0x20 && character !== 0x09) break;
+      markerStart += 1;
+    }
+
+    let markerEnd = lineContentEnd;
+    while (markerEnd > markerStart) {
+      const character = content.charCodeAt(markerEnd - 1);
+      if (character !== 0x20 && character !== 0x09) break;
+      markerEnd -= 1;
+    }
+
+    let lineEnd = lineContentEnd;
+    if (lineContentEnd < content.length) {
+      lineEnd += 1;
+      if (content.charCodeAt(lineContentEnd) === 0x0d && content.charCodeAt(lineContentEnd + 1) === 0x0a) {
+        lineEnd += 1;
+      }
+    }
+
+    if (content.slice(markerStart, markerEnd) === marker) {
+      lines.push({ lineStart, lineEnd });
+    }
+
+    if (lineEnd === content.length) break;
+    lineStart = lineEnd;
   }
   return lines;
 }

@@ -86,6 +86,9 @@ Reinstalling generated Markdown connectors is byte-idempotent: the Codex skill
 `.codex/skills/lcm-memory/SKILL.md` remains byte-identical to its canonical
 template with exactly one final newline, and rules connectors remove and
 reappend their managed block without changing the established LF or CRLF style.
+Rules installs also tolerate unmatched standalone `<!-- lcm -->` lines: they
+preserve user-authored and inline comment text while keeping the generated
+managed block at one copy across repeated installs.
 
 To import existing Codex sessions into LCM:
 

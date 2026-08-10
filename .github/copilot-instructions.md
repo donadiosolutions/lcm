@@ -5,6 +5,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 ## Primary concerns
 
 - Generated Markdown EOF and append-mode managed-block normalization must remove only terminal CR/LF sequences and preserve one established EOL style: use CRLF when the retained document or generated content uses CRLF, otherwise LF. Normalize the generated block and separator to that style, emit exactly one final line break, and never use general trailing-whitespace trimming because Markdown spaces may be semantic.
+- Standalone managed-marker scanning must use a linear, non-overlapping line walk that does not consume the next line's prefix. Match only a complete line with optional spaces/tabs around a marker, preserve `lineStart`/`lineEnd` semantics for block removal, and keep unmatched or inline marker text as user content while repeated installs remain idempotent.
 
 ### Database connection pattern (highest priority)
 
