@@ -4,7 +4,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 
 ## Primary concerns
 
-- Generated Markdown EOF normalization must remove only terminal CR/LF sequences and append one LF; never use general trailing-whitespace trimming because Markdown spaces may be semantic.
+- Generated Markdown EOF normalization must remove only terminal CR/LF sequences and append exactly one terminal line break in the content's established EOL style (CRLF when the content uses CRLF, otherwise LF); never use general trailing-whitespace trimming because Markdown spaces may be semantic.
 
 ### Database connection pattern (highest priority)
 

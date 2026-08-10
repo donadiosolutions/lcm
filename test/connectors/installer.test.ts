@@ -187,13 +187,16 @@ describe('installConnector — Codex native hooks', () => {
   });
 
   it.each([
-    ['preserves trailing spaces before a terminal newline', 'Heading  \n', 'Heading  \n'],
+    ['preserves trailing spaces before a terminal CRLF', 'Heading  \r\n', 'Heading  \r\n'],
     ['preserves trailing spaces without a terminal newline', 'Heading  ', 'Heading  \n'],
-    ['preserves a trailing tab before a terminal newline', 'Heading\t\r\n', 'Heading\t\n'],
-    ['normalizes repeated mixed newline sequences', 'Heading\r\n\n\r\n', 'Heading\n'],
+    ['preserves a trailing tab before a terminal CRLF', 'Heading\t\r\n', 'Heading\t\r\n'],
+    ['normalizes repeated CRLF sequences to one CRLF', 'Heading\r\n\r\n\r\n', 'Heading\r\n'],
+    ['normalizes mixed terminal newline sequences to one CRLF', 'Heading\r\n\n\r\n', 'Heading\r\n'],
+    ['normalizes repeated LF sequences to one LF', 'Heading\n\n\n', 'Heading\n'],
+    ['adds LF when content has no terminal newline', 'Heading', 'Heading\n'],
     ['normalizes empty and newline-only content', '', '\n'],
     ['normalizes LF-only content', '\n', '\n'],
-    ['normalizes CRLF-only content', '\r\n', '\n'],
+    ['preserves CRLF for CRLF-only content', '\r\n', '\r\n'],
     ['normalizes CR-only content', '\r', '\n'],
   ])('%s', async (_description, input, expected) => {
     vi.resetModules();
@@ -205,6 +208,34 @@ describe('installConnector — Codex native hooks', () => {
       const { installConnector: installMockedConnector } = await import('../../src/connectors/installer.js');
       const result = installMockedConnector('codex', 'skill', tmpDir);
       expect(readFileSync(result.path, 'utf-8')).toBe(expected);
+    } finally {
+      vi.doUnmock('../../src/connectors/template-service.js');
+    }
+  });
+
+  it('preserves CRLF canonical bytes across repeated Codex skill installs', async () => {
+    const canonical = readFileSync(
+      new URL('../../src/connectors/templates/skill/SKILL.md', import.meta.url),
+      'utf-8',
+    );
+    const canonicalCrLf = canonical.replaceAll('\n', '\r\n');
+    const skillPath = join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md');
+    vi.resetModules();
+    vi.doMock('../../src/connectors/template-service.js', () => ({
+      generateContent: () => canonicalCrLf,
+    }));
+
+    try {
+      const { installConnector: installMockedConnector } = await import('../../src/connectors/installer.js');
+      installMockedConnector('codex', 'skill', tmpDir);
+      const firstInstall = readFileSync(skillPath, 'utf-8');
+
+      installMockedConnector('codex', 'skill', tmpDir);
+      const secondInstall = readFileSync(skillPath, 'utf-8');
+
+      expect(firstInstall).toBe(canonicalCrLf);
+      expect(secondInstall).toBe(canonicalCrLf);
+      expect(secondInstall).toBe(firstInstall);
     } finally {
       vi.doUnmock('../../src/connectors/template-service.js');
     }

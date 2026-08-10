@@ -108,7 +108,14 @@ function removeMarkers(content: string): string {
 }
 
 function normalizeMarkdownEof(content: string): string {
-  return content.replace(/[\r\n]+$/u, '') + '\n';
+  let contentEnd = content.length;
+  while (contentEnd > 0) {
+    const lastCharacter = content.charCodeAt(contentEnd - 1);
+    if (lastCharacter !== 0x0a && lastCharacter !== 0x0d) break;
+    contentEnd -= 1;
+  }
+  const eol = content.includes('\r\n') ? '\r\n' : '\n';
+  return content.slice(0, contentEnd) + eol;
 }
 
 // Strategy 1: Markdown targets (rules, skill)
