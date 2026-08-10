@@ -240,6 +240,46 @@ function defaultRunGit(args, cwd) {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
+function normalizeSha(value) {
+  return typeof value === "string" ? value.toLowerCase() : undefined;
+}
+
+export function assertExactPullRequestMerge(
+  pr,
+  commit,
+  { runGit = defaultRunGit, cwd = process.cwd(), requiredBase },
+) {
+  const sha = normalizeSha(commit);
+  if (
+    !sha ||
+    typeof requiredBase !== "string" ||
+    !pr?.merged_at ||
+    pr.base?.ref !== requiredBase ||
+    normalizeSha(pr.merge_commit_sha) !== sha
+  ) {
+    throw new Error(
+      `Pull request #${pr?.number ?? "unknown"} is not the exact ${requiredBase} merge for ${commit}`,
+    );
+  }
+
+  const parentOutput = runGit(["show", "-s", "--format=%P", commit], cwd);
+  if (typeof parentOutput !== "string") {
+    throw new Error(`Pull request #${pr.number} merge parent identity is invalid`);
+  }
+  const parents = parentOutput
+    .split(/\s+/u)
+    .filter(Boolean)
+    .map(normalizeSha);
+  if (
+    parents.length !== 2 ||
+    parents[0] !== normalizeSha(pr.base?.sha) ||
+    parents[1] !== normalizeSha(pr.head?.sha)
+  ) {
+    throw new Error(`Pull request #${pr.number} merge parent identity is invalid`);
+  }
+  return Object.freeze({ pr, parents: Object.freeze(parents) });
+}
+
 export async function collectReleasePullRequests({
   github,
   owner,
@@ -270,9 +310,17 @@ export async function collectReleasePullRequests({
 
   const associated = associateCommitsWithPullRequests(commits, associations);
   const uniqueNumbers = [...new Set(associated.map(({ number }) => number))];
+  const selectedCommits = new Map(
+    associated.map((selected, index) => [selected.number, commits[index]]),
+  );
   const entries = [];
   for (const pull_number of uniqueNumbers) {
     const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
+    assertExactPullRequestMerge(pr, selectedCommits.get(pull_number), {
+      runGit,
+      cwd,
+      requiredBase: "main",
+    });
     const files = await github.paginate(github.rest.pulls.listFiles, {
       owner,
       repo,

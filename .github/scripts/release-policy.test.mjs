@@ -8,6 +8,7 @@ import {
   RELEASE_RUN_NAME_PREFIX,
   assertActionCreatedReleaseBody,
   assertRecoveryReleaseBody,
+  assertExactPullRequestMerge,
   assertNpmDistTags,
   assertReleaseCanAdvanceDistTag,
   associateCommitsWithPullRequests,
@@ -425,9 +426,127 @@ test("rejects multiple non-exact main PR associations without an exact merge SHA
   );
 });
 
+test("validates pull request merge parent identity", () => {
+  const commit = "a".repeat(40);
+  const baseSha = "b".repeat(40);
+  const headSha = "c".repeat(40);
+  const mergePr = (overrides = {}) => pr(42, [], {
+    base: { ref: "main", sha: baseSha },
+    head: { ref: "feature/42", sha: headSha },
+    merge_commit_sha: commit,
+    ...overrides,
+  });
+  const cases = [
+    {
+      name: "accepts an exact two-parent merge",
+      pr: mergePr({
+        base: { ref: "main", sha: baseSha.toUpperCase() },
+        head: { ref: "feature/42", sha: headSha.toUpperCase() },
+        merge_commit_sha: commit.toUpperCase(),
+      }),
+      parentOutput: `${baseSha.toUpperCase()} ${headSha.toUpperCase()}`,
+      expected: "pass",
+    },
+    {
+      name: "rejects a squash or rebase with one parent",
+      pr: mergePr(),
+      parentOutput: baseSha,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects an octopus merge with three parents",
+      pr: mergePr(),
+      parentOutput: `${baseSha} ${headSha} ${"d".repeat(40)}`,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects reversed parent order",
+      pr: mergePr(),
+      parentOutput: `${headSha} ${baseSha}`,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects a mismatched merge SHA",
+      pr: mergePr({ merge_commit_sha: "d".repeat(40) }),
+      parentOutput: `${baseSha} ${headSha}`,
+      expected: /not the exact main merge/u,
+    },
+    {
+      name: "rejects a mismatched base SHA",
+      pr: mergePr({ base: { ref: "main", sha: "d".repeat(40) } }),
+      parentOutput: `${baseSha} ${headSha}`,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects a mismatched head SHA",
+      pr: mergePr({ head: { ref: "feature/42", sha: "d".repeat(40) } }),
+      parentOutput: `${baseSha} ${headSha}`,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects a mismatched base ref",
+      pr: mergePr({ base: { ref: "maintenance/1.4.x", sha: baseSha } }),
+      parentOutput: `${baseSha} ${headSha}`,
+      expected: /not the exact main merge/u,
+    },
+    {
+      name: "rejects an unmerged pull request",
+      pr: mergePr({ merged_at: null }),
+      parentOutput: `${baseSha} ${headSha}`,
+      expected: /not the exact main merge/u,
+    },
+    {
+      name: "rejects malformed parent output",
+      pr: mergePr(),
+      parentOutput: "not-a-sha",
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects non-string parent output",
+      pr: mergePr(),
+      parentOutput: undefined,
+      expected: /merge parent identity is invalid/u,
+    },
+  ];
+
+  for (const testCase of cases) {
+    const runGit = () => testCase.parentOutput;
+    if (testCase.expected === "pass") {
+      const result = assertExactPullRequestMerge(testCase.pr, commit.toUpperCase(), {
+        runGit,
+        cwd: "/workspace",
+        requiredBase: "main",
+      });
+      assert.equal(result.pr, testCase.pr, testCase.name);
+      assert.deepEqual(result.parents, [baseSha, headSha], testCase.name);
+      assert.equal(Object.isFrozen(result), true, testCase.name);
+      assert.equal(Object.isFrozen(result.parents), true, testCase.name);
+    } else {
+      assert.throws(
+        () => assertExactPullRequestMerge(testCase.pr, commit, {
+          runGit,
+          cwd: "/workspace",
+          requiredBase: "main",
+        }),
+        (error) => {
+          assert.match(error.message, testCase.expected, testCase.name);
+          return true;
+        },
+        testCase.name,
+      );
+    }
+  }
+});
+
 test("paginates every commit-to-PR association lookup", async () => {
   const commit = "a".repeat(40);
-  const associatedPullRequest = pr(1, [], { merge_commit_sha: commit });
+  const baseSha = "b".repeat(40);
+  const headSha = "c".repeat(40);
+  const associatedPullRequest = pr(1, [], {
+    base: { ref: "main", sha: baseSha },
+    head: { ref: "feature/1", sha: headSha },
+    merge_commit_sha: commit,
+  });
   const associationEndpoint = () => {
     throw new Error("association endpoint must be called through github.paginate");
   };
@@ -435,11 +554,18 @@ test("paginates every commit-to-PR association lookup", async () => {
     throw new Error("files endpoint must be called through github.paginate");
   };
   const paginateCalls = [];
+  const events = [];
   const github = {
     paginate: async (endpoint, parameters) => {
       paginateCalls.push({ endpoint, parameters });
-      if (endpoint === associationEndpoint) return [associatedPullRequest];
-      if (endpoint === filesEndpoint) return [];
+      if (endpoint === associationEndpoint) {
+        events.push("associated PRs");
+        return [associatedPullRequest];
+      }
+      if (endpoint === filesEndpoint) {
+        events.push("files");
+        return [];
+      }
       throw new Error("unexpected paginated endpoint");
     },
     rest: {
@@ -447,7 +573,10 @@ test("paginates every commit-to-PR association lookup", async () => {
         listPullRequestsAssociatedWithCommit: associationEndpoint,
       },
       pulls: {
-        get: async () => ({ data: associatedPullRequest }),
+        get: async () => {
+          events.push("full PR");
+          return { data: associatedPullRequest };
+        },
         listFiles: filesEndpoint,
       },
     },
@@ -461,6 +590,11 @@ test("paginates every commit-to-PR association lookup", async () => {
    */
   const runGit = (args, cwd) => {
     gitCalls.push({ args, cwd });
+    if (args[0] === "show") {
+      events.push("merge parents");
+      return `${baseSha} ${headSha}`;
+    }
+    events.push("commit list");
     return commit;
   };
 
@@ -480,7 +614,12 @@ test("paginates every commit-to-PR association lookup", async () => {
       args: ["rev-list", "--first-parent", "--reverse", "v1.4.1..v1.5.0"],
       cwd: "/workspace",
     },
+    {
+      args: ["show", "-s", "--format=%P", commit],
+      cwd: "/workspace",
+    },
   ]);
+  assert.deepEqual(events, ["commit list", "associated PRs", "full PR", "merge parents", "files"]);
   assert.equal(paginateCalls[0].endpoint, associationEndpoint);
   assert.deepEqual(paginateCalls[0].parameters, {
     owner: "donadiosolutions",
