@@ -47,6 +47,9 @@ const MANAGED_MARKER_PAIRS = [
 const MANAGED_MARKERS = new Set<string>(
   MANAGED_MARKER_PAIRS.flatMap(({ START, END }) => [START, END]),
 );
+const MANAGED_START_MARKERS = new Set<string>(
+  MANAGED_MARKER_PAIRS.map(({ START }) => START),
+);
 
 type MarkerLine = {
   lineStart: number;
@@ -105,7 +108,15 @@ function findStandaloneManagedMarkerLines(content: string): MarkerLine[] {
 }
 
 function isGeneratedLcmBlock(content: string, start: MarkerLine, end: MarkerLine): boolean {
-  return content.slice(start.lineEnd, end.lineStart).trimStart().startsWith('# Workflow Instruction');
+  return /^# Workflow Instruction(?:\r\n|\n|\r|$)/u.test(content.slice(start.lineEnd, end.lineStart));
+}
+
+function isWorkflowInstructionOnly(content: string, startIdx: number, endIdx: number): boolean {
+  if (startIdx >= endIdx) return false;
+
+  const lines = content.slice(startIdx, endIdx).split(/\r\n|\n|\r/);
+  if (lines.at(-1) === '') lines.pop();
+  return lines.length > 0 && lines.every((line) => line === '# Workflow Instruction');
 }
 
 function managedBlock(start: MarkerLine, end: MarkerLine): ManagedBlock {
@@ -121,16 +132,33 @@ function findSameMarkerBlocks(
   markerLines: MarkerLine[],
   marker: string,
 ): ManagedBlock[] {
-  const candidates: MarkerLine[] = [];
-  for (const line of markerLines) {
-    if (line.marker === marker) candidates.push(line);
+  const candidates: Array<{ line: MarkerLine; markerIndex: number }> = [];
+  for (let markerIndex = 0; markerIndex < markerLines.length; markerIndex += 1) {
+    const line = markerLines[markerIndex];
+    if (line.marker === marker) candidates.push({ line, markerIndex });
   }
 
   const blocks: ManagedBlock[] = [];
-  for (let index = 0; index + 1 < candidates.length; index += 1) {
-    const start = candidates[index];
-    const end = candidates[index + 1];
-    if (isGeneratedLcmBlock(content, start, end)) blocks.push(managedBlock(start, end));
+  for (let index = 0; index < candidates.length; index += 1) {
+    const start = candidates[index].line;
+    const nextSameMarker = candidates[index + 1]?.line;
+    if (nextSameMarker && isGeneratedLcmBlock(content, start, nextSameMarker)) {
+      blocks.push(managedBlock(start, nextSameMarker));
+    }
+
+    const nextMarker = markerLines[candidates[index].markerIndex + 1];
+    const endIdx = nextMarker?.lineStart ?? content.length;
+    if (isWorkflowInstructionOnly(content, start.lineEnd, endIdx)) {
+      let partialStartIdx = start.lineStart;
+      let previousMarkerIndex = candidates[index].markerIndex - 1;
+      while (previousMarkerIndex >= 0) {
+        const previousMarker = markerLines[previousMarkerIndex];
+        if (previousMarker.lineEnd !== partialStartIdx || !MANAGED_START_MARKERS.has(previousMarker.marker)) break;
+        partialStartIdx = previousMarker.lineStart;
+        previousMarkerIndex -= 1;
+      }
+      blocks.push({ startIdx: partialStartIdx, endIdx, endLength: 0 });
+    }
   }
   return blocks;
 }
@@ -174,10 +202,15 @@ function compareManagedBlocks(left: ManagedBlock, right: ManagedBlock): number {
   return left.startIdx - right.startIdx;
 }
 
+function managedBlockEnd(block: ManagedBlock): number {
+  return block.endIdx + block.endLength;
+}
+
 function mergeManagedBlockCandidates(candidateSets: ManagedBlock[][]): ManagedBlock[] {
   const indexes = candidateSets.map(() => 0);
   const blocks: ManagedBlock[] = [];
-  let previousEnd = 0;
+  let unionStartIdx: number | undefined;
+  let unionEndIdx = 0;
 
   while (true) {
     let selectedSet = -1;
@@ -192,10 +225,20 @@ function mergeManagedBlockCandidates(candidateSets: ManagedBlock[][]): ManagedBl
     if (!selected) break;
 
     indexes[selectedSet] += 1;
-    const selectedEnd = selected.endIdx + selected.endLength;
-    if (selected.startIdx < previousEnd) continue;
-    blocks.push(selected);
-    previousEnd = selectedEnd;
+    const selectedEndIdx = managedBlockEnd(selected);
+    if (unionStartIdx === undefined || selected.startIdx > unionEndIdx) {
+      if (unionStartIdx !== undefined) {
+        blocks.push({ startIdx: unionStartIdx, endIdx: unionEndIdx, endLength: 0 });
+      }
+      unionStartIdx = selected.startIdx;
+      unionEndIdx = selectedEndIdx;
+    } else if (selectedEndIdx > unionEndIdx) {
+      unionEndIdx = selectedEndIdx;
+    }
+  }
+
+  if (unionStartIdx !== undefined) {
+    blocks.push({ startIdx: unionStartIdx, endIdx: unionEndIdx, endLength: 0 });
   }
 
   return blocks;
