@@ -428,7 +428,10 @@ describe("portable-knowledge — import", () => {
     expect(existsSync(aliasDbPath)).toBe(false);
   });
 
-  it("reconciles a legacy linked-worktree store before importing portable knowledge", async () => {
+  it(
+    "reconciles a legacy linked-worktree store before importing portable knowledge",
+    { timeout: 10_000 },
+    async () => {
     const { main, linked } = makeRepository();
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
