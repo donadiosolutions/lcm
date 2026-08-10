@@ -36,6 +36,12 @@ lcm connectors doctor github-copilot
 
 This writes a repo-local skill file at `.github/skills/lcm-memory/SKILL.md`.
 
+Rules connectors append one managed Markdown block to the target document. The
+installer keeps the document byte-consistent when it reinstalls that block: it
+uses CRLF when the retained document or generated block uses CRLF, otherwise
+LF, normalizes the separator and generated block to that style, and emits one
+final line break. Markdown-significant trailing spaces and tabs are preserved.
+
 ## Install the Codex connector
 
 For Codex in the current repository:
@@ -76,7 +82,10 @@ lcm connectors install codex --type skill
 lcm connectors install codex --type rules
 ```
 
-Reinstalling the generated Codex skill is byte-idempotent: `.codex/skills/lcm-memory/SKILL.md` is kept byte-identical to the canonical template with exactly one final newline, so repeated installs do not add blank lines or dirty a tracked canonical copy.
+Reinstalling generated Markdown connectors is byte-idempotent: the Codex skill
+`.codex/skills/lcm-memory/SKILL.md` remains byte-identical to its canonical
+template with exactly one final newline, and rules connectors remove and
+reappend their managed block without changing the established LF or CRLF style.
 
 To import existing Codex sessions into LCM:
 

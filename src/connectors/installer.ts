@@ -49,6 +49,8 @@ type MarkerLine = {
   lineEnd: number;
 };
 
+type MarkdownEol = '\n' | '\r\n';
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -97,25 +99,68 @@ function hasManagedBlock(content: string): boolean {
   return findManagedBlock(content) !== undefined;
 }
 
+function establishedMarkdownEol(...contents: string[]): MarkdownEol {
+  return contents.some(content => content.includes('\r\n')) ? '\r\n' : '\n';
+}
+
+function trimMarkdownLineBreaksAtStart(content: string): string {
+  let contentStart = 0;
+  while (contentStart < content.length) {
+    const character = content.charCodeAt(contentStart);
+    if (character !== 0x0a && character !== 0x0d) break;
+    contentStart += 1;
+  }
+  return content.slice(contentStart);
+}
+
+function trimMarkdownLineBreaksAtEnd(content: string): string {
+  let contentEnd = content.length;
+  while (contentEnd > 0) {
+    const character = content.charCodeAt(contentEnd - 1);
+    if (character !== 0x0a && character !== 0x0d) break;
+    contentEnd -= 1;
+  }
+  return content.slice(0, contentEnd);
+}
+
+function normalizeMarkdownLineEndings(content: string, eol: MarkdownEol): string {
+  const parts: string[] = [];
+  let segmentStart = 0;
+  for (let index = 0; index < content.length; index += 1) {
+    const character = content.charCodeAt(index);
+    if (character !== 0x0a && character !== 0x0d) continue;
+    parts.push(content.slice(segmentStart, index), eol);
+    if (character === 0x0d && content.charCodeAt(index + 1) === 0x0a) index += 1;
+    segmentStart = index + 1;
+  }
+  parts.push(content.slice(segmentStart));
+  return parts.join('');
+}
+
 function removeMarkers(content: string): string {
   const block = findManagedBlock(content);
   if (!block) return content;
-  const before = content.slice(0, block.startIdx).trimEnd();
-  const after = content.slice(block.endIdx + block.endLength).trimStart();
-  if (!before) return after.trim();
-  if (!after) return before.trim();
-  return `${before}\n${after}`.trim();
+  const eol = establishedMarkdownEol(content);
+  const before = trimMarkdownLineBreaksAtEnd(content.slice(0, block.startIdx));
+  const after = trimMarkdownLineBreaksAtEnd(
+    trimMarkdownLineBreaksAtStart(content.slice(block.endIdx + block.endLength)),
+  );
+  if (!before) return after;
+  if (!after) return before;
+  return normalizeMarkdownLineEndings(`${before}${eol}${after}`, eol);
 }
 
-function normalizeMarkdownEof(content: string): string {
-  let contentEnd = content.length;
-  while (contentEnd > 0) {
-    const lastCharacter = content.charCodeAt(contentEnd - 1);
-    if (lastCharacter !== 0x0a && lastCharacter !== 0x0d) break;
-    contentEnd -= 1;
-  }
-  const eol = content.includes('\r\n') ? '\r\n' : '\n';
-  return content.slice(0, contentEnd) + eol;
+function normalizeMarkdownEof(content: string, eol: MarkdownEol = establishedMarkdownEol(content)): string {
+  return normalizeMarkdownLineEndings(trimMarkdownLineBreaksAtEnd(content), eol) + eol;
+}
+
+function appendMarkdown(existing: string, content: string): string {
+  const cleaned = removeMarkers(existing);
+  const eol = establishedMarkdownEol(existing, cleaned, content);
+  const normalizedExisting = normalizeMarkdownLineEndings(trimMarkdownLineBreaksAtEnd(cleaned), eol);
+  const normalizedContent = normalizeMarkdownEof(content, eol);
+  if (!normalizedExisting) return normalizedContent;
+  return `${normalizedExisting}${eol}${normalizedContent}`;
 }
 
 // Strategy 1: Markdown targets (rules, skill)
@@ -128,9 +173,8 @@ function installMarkdown(content: string, filePath: string, writeMode: 'append' 
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-    // Remove old markers if present before re-appending
-    const cleaned = removeMarkers(existing);
-    writeFileSync(filePath, cleaned + (cleaned.endsWith('\n') || cleaned === '' ? '' : '\n') + content + '\n');
+    // Remove old markers if present before re-appending.
+    writeFileSync(filePath, appendMarkdown(existing, content));
   } else {
     writeFileSync(filePath, normalizeMarkdownEof(content));
   }
@@ -339,11 +383,12 @@ export function removeConnector(agentIdOrName: string, type?: ConnectorType, cwd
   let content: string;
   try { content = readFileSync(resolvedPath, 'utf-8'); } catch { return false; }
   if (!hasManagedBlock(content)) return false;
+  const eol = establishedMarkdownEol(content);
   const cleaned = removeMarkers(content);
   if (cleaned.trim() === '') {
     unlinkSync(resolvedPath);
   } else {
-    writeFileSync(resolvedPath, cleaned + '\n');
+    writeFileSync(resolvedPath, normalizeMarkdownEof(cleaned, eol));
   }
   return true;
 }
