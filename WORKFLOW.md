@@ -19,15 +19,31 @@ This document is a living record. **Update it whenever you learn something:**
 ## Branch Strategy
 
 ```text
-feature/docs branches → main (default, protected)
+ordinary feat/docs/fix branches → main (default, protected)
+maintenance fix branches        → maintenance/<major>.<minor>.x (protected)
 ```
 
-- **`main`** — Default branch. All PRs target main. Protected: pull requests, required checks, and reviews are required; no force push. Pushing a matching stable `vX.Y.Z` or beta `vX.Y.Z-beta.N` tag triggers draft-release creation.
-- **Feature branches** — `feat/TOPIC`, `docs/TOPIC`, `fix/TOPIC`. Always branch from main and use an isolated worktree for each concurrent change.
+- **`main`** — Default target for ordinary feature, documentation, and fix
+  pull requests. It is protected: pull requests, required checks, and reviews
+  are required; no force push. Pushing a matching stable `vX.Y.Z` or beta
+  `vX.Y.Z-beta.N` tag triggers draft-release creation.
+- **`maintenance/<major>.<minor>.x`** — Target for fixes to an existing
+  maintenance line. Create the topic branch from that exact maintenance branch
+  and target the pull request back to it. The maintenance branch must be
+  protected before external admission can accept the pull request.
+- **Topic branches** — Use `feat/TOPIC`, `docs/TOPIC`, or `fix/TOPIC` as
+  appropriate, based on the selected target branch, and use an isolated worktree
+  for each concurrent change.
+
+Ordinary and maintenance pull requests follow the same protected flow: every
+required exact-head check and review must pass, and the pull request must merge
+with a merge commit. Use `main` as `TARGET_BRANCH` for ordinary work or the
+selected protected `maintenance/<major>.<minor>.x` branch for a maintenance fix
+in every sync, branch, rebase, and pull-request target operation below.
 
 Independent changes may be developed in parallel on isolated branches and
 worktrees. Dependent work must wait for its upstream PR to merge, then fetch
-and rebase onto the new `main` before it is merged.
+and rebase onto the updated target branch before it is merged.
 
 The repository does not use a merge queue. Merge protected pull requests
 directly with merge commits only after every required exact-head check and
@@ -192,8 +208,8 @@ or service fails.
 
 ## Phase 2: Spec Review via PR
 
-1. **Sync first:** `git checkout main && git pull --ff-only origin main` before branching — stale local bases cause Copilot to review unrelated code
-2. Create a `docs/TOPIC` branch from main
+1. **Sync first:** Set `TARGET_BRANCH` according to Branch Strategy, then run `git checkout "$TARGET_BRANCH" && git pull --ff-only origin "$TARGET_BRANCH"` before branching — stale local bases cause Copilot to review unrelated code
+2. Create a `docs/TOPIC` branch from the selected target branch
 3. Ensure only documentation files are in the diff — specs, plans, workflow docs
 4. Push and open PR
 5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
@@ -203,10 +219,10 @@ or service fails.
 
 ## Phase 3: Implementation (Sonnet subagents)
 
-1. **Sync first:** `git checkout main && git pull --ff-only origin main` to get latest (including merged specs)
+1. **Sync first:** Set `TARGET_BRANCH` according to Branch Strategy, then run `git checkout "$TARGET_BRANCH" && git pull --ff-only origin "$TARGET_BRANCH"` to get the latest target (including merged specs)
 2. Dispatch `model: sonnet` subagents with `isolation: worktree` for each task in the plan
 3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
-4. **Sequential tasks** → launch the dependent branch only after the upstream PR merges, then branch from the updated `main`. If a downstream branch already exists on the old upstream tip, enter its isolated worktree, set `OLD_UPSTREAM_TIP` to that commit, and replay only its downstream commits with `git fetch origin main && git rebase --onto origin/main "${OLD_UPSTREAM_TIP}"`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
+4. **Sequential tasks** → launch the dependent branch only after the upstream PR merges, then branch from the updated target branch. If a downstream branch already exists on the old upstream tip, enter its isolated worktree, set `TARGET_BRANCH` and `OLD_UPSTREAM_TIP`, and replay only its downstream commits with `git fetch origin "$TARGET_BRANCH" && git rebase --onto "origin/$TARGET_BRANCH" "${OLD_UPSTREAM_TIP}"`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
 5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
 6. After subagent completes: review the diff, push, open PR, request Copilot review
 
@@ -294,9 +310,9 @@ gh api repos/{owner}/{repo}/pulls/{n}/comments \
 
 ### Common Pitfalls
 
-- **Stale diff**: Always sync main before creating branches. If main has unpushed local commits, the PR diff includes unrelated code and Copilot reviews the wrong things.
+- **Stale diff**: Always sync the selected target branch before creating topic branches. If that target has unpushed local commits, the PR diff includes unrelated code and Copilot reviews the wrong things.
 - **@copilot in comments**: Opens a new PR instead of triggering review. Always use the reviewers API.
 - **REST API 422 for Copilot bot**: The `requested_reviewers` REST endpoint rejects bot slugs. Use `gh pr edit --add-reviewer` instead.
 - **Empty commits don't trigger Copilot**: Copilot only reviews on substantive diffs. Use `gh pr edit` re-request instead.
-- **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Set `CLEAN_BRANCH` to the new branch name and `DOCS_COMMIT_SHA` to the documentation commit, then use `git checkout -B "${CLEAN_BRANCH}" origin/main && git cherry-pick "${DOCS_COMMIT_SHA}"`.
-- **Sequential PR chains**: Create PR B from updated `main` only after PR A lands. If PR B already contains commits based on PR A's old tip, enter PR B's isolated worktree, set `OLD_PR_A_TIP` to that commit, and replay only its own commits with `git fetch origin main && git rebase --onto origin/main "${OLD_PR_A_TIP}"`. Omit the branch argument so Git rebases the branch already checked out in that worktree instead of attempting a conflicting cross-worktree checkout.
+- **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Set `TARGET_BRANCH` according to Branch Strategy, `CLEAN_BRANCH` to the new branch name, and `DOCS_COMMIT_SHA` to the documentation commit, then use `git checkout -B "${CLEAN_BRANCH}" "origin/${TARGET_BRANCH}" && git cherry-pick "${DOCS_COMMIT_SHA}"`.
+- **Sequential PR chains**: Create PR B from the updated target branch only after PR A lands. If PR B already contains commits based on PR A's old tip, enter PR B's isolated worktree, set `TARGET_BRANCH` and `OLD_PR_A_TIP`, and replay only its own commits with `git fetch origin "$TARGET_BRANCH" && git rebase --onto "origin/$TARGET_BRANCH" "${OLD_PR_A_TIP}"`. Omit the branch argument so Git rebases the branch already checked out in that worktree instead of attempting a conflicting cross-worktree checkout.
