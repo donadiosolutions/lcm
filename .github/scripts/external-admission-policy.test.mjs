@@ -5,6 +5,7 @@ import {
   CHECK_IDENTITIES,
   evaluateAdmissionChecks,
   evaluateCiActionsRun,
+  evaluatePullRequestEligibility,
   flattenCheckRunPages,
   parseActionsRunId,
   runPolicyCommand,
@@ -12,6 +13,16 @@ import {
 
 const HEAD_SHA = "a".repeat(40);
 const REPOSITORY = "donadiosolutions/lcm";
+const eligibleMain = {
+  state: "open",
+  draft: false,
+  head: { sha: HEAD_SHA },
+  base: { ref: "main", repo: { full_name: REPOSITORY } },
+};
+const eligibleMaintenance = {
+  ...eligibleMain,
+  base: { ref: "maintenance/1.4.x", repo: { full_name: REPOSITORY } },
+};
 
 function check(identity, overrides = {}) {
   return {
@@ -54,6 +65,62 @@ test("defines only the authenticated CI and DCO identities", () => {
     appId: 15368,
     appSlug: "github-actions",
   });
+});
+
+test("admits only open exact-head PRs on protected repository bases", () => {
+  assert.deepEqual(evaluatePullRequestEligibility({
+    pullRequest: eligibleMain,
+    headSha: HEAD_SHA,
+    repository: REPOSITORY,
+    baseProtected: true,
+  }), { eligible: true });
+
+  assert.deepEqual(evaluatePullRequestEligibility({
+    pullRequest: eligibleMaintenance,
+    headSha: HEAD_SHA,
+    repository: REPOSITORY,
+    baseProtected: true,
+  }), { eligible: true });
+
+  const rejectedCases = [
+    ["maintenance/1.x", "unsupported-base", {
+      ...eligibleMain,
+      base: { ref: "maintenance/1.x", repo: { full_name: REPOSITORY } },
+    }],
+    ["maintenance/1.4", "unsupported-base", {
+      ...eligibleMain,
+      base: { ref: "maintenance/1.4", repo: { full_name: REPOSITORY } },
+    }],
+    ["maintenance/security", "unsupported-base", {
+      ...eligibleMain,
+      base: { ref: "maintenance/security", repo: { full_name: REPOSITORY } },
+    }],
+    ["release/1.4.x", "unsupported-base", {
+      ...eligibleMain,
+      base: { ref: "release/1.4.x", repo: { full_name: REPOSITORY } },
+    }],
+    ["unprotected maintenance branch", "unprotected-base", eligibleMaintenance, false],
+    ["wrong base repository", "repository-mismatch", {
+      ...eligibleMain,
+      base: { ref: "main", repo: { full_name: "other/repository" } },
+    }],
+    ["wrong head SHA", "ineligible-pr", {
+      ...eligibleMain,
+      head: { sha: "b".repeat(40) },
+    }],
+    ["draft", "ineligible-pr", { ...eligibleMain, draft: true }],
+    ["closed", "ineligible-pr", { ...eligibleMain, state: "closed" }],
+    ["malformed input", "ineligible-pr", null],
+  ];
+
+  for (const [name, reason, pullRequest, baseProtected = true] of rejectedCases) {
+    assert.deepEqual(evaluatePullRequestEligibility({
+      pullRequest,
+      headSha: HEAD_SHA,
+      repository: REPOSITORY,
+      baseProtected,
+    }), { eligible: false, reason }, name);
+  }
 });
 
 test("flattens every check-run page and rejects malformed pages", () => {
@@ -306,6 +373,16 @@ test("exposes the complete policy through deterministic CLI commands", () => {
     ["0", HEAD_SHA, REPOSITORY],
     JSON.stringify(actionsRun()),
   )), { state: "invalid", ready: false, terminalFailure: "ci-run-metadata" });
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "evaluate-pr",
+    [HEAD_SHA, REPOSITORY, "true"],
+    JSON.stringify(eligibleMain),
+  )), { eligible: true });
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "evaluate-pr",
+    [HEAD_SHA, REPOSITORY, "false"],
+    JSON.stringify(eligibleMaintenance),
+  )), { eligible: false, reason: "unprotected-base" });
 
   assert.throws(() => runPolicyCommand("unknown", [], "{}"), /unknown policy command/u);
   assert.throws(() => runPolicyCommand("evaluate-checks", [], "{}"), /unknown policy command/u);

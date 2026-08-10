@@ -23,6 +23,8 @@ const WAITING_CI_RUN_STATES = new Set([
   "waiting",
 ]);
 
+const MAINTENANCE_BASE = /^maintenance\/[0-9]+\.[0-9]+\.x$/u;
+
 function requireArray(value, label) {
   if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
   return value;
@@ -33,6 +35,31 @@ function requireNonEmptyString(value, label) {
     throw new TypeError(`${label} must be a non-empty string`);
   }
   return value;
+}
+
+export function evaluatePullRequestEligibility({
+  pullRequest,
+  headSha,
+  repository,
+  baseProtected,
+}) {
+  requireNonEmptyString(headSha, "head SHA");
+  requireNonEmptyString(repository, "repository");
+  if (pullRequest === null || typeof pullRequest !== "object" || Array.isArray(pullRequest)) {
+    return { eligible: false, reason: "ineligible-pr" };
+  }
+  if (pullRequest.state !== "open" || pullRequest.draft !== false || pullRequest.head?.sha !== headSha) {
+    return { eligible: false, reason: "ineligible-pr" };
+  }
+  if (pullRequest.base?.repo?.full_name !== repository) {
+    return { eligible: false, reason: "repository-mismatch" };
+  }
+  const baseRef = pullRequest.base?.ref;
+  if (baseRef !== "main" && !(typeof baseRef === "string" && MAINTENANCE_BASE.test(baseRef))) {
+    return { eligible: false, reason: "unsupported-base" };
+  }
+  if (baseProtected !== true) return { eligible: false, reason: "unprotected-base" };
+  return { eligible: true };
 }
 
 export function flattenCheckRunPages(pages) {
@@ -196,6 +223,15 @@ export function runPolicyCommand(command, args, input) {
   if (command === "evaluate-ci-run" && args.length === 3) {
     const [runId, headSha, repository] = args;
     return JSON.stringify(evaluateCiActionsRun(payload, { runId, headSha, repository }));
+  }
+  if (command === "evaluate-pr" && args.length === 3) {
+    const [headSha, repository, baseProtected] = args;
+    return JSON.stringify(evaluatePullRequestEligibility({
+      pullRequest: payload,
+      headSha,
+      repository,
+      baseProtected: baseProtected === "true",
+    }));
   }
   throw new TypeError("unknown policy command or invalid arguments");
 }
