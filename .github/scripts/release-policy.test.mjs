@@ -485,7 +485,7 @@ test("preserves the canonical main error for an ordinary missing-main associatio
   });
 });
 
-test("validates pull request merge parent identity", () => {
+test("validates merge parent shape and pull request head identity", () => {
   const commit = "a".repeat(40);
   const baseSha = "b".repeat(40);
   const headSha = "c".repeat(40);
@@ -531,15 +531,27 @@ test("validates pull request merge parent identity", () => {
       expected: /not the exact main merge/u,
     },
     {
-      name: "rejects a mismatched base SHA",
+      name: "accepts exact merge evidence when GitHub base SHA differs from first parent",
       pr: mergePr({ base: { ref: "main", sha: "d".repeat(40) } }),
       parentOutput: `${baseSha} ${headSha}`,
-      expected: /merge parent identity is invalid/u,
+      expected: "pass",
     },
     {
       name: "rejects a mismatched head SHA",
       pr: mergePr({ head: { ref: "feature/42", sha: "d".repeat(40) } }),
       parentOutput: `${baseSha} ${headSha}`,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects a non-string head SHA",
+      pr: mergePr({ head: { ref: "feature/42", sha: null } }),
+      parentOutput: baseSha + " " + headSha,
+      expected: /merge parent identity is invalid/u,
+    },
+    {
+      name: "rejects a noncanonical head SHA",
+      pr: mergePr({ head: { ref: "feature/42", sha: "not-a-sha" } }),
+      parentOutput: baseSha + " " + headSha,
       expected: /merge parent identity is invalid/u,
     },
     {
@@ -824,9 +836,9 @@ for (const [description, parentOutput, expected, options = {}] of [
   ["a three-parent forward-port merge", `${B} ${H} ${"d".repeat(40)}`, /merge parent identity is invalid/u],
   ["a reversed-parent forward-port merge", `${H} ${B}`, /no valid main forward port/u],
   [
-    "a mismatched-parent forward-port merge",
+    "a forward-port whose GitHub base SHA differs from its first parent",
     `${"e".repeat(40)} ${H}`,
-    /merge parent identity is invalid/u,
+    "pass",
     {
       ancestorResults: new Map([
         [`${C}:${"e".repeat(40)}`, false],
@@ -835,12 +847,17 @@ for (const [description, parentOutput, expected, options = {}] of [
     },
   ],
 ]) {
-  test(`maintenance release provenance rejects ${description}`, async () => {
+  test(`maintenance release provenance ${expected === "pass" ? "accepts" : "rejects"} ${description}`, async () => {
+    const collect = () => collectReleasePullRequests(createMaintenanceFixture({
+      ...options,
+      forwardParents: new Map([[F, parentOutput]]),
+    }));
+    if (expected === "pass") {
+      await assert.doesNotReject(collect);
+      return;
+    }
     await assert.rejects(
-      () => collectReleasePullRequests(createMaintenanceFixture({
-        ...options,
-        forwardParents: new Map([[F, parentOutput]]),
-      })),
+      collect,
       expected,
     );
   });

@@ -299,9 +299,12 @@ export function assertExactPullRequestMerge(
   }
 
   const parents = readMergeParents(runGit, commit, cwd, `Pull request #${pr.number}`);
+  const headSha = normalizeSha(pr.head?.sha);
+  // GitHub base.sha identifies the associated base ref OID, not a guaranteed merge parent.
+  // The exact PR metadata plus local two-parent topology supplies base provenance.
   if (
-    parents[0] !== normalizeSha(pr.base?.sha) ||
-    parents[1] !== normalizeSha(pr.head?.sha)
+    !isCanonicalSha(headSha) ||
+    parents[1] !== headSha
   ) {
     throw new Error(`Pull request #${pr.number} merge parent identity is invalid`);
   }
