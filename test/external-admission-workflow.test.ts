@@ -2,6 +2,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 import { load as loadYaml } from "js-yaml";
 import { describe, expect, it } from "vitest";
 
@@ -33,6 +34,218 @@ interface ExternalAdmissionWorkflow {
   };
 }
 
+interface WorkflowRunFixture {
+  event: string;
+  head_sha: string;
+  name: string;
+  path: string;
+  repository: { full_name: string };
+}
+
+interface CheckRunFixture {
+  app: { id: number; slug: string };
+  check_suite: { head_branch: string | null };
+  head_sha: string;
+  name: string;
+}
+
+interface EventFixture {
+  name: string;
+  github: {
+    event: {
+      action: string;
+      check_run: CheckRunFixture;
+      client_payload: { head_sha: string };
+      workflow_run: WorkflowRunFixture;
+    };
+    event_name: string;
+    repository: string;
+  };
+  expectedJobRun: boolean;
+}
+
+const HEAD_SHA = "a".repeat(40);
+const REPOSITORY = "donadiosolutions/lcm";
+
+function makeEventFixture(
+  name: string,
+  eventName: string,
+  expectedJobRun: boolean,
+  overrides: {
+    action?: string;
+    checkRun?: Partial<CheckRunFixture>;
+    clientPayloadHeadSha?: string;
+    workflowRun?: Partial<WorkflowRunFixture>;
+  } = {},
+): EventFixture {
+  return {
+    name,
+    expectedJobRun,
+    github: {
+      event_name: eventName,
+      repository: REPOSITORY,
+      event: {
+        action: overrides.action ?? "",
+        client_payload: { head_sha: overrides.clientPayloadHeadSha ?? "" },
+        workflow_run: {
+          event: "",
+          head_sha: "",
+          name: "",
+          path: "",
+          repository: { full_name: "" },
+          ...overrides.workflowRun,
+        },
+        check_run: {
+          app: { id: 0, slug: "" },
+          check_suite: { head_branch: "" },
+          head_sha: "",
+          name: "",
+          ...overrides.checkRun,
+        },
+      },
+    },
+  };
+}
+
+function evaluateWorkflowExpression(expression: string, github: EventFixture["github"]): boolean {
+  const sourceExpression = expression
+    .replace(/^\s*\$\{\{\s*/u, "")
+    .replace(/\s*\}\}\s*$/u, "");
+  return Boolean(runInNewContext(sourceExpression, {
+    github,
+    startsWith: (value: string, prefix: string) => value.startsWith(prefix),
+  }));
+}
+
+function simulateWorkflowFixture(fixture: EventFixture) {
+  const jobRuns = evaluateWorkflowExpression(job.if, fixture.github);
+  if (!jobRuns) return { evaluatorReached: false, jobRuns: false, statusWrites: 0 };
+
+  const stepsRun = job.steps.map((step) =>
+    step.if === undefined ? true : evaluateWorkflowExpression(step.if, fixture.github));
+  return {
+    evaluatorReached: stepsRun[3] === true,
+    jobRuns: true,
+    statusWrites: stepsRun[0] === true ? 1 : 0,
+  };
+}
+
+const acceptedEventFixtures: EventFixture[] = [
+  makeEventFixture("workflow_run requested", "workflow_run", true, {
+    action: "requested",
+    workflowRun: {
+      event: "pull_request",
+      head_sha: HEAD_SHA,
+      name: "CI",
+      path: ".github/workflows/ci.yml",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("workflow_run in_progress", "workflow_run", true, {
+    action: "in_progress",
+    workflowRun: {
+      event: "pull_request",
+      head_sha: HEAD_SHA,
+      name: "CI",
+      path: ".github/workflows/ci.yml",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("workflow_run completed", "workflow_run", true, {
+    action: "completed",
+    workflowRun: {
+      event: "pull_request",
+      head_sha: HEAD_SHA,
+      name: "CI",
+      path: ".github/workflows/ci.yml",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("DCO created", "check_run", true, {
+    action: "created",
+    checkRun: {
+      app: { id: 1861, slug: "dco" },
+      check_suite: { head_branch: "feature/admission" },
+      head_sha: HEAD_SHA,
+      name: "DCO",
+    },
+  }),
+  makeEventFixture("DCO rerequested", "check_run", true, {
+    action: "rerequested",
+    checkRun: {
+      app: { id: 1861, slug: "dco" },
+      check_suite: { head_branch: "feature/admission" },
+      head_sha: HEAD_SHA,
+      name: "DCO",
+    },
+  }),
+  makeEventFixture("DCO completed", "check_run", true, {
+    action: "completed",
+    checkRun: {
+      app: { id: 1861, slug: "dco" },
+      check_suite: { head_branch: "feature/admission" },
+      head_sha: HEAD_SHA,
+      name: "DCO",
+    },
+  }),
+  makeEventFixture("repository dispatch", "repository_dispatch", true, {
+    action: "external-admission-reconcile",
+    clientPayloadHeadSha: HEAD_SHA,
+  }),
+];
+
+const rejectedEventFixtures: EventFixture[] = [
+  makeEventFixture("CI wrong workflow path", "workflow_run", false, {
+    workflowRun: {
+      event: "pull_request",
+      head_sha: HEAD_SHA,
+      name: "CI",
+      path: ".github/workflows/other.yml",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("CI wrong repository", "workflow_run", false, {
+    workflowRun: {
+      event: "pull_request",
+      head_sha: HEAD_SHA,
+      name: "CI",
+      path: ".github/workflows/ci.yml",
+      repository: { full_name: "other/repository" },
+    },
+  }),
+  makeEventFixture("CI wrong event", "workflow_run", false, {
+    workflowRun: {
+      event: "push",
+      head_sha: HEAD_SHA,
+      name: "CI",
+      path: ".github/workflows/ci.yml",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("DCO wrong identity", "check_run", false, {
+    action: "completed",
+    checkRun: {
+      app: { id: 9999, slug: "dco" },
+      check_suite: { head_branch: "feature/admission" },
+      head_sha: HEAD_SHA,
+      name: "DCO",
+    },
+  }),
+  makeEventFixture("DCO queue ref", "check_run", false, {
+    action: "completed",
+    checkRun: {
+      app: { id: 1861, slug: "dco" },
+      check_suite: { head_branch: "gh-readonly-queue/main/pr-123-abc" },
+      head_sha: HEAD_SHA,
+      name: "DCO",
+    },
+  }),
+  makeEventFixture("repository dispatch wrong action", "repository_dispatch", false, {
+    action: "other-reconcile",
+    clientPayloadHeadSha: HEAD_SHA,
+  }),
+];
+
 const root = new URL("../", import.meta.url);
 const source = readFileSync(new URL(".github/workflows/external-admission.yml", root), "utf8");
 const policySource = readFileSync(
@@ -51,9 +264,6 @@ const workflow = loadYaml(source) as ExternalAdmissionWorkflow;
 const job = workflow.jobs["external-admission-evaluator"];
 const evaluatorInvocation =
   job.steps.find((step) => step.name === "Evaluate external admission snapshot")?.run ?? "";
-const completedOrReconcile =
-  "${{ (github.event_name == 'repository_dispatch' && github.event.action == 'external-admission-reconcile' && github.event.client_payload.head_sha != '') || github.event.action == 'completed' }}";
-
 function runWithFailingAdmissionCommand(
   command: "gh" | "node" | "validator-jq" | "eligibility-jq" | "checks-ready-jq" | "ci-ready-jq" | "malformed-eligibility" | "valid-ineligible",
 ) {
@@ -207,6 +417,7 @@ describe("external admission workflow", () => {
       "Evaluate external admission snapshot",
     ]);
 
+    expect(job.steps[0]?.if).toBeUndefined();
     const revoke = job.steps[0]?.run ?? "";
     expect(revoke).toContain('EVENT_HEAD_SHA="${EVENT_HEAD_SHA,,}"');
     expect(revoke).toContain('if [[ ! "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]');
@@ -214,7 +425,7 @@ describe("external admission workflow", () => {
     expect(revoke).not.toContain("/pulls");
 
     const checkout = job.steps[1];
-    expect(checkout?.if).toBe(completedOrReconcile);
+    expect(checkout?.if).toBeUndefined();
     expect(checkout?.uses).toBe(
       "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
     );
@@ -227,13 +438,33 @@ describe("external admission workflow", () => {
     });
 
     const setupNode = job.steps[2];
-    expect(setupNode?.if).toBe(completedOrReconcile);
+    expect(setupNode?.if).toBeUndefined();
     expect(setupNode?.uses).toBe(
       "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
     );
     expect(setupNode?.with).toEqual({ "node-version": "22.20.0" });
-    expect(job.steps[3]?.if).toBe(completedOrReconcile);
+    expect(job.steps[3]?.if).toBeUndefined();
     expect(evaluatorInvocation).toBe("bash .github/scripts/external-admission.sh");
+  });
+
+  it("runs the reducer for every accepted event and skips rejected identities before writes", () => {
+    for (const fixture of acceptedEventFixtures) {
+      expect(fixture.expectedJobRun).toBe(true);
+      expect(simulateWorkflowFixture(fixture), fixture.name).toEqual({
+        evaluatorReached: true,
+        jobRuns: true,
+        statusWrites: 1,
+      });
+    }
+
+    for (const fixture of rejectedEventFixtures) {
+      expect(fixture.expectedJobRun).toBe(false);
+      expect(simulateWorkflowFixture(fixture), fixture.name).toEqual({
+        evaluatorReached: false,
+        jobRuns: false,
+        statusWrites: 0,
+      });
+    }
   });
 
   it("starts only for authenticated DCO, canonical pull-request CI, or reconciliation", () => {
