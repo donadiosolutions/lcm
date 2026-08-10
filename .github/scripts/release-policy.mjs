@@ -228,12 +228,16 @@ export function associateCommitsWithPullRequests(commits, associations) {
     }
   }
   if (missing.length > 0) {
-    throw new Error(
-      `Every release commit must belong to an exact merged main PR; ` +
-        `no exact merged main PR found for ${missing.join(", ")}`,
-    );
+    throw noExactMergedMainPullRequestError(missing);
   }
   return selected;
+}
+
+function noExactMergedMainPullRequestError(commits) {
+  return new Error(
+    `Every release commit must belong to an exact merged main PR; ` +
+      `no exact merged main PR found for ${commits.join(", ")}`,
+  );
 }
 
 function defaultRunGit(args, cwd) {
@@ -327,6 +331,11 @@ function formatPullRequestNumbers(pullRequests) {
   return pullRequests.map(({ number }) => `#${number}`).join(", ");
 }
 
+function maintenanceBranchForTargetTag(targetTag) {
+  const { major, minor } = parseReleaseTag(targetTag);
+  return `maintenance/${major}.${minor}.x`;
+}
+
 async function listAssociatedPullRequests(github, owner, repo, commit) {
   const pullRequests = await github.paginate(
     github.rest.repos.listPullRequestsAssociatedWithCommit,
@@ -366,9 +375,8 @@ export async function resolveMaintenanceReleasePullRequest({
     throw new TypeError("isAncestor must be a function");
   }
 
-  const { major, minor } = parseReleaseTag(targetTag);
   const repository = `${owner}/${repo}`;
-  const maintenanceBranch = `maintenance/${major}.${minor}.x`;
+  const maintenanceBranch = maintenanceBranchForTargetTag(targetTag);
   const maintenanceCandidates = exactPullRequestCandidates(
     associatedPullRequests,
     commit,
@@ -500,6 +508,7 @@ export async function collectReleasePullRequests({
     associations.set(commit, pullRequests);
   }
 
+  const repository = `${owner}/${repo}`;
   const selected = [];
   for (const commit of commits) {
     const pullRequests = associations.get(commit) ?? [];
@@ -519,6 +528,22 @@ export async function collectReleasePullRequests({
     if (exactMain.length === 1) {
       selected.push({ commit, pr: exactMain[0], requiredBase: "main" });
       continue;
+    }
+    let maintenanceBranch;
+    try {
+      maintenanceBranch = maintenanceBranchForTargetTag(targetTag);
+    } catch {
+      throw noExactMergedMainPullRequestError([commit]);
+    }
+    const hasExactMaintenanceCandidate =
+      exactPullRequestCandidates(
+        pullRequests,
+        commit,
+        maintenanceBranch,
+        repository,
+      ).length > 0;
+    if (!hasExactMaintenanceCandidate) {
+      throw noExactMergedMainPullRequestError([commit]);
     }
     const maintenancePullRequest = await resolveMaintenanceReleasePullRequest({
       github,

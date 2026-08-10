@@ -426,6 +426,65 @@ test("rejects multiple non-exact main PR associations without an exact merge SHA
   );
 });
 
+test("preserves the canonical main error for an ordinary missing-main association", async () => {
+  const commit = "f".repeat(40);
+  const associationEndpoint = () => {};
+  const calls = {
+    fullPullRequestLookups: 0,
+    mainForwardPortEnumeration: 0,
+    ancestryQueries: 0,
+  };
+  const github = {
+    paginate: async (endpoint) => {
+      assert.equal(endpoint, associationEndpoint);
+      return [];
+    },
+    rest: {
+      repos: {
+        listPullRequestsAssociatedWithCommit: associationEndpoint,
+      },
+      pulls: {
+        get: async () => {
+          calls.fullPullRequestLookups += 1;
+          throw new Error("maintenance full-PR lookup must not start");
+        },
+        listFiles: () => {},
+      },
+    },
+  };
+  const runGit = (args) => {
+    if (args[0] === "rev-list" && args.at(-1) === `${BASE_TAG}..${TARGET_TAG}`) {
+      return commit;
+    }
+    calls.mainForwardPortEnumeration += 1;
+    throw new Error("maintenance Git work must not start");
+  };
+  const isAncestor = () => {
+    calls.ancestryQueries += 1;
+    throw new Error("maintenance ancestry work must not start");
+  };
+
+  await assert.rejects(
+    () =>
+      collectReleasePullRequests({
+        github,
+        owner: "donadiosolutions",
+        repo: "lcm",
+        baseTag: BASE_TAG,
+        targetTag: TARGET_TAG,
+        cwd: "/workspace",
+        runGit,
+        isAncestor,
+      }),
+    new RegExp(`no exact merged main PR found for ${commit}`, "u"),
+  );
+  assert.deepEqual(calls, {
+    fullPullRequestLookups: 0,
+    mainForwardPortEnumeration: 0,
+    ancestryQueries: 0,
+  });
+});
+
 test("validates pull request merge parent identity", () => {
   const commit = "a".repeat(40);
   const baseSha = "b".repeat(40);
@@ -688,6 +747,20 @@ test("maintenance release provenance accepts the real #569 topology", async () =
   assert.notEqual(entries[0].pr.number, 568);
 });
 
+test("exact maintenance candidates still enter the resolver for full-PR validation", async () => {
+  const malformedFullPullRequest = {
+    ...defaultMaintenancePullRequest,
+    merge_commit_sha: "6".repeat(40),
+  };
+
+  await assert.rejects(
+    () => collectReleasePullRequests(createMaintenanceFixture({
+      fullPullRequests: [malformedFullPullRequest, defaultForwardPortPullRequest],
+    })),
+    /not the exact maintenance\/1\.4\.x merge/u,
+  );
+});
+
 test("maintenance release provenance uses the injected main ref and ancestry predicate", async () => {
   const entries = await collectReleasePullRequests(createMaintenanceFixture({
     mainRef: "refs/remotes/upstream/main",
@@ -716,7 +789,7 @@ test("maintenance release provenance rejects a maintenance PR on the wrong line"
       releasePullRequests: [wrongLine],
       fullPullRequests: [wrongLine, defaultForwardPortPullRequest],
     })),
-    /no exact merged maintenance PR/u,
+    /no exact merged main PR/u,
   );
 });
 
@@ -741,7 +814,7 @@ for (const [description, overrides] of [
         releasePullRequests: [invalidMaintenance],
         fullPullRequests: [invalidMaintenance, defaultForwardPortPullRequest],
       })),
-      /no exact merged maintenance PR/u,
+      /no exact merged main PR/u,
     );
   });
 }
@@ -839,7 +912,7 @@ for (const [description, fixtureOptions, expected] of [
   [
     "a non-exact maintenance association",
     { releasePullRequests: [{ ...defaultMaintenancePullRequest, merge_commit_sha: "6".repeat(40) }] },
-    /no exact merged maintenance PR/u,
+    /no exact merged main PR/u,
   ],
   [
     "multiple exact maintenance associations",
