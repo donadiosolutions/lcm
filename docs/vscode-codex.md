@@ -76,6 +76,8 @@ lcm connectors install codex --type skill
 lcm connectors install codex --type rules
 ```
 
+Reinstalling the generated Codex skill is byte-idempotent: `.codex/skills/lcm-memory/SKILL.md` is kept byte-identical to the canonical template with exactly one final newline, so repeated installs do not add blank lines or dirty a tracked canonical copy.
+
 To import existing Codex sessions into LCM:
 
 ```bash

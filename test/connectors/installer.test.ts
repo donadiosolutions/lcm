@@ -186,6 +186,26 @@ describe('installConnector — Codex native hooks', () => {
     process.env.HOME = originalHome;
   });
 
+  it('reinstalls the Codex skill byte-identically to the canonical template', () => {
+    const canonical = readFileSync(
+      new URL('../../src/connectors/templates/skill/SKILL.md', import.meta.url),
+      'utf-8',
+    );
+    const skillPath = join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md');
+
+    installConnector('codex', 'skill', tmpDir);
+    const firstInstall = readFileSync(skillPath, 'utf-8');
+
+    installConnector('codex', 'skill', tmpDir);
+    const secondInstall = readFileSync(skillPath, 'utf-8');
+
+    expect(canonical.endsWith('\n')).toBe(true);
+    expect(canonical.endsWith('\n\n')).toBe(false);
+    expect(firstInstall).toBe(canonical);
+    expect(secondInstall).toBe(canonical);
+    expect(secondInstall).toBe(firstInstall);
+  });
+
   it('installs hooks, skill, and global rules by default', () => {
     const result = installConnector('codex', undefined, tmpDir);
 

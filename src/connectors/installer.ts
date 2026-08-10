@@ -121,7 +121,7 @@ function installMarkdown(content: string, filePath: string, writeMode: 'append' 
     const cleaned = removeMarkers(existing);
     writeFileSync(filePath, cleaned + (cleaned.endsWith('\n') || cleaned === '' ? '' : '\n') + content + '\n');
   } else {
-    writeFileSync(filePath, content + '\n');
+    writeFileSync(filePath, content.trimEnd() + '\n');
   }
 }
 
