@@ -39,31 +39,37 @@ The required `external-admission` status separates pull-request admission from
 merge-group validation for DCO, which does not report on synthetic queue
 commits. Authenticated DCO `check_run` events and lifecycle events from the
 canonical `.github/workflows/ci.yml` workflow drive `external-admission.yml`;
-pull-request lifecycle events do not start this write-capable workflow. DCO and
-CI start or rerun events revoke stale admission and exit immediately. Their
-completion events evaluate a current exact-SHA snapshot and exit instead of
-occupying a runner while polling. A default-branch
-`external-admission-reconcile` repository dispatch with the exact PR head SHA
-provides fail-closed reconciliation if an event is delayed or lost; see the
+pull-request lifecycle events do not start this write-capable workflow. Every
+accepted DCO event, canonical CI event, or default-branch
+`external-admission-reconcile` dispatch is a wake-up for the stateless reducer:
+it evaluates the latest exact-head snapshot and exits instead of polling on a
+runner. A workflow or check-run event ID is wake-up context only, never state
+authority; the reducer selects the latest authenticated CI and DCO evidence
+for the exact head. Recovery dispatch with the exact PR head SHA provides
+fail-closed reconciliation if an event is delayed or lost; see the
 [external-admission recovery guide](docs/external-admission.md).
 
 Every eligible pull request requires authenticated DCO and exact-head canonical
-CI. Only `pull_request` runs of `.github/workflows/ci.yml` for the exact
-repository and head SHA can satisfy admission; push and synthetic merge-group
-runs are rejected before a runner starts. An aggregate `ci` check may succeed
-while a trailing workflow job is still running, so documented transient run
-states remain pending until the next trusted event. Provenance mismatches and
-terminal non-success results fail.
+CI. Only one open, non-draft pull request in the exact repository, targeting a
+protected `main` or protected `maintenance/X.Y.x` base, can satisfy admission.
+Only `pull_request` runs of `.github/workflows/ci.yml` for the exact repository
+and head SHA can satisfy its CI requirement; push and synthetic merge-group runs
+are rejected before a runner starts. The reducer reads live base protection and
+revalidates base and pull-request eligibility before success. An aggregate `ci`
+check may succeed while a trailing workflow job is still running, so incomplete
+current checks remain pending until the next trusted event. Invalid, ambiguous,
+ineligible, or terminally unsuccessful evidence is a terminal failure.
 
-Every valid event replaces stale successful admission with `pending` before
-checkout or PR association. The handler admits only one open, non-draft,
-main-targeting PR at the exact event SHA and repeats PR eligibility, latest
-authenticated CI and DCO evaluation, and CI-run provenance validation before
-success. Commit-associated PRs and check runs are paginated and flattened. The
-executable evaluator and policy are sparsely checked out from the trusted
-workflow revision with persisted credentials disabled. Although a
-`workflow_run` handler receives a write-capable token, it never downloads CI
-artifacts or caches and never checks out or executes PR-controlled content.
+Every accepted event replaces stale successful admission with `pending` before
+checkout or PR association, then evaluates the latest exact-head snapshot.
+Commit-associated PRs and check runs are paginated and flattened. The reducer
+revalidates live base protection, PR uniqueness and eligibility, authenticated
+CI and DCO evidence, and CI-run provenance at the initial, current, and final
+snapshots before success. The executable evaluator and policy are sparsely
+checked out from the trusted workflow revision with persisted credentials
+disabled. Although a `workflow_run` handler receives a write-capable token, the
+evaluator never downloads CI artifacts or caches and never checks out or
+executes PR-controlled content.
 
 The initial transition from the legacy review-provider policy required one
 documented maintainer bootstrap because the default-branch evaluator could not
