@@ -747,7 +747,10 @@ describe("daemon idle timeout", () => {
       return entry.handle;
     }) as typeof setTimeout;
     const clearIdleTimeout = ((handle: ReturnType<typeof setTimeout>) => {
-      idleTimers.find(entry => entry.handle === handle)!.active = false;
+      const entry = idleTimers.find(entry => entry.handle === handle);
+      if (entry) {
+        entry.active = false;
+      }
     }) as typeof clearTimeout;
     const daemon = await createDaemon(config, {
       onIdle: () => { idleCalled = true; },

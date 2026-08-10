@@ -51,6 +51,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Test-only numeric capacity and limit seams must reject non-positive, non-integer, and non-finite values before mutating shared state.
 - Tests that enable fake timers must restore real timers from `afterEach` or a
   `finally` block so failed assertions cannot leak fake time into later tests.
+- Test doubles for platform APIs must preserve relevant no-op and error semantics; for example, a fake `clearTimeout` should no-op for unknown handles while mutating only a matched handle, with assertions retaining coverage of known-handle behavior.
 
 ### Search ranking compatibility
 
