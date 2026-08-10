@@ -30,7 +30,9 @@ maintenance fix branches        → maintenance/<major>.<minor>.x (protected)
 - **`maintenance/<major>.<minor>.x`** — Target for fixes to an existing
   maintenance line. Create the topic branch from that exact maintenance branch
   and target the pull request back to it. The maintenance branch must be
-  protected before external admission can accept the pull request.
+  protected before external admission can accept the pull request, with the
+  required CI and CodeQL checks enabled for pull requests targeting that
+  maintenance namespace.
 - **Topic branches** — Use `feat/TOPIC`, `docs/TOPIC`, or `fix/TOPIC` as
   appropriate, based on the selected target branch, and use an isolated worktree
   for each concurrent change.
@@ -126,8 +128,8 @@ The manual release helper performs the tag step idempotently: it pushes or fetch
 | `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
 | `external-admission.yml`             | Authenticated DCO checks, canonical PR CI lifecycle, default-branch exact-SHA repository dispatch | Statelessly require exact-head canonical CI and DCO for every eligible pull request |
 | `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
-| `codeql.yml`                         | Push to main + PRs targeting main + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
-| `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
+| `codeql.yml`                         | Push to main + PRs targeting main or `maintenance/**` + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
+| `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main or `maintenance/**` + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
 | `version-pr.yml`                     | Push to main + manual `beta`/`stable` dispatch                                      | Auto-create version PRs and enter or exit Changesets beta mode                          |
 | `publish.yml`                        | Stable/beta tag pushes + GitHub release publication                                  | Create draft releases from tags; publish npm only after manual draft publication        |
 
