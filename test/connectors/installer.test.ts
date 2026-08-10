@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,42 @@ const LEGACY_LCM_MARKERS = {
 
 function countOccurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
+}
+
+type TestMarkdownEol = '\n' | '\r\n';
+
+function generatedRulesContent(eol: TestMarkdownEol): string {
+  return [
+    LCM_MARKERS.START,
+    '# Workflow Instruction',
+    'Generated  \t',
+    LCM_MARKERS.END,
+  ].join(eol);
+}
+
+function legacyRulesContent(eol: TestMarkdownEol): string {
+  return [
+    LEGACY_LCM_MARKERS.START,
+    'Legacy generated content',
+    LEGACY_LCM_MARKERS.END,
+  ].join(eol);
+}
+
+async function withMockedGeneratedContent<T>(
+  content: string,
+  callback: (install: typeof installConnector) => T | Promise<T>,
+): Promise<T> {
+  vi.resetModules();
+  vi.doMock('../../src/connectors/template-service.js', () => ({
+    generateContent: () => content,
+  }));
+
+  try {
+    const { installConnector: installMockedConnector } = await import('../../src/connectors/installer.js');
+    return await callback(installMockedConnector);
+  } finally {
+    vi.doUnmock('../../src/connectors/template-service.js');
+  }
 }
 
 beforeEach(() => {
@@ -56,6 +92,544 @@ describe('installConnector — rules (markdown append)', () => {
     const content = readFileSync(rulesPath, 'utf-8');
     expect(content).toContain('# My existing rules');
     expect(content).toContain(LCM_MARKERS.START);
+  });
+
+  it.each([
+    [
+      'uses LF when existing and generated content use LF',
+      'User  \t\n',
+      '\n' as TestMarkdownEol,
+      `User  \t\n${generatedRulesContent('\n')}\n`,
+    ],
+    [
+      'uses CRLF when existing content uses CRLF',
+      'User  \t\r\n',
+      '\n' as TestMarkdownEol,
+      `User  \t\r\n${generatedRulesContent('\r\n')}\r\n`,
+    ],
+    [
+      'uses CRLF when generated content uses CRLF',
+      'User  \t\n',
+      '\r\n' as TestMarkdownEol,
+      `User  \t\r\n${generatedRulesContent('\r\n')}\r\n`,
+    ],
+  ])('%s', async (_description, existing, generatedEol, expected) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent(generatedEol), (install) => {
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+  });
+
+  it.each([
+    ['missing file', false],
+    ['empty file', true],
+  ])('handles an %s with one generated final EOL', async (_description, createFile) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    if (createFile) writeFileSync(rulesPath, '');
+
+    await withMockedGeneratedContent(generatedRulesContent('\r\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`${generatedRulesContent('\r\n')}\r\n`);
+  });
+
+  it('reappends a CRLF managed block byte-idempotently while preserving user spaces and tabs', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        'Before  \t',
+        LCM_MARKERS.START,
+        '# Workflow Instruction',
+        'old content',
+        LCM_MARKERS.END,
+        '',
+        'After\t',
+        '',
+      ].join('\r\n'),
+    );
+    const expected = `Before  \t\r\nAfter\t\r\n${generatedRulesContent('\r\n')}\r\n`;
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+  });
+
+  it.each([
+    ['current', generatedRulesContent('\r\n')],
+    ['legacy', legacyRulesContent('\r\n')],
+  ])('uses retained LF content instead of a stale CRLF %s block on reinstall', async (_description, staleBlock) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      ['Before  \t', staleBlock, 'After\t', ''].join('\n'),
+    );
+    const expected = [
+      'Before  \t',
+      'After\t',
+      generatedRulesContent('\n'),
+      '',
+    ].join('\n');
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+    expect(readFileSync(rulesPath, 'utf-8')).not.toContain('\r\n');
+  });
+
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('keeps repeated installs fixed-point with an unmatched %s marker', async (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = ['# User-authored rules', LCM_MARKERS.START].join(eol);
+    writeFileSync(rulesPath, existing);
+    const expected = `${existing}${eol}${generatedRulesContent(eol)}${eol}`;
+
+    await withMockedGeneratedContent(generatedRulesContent(eol), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    const content = readFileSync(rulesPath, 'utf-8');
+    expect(content).toBe(expected);
+    expect(countOccurrences(content, '# Workflow Instruction')).toBe(1);
+  });
+
+  it('heals the #598 CRLF residue in one install with one generated block', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        LEGACY_LCM_MARKERS.START,
+        LCM_MARKERS.START,
+        '# Workflow Instruction',
+        '',
+      ].join('\r\n'),
+    );
+
+    await withMockedGeneratedContent(generatedRulesContent('\r\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      const firstInstall = readFileSync(rulesPath, 'utf-8');
+      expect(countOccurrences(firstInstall, '# Workflow Instruction')).toBe(1);
+
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(firstInstall);
+    });
+  });
+
+  it('heals the #598 LF residue while preserving malformed and inline user text', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      '<!-- lcm -->\n# Workflow Instruction\n# Workflow Instruction\n<!-- [LCM_CONNECTOR_END] -->\n<!-- lcm\n<!-- lcm --> tail\n\t<!-- [LCM_CONNECTOR_START] -->\t\n',
+    );
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      const firstInstall = readFileSync(rulesPath, 'utf-8');
+      expect(countOccurrences(firstInstall, '# Workflow Instruction')).toBe(1);
+      expect(firstInstall).toContain('<!-- lcm\n');
+      expect(firstInstall).toContain('<!-- lcm --> tail');
+      expect(firstInstall).toContain('\t<!-- [LCM_CONNECTOR_START] -->\t');
+
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(firstInstall);
+    });
+  });
+
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('heals duplicate same-marker blocks in one reinstall while preserving user content (%s)', async (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const firstOldBlock = generatedRulesContent(eol).replace('Generated  \t', 'FIRST_OLD_BLOCK');
+    const secondOldBlock = generatedRulesContent(eol).replace('Generated  \t', 'SECOND_OLD_BLOCK');
+    const existing = [
+      'Before  \t',
+      firstOldBlock,
+      'User-authored  \t',
+      secondOldBlock,
+      'After\t',
+      '',
+    ].join(eol);
+    const expected = [
+      'Before  \t',
+      'User-authored  \t',
+      'After\t',
+      generatedRulesContent(eol),
+      '',
+    ].join(eol);
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent(eol), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+    expect(countOccurrences(readFileSync(rulesPath, 'utf-8'), '# Workflow Instruction')).toBe(1);
+  });
+
+  it('preserves an unmatched marker and user-authored bytes while preferring the later candidate', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const retained = [
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'User-authored lines  \t',
+      'More user-authored bytes\t',
+    ].join('\n');
+    const expectedInstalled = `${retained}\n${generatedRulesContent('\n')}\n`;
+    writeFileSync(rulesPath, retained);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      const firstInstall = readFileSync(rulesPath, 'utf-8');
+      expect(firstInstall).toBe(expectedInstalled);
+
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(firstInstall);
+    });
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`${retained}\n`);
+  });
+
+  it('selects a right-biased maximum set of non-overlapping adjacent candidates', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = [
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'User-authored before the chain',
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'Ambiguous user-authored middle',
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'Canonical generated content',
+      LCM_MARKERS.START,
+    ].join('\n');
+    const expected = [
+      '# Workflow Instruction',
+      'Ambiguous user-authored middle',
+      generatedRulesContent('\n'),
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+  });
+
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('preserves an EOF user heading after a valid generated block on reinstall (%s)', async (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const heading = '# Workflow Instruction';
+    const existing = `${generatedRulesContent(eol)}${eol}${heading}`;
+    const expected = `${heading}${eol}${generatedRulesContent(eol)}${eol}`;
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent(eol), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      const firstInstall = readFileSync(rulesPath, 'utf-8');
+      expect(firstInstall).toBe(expected);
+
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(firstInstall);
+    });
+  });
+
+  it('does not expand a header-only marker past an unrelated preceding marker', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = [
+      LEGACY_LCM_MARKERS.END,
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+    ].join('\n');
+    const expected = [
+      LEGACY_LCM_MARKERS.END,
+      generatedRulesContent('\n'),
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+  });
+
+  it('heals two closed blocks around a user heading gap in one reinstall', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = [
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'FIRST_OLD_BLOCK',
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'User-authored heading gap',
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'SECOND_OLD_BLOCK',
+      LCM_MARKERS.START,
+    ].join('\n');
+    const expected = [
+      '# Workflow Instruction',
+      'User-authored heading gap',
+      generatedRulesContent('\n'),
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      const firstInstall = readFileSync(rulesPath, 'utf-8');
+      expect(firstInstall).toBe(expected);
+
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(firstInstall);
+    });
+  });
+
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('heals a mix of same-marker and legacy blocks in one reinstall (%s)', async (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = [
+      'Before',
+      legacyRulesContent(eol),
+      'Between',
+      generatedRulesContent(eol).replace('Generated  \t', 'OLD_LCM_BLOCK'),
+      'After',
+      '',
+    ].join(eol);
+    const expected = [
+      'Before',
+      'Between',
+      'After',
+      generatedRulesContent(eol),
+      '',
+    ].join(eol);
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent(eol), (install) => {
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+  });
+
+  it('preserves ambiguous and user-authored marker lines while removing a later generated block', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = [
+      'inline <!-- lcm --> text',
+      `  ${LCM_MARKERS.START}`,
+      'unmatched same-marker content',
+      `  ${LEGACY_LCM_MARKERS.START}`,
+      'unmatched legacy content',
+      generatedRulesContent('\n'),
+    ].join('\n');
+    const expected = [
+      'inline <!-- lcm --> text',
+      `  ${LCM_MARKERS.START}`,
+      'unmatched same-marker content',
+      `  ${LEGACY_LCM_MARKERS.START}`,
+      'unmatched legacy content',
+      generatedRulesContent('\n'),
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+  });
+
+  it('pairs legacy markers across another standalone marker line', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        'Before',
+        LEGACY_LCM_MARKERS.START,
+        'Legacy managed content',
+        LCM_MARKERS.START,
+        'Legacy content continues',
+        LEGACY_LCM_MARKERS.END,
+        'After',
+        '',
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('Before\nAfter\n');
+  });
+
+  it('skips an unmatched legacy end marker before pairing a later block', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        LEGACY_LCM_MARKERS.END,
+        LEGACY_LCM_MARKERS.START,
+        'Legacy managed content',
+        LEGACY_LCM_MARKERS.END,
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`${LEGACY_LCM_MARKERS.END}\n`);
+  });
+
+  it('advances past a nested legacy start after selecting the earliest end', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        'Before',
+        LEGACY_LCM_MARKERS.START,
+        'Outer content',
+        LEGACY_LCM_MARKERS.START,
+        'Nested content',
+        LEGACY_LCM_MARKERS.END,
+        LEGACY_LCM_MARKERS.END,
+        'After',
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(
+      `Before\n${LEGACY_LCM_MARKERS.END}\nAfter\n`,
+    );
+  });
+
+  it('unions a legacy wrapper and inner LCM candidate', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        'Before',
+        LEGACY_LCM_MARKERS.START,
+        'Legacy wrapper',
+        LCM_MARKERS.START,
+        '# Workflow Instruction',
+        'Current managed content',
+        LCM_MARKERS.END,
+        LEGACY_LCM_MARKERS.END,
+        'After',
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('Before\nAfter\n');
+  });
+
+  it('unions crossing current and legacy blocks while preserving outside unmatched markers', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        LCM_MARKERS.START,
+        'Unmatched current marker content',
+        'Before',
+        LCM_MARKERS.START,
+        '# Workflow Instruction',
+        LEGACY_LCM_MARKERS.START,
+        'Crossing managed content',
+        LCM_MARKERS.END,
+        LEGACY_LCM_MARKERS.END,
+        'After',
+        LEGACY_LCM_MARKERS.START,
+        'Unmatched legacy marker content',
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe([
+      LCM_MARKERS.START,
+      'Unmatched current marker content',
+      'Before',
+      'After',
+      LEGACY_LCM_MARKERS.START,
+      'Unmatched legacy marker content',
+      '',
+    ].join('\n'));
+  });
+
+  it('unions a current wrapper and legacy block without leaving an orphan end marker', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        LCM_MARKERS.START,
+        '# Workflow Instruction',
+        LEGACY_LCM_MARKERS.START,
+        'Wrapped legacy content',
+        LEGACY_LCM_MARKERS.END,
+        LCM_MARKERS.END,
+        'After',
+        LEGACY_LCM_MARKERS.START,
+        'Unmatched legacy marker content',
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe([
+      'After',
+      LEGACY_LCM_MARKERS.START,
+      'Unmatched legacy marker content',
+      '',
+    ].join('\n'));
+  });
+
+  it('heals a marker-dense duplicate residue without quadratic candidate pairing', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const strayMarkers = Array.from({ length: 4_000 }, () => LCM_MARKERS.START).join('\n');
+    const existing = [
+      strayMarkers,
+      generatedRulesContent('\n').replace('Generated  \t', 'FIRST_OLD_BLOCK'),
+      generatedRulesContent('\n').replace('Generated  \t', 'SECOND_OLD_BLOCK'),
+      'User content',
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      const firstInstall = readFileSync(rulesPath, 'utf-8');
+      expect(firstInstall).toContain(strayMarkers);
+      expect(countOccurrences(firstInstall, '# Workflow Instruction')).toBe(1);
+
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(firstInstall);
+    });
   });
 
   it('is idempotent — install twice, markers appear once', () => {
@@ -184,6 +758,81 @@ describe('installConnector — Codex native hooks', () => {
 
   afterEach(() => {
     process.env.HOME = originalHome;
+  });
+
+  it.each([
+    ['preserves trailing spaces before a terminal CRLF', 'Heading  \r\n', 'Heading  \r\n'],
+    ['preserves trailing spaces without a terminal newline', 'Heading  ', 'Heading  \n'],
+    ['preserves a trailing tab before a terminal CRLF', 'Heading\t\r\n', 'Heading\t\r\n'],
+    ['normalizes repeated CRLF sequences to one CRLF', 'Heading\r\n\r\n\r\n', 'Heading\r\n'],
+    ['normalizes mixed terminal newline sequences to one CRLF', 'Heading\r\n\n\r\n', 'Heading\r\n'],
+    ['normalizes repeated LF sequences to one LF', 'Heading\n\n\n', 'Heading\n'],
+    ['adds LF when content has no terminal newline', 'Heading', 'Heading\n'],
+    ['normalizes empty and newline-only content', '', '\n'],
+    ['normalizes LF-only content', '\n', '\n'],
+    ['preserves CRLF for CRLF-only content', '\r\n', '\r\n'],
+    ['normalizes CR-only content', '\r', '\n'],
+  ])('%s', async (_description, input, expected) => {
+    vi.resetModules();
+    vi.doMock('../../src/connectors/template-service.js', () => ({
+      generateContent: () => input,
+    }));
+
+    try {
+      const { installConnector: installMockedConnector } = await import('../../src/connectors/installer.js');
+      const result = installMockedConnector('codex', 'skill', tmpDir);
+      expect(readFileSync(result.path, 'utf-8')).toBe(expected);
+    } finally {
+      vi.doUnmock('../../src/connectors/template-service.js');
+    }
+  });
+
+  it('preserves CRLF canonical bytes across repeated Codex skill installs', async () => {
+    const canonical = readFileSync(
+      new URL('../../src/connectors/templates/skill/SKILL.md', import.meta.url),
+      'utf-8',
+    );
+    const canonicalCrLf = canonical.replaceAll('\n', '\r\n');
+    const skillPath = join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md');
+    vi.resetModules();
+    vi.doMock('../../src/connectors/template-service.js', () => ({
+      generateContent: () => canonicalCrLf,
+    }));
+
+    try {
+      const { installConnector: installMockedConnector } = await import('../../src/connectors/installer.js');
+      installMockedConnector('codex', 'skill', tmpDir);
+      const firstInstall = readFileSync(skillPath, 'utf-8');
+
+      installMockedConnector('codex', 'skill', tmpDir);
+      const secondInstall = readFileSync(skillPath, 'utf-8');
+
+      expect(firstInstall).toBe(canonicalCrLf);
+      expect(secondInstall).toBe(canonicalCrLf);
+      expect(secondInstall).toBe(firstInstall);
+    } finally {
+      vi.doUnmock('../../src/connectors/template-service.js');
+    }
+  });
+
+  it('reinstalls the Codex skill byte-identically to the canonical template', () => {
+    const canonical = readFileSync(
+      new URL('../../src/connectors/templates/skill/SKILL.md', import.meta.url),
+      'utf-8',
+    );
+    const skillPath = join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md');
+
+    installConnector('codex', 'skill', tmpDir);
+    const firstInstall = readFileSync(skillPath, 'utf-8');
+
+    installConnector('codex', 'skill', tmpDir);
+    const secondInstall = readFileSync(skillPath, 'utf-8');
+
+    expect(canonical.endsWith('\n')).toBe(true);
+    expect(canonical.endsWith('\n\n')).toBe(false);
+    expect(firstInstall).toBe(canonical);
+    expect(secondInstall).toBe(canonical);
+    expect(secondInstall).toBe(firstInstall);
   });
 
   it('installs hooks, skill, and global rules by default', () => {
@@ -455,6 +1104,149 @@ describe('removeConnector — rules', () => {
     expect(content).not.toContain('old managed content');
   });
 
+  it('preserves CRLF and Markdown spaces when removing a managed block', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        'Before  \t',
+        LCM_MARKERS.START,
+        '# Workflow Instruction',
+        'managed content',
+        LCM_MARKERS.END,
+        'After\t',
+        '',
+      ].join('\r\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('Before  \t\r\nAfter\t\r\n');
+  });
+
+  it.each([
+    ['current', generatedRulesContent('\r\n')],
+    ['legacy', legacyRulesContent('\r\n')],
+  ])('uses retained LF content instead of a stale CRLF %s block on removal', (_description, staleBlock) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      ['Before  \t', staleBlock, 'After\t', ''].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('Before  \t\nAfter\t\n');
+    expect(readFileSync(rulesPath, 'utf-8')).not.toContain('\r\n');
+  });
+
+  it('recognizes adjacent standalone same-marker lines when removing a managed block', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        LCM_MARKERS.START,
+        LCM_MARKERS.START,
+        '# Workflow Instruction',
+        'managed content',
+        LCM_MARKERS.END,
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`${LCM_MARKERS.START}\n`);
+  });
+
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('removes every recognized block at file boundaries while preserving the user section (%s)', (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        generatedRulesContent(eol),
+        '',
+        'Keep  \t',
+        '',
+        legacyRulesContent(eol),
+      ].join(eol),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`Keep  \t${eol}`);
+  });
+
+  it('removes a valid generated block without deleting an exact EOF user heading', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const heading = '# Workflow Instruction';
+    writeFileSync(rulesPath, `${generatedRulesContent('\n')}\n${heading}`);
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`${heading}\n`);
+  });
+
+  it('deletes the file when all duplicate recognized blocks are removed', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [generatedRulesContent('\n'), generatedRulesContent('\n'), ''].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(existsSync(rulesPath)).toBe(false);
+  });
+
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('preserves whitespace-only user Markdown outside a managed block (%s)', (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const whitespace = '  \t\f';
+    writeFileSync(rulesPath, [whitespace, generatedRulesContent(eol), ''].join(eol));
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(existsSync(rulesPath)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`${whitespace}${eol}`);
+  });
+
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('deletes rules with only blank lines outside a managed block (%s)', (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(rulesPath, ['', generatedRulesContent(eol), ''].join(eol));
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(existsSync(rulesPath)).toBe(false);
+  });
+
+  it('removes a generated same-marker block at the file boundaries', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [LCM_MARKERS.START, '# Workflow Instruction', LCM_MARKERS.END].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(existsSync(rulesPath)).toBe(false);
+  });
+
+  it('recognizes whitespace-indented standalone marker lines', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(
+      rulesPath,
+      [
+        'Before',
+        ` \t${LCM_MARKERS.START}`,
+        '# Workflow Instruction',
+        `\t${LCM_MARKERS.END}`,
+        'After',
+      ].join('\n'),
+    );
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('Before\nAfter\n');
+  });
+
   it('returns false when file does not exist', () => {
     const removed = removeConnector('claude-code', 'rules', tmpDir);
     expect(removed).toBe(false);
@@ -476,6 +1268,19 @@ describe('removeConnector — rules', () => {
       'Keep this user-authored block.',
       '<!-- lcm -->',
       '',
+    ].join('\n');
+    writeFileSync(rulesPath, original);
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(false);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(original);
+  });
+
+  it('preserves inline and unmatched legacy markers as user content', () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const original = [
+      'inline <!-- lcm --> text',
+      `  ${LEGACY_LCM_MARKERS.START}`,
+      'unmatched legacy marker content',
     ].join('\n');
     writeFileSync(rulesPath, original);
 

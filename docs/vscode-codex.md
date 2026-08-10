@@ -36,6 +36,12 @@ lcm connectors doctor github-copilot
 
 This writes a repo-local skill file at `.github/skills/lcm-memory/SKILL.md`.
 
+Rules connectors append one managed Markdown block to the target document. The
+installer keeps the document byte-consistent when it reinstalls that block: it
+uses CRLF when the retained document or generated block uses CRLF, otherwise
+LF, normalizes the separator and generated block to that style, and emits one
+final line break. Markdown-significant trailing spaces and tabs are preserved.
+
 ## Install the Codex connector
 
 For Codex in the current repository:
@@ -75,6 +81,25 @@ If you only want the Codex skill or rules instead of the default set:
 lcm connectors install codex --type skill
 lcm connectors install codex --type rules
 ```
+
+Reinstalling generated Markdown connectors is byte-idempotent: the Codex skill
+`.codex/skills/lcm-memory/SKILL.md` remains byte-identical to its canonical
+template with exactly one final newline, and normal rules append installs remove
+and reappend their managed block without changing the established LF or CRLF
+style. One-run healing is limited to recognized current or legacy managed
+blocks, the maximal union of their overlapping or touching recognized ranges,
+and a current marker followed only by one or more exact `# Workflow Instruction`
+lines as a recoverable header-only partial region. These recognized regions are
+replaced with one canonical block in the established style. Arbitrary
+ambiguous or malformed unmatched marker/header combinations are preserved
+conservatively and may require a second reinstall to become byte-stable; user-
+authored Markdown outside recognized regions, including heading lines, is never
+removed by this recovery behavior.
+
+Removing a rules connector deletes its file only when managed-block removal
+leaves zero bytes. Spaces, tabs, form-feed, and other non-CR/LF user Markdown
+bytes are preserved and written with exactly one established terminal EOL;
+content consisting only of blank lines is deleted.
 
 To import existing Codex sessions into LCM:
 

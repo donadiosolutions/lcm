@@ -44,67 +44,305 @@ const MANAGED_MARKER_PAIRS = [
   },
 ] as const;
 
+const MANAGED_MARKERS = new Set<string>(
+  MANAGED_MARKER_PAIRS.flatMap(({ START, END }) => [START, END]),
+);
+const MANAGED_START_MARKERS = new Set<string>(
+  MANAGED_MARKER_PAIRS.map(({ START }) => START),
+);
+
 type MarkerLine = {
   lineStart: number;
   lineEnd: number;
+  marker: string;
 };
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+type MarkdownEol = '\n' | '\r\n';
 
-function findStandaloneMarkerLines(content: string, marker: string): MarkerLine[] {
+type ManagedBlock = {
+  startIdx: number;
+  endIdx: number;
+  endLength: number;
+};
+
+function findStandaloneManagedMarkerLines(content: string): MarkerLine[] {
   const lines: MarkerLine[] = [];
-  const pattern = new RegExp(`(^|\\r?\\n)[ \\t]*${escapeRegExp(marker)}[ \\t]*(?:\\r?\\n|$)`, 'g');
-  for (let match = pattern.exec(content); match; match = pattern.exec(content)) {
-    const lineStart = match.index + match[1].length;
-    lines.push({
-      lineStart,
-      lineEnd: match.index + match[0].length,
-    });
+  let lineStart = 0;
+  while (lineStart <= content.length) {
+    let lineContentEnd = lineStart;
+    while (lineContentEnd < content.length) {
+      const character = content.charCodeAt(lineContentEnd);
+      if (character === 0x0a || character === 0x0d) break;
+      lineContentEnd += 1;
+    }
+
+    let markerStart = lineStart;
+    while (markerStart < lineContentEnd) {
+      const character = content.charCodeAt(markerStart);
+      if (character !== 0x20 && character !== 0x09) break;
+      markerStart += 1;
+    }
+
+    let markerEnd = lineContentEnd;
+    while (markerEnd > markerStart) {
+      const character = content.charCodeAt(markerEnd - 1);
+      if (character !== 0x20 && character !== 0x09) break;
+      markerEnd -= 1;
+    }
+
+    let lineEnd = lineContentEnd;
+    if (lineContentEnd < content.length) {
+      lineEnd += 1;
+      if (content.charCodeAt(lineContentEnd) === 0x0d && content.charCodeAt(lineContentEnd + 1) === 0x0a) {
+        lineEnd += 1;
+      }
+    }
+
+    const marker = content.slice(markerStart, markerEnd);
+    if (MANAGED_MARKERS.has(marker)) lines.push({ lineStart, lineEnd, marker });
+
+    if (lineEnd === content.length) break;
+    lineStart = lineEnd;
   }
   return lines;
 }
 
 function isGeneratedLcmBlock(content: string, start: MarkerLine, end: MarkerLine): boolean {
-  return content.slice(start.lineEnd, end.lineStart).trimStart().startsWith('# Workflow Instruction');
+  return /^# Workflow Instruction(?:\r\n|\n|\r|$)/u.test(content.slice(start.lineEnd, end.lineStart));
 }
 
-function findManagedBlock(content: string): { startIdx: number; endIdx: number; endLength: number } | undefined {
-  let found: { startIdx: number; endIdx: number; endLength: number } | undefined;
-  for (const markers of MANAGED_MARKER_PAIRS) {
-    const starts = findStandaloneMarkerLines(content, markers.START);
-    const ends = markers.START === markers.END ? starts : findStandaloneMarkerLines(content, markers.END);
-    for (const start of starts) {
-      for (const end of ends) {
-        if (end.lineStart <= start.lineStart) continue;
-        if (markers.START === markers.END && !isGeneratedLcmBlock(content, start, end)) continue;
-        if (!found || start.lineStart < found.startIdx) {
-          found = {
-            startIdx: start.lineStart,
-            endIdx: end.lineStart,
-            endLength: end.lineEnd - end.lineStart,
-          };
+function isWorkflowInstructionOnly(content: string, startIdx: number, endIdx: number): boolean {
+  if (startIdx >= endIdx) return false;
+
+  const lines = content.slice(startIdx, endIdx).split(/\r\n|\n|\r/);
+  if (lines.at(-1) === '') lines.pop();
+  return lines.length > 0 && lines.every((line) => line === '# Workflow Instruction');
+}
+
+function managedBlock(start: MarkerLine, end: MarkerLine): ManagedBlock {
+  return {
+    startIdx: start.lineStart,
+    endIdx: end.lineStart,
+    endLength: end.lineEnd - end.lineStart,
+  };
+}
+
+function findSameMarkerBlocks(
+  content: string,
+  markerLines: MarkerLine[],
+  marker: string,
+): ManagedBlock[] {
+  const candidates: Array<{ line: MarkerLine; markerIndex: number }> = [];
+  for (let markerIndex = 0; markerIndex < markerLines.length; markerIndex += 1) {
+    const line = markerLines[markerIndex];
+    if (line.marker === marker) candidates.push({ line, markerIndex });
+  }
+
+  const generatedPairs: boolean[] = [];
+  for (let index = 0; index + 1 < candidates.length; index += 1) {
+    generatedPairs.push(isGeneratedLcmBlock(content, candidates[index].line, candidates[index + 1].line));
+  }
+
+  const selectedPairs: boolean[] = [];
+  for (let index = generatedPairs.length - 1; index >= 0; index -= 1) {
+    if (generatedPairs[index] && !selectedPairs[index + 1]) selectedPairs[index] = true;
+  }
+
+  const blocks: ManagedBlock[] = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const start = candidates[index].line;
+    const nextSameMarker = candidates[index + 1]?.line;
+    if (selectedPairs[index] && nextSameMarker) {
+      blocks.push(managedBlock(start, nextSameMarker));
+    }
+
+    if (!selectedPairs[index] && !selectedPairs[index - 1]) {
+      const nextMarker = markerLines[candidates[index].markerIndex + 1];
+      const endIdx = nextMarker?.lineStart ?? content.length;
+      if (isWorkflowInstructionOnly(content, start.lineEnd, endIdx)) {
+        let partialStartIdx = start.lineStart;
+        let previousMarkerIndex = candidates[index].markerIndex - 1;
+        while (previousMarkerIndex >= 0) {
+          const previousMarker = markerLines[previousMarkerIndex];
+          if (previousMarker.lineEnd !== partialStartIdx || !MANAGED_START_MARKERS.has(previousMarker.marker)) break;
+          partialStartIdx = previousMarker.lineStart;
+          previousMarkerIndex -= 1;
         }
-        break;
+        blocks.push({ startIdx: partialStartIdx, endIdx, endLength: 0 });
       }
     }
   }
-  return found;
+  return blocks;
+}
+
+function advancePastLine(lines: MarkerLine[], index: number, lineEnd: number): number {
+  while (index < lines.length && lines[index].lineStart < lineEnd) index += 1;
+  return index;
+}
+
+function findDistinctMarkerBlocks(
+  markerLines: MarkerLine[],
+  startMarker: string,
+  endMarker: string,
+): ManagedBlock[] {
+  const starts: MarkerLine[] = [];
+  const ends: MarkerLine[] = [];
+  for (const line of markerLines) {
+    if (line.marker === startMarker) starts.push(line);
+    if (line.marker === endMarker) ends.push(line);
+  }
+
+  const blocks: ManagedBlock[] = [];
+  let startIndex = 0;
+  let endIndex = 0;
+  while (startIndex < starts.length && endIndex < ends.length) {
+    const start = starts[startIndex];
+    const end = ends[endIndex];
+    if (end.lineStart <= start.lineStart) {
+      endIndex += 1;
+      continue;
+    }
+
+    blocks.push(managedBlock(start, end));
+    startIndex = advancePastLine(starts, startIndex + 1, end.lineEnd);
+    endIndex = advancePastLine(ends, endIndex + 1, end.lineEnd);
+  }
+  return blocks;
+}
+
+function compareManagedBlocks(left: ManagedBlock, right: ManagedBlock): number {
+  return left.startIdx - right.startIdx;
+}
+
+function managedBlockEnd(block: ManagedBlock): number {
+  return block.endIdx + block.endLength;
+}
+
+function mergeManagedBlockCandidates(candidateSets: ManagedBlock[][]): ManagedBlock[] {
+  const indexes = candidateSets.map(() => 0);
+  const blocks: ManagedBlock[] = [];
+  let unionStartIdx: number | undefined;
+  let unionEndIdx = 0;
+
+  while (true) {
+    let selectedSet = -1;
+    let selected: ManagedBlock | undefined;
+    for (let setIndex = 0; setIndex < candidateSets.length; setIndex += 1) {
+      const candidate = candidateSets[setIndex][indexes[setIndex]];
+      if (candidate && (!selected || compareManagedBlocks(candidate, selected) < 0)) {
+        selectedSet = setIndex;
+        selected = candidate;
+      }
+    }
+    if (!selected) break;
+
+    indexes[selectedSet] += 1;
+    const selectedEndIdx = managedBlockEnd(selected);
+    if (unionStartIdx === undefined || selected.startIdx > unionEndIdx) {
+      if (unionStartIdx !== undefined) {
+        blocks.push({ startIdx: unionStartIdx, endIdx: unionEndIdx, endLength: 0 });
+      }
+      unionStartIdx = selected.startIdx;
+      unionEndIdx = selectedEndIdx;
+    } else if (selectedEndIdx > unionEndIdx) {
+      unionEndIdx = selectedEndIdx;
+    }
+  }
+
+  if (unionStartIdx !== undefined) {
+    blocks.push({ startIdx: unionStartIdx, endIdx: unionEndIdx, endLength: 0 });
+  }
+
+  return blocks;
+}
+
+function findManagedBlocks(content: string): ManagedBlock[] {
+  const markerLines = findStandaloneManagedMarkerLines(content);
+  const candidateSets = MANAGED_MARKER_PAIRS.map(({ START, END }) => (
+    START === END
+      ? findSameMarkerBlocks(content, markerLines, START)
+      : findDistinctMarkerBlocks(markerLines, START, END)
+  ));
+  return mergeManagedBlockCandidates(candidateSets);
 }
 
 function hasManagedBlock(content: string): boolean {
-  return findManagedBlock(content) !== undefined;
+  return findManagedBlocks(content).length > 0;
+}
+
+function establishedMarkdownEol(...contents: string[]): MarkdownEol {
+  return contents.some(content => content.includes('\r\n')) ? '\r\n' : '\n';
+}
+
+function trimMarkdownLineBreaksAtStart(content: string): string {
+  let contentStart = 0;
+  while (contentStart < content.length) {
+    const character = content.charCodeAt(contentStart);
+    if (character !== 0x0a && character !== 0x0d) break;
+    contentStart += 1;
+  }
+  return content.slice(contentStart);
+}
+
+function trimMarkdownLineBreaksAtEnd(content: string): string {
+  let contentEnd = content.length;
+  while (contentEnd > 0) {
+    const character = content.charCodeAt(contentEnd - 1);
+    if (character !== 0x0a && character !== 0x0d) break;
+    contentEnd -= 1;
+  }
+  return content.slice(0, contentEnd);
+}
+
+function normalizeMarkdownLineEndings(content: string, eol: MarkdownEol): string {
+  const parts: string[] = [];
+  let segmentStart = 0;
+  for (let index = 0; index < content.length; index += 1) {
+    const character = content.charCodeAt(index);
+    if (character !== 0x0a && character !== 0x0d) continue;
+    parts.push(content.slice(segmentStart, index), eol);
+    if (character === 0x0d && content.charCodeAt(index + 1) === 0x0a) index += 1;
+    segmentStart = index + 1;
+  }
+  parts.push(content.slice(segmentStart));
+  return parts.join('');
 }
 
 function removeMarkers(content: string): string {
-  const block = findManagedBlock(content);
-  if (!block) return content;
-  const before = content.slice(0, block.startIdx).trimEnd();
-  const after = content.slice(block.endIdx + block.endLength).trimStart();
-  if (!before) return after.trim();
-  if (!after) return before.trim();
-  return `${before}\n${after}`.trim();
+  const blocks = findManagedBlocks(content);
+  if (blocks.length === 0) return content;
+
+  const retainedRaw: string[] = [];
+  let cursor = 0;
+  for (const block of blocks) {
+    retainedRaw.push(content.slice(cursor, block.startIdx));
+    cursor = block.endIdx + block.endLength;
+  }
+  retainedRaw.push(content.slice(cursor));
+
+  const eol = establishedMarkdownEol(...retainedRaw);
+  const retained: string[] = [];
+  for (let index = 0; index < retainedRaw.length; index += 1) {
+    let segment = trimMarkdownLineBreaksAtEnd(retainedRaw[index]);
+    if (index > 0) segment = trimMarkdownLineBreaksAtStart(segment);
+    if (segment) retained.push(segment);
+  }
+
+  if (retained.length === 0) return '';
+  return `${normalizeMarkdownLineEndings(retained.join(eol), eol)}${eol}`;
+}
+
+function normalizeMarkdownEof(content: string, eol: MarkdownEol = establishedMarkdownEol(content)): string {
+  return normalizeMarkdownLineEndings(trimMarkdownLineBreaksAtEnd(content), eol) + eol;
+}
+
+function appendMarkdown(existing: string, content: string): string {
+  const cleaned = removeMarkers(existing);
+  const eol = establishedMarkdownEol(cleaned, content);
+  const normalizedExisting = normalizeMarkdownLineEndings(trimMarkdownLineBreaksAtEnd(cleaned), eol);
+  const normalizedContent = normalizeMarkdownEof(content, eol);
+  if (!normalizedExisting) return normalizedContent;
+  return `${normalizedExisting}${eol}${normalizedContent}`;
 }
 
 // Strategy 1: Markdown targets (rules, skill)
@@ -117,11 +355,10 @@ function installMarkdown(content: string, filePath: string, writeMode: 'append' 
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-    // Remove old markers if present before re-appending
-    const cleaned = removeMarkers(existing);
-    writeFileSync(filePath, cleaned + (cleaned.endsWith('\n') || cleaned === '' ? '' : '\n') + content + '\n');
+    // Remove old markers if present before re-appending.
+    writeFileSync(filePath, appendMarkdown(existing, content));
   } else {
-    writeFileSync(filePath, content + '\n');
+    writeFileSync(filePath, normalizeMarkdownEof(content));
   }
 }
 
@@ -329,10 +566,11 @@ export function removeConnector(agentIdOrName: string, type?: ConnectorType, cwd
   try { content = readFileSync(resolvedPath, 'utf-8'); } catch { return false; }
   if (!hasManagedBlock(content)) return false;
   const cleaned = removeMarkers(content);
-  if (cleaned.trim() === '') {
+  const eol = establishedMarkdownEol(cleaned);
+  if (cleaned === '') {
     unlinkSync(resolvedPath);
   } else {
-    writeFileSync(resolvedPath, cleaned + '\n');
+    writeFileSync(resolvedPath, normalizeMarkdownEof(cleaned, eol));
   }
   return true;
 }
