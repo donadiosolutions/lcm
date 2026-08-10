@@ -243,6 +243,20 @@ describe("EventsDb", () => {
     }
   });
 
+  it.each([1, 2] as const)(
+    "rejects requiredObservations below the schema minimum: %s",
+    (requiredObservations) => {
+      const db = new EventsDb(dbPath);
+      try {
+        expect(() => db.observeMissingCwd(0, 0, requiredObservations)).toThrow(
+          "requiredObservations must be a positive safe integer no less than 3",
+        );
+      } finally {
+        db.close();
+      }
+    },
+  );
+
   it("persists reversible missing-CWD parking across close and reopen", () => {
     const intervalMs = 5 * 60 * 1000;
     const first = new EventsDb(dbPath);

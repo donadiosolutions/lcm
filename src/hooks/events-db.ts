@@ -566,8 +566,13 @@ export class EventsDb {
     if (!Number.isSafeInteger(minimumIntervalMs) || minimumIntervalMs < 0) {
       throw new Error("minimumIntervalMs must be a non-negative safe integer");
     }
-    if (!Number.isSafeInteger(requiredObservations) || requiredObservations <= 0) {
-      throw new Error("requiredObservations must be a positive safe integer");
+    if (
+      !Number.isSafeInteger(requiredObservations)
+      || requiredObservations < MISSING_CWD_PARKING_OBSERVATIONS
+    ) {
+      throw new Error(
+        `requiredObservations must be a positive safe integer no less than ${MISSING_CWD_PARKING_OBSERVATIONS}`,
+      );
     }
 
     const stateRows = this.db.prepare(
