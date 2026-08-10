@@ -108,7 +108,7 @@ function removeMarkers(content: string): string {
 }
 
 function normalizeMarkdownEof(content: string): string {
-  return content.replace(/(?:\r\n|\r|\n)+$/, '') + '\n';
+  return content.replace(/[\r\n]+$/u, '') + '\n';
 }
 
 // Strategy 1: Markdown targets (rules, skill)

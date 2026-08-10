@@ -188,6 +188,7 @@ describe('installConnector — Codex native hooks', () => {
 
   it.each([
     ['preserves trailing spaces before a terminal newline', 'Heading  \n', 'Heading  \n'],
+    ['preserves trailing spaces without a terminal newline', 'Heading  ', 'Heading  \n'],
     ['preserves a trailing tab before a terminal newline', 'Heading\t\r\n', 'Heading\t\n'],
     ['normalizes repeated mixed newline sequences', 'Heading\r\n\n\r\n', 'Heading\n'],
     ['normalizes empty and newline-only content', '', '\n'],
