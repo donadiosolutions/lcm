@@ -342,6 +342,47 @@ describe('installConnector — rules (markdown append)', () => {
     expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
   });
 
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('preserves an EOF user heading after a valid generated block on reinstall (%s)', async (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const heading = '# Workflow Instruction';
+    const existing = `${generatedRulesContent(eol)}${eol}${heading}`;
+    const expected = `${heading}${eol}${generatedRulesContent(eol)}${eol}`;
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent(eol), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      const firstInstall = readFileSync(rulesPath, 'utf-8');
+      expect(firstInstall).toBe(expected);
+
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(firstInstall);
+    });
+  });
+
+  it('does not expand a header-only marker past an unrelated preceding marker', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const existing = [
+      LEGACY_LCM_MARKERS.END,
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+    ].join('\n');
+    const expected = [
+      LEGACY_LCM_MARKERS.END,
+      generatedRulesContent('\n'),
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+    });
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(expected);
+  });
+
   it('heals two closed blocks around a user heading gap in one reinstall', async () => {
     const rulesPath = join(tmpDir, 'CLAUDE.md');
     const existing = [
@@ -1132,6 +1173,15 @@ describe('removeConnector — rules', () => {
 
     expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
     expect(readFileSync(rulesPath, 'utf-8')).toBe(`Keep  \t${eol}`);
+  });
+
+  it('removes a valid generated block without deleting an exact EOF user heading', async () => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const heading = '# Workflow Instruction';
+    writeFileSync(rulesPath, `${generatedRulesContent('\n')}\n${heading}`);
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`${heading}\n`);
   });
 
   it('deletes the file when all duplicate recognized blocks are removed', () => {

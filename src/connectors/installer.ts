@@ -156,18 +156,20 @@ function findSameMarkerBlocks(
       blocks.push(managedBlock(start, nextSameMarker));
     }
 
-    const nextMarker = markerLines[candidates[index].markerIndex + 1];
-    const endIdx = nextMarker?.lineStart ?? content.length;
-    if (isWorkflowInstructionOnly(content, start.lineEnd, endIdx)) {
-      let partialStartIdx = start.lineStart;
-      let previousMarkerIndex = candidates[index].markerIndex - 1;
-      while (previousMarkerIndex >= 0) {
-        const previousMarker = markerLines[previousMarkerIndex];
-        if (previousMarker.lineEnd !== partialStartIdx || !MANAGED_START_MARKERS.has(previousMarker.marker)) break;
-        partialStartIdx = previousMarker.lineStart;
-        previousMarkerIndex -= 1;
+    if (!selectedPairs[index] && !selectedPairs[index - 1]) {
+      const nextMarker = markerLines[candidates[index].markerIndex + 1];
+      const endIdx = nextMarker?.lineStart ?? content.length;
+      if (isWorkflowInstructionOnly(content, start.lineEnd, endIdx)) {
+        let partialStartIdx = start.lineStart;
+        let previousMarkerIndex = candidates[index].markerIndex - 1;
+        while (previousMarkerIndex >= 0) {
+          const previousMarker = markerLines[previousMarkerIndex];
+          if (previousMarker.lineEnd !== partialStartIdx || !MANAGED_START_MARKERS.has(previousMarker.marker)) break;
+          partialStartIdx = previousMarker.lineStart;
+          previousMarkerIndex -= 1;
+        }
+        blocks.push({ startIdx: partialStartIdx, endIdx, endLength: 0 });
       }
-      blocks.push({ startIdx: partialStartIdx, endIdx, endLength: 0 });
     }
   }
   return blocks;
