@@ -560,7 +560,7 @@ export function removeConnector(agentIdOrName: string, type?: ConnectorType, cwd
   if (!hasManagedBlock(content)) return false;
   const cleaned = removeMarkers(content);
   const eol = establishedMarkdownEol(cleaned);
-  if (cleaned.trim() === '') {
+  if (cleaned === '') {
     unlinkSync(resolvedPath);
   } else {
     writeFileSync(resolvedPath, normalizeMarkdownEof(cleaned, eol));

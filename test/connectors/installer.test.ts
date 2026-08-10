@@ -1117,6 +1117,30 @@ describe('removeConnector — rules', () => {
     expect(existsSync(rulesPath)).toBe(false);
   });
 
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('preserves whitespace-only user Markdown outside a managed block (%s)', (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const whitespace = '  \t\f';
+    writeFileSync(rulesPath, [whitespace, generatedRulesContent(eol), ''].join(eol));
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(existsSync(rulesPath)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(`${whitespace}${eol}`);
+  });
+
+  it.each([
+    ['LF', '\n' as TestMarkdownEol],
+    ['CRLF', '\r\n' as TestMarkdownEol],
+  ])('deletes rules with only blank lines outside a managed block (%s)', (_description, eol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(rulesPath, ['', generatedRulesContent(eol), ''].join(eol));
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(existsSync(rulesPath)).toBe(false);
+  });
+
   it('removes a generated same-marker block at the file boundaries', () => {
     const rulesPath = join(tmpDir, 'CLAUDE.md');
     writeFileSync(

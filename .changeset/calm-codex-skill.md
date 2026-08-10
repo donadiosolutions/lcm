@@ -11,4 +11,7 @@ header-only partial region consisting of a current marker followed only by
 exact `# Workflow Instruction` lines. Arbitrary ambiguous or malformed
 unmatched marker/header combinations remain preserved conservatively and may
 require a second reinstall to become byte-stable; user-authored Markdown,
-including heading lines, outside recognized regions is not removed.
+including heading lines, outside recognized regions is not removed. Removing a
+rules connector preserves spaces, tabs, form-feed, and other non-CR/LF user
+Markdown bytes with exactly one established terminal EOL, while blank-line-only
+content is deleted.

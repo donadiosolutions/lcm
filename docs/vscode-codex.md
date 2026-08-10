@@ -96,6 +96,11 @@ conservatively and may require a second reinstall to become byte-stable; user-
 authored Markdown outside recognized regions, including heading lines, is never
 removed by this recovery behavior.
 
+Removing a rules connector deletes its file only when managed-block removal
+leaves zero bytes. Spaces, tabs, form-feed, and other non-CR/LF user Markdown
+bytes are preserved and written with exactly one established terminal EOL;
+content consisting only of blank lines is deleted.
+
 To import existing Codex sessions into LCM:
 
 ```bash
