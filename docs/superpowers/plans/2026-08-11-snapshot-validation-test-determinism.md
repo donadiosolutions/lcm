@@ -42,13 +42,13 @@ EXISTING_TEST_BRANCH_TIP=$(
 REVIEWED_ADDENDUM_HEAD=$(
   git rev-parse --verify 'refs/lcm/planning/open-bugs-2026-08-11^{commit}'
 )
-test "$(git rev-parse --show-toplevel)" = +  "/home/bcdonadio/.codex/worktrees/b6b7/lcm-issues-601-605"
+test "$(git rev-parse --show-toplevel)" = "/home/bcdonadio/.codex/worktrees/b6b7/lcm-issues-601-605"
 test "$(git branch --show-current)" = "fix/601-605-test-determinism"
 test "$(git rev-parse HEAD)" = "$EXISTING_TEST_BRANCH_TIP"
 test "$EXISTING_TEST_BRANCH_TIP" = "$EXPECTED_EXISTING_TIP"
-git merge-base --is-ancestor +  8a05bc794dddd29b2b39adac62c22c651ebf1cda +  "$EXISTING_TEST_BRANCH_TIP"
-git merge-base --is-ancestor +  cacbc208042caa45f0d397a1f2b9ee482c511bba +  "$EXISTING_TEST_BRANCH_TIP"
-git update-ref +  refs/lcm/extension-bases/issues-606-607 +  "$EXISTING_TEST_BRANCH_TIP"
+git merge-base --is-ancestor 8a05bc794dddd29b2b39adac62c22c651ebf1cda "$EXISTING_TEST_BRANCH_TIP"
+git merge-base --is-ancestor cacbc208042caa45f0d397a1f2b9ee482c511bba "$EXISTING_TEST_BRANCH_TIP"
+git update-ref refs/lcm/extension-bases/issues-606-607 "$EXISTING_TEST_BRANCH_TIP"
 ```
 
 Require a clean worktree and valid GPG/DCO evidence for the existing two
@@ -56,7 +56,7 @@ implementation commits. Then intentionally attach the separately reviewed,
 signed planning history with one signed no-fast-forward merge:
 
 ```bash
-git merge --no-ff -S --signoff +  -m "docs: merge reviewed timeout addendum" +  "$REVIEWED_ADDENDUM_HEAD"
+git merge --no-ff -S --signoff -m "docs: merge reviewed timeout addendum" "$REVIEWED_ADDENDUM_HEAD"
 git merge-base --is-ancestor "$EXISTING_TEST_BRANCH_TIP" HEAD
 git merge-base --is-ancestor "$REVIEWED_ADDENDUM_HEAD" HEAD
 git status --short
