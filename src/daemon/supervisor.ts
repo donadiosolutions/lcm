@@ -2408,7 +2408,6 @@ export function createSupervisor(
   const discoverLegacySystemdUnits = async (
     options?: SupervisorOperationOptions,
   ): Promise<LegacySystemdDiscovery> => {
-    if (kind !== "systemd-user") return Object.freeze({ kind: "unavailable", reason: "unsupported-platform" });
     const operationDeadline = resolveOperationDeadline(options);
     try {
       const listed = await runner.invoke(
@@ -2454,7 +2453,6 @@ export function createSupervisor(
     candidate: LegacySystemdUnit,
     options?: SupervisorOperationOptions,
   ): Promise<void> => {
-    if (kind !== "systemd-user") throw commandFailedError();
     const operationDeadline = resolveOperationDeadline(options);
     if (
       !LEGACY_SYSTEMD_UNIT_PATTERN.test(candidate.name)

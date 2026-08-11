@@ -3666,7 +3666,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
         return legacyRefusal("ambiguous", "legacy daemon systemd discovery found no authenticated candidate; refusing migration", firstPid.pid);
       }
       if (discovered.candidates.length !== 1) {
-        return legacyRefusal("ambiguous", "legacy daemon systemd discovery found multiple candidates; refusing migration", firstPid.kind === "present" ? firstPid.pid : undefined);
+        return legacyRefusal("ambiguous", "legacy daemon systemd discovery found multiple candidates; refusing migration", firstPid.pid);
       }
       const candidate = discovered.candidates[0]!;
       const pid = firstPid.pid;

@@ -848,6 +848,24 @@ describe("legacy generated systemd discovery and exact stop", () => {
   });
 
   it.each([
+    { name: "explicit not-found state", result: { code: 0, stdout: "LoadState=not-found\nMainPID=0" } },
+    { name: "not-found command status", result: { code: 1, stderr: "Unit lcm-daemon-1234-1720000000000.service not-found" } },
+  ])("accepts $name as exact unit absence", async ({ result }) => {
+    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const runner = runQueue([
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: "stop queued" },
+      result,
+    ]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      sleep: vi.fn(async () => undefined),
+    }));
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).resolves.toBeUndefined();
+  });
+
+  it.each([
     { name: "manager PID changes", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("active", 9999) },
     { name: "loaded inactive unit remains", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("inactive") },
     { name: "loaded failed unit remains", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("failed") },
@@ -917,6 +935,95 @@ describe("legacy generated systemd discovery and exact stop", () => {
     expect(capabilities.stopLegacySystemdUnit).toBeTypeOf("function");
     await expect(capabilities.stopLegacySystemdUnit!(candidate, { deadline: 99 })).rejects.toThrow("manager command");
     expect(runner.calls).toHaveLength(0);
+  });
+
+  it("rethrows an unexpected discovery deadline failure without exposing manager output", async () => {
+    let nowCalls = 0;
+    const runner = runQueue([{ code: 0, stdout: legacySystemdList("lcm-daemon-10-100.service") }]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      now: () => {
+        nowCalls += 1;
+        if (nowCalls > 1) throw new Error("clock failed");
+        return 0;
+      },
+    }));
+    await expect(capabilities.discoverLegacySystemdUnits!({ deadline: 100 })).rejects.toThrow("clock failed");
+  });
+
+  it("bounds a persistent exact-stop transition at one poll", async () => {
+    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const runner = runQueue([
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: "stop queued" },
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+    ]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      stopTimeoutMs: 1,
+      sleep: vi.fn(async () => undefined),
+      now: () => 0,
+    }));
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
+  });
+
+  it("polls a persistent exact-stop transition within multiple bounded intervals", async () => {
+    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const runner = runQueue([
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: "stop queued" },
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      stopTimeoutMs: 100,
+      sleep,
+      now: () => 0,
+    }));
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
+    expect(sleep).toHaveBeenCalledWith(50);
+  });
+
+  it("uses the bounded default sleep for a persistent exact-stop transition", async () => {
+    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const runner = runQueue([
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: "stop queued" },
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+    ]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      stopTimeoutMs: 100,
+      now: () => 0,
+    }));
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
+  });
+
+  it("stops immediately when the exact-stop deadline expires after a persistent poll", async () => {
+    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const runner = runQueue([
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: "stop queued" },
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+    ]);
+    let nowCalls = 0;
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      stopTimeoutMs: 100,
+      now: () => {
+        nowCalls += 1;
+        return nowCalls >= 7 ? 100 : 0;
+      },
+    }));
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
   });
 });
 
