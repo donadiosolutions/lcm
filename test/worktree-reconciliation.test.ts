@@ -58,6 +58,7 @@ const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const CACHE_RECONCILIATION_TIMEOUT_MS = 10_000;
 const FULL_SUITE_RECONCILIATION_TEST_TIMEOUT_MS = 15_000;
+const FULL_SUITE_SNAPSHOT_MIGRATION_TEST_TIMEOUT_MS = 15_000;
 const FULL_SUITE_SNAPSHOT_VALIDATION_TEST_TIMEOUT_MS = 15_000;
 const FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS = 15_000;
 // Full-suite child-process contention can exceed Vitest's 5-second default.
@@ -1190,7 +1191,7 @@ describe("worktree reconciliation", () => {
       [targetHash]: { canonical, aliases: [linked] },
     });
     expect(existsSync(join(home, ".lcm", "oldmaps"))).toBe(true);
-  });
+  }, FULL_SUITE_SNAPSHOT_MIGRATION_TEST_TIMEOUT_MS);
 
   it("normalizes a legacy main snapshot with WAL state without migrating source evidence", () => {
     const { main, linked } = makeRepository(home);
@@ -1279,7 +1280,7 @@ describe("worktree reconciliation", () => {
     evidence.close();
     expect(readdirSync(join(home, ".lcm", "projects", targetHash))
       .some((name) => name.startsWith(".lcm-reconciliation-snapshot-"))).toBe(false);
-  });
+  }, FULL_SUITE_SNAPSHOT_MIGRATION_TEST_TIMEOUT_MS);
 
   it("keeps target and legacy evidence clean when snapshot migration fails, then retries", () => {
     const { main, linked } = makeRepository(home);
@@ -1343,7 +1344,7 @@ describe("worktree reconciliation", () => {
     expect(evidence.prepare("PRAGMA table_info(conversations)").all()
       .map((column) => (column as { name: string }).name)).not.toContain("bootstrapped_at");
     evidence.close();
-  });
+  }, FULL_SUITE_SNAPSHOT_MIGRATION_TEST_TIMEOUT_MS);
 
   it("uses stable per-table fence triggers across schema-drift retries", () => {
     const { main, linked } = makeRepository(home);
