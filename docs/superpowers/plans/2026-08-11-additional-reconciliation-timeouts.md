@@ -56,14 +56,14 @@ test "$EXISTING_TEST_BRANCH_TIP" = "$EXPECTED_EXISTING_TIP"
 test -z "$(git status --porcelain)"
 git merge-base --is-ancestor 1f221aa204c61600eba3751080cb17ec7f6f23f7 "$EXISTING_TEST_BRANCH_TIP"
 git merge-base --is-ancestor 280b51f4a8c2581734087bf465645675eb7d930b "$EXISTING_TEST_BRANCH_TIP"
-for commit in +  1f221aa204c61600eba3751080cb17ec7f6f23f7 +  280b51f4a8c2581734087bf465645675eb7d930b
+for commit in 1f221aa204c61600eba3751080cb17ec7f6f23f7 280b51f4a8c2581734087bf465645675eb7d930b
 do
   git verify-commit "$commit"
   git log -1 --format=%B "$commit" |
     rg -q '^Signed-off-by: Bernardo Donadio <bcdonadio@bcdonadio\.com>$'
 done
 git update-ref refs/lcm/extension-bases/issues-608-609 "$EXISTING_TEST_BRANCH_TIP"
-test "$(git rev-parse --verify 'refs/lcm/extension-bases/issues-608-609^{commit}')" = +  "$EXPECTED_EXISTING_TIP"
+test "$(git rev-parse --verify 'refs/lcm/extension-bases/issues-608-609^{commit}')" = "$EXPECTED_EXISTING_TIP"
 ```
 
 Require a clean worktree and valid GPG/DCO evidence for the existing history.
@@ -231,7 +231,7 @@ MERGE_CHECKPOINT=$(
   git rev-parse --verify 'refs/lcm/merge-checkpoints/issues-608-609^{commit}'
 )
 test "$(git branch --show-current)" = "fix/601-605-test-determinism"
-test "$(git rev-parse --verify 'refs/lcm/extension-bases/issues-608-609^{commit}')" = +  280b51f4a8c2581734087bf465645675eb7d930b
+test "$(git rev-parse --verify 'refs/lcm/extension-bases/issues-608-609^{commit}')" = 280b51f4a8c2581734087bf465645675eb7d930b
 test "$REVIEWED_PLAN_HEAD" = "$(
   git rev-parse --verify 'refs/lcm/planning/open-bugs-2026-08-11^{commit}'
 )"
@@ -244,10 +244,10 @@ git verify-commit "$MERGE_CHECKPOINT"
 git diff --check "$IMPLEMENTATION_BASE"...HEAD
 git diff --check "$EXTENSION_BASE"...HEAD
 FULL_ACTUAL=$(git diff --name-only "$IMPLEMENTATION_BASE"...HEAD | sort)
-FULL_EXPECTED=$(printf '%s\n' +  docs/superpowers/plans/2026-08-11-additional-reconciliation-timeouts.md +  docs/superpowers/plans/2026-08-11-snapshot-validation-test-determinism.md +  docs/superpowers/specs/2026-08-11-open-bug-remediation-design.md +  test/batch-compact.test.ts +  test/worktree-reconciliation.test.ts | sort)
+FULL_EXPECTED=$(printf '%s\n' docs/superpowers/plans/2026-08-11-additional-reconciliation-timeouts.md docs/superpowers/plans/2026-08-11-snapshot-validation-test-determinism.md docs/superpowers/specs/2026-08-11-open-bug-remediation-design.md test/batch-compact.test.ts test/worktree-reconciliation.test.ts | sort)
 test "$FULL_ACTUAL" = "$FULL_EXPECTED"
 EXTENSION_ACTUAL=$(git diff --name-only "$EXTENSION_BASE"...HEAD | sort)
-EXTENSION_EXPECTED=$(printf '%s\n' +  docs/superpowers/plans/2026-08-11-additional-reconciliation-timeouts.md +  docs/superpowers/specs/2026-08-11-open-bug-remediation-design.md +  test/worktree-reconciliation.test.ts | sort)
+EXTENSION_EXPECTED=$(printf '%s\n' docs/superpowers/plans/2026-08-11-additional-reconciliation-timeouts.md docs/superpowers/specs/2026-08-11-open-bug-remediation-design.md test/worktree-reconciliation.test.ts | sort)
 test "$EXTENSION_ACTUAL" = "$EXTENSION_EXPECTED"
 test -z "$(git status --porcelain)"
 for commit in $(git rev-list "$IMPLEMENTATION_BASE"..HEAD)
