@@ -1171,9 +1171,13 @@ async function createDaemonClientOrExit(
 export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
   const customHelp = resolveCustomHelpRequest(cliArgv);
   if (customHelp) {
-    const { hasCommandHelp, printHelp } = await import("../src/cli-help.js");
-    if (customHelp.command === undefined || hasCommandHelp(customHelp.command)) {
-      printHelp(customHelp.command);
+    const cliHelp = await import("../src/cli-help.js");
+    const hasCommandHelp = Object.prototype.hasOwnProperty.call(cliHelp, "hasCommandHelp")
+      ? (cliHelp as { hasCommandHelp?: unknown }).hasCommandHelp
+      : undefined;
+    if (customHelp.command === undefined
+      || (typeof hasCommandHelp === "function" && hasCommandHelp(customHelp.command))) {
+      cliHelp.printHelp(customHelp.command);
       exit(0);
     }
   }
