@@ -344,15 +344,19 @@ function resolveCustomHelpRequest(cliArgv: string[]): CustomHelpRequest | undefi
   const args = cliArgv.slice(2);
   if (args.length === 0) return {};
   if (args.length === 1 && (args[0] === "-h" || args[0] === "--help")) return {};
-  if (!args.includes("-h") && !args.includes("--help")) return undefined;
+  const terminator = args.indexOf("--");
+  const optionArgs = terminator === -1 ? args : args.slice(0, terminator);
+  if (!optionArgs.includes("-h") && !optionArgs.includes("--help")) return undefined;
 
-  const [command] = args;
-  return args.length >= 3 && ["daemon", "config", "connectors"].includes(command)
-    ? { command }
-    : undefined;
+  const [command] = optionArgs;
+  if (command === "help") {
+    const topic = optionArgs[1];
+    return topic === undefined || topic === "-h" || topic === "--help"
+      ? {}
+      : { command: topic };
+  }
+  return { command };
 }
-
-
 
 export function registerMemoryCommands(program: Command): void {
   program
@@ -1160,6 +1164,15 @@ async function createDaemonClientOrExit(
 
 /** @internal CLI entry seam; defaults preserve the published executable behavior. */
 export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
+  const customHelp = resolveCustomHelpRequest(cliArgv);
+  if (customHelp) {
+    const { hasCommandHelp, printHelp } = await import("../src/cli-help.js");
+    if (customHelp.command === undefined || hasCommandHelp(customHelp.command)) {
+      printHelp(customHelp.command);
+      exit(0);
+    }
+  }
+
   const internalDaemonTestIdentity = resolveInternalDaemonTestIdentity(cliArgv);
   migrateLegacyHomeIfNeeded();
   const { readFileSync } = await import("node:fs");
@@ -2755,16 +2768,6 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
       exit(1);
     })();
   });
-
-  // Resolve unsafe nested help from argv before parsing. Commander does not
-  // reliably expose a child help option to these nested actions, and those
-  // actions may read or mutate state before help can be rendered.
-  const customHelp = resolveCustomHelpRequest(cliArgv);
-  if (customHelp) {
-    const { printHelp } = await import("../src/cli-help.js");
-    printHelp(customHelp.command);
-    exit(0);
-  }
 
   await program.parseAsync(cliArgv);
   await unknownCommandCompletion;

@@ -555,6 +555,10 @@ const GROUPS = [
   },
 ];
 
+export function hasCommandHelp(command: string): boolean {
+  return Object.hasOwn(HELP, command);
+}
+
 function pad(str: string, width: number): string {
   return str + " ".repeat(width - str.length);
 }
