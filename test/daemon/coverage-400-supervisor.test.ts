@@ -655,6 +655,271 @@ describe("supervisor coverage: manager states and lifecycle boundaries", () => {
   });
 });
 
+type LegacySystemdUnitTestShape = Readonly<{ name: string; managerPid: number }>;
+type LegacySystemdDiscoveryTestShape =
+  | Readonly<{ kind: "candidates"; candidates: readonly LegacySystemdUnitTestShape[] }>
+  | Readonly<{ kind: "unavailable"; reason: string }>;
+type LegacySystemdCapabilitiesTestShape = {
+  readonly discoverLegacySystemdUnits?: (options?: { readonly deadline?: number }) => Promise<LegacySystemdDiscoveryTestShape>;
+  readonly stopLegacySystemdUnit?: (candidate: LegacySystemdUnitTestShape, options?: { readonly deadline?: number }) => Promise<void>;
+};
+
+function legacySystemdCapabilities(value: unknown): LegacySystemdCapabilitiesTestShape {
+  return value as LegacySystemdCapabilitiesTestShape;
+}
+
+function legacySystemdList(...names: readonly string[]): string {
+  return names.map((name) => `${name} loaded active running legacy`).join("\n");
+}
+
+function legacySystemdState(
+  state: "active" | "inactive" | "failed" | "malformed" | "not-found" = "active",
+  pid = 4242,
+): string {
+  if (state === "not-found") return "LoadState=not-found\nMainPID=0";
+  if (state === "malformed") return "LoadState=loaded\nActiveState=unknown\nSubState=unknown\nMainPID=not-a-pid";
+  return [
+    "LoadState=loaded",
+    `ActiveState=${state}`,
+    `SubState=${state === "active" ? "running" : state}`,
+    `MainPID=${state === "active" ? pid : 0}`,
+  ].join("\n");
+}
+
+describe("legacy generated systemd discovery and exact stop", () => {
+  it("discovers only strict legacy names and returns authenticated manager PIDs", async () => {
+    const value = spec("systemd-user");
+    const runner = runQueue([
+      {
+        code: 0,
+        stdout: legacySystemdList(
+          "lcm-daemon-1234-1720000000000.service",
+          "lcm-daemon-0123456789abcdef0123.service",
+          "lcm-daemon-1234-not-a-time.service",
+          "other.service",
+          "lcm-daemon-1234-1720000000000.service",
+        ),
+        stderr: "list-unit diagnostic must not escape",
+      },
+      { code: 0, stdout: legacySystemdState("active", 4242), stderr: "show diagnostic must not escape" },
+    ]);
+    const supervisor = createSupervisor("systemd-user", { run: runner.run, platform: "linux" });
+    const capabilities = legacySystemdCapabilities(supervisor);
+    expect(capabilities.discoverLegacySystemdUnits).toBeTypeOf("function");
+    const result = await capabilities.discoverLegacySystemdUnits!();
+
+    expect(result).toEqual({
+      kind: "candidates",
+      candidates: [{ name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 }],
+    });
+    expect(result).not.toHaveProperty("stdout");
+    expect(result).not.toHaveProperty("stderr");
+    expect(runner.calls.map(({ command, args }) => ({ command, args }))).toEqual([
+      {
+        command: "systemctl",
+        args: ["--user", "list-units", "--type=service", "--state=active", "--no-legend", "--plain"],
+      },
+      {
+        command: "systemctl",
+        args: ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID", "lcm-daemon-1234-1720000000000.service"],
+      },
+    ]);
+  });
+
+  it.each([
+    {
+      name: "zero candidates",
+      list: legacySystemdList("other.service"),
+      shows: [] as readonly CommandResult[],
+      expected: { kind: "candidates", candidates: [] },
+    },
+    {
+      name: "multiple candidates",
+      list: legacySystemdList("lcm-daemon-20-200.service", "lcm-daemon-10-100.service"),
+      shows: [
+        { code: 0, stdout: legacySystemdState("active", 10) },
+        { code: 0, stdout: legacySystemdState("active", 20) },
+      ],
+      expected: {
+        kind: "candidates",
+        candidates: [
+          { name: "lcm-daemon-10-100.service", managerPid: 10 },
+          { name: "lcm-daemon-20-200.service", managerPid: 20 },
+        ],
+      },
+    },
+    {
+      name: "malformed PID",
+      list: legacySystemdList("lcm-daemon-10-100.service"),
+      shows: [{ code: 0, stdout: legacySystemdState("malformed") }],
+      expected: { kind: "candidates", candidates: [] },
+    },
+    {
+      name: "non-running state",
+      list: legacySystemdList("lcm-daemon-10-100.service"),
+      shows: [{ code: 0, stdout: legacySystemdState("failed") }],
+      expected: { kind: "candidates", candidates: [] },
+    },
+    {
+      name: "not-found race",
+      list: legacySystemdList("lcm-daemon-10-100.service"),
+      shows: [{ code: 1, stderr: "Unit lcm-daemon-10-100.service not found" }],
+      expected: { kind: "candidates", candidates: [] },
+    },
+  ])("returns $expected.kind for $name", async ({ list, shows, expected }) => {
+    const runner = runQueue([{ code: 0, stdout: list }, ...shows]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+    }));
+    expect(capabilities.discoverLegacySystemdUnits).toBeTypeOf("function");
+    await expect(capabilities.discoverLegacySystemdUnits!()).resolves.toEqual(expected);
+  });
+
+  it.each([
+    { name: "list timeout", list: { timedOut: true }, expected: { kind: "unavailable", reason: "manager-timeout" } },
+    { name: "list permission failure", list: { code: 1, stderr: "Operation not permitted" }, expected: { kind: "unavailable", reason: "manager-command-failed" } },
+    { name: "list unexpected status", list: { code: 1, stderr: "manager exploded" }, expected: { kind: "unavailable", reason: "manager-command-failed" } },
+    { name: "show timeout", list: { code: 0, stdout: legacySystemdList("lcm-daemon-10-100.service") }, show: { timedOut: true }, expected: { kind: "unavailable", reason: "manager-timeout" } },
+    { name: "show permission failure", list: { code: 0, stdout: legacySystemdList("lcm-daemon-10-100.service") }, show: { code: 1, stderr: "Operation not permitted" }, expected: { kind: "unavailable", reason: "manager-command-failed" } },
+    { name: "show unexpected status", list: { code: 0, stdout: legacySystemdList("lcm-daemon-10-100.service") }, show: { code: 2, stderr: "bad manager state" }, expected: { kind: "unavailable", reason: "manager-command-failed" } },
+  ])("fails closed with no raw output for $name", async ({ list, show, expected }) => {
+    const runner = runQueue([list, ...(show === undefined ? [] : [show])]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+    }));
+    expect(capabilities.discoverLegacySystemdUnits).toBeTypeOf("function");
+    const result = await capabilities.discoverLegacySystemdUnits!();
+    expect(result).toEqual(expected);
+    expect(result).not.toHaveProperty("stdout");
+    expect(result).not.toHaveProperty("stderr");
+  });
+
+  it("returns bounded unavailability when the operation deadline is exhausted", async () => {
+    const runner = runQueue([]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      now: () => 100,
+    }));
+    expect(capabilities.discoverLegacySystemdUnits).toBeTypeOf("function");
+    await expect(capabilities.discoverLegacySystemdUnits!({ deadline: 99 })).resolves.toEqual({
+      kind: "unavailable",
+      reason: "manager-timeout",
+    });
+    expect(runner.calls).toHaveLength(0);
+  });
+
+  it("does not expose Linux discovery on launchd", async () => {
+    const capabilities = legacySystemdCapabilities(createSupervisor("launchd-user", {
+      run: vi.fn(),
+      platform: "darwin",
+      uid: 501,
+    }));
+    expect(capabilities.discoverLegacySystemdUnits).toBeUndefined();
+    expect(capabilities.stopLegacySystemdUnit).toBeUndefined();
+  });
+
+  it("stops one exact active candidate and accepts daemon-owned PID-file disappearance", async () => {
+    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const runner = runQueue([
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: "stop queued" },
+      { code: 0, stdout: legacySystemdState("not-found") },
+    ]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+    }));
+    expect(capabilities.stopLegacySystemdUnit).toBeTypeOf("function");
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).resolves.toBeUndefined();
+    expect(runner.calls.map(({ command, args }) => ({ command, args }))).toEqual([
+      {
+        command: "systemctl",
+        args: ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID", candidate.name],
+      },
+      { command: "systemctl", args: ["--user", "stop", candidate.name] },
+      {
+        command: "systemctl",
+        args: ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID", candidate.name],
+      },
+    ]);
+  });
+
+  it.each([
+    { name: "manager PID changes", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("active", 9999) },
+    { name: "loaded inactive unit remains", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("inactive") },
+    { name: "loaded failed unit remains", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("failed") },
+    { name: "malformed post-stop state", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("malformed") },
+  ])("refuses $name after exact stop", async ({ initial, afterStop }) => {
+    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const runner = runQueue([
+      { code: 0, stdout: initial },
+      { code: 0, stdout: "stop queued" },
+      { code: 0, stdout: afterStop },
+    ]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      sleep: vi.fn(async () => undefined),
+    }));
+    expect(capabilities.stopLegacySystemdUnit).toBeTypeOf("function");
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
+  });
+
+  it.each([
+    { name: "stable name", candidate: { name: "lcm-daemon-aaaaaaaaaaaaaaaaaaaa.service", managerPid: 4242 } },
+    { name: "arbitrary name", candidate: { name: "other.service", managerPid: 4242 } },
+    { name: "zero PID", candidate: { name: "lcm-daemon-1234-1720000000000.service", managerPid: 0 } },
+    { name: "non-integer PID", candidate: { name: "lcm-daemon-1234-1720000000000.service", managerPid: 1.5 } },
+  ])("refuses a smuggled $name without invoking systemd", async ({ candidate }) => {
+    const runner = runQueue([]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+    }));
+    expect(capabilities.stopLegacySystemdUnit).toBeTypeOf("function");
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
+    expect(runner.calls).toHaveLength(0);
+  });
+
+  it.each([
+    { name: "initial PID mismatch", results: [{ code: 0, stdout: legacySystemdState("active", 9999) }] },
+    { name: "show timeout", results: [{ timedOut: true }] },
+    { name: "stop timeout", results: [{ code: 0, stdout: legacySystemdState("active", 4242) }, { timedOut: true }] },
+    { name: "stop error", results: [{ code: 0, stdout: legacySystemdState("active", 4242) }, { code: 1, stderr: "permission denied" }] },
+    { name: "post-stop timeout", results: [{ code: 0, stdout: legacySystemdState("active", 4242) }, { code: 0, stdout: "stop queued" }, { timedOut: true }] },
+  ])("refuses $name", async ({ results }) => {
+    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const runner = runQueue(results);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+    }));
+    expect(capabilities.stopLegacySystemdUnit).toBeTypeOf("function");
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
+  });
+
+  it("requires exact absence after a successful stop and honors the deadline", async () => {
+    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const runner = runQueue([
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: "stop queued" },
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+    ]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      now: () => 100,
+      sleep: vi.fn(async () => undefined),
+    }));
+    expect(capabilities.stopLegacySystemdUnit).toBeTypeOf("function");
+    await expect(capabilities.stopLegacySystemdUnit!(candidate, { deadline: 99 })).rejects.toThrow("manager command");
+    expect(runner.calls).toHaveLength(0);
+  });
+});
+
 describe("supervisor coverage: credentials and private launch files", () => {
   it("classifies credential-directory and allow-list metadata mismatches", async () => {
     const stateRoot = root();
