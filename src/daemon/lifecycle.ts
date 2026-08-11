@@ -39,6 +39,7 @@ import {
   createSupervisorSpec,
   isSupervisorPreflightUnavailableReason,
   managedLaunchEnvironment,
+  type LegacySystemdUnit,
   type Supervisor,
   type SupervisorKind,
   type SupervisorObservation,
@@ -494,6 +495,26 @@ function healthVersionMatches(health: HealthResponse | null, expectedVersion: st
     && health.version === expectedVersion;
 }
 
+function isStrictLegacyUpgradeVersion(
+  observedVersion: string | undefined,
+  installedVersion: string | undefined,
+): boolean {
+  const parse = (value: string | undefined): readonly [number, number, number] | undefined => {
+    if (value === undefined || !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/u.test(value)) return undefined;
+    const parts = value.split(".").map(Number);
+    return parts.every((part) => Number.isSafeInteger(part))
+      ? [parts[0]!, parts[1]!, parts[2]!]
+      : undefined;
+  };
+  const observed = parse(observedVersion);
+  const installed = parse(installedVersion);
+  return observed !== undefined
+    && installed !== undefined
+    && observed[0] === installed[0]
+    && observed[1] === installed[1]
+    && observed[2] < installed[2];
+}
+
 function healthStorageBackendMatches(
   health: HealthResponse | null,
   expectedStorageBackend: StorageBackend,
@@ -691,6 +712,56 @@ function readPidFile(
     }
     return null;
   }
+}
+
+type LegacyPidFileEvidence =
+  | Readonly<{ kind: "missing" }>
+  | Readonly<{ kind: "unsafe" }>
+  | Readonly<{ kind: "present"; pid: number; device: number; inode: number }>;
+
+function readLegacyPidFileEvidence(path: string): LegacyPidFileEvidence {
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stats = fstatSync(descriptor);
+    if (!stats.isFile() || stats.nlink !== 1) return { kind: "unsafe" };
+    const value = readFileSync(descriptor, "utf-8").trim();
+    if (!/^[1-9][0-9]*$/u.test(value)) return { kind: "unsafe" };
+    const pid = Number(value);
+    if (!Number.isSafeInteger(pid) || pid <= 0) return { kind: "unsafe" };
+    return { kind: "present", pid, device: stats.dev, inode: stats.ino };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { kind: "missing" }
+      : { kind: "unsafe" };
+  } finally {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* preserve the unsafe evidence */ }
+    }
+  }
+}
+
+type LegacyTokenEvidence =
+  | Readonly<{ kind: "missing" }>
+  | Readonly<{ kind: "unsafe" }>
+  | Readonly<{ kind: "present"; token: string }>;
+
+function readLegacyTokenEvidence(path: string): LegacyTokenEvidence {
+  try {
+    const token = readRegularFileNoFollow(path).trim();
+    return token.length === 0 ? { kind: "unsafe" } : { kind: "present", token };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { kind: "missing" }
+      : { kind: "unsafe" };
+  }
+}
+
+function sameLegacyPidFileIdentity(
+  left: Extract<LegacyPidFileEvidence, { kind: "present" }>,
+  right: Extract<LegacyPidFileEvidence, { kind: "present" }>,
+): boolean {
+  return left.pid === right.pid && left.device === right.device && left.inode === right.inode;
 }
 
 function cleanStalePid(
@@ -3439,6 +3510,9 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
           sleep: dependencies.sleep,
           now: monotonicNow,
         });
+    if (opts._abortSignal?.aborted) {
+      return restartRefusal("response-timeout", "daemon lifecycle was interrupted before legacy migration");
+    }
     let observation: SupervisorObservation;
     try {
       // Probe before any PID read, health request, signal, or start. Only an
@@ -3467,6 +3541,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
       managerPid?: number,
       admittedSpec?: SupervisorSpec,
       restarted = false,
+      stoppedPidOverride?: number,
     ): Promise<RestartDaemonResult> => {
       const remainingSpawnTimeoutMs = Math.max(0, Math.floor(verificationDeadline - monotonicNow()));
       const ensured = await ensure({
@@ -3486,7 +3561,8 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
       return {
         ...ensured,
         restarted,
-        stoppedPid: observation.kind === "registered-running-valid" ? observation.managerPid : undefined,
+        stoppedPid: stoppedPidOverride
+          ?? (observation.kind === "registered-running-valid" ? observation.managerPid : undefined),
       };
     };
     const stopStartAndEnsure = async (): Promise<RestartDaemonResult> => {
@@ -3510,6 +3586,181 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
         }
       }
     };
+    const startStableAndEnsure = async (stoppedPid: number): Promise<RestartDaemonResult> => {
+      const staged = stageManagedCredentials(spec, dependencies.environment);
+      let admitted = false;
+      try {
+        const started = await supervisor.start(staged.spec, { deadline: verificationDeadline });
+        const ensured = await ensureAfterManagerOperation(started.managerPid, staged.spec, true, stoppedPid);
+        admitted = ensured.connected === true;
+        return ensured;
+      } finally {
+        if (admitted && staged.credentialDirectory !== undefined) {
+          try { cleanupManagedCredentialDirectory(staged.credentialDirectory, spec.stateRoot); } catch { /* preserve unresolved evidence */ }
+        }
+      }
+    };
+
+    type LegacyMigrationAttempt =
+      | Readonly<{ kind: "not-applicable" }>
+      | Readonly<{ kind: "refused"; refusalReason: DaemonLifecycleRefusalReason; warning: string; pid?: number }>
+      | Readonly<{ kind: "migrated"; stoppedPid: number }>;
+
+    const legacyRefusal = (
+      refusalReason: DaemonLifecycleRefusalReason,
+      warning: string,
+      pid?: number,
+    ): Extract<LegacyMigrationAttempt, { kind: "refused" }> => ({
+      kind: "refused",
+      refusalReason,
+      warning,
+      ...(pid === undefined ? {} : { pid }),
+    });
+
+    const migrateAuthenticatedLegacyDaemon = async (): Promise<LegacyMigrationAttempt> => {
+      if (
+        managerKind !== "systemd-user"
+        || supervisor.discoverLegacySystemdUnits === undefined
+        || supervisor.stopLegacySystemdUnit === undefined
+      ) return { kind: "not-applicable" };
+
+      const firstPid = readLegacyPidFileEvidence(opts.pidFilePath);
+      if (firstPid.kind === "unsafe") {
+        return legacyRefusal("ambiguous", "legacy daemon PID evidence was not a safe regular file; refusing migration");
+      }
+      const secondPid = readLegacyPidFileEvidence(opts.pidFilePath);
+      if (secondPid.kind === "unsafe") {
+        return legacyRefusal("ambiguous", "legacy daemon PID evidence changed to an unsafe file; refusing migration");
+      }
+      if (
+        firstPid.kind === "present"
+        && secondPid.kind === "present"
+        && !sameLegacyPidFileIdentity(firstPid, secondPid)
+      ) {
+        return legacyRefusal("ambiguous", "legacy daemon PID evidence changed between reads; refusing migration", firstPid.pid);
+      }
+      if (firstPid.kind === "missing" && secondPid.kind === "missing") return { kind: "not-applicable" };
+      if (firstPid.kind === "missing" || secondPid.kind === "missing") {
+        return legacyRefusal("ambiguous", "legacy daemon PID evidence disappeared between reads; refusing migration");
+      }
+      const discover = async (): Promise<
+        | Readonly<{ kind: "refused"; refusalReason: DaemonLifecycleRefusalReason; warning: string; pid?: number }>
+        | Readonly<{ kind: "candidates"; candidates: readonly LegacySystemdUnit[] }>
+      > => {
+        try {
+          const found = await supervisor.discoverLegacySystemdUnits!({ deadline: verificationDeadline });
+          if (found.kind === "unavailable") {
+            return legacyRefusal(
+              "manager-unavailable",
+              `legacy daemon systemd discovery was unavailable (${found.reason}); refusing migration`,
+            );
+          }
+          return found;
+        } catch {
+          return legacyRefusal("manager-unavailable", "legacy daemon systemd discovery failed; refusing migration");
+        }
+      };
+      const discovered = await discover();
+      if (discovered.kind === "refused") return discovered;
+      if (discovered.candidates.length === 0) {
+        return legacyRefusal("ambiguous", "legacy daemon systemd discovery found no authenticated candidate; refusing migration", firstPid.pid);
+      }
+      if (discovered.candidates.length !== 1) {
+        return legacyRefusal("ambiguous", "legacy daemon systemd discovery found multiple candidates; refusing migration", firstPid.kind === "present" ? firstPid.pid : undefined);
+      }
+      const candidate = discovered.candidates[0]!;
+      const pid = firstPid.pid;
+      if (candidate.managerPid !== pid || !Number.isSafeInteger(candidate.managerPid) || candidate.managerPid <= 0) {
+        return legacyRefusal("invalid-collision", "legacy daemon manager PID did not match its owned PID file", pid);
+      }
+      if (!isAlive(pid)) return legacyRefusal("ambiguous", "legacy daemon PID is no longer live; refusing migration", pid);
+      const publicDeadline = remainingVerificationDeadline();
+      if (!publicDeadline) return legacyRefusal("response-timeout", "legacy daemon health verification deadline expired", pid);
+      const publicObservation = await observeDaemonHealth(opts.port, fetchFn, publicDeadline);
+      if (publicObservation.kind === "no-response") {
+        return legacyRefusal("response-timeout", "legacy daemon health did not respond during migration", pid);
+      }
+      if (publicObservation.body !== "valid" || publicObservation.parsedBody === undefined) {
+        return legacyRefusal("response-invalid", "legacy daemon returned invalid public health during migration", pid);
+      }
+      const publicHealth = publicObservation.parsedBody;
+      if (!isRecognizedDaemonHealth(publicHealth)) {
+        return legacyRefusal("response-invalid", "legacy daemon returned unrecognized public health during migration", pid);
+      }
+      if (publicHealth.pid !== pid || (testScope !== undefined && publicHealth.ownerId !== testScope.ownerId)) {
+        return legacyRefusal("invalid-collision", "legacy daemon public health did not match its manager PID", pid);
+      }
+      if (!isStrictLegacyUpgradeVersion(publicHealth.version, expectedVersion)) {
+        return legacyRefusal("response-invalid", "legacy daemon version was not a strict older patch in the installed release line", pid);
+      }
+      const storage = recognizedHealthStorageBackend(publicHealth);
+      if (storage === null) return legacyRefusal("response-invalid", "legacy daemon reported an unknown storage backend", pid);
+      const tokenEvidence = readLegacyTokenEvidence(tokenPath);
+      if (tokenEvidence.kind !== "present") {
+        return legacyRefusal("response-auth-failure", "legacy daemon token evidence was missing or unsafe", pid);
+      }
+      const authenticated = await checkDaemonDiagnostics(
+        opts.port,
+        tokenPath,
+        fetchFn,
+        remainingVerificationDeadline,
+        publicHealth,
+        storage,
+        (path: string) => {
+          const current = readLegacyTokenEvidence(path);
+          return current.kind === "present" ? current.token : null;
+        },
+      );
+      if (authenticated === null) return legacyRefusal("response-auth-failure", "legacy daemon health could not be authenticated", pid);
+      if (!processEntrypointMatches(authenticated, expectedEntrypoint, platform, procRoot, realpath)) {
+        return legacyRefusal("response-invalid", "legacy daemon entrypoint did not match the requested runtime", pid);
+      }
+      if (!isLikelyLcmDaemonProcessForPlatform(pid, platform, dependencies.spawnSync, procRoot, windowsPowerShellPath)) {
+        return legacyRefusal("invalid-collision", "legacy daemon process command was not an LCM daemon", pid);
+      }
+      const listenerPorts = opts._listeningPortsOverride
+        ? opts._listeningPortsOverride(pid)
+        : findListeningTcpPorts(pid, platform, dependencies.spawnSync, procRoot, opts.port);
+      if (!listenerPorts.includes(opts.port)) return legacyRefusal("invalid-collision", "legacy daemon did not own the configured loopback listener", pid);
+      if (opts._abortSignal?.aborted) return legacyRefusal("response-timeout", "legacy daemon migration was interrupted", pid);
+      if (!remainingVerificationDeadline()) return legacyRefusal("response-timeout", "legacy daemon migration deadline expired", pid);
+      const preStopPid = readLegacyPidFileEvidence(opts.pidFilePath);
+      if (preStopPid.kind !== "present" || !sameLegacyPidFileIdentity(firstPid, preStopPid) || preStopPid.pid !== pid || !isAlive(pid)) {
+        return legacyRefusal("ambiguous", "legacy daemon PID evidence changed before exact stop", pid);
+      }
+      const preStopDiscovery = await discover();
+      if (preStopDiscovery.kind === "refused") return { ...preStopDiscovery, refusalReason: "ambiguous", pid };
+      if (
+        preStopDiscovery.candidates.length !== 1
+        || preStopDiscovery.candidates[0]!.name !== candidate.name
+        || preStopDiscovery.candidates[0]!.managerPid !== candidate.managerPid
+      ) {
+        return legacyRefusal("ambiguous", "legacy daemon candidate changed before exact stop", pid);
+      }
+      try {
+        await supervisor.stopLegacySystemdUnit(candidate, { deadline: verificationDeadline });
+      } catch {
+        return legacyRefusal("startup-failure", "legacy daemon exact stop failed; stable replacement was not started", pid);
+      }
+      if (isAlive(pid)) return legacyRefusal("startup-failure", "legacy daemon remained live after exact stop; stable replacement was not started", pid);
+      const afterStopPid = readLegacyPidFileEvidence(opts.pidFilePath);
+      if (afterStopPid.kind === "unsafe") return legacyRefusal("ambiguous", "legacy daemon PID evidence became unsafe after exact stop", pid);
+      if (afterStopPid.kind === "present") {
+        if (!sameLegacyPidFileIdentity(firstPid, afterStopPid) || afterStopPid.pid !== pid) {
+          return legacyRefusal("ambiguous", "legacy daemon PID path was replaced after exact stop", pid);
+        }
+        try {
+          if (scopedState) assertScopedStateAccess(scopedState);
+          unlinkSync(opts.pidFilePath);
+          if (scopedState) assertScopedStateAccess(scopedState);
+        } catch {
+          return legacyRefusal("ambiguous", "legacy daemon PID cleanup could not be authenticated after exact stop", pid);
+        }
+        const cleanupProbe = readLegacyPidFileEvidence(opts.pidFilePath);
+        if (cleanupProbe.kind !== "missing") return legacyRefusal("ambiguous", "legacy daemon PID path changed during cleanup", pid);
+      }
+      return { kind: "migrated", stoppedPid: pid };
+    };
     if (observation.kind === "registered-stale-config") {
       // Explicit restart is the sole operation authorized to replace stale
       // manager configuration.  Require the old registration to carry the
@@ -3522,6 +3773,27 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
         return await stopStartAndEnsure();
       } catch {
         return restartRefusal("startup-failure", "managed daemon supervisor stale configuration repair failed");
+      }
+    }
+    if (observation.kind === "absent") {
+      const legacyMigration = await migrateAuthenticatedLegacyDaemon();
+      if (legacyMigration.kind === "refused") {
+        return restartRefusal(
+          legacyMigration.refusalReason,
+          legacyMigration.warning,
+          legacyMigration.pid === undefined ? {} : { pid: legacyMigration.pid },
+        );
+      }
+      if (legacyMigration.kind === "migrated") {
+        try {
+          return await startStableAndEnsure(legacyMigration.stoppedPid);
+        } catch {
+          return restartRefusal(
+            "startup-failure",
+            "stable daemon start failed after authenticated legacy migration",
+            { stoppedPid: legacyMigration.stoppedPid },
+          );
+        }
       }
     }
     if (observation.kind === "absent" || observation.kind === "registered-not-running-valid") {

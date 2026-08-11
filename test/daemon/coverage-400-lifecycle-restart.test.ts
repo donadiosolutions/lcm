@@ -154,6 +154,139 @@ function managedSupervisor(
   };
 }
 
+type LegacyUnit = Readonly<{ name: string; managerPid: number }>;
+type LegacyDiscovery =
+  | Readonly<{ kind: "candidates"; candidates: readonly LegacyUnit[] }>
+  | Readonly<{ kind: "unavailable"; reason: string }>;
+
+function legacyMigrationSupervisor(
+  discovery: LegacyDiscovery,
+  onStop?: (candidate: LegacyUnit) => void | Promise<void>,
+): {
+  supervisor: Supervisor;
+  probe: ReturnType<typeof vi.fn>;
+  start: ReturnType<typeof vi.fn>;
+  stopAndStart: ReturnType<typeof vi.fn>;
+  discoverLegacySystemdUnits: ReturnType<typeof vi.fn>;
+  stopLegacySystemdUnit: ReturnType<typeof vi.fn>;
+} {
+  const probe = vi.fn(async (spec: SupervisorSpec) => ({ kind: "absent" as const, name: spec.name }));
+  const start = vi.fn(async () => ({ kind: "systemd-user" as const, managerPid: 5252 }));
+  const stopAndStart = vi.fn();
+  const discoverLegacySystemdUnits = vi.fn(async () => discovery);
+  const stopLegacySystemdUnit = vi.fn(async (candidate: LegacyUnit) => onStop?.(candidate));
+  return {
+    supervisor: {
+      probe,
+      start,
+      stopAndStart,
+      stopAndAwaitAbsent: vi.fn(),
+      discoverLegacySystemdUnits,
+      stopLegacySystemdUnit,
+    } as unknown as Supervisor,
+    probe,
+    start,
+    stopAndStart,
+    discoverLegacySystemdUnits,
+    stopLegacySystemdUnit,
+  };
+}
+
+type LegacyFixtureConfig = Readonly<{
+  pidState?: "valid" | "missing" | "malformed" | "symlink" | "directory";
+  tokenState?: "valid" | "missing" | "symlink";
+  discoveries?: readonly LegacyDiscovery[];
+  publicHealth?: Record<string, unknown> | null;
+  authenticatedHealth?: Record<string, unknown> | null;
+  accessStatus?: number;
+  processCommand?: string;
+  listenerPorts?: readonly number[];
+  alive?: boolean;
+  stopBehavior?: "remove-pid" | "keep-alive" | "replace-pid" | "throw";
+  startBehavior?: "throw";
+  mutatePidBeforeSecondDiscovery?: boolean;
+  monotonicNow?: () => number;
+}>;
+
+async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
+  readonly result: Awaited<ReturnType<typeof restartDaemonProduction>>;
+  readonly pidPath: string;
+  readonly supervisor: ReturnType<typeof legacyMigrationSupervisor>;
+  readonly ensure: ReturnType<typeof vi.fn>;
+  readonly kill: ReturnType<typeof vi.fn>;
+}> {
+  const dir = root("issue-600-legacy-matrix-");
+  const procRoot = join(dir, "proc");
+  mkdirSync(procRoot, { recursive: true });
+  const pidPath = join(dir, "daemon.pid");
+  const pidState = config.pidState ?? "valid";
+  if (pidState === "valid") writePid(dir, 4242);
+  if (pidState === "malformed") writeFileSync(pidPath, "not-a-pid", { mode: 0o600 });
+  if (pidState === "directory") mkdirSync(pidPath);
+  if (pidState === "symlink") {
+    const external = join(root("issue-600-legacy-external-"), "daemon.pid");
+    writeFileSync(external, "4242", { mode: 0o600 });
+    symlinkSync(external, pidPath);
+  }
+  const tokenPath = join(dir, "daemon.token");
+  const tokenState = config.tokenState ?? "valid";
+  if (tokenState === "valid") writeFileSync(tokenPath, "legacy-token", { mode: 0o600 });
+  if (tokenState === "symlink") {
+    const external = join(root("issue-600-legacy-token-external-"), "daemon.token");
+    writeFileSync(external, "legacy-token", { mode: 0o600 });
+    symlinkSync(external, tokenPath);
+  }
+  const aliveState = { value: config.alive ?? true };
+  writeProc(procRoot, 4242, 1234, config.processCommand ?? "node lcm daemon start --foreground");
+  const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+  const discoveries = config.discoveries ?? [{ kind: "candidates" as const, candidates: [candidate] }];
+  let discoveryIndex = 0;
+  const supervisor = legacyMigrationSupervisor(
+    discoveries[0]!,
+    async () => {
+      if (config.stopBehavior === "throw") throw new Error("legacy stop failed");
+      if (config.stopBehavior === "keep-alive") return;
+      aliveState.value = false;
+      if (config.stopBehavior === "replace-pid") writeFileSync(pidPath, "9999", { mode: 0o600 });
+      else if (config.stopBehavior === "remove-pid") {
+        try { unlinkSync(pidPath); } catch { /* preserve fixture state */ }
+      }
+    },
+  );
+  supervisor.discoverLegacySystemdUnits.mockImplementation(async () => {
+    const result = discoveries[Math.min(discoveryIndex++, discoveries.length - 1)]!;
+    if (config.mutatePidBeforeSecondDiscovery && discoveryIndex === 1) writeFileSync(pidPath, "9999", { mode: 0o600 });
+    return result;
+  });
+  if (config.startBehavior === "throw") supervisor.start.mockRejectedValue(new Error("stable start failed"));
+  const publicHealth = config.publicHealth === null ? null : config.publicHealth ?? health(4242, { version: "1.4.1", ownerId: "legacy-owner" });
+  const authenticatedHealth = config.authenticatedHealth === null
+    ? null
+    : config.authenticatedHealth ?? publicHealth;
+  const fetch = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+    if (url.endsWith("/stats/pool")) return response({ totalConnections: 0 }, config.accessStatus ?? 200);
+    const body = init?.headers ? authenticatedHealth : publicHealth;
+    return body === null ? response({ status: "warming" }, 200) : response(body);
+  }) as unknown as FetchOverride;
+  const ensure = vi.fn(async () => ({ connected: true, port: 19_999, spawned: true, startMethod: "systemd-user" as const }));
+  const kill = vi.fn();
+  const result = await restart({
+    ...baseOptions(dir),
+    _skipSpawn: false,
+    expectedVersion: "1.4.2",
+    enforceUserManagerParent: true,
+    _procRoot: procRoot,
+    _isProcessAliveOverride: () => aliveState.value,
+    _listeningPortsOverride: () => [...(config.listenerPorts ?? [19_999])],
+    _fetchOverride: fetch,
+    _killOverride: kill,
+    _supervisorOverride: supervisor.supervisor,
+    _ensureDaemonOverride: ensure,
+    _monotonicNowOverride: config.monotonicNow,
+  });
+  return { result, pidPath, supervisor, ensure, kill };
+}
+
 function testScopeFixture(prefix = "scope-"): { root: string; scope: DaemonLifecycleTestScope } {
   const dir = root(`lcm-coverage-restart-${prefix}`);
   const homeDir = join(dir, "home");
@@ -1235,6 +1368,200 @@ describe("managed restart refusal and repair coverage", () => {
     failed.stopAndStart.mockRejectedValue(new Error("manager stop"));
     const failure = await restart({ ...baseOptions(failedDir), enforceUserManagerParent: true, _supervisorOverride: failed.supervisor, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as unknown as FetchOverride });
     expect(failure.refusalReason).toBe("startup-failure");
+  });
+
+  it("migrates an authenticated legacy generated systemd daemon", async () => {
+    const dir = root("issue-600-legacy-positive-");
+    const procRoot = join(dir, "proc");
+    mkdirSync(procRoot, { recursive: true });
+    const pidPath = writePid(dir, 4242);
+    writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
+    writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
+    let alive = true;
+    const events: string[] = [];
+    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const managed = legacyMigrationSupervisor(
+      { kind: "candidates", candidates: [candidate] },
+      () => {
+        events.push("stop");
+        alive = false;
+        unlinkSync(pidPath);
+      },
+    );
+    managed.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      events.push("stable-probe");
+      return { kind: "absent" as const, name: spec.name };
+    });
+    managed.discoverLegacySystemdUnits.mockImplementation(async () => {
+      events.push("discover");
+      return { kind: "candidates" as const, candidates: [candidate] };
+    });
+    managed.start.mockImplementation(async () => {
+      events.push("stable-start");
+      return { kind: "systemd-user" as const, managerPid: 5252 };
+    });
+    const fetch = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+      if (url.endsWith("/stats/pool")) {
+        events.push("authenticated-access");
+        return response({ totalConnections: 0 });
+      }
+      events.push(init?.headers ? "authenticated-health" : "public-health");
+      return response(health(4242, {
+        version: "1.4.1",
+        ownerId: "legacy-owner",
+        entrypoint: "/lcm",
+      }));
+    }) as unknown as FetchOverride;
+    const ensureMock = vi.fn(async () => {
+      events.push("stable-admission");
+      return {
+        connected: true,
+        port: 19_999,
+        spawned: true,
+        pid: 5252,
+        startMethod: "systemd-user" as const,
+      };
+    });
+    const kill = vi.fn();
+
+    const result = await restart({
+      ...baseOptions(dir),
+      _skipSpawn: false,
+      expectedVersion: "1.4.2",
+      enforceUserManagerParent: true,
+      _procRoot: procRoot,
+      _isProcessAliveOverride: () => alive,
+      _listeningPortsOverride: () => [19_999],
+      _fetchOverride: fetch,
+      _killOverride: kill,
+      _supervisorOverride: managed.supervisor,
+      _ensureDaemonOverride: ensureMock,
+    });
+
+    expect(result).toMatchObject({
+      connected: true,
+      restarted: true,
+      stoppedPid: 4242,
+      startMethod: "systemd-user",
+    });
+    expect(events).toEqual([
+      "stable-probe",
+      "discover",
+      "public-health",
+      "authenticated-health",
+      "authenticated-access",
+      "discover",
+      "stop",
+      "stable-start",
+      "stable-admission",
+    ]);
+    expect(managed.stopAndStart).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+    expect(managed.stopLegacySystemdUnit).toHaveBeenCalledWith(candidate, { deadline: 100 });
+    expect(managed.start).toHaveBeenCalledWith(expect.objectContaining({ nonce: expect.any(String) }), { deadline: 100 });
+    expect(ensureMock).toHaveBeenCalledWith(expect.objectContaining({
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 5252,
+    }));
+    expect(existsSync(pidPath)).toBe(false);
+  });
+});
+
+describe("authenticated legacy generated systemd refusal matrix", () => {
+  const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+  const otherCandidate = { name: "lcm-daemon-5678-1720000000001.service", managerPid: 5678 };
+  const legacyHealth = (extra: Record<string, unknown> = {}): Record<string, unknown> => health(4242, {
+    version: "1.4.1",
+    ownerId: "legacy-owner",
+    ...extra,
+  });
+
+  it.each([
+    ["malformed PID before authentication", { pidState: "malformed" as const }, "ambiguous"],
+    ["symlink PID before authentication", { pidState: "symlink" as const }, undefined],
+    ["non-regular PID before authentication", { pidState: "directory" as const }, undefined],
+    ["missing token", { tokenState: "missing" as const }, "response-auth-failure"],
+    ["symlink token", { tokenState: "symlink" as const }, undefined],
+    ["dead PID", { alive: false }, "ambiguous"],
+    ["zero candidates", { discoveries: [{ kind: "candidates" as const, candidates: [] }] }, "ambiguous"],
+    ["multiple candidates", { discoveries: [{ kind: "candidates" as const, candidates: [candidate, otherCandidate] }] }, "ambiguous"],
+    ["disappearing candidate", { discoveries: [
+      { kind: "candidates" as const, candidates: [candidate] },
+      { kind: "candidates" as const, candidates: [] },
+    ] }, "ambiguous"],
+    ["manager PID mismatch", { discoveries: [{ kind: "candidates" as const, candidates: [{ ...candidate, managerPid: 5678 }] }] }, "invalid-collision"],
+    ["invalid public health", { publicHealth: { status: "warming", version: "1.4.1", pid: 4242 } }, "response-invalid"],
+    ["authenticated identity mismatch", { authenticatedHealth: legacyHealth({ pid: 9999 }) }, "response-auth-failure"],
+    ["diagnostics access failure", { accessStatus: 401 }, "response-auth-failure"],
+    ["current version", { publicHealth: legacyHealth({ version: "1.4.2" }), authenticatedHealth: legacyHealth({ version: "1.4.2" }) }, "response-invalid"],
+    ["newer version", { publicHealth: legacyHealth({ version: "1.4.3" }), authenticatedHealth: legacyHealth({ version: "1.4.3" }) }, "response-invalid"],
+    ["cross-minor version", { publicHealth: legacyHealth({ version: "1.5.1" }), authenticatedHealth: legacyHealth({ version: "1.5.1" }) }, "response-invalid"],
+    ["prerelease version", { publicHealth: legacyHealth({ version: "1.4.1-beta.1" }), authenticatedHealth: legacyHealth({ version: "1.4.1-beta.1" }) }, "response-invalid"],
+    ["wrong process", { processCommand: "node unrelated-service start --foreground" }, "invalid-collision"],
+    ["wrong entrypoint", { publicHealth: legacyHealth({ entrypoint: "/wrong" }), authenticatedHealth: legacyHealth({ entrypoint: "/wrong" }) }, "response-invalid"],
+    ["wrong listener", { listenerPorts: [] }, "invalid-collision"],
+    ["pre-stop candidate change", { discoveries: [
+      { kind: "candidates" as const, candidates: [candidate] },
+      { kind: "candidates" as const, candidates: [otherCandidate] },
+    ] }, "ambiguous"],
+    ["stop failure", { stopBehavior: "throw" as const }, "startup-failure"],
+    ["changed PID file after stop", { stopBehavior: "replace-pid" as const }, "ambiguous"],
+    ["PID remains alive after stop", { stopBehavior: "keep-alive" as const }, "startup-failure"],
+    ["descriptor replacement between reads", { mutatePidBeforeSecondDiscovery: true }, "ambiguous"],
+    ["manager discovery unavailable", { discoveries: [{ kind: "unavailable" as const, reason: "manager-timeout" }] }, "manager-unavailable"],
+  ] as const)("refuses $0 without broad mutation", async (_name, config, refusalReason) => {
+    const fixture = await runLegacyFixture(config);
+    expect(fixture.result).toMatchObject({ restarted: false });
+    if (refusalReason === undefined) expect(fixture.result.refusalReason).toBeUndefined();
+    else expect(fixture.result.refusalReason).toBe(refusalReason);
+    if (config.stopBehavior === undefined) expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
+    else expect(fixture.supervisor.stopLegacySystemdUnit).toHaveBeenCalledOnce();
+    expect(fixture.supervisor.start).not.toHaveBeenCalled();
+    expect(fixture.ensure).not.toHaveBeenCalled();
+    expect(fixture.kill).not.toHaveBeenCalled();
+  });
+
+  it("cleans an unchanged regular PID file after the exact legacy stop", async () => {
+    const fixture = await runLegacyFixture();
+    expect(fixture.result).toMatchObject({ restarted: true, stoppedPid: 4242 });
+    expect(fixture.supervisor.stopLegacySystemdUnit).toHaveBeenCalledOnce();
+    expect(fixture.supervisor.start).toHaveBeenCalledOnce();
+    expect(existsSync(fixture.pidPath)).toBe(false);
+  });
+
+  it("does not report a migrated restart when the stable start fails", async () => {
+    const fixture = await runLegacyFixture({ startBehavior: "throw" });
+    expect(fixture.result).toMatchObject({
+      restarted: false,
+      refusalReason: "startup-failure",
+      stoppedPid: 4242,
+    });
+    expect(fixture.supervisor.start).toHaveBeenCalledOnce();
+    expect(fixture.ensure).not.toHaveBeenCalled();
+  });
+
+  it("refuses interruption and deadline exhaustion before legacy mutation", async () => {
+    const interrupted = root("issue-600-legacy-interrupted-");
+    const signal = new AbortController();
+    signal.abort();
+    const interruptedFixture = legacyMigrationSupervisor({ kind: "candidates", candidates: [candidate] });
+    const interruptedResult = await restart({
+      ...baseOptions(interrupted),
+      enforceUserManagerParent: true,
+      _abortSignal: signal.signal,
+      _supervisorOverride: interruptedFixture.supervisor,
+    });
+    expect(interruptedResult).toMatchObject({ restarted: false });
+    expect(interruptedFixture.discoverLegacySystemdUnits).not.toHaveBeenCalled();
+    expect(interruptedFixture.stopLegacySystemdUnit).not.toHaveBeenCalled();
+
+    const deadlineClock = vi.fn().mockReturnValueOnce(0).mockReturnValue(100);
+    const deadlineFixture = await runLegacyFixture({ monotonicNow: deadlineClock });
+    // The fixture's clock expires after the stable probe and before the first
+    // authenticated legacy request, so no stop or stable start is allowed.
+    expect(deadlineFixture.result).toMatchObject({ restarted: false, refusalReason: "response-timeout" });
+    expect(deadlineFixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
+    expect(deadlineFixture.supervisor.start).not.toHaveBeenCalled();
   });
 });
 
