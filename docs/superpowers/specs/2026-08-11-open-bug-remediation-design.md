@@ -4,7 +4,9 @@
 
 Resolve every GitHub issue labeled `bug` that is open in
 `donadiosolutions/lcm` as of 2026-08-11. The initial inventory contains issues
-#600 through #605. Completion requires each bug to have root-cause evidence, a
+#600 through #605. During canonical verification, #606 and #607 were discovered
+and filed under the repository's mandatory bug-triage rule. Completion
+requires each bug to have root-cause evidence, a
 pre-fix failing regression, the smallest root-cause correction, complete
 documentation and Changesets decisions, the repository's exact 100% coverage
 gate, the mandated MoM review sequence, a merged signed-off PR, and verified
@@ -21,6 +23,8 @@ the work are not silently omitted.
 | #603 | Reproducible CLI compatibility defect | Accept occurrence-ordered repeatable `--tag` and `--tags` spellings for `lcm store`. |
 | #604 | Reproducible Codex passive-capture data-loss defect | Normalize observed native Codex exec payloads into the existing bounded extractor semantics and make connector doctor prove functional coverage without writes. |
 | #605 | Reproducible full-suite test-deadline defect | Give only the divergent-cache timestamp matrix a named 15-second test-owned deadline. |
+| #606 | Reproducible full-suite test-deadline defect | Give only the two snapshot-validation reconciliation scenarios a named 15-second test-owned deadline. |
+| #607 | Reproducible full-suite test-deadline defect | Give only the source-store re-fencing reconciliation scenario a named 15-second test-owned deadline. |
 
 The preliminary baseline is `origin/main` commit
 `3f15ab9f4dcf04e5ce8d6a82eb1255e3e64dfcc5`. Every branch and closure must be
@@ -34,7 +38,7 @@ test-only deadline contracts, CLI parsing changes, and passive-capture changes
 independently reviewable.
 
 1. `fix/600-legacy-daemon-upgrade-migration` — #600 plus this design document.
-2. `fix/601-605-test-determinism` — #601 and #605.
+2. `fix/601-605-test-determinism` — #601, #605, and verification-discovered #606/#607.
 3. `fix/602-603-store-help-tag-aliases` — #602 and #603.
 4. `fix/604-codex-post-tool-capture` — #604.
 
@@ -128,7 +132,7 @@ fail-closed ambiguity behavior, and why users should use `lcm doctor` or
 `lcm daemon restart` instead of manual process or wildcard service-manager
 commands. Add a patch Changeset.
 
-## PR 2: Full-Suite Test Determinism (#601, #605)
+## PR 2: Full-Suite Test Determinism (#601, #605, #606, #607)
 
 ### Root cause
 
@@ -138,6 +142,16 @@ matrix performs real worktree reconciliation and SQLite/cache validation. Both
 inherit Vitest's five-second wall-clock default and pass immediately in focused
 runs; under full parallel suite contention, individual cases have exceeded the
 default without an assertion or production failure.
+
+#606's two snapshot-validation reconciliation scenarios exercise the same
+real filesystem/SQLite pipeline. In a solo canonical coverage run they took
+5.983 and 6.080 seconds, timed out at the inherited five-second deadline, and
+then passed together in isolation.
+
+#607's source-store re-fencing scenario also performs real filesystem and
+SQLite reconciliation. It timed out once under full-suite load, then passed in
+3.40 seconds focused, 2.41 seconds under coverage, and on an exact full-suite
+rerun.
 
 These are test-owned deadline defects. The production algorithms, SQLite busy
 timeout, global Vitest timeout, pool topology, and collection scope remain
@@ -150,9 +164,14 @@ The reported timed-out test is already the failing regression for each issue:
 - `batch compaction discovery > handles absent, malformed, summarized, and
   replay discovery entries` for #601; and
 - `worktree reconciliation > rejects divergent cache rows independently of
-  '<description>' timestamp syntax` for #605.
+  '<description>' timestamp syntax` for #605; and
+- `worktree reconciliation > validates journal component snapshots before
+  merging` plus `accepts complete planned component snapshots before merging`
+  for #606; and
+- `worktree reconciliation > re-fences source stores when target merge markers
+  already exist` for #607.
 
-Preserve both scenarios and their assertions. Introduce a clearly named
+Preserve all scenarios and their assertions. Introduce a clearly named
 `15_000` ms test-owned deadline constant or equivalent explicit option and
 apply it only to those scenarios. This follows the established heavyweight
 SQLite/filesystem test pattern and is not a global relaxation. Adding a
@@ -328,7 +347,7 @@ After all four PRs merge:
 1. Fetch `origin/main` and prove each merge/fixing commit is reachable.
 2. Search GitHub again for every open issue labeled `bug`; investigate and
    include any issue opened during the workflow.
-3. Confirm #600 through #605 are closed with merged-PR evidence.
+3. Confirm #600 through #607 are closed with merged-PR evidence.
 4. In Codex, update the local main checkout exactly to `origin/main`, then run
    `npm run build`, `npm link`, `lcm doctor`, and `npm test`.
 5. Run `lcm connectors install codex` followed by
