@@ -33,10 +33,10 @@ Use four domain PRs. The split keeps the security-sensitive daemon migration,
 test-only deadline contracts, CLI parsing changes, and passive-capture changes
 independently reviewable.
 
-1. `fix/legacy-daemon-upgrade-migration` — #600 plus this design document.
-2. `fix/open-bug-test-determinism` — #601 and #605.
-3. `fix/store-help-and-tag-aliases` — #602 and #603.
-4. `fix/codex-post-tool-capture` — #604.
+1. `fix/600-legacy-daemon-upgrade-migration` — #600 plus this design document.
+2. `fix/601-605-test-determinism` — #601 and #605.
+3. `fix/602-603-store-help-tag-aliases` — #602 and #603.
+4. `fix/604-codex-post-tool-capture` — #604.
 
 The daemon, test-determinism, and CLI implementations may proceed in parallel
 from one reviewed planning head with disjoint write sets. The daemon PR merges

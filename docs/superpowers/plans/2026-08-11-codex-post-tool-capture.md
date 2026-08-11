@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Start only after the CLI PR for #602/#603 merges. Fetch updated `origin/main`, create a fresh isolated worker workspace at `UPDATED_MAIN=$(git rev-parse --verify 'origin/main^{commit}')`, require `test "$(git rev-parse HEAD)" = "$UPDATED_MAIN"`, persist it with `git update-ref refs/lcm/implementation-bases/codex-post-tool-capture "$UPDATED_MAIN"`, and create branch `fix/codex-post-tool-capture` from that durable ref; never use a `codex/` prefix.
+- Start only after the CLI PR for #602/#603 merges. Fetch updated `origin/main`, create a fresh isolated worker workspace at `UPDATED_MAIN=$(git rev-parse --verify 'origin/main^{commit}')`, require `test "$(git rev-parse HEAD)" = "$UPDATED_MAIN"`, persist it with `git update-ref refs/lcm/implementation-bases/issue-604-codex-post-tool "$UPDATED_MAIN"`, and create branch `fix/604-codex-post-tool-capture` from that durable ref; never use a `codex/` prefix.
 - Do not use, clean, stage, or modify the coordinator worktree or pre-existing files outside this branch.
 - Add no dependency and preserve exact pins and lockfile integrity.
 - Recognize only `client: "codex"` payloads with `functions.exec` or `functions.exec_command` names and explicit bounded command fields.
@@ -324,7 +324,7 @@ Expected: all commands exit zero and complete/per-file coverage is exactly 100% 
 
 ```bash
 IMPLEMENTATION_BASE=$(
-  git rev-parse --verify 'refs/lcm/implementation-bases/codex-post-tool-capture^{commit}'
+  git rev-parse --verify 'refs/lcm/implementation-bases/issue-604-codex-post-tool^{commit}'
 )
 git diff --check "$IMPLEMENTATION_BASE"...HEAD
 git status --short

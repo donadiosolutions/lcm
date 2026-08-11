@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- In a fresh isolated worker workspace, resolve `REVIEWED_PLANNING_HEAD=$(git rev-parse --verify 'refs/lcm/planning/open-bugs-2026-08-11^{commit}')`, require `test "$(git rev-parse HEAD)" = "$REVIEWED_PLANNING_HEAD"`, persist it with `git update-ref refs/lcm/implementation-bases/legacy-daemon-upgrade-migration "$REVIEWED_PLANNING_HEAD"`, and create branch `fix/legacy-daemon-upgrade-migration` from that exact SHA; never use a `codex/` prefix.
+- In a fresh isolated worker workspace, resolve `REVIEWED_PLANNING_HEAD=$(git rev-parse --verify 'refs/lcm/planning/open-bugs-2026-08-11^{commit}')`, require `test "$(git rev-parse HEAD)" = "$REVIEWED_PLANNING_HEAD"`, persist it with `git update-ref refs/lcm/implementation-bases/issue-600-legacy-daemon "$REVIEWED_PLANNING_HEAD"`, and create branch `fix/600-legacy-daemon-upgrade-migration` from that exact SHA; never use a `codex/` prefix.
 - Do not use, clean, stage, or modify the coordinator worktree or pre-existing files outside this branch.
 - The compatibility path is Linux/systemd-only and may mutate state only during explicit restart/doctor repair.
 - Historical name matching is discovery input, never ownership proof.
@@ -310,7 +310,7 @@ Expected: all commands exit zero and complete/per-file coverage is exactly 100% 
 
 ```bash
 IMPLEMENTATION_BASE=$(
-  git rev-parse --verify 'refs/lcm/implementation-bases/legacy-daemon-upgrade-migration^{commit}'
+  git rev-parse --verify 'refs/lcm/implementation-bases/issue-600-legacy-daemon^{commit}'
 )
 git diff --check "$IMPLEMENTATION_BASE"...HEAD
 git status --short

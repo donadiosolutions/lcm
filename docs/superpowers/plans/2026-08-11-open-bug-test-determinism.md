@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- In a fresh isolated worker workspace, resolve `REVIEWED_PLANNING_HEAD=$(git rev-parse --verify 'refs/lcm/planning/open-bugs-2026-08-11^{commit}')`, require `test "$(git rev-parse HEAD)" = "$REVIEWED_PLANNING_HEAD"`, persist it with `git update-ref refs/lcm/implementation-bases/open-bug-test-determinism "$REVIEWED_PLANNING_HEAD"`, and create branch `fix/open-bug-test-determinism` from that exact SHA; never use a `codex/` prefix.
+- In a fresh isolated worker workspace, resolve `REVIEWED_PLANNING_HEAD=$(git rev-parse --verify 'refs/lcm/planning/open-bugs-2026-08-11^{commit}')`, require `test "$(git rev-parse HEAD)" = "$REVIEWED_PLANNING_HEAD"`, persist it with `git update-ref refs/lcm/implementation-bases/issues-601-605-test-determinism "$REVIEWED_PLANNING_HEAD"`, and create branch `fix/601-605-test-determinism` from that exact SHA; never use a `codex/` prefix.
 - Do not use, clean, stage, or modify the coordinator worktree or pre-existing files outside this branch.
 - Modify only `test/batch-compact.test.ts` and `test/worktree-reconciliation.test.ts` unless verification exposes a directly caused test compile failure.
 - Add no dependency and do not modify production TypeScript, fixtures, Vitest configuration, global timeout, pool topology, or collection scope.
@@ -218,7 +218,7 @@ Expected: both complete suites pass and coverage reports exactly 100% lines, bra
 
 ```bash
 IMPLEMENTATION_BASE=$(
-  git rev-parse --verify 'refs/lcm/implementation-bases/open-bug-test-determinism^{commit}'
+  git rev-parse --verify 'refs/lcm/implementation-bases/issues-601-605-test-determinism^{commit}'
 )
 git diff --check "$IMPLEMENTATION_BASE"...HEAD
 git diff --name-only "$IMPLEMENTATION_BASE"...HEAD

@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- In a fresh isolated worker workspace, resolve `REVIEWED_PLANNING_HEAD=$(git rev-parse --verify 'refs/lcm/planning/open-bugs-2026-08-11^{commit}')`, require `test "$(git rev-parse HEAD)" = "$REVIEWED_PLANNING_HEAD"`, persist it with `git update-ref refs/lcm/implementation-bases/store-help-and-tag-aliases "$REVIEWED_PLANNING_HEAD"`, and create branch `fix/store-help-and-tag-aliases` from that exact SHA; never use a `codex/` prefix.
+- In a fresh isolated worker workspace, resolve `REVIEWED_PLANNING_HEAD=$(git rev-parse --verify 'refs/lcm/planning/open-bugs-2026-08-11^{commit}')`, require `test "$(git rev-parse HEAD)" = "$REVIEWED_PLANNING_HEAD"`, persist it with `git update-ref refs/lcm/implementation-bases/issues-602-603-store-cli "$REVIEWED_PLANNING_HEAD"`, and create branch `fix/602-603-store-help-tag-aliases` from that exact SHA; never use a `codex/` prefix.
 - Do not use, clean, stage, or modify the coordinator worktree or pre-existing files outside this branch.
 - This branch owns all CLI help/store changes and merges before #604 implementation begins; the Codex-hook worker must branch from the resulting updated `main`.
 - Add no dependency and preserve exact pins and lockfile integrity.
@@ -303,7 +303,7 @@ Expected: all tests pass with exactly 100% lines, branches, functions, and state
 
 ```bash
 IMPLEMENTATION_BASE=$(
-  git rev-parse --verify 'refs/lcm/implementation-bases/store-help-and-tag-aliases^{commit}'
+  git rev-parse --verify 'refs/lcm/implementation-bases/issues-602-603-store-cli^{commit}'
 )
 git diff --check "$IMPLEMENTATION_BASE"...HEAD
 git status --short
