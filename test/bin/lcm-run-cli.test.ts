@@ -512,6 +512,14 @@ describe("runCli daemon-backed and utility actions", () => {
     expect(await invoke(args)).toBeUndefined();
   });
 
+  it("preserves mixed store tag aliases in command-line order", async () => {
+    await invoke(["store", "memory", "--tag", "one", "--tags", "two", "--tag", "three"]);
+    expect(state.post).toHaveBeenCalledWith("/store", expect.objectContaining({
+      text: "memory",
+      tags: ["one", "two", "three"],
+    }));
+  });
+
   it.each([
     ["search", "q", "--limit", "0"], ["search", "q", "--layer", "bad"],
     ["grep", "q", "--mode", "bad"], ["grep", "q", "--scope", "bad"],
@@ -655,6 +663,15 @@ describe("runCli orchestration actions", () => {
     expect(await invoke(["import-knowledge", "input.json"])).toBeInstanceOf(BackendPublicationJournalError);
     expect(portable.exportKnowledge).not.toHaveBeenCalled();
     expect(portable.importKnowledge).not.toHaveBeenCalled();
+  });
+
+  it("preserves export --tags comma-separated filtering", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    await invoke(["export", "--tags", "one, two"]);
+    expect(portable.exportKnowledge).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ tags: ["one", "two"] }),
+    );
   });
 
   it.each([

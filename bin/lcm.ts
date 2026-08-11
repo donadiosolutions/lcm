@@ -456,7 +456,12 @@ export function registerMemoryCommands(program: Command): void {
   program
     .command("store <text>")
     .description("Store a durable memory entry for the current project")
-    .option("--tag <tag>", "Attach a tag to the stored memory (repeatable)", collectRepeatedOption, [])
+    .option(
+      "--tag, --tags <tag>",
+      "Attach a tag to the stored memory (repeatable)",
+      collectRepeatedOption,
+      [],
+    )
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (text: string, opts) => {
@@ -469,7 +474,7 @@ export function registerMemoryCommands(program: Command): void {
       const result = await client.post("/store", {
         cwd: process.cwd(),
         text,
-        tags: normalizeStringList(opts.tag) ?? [],
+        tags: normalizeStringList(opts.tags) ?? [],
         metadata: {},
       });
       printJson(result);
