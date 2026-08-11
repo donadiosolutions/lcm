@@ -1170,7 +1170,7 @@ async function createDaemonClientOrExit(
 /** @internal CLI entry seam; defaults preserve the published executable behavior. */
 export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
   const customHelp = resolveCustomHelpRequest(cliArgv);
-  if (customHelp) {
+  if (customHelp && cliArgv.slice(2).length > 0) {
     const cliHelp = await import("../src/cli-help.js");
     const hasCommandHelp = Object.prototype.hasOwnProperty.call(cliHelp, "hasCommandHelp")
       ? (cliHelp as { hasCommandHelp?: unknown }).hasCommandHelp
@@ -2778,6 +2778,11 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
     })();
   });
 
+  if (cliArgv.slice(2).length === 0) {
+    const { printHelp } = await import("../src/cli-help.js");
+    printHelp(customHelp?.command);
+    exit(0);
+  }
   await program.parseAsync(cliArgv);
   await unknownCommandCompletion;
 }
