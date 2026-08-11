@@ -29,6 +29,43 @@ setting, skip, retry, exclusion, or coverage exception.
 
 ---
 
+### Setup gate: Attach the reviewed addendum to the existing branch
+
+Run every command in
+`/home/bcdonadio/.codex/worktrees/b6b7/lcm-issues-601-605`. Before editing:
+
+```bash
+EXPECTED_EXISTING_TIP=cacbc208042caa45f0d397a1f2b9ee482c511bba
+EXISTING_TEST_BRANCH_TIP=$(
+  git rev-parse --verify 'refs/heads/fix/601-605-test-determinism^{commit}'
+)
+REVIEWED_ADDENDUM_HEAD=$(
+  git rev-parse --verify 'refs/lcm/planning/open-bugs-2026-08-11^{commit}'
+)
+test "$(git rev-parse --show-toplevel)" = +  "/home/bcdonadio/.codex/worktrees/b6b7/lcm-issues-601-605"
+test "$(git branch --show-current)" = "fix/601-605-test-determinism"
+test "$(git rev-parse HEAD)" = "$EXISTING_TEST_BRANCH_TIP"
+test "$EXISTING_TEST_BRANCH_TIP" = "$EXPECTED_EXISTING_TIP"
+git merge-base --is-ancestor +  8a05bc794dddd29b2b39adac62c22c651ebf1cda +  "$EXISTING_TEST_BRANCH_TIP"
+git merge-base --is-ancestor +  cacbc208042caa45f0d397a1f2b9ee482c511bba +  "$EXISTING_TEST_BRANCH_TIP"
+git update-ref +  refs/lcm/extension-bases/issues-606-607 +  "$EXISTING_TEST_BRANCH_TIP"
+```
+
+Require a clean worktree and valid GPG/DCO evidence for the existing two
+implementation commits. Then intentionally attach the separately reviewed,
+signed planning history with one signed no-fast-forward merge:
+
+```bash
+git merge --no-ff -S --signoff +  -m "docs: merge reviewed timeout addendum" +  "$REVIEWED_ADDENDUM_HEAD"
+git merge-base --is-ancestor "$EXISTING_TEST_BRANCH_TIP" HEAD
+git merge-base --is-ancestor "$REVIEWED_ADDENDUM_HEAD" HEAD
+git status --short
+```
+
+Require the merge to be conflict-free and the worktree to remain clean. If any
+identity, SHA, ancestry, signature, or merge condition differs, stop without
+editing tests.
+
 ### Task 1: Bound the two snapshot-validation regressions
 
 **Files:**
@@ -193,14 +230,31 @@ IMPLEMENTATION_BASE=$(
   git rev-parse --verify \
     'refs/lcm/implementation-bases/issues-601-605-test-determinism^{commit}'
 )
+EXTENSION_BASE=$(
+  git rev-parse --verify \
+    'refs/lcm/extension-bases/issues-606-607^{commit}'
+)
+REVIEWED_ADDENDUM_HEAD=$(
+  git rev-parse --verify \
+    'refs/lcm/planning/open-bugs-2026-08-11^{commit}'
+)
+test "$(git branch --show-current)" = "fix/601-605-test-determinism"
+git merge-base --is-ancestor "$IMPLEMENTATION_BASE" HEAD
+git merge-base --is-ancestor "$EXTENSION_BASE" HEAD
+git merge-base --is-ancestor "$REVIEWED_ADDENDUM_HEAD" HEAD
 git diff --check "$IMPLEMENTATION_BASE"...HEAD
 git diff --name-only "$IMPLEMENTATION_BASE"...HEAD
+git diff --check "$EXTENSION_BASE"...HEAD
+git diff --name-only "$EXTENSION_BASE"...HEAD
 git status --short
 git log --show-signature --format=fuller "$IMPLEMENTATION_BASE"..HEAD
 ```
 
 Require only the planning documents and the two intended test files in the
-branch diff, a clean worktree, valid GPG signatures, and DCO trailers.
+complete implementation-base diff. Require only the reviewed planning
+documents and `test/worktree-reconciliation.test.ts` in the extension-base
+diff. Require a clean worktree, valid GPG signatures, DCO trailers, and both
+the existing implementation and reviewed planning histories as ancestors.
 
 ### Task 4: Preserve evidence for the MoM review package
 
