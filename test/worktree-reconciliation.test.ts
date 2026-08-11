@@ -59,6 +59,7 @@ const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const CACHE_RECONCILIATION_TIMEOUT_MS = 10_000;
 const FULL_SUITE_RECONCILIATION_TEST_TIMEOUT_MS = 15_000;
 const FULL_SUITE_SNAPSHOT_VALIDATION_TEST_TIMEOUT_MS = 15_000;
+const FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS = 15_000;
 // Full-suite child-process contention can exceed Vitest's 5-second default.
 const FULL_SUITE_PROCESS_TEST_TIMEOUT_MS = 15_000;
 const PRIVATE_DIRECTORY_MODE = 0o700;
@@ -5720,7 +5721,7 @@ describe("worktree reconciliation", () => {
     expect(merged.prepare("SELECT COUNT(*) AS count FROM conversations").get())
       .toEqual({ count: 1 });
     merged.close();
-  });
+  }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
 
   it("fails closed when a planned source disappears or its binding changes", () => {
     const { main, linked } = makeRepository(home);
