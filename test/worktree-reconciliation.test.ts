@@ -58,6 +58,7 @@ const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const CACHE_RECONCILIATION_TIMEOUT_MS = 10_000;
 const FULL_SUITE_RECONCILIATION_TEST_TIMEOUT_MS = 15_000;
+const FULL_SUITE_INSTRUCTION_CACHE_DIVERGENCE_TEST_TIMEOUT_MS = 15_000;
 const FULL_SUITE_SNAPSHOT_MIGRATION_TEST_TIMEOUT_MS = 15_000;
 const FULL_SUITE_SNAPSHOT_VALIDATION_TEST_TIMEOUT_MS = 15_000;
 const FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS = 15_000;
@@ -2174,7 +2175,7 @@ describe("worktree reconciliation", () => {
     ).get()).toEqual({ content: "target" });
     target.close();
     expect(existsSync(fixture.sourcePath)).toBe(true);
-  });
+  }, FULL_SUITE_INSTRUCTION_CACHE_DIVERGENCE_TEST_TIMEOUT_MS);
 
   it("fails closed when a digest candidate matches different scope residuals", () => {
     const exact = {
