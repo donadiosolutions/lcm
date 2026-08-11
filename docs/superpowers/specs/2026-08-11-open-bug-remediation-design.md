@@ -4,7 +4,7 @@
 
 Resolve every GitHub issue labeled `bug` that is open in
 `donadiosolutions/lcm` as of 2026-08-11. The initial inventory contains issues
-#600 through #605. During canonical verification, #606 through #609 were
+#600 through #605. During canonical verification, #606 through #610 were
 discovered and filed under the repository's mandatory bug-triage rule.
 Completion requires each bug to have root-cause evidence, a
 pre-fix failing regression, the smallest root-cause correction, complete
@@ -27,6 +27,7 @@ the work are not silently omitted.
 | #607 | Reproducible full-suite test-deadline defect | Give only the source-store re-fencing reconciliation scenario a named 15-second test-owned deadline. |
 | #608 | Reproducible full-suite test-deadline defect | Give only the three snapshot-migration reconciliation scenarios a named 15-second test-owned deadline. |
 | #609 | Reproducible full-suite test-deadline defect | Give only the instruction-cache divergence scenario a named 15-second test-owned deadline. |
+| #610 | Reproducible full-suite test-deadline defect | Give only the completed no-op journal source-rediscovery scenario a named 15-second test-owned deadline. |
 
 The preliminary baseline is `origin/main` commit
 `3f15ab9f4dcf04e5ce8d6a82eb1255e3e64dfcc5`. Every branch and closure must be
@@ -40,7 +41,7 @@ test-only deadline contracts, CLI parsing changes, and passive-capture changes
 independently reviewable.
 
 1. `fix/600-legacy-daemon-upgrade-migration` — #600 plus this design document.
-2. `fix/601-605-test-determinism` — #601, #605, and verification-discovered #606–#609.
+2. `fix/601-605-test-determinism` — #601, #605, and verification-discovered #606–#610.
 3. `fix/602-603-store-help-tag-aliases` — #602 and #603.
 4. `fix/604-codex-post-tool-capture` — #604.
 
@@ -134,7 +135,7 @@ fail-closed ambiguity behavior, and why users should use `lcm doctor` or
 `lcm daemon restart` instead of manual process or wildcard service-manager
 commands. Add a patch Changeset.
 
-## PR 2: Full-Suite Test Determinism (#601, #605, #606–#609)
+## PR 2: Full-Suite Test Determinism (#601, #605, #606–#610)
 
 ### Root cause
 
@@ -160,6 +161,11 @@ divergence scenario likewise perform real filesystem/SQLite reconciliation.
 They timed out in separate fresh coverage runs but passed immediately in
 focused comparisons, isolating additional inherited-deadline defects.
 
+#610's completed no-op journal source-rediscovery scenario crossed the same
+inherited five-second deadline at 5.352 seconds in the next fresh coverage run.
+The unchanged focused baseline and deterministic RED command remain part of
+its required TDD plan.
+
 These are test-owned deadline defects. The production algorithms, SQLite busy
 timeout, global Vitest timeout, pool topology, and collection scope remain
 unchanged.
@@ -179,7 +185,9 @@ The reported timed-out test is already the failing regression for each issue:
   already exist` for #607;
 - the three snapshot-migration scenarios named in #608; and
 - `worktree reconciliation > fails closed on instruction-cache divergence`
-  for #609.
+  for #609; and
+- `worktree reconciliation > rediscovers mapped sources after a completed
+  no-op journal` for #610.
 
 Preserve all scenarios and their assertions. Introduce a clearly named
 `15_000` ms test-owned deadline constant or equivalent explicit option and
@@ -357,7 +365,7 @@ After all four PRs merge:
 1. Fetch `origin/main` and prove each merge/fixing commit is reachable.
 2. Search GitHub again for every open issue labeled `bug`; investigate and
    include any issue opened during the workflow.
-3. Confirm #600 through #609 are closed with merged-PR evidence.
+3. Confirm #600 through #610 are closed with merged-PR evidence.
 4. In Codex, update the local main checkout exactly to `origin/main`, then run
    `npm run build`, `npm link`, `lcm doctor`, and `npm test`.
 5. Run `lcm connectors install codex` followed by
