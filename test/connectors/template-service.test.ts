@@ -81,8 +81,10 @@ describe('generateRulesContent', () => {
     expect(content).toContain('lcm describe <nodeId>');
     expect(content).toContain('lcm expand <nodeId> --depth N');
     expect(content).toContain('lcm store');
-    expect(content).toContain('--tag, --tags <tag>');
+    expect(content).toContain('lcm store "content" --tag <tag>');
+    expect(content).toContain('`--tag <tag>` and `--tags <tag>` are repeatable aliases');
     expect(content).toContain('--tag type:solution --tags scope:lcm');
+    expect(content).not.toContain('--tag,');
     expect(content).toContain('lcm doctor');
     expect(content).toContain('lcm diagnose');
     expect(content).toContain('`lcm import`');

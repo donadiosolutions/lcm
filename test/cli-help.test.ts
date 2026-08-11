@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { printHelp } from "../src/cli-help.js";
+import { hasCommandHelp, printHelp } from "../src/cli-help.js";
+
+describe("hasCommandHelp", () => {
+  it("recognizes a known topic and rejects an unknown topic", () => {
+    expect(hasCommandHelp("store")).toBe(true);
+    expect(hasCommandHelp("not-a-real-command")).toBe(false);
+  });
+});
 
 describe("printHelp — full reference", () => {
   afterEach(() => { vi.restoreAllMocks(); });
