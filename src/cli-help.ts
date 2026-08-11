@@ -204,14 +204,15 @@ const HELP: Record<string, CommandHelp> = {
 
   store: {
     summary: "Store a durable memory entry for the current project.",
-    usage: "lcm store <text> [--tag <tag>]",
+    usage: "lcm store <text> [--tag, --tags <tag>]",
     options: [
-      ["--tag <tag>", "Attach a tag to the stored memory (repeatable)"],
+      ["--tag, --tags <tag>", "Attach a tag to the stored memory (repeatable; aliases may be mixed)"],
     ],
     examples: [
       ["lcm store \"Auth uses JWT with 24h expiry\"", "Store a plain-text memory"],
-      ["lcm store \"Use ensureDaemon before background promote\" --tag type:solution --tag scope:lcm", "Store a tagged memory"],
+      ["lcm store \"Use ensureDaemon before background promote\" --tag type:solution --tags scope:lcm", "Store a tagged memory; aliases preserve occurrence order"],
     ],
+    notes: "Each --tag or --tags occurrence attaches one tag; the spellings may be mixed and preserve command-line order. This differs from export --tags, which accepts a comma-separated filter. For known commands, --help is resolved before required arguments and command actions.",
   },
 
   compact: {

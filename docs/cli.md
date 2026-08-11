@@ -18,7 +18,20 @@ lcm connectors install --help
 
 Nested help is resolved before command execution. A help request therefore
 never starts the daemon, changes a machine or project identity, installs or removes
-a connector, or performs another command action.
+a connector, or performs another command action. For known commands, this
+preflight happens before required-argument validation, so `lcm store --help`
+and other incomplete command forms still show the relevant help page.
+
+The store command accepts one tag per occurrence using either long spelling;
+the aliases can be mixed and retain command-line order:
+
+```bash
+lcm store "Use ensureDaemon before background promote" --tag type:solution --tags scope:lcm
+```
+
+In `lcm store`, `--tag` and `--tags` are repeatable single-tag aliases. This is
+different from `lcm export --tags`, which remains a comma-separated filter,
+for example `lcm export --tags decision,architecture`.
 
 An unknown command writes an error and the complete command list to the
 terminal, completes both outputs, and then exits with status 1.

@@ -79,6 +79,14 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("lcm daemon restart");
   });
 
+  it("prints both ordered store tag aliases", () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    printHelp("store");
+    const text = out.mock.calls.map(c => c[0]).join("");
+    expect(text).toContain("--tag, --tags <tag>");
+    expect(text).toContain("--tag type:solution --tags scope:lcm");
+  });
+
   it("prints daemon restart help", () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     printHelp("daemon");

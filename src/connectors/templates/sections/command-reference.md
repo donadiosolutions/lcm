@@ -4,7 +4,8 @@
 - `lcm grep "pattern" --mode regex` — Regex search across messages and summaries
 - `lcm describe <nodeId>` — Inspect metadata for a specific memory node
 - `lcm expand <nodeId> --depth N` — Expand a summary node into lower-level detail
-- `lcm store "content"` — Persist knowledge to promoted memory
+- `lcm store "content" --tag, --tags <tag>` — Persist knowledge to promoted memory; repeatable aliases may be mixed in command-line order
+- `lcm store "content" --tag type:solution --tags scope:lcm` — Store one ordered pair of tags using both spellings
 - `lcm doctor` — Run diagnostics
 - `lcm diagnose` — Scan recent sessions for hook and MCP issues
 - `lcm import` — Import default agent session transcripts into memory
