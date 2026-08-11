@@ -38,6 +38,17 @@ lcm install
 lcm doctor
 ```
 
+On Linux, an upgrade from LCM v1.4.1 to v1.4.2 can leave one authenticated
+legacy transient systemd service running while the new stable service name is
+absent. The first `lcm doctor` after the upgrade, or an explicit
+`lcm daemon restart`, performs a one-time migration only when the manager PID,
+canonical PID/token files, authenticated health identity, older same-line
+version, process entrypoint, and loopback listener all agree. A changing,
+ambiguous, symlinked, malformed, or unauthorized candidate is not stopped and
+does not trigger a competing start. See the [managed daemon recovery guide](daemon-restart-recovery.md#one-time-migration-after-a-linux-upgrade)
+for the checks and safe refusal behavior. Never stop a wildcard service or
+start a second daemon manually during an upgrade.
+
 The hook commands and MCP server use absolute paths into the installed npm
 package. LCM owns the MCP entry's `type`, `command`, and `args`; `env` and any
 other compatible user- or Claude-managed options, sibling MCP servers, and

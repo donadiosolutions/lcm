@@ -99,6 +99,47 @@ validates the complete effective configuration before asking the manager to
 replace the service, then waits for authenticated health. Run it once after a
 configuration or package update instead of starting a competing daemon.
 
+## One-time migration after a Linux upgrade
+
+An installation upgraded from LCM v1.4.1 to v1.4.2 may still have its daemon
+inside the older generated transient systemd unit. v1.4.2 uses a stable
+state-root unit name, so the stable unit can initially appear absent while the
+older daemon is still serving requests.
+
+During `lcm doctor` or an explicit `lcm daemon restart`, LCM can migrate that
+old unit once, but only when all of these independent checks agree:
+
+- the canonical `daemon.pid` is a stable, regular, non-symlink file naming a
+  live process;
+- exactly one strictly formatted historical unit name is reported by the
+  current user's systemd manager, and its manager PID matches the PID file;
+- the daemon answers public health and token-authenticated health/access
+  requests with the same PID, owner, storage identity, and an older
+  `major.minor.patch` version in the installed major/minor line;
+- the process command and entrypoint identify an LCM daemon, and that same PID
+  owns the configured `127.0.0.1` listener; and
+- a fresh discovery immediately before mutation still identifies the same
+  single unit.
+
+Only after those checks pass does LCM stop that exact unit through
+`systemctl --user`, wait for exact unit absence and PID death, and start the
+stable managed unit. A graceful daemon may remove `daemon.pid` while it exits;
+that expected disappearance is accepted. If the unchanged PID file remains,
+LCM removes it only after proving that its file identity and PID did not
+change.
+
+Ambiguous, replaced, symlinked, malformed, unauthorized, or otherwise
+incomplete evidence is left untouched. LCM refuses multiple or changing
+candidates, changed PID files, failed stops, live PIDs, and unresolved manager
+states; it does not start a competing daemon after such a refusal. Do not use
+wildcard service stops, `kill`, `pkill`, or a second manual daemon start.
+Run the canonical commands and preserve their refusal guidance:
+
+```bash
+lcm doctor
+lcm daemon restart
+```
+
 ## Configuration and security boundary
 
 `daemon.idleTimeoutMs` controls how long an otherwise idle daemon may remain

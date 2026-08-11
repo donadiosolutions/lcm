@@ -28,6 +28,7 @@ type FakeChild = EventEmitter & {
 
 const mocks = vi.hoisted(() => ({
   ensureDaemon: vi.fn(),
+  restartDaemon: vi.fn(),
   collectEvents: vi.fn(),
   collectDetailedEvents: vi.fn(),
   spawnSync: vi.fn(),
@@ -38,7 +39,10 @@ const mocks = vi.hoisted(() => ({
   mcpChild: undefined as FakeChild | undefined,
 }));
 
-vi.mock("../src/daemon/lifecycle.js", () => ({ ensureDaemon: mocks.ensureDaemon }));
+vi.mock("../src/daemon/lifecycle.js", () => ({
+  ensureDaemon: mocks.ensureDaemon,
+  restartDaemon: mocks.restartDaemon,
+}));
 vi.mock("../src/db/events-stats.js", () => ({
   collectEventStats: (...args: unknown[]) => mocks.collectEvents(...args),
   collectDetailedEventStats: (...args: unknown[]) => mocks.collectDetailedEvents(...args),
@@ -171,6 +175,7 @@ describe("doctor service coverage", () => {
     vi.useRealTimers();
     vi.clearAllMocks();
     mocks.ensureDaemon.mockResolvedValue({ connected: false });
+    mocks.restartDaemon.mockResolvedValue({ connected: false, restarted: false });
     mocks.spawnSync.mockReturnValue({ status: 0, stdout: "", stderr: "" });
     mocks.collectEvents.mockReturnValue({ captured: 1, unprocessed: 0, errors: 0, lastCapture: null });
     mocks.collectDetailedEvents.mockReturnValue({ captured: 1, unprocessed: 0, errors: 0, lastCapture: null, projects: [], recentErrors: [] });
@@ -1170,7 +1175,7 @@ describe("doctor service coverage", () => {
   it("covers daemon restart failure, offline rejection, and warning-bearing successful restarts", async () => {
     let results: CheckResult[];
 
-    mocks.ensureDaemon.mockResolvedValueOnce({ connected: false });
+    mocks.restartDaemon.mockResolvedValueOnce({ connected: false, restarted: false });
     results = await runDoctor(makeDeps({ health: [{ ok: true, json: async () => ({ status: "ok", version: "old" }) }] }));
     expect(results.find((result) => result.name === "daemon")?.message).toContain("restart failed");
 
@@ -1180,7 +1185,7 @@ describe("doctor service coverage", () => {
 
     vi.useFakeTimers();
     mocks.mcpStdout = JSON.stringify({ id: 2, result: { tools: Array(7).fill({}) } });
-    mocks.ensureDaemon.mockResolvedValueOnce({ connected: true, warning: "restart warning" });
+    mocks.restartDaemon.mockResolvedValueOnce({ connected: true, restarted: true, warning: "restart warning" });
     results = await runWithHandshake(makeDeps({ health: [
       { ok: true, json: async () => ({ status: "ok", version: "old" }) },
       { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },

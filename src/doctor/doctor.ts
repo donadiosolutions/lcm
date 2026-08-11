@@ -999,8 +999,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     const versionMismatch = Boolean(pkgVersion && daemonVersion !== pkgVersion);
     const daemonVersionLabel = daemonVersion ? `v${daemonVersion}` : "unknown version";
     try {
-      const { ensureDaemon } = await import("../daemon/lifecycle.js");
-      const ensureResult = await ensureDaemon({
+      const { ensureDaemon, restartDaemon } = await import("../daemon/lifecycle.js");
+      const lifecycleOperation = versionMismatch ? restartDaemon : ensureDaemon;
+      const ensureResult = await lifecycleOperation({
         port: config.port,
         pidFilePath,
         spawnTimeoutMs: 10000,
