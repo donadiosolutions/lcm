@@ -38,11 +38,14 @@ independently reviewable.
 3. `fix/store-help-and-tag-aliases` — #602 and #603.
 4. `fix/codex-post-tool-capture` — #604.
 
-Implementation may proceed in parallel from one reviewed design commit with
-disjoint write sets. The daemon PR merges first so the design commit becomes
-reachable from `main`; the remaining PR diffs then contain only their domain
-changes. Each remaining branch must sync with updated `main` before its final
-full verification. Use merge commits, never rebase-merging or squashing.
+The daemon, test-determinism, and CLI implementations may proceed in parallel
+from one reviewed planning head with disjoint write sets. The daemon PR merges
+first so the shared design and plan commits become reachable from `main`; the
+test and CLI branches then sync with updated `main` before final verification.
+The Codex-hook branch starts only after the CLI PR merges because both domains
+necessarily modify `bin/lcm.ts` and `test/bin/lcm-run-cli.test.ts`; sequencing
+them avoids an unsafe parallel write set. Use merge commits, never
+rebase-merging or squashing.
 
 ## PR 1: Authenticated Legacy Daemon Migration (#600)
 
@@ -282,13 +285,13 @@ After focused and complete verification, each whole branch receives parallel
 maximum-effort adversarial review from:
 
 - `cortex-hq/zai-org-GLM-5.2`; and
-- `openrouter-personal/moonshotai-kimi-k3` using the required explicit model
+- `xai/grok-4.5` using the required explicit model
   slug even when it is absent from the advertised model roster.
 
 An `anthropic/claude-opus-5` subagent at medium effort then receives the branch,
-the complete GLM report, and the complete Kimi report and produces the
-second-pass merge verdict. If the requested Kimi route fails, retain the exact
-tool failure as evidence; never silently substitute a non-Kimi reviewer.
+the complete GLM report, and the complete Grok report and produces the
+second-pass merge verdict. If the requested Grok route fails, retain the exact
+tool failure as evidence; never silently substitute another reviewer.
 
 Any finding returns to the appropriate Luna implementation worker. Review
 feedback is evaluated through the receiving-code-review workflow; fixes receive
