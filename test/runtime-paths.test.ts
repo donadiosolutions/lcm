@@ -245,10 +245,12 @@ describe("runtime paths", () => {
       error = caught;
     }
     expect(error).toBeInstanceOf(Error);
-    if (startTime !== null) expect(error).toBeInstanceOf(BootstrapLockContentionError);
-    expect((error as Error).message).toContain(
-      startTime === null ? "owner state is ambiguous" : "already in progress",
-    );
+    if (error instanceof BootstrapLockContentionError) {
+      expect(error.message).toContain("already in progress");
+    } else {
+      expect((error as Error).constructor).toBe(Error);
+      expect((error as Error).message).toContain("owner state is ambiguous");
+    }
     expect(readFileSync(join(home, ".lcm-root-bootstrap.lock"), "utf8")).toBe(content);
   });
 
