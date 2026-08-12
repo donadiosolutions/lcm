@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import { generateRulesContent, generateMcpContent, generateSkillContent, generateContent } from '../../src/connectors/template-service.js';
 import { LCM_MARKERS } from '../../src/connectors/constants.js';
@@ -36,6 +37,8 @@ const codexAgent: Agent = {
 function countOccurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
 }
+
+const canonicalTagSchema = readFileSync(new URL('../../docs/tag-schema.md', import.meta.url), 'utf8');
 
 describe('generateRulesContent', () => {
   it('contains lcm search command', () => {
@@ -81,10 +84,22 @@ describe('generateRulesContent', () => {
     expect(content).toContain('lcm describe <nodeId>');
     expect(content).toContain('lcm expand <nodeId> --depth N');
     expect(content).toContain('lcm store');
-    expect(content).toContain('`lcm store "content" --tag type:solution`');
-    expect(content).toContain('`--tag <tag>` and `--tags <tag>` are repeatable aliases');
-    expect(content).toContain('--tag type:solution --tags scope:lcm');
+    expect(content).toContain(
+      '`lcm store "content" --tag type:solution --tag scope:lcm` — Store a solution related to LCM.',
+    );
+    expect(content).toContain('## Tag conventions');
+    expect(content).toContain('Use these basic conventions by default; add others as needed:');
+    expect(content).toContain('`type:` — Kind of learning, such as `solution`, `decision`, `root-cause`, `workflow`, or `gotcha`');
+    expect(content).toContain('`project:` — Project or repository, such as `lcm`');
+    expect(content).toContain('`scope:` — Component or domain, such as `connectors`, `hooks`, or `codecov`');
+    for (const scopeTag of ['scope:connectors', 'scope:hooks', 'scope:codecov']) {
+      expect(canonicalTagSchema).toContain(`| \`${scopeTag}\` |`);
+    }
+    expect(content).toContain('`source:` — Origin, such as `session`, `adversarial-review`, or `ci`');
+    expect(content).toContain('`priority:` — Importance, from `P0` to `P3`');
     expect(content).not.toContain('`lcm store "content" --tag <tag>`');
+    expect(content).not.toContain('--tags');
+    expect(content).not.toContain('repeatable aliases');
     expect(content).not.toContain('--tag,');
     expect(content).toContain('lcm doctor');
     expect(content).toContain('lcm diagnose');

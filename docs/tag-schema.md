@@ -40,6 +40,9 @@ All tags follow the `<prefix>:<value>` format. Free-text tags (no colon) are all
 | `scope:security` | Secret scanning, auth, access control |
 | `scope:testing` | Test strategy, test infrastructure, test failures |
 | `scope:ci` | CI/CD pipelines, GitHub Actions, release automation |
+| `scope:connectors` | Connector integrations, installation, and generated templates |
+| `scope:hooks` | Hook behavior, lifecycle, and integration |
+| `scope:codecov` | Codecov coverage components, flags, and thresholds |
 
 ### `priority:` — how urgent or important?
 
