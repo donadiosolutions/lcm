@@ -41,6 +41,32 @@ describe("handlePostToolUse", () => {
     }
   }
 
+  function readPersistedEvents(inputCwd: string): readonly Record<string, unknown>[] {
+    const db = new EventsDb(eventsDbPath(inputCwd));
+    try {
+      return db.getUnprocessed() as unknown as readonly Record<string, unknown>[];
+    } finally {
+      db.close();
+    }
+  }
+
+  async function runNativePersistenceCase(
+    payload: Record<string, unknown>,
+    includeDefaultClient = true,
+  ): Promise<readonly Record<string, unknown>[]> {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-native-cwd-"));
+    extraDirs.push(inputCwd);
+    process.env.TEST_EVENTS_DIR = inputCwd;
+    const request = {
+      session_id: "native-codex-session",
+      cwd: inputCwd,
+      ...payload,
+    };
+    if (includeDefaultClient && !Object.hasOwn(request, "client")) request.client = "codex";
+    await handlePostToolUse(JSON.stringify(request));
+    return readPersistedEvents(inputCwd);
+  }
+
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "post-tool-test-"));
     homeDir = mkdtempSync(join(tmpdir(), "post-tool-home-"));
@@ -266,6 +292,150 @@ describe("handlePostToolUse", () => {
     }));
 
     expectPersistedDecision(inputCwd);
+  });
+
+  it.each([
+    {
+      name: "functions.exec command Git event",
+      tool_name: "functions.exec",
+      tool_input: { command: "git branch capture-test" },
+      expected: { type: "git_branch", category: "git", data: "git branch", priority: 2 },
+    },
+    {
+      name: "functions.exec_command cmd environment event",
+      tool_name: "functions.exec_command",
+      tool_input: { cmd: "npm install capture-test" },
+      expected: { type: "env_install", category: "env", data: "npm install capture-test", priority: 2 },
+    },
+    {
+      name: "functions.exec isError error event",
+      tool_name: "functions.exec",
+      tool_input: { command: "git branch capture-test" },
+      tool_output: { isError: true },
+      expected: { type: "error_tool", category: "error", data: "Bash error: git branch capture-test", priority: 1 },
+    },
+    {
+      name: "functions.exec_command is_error error event",
+      tool_name: "functions.exec_command",
+      tool_input: { cmd: "npm install capture-test" },
+      tool_output: { is_error: true },
+      expected: { type: "error_tool", category: "error", data: "Bash error: npm install capture-test", priority: 1 },
+    },
+    {
+      name: "functions.exec nonzero exit_code error event",
+      tool_name: "functions.exec",
+      tool_input: { command: "git branch capture-test" },
+      tool_response: { exit_code: 2 },
+      expected: { type: "error_tool", category: "error", data: "Bash error: git branch capture-test", priority: 1 },
+    },
+    {
+      name: "functions.exec_command nonzero exitCode error event",
+      tool_name: "functions.exec_command",
+      tool_input: { cmd: "npm install capture-test" },
+      tool_response: { exitCode: 2 },
+      expected: { type: "error_tool", category: "error", data: "Bash error: npm install capture-test", priority: 1 },
+    },
+    {
+      name: "functions.exec zero exit_code normal event",
+      tool_name: "functions.exec",
+      tool_input: { command: "git branch capture-test" },
+      tool_output: { exit_code: 0 },
+      expected: { type: "git_branch", category: "git", data: "git branch", priority: 2 },
+    },
+    {
+      name: "functions.exec_command zero exitCode normal event",
+      tool_name: "functions.exec_command",
+      tool_input: { cmd: "npm install capture-test" },
+      tool_response: { exitCode: 0 },
+      expected: { type: "env_install", category: "env", data: "npm install capture-test", priority: 2 },
+    },
+    {
+      name: "functions.exec output status takes precedence over response status",
+      tool_name: "functions.exec",
+      tool_input: { command: "git branch capture-test", cmd: "npm install ignored" },
+      tool_output: { isError: false, is_error: true, exit_code: 2, exitCode: 3 },
+      tool_response: { isError: true },
+      expected: { type: "git_branch", category: "git", data: "git branch", priority: 2 },
+    },
+    {
+      name: "functions.exec response field precedence uses isError before aliases and codes",
+      tool_name: "functions.exec",
+      tool_input: { command: "git branch capture-test" },
+      tool_response: { isError: true, is_error: false, exit_code: 0, exitCode: 0 },
+      expected: { type: "error_tool", category: "error", data: "Bash error: git branch capture-test", priority: 1 },
+    },
+  ] as const)("persists native Codex $name through EventsDb", async ({ expected, ...payload }) => {
+    const rows = await runNativePersistenceCase(payload);
+    expect(rows).toEqual([
+      expect.objectContaining({
+        session_id: "native-codex-session",
+        source_hook: "PostToolUse",
+        ...expected,
+      }),
+    ]);
+  });
+
+  it.each([
+    { name: "functions.exec success", tool_name: "functions.exec", tool_input: { command: "lcm store capture-test" } },
+    { name: "functions.exec error", tool_name: "functions.exec", tool_input: { command: "lcm store capture-test" }, tool_output: { isError: true } },
+    { name: "functions.exec_command success", tool_name: "functions.exec_command", tool_input: { cmd: "lcm store capture-test" } },
+    { name: "functions.exec_command error", tool_name: "functions.exec_command", tool_input: { cmd: "lcm store capture-test" }, tool_response: { exitCode: 1 } },
+  ] as const)("does not persist native Codex lcm-store feedback loop: $name", async (payload) => {
+    expect(await runNativePersistenceCase(payload)).toEqual([]);
+  });
+
+  it("does not persist raw native output, response, or secret sentinels", async () => {
+    const rows = await runNativePersistenceCase({
+      tool_name: "functions.exec_command",
+      tool_input: { cmd: "npm install capture-test" },
+      tool_output: {
+        isError: true,
+        stdout: "RAW_STDOUT_SECRET",
+        stderr: "RAW_STDERR_SECRET",
+        secret: "RAW_OUTPUT_SECRET",
+      },
+      tool_response: {
+        isError: true,
+        stdout: "RAW_RESPONSE_STDOUT_SECRET",
+        stderr: "RAW_RESPONSE_STDERR_SECRET",
+      },
+    });
+    expect(rows).toEqual([
+      expect.objectContaining({
+        type: "error_tool",
+        data: "Bash error: npm install capture-test",
+      }),
+    ]);
+    expect(JSON.stringify(rows)).not.toContain("RAW_");
+  });
+
+  it.each([
+    { name: "unknown native function", tool_name: "functions.unknown", tool_input: { command: "git branch capture-test" } },
+    { name: "malformed command object", tool_name: "functions.exec", tool_input: "not an object" },
+    { name: "missing command", tool_name: "functions.exec_command", tool_input: { unrelated: "value" } },
+    { name: "non-Codex native function", client: "claude", tool_name: "functions.exec", tool_input: { command: "git branch capture-test" } },
+    { name: "missing client native function", tool_name: "functions.exec", tool_input: { command: "git branch capture-test" } },
+  ] as const)("does not persist unsupported native input: $name", async ({ client: _client, ...payload }) => {
+    const rows = await runNativePersistenceCase(
+      { ...payload, ...(_client === undefined ? {} : { client: _client }) },
+      _client !== undefined,
+    );
+    expect(rows).toEqual([]);
+  });
+
+  it.each([
+    { name: "missing session ID", payload: { client: "codex", tool_name: "functions.exec", tool_input: { command: "git branch capture-test" } } },
+    { name: "numeric session ID", payload: { session_id: 42, client: "codex", tool_name: "functions.exec", tool_input: { command: "git branch capture-test" } } },
+    { name: "null session ID", payload: { session_id: null, client: "codex", tool_name: "functions.exec", tool_input: { command: "git branch capture-test" } } },
+    { name: "malformed JSON", raw: "not json" },
+    { name: "null JSON", raw: "null" },
+    { name: "array JSON", raw: "[]" },
+  ] as const)("does not persist invalid PostToolUse identity or shape: $name", async ({ payload, raw }) => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-invalid-native-cwd-"));
+    extraDirs.push(inputCwd);
+    process.env.TEST_EVENTS_DIR = inputCwd;
+    await handlePostToolUse(raw ?? JSON.stringify({ cwd: inputCwd, ...payload }));
+    expect(readPersistedEvents(inputCwd)).toEqual([]);
   });
 
   it("uses persisted scrub patterns when PostgreSQL secrets are not staged yet", async () => {
