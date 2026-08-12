@@ -109,9 +109,16 @@ describe("centralized remediation guidance", () => {
     const staleConfigSection = source.match(
       /### Doctor recovery for stale daemon configuration\n([\s\S]*?)(?=\n## |$)/u,
     )?.[1];
+    const normalizedStaleConfigSection = staleConfigSection?.replace(/\s+/gu, " ");
 
-    expect(staleConfigSection).toBeDefined();
-    expect(staleConfigSection).toContain("adds no new configuration options");
+    expect(normalizedStaleConfigSection).toBeDefined();
+    expect(normalizedStaleConfigSection).toContain("adds no new configuration options");
+    expect(normalizedStaleConfigSection).toContain("existing daemon port");
+    expect(normalizedStaleConfigSection).toContain("storage backend");
+    expect(normalizedStaleConfigSection).toContain("runtime/entrypoint");
+    expect(normalizedStaleConfigSection).toContain("state paths");
+    expect(normalizedStaleConfigSection).toContain("user manager configuration");
+    expect(normalizedStaleConfigSection).toContain("invoked with `lcm doctor`");
   });
 
   it("keeps every lifecycle refusal reason on the bounded remediation map", () => {
