@@ -115,6 +115,8 @@ describe("Codex hook configuration boundaries", () => {
   it.each([
     ["absent file", undefined, "absent"],
     ["malformed JSON", "not-json", "incomplete"],
+    ["parsed JSON is not an object", "null", "incomplete"],
+    ["hooks is not a record", JSON.stringify({ hooks: [] }), "incomplete"],
     ["missing PostToolUse", JSON.stringify({ hooks: { SessionStart: [] } }), "incomplete"],
     ["PostToolUse is not an array", JSON.stringify({ hooks: { PostToolUse: {} } }), "incomplete"],
     ["wrong matcher", JSON.stringify({ hooks: { PostToolUse: [{ matcher: "tool", hooks: [{ type: "command", command: "lcm post-tool --client codex" }] }] } }), "incomplete"],
