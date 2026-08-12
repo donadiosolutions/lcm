@@ -205,7 +205,7 @@ vi.mock("../../src/storage/postgresql/provisioning.js", () => ({
 
 const {
   assertParsedInternalDaemonTestIdentity, handleCliError, isStrictContainedRelativePath,
-  isForegroundDaemonStartArgv,
+  isForegroundDaemonStartArgv, migrateLegacyHomeForForegroundDaemonStart,
   resolveCompactRequestPolicyOverride,
   runCli, runMainIfInvoked, shouldRunMain,
   withHookOverrides, writeCliError, writeCliOutput,
@@ -326,6 +326,35 @@ describe("runCli registration and help dispatch", () => {
     expect(sleep).toHaveBeenCalledTimes(1);
     expect(sleep).toHaveBeenCalledWith(50);
     expect(attempt.mock.calls.map(([value]) => value)).toEqual([1, 2]);
+  });
+
+  it("uses the production bounded-delay seam for foreground startup contention", async () => {
+    vi.useFakeTimers();
+    const contention = new actualRuntimePaths.BootstrapLockContentionError(
+      "LCM root bootstrap is already in progress; retry after it completes",
+    );
+    state.migrateLegacyHome
+      .mockImplementationOnce(() => { throw contention; })
+      .mockImplementationOnce(() => undefined);
+
+    const pending = invoke(["daemon", "start", "--foreground"]);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(await pending).toBeUndefined();
+    expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the exported preflight helper fail-fast for non-foreground argv", async () => {
+    const migrate = vi.fn(() => undefined);
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    await migrateLegacyHomeForForegroundDaemonStart(["node", "lcm", "status"], {
+      migrate,
+      sleep,
+    });
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it("stops after twenty live bootstrap contention attempts", async () => {
