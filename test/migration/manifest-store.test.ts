@@ -83,6 +83,39 @@ function resealManifest(value: MigrationManifest, changes: Partial<MigrationMani
   };
 }
 
+function replaceWithMaximumRevision(home: string, initial: MigrationManifest): MigrationManifest {
+  const maximum = resealManifest(initial, {
+    revision: Number.MAX_SAFE_INTEGER,
+    previousManifestSha256: "b".repeat(64),
+  });
+  const initialPath = migrationManifestRevisionPath({
+    generationId: initial.generationId,
+    revision: 0,
+    checksumSha256: initial.checksumSha256,
+  }, home);
+  const initialDirectory = resolve(initialPath, "..");
+  const maximumDirectory = join(resolve(initialDirectory, ".."), "9007199254740991");
+  const maximumFile = join(initialDirectory, `${maximum.checksumSha256}.json`);
+  const maximumContent = readFileSync(initialPath, "utf8")
+    .replace(initial.checksumSha256, maximum.checksumSha256)
+    .replace('"previousManifestSha256":null', `"previousManifestSha256":"${maximum.previousManifestSha256}"`)
+    .replace('"revision":0', `"revision":${Number.MAX_SAFE_INTEGER}`);
+  renameSync(initialPath, maximumFile);
+  writeFileSync(maximumFile, maximumContent, { mode: 0o600 });
+  renameSync(initialDirectory, maximumDirectory);
+  writeFileSync(
+    migrationManifestHeadPath(initial.generationId, home),
+    migrationManifestHeadContent(createMigrationManifestHead({
+      generationId: maximum.generationId,
+      revision: maximum.revision,
+      manifestSha256: maximum.checksumSha256,
+      updatedAt: maximum.updatedAt,
+    })),
+    { mode: 0o600 },
+  );
+  return maximum;
+}
+
 function expectProtocolReason(callback: () => unknown, reason: MigrationProtocolError["reason"]): void {
   try {
     callback();
@@ -629,6 +662,45 @@ describe("migration manifest compare-and-swap update", () => {
     expect(events).toEqual([]);
   });
 
+  it("passes a frozen predecessor to the reducer and refuses exhausted revisions before reducer effects", () => {
+    const frozenHome = makeHome();
+    const frozenInitial = manifest("frozen-update");
+    const frozenStore = new MigrationManifestStore({ homeDir: frozenHome });
+    frozenStore.create(frozenInitial);
+    const updated = frozenStore.update(
+      frozenInitial.generationId,
+      frozenInitial.checksumSha256,
+      (current) => {
+        expect(Object.isFrozen(current)).toBe(true);
+        expect(Object.isFrozen(current.source)).toBe(true);
+        return beginMigrationEffect(current, {
+          effectId: "effect-frozen",
+          kind: "verify-dry-run",
+          inputSha256: HASH,
+          startedAt: "2026-08-12T12:00:01.000Z",
+        });
+      },
+    );
+    expect(updated.revision).toBe(1);
+
+    const exhaustedHome = makeHome();
+    const exhaustedInitial = manifest("exhausted-update");
+    const exhaustedStore = new MigrationManifestStore({ homeDir: exhaustedHome });
+    exhaustedStore.create(exhaustedInitial);
+    const maximum = replaceWithMaximumRevision(exhaustedHome, exhaustedInitial);
+    let reducerCalls = 0;
+    expectProtocolReason(() => exhaustedStore.update(
+      maximum.generationId,
+      maximum.checksumSha256,
+      (current) => {
+        reducerCalls += 1;
+        return current;
+      },
+    ), "unexpected-state");
+    expect(reducerCalls).toBe(0);
+    expect(exhaustedStore.read(maximum.generationId)).toEqual(maximum);
+  });
+
   it("preserves exact update crash states and retries only the pre-revision boundary", () => {
     const crashEvents = [
       "before-revision-publication",
@@ -730,35 +802,7 @@ describe("migration manifest compare-and-swap update", () => {
     const initial = manifest("maximum-revision");
     const store = new MigrationManifestStore({ homeDir: home });
     store.create(initial);
-    const maximum = resealManifest(initial, {
-      revision: Number.MAX_SAFE_INTEGER,
-      previousManifestSha256: "b".repeat(64),
-    });
-    const initialPath = migrationManifestRevisionPath({
-      generationId: initial.generationId,
-      revision: 0,
-      checksumSha256: initial.checksumSha256,
-    }, home);
-    const initialDirectory = resolve(initialPath, "..");
-    const maximumDirectory = join(resolve(initialDirectory, ".."), "9007199254740991");
-    const maximumFile = join(initialDirectory, `${maximum.checksumSha256}.json`);
-    const maximumContent = readFileSync(initialPath, "utf8")
-      .replace(initial.checksumSha256, maximum.checksumSha256)
-      .replace('"previousManifestSha256":null', `"previousManifestSha256":"${maximum.previousManifestSha256}"`)
-      .replace('"revision":0', `"revision":${Number.MAX_SAFE_INTEGER}`);
-    renameSync(initialPath, maximumFile);
-    writeFileSync(maximumFile, maximumContent, { mode: 0o600 });
-    renameSync(initialDirectory, maximumDirectory);
-    writeFileSync(
-      migrationManifestHeadPath(initial.generationId, home),
-      migrationManifestHeadContent(createMigrationManifestHead({
-        generationId: maximum.generationId,
-        revision: maximum.revision,
-        manifestSha256: maximum.checksumSha256,
-        updatedAt: maximum.updatedAt,
-      })),
-      { mode: 0o600 },
-    );
+    const maximum = replaceWithMaximumRevision(home, initial);
     expect(store.read(initial.generationId)).toEqual(maximum);
   });
 });

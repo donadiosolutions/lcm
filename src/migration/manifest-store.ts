@@ -643,11 +643,16 @@ export class MigrationManifestStore {
       if (current.manifest.checksumSha256 !== expectedChecksumSha256) {
         throw new MigrationProtocolError("unexpected-state", "migration manifest update is stale");
       }
+      const previousRevision = current.manifest.revision;
+      const previousChecksumSha256 = current.manifest.checksumSha256;
+      if (previousRevision === Number.MAX_SAFE_INTEGER) {
+        throw new MigrationProtocolError("unexpected-state", "migration manifest revision is exhausted");
+      }
       const candidate = parseMigrationManifest(reduce(current.manifest));
       if (
         candidate.generationId !== generationId
-        || candidate.revision !== current.manifest.revision + 1
-        || candidate.previousManifestSha256 !== current.manifest.checksumSha256
+        || candidate.revision !== previousRevision + 1
+        || candidate.previousManifestSha256 !== previousChecksumSha256
       ) {
         throw new MigrationProtocolError("unexpected-state", "migration manifest reducer returned an invalid successor");
       }
