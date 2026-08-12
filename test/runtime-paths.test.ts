@@ -246,7 +246,7 @@ describe("runtime paths", () => {
     }
     expect(error).toBeInstanceOf(Error);
     if (startTime !== null) {
-      expect(error?.constructor).toBe(BootstrapLockContentionError);
+      expect((error as Error).constructor).toBe(BootstrapLockContentionError);
       expect((error as Error).message).toContain("verified live owner");
       expect((error as Error).message).toContain("automatic lock recovery was not attempted");
       expect((error as Error).message).toContain("retry after the competing LCM operation completes");
