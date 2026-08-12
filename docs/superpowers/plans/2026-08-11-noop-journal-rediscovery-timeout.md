@@ -131,10 +131,10 @@ git verify-commit "$MERGE_CHECKPOINT"
 git diff --check "$IMPLEMENTATION_BASE"...HEAD
 git diff --check "$EXTENSION_BASE"...HEAD
 FULL_ACTUAL=$(git diff --name-only "$IMPLEMENTATION_BASE"...HEAD | sort)
-FULL_EXPECTED=$(printf '%s\n' .github/copilot-instructions.md docs/superpowers/plans/2026-08-11-additional-reconciliation-timeouts.md docs/superpowers/plans/2026-08-11-noop-journal-rediscovery-timeout.md docs/superpowers/plans/2026-08-11-snapshot-validation-test-determinism.md docs/superpowers/specs/2026-08-11-open-bug-remediation-design.md test/batch-compact.test.ts test/worktree-reconciliation.test.ts | sort)
+FULL_EXPECTED=$(printf '%s\n' .github/copilot-instructions.md docs/superpowers/evidence/2026-08-11-test-determinism.md docs/superpowers/plans/2026-08-11-additional-reconciliation-timeouts.md docs/superpowers/plans/2026-08-11-noop-journal-rediscovery-timeout.md docs/superpowers/plans/2026-08-11-open-bug-test-determinism.md docs/superpowers/plans/2026-08-11-snapshot-validation-test-determinism.md docs/superpowers/specs/2026-08-11-open-bug-remediation-design.md test/batch-compact.test.ts test/worktree-reconciliation.test.ts | sort)
 test "$FULL_ACTUAL" = "$FULL_EXPECTED"
 EXTENSION_ACTUAL=$(git diff --name-only "$EXTENSION_BASE"...HEAD | sort)
-EXTENSION_EXPECTED=$(printf '%s\n' .github/copilot-instructions.md docs/superpowers/plans/2026-08-11-additional-reconciliation-timeouts.md docs/superpowers/plans/2026-08-11-noop-journal-rediscovery-timeout.md docs/superpowers/plans/2026-08-11-snapshot-validation-test-determinism.md docs/superpowers/specs/2026-08-11-open-bug-remediation-design.md test/worktree-reconciliation.test.ts | sort)
+EXTENSION_EXPECTED=$(printf '%s\n' .github/copilot-instructions.md docs/superpowers/evidence/2026-08-11-test-determinism.md docs/superpowers/plans/2026-08-11-additional-reconciliation-timeouts.md docs/superpowers/plans/2026-08-11-noop-journal-rediscovery-timeout.md docs/superpowers/plans/2026-08-11-open-bug-test-determinism.md docs/superpowers/plans/2026-08-11-snapshot-validation-test-determinism.md docs/superpowers/specs/2026-08-11-open-bug-remediation-design.md test/worktree-reconciliation.test.ts | sort)
 test "$EXTENSION_ACTUAL" = "$EXTENSION_EXPECTED"
 test -z "$(git status --porcelain)"
 for commit in $(git rev-list "$IMPLEMENTATION_BASE"..HEAD); do git verify-commit "$commit"; git log -1 --format=%B "$commit" | rg -q '^Signed-off-by: Bernardo Donadio <bcdonadio@bcdonadio\.com>$'; done
@@ -143,4 +143,6 @@ for commit in $(git rev-list "$IMPLEMENTATION_BASE"..HEAD); do git verify-commit
 Require every command to pass. Preserve the original 5.352-second failure,
 focused baseline, exact RED/GREEN, twenty-process result, complete 100%
 coverage table, exact head, changed files, and signature/DCO audit for the
-whole-branch GLM/Grok review and Opus second pass.
+whole-branch GLM/Grok review and Opus second pass. Supply
+[the test-determinism review evidence](../evidence/2026-08-11-test-determinism.md)
+as part of that exact review package.

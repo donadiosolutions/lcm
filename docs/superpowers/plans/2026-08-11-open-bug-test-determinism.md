@@ -221,9 +221,26 @@ IMPLEMENTATION_BASE=$(
   git rev-parse --verify 'refs/lcm/implementation-bases/issues-601-605-test-determinism^{commit}'
 )
 git diff --check "$IMPLEMENTATION_BASE"...HEAD
-git diff --name-only "$IMPLEMENTATION_BASE"...HEAD
-git status --short
-git log --show-signature --format=fuller "$IMPLEMENTATION_BASE"..HEAD
+FULL_ACTUAL=$(git diff --name-only "$IMPLEMENTATION_BASE"...HEAD | sort)
+FULL_EXPECTED=$(printf '%s\n' .github/copilot-instructions.md docs/superpowers/evidence/2026-08-11-test-determinism.md docs/superpowers/plans/2026-08-11-additional-reconciliation-timeouts.md docs/superpowers/plans/2026-08-11-noop-journal-rediscovery-timeout.md docs/superpowers/plans/2026-08-11-open-bug-test-determinism.md docs/superpowers/plans/2026-08-11-snapshot-validation-test-determinism.md docs/superpowers/specs/2026-08-11-open-bug-remediation-design.md test/batch-compact.test.ts test/worktree-reconciliation.test.ts | sort)
+test "$FULL_ACTUAL" = "$FULL_EXPECTED"
+test -z "$(git status --porcelain)"
+for commit in $(git rev-list "$IMPLEMENTATION_BASE"..HEAD)
+do
+  git verify-commit "$commit"
+  git log -1 --format=%B "$commit" |
+    rg -q '^Signed-off-by: Bernardo Donadio <bcdonadio@bcdonadio\.com>$'
+done
 ```
 
-Expected: only `test/batch-compact.test.ts` and `test/worktree-reconciliation.test.ts` differ from the recorded planning head; the worktree is clean; every commit has a valid GPG signature and `Signed-off-by` trailer.
+Expected: the complete review-package allowlist matches exactly, the worktree
+is clean, and every commit has a valid GPG signature and `Signed-off-by`
+trailer.
+
+### Task 4: Preserve evidence for downstream review
+
+The exact retained RED/GREEN, stability, full-suite, coverage, commit, and
+provenance evidence for #601 and #605 is included with the later extensions in
+[the test-determinism review evidence](../evidence/2026-08-11-test-determinism.md).
+This file is part of the exact review package, not a reference to transient
+worker commentary.
