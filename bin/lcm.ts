@@ -217,7 +217,7 @@ export type ForegroundDaemonPreflightSeams = {
 };
 
 const DEFAULT_FOREGROUND_DAEMON_PREFLIGHT_SEAMS: Omit<ForegroundDaemonPreflightSeams, "migrate"> = {
-  sleep: (delayMs) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)),
+  sleep: (delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)),
 };
 
 /** @internal Verifies that Commander preserved the preflighted hidden identity. */

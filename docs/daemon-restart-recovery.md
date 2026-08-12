@@ -188,6 +188,9 @@ milliseconds between attempts. The
 maximum wait is therefore 950 milliseconds. Once the authenticated bootstrap
 lock is released, startup continues normally.
 
+The 20-attempt limit and 50-millisecond delay are fixed implementation values;
+there is no user configuration for this foreground retry window.
+
 Only the exact foreground start command uses this bounded retry. Ordinary LCM
 commands remain fail-fast, and malformed, ambiguous, foreign, stale-recovery,
 or other migration failures are never retried. If the live-lock contention
