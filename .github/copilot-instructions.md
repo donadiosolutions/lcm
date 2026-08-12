@@ -50,7 +50,9 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - New HTTP routes must have corresponding tests in `test/daemon/routes/`.
 - Tests should cover: happy path, missing required fields (400), and resource-not-found (404).
 - Flag PRs adding routes without tests.
+- Exported production helpers require direct non-mocked tests; do not rely on coverage through a consumer that mocks the defining module.
 - Never delete legacy parsing fallbacks or defensive handling for non-`Error` thrown values merely to satisfy coverage. Cover those branches with deterministic failure injection while preserving compatibility behavior.
+- Copy-paste shell examples must contain executable argument tokens. Keep Commander comma declaration syntax such as `--tag, --tags <tag>` in option declarations or help text, never in an invocation where `--tag,` would be passed literally.
 - Hook command or protocol changes must be searched and aligned across user docs, bundled hook READMEs and skill checklists, installer command registrations, and E2E tests.
 - Test-only numeric capacity and limit seams must reject non-positive, non-integer, and non-finite values before mutating shared state.
 - Tests that enable fake timers must restore real timers from `afterEach` or a

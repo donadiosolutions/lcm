@@ -68,6 +68,19 @@ describe("memory command registration", () => {
     expect(optionFlags).toContain("--limit <n>");
   });
 
+  it("registers one ordered store tag option with both long aliases", () => {
+    const program = new Command("lcm");
+    registerMemoryCommands(program);
+
+    const storeCommand = program.commands.find((command) => command.name() === "store");
+    expect(storeCommand).toBeDefined();
+
+    const tagOptions = storeCommand?.options.filter((option) =>
+      option.flags.includes("--tag") || option.flags.includes("--tags"));
+    expect(tagOptions).toHaveLength(1);
+    expect(tagOptions?.[0]?.flags).toBe("--tag, --tags <tag>");
+  });
+
   it("treats symlinked invocation as the same entrypoint", () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-argv-"));
     const target = join(dir, "lcm.js");

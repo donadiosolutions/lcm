@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { printHelp } from "../src/cli-help.js";
+import { hasCommandHelp, printHelp } from "../src/cli-help.js";
+
+describe("hasCommandHelp", () => {
+  it("recognizes a known topic and rejects an unknown topic", () => {
+    expect(hasCommandHelp("store")).toBe(true);
+    expect(hasCommandHelp("not-a-real-command")).toBe(false);
+  });
+});
 
 describe("printHelp — full reference", () => {
   afterEach(() => { vi.restoreAllMocks(); });
@@ -77,6 +84,14 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("always masked");
     expect(text).toContain("custom and openai-compatible normalize to OpenAI and retain those settings");
     expect(text).toContain("lcm daemon restart");
+  });
+
+  it("prints both ordered store tag aliases", () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    printHelp("store");
+    const text = out.mock.calls.map(c => c[0]).join("");
+    expect(text).toContain("--tag, --tags <tag>");
+    expect(text).toContain("--tag type:solution --tags scope:lcm");
   });
 
   it("prints daemon restart help", () => {

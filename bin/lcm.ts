@@ -423,15 +423,19 @@ function resolveCustomHelpRequest(cliArgv: string[]): CustomHelpRequest | undefi
   const args = cliArgv.slice(2);
   if (args.length === 0) return {};
   if (args.length === 1 && (args[0] === "-h" || args[0] === "--help")) return {};
-  if (!args.includes("-h") && !args.includes("--help")) return undefined;
+  const terminator = args.indexOf("--");
+  const optionArgs = terminator === -1 ? args : args.slice(0, terminator);
+  if (!optionArgs.includes("-h") && !optionArgs.includes("--help")) return undefined;
 
-  const [command] = args;
-  return args.length >= 3 && ["daemon", "config", "connectors"].includes(command)
-    ? { command }
-    : undefined;
+  const [command] = optionArgs;
+  if (command === "help") {
+    const topic = optionArgs[1];
+    return topic === undefined || topic === "-h" || topic === "--help"
+      ? {}
+      : { command: topic };
+  }
+  return { command };
 }
-
-
 
 export function registerMemoryCommands(program: Command): void {
   program
@@ -443,11 +447,6 @@ export function registerMemoryCommands(program: Command): void {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (query: string, opts) => {
-      if (opts.help) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("search"); exit(0);
-      }
-
       const layers = normalizeStringList(opts.layer);
       const tags = normalizeStringList(opts.tag) ?? [];
       ensureAllowedValues(layers, ["episodic", "promoted"], "--layer");
@@ -472,11 +471,6 @@ export function registerMemoryCommands(program: Command): void {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (query: string, opts) => {
-      if (opts.help) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("grep"); exit(0);
-      }
-
       const mode = ensureAllowedValue(opts.mode, ["full_text", "regex"], "--mode");
       const scope = ensureAllowedValue(opts.scope, ["messages", "summaries", "both"], "--scope");
 
@@ -531,7 +525,12 @@ export function registerMemoryCommands(program: Command): void {
   program
     .command("store <text>")
     .description("Store a durable memory entry for the current project")
-    .option("--tag <tag>", "Attach a tag to the stored memory (repeatable)", collectRepeatedOption, [])
+    .option(
+      "--tag, --tags <tag>",
+      "Attach a tag to the stored memory (repeatable)",
+      collectRepeatedOption,
+      [],
+    )
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (text: string, opts) => {
@@ -544,7 +543,7 @@ export function registerMemoryCommands(program: Command): void {
       const result = await client.post("/store", {
         cwd: process.cwd(),
         text,
-        tags: normalizeStringList(opts.tag) ?? [],
+        tags: normalizeStringList(opts.tags) ?? [],
         metadata: {},
       });
       printJson(result);
@@ -1055,13 +1054,7 @@ export function registerPostgreSqlCommand(program: Command): void {
   const postgresCmd = new Command("postgres")
     .description("Provision and maintain PostgreSQL storage");
   postgresCmd.helpOption(false).option("-h, --help", "Show help");
-  const helpRequested = (opts: PostgreSqlOptions): boolean =>
-    opts.help === true || postgresCmd.opts<PostgreSqlOptions>().help === true;
-  postgresCmd.action(async (opts: PostgreSqlOptions) => {
-    if (helpRequested(opts)) {
-      const { printHelp } = await import("../src/cli-help.js");
-      printHelp("postgres"); exit(0);
-    }
+  postgresCmd.action(async () => {
     console.error("Usage: lcm postgres migrate [--json]");
     exit(1);
   });
@@ -1073,10 +1066,6 @@ export function registerPostgreSqlCommand(program: Command): void {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts: PostgreSqlOptions) => {
-      if (helpRequested(opts)) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("postgres"); exit(0);
-      }
       try {
         const { provisionPostgreSql } = await import(
           "../src/storage/postgresql/provisioning.js"
@@ -1242,6 +1231,19 @@ export async function runCli(
   cliArgv: string[] = process.argv,
   preflightSeams?: ForegroundDaemonPreflightSeams,
 ): Promise<void> {
+  const customHelp = resolveCustomHelpRequest(cliArgv);
+  if (customHelp && cliArgv.slice(2).length > 0) {
+    const cliHelp = await import("../src/cli-help.js");
+    const hasCommandHelp = Object.prototype.hasOwnProperty.call(cliHelp, "hasCommandHelp")
+      ? (cliHelp as { hasCommandHelp?: unknown }).hasCommandHelp
+      : undefined;
+    if (customHelp.command === undefined
+      || (typeof hasCommandHelp === "function" && hasCommandHelp(customHelp.command))) {
+      cliHelp.printHelp(customHelp.command);
+      exit(0);
+    }
+  }
+
   const internalDaemonTestIdentity = resolveInternalDaemonTestIdentity(cliArgv);
   const migrate = preflightSeams?.migrate ?? migrateLegacyHomeIfNeeded;
   if (isForegroundDaemonStartArgv(cliArgv)) {
@@ -1733,10 +1735,6 @@ export async function runCli(
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
-      if (opts.help) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("install"); exit(0);
-      }
       const dryRun: boolean = opts.dryRun ?? false;
       const { install } = await import("../installer/install.js");
       if (dryRun) {
@@ -1757,10 +1755,6 @@ export async function runCli(
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
-      if (opts.help) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("uninstall"); exit(0);
-      }
       const dryRun: boolean = opts.dryRun ?? false;
       const { uninstall } = await import("../installer/uninstall.js");
       if (dryRun) {
@@ -1951,11 +1945,7 @@ export async function runCli(
   // ─── events ────────────────────────────────────────────────────────────────
   const eventsCmd = new Command("events").description("Manage passive-learning sidecar events");
   eventsCmd.helpOption(false).option("-h, --help", "Show help");
-  eventsCmd.action(async (opts) => {
-    if (opts.help || cliArgv.includes("-h") || cliArgv.includes("--help")) {
-      const { printHelp } = await import("../src/cli-help.js");
-      printHelp("events"); exit(0);
-    }
+  eventsCmd.action(async () => {
     console.error(
       "Usage: lcm events <promote|status|validate|quarantine|replay> [options]",
     );
@@ -1970,11 +1960,6 @@ export async function runCli(
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
-      if (opts.help || cliArgv.includes("-h") || cliArgv.includes("--help")) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("events"); exit(0);
-      }
-
       const all: boolean = opts.all ?? false;
       const jsonFlag: boolean = opts.json ?? false;
       const client = await createDaemonClientOrExit();
@@ -2256,11 +2241,7 @@ export async function runCli(
   // ─── connectors ────────────────────────────────────────────────────────────
   const connectorsCmd = new Command("connectors").description("Manage connectors for coding agents");
   connectorsCmd.helpOption(false).option("-h, --help", "Show help");
-  connectorsCmd.action(async (opts) => {
-    if (opts.help) {
-      const { printHelp } = await import("../src/cli-help.js");
-      printHelp("connectors"); exit(0);
-    }
+  connectorsCmd.action(async () => {
     console.error("Usage: lcm connectors <list|install|remove|doctor> [options]");
     exit(1);
   });
@@ -2847,16 +2828,11 @@ export async function runCli(
     })();
   });
 
-  // Resolve unsafe nested help from argv before parsing. Commander does not
-  // reliably expose a child help option to these nested actions, and those
-  // actions may read or mutate state before help can be rendered.
-  const customHelp = resolveCustomHelpRequest(cliArgv);
-  if (customHelp) {
+  if (cliArgv.slice(2).length === 0) {
     const { printHelp } = await import("../src/cli-help.js");
-    printHelp(customHelp.command);
+    printHelp(customHelp?.command);
     exit(0);
   }
-
   await program.parseAsync(cliArgv);
   await unknownCommandCompletion;
 }

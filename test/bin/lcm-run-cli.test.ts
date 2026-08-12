@@ -59,6 +59,7 @@ const state = vi.hoisted(() => ({
   importProgressLast: true,
   sensitiveStdout: "sensitive",
   packageVersion: "1.4.0" as unknown,
+  packageFileReads: 0,
   storageBackend: "sqlite" as "sqlite" | "postgresql",
   provisionResult: {
     applied: ["0001_migration_ledger"],
@@ -70,6 +71,17 @@ const state = vi.hoisted(() => ({
     canonical: path,
   })),
   daemonClientInstances: 0,
+  listConnectors: vi.fn(() => state.installed),
+  installConnector: vi.fn(() => state.installResult),
+  removeConnector: vi.fn(() => state.removeResult),
+  registerMachine: vi.fn(),
+  showMachine: vi.fn(),
+  recoverMachine: vi.fn(),
+  listProjects: vi.fn(),
+  showProject: vi.fn(),
+  linkProject: vi.fn(),
+  unlinkProject: vi.fn(),
+  createProject: vi.fn(),
   runtimeHome: "/lcm",
   runtimePidPath: "/lcm/daemon.pid",
   runtimeTokenPath: "/lcm/daemon.token",
@@ -92,7 +104,10 @@ vi.mock("node:process", async importOriginal => ({
 vi.mock("node:fs", async importOriginal => ({
   ...(await importOriginal<typeof import("node:fs")>()),
   readFileSync: vi.fn((path: unknown) => {
-    if (String(path).endsWith("package.json")) return JSON.stringify({ version: state.packageVersion });
+    if (String(path).endsWith("package.json")) {
+      state.packageFileReads += 1;
+      return JSON.stringify({ version: state.packageVersion });
+    }
     if (state.readError) throw state.readError;
     return state.fileText;
   }),
@@ -142,7 +157,15 @@ vi.mock("../../src/config-projection.js", async importOriginal => ({
   loadStoredLlmRequestPolicyConfig: state.loadPolicyConfig,
 }));
 vi.mock("../../src/daemon/lifecycle.js", () => ({ ensureDaemon: state.ensureDaemon, restartDaemon: state.restartDaemon }));
-vi.mock("../../src/cli-help.js", () => ({ printHelp: state.printHelp }));
+vi.mock("../../src/cli-help.js", () => ({
+  hasCommandHelp: vi.fn((command: string) => new Set([
+    "install", "uninstall", "daemon", "config", "status", "doctor", "machine", "project",
+    "postgres", "search", "grep", "describe", "expand", "store", "compact", "restore",
+    "session-end", "user-prompt", "post-tool", "session-snapshot", "mcp", "events", "diagnose",
+    "connectors", "sensitive", "import", "promote", "export", "import-knowledge",
+  ]).has(command)),
+  printHelp: state.printHelp,
+}));
 vi.mock("../../src/hooks/dispatch.js", () => ({ dispatchHook: state.dispatchHook }));
 vi.mock("../../src/mcp/server.js", () => ({ startMcpServer: vi.fn(async () => undefined) }));
 vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (options: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
@@ -166,8 +189,20 @@ vi.mock("../../src/connectors/registry.js", () => ({
   findAgent: vi.fn((name: string) => name === "codex" ? ({ id: "codex", name: "Codex" }) : undefined),
 }));
 vi.mock("../../src/connectors/installer.js", () => ({
-  listConnectors: vi.fn(() => state.installed), installConnector: vi.fn(() => state.installResult),
-  removeConnector: vi.fn(() => state.removeResult),
+  listConnectors: state.listConnectors,
+  installConnector: state.installConnector,
+  removeConnector: state.removeConnector,
+}));
+vi.mock("../../src/identity-service.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/identity-service.js")>()),
+  registerMachine: state.registerMachine,
+  showMachine: state.showMachine,
+  recoverMachine: state.recoverMachine,
+  listProjects: state.listProjects,
+  showProject: state.showProject,
+  linkProject: state.linkProject,
+  unlinkProject: state.unlinkProject,
+  createProject: state.createProject,
 }));
 vi.mock("../../src/config-manager.js", () => ({
   getConfigValue: state.configGetValue,
@@ -256,6 +291,7 @@ beforeEach(() => {
   state.importProgressLast = true;
   state.sensitiveStdout = "sensitive";
   state.packageVersion = "1.4.0";
+  state.packageFileReads = 0;
   state.runtimeHome = "/lcm";
   state.runtimePidPath = "/lcm/daemon.pid";
   state.runtimeTokenPath = "/lcm/daemon.token";
@@ -544,6 +580,64 @@ describe("runCli registration and help dispatch", () => {
     }
   });
 
+  it.each([
+    [["search", "--help"], "search"],
+    [["grep", "--help"], "grep"],
+    [["describe", "--help"], "describe"],
+    [["expand", "--help"], "expand"],
+    [["store", "--help"], "store"],
+    [["import-knowledge", "--help"], "import-knowledge"],
+    [["events", "replay", "--help"], "events"],
+    [["config", "get", "--help"], "config"],
+    [["config", "set", "--help"], "config"],
+    [["machine", "recover", "--help"], "machine"],
+    [["project", "link", "--help"], "project"],
+    [["connectors", "install", "--help"], "connectors"],
+    [["connectors", "remove", "--type", "--help"], "connectors"],
+  ] as const)("renders help before required validation for %#", async (args, topic) => {
+    expect((await invoke(args))?.message).toBe("exit:0");
+    expect(state.printHelp).toHaveBeenCalledWith(topic);
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    expect(state.configGetValue).not.toHaveBeenCalled();
+    expect(state.configSetValue).not.toHaveBeenCalled();
+    expect(state.listConnectors).not.toHaveBeenCalled();
+    expect(state.installConnector).not.toHaveBeenCalled();
+    expect(state.removeConnector).not.toHaveBeenCalled();
+    expect(state.registerMachine).not.toHaveBeenCalled();
+    expect(state.showMachine).not.toHaveBeenCalled();
+    expect(state.recoverMachine).not.toHaveBeenCalled();
+    expect(state.listProjects).not.toHaveBeenCalled();
+    expect(state.showProject).not.toHaveBeenCalled();
+    expect(state.linkProject).not.toHaveBeenCalled();
+    expect(state.unlinkProject).not.toHaveBeenCalled();
+    expect(state.createProject).not.toHaveBeenCalled();
+    expect(state.packageFileReads).toBe(0);
+  });
+
+  it("keeps unknown --help on the unknown-command path", async () => {
+    expect((await invoke(["unknown", "--help"]))?.message).toBe("exit:1");
+    expect(state.printHelp).toHaveBeenCalledWith();
+    expect(state.printHelp).not.toHaveBeenCalledWith("unknown");
+  });
+
+  it("keeps literal arguments after -- out of custom help resolution", async () => {
+    expect(await invoke(["store", "--", "--help"])).toBeUndefined();
+    expect(state.printHelp).not.toHaveBeenCalled();
+    expect(state.post).toHaveBeenCalledWith("/store", expect.objectContaining({ text: "--help" }));
+  });
+
+  it.each([
+    [["help", "store"], "store"],
+    [["help", "store", "--help"], "store"],
+    [["help", "--help"], undefined],
+  ] as const)("preserves explicit help pseudo-command %#", async (args, topic) => {
+    expect((await invoke(args))?.message).toBe("exit:0");
+    if (topic === undefined) expect(state.printHelp).toHaveBeenCalledWith(undefined);
+    else expect(state.printHelp).toHaveBeenCalledWith(topic);
+  });
+
   it("rejects removed map help through the unknown-command path", async () => {
     expect((await invoke(["map", "add", "--help"]))?.message).toBe("exit:1");
     expect(state.printHelp).toHaveBeenCalledWith();
@@ -558,6 +652,14 @@ describe("runCli daemon-backed and utility actions", () => {
     ["describe", "node"], ["expand", "node", "--depth", "2"], ["store", "memory", "--tag", "one"],
   ])("dispatches memory action %#", async (...args) => {
     expect(await invoke(args)).toBeUndefined();
+  });
+
+  it("preserves mixed store tag aliases in command-line order", async () => {
+    await invoke(["store", "memory", "--tag", "one", "--tags", "two", "--tag", "three"]);
+    expect(state.post).toHaveBeenCalledWith("/store", expect.objectContaining({
+      text: "memory",
+      tags: ["one", "two", "three"],
+    }));
   });
 
   it.each([
@@ -703,6 +805,15 @@ describe("runCli orchestration actions", () => {
     expect(await invoke(["import-knowledge", "input.json"])).toBeInstanceOf(BackendPublicationJournalError);
     expect(portable.exportKnowledge).not.toHaveBeenCalled();
     expect(portable.importKnowledge).not.toHaveBeenCalled();
+  });
+
+  it("preserves export --tags comma-separated filtering", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    await invoke(["export", "--tags", "one, two"]);
+    expect(portable.exportKnowledge).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ tags: ["one", "two"] }),
+    );
   });
 
   it.each([
