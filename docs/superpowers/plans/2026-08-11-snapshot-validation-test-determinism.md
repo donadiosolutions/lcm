@@ -40,8 +40,16 @@ EXISTING_TEST_BRANCH_TIP=$(
   git rev-parse --verify 'refs/heads/fix/601-605-test-determinism^{commit}'
 )
 REVIEWED_ADDENDUM_HEAD=$(
-  git rev-parse --verify 'refs/lcm/planning/open-bugs-2026-08-11^{commit}'
+  git rev-parse --verify 'refs/lcm/reviewed-plans/issues-606-607^{commit}'
 )
+MERGE_CHECKPOINT=$(
+  git rev-parse --verify 'refs/lcm/merge-checkpoints/issues-606-607^{commit}'
+)
+test "$REVIEWED_ADDENDUM_HEAD" = 47e322f922963a8be91223546bce952405493acf
+test "$MERGE_CHECKPOINT" = 0ee5769975435a2b1ca7500c4d9a427c94763f3f
+test "$REVIEWED_ADDENDUM_HEAD" = "$(git rev-parse --verify "$MERGE_CHECKPOINT^2")"
+test "$(git rev-list --parents -n 1 "$MERGE_CHECKPOINT" | wc -w)" -eq 3
+git verify-commit "$MERGE_CHECKPOINT"
 test "$(git rev-parse --show-toplevel)" = "/home/bcdonadio/.codex/worktrees/b6b7/lcm-issues-601-605"
 test "$(git branch --show-current)" = "fix/601-605-test-determinism"
 test "$(git rev-parse HEAD)" = "$EXISTING_TEST_BRANCH_TIP"
@@ -59,6 +67,9 @@ signed planning history with one signed no-fast-forward merge:
 git merge --no-ff -S --signoff -m "docs: merge reviewed timeout addendum" "$REVIEWED_ADDENDUM_HEAD"
 git merge-base --is-ancestor "$EXISTING_TEST_BRANCH_TIP" HEAD
 git merge-base --is-ancestor "$REVIEWED_ADDENDUM_HEAD" HEAD
+git update-ref refs/lcm/merge-checkpoints/issues-606-607 HEAD
+test "$(git rev-parse --verify 'refs/lcm/merge-checkpoints/issues-606-607^{commit}')" = "$MERGE_CHECKPOINT"
+test "$REVIEWED_ADDENDUM_HEAD" = "$(git rev-parse --verify "$MERGE_CHECKPOINT^2")"
 git status --short
 ```
 
@@ -236,18 +247,32 @@ EXTENSION_BASE=$(
 )
 REVIEWED_ADDENDUM_HEAD=$(
   git rev-parse --verify \
-    'refs/lcm/planning/open-bugs-2026-08-11^{commit}'
+    'refs/lcm/reviewed-plans/issues-606-607^{commit}'
+)
+MERGE_CHECKPOINT=$(
+  git rev-parse --verify \
+    'refs/lcm/merge-checkpoints/issues-606-607^{commit}'
 )
 test "$(git branch --show-current)" = "fix/601-605-test-determinism"
+test "$REVIEWED_ADDENDUM_HEAD" = 47e322f922963a8be91223546bce952405493acf
+test "$MERGE_CHECKPOINT" = 0ee5769975435a2b1ca7500c4d9a427c94763f3f
+test "$REVIEWED_ADDENDUM_HEAD" = "$(git rev-parse --verify "$MERGE_CHECKPOINT^2")"
 git merge-base --is-ancestor "$IMPLEMENTATION_BASE" HEAD
 git merge-base --is-ancestor "$EXTENSION_BASE" HEAD
 git merge-base --is-ancestor "$REVIEWED_ADDENDUM_HEAD" HEAD
+git merge-base --is-ancestor "$MERGE_CHECKPOINT" HEAD
+test "$(git rev-list --parents -n 1 "$MERGE_CHECKPOINT" | wc -w)" -eq 3
+git verify-commit "$MERGE_CHECKPOINT"
 git diff --check "$IMPLEMENTATION_BASE"...HEAD
-git diff --name-only "$IMPLEMENTATION_BASE"...HEAD
 git diff --check "$EXTENSION_BASE"...HEAD
-git diff --name-only "$EXTENSION_BASE"...HEAD
-git status --short
-git log --show-signature --format=fuller "$IMPLEMENTATION_BASE"..HEAD
+FULL_ACTUAL=$(git diff --name-only "$IMPLEMENTATION_BASE"...HEAD | sort)
+FULL_EXPECTED=$(printf '%s\n' .github/copilot-instructions.md docs/superpowers/plans/2026-08-11-additional-reconciliation-timeouts.md docs/superpowers/plans/2026-08-11-noop-journal-rediscovery-timeout.md docs/superpowers/plans/2026-08-11-snapshot-validation-test-determinism.md docs/superpowers/specs/2026-08-11-open-bug-remediation-design.md test/batch-compact.test.ts test/worktree-reconciliation.test.ts | sort)
+test "$FULL_ACTUAL" = "$FULL_EXPECTED"
+EXTENSION_ACTUAL=$(git diff --name-only "$EXTENSION_BASE"...HEAD | sort)
+EXTENSION_EXPECTED=$(printf '%s\n' .github/copilot-instructions.md docs/superpowers/plans/2026-08-11-additional-reconciliation-timeouts.md docs/superpowers/plans/2026-08-11-noop-journal-rediscovery-timeout.md docs/superpowers/plans/2026-08-11-snapshot-validation-test-determinism.md docs/superpowers/specs/2026-08-11-open-bug-remediation-design.md test/worktree-reconciliation.test.ts | sort)
+test "$EXTENSION_ACTUAL" = "$EXTENSION_EXPECTED"
+test -z "$(git status --porcelain)"
+for commit in $(git rev-list "$IMPLEMENTATION_BASE"..HEAD); do git verify-commit "$commit"; git log -1 --format=%B "$commit" | rg -q '^Signed-off-by: Bernardo Donadio <bcdonadio@bcdonadio\.com>$'; done
 ```
 
 Require only the planning documents and the two intended test files in the
