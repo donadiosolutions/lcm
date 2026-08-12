@@ -1,13 +1,36 @@
 import { createHash } from "node:crypto";
+import {
+  fchmodSync,
+  fsyncSync,
+  mkdirSync,
+  readdirSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { withPrivateMutationLock } from "../private-mutation-lock.js";
+import {
+  atomicWritePrivateFileDurable,
+  assertPrivateDirectory,
+  openPrivateDirectory,
+  readBoundedRegularFileWithStat,
+  type PrivateDirectoryHandle,
+} from "../security-files.js";
+import {
+  assertHomeLockTopology,
+  closeHomeLockTopology,
+  openHomeLockTopology,
+  restoreHomeLockTopologyMode,
+} from "../storage/home-lock-topology.js";
 import {
   MigrationProtocolError,
+  parseMigrationManifest,
+  type MigrationManifest,
   type MigrationManifestHead,
 } from "./protocol.js";
 
 const GENERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
 
 function invalidPathInput(message: string): never {
   throw new MigrationProtocolError("invalid-input", message);
@@ -68,6 +91,149 @@ function exactHeadKeys(value: Record<string, unknown>): boolean {
 
 function migrationRoot(homeDir?: string): string {
   return join(resolve(homeDir ?? homedir()), ".lcm", "migrations");
+}
+
+function lcmRoot(homeDir: string): string {
+  return join(homeDir, ".lcm");
+}
+
+type CanonicalJson = null | boolean | number | string
+  | readonly CanonicalJson[]
+  | Readonly<{ [key: string]: CanonicalJson }>;
+
+function canonicalJson(value: CanonicalJson): string {
+  if (
+    value === null
+    || typeof value === "boolean"
+    || typeof value === "string"
+  ) {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const record = value as Readonly<Record<string, CanonicalJson>>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key]!)}`).join(",")}}`;
+}
+
+function manifestContent(manifest: MigrationManifest): string {
+  return `${canonicalJson(manifest as unknown as CanonicalJson)}\n`;
+}
+
+function parseManifestContent(content: string): MigrationManifest {
+  if (!/^[\x00-\x7f]*$/u.test(content) || !content.endsWith("\n")) {
+    return malformedHead("migration manifest content is invalid");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(content.slice(0, -1));
+  } catch (error) {
+    throw new MigrationProtocolError("malformed-manifest", "migration manifest JSON is invalid", {
+      cause: error,
+    });
+  }
+  const manifest = parseMigrationManifest(value);
+  if (content !== manifestContent(manifest)) {
+    return malformedHead("migration manifest content is not canonical");
+  }
+  return manifest;
+}
+
+function currentUid(): number | undefined {
+  return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+function closeHandles(handles: readonly PrivateDirectoryHandle[]): void {
+  for (const handle of [...handles].reverse()) handle.close();
+}
+
+function withAuthenticatedDirectories<T>(
+  paths: readonly string[],
+  expectedUid: number | undefined,
+  callback: () => T,
+): T {
+  const handles: PrivateDirectoryHandle[] = [];
+  try {
+    for (const path of paths) handles.push(openPrivateDirectory(path, { expectedUid }));
+    for (let index = 0; index < paths.length; index += 1) {
+      assertPrivateDirectory(handles[index]!, paths[index]!, handles[index]!.witness, expectedUid);
+    }
+    const result = callback();
+    for (let index = 0; index < paths.length; index += 1) {
+      assertPrivateDirectory(handles[index]!, paths[index]!, undefined, expectedUid);
+    }
+    return result;
+  } finally {
+    closeHandles(handles);
+  }
+}
+
+function ensurePrivateChild(
+  parentPath: string,
+  name: string,
+  expectedUid: number | undefined,
+  requireAbsent = false,
+): string {
+  const childPath = join(parentPath, name);
+  return withAuthenticatedDirectories([parentPath], expectedUid, () => {
+    let created = false;
+    try {
+      mkdirSync(childPath, { mode: 0o700 });
+      created = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (requireAbsent) {
+        throw new MigrationProtocolError("unexpected-state", "migration generation already exists");
+      }
+    }
+    const child = openPrivateDirectory(childPath, { expectedUid });
+    try {
+      if (created) {
+        fchmodSync(child.fd, 0o700);
+        fsyncSync(child.fd);
+      }
+      assertPrivateDirectory(child, childPath, child.witness, expectedUid);
+    } finally {
+      child.close();
+    }
+    if (created) {
+      const parent = openPrivateDirectory(parentPath, { expectedUid });
+      try {
+        fsyncSync(parent.fd);
+      } finally {
+        parent.close();
+      }
+    }
+    return childPath;
+  });
+}
+
+function withManifestMutationLock<T>(
+  homeDir: string | undefined,
+  expectedUid: number | undefined,
+  callback: () => T,
+): T {
+  const topology = openHomeLockTopology(homeDir, expectedUid);
+  try {
+    return withPrivateMutationLock(
+      migrationManifestLockPath(homeDir),
+      "migration manifest",
+      () => {
+        assertHomeLockTopology(topology);
+        restoreHomeLockTopologyMode(topology);
+        const result = callback();
+        assertHomeLockTopology(topology);
+        return result;
+      },
+    );
+  } finally {
+    try {
+      restoreHomeLockTopologyMode(topology);
+    } finally {
+      closeHomeLockTopology(topology);
+    }
+  }
 }
 
 /** Home-level lock acquired before the migration tree exists. */
@@ -227,4 +393,139 @@ export function parseMigrationManifestHeadContent(content: string): MigrationMan
     return malformedHead("migration manifest head content is not canonical");
   }
   return expected;
+}
+
+type MigrationManifestStoreObserver = (event: string, path: string) => void;
+
+/** Durable immutable revision store for one reversible migration protocol. */
+export class MigrationManifestStore {
+  readonly #homeDir: string;
+  readonly #observer: MigrationManifestStoreObserver;
+  readonly #expectedUid: number | undefined;
+
+  constructor(options: Readonly<{
+    homeDir?: string;
+    observer?: MigrationManifestStoreObserver;
+    expectedUid?: number;
+  }> = {}) {
+    this.#homeDir = resolve(options.homeDir ?? homedir());
+    this.#observer = options.observer ?? (() => undefined);
+    this.#expectedUid = options.expectedUid ?? currentUid();
+  }
+
+  create(manifest: MigrationManifest): MigrationManifest {
+    const authenticated = parseMigrationManifest(manifest);
+    if (authenticated.revision !== 0 || authenticated.previousManifestSha256 !== null) {
+      throw new MigrationProtocolError("invalid-input", "migration manifest genesis is invalid");
+    }
+    return withManifestMutationLock(this.#homeDir, this.#expectedUid, () => {
+      const root = lcmRoot(this.#homeDir);
+      return withAuthenticatedDirectories([root], this.#expectedUid, () => {
+        const migrations = ensurePrivateChild(root, "migrations", this.#expectedUid);
+        const revisionPath = migrationManifestRevisionPath({
+          generationId: authenticated.generationId,
+          revision: authenticated.revision,
+          checksumSha256: authenticated.checksumSha256,
+        }, this.#homeDir);
+        this.#observer("before-revision-publication", revisionPath);
+        const generation = ensurePrivateChild(
+          migrations,
+          authenticated.generationId,
+          this.#expectedUid,
+          true,
+        );
+        const revisions = ensurePrivateChild(generation, "revisions", this.#expectedUid);
+        const revisionDirectory = ensurePrivateChild(
+          revisions,
+          authenticated.revision.toString(10).padStart(16, "0"),
+          this.#expectedUid,
+          true,
+        );
+        return withAuthenticatedDirectories(
+          [root, migrations, generation, revisions, revisionDirectory],
+          this.#expectedUid,
+          () => {
+            atomicWritePrivateFileDurable(revisionPath, manifestContent(authenticated), {
+              expectedUid: this.#expectedUid,
+              requireAbsent: true,
+              maxExistingBytes: MAX_MANIFEST_BYTES,
+            });
+            this.#observer("after-revision-publication", revisionPath);
+            const head = createMigrationManifestHead({
+              generationId: authenticated.generationId,
+              revision: authenticated.revision,
+              manifestSha256: authenticated.checksumSha256,
+              updatedAt: authenticated.updatedAt,
+            });
+            const headPath = migrationManifestHeadPath(authenticated.generationId, this.#homeDir);
+            this.#observer("before-head-publication", headPath);
+            atomicWritePrivateFileDurable(headPath, migrationManifestHeadContent(head), {
+              expectedUid: this.#expectedUid,
+              expectedContentSha256: null,
+              requireAbsent: true,
+              maxExistingBytes: MAX_MANIFEST_BYTES,
+            });
+            this.#observer("after-head-publication", headPath);
+            return authenticated;
+          },
+        );
+      });
+    });
+  }
+
+  read(generationId: string): MigrationManifest {
+    const generation = migrationManifestGenerationDirectory(generationId, this.#homeDir);
+    const root = lcmRoot(this.#homeDir);
+    const migrations = migrationRoot(this.#homeDir);
+    const revisions = join(generation, "revisions");
+    return withAuthenticatedDirectories(
+      [root, migrations, generation, revisions],
+      this.#expectedUid,
+      () => {
+        const headPath = migrationManifestHeadPath(generationId, this.#homeDir);
+        const headContent = readBoundedRegularFileWithStat(headPath, {
+          allowedRoot: generation,
+          maxBytes: MAX_MANIFEST_BYTES,
+          expectedUid: this.#expectedUid,
+          allowedModes: [0o600],
+          requireSingleLink: true,
+        }).content;
+        const head = parseMigrationManifestHeadContent(headContent);
+        if (head.generationId !== generationId) {
+          return malformedHead("migration manifest head generation does not match");
+        }
+        const revisionDirectory = join(
+          revisions,
+          head.revision.toString(10).padStart(16, "0"),
+        );
+        return withAuthenticatedDirectories([revisionDirectory], this.#expectedUid, () => {
+          const entries = readdirSync(revisionDirectory);
+          if (entries.length !== 1 || entries[0] !== head.revisionFilename) {
+            return malformedHead("migration manifest revision directory is invalid");
+          }
+          const revisionPath = migrationManifestRevisionPath({
+            generationId,
+            revision: head.revision,
+            checksumSha256: head.manifestSha256,
+          }, this.#homeDir);
+          const content = readBoundedRegularFileWithStat(revisionPath, {
+            allowedRoot: revisionDirectory,
+            maxBytes: MAX_MANIFEST_BYTES,
+            expectedUid: this.#expectedUid,
+            allowedModes: [0o600],
+            requireSingleLink: true,
+          }).content;
+          const manifest = parseManifestContent(content);
+          if (
+            manifest.generationId !== generationId
+            || manifest.revision !== head.revision
+            || manifest.checksumSha256 !== head.manifestSha256
+          ) {
+            return malformedHead("migration manifest revision does not match its head");
+          }
+          return manifest;
+        });
+      },
+    );
+  }
 }
