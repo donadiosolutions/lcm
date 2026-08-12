@@ -60,6 +60,9 @@ export type RuntimeHomeBootstrap = RuntimeHomeMigration & {
   created: boolean;
 };
 
+/** Raised only when a validated bootstrap lock has a definitively live owner. */
+export class BootstrapLockContentionError extends Error {}
+
 type BigIntFileStat = Readonly<{
   isDirectory: () => boolean;
   isFile: () => boolean;
@@ -1700,7 +1703,7 @@ function acquireBootstrapLock(homeDir: string, topology: HomeTopology): Bootstra
   const existing = readBootstrapLock(path, homeDir);
   const state = bootstrapOwnerState(existing.owner);
   if (state === "live") {
-    throw new Error("LCM root bootstrap is already in progress; retry after it completes");
+    throw new BootstrapLockContentionError("LCM root bootstrap is already in progress; retry after it completes");
   }
   if (state === "ambiguous") {
     throw new Error("LCM root bootstrap owner state is ambiguous; automatic recovery was not attempted; inspect the lock metadata and running processes before retrying");
