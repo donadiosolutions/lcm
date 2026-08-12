@@ -389,11 +389,9 @@ function assertUniqueCollections(
   reports: readonly MigrationReportReference[],
 ): void {
   const domains = new Set<string>();
-  const ordinals = new Set<number>();
   for (const checkpoint of checkpoints) {
-    if (domains.has(checkpoint.domain) || ordinals.has(checkpoint.ordinal)) protocolError("malformed-manifest", "checkpoints must be unique");
+    if (domains.has(checkpoint.domain)) protocolError("malformed-manifest", "checkpoints must be unique");
     domains.add(checkpoint.domain);
-    ordinals.add(checkpoint.ordinal);
   }
   const reportIds = new Set<string>();
   for (const report of reports) {
@@ -417,9 +415,13 @@ function assertCrossFieldInvariants(manifest: Omit<MigrationManifest, "checksumS
   const eligiblePhase = manifest.phase === "verified" || manifest.phase === "activating" || manifest.phase === "active"
     || manifest.phase === "rolling-back" || manifest.phase === "rolled-back";
   if (manifest.activationEligible !== (eligiblePhase && verificationReport)) protocolError("malformed-manifest", "activation eligibility is invalid");
-  if (manifest.rollbackLineage.returnPhase !== null && manifest.phase !== "rolling-back") protocolError("malformed-manifest", "rollback return phase is invalid");
+  const rollbackPhase = manifest.phase === "rolling-back" || manifest.phase === "rolled-back";
+  if (manifest.rollbackLineage.returnPhase !== null && !rollbackPhase) protocolError("malformed-manifest", "rollback return phase is invalid");
   if (manifest.rollbackLineage.mode !== null && manifest.phase !== "rolled-back") protocolError("malformed-manifest", "rollback mode is invalid");
-  if (manifest.phase === "rolled-back" && manifest.rollbackLineage.mode === null) protocolError("malformed-manifest", "rolled-back phase requires rollback mode");
+  if (manifest.phase === "rolled-back") {
+    if (manifest.rollbackLineage.mode === null) protocolError("malformed-manifest", "rolled-back phase requires rollback mode");
+    if (manifest.rollbackLineage.returnPhase === null) protocolError("malformed-manifest", "rolled-back phase requires a sealed return phase");
+  }
 }
 
 type LegalEffect = Readonly<{
