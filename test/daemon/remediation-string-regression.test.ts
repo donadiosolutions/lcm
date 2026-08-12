@@ -104,6 +104,16 @@ describe("centralized remediation guidance", () => {
     expect(source).not.toMatch(/(?:Fix|Try|Start it with|run:)\s*[^\n]*(?:--foreground|--detach)/u);
   });
 
+  it("documents configuration behavior for stale daemon recovery", () => {
+    const source = readRepositoryFile("docs/daemon-restart-recovery.md");
+    const staleConfigSection = source.match(
+      /### Doctor recovery for stale daemon configuration\n([\s\S]*?)(?=\n## |$)/u,
+    )?.[1];
+
+    expect(staleConfigSection).toBeDefined();
+    expect(staleConfigSection).toContain("adds no new configuration options");
+  });
+
   it("keeps every lifecycle refusal reason on the bounded remediation map", () => {
     for (const reason of DAEMON_REFUSAL_REASONS) {
       const guidance = mapDaemonRefusalToRemediation(reason);

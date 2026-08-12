@@ -109,6 +109,10 @@ validated port, state paths, storage identity, executable, entrypoint, and
 user-service-manager safeguards. It then checks authenticated daemon health
 again before reporting the result.
 
+This behavior adds no new configuration options. It uses the existing daemon
+port, storage backend, runtime/entrypoint, state paths, and user manager
+configuration, and is invoked with `lcm doctor`.
+
 A successful repair is reported as a warning with `fixApplied: true` because
 doctor changed the managed service state; the output explicitly says that the
 stale configuration was repaired and the daemon restarted. Other lifecycle
