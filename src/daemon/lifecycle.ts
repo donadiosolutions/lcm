@@ -3746,6 +3746,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
         preStopDiscovery.candidates.length !== 1
         || preStopDiscovery.candidates[0]!.name !== candidate.name
         || preStopDiscovery.candidates[0]!.managerPid !== candidate.managerPid
+        || preStopDiscovery.candidates[0]!.invocationId !== candidate.invocationId
       ) {
         return legacyRefusal("ambiguous", "legacy daemon candidate changed before exact stop", pid);
       }

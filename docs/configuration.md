@@ -42,12 +42,19 @@ On Linux, an upgrade from LCM v1.4.1 to v1.4.2 can leave one authenticated
 legacy transient systemd service running while the new stable service name is
 absent. The first `lcm doctor` after the upgrade, or an explicit
 `lcm daemon restart`, performs a one-time migration only when the manager PID,
-canonical PID/token files, authenticated health identity, older same-line
-version, process entrypoint, and loopback listener all agree. A changing,
-ambiguous, symlinked, malformed, or unauthorized candidate is not stopped and
-does not trigger a competing start. After exact stop, the stable daemon starts
-only if the authenticated legacy daemon removed its own PID file. Any
-remaining PID pathname is preserved without unlinking and blocks stable start.
+systemd invocation ID, canonical PID/token files, authenticated health
+identity, older same-line version, process entrypoint, and loopback listener
+all agree. A changing, ambiguous, symlinked, malformed, or unauthorized
+candidate is not stopped and does not trigger a competing start. After exact
+stop, the stable daemon starts only if the authenticated legacy daemon removed
+its own PID file. Any remaining PID pathname is preserved without unlinking
+and blocks stable start.
+While systemd retires the already-authenticated unit, LCM may wait through a
+bounded `deactivating` stop/final substate only when the manager still reports
+the same nonzero invocation ID and either the original PID or PID 0 as part of
+that same shutdown. This post-stop observation never authorizes the stop and
+does not count as success; the manager must report the exact unit absent before
+migration can continue.
 When the PID file is already missing, bounded strict discovery must prove that
 no legacy candidate exists before normal absent startup continues; a candidate
 in any discoverable systemd state, including reloading, refreshing,

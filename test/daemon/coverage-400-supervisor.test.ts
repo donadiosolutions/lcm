@@ -655,7 +655,14 @@ describe("supervisor coverage: manager states and lifecycle boundaries", () => {
   });
 });
 
-type LegacySystemdUnitTestShape = Readonly<{ name: string; managerPid: number }>;
+const LEGACY_INVOCATION_ID = "1234567890abcdef1234567890abcdef";
+const CHANGED_LEGACY_INVOCATION_ID = "abcdef1234567890abcdef1234567890";
+
+type LegacySystemdUnitTestShape = Readonly<{
+  name: string;
+  managerPid: number;
+  invocationId: string;
+}>;
 type LegacySystemdDiscoveryTestShape =
   | Readonly<{ kind: "candidates"; candidates: readonly LegacySystemdUnitTestShape[] }>
   | Readonly<{ kind: "unavailable"; reason: string }>;
@@ -666,6 +673,27 @@ type LegacySystemdCapabilitiesTestShape = {
 
 function legacySystemdCapabilities(value: unknown): LegacySystemdCapabilitiesTestShape {
   return value as LegacySystemdCapabilitiesTestShape;
+}
+
+function legacySystemdCandidate(
+  overrides: Partial<LegacySystemdUnitTestShape> = {},
+): LegacySystemdUnitTestShape {
+  return {
+    name: "lcm-daemon-1234-1720000000000.service",
+    managerPid: 4242,
+    invocationId: LEGACY_INVOCATION_ID,
+    ...overrides,
+  };
+}
+
+function legacySystemdShowArgsForTest(name: string): readonly string[] {
+  return [
+    "--user",
+    "show",
+    "--no-pager",
+    "--property=LoadState,ActiveState,SubState,MainPID,InvocationID",
+    name,
+  ];
 }
 
 function legacySystemdList(...names: readonly string[]): string {
@@ -685,8 +713,27 @@ type LegacySystemdTestActiveState =
 
 function legacySystemdState(
   state: LegacySystemdTestActiveState | "malformed" | "not-found" | "unloaded" = "active",
-  pid = 4242,
-  subState: "running" | "start" | "start-post" | "reload" | "stop" | "stop-sigterm" | "failed" | "dead" = "running",
+  pid: number | string | null = 4242,
+  subState:
+    | "running"
+    | "start"
+    | "start-post"
+    | "reload"
+    | "stop"
+    | "stop-sigterm"
+    | "stop-sigkill"
+    | "stop-watchdog"
+    | "stop-post"
+    | "final-sigterm"
+    | "final-sigkill"
+    | "final-watchdog"
+    | "failed"
+    | "dead"
+    | "unexpected-transition"
+    | "cleaning"
+    | "auto-restart"
+    | "auto-restart-queued" = "running",
+  invocationId: string | null = LEGACY_INVOCATION_ID,
 ): string {
   if (state === "not-found" || state === "unloaded") {
     return `LoadState=${state}\nActiveState=inactive\nSubState=dead\nMainPID=0`;
@@ -696,7 +743,8 @@ function legacySystemdState(
     "LoadState=loaded",
     `ActiveState=${state}`,
     `SubState=${subState}`,
-    `MainPID=${pid}`,
+    ...(pid === null ? [] : [`MainPID=${pid}`]),
+    ...(invocationId === null ? [] : [`InvocationID=${invocationId}`]),
   ].join("\n");
 }
 
@@ -727,7 +775,11 @@ describe("legacy generated systemd discovery and exact stop", () => {
 
     expect(result).toEqual({
       kind: "candidates",
-      candidates: [{ name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 }],
+      candidates: [{
+        name: "lcm-daemon-1234-1720000000000.service",
+        managerPid: 4242,
+        invocationId: LEGACY_INVOCATION_ID,
+      }],
     });
     expect(result).not.toHaveProperty("stdout");
     expect(result).not.toHaveProperty("stderr");
@@ -738,7 +790,7 @@ describe("legacy generated systemd discovery and exact stop", () => {
       },
       {
         command: "systemctl",
-        args: ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID", "lcm-daemon-1234-1720000000000.service"],
+        args: ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,InvocationID", "lcm-daemon-1234-1720000000000.service"],
       },
     ]);
   });
@@ -760,8 +812,8 @@ describe("legacy generated systemd discovery and exact stop", () => {
       expected: {
         kind: "candidates",
         candidates: [
-          { name: "lcm-daemon-10-100.service", managerPid: 10 },
-          { name: "lcm-daemon-20-200.service", managerPid: 20 },
+          { name: "lcm-daemon-10-100.service", managerPid: 10, invocationId: LEGACY_INVOCATION_ID },
+          { name: "lcm-daemon-20-200.service", managerPid: 20, invocationId: LEGACY_INVOCATION_ID },
         ],
       },
     },
@@ -769,6 +821,36 @@ describe("legacy generated systemd discovery and exact stop", () => {
       name: "malformed PID",
       list: legacySystemdList("lcm-daemon-10-100.service"),
       shows: [{ code: 0, stdout: legacySystemdState("malformed") }],
+      expected: { kind: "unavailable", reason: "state-conflict" },
+    },
+    {
+      name: "missing invocation witness",
+      list: legacySystemdList("lcm-daemon-10-100.service"),
+      shows: [{ code: 0, stdout: legacySystemdState("active", 10, "running", null) }],
+      expected: { kind: "unavailable", reason: "state-conflict" },
+    },
+    {
+      name: "malformed invocation witness",
+      list: legacySystemdList("lcm-daemon-10-100.service"),
+      shows: [{ code: 0, stdout: legacySystemdState("active", 10, "running", "not-an-id") }],
+      expected: { kind: "unavailable", reason: "state-conflict" },
+    },
+    {
+      name: "zero invocation witness",
+      list: legacySystemdList("lcm-daemon-10-100.service"),
+      shows: [{ code: 0, stdout: legacySystemdState("active", 10, "running", "0".repeat(32)) }],
+      expected: { kind: "unavailable", reason: "state-conflict" },
+    },
+    {
+      name: "uppercase invocation witness",
+      list: legacySystemdList("lcm-daemon-10-100.service"),
+      shows: [{ code: 0, stdout: legacySystemdState("active", 10, "running", LEGACY_INVOCATION_ID.toUpperCase()) }],
+      expected: { kind: "unavailable", reason: "state-conflict" },
+    },
+    {
+      name: "oversized invocation witness",
+      list: legacySystemdList("lcm-daemon-10-100.service"),
+      shows: [{ code: 0, stdout: legacySystemdState("active", 10, "running", `${LEGACY_INVOCATION_ID}0`) }],
       expected: { kind: "unavailable", reason: "state-conflict" },
     },
     {
@@ -833,7 +915,7 @@ describe("legacy generated systemd discovery and exact stop", () => {
     });
     expect(runner.calls.map(({ args }) => args)).toEqual([
       ["--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager", "--plain"],
-      ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID", name],
+      ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,InvocationID", name],
     ]);
     expect(runner.calls.some(({ args }) => args.includes("stop"))).toBe(false);
   });
@@ -884,7 +966,7 @@ describe("legacy generated systemd discovery and exact stop", () => {
   });
 
   it("stops one exact active candidate and accepts daemon-owned PID-file disappearance", async () => {
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacySystemdCandidate();
     const runner = runQueue([
       { code: 0, stdout: legacySystemdState("active", 4242) },
       { code: 0, stdout: "stop queued" },
@@ -899,12 +981,12 @@ describe("legacy generated systemd discovery and exact stop", () => {
     expect(runner.calls.map(({ command, args }) => ({ command, args }))).toEqual([
       {
         command: "systemctl",
-        args: ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID", candidate.name],
+        args: legacySystemdShowArgsForTest(candidate.name),
       },
       { command: "systemctl", args: ["--user", "stop", candidate.name] },
       {
         command: "systemctl",
-        args: ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID", candidate.name],
+        args: legacySystemdShowArgsForTest(candidate.name),
       },
     ]);
   });
@@ -923,7 +1005,7 @@ describe("legacy generated systemd discovery and exact stop", () => {
     ["not-found", "dead", 0],
     ["unloaded", "dead", 0],
   ] as const)("refuses exact untrusted %s/%s state before issuing stop", async (state, subState, managerPid) => {
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacySystemdCandidate();
     const runner = runQueue([
       { code: 0, stdout: legacySystemdState(state, managerPid, subState) },
     ]);
@@ -934,13 +1016,13 @@ describe("legacy generated systemd discovery and exact stop", () => {
 
     await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
     expect(runner.calls.map(({ args }) => args)).toEqual([
-      ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID", candidate.name],
+      legacySystemdShowArgsForTest(candidate.name),
     ]);
     expect(runner.calls.some(({ args }) => args.includes("stop"))).toBe(false);
   });
 
   it("refuses malformed exact state before issuing stop", async () => {
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacySystemdCandidate();
     const runner = runQueue([{ code: 0, stdout: legacySystemdState("malformed") }]);
     const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
       run: runner.run,
@@ -949,7 +1031,7 @@ describe("legacy generated systemd discovery and exact stop", () => {
 
     await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
     expect(runner.calls.map(({ args }) => args)).toEqual([
-      ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID", candidate.name],
+      legacySystemdShowArgsForTest(candidate.name),
     ]);
     expect(runner.calls.some(({ args }) => args.includes("stop"))).toBe(false);
   });
@@ -958,7 +1040,7 @@ describe("legacy generated systemd discovery and exact stop", () => {
     { name: "explicit not-found state", result: { code: 0, stdout: "LoadState=not-found\nMainPID=0" } },
     { name: "not-found command status", result: { code: 1, stderr: "Unit lcm-daemon-1234-1720000000000.service not-found" } },
   ])("accepts $name as exact unit absence", async ({ result }) => {
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacySystemdCandidate();
     const runner = runQueue([
       { code: 0, stdout: legacySystemdState("active", 4242) },
       { code: 0, stdout: "stop queued" },
@@ -973,31 +1055,144 @@ describe("legacy generated systemd discovery and exact stop", () => {
   });
 
   it.each([
+    ["stop", 4242],
+    ["stop", 0],
+    ["stop-sigterm", 4242],
+    ["stop-sigterm", 0],
+    ["stop-sigkill", 4242],
+    ["stop-sigkill", 0],
+    ["stop-watchdog", 4242],
+    ["stop-watchdog", 0],
+    ["stop-post", 4242],
+    ["stop-post", 0],
+    ["final-sigterm", 4242],
+    ["final-sigterm", 0],
+    ["final-sigkill", 4242],
+    ["final-sigkill", 0],
+    ["final-watchdog", 4242],
+    ["final-watchdog", 0],
+  ] as const)("polls authenticated legacy shutdown %s with MainPID %i until exact absence", async (subState, managerPid) => {
+    const candidate = legacySystemdCandidate();
+    const runner = runQueue([
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: "stop queued" },
+      { code: 0, stdout: legacySystemdState("deactivating", managerPid, subState) },
+      { code: 0, stdout: legacySystemdState("not-found") },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      stopTimeoutMs: 100,
+      sleep,
+      now: () => 0,
+    }));
+
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).resolves.toBeUndefined();
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(50);
+    expect(runner.calls.map(({ args }) => args)).toEqual([
+      legacySystemdShowArgsForTest(candidate.name),
+      ["--user", "stop", candidate.name],
+      legacySystemdShowArgsForTest(candidate.name),
+      legacySystemdShowArgsForTest(candidate.name),
+    ]);
+  });
+
+  it.each([
     { name: "manager PID changes", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("active", 9999) },
+    { name: "deactivating manager PID changes", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", 9999, "stop") },
+    { name: "deactivating PID is missing", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", null, "stop") },
+    { name: "deactivating PID has leading zero", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", "00", "stop") },
+    { name: "deactivating PID is nonnumeric", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", "not-a-pid", "stop") },
+    { name: "deactivating invocation witness is missing", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", 4242, "stop", null) },
+    { name: "deactivating invocation witness is malformed", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", 4242, "stop", "not-an-id") },
+    { name: "deactivating invocation witness changes", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", 4242, "stop", CHANGED_LEGACY_INVOCATION_ID) },
+    { name: "active invocation witness is missing", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("active", 4242, "running", null) },
+    { name: "active invocation witness changes", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("active", 4242, "running", CHANGED_LEGACY_INVOCATION_ID) },
+    { name: "deactivating running substate", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", 4242, "running") },
+    { name: "deactivating unknown substate", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", 4242, "unexpected-transition") },
+    { name: "deactivating cleaning substate", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", 4242, "cleaning") },
+    { name: "deactivating auto-restart substate", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", 4242, "auto-restart") },
+    { name: "deactivating auto-restart queued substate", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("deactivating", 4242, "auto-restart-queued") },
+    { name: "active dead substate", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("active", 4242, "dead") },
+    { name: "activating start transition", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("activating", 4242, "start") },
+    { name: "reloading transition", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("reloading", 4242, "reload") },
+    { name: "refreshing transition", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("refreshing", 4242, "reload") },
+    { name: "maintenance state", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("maintenance", 0, "failed") },
+    { name: "future manager state", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("future-state", 4242, "running") },
     { name: "loaded inactive unit remains", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("inactive", 0, "dead") },
     { name: "loaded failed unit remains", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("failed", 0, "failed") },
+    { name: "unloaded unit remains", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("unloaded", 0, "dead") },
     { name: "malformed post-stop state", initial: legacySystemdState("active", 4242), afterStop: legacySystemdState("malformed") },
   ])("refuses $name after exact stop", async ({ initial, afterStop }) => {
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacySystemdCandidate();
     const runner = runQueue([
       { code: 0, stdout: initial },
       { code: 0, stdout: "stop queued" },
       { code: 0, stdout: afterStop },
     ]);
+    const sleep = vi.fn(async () => undefined);
     const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
       run: runner.run,
       platform: "linux",
-      sleep: vi.fn(async () => undefined),
+      sleep,
     }));
     expect(capabilities.stopLegacySystemdUnit).toBeTypeOf("function");
     await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
+    expect(runner.calls).toHaveLength(3);
+    expect(runner.calls.filter(({ args }) => args.includes("stop"))).toHaveLength(1);
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it.each([
-    { name: "stable name", candidate: { name: "lcm-daemon-aaaaaaaaaaaaaaaaaaaa.service", managerPid: 4242 } },
-    { name: "arbitrary name", candidate: { name: "other.service", managerPid: 4242 } },
-    { name: "zero PID", candidate: { name: "lcm-daemon-1234-1720000000000.service", managerPid: 0 } },
-    { name: "non-integer PID", candidate: { name: "lcm-daemon-1234-1720000000000.service", managerPid: 1.5 } },
+    { name: "missing candidate invocation witness", candidate: { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 } },
+    { name: "empty candidate invocation witness", candidate: legacySystemdCandidate({ invocationId: "" }) },
+    { name: "zero candidate invocation witness", candidate: legacySystemdCandidate({ invocationId: "0".repeat(32) }) },
+    { name: "malformed candidate invocation witness", candidate: legacySystemdCandidate({ invocationId: "not-an-id" }) },
+    { name: "initial invocation witness changes", candidate: legacySystemdCandidate(), initial: legacySystemdState("active", 4242, "running", CHANGED_LEGACY_INVOCATION_ID) },
+    { name: "initial invocation witness is missing", candidate: legacySystemdCandidate(), initial: legacySystemdState("active", 4242, "running", null) },
+    { name: "initial invocation witness is malformed", candidate: legacySystemdCandidate(), initial: legacySystemdState("active", 4242, "running", "not-an-id") },
+  ])("refuses $name before issuing exact stop", async ({ candidate, initial }) => {
+    const runner = runQueue(initial === undefined ? [] : [{ code: 0, stdout: initial }]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+    }));
+
+    await expect(capabilities.stopLegacySystemdUnit!(candidate as LegacySystemdUnitTestShape)).rejects.toThrow("manager command");
+    expect(runner.calls.some(({ args }) => args.includes("stop"))).toBe(false);
+    expect(runner.calls).toHaveLength(initial === undefined ? 0 : 1);
+  });
+
+  it("bounds a persistent authenticated legacy shutdown transition", async () => {
+    const candidate = legacySystemdCandidate();
+    const runner = runQueue([
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: "stop queued" },
+      { code: 0, stdout: legacySystemdState("deactivating", 4242, "stop-sigterm") },
+      { code: 0, stdout: legacySystemdState("deactivating", 0, "stop-post") },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      stopTimeoutMs: 100,
+      sleep,
+      now: () => 0,
+    }));
+
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
+    expect(runner.calls).toHaveLength(4);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(50);
+  });
+
+  it.each([
+    { name: "stable name", candidate: legacySystemdCandidate({ name: "lcm-daemon-aaaaaaaaaaaaaaaaaaaa.service" }) },
+    { name: "arbitrary name", candidate: legacySystemdCandidate({ name: "other.service" }) },
+    { name: "zero PID", candidate: legacySystemdCandidate({ managerPid: 0 }) },
+    { name: "non-integer PID", candidate: legacySystemdCandidate({ managerPid: 1.5 }) },
   ])("refuses a smuggled $name without invoking systemd", async ({ candidate }) => {
     const runner = runQueue([]);
     const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
@@ -1015,8 +1210,9 @@ describe("legacy generated systemd discovery and exact stop", () => {
     { name: "stop timeout", results: [{ code: 0, stdout: legacySystemdState("active", 4242) }, { timedOut: true }] },
     { name: "stop error", results: [{ code: 0, stdout: legacySystemdState("active", 4242) }, { code: 1, stderr: "permission denied" }] },
     { name: "post-stop timeout", results: [{ code: 0, stdout: legacySystemdState("active", 4242) }, { code: 0, stdout: "stop queued" }, { timedOut: true }] },
+    { name: "post-stop command error", results: [{ code: 0, stdout: legacySystemdState("active", 4242) }, { code: 0, stdout: "stop queued" }, { code: 1, stderr: "permission denied" }] },
   ])("refuses $name", async ({ results }) => {
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacySystemdCandidate();
     const runner = runQueue(results);
     const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
       run: runner.run,
@@ -1024,10 +1220,13 @@ describe("legacy generated systemd discovery and exact stop", () => {
     }));
     expect(capabilities.stopLegacySystemdUnit).toBeTypeOf("function");
     await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
+    expect(runner.calls.filter(({ args }) => args.includes("stop"))).toHaveLength(
+      results.length > 1 ? 1 : 0,
+    );
   });
 
   it("requires exact absence after a successful stop and honors the deadline", async () => {
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacySystemdCandidate();
     const runner = runQueue([
       { code: 0, stdout: legacySystemdState("active", 4242) },
       { code: 0, stdout: "stop queued" },
@@ -1060,7 +1259,7 @@ describe("legacy generated systemd discovery and exact stop", () => {
   });
 
   it("bounds a persistent exact-stop transition at one poll", async () => {
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacySystemdCandidate();
     const runner = runQueue([
       { code: 0, stdout: legacySystemdState("active", 4242) },
       { code: 0, stdout: "stop queued" },
@@ -1077,7 +1276,7 @@ describe("legacy generated systemd discovery and exact stop", () => {
   });
 
   it("polls a persistent exact-stop transition within multiple bounded intervals", async () => {
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacySystemdCandidate();
     const runner = runQueue([
       { code: 0, stdout: legacySystemdState("active", 4242) },
       { code: 0, stdout: "stop queued" },
@@ -1097,7 +1296,7 @@ describe("legacy generated systemd discovery and exact stop", () => {
   });
 
   it("uses the bounded default sleep for a persistent exact-stop transition", async () => {
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacySystemdCandidate();
     const runner = runQueue([
       { code: 0, stdout: legacySystemdState("active", 4242) },
       { code: 0, stdout: "stop queued" },
@@ -1114,7 +1313,7 @@ describe("legacy generated systemd discovery and exact stop", () => {
   });
 
   it("stops immediately when the exact-stop deadline expires after a persistent poll", async () => {
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacySystemdCandidate();
     const runner = runQueue([
       { code: 0, stdout: legacySystemdState("active", 4242) },
       { code: 0, stdout: "stop queued" },

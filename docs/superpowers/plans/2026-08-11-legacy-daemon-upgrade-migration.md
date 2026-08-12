@@ -455,3 +455,119 @@ but migration returned `restarted: true` instead of refusing. The direct-stop
 untrusted-state cases passed on the baseline, accurately proving its immediate
 exact-`show` revalidation already prevented stop; #613 was the earlier discovery
 omission/classification seam, not an exact-stop authorization bypass.
+
+### Task 7: Accept only identity-consistent post-stop systemd retirement (#614)
+
+**Files:**
+- Modify: `src/daemon/supervisor.ts`
+- Modify: `src/daemon/lifecycle.ts`
+- Modify: focused supervisor and lifecycle tests
+- Modify: daemon user docs, Changeset, and Copilot instructions
+
+- [x] **Step 1: Add #614 RED regressions before production changes**
+
+At exact clean head `23cc77b0877b3b1f88945de0cd5a7bfa87b5143d`, add a
+table covering every conservative systemd stop/final substate (`stop`,
+`stop-watchdog`, `stop-sigterm`, `stop-sigkill`, `stop-post`,
+`final-watchdog`, `final-sigterm`, and `final-sigkill`) with both the exact
+original PID and literal PID 0. This exact set is the `UNIT_DEACTIVATING`
+service-state mapping in systemd v255 `src/core/service.c` lines 58–65 and
+87–94, also exercised by its timeout/coldplug logic; prefix matching and
+`cleaning`, `auto-restart*`, dead, failed, activation, or reload states remain
+excluded. Each case requires initial exact running authentication with a valid
+nonzero canonical `InvocationID`, successful exact stop, the same invocation
+witness through the transition, one bounded sleep, a second exact show, and
+exact not-found success. Add negative cases for candidate/witness omission or
+malformation, pre-stop witness mismatch, post-stop witness loss/change, PID
+drift, missing/ambiguous PID values, unknown or contradictory states/substates,
+unloaded/malformed state, manager error, failed stop, and bounded timeout.
+Preserve direct pre-stop transition refusals so no transition can authorize a
+stop. Add lifecycle composition proving one real supervisor deactivation plus
+PID-file disappearance starts/adopts stable, while witness drift never starts
+or ensures.
+
+Exact RED command, run while `git diff -- src/daemon/supervisor.ts` was empty:
+
+```bash
+npm exec -- vitest run test/daemon/coverage-400-supervisor.test.ts \
+  -t "polls authenticated legacy shutdown"
+```
+
+Result: one file failed; all 16 selected positive cases failed at
+`src/daemon/supervisor.ts:2499` because the baseline rejected the first
+legitimate `deactivating` observation. 155 unrelated tests were skipped. This
+was a direct pre-production RED, not a reconstruction.
+
+After review required stronger identity continuity, reconstruct the complete
+test-only RED in a disposable detached worktree at exact
+`23cc77b0877b3b1f88945de0cd5a7bfa87b5143d`. Apply only the two focused test
+diffs, verify `git diff -- src/daemon/supervisor.ts src/daemon/lifecycle.ts` is
+empty, and run:
+
+```bash
+npm exec -- vitest run test/daemon/coverage-400-supervisor.test.ts \
+  test/daemon/coverage-400-lifecycle-restart.test.ts \
+  -t "invocation witness|polls authenticated legacy shutdown|identity-bound deactivation|invocation drift"
+```
+
+Result: both files failed; 32 tests failed, 4 preservation controls passed, and
+292 were skipped. The baseline accepted missing/malformed/zero/uppercase/
+oversized invocation witnesses during discovery, did not carry or validate a
+candidate witness, stopped despite pre-stop witness mismatch, polled through
+post-stop witness loss/change, rejected all 16 normal deactivation positives,
+could not complete the lifecycle transition, and incorrectly migrated after a
+pre-stop invocation change. The disposable worktree and test patch were then
+removed; committed history and the implementation worktree were unchanged.
+
+- [x] **Step 2: Implement a pure narrow classifier and run focused GREEN**
+
+Extend the candidate and exact show projection with systemd `InvocationID`.
+Accept only the canonical nonzero ID128 form (exactly 32 lowercase hexadecimal
+characters). Discovery carries this witness, lifecycle revalidation compares
+it, and the pre-stop exact show must match it before the sole stop command. Add
+a pure post-stop classifier accepting only loaded/deactivating state, the exact
+eight-state v255 allowlist, the same invocation witness, and either the original
+PID or literal PID 0. Inside the bounded poll, retry that state or exact
+active/running identity with the same witness; return only for exact absence
+and refuse every other observation. PID 0 is never identity or success.
+
+Focused GREEN command:
+
+```bash
+npm exec -- vitest run test/daemon/coverage-400-supervisor.test.ts \
+  -t "polls authenticated legacy shutdown|refuses .* after exact stop|bounds a persistent authenticated legacy shutdown transition|refuses exact untrusted"
+```
+
+Initial transition GREEN: one file passed; 41 tests passed and 130 were
+skipped. After adding InvocationID continuity and lifecycle composition, the
+combined focused command selected both test files and passed 68 tests with 260
+skipped.
+
+- [x] **Step 3: Preserve lifecycle composition and align documentation**
+
+Add a lifecycle test using the real systemd supervisor stop implementation to
+prove running/same invocation → stop success → deactivating/same invocation/
+PID 0 → exact not-found, paired with daemon-owned PID-file disappearance,
+reaches stable start/admission and records `stoppedPid`. Add the inverse real
+supervisor fixture proving changed post-stop invocation refuses before stable
+start or ensure. Document that post-stop transition acceptance is bounded
+observation—not pre-stop authority, identity by PID 0, cleanup, absence, or
+success—and update reusable review guidance accordingly.
+
+- [x] **Step 4: Run complete verification and create a new signed DCO commit**
+
+Run the affected supervisor and lifecycle suites, build, typecheck, lint,
+Codecov metadata contract, and a fresh `npm run test:ci` with 100% statements,
+branches, functions, and lines. Commit with `git commit -S --signoff` without
+amending or rewriting prior history.
+
+Verification result: the full affected supervisor/lifecycle/Codecov command
+passed 334 tests in three files. Build, typecheck (including PostgreSQL
+conformance), and lint each exited 0. The fresh `npm run test:ci` passed 260
+files with two skipped files and 6,290 tests with 12 skipped tests; coverage was
+100% statements (26,781/26,781), branches (19,331/19,331), functions
+(4,247/4,247), and lines (24,444/24,444). `src/daemon/supervisor.ts` and
+`src/daemon/lifecycle.ts` remain exclusively and accurately owned by the
+existing `integration-service-managers` Codecov component, so no taxonomy,
+path, count, topology, status, flag, or exclusion change is semantically
+warranted.

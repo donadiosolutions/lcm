@@ -29,7 +29,10 @@ import {
   type DaemonLifecycleTestScope,
 } from "../../src/daemon/lifecycle-scope.js";
 import { managedDaemonPath } from "../../src/daemon/managed-path.js";
-import { managedLaunchEnvironmentDigest } from "../../src/daemon/supervisor.js";
+import {
+  createSupervisor,
+  managedLaunchEnvironmentDigest,
+} from "../../src/daemon/supervisor.js";
 
 type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
 type RestartDaemonOptions = Parameters<typeof restartDaemonProduction>[0];
@@ -289,7 +292,10 @@ function managedSupervisor(
   };
 }
 
-type LegacyUnit = Readonly<{ name: string; managerPid: number }>;
+const LEGACY_INVOCATION_ID = "1234567890abcdef1234567890abcdef";
+const CHANGED_LEGACY_INVOCATION_ID = "abcdef1234567890abcdef1234567890";
+
+type LegacyUnit = Readonly<{ name: string; managerPid: number; invocationId: string }>;
 type LegacyDiscovery =
   | Readonly<{ kind: "candidates"; candidates: readonly LegacyUnit[] }>
   | Readonly<{ kind: "unavailable"; reason: string }>;
@@ -297,6 +303,10 @@ type LegacyDiscovery =
 function legacyMigrationSupervisor(
   discovery: LegacyDiscovery,
   onStop?: (candidate: LegacyUnit) => void | Promise<void>,
+  stopImplementation?: (
+    candidate: LegacyUnit,
+    options?: { readonly deadline?: number },
+  ) => Promise<void>,
 ): {
   supervisor: Supervisor;
   probe: ReturnType<typeof vi.fn>;
@@ -309,7 +319,13 @@ function legacyMigrationSupervisor(
   const start = vi.fn(async () => ({ kind: "systemd-user" as const, managerPid: 5252 }));
   const stopAndStart = vi.fn();
   const discoverLegacySystemdUnits = vi.fn(async () => discovery);
-  const stopLegacySystemdUnit = vi.fn(async (candidate: LegacyUnit) => onStop?.(candidate));
+  const stopLegacySystemdUnit = vi.fn(async (
+    candidate: LegacyUnit,
+    options?: { readonly deadline?: number },
+  ) => {
+    if (stopImplementation !== undefined) return stopImplementation(candidate, options);
+    return onStop?.(candidate);
+  });
   return {
     supervisor: {
       probe,
@@ -325,6 +341,30 @@ function legacyMigrationSupervisor(
     discoverLegacySystemdUnits,
     stopLegacySystemdUnit,
   };
+}
+
+function legacyUnit(overrides: Partial<LegacyUnit> = {}): LegacyUnit {
+  return {
+    name: "lcm-daemon-1234-1720000000000.service",
+    managerPid: 4242,
+    invocationId: LEGACY_INVOCATION_ID,
+    ...overrides,
+  };
+}
+
+function legacyManagerState(
+  activeState: "active" | "deactivating" | "not-found",
+  mainPid: number,
+  subState: "running" | "stop-sigterm" | "dead",
+  invocationId: string = LEGACY_INVOCATION_ID,
+): string {
+  return [
+    `LoadState=${activeState === "not-found" ? "not-found" : "loaded"}`,
+    `ActiveState=${activeState === "not-found" ? "inactive" : activeState}`,
+    `SubState=${subState}`,
+    `MainPID=${mainPid}`,
+    ...(activeState === "not-found" ? [] : [`InvocationID=${invocationId}`]),
+  ].join("\n");
 }
 
 type LegacyFixtureConfig = Readonly<{
@@ -389,7 +429,7 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
   }
   const aliveState = { value: config.alive ?? true };
   writeProc(procRoot, 4242, 1234, config.processCommand ?? "node lcm daemon start --foreground");
-  const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+  const candidate = legacyUnit();
   const discoveries = config.discoveries ?? [{ kind: "candidates" as const, candidates: [candidate] }];
   let discoveryIndex = 0;
   const supervisor = legacyMigrationSupervisor(
@@ -1585,7 +1625,7 @@ describe("managed restart refusal and repair coverage", () => {
     writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
     let alive = true;
     const events: string[] = [];
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacyUnit();
     const managed = legacyMigrationSupervisor(
       { kind: "candidates", candidates: [candidate] },
       () => {
@@ -1671,11 +1711,173 @@ describe("managed restart refusal and repair coverage", () => {
     }));
     expect(existsSync(pidPath)).toBe(false);
   });
+
+  it("starts stable after the real legacy supervisor observes one identity-bound deactivation", async () => {
+    const dir = root("issue-614-legacy-transition-");
+    const procRoot = join(dir, "proc");
+    mkdirSync(procRoot, { recursive: true });
+    const pidPath = writePid(dir, 4242);
+    writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
+    writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
+    let alive = true;
+    const candidate = legacyUnit();
+    const managerCalls: string[][] = [];
+    const managerResults = [
+      { code: 0, stdout: legacyManagerState("active", 4242, "running") },
+      { code: 0, stdout: "stop queued" },
+      { code: 0, stdout: legacyManagerState("deactivating", 0, "stop-sigterm") },
+      { code: 0, stdout: legacyManagerState("not-found", 0, "dead") },
+    ];
+    const run = vi.fn(async (_command: string, args: readonly string[]) => {
+      managerCalls.push([...args]);
+      if (args[1] === "stop") {
+        alive = false;
+        unlinkSync(pidPath);
+      }
+      return managerResults.shift() ?? { code: 1, stderr: "unexpected manager call" };
+    });
+    const exactSupervisor = createSupervisor("systemd-user", {
+      run,
+      platform: "linux",
+      stopTimeoutMs: 100,
+      sleep: async () => undefined,
+      now: () => 0,
+    });
+    const managed = legacyMigrationSupervisor(
+      { kind: "candidates", candidates: [candidate] },
+      undefined,
+      exactSupervisor.stopLegacySystemdUnit,
+    );
+    managed.start.mockResolvedValue({ kind: "systemd-user", managerPid: 5252 });
+    const fetch = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+      if (url.endsWith("/stats/pool")) return response({ totalConnections: 0 });
+      return response(health(4242, {
+        version: "1.4.1",
+        ownerId: "legacy-owner",
+        entrypoint: "/lcm",
+      }));
+    }) as unknown as FetchOverride;
+    const ensureMock = vi.fn(async () => ({
+      connected: true,
+      port: 19_999,
+      spawned: true,
+      pid: 5252,
+      startMethod: "systemd-user" as const,
+    }));
+
+    await expect(restart({
+      ...baseOptions(dir),
+      _skipSpawn: false,
+      expectedVersion: "1.4.2",
+      enforceUserManagerParent: true,
+      _procRoot: procRoot,
+      _isProcessAliveOverride: () => alive,
+      _listeningPortsOverride: () => [19_999],
+      _fetchOverride: fetch,
+      _supervisorOverride: managed.supervisor,
+      _ensureDaemonOverride: ensureMock,
+    })).resolves.toMatchObject({
+      connected: true,
+      restarted: true,
+      stoppedPid: 4242,
+      startMethod: "systemd-user",
+    });
+    expect(managerCalls).toEqual([
+      ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,InvocationID", candidate.name],
+      ["--user", "stop", candidate.name],
+      ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,InvocationID", candidate.name],
+      ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,InvocationID", candidate.name],
+    ]);
+    expect(managed.start).toHaveBeenCalledOnce();
+    expect(ensureMock).toHaveBeenCalledOnce();
+    expect(existsSync(pidPath)).toBe(false);
+  });
+
+  it("refuses stable start when the real legacy supervisor observes invocation drift", async () => {
+    const dir = root("issue-614-legacy-invocation-drift-");
+    const procRoot = join(dir, "proc");
+    mkdirSync(procRoot, { recursive: true });
+    const pidPath = writePid(dir, 4242);
+    writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
+    writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
+    let alive = true;
+    const candidate = legacyUnit();
+    const managerResults = [
+      { code: 0, stdout: legacyManagerState("active", 4242, "running") },
+      { code: 0, stdout: "stop queued" },
+      {
+        code: 0,
+        stdout: legacyManagerState(
+          "deactivating",
+          0,
+          "stop-sigterm",
+          CHANGED_LEGACY_INVOCATION_ID,
+        ),
+      },
+    ];
+    const run = vi.fn(async (_command: string, args: readonly string[]) => {
+      if (args[1] === "stop") {
+        alive = false;
+        unlinkSync(pidPath);
+      }
+      return managerResults.shift() ?? { code: 1, stderr: "unexpected manager call" };
+    });
+    const exactSupervisor = createSupervisor("systemd-user", {
+      run,
+      platform: "linux",
+      stopTimeoutMs: 100,
+      sleep: async () => undefined,
+      now: () => 0,
+    });
+    const managed = legacyMigrationSupervisor(
+      { kind: "candidates", candidates: [candidate] },
+      undefined,
+      exactSupervisor.stopLegacySystemdUnit,
+    );
+    const fetch = vi.fn(async (url: string): Promise<Response> => {
+      if (url.endsWith("/stats/pool")) return response({ totalConnections: 0 });
+      return response(health(4242, {
+        version: "1.4.1",
+        ownerId: "legacy-owner",
+        entrypoint: "/lcm",
+      }));
+    }) as unknown as FetchOverride;
+    const ensureMock = vi.fn(async () => ({
+      connected: true,
+      port: 19_999,
+      spawned: true,
+      startMethod: "systemd-user" as const,
+    }));
+
+    await expect(restart({
+      ...baseOptions(dir),
+      _skipSpawn: false,
+      expectedVersion: "1.4.2",
+      enforceUserManagerParent: true,
+      _procRoot: procRoot,
+      _isProcessAliveOverride: () => alive,
+      _listeningPortsOverride: () => [19_999],
+      _fetchOverride: fetch,
+      _supervisorOverride: managed.supervisor,
+      _ensureDaemonOverride: ensureMock,
+    })).resolves.toMatchObject({
+      restarted: false,
+      refusalReason: "startup-failure",
+      pid: 4242,
+    });
+    expect(run.mock.calls.filter(([, args]) => args[1] === "stop")).toHaveLength(1);
+    expect(managed.start).not.toHaveBeenCalled();
+    expect(ensureMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("authenticated legacy generated systemd refusal matrix", () => {
-  const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
-  const otherCandidate = { name: "lcm-daemon-5678-1720000000001.service", managerPid: 5678 };
+  const candidate = legacyUnit();
+  const otherCandidate = legacyUnit({
+    name: "lcm-daemon-5678-1720000000001.service",
+    managerPid: 5678,
+    invocationId: CHANGED_LEGACY_INVOCATION_ID,
+  });
   const legacyHealth = (extra: Record<string, unknown> = {}): Record<string, unknown> => health(4242, {
     version: "1.4.1",
     ownerId: "legacy-owner",
@@ -1718,6 +1920,10 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     ["pre-stop candidate change", { discoveries: [
       { kind: "candidates" as const, candidates: [candidate] },
       { kind: "candidates" as const, candidates: [otherCandidate] },
+    ] }, "ambiguous"],
+    ["pre-stop invocation witness change", { discoveries: [
+      { kind: "candidates" as const, candidates: [candidate] },
+      { kind: "candidates" as const, candidates: [{ ...candidate, invocationId: CHANGED_LEGACY_INVOCATION_ID }] },
     ] }, "ambiguous"],
     ["pre-stop discovery refusal", { discoveries: [
       { kind: "candidates" as const, candidates: [candidate] },
@@ -1845,7 +2051,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     const dir = root("issue-600-legacy-pid-race-");
     const pidPath = writePid(dir, 4242);
     writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
-    const supervisor = legacyMigrationSupervisor({ kind: "candidates", candidates: [{ name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 }] });
+    const supervisor = legacyMigrationSupervisor({ kind: "candidates", candidates: [legacyUnit()] });
     const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: false }));
     legacyPidFileFault.path = pidPath;
     legacyPidFileFault.mode = mode;
@@ -1890,7 +2096,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
     writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
     let alive = true;
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacyUnit();
     const supervisor = legacyMigrationSupervisor(
       { kind: "candidates", candidates: [candidate] },
       () => { alive = false; },
@@ -1928,7 +2134,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     linkSync(pidPath, `${pidPath}.alias`);
     writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
     writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacyUnit();
     const supervisor = legacyMigrationSupervisor({ kind: "candidates", candidates: [candidate] });
     const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: false }));
     const previousArgv = process.argv[1];
@@ -1966,7 +2172,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     const fixture = testScopeFixture("legacy-owner-collision-");
     const pidPath = writePid(fixture.scope.stateDir, 4242);
     writeFileSync(join(fixture.scope.stateDir, "daemon.token"), "legacy-token", { mode: 0o600 });
-    const candidate = { name: "lcm-daemon-1234-1720000000000.service", managerPid: 4242 };
+    const candidate = legacyUnit();
     const supervisor = legacyMigrationSupervisor({ kind: "candidates", candidates: [candidate] });
     const fetch = fixture.scope.dependencies.fetch as unknown as ReturnType<typeof vi.fn>;
     fetch.mockImplementation(async (url: string) => url.endsWith("/stats/pool")
