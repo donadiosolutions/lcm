@@ -8,7 +8,7 @@ Passive learning captures insights from your Claude Code sessions automatically 
 
 Two hooks capture events during your session:
 
-- **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output.
+- **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output. For Codex, the native `functions.exec` and `functions.exec_command` calls are adapted into the existing Bash event semantics.
 - **UserPromptSubmit** — fires on each user prompt. Detects decisions ("always use X"), role statements ("I'm a data scientist"), and intent patterns.
 
 Events are written to a **sidecar SQLite database**
@@ -34,6 +34,36 @@ new global sequences during their transactional schema upgrade.
 
 ### What Gets Captured
 
+#### Codex native command capture
+
+The Codex connector recognizes only PostToolUse payloads marked with
+`client: "codex"` whose `tool_name` is exactly `functions.exec` or
+`functions.exec_command`. The adapter accepts the string `tool_input.command`
+first, or the string `tool_input.cmd` when `command` is not a string. Other
+command-like, path-like, and file-like fields are ignored; a blank `command`
+does not fall back to `cmd`.
+
+The adapter passes only bounded semantic information into the existing Bash
+extractor:
+
+- A command is limited to 2,000 characters at the adapter boundary; longer
+  commands are clipped with `...` before event classification.
+- The existing event-data truncation and event scrubbing still run after
+  classification, including the normal sensitive-path redaction rules.
+- Status is read only from direct, top-level fields. `tool_output` wins over
+  `tool_response` when it contains a valid status. Within either object, the
+  precedence is `isError`, `is_error`, `exit_code`, then `exitCode`; boolean
+  values are used directly and finite numeric exit codes treat zero as
+  success and any other value as an error. Invalid, nested, string, `NaN`, and
+  infinite values are ignored.
+- The raw Codex response, stdout, stderr, and unknown output fields are never
+  copied into the normalized event. Shell text is not parsed into file events.
+- A command whose trimmed text begins with `lcm store` is suppressed so LCM's
+  own storage activity cannot create a passive-learning feedback loop.
+
+Only events recognized by the existing Bash extractor are queued. The command
+itself is not stored as a transcript.
+
 | Category | Examples | Priority |
 |----------|----------|----------|
 | Decisions | User answers to AskUserQuestion, "always use TypeScript" | 1 (immediate) |
@@ -47,7 +77,9 @@ new global sequences during their transactional schema upgrade.
 
 ### What Is NOT Captured
 
-- Raw tool payload contents such as file contents and command stdout/stderr (only tool metadata and brief user answers are stored)
+- Raw tool payload contents such as file contents, command stdout/stderr, and
+  unknown Codex response fields (only bounded semantic metadata and brief user
+  answers are stored)
 - Sensitive file paths (`.env`, `.ssh/`, `credentials`, `.npmrc`)
 - LCM's own `lcm_store` calls (prevents feedback loops)
 
