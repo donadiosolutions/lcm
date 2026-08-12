@@ -31,6 +31,7 @@ import {
 
 const GENERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const MANIFEST_FILENAME_PATTERN = /^([0-9a-f]{64})\.json$/u;
 const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
 
 function invalidPathInput(message: string): never {
@@ -250,6 +251,68 @@ function assertNoImmediateSuccessor(
   throw new MigrationProtocolError(
     "recovery-required",
     "migration manifest has an unpublished immediate successor",
+  );
+}
+
+function exactRecoveryCandidate(
+  revisions: string,
+  generationId: string,
+  revision: number,
+  previousManifestSha256: string | null,
+  expectedUid: number | undefined,
+): Readonly<{ manifest: MigrationManifest; directory: string }> | null {
+  const directory = join(revisions, revisionDirectoryName(revision));
+  try {
+    lstatSync(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  return withAuthenticatedDirectories([directory], expectedUid, () => {
+    const entries = readDirectoryEntriesBounded(directory, 2);
+    const match = entries.length === 1 ? MANIFEST_FILENAME_PATTERN.exec(entries[0]!) : null;
+    if (match === null) {
+      return malformedHead("migration manifest recovery directory is ambiguous");
+    }
+    const checksumSha256 = match[1]!;
+    const path = join(directory, entries[0]!);
+    const content = readBoundedRegularFileWithStat(path, {
+      allowedRoot: directory,
+      maxBytes: MAX_MANIFEST_BYTES,
+      expectedUid,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+    }).content;
+    const manifest = parseManifestContent(content);
+    if (
+      manifest.generationId !== generationId
+      || manifest.revision !== revision
+      || manifest.checksumSha256 !== checksumSha256
+    ) {
+      return malformedHead("migration manifest recovery candidate does not match its path");
+    }
+    if (manifest.previousManifestSha256 !== previousManifestSha256) {
+      throw new MigrationProtocolError(
+        "unexpected-state",
+        "migration manifest recovery candidate has the wrong predecessor",
+      );
+    }
+    return { manifest, directory };
+  });
+}
+
+function assertNoRecoverySecondHop(revisions: string, revision: number): void {
+  if (revision === Number.MAX_SAFE_INTEGER) return;
+  const secondHop = join(revisions, revisionDirectoryName(revision + 1));
+  try {
+    lstatSync(secondHop);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  throw new MigrationProtocolError(
+    "unexpected-state",
+    "migration manifest recovery found a forbidden second hop",
   );
 }
 
@@ -568,6 +631,17 @@ export class MigrationManifestStore {
   }
 
   #readState(generationId: string): AuthenticatedManifestState {
+    const state = this.#readOptionalState(generationId, true);
+    if (state === null) {
+      throw new MigrationProtocolError("unexpected-state", "migration manifest head is absent");
+    }
+    return state;
+  }
+
+  #readOptionalState(
+    generationId: string,
+    rejectImmediateSuccessor: boolean,
+  ): AuthenticatedManifestState | null {
     const generation = migrationManifestGenerationDirectory(generationId, this.#homeDir);
     const root = lcmRoot(this.#homeDir);
     const migrations = migrationRoot(this.#homeDir);
@@ -577,13 +651,19 @@ export class MigrationManifestStore {
       this.#expectedUid,
       () => {
         const headPath = migrationManifestHeadPath(generationId, this.#homeDir);
-        const headContent = readBoundedRegularFileWithStat(headPath, {
-          allowedRoot: generation,
-          maxBytes: MAX_MANIFEST_BYTES,
-          expectedUid: this.#expectedUid,
-          allowedModes: [0o600],
-          requireSingleLink: true,
-        }).content;
+        let headContent: string;
+        try {
+          headContent = readBoundedRegularFileWithStat(headPath, {
+            allowedRoot: generation,
+            maxBytes: MAX_MANIFEST_BYTES,
+            expectedUid: this.#expectedUid,
+            allowedModes: [0o600],
+            requireSingleLink: true,
+          }).content;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+          throw error;
+        }
         const head = parseMigrationManifestHeadContent(headContent);
         if (head.generationId !== generationId) {
           return malformedHead("migration manifest head generation does not match");
@@ -617,7 +697,7 @@ export class MigrationManifestStore {
           ) {
             return malformedHead("migration manifest revision does not match its head");
           }
-          assertNoImmediateSuccessor(revisions, head.revision);
+          if (rejectImmediateSuccessor) assertNoImmediateSuccessor(revisions, head.revision);
           return {
             head,
             headContent,
@@ -696,6 +776,55 @@ export class MigrationManifestStore {
           });
           this.#observer("after-head-publication", headPath);
           return candidate;
+        },
+      );
+    });
+  }
+
+  recover(generationId: string): MigrationManifest {
+    return withManifestMutationLock(this.#homeDir, this.#expectedUid, () => {
+      const current = this.#readOptionalState(generationId, false);
+      if (current?.manifest.revision === Number.MAX_SAFE_INTEGER) return current.manifest;
+      const generation = migrationManifestGenerationDirectory(generationId, this.#homeDir);
+      const root = lcmRoot(this.#homeDir);
+      const migrations = migrationRoot(this.#homeDir);
+      const revisions = join(generation, "revisions");
+      return withAuthenticatedDirectories(
+        [root, migrations, generation, revisions],
+        this.#expectedUid,
+        () => {
+          const nextRevision = current === null ? 0 : current.manifest.revision + 1;
+          const candidate = exactRecoveryCandidate(
+            revisions,
+            generationId,
+            nextRevision,
+            current?.manifest.checksumSha256 ?? null,
+            this.#expectedUid,
+          );
+          if (candidate === null) {
+            if (current !== null) return current.manifest;
+            throw new MigrationProtocolError(
+              "unexpected-state",
+              "migration manifest has no recoverable genesis revision",
+            );
+          }
+          assertNoRecoverySecondHop(revisions, nextRevision);
+          const headPath = migrationManifestHeadPath(generationId, this.#homeDir);
+          const head = createMigrationManifestHead({
+            generationId,
+            revision: candidate.manifest.revision,
+            manifestSha256: candidate.manifest.checksumSha256,
+            updatedAt: candidate.manifest.updatedAt,
+          });
+          this.#observer("before-head-publication", headPath);
+          atomicWritePrivateFileDurable(headPath, migrationManifestHeadContent(head), {
+            expectedUid: this.#expectedUid,
+            expectedContentSha256: current === null ? null : sha256(current.headContent),
+            requireAbsent: current === null,
+            maxExistingBytes: MAX_MANIFEST_BYTES,
+          });
+          this.#observer("after-head-publication", headPath);
+          return candidate.manifest;
         },
       );
     });
