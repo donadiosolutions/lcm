@@ -45,7 +45,12 @@ absent. The first `lcm doctor` after the upgrade, or an explicit
 canonical PID/token files, authenticated health identity, older same-line
 version, process entrypoint, and loopback listener all agree. A changing,
 ambiguous, symlinked, malformed, or unauthorized candidate is not stopped and
-does not trigger a competing start. See the [managed daemon recovery guide](daemon-restart-recovery.md#one-time-migration-after-a-linux-upgrade)
+does not trigger a competing start. After exact stop, the stable daemon starts
+only if the authenticated legacy daemon removed its own PID file. Any
+remaining PID pathname is preserved without unlinking and blocks stable start.
+When the PID file is already missing, bounded strict discovery must prove that
+no legacy candidate exists before normal absent startup continues; a candidate
+or unavailable discovery blocks startup. See the [managed daemon recovery guide](daemon-restart-recovery.md#one-time-migration-after-a-linux-upgrade)
 for the checks and safe refusal behavior. Never stop a wildcard service or
 start a second daemon manually during an upgrade.
 

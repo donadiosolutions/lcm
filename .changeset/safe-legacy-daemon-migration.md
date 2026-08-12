@@ -2,4 +2,4 @@
 "@donadiosolutions/lcm": patch
 ---
 
-Recover authenticated legacy Linux daemon services safely after upgrading.
+Migrate authenticated legacy Linux daemons only after their PID file disappears during exact stop.

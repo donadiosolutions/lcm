@@ -122,17 +122,27 @@ old unit once, but only when all of these independent checks agree:
   single unit.
 
 Only after those checks pass does LCM stop that exact unit through
-`systemctl --user`, wait for exact unit absence and PID death, and start the
-stable managed unit. A graceful daemon may remove `daemon.pid` while it exits;
-that expected disappearance is accepted. If the unchanged PID file remains,
-LCM removes it only after proving that its file identity and PID did not
-change.
+`systemctl --user` and wait for exact unit absence and PID death. LCM starts
+the stable managed unit only when the authenticated legacy daemon also removes
+`daemon.pid` while exiting. If any PID path remains after the stop—an unchanged
+regular file, a replacement, a symlink, a hardlink, or malformed evidence—LCM
+preserves it and refuses the stable start. LCM does not unlink a post-stop PID
+pathname after checking a descriptor because the pathname can be replaced
+between those operations.
 
-Ambiguous, replaced, symlinked, malformed, unauthorized, or otherwise
-incomplete evidence is left untouched. LCM refuses multiple or changing
-candidates, changed PID files, failed stops, live PIDs, and unresolved manager
-states; it does not start a competing daemon after such a refusal. Do not use
-wildcard service stops, `kill`, `pkill`, or a second manual daemon start.
+If `daemon.pid` is already missing, LCM first performs the same bounded,
+strict legacy-unit discovery. A discovered historical unit cannot be
+authenticated without its PID evidence, so LCM preserves it and refuses a
+stable start. Normal absent startup continues only when discovery proves that
+no historical candidate exists. Unavailable or failed discovery also refuses
+rather than assuming absence.
+
+Ambiguous, replaced, symlinked, hardlinked, malformed, unauthorized, or
+otherwise incomplete evidence is left untouched. LCM refuses multiple or
+changing candidates, any PID path remaining after stop, failed stops, live
+PIDs, and unresolved manager states; it does not start a competing daemon
+after such a refusal. Do not use wildcard service stops, `kill`, `pkill`, or a
+second manual daemon start.
 Run the canonical commands and preserve their refusal guidance:
 
 ```bash

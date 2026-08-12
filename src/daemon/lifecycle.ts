@@ -3624,25 +3624,6 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
         || supervisor.stopLegacySystemdUnit === undefined
       ) return { kind: "not-applicable" };
 
-      const firstPid = readLegacyPidFileEvidence(opts.pidFilePath);
-      if (firstPid.kind === "unsafe") {
-        return legacyRefusal("ambiguous", "legacy daemon PID evidence was not a safe regular file; refusing migration");
-      }
-      const secondPid = readLegacyPidFileEvidence(opts.pidFilePath);
-      if (secondPid.kind === "unsafe") {
-        return legacyRefusal("ambiguous", "legacy daemon PID evidence changed to an unsafe file; refusing migration");
-      }
-      if (
-        firstPid.kind === "present"
-        && secondPid.kind === "present"
-        && !sameLegacyPidFileIdentity(firstPid, secondPid)
-      ) {
-        return legacyRefusal("ambiguous", "legacy daemon PID evidence changed between reads; refusing migration", firstPid.pid);
-      }
-      if (firstPid.kind === "missing" && secondPid.kind === "missing") return { kind: "not-applicable" };
-      if (firstPid.kind === "missing" || secondPid.kind === "missing") {
-        return legacyRefusal("ambiguous", "legacy daemon PID evidence disappeared between reads; refusing migration");
-      }
       const discover = async (): Promise<
         | Readonly<{ kind: "refused"; refusalReason: DaemonLifecycleRefusalReason; warning: string; pid?: number }>
         | Readonly<{ kind: "candidates"; candidates: readonly LegacySystemdUnit[] }>
@@ -3660,6 +3641,33 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
           return legacyRefusal("manager-unavailable", "legacy daemon systemd discovery failed; refusing migration");
         }
       };
+      const firstPid = readLegacyPidFileEvidence(opts.pidFilePath);
+      if (firstPid.kind === "unsafe") {
+        return legacyRefusal("ambiguous", "legacy daemon PID evidence was not a safe regular file; refusing migration");
+      }
+      const secondPid = readLegacyPidFileEvidence(opts.pidFilePath);
+      if (secondPid.kind === "unsafe") {
+        return legacyRefusal("ambiguous", "legacy daemon PID evidence changed to an unsafe file; refusing migration");
+      }
+      if (
+        firstPid.kind === "present"
+        && secondPid.kind === "present"
+        && !sameLegacyPidFileIdentity(firstPid, secondPid)
+      ) {
+        return legacyRefusal("ambiguous", "legacy daemon PID evidence changed between reads; refusing migration", firstPid.pid);
+      }
+      if (firstPid.kind === "missing" && secondPid.kind === "missing") {
+        const missingPidDiscovery = await discover();
+        if (missingPidDiscovery.kind === "refused") return missingPidDiscovery;
+        if (missingPidDiscovery.candidates.length === 0) return { kind: "not-applicable" };
+        return legacyRefusal(
+          "ambiguous",
+          "legacy daemon PID evidence was missing while a historical systemd candidate remained; stable replacement was not started",
+        );
+      }
+      if (firstPid.kind === "missing" || secondPid.kind === "missing") {
+        return legacyRefusal("ambiguous", "legacy daemon PID evidence disappeared between reads; refusing migration");
+      }
       const discovered = await discover();
       if (discovered.kind === "refused") return discovered;
       if (discovered.candidates.length === 0) {
@@ -3746,18 +3754,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
       const afterStopPid = readLegacyPidFileEvidence(opts.pidFilePath);
       if (afterStopPid.kind === "unsafe") return legacyRefusal("ambiguous", "legacy daemon PID evidence became unsafe after exact stop", pid);
       if (afterStopPid.kind === "present") {
-        if (!sameLegacyPidFileIdentity(firstPid, afterStopPid) || afterStopPid.pid !== pid) {
-          return legacyRefusal("ambiguous", "legacy daemon PID path was replaced after exact stop", pid);
-        }
-        try {
-          if (scopedState) assertScopedStateAccess(scopedState);
-          unlinkSync(opts.pidFilePath);
-          if (scopedState) assertScopedStateAccess(scopedState);
-        } catch {
-          return legacyRefusal("ambiguous", "legacy daemon PID cleanup could not be authenticated after exact stop", pid);
-        }
-        const cleanupProbe = readLegacyPidFileEvidence(opts.pidFilePath);
-        if (cleanupProbe.kind !== "missing") return legacyRefusal("ambiguous", "legacy daemon PID path changed during cleanup", pid);
+        return legacyRefusal("ambiguous", "legacy daemon PID path remained after exact stop; stable replacement was not started", pid);
       }
       return { kind: "migrated", stoppedPid: pid };
     };

@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import {
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -10,6 +11,7 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -43,8 +45,17 @@ type ManagedCredentialSnapshot = {
 
 const legacyPidFileFault = vi.hoisted(() => ({
   path: undefined as string | undefined,
-  mode: undefined as "missing" | "replacement" | "unsafe" | "cleanup-replacement" | undefined,
+  mode: undefined as
+    | "missing"
+    | "replacement"
+    | "unsafe"
+    | "former-cleanup-replacement"
+    | "former-cleanup-symlink"
+    | "former-cleanup-hardlink"
+    | undefined,
   openCalls: 0,
+  formerCleanupDescriptor: undefined as number | undefined,
+  unlinkCalls: 0,
 }));
 const legacyTokenFileFault = vi.hoisted(() => ({
   path: undefined as string | undefined,
@@ -77,16 +88,38 @@ vi.mock("node:fs", async (importOriginal) => {
           throw error;
         }
       }
-      return actual.openSync(...args);
-    },
-    unlinkSync: (...args: Parameters<typeof actual.unlinkSync>) => {
-      const result = actual.unlinkSync(...args);
-      if (legacyPidFileFault.path !== undefined
+      const descriptor = actual.openSync(...args);
+      if (
+        legacyPidFileFault.path !== undefined
         && String(args[0]) === legacyPidFileFault.path
-        && legacyPidFileFault.mode === "cleanup-replacement") {
-        actual.writeFileSync(legacyPidFileFault.path, "9999", { mode: 0o600 });
+        && legacyPidFileFault.openCalls === 4
+        && legacyPidFileFault.mode?.startsWith("former-cleanup-") === true
+      ) {
+        legacyPidFileFault.formerCleanupDescriptor = descriptor;
+      }
+      return descriptor;
+    },
+    closeSync: (...args: Parameters<typeof actual.closeSync>) => {
+      const result = actual.closeSync(...args);
+      if (args[0] === legacyPidFileFault.formerCleanupDescriptor && legacyPidFileFault.path !== undefined) {
+        legacyPidFileFault.formerCleanupDescriptor = undefined;
+        const originalPath = `${legacyPidFileFault.path}.authenticated`;
+        actual.renameSync(legacyPidFileFault.path, originalPath);
+        if (legacyPidFileFault.mode === "former-cleanup-replacement") {
+          actual.writeFileSync(legacyPidFileFault.path, "9999", { mode: 0o600 });
+        } else if (legacyPidFileFault.mode === "former-cleanup-symlink") {
+          actual.symlinkSync(originalPath, legacyPidFileFault.path);
+        } else if (legacyPidFileFault.mode === "former-cleanup-hardlink") {
+          actual.linkSync(originalPath, legacyPidFileFault.path);
+        }
       }
       return result;
+    },
+    unlinkSync: (...args: Parameters<typeof actual.unlinkSync>) => {
+      if (legacyPidFileFault.path !== undefined && String(args[0]) === legacyPidFileFault.path) {
+        legacyPidFileFault.unlinkCalls += 1;
+      }
+      return actual.unlinkSync(...args);
     },
   };
 });
@@ -104,7 +137,6 @@ vi.mock("../../src/daemon/managed-credentials.js", async (importOriginal) => {
 });
 
 const roots: string[] = [];
-let activeLegacyRestartOptions: EnsureDaemonOptions | undefined;
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -112,10 +144,11 @@ afterEach(() => {
   legacyPidFileFault.path = undefined;
   legacyPidFileFault.mode = undefined;
   legacyPidFileFault.openCalls = 0;
+  legacyPidFileFault.formerCleanupDescriptor = undefined;
+  legacyPidFileFault.unlinkCalls = 0;
   legacyTokenFileFault.path = undefined;
   legacyTokenFileFault.code = "ENOENT";
   legacyTokenFileFault.openCalls = 0;
-  activeLegacyRestartOptions = undefined;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -180,9 +213,7 @@ function ensure(options: EnsureDaemonOptions): ReturnType<typeof ensureDaemonPro
 }
 
 function restart(options: RestartDaemonOptions, environment: NodeJS.ProcessEnv = {}): ReturnType<typeof restartDaemonProduction> {
-  const prepared = hermetic(options, environment);
-  activeLegacyRestartOptions = prepared;
-  return restartDaemonProduction(prepared);
+  return restartDaemonProduction(hermetic(options, environment));
 }
 
 function baseOptions(rootPath: string): EnsureDaemonOptions {
@@ -292,10 +323,9 @@ type LegacyFixtureConfig = Readonly<{
   stopBehavior?: "remove-pid" | "keep-alive" | "replace-pid" | "replace-unsafe" | "leave-pid" | "throw";
   startBehavior?: "throw";
   mutatePidBeforeSecondDiscovery?: boolean;
-  mutateStateAfterStop?: boolean;
   discoveryThrows?: boolean;
   environment?: NodeJS.ProcessEnv;
-  replacePidAfterCleanup?: boolean;
+  formerCleanupMutation?: "replacement" | "symlink" | "hardlink";
   useProcListener?: boolean;
   abortSignal?: AbortSignal;
   abortController?: AbortController;
@@ -342,21 +372,18 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
   const supervisor = legacyMigrationSupervisor(
     discoveries[0]!,
     async () => {
-      if (config.stopBehavior === "throw") throw new Error("legacy stop failed");
-      if (config.stopBehavior === "keep-alive") return;
+      const stopBehavior = config.stopBehavior ?? "remove-pid";
+      if (stopBehavior === "throw") throw new Error("legacy stop failed");
+      if (stopBehavior === "keep-alive") return;
       aliveState.value = false;
-      if (config.stopBehavior === "replace-pid") writeFileSync(pidPath, "9999", { mode: 0o600 });
-      else if (config.stopBehavior === "replace-unsafe") {
+      if (stopBehavior === "replace-pid") writeFileSync(pidPath, "9999", { mode: 0o600 });
+      else if (stopBehavior === "replace-unsafe") {
         const oldPath = `${pidPath}.old`;
         renameSync(pidPath, oldPath);
         symlinkSync(oldPath, pidPath);
       }
-      else if (config.stopBehavior === "remove-pid") {
+      else if (stopBehavior === "remove-pid") {
         try { unlinkSync(pidPath); } catch { /* preserve fixture state */ }
-      }
-      if (config.mutateStateAfterStop) {
-        const seams = activeLegacyRestartOptions?._hermeticTestSeams as unknown as { stateDir: string } | undefined;
-        if (seams !== undefined) seams.stateDir = join(dir, "changed-state-root");
       }
     },
   );
@@ -380,9 +407,10 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
   const ensure = vi.fn(async () => ({ connected: true, port: 19_999, spawned: true, startMethod: "systemd-user" as const }));
   const kill = vi.fn();
   if (config.useProcListener) writeProcListenerEvidence(procRoot, 4242, 19_999);
-  if (config.replacePidAfterCleanup) {
+  if (config.stopBehavior === "leave-pid") legacyPidFileFault.path = pidPath;
+  if (config.formerCleanupMutation !== undefined) {
     legacyPidFileFault.path = pidPath;
-    legacyPidFileFault.mode = "cleanup-replacement";
+    legacyPidFileFault.mode = `former-cleanup-${config.formerCleanupMutation}`;
   }
   if (config.tokenInvalidAfterInitialRead || config.tokenErrorAfterInitialRead) {
     legacyTokenFileFault.path = tokenPath;
@@ -391,7 +419,7 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
   const preStopClock = { expired: false };
   const monotonicNow = config.expireBeforePreStop
     ? () => preStopClock.expired ? 100 : 0
-    : config.monotonicNow;
+    : config.monotonicNow ?? (() => 0);
   const result = await restart({
     ...baseOptions(dir),
     _skipSpawn: false,
@@ -1670,9 +1698,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     ["changed PID file after stop", { stopBehavior: "replace-pid" as const }, "ambiguous"],
     ["unsafe PID file after stop", { stopBehavior: "replace-unsafe" as const }, "ambiguous"],
     ["PID remains alive after stop", { stopBehavior: "keep-alive" as const }, "startup-failure"],
-    ["PID path changes during cleanup", { replacePidAfterCleanup: true }, "ambiguous"],
     ["descriptor replacement between reads", { mutatePidBeforeSecondDiscovery: true }, "ambiguous"],
-    ["PID cleanup scope changed", { mutateStateAfterStop: true }, "ambiguous"],
     ["manager discovery unavailable", { discoveries: [{ kind: "unavailable" as const, reason: "manager-timeout" }] }, "manager-unavailable"],
     ["manager discovery failure", { discoveryThrows: true }, "manager-unavailable"],
   ] as const)("refuses $0 without broad mutation", async (_name, config, refusalReason) => {
@@ -1680,20 +1706,75 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     expect(fixture.result).toMatchObject({ restarted: false });
     if (refusalReason === undefined) expect(fixture.result.refusalReason).toBeUndefined();
     else expect(fixture.result.refusalReason).toBe(refusalReason);
-    if (config.stopBehavior === undefined && config.mutateStateAfterStop !== true && config.replacePidAfterCleanup !== true) expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
+    if (config.stopBehavior === undefined) expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
     else expect(fixture.supervisor.stopLegacySystemdUnit).toHaveBeenCalledOnce();
     expect(fixture.supervisor.start).not.toHaveBeenCalled();
     expect(fixture.ensure).not.toHaveBeenCalled();
     expect(fixture.kill).not.toHaveBeenCalled();
   });
 
-  it("cleans an unchanged regular PID file after the exact legacy stop", async () => {
-    const fixture = await runLegacyFixture();
-    expect(fixture.result).toMatchObject({ restarted: true, stoppedPid: 4242 });
+  it("refuses stable start when a remaining PID path is unchanged after the exact legacy stop", async () => {
+    const fixture = await runLegacyFixture({ stopBehavior: "leave-pid" });
+    expect(fixture.result).toMatchObject({ restarted: false, refusalReason: "ambiguous", pid: 4242 });
     expect(fixture.supervisor.stopLegacySystemdUnit).toHaveBeenCalledOnce();
-    expect(fixture.supervisor.start).toHaveBeenCalledOnce();
-    expect(existsSync(fixture.pidPath)).toBe(false);
+    expect(fixture.supervisor.start).not.toHaveBeenCalled();
+    expect(fixture.ensure).not.toHaveBeenCalled();
+    expect(readFileSync(fixture.pidPath, "utf-8")).toBe("4242");
+    expect(legacyPidFileFault.unlinkCalls).toBe(0);
   });
+
+  it("refuses missing PID evidence when strict discovery finds a legacy candidate", async () => {
+    const fixture = await runLegacyFixture({ pidState: "missing" });
+    expect(fixture.result).toMatchObject({ restarted: false, refusalReason: "ambiguous" });
+    expect(fixture.result.warning).toContain("PID evidence was missing");
+    expect(fixture.supervisor.discoverLegacySystemdUnits).toHaveBeenCalledWith({ deadline: 100 });
+    expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
+    expect(fixture.supervisor.start).not.toHaveBeenCalled();
+    expect(fixture.ensure).not.toHaveBeenCalled();
+  });
+
+  it("refuses missing PID evidence when strict discovery is unavailable", async () => {
+    const fixture = await runLegacyFixture({
+      pidState: "missing",
+      discoveries: [{ kind: "unavailable", reason: "manager-timeout" }],
+    });
+    expect(fixture.result).toMatchObject({ restarted: false, refusalReason: "manager-unavailable" });
+    expect(fixture.supervisor.discoverLegacySystemdUnits).toHaveBeenCalledWith({ deadline: 100 });
+    expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
+    expect(fixture.supervisor.start).not.toHaveBeenCalled();
+    expect(fixture.ensure).not.toHaveBeenCalled();
+  });
+
+  it("preserves normal absent startup when missing PID evidence has no legacy candidates", async () => {
+    const fixture = await runLegacyFixture({
+      pidState: "missing",
+      discoveries: [{ kind: "candidates", candidates: [] }],
+    });
+    expect(fixture.result).toMatchObject({ connected: true, restarted: false });
+    expect(fixture.supervisor.discoverLegacySystemdUnits).toHaveBeenCalledWith({ deadline: 100 });
+    expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
+    expect(fixture.supervisor.start).not.toHaveBeenCalled();
+    expect(fixture.ensure).toHaveBeenCalledOnce();
+  });
+
+  it.each(["replacement", "symlink", "hardlink"] as const)(
+    "refuses a %s inserted at the former cleanup seam without unlink or stable start",
+    async (mutation) => {
+      const fixture = await runLegacyFixture({
+        stopBehavior: "leave-pid",
+        formerCleanupMutation: mutation,
+      });
+      expect(fixture.result).toMatchObject({ restarted: false, refusalReason: "ambiguous", pid: 4242 });
+      expect(fixture.supervisor.stopLegacySystemdUnit).toHaveBeenCalledOnce();
+      expect(fixture.supervisor.start).not.toHaveBeenCalled();
+      expect(fixture.ensure).not.toHaveBeenCalled();
+      expect(existsSync(fixture.pidPath)).toBe(true);
+      expect(legacyPidFileFault.unlinkCalls).toBe(0);
+      if (mutation === "replacement") expect(readFileSync(fixture.pidPath, "utf-8")).toBe("9999");
+      if (mutation === "symlink") expect(lstatSync(fixture.pidPath).isSymbolicLink()).toBe(true);
+      if (mutation === "hardlink") expect(statSync(fixture.pidPath).nlink).toBe(2);
+    },
+  );
 
   it.each([
     ["PID evidence is replaced between reads", "replacement" as const, "legacy daemon PID evidence changed between reads"],
@@ -1732,15 +1813,15 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     expect(readdirSync(join(dirname(fixture.pidPath), "credentials"))).not.toHaveLength(0);
   });
 
-  it("cleans an unchanged PID file after exact stop while preserving the positive migration", async () => {
-    const fixture = await runLegacyFixture({ stopBehavior: "leave-pid" });
+  it("starts the stable daemon only after exact stop removes the legacy PID file", async () => {
+    const fixture = await runLegacyFixture({ stopBehavior: "remove-pid" });
     expect(fixture.result).toMatchObject({ connected: true, restarted: true, stoppedPid: 4242 });
     expect(fixture.supervisor.stopLegacySystemdUnit).toHaveBeenCalledOnce();
     expect(fixture.supervisor.start).toHaveBeenCalledOnce();
     expect(existsSync(fixture.pidPath)).toBe(false);
   });
 
-  it("supports legacy PID cleanup without a scoped test-state seam", async () => {
+  it("refuses a remaining legacy PID path without a scoped test-state seam", async () => {
     const dir = root("issue-600-legacy-unscoped-cleanup-");
     const procRoot = join(dir, "proc");
     mkdirSync(procRoot, { recursive: true });
@@ -1769,9 +1850,10 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
         _supervisorOverride: supervisor.supervisor,
         _ensureDaemonOverride: ensureMock,
       });
-      expect(result).toMatchObject({ connected: true, restarted: true, stoppedPid: 4242 });
-      expect(existsSync(pidPath)).toBe(false);
-      expect(ensureMock).toHaveBeenCalledOnce();
+      expect(result).toMatchObject({ connected: false, restarted: false, refusalReason: "ambiguous", pid: 4242 });
+      expect(readFileSync(pidPath, "utf-8")).toBe("4242");
+      expect(supervisor.start).not.toHaveBeenCalled();
+      expect(ensureMock).not.toHaveBeenCalled();
     } finally {
       process.argv[1] = previousArgv;
     }
