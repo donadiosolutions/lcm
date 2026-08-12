@@ -50,7 +50,11 @@ only if the authenticated legacy daemon removed its own PID file. Any
 remaining PID pathname is preserved without unlinking and blocks stable start.
 When the PID file is already missing, bounded strict discovery must prove that
 no legacy candidate exists before normal absent startup continues; a candidate
-or unavailable discovery blocks startup. See the [managed daemon recovery guide](daemon-restart-recovery.md#one-time-migration-after-a-linux-upgrade)
+in any discoverable systemd state, including reloading, refreshing,
+activating, deactivating, maintenance, inactive, or failed, blocks startup
+unless exact manager state proves it disappeared. A PID descriptor close
+failure also invalidates the evidence and stops migration before any service
+or pathname mutation. See the [managed daemon recovery guide](daemon-restart-recovery.md#one-time-migration-after-a-linux-upgrade)
 for the checks and safe refusal behavior. Never stop a wildcard service or
 start a second daemon manually during an upgrade.
 

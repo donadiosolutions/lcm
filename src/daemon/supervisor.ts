@@ -349,8 +349,9 @@ const LEGACY_SYSTEMD_LIST_ARGS = [
   "--user",
   "list-units",
   "--type=service",
-  "--state=active",
+  "--all",
   "--no-legend",
+  "--no-pager",
   "--plain",
 ] as const;
 
@@ -2437,7 +2438,10 @@ export function createSupervisor(
           if (isNotFoundOutput("systemd-user", shown.code, `${shown.stdout}\n${shown.stderr}`)) continue;
           return Object.freeze({ kind: "unavailable", reason: unavailableReason(shown) });
         }
-        if (!isLegacySystemdRunning(state, state.mainPid ?? -1)) continue;
+        if (isLegacySystemdAbsent(shown, state)) continue;
+        if (!isLegacySystemdRunning(state, state.mainPid ?? -1)) {
+          return Object.freeze({ kind: "unavailable", reason: "state-conflict" });
+        }
         candidates.push(Object.freeze({ name, managerPid: state.mainPid! }));
       }
       return Object.freeze({ kind: "candidates", candidates: Object.freeze(candidates) });

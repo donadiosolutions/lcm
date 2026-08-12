@@ -88,10 +88,17 @@ Expected: the Supervisor capabilities do not exist.
 For systemd only, run a bounded argv command equivalent to:
 
 ```ts
-["--user", "list-units", "--type=service", "--state=active", "--no-legend", "--plain"]
+["--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager", "--plain"]
 ```
 
 Filter complete unit-name tokens with the strict historical regex, deduplicate, sort, and inspect each exact name with bounded `show` properties. Stable digest names and malformed names are ignored, not mutated. Transport/permission ambiguity returns `unavailable`; an exact not-found candidate is treated as a discovery race and omitted.
+
+An exact strict unit not positively loaded/active/running with a positive
+`MainPID` is a fail-closed `state-conflict`. This includes reloading,
+refreshing, activating, deactivating, maintenance, inactive, failed, malformed,
+unloaded, and future states. It is neither an authenticated candidate nor safe
+absence. Only code-0 `LoadState=not-found` with no PID, or systemd's exact
+not-found command result, is omitted as genuine disappearance.
 
 - [ ] **Step 4: Add exact-stop RED tests**
 
@@ -379,3 +386,72 @@ Remove every promise that LCM cleans an unchanged post-stop PID file. State that
 - [ ] **Step 8: Verify and commit without rewriting history**
 
 Run the complete Task 4 verification, require 100% coverage in all dimensions, then create a new GPG-signed DCO commit with `git commit -S --signoff`. Do not amend, rebase, force-push, push, or open a PR.
+
+### Task 6: Address transitional discovery and descriptor-close review findings
+
+**Files:**
+- Modify: `src/daemon/supervisor.ts`
+- Modify: `src/daemon/lifecycle.ts`
+- Modify: `src/doctor/doctor.ts`
+- Modify: focused supervisor/lifecycle and Codecov contract tests
+- Modify: Codecov metadata, user docs, Changeset, and Copilot instructions
+
+- [ ] **Step 1: Add #613 RED regressions**
+
+Require `--all` enumeration before strict historical-name filtering. Cover
+realistic `running`, `start`, `start-post`, `reload`, `stop`, `stop-sigterm`,
+`failed`, and `dead` substates across active, reloading, refreshing, activating,
+deactivating, maintenance, inactive, and failed states. Every discoverable
+strict unit without exact running authentication returns fail-closed
+`state-conflict`; missing PID evidence then reaches no exact stop, stable start,
+or ensure call. Near-miss names remain excluded.
+
+- [ ] **Step 2: Implement #613 and run focused GREEN**
+
+Enumerate all service units with `--all --no-pager`, retain the exact strict-name
+filter, and treat exact listed non-running state as conflict. Only
+loaded/active/running state with a positive `MainPID` becomes a candidate; only
+exact not-found evidence becomes disappearance. Add direct exact-stop tests
+proving every untrusted state refuses after `show` and before `stop`.
+
+- [ ] **Step 3: Add #612 RED regression**
+
+Inject a `closeSync` failure after otherwise valid PID evidence and prove the
+close is attempted while migration currently proceeds incorrectly. Require no
+discovery, stop, unlink, stable start, or ensure in the corrected behavior.
+
+- [ ] **Step 4: Implement #612 and run focused GREEN**
+
+Stage the evidence result until descriptor cleanup completes. Any close failure
+overrides present evidence to `unsafe` before migration can authenticate or
+mutate state.
+
+- [ ] **Step 5: Complete review maintenance and verify**
+
+Rename doctor's selected-operation result to `lifecycleResult`; update the
+existing Codecov service-manager component description atomically without
+changing its already-complete ownership; align docs, Changeset, and reusable
+review policy; run focused suites, build, typecheck, lint, and fresh `test:ci`.
+
+#### Reconstructed RED evidence against clean `cb76e425`
+
+The draft production patch already existed when the complete-state addendum
+arrived, so the test-first proof was reconstructed objectively without rewriting
+history: the full working patch was stashed, only the two updated regression
+test files were restored over clean `cb76e425`, the command below was run, the
+test-only changes were discarded, and the full patch was restored.
+
+```bash
+npm exec -- vitest run test/daemon/coverage-400-supervisor.test.ts \
+  test/daemon/coverage-400-lifecycle-restart.test.ts \
+  -t "complete state policy|untrusted|malformed exact state|descriptor close failure|strict legacy unit is|discovers only strict legacy names|explicit (not-found|unloaded) state"
+```
+
+Result: 2 test files failed; 13 tests failed, 22 passed, and 239 were skipped.
+Twelve discovery assertions showed the clean baseline still invoked
+`--state=active` or returned false-zero candidates for strict non-running
+states. The close-failure regression showed the descriptor close was attempted
+but migration returned `restarted: true` instead of refusing. The direct-stop
+untrusted-state cases passed on the baseline, accurately proving its immediate
+exact-`show` revalidation already prevented stop; #613 was the earlier discovery
+omission/classification seam, not an exact-stop authorization bypass.

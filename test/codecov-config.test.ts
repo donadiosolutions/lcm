@@ -207,7 +207,7 @@ const expectedComponents = [
   },
   {
     component_id: "integration-service-managers",
-    name: "Integration - Service Managers",
+    name: "Integration - Service Managers and Legacy Migration",
     paths: [
       "^src/daemon/health-observation\\.ts$",
       "^src/daemon/lifecycle-scope\\.ts$",

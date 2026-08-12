@@ -121,6 +121,16 @@ old unit once, but only when all of these independent checks agree:
 - a fresh discovery immediately before mutation still identifies the same
   single unit.
 
+Discovery enumerates all systemd user services before applying the strict
+historical-name filter, so `reloading`, `refreshing`, `activating`,
+`deactivating`, `maintenance`, inactive, failed, and future manager states
+cannot disappear behind a state-filtered query. Only exact
+`loaded`/`active`/`running` state with a positive manager PID is an
+authenticatable candidate. A strict unit in any other discoverable state is
+preserved and blocks stable startup; LCM never issues an exact stop for it.
+Only an exact `LoadState=not-found` projection with no PID, or systemd's exact
+not-found command result, proves a listed unit disappeared during discovery.
+
 Only after those checks pass does LCM stop that exact unit through
 `systemctl --user` and wait for exact unit absence and PID death. LCM starts
 the stable managed unit only when the authenticated legacy daemon also removes
@@ -129,6 +139,10 @@ regular file, a replacement, a symlink, a hardlink, or malformed evidence—LCM
 preserves it and refuses the stable start. LCM does not unlink a post-stop PID
 pathname after checking a descriptor because the pathname can be replaced
 between those operations.
+
+LCM also treats descriptor cleanup as part of PID-evidence authentication. If
+closing the descriptor fails, the evidence is unsafe and migration stops before
+discovery, exact stop, unlink, or stable startup.
 
 If `daemon.pid` is already missing, LCM first performs the same bounded,
 strict legacy-unit discovery. A discovered historical unit cannot be

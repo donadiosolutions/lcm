@@ -721,24 +721,28 @@ type LegacyPidFileEvidence =
 
 function readLegacyPidFileEvidence(path: string): LegacyPidFileEvidence {
   let descriptor: number | undefined;
+  let evidence: LegacyPidFileEvidence;
   try {
     descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     const stats = fstatSync(descriptor);
-    if (!stats.isFile() || stats.nlink !== 1) return { kind: "unsafe" };
-    const value = readFileSync(descriptor, "utf-8").trim();
-    if (!/^[1-9][0-9]*$/u.test(value)) return { kind: "unsafe" };
-    const pid = Number(value);
-    if (!Number.isSafeInteger(pid) || pid <= 0) return { kind: "unsafe" };
-    return { kind: "present", pid, device: stats.dev, inode: stats.ino };
+    if (!stats.isFile() || stats.nlink !== 1) {
+      evidence = { kind: "unsafe" };
+    } else {
+      const value = readFileSync(descriptor, "utf-8").trim();
+      const pid = Number(value);
+      evidence = /^[1-9][0-9]*$/u.test(value) && Number.isSafeInteger(pid) && pid > 0
+        ? { kind: "present", pid, device: stats.dev, inode: stats.ino }
+        : { kind: "unsafe" };
+    }
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT"
+    evidence = (error as NodeJS.ErrnoException).code === "ENOENT"
       ? { kind: "missing" }
       : { kind: "unsafe" };
-  } finally {
-    if (descriptor !== undefined) {
-      try { closeSync(descriptor); } catch { /* preserve the unsafe evidence */ }
-    }
   }
+  if (descriptor !== undefined) {
+    try { closeSync(descriptor); } catch { return { kind: "unsafe" }; }
+  }
+  return evidence;
 }
 
 type LegacyTokenEvidence =
