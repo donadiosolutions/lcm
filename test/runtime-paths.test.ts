@@ -232,9 +232,10 @@ describe("runtime paths", () => {
 
   it("preserves a bootstrap lock owned by a live matching process", () => {
     const home = makeHome();
+    const startTime = processStartTime();
     const content = writeBootstrapLock(home, {
       pid: process.pid,
-      processStartTime: processStartTime(),
+      processStartTime: startTime,
     });
 
     let error: unknown;
@@ -244,9 +245,9 @@ describe("runtime paths", () => {
       error = caught;
     }
     expect(error).toBeInstanceOf(Error);
-    if (processStartTime() !== null) expect(error).toBeInstanceOf(BootstrapLockContentionError);
+    if (startTime !== null) expect(error).toBeInstanceOf(BootstrapLockContentionError);
     expect((error as Error).message).toContain(
-      processStartTime() === null ? "owner state is ambiguous" : "already in progress",
+      startTime === null ? "owner state is ambiguous" : "already in progress",
     );
     expect(readFileSync(join(home, ".lcm-root-bootstrap.lock"), "utf8")).toBe(content);
   });
