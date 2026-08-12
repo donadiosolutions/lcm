@@ -3,6 +3,7 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -288,7 +289,12 @@ describe("migration manifest durable create and read", () => {
     });
     expectProtocolReason(() => store.create(advanced), "invalid-input");
     expect(store.create(initial)).toEqual(initial);
-    expectProtocolReason(() => store.create(initial), "unexpected-state");
+    const duplicateEvents: string[] = [];
+    expectProtocolReason(() => new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => duplicateEvents.push(event),
+    }).create(initial), "unexpected-state");
+    expect(duplicateEvents).toEqual([]);
 
     const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
     if (expectedUid === undefined) throw new Error("manifest owner-policy tests require process.getuid");
@@ -439,5 +445,86 @@ describe("migration manifest durable create and read", () => {
       revision: 0,
       checksumSha256: negativeZero.checksumSha256,
     }, negativeZeroHome), "utf8")).toContain('"revision":0');
+  });
+
+  it("preserves a concurrently created revision and aggregates descriptor cleanup failures", () => {
+    const collisionHome = makeHome();
+    const collision = manifest("revision-collision");
+    const collisionPath = migrationManifestRevisionPath({
+      generationId: collision.generationId,
+      revision: 0,
+      checksumSha256: collision.checksumSha256,
+    }, collisionHome);
+    const realLink = createRequire(import.meta.url)("node:fs").linkSync as typeof linkSync;
+    expect(() => withPatchedFs("linkSync", ((source: string, destination: string) => {
+      if (destination === collisionPath) writeFileSync(destination, "attacker", { mode: 0o600 });
+      return realLink(source, destination);
+    }) as never, () => new MigrationManifestStore({ homeDir: collisionHome }).create(collision)))
+      .toThrow("created concurrently");
+    expect(readFileSync(collisionPath, "utf8")).toBe("attacker");
+
+    const absenceHome = makeHome();
+    const absenceGeneration = manifest("absence-probe");
+    const realLstat = createRequire(import.meta.url)("node:fs").lstatSync as typeof lstatSync;
+    expect(() => withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+      if (path.endsWith("/absence-probe")) {
+        const error = new Error("probe denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return realLstat(path, options as never);
+    }) as never, () => new MigrationManifestStore({ homeDir: absenceHome }).create(absenceGeneration)))
+      .toThrow("probe denied");
+
+    const generationRaceHome = makeHome();
+    const generationRace = manifest("generation-race");
+    const realMkdir = createRequire(import.meta.url)("node:fs").mkdirSync as typeof mkdirSync;
+    expectProtocolReason(() => withPatchedFs("mkdirSync", ((path: string, options?: unknown) => {
+      if (path.endsWith("/generation-race")) {
+        const error = new Error("generation appeared") as NodeJS.ErrnoException;
+        error.code = "EEXIST";
+        throw error;
+      }
+      return realMkdir(path, options as never);
+    }) as never, () => new MigrationManifestStore({ homeDir: generationRaceHome }).create(generationRace)), "unexpected-state");
+
+    const cleanupHome = makeHome();
+    const cleanupStore = new MigrationManifestStore({ homeDir: cleanupHome });
+    const cleanup = manifest("cleanup-generation");
+    cleanupStore.create(cleanup);
+    const realClose = createRequire(import.meta.url)("node:fs").closeSync as (fd: number) => void;
+    let closeCalls = 0;
+    let failure: unknown;
+    try {
+      withPatchedFs("closeSync", ((fd: number) => {
+        closeCalls += 1;
+        realClose(fd);
+        if (closeCalls >= 3) throw new Error(`close-${closeCalls}`);
+      }) as never, () => cleanupStore.read(cleanup.generationId));
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(closeCalls).toBeGreaterThanOrEqual(7);
+
+    let baselineCloseCalls = 0;
+    withPatchedFs("closeSync", ((fd: number) => {
+      baselineCloseCalls += 1;
+      realClose(fd);
+    }) as never, () => cleanupStore.read(cleanup.generationId));
+    closeCalls = 0;
+    failure = undefined;
+    try {
+      withPatchedFs("closeSync", ((fd: number) => {
+        closeCalls += 1;
+        realClose(fd);
+        if (closeCalls >= baselineCloseCalls - 1) throw new Error(`final-close-${closeCalls}`);
+      }) as never, () => cleanupStore.read(cleanup.generationId));
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toHaveLength(2);
+    expect(closeCalls).toBe(baselineCloseCalls);
   });
 });

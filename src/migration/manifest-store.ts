@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import {
   fchmodSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
+  opendirSync,
   readdirSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -106,10 +108,8 @@ function canonicalJson(value: CanonicalJson): string {
     value === null
     || typeof value === "boolean"
     || typeof value === "string"
+    || typeof value === "number"
   ) {
-    return JSON.stringify(value);
-  }
-  if (typeof value === "number") {
     return JSON.stringify(value);
   }
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -144,8 +144,20 @@ function currentUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
 }
 
-function closeHandles(handles: readonly PrivateDirectoryHandle[]): void {
-  for (const handle of [...handles].reverse()) handle.close();
+function closeHandles(handles: readonly PrivateDirectoryHandle[]): unknown[] {
+  const errors: unknown[] = [];
+  for (const handle of [...handles].reverse()) {
+    try {
+      handle.close();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  return errors;
+}
+
+function revisionDirectoryName(revision: number): string {
+  return revision.toString(10).padStart(16, "0");
 }
 
 function withAuthenticatedDirectories<T>(
@@ -154,19 +166,66 @@ function withAuthenticatedDirectories<T>(
   callback: () => T,
 ): T {
   const handles: PrivateDirectoryHandle[] = [];
+  let result: T | undefined;
+  let primaryError: unknown;
   try {
     for (const path of paths) handles.push(openPrivateDirectory(path, { expectedUid }));
     for (let index = 0; index < paths.length; index += 1) {
       assertPrivateDirectory(handles[index]!, paths[index]!, handles[index]!.witness, expectedUid);
     }
-    const result = callback();
+    result = callback();
     for (let index = 0; index < paths.length; index += 1) {
       assertPrivateDirectory(handles[index]!, paths[index]!, undefined, expectedUid);
     }
-    return result;
+  } catch (error) {
+    primaryError = error;
   } finally {
-    closeHandles(handles);
+    const cleanupErrors = closeHandles(handles);
+    if (primaryError !== undefined && cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [primaryError, ...cleanupErrors],
+        "migration manifest operation and directory cleanup failed",
+        { cause: primaryError },
+      );
+    }
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (cleanupErrors.length > 1) {
+      throw new AggregateError(cleanupErrors, "migration manifest directory cleanup failed");
+    }
   }
+  if (primaryError !== undefined) throw primaryError;
+  return result as T;
+}
+
+function assertPrivateChildAbsent(
+  parentPath: string,
+  name: string,
+  expectedUid: number | undefined,
+): void {
+  withAuthenticatedDirectories([parentPath], expectedUid, () => {
+    try {
+      lstatSync(join(parentPath, name));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    throw new MigrationProtocolError("unexpected-state", "migration generation already exists");
+  });
+}
+
+function readDirectoryEntriesBounded(path: string, maxEntries: number): string[] {
+  const directory = opendirSync(path, { bufferSize: 1 });
+  const entries: string[] = [];
+  try {
+    while (entries.length <= maxEntries) {
+      const entry = directory.readSync();
+      if (entry === null) break;
+      entries.push(entry.name);
+    }
+  } finally {
+    directory.closeSync();
+  }
+  return entries;
 }
 
 function ensurePrivateChild(
@@ -274,7 +333,7 @@ export function migrationManifestRevisionPath(
   return join(
     migrationManifestGenerationDirectory(input.generationId, homeDir),
     "revisions",
-    input.revision.toString(10).padStart(16, "0"),
+    revisionDirectoryName(input.revision),
     `${input.checksumSha256}.json`,
   );
 }
@@ -427,6 +486,11 @@ export class MigrationManifestStore {
           revision: authenticated.revision,
           checksumSha256: authenticated.checksumSha256,
         }, this.#homeDir);
+        assertPrivateChildAbsent(
+          migrations,
+          authenticated.generationId,
+          this.#expectedUid,
+        );
         this.#observer("before-revision-publication", revisionPath);
         const generation = ensurePrivateChild(
           migrations,
@@ -437,7 +501,7 @@ export class MigrationManifestStore {
         const revisions = ensurePrivateChild(generation, "revisions", this.#expectedUid);
         const revisionDirectory = ensurePrivateChild(
           revisions,
-          authenticated.revision.toString(10).padStart(16, "0"),
+          revisionDirectoryName(authenticated.revision),
           this.#expectedUid,
           true,
         );
@@ -447,6 +511,7 @@ export class MigrationManifestStore {
           () => {
             atomicWritePrivateFileDurable(revisionPath, manifestContent(authenticated), {
               expectedUid: this.#expectedUid,
+              expectedContentSha256: null,
               requireAbsent: true,
               maxExistingBytes: MAX_MANIFEST_BYTES,
             });
@@ -496,10 +561,10 @@ export class MigrationManifestStore {
         }
         const revisionDirectory = join(
           revisions,
-          head.revision.toString(10).padStart(16, "0"),
+          revisionDirectoryName(head.revision),
         );
         return withAuthenticatedDirectories([revisionDirectory], this.#expectedUid, () => {
-          const entries = readdirSync(revisionDirectory);
+          const entries = readDirectoryEntriesBounded(revisionDirectory, 2);
           if (entries.length !== 1 || entries[0] !== head.revisionFilename) {
             return malformedHead("migration manifest revision directory is invalid");
           }
