@@ -308,7 +308,9 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
     expect(managerSpawn).toHaveBeenCalledOnce();
     expect(managerSpawn.mock.calls[0]?.[2]).toMatchObject({ timeout: 60_000 });
 
-    const restartSpawn = vi.fn(() => ({ status: 1, stdout: "", stderr: "Unit is not-found" }));
+    const restartSpawn = vi.fn((_command: string, args: readonly string[]) => args.includes("list-units")
+      ? { status: 0, stdout: "", stderr: "" }
+      : { status: 1, stdout: "", stderr: "Unit is not-found" });
     const restartScoped = createScopedFixture({
       fetch: vi.fn(async () => { throw new Error("offline"); }) as never,
       spawnSync: restartSpawn as never,
@@ -327,8 +329,9 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
     } finally {
       wallClock.mockRestore();
     }
-    expect(restartSpawn).toHaveBeenCalledOnce();
+    expect(restartSpawn).toHaveBeenCalledTimes(2);
     expect(restartSpawn.mock.calls[0]?.[2]).toMatchObject({ timeout: 60_000 });
+    expect(restartSpawn.mock.calls[1]?.[2]).toMatchObject({ timeout: 60_000 });
 
     for (const [spawnTimeoutMs, expectedCommandTimeoutMs] of [[1.9, 1], [60_000.9, 60_000]] as const) {
       const fractionalSpawn = vi.fn(() => ({ status: 1, stdout: "", stderr: "Unit is not-found" }));

@@ -209,6 +209,18 @@ export type SupervisorObservation =
     readonly reason: SupervisorReason;
   });
 
+/** A strictly named, active legacy systemd unit authenticated by manager PID and invocation. */
+export interface LegacySystemdUnit {
+  readonly name: string;
+  readonly managerPid: number;
+  readonly invocationId: string;
+}
+
+/** Bounded result of discovering historical generated systemd units. */
+export type LegacySystemdDiscovery =
+  | { readonly kind: "candidates"; readonly candidates: readonly LegacySystemdUnit[] }
+  | { readonly kind: "unavailable"; readonly reason: SupervisorReason };
+
 /** Result returned after a manager-owned launch has been adopted or started. */
 export interface SupervisorStartResult {
   readonly kind: SupervisorKind;
@@ -277,6 +289,13 @@ export interface Supervisor {
   readonly start: (spec: SupervisorSpec, options?: SupervisorOperationOptions) => Promise<SupervisorStartResult>;
   readonly stopAndStart: (spec: SupervisorSpec, options?: SupervisorOperationOptions) => Promise<SupervisorStartResult>;
   readonly stopAndAwaitAbsent: (spec: SupervisorSpec, options?: SupervisorOperationOptions) => Promise<void>;
+  readonly discoverLegacySystemdUnits?: (
+    options?: SupervisorOperationOptions,
+  ) => Promise<LegacySystemdDiscovery>;
+  readonly stopLegacySystemdUnit?: (
+    candidate: LegacySystemdUnit,
+    options?: SupervisorOperationOptions,
+  ) => Promise<void>;
 }
 
 const MARKER = "lcm-supervisor-v1" as const;
@@ -292,13 +311,13 @@ const MAX_POLL_INTERVALS = 100;
 const MAX_LAUNCHD_TRANSITION_POLL_INTERVALS = 3;
 const SYSTEMD_STOP_TRANSITION_SUBSTATES = new Set([
   "stop",
+  "stop-watchdog",
   "stop-sigterm",
   "stop-sigkill",
-  "stop-watchdog",
   "stop-post",
+  "final-watchdog",
   "final-sigterm",
   "final-sigkill",
-  "final-watchdog",
 ]);
 const MAX_NONCE_LENGTH = 128;
 const MAX_METADATA_VALUE_LENGTH = 512;
@@ -326,6 +345,16 @@ const MAX_ARGUMENT_BYTES = 64 * 1024;
  */
 const MAX_ARGUMENT_JSON_BYTES = MAX_ARGUMENT_BYTES * 6 + MAX_ARGUMENT_COUNT * 3 + 1;
 const XML_HEADER = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
+const LEGACY_SYSTEMD_UNIT_PATTERN = /^lcm-daemon-[1-9][0-9]*-[1-9][0-9]*\.service$/u;
+const LEGACY_SYSTEMD_LIST_ARGS = [
+  "--user",
+  "list-units",
+  "--type=service",
+  "--all",
+  "--no-legend",
+  "--no-pager",
+  "--plain",
+] as const;
 
 type Realpath = (path: string) => string;
 
@@ -2006,6 +2035,96 @@ function systemdProbeArgs(spec: SupervisorSpec): readonly string[] {
   ];
 }
 
+function legacySystemdShowArgs(name: string): readonly string[] {
+  return [
+    "--user",
+    "show",
+    "--no-pager",
+    "--property=LoadState,ActiveState,SubState,MainPID,InvocationID",
+    name,
+  ];
+}
+
+type LegacySystemdState = Readonly<{
+  readonly loadState?: string;
+  readonly activeState?: string;
+  readonly subState?: string;
+  readonly mainPidValue?: string;
+  readonly mainPid?: number;
+  readonly invocationIdValue?: string;
+  readonly invocationId?: string;
+}>;
+
+function parseSystemdInvocationId(value: string | undefined): string | undefined {
+  return value !== undefined && /^[0-9a-f]{32}$/u.test(value) && !/^0{32}$/u.test(value)
+    ? value
+    : undefined;
+}
+
+function parseLegacySystemdState(result: {
+  readonly stdout: string;
+  readonly stderr: string;
+}): LegacySystemdState {
+  const values = parseManagerOutput(`${result.stdout}\n${result.stderr}`);
+  const mainPidValue = lookup(values, "MainPID", "pid", "PID", "process.pid", "ProcessID");
+  const invocationIdValue = lookup(values, "InvocationID");
+  return Object.freeze({
+    loadState: lookup(values, "LoadState", "loadState"),
+    activeState: lookup(values, "ActiveState", "state", "State", "status"),
+    subState: lookup(values, "SubState", "subState", "substate"),
+    ...(mainPidValue === undefined ? {} : { mainPidValue }),
+    ...(parsePid(mainPidValue) === undefined ? {} : { mainPid: parsePid(mainPidValue) }),
+    ...(invocationIdValue === undefined ? {} : { invocationIdValue }),
+    ...(parseSystemdInvocationId(invocationIdValue) === undefined
+      ? {}
+      : { invocationId: parseSystemdInvocationId(invocationIdValue) }),
+  });
+}
+
+function isLegacySystemdRunning(
+  state: LegacySystemdState,
+  managerPid: number,
+  invocationId: string,
+): boolean {
+  return /^loaded$/iu.test(state.loadState ?? "")
+    && /^active$/iu.test(state.activeState ?? "")
+    && /^running$/iu.test(state.subState ?? "")
+    && state.mainPid === managerPid
+    && state.invocationId === invocationId;
+}
+
+/**
+ * Recognize only a narrow systemd-owned shutdown transition after an exact
+ * legacy unit has already authenticated as loaded/active/running and its exact
+ * stop command has succeeded.  A matching PID or systemd-cleared zero permits
+ * bounded read-only polling; it is never absence or mutation authority.
+ */
+function isLegacySystemdStopTransition(
+  state: LegacySystemdState,
+  managerPid: number,
+  invocationId: string,
+): boolean {
+  return /^loaded$/iu.test(state.loadState ?? "")
+    && /^deactivating$/iu.test(state.activeState ?? "")
+    && SYSTEMD_STOP_TRANSITION_SUBSTATES.has((state.subState ?? "").toLowerCase())
+    && (state.mainPid === managerPid || state.mainPidValue === "0")
+    && state.invocationId === invocationId;
+}
+
+function isLegacySystemdAbsent(
+  result: {
+    readonly code: number | null;
+    readonly stdout: string;
+    readonly stderr: string;
+  },
+  state: LegacySystemdState,
+): boolean {
+  const mainPidSafe = state.mainPidValue === undefined || state.mainPidValue === "0";
+  if (!mainPidSafe) return false;
+  if (/^not[- ]found$/iu.test(state.loadState ?? "")) return true;
+  return result.code !== 0 && isNotFoundOutput("systemd-user", result.code, `${result.stdout}\n${result.stderr}`);
+}
+
 type SupervisorProbeCapture = {
   parsed?: Map<string, string>;
   code?: number | null;
@@ -2237,6 +2356,7 @@ export function createSupervisor(
   const runner = createObservationRunner(kind, dependencies);
   const now = dependencies.now ?? performance.now.bind(performance);
   const configuredCommandTimeoutMs = dependencies.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+  const configuredStopTimeoutMs = dependencies.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
 
   const resolveOperationDeadline = (options?: SupervisorOperationOptions): number | undefined => {
     if (options?.deadline === undefined) return undefined;
@@ -2322,6 +2442,124 @@ export function createSupervisor(
     capture,
     operationTimeout(deadline, configuredCommandTimeoutMs),
   );
+
+  const discoverLegacySystemdUnits = async (
+    options?: SupervisorOperationOptions,
+  ): Promise<LegacySystemdDiscovery> => {
+    const operationDeadline = resolveOperationDeadline(options);
+    try {
+      const listed = await runner.invoke(
+        "systemctl",
+        LEGACY_SYSTEMD_LIST_ARGS,
+        operationTimeout(operationDeadline, configuredCommandTimeoutMs),
+      );
+      if (listed.timedOut) return Object.freeze({ kind: "unavailable", reason: "manager-timeout" });
+      if (listed.code !== 0) {
+        return Object.freeze({ kind: "unavailable", reason: unavailableReason(listed) });
+      }
+      const names = new Set<string>();
+      for (const line of listed.stdout.split(/\r?\n/u)) {
+        const name = line.trim().split(/\s+/u, 1)[0];
+        if (name !== undefined && LEGACY_SYSTEMD_UNIT_PATTERN.test(name)) names.add(name);
+      }
+      const candidates: LegacySystemdUnit[] = [];
+      for (const name of [...names].sort()) {
+        const shown = await runner.invoke(
+          "systemctl",
+          legacySystemdShowArgs(name),
+          operationTimeout(operationDeadline, configuredCommandTimeoutMs),
+        );
+        if (shown.timedOut) return Object.freeze({ kind: "unavailable", reason: "manager-timeout" });
+        const state = parseLegacySystemdState(shown);
+        if (shown.code !== 0) {
+          if (isNotFoundOutput("systemd-user", shown.code, `${shown.stdout}\n${shown.stderr}`)) continue;
+          return Object.freeze({ kind: "unavailable", reason: unavailableReason(shown) });
+        }
+        if (isLegacySystemdAbsent(shown, state)) continue;
+        if (
+          state.invocationId === undefined
+          || !isLegacySystemdRunning(state, state.mainPid ?? -1, state.invocationId)
+        ) {
+          return Object.freeze({ kind: "unavailable", reason: "state-conflict" });
+        }
+        candidates.push(Object.freeze({
+          name,
+          managerPid: state.mainPid!,
+          invocationId: state.invocationId,
+        }));
+      }
+      return Object.freeze({ kind: "candidates", candidates: Object.freeze(candidates) });
+    } catch (error) {
+      if (error instanceof SupervisorCommandError && error.reason === "timeout") {
+        return Object.freeze({ kind: "unavailable", reason: "manager-timeout" });
+      }
+      throw error;
+    }
+  };
+
+  const stopLegacySystemdUnit = async (
+    candidate: LegacySystemdUnit,
+    options?: SupervisorOperationOptions,
+  ): Promise<void> => {
+    const operationDeadline = resolveOperationDeadline(options);
+    if (
+      !LEGACY_SYSTEMD_UNIT_PATTERN.test(candidate.name)
+      || !Number.isSafeInteger(candidate.managerPid)
+      || candidate.managerPid <= 0
+      || typeof candidate.invocationId !== "string"
+      || parseSystemdInvocationId(candidate.invocationId) !== candidate.invocationId
+    ) throw commandFailedError();
+    const boundedStopTimeoutMs = clampRunnerTimeout(configuredStopTimeoutMs);
+    const stopDeadline = operationDeadline === undefined
+      ? now() + boundedStopTimeoutMs
+      : Math.min(operationDeadline, now() + boundedStopTimeoutMs);
+    if (stopDeadline - now() <= 0) throw commandFailedError("timeout");
+    const show = (): Promise<Awaited<ReturnType<typeof runner.invoke>>> => runner.invoke(
+      "systemctl",
+      legacySystemdShowArgs(candidate.name),
+      operationTimeout(stopDeadline, configuredCommandTimeoutMs),
+    );
+    const initial = await show();
+    if (initial.timedOut) throw commandFailedError("timeout");
+    const initialState = parseLegacySystemdState(initial);
+    if (
+      initial.code !== 0
+      || !isLegacySystemdRunning(initialState, candidate.managerPid, candidate.invocationId)
+    ) {
+      throw commandFailedError();
+    }
+    const stopped = await runner.invoke(
+      "systemctl",
+      ["--user", "stop", candidate.name],
+      operationTimeout(stopDeadline, boundedStopTimeoutMs),
+    );
+    if (stopped.timedOut) throw commandFailedError("timeout");
+    if (stopped.code !== 0) throw commandFailedError();
+    const maxPollIntervals = Math.max(
+      1,
+      Math.ceil(Math.max(0, stopDeadline - now()) / DEFAULT_POLL_INTERVAL_MS),
+    );
+    for (let attempt = 0; attempt < maxPollIntervals; attempt += 1) {
+      const observed = await show();
+      if (observed.timedOut) throw commandFailedError("timeout");
+      const state = parseLegacySystemdState(observed);
+      if (isLegacySystemdAbsent(observed, state)) return;
+      if (
+        observed.code !== 0
+        || (!isLegacySystemdRunning(state, candidate.managerPid, candidate.invocationId)
+          && !isLegacySystemdStopTransition(state, candidate.managerPid, candidate.invocationId))
+      ) {
+        throw commandFailedError();
+      }
+      if (attempt + 1 >= maxPollIntervals) break;
+      const remaining = stopDeadline - now();
+      if (remaining <= 0) break;
+      const delay = Math.min(DEFAULT_POLL_INTERVAL_MS, remaining);
+      if (dependencies.sleep !== undefined) await dependencies.sleep(delay);
+      else await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, delay));
+    }
+    throw commandFailedError("timeout");
+  };
 
   /**
    * launchd can report a bootout target absent before it has released the
@@ -2833,7 +3071,13 @@ export function createSupervisor(
     return startInternal(spec, false, operationDeadline);
   };
 
-  return Object.freeze({ probe, start, stopAndStart, stopAndAwaitAbsent });
+  return Object.freeze({
+    probe,
+    start,
+    stopAndStart,
+    stopAndAwaitAbsent,
+    ...(kind === "systemd-user" ? { discoverLegacySystemdUnits, stopLegacySystemdUnit } : {}),
+  });
 }
 
 function metadataEnvironmentArgs(

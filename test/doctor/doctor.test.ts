@@ -7,7 +7,7 @@ import { runDoctor } from "../../src/doctor/doctor.js";
 import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js";
 import { legacyLcmMcpServerName } from "../../src/legacy-names.js";
 import { LCM_MD_CONTENT } from "../../src/daemon/orientation.js";
-import { ensureDaemon } from "../../src/daemon/lifecycle.js";
+import { ensureDaemon, restartDaemon } from "../../src/daemon/lifecycle.js";
 import {
   clearProjectMapCache,
   hashProjectPath,
@@ -21,6 +21,7 @@ import {
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn().mockResolvedValue({ connected: false }),
+  restartDaemon: vi.fn().mockResolvedValue({ connected: false, restarted: false }),
 }));
 
 vi.mock("../../src/db/events-stats.js", () => ({
@@ -39,6 +40,8 @@ beforeEach(() => {
   mkdirSync(join(defaultDoctorHome, ".lcm"), { recursive: true, mode: 0o700 });
   vi.mocked(ensureDaemon).mockReset();
   vi.mocked(ensureDaemon).mockResolvedValue({ connected: false });
+  vi.mocked(restartDaemon).mockReset();
+  vi.mocked(restartDaemon).mockResolvedValue({ connected: false, restarted: false });
   mockCollectEventStats.mockClear();
   mockCollectDetailedEventStats.mockClear();
   mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null });
@@ -861,8 +864,8 @@ describe("runDoctor daemon version mismatch", () => {
     const pkgVersion = "0.6.0";
     const daemonVersion = "0.5.0";
 
-    // ensureDaemon returns connected on restart attempt
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true });
+    // restartDaemon returns connected on the authenticated migration attempt
+    vi.mocked(restartDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true, restarted: true });
 
     const deps = minimalDeps({
       cwd: "/tmp/nonexistent-project-xyz",
@@ -883,20 +886,36 @@ describe("runDoctor daemon version mismatch", () => {
     const results = await runDoctor(deps);
     const daemonResult = results.find((r) => r.name === "daemon");
 
-    expect(vi.mocked(ensureDaemon)).toHaveBeenCalledWith(
+    expect(vi.mocked(restartDaemon)).toHaveBeenCalledWith(
       expect.objectContaining({ expectedVersion: pkgVersion, expectedStorageBackend: "sqlite" }),
     );
+    expect(vi.mocked(ensureDaemon)).not.toHaveBeenCalled();
     expect(daemonResult?.fixApplied).toBe(true);
     expect(daemonResult?.message).toContain("restarted");
     expect(daemonResult?.message).toContain(daemonVersion);
     expect(daemonResult?.message).toContain(pkgVersion);
   });
 
+  it("keeps matching-version health on ensureDaemon and never calls restartDaemon", async (): Promise<void> => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: false });
+    const deps = minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
+    });
+
+    const results = await runDoctor(deps);
+    expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+    expect(vi.mocked(restartDaemon)).not.toHaveBeenCalled();
+    expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "pass" });
+  });
+
   it("reports warn with fixApplied:false when restart does not fix version mismatch", async (): Promise<void> => {
     const pkgVersion = "0.6.0";
     const daemonVersion = "0.5.0";
 
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true });
+    vi.mocked(restartDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true, restarted: true });
 
     const deps = minimalDeps({
       cwd: "/tmp/nonexistent-project-xyz",
@@ -928,7 +947,7 @@ describe("runDoctor daemon version mismatch", () => {
   it("treats missing daemon version as a mismatch when package version is known", async (): Promise<void> => {
     const pkgVersion = "0.6.0";
 
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true });
+    vi.mocked(restartDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true, restarted: true });
 
     const deps = minimalDeps({
       cwd: "/tmp/nonexistent-project-xyz",
@@ -957,7 +976,7 @@ describe("runDoctor daemon version mismatch", () => {
   it("does not recommend event promotion when a stale daemon restart throws", async (): Promise<void> => {
     const pkgVersion = "0.6.0";
     const daemonVersion = "0.5.0";
-    vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("restart failed"));
+    vi.mocked(restartDaemon).mockRejectedValueOnce(new Error("restart failed"));
     mockCollectEventStats.mockReturnValue({ captured: 5000, unprocessed: 2000, errors: 0, lastCapture: "2026-03-26 10:00:00", sidecarsWithUnprocessed: 1 });
 
     const deps = minimalDeps({

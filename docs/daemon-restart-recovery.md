@@ -18,9 +18,9 @@ does not scan for a process with a matching name or port.
 Default managed lifecycle calls use the same packaged runtime entrypoint in the
 manager arguments, even when the CLI was launched through a wrapper or shim.
 During an explicit restart, LCM also waits for the exact systemd unit to leave
-its bounded `deactivating`/`stop-*` transition and prove manager absence before
-requesting same-name recreation. A different identity, unknown transition, or
-unresolved manager state remains a fail-closed refusal.
+its bounded `deactivating` stop/final transition and prove manager absence
+before requesting same-name recreation. A different identity, unknown
+transition, or unresolved manager state remains a fail-closed refusal.
 
 The service is deliberately not a supervisor loop. LCM does not configure a
 systemd `Restart=` policy or a launchd `KeepAlive` policy. A daemon that exits
@@ -98,6 +98,85 @@ registration, MCP setup, and summarizer readiness. `lcm daemon restart`
 validates the complete effective configuration before asking the manager to
 replace the service, then waits for authenticated health. Run it once after a
 configuration or package update instead of starting a competing daemon.
+
+## One-time migration after a Linux upgrade
+
+An installation upgraded from LCM v1.4.1 to v1.4.2 may still have its daemon
+inside the older generated transient systemd unit. v1.4.2 uses a stable
+state-root unit name, so the stable unit can initially appear absent while the
+older daemon is still serving requests.
+
+During `lcm doctor` or an explicit `lcm daemon restart`, LCM can migrate that
+old unit once, but only when all of these independent checks agree:
+
+- the canonical `daemon.pid` is a stable, regular, non-symlink file naming a
+  live process;
+- exactly one strictly formatted historical unit name is reported by the
+  current user's systemd manager, its manager PID matches the PID file, and it
+  carries a valid nonzero systemd invocation ID;
+- the daemon answers public health and token-authenticated health/access
+  requests with the same PID, owner, storage identity, and an older
+  `major.minor.patch` version in the installed major/minor line;
+- the process command and entrypoint identify an LCM daemon, and that same PID
+  owns the configured `127.0.0.1` listener; and
+- a fresh discovery immediately before mutation still identifies the same
+  single unit.
+
+Discovery enumerates all systemd user services before applying the strict
+historical-name filter, so `reloading`, `refreshing`, `activating`,
+`deactivating`, `maintenance`, inactive, failed, and future manager states
+cannot disappear behind a state-filtered query. Only exact
+`loaded`/`active`/`running` state with a positive manager PID is an
+authenticatable candidate only when it also has a valid systemd invocation ID.
+A strict unit in any other discoverable state, or without that witness, is
+preserved and blocks stable startup; LCM never issues an exact stop for it.
+Only an exact `LoadState=not-found` projection with no PID, or systemd's exact
+not-found command result, proves a listed unit disappeared during discovery.
+
+Only after those checks pass does LCM stop that exact unit through
+`systemctl --user`. The state that authorizes that command remains strictly
+`loaded`/`active`/`running` with the original positive PID. After the command
+succeeds, LCM may poll through a bounded, manager-owned shutdown transition:
+the unit must remain loaded and `deactivating`, its substate must be one of
+systemd's recognized stop/final substates, and its PID must remain the original
+PID or become 0 as part of that same transition. Every observation must retain
+the exact invocation ID authenticated before stop; PID 0 alone is never an
+identity witness or success. This narrow post-stop state is retryable
+observation only—it never retroactively authorizes a stop and never counts as
+cleanup or success. A missing, malformed, or changed invocation ID, changed
+positive PID, other state or substate, manager error, or timeout is a refusal.
+Only exact unit absence completes the manager stop.
+
+LCM then requires PID death and starts the stable managed unit only when the
+authenticated legacy daemon also removes `daemon.pid` while exiting. If any
+PID path remains after the stop—an unchanged regular file, a replacement, a
+symlink, a hardlink, or malformed evidence—LCM preserves it and refuses the
+stable start. LCM does not unlink a post-stop PID pathname after checking a
+descriptor because the pathname can be replaced between those operations.
+
+LCM also treats descriptor cleanup as part of PID-evidence authentication. If
+closing the descriptor fails, the evidence is unsafe and migration stops before
+discovery, exact stop, unlink, or stable startup.
+
+If `daemon.pid` is already missing, LCM first performs the same bounded,
+strict legacy-unit discovery. A discovered historical unit cannot be
+authenticated without its PID evidence, so LCM preserves it and refuses a
+stable start. Normal absent startup continues only when discovery proves that
+no historical candidate exists. Unavailable or failed discovery also refuses
+rather than assuming absence.
+
+Ambiguous, replaced, symlinked, hardlinked, malformed, unauthorized, or
+otherwise incomplete evidence is left untouched. LCM refuses multiple or
+changing candidates, any PID path remaining after stop, failed stops, live
+PIDs, and unresolved manager states; it does not start a competing daemon
+after such a refusal. Do not use wildcard service stops, `kill`, `pkill`, or a
+second manual daemon start.
+Run the canonical commands and preserve their refusal guidance:
+
+```bash
+lcm doctor
+lcm daemon restart
+```
 
 ## Configuration and security boundary
 

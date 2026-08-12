@@ -38,6 +38,33 @@ lcm install
 lcm doctor
 ```
 
+On Linux, an upgrade from LCM v1.4.1 to v1.4.2 can leave one authenticated
+legacy transient systemd service running while the new stable service name is
+absent. The first `lcm doctor` after the upgrade, or an explicit
+`lcm daemon restart`, performs a one-time migration only when the manager PID,
+systemd invocation ID, canonical PID/token files, authenticated health
+identity, older same-line version, process entrypoint, and loopback listener
+all agree. A changing, ambiguous, symlinked, malformed, or unauthorized
+candidate is not stopped and does not trigger a competing start. After exact
+stop, the stable daemon starts only if the authenticated legacy daemon removed
+its own PID file. Any remaining PID pathname is preserved without unlinking
+and blocks stable start.
+While systemd retires the already-authenticated unit, LCM may wait through a
+bounded `deactivating` stop/final substate only when the manager still reports
+the same nonzero invocation ID and either the original PID or PID 0 as part of
+that same shutdown. This post-stop observation never authorizes the stop and
+does not count as success; the manager must report the exact unit absent before
+migration can continue.
+When the PID file is already missing, bounded strict discovery must prove that
+no legacy candidate exists before normal absent startup continues; a candidate
+in any discoverable systemd state, including reloading, refreshing,
+activating, deactivating, maintenance, inactive, or failed, blocks startup
+unless exact manager state proves it disappeared. A PID descriptor close
+failure also invalidates the evidence and stops migration before any service
+or pathname mutation. See the [managed daemon recovery guide](daemon-restart-recovery.md#one-time-migration-after-a-linux-upgrade)
+for the checks and safe refusal behavior. Never stop a wildcard service or
+start a second daemon manually during an upgrade.
+
 The hook commands and MCP server use absolute paths into the installed npm
 package. LCM owns the MCP entry's `type`, `command`, and `args`; `env` and any
 other compatible user- or Claude-managed options, sibling MCP servers, and
