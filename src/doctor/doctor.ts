@@ -999,8 +999,9 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     const versionMismatch = Boolean(pkgVersion && daemonVersion !== pkgVersion);
     const daemonVersionLabel = daemonVersion ? `v${daemonVersion}` : "unknown version";
     try {
-      const { ensureDaemon } = await import("../daemon/lifecycle.js");
-      const ensureResult = await ensureDaemon({
+      const { ensureDaemon, restartDaemon } = await import("../daemon/lifecycle.js");
+      const lifecycleOperation = versionMismatch ? restartDaemon : ensureDaemon;
+      const lifecycleResult = await lifecycleOperation({
         port: config.port,
         pidFilePath,
         spawnTimeoutMs: 10000,
@@ -1011,12 +1012,12 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         expectedEntrypoint: runtimePath,
         enforceUserManagerParent: true,
       });
-      if (ensureResult.connected) daemonPid = ensureResult.pid ?? initialHealthPid;
+      if (lifecycleResult.connected) daemonPid = lifecycleResult.pid ?? initialHealthPid;
 
       let postRestartVersion: string | undefined;
       let postRestartOk = false;
       let postRestartStorageReadiness: DaemonStorageReadiness = "unverified";
-      if (ensureResult.connected) {
+      if (lifecycleResult.connected) {
         try {
           const h = await readDoctorAuthenticatedHealth(deps, config.port);
           if (h) {
@@ -1029,10 +1030,10 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       }
 
       if (versionMismatch) {
-        const fixApplied = ensureResult.connected && postRestartOk && postRestartVersion === pkgVersion;
+        const fixApplied = lifecycleResult.connected && postRestartOk && postRestartVersion === pkgVersion;
         if (fixApplied) {
           clearRemediationMarker();
-          const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
+          const warning = lifecycleResult.warning ? `\n     Warning: ${lifecycleResult.warning}` : "";
           results.push({
             name: "daemon", category: "Daemon", status: "warn",
             message: `localhost:${config.port} — restarted (${daemonVersionLabel} → v${pkgVersion})${warning}`,
@@ -1040,11 +1041,11 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
           });
           daemonHealthy = true;
           daemonStorageReadiness = postRestartStorageReadiness;
-        } else if (ensureResult.connected) {
+        } else if (lifecycleResult.connected) {
           const runningVersionLabel = postRestartVersion ? `v${postRestartVersion}` : daemonVersionLabel;
           results.push({
             name: "daemon", category: "Daemon", status: "warn",
-            message: `localhost:${config.port} — version mismatch (${runningVersionLabel} running, v${pkgVersion} installed); restart did not fix mismatch\n     Fix: ${remediationGuidance(refusalReasonFrom(ensureResult, "not-running"))}`,
+            message: `localhost:${config.port} — version mismatch (${runningVersionLabel} running, v${pkgVersion} installed); restart did not fix mismatch\n     Fix: ${remediationGuidance(refusalReasonFrom(lifecycleResult, "not-running"))}`,
             fixApplied: false,
           });
           daemonHealthy = false;
@@ -1052,23 +1053,23 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         } else {
           results.push({
             name: "daemon", category: "Daemon", status: "fail",
-            message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed); restart failed\n     Fix: ${remediationGuidance(refusalReasonFrom(ensureResult, "not-running"))}`,
+            message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed); restart failed\n     Fix: ${remediationGuidance(refusalReasonFrom(lifecycleResult, "not-running"))}`,
             fixApplied: false,
           });
           daemonHealthy = false;
           daemonStorageReadiness = "unverified";
         }
-      } else if (!ensureResult.connected) {
+      } else if (!lifecycleResult.connected) {
         results.push({
           name: "daemon", category: "Daemon", status: "fail",
-          message: `localhost:${config.port} — running daemon could not be validated or restarted\n     Fix: ${remediationGuidance(refusalReasonFrom(ensureResult, "not-running"))}`,
+          message: `localhost:${config.port} — running daemon could not be validated or restarted\n     Fix: ${remediationGuidance(refusalReasonFrom(lifecycleResult, "not-running"))}`,
           fixApplied: false,
         });
         daemonHealthy = false;
         daemonStorageReadiness = "unverified";
-      } else if (ensureResult.restartedForParent) {
+      } else if (lifecycleResult.restartedForParent) {
         clearRemediationMarker();
-        const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
+        const warning = lifecycleResult.warning ? `\n     Warning: ${lifecycleResult.warning}` : "";
         results.push({
           name: "daemon", category: "Daemon", status: "warn",
           message: `localhost:${config.port} — restarted under user systemd${warning}`,
@@ -1076,11 +1077,11 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         });
         daemonHealthy = true;
         daemonStorageReadiness = postRestartStorageReadiness;
-      } else if (ensureResult.warning) {
+      } else if (lifecycleResult.warning) {
         clearRemediationMarker();
         results.push({
           name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} (up)\n     Warning: ${ensureResult.warning}`,
+          message: `localhost:${config.port} (up)\n     Warning: ${lifecycleResult.warning}`,
           fixApplied: false,
         });
         daemonHealthy = true;
