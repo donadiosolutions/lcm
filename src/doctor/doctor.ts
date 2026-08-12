@@ -1067,7 +1067,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
           daemonHealthy = false;
           daemonStorageReadiness = "unverified";
         }
-      } else if (repairedStaleConfiguration && lifecycleResult.connected) {
+      } else if (repairedStaleConfiguration && lifecycleResult.connected && postRestartOk) {
         clearRemediationMarker();
         const warning = lifecycleResult.warning ? `\n     Warning: ${lifecycleResult.warning}` : "";
         results.push({
@@ -1077,6 +1077,14 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         });
         daemonHealthy = true;
         daemonStorageReadiness = postRestartStorageReadiness;
+      } else if (repairedStaleConfiguration && lifecycleResult.connected) {
+        results.push({
+          name: "daemon", category: "Daemon", status: "fail",
+          message: `localhost:${config.port} — stale configuration repair restarted the daemon, but authenticated health could not be verified after restart\n     Fix: ${remediationGuidance("stale-config")}`,
+          fixApplied: false,
+        });
+        daemonHealthy = false;
+        daemonStorageReadiness = "unverified";
       } else if (!lifecycleResult.connected) {
         results.push({
           name: "daemon", category: "Daemon", status: "fail",
