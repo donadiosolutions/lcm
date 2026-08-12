@@ -145,5 +145,24 @@ describe("migration manifest head codec", () => {
       () => migrationManifestHeadContent({ ...head, version: 2 as never }),
       "malformed-manifest",
     );
+    for (const candidate of [
+      { ...head, revisionFilename: `${"b".repeat(64)}.json` },
+      { ...head, checksumSha256: "0".repeat(64) },
+      { ...head, updatedAt: "yesterday" },
+      { ...head, manifestSha256: "A".repeat(64) },
+    ]) {
+      expectProtocolReason(
+        () => migrationManifestHeadContent(candidate as never),
+        "malformed-manifest",
+      );
+    }
+    expectProtocolReason(
+      () => parseMigrationManifestHeadContent(1 as never),
+      "malformed-manifest",
+    );
+    expectProtocolReason(
+      () => parseMigrationManifestHeadContent(content.replace('"revision":0', '"revision":0e0')),
+      "malformed-manifest",
+    );
   });
 });

@@ -151,7 +151,14 @@ export function createMigrationManifestHead(
 
 /** Serialize an authenticated head to exact canonical ASCII JSON. */
 export function migrationManifestHeadContent(head: MigrationManifestHead): string {
-  const expected = createMigrationManifestHead(head);
+  let expected: MigrationManifestHead;
+  try {
+    expected = createMigrationManifestHead(head);
+  } catch (error) {
+    throw new MigrationProtocolError("malformed-manifest", "migration manifest head is invalid", {
+      cause: error,
+    });
+  }
   if (
     head.version !== 1
     || head.revisionFilename !== expected.revisionFilename
