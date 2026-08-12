@@ -1703,7 +1703,10 @@ function acquireBootstrapLock(homeDir: string, topology: HomeTopology): Bootstra
   const existing = readBootstrapLock(path, homeDir);
   const state = bootstrapOwnerState(existing.owner);
   if (state === "live") {
-    throw new BootstrapLockContentionError("LCM root bootstrap is already in progress; retry after it completes");
+    throw new BootstrapLockContentionError(
+      "LCM root bootstrap contention: verified live owner; automatic lock recovery was not attempted; "
+      + "retry after the competing LCM operation completes; do not delete the bootstrap lock manually",
+    );
   }
   if (state === "ambiguous") {
     throw new Error("LCM root bootstrap owner state is ambiguous; automatic recovery was not attempted; inspect the lock metadata and running processes before retrying");
