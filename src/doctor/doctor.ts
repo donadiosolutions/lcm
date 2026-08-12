@@ -1000,8 +1000,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     const daemonVersionLabel = daemonVersion ? `v${daemonVersion}` : "unknown version";
     try {
       const { ensureDaemon, restartDaemon } = await import("../daemon/lifecycle.js");
-      const lifecycleOperation = versionMismatch ? restartDaemon : ensureDaemon;
-      const lifecycleResult = await lifecycleOperation({
+      const lifecycleOptions = {
         port: config.port,
         pidFilePath,
         spawnTimeoutMs: 10000,
@@ -1011,7 +1010,16 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         spawnArgs: daemonSpawnArgs,
         expectedEntrypoint: runtimePath,
         enforceUserManagerParent: true,
-      });
+      };
+      let lifecycleResult = versionMismatch
+        ? await restartDaemon(lifecycleOptions)
+        : await ensureDaemon(lifecycleOptions);
+      const repairedStaleConfiguration = !versionMismatch
+        && !lifecycleResult.connected
+        && lifecycleResult.refusalReason === "stale-config";
+      if (repairedStaleConfiguration) {
+        lifecycleResult = await restartDaemon(lifecycleOptions);
+      }
       if (lifecycleResult.connected) daemonPid = lifecycleResult.pid ?? initialHealthPid;
 
       let postRestartVersion: string | undefined;
@@ -1059,10 +1067,22 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
           daemonHealthy = false;
           daemonStorageReadiness = "unverified";
         }
+      } else if (repairedStaleConfiguration && lifecycleResult.connected) {
+        clearRemediationMarker();
+        const warning = lifecycleResult.warning ? `\n     Warning: ${lifecycleResult.warning}` : "";
+        results.push({
+          name: "daemon", category: "Daemon", status: "warn",
+          message: `localhost:${config.port} — stale configuration repaired; daemon restarted${warning}`,
+          fixApplied: true,
+        });
+        daemonHealthy = true;
+        daemonStorageReadiness = postRestartStorageReadiness;
       } else if (!lifecycleResult.connected) {
         results.push({
           name: "daemon", category: "Daemon", status: "fail",
-          message: `localhost:${config.port} — running daemon could not be validated or restarted\n     Fix: ${remediationGuidance(refusalReasonFrom(lifecycleResult, "not-running"))}`,
+          message: repairedStaleConfiguration
+            ? `localhost:${config.port} — stale configuration repair/restart failed\n     Fix: ${remediationGuidance(refusalReasonFrom(lifecycleResult, "stale-config"))}`
+            : `localhost:${config.port} — running daemon could not be validated or restarted\n     Fix: ${remediationGuidance(refusalReasonFrom(lifecycleResult, "not-running"))}`,
           fixApplied: false,
         });
         daemonHealthy = false;
@@ -1087,7 +1107,12 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         daemonHealthy = true;
       } else {
         clearRemediationMarker();
-        results.push({ name: "daemon", category: "Daemon", status: "pass", message: `localhost:${config.port} (up)` });
+        results.push({
+          name: "daemon",
+          category: "Daemon",
+          status: "pass",
+          message: `localhost:${config.port} (up)`,
+        });
         daemonHealthy = true;
       }
     } catch {
