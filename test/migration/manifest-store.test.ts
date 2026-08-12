@@ -7,6 +7,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -28,6 +29,7 @@ import {
 import {
   beginMigrationEffect,
   createMigrationManifest,
+  migrationManifestCanonicalSha256,
   MigrationProtocolError,
   type MigrationManifest,
 } from "../../src/migration/protocol.js";
@@ -71,6 +73,14 @@ function manifest(generationId = "generation-1"): MigrationManifest {
     preservedSourceGenerationId: generationId,
     createdAt: UPDATED_AT,
   });
+}
+
+function resealManifest(value: MigrationManifest, changes: Partial<MigrationManifest>): MigrationManifest {
+  const { checksumSha256: _checksum, ...payload } = { ...value, ...changes };
+  return {
+    ...payload,
+    checksumSha256: migrationManifestCanonicalSha256(payload),
+  };
 }
 
 function expectProtocolReason(callback: () => unknown, reason: MigrationProtocolError["reason"]): void {
@@ -526,5 +536,229 @@ describe("migration manifest durable create and read", () => {
     expect(failure).toBeInstanceOf(AggregateError);
     expect((failure as AggregateError).errors).toHaveLength(2);
     expect(closeCalls).toBe(baselineCloseCalls);
+  });
+});
+
+describe("migration manifest compare-and-swap update", () => {
+  it("publishes one linked successor and rejects a stale expected checksum before reducer effects", () => {
+    const home = makeHome();
+    const events: string[] = [];
+    const store = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => events.push(event),
+    });
+    const initial = manifest("update-generation");
+    store.create(initial);
+    events.length = 0;
+    let reducerCalls = 0;
+
+    const updated = store.update(initial.generationId, initial.checksumSha256, (current) => {
+      reducerCalls += 1;
+      return beginMigrationEffect(current, {
+        effectId: "effect-1",
+        kind: "verify-dry-run",
+        inputSha256: HASH,
+        startedAt: "2026-08-12T12:00:01.000Z",
+      });
+    });
+
+    expect(reducerCalls).toBe(1);
+    expect(updated).toMatchObject({
+      generationId: initial.generationId,
+      revision: 1,
+      previousManifestSha256: initial.checksumSha256,
+    });
+    expect(store.read(initial.generationId)).toEqual(updated);
+    expect(events).toEqual([
+      "before-revision-publication",
+      "after-revision-publication",
+      "before-head-publication",
+      "after-head-publication",
+    ]);
+    expect(existsSync(migrationManifestRevisionPath({
+      generationId: updated.generationId,
+      revision: updated.revision,
+      checksumSha256: updated.checksumSha256,
+    }, home))).toBe(true);
+
+    events.length = 0;
+    expectProtocolReason(() => store.update(
+      initial.generationId,
+      initial.checksumSha256,
+      () => {
+        reducerCalls += 1;
+        return updated;
+      },
+    ), "unexpected-state");
+    expect(reducerCalls).toBe(1);
+    expect(events).toEqual([]);
+  });
+
+  it("rejects invalid update inputs and every malformed reducer successor before publication", () => {
+    const home = makeHome();
+    const events: string[] = [];
+    const store = new MigrationManifestStore({ homeDir: home, observer: (event) => events.push(event) });
+    const initial = manifest("invalid-update");
+    store.create(initial);
+    events.length = 0;
+
+    expectProtocolReason(() => store.update(initial.generationId, "A".repeat(64), (value) => value), "invalid-input");
+    expectProtocolReason(() => store.update(initial.generationId, initial.checksumSha256, null as never), "invalid-input");
+    expect(() => store.update(initial.generationId, initial.checksumSha256, () => {
+      throw new Error("reducer failed");
+    })).toThrow("reducer failed");
+
+    const valid = beginMigrationEffect(initial, {
+      effectId: "effect-1",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    for (const candidate of [
+      resealManifest(valid, { generationId: "other-generation" }),
+      resealManifest(valid, { revision: 2 }),
+      resealManifest(valid, { previousManifestSha256: "b".repeat(64) }),
+      { ...valid, checksumSha256: "0".repeat(64) },
+    ]) {
+      expectProtocolReason(
+        () => store.update(initial.generationId, initial.checksumSha256, () => candidate),
+        candidate.checksumSha256 === "0".repeat(64) ? "checksum-mismatch" : "unexpected-state",
+      );
+    }
+    expect(store.read(initial.generationId)).toEqual(initial);
+    expect(events).toEqual([]);
+  });
+
+  it("preserves exact update crash states and retries only the pre-revision boundary", () => {
+    const crashEvents = [
+      "before-revision-publication",
+      "after-revision-publication",
+      "before-head-publication",
+      "after-head-publication",
+    ] as const;
+    for (const crashEvent of crashEvents) {
+      const home = makeHome();
+      const initial = manifest(`update-crash-${crashEvents.indexOf(crashEvent)}`);
+      const store = new MigrationManifestStore({ homeDir: home });
+      store.create(initial);
+      const candidate = beginMigrationEffect(initial, {
+        effectId: "effect-1",
+        kind: "verify-dry-run",
+        inputSha256: HASH,
+        startedAt: "2026-08-12T12:00:01.000Z",
+      });
+      const crashing = new MigrationManifestStore({
+        homeDir: home,
+        observer: (event) => {
+          if (event === crashEvent) throw new Error(`crash:${event}`);
+        },
+      });
+      expect(() => crashing.update(initial.generationId, initial.checksumSha256, () => candidate))
+        .toThrow(`crash:${crashEvent}`);
+
+      const successorPath = migrationManifestRevisionPath({
+        generationId: candidate.generationId,
+        revision: candidate.revision,
+        checksumSha256: candidate.checksumSha256,
+      }, home);
+      const crashIndex = crashEvents.indexOf(crashEvent);
+      expect(existsSync(successorPath)).toBe(crashIndex >= 1);
+      if (crashEvent === "before-revision-publication") {
+        expect(existsSync(resolve(successorPath, ".."))).toBe(false);
+        expect(store.update(initial.generationId, initial.checksumSha256, () => candidate)).toEqual(candidate);
+      } else if (crashEvent === "after-head-publication") {
+        expect(store.read(initial.generationId)).toEqual(candidate);
+      } else {
+        expectProtocolReason(() => store.read(initial.generationId), "recovery-required");
+      }
+    }
+  });
+
+  it("loses exact-string head compare-and-swap races without overwriting shorter evidence", () => {
+    const home = makeHome();
+    const initial = manifest("head-cas-race");
+    const headPath = migrationManifestHeadPath(initial.generationId, home);
+    new MigrationManifestStore({ homeDir: home }).create(initial);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-1",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const replacement = "{}\n";
+    const racing = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => {
+        if (event === "before-head-publication") {
+          writeFileSync(headPath, replacement, { mode: 0o600 });
+        }
+      },
+    });
+    expect(() => racing.update(initial.generationId, initial.checksumSha256, () => candidate))
+      .toThrow("changed before durable publication");
+    expect(readFileSync(headPath, "utf8")).toBe(replacement);
+    expect(existsSync(migrationManifestRevisionPath({
+      generationId: candidate.generationId,
+      revision: candidate.revision,
+      checksumSha256: candidate.checksumSha256,
+    }, home))).toBe(true);
+  });
+
+  it("preserves immediate-successor probe failures instead of guessing", () => {
+    const home = makeHome();
+    const initial = manifest("successor-probe-failure");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const successor = join(
+      migrationManifestGenerationDirectory(initial.generationId, home),
+      "revisions",
+      "0000000000000001",
+    );
+    const realLstat = createRequire(import.meta.url)("node:fs").lstatSync as typeof lstatSync;
+    expect(() => withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+      if (path === successor) {
+        const error = new Error("successor probe denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return realLstat(path, options as never);
+    }) as never, () => store.read(initial.generationId))).toThrow("successor probe denied");
+  });
+
+  it("reads a valid maximum-safe revision without probing an impossible successor", () => {
+    const home = makeHome();
+    const initial = manifest("maximum-revision");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const maximum = resealManifest(initial, {
+      revision: Number.MAX_SAFE_INTEGER,
+      previousManifestSha256: "b".repeat(64),
+    });
+    const initialPath = migrationManifestRevisionPath({
+      generationId: initial.generationId,
+      revision: 0,
+      checksumSha256: initial.checksumSha256,
+    }, home);
+    const initialDirectory = resolve(initialPath, "..");
+    const maximumDirectory = join(resolve(initialDirectory, ".."), "9007199254740991");
+    const maximumFile = join(initialDirectory, `${maximum.checksumSha256}.json`);
+    const maximumContent = readFileSync(initialPath, "utf8")
+      .replace(initial.checksumSha256, maximum.checksumSha256)
+      .replace('"previousManifestSha256":null', `"previousManifestSha256":"${maximum.previousManifestSha256}"`)
+      .replace('"revision":0', `"revision":${Number.MAX_SAFE_INTEGER}`);
+    renameSync(initialPath, maximumFile);
+    writeFileSync(maximumFile, maximumContent, { mode: 0o600 });
+    renameSync(initialDirectory, maximumDirectory);
+    writeFileSync(
+      migrationManifestHeadPath(initial.generationId, home),
+      migrationManifestHeadContent(createMigrationManifestHead({
+        generationId: maximum.generationId,
+        revision: maximum.revision,
+        manifestSha256: maximum.checksumSha256,
+        updatedAt: maximum.updatedAt,
+      })),
+      { mode: 0o600 },
+    );
+    expect(store.read(initial.generationId)).toEqual(maximum);
   });
 });

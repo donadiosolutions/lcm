@@ -227,6 +227,32 @@ function readDirectoryEntriesBounded(path: string, maxEntries: number): string[]
   return entries;
 }
 
+type AuthenticatedManifestState = Readonly<{
+  head: MigrationManifestHead;
+  headContent: string;
+  manifest: MigrationManifest;
+  generation: string;
+  revisions: string;
+}>;
+
+function assertNoImmediateSuccessor(
+  revisions: string,
+  revision: number,
+): void {
+  if (revision === Number.MAX_SAFE_INTEGER) return;
+  const successorPath = join(revisions, revisionDirectoryName(revision + 1));
+  try {
+    lstatSync(successorPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  throw new MigrationProtocolError(
+    "recovery-required",
+    "migration manifest has an unpublished immediate successor",
+  );
+}
+
 function ensurePrivateChild(
   parentPath: string,
   name: string,
@@ -538,6 +564,10 @@ export class MigrationManifestStore {
   }
 
   read(generationId: string): MigrationManifest {
+    return this.#readState(generationId).manifest;
+  }
+
+  #readState(generationId: string): AuthenticatedManifestState {
     const generation = migrationManifestGenerationDirectory(generationId, this.#homeDir);
     const root = lcmRoot(this.#homeDir);
     const migrations = migrationRoot(this.#homeDir);
@@ -587,9 +617,82 @@ export class MigrationManifestStore {
           ) {
             return malformedHead("migration manifest revision does not match its head");
           }
-          return manifest;
+          assertNoImmediateSuccessor(revisions, head.revision);
+          return {
+            head,
+            headContent,
+            manifest,
+            generation,
+            revisions,
+          };
         });
       },
     );
+  }
+
+  update(
+    generationId: string,
+    expectedChecksumSha256: string,
+    reduce: (manifest: MigrationManifest) => MigrationManifest,
+  ): MigrationManifest {
+    if (!isSha256(expectedChecksumSha256) || typeof reduce !== "function") {
+      throw new MigrationProtocolError("invalid-input", "migration manifest update input is invalid");
+    }
+    return withManifestMutationLock(this.#homeDir, this.#expectedUid, () => {
+      const current = this.#readState(generationId);
+      if (current.manifest.checksumSha256 !== expectedChecksumSha256) {
+        throw new MigrationProtocolError("unexpected-state", "migration manifest update is stale");
+      }
+      const candidate = parseMigrationManifest(reduce(current.manifest));
+      if (
+        candidate.generationId !== generationId
+        || candidate.revision !== current.manifest.revision + 1
+        || candidate.previousManifestSha256 !== current.manifest.checksumSha256
+      ) {
+        throw new MigrationProtocolError("unexpected-state", "migration manifest reducer returned an invalid successor");
+      }
+      const revisionName = revisionDirectoryName(candidate.revision);
+      assertPrivateChildAbsent(current.revisions, revisionName, this.#expectedUid);
+      const revisionPath = migrationManifestRevisionPath({
+        generationId,
+        revision: candidate.revision,
+        checksumSha256: candidate.checksumSha256,
+      }, this.#homeDir);
+      const headPath = migrationManifestHeadPath(generationId, this.#homeDir);
+      this.#observer("before-revision-publication", revisionPath);
+      const revisionDirectory = ensurePrivateChild(
+        current.revisions,
+        revisionName,
+        this.#expectedUid,
+        true,
+      );
+      return withAuthenticatedDirectories(
+        [current.generation, current.revisions, revisionDirectory],
+        this.#expectedUid,
+        () => {
+          atomicWritePrivateFileDurable(revisionPath, manifestContent(candidate), {
+            expectedUid: this.#expectedUid,
+            expectedContentSha256: null,
+            requireAbsent: true,
+            maxExistingBytes: MAX_MANIFEST_BYTES,
+          });
+          this.#observer("after-revision-publication", revisionPath);
+          const nextHead = createMigrationManifestHead({
+            generationId,
+            revision: candidate.revision,
+            manifestSha256: candidate.checksumSha256,
+            updatedAt: candidate.updatedAt,
+          });
+          this.#observer("before-head-publication", headPath);
+          atomicWritePrivateFileDurable(headPath, migrationManifestHeadContent(nextHead), {
+            expectedUid: this.#expectedUid,
+            expectedContentSha256: sha256(current.headContent),
+            maxExistingBytes: MAX_MANIFEST_BYTES,
+          });
+          this.#observer("after-head-publication", headPath);
+          return candidate;
+        },
+      );
+    });
   }
 }
