@@ -528,3 +528,54 @@ export function createMigrationManifest(input: CreateMigrationManifestInput): Mi
   assertCrossFieldInvariants(payload);
   return deepFreeze({ ...payload, checksumSha256: migrationManifestCanonicalSha256(payload) });
 }
+
+export function beginMigrationEffect(
+  manifest: MigrationManifest,
+  input: BeginMigrationEffectInput,
+): MigrationManifest {
+  const current = parseMigrationManifest(manifest);
+  if (!isRecord(input) || !exactKeys(input, ["effectId", "inputSha256", "kind", "startedAt"])) {
+    protocolError("invalid-input", "migration effect input has an invalid shape");
+  }
+  if (!isIdentifier(input.effectId) || !EFFECTS.includes(input.kind)
+    || !isHash(input.inputSha256) || !isIsoTimestamp(input.startedAt)) {
+    protocolError("invalid-input", "migration effect input is invalid");
+  }
+  if (current.pendingEffect !== null) {
+    protocolError("unexpected-state", "migration already has a pending effect");
+  }
+  const legal = legalEffect(current.phase, input.kind);
+  if (legal === null) {
+    protocolError("unexpected-state", "migration effect is not legal in the current phase");
+  }
+  if (current.revision === Number.MAX_SAFE_INTEGER) {
+    protocolError("unexpected-state", "migration manifest revision is exhausted");
+  }
+  if (Date.parse(input.startedAt) < Date.parse(current.updatedAt)) {
+    protocolError("unexpected-state", "migration effect timestamp regressed");
+  }
+  const payload = {
+    ...unsignedMigrationManifest(current),
+    revision: current.revision + 1,
+    pendingEffect: {
+      effectId: input.effectId,
+      kind: input.kind,
+      fromPhase: current.phase,
+      targetPhase: legal.targetPhase,
+      inputSha256: input.inputSha256,
+      recovery: legal.recovery,
+      startedAt: input.startedAt,
+    },
+    previousManifestSha256: current.checksumSha256,
+    updatedAt: input.startedAt,
+  } satisfies Omit<MigrationManifest, "checksumSha256">;
+  assertCrossFieldInvariants(payload);
+  return deepFreeze({ ...payload, checksumSha256: migrationManifestCanonicalSha256(payload) });
+}
+
+function unsignedMigrationManifest(
+  manifest: MigrationManifest,
+): Omit<MigrationManifest, "checksumSha256"> {
+  const { checksumSha256: _checksumSha256, ...payload } = manifest;
+  return payload;
+}

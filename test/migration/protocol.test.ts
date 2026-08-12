@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   MigrationProtocolError,
+  beginMigrationEffect,
   createMigrationManifest,
   migrationManifestCanonicalSha256,
   parseMigrationManifest,
   type MigrationCheckpoint,
+  type BeginMigrationEffectInput,
   type MigrationManifest,
   type MigrationReportReference,
   type MigrationStorageWitness,
@@ -16,6 +18,7 @@ const HASH_B = "b".repeat(64);
 const HASH_C = "c".repeat(64);
 const CREATED_AT = "2026-08-12T12:00:00.000Z";
 const UPDATED_AT = "2026-08-12T12:00:01.000Z";
+const EFFECT_AT = "2026-08-12T12:00:02.000Z";
 
 function witness(backend: MigrationStorageWitness["backend"], capturedAt: string): MigrationStorageWitness {
   return {
@@ -83,6 +86,17 @@ function report(
   createdAt = CREATED_AT,
 ): MigrationReportReference {
   return { kind, reportId, reportSha256: HASH_C, createdAt };
+}
+
+function manifestInPhase(phase: "dry-run-verified" | "copying"): MigrationManifest {
+  const manifest = createValidManifest();
+  return parseMigrationManifest(sealManifest({
+    ...manifest,
+    revision: 1,
+    previousManifestSha256: manifest.checksumSha256,
+    phase,
+    updatedAt: UPDATED_AT,
+  }));
 }
 
 describe("migration manifest protocol", () => {
@@ -684,5 +698,97 @@ describe("migration manifest protocol", () => {
       rollbackLineage: { ...lineage, parentGenerationId: "generation-0" },
     }));
     expect(withParent.rollbackLineage.parentGenerationId).toBe("generation-0");
+  });
+
+  describe("beginMigrationEffect", () => {
+    const verifyInput: BeginMigrationEffectInput = {
+      effectId: "effect-1",
+      kind: "verify-dry-run",
+      inputSha256: HASH_A,
+      startedAt: EFFECT_AT,
+    };
+
+    it("seals a new immutable pending-effect revision without mutating the input", () => {
+      const manifest = createValidManifest();
+      const next = beginMigrationEffect(manifest, verifyInput);
+
+      expect(next).toMatchObject({
+        revision: 1,
+        phase: "planned",
+        previousManifestSha256: manifest.checksumSha256,
+        updatedAt: EFFECT_AT,
+        pendingEffect: {
+          ...verifyInput,
+          fromPhase: "planned",
+          targetPhase: "dry-run-verified",
+          recovery: "retry-idempotent",
+        },
+      });
+      expect(next.checksumSha256).toBe(migrationManifestCanonicalSha256(unsignedManifest(next)));
+      expect(next.source).toEqual(manifest.source);
+      expect(next.destination).toEqual(manifest.destination);
+      expect(next.checkpoints).toEqual(manifest.checkpoints);
+      expect(next.reports).toEqual(manifest.reports);
+      expect(manifest.pendingEffect).toBeNull();
+      expect(Object.isFrozen(next.pendingEffect)).toBe(true);
+    });
+
+    it("derives authoritative readback for a legal copy effect", () => {
+      const manifest = manifestInPhase("dry-run-verified");
+      const next = beginMigrationEffect(manifest, {
+        effectId: "copy-1",
+        kind: "copy-batch",
+        inputSha256: HASH_B,
+        startedAt: EFFECT_AT,
+      });
+
+      expect(next.pendingEffect).toMatchObject({
+        fromPhase: "dry-run-verified",
+        targetPhase: "copying",
+        recovery: "authoritative-readback-required",
+      });
+    });
+
+    it("rejects a second pending effect and illegal phase-effect pairs", () => {
+      const pending = beginMigrationEffect(createValidManifest(), verifyInput);
+      expectProtocolError(() => beginMigrationEffect(pending, { ...verifyInput, effectId: "effect-2" }), "unexpected-state");
+      expectProtocolError(() => beginMigrationEffect(createValidManifest(), {
+        ...verifyInput,
+        kind: "publish-activation",
+      }), "unexpected-state");
+    });
+
+    it.each([
+      ["invalid input shape", { extra: true }],
+      ["invalid effect id", { effectId: "-bad" }],
+      ["invalid input hash", { inputSha256: "A".repeat(64) }],
+      ["invalid started time", { startedAt: "2026-08-12" }],
+    ] as const)("rejects %s", (_name, overrides) => {
+      expectProtocolError(
+        () => beginMigrationEffect(createValidManifest(), { ...verifyInput, ...overrides }),
+        "invalid-input",
+      );
+    });
+
+    it("rejects a timestamp older than the current manifest", () => {
+      const manifest = manifestInPhase("copying");
+      expectProtocolError(() => beginMigrationEffect(manifest, {
+        effectId: "copy-2",
+        kind: "copy-batch",
+        inputSha256: HASH_B,
+        startedAt: CREATED_AT,
+      }), "unexpected-state");
+    });
+
+    it("rejects revision overflow", () => {
+      const manifest = createValidManifest();
+      const exhausted = parseMigrationManifest(sealManifest({
+        ...manifest,
+        revision: Number.MAX_SAFE_INTEGER,
+        previousManifestSha256: HASH_A,
+        updatedAt: UPDATED_AT,
+      }));
+      expectProtocolError(() => beginMigrationEffect(exhausted, verifyInput), "unexpected-state");
+    });
   });
 });
