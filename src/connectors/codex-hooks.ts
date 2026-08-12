@@ -1,9 +1,18 @@
 import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 
 export const CODEX_HOOKS_PATH = "~/.codex/hooks.json";
 export const CODEX_CONFIG_PATH = "~/.codex/config.toml";
 export const LEGACY_CODEX_HOOKS_PATHS = [".codex/hooks.json"] as const;
+
+export type CodexPostToolHookState = "absent" | "incomplete" | "installed";
+
+export interface CodexPostToolHookInspection {
+  readonly path: string;
+  readonly state: CodexPostToolHookState;
+  readonly structural: boolean;
+}
 
 type CodexCommandHook = {
   type?: string;
@@ -259,4 +268,41 @@ export function hasCodexHooks(hooksPath: string): boolean {
       group.hooks.some((hook) => isLcmHookCommand(hook.command)),
     ),
   );
+}
+
+/** Resolve the Codex hooks path using the same `~/` convention as installation. */
+export function resolveCodexHooksPath(cwd: string = process.cwd()): string {
+  void cwd;
+  return join(homedir(), CODEX_HOOKS_PATH.slice(2));
+}
+
+function hasExactPostToolHook(value: unknown): boolean {
+  if (!isObject(value) || !isObject(value.hooks)) return false;
+  const postToolUse = value.hooks.PostToolUse;
+  if (!Array.isArray(postToolUse)) return false;
+
+  return postToolUse.some((group) => {
+    if (!isObject(group) || group.matcher !== "*" || !Array.isArray(group.hooks)) return false;
+    return group.hooks.some((hook) =>
+      isObject(hook)
+      && hook.type === "command"
+      && hook.command === "lcm post-tool --client codex",
+    );
+  });
+}
+
+/** Inspect only the exact native Codex PostToolUse contract; this function never writes. */
+export function inspectCodexPostToolHook(hooksPath: string): CodexPostToolHookInspection {
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(hooksPath, "utf-8"));
+  } catch (error) {
+    const state: CodexPostToolHookState = (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? "absent"
+      : "incomplete";
+    return { path: hooksPath, state, structural: false };
+  }
+
+  const structural = hasExactPostToolHook(value);
+  return { path: hooksPath, state: structural ? "installed" : "incomplete", structural };
 }

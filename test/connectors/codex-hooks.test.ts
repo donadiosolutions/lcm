@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import {
   enableCodexHooksFeature,
   hasCodexHooks,
+  inspectCodexPostToolHook,
   installCodexHooks,
   removeCodexHooks,
+  resolveCodexHooksPath,
   setCodexHooksFeature,
 } from "../../src/connectors/codex-hooks.js";
 
@@ -97,5 +99,56 @@ describe("Codex hook configuration boundaries", () => {
     installCodexHooks(hooksPath, configPath);
     expect(removeCodexHooks(hooksPath)).toBe(true);
     expect(existsSync(hooksPath)).toBe(false);
+  });
+
+  it("keeps broad discovery permissive while exact inspection requires the native PostToolUse hook", () => {
+    writeFileSync(hooksPath, JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: "command", command: "lcm restore --client codex" }] }],
+      },
+    }));
+
+    expect(hasCodexHooks(hooksPath)).toBe(true);
+    expect(inspectCodexPostToolHook(hooksPath)).toMatchObject({ state: "incomplete" });
+  });
+
+  it.each([
+    ["absent file", undefined, "absent"],
+    ["malformed JSON", "not-json", "incomplete"],
+    ["missing PostToolUse", JSON.stringify({ hooks: { SessionStart: [] } }), "incomplete"],
+    ["PostToolUse is not an array", JSON.stringify({ hooks: { PostToolUse: {} } }), "incomplete"],
+    ["wrong matcher", JSON.stringify({ hooks: { PostToolUse: [{ matcher: "tool", hooks: [{ type: "command", command: "lcm post-tool --client codex" }] }] } }), "incomplete"],
+    ["wrong hook type", JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "prompt", command: "lcm post-tool --client codex" }] }] } }), "incomplete"],
+    ["wrong client", JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "lcm post-tool" }] }] } }), "incomplete"],
+    ["extra command arguments", JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "lcm post-tool --client codex --verbose" }] }] } }), "incomplete"],
+    ["missing command", JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command" }] }] } }), "incomplete"],
+    ["exact native hook", JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "lcm post-tool --client codex" }] }] } }), "installed"],
+  ] as const)("classifies %s with exact PostToolUse structural rules", (_label, content, expected) => {
+    if (content !== undefined) writeFileSync(hooksPath, content);
+    expect(inspectCodexPostToolHook(hooksPath)).toMatchObject({
+      state: expected,
+      structural: expected === "installed",
+    });
+  });
+
+  it("resolves the same canonical global hooks path used by installation", () => {
+    expect(resolveCodexHooksPath(dir)).toBe(join(process.env.HOME ?? "", ".codex", "hooks.json"));
+  });
+
+  it("does not modify the hook file during structural inspection", () => {
+    const content = JSON.stringify({
+      hooks: {
+        PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "lcm post-tool --client codex" }] }],
+      },
+    });
+    writeFileSync(hooksPath, content);
+
+    expect(inspectCodexPostToolHook(hooksPath)).toMatchObject({ state: "installed", structural: true });
+    expect(readFileSync(hooksPath, "utf-8")).toBe(content);
+  });
+
+  it("treats a readable-path failure other than absence as incomplete", () => {
+    mkdirSync(hooksPath);
+    expect(inspectCodexPostToolHook(hooksPath)).toMatchObject({ state: "incomplete", structural: false });
   });
 });
