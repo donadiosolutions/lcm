@@ -805,6 +805,8 @@ export function atomicWritePrivateFileExclusive(
 }
 
 export type DurablePrivateWriteOptions = Readonly<{
+  /** Require every retained directory and precondition read to use this owner policy. */
+  expectedUid?: number;
   /** Require the destination to be absent rather than replacing it. */
   requireAbsent?: boolean;
   /** Bind replacement to the content observed by the caller while locked. */
@@ -840,7 +842,8 @@ export function atomicWritePrivateFileDurable(
     throw new Error("private durable publication mode must be owner-only");
   }
   const directory = dirname(path);
-  const parent = openPrivateDirectory(directory);
+  const expectedUid = options.expectedUid ?? currentUid();
+  const parent = openPrivateDirectory(directory, { expectedUid });
   const parentIdentity: PrivatePathIdentity = {
     dev: BigInt(parent.witness.dev),
     ino: BigInt(parent.witness.ino),
@@ -851,7 +854,7 @@ export function atomicWritePrivateFileDurable(
       const observed = readBoundedRegularFileWithStat(path, {
         allowedRoot: directory,
         maxBytes: options.maxExistingBytes ?? Math.max(Buffer.byteLength(content), 1) + 1,
-        expectedUid: currentUid(),
+        expectedUid,
         allowedModes: OWNER_ONLY_FILE_MODES,
         requireSingleLink: true,
       });
@@ -919,7 +922,7 @@ export function atomicWritePrivateFileDurable(
       assertPrivateFileSingleLink(path, temporaryIdentity);
       temporaryIdentity = undefined;
     }
-    assertPrivateDirectory(parent, directory, parent.witness);
+    assertPrivateDirectory(parent, directory, parent.witness, expectedUid);
     fsyncSync(parent.fd);
   } catch (error) {
     primaryError = error;

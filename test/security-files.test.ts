@@ -307,6 +307,22 @@ describe("private filesystem primitives", () => {
     })).toThrow();
   });
 
+  it("threads an explicit owner policy through durable publication", () => {
+    const root = makeRoot();
+    const path = join(root, "durable-owner.json");
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (expectedUid === undefined) throw new Error("durable owner-policy tests require process.getuid");
+
+    expect(() => atomicWritePrivateFileDurable(path, "private", {
+      expectedUid: expectedUid + 1,
+      requireAbsent: true,
+    })).toThrow("owner");
+    expect(existsSync(path)).toBe(false);
+
+    atomicWritePrivateFileDurable(path, "private", { expectedUid, requireAbsent: true });
+    expect(readFileSync(path, "utf8")).toBe("private");
+  });
+
   it("fsyncs an authenticated owner-only final mode before durable publication", () => {
     const root = makeRoot();
     const path = join(root, "owner-readonly.json");
