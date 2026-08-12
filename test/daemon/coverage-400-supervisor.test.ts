@@ -688,7 +688,7 @@ function legacySystemdState(
 
 describe("legacy generated systemd discovery and exact stop", () => {
   it("discovers only strict legacy names and returns authenticated manager PIDs", async () => {
-    const value = spec("systemd-user");
+    spec("systemd-user");
     const runner = runQueue([
       {
         code: 0,
