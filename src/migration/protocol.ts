@@ -123,6 +123,12 @@ export type MigrationManifestHead = Readonly<{
   checksumSha256: string;
 }>;
 
+export type MigrationRecoveryClassification =
+  | Readonly<{ action: "ready" }>
+  | Readonly<{ action: "resume"; effect: PendingMigrationEffect }>
+  | Readonly<{ action: "readback"; effect: PendingMigrationEffect }>
+  | Readonly<{ action: "settled"; phase: "active" | "rolled-back" | "aborted" }>;
+
 export type MigrationProtocolReason =
   | "invalid-input"
   | "malformed-manifest"
@@ -611,6 +617,7 @@ function assertCompletionEvidence(
 ): Readonly<{
   checkpoint?: MigrationCheckpoint;
   report?: MigrationReportReference;
+  rollbackMode: "pre-write" | "post-write" | null;
 }> {
   const checkpointValue = input.checkpoint === undefined
     ? undefined
@@ -654,7 +661,7 @@ function assertCompletionEvidence(
       break;
   }
   if (!valid) protocolError("invalid-input", "migration completion evidence is invalid");
-  return { checkpoint: checkpointValue, report: reportValue };
+  return { checkpoint: checkpointValue, report: reportValue, rollbackMode: input.rollbackMode ?? null };
 }
 
 function nextCheckpoints(
@@ -716,9 +723,12 @@ export function completeMigrationEffect(
     protocolError("invalid-input", "migration report timestamp is outside the effect boundary");
   }
   const rollbackLineage = pending.kind === "prepare-rollback"
-    ? { ...current.rollbackLineage, returnPhase: pending.fromPhase as "verified" | "active" }
+    ? {
+      ...current.rollbackLineage,
+      returnPhase: pending.fromPhase === "active" ? "active" as const : "verified" as const,
+    }
     : pending.kind === "publish-rollback"
-      ? { ...current.rollbackLineage, mode: input.rollbackMode! }
+      ? { ...current.rollbackLineage, mode: evidence.rollbackMode }
       : current.rollbackLineage;
   return sealMigrationSuccessor(current, input.completedAt, {
     phase: pending.targetPhase,
@@ -778,4 +788,19 @@ export function abandonMigrationEffect(
       : current.rollbackLineage,
     pendingEffect: null,
   });
+}
+
+export function classifyMigrationRecovery(
+  manifest: MigrationManifest,
+): MigrationRecoveryClassification {
+  const current = parseMigrationManifest(manifest);
+  if (current.pendingEffect !== null) {
+    return current.pendingEffect.recovery === "retry-idempotent"
+      ? deepFreeze({ action: "resume" as const, effect: current.pendingEffect })
+      : deepFreeze({ action: "readback" as const, effect: current.pendingEffect });
+  }
+  if (current.phase === "active" || current.phase === "rolled-back" || current.phase === "aborted") {
+    return deepFreeze({ action: "settled" as const, phase: current.phase });
+  }
+  return deepFreeze({ action: "ready" as const });
 }

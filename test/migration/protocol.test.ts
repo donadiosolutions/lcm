@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   MigrationProtocolError,
   abandonMigrationEffect,
   beginMigrationEffect,
   completeMigrationEffect,
+  classifyMigrationRecovery,
   createMigrationManifest,
   migrationManifestCanonicalSha256,
   parseMigrationManifest,
@@ -747,6 +751,11 @@ describe("migration manifest protocol", () => {
       expect(next.destination).toEqual(manifest.destination);
       expect(next.checkpoints).toEqual(manifest.checkpoints);
       expect(next.reports).toEqual(manifest.reports);
+      expect(next.version).toBe(manifest.version);
+      expect(next.generationId).toBe(manifest.generationId);
+      expect(next.createdAt).toBe(manifest.createdAt);
+      expect(next.activationEligible).toBe(manifest.activationEligible);
+      expect(next.rollbackLineage).toEqual(manifest.rollbackLineage);
       expect(manifest.pendingEffect).toBeNull();
       expect(Object.isFrozen(next.pendingEffect)).toBe(true);
     });
@@ -831,6 +840,12 @@ describe("migration manifest protocol", () => {
       });
       expect(next.checksumSha256).toBe(migrationManifestCanonicalSha256(unsignedManifest(next)));
       expect(pending.pendingEffect).not.toBeNull();
+      expect(next.version).toBe(pending.version);
+      expect(next.generationId).toBe(pending.generationId);
+      expect(next.createdAt).toBe(pending.createdAt);
+      expect(next.source).toEqual(pending.source);
+      expect(next.destination).toEqual(pending.destination);
+      expect(next.rollbackLineage).toEqual(pending.rollbackLineage);
     });
 
     it("publishes a monotonic per-domain copy checkpoint", () => {
@@ -1275,6 +1290,93 @@ describe("migration manifest protocol", () => {
         () => abandonMigrationEffect(missingReturn, abandonment("publish-r", "2026-08-12T12:00:05.000Z")),
         "unexpected-state",
       );
+    });
+  });
+
+  describe("classifyMigrationRecovery", () => {
+    it("classifies ready and settled manifests without touching live storage", () => {
+      const root = mkdtempSync(join(tmpdir(), "lcm-migration-classifier-"));
+      try {
+        const marker = join(root, "mutable-live-tree");
+        writeFileSync(marker, "before", "utf8");
+        expect(classifyMigrationRecovery(createValidManifest())).toEqual({ action: "ready" });
+
+        const verified = parseMigrationManifest(sealManifest({
+          ...createValidManifest(),
+          revision: 1,
+          phase: "verified",
+          previousManifestSha256: HASH_A,
+          reports: [report("verification-1", "verification")],
+          activationEligible: true,
+          updatedAt: UPDATED_AT,
+        }));
+        const active = completeMigrationEffect(beginMigrationEffect(
+          completeMigrationEffect(beginMigrationEffect(verified, {
+            effectId: "prepare-a",
+            kind: "prepare-activation",
+            inputSha256: HASH_A,
+            startedAt: EFFECT_AT,
+          }), { effectId: "prepare-a", completedAt: COMPLETE_AT }),
+          {
+            effectId: "publish-a",
+            kind: "publish-activation",
+            inputSha256: HASH_B,
+            startedAt: "2026-08-12T12:00:04.000Z",
+          },
+        ), {
+          effectId: "publish-a",
+          completedAt: "2026-08-12T12:00:05.000Z",
+          report: report("activation-1", "activation", "2026-08-12T12:00:05.000Z"),
+        });
+        writeFileSync(marker, "after", "utf8");
+        expect(classifyMigrationRecovery(active)).toEqual({ action: "settled", phase: "active" });
+
+        const aborted = completeMigrationEffect(beginFrom(createValidManifest(), "abort", "abort-1"), {
+          effectId: "abort-1",
+          completedAt: COMPLETE_AT,
+          report: report("abort-1", "abort", COMPLETE_AT),
+        });
+        expect(classifyMigrationRecovery(aborted)).toEqual({ action: "settled", phase: "aborted" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("classifies retry-idempotent effects for resume", () => {
+      const pending = beginFrom(createValidManifest(), "verify-dry-run");
+      expect(classifyMigrationRecovery(pending)).toEqual({ action: "resume", effect: pending.pendingEffect });
+    });
+
+    it("classifies uncertain durable effects for authoritative readback", () => {
+      const pending = beginMigrationEffect(manifestInPhase("dry-run-verified"), {
+        effectId: "copy-1",
+        kind: "copy-batch",
+        inputSha256: HASH_A,
+        startedAt: EFFECT_AT,
+      });
+      expect(classifyMigrationRecovery(pending)).toEqual({ action: "readback", effect: pending.pendingEffect });
+    });
+
+    it("reports rolled-back terminal lineage as settled", () => {
+      const genesis = createValidManifest();
+      const rolledBack = parseMigrationManifest(sealManifest({
+        ...genesis,
+        revision: 4,
+        phase: "rolled-back",
+        previousManifestSha256: HASH_A,
+        reports: [
+          report("verification-1", "verification"),
+          report("rollback-1", "rollback", UPDATED_AT),
+        ],
+        activationEligible: true,
+        rollbackLineage: {
+          ...genesis.rollbackLineage,
+          mode: "post-write",
+          returnPhase: "active",
+        },
+        updatedAt: UPDATED_AT,
+      }));
+      expect(classifyMigrationRecovery(rolledBack)).toEqual({ action: "settled", phase: "rolled-back" });
     });
   });
 });
