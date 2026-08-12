@@ -99,6 +99,29 @@ validates the complete effective configuration before asking the manager to
 replace the service, then waits for authenticated health. Run it once after a
 configuration or package update instead of starting a competing daemon.
 
+### Doctor recovery for stale daemon configuration
+
+When the daemon is healthy and its version matches the installed LCM version,
+`lcm doctor` first performs the normal non-destructive daemon validation. If
+that validation identifies the managed service registration as exactly
+`stale-config`, doctor performs one authenticated restart using the same
+validated port, state paths, storage identity, executable, entrypoint, and
+user-service-manager safeguards. It then checks authenticated daemon health
+again before reporting the result.
+
+This behavior adds no new configuration options. It uses the existing daemon
+port, storage backend, runtime/entrypoint, state paths, and user manager
+configuration, and is invoked with `lcm doctor`.
+
+A successful repair is reported as a warning with `fixApplied: true` because
+doctor changed the managed service state; the output explicitly says that the
+stale configuration was repaired and the daemon restarted. Other lifecycle
+refusals are not converted into restart permission. If the explicit repair is
+refused, doctor reports a failure and keeps the lifecycle refusal's exact
+remediation, such as running `lcm daemon restart` for another explicit,
+fail-closed attempt. Do not manually stop a process or start a competing
+daemon.
+
 ## One-time migration after a Linux upgrade
 
 An installation upgraded from LCM v1.4.1 to v1.4.2 may still have its daemon

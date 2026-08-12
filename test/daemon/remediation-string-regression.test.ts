@@ -104,6 +104,23 @@ describe("centralized remediation guidance", () => {
     expect(source).not.toMatch(/(?:Fix|Try|Start it with|run:)\s*[^\n]*(?:--foreground|--detach)/u);
   });
 
+  it("documents configuration behavior for stale daemon recovery", () => {
+    const source = readRepositoryFile("docs/daemon-restart-recovery.md");
+    const staleConfigSection = source.match(
+      /### Doctor recovery for stale daemon configuration\n([\s\S]*?)(?=\n## |$)/u,
+    )?.[1];
+    const normalizedStaleConfigSection = staleConfigSection?.replace(/\s+/gu, " ");
+
+    expect(normalizedStaleConfigSection).toBeDefined();
+    expect(normalizedStaleConfigSection).toContain("adds no new configuration options");
+    expect(normalizedStaleConfigSection).toContain("existing daemon port");
+    expect(normalizedStaleConfigSection).toContain("storage backend");
+    expect(normalizedStaleConfigSection).toContain("runtime/entrypoint");
+    expect(normalizedStaleConfigSection).toContain("state paths");
+    expect(normalizedStaleConfigSection).toContain("user manager configuration");
+    expect(normalizedStaleConfigSection).toContain("invoked with `lcm doctor`");
+  });
+
   it("keeps every lifecycle refusal reason on the bounded remediation map", () => {
     for (const reason of DAEMON_REFUSAL_REASONS) {
       const guidance = mapDaemonRefusalToRemediation(reason);

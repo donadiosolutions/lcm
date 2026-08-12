@@ -8,6 +8,8 @@ import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js"
 import { legacyLcmMcpServerName } from "../../src/legacy-names.js";
 import { LCM_MD_CONTENT } from "../../src/daemon/orientation.js";
 import { ensureDaemon, restartDaemon } from "../../src/daemon/lifecycle.js";
+import { emitDaemonNotice } from "../../src/hooks/daemon-notice.js";
+import { daemonRemediationMarkerPath } from "../../src/daemon/remediation.js";
 import {
   clearProjectMapCache,
   hashProjectPath,
@@ -909,6 +911,155 @@ describe("runDoctor daemon version mismatch", () => {
     expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
     expect(vi.mocked(restartDaemon)).not.toHaveBeenCalled();
     expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "pass" });
+  });
+
+  it.each([
+    undefined,
+    "managed restart warning",
+  ] as const)("repairs matching-version stale configuration with an identical restart request (%s)", async (warning): Promise<void> => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: false,
+      port: 3737,
+      spawned: false,
+      refusalReason: "stale-config",
+    });
+    vi.mocked(restartDaemon).mockResolvedValueOnce({
+      connected: true,
+      port: 3737,
+      spawned: true,
+      restarted: true,
+      ...(warning === undefined ? {} : { warning }),
+    });
+    const fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) });
+
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch,
+    }));
+    const daemonResult = results.find((result) => result.name === "daemon");
+    const ensureOptions = vi.mocked(ensureDaemon).mock.calls[0]?.[0];
+
+    expect(ensureOptions).toBeDefined();
+    expect(vi.mocked(restartDaemon)).toHaveBeenCalledOnce();
+    expect(vi.mocked(restartDaemon)).toHaveBeenCalledWith(ensureOptions);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(daemonResult).toMatchObject({ status: "warn", fixApplied: true });
+    expect(daemonResult?.message).toContain("stale configuration repaired");
+    expect(daemonResult?.message).toContain("daemon restarted");
+    if (warning === undefined) expect(daemonResult?.message).not.toContain("Warning:");
+    else expect(daemonResult?.message).toContain(warning);
+  });
+
+  it.each(["null", "reject"] as const)(
+    "does not report stale configuration repair as healthy when authenticated follow-up health %s",
+    async (followUpOutcome): Promise<void> => {
+      vi.mocked(ensureDaemon).mockResolvedValueOnce({
+        connected: false,
+        port: 3737,
+        spawned: false,
+        refusalReason: "stale-config",
+      });
+      vi.mocked(restartDaemon).mockResolvedValueOnce({
+        connected: true,
+        port: 3737,
+        spawned: true,
+        restarted: true,
+      });
+
+      const stateRoot = join(defaultDoctorHome, ".lcm");
+      const markerPath = daemonRemediationMarkerPath(stateRoot);
+      emitDaemonNotice({
+        scope: stateRoot,
+        stateRoot,
+        reason: "stale-config",
+        write: () => undefined,
+      });
+      expect(existsSync(markerPath)).toBe(true);
+
+      const fetch = vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) });
+      if (followUpOutcome === "null") {
+        fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: "degraded", version: "0.5.0" }) });
+      } else {
+        fetch.mockRejectedValueOnce(new Error("authenticated health unavailable"));
+      }
+
+      const results = await runDoctor(minimalDeps({
+        cwd: "/tmp/nonexistent-project-xyz",
+        fetch,
+      }));
+      const daemonResult = results.find((result) => result.name === "daemon");
+
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+      expect(vi.mocked(restartDaemon)).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch.mock.calls[0]?.[1]).not.toMatchObject({ headers: expect.anything() });
+      expect(fetch.mock.calls[1]?.[1]).toMatchObject({ headers: { Authorization: "Bearer {}" } });
+      expect(daemonResult).toMatchObject({ status: "fail", fixApplied: false });
+      expect(daemonResult?.message).toContain("authenticated health could not be verified after restart");
+      expect(daemonResult?.message).toContain(
+        "lcm daemon unavailable (stale-config); run 'lcm daemon restart'.",
+      );
+      expect(results.find((result) => result.name === "mcp-handshake-lcm")).toBeUndefined();
+      expect(existsSync(markerPath)).toBe(true);
+    },
+  );
+
+  it("does not restart a matching-version daemon for a non-stale ensure refusal", async (): Promise<void> => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: false,
+      port: 3737,
+      spawned: false,
+      refusalReason: "invalid-collision",
+    });
+
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ status: "ok", version: "0.5.0" }),
+      }),
+    }));
+    const daemonResult = results.find((result) => result.name === "daemon");
+
+    expect(vi.mocked(restartDaemon)).not.toHaveBeenCalled();
+    expect(daemonResult).toMatchObject({ status: "fail", fixApplied: false });
+    expect(daemonResult?.message).toContain(
+      "lcm daemon unavailable (invalid-collision); run 'lcm daemon restart' or 'lcm doctor'.",
+    );
+  });
+
+  it("keeps a stale-config restart refusal failed with its exact remediation", async (): Promise<void> => {
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: false,
+      port: 3737,
+      spawned: false,
+      refusalReason: "stale-config",
+    });
+    vi.mocked(restartDaemon).mockResolvedValueOnce({
+      connected: false,
+      port: 3737,
+      spawned: false,
+      restarted: false,
+      refusalReason: "stale-config",
+    });
+
+    const results = await runDoctor(minimalDeps({
+      cwd: "/tmp/nonexistent-project-xyz",
+      fetch: vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ status: "ok", version: "0.5.0" }),
+      }),
+    }));
+    const daemonResult = results.find((result) => result.name === "daemon");
+
+    expect(vi.mocked(restartDaemon)).toHaveBeenCalledOnce();
+    expect(daemonResult).toMatchObject({ status: "fail", fixApplied: false });
+    expect(daemonResult?.message).toContain(
+      "lcm daemon unavailable (stale-config); run 'lcm daemon restart'.",
+    );
   });
 
   it("reports warn with fixApplied:false when restart does not fix version mismatch", async (): Promise<void> => {
