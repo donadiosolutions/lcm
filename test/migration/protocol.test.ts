@@ -3,11 +3,13 @@ import { describe, expect, it } from "vitest";
 import {
   MigrationProtocolError,
   beginMigrationEffect,
+  completeMigrationEffect,
   createMigrationManifest,
   migrationManifestCanonicalSha256,
   parseMigrationManifest,
   type MigrationCheckpoint,
   type BeginMigrationEffectInput,
+  type CompleteMigrationEffectInput,
   type MigrationManifest,
   type MigrationReportReference,
   type MigrationStorageWitness,
@@ -19,6 +21,7 @@ const HASH_C = "c".repeat(64);
 const CREATED_AT = "2026-08-12T12:00:00.000Z";
 const UPDATED_AT = "2026-08-12T12:00:01.000Z";
 const EFFECT_AT = "2026-08-12T12:00:02.000Z";
+const COMPLETE_AT = "2026-08-12T12:00:03.000Z";
 
 function witness(backend: MigrationStorageWitness["backend"], capturedAt: string): MigrationStorageWitness {
   return {
@@ -97,6 +100,19 @@ function manifestInPhase(phase: "dry-run-verified" | "copying"): MigrationManife
     phase,
     updatedAt: UPDATED_AT,
   }));
+}
+
+function beginFrom(
+  manifest: MigrationManifest,
+  kind: BeginMigrationEffectInput["kind"],
+  effectId = `effect-${kind}`,
+): MigrationManifest {
+  return beginMigrationEffect(manifest, {
+    effectId,
+    kind,
+    inputSha256: HASH_A,
+    startedAt: EFFECT_AT,
+  });
 }
 
 describe("migration manifest protocol", () => {
@@ -789,6 +805,265 @@ describe("migration manifest protocol", () => {
         updatedAt: UPDATED_AT,
       }));
       expectProtocolError(() => beginMigrationEffect(exhausted, verifyInput), "unexpected-state");
+    });
+  });
+
+  describe("completeMigrationEffect", () => {
+    it("completes dry-run verification with the exact report and linked revision", () => {
+      const pending = beginFrom(createValidManifest(), "verify-dry-run");
+      const dryRunReport = report("dry-run-1", "dry-run", COMPLETE_AT);
+      const next = completeMigrationEffect(pending, {
+        effectId: "effect-verify-dry-run",
+        completedAt: COMPLETE_AT,
+        report: dryRunReport,
+      });
+
+      expect(next).toMatchObject({
+        revision: pending.revision + 1,
+        phase: "dry-run-verified",
+        previousManifestSha256: pending.checksumSha256,
+        updatedAt: COMPLETE_AT,
+        pendingEffect: null,
+        reports: [dryRunReport],
+        activationEligible: false,
+      });
+      expect(next.checksumSha256).toBe(migrationManifestCanonicalSha256(unsignedManifest(next)));
+      expect(pending.pendingEffect).not.toBeNull();
+    });
+
+    it("publishes a monotonic per-domain copy checkpoint", () => {
+      const current = manifestInPhase("dry-run-verified");
+      const first = completeMigrationEffect(beginFrom(current, "copy-batch", "copy-1"), {
+        effectId: "copy-1",
+        completedAt: COMPLETE_AT,
+        checkpoint: checkpoint("messages", 1),
+      });
+      const second = completeMigrationEffect(beginMigrationEffect(first, {
+        effectId: "copy-2",
+        kind: "copy-batch",
+        inputSha256: HASH_B,
+        startedAt: "2026-08-12T12:00:04.000Z",
+      }), {
+        effectId: "copy-2",
+        completedAt: "2026-08-12T12:00:05.000Z",
+        checkpoint: checkpoint("messages", 2),
+      });
+
+      expect(first.phase).toBe("copying");
+      expect(second.checkpoints).toEqual([checkpoint("messages", 2)]);
+      expectProtocolError(() => completeMigrationEffect(beginMigrationEffect(second, {
+        effectId: "copy-3",
+        kind: "copy-batch",
+        inputSha256: HASH_C,
+        startedAt: "2026-08-12T12:00:06.000Z",
+      }), {
+        effectId: "copy-3",
+        completedAt: "2026-08-12T12:00:07.000Z",
+        checkpoint: checkpoint("messages", 2),
+      }), "unexpected-state");
+      expectProtocolError(() => completeMigrationEffect(beginMigrationEffect(second, {
+        effectId: "copy-4",
+        kind: "copy-batch",
+        inputSha256: HASH_C,
+        startedAt: "2026-08-12T12:00:08.000Z",
+      }), {
+        effectId: "copy-4",
+        completedAt: "2026-08-12T12:00:09.000Z",
+        checkpoint: {
+          ...checkpoint("messages", 3),
+          recordCount: 1,
+        },
+      }), "unexpected-state");
+      const copied = completeMigrationEffect(beginMigrationEffect(second, {
+        effectId: "copy-complete",
+        kind: "complete-copy",
+        inputSha256: HASH_C,
+        startedAt: "2026-08-12T12:00:10.000Z",
+      }), {
+        effectId: "copy-complete",
+        completedAt: "2026-08-12T12:00:11.000Z",
+      });
+      expect(copied.phase).toBe("copied");
+    });
+
+    it("completes verification, activation boundaries, and activation publication", () => {
+      const genesis = createValidManifest();
+      const copied = parseMigrationManifest(sealManifest({
+        ...genesis,
+        revision: 1,
+        phase: "copied",
+        previousManifestSha256: genesis.checksumSha256,
+        updatedAt: UPDATED_AT,
+      }));
+      const verified = completeMigrationEffect(beginFrom(copied, "verify-generation", "verify-1"), {
+        effectId: "verify-1",
+        completedAt: COMPLETE_AT,
+        report: report("verify-report", "verification", COMPLETE_AT),
+        activationEligible: true,
+      });
+      const activating = completeMigrationEffect(beginMigrationEffect(verified, {
+        effectId: "prepare-1",
+        kind: "prepare-activation",
+        inputSha256: HASH_B,
+        startedAt: "2026-08-12T12:00:04.000Z",
+      }), {
+        effectId: "prepare-1",
+        completedAt: "2026-08-12T12:00:05.000Z",
+      });
+      const active = completeMigrationEffect(beginMigrationEffect(activating, {
+        effectId: "publish-1",
+        kind: "publish-activation",
+        inputSha256: HASH_C,
+        startedAt: "2026-08-12T12:00:06.000Z",
+      }), {
+        effectId: "publish-1",
+        completedAt: "2026-08-12T12:00:07.000Z",
+        report: report("activation-report", "activation", "2026-08-12T12:00:07.000Z"),
+      });
+
+      expect(verified).toMatchObject({ phase: "verified", activationEligible: true });
+      expect(activating).toMatchObject({ phase: "activating", activationEligible: true });
+      expect(active).toMatchObject({ phase: "active", activationEligible: true });
+    });
+
+    it("seals rollback return phase and terminal mode", () => {
+      const genesis = createValidManifest();
+      const verified = parseMigrationManifest(sealManifest({
+        ...genesis,
+        revision: 1,
+        phase: "verified",
+        previousManifestSha256: genesis.checksumSha256,
+        reports: [report("verify-report", "verification")],
+        activationEligible: true,
+        updatedAt: UPDATED_AT,
+      }));
+      const rolling = completeMigrationEffect(beginFrom(verified, "prepare-rollback", "prepare-rb"), {
+        effectId: "prepare-rb",
+        completedAt: COMPLETE_AT,
+      });
+      const rolledBack = completeMigrationEffect(beginMigrationEffect(rolling, {
+        effectId: "publish-rb",
+        kind: "publish-rollback",
+        inputSha256: HASH_B,
+        startedAt: "2026-08-12T12:00:04.000Z",
+      }), {
+        effectId: "publish-rb",
+        completedAt: "2026-08-12T12:00:05.000Z",
+        report: report("rollback-report", "rollback", "2026-08-12T12:00:05.000Z"),
+        rollbackMode: "pre-write",
+      });
+      const rolledBackPostWrite = completeMigrationEffect(beginMigrationEffect(rolling, {
+        effectId: "publish-rb-post-write",
+        kind: "publish-rollback",
+        inputSha256: HASH_C,
+        startedAt: "2026-08-12T12:00:06.000Z",
+      }), {
+        effectId: "publish-rb-post-write",
+        completedAt: "2026-08-12T12:00:07.000Z",
+        report: report("rollback-report-post-write", "rollback", "2026-08-12T12:00:07.000Z"),
+        rollbackMode: "post-write",
+      });
+
+      expect(rolling.rollbackLineage.returnPhase).toBe("verified");
+      expect(rolledBack).toMatchObject({
+        phase: "rolled-back",
+        rollbackLineage: { returnPhase: "verified", mode: "pre-write" },
+      });
+      expect(rolledBackPostWrite.rollbackLineage.mode).toBe("post-write");
+    });
+
+    it("requires the exact pending effect and completion evidence", () => {
+      const pending = beginFrom(createValidManifest(), "verify-dry-run");
+      expectProtocolError(() => completeMigrationEffect(pending, {
+        effectId: "wrong",
+        completedAt: COMPLETE_AT,
+        report: report("dry-run-1", "dry-run", COMPLETE_AT),
+      }), "unexpected-state");
+      expectProtocolError(() => completeMigrationEffect(pending, {
+        effectId: "effect-verify-dry-run",
+        completedAt: COMPLETE_AT,
+      }), "invalid-input");
+      expectProtocolError(() => completeMigrationEffect(pending, {
+        effectId: "effect-verify-dry-run",
+        completedAt: COMPLETE_AT,
+        checkpoint: checkpoint("messages", 1),
+        report: report("dry-run-1", "dry-run", COMPLETE_AT),
+      }), "invalid-input");
+      expectProtocolError(() => completeMigrationEffect(pending, {
+        effectId: "effect-verify-dry-run",
+        completedAt: COMPLETE_AT,
+        report: report("wrong-kind", "verification", COMPLETE_AT),
+      }), "invalid-input");
+      expectProtocolError(() => completeMigrationEffect(createValidManifest(), {
+        effectId: "effect-verify-dry-run",
+        completedAt: COMPLETE_AT,
+        report: report("dry-run-1", "dry-run", COMPLETE_AT),
+      }), "unexpected-state");
+    });
+
+    it.each([
+      ["invalid shape", null],
+      ["surplus field", { effectId: "effect-verify-dry-run", completedAt: COMPLETE_AT, extra: true }],
+      ["invalid effect id", { effectId: "-bad", completedAt: COMPLETE_AT }],
+      ["invalid completion time", { effectId: "effect-verify-dry-run", completedAt: "2026-08-12" }],
+      ["invalid eligibility type", { effectId: "effect-verify-dry-run", completedAt: COMPLETE_AT, activationEligible: "yes" }],
+      ["invalid rollback mode", { effectId: "effect-verify-dry-run", completedAt: COMPLETE_AT, rollbackMode: "sideways" }],
+    ] as const)("rejects %s completion input", (_name, candidate) => {
+      const pending = beginFrom(createValidManifest(), "verify-dry-run");
+      expectProtocolError(
+        () => completeMigrationEffect(pending, candidate as unknown as CompleteMigrationEffectInput),
+        "invalid-input",
+      );
+    });
+
+    it("rejects exhausted revisions and report timestamps outside the effect", () => {
+      const pending = beginFrom(createValidManifest(), "verify-dry-run");
+      const exhausted = parseMigrationManifest(sealManifest({
+        ...pending,
+        revision: Number.MAX_SAFE_INTEGER,
+        previousManifestSha256: HASH_A,
+      }));
+      expectProtocolError(() => completeMigrationEffect(exhausted, {
+        effectId: "effect-verify-dry-run",
+        completedAt: COMPLETE_AT,
+        report: report("dry-run-1", "dry-run", COMPLETE_AT),
+      }), "unexpected-state");
+      for (const createdAt of [UPDATED_AT, "2026-08-12T12:00:04.000Z"]) {
+        expectProtocolError(() => completeMigrationEffect(pending, {
+          effectId: "effect-verify-dry-run",
+          completedAt: COMPLETE_AT,
+          report: report(`dry-run-${createdAt}`, "dry-run", createdAt),
+        }), "invalid-input");
+      }
+    });
+
+    it("rejects duplicate report identities", () => {
+      const genesis = createValidManifest();
+      const withReport = parseMigrationManifest(sealManifest({
+        ...genesis,
+        reports: [report("dry-run-1", "dry-run", CREATED_AT)],
+      }));
+      const pending = beginFrom(withReport, "verify-dry-run");
+      expectProtocolError(() => completeMigrationEffect(pending, {
+        effectId: "effect-verify-dry-run",
+        completedAt: COMPLETE_AT,
+        report: report("dry-run-1", "dry-run", COMPLETE_AT),
+      }), "unexpected-state");
+    });
+
+    it("completes abort with sanitized evidence and rejects timestamp regression", () => {
+      const pending = beginFrom(createValidManifest(), "abort", "abort-1");
+      const aborted = completeMigrationEffect(pending, {
+        effectId: "abort-1",
+        completedAt: COMPLETE_AT,
+        report: report("abort-report", "abort", COMPLETE_AT),
+      });
+      expect(aborted.phase).toBe("aborted");
+      expectProtocolError(() => completeMigrationEffect(pending, {
+        effectId: "abort-1",
+        completedAt: CREATED_AT,
+        report: report("abort-report", "abort", CREATED_AT),
+      }), "unexpected-state");
     });
   });
 });

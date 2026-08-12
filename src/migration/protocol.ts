@@ -322,11 +322,14 @@ function parseWitness(
   };
 }
 
-function parseCheckpoint(value: unknown): MigrationCheckpoint {
-  const checkpoint = assertExactObject(value, ["destinationCommitSha256", "domain", "ordinal", "recordCount", "sourceCheckpointSha256"], "checkpoint");
+function parseCheckpoint(
+  value: unknown,
+  reason: MigrationProtocolReason = "malformed-manifest",
+): MigrationCheckpoint {
+  const checkpoint = assertExactObject(value, ["destinationCommitSha256", "domain", "ordinal", "recordCount", "sourceCheckpointSha256"], "checkpoint", reason);
   if (!isIdentifier(checkpoint.domain) || !isSafeNonNegativeInteger(checkpoint.ordinal)
     || !isSafeNonNegativeInteger(checkpoint.recordCount) || !isHash(checkpoint.sourceCheckpointSha256)
-    || !isHash(checkpoint.destinationCommitSha256)) protocolError("malformed-manifest", "checkpoint is invalid");
+    || !isHash(checkpoint.destinationCommitSha256)) protocolError(reason, "checkpoint is invalid");
   return {
     domain: checkpoint.domain,
     ordinal: checkpoint.ordinal,
@@ -336,11 +339,14 @@ function parseCheckpoint(value: unknown): MigrationCheckpoint {
   };
 }
 
-function parseReport(value: unknown): MigrationReportReference {
-  const report = assertExactObject(value, ["createdAt", "kind", "reportId", "reportSha256"], "report");
+function parseReport(
+  value: unknown,
+  reason: MigrationProtocolReason = "malformed-manifest",
+): MigrationReportReference {
+  const report = assertExactObject(value, ["createdAt", "kind", "reportId", "reportSha256"], "report", reason);
   if (!REPORT_KINDS.includes(report.kind as MigrationReportReference["kind"])
     || !isIdentifier(report.reportId) || !isHash(report.reportSha256) || !isIsoTimestamp(report.createdAt)) {
-    protocolError("malformed-manifest", "report is invalid");
+    protocolError(reason, "report is invalid");
   }
   return {
     kind: report.kind as MigrationReportReference["kind"],
@@ -468,8 +474,8 @@ export function parseMigrationManifest(value: unknown): MigrationManifest {
   }
   const source = parseWitness(manifest.source, "source");
   const destination = parseWitness(manifest.destination, "destination");
-  const checkpoints = sortCheckpoints(manifest.checkpoints.map(parseCheckpoint));
-  const reports = sortReports(manifest.reports.map(parseReport));
+  const checkpoints = sortCheckpoints(manifest.checkpoints.map((checkpoint) => parseCheckpoint(checkpoint)));
+  const reports = sortReports(manifest.reports.map((report) => parseReport(report)));
   const rollbackLineage = parseRollbackLineage(manifest.rollbackLineage);
   const pendingEffect = parsePendingEffect(manifest.pendingEffect);
   assertUniqueCollections(checkpoints, reports);
@@ -554,9 +560,7 @@ export function beginMigrationEffect(
   if (Date.parse(input.startedAt) < Date.parse(current.updatedAt)) {
     protocolError("unexpected-state", "migration effect timestamp regressed");
   }
-  const payload = {
-    ...unsignedMigrationManifest(current),
-    revision: current.revision + 1,
+  return sealMigrationSuccessor(current, input.startedAt, {
     pendingEffect: {
       effectId: input.effectId,
       kind: input.kind,
@@ -566,8 +570,25 @@ export function beginMigrationEffect(
       recovery: legal.recovery,
       startedAt: input.startedAt,
     },
+  });
+}
+
+type MigrationSuccessorOverrides = Partial<Pick<
+  Omit<MigrationManifest, "checksumSha256">,
+  "activationEligible" | "checkpoints" | "pendingEffect" | "phase" | "reports" | "rollbackLineage"
+>>;
+
+function sealMigrationSuccessor(
+  current: MigrationManifest,
+  updatedAt: string,
+  overrides: MigrationSuccessorOverrides,
+): MigrationManifest {
+  const payload = {
+    ...unsignedMigrationManifest(current),
+    revision: current.revision + 1,
+    ...overrides,
     previousManifestSha256: current.checksumSha256,
-    updatedAt: input.startedAt,
+    updatedAt,
   } satisfies Omit<MigrationManifest, "checksumSha256">;
   assertCrossFieldInvariants(payload);
   return deepFreeze({ ...payload, checksumSha256: migrationManifestCanonicalSha256(payload) });
@@ -578,4 +599,137 @@ function unsignedMigrationManifest(
 ): Omit<MigrationManifest, "checksumSha256"> {
   const { checksumSha256: _checksumSha256, ...payload } = manifest;
   return payload;
+}
+
+function hasOnlyKeys(value: RecordValue, allowed: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function assertCompletionEvidence(
+  pending: PendingMigrationEffect,
+  input: CompleteMigrationEffectInput,
+): Readonly<{
+  checkpoint?: MigrationCheckpoint;
+  report?: MigrationReportReference;
+}> {
+  const checkpointValue = input.checkpoint === undefined
+    ? undefined
+    : parseCheckpoint(input.checkpoint, "invalid-input");
+  const reportValue = input.report === undefined
+    ? undefined
+    : parseReport(input.report, "invalid-input");
+  const noCheckpoint = checkpointValue === undefined;
+  const noReport = reportValue === undefined;
+  const noEligibility = input.activationEligible === undefined;
+  const noRollbackMode = input.rollbackMode === undefined;
+  const exactReport = (kind: MigrationReportReference["kind"]): boolean => (
+    noCheckpoint && reportValue?.kind === kind && noEligibility && noRollbackMode
+  );
+  let valid = false;
+  switch (pending.kind) {
+    case "verify-dry-run":
+      valid = exactReport("dry-run");
+      break;
+    case "copy-batch":
+      valid = checkpointValue !== undefined && noReport && noEligibility && noRollbackMode;
+      break;
+    case "complete-copy":
+    case "prepare-activation":
+    case "prepare-rollback":
+      valid = noCheckpoint && noReport && noEligibility && noRollbackMode;
+      break;
+    case "verify-generation":
+      valid = noCheckpoint && reportValue?.kind === "verification"
+        && input.activationEligible === true && noRollbackMode;
+      break;
+    case "publish-activation":
+      valid = exactReport("activation");
+      break;
+    case "publish-rollback":
+      valid = noCheckpoint && reportValue?.kind === "rollback" && noEligibility
+        && (input.rollbackMode === "pre-write" || input.rollbackMode === "post-write");
+      break;
+    case "abort":
+      valid = exactReport("abort");
+      break;
+  }
+  if (!valid) protocolError("invalid-input", "migration completion evidence is invalid");
+  return { checkpoint: checkpointValue, report: reportValue };
+}
+
+function nextCheckpoints(
+  current: readonly MigrationCheckpoint[],
+  checkpointValue: MigrationCheckpoint | undefined,
+): readonly MigrationCheckpoint[] {
+  if (checkpointValue === undefined) return current;
+  const existing = current.find((checkpoint) => checkpoint.domain === checkpointValue.domain);
+  if (existing !== undefined
+    && (checkpointValue.ordinal <= existing.ordinal || checkpointValue.recordCount < existing.recordCount)) {
+    protocolError("unexpected-state", "migration checkpoint regressed");
+  }
+  return sortCheckpoints([
+    ...current.filter((checkpoint) => checkpoint.domain !== checkpointValue.domain),
+    checkpointValue,
+  ]);
+}
+
+function nextReports(
+  current: readonly MigrationReportReference[],
+  reportValue: MigrationReportReference | undefined,
+): readonly MigrationReportReference[] {
+  if (reportValue === undefined) return current;
+  if (current.some((report) => report.reportId === reportValue.reportId)) {
+    protocolError("unexpected-state", "migration report identity already exists");
+  }
+  return sortReports([...current, reportValue]);
+}
+
+export function completeMigrationEffect(
+  manifest: MigrationManifest,
+  input: CompleteMigrationEffectInput,
+): MigrationManifest {
+  const current = parseMigrationManifest(manifest);
+  if (!isRecord(input)
+    || !hasOnlyKeys(input, ["activationEligible", "checkpoint", "completedAt", "effectId", "report", "rollbackMode"])
+    || !Object.hasOwn(input, "effectId") || !Object.hasOwn(input, "completedAt")) {
+    protocolError("invalid-input", "migration completion input has an invalid shape");
+  }
+  if (!isIdentifier(input.effectId) || !isIsoTimestamp(input.completedAt)
+    || (input.activationEligible !== undefined && typeof input.activationEligible !== "boolean")
+    || (input.rollbackMode !== undefined && input.rollbackMode !== "pre-write" && input.rollbackMode !== "post-write")) {
+    protocolError("invalid-input", "migration completion input is invalid");
+  }
+  const pending = current.pendingEffect;
+  if (pending === null || pending.effectId !== input.effectId) {
+    protocolError("unexpected-state", "migration completion does not match the pending effect");
+  }
+  if (current.revision === Number.MAX_SAFE_INTEGER) {
+    protocolError("unexpected-state", "migration manifest revision is exhausted");
+  }
+  if (Date.parse(input.completedAt) < Date.parse(current.updatedAt)) {
+    protocolError("unexpected-state", "migration completion timestamp regressed");
+  }
+  const evidence = assertCompletionEvidence(pending, input);
+  if (evidence.report !== undefined
+    && (Date.parse(evidence.report.createdAt) < Date.parse(pending.startedAt)
+      || Date.parse(evidence.report.createdAt) > Date.parse(input.completedAt))) {
+    protocolError("invalid-input", "migration report timestamp is outside the effect boundary");
+  }
+  const rollbackLineage = pending.kind === "prepare-rollback"
+    ? { ...current.rollbackLineage, returnPhase: pending.fromPhase as "verified" | "active" }
+    : pending.kind === "publish-rollback"
+      ? { ...current.rollbackLineage, mode: input.rollbackMode! }
+      : current.rollbackLineage;
+  return sealMigrationSuccessor(current, input.completedAt, {
+    phase: pending.targetPhase,
+    checkpoints: nextCheckpoints(current.checkpoints, evidence.checkpoint),
+    reports: nextReports(current.reports, evidence.report),
+    activationEligible: pending.kind === "verify-generation"
+      ? true
+      : pending.kind === "abort"
+        ? false
+        : current.activationEligible,
+    rollbackLineage,
+    pendingEffect: null,
+  });
 }
