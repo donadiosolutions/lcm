@@ -733,3 +733,49 @@ export function completeMigrationEffect(
     pendingEffect: null,
   });
 }
+
+export function abandonMigrationEffect(
+  manifest: MigrationManifest,
+  input: AbandonMigrationEffectInput,
+): MigrationManifest {
+  const current = parseMigrationManifest(manifest);
+  if (!isRecord(input) || !exactKeys(input, ["abandonedAt", "effectId", "report"])) {
+    protocolError("invalid-input", "migration abandonment input has an invalid shape");
+  }
+  if (!isIdentifier(input.effectId) || !isIsoTimestamp(input.abandonedAt)) {
+    protocolError("invalid-input", "migration abandonment input is invalid");
+  }
+  const reportValue = parseReport(input.report, "invalid-input");
+  if (reportValue.kind !== "abandonment") {
+    protocolError("invalid-input", "migration abandonment report is invalid");
+  }
+  const pending = current.pendingEffect;
+  if (pending === null || pending.effectId !== input.effectId
+    || (pending.kind !== "publish-activation" && pending.kind !== "publish-rollback")) {
+    protocolError("unexpected-state", "migration abandonment does not match a pending publication");
+  }
+  if (current.revision === Number.MAX_SAFE_INTEGER) {
+    protocolError("unexpected-state", "migration manifest revision is exhausted");
+  }
+  if (Date.parse(input.abandonedAt) < Date.parse(current.updatedAt)) {
+    protocolError("unexpected-state", "migration abandonment timestamp regressed");
+  }
+  if (Date.parse(reportValue.createdAt) < Date.parse(pending.startedAt)
+    || Date.parse(reportValue.createdAt) > Date.parse(input.abandonedAt)) {
+    protocolError("invalid-input", "migration abandonment report timestamp is outside the effect boundary");
+  }
+  const returnPhase = pending.kind === "publish-activation"
+    ? "verified"
+    : current.rollbackLineage.returnPhase;
+  if (returnPhase === null) {
+    protocolError("unexpected-state", "migration rollback return phase is missing");
+  }
+  return sealMigrationSuccessor(current, input.abandonedAt, {
+    phase: returnPhase,
+    reports: nextReports(current.reports, reportValue),
+    rollbackLineage: pending.kind === "publish-rollback"
+      ? { ...current.rollbackLineage, returnPhase: null }
+      : current.rollbackLineage,
+    pendingEffect: null,
+  });
+}

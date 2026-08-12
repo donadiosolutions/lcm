@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   MigrationProtocolError,
+  abandonMigrationEffect,
   beginMigrationEffect,
   completeMigrationEffect,
   createMigrationManifest,
@@ -10,6 +11,7 @@ import {
   type MigrationCheckpoint,
   type BeginMigrationEffectInput,
   type CompleteMigrationEffectInput,
+  type AbandonMigrationEffectInput,
   type MigrationManifest,
   type MigrationReportReference,
   type MigrationStorageWitness,
@@ -1064,6 +1066,215 @@ describe("migration manifest protocol", () => {
         completedAt: CREATED_AT,
         report: report("abort-report", "abort", CREATED_AT),
       }), "unexpected-state");
+    });
+  });
+
+  describe("abandonMigrationEffect", () => {
+    function verifiedManifest(): MigrationManifest {
+      const genesis = createValidManifest();
+      return parseMigrationManifest(sealManifest({
+        ...genesis,
+        revision: 1,
+        phase: "verified",
+        previousManifestSha256: genesis.checksumSha256,
+        reports: [report("verification-1", "verification", UPDATED_AT)],
+        activationEligible: true,
+        updatedAt: UPDATED_AT,
+      }));
+    }
+
+    function abandonment(effectId: string, abandonedAt: string): AbandonMigrationEffectInput {
+      return {
+        effectId,
+        abandonedAt,
+        report: report(`abandon-${effectId}`, "abandonment", abandonedAt) as AbandonMigrationEffectInput["report"],
+      };
+    }
+
+    it("returns a negatively-read-back activation publication to verified", () => {
+      const verified = verifiedManifest();
+      const activating = completeMigrationEffect(beginMigrationEffect(verified, {
+        effectId: "prepare-a",
+        kind: "prepare-activation",
+        inputSha256: HASH_A,
+        startedAt: EFFECT_AT,
+      }), {
+        effectId: "prepare-a",
+        completedAt: COMPLETE_AT,
+      });
+      const pending = beginMigrationEffect(activating, {
+        effectId: "publish-a",
+        kind: "publish-activation",
+        inputSha256: HASH_B,
+        startedAt: "2026-08-12T12:00:04.000Z",
+      });
+      const next = abandonMigrationEffect(pending, abandonment("publish-a", "2026-08-12T12:00:05.000Z"));
+
+      expect(next).toMatchObject({
+        revision: pending.revision + 1,
+        phase: "verified",
+        activationEligible: true,
+        pendingEffect: null,
+        previousManifestSha256: pending.checksumSha256,
+        updatedAt: "2026-08-12T12:00:05.000Z",
+      });
+      expect(next.reports.some((item) => item.kind === "abandonment")).toBe(true);
+      expect(beginMigrationEffect(next, {
+        effectId: "prepare-a-2",
+        kind: "prepare-activation",
+        inputSha256: HASH_C,
+        startedAt: "2026-08-12T12:00:06.000Z",
+      }).pendingEffect?.kind).toBe("prepare-activation");
+    });
+
+    it.each(["verified", "active"] as const)("returns rollback publication to sealed %s phase", (returnPhase) => {
+      const base = returnPhase === "verified"
+        ? verifiedManifest()
+        : parseMigrationManifest(sealManifest({
+          ...verifiedManifest(),
+          revision: 2,
+          phase: "active",
+          previousManifestSha256: HASH_A,
+          updatedAt: EFFECT_AT,
+        }));
+      const rolling = completeMigrationEffect(beginMigrationEffect(base, {
+        effectId: `prepare-r-${returnPhase}`,
+        kind: "prepare-rollback",
+        inputSha256: HASH_A,
+        startedAt: COMPLETE_AT,
+      }), {
+        effectId: `prepare-r-${returnPhase}`,
+        completedAt: "2026-08-12T12:00:04.000Z",
+      });
+      const pending = beginMigrationEffect(rolling, {
+        effectId: `publish-r-${returnPhase}`,
+        kind: "publish-rollback",
+        inputSha256: HASH_B,
+        startedAt: "2026-08-12T12:00:05.000Z",
+      });
+      const next = abandonMigrationEffect(pending, abandonment(
+        `publish-r-${returnPhase}`,
+        "2026-08-12T12:00:06.000Z",
+      ));
+      expect(next).toMatchObject({
+        phase: returnPhase,
+        activationEligible: true,
+        pendingEffect: null,
+        rollbackLineage: { returnPhase: null, mode: null },
+      });
+    });
+
+    it("rejects non-publication effects and mismatched identities", () => {
+      const retryPending = beginFrom(createValidManifest(), "verify-dry-run");
+      expectProtocolError(
+        () => abandonMigrationEffect(retryPending, abandonment("effect-verify-dry-run", COMPLETE_AT)),
+        "unexpected-state",
+      );
+      const verified = verifiedManifest();
+      const activating = completeMigrationEffect(beginMigrationEffect(verified, {
+        effectId: "prepare-a",
+        kind: "prepare-activation",
+        inputSha256: HASH_A,
+        startedAt: EFFECT_AT,
+      }), { effectId: "prepare-a", completedAt: COMPLETE_AT });
+      const pending = beginMigrationEffect(activating, {
+        effectId: "publish-a",
+        kind: "publish-activation",
+        inputSha256: HASH_B,
+        startedAt: "2026-08-12T12:00:04.000Z",
+      });
+      expectProtocolError(
+        () => abandonMigrationEffect(pending, abandonment("wrong-effect", "2026-08-12T12:00:05.000Z")),
+        "unexpected-state",
+      );
+    });
+
+    it("rejects malformed evidence and timestamps outside the pending effect", () => {
+      const verified = verifiedManifest();
+      const activating = completeMigrationEffect(beginMigrationEffect(verified, {
+        effectId: "prepare-a",
+        kind: "prepare-activation",
+        inputSha256: HASH_A,
+        startedAt: EFFECT_AT,
+      }), { effectId: "prepare-a", completedAt: COMPLETE_AT });
+      const pending = beginMigrationEffect(activating, {
+        effectId: "publish-a",
+        kind: "publish-activation",
+        inputSha256: HASH_B,
+        startedAt: "2026-08-12T12:00:04.000Z",
+      });
+      expectProtocolError(() => abandonMigrationEffect(pending, {
+        ...abandonment("publish-a", "2026-08-12T12:00:05.000Z"),
+        report: report("wrong", "abort", "2026-08-12T12:00:05.000Z") as AbandonMigrationEffectInput["report"],
+      }), "invalid-input");
+      for (const abandonedAt of [COMPLETE_AT, "2026-08-12T12:00:06.000Z"]) {
+        const input = abandonedAt === COMPLETE_AT
+          ? abandonment("publish-a", abandonedAt)
+          : {
+            ...abandonment("publish-a", abandonedAt),
+            report: report("bad-report-time", "abandonment", "2026-08-12T12:00:07.000Z") as AbandonMigrationEffectInput["report"],
+          };
+        expectProtocolError(() => abandonMigrationEffect(pending, input), abandonedAt === COMPLETE_AT ? "unexpected-state" : "invalid-input");
+      }
+    });
+
+    it.each([
+      ["invalid shape", null],
+      ["surplus field", { ...abandonment("publish-a", "2026-08-12T12:00:05.000Z"), extra: true }],
+      ["invalid effect id", { ...abandonment("publish-a", "2026-08-12T12:00:05.000Z"), effectId: "-bad" }],
+      ["invalid abandonment time", { ...abandonment("publish-a", "2026-08-12T12:00:05.000Z"), abandonedAt: "2026-08-12" }],
+    ] as const)("rejects %s abandonment input", (_name, candidate) => {
+      expectProtocolError(
+        () => abandonMigrationEffect(createValidManifest(), candidate as unknown as AbandonMigrationEffectInput),
+        "invalid-input",
+      );
+    });
+
+    it("rejects exhausted abandonment revisions and missing rollback return lineage", () => {
+      const verified = verifiedManifest();
+      const activating = completeMigrationEffect(beginMigrationEffect(verified, {
+        effectId: "prepare-a",
+        kind: "prepare-activation",
+        inputSha256: HASH_A,
+        startedAt: EFFECT_AT,
+      }), { effectId: "prepare-a", completedAt: COMPLETE_AT });
+      const pendingActivation = beginMigrationEffect(activating, {
+        effectId: "publish-a",
+        kind: "publish-activation",
+        inputSha256: HASH_B,
+        startedAt: "2026-08-12T12:00:04.000Z",
+      });
+      const exhausted = parseMigrationManifest(sealManifest({
+        ...pendingActivation,
+        revision: Number.MAX_SAFE_INTEGER,
+        previousManifestSha256: HASH_A,
+      }));
+      expectProtocolError(
+        () => abandonMigrationEffect(exhausted, abandonment("publish-a", "2026-08-12T12:00:05.000Z")),
+        "unexpected-state",
+      );
+
+      const missingReturn = parseMigrationManifest(sealManifest({
+        ...verified,
+        revision: 3,
+        phase: "rolling-back",
+        previousManifestSha256: HASH_A,
+        rollbackLineage: { ...verified.rollbackLineage, returnPhase: null },
+        pendingEffect: {
+          effectId: "publish-r",
+          kind: "publish-rollback",
+          fromPhase: "rolling-back",
+          targetPhase: "rolled-back",
+          inputSha256: HASH_B,
+          recovery: "authoritative-readback-required",
+          startedAt: "2026-08-12T12:00:04.000Z",
+        },
+        updatedAt: "2026-08-12T12:00:04.000Z",
+      }));
+      expectProtocolError(
+        () => abandonMigrationEffect(missingReturn, abandonment("publish-r", "2026-08-12T12:00:05.000Z")),
+        "unexpected-state",
+      );
     });
   });
 });
