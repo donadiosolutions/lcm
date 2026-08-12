@@ -64,7 +64,7 @@ The hook connector installs these Codex events:
 |---|---|---|
 | `SessionStart` | `lcm restore --client codex` | Restores project context when Codex starts, resumes, or clears a session |
 | `UserPromptSubmit` | `lcm user-prompt --client codex` | Searches memory and injects prompt-time hints |
-| `PostToolUse` | `lcm post-tool --client codex` | Captures passive learning signals from supported tool calls |
+| `PostToolUse` | `lcm post-tool --client codex` | Captures bounded semantic signals from `functions.exec` and `functions.exec_command` |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingests transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingests transcript deltas and triggers compaction once the configured token threshold is reached |
 
@@ -74,6 +74,41 @@ Codex must trust the project `.codex/` layer for project-local hooks to load. Fo
 lcm connectors install codex --global
 lcm connectors doctor codex --global
 ```
+
+### Codex PostToolUse capture boundary
+
+The installed PostToolUse hook must be an exact command hook under a `*`
+matcher:
+
+```json
+{
+  "matcher": "*",
+  "hooks": [
+    { "type": "command", "command": "lcm post-tool --client codex" }
+  ]
+}
+```
+
+`lcm connectors doctor codex` (or the same command with `--global`) verifies
+that structure in the canonical Codex hook file. It then runs a pure,
+no-write functional check over representative native payloads. The check does
+not run the hook handler, write hook files, create an event database, open an
+EventsDb, or append sidecar events. If the structure is absent or incomplete,
+doctor prints `Codex: native exec capture functional check skipped` and does
+not claim functional health.
+
+Codex capture is deliberately narrow. Only `client: "codex"` payloads with
+`tool_name` equal to `functions.exec` or `functions.exec_command` are adapted.
+The adapter takes `tool_input.command`, or `tool_input.cmd` when `command` is
+absent, and bounds the accepted command to 2,000 characters before passing it
+through the existing event-data truncation and sensitive-data scrubbing. It
+projects only direct status fields from `tool_output` (preferred) or
+`tool_response`, using `isError`, `is_error`, `exit_code`, and `exitCode` in
+that order. Raw stdout/stderr, raw responses, nested or unknown output fields,
+and file-like fields are not persisted or interpreted as file events. A
+trimmed command beginning with `lcm store` is suppressed to avoid a feedback
+loop from LCM's own storage calls. There is no new configuration option for
+these fixed capture rules.
 
 If you only want the Codex skill or rules instead of the default set:
 
@@ -122,4 +157,6 @@ lcm import --provider all
 1. Add first-class `lcm setup vscode` and `lcm setup codex` commands instead of overloading `lcm install`.
 2. Add TOML read/write support so Codex MCP setup can be automated.
 3. Add a real VS Code runtime adapter for restore, writeback, and prompt-time recall instead of rules-only guidance.
-4. Expand connector diagnostics to validate Codex hook event coverage.
+4. Connector diagnostics now validate the exact Codex PostToolUse structure and
+   its pure native-exec capture path; no database or hook-file writes are part
+   of the check.

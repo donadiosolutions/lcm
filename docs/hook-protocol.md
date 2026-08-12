@@ -162,6 +162,78 @@ The `daemon_port` payload field is ignored. PostToolUse never sends the daemon
 bearer token or captured event data to a payload-selected listener; queued
 events are collected by the daemon's bounded background processing instead.
 
+### Codex native PostToolUse capture
+
+The Codex connector uses the following exact hook entry in the canonical
+`~/.codex/hooks.json` file (or the equivalent path selected by the existing
+connector install scope):
+
+```json
+{
+  "PostToolUse": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "lcm post-tool --client codex"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The `matcher`, hook `type`, and command are structural contract values. The
+installed connector may also retain its timeout and status-message metadata,
+but the command must remain exactly `lcm post-tool --client codex`; extra
+arguments do not satisfy the contract. Install it with:
+
+```bash
+lcm connectors install codex
+lcm connectors doctor codex
+```
+
+The `--global` option selects the existing global connector scope; no new
+configuration option is required for native command capture, and the 2,000-
+character adapter bound is fixed rather than configurable.
+
+Codex sends native tool names `functions.exec` and `functions.exec_command`.
+For those names, lcm accepts only the bounded semantic command (`command`, or
+`cmd` when `command` is absent) and a direct status projection. `tool_output` is
+checked before `tool_response`; status fields are considered in this order:
+`isError`, `is_error`, `exit_code`, and `exitCode`. Boolean values are used
+directly, while finite numeric exit codes map zero to success and nonzero to an
+error. A valid false or zero value is authoritative. Nested or invalid values
+are ignored.
+
+The adapter does not persist raw Codex responses, stdout, stderr, or unknown
+fields, and it does not infer file events from shell text or unrecognized
+file-like fields. The existing event truncation and scrubbing pipeline still
+runs on derived event data. Commands whose trimmed text begins with `lcm
+store` are suppressed to prevent LCM's own writes from feeding back into
+passive learning.
+
+`lcm connectors doctor codex` performs two checks for the targeted Codex
+connector. It first verifies the exact structural hook contract above. Only
+when that check passes does it run the native-exec functional probe. The probe
+is pure and in-memory: it exercises normalization and extraction without
+invoking the PostToolUse handler, opening an EventsDb, appending sidecar
+events, writing hook files, or creating a database. A structurally absent or
+incomplete hook never reports functional success; its functional result is
+reported as:
+
+```text
+Codex: native exec capture functional check skipped
+```
+
+When the exact structure and the pure probe both pass, doctor reports:
+
+```text
+✓ Codex: PostToolUse hook installed
+✓ Codex: native exec capture functional
+```
+
 ## SessionSnapshot Hook
 
 **Command:** `lcm session-snapshot`

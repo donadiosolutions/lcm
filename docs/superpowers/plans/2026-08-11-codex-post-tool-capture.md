@@ -13,8 +13,8 @@
 - Start only after the CLI PR for #602/#603 merges. Fetch updated `origin/main`, create a fresh isolated worker workspace at `UPDATED_MAIN=$(git rev-parse --verify 'origin/main^{commit}')`, require `test "$(git rev-parse HEAD)" = "$UPDATED_MAIN"`, persist it with `git update-ref refs/lcm/implementation-bases/issue-604-codex-post-tool "$UPDATED_MAIN"`, and create branch `fix/604-codex-post-tool-capture` from that durable ref; never use a `codex/` prefix.
 - Do not use, clean, stage, or modify the coordinator worktree or pre-existing files outside this branch.
 - Add no dependency and preserve exact pins and lockfile integrity.
-- Recognize only `client: "codex"` payloads with `functions.exec` or `functions.exec_command` names and explicit bounded command fields.
-- Never serialize raw `tool_input`, `tool_response`, stdout, stderr, or unknown output into an event.
+- Recognize only `client: "codex"` payloads with `functions.exec` or `functions.exec_command` names and explicit bounded command fields. Copy at most 2,000 command characters plus a literal `...` truncation marker into the canonical in-memory shape; no raw command object survives normalization.
+- Never serialize raw `tool_input`, `tool_response`, stdout, stderr, or unknown output into an event. The bounded command is used only by the allowlisted semantic extractor, and extracted event data passes through the existing built-in and project-aware scrubber before enqueue.
 - Preserve feedback-loop exclusions, built-in/project scrubbing, truncation, and append-before-project-metadata ordering.
 - Functional doctor is pure/no-write and must not touch the user's event database.
 - The existing `unit-hooks` directory path already exclusively owns the new production file. Update `codecov.yml` atomically with the count test by documenting that the directory path owns native hook adapters, but do not add a redundant exact-file path; update the literal expected production-file count in `test/codecov-config.test.ts`.
@@ -57,7 +57,7 @@ Create table-driven tests for:
 
 Normalize each fixture, pass it to `extractPostToolEvents`, and assert the existing event type/category/priority. Add negative fixtures for non-Codex clients, unknown `functions.*` names, non-string `cmd`/`command`, lcm-store feedback-loop names, and response objects containing a sentinel secret. Assert the secret never appears in normalized input or event data.
 
-Add status fixtures with this exact policy: inspect only top-level status fields in record-valued `tool_output` and `tool_response`; prefer `tool_output` over `tool_response`; within one record prefer boolean `isError`, then boolean `is_error`, then finite numeric `exit_code`, then finite numeric `exitCode`. A boolean maps directly, numeric zero maps to false, and every other finite number maps to true. Strings, nested objects, `NaN`, and infinities are ignored. An explicit higher-precedence false overrides a lower-precedence nonzero code. If no recognized field exists, omit canonical `tool_output`. Add conflict fixtures proving every precedence rule.
+Add status fixtures with this exact policy: inspect only top-level status fields in record-valued `tool_output` and `tool_response`, consulting `tool_output` first. Within one record, select the first valid field in this precedence order: boolean `isError`, boolean `is_error`, finite numeric `exit_code`, finite numeric `exitCode`. A boolean maps directly, numeric zero maps to false, and every other finite number maps to true. A valid false/zero wins. Strings, nested objects, `NaN`, and infinities are invalid and ignored. Fall back to `tool_response` only when `tool_output` contains no valid recognized field. If neither source contains one, omit canonical `tool_output`. Add conflict and invalid-field fixtures proving every source and field precedence rule.
 
 No captured structured Codex file-operation shape is available in #604. Add negative fixtures proving nested/unknown `operation`, `path`, and file-like fields cannot produce file events, and shell text such as `cat`, `sed`, `rm`, or redirects is never parsed into file events. Do not invent a structured mapping without a real captured payload.
 
@@ -93,23 +93,29 @@ export function normalizePostToolInput(input: RawPostToolInput): PostToolInput {
 }
 ```
 
-Keep command selection deterministic: prefer `command` when it is a string,
-otherwise `cmd`; trim only to decide whether a command is empty. An empty or
-missing command produces an inert canonical input and no event regardless of
-status, while the original non-empty command string is retained for existing
-bounded extractor semantics.
+Keep command selection deterministic: when `command` is a string it wins even
+when blank; only if it is not a string may a string `cmd` be selected. Trim only
+to decide whether the selected command is empty and to apply the native
+feedback-loop matcher; do not fall back from a blank string `command` to `cmd`.
+An empty or missing selected command produces an inert canonical input and no
+event regardless of status. Bound a non-empty selected command before extraction
+to its first 2,000 UTF-16 code units plus `...` when truncated. This mirrors the
+existing event-data soft cap while preventing an unbounded raw command from
+entering the extractor. Extracted data is then scrubbed by the existing
+project-aware event scrubber before any durable write.
 
 Implement functional coverage from fixed benign fixtures:
 
 ```ts
 export function codexPostToolFunctionalCoverage(): boolean {
-  return [
-    { tool_name: "functions.exec", tool_input: { command: "git branch" } },
-    { tool_name: "functions.exec_command", tool_input: { cmd: "npm install probe" } },
-  ].every(fixture => extractPostToolEvents(normalizePostToolInput({
-    client: "codex",
-    ...fixture,
-  })).length === 1);
+  const fixtures = [
+    { tool_name: "functions.exec", tool_input: { command: "git branch" }, expected: "git_branch" },
+    { tool_name: "functions.exec_command", tool_input: { cmd: "npm install probe" }, expected: "env_install" },
+  ];
+  return fixtures.every(({ expected, ...fixture }) => {
+    const events = extractPostToolEvents(normalizePostToolInput({ client: "codex", ...fixture }));
+    return events.length === 1 && events[0]?.type === expected;
+  });
 }
 ```
 
@@ -223,7 +229,7 @@ For targeted installed Codex connector doctor, require output that distinguishes
 ✓ Codex: native exec capture functional
 ```
 
-Targeted doctor must inspect the canonical `~/.codex/hooks.json` path using the same default/`--global` resolution as installation even when broad discovery finds only a partial installation. Preserve existing connector path output, then print structural and functional lines. Distinguish absent, incomplete, and installed-but-nonfunctional states; never print functional success when structure is absent/incomplete. Mock functional failure and assert actionable output plus exit 1.
+Targeted doctor must inspect the canonical `~/.codex/hooks.json` path using the same default/`--global` resolution as installation even when broad discovery finds only a partial installation. Preserve existing connector path output, then print structural and functional lines. Distinguish absent, incomplete, and installed-but-nonfunctional states; never print functional success when structure is absent/incomplete. Print `Codex: native exec capture functional check skipped` when structure is absent or incomplete. Mock functional failure and assert actionable output plus exit 1.
 
 Make the pure probe mockable before module import through an injected dependency or module mock. Assert doctor does not call `appendLocalHookEvents`, instantiate `EventsDb`, write hook files, or create an event database.
 
@@ -239,7 +245,7 @@ Expected: existing broad `hasCodexHooks` accepts partial hook files and doctor o
 
 - [ ] **Step 4: Implement exact structural inspection and no-write probe**
 
-Keep broad connector discovery compatibility unchanged. Targeted health calls the exact structural inspector and only then the in-memory functional probe. Aggregate failures and call `exit(1)` only after printing all requested agent results. Non-Codex connector behavior remains unchanged.
+Keep broad connector discovery compatibility and its existing output unchanged. Targeted health calls the exact structural inspector and only then the in-memory functional probe. Aggregate failures and call `exit(1)` only after printing all requested agent results. The probe imports only the pure normalizer/extractor path: it must not import or call `handlePostToolUse`, `appendLocalHookEvents`, `EventsDb`, or filesystem setup. Non-Codex connector behavior remains unchanged.
 
 - [ ] **Step 5: Run GREEN**
 

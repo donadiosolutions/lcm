@@ -262,6 +262,20 @@ describe("dispatchHook", () => {
     expect(ensureBootstrapped).not.toHaveBeenCalled();
   });
 
+  it("preserves the top-level Codex client for direct post-tool dispatch", async () => {
+    const payload = JSON.stringify({
+      client: "codex",
+      session_id: "test",
+      tool_name: "functions.exec",
+      tool_input: { command: "git branch capture-test" },
+    });
+    vi.mocked(handlePostToolUse).mockClear();
+
+    await dispatchHook("post-tool", payload);
+
+    expect(handlePostToolUse).toHaveBeenCalledWith(payload);
+  });
+
   it("ignores daemon_port from post-tool payload without loading config", async () => {
     vi.mocked(handlePostToolUse).mockClear();
     vi.mocked(loadHookConfig).mockClear();

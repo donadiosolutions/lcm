@@ -2380,6 +2380,7 @@ export async function runCli(
 
       const installed = listConnectors(opts.global ? homedir() : process.cwd());
       console.log("\n  Connector health:\n");
+      let failures = 0;
       for (const agent of agents) {
         const agentConnectors = installed.filter((c: any) => c.agentId === (agent as any).id);
         if ((agentConnectors as any[]).length === 0) {
@@ -2389,8 +2390,40 @@ export async function runCli(
             console.log(`  ✓ ${(agent as any).name}: ${c.type} at ${c.path}`);
           }
         }
+
+        if ((agent as any).id !== "codex" || agentName === undefined) continue;
+
+        const {
+          inspectCodexPostToolHook,
+          resolveCodexHooksPath,
+        } = await import("../src/connectors/codex-hooks.js");
+        const { codexPostToolFunctionalCoverage } = await import("../src/hooks/post-tool-normalization.js");
+        const inspection = inspectCodexPostToolHook(
+          resolveCodexHooksPath(opts.global ? homedir() : process.cwd()),
+        );
+
+        if (inspection.state === "installed") {
+          console.log("  ✓ Codex: PostToolUse hook installed");
+          let functional = false;
+          try {
+            functional = codexPostToolFunctionalCoverage();
+          } catch {
+            functional = false;
+          }
+          if (functional) {
+            console.log("  ✓ Codex: native exec capture functional");
+          } else {
+            console.log("  ✗ Codex: native exec capture functional");
+            failures += 1;
+          }
+        } else {
+          console.log(`  ✗ Codex: PostToolUse hook ${inspection.state}`);
+          console.log("  Codex: native exec capture functional check skipped");
+          failures += 1;
+        }
       }
       console.log();
+      if (failures > 0) exit(1);
     });
 
   program.addCommand(connectorsCmd);

@@ -39,6 +39,7 @@ component_management:
     - component_id: "unit-hooks"
       name: "Unit - Hooks"
       paths:
+        # Includes native hook adapters under the existing hooks directory ownership.
         - "src/hooks/"
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"

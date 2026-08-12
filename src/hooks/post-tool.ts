@@ -1,5 +1,6 @@
 // src/hooks/post-tool.ts
 import { extractPostToolEvents } from "./extractors.js";
+import { normalizePostToolInput } from "./post-tool-normalization.js";
 import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
 import { appendLocalHookEvents } from "./local-enqueue.js";
@@ -10,6 +11,7 @@ import {
 } from "./publication-fence.js";
 
 interface PostToolHookInput {
+  client?: unknown;
   session_id?: unknown;
   tool_name?: unknown;
   tool_input?: unknown;
@@ -28,15 +30,6 @@ function resolveHookCwd(inputCwd: unknown): string {
   return process.cwd();
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function normalizeToolOutput(value: unknown): { isError?: boolean } | undefined {
-  if (!isRecord(value)) return undefined;
-  return typeof value.isError === "boolean" ? { isError: value.isError } : {};
-}
-
 export async function handlePostToolUse(
   stdin: string,
   _port?: number,
@@ -44,16 +37,11 @@ export async function handlePostToolUse(
   let cwd: string | undefined;
   try {
     const input = JSON.parse(stdin) as PostToolHookInput;
-    const { session_id, tool_name, tool_input, tool_response, tool_output } = input;
+    const { session_id, tool_name } = input;
 
     if (typeof tool_name !== "string" || typeof session_id !== "string") return { exitCode: 0, stdout: "" };
 
-    const extractedEvents = extractPostToolEvents({
-      tool_name,
-      tool_input: isRecord(tool_input) ? tool_input : {},
-      tool_response,
-      tool_output: normalizeToolOutput(tool_output),
-    });
+    const extractedEvents = extractPostToolEvents(normalizePostToolInput(input));
     if (extractedEvents.length === 0) return { exitCode: 0, stdout: "" };
 
     const resolvedCwd = resolveHookCwd(input.cwd);
