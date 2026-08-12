@@ -66,6 +66,17 @@ describe("MCP tool definitions", () => {
     const tool = getMcpToolDefinitions().find((t: any) => t.name === "lcm_search");
     expect(tool!.description).toContain("episodic");
   });
+
+  it("lcm_store advertises canonical prefixes and the memory usage pair", () => {
+    const tool = getMcpToolDefinitions().find((t: any) => t.name === "lcm_store");
+    const description = tool!.inputSchema.properties.tags.description;
+    expect(description).toContain("category");
+    expect(description).toContain("signal");
+    expect(description).toContain("memory_id");
+    expect(description).toContain("signal:memory_used");
+    expect(description).toContain("memory_id:<id>");
+    expect(description).toContain("paired");
+  });
 });
 
 describe("handleDaemonRequest", () => {

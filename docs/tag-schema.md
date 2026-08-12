@@ -86,6 +86,27 @@ Format: `sprint:spN` (e.g. `sprint:sp3`). Use the sprint declared in the current
 | `source:agent` | From a teammate or subagent |
 | `source:retrospective` | From a sprint retrospective |
 
+### `category:` — what kind of captured event is this?
+
+| Value | When to use |
+|-------|-------------|
+| `category:intent` | A captured user intent or requested outcome |
+| `category:mcp` | MCP tool or integration activity |
+
+### `signal:` — what memory lifecycle signal does this record?
+
+| Value | When to use |
+|-------|-------------|
+| `signal:memory_used` | A prior memory directly informed current work |
+| `signal:reinforced` | New evidence reinforced an existing memory |
+| `signal:review` | A review result or review-derived learning |
+
+### `memory_id:` — which promoted memory was referenced?
+
+| Value | When to use |
+|-------|-------------|
+| `memory_id:<id>` | The referenced promoted-memory identifier; pair with `signal:memory_used` so recall usage counting can attribute the memory |
+
 ## Combining tags
 
 A single `lcm_store` entry should use 2–4 canonical tags, covering at minimum `type:` and one of `project:` or `scope:`. Sprint and source tags are recommended for traceability.
@@ -103,7 +124,7 @@ The bad form still works for full-text search but cannot be filtered by tag cate
 
 ## Migration note
 
-Existing entries tagged with legacy formats (e.g. `category:decision`, `decision`, `category:gotcha`) are not retroactively migrated — the schema applies to new stores only. The `promote-events` AUTO_TAGS mapping uses `category:*` as an internal convention; those are separate from the canonical user-facing schema defined here.
+Existing entries tagged with legacy formats (e.g. `category:decision`, `decision`, `category:gotcha`) are not retroactively migrated — the schema applies to new stores only.
 
 ## Validation
 

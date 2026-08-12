@@ -85,7 +85,7 @@ describe('generateRulesContent', () => {
     expect(content).toContain('lcm expand <nodeId> --depth N');
     expect(content).toContain('lcm store');
     expect(content).toContain(
-      '`lcm store "content" --tag type:solution --tag scope:lcm` — Store a solution related to LCM.',
+      '`lcm store "content" --tag type:solution --tag scope:lcm` — Store a solution related to LCM',
     );
     expect(content).toContain('## Tag conventions');
     expect(content).toContain('Use these basic conventions by default; add others as needed:');
@@ -97,6 +97,23 @@ describe('generateRulesContent', () => {
     }
     expect(content).toContain('`source:` — Origin, such as `session`, `adversarial-review`, or `ci`');
     expect(content).toContain('`priority:` — Importance, from `P0` to `P3`');
+    expect(content).toContain('`category:` — Event category, such as `intent` or `mcp`');
+    expect(content).toContain(
+      '`signal:` — Memory signal, such as `memory_used`, `reinforced`, or `review`; pair `signal:memory_used` with `memory_id:<id>`',
+    );
+    expect(content).not.toContain('`memory_id:` —');
+    for (const tag of [
+      'category:intent',
+      'category:mcp',
+      'signal:memory_used',
+      'signal:reinforced',
+      'signal:review',
+    ]) {
+      expect(canonicalTagSchema).toContain(`| \`${tag}\` |`);
+    }
+    expect(canonicalTagSchema).toContain(
+      '| `memory_id:<id>` | The referenced promoted-memory identifier; pair with `signal:memory_used` so recall usage counting can attribute the memory |',
+    );
     expect(content).not.toContain('`lcm store "content" --tag <tag>`');
     expect(content).not.toContain('--tags');
     expect(content).not.toContain('repeatable aliases');
