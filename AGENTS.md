@@ -1,7 +1,9 @@
 # Repository Instructions
 
-<!-- Claude Code include: @WORKFLOW.md -->
-See [WORKFLOW.md](./WORKFLOW.md) for the full development workflow.
+- Read [AGENTS.local.md](./AGENTS.local.md) if present.
+  - Statements in this local file should override any project instruction.
+  - The file is intentionally gitignored. Keep it that way.
+- See [WORKFLOW.md](./WORKFLOW.md) for the full development workflow.
 
 ## Test Coverage Approval Gate
 
