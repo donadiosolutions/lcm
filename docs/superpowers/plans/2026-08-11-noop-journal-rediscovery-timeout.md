@@ -31,7 +31,7 @@ test "$(git branch --show-current)" = "fix/601-605-test-determinism"
 test "$(git rev-parse HEAD)" = "$EXISTING_TEST_BRANCH_TIP"
 test "$EXISTING_TEST_BRANCH_TIP" = "$EXPECTED_EXISTING_TIP"
 test -z "$(git status --porcelain)"
-git merge-base --is-ancestor 5d408ffd69fac81de194309cf9b68c44f7ef6266 "$EXISTING_TEST_BRANCH_TIP"
+git merge-base --is-ancestor 5d408ffdeb5e7fbefc68940d07d43a8bf6e6c7f9 "$EXISTING_TEST_BRANCH_TIP"
 git merge-base --is-ancestor 81b869bc73fce53fbac07427a9f5a25c4cbae0b9 "$EXISTING_TEST_BRANCH_TIP"
 git verify-commit "$EXPECTED_EXISTING_TIP"
 git log -1 --format=%B "$EXPECTED_EXISTING_TIP" | rg -q '^Signed-off-by: Bernardo Donadio <bcdonadio@bcdonadio\.com>$'
