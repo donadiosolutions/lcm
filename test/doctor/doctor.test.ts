@@ -911,7 +911,10 @@ describe("runDoctor daemon version mismatch", () => {
     expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "pass" });
   });
 
-  it("repairs matching-version stale configuration with an identical restart request", async (): Promise<void> => {
+  it.each([
+    undefined,
+    "managed restart warning",
+  ] as const)("repairs matching-version stale configuration with an identical restart request (%s)", async (warning): Promise<void> => {
     vi.mocked(ensureDaemon).mockResolvedValueOnce({
       connected: false,
       port: 3737,
@@ -923,7 +926,7 @@ describe("runDoctor daemon version mismatch", () => {
       port: 3737,
       spawned: true,
       restarted: true,
-      warning: "managed restart warning",
+      ...(warning === undefined ? {} : { warning }),
     });
     const fetch = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) })
@@ -943,7 +946,8 @@ describe("runDoctor daemon version mismatch", () => {
     expect(daemonResult).toMatchObject({ status: "warn", fixApplied: true });
     expect(daemonResult?.message).toContain("stale configuration repaired");
     expect(daemonResult?.message).toContain("daemon restarted");
-    expect(daemonResult?.message).toContain("managed restart warning");
+    if (warning === undefined) expect(daemonResult?.message).not.toContain("Warning:");
+    else expect(daemonResult?.message).toContain(warning);
   });
 
   it("does not restart a matching-version daemon for a non-stale ensure refusal", async (): Promise<void> => {
