@@ -817,6 +817,70 @@ describe("migration manifest protocol", () => {
       }));
       expectProtocolError(() => beginMigrationEffect(exhausted, verifyInput), "unexpected-state");
     });
+
+    it("exhaustively accepts only the legal phase-effect pairs and never mutates rejected inputs", () => {
+      const phases = [
+        "planned", "dry-run-verified", "copying", "copied", "verified",
+        "activating", "active", "rolling-back", "rolled-back", "aborted",
+      ] as const;
+      const effects = [
+        "verify-dry-run", "copy-batch", "complete-copy", "verify-generation",
+        "prepare-activation", "publish-activation", "prepare-rollback",
+        "publish-rollback", "abort",
+      ] as const;
+      const legalPairs = new Set([
+        "planned:verify-dry-run",
+        "dry-run-verified:copy-batch",
+        "copying:copy-batch",
+        "copying:complete-copy",
+        "copied:verify-generation",
+        "verified:prepare-activation",
+        "activating:publish-activation",
+        "verified:prepare-rollback",
+        "active:prepare-rollback",
+        "rolling-back:publish-rollback",
+        "planned:abort",
+        "dry-run-verified:abort",
+        "copying:abort",
+        "copied:abort",
+        "verified:abort",
+      ]);
+      const genesis = createValidManifest();
+
+      for (const phase of phases) {
+        const eligible = ["verified", "activating", "active", "rolling-back", "rolled-back"].includes(phase);
+        const manifest = parseMigrationManifest(sealManifest({
+          ...genesis,
+          revision: 1,
+          phase,
+          previousManifestSha256: genesis.checksumSha256,
+          reports: eligible ? [report("verification-exhaustive", "verification", UPDATED_AT)] : [],
+          activationEligible: eligible,
+          rollbackLineage: {
+            ...genesis.rollbackLineage,
+            mode: phase === "rolled-back" ? "pre-write" : null,
+            returnPhase: phase === "rolling-back" || phase === "rolled-back" ? "active" : null,
+          },
+          updatedAt: UPDATED_AT,
+        }));
+        for (const kind of effects) {
+          const key = `${phase}:${kind}`;
+          const before = JSON.stringify(manifest);
+          const invoke = () => beginMigrationEffect(manifest, {
+            effectId: `effect-${phase}-${kind}`,
+            kind,
+            inputSha256: HASH_A,
+            startedAt: EFFECT_AT,
+          });
+          if (legalPairs.has(key)) {
+            expect(invoke().pendingEffect?.kind, key).toBe(kind);
+          } else {
+            expectProtocolError(invoke, "unexpected-state");
+            expect(JSON.stringify(manifest), key).toBe(before);
+          }
+        }
+      }
+    });
   });
 
   describe("completeMigrationEffect", () => {
