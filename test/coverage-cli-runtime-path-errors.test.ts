@@ -213,6 +213,7 @@ vi.mock("../src/security-files.js", async () => {
   };
 });
 import {
+  BootstrapLockContentionError,
   bootstrapLcmHome,
   legacyLcmHomeDir,
   lcmHomeDir,
@@ -1036,7 +1037,15 @@ describe("runtime home rename failures", () => {
       extra: true,
     })}\n`, { mode: 0o600 });
 
-    expect(() => bootstrapLcmHome(home)).toThrow("unexpected fields");
+    let error: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(BootstrapLockContentionError);
+    expect((error as Error).message).toContain("unexpected fields");
     expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
   });
 
@@ -1087,7 +1096,7 @@ describe("runtime home rename failures", () => {
     expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
   });
 
-  it("fails closed when the owner liveness permission probe is denied", () => {
+  it("fails closed when owner state is ambiguous after a denied liveness probe", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-permission-"));
     homes.push(home);
     writeBootstrapLock(home, { pid: process.pid, processStartTime: "1" });
@@ -1096,40 +1105,72 @@ describe("runtime home rename failures", () => {
     });
 
     try {
-      expect(() => bootstrapLcmHome(home)).toThrow("owner state is ambiguous");
+      let error: unknown;
+      try {
+        bootstrapLcmHome(home);
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(BootstrapLockContentionError);
+      expect((error as Error).message).toContain("owner state is ambiguous");
       expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
     } finally {
       kill.mockRestore();
     }
   });
 
-  it("fails closed when process-start metadata is malformed or unavailable", () => {
+  it("fails closed when owner state is ambiguous after malformed process-start metadata", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-process-stat-"));
     homes.push(home);
     writeBootstrapLock(home, { pid: process.pid, processStartTime: "1" });
     processControl.procStat = "malformed) process stat";
 
-    expect(() => bootstrapLcmHome(home)).toThrow("owner state is ambiguous");
+    let error: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(BootstrapLockContentionError);
+    expect((error as Error).message).toContain("owner state is ambiguous");
     expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
   });
 
-  it("fails closed when process stat has no command terminator", () => {
+  it("fails closed when owner state is ambiguous after an invalid process-stat shape", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-process-stat-shape-"));
     homes.push(home);
     writeBootstrapLock(home, { pid: process.pid, processStartTime: "1" });
     processControl.procStat = "malformed process stat";
 
-    expect(() => bootstrapLcmHome(home)).toThrow("owner state is ambiguous");
+    let error: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(BootstrapLockContentionError);
+    expect((error as Error).message).toContain("owner state is ambiguous");
     expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
   });
 
-  it("records an unavailable process-start witness without reclaiming a lock", () => {
+  it("fails closed when owner state is ambiguous after an unavailable process-start witness", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-process-stat-error-"));
     homes.push(home);
     writeBootstrapLock(home, { pid: process.pid, processStartTime: "1" });
     processControl.procStatError = new Error("process stat unavailable");
 
-    expect(() => bootstrapLcmHome(home)).toThrow("owner state is ambiguous");
+    let error: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(BootstrapLockContentionError);
+    expect((error as Error).message).toContain("owner state is ambiguous");
     expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
   });
 
@@ -1338,7 +1379,15 @@ describe("runtime home rename failures", () => {
       return stat;
     };
 
-    expect(() => bootstrapLcmHome(home)).toThrow("bootstrap reclaim claim");
+    let error: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(BootstrapLockContentionError);
+    expect((error as Error).message).toContain("bootstrap reclaim claim");
     expect(readFileSync(claimPath, "utf8")).toBe("replacement claim\n");
     expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(true);
   });
@@ -1364,7 +1413,7 @@ describe("runtime home rename failures", () => {
     expect(readFileSync(claimPath, "utf8")).toBe("replacement claim\n");
   });
 
-  it("rejects a concurrent successor after stale-lock removal", () => {
+  it("fails closed for claimed concurrently", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-successor-race-"));
     homes.push(home);
     writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
@@ -1381,7 +1430,15 @@ describe("runtime home rename failures", () => {
       }
     };
 
-    expect(() => bootstrapLcmHome(home)).toThrow("claimed concurrently");
+    let error: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(BootstrapLockContentionError);
+    expect((error as Error).message).toContain("claimed concurrently");
     expect(readFileSync(join(home, ".lcm-root-bootstrap.lock"), "utf8")).toBe(competitor);
   });
 
@@ -1418,7 +1475,7 @@ describe("runtime home rename failures", () => {
     expect(existsSync(claimPath)).toBe(true);
   });
 
-  it("preserves a replacement between stale authentication and successor claim", () => {
+  it("fails closed for changed during stale-owner recovery", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-replacement-"));
     homes.push(home);
     const lockPath = join(home, ".lcm-root-bootstrap.lock");
@@ -1439,12 +1496,20 @@ describe("runtime home rename failures", () => {
       }
     };
 
-    expect(() => bootstrapLcmHome(home)).toThrow("changed during stale-owner recovery");
+    let error: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(BootstrapLockContentionError);
+    expect((error as Error).message).toContain("changed during stale-owner recovery");
     expect(readFileSync(lockPath, "utf8")).toBe(replacement);
     expect(readdirSync(home).some((entry) => entry.includes(".reclaim-"))).toBe(false);
   });
 
-  it("serializes two stale-lock contenders through one live reclaim claim", () => {
+  it("fails closed for recovery is already in progress", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-contenders-"));
     homes.push(home);
     writeBootstrapLock(home, { pid: process.pid + 1_000_000, processStartTime: "1" });
@@ -1462,6 +1527,8 @@ describe("runtime home rename failures", () => {
     };
 
     expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
+    expect(contenderError).toBeInstanceOf(Error);
+    expect(contenderError).not.toBeInstanceOf(BootstrapLockContentionError);
     expect(contenderError).toMatchObject({ message: expect.stringContaining("recovery is already in progress") });
     expect(existsSync(join(home, ".lcm-root-bootstrap.lock"))).toBe(false);
   });

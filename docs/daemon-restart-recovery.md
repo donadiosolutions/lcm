@@ -201,24 +201,33 @@ lcm doctor
 lcm daemon restart
 ```
 
-## Foreground startup during root migration
+## Root-bootstrap contention during CLI startup
 
-The managed foreground process used by `lcm daemon restart` may briefly start
-while another authenticated LCM command is migrating the user root. In that
-narrow case, the foreground `start` invocation with its `--foreground` option
-retries the migration preflight for at most 20 total attempts, with 50
-milliseconds between attempts. The
-maximum wait is therefore 950 milliseconds. Once the authenticated bootstrap
-lock is released, startup continues normally.
+Any non-help `lcm` invocation may briefly overlap another authenticated LCM
+operation that is bootstrapping the user root. The CLI retries that one
+root-bootstrap migration boundary for at most 20 total attempts, with 50
+milliseconds between attempts. The fixed maximum wait is therefore 950
+milliseconds per invocation; there is no user configuration for this budget.
+After a successful preflight, daemon-backed commands do not perform a second
+bootstrap migration.
 
-The 20-attempt limit and 50-millisecond delay are fixed implementation values;
-there is no user configuration for this foreground retry window.
+Retry is enabled only when the runtime has authenticated a verified live owner
+of the bootstrap lock and raises `BootstrapLockContentionError`. The CLI does
+not inspect, delete, rename, or reclaim the lock while retrying. If the
+competing LCM operation completes within the budget, the original command
+continues normally, including ordinary commands such as `lcm search`.
 
-Only the exact foreground start command uses this bounded retry. Ordinary LCM
-commands remain fail-fast, and malformed, ambiguous, foreign, stale-recovery,
-or other migration failures are never retried. If the live-lock contention
-continues through the bounded window, inspect the state with `lcm doctor` and
-retry `lcm daemon restart` once the competing operation has completed.
+Ambiguous or unavailable owner liveness, malformed or tampered metadata,
+stale-lock recovery already in progress, a lock changed during stale-owner
+recovery, and a concurrent successor or reclaim claim remain immediate
+fail-closed errors. Those states do not prove one authenticated live bootstrap
+owner and are never converted into retryable contention.
+
+When the verified live owner remains through all 20 attempts, LCM reports that
+automatic lock recovery was not attempted. Retry after the competing LCM
+operation completes, and do not delete the bootstrap lock manually. `lcm doctor`
+does not diagnose the root-bootstrap lock; use the safe message from
+the failed invocation and retry only after the competing operation has ended.
 
 ## Configuration and security boundary
 

@@ -245,8 +245,12 @@ describe("runtime paths", () => {
       error = caught;
     }
     expect(error).toBeInstanceOf(Error);
-    if (error instanceof BootstrapLockContentionError) {
-      expect(error.message).toContain("already in progress");
+    if (startTime !== null) {
+      expect((error as Error).constructor).toBe(BootstrapLockContentionError);
+      expect((error as Error).message).toContain("verified live owner");
+      expect((error as Error).message).toContain("automatic lock recovery was not attempted");
+      expect((error as Error).message).toContain("retry after the competing LCM operation completes");
+      expect((error as Error).message).toContain("do not delete the bootstrap lock manually");
     } else {
       expect((error as Error).constructor).toBe(Error);
       expect((error as Error).message).toContain("owner state is ambiguous");

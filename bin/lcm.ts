@@ -207,18 +207,36 @@ type DaemonRootOptions = {
   help?: boolean;
 };
 
-const FOREGROUND_DAEMON_MIGRATION_ATTEMPTS = 20;
-const FOREGROUND_DAEMON_MIGRATION_DELAY_MS = 50;
+const ROOT_BOOTSTRAP_RETRY_ATTEMPTS = 20;
+const ROOT_BOOTSTRAP_RETRY_DELAY_MS = 50;
 
-export type ForegroundDaemonPreflightSeams = {
+export type RootBootstrapRetrySeams = {
   readonly migrate: () => unknown;
   readonly sleep: (delayMs: number) => Promise<void>;
   readonly attempt?: (attempt: number) => void;
 };
 
-const DEFAULT_FOREGROUND_DAEMON_PREFLIGHT_SEAMS: Omit<ForegroundDaemonPreflightSeams, "migrate"> = {
+const DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS: Omit<RootBootstrapRetrySeams, "migrate"> = {
   sleep: (delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)),
 };
+
+export async function migrateLegacyHomeWithRetry(
+  seams: RootBootstrapRetrySeams,
+): Promise<void> {
+  for (let attempt = 1; attempt <= ROOT_BOOTSTRAP_RETRY_ATTEMPTS; attempt += 1) {
+    seams.attempt?.(attempt);
+    try {
+      seams.migrate();
+      return;
+    } catch (error) {
+      if (!(error instanceof BootstrapLockContentionError)
+        || attempt === ROOT_BOOTSTRAP_RETRY_ATTEMPTS) {
+        throw error;
+      }
+      await seams.sleep(ROOT_BOOTSTRAP_RETRY_DELAY_MS);
+    }
+  }
+}
 
 /** @internal Verifies that Commander preserved the preflighted hidden identity. */
 export function assertParsedInternalDaemonTestIdentity(
@@ -351,71 +369,6 @@ function resolveInternalDaemonTestIdentity(
     throw new Error("Internal daemon test filesystem is not canonical owned state");
   }
   return identity;
-}
-
-/** @internal Exact argv gate for the only startup path allowed to retry migration contention. */
-export function isForegroundDaemonStartArgv(cliArgv: readonly string[]): boolean {
-  const args = cliArgv.slice(2);
-  if (args[0] !== "daemon" || args[1] !== "start") return false;
-
-  let foreground = false;
-  let ownerCount = 0;
-  let entrypointCount = 0;
-  for (let index = 2; index < args.length; index += 1) {
-    const arg = args[index]!;
-    if (arg === "--foreground") {
-      if (foreground) return false;
-      foreground = true;
-      continue;
-    }
-    const inlineOwner = arg.startsWith(`${DAEMON_TEST_OWNER_OPTION}=`);
-    const inlineEntrypoint = arg.startsWith(`${DAEMON_TEST_ENTRYPOINT_OPTION}=`);
-    if (inlineOwner || inlineEntrypoint) {
-      const value = arg.slice(arg.indexOf("=") + 1);
-      if (value.length === 0) return false;
-      if (inlineOwner) ownerCount += 1;
-      else entrypointCount += 1;
-      continue;
-    }
-    if (arg === DAEMON_TEST_OWNER_OPTION || arg === DAEMON_TEST_ENTRYPOINT_OPTION) {
-      const value = args[index + 1];
-      if (value === undefined || value.startsWith("-")) return false;
-      if (arg === DAEMON_TEST_OWNER_OPTION) ownerCount += 1;
-      else entrypointCount += 1;
-      index += 1;
-      continue;
-    }
-    return false;
-  }
-
-  return foreground
-    && ((ownerCount === 0 && entrypointCount === 0)
-      || (ownerCount === 1 && entrypointCount === 1));
-}
-
-/** @internal Bounded migration preflight for the exact managed foreground daemon argv. */
-export async function migrateLegacyHomeForForegroundDaemonStart(
-  cliArgv: readonly string[],
-  seams: ForegroundDaemonPreflightSeams,
-): Promise<void> {
-  if (!isForegroundDaemonStartArgv(cliArgv)) {
-    seams.migrate();
-    return;
-  }
-
-  for (let attempt = 1; attempt <= FOREGROUND_DAEMON_MIGRATION_ATTEMPTS; attempt += 1) {
-    seams.attempt?.(attempt);
-    try {
-      seams.migrate();
-      return;
-    } catch (error) {
-      if (!(error instanceof BootstrapLockContentionError)
-        || attempt === FOREGROUND_DAEMON_MIGRATION_ATTEMPTS) {
-        throw error;
-      }
-      await seams.sleep(FOREGROUND_DAEMON_MIGRATION_DELAY_MS);
-    }
-  }
 }
 
 /** Resolve custom help before Commander can dispatch a nested command action. */
@@ -1196,7 +1149,6 @@ async function createDaemonClientOrExit(
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
   const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
 
-  migrateLegacyHomeIfNeeded();
   const configFile = defaultConfigPath();
   const config = loadDaemonConfig(configFile);
   if (options.preflightStorage !== false) selectStorageBackendForConfig(configFile, config.storage);
@@ -1229,7 +1181,7 @@ async function createDaemonClientOrExit(
 /** @internal CLI entry seam; defaults preserve the published executable behavior. */
 export async function runCli(
   cliArgv: string[] = process.argv,
-  preflightSeams?: ForegroundDaemonPreflightSeams,
+  preflightSeams?: RootBootstrapRetrySeams,
 ): Promise<void> {
   const customHelp = resolveCustomHelpRequest(cliArgv);
   if (customHelp && cliArgv.slice(2).length > 0) {
@@ -1246,15 +1198,11 @@ export async function runCli(
 
   const internalDaemonTestIdentity = resolveInternalDaemonTestIdentity(cliArgv);
   const migrate = preflightSeams?.migrate ?? migrateLegacyHomeIfNeeded;
-  if (isForegroundDaemonStartArgv(cliArgv)) {
-    await migrateLegacyHomeForForegroundDaemonStart(cliArgv, {
-      migrate,
-      sleep: preflightSeams?.sleep ?? DEFAULT_FOREGROUND_DAEMON_PREFLIGHT_SEAMS.sleep,
-      attempt: preflightSeams?.attempt,
-    });
-  } else {
-    migrate();
-  }
+  await migrateLegacyHomeWithRetry({
+    migrate,
+    sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
+    attempt: preflightSeams?.attempt,
+  });
   const { readFileSync } = await import("node:fs");
   const { join } = await import("node:path");
   const pkgPath = join(packageRootFor(import.meta.url, 2), "package.json");
@@ -2872,7 +2820,13 @@ export async function runCli(
 
 /** @internal Top-level rejection handler kept separate for deterministic tests. */
 export function handleCliError(err: unknown): never {
-  console.error(err instanceof ConfigValidationError || err instanceof StorageBackendUnavailableError ? err.message : err);
+  console.error(
+    err instanceof ConfigValidationError
+      || err instanceof StorageBackendUnavailableError
+      || err instanceof BootstrapLockContentionError
+      ? err.message
+      : err,
+  );
   return exit(1);
 }
 

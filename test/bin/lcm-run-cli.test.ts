@@ -254,7 +254,7 @@ vi.mock("../../src/storage/postgresql/provisioning.js", () => ({
 
 const {
   assertParsedInternalDaemonTestIdentity, handleCliError, isStrictContainedRelativePath,
-  isForegroundDaemonStartArgv, migrateLegacyHomeForForegroundDaemonStart,
+  migrateLegacyHomeWithRetry,
   resolveCompactRequestPolicyOverride,
   runCli, runMainIfInvoked, shouldRunMain,
   withHookOverrides, writeCliError, writeCliOutput,
@@ -264,13 +264,13 @@ const actualRuntimePaths = await vi.importActual<typeof import("../../src/runtim
 const { batchCompact } = await import("../../src/batch-compact.js");
 const { isDaemonTransportFailure } = await import("../../src/daemon/http-url.js");
 
-type ForegroundPreflightSeams = {
+type RootBootstrapTestSeams = {
   migrate: () => unknown;
   sleep: (delayMs: number) => Promise<void>;
   attempt?: (attempt: number) => void;
 };
 
-async function invoke(args: string[], seams?: ForegroundPreflightSeams): Promise<Error | undefined> {
+async function invoke(args: string[], seams?: RootBootstrapTestSeams): Promise<Error | undefined> {
   try {
     await runCli(["node", "lcm", ...args], seams);
     return undefined;
@@ -335,59 +335,7 @@ afterEach(() => {
 });
 
 describe("runCli registration and help dispatch", () => {
-  it("classifies only exact foreground daemon starts, including hidden test identity flags", () => {
-    const argv = (...args: string[]): string[] => ["node", "lcm", ...args];
-    expect(isForegroundDaemonStartArgv(argv("daemon", "start", "--foreground"))).toBe(true);
-    expect(isForegroundDaemonStartArgv(argv(
-      "daemon", "start", "--foreground",
-      "--internal-lcm-test-daemon-owner=owned",
-      "--internal-lcm-test-daemon-entrypoint=/tmp/owned.mjs",
-    ))).toBe(true);
-    expect(isForegroundDaemonStartArgv(argv(
-      "daemon", "start",
-      "--internal-lcm-test-daemon-owner", "owned",
-      "--foreground",
-      "--internal-lcm-test-daemon-entrypoint", "/tmp/owned.mjs",
-    ))).toBe(true);
-
-    for (const nearMiss of [
-      argv("daemon", "start"),
-      argv("daemon", "restart", "--foreground"),
-      argv("daemon", "start", "--foreground", "--detach"),
-      argv("daemon", "start", "--foreground", "--foreground"),
-      argv("daemon", "start", "--foreground=true"),
-      argv("daemon", "start", "--foreground", "unexpected"),
-      argv("daemon", "start", "--foreground", "--"),
-      argv("daemon", "start", "--foreground", "--internal-lcm-test-daemon-owner"),
-      argv("daemon", "start", "--foreground", "--internal-lcm-test-daemon-owner="),
-      argv("daemon", "start", "--foreground", "--internal-lcm-test-daemon-owner", "owned", "--internal-lcm-test-daemon-entrypoint"),
-    ]) {
-      expect(isForegroundDaemonStartArgv(nearMiss)).toBe(false);
-    }
-  });
-
-  it("retries authenticated live bootstrap contention until foreground startup can proceed", async () => {
-    const contention = new actualRuntimePaths.BootstrapLockContentionError(
-      "LCM root bootstrap is already in progress; retry after it completes",
-    );
-    const sleep = vi.fn(async (_delayMs: number) => undefined);
-    const attempt = vi.fn();
-    state.migrateLegacyHome
-      .mockImplementationOnce(() => { throw contention; })
-      .mockImplementationOnce(() => undefined);
-
-    expect(await invoke(["daemon", "start", "--foreground"], {
-      migrate: state.migrateLegacyHome,
-      sleep,
-      attempt,
-    })).toBeUndefined();
-    expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
-    expect(sleep).toHaveBeenCalledTimes(1);
-    expect(sleep).toHaveBeenCalledWith(50);
-    expect(attempt.mock.calls.map(([value]) => value)).toEqual([1, 2]);
-  });
-
-  it("uses the production bounded-delay seam for foreground startup contention", async () => {
+  it("retries transient root bootstrap contention for an ordinary command", async () => {
     vi.useFakeTimers();
     const contention = new actualRuntimePaths.BootstrapLockContentionError(
       "LCM root bootstrap is already in progress; retry after it completes",
@@ -396,73 +344,74 @@ describe("runCli registration and help dispatch", () => {
       .mockImplementationOnce(() => { throw contention; })
       .mockImplementationOnce(() => undefined);
 
-    const pending = invoke(["daemon", "start", "--foreground"]);
+    const pending = invoke(["search", "q"]);
     await vi.advanceTimersByTimeAsync(50);
 
     expect(await pending).toBeUndefined();
+    expect(state.post).toHaveBeenCalledWith("/search", expect.objectContaining({ query: "q" }));
     expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps the exported preflight helper fail-fast for non-foreground argv", async () => {
-    const migrate = vi.fn(() => undefined);
-    const sleep = vi.fn(async (_delayMs: number) => undefined);
-
-    await migrateLegacyHomeForForegroundDaemonStart(["node", "lcm", "status"], {
-      migrate,
-      sleep,
-    });
-
-    expect(migrate).toHaveBeenCalledOnce();
-    expect(sleep).not.toHaveBeenCalled();
+  it("uses a single root bootstrap migration for an immediately successful search", async () => {
+    expect(await invoke(["search", "q"])).toBeUndefined();
+    expect(state.post).toHaveBeenCalledWith("/search", expect.objectContaining({ query: "q" }));
+    expect(state.migrateLegacyHome).toHaveBeenCalledTimes(1);
   });
 
-  it("stops after twenty live bootstrap contention attempts", async () => {
+  it("root bootstrap retry policy retries typed contention and records attempts", async () => {
     const contention = new actualRuntimePaths.BootstrapLockContentionError(
       "LCM root bootstrap is already in progress; retry after it completes",
     );
+    const migrate = vi.fn()
+      .mockImplementationOnce(() => { throw contention; })
+      .mockImplementationOnce(() => undefined);
     const sleep = vi.fn(async (_delayMs: number) => undefined);
-    const migrate = vi.fn(() => { throw contention; });
+    const attempt = vi.fn();
 
-    const error = await invoke(["daemon", "start", "--foreground"], {
+    await migrateLegacyHomeWithRetry({
       migrate,
       sleep,
+      attempt,
     });
 
-    expect(error).toBe(contention);
+    expect(migrate).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(50);
+    expect(attempt.mock.calls.map(([value]) => value)).toEqual([1, 2]);
+  });
+
+  it("root bootstrap retry policy stops after twenty typed contention attempts", async () => {
+    const contention = new actualRuntimePaths.BootstrapLockContentionError(
+      "LCM root bootstrap is already in progress; retry after it completes",
+    );
+    const migrate = vi.fn(() => { throw contention; });
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+    const attempt = vi.fn();
+
+    await expect(migrateLegacyHomeWithRetry({ migrate, sleep, attempt })).rejects.toBe(contention);
+
     expect(migrate).toHaveBeenCalledTimes(20);
     expect(sleep).toHaveBeenCalledTimes(19);
     expect(sleep).toHaveBeenNthCalledWith(19, 50);
+    expect(attempt.mock.calls.map(([value]) => value)).toEqual(
+      Array.from({ length: 20 }, (_value, index) => index + 1),
+    );
   });
 
   it.each([
-    ["ordinary command", ["status"]],
-    ["malformed lock", ["daemon", "start", "--foreground"]],
-  ] as const)("does not retry a %s when migration fails", async (_label, args) => {
-    const failure = new Error("migration failed");
-    const sleep = vi.fn(async (_delayMs: number) => undefined);
-    const migrate = vi.fn(() => { throw failure; });
-
-    const error = await invoke([...args], { migrate, sleep });
-
-    expect(error).toBe(failure);
-    expect(migrate).toHaveBeenCalledOnce();
-    expect(sleep).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    "ambiguous owner state",
-    "foreign lock owner",
-    "stale-lock recovery changed repeatedly",
-    "stale-lock recovery is already in progress",
+    "LCM root bootstrap owner state is ambiguous",
+    "LCM root bootstrap stale-lock recovery is already in progress",
+    "bootstrap lock changed during stale-owner recovery",
+    "LCM root bootstrap lock was claimed concurrently",
+    "LCM root bootstrap lock could not be authenticated",
     "non-contention migration failure",
-  ])("does not retry %s", async (detail) => {
-    const failure = new Error(detail);
+  ])("does not retry untyped root bootstrap failure: %s", async (message) => {
+    const failure = new Error(message);
     const sleep = vi.fn(async (_delayMs: number) => undefined);
     const migrate = vi.fn(() => { throw failure; });
 
-    const error = await invoke(["daemon", "start", "--foreground"], { migrate, sleep });
+    await expect(migrateLegacyHomeWithRetry({ migrate, sleep })).rejects.toBe(failure);
 
-    expect(error).toBe(failure);
     expect(migrate).toHaveBeenCalledOnce();
     expect(sleep).not.toHaveBeenCalled();
   });
@@ -479,15 +428,20 @@ describe("runCli registration and help dispatch", () => {
     const genericError = new Error("boom");
     const configError = new ConfigValidationError("cli", "invalid");
     const backendError = new StorageBackendUnavailableError("postgresql");
+    const contentionError = new actualRuntimePaths.BootstrapLockContentionError(
+      "safe bootstrap contention message",
+    );
     expect(() => handleCliError(genericError)).toThrow("exit:1");
     expect(() => handleCliError(configError)).toThrow("exit:1");
     expect(() => handleCliError(backendError)).toThrow("exit:1");
+    expect(() => handleCliError(contentionError)).toThrow("exit:1");
     expect(() => writeCliOutput("out")).not.toThrow();
     expect(() => writeCliError("err")).not.toThrow();
-    expect(consoleError).toHaveBeenCalledTimes(3);
+    expect(consoleError).toHaveBeenCalledTimes(4);
     expect(consoleError).toHaveBeenNthCalledWith(1, genericError);
     expect(consoleError).toHaveBeenNthCalledWith(2, configError.message);
     expect(consoleError).toHaveBeenNthCalledWith(3, backendError.message);
+    expect(consoleError).toHaveBeenNthCalledWith(4, contentionError.message);
     expect(stdout).toHaveBeenCalledWith("out");
     expect(stderr).toHaveBeenCalledWith("err");
     const runner = vi.fn(async () => undefined);
