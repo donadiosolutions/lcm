@@ -4,7 +4,7 @@
 
 **Goal:** Close #600 by safely migrating one authenticated v1.4.1 generated Linux systemd unit to the stable managed unit used by v1.4.2.
 
-**Architecture:** Keep stable-unit collision classification fail-closed. Add bounded systemd-only discovery and exact-stop capabilities to the supervisor, then let explicit restart authenticate a single legacy candidate through manager PID, owned state, process command/entrypoint, loopback listener, token-authenticated health/access, and an immediate pre-stop re-probe before starting the normal stable unit.
+**Architecture:** Keep stable-unit collision classification fail-closed. Add bounded systemd-only discovery and exact-stop capabilities to the supervisor, then let explicit restart authenticate a single legacy candidate through manager PID, owned state, process command/entrypoint, loopback listener, token-authenticated health/access, and an immediate pre-stop re-probe. Stable replacement is allowed only when the authenticated legacy daemon removes its own PID file during exact stop; LCM never mutates a remaining PID pathname after descriptor validation.
 
 **Tech Stack:** TypeScript, Vitest 4.1.10, Node.js 25.9.0, Linux `/proc`, systemd user manager, HTTP health/authentication, Git.
 
@@ -16,6 +16,8 @@
 - Historical name matching is discovery input, never ownership proof.
 - Require exactly one candidate and agreement across every identity signal before mutation.
 - Stop one exact unit name through argv-based `systemctl --user`; never use shell expansion, wildcard stop, `kill`, `pkill`, or broad cleanup.
+- After exact legacy stop, treat PID-file disappearance as the only successful state transition. If any PID pathname remains, preserve it and refuse stable start; do not unlink a pathname after descriptor identity checks.
+- When the PID file is missing before authentication, perform bounded strict legacy-unit discovery. Preserve ordinary absent startup only when discovery proves zero legacy candidates; any candidate or unavailable discovery refuses stable start.
 - Preserve existing stable foreign-job, stale-config, ambiguous-manager, detached, credential, and publication fences.
 - Add no dependency and preserve exact pins/lockfile integrity.
 - Update user documentation and add one patch Changeset.
@@ -86,10 +88,17 @@ Expected: the Supervisor capabilities do not exist.
 For systemd only, run a bounded argv command equivalent to:
 
 ```ts
-["--user", "list-units", "--type=service", "--state=active", "--no-legend", "--plain"]
+["--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager", "--plain"]
 ```
 
 Filter complete unit-name tokens with the strict historical regex, deduplicate, sort, and inspect each exact name with bounded `show` properties. Stable digest names and malformed names are ignored, not mutated. Transport/permission ambiguity returns `unavailable`; an exact not-found candidate is treated as a discovery race and omitted.
+
+An exact strict unit not positively loaded/active/running with a positive
+`MainPID` is a fail-closed `state-conflict`. This includes reloading,
+refreshing, activating, deactivating, maintenance, inactive, failed, malformed,
+unloaded, and future states. It is neither an authenticated candidate nor safe
+absence. Only code-0 `LoadState=not-found` with no PID, or systemd's exact
+not-found command result, is omitted as genuine disappearance.
 
 - [ ] **Step 4: Add exact-stop RED tests**
 
@@ -144,7 +153,7 @@ Build a hermetic Linux fixture with:
 - public health and token-authenticated health/access reporting PID `4242`, the same owner/storage identity, and an older LCM version;
 - stable supervisor probe `absent`;
 - exactly one discovery candidate `lcm-daemon-1234-1720000000000.service` with manager PID `4242`;
-- successful exact legacy stop/absence; and
+- successful exact legacy stop/absence in which the legacy daemon removes its own PID file; and
 - the normal stable supervisor start plus authenticated replacement health.
 
 Expect `restartDaemon` to report connected/restarted, `stoppedPid: 4242`, and `startMethod: "systemd-user"`. Assert exact operation order: stable probe, legacy discovery, endpoint/diagnostics/process/listener authentication, exact stop, PID death/cleanup, stable start, stable admission. Assert process kill seams are never called.
@@ -160,7 +169,7 @@ Expected: current restart returns `not-running` or `invalid-collision` and never
 
 - [ ] **Step 3: Add the complete fail-closed matrix before implementation**
 
-Table-drive one mismatch at a time: missing/malformed PID before authentication; symlink/non-regular/no-follow PID and token paths; descriptor replacement between reads; unstable PID values; dead PID; zero/multiple/disappearing candidates; manager PID mismatch; invalid public health; token read/auth failure; authenticated identity mismatch; diagnostics access failure; incompatible/current version; wrong process/entrypoint; wrong/no listener; pre-stop candidate change; stop failure; changed PID file after stop; PID remaining alive; interruption/deadline exhaustion. Add a successful graceful-stop case where the exact stopped daemon removes its own PID file. Assert no stop for pre-auth failures, no stable start after stop failure, no unlink when a replacement PID path appears, no kill, and no unrelated cleanup.
+Table-drive one mismatch at a time: missing/malformed PID before authentication; symlink/non-regular/no-follow PID and token paths; descriptor replacement between reads; unstable PID values; dead PID; zero/multiple/disappearing candidates; manager PID mismatch; invalid public health; token read/auth failure; authenticated identity mismatch; diagnostics access failure; incompatible/current version; wrong process/entrypoint; wrong/no listener; pre-stop candidate change; stop failure; any PID pathname remaining after stop; PID remaining alive; interruption/deadline exhaustion. Add a successful graceful-stop case where the exact stopped daemon removes its own PID file. Inject regular-file replacement, symlink, and hardlink path insertions immediately after the post-stop descriptor closes at the former cleanup seam. Assert no stop for pre-auth failures, no stable start after stop failure, no pathname unlink for any remaining PID evidence, no kill, and no unrelated cleanup. For initially missing PID evidence, assert strict discovery runs: any candidate refuses without stable start or ensure, while zero candidates preserves normal absent startup.
 
 - [ ] **Step 4: Run the positive and refusal matrix RED**
 
@@ -183,17 +192,18 @@ managerKind === "systemd-user"
 
 The helper must:
 
-1. read the owned PID twice and require one stable live positive PID;
-2. discover exactly one candidate and require its manager PID to equal the owned PID;
-3. observe valid public health for the configured loopback endpoint;
-4. call `checkDaemonDiagnostics` with the owned token and require the same health identity/PID and authenticated access;
-5. accept only strict stable `major.minor.patch` versions with the same major/minor as the installed version and a lower patch number; reject current, newer, prerelease, malformed, cross-minor, and cross-major versions;
-6. require `processEntrypointMatches`, likely-LCM daemon command, and exact loopback listener ownership for the same PID;
-7. rediscover and require the same sole `{ name, managerPid }` immediately before mutation;
-8. call exact stop and require the stopped PID no longer live;
-9. after exact unit absence and PID death, descriptor-safely re-observe the canonical PID path: accept an absent path because the stopped daemon may remove its own PID file; accept a present path for cleanup only when it is the unchanged regular-file identity and still contains the stopped PID; preserve and refuse stable start for a different PID, replaced descriptor identity, symlink, malformed file, or any other unsafe state;
-10. return a typed migration result carrying `stoppedPid`, clean only the unchanged owned PID evidence, and enter the existing stable manager start/admission path so `RestartDaemonResult.stoppedPid` reports the legacy PID even though the stable observation began `absent`; and
-11. preserve evidence and return a bounded refusal without mutation on every mismatch.
+1. read the owned PID twice and require one stable live positive PID before authenticating a candidate;
+2. if both reads are missing, perform bounded strict discovery before returning not-applicable: zero candidates preserve ordinary absent startup, while any candidate, unavailable discovery, or discovery failure refuses stable start without calling ensure;
+3. otherwise discover exactly one candidate and require its manager PID to equal the owned PID;
+4. observe valid public health for the configured loopback endpoint;
+5. call `checkDaemonDiagnostics` with the owned token and require the same health identity/PID and authenticated access;
+6. accept only strict stable `major.minor.patch` versions with the same major/minor as the installed version and a lower patch number; reject current, newer, prerelease, malformed, cross-minor, and cross-major versions;
+7. require `processEntrypointMatches`, likely-LCM daemon command, and exact loopback listener ownership for the same PID;
+8. rediscover and require the same sole `{ name, managerPid }` immediately before mutation;
+9. call exact stop and require the stopped PID no longer live;
+10. after exact unit absence and PID death, descriptor-safely re-observe the canonical PID path and continue only when it is absent because the stopped daemon removed it. Any present regular file, replacement, symlink, hardlink, malformed file, or otherwise unsafe evidence is preserved and refuses stable start. Never close an authenticated descriptor and then mutate its pathname; no portable atomic identity-bound unlink primitive exists here;
+11. return a typed migration result carrying `stoppedPid` only after PID-file disappearance, then enter the existing stable manager start/admission path so `RestartDaemonResult.stoppedPid` reports the legacy PID even though the stable observation began `absent`; and
+12. preserve evidence and return a bounded refusal without mutation on every mismatch.
 
 Do not broaden `staleReason`, stable-unit classification, or detached recovery.
 
@@ -263,7 +273,7 @@ Expected: mismatch and matching-version cases pass with mutually exclusive lifec
 
 - [ ] **Step 5: Update user documentation**
 
-Document that Linux upgrades from v1.4.1 may require a one-time authenticated migration; enumerate the independent checks at a user-comprehensible level; state that ambiguous candidates are untouched; recommend `lcm doctor` or `lcm daemon restart`; prohibit manual wildcard service stops and competing daemon starts.
+Document that Linux upgrades from v1.4.1 may require a one-time authenticated migration; enumerate the independent checks at a user-comprehensible level; state that only daemon-owned PID-file disappearance permits stable replacement and every remaining path is preserved; state that a missing PID with any discovered legacy candidate refuses; recommend `lcm doctor` or `lcm daemon restart`; prohibit manual wildcard service stops and competing daemon starts.
 
 - [ ] **Step 6: Add patch Changeset**
 
@@ -320,3 +330,244 @@ rg -n "pkill|killall|systemctl.*\*|v8 ignore|coverage.*ignore" \
 ```
 
 Expected: clean worktree, valid GPG/DCO, no broad mutation, no exclusion, no dependency change, and foreign stable-unit tests remain fail-closed.
+
+### Task 5: Address post-implementation security review findings
+
+**Files:**
+- Modify: `src/daemon/lifecycle.ts`
+- Modify: `test/daemon/coverage-400-lifecycle-restart.test.ts`
+- Modify: `docs/daemon-restart-recovery.md`
+- Modify: `docs/configuration.md`
+- Modify: `.changeset/safe-legacy-daemon-migration.md`
+- Modify: `.github/copilot-instructions.md`
+
+**Interfaces:**
+- Consumes: Task 1 strict bounded discovery and Task 2 authenticated exact-stop migration.
+- Produces: disappearance-only post-stop admission and missing-PID candidate refusal without pathname mutation.
+
+- [ ] **Step 1: Add post-stop pathname RED regressions**
+
+Change the unchanged-present case to require `restarted: false`, `refusalReason: "ambiguous"`, preserved PID evidence, no unlink, no stable supervisor start, and no ensure. Add deterministic replacement, symlink, and hardlink insertion immediately after the post-stop descriptor closes; require the same refusal and preservation properties.
+
+- [ ] **Step 2: Run post-stop RED**
+
+```bash
+npm exec -- vitest run test/daemon/coverage-400-lifecycle-restart.test.ts \
+  -t "remaining PID|former cleanup seam"
+```
+
+Expected: the unchanged path is unlinked and starts the stable unit; race insertions expose pathname cleanup behavior.
+
+- [ ] **Step 3: Remove post-stop pathname cleanup and run GREEN**
+
+Accept only `afterStopPid.kind === "missing"`. Return a bounded ambiguous refusal for every present or unsafe result without calling `unlinkSync`, stable supervisor start, or ensure. Run the Step 2 command unchanged and require all cases to pass.
+
+- [ ] **Step 4: Add missing-PID discovery RED regressions**
+
+For two missing PID reads with one strict legacy candidate, require explicit ambiguous refusal and assert discovery runs while stop, stable start, and ensure do not. Add the zero-candidate control requiring normal absent startup through ensure.
+
+- [ ] **Step 5: Run missing-PID RED**
+
+```bash
+npm exec -- vitest run test/daemon/coverage-400-lifecycle-restart.test.ts \
+  -t "missing PID evidence"
+```
+
+Expected: candidate-present incorrectly reaches normal absent startup and zero-candidate discovery is not called.
+
+- [ ] **Step 6: Implement bounded missing-PID discovery and run GREEN**
+
+Move the bounded discovery helper before the missing-PID branch. On two missing reads, return not-applicable only for a successful zero-candidate discovery; return the existing sanitized manager refusal for unavailable/error results and an explicit ambiguous refusal for one or more candidates. Run the Step 5 command unchanged.
+
+- [ ] **Step 7: Align docs and reusable review guidance**
+
+Remove every promise that LCM cleans an unchanged post-stop PID file. State that only daemon-owned disappearance succeeds and any remaining pathname is preserved. Add a Copilot instruction that descriptor/path identity validation followed by pathname mutation is racy unless an atomic identity-bound primitive exists; prefer fail-closed no mutation.
+
+- [ ] **Step 8: Verify and commit without rewriting history**
+
+Run the complete Task 4 verification, require 100% coverage in all dimensions, then create a new GPG-signed DCO commit with `git commit -S --signoff`. Do not amend, rebase, force-push, push, or open a PR.
+
+### Task 6: Address transitional discovery and descriptor-close review findings
+
+**Files:**
+- Modify: `src/daemon/supervisor.ts`
+- Modify: `src/daemon/lifecycle.ts`
+- Modify: `src/doctor/doctor.ts`
+- Modify: focused supervisor/lifecycle and Codecov contract tests
+- Modify: Codecov metadata, user docs, Changeset, and Copilot instructions
+
+- [ ] **Step 1: Add #613 RED regressions**
+
+Require `--all` enumeration before strict historical-name filtering. Cover
+realistic `running`, `start`, `start-post`, `reload`, `stop`, `stop-sigterm`,
+`failed`, and `dead` substates across active, reloading, refreshing, activating,
+deactivating, maintenance, inactive, and failed states. Every discoverable
+strict unit without exact running authentication returns fail-closed
+`state-conflict`; missing PID evidence then reaches no exact stop, stable start,
+or ensure call. Near-miss names remain excluded.
+
+- [ ] **Step 2: Implement #613 and run focused GREEN**
+
+Enumerate all service units with `--all --no-pager`, retain the exact strict-name
+filter, and treat exact listed non-running state as conflict. Only
+loaded/active/running state with a positive `MainPID` becomes a candidate; only
+exact not-found evidence becomes disappearance. Add direct exact-stop tests
+proving every untrusted state refuses after `show` and before `stop`.
+
+- [ ] **Step 3: Add #612 RED regression**
+
+Inject a `closeSync` failure after otherwise valid PID evidence and prove the
+close is attempted while migration currently proceeds incorrectly. Require no
+discovery, stop, unlink, stable start, or ensure in the corrected behavior.
+
+- [ ] **Step 4: Implement #612 and run focused GREEN**
+
+Stage the evidence result until descriptor cleanup completes. Any close failure
+overrides present evidence to `unsafe` before migration can authenticate or
+mutate state.
+
+- [ ] **Step 5: Complete review maintenance and verify**
+
+Rename doctor's selected-operation result to `lifecycleResult`; update the
+existing Codecov service-manager component description atomically without
+changing its already-complete ownership; align docs, Changeset, and reusable
+review policy; run focused suites, build, typecheck, lint, and fresh `test:ci`.
+
+#### Reconstructed RED evidence against clean `cb76e425`
+
+The draft production patch already existed when the complete-state addendum
+arrived, so the test-first proof was reconstructed objectively without rewriting
+history: the full working patch was stashed, only the two updated regression
+test files were restored over clean `cb76e425`, the command below was run, the
+test-only changes were discarded, and the full patch was restored.
+
+```bash
+npm exec -- vitest run test/daemon/coverage-400-supervisor.test.ts \
+  test/daemon/coverage-400-lifecycle-restart.test.ts \
+  -t "complete state policy|untrusted|malformed exact state|descriptor close failure|strict legacy unit is|discovers only strict legacy names|explicit (not-found|unloaded) state"
+```
+
+Result: 2 test files failed; 13 tests failed, 22 passed, and 239 were skipped.
+Twelve discovery assertions showed the clean baseline still invoked
+`--state=active` or returned false-zero candidates for strict non-running
+states. The close-failure regression showed the descriptor close was attempted
+but migration returned `restarted: true` instead of refusing. The direct-stop
+untrusted-state cases passed on the baseline, accurately proving its immediate
+exact-`show` revalidation already prevented stop; #613 was the earlier discovery
+omission/classification seam, not an exact-stop authorization bypass.
+
+### Task 7: Accept only identity-consistent post-stop systemd retirement (#614)
+
+**Files:**
+- Modify: `src/daemon/supervisor.ts`
+- Modify: `src/daemon/lifecycle.ts`
+- Modify: focused supervisor and lifecycle tests
+- Modify: daemon user docs, Changeset, and Copilot instructions
+
+- [x] **Step 1: Add #614 RED regressions before production changes**
+
+At exact clean head `23cc77b0877b3b1f88945de0cd5a7bfa87b5143d`, add a
+table covering every conservative systemd stop/final substate (`stop`,
+`stop-watchdog`, `stop-sigterm`, `stop-sigkill`, `stop-post`,
+`final-watchdog`, `final-sigterm`, and `final-sigkill`) with both the exact
+original PID and literal PID 0. This exact set is the `UNIT_DEACTIVATING`
+service-state mapping in systemd v255 `src/core/service.c` lines 58–65 and
+87–94, also exercised by its timeout/coldplug logic; prefix matching and
+`cleaning`, `auto-restart*`, dead, failed, activation, or reload states remain
+excluded. Each case requires initial exact running authentication with a valid
+nonzero canonical `InvocationID`, successful exact stop, the same invocation
+witness through the transition, one bounded sleep, a second exact show, and
+exact not-found success. Add negative cases for candidate/witness omission or
+malformation, pre-stop witness mismatch, post-stop witness loss/change, PID
+drift, missing/ambiguous PID values, unknown or contradictory states/substates,
+unloaded/malformed state, manager error, failed stop, and bounded timeout.
+Preserve direct pre-stop transition refusals so no transition can authorize a
+stop. Add lifecycle composition proving one real supervisor deactivation plus
+PID-file disappearance starts/adopts stable, while witness drift never starts
+or ensures.
+
+Exact RED command, run while `git diff -- src/daemon/supervisor.ts` was empty:
+
+```bash
+npm exec -- vitest run test/daemon/coverage-400-supervisor.test.ts \
+  -t "polls authenticated legacy shutdown"
+```
+
+Result: one file failed; all 16 selected positive cases failed at
+`src/daemon/supervisor.ts:2499` because the baseline rejected the first
+legitimate `deactivating` observation. 155 unrelated tests were skipped. This
+was a direct pre-production RED, not a reconstruction.
+
+After review required stronger identity continuity, reconstruct the complete
+test-only RED in a disposable detached worktree at exact
+`23cc77b0877b3b1f88945de0cd5a7bfa87b5143d`. Apply only the two focused test
+diffs, verify `git diff -- src/daemon/supervisor.ts src/daemon/lifecycle.ts` is
+empty, and run:
+
+```bash
+npm exec -- vitest run test/daemon/coverage-400-supervisor.test.ts \
+  test/daemon/coverage-400-lifecycle-restart.test.ts \
+  -t "invocation witness|polls authenticated legacy shutdown|identity-bound deactivation|invocation drift"
+```
+
+Result: both files failed; 32 tests failed, 4 preservation controls passed, and
+292 were skipped. The baseline accepted missing/malformed/zero/uppercase/
+oversized invocation witnesses during discovery, did not carry or validate a
+candidate witness, stopped despite pre-stop witness mismatch, polled through
+post-stop witness loss/change, rejected all 16 normal deactivation positives,
+could not complete the lifecycle transition, and incorrectly migrated after a
+pre-stop invocation change. The disposable worktree and test patch were then
+removed; committed history and the implementation worktree were unchanged.
+
+- [x] **Step 2: Implement a pure narrow classifier and run focused GREEN**
+
+Extend the candidate and exact show projection with systemd `InvocationID`.
+Accept only the canonical nonzero ID128 form (exactly 32 lowercase hexadecimal
+characters). Discovery carries this witness, lifecycle revalidation compares
+it, and the pre-stop exact show must match it before the sole stop command. Add
+a pure post-stop classifier accepting only loaded/deactivating state, the exact
+eight-state v255 allowlist, the same invocation witness, and either the original
+PID or literal PID 0. Inside the bounded poll, retry that state or exact
+active/running identity with the same witness; return only for exact absence
+and refuse every other observation. PID 0 is never identity or success.
+
+Focused GREEN command:
+
+```bash
+npm exec -- vitest run test/daemon/coverage-400-supervisor.test.ts \
+  -t "polls authenticated legacy shutdown|refuses .* after exact stop|bounds a persistent authenticated legacy shutdown transition|refuses exact untrusted"
+```
+
+Initial transition GREEN: one file passed; 41 tests passed and 130 were
+skipped. After adding InvocationID continuity and lifecycle composition, the
+combined focused command selected both test files and passed 68 tests with 260
+skipped.
+
+- [x] **Step 3: Preserve lifecycle composition and align documentation**
+
+Add a lifecycle test using the real systemd supervisor stop implementation to
+prove running/same invocation → stop success → deactivating/same invocation/
+PID 0 → exact not-found, paired with daemon-owned PID-file disappearance,
+reaches stable start/admission and records `stoppedPid`. Add the inverse real
+supervisor fixture proving changed post-stop invocation refuses before stable
+start or ensure. Document that post-stop transition acceptance is bounded
+observation—not pre-stop authority, identity by PID 0, cleanup, absence, or
+success—and update reusable review guidance accordingly.
+
+- [x] **Step 4: Run complete verification and create a new signed DCO commit**
+
+Run the affected supervisor and lifecycle suites, build, typecheck, lint,
+Codecov metadata contract, and a fresh `npm run test:ci` with 100% statements,
+branches, functions, and lines. Commit with `git commit -S --signoff` without
+amending or rewriting prior history.
+
+Verification result: the full affected supervisor/lifecycle/Codecov command
+passed 334 tests in three files. Build, typecheck (including PostgreSQL
+conformance), and lint each exited 0. The fresh `npm run test:ci` passed 260
+files with two skipped files and 6,290 tests with 12 skipped tests; coverage was
+100% statements (26,781/26,781), branches (19,331/19,331), functions
+(4,247/4,247), and lines (24,444/24,444). `src/daemon/supervisor.ts` and
+`src/daemon/lifecycle.ts` remain exclusively and accurately owned by the
+existing `integration-service-managers` Codecov component, so no taxonomy,
+path, count, topology, status, flag, or exclusion change is semantically
+warranted.

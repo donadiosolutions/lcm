@@ -21,6 +21,7 @@ import {
 } from "../src/daemon/config.js";
 import {
   configPath as defaultConfigPath,
+  BootstrapLockContentionError,
   daemonPidPath,
   daemonTokenPath,
   lcmHomeDir,
@@ -206,6 +207,19 @@ type DaemonRootOptions = {
   help?: boolean;
 };
 
+const FOREGROUND_DAEMON_MIGRATION_ATTEMPTS = 20;
+const FOREGROUND_DAEMON_MIGRATION_DELAY_MS = 50;
+
+export type ForegroundDaemonPreflightSeams = {
+  readonly migrate: () => unknown;
+  readonly sleep: (delayMs: number) => Promise<void>;
+  readonly attempt?: (attempt: number) => void;
+};
+
+const DEFAULT_FOREGROUND_DAEMON_PREFLIGHT_SEAMS: Omit<ForegroundDaemonPreflightSeams, "migrate"> = {
+  sleep: (delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)),
+};
+
 /** @internal Verifies that Commander preserved the preflighted hidden identity. */
 export function assertParsedInternalDaemonTestIdentity(
   opts: Pick<
@@ -339,6 +353,71 @@ function resolveInternalDaemonTestIdentity(
   return identity;
 }
 
+/** @internal Exact argv gate for the only startup path allowed to retry migration contention. */
+export function isForegroundDaemonStartArgv(cliArgv: readonly string[]): boolean {
+  const args = cliArgv.slice(2);
+  if (args[0] !== "daemon" || args[1] !== "start") return false;
+
+  let foreground = false;
+  let ownerCount = 0;
+  let entrypointCount = 0;
+  for (let index = 2; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "--foreground") {
+      if (foreground) return false;
+      foreground = true;
+      continue;
+    }
+    const inlineOwner = arg.startsWith(`${DAEMON_TEST_OWNER_OPTION}=`);
+    const inlineEntrypoint = arg.startsWith(`${DAEMON_TEST_ENTRYPOINT_OPTION}=`);
+    if (inlineOwner || inlineEntrypoint) {
+      const value = arg.slice(arg.indexOf("=") + 1);
+      if (value.length === 0) return false;
+      if (inlineOwner) ownerCount += 1;
+      else entrypointCount += 1;
+      continue;
+    }
+    if (arg === DAEMON_TEST_OWNER_OPTION || arg === DAEMON_TEST_ENTRYPOINT_OPTION) {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith("-")) return false;
+      if (arg === DAEMON_TEST_OWNER_OPTION) ownerCount += 1;
+      else entrypointCount += 1;
+      index += 1;
+      continue;
+    }
+    return false;
+  }
+
+  return foreground
+    && ((ownerCount === 0 && entrypointCount === 0)
+      || (ownerCount === 1 && entrypointCount === 1));
+}
+
+/** @internal Bounded migration preflight for the exact managed foreground daemon argv. */
+export async function migrateLegacyHomeForForegroundDaemonStart(
+  cliArgv: readonly string[],
+  seams: ForegroundDaemonPreflightSeams,
+): Promise<void> {
+  if (!isForegroundDaemonStartArgv(cliArgv)) {
+    seams.migrate();
+    return;
+  }
+
+  for (let attempt = 1; attempt <= FOREGROUND_DAEMON_MIGRATION_ATTEMPTS; attempt += 1) {
+    seams.attempt?.(attempt);
+    try {
+      seams.migrate();
+      return;
+    } catch (error) {
+      if (!(error instanceof BootstrapLockContentionError)
+        || attempt === FOREGROUND_DAEMON_MIGRATION_ATTEMPTS) {
+        throw error;
+      }
+      await seams.sleep(FOREGROUND_DAEMON_MIGRATION_DELAY_MS);
+    }
+  }
+}
+
 /** Resolve custom help before Commander can dispatch a nested command action. */
 function resolveCustomHelpRequest(cliArgv: string[]): CustomHelpRequest | undefined {
   const args = cliArgv.slice(2);
@@ -368,11 +447,6 @@ export function registerMemoryCommands(program: Command): void {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (query: string, opts) => {
-      if (opts.help) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("search"); exit(0);
-      }
-
       const layers = normalizeStringList(opts.layer);
       const tags = normalizeStringList(opts.tag) ?? [];
       ensureAllowedValues(layers, ["episodic", "promoted"], "--layer");
@@ -397,11 +471,6 @@ export function registerMemoryCommands(program: Command): void {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (query: string, opts) => {
-      if (opts.help) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("grep"); exit(0);
-      }
-
       const mode = ensureAllowedValue(opts.mode, ["full_text", "regex"], "--mode");
       const scope = ensureAllowedValue(opts.scope, ["messages", "summaries", "both"], "--scope");
 
@@ -985,13 +1054,7 @@ export function registerPostgreSqlCommand(program: Command): void {
   const postgresCmd = new Command("postgres")
     .description("Provision and maintain PostgreSQL storage");
   postgresCmd.helpOption(false).option("-h, --help", "Show help");
-  const helpRequested = (opts: PostgreSqlOptions): boolean =>
-    opts.help === true || postgresCmd.opts<PostgreSqlOptions>().help === true;
-  postgresCmd.action(async (opts: PostgreSqlOptions) => {
-    if (helpRequested(opts)) {
-      const { printHelp } = await import("../src/cli-help.js");
-      printHelp("postgres"); exit(0);
-    }
+  postgresCmd.action(async () => {
     console.error("Usage: lcm postgres migrate [--json]");
     exit(1);
   });
@@ -1003,10 +1066,6 @@ export function registerPostgreSqlCommand(program: Command): void {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts: PostgreSqlOptions) => {
-      if (helpRequested(opts)) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("postgres"); exit(0);
-      }
       try {
         const { provisionPostgreSql } = await import(
           "../src/storage/postgresql/provisioning.js"
@@ -1168,7 +1227,10 @@ async function createDaemonClientOrExit(
 }
 
 /** @internal CLI entry seam; defaults preserve the published executable behavior. */
-export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
+export async function runCli(
+  cliArgv: string[] = process.argv,
+  preflightSeams?: ForegroundDaemonPreflightSeams,
+): Promise<void> {
   const customHelp = resolveCustomHelpRequest(cliArgv);
   if (customHelp && cliArgv.slice(2).length > 0) {
     const cliHelp = await import("../src/cli-help.js");
@@ -1183,7 +1245,16 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
   }
 
   const internalDaemonTestIdentity = resolveInternalDaemonTestIdentity(cliArgv);
-  migrateLegacyHomeIfNeeded();
+  const migrate = preflightSeams?.migrate ?? migrateLegacyHomeIfNeeded;
+  if (isForegroundDaemonStartArgv(cliArgv)) {
+    await migrateLegacyHomeForForegroundDaemonStart(cliArgv, {
+      migrate,
+      sleep: preflightSeams?.sleep ?? DEFAULT_FOREGROUND_DAEMON_PREFLIGHT_SEAMS.sleep,
+      attempt: preflightSeams?.attempt,
+    });
+  } else {
+    migrate();
+  }
   const { readFileSync } = await import("node:fs");
   const { join } = await import("node:path");
   const pkgPath = join(packageRootFor(import.meta.url, 2), "package.json");
@@ -1664,10 +1735,6 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
-      if (opts.help) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("install"); exit(0);
-      }
       const dryRun: boolean = opts.dryRun ?? false;
       const { install } = await import("../installer/install.js");
       if (dryRun) {
@@ -1688,10 +1755,6 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
-      if (opts.help) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("uninstall"); exit(0);
-      }
       const dryRun: boolean = opts.dryRun ?? false;
       const { uninstall } = await import("../installer/uninstall.js");
       if (dryRun) {
@@ -1882,11 +1945,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
   // ─── events ────────────────────────────────────────────────────────────────
   const eventsCmd = new Command("events").description("Manage passive-learning sidecar events");
   eventsCmd.helpOption(false).option("-h, --help", "Show help");
-  eventsCmd.action(async (opts) => {
-    if (opts.help || cliArgv.includes("-h") || cliArgv.includes("--help")) {
-      const { printHelp } = await import("../src/cli-help.js");
-      printHelp("events"); exit(0);
-    }
+  eventsCmd.action(async () => {
     console.error(
       "Usage: lcm events <promote|status|validate|quarantine|replay> [options]",
     );
@@ -1901,11 +1960,6 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
-      if (opts.help || cliArgv.includes("-h") || cliArgv.includes("--help")) {
-        const { printHelp } = await import("../src/cli-help.js");
-        printHelp("events"); exit(0);
-      }
-
       const all: boolean = opts.all ?? false;
       const jsonFlag: boolean = opts.json ?? false;
       const client = await createDaemonClientOrExit();
@@ -2187,11 +2241,7 @@ export async function runCli(cliArgv: string[] = process.argv): Promise<void> {
   // ─── connectors ────────────────────────────────────────────────────────────
   const connectorsCmd = new Command("connectors").description("Manage connectors for coding agents");
   connectorsCmd.helpOption(false).option("-h, --help", "Show help");
-  connectorsCmd.action(async (opts) => {
-    if (opts.help) {
-      const { printHelp } = await import("../src/cli-help.js");
-      printHelp("connectors"); exit(0);
-    }
+  connectorsCmd.action(async () => {
     console.error("Usage: lcm connectors <list|install|remove|doctor> [options]");
     exit(1);
   });

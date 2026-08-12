@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  BootstrapLockContentionError,
   bootstrapLcmHome,
   configPath,
   daemonPidPath,
@@ -231,14 +232,25 @@ describe("runtime paths", () => {
 
   it("preserves a bootstrap lock owned by a live matching process", () => {
     const home = makeHome();
+    const startTime = processStartTime();
     const content = writeBootstrapLock(home, {
       pid: process.pid,
-      processStartTime: processStartTime(),
+      processStartTime: startTime,
     });
 
-    expect(() => bootstrapLcmHome(home)).toThrow(
-      processStartTime() === null ? "owner state is ambiguous" : "already in progress",
-    );
+    let error: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    if (error instanceof BootstrapLockContentionError) {
+      expect(error.message).toContain("already in progress");
+    } else {
+      expect((error as Error).constructor).toBe(Error);
+      expect((error as Error).message).toContain("owner state is ambiguous");
+    }
     expect(readFileSync(join(home, ".lcm-root-bootstrap.lock"), "utf8")).toBe(content);
   });
 

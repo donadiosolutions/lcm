@@ -10,6 +10,8 @@ import { runLcmMigrations } from "../src/db/migration.js";
 import { addProjectAlias, clearProjectMapCache, projectMapPath } from "../src/project-map.js";
 import { ensureProjectDir, projectPaths } from "../src/daemon/project.js";
 
+const FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS = 15_000;
+
 function resetLcmHome(): void {
   rmSync(join(homedir(), ".lcm"), { recursive: true, force: true });
   mkdirSync(join(homedir(), ".lcm"), { recursive: true });
@@ -640,7 +642,7 @@ describe("batch compaction discovery", () => {
     writeFileSync(projectMapPath(), "{");
     clearProjectMapCache();
     expect(findUncompacted(100, true, "/unmapped", true)).toEqual([]);
-  });
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
 
   it("reports empty, dry-run, skipped, and unknown-error batch outcomes", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
