@@ -1615,6 +1615,7 @@ describe("systemd-user supervisor", () => {
       { code: 0, stdout: stale },
       { code: 0, stdout: stale },
       { code: 0, stdout: "stopped" },
+      { code: 0, stdout: "reset" },
       { code: 1, stderr: "Unit is not-found" },
       { code: 1, stderr: "Unit is not-found" },
       { code: 0, stdout: "started" },
@@ -1642,6 +1643,7 @@ describe("systemd-user supervisor", () => {
       { code: 0, stdout: stale },
       { code: 0, stdout: stale },
       { code: 0, stdout: "stopped" },
+      { code: 0, stdout: "reset" },
       { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
       { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
       { code: 0, stdout: "started" },
@@ -1696,6 +1698,88 @@ describe("systemd-user supervisor", () => {
     ]);
     await expect(createSupervisor("systemd-user", { run: missingCaRunner.run, platform: "linux" }).stopAndStart(configuredWithCa)).rejects.toThrow("manager command");
     expect(missingCaRunner.calls.some(({ command, args }) => command === "systemctl" && args[1] === "stop")).toBe(false);
+  });
+
+  it("resets an authenticated stale failed registration before proving absence and replacement", async () => {
+    const root = makeRoot();
+    const spec = makeSpec("systemd-user", root);
+    const prior = makeSpec("systemd-user", root, {
+      port: spec.port + 1,
+      nonce: "prior-stale",
+    });
+    const runner = fakeRunner([
+      { code: 0, stdout: managerText(prior, "failed") },
+      { code: 0, stdout: managerText(prior, "failed") },
+      { code: 0, stdout: "stopped" },
+      { code: 0, stdout: "reset" },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: managerText(spec, "active", 818) },
+    ]);
+
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+    }).stopAndStart(spec)).resolves.toMatchObject({ managerPid: 818 });
+
+    expect(runner.calls.slice(2, 7).map(({ command, args }) => command === "systemd-run"
+      ? "replacement-start"
+      : `${command}:${args[1]}`)).toEqual([
+      "systemctl:stop",
+      "systemctl:reset-failed",
+      "systemctl:show",
+      "systemctl:show",
+      "replacement-start",
+    ]);
+    expect(runner.calls[3]?.args).toEqual(["--user", "reset-failed", spec.systemdUnit]);
+    expect(runner.calls[6]?.args).toContain(`--unit=${spec.systemdUnit}`);
+  });
+
+  it.each([
+    ["permission", { code: 1, stderr: "permission denied" }],
+    ["transport", { code: null, stderr: "transport failed" }],
+  ] as const)("blocks authenticated stale replacement when reset-failed has a %s failure", async (_label, resetResult) => {
+    const root = makeRoot();
+    const spec = makeSpec("systemd-user", root);
+    const prior = makeSpec("systemd-user", root, { port: spec.port + 1, nonce: "prior-stale" });
+    const runner = fakeRunner([
+      { code: 0, stdout: managerText(prior, "failed") },
+      { code: 0, stdout: managerText(prior, "failed") },
+      { code: 0, stdout: "stopped" },
+      resetResult,
+    ]);
+
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+    }).stopAndStart(spec)).rejects.toThrow("manager command");
+    expect(runner.calls[3]?.args).toEqual(["--user", "reset-failed", spec.systemdUnit]);
+    expect(runner.calls.some(({ command }) => command === "systemd-run")).toBe(false);
+    expect(runner.calls).toHaveLength(4);
+  });
+
+  it("tolerates only the exact stale service not-found result from reset-failed", async () => {
+    const root = makeRoot();
+    const spec = makeSpec("systemd-user", root);
+    const prior = makeSpec("systemd-user", root, { port: spec.port + 1, nonce: "prior-stale" });
+    const runner = fakeRunner([
+      { code: 0, stdout: managerText(prior, "failed") },
+      { code: 0, stdout: managerText(prior, "failed") },
+      { code: 0, stdout: "stopped" },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+      { code: 1, stderr: `Unit ${spec.systemdUnit} not-found` },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: managerText(spec, "active", 819) },
+    ]);
+
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+    }).stopAndStart(spec)).resolves.toMatchObject({ managerPid: 819 });
+    expect(runner.calls[3]?.args).toEqual(["--user", "reset-failed", spec.systemdUnit]);
+    expect(runner.calls[4]?.args).toContain(spec.systemdUnit);
   });
 
   it("covers command preflight, bounded timeout, runner errors, and explicit restart decisions", async () => {

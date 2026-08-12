@@ -2963,11 +2963,17 @@ export function createSupervisor(
     // must not become cleanup authority merely because a later probe is absent.
     const stopResultAllowsAbsent = result.code === 0
       || (exactPriorObservation && stopResultIsNotFound);
-    if (
-      kind === "systemd-user"
-      && current.kind === "registered-not-running-valid"
+    const resetFailedRequired = kind === "systemd-user"
       && result.code === 0
-    ) {
+      && (
+        current.kind === "registered-not-running-valid"
+        || (
+          allowStaleConfig
+          && staleSource?.kind === "registered-stale-config"
+          && isAuthenticatedSystemdStaleObservation(spec, staleSource, current)
+        )
+      );
+    if (resetFailedRequired) {
       // If a terminal registration remains manager-referenced after stop,
       // reset-failed is the scoped cleanup request before same-name
       // recreation. Manager GC may remove it before reset-failed reaches the
