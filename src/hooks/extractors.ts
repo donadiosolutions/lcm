@@ -8,7 +8,7 @@ export interface ExtractedEvent {
   tags?: string[];
 }
 
-interface PostToolInput {
+export interface PostToolInput {
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_response?: unknown;
