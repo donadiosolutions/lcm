@@ -297,10 +297,12 @@ describe("runCli registration and help dispatch", () => {
       argv("daemon", "start"),
       argv("daemon", "restart", "--foreground"),
       argv("daemon", "start", "--foreground", "--detach"),
+      argv("daemon", "start", "--foreground", "--foreground"),
       argv("daemon", "start", "--foreground=true"),
       argv("daemon", "start", "--foreground", "unexpected"),
       argv("daemon", "start", "--foreground", "--"),
       argv("daemon", "start", "--foreground", "--internal-lcm-test-daemon-owner"),
+      argv("daemon", "start", "--foreground", "--internal-lcm-test-daemon-owner="),
       argv("daemon", "start", "--foreground", "--internal-lcm-test-daemon-owner", "owned", "--internal-lcm-test-daemon-entrypoint"),
     ]) {
       expect(isForegroundDaemonStartArgv(nearMiss)).toBe(false);
