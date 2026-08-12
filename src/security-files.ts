@@ -148,9 +148,10 @@ export function assertPrivateDirectory(
   handle: PrivateDirectoryHandle,
   path: string,
   expected?: PrivateDirectoryWitness,
+  expectedUid: number | undefined = currentUid(),
 ): PrivateDirectoryWitness {
   const stat = directoryStat(handle.fd);
-  assertPrivateDirectoryStat(stat, currentUid());
+  assertPrivateDirectoryStat(stat, expectedUid);
   const canonicalPath = realpathSync(path);
   const pathStat = statSync(canonicalPath, { bigint: true }) as unknown as BigIntDirectoryStat;
   if (pathStat.dev !== stat.dev || pathStat.ino !== stat.ino) {
@@ -164,10 +165,14 @@ export function assertPrivateDirectory(
 }
 
 /** Flush a private directory through a descriptor with strict open flags. */
-export function syncPrivateDirectory(path: string): void {
-  const handle = openPrivateDirectory(path);
+export function syncPrivateDirectory(
+  path: string,
+  options: { readonly expectedUid?: number } = {},
+): void {
+  const expectedUid = options.expectedUid ?? currentUid();
+  const handle = openPrivateDirectory(path, { expectedUid });
   try {
-    assertPrivateDirectory(handle, path, handle.witness);
+    assertPrivateDirectory(handle, path, handle.witness, expectedUid);
     fsyncSync(handle.fd);
   } finally {
     handle.close();

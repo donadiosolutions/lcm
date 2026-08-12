@@ -174,6 +174,21 @@ describe("private filesystem primitives", () => {
     expect(() => openPrivateDirectory(path)).toThrow("mode");
   });
 
+  it("threads an explicit expected uid through retained assertions and directory sync", () => {
+    const path = join(makeRoot(), "uid-policy");
+    mkdirSync(path, { mode: 0o700 });
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (expectedUid === undefined) return;
+
+    const handle = openPrivateDirectory(path, { expectedUid });
+    expect(assertPrivateDirectory(handle, path, handle.witness, expectedUid)).toEqual(handle.witness);
+    expect(() => assertPrivateDirectory(handle, path, undefined, expectedUid + 1)).toThrow("owner");
+    handle.close();
+
+    expect(() => syncPrivateDirectory(path, { expectedUid: expectedUid + 1 })).toThrow("owner");
+    expect(() => syncPrivateDirectory(path, { expectedUid })).not.toThrow();
+  });
+
   it("rejects a non-directory descriptor, an unexpected owner, and a changed witness", () => {
     const root = makeRoot();
     const file = join(root, "file");
