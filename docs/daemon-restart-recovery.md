@@ -178,6 +178,22 @@ lcm doctor
 lcm daemon restart
 ```
 
+## Foreground startup during root migration
+
+The managed foreground process used by `lcm daemon restart` may briefly start
+while another authenticated LCM command is migrating the user root. In that
+narrow case, the foreground `start` invocation with its `--foreground` option
+retries the migration preflight for at most 20 total attempts, with 50
+milliseconds between attempts. The
+maximum wait is therefore 950 milliseconds. Once the authenticated bootstrap
+lock is released, startup continues normally.
+
+Only the exact foreground start command uses this bounded retry. Ordinary LCM
+commands remain fail-fast, and malformed, ambiguous, foreign, stale-recovery,
+or other migration failures are never retried. If the live-lock contention
+continues through the bounded window, inspect the state with `lcm doctor` and
+retry `lcm daemon restart` once the competing operation has completed.
+
 ## Configuration and security boundary
 
 `daemon.idleTimeoutMs` controls how long an otherwise idle daemon may remain

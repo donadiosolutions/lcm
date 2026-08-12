@@ -205,17 +205,25 @@ vi.mock("../../src/storage/postgresql/provisioning.js", () => ({
 
 const {
   assertParsedInternalDaemonTestIdentity, handleCliError, isStrictContainedRelativePath,
+  isForegroundDaemonStartArgv,
   resolveCompactRequestPolicyOverride,
   runCli, runMainIfInvoked, shouldRunMain,
   withHookOverrides, writeCliError, writeCliOutput,
 } = await import("../../bin/lcm.js");
 const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+const actualRuntimePaths = await vi.importActual<typeof import("../../src/runtime-paths.js")>("../../src/runtime-paths.js");
 const { batchCompact } = await import("../../src/batch-compact.js");
 const { isDaemonTransportFailure } = await import("../../src/daemon/http-url.js");
 
-async function invoke(args: string[]): Promise<Error | undefined> {
+type ForegroundPreflightSeams = {
+  migrate: () => unknown;
+  sleep: (delayMs: number) => Promise<void>;
+  attempt?: (attempt: number) => void;
+};
+
+async function invoke(args: string[], seams?: ForegroundPreflightSeams): Promise<Error | undefined> {
   try {
-    await runCli(["node", "lcm", ...args]);
+    await runCli(["node", "lcm", ...args], seams);
     return undefined;
   } catch (error) {
     return error instanceof Error ? error : new Error(String(error));
@@ -259,6 +267,8 @@ beforeEach(() => {
   state.provisionError = undefined;
   state.daemonClientInstances = 0;
   state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] };
+  state.migrateLegacyHome.mockReset();
+  state.migrateLegacyHome.mockImplementation(() => undefined);
 });
 
 afterEach(() => {
@@ -268,6 +278,107 @@ afterEach(() => {
 });
 
 describe("runCli registration and help dispatch", () => {
+  it("classifies only exact foreground daemon starts, including hidden test identity flags", () => {
+    const argv = (...args: string[]): string[] => ["node", "lcm", ...args];
+    expect(isForegroundDaemonStartArgv(argv("daemon", "start", "--foreground"))).toBe(true);
+    expect(isForegroundDaemonStartArgv(argv(
+      "daemon", "start", "--foreground",
+      "--internal-lcm-test-daemon-owner=owned",
+      "--internal-lcm-test-daemon-entrypoint=/tmp/owned.mjs",
+    ))).toBe(true);
+    expect(isForegroundDaemonStartArgv(argv(
+      "daemon", "start",
+      "--internal-lcm-test-daemon-owner", "owned",
+      "--foreground",
+      "--internal-lcm-test-daemon-entrypoint", "/tmp/owned.mjs",
+    ))).toBe(true);
+
+    for (const nearMiss of [
+      argv("daemon", "start"),
+      argv("daemon", "restart", "--foreground"),
+      argv("daemon", "start", "--foreground", "--detach"),
+      argv("daemon", "start", "--foreground=true"),
+      argv("daemon", "start", "--foreground", "unexpected"),
+      argv("daemon", "start", "--foreground", "--"),
+      argv("daemon", "start", "--foreground", "--internal-lcm-test-daemon-owner"),
+      argv("daemon", "start", "--foreground", "--internal-lcm-test-daemon-owner", "owned", "--internal-lcm-test-daemon-entrypoint"),
+    ]) {
+      expect(isForegroundDaemonStartArgv(nearMiss)).toBe(false);
+    }
+  });
+
+  it("retries authenticated live bootstrap contention until foreground startup can proceed", async () => {
+    const contention = new actualRuntimePaths.BootstrapLockContentionError(
+      "LCM root bootstrap is already in progress; retry after it completes",
+    );
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+    const attempt = vi.fn();
+    state.migrateLegacyHome
+      .mockImplementationOnce(() => { throw contention; })
+      .mockImplementationOnce(() => undefined);
+
+    expect(await invoke(["daemon", "start", "--foreground"], {
+      migrate: state.migrateLegacyHome,
+      sleep,
+      attempt,
+    })).toBeUndefined();
+    expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(50);
+    expect(attempt.mock.calls.map(([value]) => value)).toEqual([1, 2]);
+  });
+
+  it("stops after twenty live bootstrap contention attempts", async () => {
+    const contention = new actualRuntimePaths.BootstrapLockContentionError(
+      "LCM root bootstrap is already in progress; retry after it completes",
+    );
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+    const migrate = vi.fn(() => { throw contention; });
+
+    const error = await invoke(["daemon", "start", "--foreground"], {
+      migrate,
+      sleep,
+    });
+
+    expect(error).toBe(contention);
+    expect(migrate).toHaveBeenCalledTimes(20);
+    expect(sleep).toHaveBeenCalledTimes(19);
+    expect(sleep).toHaveBeenNthCalledWith(19, 50);
+  });
+
+  it.each([
+    ["ordinary command", ["status"]],
+    ["malformed lock", ["daemon", "start", "--foreground"]],
+  ] as const)("does not retry a %s when migration fails", async (_label, args) => {
+    const failure = new Error("migration failed");
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+    const migrate = vi.fn(() => { throw failure; });
+
+    const error = await invoke([...args], { migrate, sleep });
+
+    expect(error).toBe(failure);
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "ambiguous owner state",
+    "foreign lock owner",
+    "stale-lock recovery changed repeatedly",
+    "stale-lock recovery is already in progress",
+    "non-contention migration failure",
+  ])("does not retry %s", async (detail) => {
+    const failure = new Error(detail);
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+    const migrate = vi.fn(() => { throw failure; });
+
+    const error = await invoke(["daemon", "start", "--foreground"], { migrate, sleep });
+
+    expect(error).toBe(failure);
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
   it("covers standalone parsing and entry guard fallbacks", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
