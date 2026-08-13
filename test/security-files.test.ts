@@ -21,6 +21,7 @@ import {
   realpathSync,
   statSync as fsStatSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -211,21 +212,36 @@ describe("private filesystem primitives", () => {
 
   it("rejects inconsistent writer-alias metadata and content observations", () => {
     const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const initialMetadata = writerAliasFixture();
+    const initialStat = fsStatSync(initialMetadata.finalPath, { bigint: true });
     const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
     const originalFstat = nodeFs.fstatSync as typeof fstatSync;
-    const metadata = writerAliasFixture();
-    let bigintStats = 0;
+    let matchingFstats = 0;
     expect(() => withPatchedFs("fstatSync", ((fd: number, options?: unknown) => {
       const stat = originalFstat(fd, options as never);
-      if ((options as { bigint?: boolean } | undefined)?.bigint === true) bigintStats += 1;
-      if (bigintStats === 3 && (options as { bigint?: boolean } | undefined)?.bigint === true) {
-        return Object.assign(stat, { mtimeNs: (stat as unknown as { mtimeNs: bigint }).mtimeNs + 1n });
+      if ((options as { bigint?: boolean } | undefined)?.bigint === true
+        && stat.dev === initialStat.dev && stat.ino === initialStat.ino) {
+        matchingFstats += 1;
+        if (matchingFstats === 1) {
+          return Object.assign(stat, { mtimeNs: stat.mtimeNs + 1n });
+        }
       }
       return stat;
-    }) as never, () => consumeAuthenticatedWriterAlias(metadata.finalPath, metadata.aliasPath, {
+    }) as never, () => consumeAuthenticatedWriterAlias(
+      initialMetadata.finalPath,
+      initialMetadata.aliasPath,
+      { maxBytes: 1024, expectedUid },
+    ))).toThrow("writer alias metadata does not match the final file");
+    expect(existsSync(initialMetadata.aliasPath)).toBe(true);
+
+    const metadata = writerAliasFixture();
+    expect(() => consumeAuthenticatedWriterAlias(metadata.finalPath, metadata.aliasPath, {
       maxBytes: 1024,
       expectedUid,
-    }))).toThrow("metadata");
+      _beforeUnlinkForTesting: () => {
+        utimesSync(metadata.finalPath, new Date(1), new Date(1));
+      },
+    })).toThrow("writer alias changed during consume");
     expect(existsSync(metadata.aliasPath)).toBe(true);
 
     const originalRead = nodeFs.readSync as typeof import("node:fs").readSync;
