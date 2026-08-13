@@ -4,6 +4,7 @@ export * from "./conversation-repository.js";
 export * from "./contracts.js";
 export * from "./errors.js";
 export * from "./extensions.js";
+export * from "./factory.js";
 export * from "./identity-repository.js";
 export * from "./lexical-search-repository.js";
 export * from "./migrations.js";

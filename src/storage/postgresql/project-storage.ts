@@ -329,7 +329,7 @@ export class PostgreSqlProjectStorage implements ProjectStorage {
     readonly projectId: string,
     readonly machineId: string,
     private readonly onClose: (
-      storage: PostgreSqlProjectStorage,
+      storage: ProjectStorage,
     ) => void | Promise<void>,
   ) {
     this.rootExecutor = new SignalBoundRootExecutor(
