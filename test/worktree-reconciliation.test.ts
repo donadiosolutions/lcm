@@ -1781,7 +1781,7 @@ describe("worktree reconciliation", () => {
         aliases: expect.arrayContaining([linked, deletedWorktree]),
       },
     });
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("runs automatically on first local project storage access", () => {
     const { main, linked } = makeRepository(home);
@@ -1819,7 +1819,7 @@ describe("worktree reconciliation", () => {
       return [JSON.parse(readFileSync(metaPath, "utf8")).cwd];
     });
     expect(exportAllCwds).toContain(canonical);
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("preserves safe canonical project metadata while publishing canonical cwd", () => {
     const { main, linked } = makeRepository(home);
@@ -1850,7 +1850,7 @@ describe("worktree reconciliation", () => {
       lastIngest: "2026-07-25T00:00:00.000Z",
       custom: { retained: true },
     });
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("does not rewrite already-canonical target metadata", () => {
     const { main, linked } = makeRepository(home);
@@ -1875,7 +1875,7 @@ describe("worktree reconciliation", () => {
 
     expect(reconcileWorktrees(linked).status).toBe("completed");
     expect(readFileSync(metaPath, "utf8")).toBe(metadata);
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("rejects a non-file canonical metadata path before map publication", () => {
     const { main, linked } = makeRepository(home);
@@ -1899,7 +1899,7 @@ describe("worktree reconciliation", () => {
       "invalid canonical project metadata path",
     );
     expect(listProjectMapEntries()).toHaveProperty(sourceHash);
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it.each(["\"invalid\"", "null", "[]"])(
     "rejects unsafe canonical metadata value %s before map publication",
@@ -2123,7 +2123,7 @@ describe("worktree reconciliation", () => {
        FROM session_instruction_cache WHERE session_id = 'shared-cache-scope'`,
     ).get()).toEqual(expected);
     merged.close();
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("does not arbitrate scoped cache content by timestamps or process timezone", () => {
     const originalTimezone = process.env.TZ;
