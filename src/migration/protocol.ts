@@ -419,27 +419,27 @@ function assertCrossFieldInvariants(
   if (manifest.source.backend !== "sqlite" || manifest.destination.backend !== "postgresql") {
     protocolError(reason, "migration manifest backend direction is invalid");
   }
-  if ((manifest.revision === 0) !== (manifest.previousManifestSha256 === null)) protocolError("malformed-manifest", "revision predecessor is invalid");
+  if ((manifest.revision === 0) !== (manifest.previousManifestSha256 === null)) protocolError(reason, "revision predecessor is invalid");
   if (manifest.phase === "rolled-back" || manifest.phase === "aborted") {
-    if (manifest.pendingEffect !== null) protocolError("malformed-manifest", "terminal phase cannot have a pending effect");
+    if (manifest.pendingEffect !== null) protocolError(reason, "terminal phase cannot have a pending effect");
   }
   if (manifest.pendingEffect !== null) {
-    if (manifest.pendingEffect.fromPhase !== manifest.phase) protocolError("malformed-manifest", "pending effect phase is invalid");
+    if (manifest.pendingEffect.fromPhase !== manifest.phase) protocolError(reason, "pending effect phase is invalid");
     const legal = legalEffect(manifest.phase, manifest.pendingEffect.kind);
     if (legal === null || legal.targetPhase !== manifest.pendingEffect.targetPhase
-      || legal.recovery !== manifest.pendingEffect.recovery) protocolError("malformed-manifest", "pending effect transition is invalid");
+      || legal.recovery !== manifest.pendingEffect.recovery) protocolError(reason, "pending effect transition is invalid");
   }
   const verificationReport = manifest.reports.some((report) => report.kind === "verification");
   const eligiblePhase = manifest.phase === "verified" || manifest.phase === "activating" || manifest.phase === "active"
     || manifest.phase === "rolling-back" || manifest.phase === "rolled-back";
-  if (manifest.activationEligible !== (eligiblePhase && verificationReport)) protocolError("malformed-manifest", "activation eligibility is invalid");
+  if (manifest.activationEligible !== (eligiblePhase && verificationReport)) protocolError(reason, "activation eligibility is invalid");
   const rollbackPhase = manifest.phase === "rolling-back" || manifest.phase === "rolled-back";
-  if (manifest.rollbackLineage.returnPhase !== null && !rollbackPhase) protocolError("malformed-manifest", "rollback return phase is invalid");
-  if (manifest.phase === "rolling-back" && manifest.rollbackLineage.returnPhase === null) protocolError("malformed-manifest", "rolling-back phase requires a sealed return phase");
-  if (manifest.rollbackLineage.mode !== null && manifest.phase !== "rolled-back") protocolError("malformed-manifest", "rollback mode is invalid");
+  if (manifest.rollbackLineage.returnPhase !== null && !rollbackPhase) protocolError(reason, "rollback return phase is invalid");
+  if (manifest.phase === "rolling-back" && manifest.rollbackLineage.returnPhase === null) protocolError(reason, "rolling-back phase requires a sealed return phase");
+  if (manifest.rollbackLineage.mode !== null && manifest.phase !== "rolled-back") protocolError(reason, "rollback mode is invalid");
   if (manifest.phase === "rolled-back") {
-    if (manifest.rollbackLineage.mode === null) protocolError("malformed-manifest", "rolled-back phase requires rollback mode");
-    if (manifest.rollbackLineage.returnPhase === null) protocolError("malformed-manifest", "rolled-back phase requires a sealed return phase");
+    if (manifest.rollbackLineage.mode === null) protocolError(reason, "rolled-back phase requires rollback mode");
+    if (manifest.rollbackLineage.returnPhase === null) protocolError(reason, "rolled-back phase requires a sealed return phase");
   }
 }
 

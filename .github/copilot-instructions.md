@@ -105,6 +105,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Flag `DROP COLUMN`, `DROP TABLE`, `ALTER COLUMN type`, or other destructive DDL outside such a tested staged replacement.
 - Migrations must be idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`).
 - Multi-statement schema bootstrap and repair paths, including schema-version writes, must run in one explicit transaction and roll back every partial DDL or metadata change on failure.
+- When a shared invariant validator accepts a caller-specific protocol reason, every invariant failure in that validator must use the supplied reason; preserve caller-specific taxonomy instead of hard-coding a parse-only reason.
 
 ### Error handling
 
