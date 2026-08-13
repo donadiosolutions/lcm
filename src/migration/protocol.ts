@@ -429,6 +429,7 @@ function assertCrossFieldInvariants(manifest: Omit<MigrationManifest, "checksumS
   if (manifest.activationEligible !== (eligiblePhase && verificationReport)) protocolError("malformed-manifest", "activation eligibility is invalid");
   const rollbackPhase = manifest.phase === "rolling-back" || manifest.phase === "rolled-back";
   if (manifest.rollbackLineage.returnPhase !== null && !rollbackPhase) protocolError("malformed-manifest", "rollback return phase is invalid");
+  if (manifest.phase === "rolling-back" && manifest.rollbackLineage.returnPhase === null) protocolError("malformed-manifest", "rolling-back phase requires a sealed return phase");
   if (manifest.rollbackLineage.mode !== null && manifest.phase !== "rolled-back") protocolError("malformed-manifest", "rollback mode is invalid");
   if (manifest.phase === "rolled-back") {
     if (manifest.rollbackLineage.mode === null) protocolError("malformed-manifest", "rolled-back phase requires rollback mode");
@@ -539,6 +540,27 @@ export function createMigrationManifest(input: CreateMigrationManifestInput): Mi
   } satisfies Omit<MigrationManifest, "checksumSha256">;
   assertCrossFieldInvariants(payload);
   return deepFreeze({ ...payload, checksumSha256: migrationManifestCanonicalSha256(payload) });
+}
+
+export function assertMigrationManifestGenesis(
+  manifest: MigrationManifest,
+): MigrationManifest {
+  const current = parseMigrationManifest(manifest);
+  if (
+    current.revision !== 0
+    || current.previousManifestSha256 !== null
+    || current.phase !== "planned"
+    || current.pendingEffect !== null
+    || current.checkpoints.length !== 0
+    || current.reports.length !== 0
+    || current.activationEligible
+    || current.rollbackLineage.mode !== null
+    || current.rollbackLineage.returnPhase !== null
+    || current.createdAt !== current.updatedAt
+  ) {
+    protocolError("unexpected-state", "migration manifest is not a legal genesis");
+  }
+  return current;
 }
 
 export function beginMigrationEffect(
@@ -776,10 +798,7 @@ export function abandonMigrationEffect(
   }
   const returnPhase = pending.kind === "publish-activation"
     ? "verified"
-    : current.rollbackLineage.returnPhase;
-  if (returnPhase === null) {
-    protocolError("unexpected-state", "migration rollback return phase is missing");
-  }
+    : current.rollbackLineage.returnPhase!;
   return sealMigrationSuccessor(current, input.abandonedAt, {
     phase: returnPhase,
     reports: nextReports(current.reports, reportValue),
@@ -788,6 +807,93 @@ export function abandonMigrationEffect(
       : current.rollbackLineage,
     pendingEffect: null,
   });
+}
+
+function sameManifest(left: MigrationManifest, right: MigrationManifest): boolean {
+  return canonicalJson(left, new Set()) === canonicalJson(right, new Set());
+}
+
+function successorValidationError(options?: ErrorOptions): never {
+  protocolError(
+    "unexpected-state",
+    "migration manifest is not a legal immediate protocol successor",
+    options,
+  );
+}
+
+/**
+ * Authenticate one candidate as the exact result of a legal public reducer.
+ *
+ * A checksum authenticates a snapshot, not its relationship to a predecessor.
+ * This seam reconstructs the only reducer input the candidate could represent,
+ * replays that reducer, and requires byte-for-byte equivalent manifest data.
+ */
+export function assertMigrationManifestSuccessor(
+  previous: MigrationManifest,
+  candidate: MigrationManifest,
+): MigrationManifest {
+  const current = parseMigrationManifest(previous);
+  const next = parseMigrationManifest(candidate);
+  let expected: MigrationManifest;
+  try {
+    if (current.pendingEffect === null) {
+      if (next.pendingEffect === null) return successorValidationError();
+      expected = beginMigrationEffect(current, {
+        effectId: next.pendingEffect.effectId,
+        kind: next.pendingEffect.kind,
+        inputSha256: next.pendingEffect.inputSha256,
+        startedAt: next.pendingEffect.startedAt,
+      });
+    } else {
+      if (next.pendingEffect !== null) return successorValidationError();
+      const newReports = next.reports.filter((report) => (
+        !current.reports.some((existing) => existing.reportId === report.reportId)
+      ));
+      if (
+        newReports.length === 1
+        && newReports[0]!.kind === "abandonment"
+        && (current.pendingEffect.kind === "publish-activation"
+          || current.pendingEffect.kind === "publish-rollback")
+      ) {
+        expected = abandonMigrationEffect(current, {
+          effectId: current.pendingEffect.effectId,
+          abandonedAt: next.updatedAt,
+          report: newReports[0] as MigrationReportReference & Readonly<{ kind: "abandonment" }>,
+        });
+      } else {
+        const changedCheckpoints = next.checkpoints.filter((checkpoint) => {
+          const existing = current.checkpoints.find((value) => value.domain === checkpoint.domain);
+          return existing === undefined
+            || canonicalJson(existing, new Set()) !== canonicalJson(checkpoint, new Set());
+        });
+        const input: {
+          effectId: string;
+          completedAt: string;
+          checkpoint?: MigrationCheckpoint;
+          report?: MigrationReportReference;
+          activationEligible?: boolean;
+          rollbackMode?: "pre-write" | "post-write";
+        } = {
+          effectId: current.pendingEffect.effectId,
+          completedAt: next.updatedAt,
+        };
+        if (changedCheckpoints.length === 1) input.checkpoint = changedCheckpoints[0];
+        if (newReports.length === 1) input.report = newReports[0];
+        if (current.pendingEffect.kind === "verify-generation") {
+          input.activationEligible = next.activationEligible;
+        }
+        if (current.pendingEffect.kind === "publish-rollback"
+          && next.rollbackLineage.mode !== null) {
+          input.rollbackMode = next.rollbackLineage.mode;
+        }
+        expected = completeMigrationEffect(current, input);
+      }
+    }
+  } catch (error) {
+    return successorValidationError({ cause: error });
+  }
+  if (!sameManifest(expected, next)) return successorValidationError();
+  return next;
 }
 
 export function classifyMigrationRecovery(

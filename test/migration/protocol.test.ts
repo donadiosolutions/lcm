@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   MigrationProtocolError,
+  assertMigrationManifestGenesis,
+  assertMigrationManifestSuccessor,
   abandonMigrationEffect,
   beginMigrationEffect,
   completeMigrationEffect,
@@ -151,6 +153,27 @@ describe("migration manifest protocol", () => {
       migrationManifestCanonicalSha256(unsignedManifest(manifest)),
     );
     expect(JSON.stringify(manifest)).not.toMatch(/[^\x00-\x7F]/u);
+  });
+
+  it("accepts only the exact genesis state for headless recovery", () => {
+    const genesis = createValidManifest();
+    expect(assertMigrationManifestGenesis(genesis)).toEqual(genesis);
+    for (const [candidate, reason] of [
+      [sealManifest({ ...genesis, updatedAt: UPDATED_AT }), "unexpected-state"],
+      [sealManifest({ ...genesis, phase: "aborted" }), "unexpected-state"],
+      [sealManifest({ ...genesis, activationEligible: true }), "malformed-manifest"],
+      [sealManifest({ ...genesis, checkpoints: [checkpoint("forged", 1)] }), "unexpected-state"],
+      [sealManifest({ ...genesis, reports: [report("forged-report")] }), "unexpected-state"],
+      [sealManifest({
+        ...genesis,
+        rollbackLineage: { ...genesis.rollbackLineage, mode: "pre-write" },
+      }), "malformed-manifest"],
+    ]) {
+      expectProtocolError(
+        () => assertMigrationManifestGenesis(candidate as MigrationManifest),
+        reason as MigrationProtocolError["reason"],
+      );
+    }
   });
 
   it("canonicalizes checkpoint and report collection order and deeply freezes returned copies", () => {
@@ -603,6 +626,187 @@ describe("migration manifest protocol", () => {
         returnPhase: "verified",
       },
     })), "malformed-manifest");
+
+    expectProtocolError(() => parseMigrationManifest(sealManifest({
+      ...base,
+      phase: "rolling-back",
+      rollbackLineage: {
+        parentGenerationId: null,
+        preservedSourceGenerationId: "source-generation-1",
+        mode: null,
+        returnPhase: null,
+      },
+    })), "malformed-manifest");
+  });
+
+  it("authenticates only exact public-reducer successors", () => {
+    const initial = createValidManifest();
+    const begun = beginMigrationEffect(initial, {
+      effectId: "effect-successor",
+      kind: "verify-dry-run",
+      inputSha256: HASH_A,
+      startedAt: EFFECT_AT,
+    });
+    expect(assertMigrationManifestSuccessor(initial, begun)).toEqual(begun);
+    const completed = completeMigrationEffect(begun, {
+      effectId: "effect-successor",
+      completedAt: COMPLETE_AT,
+      report: report("report-successor", "dry-run", COMPLETE_AT),
+    });
+    expect(assertMigrationManifestSuccessor(begun, completed)).toEqual(completed);
+
+    const copyBase = manifestInPhase("dry-run-verified");
+    const copyPending = beginMigrationEffect(copyBase, {
+      effectId: "copy-successor",
+      kind: "copy-batch",
+      inputSha256: HASH_A,
+      startedAt: EFFECT_AT,
+    });
+    const firstCheckpoint = completeMigrationEffect(copyPending, {
+      effectId: "copy-successor",
+      completedAt: COMPLETE_AT,
+      checkpoint: checkpoint("messages", 1),
+    });
+    expect(assertMigrationManifestSuccessor(copyPending, firstCheckpoint)).toEqual(firstCheckpoint);
+    const nextCopyPending = beginMigrationEffect(firstCheckpoint, {
+      effectId: "copy-successor-next",
+      kind: "copy-batch",
+      inputSha256: HASH_B,
+      startedAt: "2026-08-12T12:00:04.000Z",
+    });
+    const replacedCheckpoint = completeMigrationEffect(nextCopyPending, {
+      effectId: "copy-successor-next",
+      completedAt: "2026-08-12T12:00:05.000Z",
+      checkpoint: checkpoint("messages", 2),
+    });
+    expect(assertMigrationManifestSuccessor(nextCopyPending, replacedCheckpoint))
+      .toEqual(replacedCheckpoint);
+
+    const verified = parseMigrationManifest(sealManifest({
+      ...initial,
+      revision: 4,
+      previousManifestSha256: HASH_A,
+      phase: "verified",
+      reports: [report("verified-successor", "verification", UPDATED_AT)],
+      activationEligible: true,
+      updatedAt: UPDATED_AT,
+    }));
+    const preparing = beginMigrationEffect(verified, {
+      effectId: "prepare-successor",
+      kind: "prepare-activation",
+      inputSha256: HASH_A,
+      startedAt: EFFECT_AT,
+    });
+    const activating = completeMigrationEffect(preparing, {
+      effectId: "prepare-successor",
+      completedAt: COMPLETE_AT,
+    });
+    const publishing = beginMigrationEffect(activating, {
+      effectId: "publish-successor",
+      kind: "publish-activation",
+      inputSha256: HASH_B,
+      startedAt: "2026-08-12T12:00:04.000Z",
+    });
+    const abandoned = abandonMigrationEffect(publishing, {
+      effectId: "publish-successor",
+      abandonedAt: "2026-08-12T12:00:05.000Z",
+      report: {
+        kind: "abandonment",
+        reportId: "abandon-successor",
+        reportSha256: HASH_C,
+        createdAt: "2026-08-12T12:00:05.000Z",
+      },
+    });
+    expect(assertMigrationManifestSuccessor(publishing, abandoned)).toEqual(abandoned);
+    const copied = parseMigrationManifest(sealManifest({
+      ...initial,
+      revision: 2,
+      previousManifestSha256: HASH_A,
+      phase: "copied",
+      updatedAt: UPDATED_AT,
+    }));
+    const verifyPending = beginMigrationEffect(copied, {
+      effectId: "verify-successor",
+      kind: "verify-generation",
+      inputSha256: HASH_A,
+      startedAt: EFFECT_AT,
+    });
+    const verifiedSuccessor = completeMigrationEffect(verifyPending, {
+      effectId: "verify-successor",
+      completedAt: COMPLETE_AT,
+      report: report("verify-successor-report", "verification", COMPLETE_AT),
+      activationEligible: true,
+    });
+    expect(assertMigrationManifestSuccessor(verifyPending, verifiedSuccessor))
+      .toEqual(verifiedSuccessor);
+
+    const rolling = completeMigrationEffect(beginMigrationEffect(verifiedSuccessor, {
+      effectId: "prepare-rollback-successor",
+      kind: "prepare-rollback",
+      inputSha256: HASH_A,
+      startedAt: "2026-08-12T12:00:04.000Z",
+    }), {
+      effectId: "prepare-rollback-successor",
+      completedAt: "2026-08-12T12:00:05.000Z",
+    });
+    const rollbackPending = beginMigrationEffect(rolling, {
+      effectId: "publish-rollback-successor",
+      kind: "publish-rollback",
+      inputSha256: HASH_B,
+      startedAt: "2026-08-12T12:00:06.000Z",
+    });
+    const rolledBack = completeMigrationEffect(rollbackPending, {
+      effectId: "publish-rollback-successor",
+      completedAt: "2026-08-12T12:00:07.000Z",
+      report: report("rollback-successor-report", "rollback", "2026-08-12T12:00:07.000Z"),
+      rollbackMode: "pre-write",
+    });
+    expect(assertMigrationManifestSuccessor(rollbackPending, rolledBack)).toEqual(rolledBack);
+
+    for (const candidate of [
+      sealManifest({ ...begun, source: witness("postgresql", CREATED_AT) }),
+      sealManifest({ ...begun, phase: "dry-run-verified", pendingEffect: null }),
+      sealManifest({ ...begun, reports: [report("injected", "dry-run")] }),
+      sealManifest({ ...begun, checkpoints: [checkpoint("injected", 1)] }),
+    ]) {
+      expectProtocolError(
+        () => assertMigrationManifestSuccessor(initial, candidate),
+        "unexpected-state",
+      );
+    }
+    expectProtocolError(
+      () => assertMigrationManifestSuccessor(initial, initial),
+      "unexpected-state",
+    );
+    expectProtocolError(
+      () => assertMigrationManifestSuccessor(begun, sealManifest({
+        ...completed,
+        pendingEffect: {
+          effectId: "illegal-second-pending",
+          kind: "copy-batch",
+          fromPhase: "dry-run-verified",
+          targetPhase: "copying",
+          inputSha256: HASH_A,
+          recovery: "authoritative-readback-required",
+          startedAt: "2026-08-12T12:00:04.000Z",
+        },
+      })),
+      "unexpected-state",
+    );
+    expectProtocolError(
+      () => assertMigrationManifestSuccessor(begun, sealManifest({
+        ...completed,
+        reports: [],
+      })),
+      "unexpected-state",
+    );
+    expectProtocolError(
+      () => assertMigrationManifestSuccessor(begun, sealManifest({
+        ...completed,
+        reports: [report("wrong-abandonment", "abandonment", COMPLETE_AT)],
+      })),
+      "unexpected-state",
+    );
   });
 
   it.each([
@@ -1333,27 +1537,6 @@ describe("migration manifest protocol", () => {
         "unexpected-state",
       );
 
-      const missingReturn = parseMigrationManifest(sealManifest({
-        ...verified,
-        revision: 3,
-        phase: "rolling-back",
-        previousManifestSha256: HASH_A,
-        rollbackLineage: { ...verified.rollbackLineage, returnPhase: null },
-        pendingEffect: {
-          effectId: "publish-r",
-          kind: "publish-rollback",
-          fromPhase: "rolling-back",
-          targetPhase: "rolled-back",
-          inputSha256: HASH_B,
-          recovery: "authoritative-readback-required",
-          startedAt: "2026-08-12T12:00:04.000Z",
-        },
-        updatedAt: "2026-08-12T12:00:04.000Z",
-      }));
-      expectProtocolError(
-        () => abandonMigrationEffect(missingReturn, abandonment("publish-r", "2026-08-12T12:00:05.000Z")),
-        "unexpected-state",
-      );
     });
   });
 

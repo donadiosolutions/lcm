@@ -6,11 +6,13 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -82,6 +84,13 @@ function resealManifest(value: MigrationManifest, changes: Partial<MigrationMani
     ...payload,
     checksumSha256: migrationManifestCanonicalSha256(payload),
   };
+}
+
+function canonicalFixture(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalFixture).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalFixture(record[key])}`).join(",")}}`;
 }
 
 function replaceWithRevision(
@@ -377,7 +386,7 @@ describe("migration manifest durable create and read", () => {
       inputSha256: HASH,
       startedAt: "2026-08-12T12:00:01.000Z",
     });
-    expectProtocolReason(() => store.create(advanced), "invalid-input");
+    expectProtocolReason(() => store.create(advanced), "unexpected-state");
     expect(store.create(initial)).toEqual(initial);
     const duplicateEvents: string[] = [];
     expectProtocolReason(() => new MigrationManifestStore({
@@ -424,9 +433,74 @@ describe("migration manifest durable create and read", () => {
       .create(manifest("mkdir-failure")))).toThrow("mkdir denied");
   });
 
+  it("rejects oversized canonical genesis content before creating durable paths", () => {
+    const home = makeHome();
+    const initial = manifest("oversized-genesis");
+    const reports = Array.from({ length: 6_500 }, (_, index) => ({
+      kind: "dry-run" as const,
+      reportId: `report-${index.toString(10).padStart(8, "0")}`,
+      reportSha256: HASH,
+      createdAt: UPDATED_AT,
+    }));
+    const oversized = resealManifest(initial, { reports });
+    expect(Buffer.byteLength(`${canonicalFixture(oversized)}\n`, "utf8")).toBeGreaterThan(1 * 1024 * 1024);
+
+    expectProtocolReason(
+      () => new MigrationManifestStore({ homeDir: home }).create(oversized),
+      "unexpected-state",
+    );
+    expect(existsSync(join(home, ".lcm", "migrations"))).toBe(false);
+  });
+
+  it("rejects oversized legal successors before staging a revision", () => {
+    const home = makeHome();
+    const initial = resealManifest(manifest("oversized-update"), {
+      revision: 1,
+      previousManifestSha256: HASH,
+      reports: Array.from({ length: 6_197 }, (_, index) => ({
+        kind: "dry-run" as const,
+        reportId: `report-${index.toString(10).padStart(8, "0")}`,
+        reportSha256: HASH,
+        createdAt: UPDATED_AT,
+      })),
+    });
+    const oversized = beginMigrationEffect(initial, {
+      effectId: "oversized-next",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const store = new MigrationManifestStore({ homeDir: home });
+    const revisionPath = migrationManifestRevisionPath({
+      generationId: initial.generationId,
+      revision: initial.revision,
+      checksumSha256: initial.checksumSha256,
+    }, home);
+    mkdirSync(resolve(revisionPath, ".."), { recursive: true, mode: 0o700 });
+    writeFileSync(revisionPath, `${canonicalFixture(initial)}\n`, { mode: 0o600 });
+    writeFileSync(
+      migrationManifestHeadPath(initial.generationId, home),
+      migrationManifestHeadContent(createMigrationManifestHead({
+        generationId: initial.generationId,
+        revision: initial.revision,
+        manifestSha256: initial.checksumSha256,
+        updatedAt: initial.updatedAt,
+      })),
+      { mode: 0o600 },
+    );
+    expect(Buffer.byteLength(`${canonicalFixture(initial)}\n`, "utf8")).toBeLessThanOrEqual(1 * 1024 * 1024);
+    expect(Buffer.byteLength(`${canonicalFixture(oversized)}\n`, "utf8")).toBeGreaterThan(1 * 1024 * 1024);
+    expectProtocolReason(
+      () => store.update(initial.generationId, initial.checksumSha256, () => oversized),
+      "invalid-input",
+    );
+    expect(store.read(initial.generationId)).toEqual(initial);
+  });
+
   it("publishes revision before head at exact observer crash boundaries", () => {
     const events = [
       "before-revision-publication",
+      "before-revision-content-publication",
       "after-revision-publication",
       "before-head-publication",
       "after-head-publication",
@@ -452,18 +526,40 @@ describe("migration manifest durable create and read", () => {
       }, home);
       const head = migrationManifestHeadPath(initial.generationId, home);
       const crashIndex = events.indexOf(crashEvent);
-      expect(existsSync(revision)).toBe(crashIndex >= 1);
-      expect(existsSync(head)).toBe(crashIndex >= 3);
+      expect(existsSync(revision)).toBe(crashIndex >= 2);
+      expect(existsSync(head)).toBe(crashIndex >= 4);
       expect(observed.map((entry) => entry.slice(0, entry.indexOf(":"))))
         .toEqual(events.slice(0, crashIndex + 1));
       if (crashEvent === "after-head-publication") {
         expect(store.read(initial.generationId)).toEqual(initial);
       }
-      if (crashEvent === "before-revision-publication") {
-        expect(existsSync(migrationManifestGenerationDirectory(initial.generationId, home))).toBe(false);
+      if (crashEvent === "before-revision-publication" || crashEvent === "before-revision-content-publication") {
+        expect(existsSync(resolve(revision, ".."))).toBe(
+          crashEvent === "before-revision-content-publication",
+        );
         expect(new MigrationManifestStore({ homeDir: home }).create(initial)).toEqual(initial);
       }
     }
+  });
+
+  it("refuses an unexpected entry in a resumable headless generation", () => {
+    const home = makeHome();
+    const initial = manifest("unexpected-headless-entry");
+    const store = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event, path) => {
+        if (event !== "before-revision-publication") return;
+        const generation = resolve(path, "../../..");
+        mkdirSync(generation, { mode: 0o700 });
+        writeFileSync(join(generation, "unexpected"), "evidence", { mode: 0o600 });
+      },
+    });
+
+    expectProtocolReason(() => store.create(initial), "unexpected-state");
+    expect(readFileSync(join(
+      migrationManifestGenerationDirectory(initial.generationId, home),
+      "unexpected",
+    ), "utf8")).toBe("evidence");
   });
 
   it("refuses authenticated head, revision-directory, and revision-content disagreement", () => {
@@ -497,6 +593,32 @@ describe("migration manifest durable create and read", () => {
     const ambiguous = makeStored("ambiguous-generation");
     writeFileSync(join(resolve(ambiguous.revision, ".."), "extra"), "evidence", { mode: 0o600 });
     expectProtocolReason(() => ambiguous.store.read(ambiguous.initial.generationId), "malformed-manifest");
+
+    const crowded = makeStored("crowded-generation");
+    for (const suffix of ["d", "e"]) {
+      writeFileSync(
+        join(
+          resolve(crowded.revision, ".."),
+          `.${crowded.initial.checksumSha256}.json.${suffix.repeat(24)}.tmp`,
+        ),
+        "scratch",
+        { mode: 0o600 },
+      );
+    }
+    expectProtocolReason(() => crowded.store.read(crowded.initial.generationId), "malformed-manifest");
+
+    const scratchOnly = makeStored("scratch-only-generation");
+    renameSync(
+      scratchOnly.revision,
+      join(
+        resolve(scratchOnly.revision, ".."),
+        `.${scratchOnly.initial.checksumSha256}.json.${"f".repeat(24)}.tmp`,
+      ),
+    );
+    expectProtocolReason(
+      () => scratchOnly.store.read(scratchOnly.initial.generationId),
+      "malformed-manifest",
+    );
 
     const other = makeStored("other-content-generation");
     writeFileSync(ambiguous.revision, readFileSync(other.revision), { mode: 0o600 });
@@ -547,7 +669,9 @@ describe("migration manifest durable create and read", () => {
     }, collisionHome);
     const realLink = createRequire(import.meta.url)("node:fs").linkSync as typeof linkSync;
     expect(() => withPatchedFs("linkSync", ((source: string, destination: string) => {
-      if (destination === collisionPath) writeFileSync(destination, "attacker", { mode: 0o600 });
+      if (destination.endsWith(`/${collision.checksumSha256}.json`)) {
+        writeFileSync(destination, "attacker", { mode: 0o600 });
+      }
       return realLink(source, destination);
     }) as never, () => new MigrationManifestStore({ homeDir: collisionHome }).create(collision)))
       .toThrow("created concurrently");
@@ -569,14 +693,15 @@ describe("migration manifest durable create and read", () => {
     const generationRaceHome = makeHome();
     const generationRace = manifest("generation-race");
     const realMkdir = createRequire(import.meta.url)("node:fs").mkdirSync as typeof mkdirSync;
-    expectProtocolReason(() => withPatchedFs("mkdirSync", ((path: string, options?: unknown) => {
+    expect(() => withPatchedFs("mkdirSync", ((path: string, options?: unknown) => {
       if (path.endsWith("/generation-race")) {
         const error = new Error("generation appeared") as NodeJS.ErrnoException;
         error.code = "EEXIST";
         throw error;
       }
       return realMkdir(path, options as never);
-    }) as never, () => new MigrationManifestStore({ homeDir: generationRaceHome }).create(generationRace)), "unexpected-state");
+    }) as never, () => new MigrationManifestStore({ homeDir: generationRaceHome }).create(generationRace)))
+      .toThrow();
 
     const cleanupHome = makeHome();
     const cleanupStore = new MigrationManifestStore({ homeDir: cleanupHome });
@@ -651,6 +776,7 @@ describe("migration manifest compare-and-swap update", () => {
     expect(store.read(initial.generationId)).toEqual(updated);
     expect(events).toEqual([
       "before-revision-publication",
+      "before-revision-content-publication",
       "after-revision-publication",
       "before-head-publication",
       "after-head-publication",
@@ -705,6 +831,19 @@ describe("migration manifest compare-and-swap update", () => {
         candidate.checksumSha256 === "0".repeat(64) ? "checksum-mismatch" : "unexpected-state",
       );
     }
+    const directPhase = resealManifest(valid, {
+      phase: "dry-run-verified",
+      pendingEffect: null,
+    });
+    const changedWitness = resealManifest(valid, {
+      source: { ...valid.source, contentSha256: "b".repeat(64) },
+    });
+    for (const candidate of [directPhase, changedWitness]) {
+      expectProtocolReason(
+        () => store.update(initial.generationId, initial.checksumSha256, () => candidate),
+        "unexpected-state",
+      );
+    }
     expect(store.read(initial.generationId)).toEqual(initial);
     expect(events).toEqual([]);
   });
@@ -751,6 +890,7 @@ describe("migration manifest compare-and-swap update", () => {
   it("preserves exact update crash states and retries only the pre-revision boundary", () => {
     const crashEvents = [
       "before-revision-publication",
+      "before-revision-content-publication",
       "after-revision-publication",
       "before-head-publication",
       "after-head-publication",
@@ -781,16 +921,203 @@ describe("migration manifest compare-and-swap update", () => {
         checksumSha256: candidate.checksumSha256,
       }, home);
       const crashIndex = crashEvents.indexOf(crashEvent);
-      expect(existsSync(successorPath)).toBe(crashIndex >= 1);
-      if (crashEvent === "before-revision-publication") {
-        expect(existsSync(resolve(successorPath, ".."))).toBe(false);
+      expect(existsSync(successorPath)).toBe(crashIndex >= 2);
+      if (crashEvent === "before-revision-publication" || crashEvent === "before-revision-content-publication") {
+        expect(existsSync(resolve(successorPath, ".."))).toBe(
+          crashEvent === "before-revision-content-publication",
+        );
+        if (crashEvent === "before-revision-content-publication") {
+          expect(readdirSync(resolve(successorPath, ".."))).toEqual([]);
+        }
         expect(store.update(initial.generationId, initial.checksumSha256, () => candidate)).toEqual(candidate);
       } else if (crashEvent === "after-head-publication") {
         expect(store.read(initial.generationId)).toEqual(candidate);
       } else {
+        expectProtocolReason(
+          () => store.update(initial.generationId, initial.checksumSha256, () => candidate),
+          "recovery-required",
+        );
         expectProtocolReason(() => store.read(initial.generationId), "recovery-required");
       }
     }
+  });
+
+  it("resumes authenticated empty and writer-scratch revision directories", () => {
+    const home = makeHome();
+    const initial = manifest("staging-scratch");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const revisions = join(
+      migrationManifestGenerationDirectory(initial.generationId, home),
+      "revisions",
+    );
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-staging-scratch",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const successorDirectory = join(revisions, "0000000000000001");
+    mkdirSync(successorDirectory, { mode: 0o700 });
+    writeFileSync(
+      join(successorDirectory, `.${candidate.checksumSha256}.json.${"d".repeat(24)}.tmp`),
+      "scratch",
+      { mode: 0o600 },
+    );
+    const crashingRetry = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => {
+        if (event === "before-revision-content-publication") throw new Error("crash:retry");
+      },
+    });
+    expect(() => crashingRetry.update(
+      initial.generationId,
+      initial.checksumSha256,
+      () => candidate,
+    )).toThrow("crash:retry");
+    expect(readdirSync(successorDirectory)).toEqual([]);
+    expect(store.update(initial.generationId, initial.checksumSha256, () => candidate)).toEqual(candidate);
+    expect(store.read(initial.generationId)).toEqual(candidate);
+    expect(readdirSync(successorDirectory)).toHaveLength(1);
+  });
+
+  it("preserves multiple pre-content revision scratches and fails closed", () => {
+    const home = makeHome();
+    const initial = manifest("multiple-pre-content-revision-scratches");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-multiple-pre-content-revision-scratches",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const successorDirectory = resolve(migrationManifestRevisionPath({
+      generationId: candidate.generationId,
+      revision: candidate.revision,
+      checksumSha256: candidate.checksumSha256,
+    }, home), "..");
+    mkdirSync(successorDirectory, { mode: 0o700 });
+    const scratches = ["a", "b"].map((suffix) => (
+      `.${candidate.checksumSha256}.json.${suffix.repeat(24)}.tmp`
+    ));
+    for (const scratch of scratches) {
+      writeFileSync(join(successorDirectory, scratch), `scratch-${scratch}\n`, { mode: 0o600 });
+    }
+
+    expectProtocolReason(
+      () => store.update(initial.generationId, initial.checksumSha256, () => candidate),
+      "malformed-manifest",
+    );
+    expect(readdirSync(successorDirectory).sort()).toEqual(scratches.sort());
+    expect(existsSync(migrationManifestRevisionPath({
+      generationId: candidate.generationId,
+      revision: candidate.revision,
+      checksumSha256: candidate.checksumSha256,
+    }, home))).toBe(false);
+    expectProtocolReason(() => store.read(initial.generationId), "recovery-required");
+  });
+
+  it("accepts the exact post-link writer crash pair without deleting evidence", () => {
+    const home = makeHome();
+    const initial = manifest("post-link-scratch");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-post-link-scratch",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const successorDirectory = resolve(migrationManifestRevisionPath({
+      generationId: candidate.generationId,
+      revision: candidate.revision,
+      checksumSha256: candidate.checksumSha256,
+    }, home), "..");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalUnlink = nodeFs.unlinkSync as (path: string) => void;
+    expect(() => withPatchedFs("unlinkSync", ((path: string) => {
+      if (path.startsWith(`${successorDirectory}/.`) && path.endsWith(".tmp")) {
+        throw Object.assign(new Error("crash:after-manifest-link"), { code: "EACCES" });
+      }
+      originalUnlink(path);
+    }) as never, () => store.update(
+      initial.generationId,
+      initial.checksumSha256,
+      () => candidate,
+    ))).toThrow("crash:after-manifest-link");
+    expect(readdirSync(successorDirectory)).toHaveLength(2);
+    expectProtocolReason(() => store.read(initial.generationId), "recovery-required");
+    expect(store.recover(initial.generationId)).toEqual(candidate);
+    expect(store.read(initial.generationId)).toEqual(candidate);
+    expect(readdirSync(successorDirectory)).toHaveLength(2);
+  });
+
+  it("rejects a separate single-link revision manifest and scratch pair", () => {
+    const home = makeHome();
+    const initial = manifest("separate-single-link-revision-pair");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-separate-single-link-revision-pair",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const manifestPath = publishSuccessorOrphan(home, initial, candidate);
+    const revisionDirectory = resolve(manifestPath, "..");
+    const scratchPath = join(
+      revisionDirectory,
+      `.${candidate.checksumSha256}.json.${"e".repeat(24)}.tmp`,
+    );
+    writeFileSync(scratchPath, readFileSync(manifestPath), { mode: 0o600 });
+
+    expectProtocolReason(() => store.recover(initial.generationId), "malformed-manifest");
+    expect(readFileSync(migrationManifestHeadPath(initial.generationId, home), "utf8"))
+      .toContain(initial.checksumSha256);
+    expect(lstatSync(manifestPath).nlink).toBe(1);
+    expect(lstatSync(scratchPath).nlink).toBe(1);
+  });
+
+  it("rejects a manifest and scratch pair that is not an exact writer state", () => {
+    const home = makeHome();
+    const initial = manifest("invalid-writer-pair");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-invalid-writer-pair",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const successorDirectory = resolve(migrationManifestRevisionPath({
+      generationId: candidate.generationId,
+      revision: candidate.revision,
+      checksumSha256: candidate.checksumSha256,
+    }, home), "..");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalUnlink = nodeFs.unlinkSync as (path: string) => void;
+    expect(() => withPatchedFs("unlinkSync", ((path: string) => {
+      if (path.startsWith(`${successorDirectory}/.`) && path.endsWith(".tmp")) {
+        throw Object.assign(new Error("crash:retain-writer-pair"), { code: "EACCES" });
+      }
+      originalUnlink(path);
+    }) as never, () => store.update(
+      initial.generationId,
+      initial.checksumSha256,
+      () => candidate,
+    ))).toThrow("crash:retain-writer-pair");
+    const scratch = readdirSync(successorDirectory).find((entry) => entry.startsWith("."))!;
+    unlinkSync(join(successorDirectory, scratch));
+    writeFileSync(join(successorDirectory, scratch), "different", { mode: 0o600 });
+    linkSync(
+      join(successorDirectory, scratch),
+      join(home, "unexpected-scratch-hard-link"),
+    );
+
+    expectProtocolReason(() => store.recover(initial.generationId), "malformed-manifest");
+    expect(readFileSync(migrationManifestHeadPath(initial.generationId, home), "utf8"))
+      .toContain(initial.checksumSha256);
   });
 
   it("loses exact-string head compare-and-swap races without overwriting shorter evidence", () => {
@@ -855,6 +1182,99 @@ describe("migration manifest compare-and-swap update", () => {
 });
 
 describe("migration manifest exact recovery", () => {
+  it("consumes a post-link head alias before update stages its successor", () => {
+    const home = makeHome();
+    const initial = manifest("head-alias-update-order");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const headPath = migrationManifestHeadPath(initial.generationId, home);
+    const aliasPath = join(generation, ".head.json.0123456789abcdef01234567.tmp");
+    linkSync(headPath, aliasPath);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-head-alias-update",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const events: string[] = [];
+    const updating = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => {
+        events.push(event);
+        if (event === "before-revision-publication") {
+          expect(existsSync(aliasPath)).toBe(false);
+          expect(lstatSync(headPath).nlink).toBe(1);
+        }
+      },
+    });
+
+    expect(updating.update(initial.generationId, initial.checksumSha256, () => candidate)).toEqual(candidate);
+    expect(existsSync(aliasPath)).toBe(false);
+    expect(updating.read(initial.generationId)).toEqual(candidate);
+    expect(existsSync(migrationManifestRevisionPath({
+      generationId: candidate.generationId,
+      revision: candidate.revision,
+      checksumSha256: candidate.checksumSha256,
+    }, home))).toBe(true);
+    expect(events[0]).toBe("before-revision-publication");
+  });
+
+  it("classifies head-alias cleanup failure before staging a successor", () => {
+    const home = makeHome();
+    const initial = manifest("head-alias-cleanup-failure");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const headPath = migrationManifestHeadPath(initial.generationId, home);
+    const aliasPath = join(generation, ".head.json.0123456789abcdef01234567.tmp");
+    linkSync(headPath, aliasPath);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-head-alias-cleanup-failure",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const successorDirectory = join(generation, "revisions", "0000000000000001");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalUnlink = nodeFs.unlinkSync as (path: string) => void;
+
+    expectProtocolReason(() => withPatchedFs("unlinkSync", ((path: string) => {
+      if (path === aliasPath) throw Object.assign(new Error("cleanup denied"), { code: "EACCES" });
+      originalUnlink(path);
+    }) as never, () => store.update(
+      initial.generationId,
+      initial.checksumSha256,
+      () => candidate,
+    )), "malformed-manifest");
+    expect(existsSync(successorDirectory)).toBe(false);
+    expect(lstatSync(headPath).nlink).toBe(2);
+    expect(lstatSync(aliasPath).nlink).toBe(2);
+  });
+
+  it("consumes a post-link head alias before recovering a legal successor", () => {
+    const home = makeHome();
+    const initial = manifest("head-alias-successor-recovery");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-head-alias-successor-recovery",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    publishSuccessorOrphan(home, initial, candidate);
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const headPath = migrationManifestHeadPath(initial.generationId, home);
+    const aliasPath = join(generation, ".head.json.0123456789abcdef01234567.tmp");
+    linkSync(headPath, aliasPath);
+
+    expect(store.recover(initial.generationId)).toEqual(candidate);
+    expect(existsSync(aliasPath)).toBe(false);
+    expect(store.read(initial.generationId)).toEqual(candidate);
+  });
+
   it("returns an intact head unchanged and advances exactly one authenticated orphan", () => {
     const home = makeHome();
     const initial = manifest("recover-successor");
@@ -880,6 +1300,653 @@ describe("migration manifest exact recovery", () => {
     expect(recovering.read(initial.generationId)).toEqual(candidate);
     expect(readFileSync(orphanPath, "utf8")).toContain(candidate.checksumSha256);
     expect(recoveryEvents).toEqual(["before-head-publication", "after-head-publication"]);
+  });
+
+  it("rejects a checksum-valid forged successor before publishing the head", () => {
+    const home = makeHome();
+    const initial = manifest("recover-forged-successor");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const legalCandidate = beginMigrationEffect(initial, {
+      effectId: "effect-forged-successor",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const orphanPath = publishSuccessorOrphan(home, initial, legalCandidate);
+    const forged = rewriteManifestFixture(orphanPath, {
+      phase: "active",
+      pendingEffect: null,
+      reports: [{
+        createdAt: "2026-08-12T12:00:01.000Z",
+        kind: "verification",
+        reportId: "forged-verification",
+        reportSha256: HASH,
+      }],
+      activationEligible: true,
+      updatedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const forgedPath = migrationManifestRevisionPath({
+      generationId: forged.generationId,
+      revision: forged.revision,
+      checksumSha256: forged.checksumSha256,
+    }, home);
+    renameSync(orphanPath, forgedPath);
+    const headPath = migrationManifestHeadPath(initial.generationId, home);
+    const headBefore = readFileSync(headPath, "utf8");
+
+    expectProtocolReason(() => store.recover(initial.generationId), "unexpected-state");
+    expect(readFileSync(headPath, "utf8")).toBe(headBefore);
+    expect(existsSync(forgedPath)).toBe(true);
+    expectProtocolReason(() => store.read(initial.generationId), "recovery-required");
+  });
+
+  it("returns the current head for empty and scratch-only successors and lets update retry", () => {
+    for (const state of ["empty", "scratch-only"] as const) {
+      const home = makeHome();
+      const initial = manifest(`recover-incomplete-${state}`);
+      const store = new MigrationManifestStore({ homeDir: home });
+      store.create(initial);
+      const candidate = beginMigrationEffect(initial, {
+        effectId: `effect-incomplete-${state}`,
+        kind: "verify-dry-run",
+        inputSha256: HASH,
+        startedAt: "2026-08-12T12:00:01.000Z",
+      });
+      const successorDirectory = join(
+        migrationManifestGenerationDirectory(initial.generationId, home),
+        "revisions",
+        "0000000000000001",
+      );
+      mkdirSync(successorDirectory, { mode: 0o700 });
+      const scratch = `.${candidate.checksumSha256}.json.${"a".repeat(24)}.tmp`;
+      if (state === "scratch-only") writeFileSync(join(successorDirectory, scratch), "scratch", { mode: 0o600 });
+      const headPath = migrationManifestHeadPath(initial.generationId, home);
+      const headBefore = readFileSync(headPath, "utf8");
+
+      expectProtocolReason(() => store.read(initial.generationId), "recovery-required");
+      expect(store.recover(initial.generationId)).toEqual(initial);
+      expect(readFileSync(headPath, "utf8")).toBe(headBefore);
+      expect(readdirSync(successorDirectory)).toEqual(state === "empty" ? [] : [scratch]);
+      expect(store.update(initial.generationId, initial.checksumSha256, () => candidate)).toEqual(candidate);
+      expect(store.read(initial.generationId)).toEqual(candidate);
+    }
+  });
+
+  it("refuses an unknown scratch-only recovery entry without changing the head", () => {
+    const home = makeHome();
+    const initial = manifest("recover-unknown-scratch");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const successorDirectory = join(
+      migrationManifestGenerationDirectory(initial.generationId, home),
+      "revisions",
+      "0000000000000001",
+    );
+    mkdirSync(successorDirectory, { mode: 0o700 });
+    writeFileSync(join(successorDirectory, "unknown.tmp"), "scratch", { mode: 0o600 });
+    const headPath = migrationManifestHeadPath(initial.generationId, home);
+    const headBefore = readFileSync(headPath, "utf8");
+
+    expectProtocolReason(() => store.recover(initial.generationId), "malformed-manifest");
+    expect(readFileSync(headPath, "utf8")).toBe(headBefore);
+  });
+
+  it("recovers a create head left in the post-link pre-unlink window", () => {
+    const home = makeHome();
+    const initial = manifest("create-head-post-link");
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const headPath = migrationManifestHeadPath(initial.generationId, home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalUnlink = nodeFs.unlinkSync as (path: string) => void;
+    expect(() => withPatchedFs("unlinkSync", ((path: string) => {
+      if (path.startsWith(`${generation}/.head.json.`) && path.endsWith(".tmp")) {
+        throw Object.assign(new Error("crash:after-head-link-create"), { code: "EACCES" });
+      }
+      originalUnlink(path);
+    }) as never, () => new MigrationManifestStore({ homeDir: home }).create(initial)))
+      .toThrow("crash:after-head-link-create");
+
+    const entries = readdirSync(generation);
+    const scratch = entries.find((entry) => /^\.head\.json\.[0-9a-f]{24}\.tmp$/u.test(entry));
+    expect(scratch).toBeDefined();
+    const scratchPath = join(generation, scratch!);
+    const headStat = lstatSync(headPath);
+    const scratchStat = lstatSync(scratchPath);
+    expect(headStat.isFile()).toBe(true);
+    expect(scratchStat.isFile()).toBe(true);
+    expect(headStat.nlink).toBe(2);
+    expect(scratchStat.nlink).toBe(2);
+    expect(scratchStat.dev).toBe(headStat.dev);
+    expect(scratchStat.ino).toBe(headStat.ino);
+    const evidenceBefore = readdirSync(generation).sort();
+
+    const store = new MigrationManifestStore({ homeDir: home });
+    expect(store.read(initial.generationId)).toEqual(initial);
+    expect(store.recover(initial.generationId)).toEqual(initial);
+    expectProtocolReason(() => store.create(initial), "unexpected-state");
+    expect(readdirSync(generation).sort()).toEqual(evidenceBefore);
+    expect(readFileSync(headPath, "utf8")).toBe(readFileSync(scratchPath, "utf8"));
+  });
+
+  it("recovers a headless recovery head left in the post-link pre-unlink window", () => {
+    const home = makeHome();
+    const initial = manifest("headless-recover-head-post-link");
+    const crashing = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => {
+        if (event === "after-revision-publication") throw new Error("crash:headless-before-head");
+      },
+    });
+    expect(() => crashing.create(initial)).toThrow("crash:headless-before-head");
+
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const headPath = migrationManifestHeadPath(initial.generationId, home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalUnlink = nodeFs.unlinkSync as (path: string) => void;
+    expect(() => withPatchedFs("unlinkSync", ((path: string) => {
+      if (path.startsWith(`${generation}/.head.json.`) && path.endsWith(".tmp")) {
+        throw Object.assign(new Error("crash:after-head-link-recover"), { code: "EACCES" });
+      }
+      originalUnlink(path);
+    }) as never, () => new MigrationManifestStore({ homeDir: home }).recover(initial.generationId)))
+      .toThrow("crash:after-head-link-recover");
+
+    const scratch = readdirSync(generation)
+      .find((entry) => /^\.head\.json\.[0-9a-f]{24}\.tmp$/u.test(entry));
+    expect(scratch).toBeDefined();
+    const scratchPath = join(generation, scratch!);
+    expect(lstatSync(headPath).nlink).toBe(2);
+    expect(lstatSync(scratchPath).nlink).toBe(2);
+    const evidenceBefore = readdirSync(generation).sort();
+
+    const store = new MigrationManifestStore({ homeDir: home });
+    expect(store.read(initial.generationId)).toEqual(initial);
+    expect(store.recover(initial.generationId)).toEqual(initial);
+    expectProtocolReason(() => store.create(initial), "unexpected-state");
+    expect(readdirSync(generation).sort()).toEqual(evidenceBefore);
+    expect(readFileSync(headPath, "utf8")).toBe(readFileSync(scratchPath, "utf8"));
+  });
+
+  it("consumes a durable pre-rename head temp before update reports recovery-required", () => {
+    const home = makeHome();
+    const initial = manifest("head-pre-rename-update");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-head-pre-rename-update",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    publishSuccessorOrphan(home, initial, candidate);
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const scratchPath = join(generation, `.head.json.${"a".repeat(24)}.tmp`);
+    writeFileSync(scratchPath, migrationManifestHeadContent(createMigrationManifestHead({
+      generationId: candidate.generationId,
+      revision: candidate.revision,
+      manifestSha256: candidate.checksumSha256,
+      updatedAt: candidate.updatedAt,
+    })), { mode: 0o600 });
+
+    expectProtocolReason(() => store.read(initial.generationId), "recovery-required");
+    expect(existsSync(scratchPath)).toBe(true);
+
+    const updating = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => {
+        if (event === "before-revision-publication") {
+          expect(existsSync(scratchPath)).toBe(false);
+        }
+      },
+    });
+    expectProtocolReason(
+      () => updating.update(initial.generationId, initial.checksumSha256, () => candidate),
+      "recovery-required",
+    );
+    expect(updating.recover(initial.generationId)).toEqual(candidate);
+    expect(updating.read(initial.generationId)).toEqual(candidate);
+    expect(existsSync(scratchPath)).toBe(false);
+  });
+
+  it("recovers a headless genesis through a durable pre-link head temp", () => {
+    const home = makeHome();
+    const initial = manifest("head-pre-link-genesis-recovery");
+    const crashing = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => {
+        if (event === "after-revision-publication") throw new Error("crash:head-pre-link-genesis");
+      },
+    });
+    expect(() => crashing.create(initial)).toThrow("crash:head-pre-link-genesis");
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const scratchPath = join(generation, `.head.json.${"b".repeat(24)}.tmp`);
+    writeFileSync(scratchPath, migrationManifestHeadContent(createMigrationManifestHead({
+      generationId: initial.generationId,
+      revision: initial.revision,
+      manifestSha256: initial.checksumSha256,
+      updatedAt: initial.updatedAt,
+    })), { mode: 0o600 });
+
+    const store = new MigrationManifestStore({ homeDir: home });
+    expect(store.recover(initial.generationId)).toEqual(initial);
+    expect(store.read(initial.generationId)).toEqual(initial);
+    expect(existsSync(scratchPath)).toBe(false);
+  });
+
+  it("consumes a durable pre-link head temp before an exact create retry", () => {
+    const home = makeHome();
+    const initial = manifest("head-pre-link-create-retry");
+    const crashing = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => {
+        if (event === "after-revision-publication") throw new Error("crash:head-pre-link-create-retry");
+      },
+    });
+    expect(() => crashing.create(initial)).toThrow("crash:head-pre-link-create-retry");
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const scratchPath = join(generation, `.head.json.${"d".repeat(24)}.tmp`);
+    writeFileSync(scratchPath, migrationManifestHeadContent(createMigrationManifestHead({
+      generationId: initial.generationId,
+      revision: initial.revision,
+      manifestSha256: initial.checksumSha256,
+      updatedAt: initial.updatedAt,
+    })), { mode: 0o600 });
+
+    expectProtocolReason(
+      () => new MigrationManifestStore({ homeDir: home }).create(initial),
+      "recovery-required",
+    );
+    expect(existsSync(scratchPath)).toBe(false);
+    const store = new MigrationManifestStore({ homeDir: home });
+    expect(store.recover(initial.generationId)).toEqual(initial);
+    expect(store.read(initial.generationId)).toEqual(initial);
+  });
+
+  it("consumes a pre-rename head temp before reporting and recovering a published successor", () => {
+    const home = makeHome();
+    const initial = manifest("head-pre-rename-successor-recovery");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-head-pre-rename-successor-recovery",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    publishSuccessorOrphan(home, initial, candidate);
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const scratchPath = join(generation, `.head.json.${"c".repeat(24)}.tmp`);
+    writeFileSync(scratchPath, migrationManifestHeadContent(createMigrationManifestHead({
+      generationId: candidate.generationId,
+      revision: candidate.revision,
+      manifestSha256: candidate.checksumSha256,
+      updatedAt: candidate.updatedAt,
+    })), { mode: 0o600 });
+
+    expectProtocolReason(
+      () => store.update(initial.generationId, initial.checksumSha256, () => candidate),
+      "recovery-required",
+    );
+    expect(existsSync(scratchPath)).toBe(false);
+    expect(store.recover(initial.generationId)).toEqual(candidate);
+    expect(store.read(initial.generationId)).toEqual(candidate);
+  });
+
+  it("rejects unauthenticated single-link head writer temps without consuming them", () => {
+    for (const state of ["malformed", "wrong-generation", "missing-successor"] as const) {
+      const home = makeHome();
+      const initial = manifest(`head-temp-${state}`);
+      const store = new MigrationManifestStore({ homeDir: home });
+      store.create(initial);
+      const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+      const scratchPath = join(generation, `.head.json.${"e".repeat(24)}.tmp`);
+      const scratchContent = state === "malformed"
+        ? "not-a-head\n"
+        : migrationManifestHeadContent(createMigrationManifestHead({
+          generationId: state === "wrong-generation"
+            ? "different-generation"
+            : initial.generationId,
+          revision: 1,
+          manifestSha256: HASH,
+          updatedAt: "2026-08-12T12:00:01.000Z",
+        }));
+      writeFileSync(scratchPath, scratchContent, { mode: 0o600 });
+
+      expectProtocolReason(() => store.read(initial.generationId), "malformed-manifest");
+      expect(readFileSync(scratchPath, "utf8")).toBe(scratchContent);
+    }
+  });
+
+  it("preserves a valid head temp that does not match the published successor", () => {
+    const home = makeHome();
+    const initial = manifest("head-temp-wrong-candidate");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const retainedCandidate = beginMigrationEffect(initial, {
+      effectId: "effect-retained-head-temp",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const requestedCandidate = beginMigrationEffect(initial, {
+      effectId: "effect-requested-head-temp",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:02.000Z",
+    });
+    publishSuccessorOrphan(home, initial, requestedCandidate);
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const scratchPath = join(generation, `.head.json.${"f".repeat(24)}.tmp`);
+    const scratchContent = migrationManifestHeadContent(createMigrationManifestHead({
+      generationId: retainedCandidate.generationId,
+      revision: retainedCandidate.revision,
+      manifestSha256: retainedCandidate.checksumSha256,
+      updatedAt: retainedCandidate.updatedAt,
+    }));
+    writeFileSync(scratchPath, scratchContent, { mode: 0o600 });
+
+    expectProtocolReason(
+      () => store.update(initial.generationId, initial.checksumSha256, () => requestedCandidate),
+      "malformed-manifest",
+    );
+    expect(readFileSync(scratchPath, "utf8")).toBe(scratchContent);
+    expect(existsSync(migrationManifestRevisionPath({
+      generationId: requestedCandidate.generationId,
+      revision: requestedCandidate.revision,
+      checksumSha256: requestedCandidate.checksumSha256,
+    }, home))).toBe(true);
+  });
+
+  it("preserves a head temp when a retry requests a different successor", () => {
+    const home = makeHome();
+    const initial = manifest("head-temp-different-retry");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const publishedCandidate = beginMigrationEffect(initial, {
+      effectId: "effect-published-head-temp",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    publishSuccessorOrphan(home, initial, publishedCandidate);
+    const requestedCandidate = beginMigrationEffect(initial, {
+      effectId: "effect-different-retry",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:02.000Z",
+    });
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const scratchPath = join(generation, `.head.json.${"0".repeat(24)}.tmp`);
+    const scratchContent = migrationManifestHeadContent(createMigrationManifestHead({
+      generationId: publishedCandidate.generationId,
+      revision: publishedCandidate.revision,
+      manifestSha256: publishedCandidate.checksumSha256,
+      updatedAt: publishedCandidate.updatedAt,
+    }));
+    writeFileSync(scratchPath, scratchContent, { mode: 0o600 });
+
+    expectProtocolReason(
+      () => store.update(initial.generationId, initial.checksumSha256, () => requestedCandidate),
+      "malformed-manifest",
+    );
+    expect(readFileSync(scratchPath, "utf8")).toBe(scratchContent);
+    expect(store.recover(initial.generationId)).toEqual(publishedCandidate);
+  });
+
+  it("preserves an exact head temp when identity consumption fails", () => {
+    const home = makeHome();
+    const initial = manifest("head-temp-consume-failure");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "effect-head-temp-consume-failure",
+      kind: "verify-dry-run",
+      inputSha256: HASH,
+      startedAt: "2026-08-12T12:00:01.000Z",
+    });
+    publishSuccessorOrphan(home, initial, candidate);
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const scratchPath = join(generation, `.head.json.${"1".repeat(24)}.tmp`);
+    writeFileSync(scratchPath, migrationManifestHeadContent(createMigrationManifestHead({
+      generationId: candidate.generationId,
+      revision: candidate.revision,
+      manifestSha256: candidate.checksumSha256,
+      updatedAt: candidate.updatedAt,
+    })), { mode: 0o600 });
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalUnlink = nodeFs.unlinkSync as (path: string) => void;
+
+    expectProtocolReason(() => withPatchedFs("unlinkSync", ((path: string) => {
+      if (path === scratchPath) throw Object.assign(new Error("head temp cleanup denied"), { code: "EACCES" });
+      originalUnlink(path);
+    }) as never, () => store.recover(initial.generationId)), "malformed-manifest");
+    expect(existsSync(scratchPath)).toBe(true);
+    expect(readFileSync(migrationManifestHeadPath(initial.generationId, home), "utf8"))
+      .toContain(initial.checksumSha256);
+  });
+
+  it("rejects a headless temp without a complete immutable genesis revision", () => {
+    const home = makeHome();
+    const initial = manifest("head-temp-missing-genesis");
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    mkdirSync(join(generation, "revisions"), { recursive: true, mode: 0o700 });
+    const scratchPath = join(generation, `.head.json.${"2".repeat(24)}.tmp`);
+    const scratchContent = migrationManifestHeadContent(createMigrationManifestHead({
+      generationId: initial.generationId,
+      revision: initial.revision,
+      manifestSha256: initial.checksumSha256,
+      updatedAt: initial.updatedAt,
+    }));
+    writeFileSync(scratchPath, scratchContent, { mode: 0o600 });
+
+    expectProtocolReason(
+      () => new MigrationManifestStore({ homeDir: home }).recover(initial.generationId),
+      "malformed-manifest",
+    );
+    expect(readFileSync(scratchPath, "utf8")).toBe(scratchContent);
+  });
+
+  it("preserves an exact headless temp when create retries a different genesis", () => {
+    const home = makeHome();
+    const initial = manifest("head-temp-different-genesis");
+    const crashing = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => {
+        if (event === "after-revision-publication") throw new Error("crash:head-temp-different-genesis");
+      },
+    });
+    expect(() => crashing.create(initial)).toThrow("crash:head-temp-different-genesis");
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const scratchPath = join(generation, `.head.json.${"3".repeat(24)}.tmp`);
+    const scratchContent = migrationManifestHeadContent(createMigrationManifestHead({
+      generationId: initial.generationId,
+      revision: initial.revision,
+      manifestSha256: initial.checksumSha256,
+      updatedAt: initial.updatedAt,
+    }));
+    writeFileSync(scratchPath, scratchContent, { mode: 0o600 });
+    const different = resealManifest(initial, {
+      destination: {
+        ...initial.destination,
+        contentSha256: "7".repeat(64),
+      },
+    });
+
+    expectProtocolReason(
+      () => new MigrationManifestStore({ homeDir: home }).create(different),
+      "malformed-manifest",
+    );
+    expect(readFileSync(scratchPath, "utf8")).toBe(scratchContent);
+  });
+
+  it("rejects invalid head topology for reads, recovery, and duplicate create", () => {
+    const scenarios = [
+      "unknown-entry",
+      "extra-scratch",
+      "mixed-link-pair",
+      "nlink-three",
+      "symlink",
+    ] as const;
+    for (const scenario of scenarios) {
+      const home = makeHome();
+      const initial = manifest(`invalid-head-${scenario}`);
+      const store = new MigrationManifestStore({ homeDir: home });
+      store.create(initial);
+      const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+      const headPath = migrationManifestHeadPath(initial.generationId, home);
+      const headContent = readFileSync(headPath, "utf8");
+      const scratchPath = join(generation, `.head.json.${"f".repeat(24)}.tmp`);
+      if (scenario === "unknown-entry") {
+        writeFileSync(join(generation, "unknown.tmp"), headContent, { mode: 0o600 });
+      } else if (scenario === "extra-scratch") {
+        writeFileSync(scratchPath, headContent, { mode: 0o600 });
+        writeFileSync(join(generation, `.head.json.${"e".repeat(24)}.tmp`), headContent, { mode: 0o600 });
+      } else if (scenario === "mixed-link-pair") {
+        linkSync(headPath, join(home, "head-hard-link-one"));
+        writeFileSync(scratchPath, headContent, { mode: 0o600 });
+      } else if (scenario === "nlink-three") {
+        linkSync(headPath, join(home, "head-hard-link-one"));
+        linkSync(headPath, join(home, "head-hard-link-two"));
+      } else {
+        const target = join(home, "head-symlink-target");
+        renameSync(headPath, target);
+        symlinkSync(target, headPath);
+      }
+
+      expectProtocolReason(() => store.read(initial.generationId), "malformed-manifest");
+      expectProtocolReason(() => store.recover(initial.generationId), "malformed-manifest");
+      expectProtocolReason(() => new MigrationManifestStore({ homeDir: home }).create(initial), "malformed-manifest");
+    }
+  });
+
+  it("rejects multiple head scratch names during duplicate-create preflight", () => {
+    const home = makeHome();
+    const initial = manifest("multiple-head-scratch-preflight");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    renameSync(join(generation, "revisions"), join(home, "retained-revisions"));
+    const headContent = readFileSync(migrationManifestHeadPath(initial.generationId, home), "utf8");
+    for (const suffix of ["d", "e"]) {
+      writeFileSync(
+        join(generation, `.head.json.${suffix.repeat(24)}.tmp`),
+        headContent,
+        { mode: 0o600 },
+      );
+    }
+
+    expectProtocolReason(() => store.create(initial), "malformed-manifest");
+  });
+
+  it("rejects a checksum-valid non-genesis revision zero before creating a head", () => {
+    const home = makeHome();
+    const initial = manifest("recover-forged-genesis");
+    const crashing = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => {
+        if (event === "after-revision-publication") throw new Error("crash:forged-genesis");
+      },
+    });
+    expect(() => crashing.create(initial)).toThrow("crash:forged-genesis");
+    const initialPath = migrationManifestRevisionPath({
+      generationId: initial.generationId,
+      revision: initial.revision,
+      checksumSha256: initial.checksumSha256,
+    }, home);
+    const forged = rewriteManifestFixture(initialPath, {
+      phase: "active",
+      reports: [{
+        createdAt: "2026-08-12T12:00:01.000Z",
+        kind: "verification",
+        reportId: "forged-genesis-verification",
+        reportSha256: HASH,
+      }],
+      activationEligible: true,
+      updatedAt: "2026-08-12T12:00:01.000Z",
+    });
+    const forgedPath = migrationManifestRevisionPath({
+      generationId: forged.generationId,
+      revision: forged.revision,
+      checksumSha256: forged.checksumSha256,
+    }, home);
+    renameSync(initialPath, forgedPath);
+
+    expectProtocolReason(() => new MigrationManifestStore({ homeDir: home }).recover(
+      initial.generationId,
+    ), "unexpected-state");
+    expect(existsSync(migrationManifestHeadPath(initial.generationId, home))).toBe(false);
+    expect(existsSync(forgedPath)).toBe(true);
+  });
+
+  it("rejects headless empty and scratch-only revision zero recovery while create retry converges", () => {
+    for (const state of ["empty", "scratch-only"] as const) {
+      const home = makeHome();
+      const initial = manifest(`recover-headless-incomplete-${state}`);
+      const crashing = new MigrationManifestStore({
+        homeDir: home,
+        observer: (event) => {
+          if (event === "before-revision-content-publication") throw new Error(`crash:${state}`);
+        },
+      });
+      expect(() => crashing.create(initial)).toThrow(`crash:${state}`);
+      const revisionDirectory = join(
+        migrationManifestGenerationDirectory(initial.generationId, home),
+        "revisions",
+        "0000000000000000",
+      );
+      const scratch = `.${initial.checksumSha256}.json.${"b".repeat(24)}.tmp`;
+      if (state === "scratch-only") writeFileSync(join(revisionDirectory, scratch), "scratch", { mode: 0o600 });
+
+      expectProtocolReason(() => new MigrationManifestStore({ homeDir: home }).recover(
+        initial.generationId,
+      ), "unexpected-state");
+      expect(existsSync(migrationManifestHeadPath(initial.generationId, home))).toBe(false);
+      expect(new MigrationManifestStore({ homeDir: home }).create(initial)).toEqual(initial);
+      expect(new MigrationManifestStore({ homeDir: home }).read(initial.generationId)).toEqual(initial);
+    }
+  });
+
+  it("rejects forged revision-zero genesis states before observer or path mutation", () => {
+    const candidates = [
+      ["active", (value: MigrationManifest) => resealManifest(value, {
+        phase: "active",
+        reports: [{
+          createdAt: UPDATED_AT,
+          kind: "verification",
+          reportId: "forged-create-active-verification",
+          reportSha256: HASH,
+        }],
+        activationEligible: true,
+      })],
+      ["aborted", (value: MigrationManifest) => resealManifest(value, { phase: "aborted" })],
+      ["pending", (value: MigrationManifest) => resealManifest(value, {
+        pendingEffect: {
+          effectId: "forged-genesis-effect",
+          kind: "verify-dry-run",
+          fromPhase: "planned",
+          targetPhase: "dry-run-verified",
+          inputSha256: HASH,
+          recovery: "retry-idempotent",
+          startedAt: UPDATED_AT,
+        },
+      })],
+      ["timestamp-skew", (value: MigrationManifest) => resealManifest(value, {
+        updatedAt: "2026-08-12T12:00:01.000Z",
+      })],
+    ] as const;
+    for (const [label, makeCandidate] of candidates) {
+      const home = makeHome();
+      const initial = manifest(`forged-create-genesis-${label}`);
+      const candidate = makeCandidate(initial);
+      const observed: string[] = [];
+      expectProtocolReason(() => new MigrationManifestStore({
+        homeDir: home,
+        observer: (event) => observed.push(event),
+      }).create(candidate), "unexpected-state");
+      expect(observed).toEqual([]);
+      expect(existsSync(join(home, ".lcm", "migrations"))).toBe(false);
+    }
   });
 
   it("recovers one headless genesis revision but refuses ambiguous genesis evidence", () => {
@@ -943,6 +2010,11 @@ describe("migration manifest exact recovery", () => {
     expectProtocolReason(() => new MigrationManifestStore({ homeDir: missingHome }).read(
       missing.generationId,
     ), "unexpected-state");
+    expectProtocolReason(() => new MigrationManifestStore({ homeDir: missingHome }).update(
+      missing.generationId,
+      missing.checksumSha256,
+      () => missing,
+    ), "unexpected-state");
 
     const headProbeHome = makeHome();
     const headProbeInitial = manifest("head-probe-error");
@@ -950,10 +2022,10 @@ describe("migration manifest exact recovery", () => {
     headProbeStore.create(headProbeInitial);
     const headPath = migrationManifestHeadPath(headProbeInitial.generationId, headProbeHome);
     const realOpen = createRequire(import.meta.url)("node:fs").openSync as typeof import("node:fs").openSync;
-    expect(() => withPatchedFs("openSync", ((path: string, flags: number, mode?: number) => {
+    expectProtocolReason(() => withPatchedFs("openSync", ((path: string, flags: number, mode?: number) => {
       if (path === headPath) throw Object.assign(new Error("head probe denied"), { code: "EACCES" });
       return realOpen(path, flags, mode);
-    }) as never, () => headProbeStore.recover(headProbeInitial.generationId))).toThrow("head probe denied");
+    }) as never, () => headProbeStore.recover(headProbeInitial.generationId)), "malformed-manifest");
 
     const probeHome = makeHome();
     const initial = manifest("recovery-probe-error");
@@ -1047,7 +2119,9 @@ describe("migration manifest exact recovery", () => {
       maximumContent,
       { mode: 0o600 },
     );
-    expect(orphanStore.recover(predecessor.generationId)).toEqual(maximumOrphan);
+    expectProtocolReason(() => orphanStore.recover(predecessor.generationId), "unexpected-state");
+    expect(readFileSync(migrationManifestHeadPath(predecessor.generationId, orphanHome), "utf8"))
+      .toContain(predecessor.checksumSha256);
   });
 
   it("refuses unsafe orphan files and directories without replacing the trusted head", () => {

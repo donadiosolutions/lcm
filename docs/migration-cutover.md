@@ -10,6 +10,23 @@ This foundation does **not** copy data, activate PostgreSQL, change the current
 storage backend, or execute rollback by itself. Later migration commands will
 perform those effects and use this protocol to record their boundaries.
 
+## How to use this today
+
+Issue #621 is an internal foundation for the later migration work. It exposes
+only the programmatic `src/migration` module; there is no CLI or operator
+command for this protocol yet. Normal installations continue to use their
+existing storage selection. Do not manually create, edit, delete, or otherwise
+mutate the journal or its lock file. If the protocol refuses a journal state,
+preserve the generation directory for the later diagnostic and recovery
+tooling.
+
+## Configuration
+
+There are currently no user-configurable options for this protocol or its
+store. The journal home path is derived from LCM's normal runtime home. The
+private layout, exact file modes, and 1 MiB file-size bounds are fixed safety
+policy, not configuration options, and must not be changed manually.
+
 ## Generations and storage witnesses
 
 Every migration attempt has a bounded `generationId`. Its first manifest seals
@@ -91,10 +108,14 @@ One migration generation is stored below the private LCM root:
 
 Revision directories and all intermediate migration directories must be exact
 mode `0700`. Manifest and head files must be exact mode `0600`, regular files,
-owned by the expected user, and have exactly one link. Each file is limited to
-1 MiB and contains canonical ASCII JSON terminated by a newline. Unknown
-fields, noncanonical bytes, non-ASCII content, unsafe ownership or modes,
-symlinks, hard links, and changed identities are rejected.
+owned by the expected user, and normally have exactly one link. The one accepted
+transitional exception is an interrupted atomic publication where the exact
+final and writer-scratch names are two hard links to the same authenticated
+inode. This applies to both a manifest revision and `head.json`; arbitrary hard
+links remain invalid. Each file is limited to 1 MiB and contains canonical
+ASCII JSON terminated by a newline. Unknown fields, noncanonical bytes,
+non-ASCII content, unsafe ownership or modes, symlinks, unrelated hard links,
+and changed identities are rejected.
 
 The manifest checksum covers every manifest field except the checksum itself.
 `head.json` has its own canonical checksum and points to one revision number,
@@ -119,13 +140,28 @@ Ordinary reads authenticate the head and its selected revision. If the exact
 next numeric revision directory exists, the read returns `recovery-required`
 instead of ignoring or choosing the orphan.
 
+An empty next revision directory or one containing only an authenticated
+writer scratch file means content publication had not completed. Recovery
+preserves that pre-content state and returns the intact current head without
+advancing it; the caller must retry the same create or update operation to
+finish publication. Without an existing head, the same incomplete revision `0`
+state has no recoverable manifest, so recovery returns `unexpected-state` and
+the caller must retry creation. Recovery publishes a head only for a complete,
+authenticated manifest that is also a legal genesis or immediate protocol
+successor.
+
 Recovery advances at most one step:
 
 1. With an authenticated head, it inspects only `head.revision + 1`.
 2. Without a head, it inspects only revision `0` for headless genesis recovery.
 3. The expected directory must contain exactly one checksum-shaped manifest
-   filename. That file must pass all ownership, mode, link, size, canonical
-   checksum, generation, revision, filename, and predecessor checks.
+   filename. At most one authenticated, checksum-bound atomic-writer scratch
+   file may coexist with it after an interrupted write. If both names exist,
+   they must be the exact two-name, same-inode writer state described above;
+   separate single-link files are invalid. The manifest and scratch must pass
+   their ownership, mode, link-topology, and size checks; the manifest must also
+   pass canonical checksum, generation, revision, filename, and predecessor
+   checks.
 4. The following numeric revision directory must be absent. Its presence is a
    forbidden second hop.
 5. Recovery compare-and-swap publishes only the new head and returns the
@@ -136,6 +172,35 @@ filename order, inspects live backend data, deletes an orphan, or rewrites
 suspicious evidence. An absent candidate leaves an intact head unchanged. An
 ambiguous, malformed, wrongly linked, unsafe, or multi-hop state fails closed
 for operator investigation.
+
+An exact `head.json` plus `.head.json.<24-hex>.tmp` same-inode writer pair is
+also preserved by ordinary reads and no-op recovery. When an update or a
+manifest-bearing successor recovery is ready to mutate that head, the exact
+authenticated scratch alias is identity-consumed and the containing directory
+is synchronized immediately before the next head mutation. Cleanup failure
+therefore occurs before any successor revision is staged, while a replacement
+or other mismatch preserves the pair as evidence whenever possible for a later
+retry.
+
+The durable writer can also stop after synchronizing its exclusive
+`.head.json.<24-hex>.tmp` file but before linking or renaming it to `head.json`.
+That single-link temporary file is incomplete publication evidence, not a
+committed head. When an older authenticated `head.json` still exists, reads
+continue to authenticate that old head but report `recovery-required` if the
+temporary names its already-published immediate successor. Without a head, the
+temporary must name the exact immutable genesis revision. The temporary's
+canonical head seal, generation, revision, manifest checksum, timestamp,
+owner, mode, single-link topology, size, and bytes must all remain bound to
+that legal immutable revision. Malformed, mismatched, multiply linked, or
+unaccompanied temporary evidence fails closed and is preserved.
+
+An exact create retry, update retry, or recovery operation identity-consumes
+the authenticated single-link temporary and synchronizes the generation
+directory before attempting another head publication. A retry update still
+reports `recovery-required` when the immutable successor already exists;
+recovery then advances that exact successor. This prevents both pre-link and
+pre-rename crash windows from permanently wedging the generation while keeping
+ambiguous journal evidence available for operator investigation.
 
 ## Settled lineage
 
@@ -170,9 +235,10 @@ diagnostic and recovery commands once those commands are available.
 
 ## Current rollout boundary
 
-The protocol, reducers, durable store, and exact recovery primitive are now
-available as the `src/migration` module for the remaining cutover work. Snapshot
-capture, dry-run planning, batch copy, reconciliation, activation, rollback,
-CLI commands, and end-to-end recovery remain separate deliverables. Until those
-features land, normal installations continue using their existing storage
-selection and should not manually create or mutate this journal.
+Issue #621 provides only the protocol, reducers, durable store, and exact
+recovery primitive in the internal `src/migration` module. The later #622–#628
+deliverables cover snapshot capture, dry-run planning, batch copy,
+reconciliation, activation, rollback, CLI/operator commands, and end-to-end
+recovery. Until those features land, normal installations continue using their
+existing storage selection and should not manually create or mutate this
+journal.

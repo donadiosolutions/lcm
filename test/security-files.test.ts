@@ -35,6 +35,7 @@ import {
   atomicWritePrivateFileExclusive,
   assertPrivateDirectory,
   copyRegularFilePrivateExclusive,
+  consumeAuthenticatedWriterAlias,
   consumeBoundedRegularFile,
   deleteRegularFile,
   ensurePrivateDirectory,
@@ -58,6 +59,21 @@ function makeRoot(): string {
   return root;
 }
 
+function writerAliasFixture(content = "head\n"): Readonly<{
+  aliasPath: string;
+  finalPath: string;
+  generation: string;
+}> {
+  const root = makeRoot();
+  const generation = join(root, "generation");
+  mkdirSync(generation, { mode: 0o700 });
+  const finalPath = join(generation, "head.json");
+  const aliasPath = join(generation, ".head.json.0123456789abcdef01234567.tmp");
+  writeFileSync(finalPath, content, { mode: 0o600 });
+  linkSync(finalPath, aliasPath);
+  return { aliasPath, finalPath, generation };
+}
+
 function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T): T {
   const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
   const original = nodeFs[name];
@@ -72,6 +88,257 @@ function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T)
 }
 
 describe("private filesystem primitives", () => {
+  it("consumes an authenticated writer alias while retaining the final inode", () => {
+    const { aliasPath, finalPath } = writerAliasFixture();
+
+    expect(() => consumeAuthenticatedWriterAlias(finalPath, aliasPath, {
+      maxBytes: 1024,
+    })).not.toThrow();
+    expect(existsSync(aliasPath)).toBe(false);
+    expect(readFileSync(finalPath, "utf8")).toBe("head\n");
+    expect(lstatSync(finalPath).nlink).toBe(1);
+  });
+
+  it("rejects invalid writer-alias inputs and initial topology without mutation", () => {
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const invalidOptions = [
+      { maxBytes: Number.NaN },
+      { maxBytes: -1 },
+      { maxBytes: 1024, allowedModes: [] },
+      { maxBytes: 1024, allowedModes: [0o755] },
+    ] as const;
+    for (const options of invalidOptions) {
+      const { aliasPath, finalPath } = writerAliasFixture();
+      expect(() => consumeAuthenticatedWriterAlias(finalPath, aliasPath, {
+        ...options,
+        expectedUid,
+      })).toThrow();
+      expect(existsSync(aliasPath)).toBe(true);
+    }
+
+    const same = writerAliasFixture();
+    expect(() => consumeAuthenticatedWriterAlias(same.finalPath, same.finalPath, {
+      maxBytes: 1024,
+      expectedUid,
+    })).toThrow("distinct");
+
+    const differentParents = writerAliasFixture();
+    const otherParent = join(resolve(differentParents.generation, ".."), "other-parent");
+    mkdirSync(otherParent, { mode: 0o700 });
+    const movedAlias = join(otherParent, "alias.tmp");
+    renameSync(differentParents.aliasPath, movedAlias);
+    expect(() => consumeAuthenticatedWriterAlias(
+      differentParents.finalPath,
+      movedAlias,
+      { maxBytes: 1024, expectedUid },
+    )).toThrow("parent");
+    expect(existsSync(movedAlias)).toBe(true);
+
+    for (const scenario of ["separate", "third-link", "mode", "symlink", "oversized"] as const) {
+      const fixture = writerAliasFixture(scenario === "oversized" ? "oversized" : "head\n");
+      if (scenario === "separate") {
+        unlinkSync(fixture.aliasPath);
+        writeFileSync(fixture.aliasPath, "head\n", { mode: 0o600 });
+      } else if (scenario === "third-link") {
+        linkSync(fixture.finalPath, join(resolve(fixture.generation, ".."), "third-link"));
+      } else if (scenario === "mode") {
+        chmodSync(fixture.finalPath, 0o644);
+      } else if (scenario === "symlink") {
+        unlinkSync(fixture.aliasPath);
+        symlinkSync(fixture.finalPath, fixture.aliasPath);
+      }
+      expect(() => consumeAuthenticatedWriterAlias(fixture.finalPath, fixture.aliasPath, {
+        maxBytes: scenario === "oversized" ? 1 : 1024,
+        expectedUid,
+      })).toThrow();
+      expect(existsSync(fixture.aliasPath)).toBe(true);
+    }
+  });
+
+  it("preserves writer-alias replacements and rejects post-authentication drift", () => {
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    for (const scenario of ["regular", "symlink", "directory"] as const) {
+      const fixture = writerAliasFixture();
+      expect(() => consumeAuthenticatedWriterAlias(fixture.finalPath, fixture.aliasPath, {
+        maxBytes: 1024,
+        expectedUid,
+        _beforeUnlinkForTesting: () => {
+          unlinkSync(fixture.aliasPath);
+          if (scenario === "regular") writeFileSync(fixture.aliasPath, "replacement", { mode: 0o600 });
+          else if (scenario === "symlink") symlinkSync(fixture.finalPath, fixture.aliasPath);
+          else mkdirSync(fixture.aliasPath, { mode: 0o700 });
+        },
+      })).toThrow("changed");
+      expect(existsSync(fixture.aliasPath)).toBe(true);
+      expect(readFileSync(fixture.finalPath, "utf8")).toBe("head\n");
+    }
+
+    const postUnlink = writerAliasFixture();
+    expect(() => consumeAuthenticatedWriterAlias(postUnlink.finalPath, postUnlink.aliasPath, {
+      maxBytes: 1024,
+      expectedUid,
+      _afterUnlinkForTesting: () => writeFileSync(postUnlink.aliasPath, "replacement", { mode: 0o600 }),
+    })).toThrow("replaced");
+    expect(readFileSync(postUnlink.aliasPath, "utf8")).toBe("replacement");
+
+    const finalReplacement = writerAliasFixture();
+    const retained = join(resolve(finalReplacement.generation, ".."), "retained-final");
+    expect(() => consumeAuthenticatedWriterAlias(finalReplacement.finalPath, finalReplacement.aliasPath, {
+      maxBytes: 1024,
+      expectedUid,
+      _afterUnlinkForTesting: () => {
+        renameSync(finalReplacement.finalPath, retained);
+        writeFileSync(finalReplacement.finalPath, "replacement", { mode: 0o600 });
+      },
+    })).toThrow("single-link");
+    expect(readFileSync(retained, "utf8")).toBe("head\n");
+    expect(readFileSync(finalReplacement.finalPath, "utf8")).toBe("replacement");
+
+    const finalBeforeUnlink = writerAliasFixture();
+    const retainedBeforeUnlink = join(resolve(finalBeforeUnlink.generation, ".."), "retained-before-unlink");
+    expect(() => consumeAuthenticatedWriterAlias(finalBeforeUnlink.finalPath, finalBeforeUnlink.aliasPath, {
+      maxBytes: 1024,
+      expectedUid,
+      _beforeUnlinkForTesting: () => {
+        renameSync(finalBeforeUnlink.finalPath, retainedBeforeUnlink);
+        writeFileSync(finalBeforeUnlink.finalPath, "replacement", { mode: 0o600 });
+      },
+    })).toThrow("changed during consume");
+    expect(existsSync(finalBeforeUnlink.aliasPath)).toBe(true);
+    expect(readFileSync(finalBeforeUnlink.aliasPath, "utf8")).toBe("head\n");
+    expect(readFileSync(finalBeforeUnlink.finalPath, "utf8")).toBe("replacement");
+  });
+
+  it("rejects inconsistent writer-alias metadata and content observations", () => {
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalFstat = nodeFs.fstatSync as typeof fstatSync;
+    const metadata = writerAliasFixture();
+    let bigintStats = 0;
+    expect(() => withPatchedFs("fstatSync", ((fd: number, options?: unknown) => {
+      const stat = originalFstat(fd, options as never);
+      if ((options as { bigint?: boolean } | undefined)?.bigint === true) bigintStats += 1;
+      if (bigintStats === 3 && (options as { bigint?: boolean } | undefined)?.bigint === true) {
+        return Object.assign(stat, { mtimeNs: (stat as unknown as { mtimeNs: bigint }).mtimeNs + 1n });
+      }
+      return stat;
+    }) as never, () => consumeAuthenticatedWriterAlias(metadata.finalPath, metadata.aliasPath, {
+      maxBytes: 1024,
+      expectedUid,
+    }))).toThrow("metadata");
+    expect(existsSync(metadata.aliasPath)).toBe(true);
+
+    const originalRead = nodeFs.readSync as typeof import("node:fs").readSync;
+    const initialContent = writerAliasFixture();
+    let initialReadCalls = 0;
+    expect(() => withPatchedFs("readSync", ((
+      fd: number,
+      buffer: NodeJS.ArrayBufferView,
+      offset: number,
+      length: number,
+      position: number | null,
+    ) => {
+      initialReadCalls += 1;
+      const bytesRead = originalRead(fd, buffer, offset, length, position);
+      if (initialReadCalls === 3 && bytesRead > 0) (buffer as Buffer)[offset] ^= 1;
+      return bytesRead;
+    }) as never, () => consumeAuthenticatedWriterAlias(
+      initialContent.finalPath,
+      initialContent.aliasPath,
+      { maxBytes: 1024, expectedUid },
+    ))).toThrow("content does not match");
+    expect(existsSync(initialContent.aliasPath)).toBe(true);
+
+    const content = writerAliasFixture();
+    let readCalls = 0;
+    expect(() => withPatchedFs("readSync", ((
+      fd: number,
+      buffer: NodeJS.ArrayBufferView,
+      offset: number,
+      length: number,
+      position: number | null,
+    ) => {
+      readCalls += 1;
+      const bytesRead = originalRead(fd, buffer, offset, length, position);
+      if (readCalls === 5 && bytesRead > 0) (buffer as Buffer)[offset] ^= 1;
+      return bytesRead;
+    }) as never, () => consumeAuthenticatedWriterAlias(content.finalPath, content.aliasPath, {
+      maxBytes: 1024,
+      expectedUid,
+    }))).toThrow("content changed");
+    expect(existsSync(content.aliasPath)).toBe(true);
+  });
+
+  it("rejects writer-alias pathname loss and absence-probe failures", () => {
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalLstat = nodeFs.lstatSync as typeof lstatSync;
+    const pathnameLoss = writerAliasFixture();
+    expect(() => withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+      if (path === pathnameLoss.aliasPath) return Object.assign(originalLstat(path, options as never), { ino: 0n });
+      return originalLstat(path, options as never);
+    }) as never, () => consumeAuthenticatedWriterAlias(pathnameLoss.finalPath, pathnameLoss.aliasPath, {
+      maxBytes: 1024,
+      expectedUid,
+    }))).toThrow("changed");
+    expect(existsSync(pathnameLoss.aliasPath)).toBe(true);
+
+    const probeFailure = writerAliasFixture();
+    let aliasProbes = 0;
+    expect(() => withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+      if (path === probeFailure.aliasPath) {
+        aliasProbes += 1;
+        if (aliasProbes === 2) throw Object.assign(new Error("alias probe denied"), { code: "EACCES" });
+      }
+      return originalLstat(path, options as never);
+    }) as never, () => consumeAuthenticatedWriterAlias(probeFailure.finalPath, probeFailure.aliasPath, {
+      maxBytes: 1024,
+      expectedUid,
+    }))).toThrow("alias probe denied");
+    expect(existsSync(probeFailure.aliasPath)).toBe(false);
+  });
+
+  it("reports writer-alias durability and descriptor cleanup failures", () => {
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalFsync = nodeFs.fsyncSync as (fd: number) => void;
+    const fsyncFailure = writerAliasFixture();
+    expect(() => withPatchedFs("fsyncSync", ((fd: number) => {
+      originalFsync(fd);
+      throw new Error("alias fsync failed");
+    }) as never, () => consumeAuthenticatedWriterAlias(
+      fsyncFailure.finalPath,
+      fsyncFailure.aliasPath,
+      { maxBytes: 1024, expectedUid },
+    ))).toThrow("alias fsync failed");
+    expect(existsSync(fsyncFailure.aliasPath)).toBe(false);
+    expect(lstatSync(fsyncFailure.finalPath).nlink).toBe(1);
+
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    for (const scenario of ["one", "many", "primary-and-cleanup"] as const) {
+      const fixture = writerAliasFixture();
+      let closeCalls = 0;
+      const invoke = () => withPatchedFs("closeSync", ((fd: number) => {
+        closeCalls += 1;
+        originalClose(fd);
+        if (scenario === "one" ? closeCalls === 1 : true) {
+          throw new Error(`alias close ${closeCalls}`);
+        }
+      }) as never, () => {
+        if (scenario === "primary-and-cleanup") {
+          linkSync(fixture.finalPath, join(resolve(fixture.generation, ".."), "ambiguous-link"));
+        }
+        consumeAuthenticatedWriterAlias(fixture.finalPath, fixture.aliasPath, {
+          maxBytes: 1024,
+          expectedUid,
+        });
+      });
+      expect(invoke).toThrow();
+      if (scenario === "one") expect(closeCalls).toBeGreaterThanOrEqual(3);
+      else expect(closeCalls).toBe(3);
+    }
+  });
+
   it("consumes a bounded regular file only after descriptor and inode revalidation", () => {
     const root = makeRoot();
     const path = join(root, "credential");

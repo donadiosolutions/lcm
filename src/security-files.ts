@@ -235,19 +235,33 @@ export type BoundedFileResult = {
   exactIno: string;
 };
 
-function readDescriptorBounded(fd: number, maxBytes: number): string {
+function readDescriptorBoundedBytes(
+  fd: number,
+  maxBytes: number,
+  position: number | null = null,
+): Buffer {
   const chunks: Buffer[] = [];
   let total = 0;
   const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1));
   while (total <= maxBytes) {
     const remaining = maxBytes + 1 - total;
-    const bytesRead = readSync(fd, buffer, 0, Math.min(buffer.length, remaining), null);
+    const bytesRead = readSync(
+      fd,
+      buffer,
+      0,
+      Math.min(buffer.length, remaining),
+      position === null ? null : position + total,
+    );
     if (bytesRead === 0) break;
     chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
     total += bytesRead;
   }
   if (total > maxBytes) throw new Error("file exceeds the configured size limit");
-  return Buffer.concat(chunks, total).toString("utf-8");
+  return Buffer.concat(chunks, total);
+}
+
+function readDescriptorBounded(fd: number, maxBytes: number): string {
+  return readDescriptorBoundedBytes(fd, maxBytes).toString("utf-8");
 }
 
 function validateBoundedFileMetadata(
@@ -325,24 +339,31 @@ function unlinkPrivateFileIfIdentityMatches(
   expected: PrivateFileIdentity,
   unlink: (path: string) => void = unlinkSync,
   lstat: (path: string) => BigIntFileStat = (candidate) => lstatSync(candidate, { bigint: true }) as unknown as BigIntFileStat,
-): void {
+  expectedNlink?: bigint,
+): boolean {
   let currentParent: PrivatePathIdentity;
   try {
     currentParent = privatePathIdentity(dirname(path));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
-  if (currentParent.dev !== expected.parentDev || currentParent.ino !== expected.parentIno) return;
+  if (currentParent.dev !== expected.parentDev || currentParent.ino !== expected.parentIno) return false;
   let current: BigIntFileStat;
   try {
     current = lstat(path);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
-  if (!current.isFile() || current.dev !== expected.dev || current.ino !== expected.ino) return;
+  if (
+    !current.isFile()
+    || current.dev !== expected.dev
+    || current.ino !== expected.ino
+    || (expectedNlink !== undefined && current.nlink !== expectedNlink)
+  ) return false;
   unlink(path);
+  return true;
 }
 
 function validateBoundedBigIntFileMetadata(
@@ -368,15 +389,216 @@ function assertPrivateFileSingleLink(
   path: string,
   expected: PrivateFileIdentity,
 ): void {
+  assertPrivateFileLinkCount(path, expected, 1n, "private durable publication did not produce a single-link destination");
+}
+
+function assertPrivateFileLinkCount(
+  path: string,
+  expected: PrivateFileIdentity,
+  expectedNlink: bigint,
+  message: string,
+): void {
   const current = lstatSync(path, { bigint: true }) as unknown as BigIntFileStat;
   if (
     !current.isFile()
-    || current.nlink !== 1n
+    || current.nlink !== expectedNlink
     || current.dev !== expected.dev
     || current.ino !== expected.ino
   ) {
-    throw new Error("private durable publication did not produce a single-link destination");
+    throw new Error(message);
   }
+}
+
+type AuthenticatedWriterAliasFileStat = BigIntBoundedFileStat & Readonly<{
+  ctimeNs: bigint;
+  gid: bigint;
+  mtimeNs: bigint;
+  size: bigint;
+}>;
+
+function samePrivateFileMetadata(
+  left: AuthenticatedWriterAliasFileStat,
+  right: AuthenticatedWriterAliasFileStat,
+): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.gid === right.gid
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function writerAliasPathIsAbsent(path: string): boolean {
+  try {
+    lstatSync(path);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
+}
+
+export type AuthenticatedWriterAliasOptions = Readonly<{
+  expectedUid?: number;
+  maxBytes: number;
+  allowedModes?: readonly number[];
+  /** @internal Deterministic race seam immediately before alias unlink. */
+  _beforeUnlinkForTesting?: () => void;
+  /** @internal Deterministic post-unlink identity seam for tests. */
+  _afterUnlinkForTesting?: () => void;
+}>;
+
+/**
+ * Consume the exact temporary writer name from an authenticated same-inode
+ * final/alias pair.  All validation completes while both file descriptors and
+ * the private parent descriptor are retained; the alias is then removed only
+ * if its pathname still names the authenticated inode.
+ */
+export function consumeAuthenticatedWriterAlias(
+  finalPath: string,
+  aliasPath: string,
+  options: AuthenticatedWriterAliasOptions,
+): void {
+  if (finalPath === aliasPath) throw new Error("writer alias must be a distinct path");
+  if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0) {
+    throw new RangeError("maxBytes must be a non-negative safe integer");
+  }
+  const allowedModes = options.allowedModes ?? [PRIVATE_FILE_MODE];
+  if (
+    allowedModes.length === 0
+    || allowedModes.some((mode) => !isOwnerOnlyFileMode(mode))
+  ) {
+    throw new Error("writer alias modes must be owner-only");
+  }
+  const expectedUid = options.expectedUid ?? currentUid();
+  const directory = dirname(finalPath);
+  const parent = openPrivateDirectory(directory, { expectedUid });
+  let finalFd: number | undefined;
+  let aliasFd: number | undefined;
+  let primaryError: unknown;
+  try {
+    assertPrivateDirectory(parent, directory, parent.witness, expectedUid);
+    const parentIdentity: PrivatePathIdentity = {
+      dev: BigInt(parent.witness.dev),
+      ino: BigInt(parent.witness.ino),
+    };
+    const aliasParent = privatePathIdentity(dirname(aliasPath));
+    if (aliasParent.dev !== parentIdentity.dev || aliasParent.ino !== parentIdentity.ino) {
+      throw new Error("writer alias parent is not authenticated");
+    }
+    finalFd = openSync(
+      finalPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    aliasFd = openSync(
+      aliasPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const finalStat = fstatSync(finalFd, { bigint: true }) as unknown as AuthenticatedWriterAliasFileStat;
+    const aliasStat = fstatSync(aliasFd, { bigint: true }) as unknown as AuthenticatedWriterAliasFileStat;
+    validateBoundedBigIntFileMetadata(finalStat, {
+      allowedRoot: directory,
+      maxBytes: options.maxBytes,
+      expectedUid,
+      allowedModes,
+      requireSingleLink: false,
+    });
+    validateBoundedBigIntFileMetadata(aliasStat, {
+      allowedRoot: directory,
+      maxBytes: options.maxBytes,
+      expectedUid,
+      allowedModes,
+      requireSingleLink: false,
+    });
+    if (finalStat.nlink !== 2n || aliasStat.nlink !== 2n) {
+      throw new Error("writer alias has invalid link topology");
+    }
+    if (!samePrivateFileMetadata(finalStat, aliasStat)) {
+      throw new Error("writer alias metadata does not match the final file");
+    }
+    const finalContent = readDescriptorBoundedBytes(finalFd, options.maxBytes);
+    const aliasContent = readDescriptorBoundedBytes(aliasFd, options.maxBytes);
+    if (!finalContent.equals(aliasContent)) {
+      throw new Error("writer alias content does not match the final file");
+    }
+    const finalIdentity = privateFileIdentity(finalStat, parentIdentity);
+    const aliasIdentity = privateFileIdentity(aliasStat, parentIdentity);
+    options._beforeUnlinkForTesting?.();
+    assertPrivateDirectory(parent, directory, parent.witness, expectedUid);
+    const finalAfterRead = fstatSync(finalFd, { bigint: true }) as unknown as AuthenticatedWriterAliasFileStat;
+    const aliasAfterRead = fstatSync(aliasFd, { bigint: true }) as unknown as AuthenticatedWriterAliasFileStat;
+    validateBoundedBigIntFileMetadata(finalAfterRead, {
+      allowedRoot: directory,
+      maxBytes: options.maxBytes,
+      expectedUid,
+      allowedModes,
+      requireSingleLink: false,
+    });
+    validateBoundedBigIntFileMetadata(aliasAfterRead, {
+      allowedRoot: directory,
+      maxBytes: options.maxBytes,
+      expectedUid,
+      allowedModes,
+      requireSingleLink: false,
+    });
+    if (!samePrivateFileMetadata(finalStat, finalAfterRead) || !samePrivateFileMetadata(aliasStat, aliasAfterRead)) {
+      throw new Error("writer alias changed during consume");
+    }
+    if (
+      !readDescriptorBoundedBytes(finalFd, options.maxBytes, 0).equals(finalContent)
+      || !readDescriptorBoundedBytes(aliasFd, options.maxBytes, 0).equals(aliasContent)
+    ) {
+      throw new Error("writer alias content changed during consume");
+    }
+    assertPrivateFileLinkCount(
+      finalPath,
+      finalIdentity,
+      2n,
+      "writer alias final file changed during consume",
+    );
+    if (!unlinkPrivateFileIfIdentityMatches(aliasPath, aliasIdentity, unlinkSync, undefined, 2n)) {
+      throw new Error("writer alias changed during consume");
+    }
+    options._afterUnlinkForTesting?.();
+    if (!writerAliasPathIsAbsent(aliasPath)) {
+      throw new Error("writer alias was replaced during consume");
+    }
+    assertPrivateFileSingleLink(finalPath, finalIdentity);
+    assertPrivateDirectory(parent, directory, parent.witness, expectedUid);
+    fsyncSync(parent.fd);
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    const cleanupErrors: unknown[] = [];
+    for (const fd of [aliasFd, finalFd]) {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd);
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+    }
+    try {
+      parent.close();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (primaryError !== undefined && cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [primaryError, ...cleanupErrors],
+        "writer alias consumption and descriptor cleanup failed",
+        { cause: primaryError },
+      );
+    }
+    if (primaryError === undefined && cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (primaryError === undefined && cleanupErrors.length > 1) {
+      throw new AggregateError(cleanupErrors, "writer alias descriptor cleanup failed");
+    }
+  }
+  if (primaryError !== undefined) throw primaryError;
 }
 
 /** Read a bounded regular file and its metadata from one descriptor. */
