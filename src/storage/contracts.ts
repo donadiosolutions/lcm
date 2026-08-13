@@ -404,6 +404,8 @@ export interface ProjectStorage extends ProjectRepositories {
 export interface StorageIdentityContext extends ProjectIdentity {
   readonly localProjectId?: string;
   readonly machineId?: string;
+  /** Absolute lexical path selected by the cwd-aware identity boundary. */
+  readonly selectedPath?: string;
 }
 
 export interface StorageBackendFactory {

@@ -18,6 +18,7 @@ export function resolveStorageIdentityContext(
   config: ResolvedStorageConfig,
   local: ProjectIdentity,
   homeDir?: string,
+  selectedPath?: string,
 ): StorageIdentityContext & { readonly localProjectId: string } {
   if (config.backend === "sqlite") {
     return {
@@ -38,5 +39,6 @@ export function resolveStorageIdentityContext(
     canonical: local.canonical,
     remoteProjectId: local.remoteProjectId,
     machineId: machine.machineId,
+    ...(selectedPath === undefined ? {} : { selectedPath }),
   };
 }

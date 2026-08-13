@@ -146,7 +146,16 @@ export function projectIdentity(
   const local = resolveProjectIdentity(cwd, {
     _publicationLockToken: publicationLockToken,
   });
-  return config ? resolveStorageIdentityContext(config, local) : local;
+  if (!config) return local;
+  const resolved = resolveStorageIdentityContext(config, local, undefined, resolve(cwd));
+  const { selectedPath, ...identity } = resolved;
+  Object.defineProperty(identity, "selectedPath", {
+    configurable: false,
+    enumerable: false,
+    value: selectedPath,
+    writable: false,
+  });
+  return identity;
 }
 
 export const projectId = (cwd: string): string =>
