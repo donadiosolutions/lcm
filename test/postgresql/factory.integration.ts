@@ -487,7 +487,8 @@ describe("PostgreSQL 18 project storage factory", () => {
   it.each([
     ["wrong migration owner", undefined, "lcm_harness_admin"],
     ["ledger drift", "ledger", "lcm_test_migrator"],
-    ["schema drift", "schema", "lcm_test_migrator"],
+    ["schema definition drift", "schema", "lcm_test_migrator"],
+    ["search-configuration drift", "search", "lcm_test_migrator"],
     ["overbroad ACL", "acl", "lcm_test_migrator"],
   ] as const)("fails construction for %s", async (_label, drift, migrationRole) => {
     await withPostgreSqlTestDatabase(`factory-${drift ?? "owner"}`, async (database) => {
@@ -503,6 +504,10 @@ describe("PostgreSQL 18 project storage factory", () => {
           text: `ALTER TABLE lcm.projects
                  ALTER COLUMN identity_key DROP NOT NULL`,
         }, { domain: "factory", operation: "injectFactorySchemaDrift" });
+      } else if (drift === "search") {
+        await database.migrator.query({
+          text: "ALTER TEXT SEARCH CONFIGURATION lcm.search_v1 DROP MAPPING FOR uint",
+        }, { domain: "factory", operation: "injectFactorySearchDrift" });
       } else if (drift === "acl") {
         await database.migrator.query({
           text: "GRANT SELECT ON TABLE lcm.conversations TO PUBLIC",
@@ -523,12 +528,42 @@ describe("PostgreSQL 18 project storage factory", () => {
     });
   });
 
-  it("fails construction when one required runtime grant script is absent", async () => {
-    await withPostgreSqlTestDatabase("factory-grant", async (database) => {
-      await applyAllRuntimeGrants(database, {
-        omit: ["postgresql-runtime-coordination-grants.sql"],
+  it.each(REQUIRED_GRANT_SCRIPTS)(
+    "fails construction when %s is absent",
+    async (omittedScript) => {
+      await withPostgreSqlTestDatabase("factory-grant", async (database) => {
+        await applyAllRuntimeGrants(database, {
+          omit: [omittedScript],
+        });
+        const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-grant-"));
+        try {
+          await expect(createPostgreSqlStorageBackendFactoryForTesting(
+            factoryConfig(database),
+            homeDir,
+          )).rejects.toMatchObject({
+            code: "STORAGE_INITIALIZATION_FAILED",
+            operation: "createFactory",
+          });
+        } finally {
+          rmSync(homeDir, { recursive: true, force: true });
+        }
       });
-      const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-grant-"));
+    },
+  );
+
+  it("fails construction when an extension is outside its required namespace", async () => {
+    await withPostgreSqlTestDatabase("factory-extension", async (database) => {
+      await applyAllRuntimeGrants(database);
+      const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+      try {
+        await administrator.query({
+          text: `CREATE SCHEMA lcm_factory_extensions;
+                 ALTER EXTENSION unaccent SET SCHEMA lcm_factory_extensions`,
+        }, { domain: "factory", operation: "injectFactoryExtensionDrift" });
+      } finally {
+        await administrator.close();
+      }
+      const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-extension-"));
       try {
         await expect(createPostgreSqlStorageBackendFactoryForTesting(
           factoryConfig(database),
@@ -572,7 +607,7 @@ describe("PostgreSQL 18 project storage factory", () => {
     });
   });
 
-  it("fails opens for unresolved publication and mismatched identity", async () => {
+  it("fails opens for unresolved publication and absent or mismatched identity", async () => {
     await withPostgreSqlTestDatabase("factory-admit", async (database) => {
       await applyAllRuntimeGrants(database);
       const fixture = await createIdentityFixture(database, "factory-admit");
@@ -596,6 +631,18 @@ describe("PostgreSQL 18 project storage factory", () => {
           code: "STORAGE_INITIALIZATION_FAILED",
           operation: "openProject",
         });
+        const identities = new PostgreSqlIdentityRepository(database.migrator);
+        await identities.unlinkProject(
+          fixture.machine.machineId,
+          fixture.second.projectId,
+        );
+        await expect(identities.deleteProjectIfUnreferenced(fixture.second.projectId))
+          .resolves.toBe(true);
+        await expect(factory.openProject(identityContext(fixture, "second")))
+          .rejects.toMatchObject({
+            code: "STORAGE_INITIALIZATION_FAILED",
+            operation: "openProject",
+          });
       } finally {
         await factory.close();
         rmSync(homeDir, { recursive: true, force: true });
