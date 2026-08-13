@@ -803,6 +803,7 @@ describe("POST /compact", () => {
     const originalUserProfile = process.env.USERPROFILE;
     const originalPostgresUrl = process.env.LCM_POSTGRES_URL;
     const originalPostgresCaFile = process.env.LCM_POSTGRES_CA_FILE;
+    const originalPostgresMigrationRole = process.env.LCM_POSTGRES_MIGRATION_ROLE;
     const tempHome = mkdtempSync(join(tmpdir(), "lcm-compact-config-admission-"));
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
@@ -816,6 +817,7 @@ describe("POST /compact", () => {
     writeFileSync(caFile, "test-ca\n", { mode: 0o600 });
     process.env.LCM_POSTGRES_URL = "postgresql://user:password@localhost/lcm";
     process.env.LCM_POSTGRES_CA_FILE = caFile;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
     const summarizeStarted = deferred<void>();
     const releaseSummary = deferred<string>();
     vi.mocked(createOpenAISummarizer).mockReturnValueOnce(async () => {
@@ -883,6 +885,8 @@ describe("POST /compact", () => {
       else process.env.LCM_POSTGRES_URL = originalPostgresUrl;
       if (originalPostgresCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
       else process.env.LCM_POSTGRES_CA_FILE = originalPostgresCaFile;
+      if (originalPostgresMigrationRole === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE;
+      else process.env.LCM_POSTGRES_MIGRATION_ROLE = originalPostgresMigrationRole;
     }
   });
 

@@ -159,8 +159,10 @@ describe("ensureCore", () => {
     writeFileSync(caFile, "test-ca");
     const previousUrl = process.env.LCM_POSTGRES_URL;
     const previousCa = process.env.LCM_POSTGRES_CA_FILE;
+    const previousMigrationRole = process.env.LCM_POSTGRES_MIGRATION_ROLE;
     process.env.LCM_POSTGRES_URL = "postgresql://user:password@db.example/lcm";
     process.env.LCM_POSTGRES_CA_FILE = caFile;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
     const deps = makeDeps({
       configPath,
       existsSync: vi.fn().mockReturnValue(true),
@@ -178,6 +180,8 @@ describe("ensureCore", () => {
       else process.env.LCM_POSTGRES_URL = previousUrl;
       if (previousCa === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
       else process.env.LCM_POSTGRES_CA_FILE = previousCa;
+      if (previousMigrationRole === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE;
+      else process.env.LCM_POSTGRES_MIGRATION_ROLE = previousMigrationRole;
       rmSync(dir, { recursive: true, force: true });
     }
   });

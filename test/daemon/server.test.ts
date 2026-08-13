@@ -176,8 +176,10 @@ describe("daemon server", () => {
     writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
     const previousPostgresUrl = process.env.LCM_POSTGRES_URL;
     const previousPostgresCa = process.env.LCM_POSTGRES_CA_FILE;
+    const previousPostgresMigrationRole = process.env.LCM_POSTGRES_MIGRATION_ROLE;
     process.env.LCM_POSTGRES_URL = "postgresql://user:secret@db.example.test/lcm";
     process.env.LCM_POSTGRES_CA_FILE = caPath;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
 
     let scheduledScan: (() => unknown) | undefined;
     const realSetInterval = globalThis.setInterval;
@@ -236,6 +238,8 @@ describe("daemon server", () => {
       else process.env.LCM_POSTGRES_URL = previousPostgresUrl;
       if (previousPostgresCa === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
       else process.env.LCM_POSTGRES_CA_FILE = previousPostgresCa;
+      if (previousPostgresMigrationRole === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE;
+      else process.env.LCM_POSTGRES_MIGRATION_ROLE = previousPostgresMigrationRole;
     }
   });
 
@@ -246,8 +250,10 @@ describe("daemon server", () => {
     writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
     const previousUrl = process.env.LCM_POSTGRES_URL;
     const previousCa = process.env.LCM_POSTGRES_CA_FILE;
+    const previousMigrationRole = process.env.LCM_POSTGRES_MIGRATION_ROLE;
     process.env.LCM_POSTGRES_URL = "postgresql://user:secret@db.example.test/lcm";
     process.env.LCM_POSTGRES_CA_FILE = caPath;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
     daemon = await createDaemon(loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }), {
       publicationConfigPath: configPath,
     });
@@ -269,6 +275,8 @@ describe("daemon server", () => {
       else process.env.LCM_POSTGRES_URL = previousUrl;
       if (previousCa === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
       else process.env.LCM_POSTGRES_CA_FILE = previousCa;
+      if (previousMigrationRole === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE;
+      else process.env.LCM_POSTGRES_MIGRATION_ROLE = previousMigrationRole;
     }
   });
 
@@ -351,6 +359,7 @@ describe("daemon server", () => {
       {
         LCM_POSTGRES_URL: "postgresql://user:secret@db.example.test/lcm",
         LCM_POSTGRES_CA_FILE: caPath,
+        LCM_POSTGRES_MIGRATION_ROLE: "lcm_test_migrator",
       },
     );
     config.restoration.promptSearchMaxResults = 0;
@@ -911,6 +920,7 @@ describe("daemon auth", () => {
       {
         LCM_POSTGRES_URL: "postgresql://user:secret@db.example.test/lcm",
         LCM_POSTGRES_CA_FILE: caPath,
+        LCM_POSTGRES_MIGRATION_ROLE: "lcm_test_migrator",
       },
     );
     const daemon = await createDaemon(config, {

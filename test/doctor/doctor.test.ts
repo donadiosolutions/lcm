@@ -1256,8 +1256,10 @@ describe("runDoctor daemon version mismatch", () => {
     writeFileSync(caFile, "test-ca");
     const previousUrl = process.env.LCM_POSTGRES_URL;
     const previousCaFile = process.env.LCM_POSTGRES_CA_FILE;
+    const previousMigrationRole = process.env.LCM_POSTGRES_MIGRATION_ROLE;
     process.env.LCM_POSTGRES_URL = "postgresql://user:password@db.example/lcm";
     process.env.LCM_POSTGRES_CA_FILE = caFile;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
     const stagedHealth = {
       status: "unavailable",
       version: "0.5.0",
@@ -1327,6 +1329,8 @@ describe("runDoctor daemon version mismatch", () => {
       else process.env.LCM_POSTGRES_URL = previousUrl;
       if (previousCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
       else process.env.LCM_POSTGRES_CA_FILE = previousCaFile;
+      if (previousMigrationRole === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE;
+      else process.env.LCM_POSTGRES_MIGRATION_ROLE = previousMigrationRole;
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -1712,8 +1716,10 @@ describe("runDoctor configuration validation", () => {
     writeFileSync(caFile, "test-ca");
     const previousUrl = process.env.LCM_POSTGRES_URL;
     const previousCaFile = process.env.LCM_POSTGRES_CA_FILE;
+    const previousMigrationRole = process.env.LCM_POSTGRES_MIGRATION_ROLE;
     process.env.LCM_POSTGRES_URL = "postgresql://user:password@db.example/lcm";
     process.env.LCM_POSTGRES_CA_FILE = caFile;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
     const fetch = vi.fn();
     try {
       for (const provider of ["auto", "openai"] as const) {
@@ -1745,6 +1751,8 @@ describe("runDoctor configuration validation", () => {
       else process.env.LCM_POSTGRES_URL = previousUrl;
       if (previousCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
       else process.env.LCM_POSTGRES_CA_FILE = previousCaFile;
+      if (previousMigrationRole === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE;
+      else process.env.LCM_POSTGRES_MIGRATION_ROLE = previousMigrationRole;
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -1755,8 +1763,10 @@ describe("runDoctor configuration validation", () => {
     writeFileSync(caFile, "test-ca");
     const previousUrl = process.env.LCM_POSTGRES_URL;
     const previousCaFile = process.env.LCM_POSTGRES_CA_FILE;
+    const previousMigrationRole = process.env.LCM_POSTGRES_MIGRATION_ROLE;
     process.env.LCM_POSTGRES_URL = "postgresql://user:password@db.example/lcm";
     process.env.LCM_POSTGRES_CA_FILE = caFile;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
     const stagedHealth = {
       status: "unavailable",
       version: "0.5.0",
@@ -1850,6 +1860,8 @@ describe("runDoctor configuration validation", () => {
       else process.env.LCM_POSTGRES_URL = previousUrl;
       if (previousCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
       else process.env.LCM_POSTGRES_CA_FILE = previousCaFile;
+      if (previousMigrationRole === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE;
+      else process.env.LCM_POSTGRES_MIGRATION_ROLE = previousMigrationRole;
       rmSync(dir, { recursive: true, force: true });
     }
   });
