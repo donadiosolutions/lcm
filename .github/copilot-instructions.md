@@ -47,6 +47,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 
 ### Test coverage
 
+- Tests for void/throw-based assertion helpers must assert invocation with `not.toThrow()` rather than inspect their `undefined` return.
+
 - New HTTP routes must have corresponding tests in `test/daemon/routes/`.
 - Tests should cover: happy path, missing required fields (400), and resource-not-found (404).
 - Flag PRs adding routes without tests.

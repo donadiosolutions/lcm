@@ -2299,7 +2299,7 @@ describe("revocable mutation permits", () => {
 
     const topology = openHomeLockTopology(home, expectedUid);
     try {
-      expect(assertHomeLockTopology(topology)).toBeUndefined();
+      expect(() => assertHomeLockTopology(topology)).not.toThrow();
       restoreHomeLockTopologyMode(topology);
       expect(statSync(home).mode & 0o7777).toBe(0o755);
     } finally {
@@ -2311,7 +2311,7 @@ describe("revocable mutation permits", () => {
     const defaultTopology = openHomeLockTopology();
     try {
       expect(defaultTopology.homePath).toBe(resolve(homedir()));
-      expect(assertHomeLockTopology(defaultTopology)).toBeUndefined();
+      expect(() => assertHomeLockTopology(defaultTopology)).not.toThrow();
     } finally {
       closeHomeLockTopology(defaultTopology);
     }
