@@ -54,24 +54,27 @@ backend-specific primitive.
 
 SQLite remains the zero-configuration production default. The reusable
 conformance suite is backend-neutral, and the PostgreSQL conversation adapter
-now implements the same conversation, message, and message-part contract.
+implements the same conversation, message, and message-part contract. The
+explicit PostgreSQL composition root combines it with the summary, context,
+large-file, promoted-memory, recall, redaction-administration, lexical-search,
+and coordination adapters behind one complete `ProjectStorage` contract.
 The native-transcript repository adds immutable sanitized client-native
 records, exact message provenance, atomic checkpoint accounting, and
 idempotent ingest-key conflict handling. It intentionally exposes no payload
 update or deletion operation. During this staged phase, embedded backfill code
 receives `NativeTranscriptRepository` explicitly; PostgreSQL callers construct
 `PostgreSqlNativeTranscriptRepository`. The repository is not exposed through
-`ProjectStorage`. That adapter, the PostgreSQL runtime, migration
-runner, identity repository, and isolated test-database lease are shared
-foundations; they do not enable daemon or CLI routing. Until all PostgreSQL
-domain adapters and rollout gates land, selecting `postgresql` leaves general
-storage routes explicitly unavailable behind the staged loopback daemon rather
-than falling back to SQLite. See
+`ProjectStorage`. The production PostgreSQL factory, native-transcript adapter,
+runtime, migration runner, identity repository, and isolated test-database
+lease do not by themselves enable daemon or CLI routing. Until the remaining
+route and rollout gates land, selecting `postgresql` leaves general storage
+routes explicitly unavailable behind the staged loopback daemon rather than
+falling back to SQLite. See
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) for the
 local-scrubbing, checkpoint, quarantine, and rollback boundaries.
 The issue #88 adapters implement the existing `ProjectRepositories` contracts
-for promoted memory, recall, redaction administration, and coordination, but
-remain deliberately absent from the unavailable PostgreSQL storage factory.
+for promoted memory, recall, redaction administration, and coordination and
+are included in the explicit PostgreSQL project-storage factory.
 See [PostgreSQL memory and administration](../src/storage/postgresql/reference/postgresql-memory-administration.md)
 for their metadata, concurrency, purge, and retention contract. Issue #90
 extends the concrete staged `PostgreSqlCoordinationRepository` with distributed
@@ -171,9 +174,11 @@ generated identity sequences, or the search-normalization, summary-identity,
 large-file-identity, and session-ingest-identity functions; unknown
 pre-existing object ACLs are preserved. The normalization function is created
 without replacement, so a same-signature collision fails and rolls back the
-pending migration rather than overwriting operator code. Runtime grants remain
-absent until their owning adapters land and an administrator applies the
-corresponding reviewed script. Normalization-function ACL readiness accepts
+pending migration rather than overwriting operator code. Baseline migrations
+still grant no application privileges. An administrator applies the exact
+reviewed scripts for the restricted runtime role, and the PostgreSQL factory
+rejects construction unless the complete required grant set is present with no
+overbroad managed-object privileges. Normalization-function ACL readiness accepts
 only the owner plus non-`PUBLIC` runtime roles whose entries are
 non-grantable, owner-granted `EXECUTE`; broader privilege shapes fail closed.
 The three advisory-locked exact-identity triggers require `READ COMMITTED`
