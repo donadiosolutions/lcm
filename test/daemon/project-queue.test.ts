@@ -14,6 +14,16 @@ function deferred(): Deferred {
   return { promise, resolve };
 }
 
+async function waitForEntryBeforeSettlement<T>(entry: Promise<void>, operation: Promise<T>): Promise<void> {
+  const outcome = await Promise.race([
+    entry.then(() => "entered" as const),
+    operation.then(() => "settled" as const, () => "settled" as const),
+  ]);
+  if (outcome === "settled") {
+    throw new Error("queue operation settled before entering its test gate");
+  }
+}
+
 describe("enqueue", () => {
   it("returns the result of fn", async () => {
     const result = await enqueue("proj-result", () => Promise.resolve(42));
@@ -40,10 +50,10 @@ describe("enqueue", () => {
     });
 
     try {
-      await firstEntry.promise;
+      await waitForEntryBeforeSettlement(firstEntry.promise, first);
       expect(entered).toEqual(["first"]);
       releaseFirst.resolve();
-      await secondEntry.promise;
+      await waitForEntryBeforeSettlement(secondEntry.promise, second);
       await Promise.all([first, second]);
       expect(entered).toEqual(["first", "second"]);
       expect(order).toEqual([1, 2]);
@@ -72,7 +82,10 @@ describe("enqueue", () => {
     });
 
     try {
-      await Promise.all([aEntry.promise, bEntry.promise]);
+      await Promise.all([
+        waitForEntryBeforeSettlement(aEntry.promise, a),
+        waitForEntryBeforeSettlement(bEntry.promise, b),
+      ]);
       expect(started).toHaveLength(2);
       expect(started).toEqual(expect.arrayContaining(["a", "b"]));
       releaseA.resolve();

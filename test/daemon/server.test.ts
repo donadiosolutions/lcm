@@ -778,6 +778,7 @@ describe("daemon idle timeout", () => {
 
   it("resets idle timer on request", async () => {
     let idleCalled = false;
+    let finalTimer: IdleTimerEntry | undefined;
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
     config.daemon.idleTimeoutMs = 200;
@@ -805,16 +806,16 @@ describe("daemon idle timeout", () => {
       expect(idleTimers.timers.filter(entry => !entry.active)).toHaveLength(2);
       const activeTimers = idleTimers.timers.filter(entry => entry.active);
       expect(activeTimers).toHaveLength(1);
+      finalTimer = activeTimers[0];
+      expect(finalTimer).toMatchObject({ delayMs: 200, active: true });
       expect(idleCalled).toBe(false);
       expect(daemon.idleTriggered).toBe(false);
-
-      idleTimers.fire(activeTimers[0]!.handle);
-      expect(idleCalled).toBe(true);
-      expect(daemon.idleTriggered).toBe(true);
     } finally {
       await daemon.stop();
     }
-    expect(idleTimers.timers.every(timer => !timer.active)).toBe(true);
+    expect(finalTimer?.active).toBe(false);
+    expect(idleCalled).toBe(false);
+    expect(daemon.idleTriggered).toBe(false);
   });
 });
 

@@ -2396,6 +2396,11 @@ describe("project map", () => {
       const initialDirectoryWatcher = activeWatcher();
       expect(initialDirectoryWatcher.path).toBe(dirname(projectMapPath()));
 
+      deliver("rename", "unrelated");
+      expect(vi.getTimerCount()).toBe(0);
+      expect(initialDirectoryWatcher.closed).toBe(false);
+      expect(activeWatcher()).toBe(initialDirectoryWatcher);
+
       writeProjectMap("{ }\n");
       deliver("rename", "map.json");
       expect(vi.getTimerCount()).toBe(1);
