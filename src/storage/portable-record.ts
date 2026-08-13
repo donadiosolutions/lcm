@@ -553,50 +553,6 @@ const PORTABLE_RECORD_SCHEMA_BASE = {
     },
     hashes: "lowercase-sha256-canonical-utf8",
   },
-  comparators: {
-    canonicalJsonObjectKeys: "unsigned-utf16-code-unit-lexicographic",
-    portableTuples: "unsigned-utf8-byte-lexicographic",
-  },
-  constructionContext: {
-    required: true,
-    serialized: false,
-    domains: {
-      machines: "null",
-      project: "null",
-      "project-aliases": ["projectIdentity"],
-      conversations: ["projectIdentity"],
-      messages: ["conversationOrder"],
-      "message-parts": ["messageOrder"],
-      "large-files": ["conversationOrder"],
-      summaries: ["conversationOrder"],
-      "summary-file-links": "null",
-      "summary-message-links": "null",
-      "summary-parent-links": "null",
-      "context-items": ["conversationOrder"],
-      "promoted-memories": "null",
-      "promoted-memory-tags": "null",
-      "recall-surfacings": "null",
-      "redaction-counters": "null",
-      "session-ingest": "null",
-      "session-instructions": "null",
-      "native-transcripts": "null",
-      "native-transcript-message-links": "null",
-      "native-transcript-checkpoints": "null",
-      "passive-events": "null",
-    },
-  },
-  contextValidation: {
-    parentOrders: "strictly-validated-and-reconstructed-from-wire-order",
-    projectIdentity: "strictly-validated-and-bound-by-project-preimage",
-    discardedBeforeFreeze: true,
-  },
-  closureProjection: {
-    conversations: ["sessionId", "title", "bootstrappedAt", "createdAt", "updatedAt", "occurrenceOrdinal"],
-    messages: ["conversationOrder", "seq"],
-    "message-parts": ["messageOrder", "ordinal"],
-    "context-items": ["conversationOrder", "ordinal"],
-    occurrenceNumbering: "canonical-order-with-contiguous-equal-closure-blocks",
-  },
   limits: PORTABLE_LIMITS,
   domainsByOrder: {
     machines: {
@@ -1088,10 +1044,12 @@ function normalizeTimestamp(value: PortableRawTimestamp): string {
     }
   } else {
     if (!(value instanceof Date) || Number.isNaN(value.getTime())) malformed();
-    value = value.toISOString().replace(/(\.\d{3})Z$/, "$1000Z");
+    const iso = value.toISOString();
+    value = iso.replace(/(\.\d{3})Z$/, "$1000Z");
     match = value.match(SIX_DIGIT_TIMESTAMP_PATTERN);
   }
-  const normalizedMatch = match as RegExpMatchArray;
+  if (match === null) malformed();
+  const normalizedMatch = match;
   const year = Number(normalizedMatch[1]);
   const month = Number(normalizedMatch[2]);
   const day = Number(normalizedMatch[3]);
@@ -1206,7 +1164,12 @@ function canonicalJsonValue(
     for (let index = 0; index < value.length; index += 1) {
       if (!Object.prototype.hasOwnProperty.call(value, index)) malformed();
     }
-    if (keys.some((key) => typeof key === "symbol" || (typeof key === "string" && !/^\d+$/.test(key) && key !== "length"))) malformed();
+    if (keys.some((key) => {
+      if (typeof key === "symbol") return true;
+      if (key === "length") return false;
+      const index = Number(key);
+      return !Number.isSafeInteger(index) || index < 0 || String(index) !== key || index >= value.length;
+    })) malformed();
     result = `[${value.map((item) => canonicalJsonValue(item, depth + 1, seen, maximumDepth)).join(",")}]`;
   } else {
     if (!isPlainObject(value)) malformed();
@@ -2186,5 +2149,6 @@ function validatePortableRecord(parsed: unknown): PortableRecord {
   if (parsed.identitySha256 !== record.identitySha256) malformed();
   if (canonicalJson(parsed.dependencies) !== canonicalJson(record.dependencies)) malformed();
   if (parsed.recordSha256 !== record.recordSha256) malformed();
+  if (canonicalEnvelopeJson(parsed) !== canonicalEnvelopeJson(record)) malformed();
   return record;
 }

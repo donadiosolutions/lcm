@@ -1138,6 +1138,13 @@ describe("portable record public seam", () => {
     }
     expectCode(() => parsePortableRecord(Buffer.from(`${JSON.stringify({ ...encoded, domainVersion: 2 })}\n`)), "unsupported-version");
     expectCode(() => parsePortableRecord(Buffer.from(`${JSON.stringify({ ...encoded, extra: "field" })}\n`)), "malformed-record");
+
+    const ingest = create("session-ingest", representativeValues["session-ingest"]);
+    const noncanonicalInteger = Buffer.from(bytes(ingest)).toString("utf8").replace(
+      '"messageCount":{"$integer":"1"}',
+      '"messageCount":1',
+    );
+    expectCode(() => parsePortableRecord(Buffer.from(noncanonicalInteger, "utf8")), "malformed-record");
   });
 
   it("rejects forbidden JSON values and oversized UTF-8 before parser work", () => {
@@ -1263,6 +1270,8 @@ describe("portable record public seam", () => {
   });
 
   it("covers canonical scalar, container, and comparator rejection branches", () => {
+    expect(canonicalJson(true)).toBe("true");
+    expect(canonicalJson(false)).toBe("false");
     expectCode(() => canonicalJson("\udc00"), "malformed-record");
     expectCode(() => canonicalJson(Object.create(null, {
       value: { get: () => 1, enumerable: true },
@@ -1273,6 +1282,9 @@ describe("portable record public seam", () => {
     const arrayWithSymbol = [1] as unknown[] & { [key: symbol]: number };
     arrayWithSymbol[Symbol("extra")] = 2;
     expectCode(() => canonicalJson(arrayWithSymbol), "malformed-record");
+    const arrayWithLeadingZero = [1] as unknown[] & Record<string, unknown>;
+    arrayWithLeadingZero["01"] = 2;
+    expectCode(() => canonicalJson(arrayWithLeadingZero), "malformed-record");
     expectCode(() => canonicalJson(new Map()), "malformed-record");
     expect(canonicalJson(Object.create(null, { a: { value: 1, enumerable: true } }))).toBe('{"a":1}');
     expect(comparePortableOrder([null], [null])).toBe(0);
@@ -1316,6 +1328,10 @@ describe("portable record public seam", () => {
     expectCode(() => create("conversations", {
       ...representativeValues.conversations,
       createdAt: new Date(Number.NaN),
+    }), "malformed-record");
+    expectCode(() => create("conversations", {
+      ...representativeValues.conversations,
+      createdAt: new Date(8.64e15),
     }), "malformed-record");
     expectCode(() => create("conversations", {
       ...representativeValues.conversations,
