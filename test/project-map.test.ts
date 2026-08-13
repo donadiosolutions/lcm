@@ -2336,20 +2336,145 @@ describe("project map", () => {
     }
   });
 
-  it("reloads map watches for directory creation, deletion, and file changes", async () => {
-    const directoryWatcher = watchProjectMap();
-    writeFileSync(join(homedir(), ".lcm", "unrelated"), "ignored");
-    writeProjectMap("{}\n");
-    rmSync(projectMapPath());
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    directoryWatcher.close();
+  it("reloads map watches for directory creation, deletion, and file changes", () => {
+    type FakeWatchCallback = (event: string, filename: string | Buffer | null) => void;
+    type FakeWatcher = {
+      path: string;
+      closed: boolean;
+      close: () => void;
+      unref: () => FakeWatcher;
+      deliver: FakeWatchCallback;
+    };
 
-    writeProjectMap("{}\n");
-    const fileWatcher = watchProjectMap();
-    writeProjectMap("{ }\n");
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    fileWatcher.close();
+    const nodeFs = createRequire(import.meta.url)("node:fs") as {
+      watch: typeof import("node:fs").watch;
+    };
+    const originalWatch = nodeFs.watch;
+    const activeWatchers = new Set<FakeWatcher>();
+    const createdWatchers: FakeWatcher[] = [];
+    const projectWatchers: Array<ReturnType<typeof watchProjectMap>> = [];
 
-    expect(reloadProjectMapCache()).toBe(true);
+    const fakeWatch = (watchPath: string, callback: FakeWatchCallback): FakeWatcher => {
+      const watcher: FakeWatcher = {
+        path: watchPath,
+        closed: false,
+        close: () => {
+          if (watcher.closed) return;
+          watcher.closed = true;
+          activeWatchers.delete(watcher);
+        },
+        unref: () => watcher,
+        deliver: (event, filename) => callback(event, filename),
+      };
+      activeWatchers.add(watcher);
+      createdWatchers.push(watcher);
+      return watcher;
+    };
+
+    const activeWatcher = (): FakeWatcher => {
+      const watcher = activeWatchers.values().next().value;
+      if (!watcher || watcher.closed) throw new Error("cannot deliver event: no active watcher");
+      return watcher;
+    };
+
+    const deliver = (event: "rename" | "change", filename: string | null): void => {
+      activeWatcher().deliver(event, filename);
+    };
+
+    let directoryWatcher: ReturnType<typeof watchProjectMap> | undefined;
+    let fileWatcher: ReturnType<typeof watchProjectMap> | undefined;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      nodeFs.watch = fakeWatch as unknown as typeof nodeFs.watch;
+      syncBuiltinESMExports();
+
+      expect(() => deliver("rename", "map.json")).toThrow("no active watcher");
+
+      directoryWatcher = watchProjectMap();
+      projectWatchers.push(directoryWatcher);
+      const initialDirectoryWatcher = activeWatcher();
+      expect(initialDirectoryWatcher.path).toBe(dirname(projectMapPath()));
+
+      writeProjectMap("{ }\n");
+      deliver("rename", "map.json");
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(25);
+      expect(readFileSync(projectMapPath(), "utf8")).toBe("{}\n");
+      expect(activeWatcher()).toBe(initialDirectoryWatcher);
+
+      rmSync(projectMapPath());
+      deliver("rename", "map.json");
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(25);
+      expect(initialDirectoryWatcher.closed).toBe(true);
+      expect(activeWatchers.size).toBe(1);
+      const rearmedDirectoryWatcher = activeWatcher();
+      expect(rearmedDirectoryWatcher.path).toBe(dirname(projectMapPath()));
+
+      directoryWatcher.close();
+      expect(rearmedDirectoryWatcher.closed).toBe(true);
+      expect(activeWatchers.size).toBe(0);
+      expect(() => deliver("rename", "map.json")).toThrow("no active watcher");
+
+      writeProjectMap("{}\n");
+      fileWatcher = watchProjectMap();
+      projectWatchers.push(fileWatcher);
+      const initialFileWatcher = activeWatcher();
+      expect(initialFileWatcher.path).toBe(projectMapPath());
+
+      writeProjectMap("{ }\n");
+      deliver("change", "map.json");
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(25);
+      expect(readFileSync(projectMapPath(), "utf8")).toBe("{}\n");
+      expect(initialFileWatcher.closed).toBe(true);
+      expect(activeWatchers.size).toBe(1);
+      const rearmedFileWatcher = activeWatcher();
+      expect(rearmedFileWatcher.path).toBe(projectMapPath());
+
+      rmSync(projectMapPath());
+      deliver("rename", "map.json");
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(25);
+      expect(rearmedFileWatcher.closed).toBe(true);
+      expect(activeWatchers.size).toBe(1);
+      expect(activeWatcher().path).toBe(dirname(projectMapPath()));
+
+      expect(reloadProjectMapCache()).toBe(true);
+    } finally {
+      const cleanupErrors: unknown[] = [];
+      for (const watcher of projectWatchers) {
+        try {
+          watcher.close();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      for (const watcher of createdWatchers) {
+        try {
+          watcher.close();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      if (activeWatchers.size !== 0) {
+        cleanupErrors.push(new Error(`active fake watchers remain after cleanup: ${activeWatchers.size}`));
+      }
+      try {
+        nodeFs.watch = originalWatch;
+        syncBuiltinESMExports();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      try {
+        vi.useRealTimers();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      if (cleanupErrors.length === 1) throw cleanupErrors[0];
+      if (cleanupErrors.length > 1) {
+        throw new AggregateError(cleanupErrors, "project map watcher test and cleanup failed");
+      }
+    }
   });
 });
