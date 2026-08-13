@@ -18,6 +18,7 @@ const POSTGRESQL_REFERENCE_FILES = [
   "postgresql-runtime-coordination-grants.sql",
   "postgresql-runtime-identity-grants.sql",
   "postgresql-runtime-memory-grants.sql",
+  "postgresql-runtime-readiness-grants.sql",
   "postgresql-runtime-search-grants.sql",
   "postgresql-runtime-summary-context-grants.sql",
   "postgresql-runtime-transcript-grants.sql",

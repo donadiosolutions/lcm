@@ -1,6 +1,7 @@
 # PostgreSQL 18 schema reference
 
-This reference describes the durable PostgreSQL baseline introduced by
+This reference describes the durable PostgreSQL baseline and read-only
+runtime-readiness contract introduced by
 `0001_migration_ledger.sql` and `0002_schema_baseline.sql`. The latter creates
 23 domain tables, backend-neutral project identity, and bounded session lookup
 keys. This is a schema and readiness contract, not an enabled
@@ -543,10 +544,19 @@ on a provider does not justify silently expanding the baseline.
    With `storage.backend` configured, the supported packaged entry point is
    `LCM_POSTGRES_URL="$LCM_POSTGRES_MIGRATION_URL" lcm postgres migrate`; it
    accepts `--json` for automation and closes the migration pool before exit.
-2. Runtime health verifies server version, UTF-8 database encoding, extension
-   readiness, and the fingerprinted `lcm.search_v1` text-search contract.
-   Failed readiness produces corrective guidance without changing database or
-   cluster state.
+2. The eager runtime-readiness verifier verifies the exact PostgreSQL 18,
+   `UTF8`, `UTC`, and certificate-verified TLS contract; required extensions
+   and the fingerprinted `lcm.search_v1` text-search contract; the complete
+   ordered migration history and packaged checksums; the latest schema,
+   definition, relation-ACL, column-ACL, and identity-function fingerprints;
+   and ownership of the schema, ledger, and every managed object by the
+   configured `storage.postgresql.migrationRole`. It also verifies the
+   restricted runtime role's owner/membership/attribute policy, exact direct
+   ACL shape, and exact effective least-privilege result. The configured
+   migration role is passed as the trusted expected owner; the verifier never
+   substitutes `CURRENT_USER`, an observed catalog owner, or an opaque
+   migration witness hash. Failed readiness produces sanitized corrective
+   guidance without changing database or cluster state.
 3. The migration runner validates packaged SHA-256 artifacts, captures the
    postmaster epoch, requires UTF-8, and performs the functional extension probe
    before opening the DDL transaction. It then opens one transaction, takes a database-scoped
@@ -670,16 +680,25 @@ identifier-quoted transfer guidance. Missing, malformed, or contradictory
 ownership catalog values fail closed without exposing the existing owner,
 connection details, or raw database errors.
 
-After schema creation, an administrator grants each implemented repository
-only its exact runtime privileges with the reviewed
+After schema creation, an administrator grants the read-only verifier and
+each implemented repository only their exact runtime privileges with the
+reviewed
+[`postgresql-runtime-readiness-grants.sql`](postgresql-runtime-readiness-grants.sql),
 [`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql),
 [`postgresql-runtime-conversation-grants.sql`](postgresql-runtime-conversation-grants.sql),
-[`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql),
-and
-[`postgresql-runtime-memory-grants.sql`](postgresql-runtime-memory-grants.sql)
-scripts:
+[`postgresql-runtime-summary-context-grants.sql`](postgresql-runtime-summary-context-grants.sql),
+[`postgresql-runtime-memory-grants.sql`](postgresql-runtime-memory-grants.sql),
+[`postgresql-runtime-search-grants.sql`](postgresql-runtime-search-grants.sql),
+and [`postgresql-runtime-coordination-grants.sql`](postgresql-runtime-coordination-grants.sql)
+scripts. The transcript script is optional because native-transcript
+persistence is outside `ProjectStorage`; readiness accepts its exact optional
+privilege set either absent or present:
 
 ```bash
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file src/storage/postgresql/reference/postgresql-runtime-readiness-grants.sql
+
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql
@@ -690,12 +709,31 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-summary-context-grants.sql
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file src/storage/postgresql/reference/postgresql-runtime-memory-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file src/storage/postgresql/reference/postgresql-runtime-search-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql
 ```
+
+If native-transcript persistence is explicitly enabled for the caller, also
+apply `postgresql-runtime-transcript-grants.sql` between the conversation and
+summary/context scripts. Omitting it is valid for the core runtime. Every
+script requires the same `lcm_runtime_role`, stops on the first error, and
+commits its own transaction. The readiness script grants exactly `SELECT` on
+`lcm.schema_migrations`, `USAGE` on the `public` schema, and `EXECUTE` on
+`public.digest(text, text)` and `public.digest(bytea, text)`. It grants no
+application-table DML, ownership, sequence access, or migration authority.
+Those catalog and digest privileges are the minimum needed for the read-only
+verifier to inspect the complete ledger and fingerprint material.
 
 Replace `lcm_runtime` with the deployment's runtime role. The script grants
 schema `USAGE` and table `SELECT` where identity readback requires it. Writes

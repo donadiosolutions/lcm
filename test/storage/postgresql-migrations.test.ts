@@ -10,6 +10,8 @@ import {
   getPostgreSqlSchemaSnapshotExpectations,
   loadPostgreSqlMigrations,
   loadPostgreSqlSchemaSnapshots,
+  validatePostgreSqlMigrations,
+  validatePostgreSqlSchemaSnapshotRegistry,
   PostgreSqlBaselineDefinitionPreflightError,
   PostgreSqlIdentityFunctionPreflightError,
   PostgreSqlMigrationLedgerRelationPreflightError,
@@ -320,6 +322,14 @@ function executor(options: {
 }
 
 describe("PostgreSQL migration runner", () => {
+  it("exports pure manifest and snapshot registry validation for runtime readiness", () => {
+    const migrations = loadPostgreSqlMigrations();
+    const snapshots = loadPostgreSqlSchemaSnapshots();
+
+    expect(() => validatePostgreSqlMigrations(migrations)).not.toThrow();
+    expect(() => validatePostgreSqlSchemaSnapshotRegistry(migrations, snapshots)).not.toThrow();
+  });
+
   it("derives changed future expectations and selects by migration history, not registry order", () => {
     const snapshot = (
       migrationId: string,
@@ -1473,6 +1483,12 @@ describe("PostgreSQL migration runner", () => {
       ]);
     expect(inventorySql).toContain("pg_catalog.unnest");
     expect(inventorySql).toContain("WHEN 'S' THEN 's'::pg_catalog.\"char\"");
+    expect(inventorySql).toMatch(
+      /'table\|schema_migrations'[\s\S]*?privilege\.privilege_type[\s\S]*?'SELECT'/u,
+    );
+    expect(inventorySql).toMatch(
+      /relation\.relname[\s\S]*?'projects'[\s\S]*?ARRAY\[[\s\S]*?'project_id'[\s\S]*?'identity_key'[\s\S]*?'display_name'[\s\S]*?\][\s\S]*?'INSERT'/u,
+    );
     for (const summaryContextGrantIdentity of [
       "'table|summaries'",
       "'table|summary_parents'",

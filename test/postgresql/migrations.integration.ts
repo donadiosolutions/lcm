@@ -10,6 +10,10 @@ import {
 } from "../../src/storage/postgresql/migrations.js";
 import type { PostgreSqlMigration } from "../../src/storage/postgresql/contracts.js";
 import {
+  POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST,
+  verifyPostgreSqlRuntimeSchema,
+} from "../../src/storage/postgresql/runtime-readiness.js";
+import {
   PostgreSqlRuntime,
   POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
 } from "../../src/storage/postgresql/runtime.js";
@@ -39,6 +43,51 @@ CREATE TABLE IF NOT EXISTS lcm.schema_migrations (
   checksum_sha256 text NOT NULL CHECK (checksum_sha256 ~ '^[0-9a-f]{64}$'),
   applied_at timestamptz NOT NULL DEFAULT statement_timestamp()
 );`;
+
+const REQUIRED_RUNTIME_GRANT_SCRIPTS = [
+  "postgresql-runtime-readiness-grants.sql",
+  "postgresql-runtime-identity-grants.sql",
+  "postgresql-runtime-conversation-grants.sql",
+  "postgresql-runtime-summary-context-grants.sql",
+  "postgresql-runtime-memory-grants.sql",
+  "postgresql-runtime-search-grants.sql",
+  "postgresql-runtime-coordination-grants.sql",
+] as const;
+
+const OPTIONAL_RUNTIME_GRANT_SCRIPT = "postgresql-runtime-transcript-grants.sql";
+
+async function applyRuntimeGrantScripts(
+  database: PostgreSqlTestDatabase,
+  options: {
+    readonly includeTranscript?: boolean;
+    readonly omit?: readonly string[];
+  } = {},
+): Promise<void> {
+  const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+  const scripts = options.includeTranscript === true
+    ? [...REQUIRED_RUNTIME_GRANT_SCRIPTS, OPTIONAL_RUNTIME_GRANT_SCRIPT]
+    : REQUIRED_RUNTIME_GRANT_SCRIPTS;
+  try {
+    for (const script of scripts) {
+      if (options.omit?.includes(script)) continue;
+      const template = readFileSync(
+        join(process.cwd(), "src", "storage", "postgresql", "reference", script),
+        "utf8",
+      );
+      const sql = template
+        .split("\n")
+        .filter((line) => !line.startsWith("\\"))
+        .join("\n")
+        .replaceAll(':"lcm_runtime_role"', '"lcm_test_runtime"');
+      await administrator.query({ text: sql }, {
+        domain: "factory",
+        operation: `applyRuntimeGrantScript:${script}`,
+      });
+    }
+  } finally {
+    await administrator.close();
+  }
+}
 
 async function waitForSummaryMigrationRelationLock(
   admin: PostgreSqlRuntime,
@@ -145,6 +194,162 @@ async function executeRawMigrationExpectingFailure(
 }
 
 describe("PostgreSQL migrations and database isolation", () => {
+  it.each([
+    { label: "without transcript grants", includeTranscript: false },
+    { label: "with transcript grants", includeTranscript: true },
+  ])("verifies PG18 runtime readiness $label", async ({ label, includeTranscript }) => {
+    await withPostgreSqlTestDatabase(
+      `runtime-readiness-${label}`,
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database, { includeTranscript });
+
+        const readiness = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+          expectedOwner: "lcm_test_migrator",
+        });
+        const version = await database.runtime.query<{
+          server_version_num: number;
+          server_encoding: string;
+          timezone: string;
+          role: string;
+          tls: boolean;
+        }>({
+          text: `SELECT
+                   pg_catalog.current_setting('server_version_num')::integer
+                     AS server_version_num,
+                   pg_catalog.current_setting('server_encoding') AS server_encoding,
+                   pg_catalog.current_setting('TimeZone') AS timezone,
+                   CURRENT_USER::text AS role,
+                   COALESCE((
+                     SELECT ssl
+                     FROM pg_catalog.pg_stat_ssl
+                     WHERE pid = pg_catalog.pg_backend_pid()
+                   ), false) AS tls`,
+        }, { domain: "factory", operation: "verifyRuntimeReadinessWitness" });
+        expect(version.rows).toEqual([{
+          server_version_num: expect.any(Number),
+          server_encoding: "UTF8",
+          timezone: "UTC",
+          role: "lcm_test_runtime",
+          tls: true,
+        }]);
+        expect(Math.floor(version.rows[0]!.server_version_num / 10_000)).toBe(18);
+
+        const expectedMigrationIds = loadPostgreSqlMigrations().map(({ id }) => id);
+        expect(readiness).toMatchObject({
+          currentMigrationIds: expectedMigrationIds,
+          expectedOwner: "lcm_test_migrator",
+          runtimeRole: "lcm_test_runtime",
+          managedObjectCount: expect.any(Number),
+          definitionObjectCount: expect.any(Number),
+          privilegeManifestVersion: POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.version,
+        });
+        expect(Object.keys(readiness).sort()).toEqual([
+          "currentMigrationIds",
+          "definitionObjectCount",
+          "expectedOwner",
+          "managedObjectCount",
+          "privilegeManifestVersion",
+          "runtimeRole",
+        ]);
+
+        const ledger = await database.runtime.query<{
+          id: string;
+          checksum_sha256: string;
+        }>({
+          text: `SELECT id, checksum_sha256
+                 FROM lcm.schema_migrations
+                 ORDER BY id`,
+        }, { domain: "factory", operation: "verifyRuntimeMigrationLedger" });
+        expect(ledger.rows).toEqual(loadPostgreSqlMigrations().map((entry) => ({
+          id: entry.id,
+          checksum_sha256: entry.sha256,
+        })));
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it.each(REQUIRED_RUNTIME_GRANT_SCRIPTS)(
+    "rejects readiness when %s is omitted",
+    async (omittedScript) => {
+      await withPostgreSqlTestDatabase(
+        `readiness-omit-${omittedScript}`,
+        async (database) => {
+          await runPostgreSqlMigrations(database.migrator);
+          await applyRuntimeGrantScripts(database, { omit: [omittedScript] });
+
+          await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          })).rejects.toMatchObject({
+            backend: "postgresql",
+            code: "STORAGE_INITIALIZATION_FAILED",
+          });
+        },
+        { runMigrations: false },
+      );
+    },
+  );
+
+  it("rejects an overbroad PUBLIC managed-table grant", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-public-grant",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        await database.migrator.query({
+          text: "GRANT SELECT ON TABLE lcm.projects TO PUBLIC",
+        }, { domain: "factory", operation: "injectReadinessPublicGrant" });
+
+        await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+          expectedOwner: "lcm_test_migrator",
+        })).rejects.toMatchObject({
+          reason: "schema-fingerprint",
+          operation: "inspectSchemaDefinitions",
+        });
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("keeps the restricted runtime unable to mutate the ledger, create, or migrate", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-runtime-denials",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+          expectedOwner: "lcm_test_migrator",
+        })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+
+        for (const [operation, text] of [
+          ["denyRuntimeLedgerInsert", "INSERT INTO lcm.schema_migrations (id, checksum_sha256) VALUES ('9999_forbidden', repeat('0', 64))"],
+          ["denyRuntimeLedgerUpdate", "UPDATE lcm.schema_migrations SET checksum_sha256 = repeat('0', 64)"],
+          ["denyRuntimeLedgerDelete", "DELETE FROM lcm.schema_migrations"],
+          ["denyRuntimeLedgerTruncate", "TRUNCATE TABLE lcm.schema_migrations"],
+          ["denyRuntimeSchemaCreate", "CREATE TABLE lcm.runtime_forbidden (id integer)"],
+        ] as const) {
+          await expect(database.runtime.query({ text }, {
+            domain: "factory",
+            operation,
+          })).rejects.toMatchObject({ backend: "postgresql" });
+        }
+
+        const pending = migration(
+          "0006_runtime_forbidden",
+          "CREATE TABLE lcm.runtime_migration_forbidden (id integer)",
+        );
+        await expect(runPostgreSqlMigrations(database.runtime, {
+          migrations: [...loadPostgreSqlMigrations(), pending],
+        })).rejects.toMatchObject({
+          backend: "postgresql",
+          code: "STORAGE_INITIALIZATION_FAILED",
+        });
+      },
+      { runMigrations: false },
+    );
+  });
+
   it.each([
     { label: "0002 baseline", migrationCount: 2, snapshotCount: 1 },
     { label: "0003 machine identity", migrationCount: 3, snapshotCount: 2 },

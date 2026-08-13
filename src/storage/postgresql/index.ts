@@ -12,5 +12,6 @@ export * from "./native-transcript-repository.js";
 export * from "./passive-event-repository.js";
 export * from "./publication-guard.js";
 export * from "./runtime.js";
+export * from "./runtime-readiness.js";
 export * from "./search-configuration.js";
 export * from "./summary-context-repositories.js";

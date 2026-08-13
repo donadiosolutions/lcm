@@ -100,7 +100,7 @@ export type PostgreSqlSchemaSnapshot = ExpectedBaselineDefinitionInventory & {
   }[];
   readonly migrationId: string;
 };
-type PostgreSqlSchemaSnapshotExpectations = {
+export type PostgreSqlSchemaSnapshotExpectations = {
   readonly definitionGroupCounts: readonly number[];
   readonly definitionGroupHashes: readonly string[];
   readonly definitionGroupKinds: readonly string[];
@@ -982,7 +982,7 @@ export function loadPostgreSqlMigrations(
   });
 }
 
-function validateMigrations(migrations: readonly PostgreSqlMigration[]): void {
+export function validatePostgreSqlMigrations(migrations: readonly PostgreSqlMigration[]): void {
   let previous = "";
   const ids = new Set<string>();
   for (const migration of migrations) {
@@ -1000,7 +1000,7 @@ function validateMigrations(migrations: readonly PostgreSqlMigration[]): void {
   }
 }
 
-function validateSchemaSnapshotRegistry(
+export function validatePostgreSqlSchemaSnapshotRegistry(
   migrations: readonly PostgreSqlMigration[],
   snapshots: readonly PostgreSqlSchemaSnapshot[],
 ): void {
@@ -1062,8 +1062,8 @@ export async function runPostgreSqlMigrations(
 ): Promise<PostgreSqlMigrationResult> {
   const migrations = [...(options.migrations ?? loadPostgreSqlMigrations())];
   const schemaSnapshots = [...(options.schemaSnapshots ?? loadPostgreSqlSchemaSnapshots())];
-  validateMigrations(migrations);
-  validateSchemaSnapshotRegistry(migrations, schemaSnapshots);
+  validatePostgreSqlMigrations(migrations);
+  validatePostgreSqlSchemaSnapshotRegistry(migrations, schemaSnapshots);
   // The functional pg_stat_statements probe can raise SQLSTATE 55000 when the
   // library was not preloaded. Run it before opening the all-or-nothing DDL
   // transaction so that expected readiness failure cannot poison that scope.
@@ -1714,6 +1714,11 @@ export async function runPostgreSqlMigrations(
                        )
                        OR (
                          acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           'table|schema_migrations'
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=) 'SELECT'
+                       )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
                            'table|projects'
                          AND privilege.privilege_type OPERATOR(pg_catalog.=)
                            ANY (ARRAY['SELECT', 'DELETE']::pg_catalog.text[])
@@ -1867,7 +1872,11 @@ export async function runPostgreSqlMigrations(
                               relation.relname OPERATOR(pg_catalog.=) 'projects'
                               AND attribute.attname OPERATOR(pg_catalog.=)
                                 ANY (
-                                  ARRAY['identity_key', 'display_name']::pg_catalog.text[]
+                                  ARRAY[
+                                    'project_id',
+                                    'identity_key',
+                                    'display_name'
+                                  ]::pg_catalog.text[]
                                 )
                               AND privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
                             )
