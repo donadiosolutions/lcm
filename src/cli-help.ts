@@ -148,7 +148,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm postgres migrate", "Apply pending migrations and report the current schema history"],
       ["lcm postgres migrate --json", "Return applied and current migration IDs as JSON"],
     ],
-    notes: "Configure storage.backend=postgresql and supply the migration role through LCM_POSTGRES_URL plus the verified CA path through LCM_POSTGRES_CA_FILE. The command validates PostgreSQL 18, extensions, ownership, migration checksums, and schema fingerprints. It does not install extensions or grant runtime privileges.",
+    notes: "Configure storage.backend=postgresql and set the non-secret expected owner through storage.postgresql.migrationRole or its LCM_POSTGRES_MIGRATION_ROLE fallback. Supply migration-owner credentials through LCM_POSTGRES_URL and the verified CA path through LCM_POSTGRES_CA_FILE. The command validates PostgreSQL 18, extensions, ownership, migration checksums, and schema fingerprints. It does not install extensions or grant runtime privileges.",
   },
 
   search: {
