@@ -12,12 +12,15 @@ portable import/export and reversible SQLite/PostgreSQL migration.
 **Architecture:** Add a strict domain codec in
 `src/storage/portable-record.ts` and the stream/manifest/checkpoint protocol in
 `src/storage/portable-record-stream.ts`. Source adapters normalize backend
-values into the domain union and expose one already-bounded page seam; a shared
-validated stream wrapper checks exact keys and dependencies, produces canonical
-UTF-8 JSON and SHA-256 digests, and advances one domain checkpoint only after a
-complete bounded page exists. The contract is project-scoped, contains no SQL,
-table names, paths to storage files, publication mechanics, destination
-transactions, or migration state machine types.
+values plus exact transient construction context into the domain union and
+expose one already-bounded page seam; a shared validated stream wrapper checks
+exact keys and dependencies, produces canonical UTF-8 JSON and SHA-256 digests,
+and advances one domain checkpoint only after a complete bounded page exists.
+Construction context supplies only parent-order or selected-project evidence
+that is intentionally absent from a child value and is never serialized into a
+record. The contract is project-scoped, contains no SQL, table names, paths to
+storage files, publication mechanics, destination transactions, or migration
+state machine types.
 
 **Tech Stack:** TypeScript 6.0, Node.js 22+ `node:crypto`, Vitest 4.1.10. No
 new dependency and no package-lock change.
@@ -75,13 +78,23 @@ new dependency and no package-lock change.
   `{ scope: "shared", projectId: <registered remote UUIDv7> }` for any
   cross-backend stream, or
   `{ scope: "local", projectId: <64-hex local project hash> }` for an unbound
-  SQLite-only export. Shared identity takes precedence whenever the project map
-  carries a remote binding; the PostgreSQL source derives the same value from
-  `projects.project_id`. Because that UUIDv7 is the registered stable project
-  authority across machines, preserving it is intentional; it is not treated
-  as a backend-local surrogate. A local-scoped stream may be reapplied only to
-  that exact local project unless #618 performs an explicit authenticated
-  rebind;
+  SQLite-only export. The local ID is the existing `hashProjectPath` result:
+  lowercase SHA-256 of the UTF-8 bytes of the authenticated project-map
+  canonical anchor (the value originally produced by
+  `normalizeProjectIdentityPath` before `hashProjectPath`), with no additional
+  prefix or JSON framing. Its authenticated project-map reader owns that derivation; the
+  record codec validates the exact lowercase 64-hex result because the path is
+  deliberately absent from the project record. The shared ID is a lowercase
+  UUIDv7 read from the registered project binding. Shared identity takes
+  precedence whenever the project map carries a remote binding; the PostgreSQL
+  source derives the same value from `projects.project_id`. Because that UUIDv7
+  is the registered stable project authority across machines, preserving it is
+  intentional; it is not treated as a backend-local surrogate. Both the
+  `project` record and every project dependency use the exact logical-key
+  preimage `["lcm-portable-identity-v1", "project", [scope, projectId]]`.
+  Neither a nested identity object nor a caller-supplied project digest is a
+  logical key. A local-scoped stream may be reapplied only to that exact local
+  project unless #618 performs an explicit authenticated rebind;
   it never silently compares equal to a shared stream. Local path hashes,
   display names, creation/update times, and alias-link timestamps are
   backend-local metadata, not substitute project identities.
@@ -149,8 +162,20 @@ new dependency and no package-lock change.
   passive events from the authenticated local outbox/generation sidecar. A
   missing or unsupported domain is incomplete coverage and cannot describe a
   complete stream. #622/#626 own capturing and restoring those sources.
+- `createPortableRecord` never invents a parent order or project dependency.
+  Its required adapter-only `context` member is exactly `null`,
+  `{ projectIdentity }`, `{ conversationOrder }`, or `{ messageOrder }` as
+  selected by the domain map below. The codec validates exact context keys,
+  tuple arity, scalar ranges, timestamp spellings, and every relationship that
+  can be recomputed from the child value. Construction context is sensitive
+  transient input: it is never a wire or error field. Parsing reconstructs
+  parent-order context from the record's canonical `order`; the only opaque
+  dependency is the selected project record digest, which Task 2 binds against
+  the single project record during its bounded manifest pre-pass.
 - Keep the existing supported data contract: reject NUL and malformed UTF-16;
-  recursively sort object keys using locale-independent code-unit order;
+  recursively sort canonical JSON object keys by unsigned UTF-16 code-unit
+  lexicographic order (the explicit ECMAScript `<`/`>` comparison, never
+  `localeCompare`);
   preserve array order and duplicates; reject sparse arrays, extra array
   properties, accessors, symbol keys, cycles, unsupported prototypes,
   `undefined`, symbols, functions, non-finite numbers, negative zero, and
@@ -181,18 +206,33 @@ PORTABLE_RECORD_SCHEMA_DESCRIPTOR]))`. That one frozen descriptor contains
   limits are exact manifest fields bound separately by the manifest checksum,
   avoiding a circular record/stream module dependency.
 - `PORTABLE_LIMITS` is exactly `{ maxJsonDepth: 100,
-maxRecordBytes: 64 * 1024 * 1024, maxBatchRecords: 500,
-maxBatchBytes: 72 * 1024 * 1024, maxControlBytes: 1024 * 1024 }`. The five
-  values are manifest-bound. A source always receives the global 500-record / 72
+maxRecordBytes: 128 * 1024 * 1024, maxBatchRecords: 500,
+maxBatchBytes: 144 * 1024 * 1024, maxControlBytes: 1024 * 1024 }`. The five
+  values are manifest-bound. A source always receives the global 500-record / 144
   MiB page limits even when the caller requests lower limits, so it returns a
   source-bounded page from which the wrapper selects the caller-bounded prefix. A
   globally representable record larger than the caller limit yields retryable
   `batch-limit-exceeded`; one above the global record limit yields terminal
-  `record-unrepresentable`; neither advances the prior checkpoint. The 64 MiB
-  limit exceeds the proven maximum canonical encoding of a valid 10 MiB native
-  transcript input, including six-byte JSON escape forms, sorted keys,
-  envelope fields, and one newline. Task 3 freezes both the mathematical bound
-  and an adversarial near-limit vector; transcript links remain separate.
+  `record-unrepresentable`; neither advances the prior checkpoint. A
+  native-transcript adapter must prove
+  `canonicalPayloadBytes <= 100 * 1024 * 1024` and
+  `canonicalMetadataBytes <= maxControlBytes` before constructing a record.
+  The payload ceiling is exactly ten times the existing 10 MiB raw JSONL limit:
+  canonical number re-spelling expands an accepted token by at most 4x, while
+  each scrubbed nonempty decoded-string range becomes the 10-byte
+  `[REDACTED]` marker and expands its source contribution by at most 10x.
+  Number tokens and decoded string ranges are disjoint, so the factors do not
+  multiply; unchanged structure/strings add no bytes beyond their original JSON
+  token representation. The separate 1 MiB canonical metadata ceiling covers
+  all native value fields except `nativePayload`; the codec computes the exact
+  native value/order/dependency/envelope/digest framing and requires the complete
+  record to remain at or below 128 MiB. The nominal 27 MiB difference is
+  intentionally headroom, not an unsupported claim that every other field can
+  consume it. Task 3
+  freezes the arithmetic, adversarial numeric and scrub-range vectors, exact
+  envelope overhead, and a scaled near-limit vector. Existing issue #682 owns
+  adding a post-scrub persistence bound; #616 still rejects any already-stored
+  record that violates its portable ceilings without mutating the source.
 - Compatibility is exact in version 1: one stream version, one schema digest,
   the complete known domain inventory, and domain version 1. Unknown versions,
   domains, record fields, missing domains, or schema digests fail closed. A
@@ -244,7 +284,9 @@ dependencies, value, recordSha256 }`. Each dependency has exact keys
 logical-key preimage `["lcm-portable-identity-v1", domain, logicalKey]`, not a
 backend row key. `recordSha256` hashes the canonical envelope without its
 `recordSha256` member. Dependencies are sorted by domain order then hash,
-contain no duplicates, and point only to an earlier domain. `logicalKey` is an
+contain no duplicate exact `{ domain, identitySha256 }` pairs (multiple
+distinct identities from one domain are legal), and point only to an earlier
+domain. `logicalKey` is an
 exact domain tuple from the table below whose scalar types are string, tagged
 integer, or null. Each domain has a declared portable total order with explicit
 tie-breakers. The logical-key fields (or the unhashed fields that produce a
@@ -259,8 +301,12 @@ cross-page drift; no whole-domain in-process sort or trusted inventory duplicate
 claim is required. `order` is a domain-specific tuple of strings, tagged
 integers, and nulls. Tuple comparison is positional: null sorts before non-null,
 tagged integers compare numerically, and strings compare by unsigned UTF-8
-bytes. Raw adapters use explicit `BINARY` (SQLite) or `C` (PostgreSQL)
-collation, explicit null placement, and numeric column order. They may use a
+bytes, byte by byte. This tuple comparator is deliberately distinct from the
+unsigned UTF-16 code-unit comparator used only for canonical JSON object keys;
+both exact algorithm names and divergent BMP/supplementary-plane golden vectors
+are frozen in the schema descriptor. Raw adapters use explicit `BINARY`
+(SQLite) or `C` (PostgreSQL) collation, explicit null placement, and numeric
+column order. They may use a
 bounded keyset/temporary-index query when the installed schema lacks the exact
 portable index; #622/#618/#626 own those SQL plans. No adapter may substitute a
 physical row ID as a final tie-breaker.
@@ -281,6 +327,145 @@ conversationOccurrenceOrdinal, ordinal]`.
 
 All other rows use the literal flat tuples printed in the table. These exact
 field-name arrays live in the schema descriptor and therefore affect its digest.
+
+Record construction has an exact adapter-only context map. The context is
+validated and discarded before the record is frozen; it never appears in
+canonical bytes:
+
+```ts
+export type PortableRawConversationOrder = readonly [
+  sessionId: string,
+  title: string | null,
+  bootstrappedAt: PortableRawTimestamp | null,
+  createdAt: PortableRawTimestamp,
+  updatedAt: PortableRawTimestamp,
+  occurrenceOrdinal: PortableRawInteger
+];
+
+export type PortableRawMessageOrder = readonly [
+  ...conversation: PortableRawConversationOrder,
+  seq: PortableRawInteger
+];
+
+export type PortableRecordConstructionContextByDomain = Readonly<{
+  machines: null;
+  project: null;
+  "project-aliases": Readonly<{
+    projectIdentity: PortableProjectIdentity;
+  }>;
+  conversations: Readonly<{
+    projectIdentity: PortableProjectIdentity;
+  }>;
+  messages: Readonly<{
+    conversationOrder: PortableRawConversationOrder;
+  }>;
+  "message-parts": Readonly<{
+    messageOrder: PortableRawMessageOrder;
+  }>;
+  "large-files": null;
+  summaries: null;
+  "summary-file-links": null;
+  "summary-message-links": null;
+  "summary-parent-links": null;
+  "context-items": Readonly<{
+    conversationOrder: PortableRawConversationOrder;
+  }>;
+  "promoted-memories": Readonly<{
+    projectIdentity: PortableProjectIdentity;
+  }>;
+  "promoted-memory-tags": null;
+  "recall-surfacings": Readonly<{
+    projectIdentity: PortableProjectIdentity;
+  }>;
+  "redaction-counters": Readonly<{
+    projectIdentity: PortableProjectIdentity;
+  }>;
+  "session-ingest": Readonly<{
+    projectIdentity: PortableProjectIdentity;
+  }>;
+  "session-instructions": Readonly<{
+    projectIdentity: PortableProjectIdentity;
+  }>;
+  "native-transcripts": Readonly<{
+    projectIdentity: PortableProjectIdentity;
+    canonicalPayloadBytes: number;
+    canonicalMetadataBytes: number;
+  }>;
+  "native-transcript-message-links": null;
+  "native-transcript-checkpoints": Readonly<{
+    projectIdentity: PortableProjectIdentity;
+  }>;
+  "passive-events": Readonly<{
+    projectIdentity: PortableProjectIdentity;
+  }>;
+}>;
+
+export interface PortableRecordInput<
+  D extends PortableDomain = PortableDomain
+> {
+  readonly domain: D;
+  readonly ordinal: number;
+  readonly value: PortableRecordValueInputByDomain[D];
+  readonly context: PortableRecordConstructionContextByDomain[D];
+}
+```
+
+`PortableRecordValueInputByDomain` has the same exact keys and discriminants as
+`PortableRecordValueByDomain`, but replaces each tagged integer or timestamp
+with its declared adapter-only raw scalar union. It does not loosen embedded
+`JsonValue`. A conversation context is normalized to the six-field canonical
+conversation order, its first five fields recompute
+`conversationFingerprint`, and that fingerprint plus occurrence ordinal must
+recompute the child's `conversationIdentitySha256`. A message context performs
+that same conversation check and then recomputes the message identity from
+conversation identity plus `seq`; it must equal the message-part value's
+`messageIdentitySha256`. Thus no caller can use context to choose an unrelated
+parent order. Project context computes the one selected-project dependency;
+the native-transcript project context also carries the two independently
+checked canonical byte witnesses specified below.
+All remaining dependencies are recomputed directly from value logical keys.
+The `project` record and every project-context dependency use the scalar
+logical key `[identity.scope, identity.projectId]`; the nested identity object
+is a value shape only and is never itself placed in a logical-key preimage.
+
+`parsePortableRecord` and serializer validation never require external context.
+They reconstruct conversation/message context from the canonical wire `order`,
+recompute every parent identity and value-derived dependency, and validate the
+selected-project dependency as exactly one lowercase digest in the correct
+domain/order position. Task 2's pre-pass then requires every such opaque
+project dependency to equal the identity of the stream's single `project`
+record. A standalone parsed record is structurally and cryptographically
+canonical but does not independently assert project membership.
+
+`PORTABLE_RECORD_SCHEMA_DESCRIPTOR` freezes the construction contract as well
+as the wire contract. Every domain descriptor has exact
+`constructionContext` and `contextValidation` arrays in addition to its value,
+logical-key, order, dependency, scalar, and coverage arrays. The context arrays
+name only the transient evidence above; changing a context shape or validation
+rule changes `PORTABLE_RECORD_SCHEMA_SHA256` even though `context` is not an
+envelope key. This prevents adapters from silently constructing the same wire
+shape under different parent-binding rules.
+The project descriptor's logical key is the literal field path array
+`["identity.scope", "identity.projectId"]`; it is never `["identity"]`.
+The canonicalization descriptor names object-key ordering
+`unsigned-utf16-code-unit-order` and portable tuple ordering
+`unsigned-utf8-byte-order` as separate algorithms. The conversation descriptor
+also freezes every identity-free closure projection tuple above, including the
+external-message fingerprint/sequence substitute, plus the algorithm order
+`full-closure -> digest -> full-byte collision check -> preserve class
+multiplicity -> unsigned-digest class sort -> contiguous ordinal block`. Task 1
+replaces any earlier draft spelling atomically before freezing the schema digest.
+
+For `native-transcripts`, `PortableRecordInput` additionally carries exact
+adapter-only byte evidence inside its construction context:
+`canonicalPayloadBytes` and `canonicalMetadataBytes`, both nonnegative safe
+integers. The native context is therefore
+`{ projectIdentity, canonicalPayloadBytes, canonicalMetadataBytes }`; the codec
+independently canonicalizes `nativePayload` and the value-without-`nativePayload`
+and requires exact byte-count equality before applying the 100 MiB / 1 MiB
+ceilings. These witnesses are discarded with the rest of context and never
+serialize. Parsing recomputes both counts directly from canonical wire values,
+so the finalized record remains self-contained.
 
 ```ts
 export interface PortableRecord<D extends PortableDomain = PortableDomain> {
@@ -305,7 +490,7 @@ export interface PortableRecord<D extends PortableDomain = PortableDomain> {
 |     1 | `machines` (identity/sidecar)                     | `[identityKey]` / identity key                                                                                                                                                       | identity key and nullable registered machine UUIDv7; display name is deliberately excluded as mutable presentation metadata; none                      |
 |     2 | `project` (identity/sidecar)                      | `[scope, projectId]` / same; shared takes precedence over local                                                                                                                      | exact portable identity only; none                                                                                                                     |
 |     3 | `project-aliases` (identity/sidecar)              | key `[machineIdentityKey, normalizedPath]`; order adds `path` as a conflict tie-breaker                                                                                              | exact and normalized path; machine, project                                                                                                            |
-|     4 | `conversations` (both DBs)                        | key `[conversationFingerprint, occurrenceOrdinal]`; order `[sessionId, title, bootstrappedAt, createdAt, updatedAt, occurrenceOrdinal]`                                              | fingerprint of the five preceding portable fields plus zero-based exact-duplicate occurrence; project                                                  |
+|     4 | `conversations` (both DBs)                        | key `[conversationFingerprint, occurrenceOrdinal]`; order `[sessionId, title, bootstrappedAt, createdAt, updatedAt, occurrenceOrdinal]`                                              | fingerprint of the five preceding portable fields plus canonical-closure occurrence; project                                                           |
 |     5 | `messages` (both DBs)                             | key `[conversationIdentitySha256, seq]`; order `[sessionId, title, bootstrappedAt, conversationCreatedAt, conversationUpdatedAt, conversationOccurrenceOrdinal, seq]`                | conversation identity, sequence, role/content/tokens/time; conversation                                                                                |
 |     6 | `message-parts` (raw DB)                          | key `[messageIdentitySha256, ordinal]`; order `[sessionId, title, bootstrappedAt, conversationCreatedAt, conversationUpdatedAt, conversationOccurrenceOrdinal, messageSeq, ordinal]` | message identity, caller part ID plus every durable part field; message                                                                                |
 |     7 | `large-files` (both DBs)                          | `[fileId]` / exact file ID                                                                                                                                                           | file/conversation metadata and time; conversation                                                                                                      |
@@ -345,20 +530,55 @@ frozen here so adapters cannot select different semantics:
 
 `conversationFingerprint` is the SHA-256 of canonical
 `["lcm-portable-conversation-value-v1", sessionId, title, bootstrappedAt,
-createdAt, updatedAt]`; `occurrenceOrdinal` is zero-based only among records
-with that exact fingerprint. `recall-surfacings` assigns the same kind of
-ordinal within `[memoryId, sessionId|null, surfacedAt]`. Adapters may enumerate
-physically distinct rows only to assign ordinals inside an otherwise
-indistinguishable portable-value group, then must emit the portable tuple plus
-ordinal. #618/#623 writers insert each equal group in occurrence order and
-preserve its fields, so re-export recomputes the same ordinals. A subsequent
-edit deliberately changes the conversation fingerprint and therefore the
-snapshot identity; resume validation classifies that as source drift. Physical
-IDs never enter a key, value other than the occurrence number, order tuple, or
-hash. Task 3 proves equal-timestamp conversations with distinct portable
-values sort independently of physical IDs, exact duplicates with different
-dependent messages preserve occurrence order across a round trip, nullable
-recalls, and repeated identical recalls remain byte-identical.
+createdAt, updatedAt]`. When fingerprints are distinct, the
+`occurrenceOrdinal` is `0`. For an equal-fingerprint group, the source computes
+one canonical closure digest per conversation from every portable descendant
+using an exhaustive identity-free projection. It contains, in domain order:
+message values keyed by `seq`; message-part values keyed by `(messageSeq,
+ordinal)`; large-file values with their conversation digest replaced by the
+current fingerprint; summary values with the same replacement;
+summary-file/parent rows reached through those summaries; summary-message rows
+projected as `(summaryId, ordinal, referencedConversationFingerprint,
+referencedMessageSeq)`; context items projected as `(ordinal, itemType,
+referencedConversationFingerprint, referencedMessageSeq|null, summaryId|null,
+createdAt)`; and native transcript message links projected as
+`(machineIdentityKey, ingestKey, sourceOrdinal,
+referencedConversationFingerprint, referencedMessageSeq)`. A reference to a
+message outside the conversation being closed therefore uses only that
+conversation's five-field fingerprint plus message sequence—never its
+occurrence ordinal or message identity. Every projection removes
+`conversationIdentitySha256` and `messageIdentitySha256`; no closure can depend
+on another unresolved occurrence.
+
+Each closure uses explicit domain separators and the same canonical codec. The
+source first computes every full canonical closure and digest. Equal digests
+must have byte-identical full closures; otherwise source verification is
+`invalid`. It groups byte-identical closures while preserving each group's exact
+multiplicity, sorts the distinct closure classes by digest using unsigned bytes,
+and assigns each class the next contiguous ordinal block with one ordinal per
+source conversation. Assignment of physical members inside one byte-identical
+class is irrelevant: every member has the same projected subtree, so the
+canonical records produced for that ordinal block are invariant. This
+order—full-byte collision check, multiplicity-preserving grouping, class sort,
+then contiguous block numbering—preserves duplicate parent count as well as
+bytes. Writers insert one parent and one identical descendant set for every
+ordinal in the block; re-export therefore reconstructs the same multiplicity,
+ordinals, and records. Any closure change may reassign occurrence ordinals and
+is classified as source drift against the frozen witness, never accepted during
+a resume.
+
+This closure pre-pass is adapter-owned, page-bounded, and spillable under the
+same authenticated snapshot; no closure bytes enter records or checkpoints.
+It must cap every buffered/spilled key and digest by the portable record/control
+limits, and #622/#618/#626 own the backend query/temp-file implementation.
+`recall-surfacings`, whose records have no descendants, retain a zero-based
+`occurrenceOrdinal` within `[memoryId, sessionId|null, surfacedAt]`; adapters may
+enumerate physically distinct equal leaf rows solely to assign that ordinal.
+#618/#623 writers insert each equal recall group in occurrence order, so
+re-export recomputes the same bytes. Task 3 proves distinct and identical
+duplicate-conversation closures, collision rejection by full canonical closure
+comparison (not digest alone), equal timestamps independent of physical IDs,
+nullable recalls, and repeated identical recalls.
 
 No repository API is assumed to expose the needed raw precision or physical
 columns. #622 implements authenticated SQLite/snapshot extraction, #618 owns
@@ -667,10 +887,10 @@ export interface PortableSourcePageInput {
   readonly domain: PortableDomain;
   readonly afterOrdinal: number;
   readonly includePredecessor: boolean;
-  /** Global source cap; the wrapper applies any lower caller record count. */
+  /** Global cap for records only; predecessor is outside this count. */
   readonly maxRecords: 500;
-  /** Always PORTABLE_LIMITS.maxBatchBytes, even for a lower caller batch. */
-  readonly maxBytes: 75497472;
+  /** Global framed-byte cap for records only; predecessor is outside it. */
+  readonly maxBytes: 150994944;
   readonly signal?: AbortSignal;
 }
 
@@ -700,6 +920,15 @@ export interface PortableSourceVerificationInput {
   readonly sourceWitnessSha256: string;
   readonly contentSha256?: string;
   readonly manifestSha256?: string;
+  /** Omitted for whole-source checks; present for authoritative checkpoint proof. */
+  readonly boundary?: Readonly<{
+    readonly domain: PortableDomain;
+    readonly nextOrdinal: number;
+    readonly recordCount: number;
+    readonly prefixSha256: string;
+    readonly lastRecordIdentitySha256: string | null;
+    readonly lastRecordSha256: string | null;
+  }>;
   readonly signal?: AbortSignal;
 }
 
@@ -713,9 +942,9 @@ export interface PortableReadBatchInput {
 
 export interface PortableLimits {
   readonly maxJsonDepth: 100;
-  readonly maxRecordBytes: 67108864;
+  readonly maxRecordBytes: 134217728;
   readonly maxBatchRecords: 500;
-  readonly maxBatchBytes: 75497472;
+  readonly maxBatchBytes: 150994944;
   readonly maxControlBytes: 1048576;
 }
 
@@ -775,6 +1004,7 @@ export interface PortableVerification {
   readonly prefixSha256: string;
   readonly complete: boolean;
   readonly matchesManifestBoundary: boolean;
+  readonly authoritative: true;
 }
 ```
 
@@ -797,9 +1027,29 @@ claims all domains were transferred; #624 owns whole-generation reconciliation.
 pre-pass. It snapshots `describeSource()`, reads every available domain page by
 page using the fixed global bounds, validates predecessor/order/duplicates and
 hashes records without retaining prior pages, verifies the exact source witness
-after the scan, and then freezes the manifest. The transfer read is a deliberate
-second pass. Before and after every page and at `verify(checkpoint)`, the wrapper
-calls `verifySource` with the original witness/source/content/manifest digests;
+after the scan, and then freezes the manifest. During that ordered scan it first
+requires exactly one `project` record, retains only that record's
+`identitySha256`, and rejects every opaque `{ domain: "project", ... }`
+dependency that differs from it. The authenticated source verification seam owns
+foreign-key existence for all other dependencies without requiring an unbounded
+in-process identity set. The transfer read is a deliberate second pass. Before
+and after every page the wrapper calls `verifySource` with the original
+witness/source/content/manifest digests. At `verify(checkpoint)`, it additionally
+passes the checkpoint boundary tuple after validating the checkpoint's exact
+self-checksum, manifest/domain binding, `recordCount === nextOrdinal`, initial
+or noninitial nullability of the last-record pair, completion flag, and
+previous-checkpoint digest shape. The source must authenticate that exact
+prefix/last-record boundary under the original witness using a bounded keyset
+prefix proof or adapter-owned digest index; `unchanged` is illegal unless that
+boundary exists and matches. Thus verification is authoritative, not merely
+structural, even for a partial checkpoint. Source authority covers the current
+boundary only. `previousCheckpointSha256` is a destination-side linkage field:
+`createPortableBatch` requires it to equal the actual prior checkpoint supplied
+to that call, while #623 durably stores the resulting current checkpoint body and
+binds its SHA-256 into #621. Public `verify(checkpoint)` cannot prove an absent
+predecessor body and therefore validates only the field's shape, never reports
+that the historical chain itself is source-authenticated.
+For every verification call,
 an explicit adapter `changed` result becomes terminal `source-changed`, while an
 `invalid` result becomes terminal `source-invalid`, and an adapter exception or
 `unavailable` result becomes retryable `source-unavailable`. Source validation
@@ -807,9 +1057,16 @@ owns backend-side foreign-key, required-reference, summary-DAG, identity, and
 coverage checks; fixed outcomes carry no raw database reason.
 
 For resumed reads the wrapper asks `readDomainPage` for one predecessor plus at
-most 500 globally representable records under the 72 MiB global page cap. The
-source always receives those fixed global bounds; the wrapper applies lower
-caller count/byte limits after receiving a source-bounded page. The wrapper
+most 500 globally representable records. `maxRecords` and the 144 MiB
+`maxBytes` cap apply only to the `records` array and its newline-framed canonical
+bytes. The predecessor is returned in addition to both budgets, is separately
+bounded by the 128 MiB `maxRecordBytes`, and is verification-only. Peak source
+page residency is therefore explicitly bounded by `maxBatchBytes +
+maxRecordBytes` (272 MiB), plus fixed control overhead. The source always
+receives those fixed global record-array bounds; the wrapper applies lower
+caller count/byte limits after receiving a source-bounded page. Global
+over-return checks count and measure `records` only; predecessor size is checked
+only against `maxRecordBytes`. The wrapper
 authenticates the predecessor against `lastRecordIdentitySha256` and
 `lastRecordSha256`, compares
 the exact per-domain order tuple, then returns retryable
@@ -873,8 +1130,11 @@ Explicitly unchanged:
 
 **Produces:** `PortableDomain`, the six branded portable integer ranges,
 adapter-only
-`PortableRawInteger`/`PortableRawTimestamp` scalar inputs, the complete
-`PortableRecordValue` union, `PortableRecord`,
+`PortableRawInteger`/`PortableRawTimestamp` scalar inputs,
+`PortableRawConversationOrder`, `PortableRawMessageOrder`, the exact
+`PortableRecordValueInputByDomain` and
+`PortableRecordConstructionContextByDomain` maps, the complete
+`PortableRecordValue` union, `PortableRecordInput`, `PortableRecord`,
 `PORTABLE_RECORD_DOMAIN_ORDER`, `PORTABLE_RECORD_SCHEMA_SHA256`,
 `createPortableRecord`, `serializePortableRecord`, and
 `parsePortableRecord`.
@@ -882,7 +1142,9 @@ adapter-only
 - [ ] Write RED tests importing the absent module and enumerating the literal
       22-domain order above. Assert each representative domain value creates a
       deeply frozen envelope with computed order/identity/dependencies and a
-      lowercase 64-hex `recordSha256`.
+      lowercase 64-hex `recordSha256`. Pass the exact domain-specific
+      construction context above; prove missing, additional, wrong-kind,
+      wrong-arity, and mismatched-parent contexts fail before a record exists.
 - [ ] Run `npx vitest run test/storage/portable-record.test.ts`; require RED on
       the absent public seam.
 - [ ] Implement canonical primitive helpers: signed-64-bit tagged integers,
@@ -891,9 +1153,11 @@ adapter-only
       exact six-digit UTC timestamps, finite floats,
       printable/hash/UUID/client/role/category discriminants, malformed-UTF-16 and
       NUL rejection, plain/null-prototype object validation, depth/cycle checks,
-      locale-independent key sorting, deep freeze, and canonical SHA-256.
+      explicit unsigned-UTF-16 object-key sorting, deep freeze, and canonical
+      SHA-256.
 - [ ] Freeze golden canonical vectors before broad validators: exact object-key
-      order, UTF-8 and JSON escapes, safe integer/float/exponent spellings, six-digit
+      order, divergent unsigned-UTF-16-key/unsigned-UTF-8-tuple Unicode vectors,
+      UTF-8 and JSON escapes, safe integer/float/exponent spellings, six-digit
       timestamps, tagged integers, identity/record/schema/domain-prefix/aggregate/
       manifest/checkpoint hashes, and the eight-byte unsigned length preimage.
 - [ ] Define exact adapter-only scalar normalization: integers accept only
@@ -908,13 +1172,28 @@ adapter-only
       and additional fields. Validate message-part fields exhaustively, summary DAG
       self-links, context's exactly-one target, transcript payload/object shape and
       link ordinals, checkpoint counters, and passive terminal-disposition shape.
+      Normalize and validate the exact construction-context map, discard it before
+      serialization, and bind conversation/message contexts to the child parent
+      identity as specified above. Derive every project context dependency from the
+      canonical project identity preimage, never accept a caller-supplied digest.
       Prove descriptor validation rejects any domain whose order does not make
-      duplicate logical identities adjacent.
+      duplicate logical identities adjacent or whose context contract cannot
+      reconstruct its declared order/dependencies. Freeze the project field-path
+      logical key, both distinct Unicode comparator names/vectors, and the
+      exhaustive identity-free conversation closure projection tuples and
+      compare/group/number ordering; prove external message references use only
+      fingerprint/sequence, equal closure hashes require full canonical closure
+      equality, equal-closure multiplicity is preserved, grouping precedes
+      contiguous ordinal-block assignment, and no projection retains a
+      conversation/message identity digest.
 - [ ] Implement canonical envelope serialization and exact parsing. Parsing is
       byte-bounded, catches parser failures without retaining a cause, requires the
       input bytes to equal reserialization (thereby rejecting whitespace,
       noncanonical numeric spellings, reordered keys, and duplicate-key JSON),
-      recomputes identity/dependencies/hash, and rejects any mismatch.
+      reconstructs transient parent context from wire order, recomputes
+      identity/dependencies/hash, and rejects any mismatch. Standalone parsing
+      validates an opaque project dependency structurally; Task 2 binds it to the
+      stream project record.
 - [ ] Add fixed-code `PortableStreamError` categories needed at this layer:
       `unsupported-version`, `unknown-domain`, `malformed-record`,
       `record-unrepresentable`, `duplicate-identity`, `order-regression`, and
@@ -961,14 +1240,21 @@ recordCount?, manifestSha256?, checkpointSha256?, message }`, omits undefined
       close semantics, and immutable/sanitized outputs. Use a fake source that
       records the exact fixed global page limits and verification digests it
       receives, while asserting lower caller limits are enforced by the wrapper.
+      Prove `records` exactly filling 144 MiB plus a separately valid predecessor
+      is accepted, predecessor bytes do not consume the records budget, and a
+      `records` array exceeding either global cap is rejected regardless of
+      predecessor size.
 - [ ] Run `npx vitest run test/storage/portable-record-stream.test.ts`; require
       RED on the absent stream module.
 - [ ] Implement manifest construction and exact canonical parsing. Require all
       22 domains exactly once and in frozen order, exact coverage states, domain
       version 1, safe counts, valid prefix hashes, aggregate content hash, exact
       fixed limits, canonical capture timestamp/source witness/schema digest, and
-      self-checksum. Build it only through the bounded pre-pass over the source and
-      reject source-description drift before returning the stream.
+      self-checksum. Build it only through the bounded pre-pass over the source,
+      require exactly one project record, bind every opaque project dependency to
+      that record's identity, and reject source-description drift before returning
+      the stream. Treat every other dependency-existence failure reported by the
+      authenticated source verifier as `source-invalid`.
 - [ ] Implement exact v1 negotiation. Test unsupported stream/domain versions,
       missing/duplicate/reordered/unknown domains, wrong schema or limit values,
       malformed inventory, and attempted caller capability downgrade. Every case
@@ -977,11 +1263,17 @@ recordCount?, manifestSha256?, checkpointSha256?, message }`, omits undefined
       parse, and verification helpers with explicit domain separation. Validate
       manifest/domain/prior-checkpoint binding, contiguous ordinals/counts,
       previous-checkpoint chains, terminal count/digest, and self-checksums.
+      `verifyPortableCheckpoint` is the pure structural helper; public
+      `stream.verify()` must additionally pass the exact partial or terminal
+      boundary to `verifySource` and returns `authoritative: true` only after the
+      source authenticates it.
 - [ ] Implement `createPortableBatch`: nonempty partial pages and empty terminal
       pages, requested/global record and byte limits, newline framing, same-domain
       records, authenticated predecessor overlap, batch-local identity uniqueness,
       exact portable order, dependency order, prior-checkpoint continuity, terminal
-      manifest agreement, and abort checks before and after validation. Never emit
+      manifest agreement, and abort checks before and after validation. Measure
+      source over-return against `records` alone and bound the predecessor
+      independently at 128 MiB. Never emit
       a checkpoint for a partial/malformed page.
 - [ ] Add remaining fixed error categories:
       `malformed-manifest`, `incompatible-schema`, `invalid-limit`,
@@ -1004,6 +1296,10 @@ recordCount?, manifestSha256?, checkpointSha256?, message }`, omits undefined
       racing a read waits for settlement and no later call reaches the source.
       Serialize reads and verifies; prove queued abort, in-flight abort, source
       changed/invalid/unavailable, close failure, and concurrent close semantics.
+      Test forged self-consistent partial checkpoints, omitted and reordered
+      prefix records, mismatched last-record digests, and unrelated previous-chain
+      hashes; none may return an authoritative verification or advance resume
+      state.
 - [ ] Run focused exact-100% coverage for both new production files; run
       typecheck, focused ESLint, and `git diff --check`.
 - [ ] Commit with
@@ -1035,20 +1331,31 @@ functions. Produces no backend implementation.
 - [ ] Represent the SQLite declared-shape fixture using signed SQLite
       integer/REAL values,
       `0`/`1` nullable booleans, space-separated timestamps, JSON text, embedded
-      tag/file arrays, local project/machine identity, and no generated remote
-      surrogate IDs. Represent the PostgreSQL fixture using `bigint`/decimal driver
-      strings, booleans, six-digit UTC timestamps, JSON objects, normalized
-      relationship rows, generated UUID surrogates, and shared identity rows. Mark
-      unavailable legacy SQLite transcript domains `authoritative-empty`; add a
-      second authenticated-sidecar shape that populates them and matches PG. Bind
-      every coverage entry to a deterministic evidence payload; prove missing or
-      unsupported evidence cannot be mislabeled empty.
+      tag/file arrays, authenticated machine identity, and no generated remote
+      surrogate IDs. Build three explicit identity/coverage cases rather than
+      claiming unlike manifests are equal: (a) an unbound local-scoped SQLite
+      export whose local project record and manifest have local-only golden bytes;
+      (b) a remote-bound SQLite generation with the same shared UUIDv7 project
+      identity and authenticated sidecar coverage as PostgreSQL; and (c) a proven
+      legacy SQLite generation whose transcript/link/checkpoint coverage is
+      `authoritative-empty` and therefore intentionally has different
+      source/manifest evidence. Represent the PostgreSQL fixture using
+      `bigint`/decimal driver strings, booleans, six-digit UTC timestamps, JSON
+      objects, normalized relationship rows, generated UUID surrogates, and shared
+      identity rows. Bind every coverage entry to a deterministic evidence payload;
+      prove missing or unsupported evidence cannot be mislabeled empty.
 - [ ] Normalize both through test-only declared-shape adapters into
       `createPortableRecord`; these fixtures prove the protocol and do not claim or
       transfer ownership of #622/#626 raw extraction.
-      Assert every canonical record byte, identity/dependency hash, domain
-      inventory, manifest content digest, batch boundary, checkpoint chain, and
-      round-tripped parsed value is identical. Explicitly prove generated
+      For case (b), assert every canonical record byte, identity/dependency hash,
+      domain inventory, manifest content digest, batch boundary, checkpoint chain,
+      and round-tripped parsed value is identical. Source identity/witness,
+      `capturedAt`, and coverage evidence remain source-authentication facts and are
+      asserted valid and backend-specific; construct a shared deterministic source
+      witness only in the isolated protocol test that intentionally requires whole
+      manifest byte equality. Cases (a) and (c) assert their expected distinct
+      project/dependency/content/manifest digests while all unaffected domain value
+      normalization remains equal. Explicitly prove generated
       PostgreSQL internal keys/search digests and SQLite rowid/FTS details never
       enter bytes. Exact equality requires the same logical source data and
       authenticated sidecar coverage, not equal physical database IDs.
@@ -1058,7 +1365,11 @@ functions. Produces no backend implementation.
       external source survives exactly.
 - [ ] Prove integer extrema remain exact, physical conversation/message/recall
       IDs may differ while canonical logical records remain identical; prove
-      duplicate sessions with equal timestamps, nullable recall sessions, and
+      duplicate sessions with equal timestamps but distinct closure digests receive
+      the same ordinals on both backends, identical closures preserve exact
+      multiplicity through contiguous ordinal blocks, a
+      forced closure-hash collision is rejected by full canonical comparison,
+      nullable recall sessions, and
       repeated identical recall tuples retain their occurrence ordinals. Prove
       transcript message ordering survives,
       summary DAG edges survive, array order/duplicates survive, aliases retain
@@ -1068,16 +1379,20 @@ functions. Produces no backend implementation.
       one step outside, including the different int64 transcript ordinal and
       int4 transcript-link ordinal; require rejection before a writer could
       receive an uninsertable destination value.
-- [ ] Prove the 64 MiB global record bound covers the maximum canonical
-      representation of an accepted 10 MiB native JSONL record. Freeze the bound:
-      canonicalizing a parsed valid JSON record cannot exceed its original JSON
-      token bytes (all mandatory quote/backslash/control escaping was already
-      present; reordering adds no bytes), while scrubbing replaces matched source
-      spans with the fixed 10-byte `[REDACTED]` token. The native scrubber must
-      expose/verify the post-scrub canonical payload bound used by the adapter;
-      then add the exact fixed envelope/order/dependency/digest/newline overhead.
-      Run adversarial escape/key-order vectors plus one bounded near-limit vector.
-      Also prove a 64 MiB+1 record fails terminally and a globally valid record
+- [ ] Prove the 128 MiB global record bound covers the maximum portable
+      representation of an accepted native transcript under the explicit adapter
+      ceilings. Freeze and independently test the arithmetic: accepted canonical
+      numeric spelling expands any raw numeric token by at most 4x (including the
+      `1e15` worst case); a nonempty decoded-string scrub range expands by at most
+      10x; number and string token regions are disjoint; unchanged JSON token bytes
+      do not grow under key reordering. Require at most 100 MiB canonical
+      `nativePayload`, at most 1 MiB canonical native metadata, compute the exact
+      order/dependency/envelope/digest/newline bytes, and separately require the
+      complete record to remain within 128 MiB. Run a mantissa/exponent sweep,
+      one-character scrub-pattern
+      vectors, adversarial escapes/key order, all metadata maxima, and a scaled
+      near-limit vector. Prove an adapter omitting either byte witness is
+      `source-invalid`; prove a 128 MiB+1 record fails terminally and a globally valid record
       above a caller's lower
       byte limit fails retryably without source ambiguity or checkpoint advance.
 - [ ] Add malformed fixture cases for unknown domain/version, duplicate and
