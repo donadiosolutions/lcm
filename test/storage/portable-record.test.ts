@@ -14,6 +14,7 @@ import {
   parsePortableRecord,
   serializePortableRecord,
   sha256,
+  validatePortableRecordSchemaDescriptor,
 } from "../../src/storage/portable-record.js";
 
 const MACHINE_IDENTITY = "machine-identity";
@@ -298,80 +299,94 @@ const representativeValues: Record<string, Record<string, unknown>> = {
 
 const expectedDomainSchema: Record<string, {
   logicalKey: readonly string[];
+  identityOrderPrefix: readonly string[];
   order: readonly string[];
   dependencies: readonly string[];
 }> = {
-  machines: { logicalKey: ["identityKey"], order: ["identityKey"], dependencies: [] },
-  project: { logicalKey: ["identity.scope", "identity.projectId"], order: ["scope", "projectId"], dependencies: [] },
+  machines: { logicalKey: ["identityKey"], identityOrderPrefix: ["identityKey"], order: ["identityKey"], dependencies: [] },
+  project: { logicalKey: ["identity.scope", "identity.projectId"], identityOrderPrefix: ["scope", "projectId"], order: ["scope", "projectId"], dependencies: [] },
   "project-aliases": {
     logicalKey: ["machineIdentityKey", "normalizedPath"],
+    identityOrderPrefix: ["machineIdentityKey", "normalizedPath"],
     order: ["machineIdentityKey", "normalizedPath", "path"],
     dependencies: ["machines", "project"],
   },
   conversations: {
     logicalKey: ["conversationFingerprint", "occurrenceOrdinal"],
+    identityOrderPrefix: ["sessionId", "title", "bootstrappedAt", "createdAt", "updatedAt", "occurrenceOrdinal"],
     order: ["sessionId", "title", "bootstrappedAt", "createdAt", "updatedAt", "occurrenceOrdinal"],
     dependencies: ["project"],
   },
   messages: {
     logicalKey: ["conversationIdentitySha256", "seq"],
+    identityOrderPrefix: ["sessionId", "title", "bootstrappedAt", "conversationCreatedAt", "conversationUpdatedAt", "conversationOccurrenceOrdinal", "seq"],
     order: ["sessionId", "title", "bootstrappedAt", "conversationCreatedAt", "conversationUpdatedAt", "conversationOccurrenceOrdinal", "seq"],
     dependencies: ["conversations"],
   },
   "message-parts": {
     logicalKey: ["messageIdentitySha256", "ordinal"],
+    identityOrderPrefix: ["sessionId", "title", "bootstrappedAt", "conversationCreatedAt", "conversationUpdatedAt", "conversationOccurrenceOrdinal", "messageSeq", "ordinal"],
     order: ["sessionId", "title", "bootstrappedAt", "conversationCreatedAt", "conversationUpdatedAt", "conversationOccurrenceOrdinal", "messageSeq", "ordinal"],
     dependencies: ["messages"],
   },
-  "large-files": { logicalKey: ["fileId"], order: ["fileId"], dependencies: ["conversations"] },
-  summaries: { logicalKey: ["summaryId"], order: ["summaryId"], dependencies: ["conversations"] },
-  "summary-file-links": { logicalKey: ["summaryId", "ordinal"], order: ["summaryId", "ordinal"], dependencies: ["summaries"] },
+  "large-files": { logicalKey: ["fileId"], identityOrderPrefix: ["fileId"], order: ["fileId"], dependencies: ["conversations"] },
+  summaries: { logicalKey: ["summaryId"], identityOrderPrefix: ["summaryId"], order: ["summaryId"], dependencies: ["conversations"] },
+  "summary-file-links": { logicalKey: ["summaryId", "ordinal"], identityOrderPrefix: ["summaryId", "ordinal"], order: ["summaryId", "ordinal"], dependencies: ["summaries"] },
   "summary-message-links": {
     logicalKey: ["summaryId", "messageIdentitySha256"],
+    identityOrderPrefix: ["summaryId", "messageIdentitySha256"],
     order: ["summaryId", "messageIdentitySha256", "ordinal"],
     dependencies: ["summaries", "messages"],
   },
   "summary-parent-links": {
     logicalKey: ["summaryId", "parentSummaryId"],
+    identityOrderPrefix: ["summaryId", "parentSummaryId"],
     order: ["summaryId", "parentSummaryId", "ordinal"],
     dependencies: ["summaries"],
   },
   "context-items": {
     logicalKey: ["conversationIdentitySha256", "ordinal"],
+    identityOrderPrefix: ["sessionId", "title", "bootstrappedAt", "conversationCreatedAt", "conversationUpdatedAt", "conversationOccurrenceOrdinal", "ordinal"],
     order: ["sessionId", "title", "bootstrappedAt", "conversationCreatedAt", "conversationUpdatedAt", "conversationOccurrenceOrdinal", "ordinal"],
     dependencies: ["conversations", "messages|summaries"],
   },
-  "promoted-memories": { logicalKey: ["memoryId"], order: ["memoryId"], dependencies: ["project"] },
-  "promoted-memory-tags": { logicalKey: ["memoryId", "ordinal"], order: ["memoryId", "ordinal"], dependencies: ["promoted-memories"] },
+  "promoted-memories": { logicalKey: ["memoryId"], identityOrderPrefix: ["memoryId"], order: ["memoryId"], dependencies: ["project"] },
+  "promoted-memory-tags": { logicalKey: ["memoryId", "ordinal"], identityOrderPrefix: ["memoryId", "ordinal"], order: ["memoryId", "ordinal"], dependencies: ["promoted-memories"] },
   "recall-surfacings": {
     logicalKey: ["memoryId", "sessionId", "surfacedAt", "occurrenceOrdinal"],
+    identityOrderPrefix: ["memoryId", "sessionId", "surfacedAt", "occurrenceOrdinal"],
     order: ["memoryId", "sessionId", "surfacedAt", "occurrenceOrdinal"],
     dependencies: ["project"],
   },
-  "redaction-counters": { logicalKey: ["category"], order: ["category"], dependencies: ["project"] },
-  "session-ingest": { logicalKey: ["sessionId"], order: ["sessionId"], dependencies: ["project"] },
+  "redaction-counters": { logicalKey: ["category"], identityOrderPrefix: ["category"], order: ["category"], dependencies: ["project"] },
+  "session-ingest": { logicalKey: ["sessionId"], identityOrderPrefix: ["sessionId"], order: ["sessionId"], dependencies: ["project"] },
   "session-instructions": {
     logicalKey: ["machineIdentityKey", "scopeHash"],
+    identityOrderPrefix: ["machineIdentityKey", "scopeHash"],
     order: ["machineIdentityKey", "scopeHash"],
     dependencies: ["machines", "project"],
   },
   "native-transcripts": {
     logicalKey: ["machineIdentityKey", "ingestKey"],
+    identityOrderPrefix: ["machineIdentityKey", "ingestKey"],
     order: ["machineIdentityKey", "ingestKey"],
     dependencies: ["machines", "project"],
   },
   "native-transcript-message-links": {
     logicalKey: ["machineIdentityKey", "ingestKey", "sourceOrdinal"],
+    identityOrderPrefix: ["machineIdentityKey", "ingestKey", "sourceOrdinal"],
     order: ["machineIdentityKey", "ingestKey", "sourceOrdinal"],
     dependencies: ["native-transcripts", "messages"],
   },
   "native-transcript-checkpoints": {
     logicalKey: ["machineIdentityKey", "clientName", "sourceLocator"],
+    identityOrderPrefix: ["machineIdentityKey", "clientName", "sourceLocator"],
     order: ["machineIdentityKey", "clientName", "sourceLocator"],
     dependencies: ["machines", "project"],
   },
   "passive-events": {
     logicalKey: ["machineIdentityKey", "eventId"],
+    identityOrderPrefix: ["machineIdentityKey", "eventId"],
     order: ["machineIdentityKey", "eventId", "machineSequence"],
     dependencies: ["machines", "project"],
   },
@@ -767,6 +782,11 @@ describe("portable record public seam", () => {
     expect(Object.isFrozen(PORTABLE_RECORD_DOMAIN_ORDER)).toBe(true);
     expect(Object.isFrozen(PORTABLE_RECORD_SCHEMA_DESCRIPTOR)).toBe(true);
     expect(PORTABLE_RECORD_SCHEMA_SHA256).toMatch(/^[0-9a-f]{64}$/);
+    expect(PORTABLE_RECORD_SCHEMA_SHA256).toBe("5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f");
+    expect(PORTABLE_RECORD_SCHEMA_DESCRIPTOR.canonicalization.integers.signedInt64).toEqual([
+      "-9223372036854775808",
+      "9223372036854775807",
+    ]);
     expect(PORTABLE_RECORD_SCHEMA_DESCRIPTOR.envelope).toEqual([
       "version", "domain", "domainVersion", "ordinal", "order", "identitySha256",
       "dependencies", "value", "recordSha256",
@@ -778,7 +798,94 @@ describe("portable record public seam", () => {
       expect(PORTABLE_RECORD_SCHEMA_DESCRIPTOR.domainsByOrder[domain].fields).toEqual(
         Object.keys(representativeValues[domain]),
       );
+      expect(PORTABLE_RECORD_SCHEMA_DESCRIPTOR.domainsByOrder[domain].rules).toHaveLength(
+        PORTABLE_RECORD_SCHEMA_DESCRIPTOR.domainsByOrder[domain].fields.length,
+      );
+      expect(Array.isArray(PORTABLE_RECORD_SCHEMA_DESCRIPTOR.domainsByOrder[domain].coverage)).toBe(true);
     }
+    expect(validatePortableRecordSchemaDescriptor(PORTABLE_RECORD_SCHEMA_DESCRIPTOR)).toBe(true);
+    const invalidOrder = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (invalidOrder as { domainsByOrder: { project: { order: string[] } } }).domainsByOrder.project.order.reverse();
+    expect(validatePortableRecordSchemaDescriptor(invalidOrder)).toBe(false);
+    const invalidContext = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (invalidContext as { domainsByOrder: { messages: { contextValidation: string[] } } })
+      .domainsByOrder.messages.contextValidation = ["exact-object"];
+    expect(validatePortableRecordSchemaDescriptor(invalidContext)).toBe(false);
+    const invalidRules = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (invalidRules as { domainsByOrder: { messages: { rules: string[] } } })
+      .domainsByOrder.messages.rules[0] = "string";
+    expect(validatePortableRecordSchemaDescriptor(invalidRules)).toBe(false);
+    const missingFields = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (missingFields as { domainsByOrder: { messages: { fields: unknown } } })
+      .domainsByOrder.messages.fields = null;
+    expect(validatePortableRecordSchemaDescriptor(missingFields)).toBe(false);
+    const nonStringRule = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (nonStringRule as { domainsByOrder: { messages: { rules: unknown[] } } })
+      .domainsByOrder.messages.rules[0] = 1;
+    expect(validatePortableRecordSchemaDescriptor(nonStringRule)).toBe(false);
+    const invalidCoverage = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (invalidCoverage as { domainsByOrder: { messages: { coverage: string[] } } })
+      .domainsByOrder.messages.coverage = [];
+    expect(validatePortableRecordSchemaDescriptor(invalidCoverage)).toBe(false);
+    expect(validatePortableRecordSchemaDescriptor(null)).toBe(false);
+    expect(validatePortableRecordSchemaDescriptor({
+      ...structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR),
+      version: 2,
+    })).toBe(false);
+    expect(validatePortableRecordSchemaDescriptor({
+      ...structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR),
+      domains: [],
+    })).toBe(false);
+    expect(validatePortableRecordSchemaDescriptor({
+      ...structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR),
+      domainsByOrder: null,
+    })).toBe(false);
+    const invalidInventory = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (invalidInventory as { domains: Array<{ domain: string }> }).domains[0].domain = "project";
+    expect(validatePortableRecordSchemaDescriptor(invalidInventory)).toBe(false);
+    const missingDomain = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (missingDomain as { domainsByOrder: Record<string, unknown> }).domainsByOrder.machines = null;
+    expect(validatePortableRecordSchemaDescriptor(missingDomain)).toBe(false);
+    const invalidDependencyOrder = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (invalidDependencyOrder as { domainsByOrder: { messages: { dependencies: string[] } } })
+      .domainsByOrder.messages.dependencies = ["passive-events"];
+    expect(validatePortableRecordSchemaDescriptor(invalidDependencyOrder)).toBe(false);
+    const invalidCanonicalization = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (invalidCanonicalization as { canonicalization: { tupleStringOrder: string } })
+      .canonicalization.tupleStringOrder = "unsigned-utf16-code-unit-order";
+    expect(validatePortableRecordSchemaDescriptor(invalidCanonicalization)).toBe(false);
+    const invalidClosure = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (invalidClosure as { domainsByOrder: { conversations: { conversationClosure: { algorithm: string[] } } } })
+      .domainsByOrder.conversations.conversationClosure.algorithm.reverse();
+    expect(validatePortableRecordSchemaDescriptor(invalidClosure)).toBe(false);
+    const extraRoot = {
+      ...structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR),
+      extra: true,
+    };
+    expect(validatePortableRecordSchemaDescriptor(extraRoot)).toBe(false);
+    const extraDomain = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (extraDomain as { domainsByOrder: { messages: Record<string, unknown> } })
+      .domainsByOrder.messages.extra = true;
+    expect(validatePortableRecordSchemaDescriptor(extraDomain)).toBe(false);
+    const invalidDependencies = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+    (invalidDependencies as { domainsByOrder: { messages: { dependencies: unknown } } })
+      .domainsByOrder.messages.dependencies = null;
+    expect(validatePortableRecordSchemaDescriptor(invalidDependencies)).toBe(false);
+    const trappedDescriptor = new Proxy({}, {
+      getPrototypeOf() {
+        throw new Error("descriptor trap");
+      },
+    });
+    expect(validatePortableRecordSchemaDescriptor(trappedDescriptor)).toBe(false);
+    const trappedDescriptorRead = new Proxy({}, {
+      getPrototypeOf() {
+        return Object.prototype;
+      },
+      get() {
+        throw new Error("descriptor read trap");
+      },
+    });
+    expect(validatePortableRecordSchemaDescriptor(trappedDescriptorRead)).toBe(false);
     expectDeepFrozen(PORTABLE_LIMITS);
     expectDeepFrozen(PORTABLE_RECORD_DOMAIN_ORDER);
     expectDeepFrozen(PORTABLE_RECORD_SCHEMA_DESCRIPTOR);
@@ -849,10 +956,10 @@ describe("portable record public seam", () => {
     expectCode(() => create("messages", representativeValues.messages, 0, { projectIdentity }), "malformed-record");
     expectCode(() => create("messages", representativeValues.messages, 0, { conversationOrder: ["wrong"] }), "malformed-record");
     expectCode(() => create("messages", representativeValues.messages, 0, {
-      conversationOrder: [...conversationOrder.slice(0, -1), integer(1)],
+      conversationOrder: [...conversationOrder.slice(0, -1), 1],
     }), "malformed-record");
     expectCode(() => create("message-parts", representativeValues["message-parts"], 0, {
-      messageOrder: [...messageOrder.slice(0, -1), integer(1)],
+      messageOrder: [...messageOrder.slice(0, -1), 1],
     }), "malformed-record");
     expectCode(() => create("project-aliases", representativeValues["project-aliases"], 0, {
       projectIdentity: { scope: "shared", projectId: PROJECT_ID },
@@ -962,6 +1069,7 @@ describe("portable record public seam", () => {
     expect(canonicalJsonBytes(preimage)).toEqual(Buffer.from(canonical, "utf8"));
     expect(independentlyHashed).toBe(PORTABLE_RECORD_SCHEMA_SHA256);
     expect(canonicalSha256(preimage)).toBe(PORTABLE_RECORD_SCHEMA_SHA256);
+    expect(PORTABLE_RECORD_SCHEMA_SHA256).toBe("5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f");
   });
 
   it("freezes independent canonical bytes and digest vectors", () => {
@@ -1008,9 +1116,9 @@ describe("portable record public seam", () => {
     expectCode(() => create("machines", { identityKey: "\ud800", machineId: null }), "malformed-record");
     const rocket = create("machines", { identityKey: "\ud83d\ude80", machineId: null });
     expect(rocket.value.identityKey).toBe("\ud83d\ude80");
-    expectCode(() => create("messages", { ...representativeValues.messages, tokenCount: integer("9223372036854775808") }), "record-unrepresentable");
-    expectCode(() => create("messages", { ...representativeValues.messages, tokenCount: integer("-1") }), "record-unrepresentable");
-    expectCode(() => create("messages", { ...representativeValues.messages, seq: integer("01") }), "malformed-record");
+    expectCode(() => create("messages", { ...representativeValues.messages, tokenCount: "9223372036854775808" }), "record-unrepresentable");
+    expectCode(() => create("messages", { ...representativeValues.messages, tokenCount: "-1" }), "record-unrepresentable");
+    expectCode(() => create("messages", { ...representativeValues.messages, seq: "01" }), "malformed-record");
     expectCode(() => create("promoted-memories", { ...representativeValues["promoted-memories"], confidence: Number.NaN }), "malformed-record");
     expectCode(() => create("promoted-memories", { ...representativeValues["promoted-memories"], confidence: -0 }), "malformed-record");
     expectCode(() => create("promoted-memories", { ...representativeValues["promoted-memories"], metadata: undefined }), "malformed-record");
@@ -1018,12 +1126,12 @@ describe("portable record public seam", () => {
 
   it("accepts integer extrema and rejects each six-range boundary outside its range", () => {
     const extrema = [
-      integer("-9223372036854775808"),
-      integer("9223372036854775807"),
-      integer("0"),
-      integer("2147483647"),
-      integer("1"),
-      integer("9007199254740991"),
+      "-9223372036854775808",
+      "9223372036854775807",
+      "0",
+      "2147483647",
+      "1",
+      "9007199254740991",
     ];
     expect(create("messages", { ...representativeValues.messages, seq: extrema[2], tokenCount: extrema[1] })).toBeTruthy();
     expect(create("redaction-counters", { category: "global", count: extrema[1] })).toBeTruthy();
@@ -1031,10 +1139,10 @@ describe("portable record public seam", () => {
     expect(create("summary-file-links", { ...representativeValues["summary-file-links"], ordinal: extrema[3] })).toBeTruthy();
     expect(create("conversations", { ...representativeValues.conversations, occurrenceOrdinal: 9007199254740991 })).toBeTruthy();
     expect(create("passive-events", { ...representativeValues["passive-events"], priority: -9007199254740991 })).toBeTruthy();
-    for (const value of [integer("9223372036854775808"), integer("-9223372036854775809"), integer("-1")]) {
+    for (const value of ["9223372036854775808", "-9223372036854775809", "-1"]) {
       expectCode(() => create("messages", { ...representativeValues.messages, tokenCount: value }), "record-unrepresentable");
     }
-    for (const value of [integer("01"), integer("+1"), integer("-0")]) {
+    for (const value of ["01", "+1", "-0"]) {
       expectCode(() => create("messages", { ...representativeValues.messages, tokenCount: value }), "malformed-record");
     }
     expectCode(() => create("conversations", { ...representativeValues.conversations, occurrenceOrdinal: Number.MAX_SAFE_INTEGER + 1 }), "malformed-record");
@@ -1058,11 +1166,90 @@ describe("portable record public seam", () => {
     expectCode(() => create("promoted-memories", { ...representativeValues["promoted-memories"], metadata: Object.create({ x: 1 }) }), "malformed-record");
     const accessor = { get x() { return 1; } };
     expectCode(() => create("promoted-memories", { ...representativeValues["promoted-memories"], metadata: accessor }), "malformed-record");
+    let valueAccessorCalls = 0;
+    const valueAccessor = { ...representativeValues.messages };
+    Object.defineProperty(valueAccessor, "content", {
+      enumerable: true,
+      get() {
+        valueAccessorCalls += 1;
+        return "accessor content";
+      },
+    });
+    expectCode(() => create("messages", valueAccessor), "malformed-record");
+    expect(valueAccessorCalls).toBe(0);
+    let contextAccessorCalls = 0;
+    const contextAccessor = Object.defineProperty({}, "projectIdentity", {
+      enumerable: true,
+      get() {
+        contextAccessorCalls += 1;
+        return projectIdentity;
+      },
+    });
+    expectCode(() => create("session-ingest", representativeValues["session-ingest"], 0, contextAccessor), "malformed-record");
+    expect(contextAccessorCalls).toBe(0);
     const symbol = Symbol("secret");
     expectCode(() => create("promoted-memories", { ...representativeValues["promoted-memories"], metadata: { [symbol]: 1 } }), "malformed-record");
     const sparse: unknown[] = [];
     sparse.length = 1;
     expectCode(() => create("native-transcripts", { ...representativeValues["native-transcripts"], nativePayload: sparse }), "malformed-record");
+    let arrayAccessorCalls = 0;
+    const arrayAccessor = ["safe"];
+    Object.defineProperty(arrayAccessor, "0", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        arrayAccessorCalls += 1;
+        return "accessor content";
+      },
+    });
+    expectCode(() => create("native-transcripts", {
+      ...representativeValues["native-transcripts"],
+      nativePayload: arrayAccessor,
+    }, 0, {
+      projectIdentity,
+      canonicalPayloadBytes: 0,
+      canonicalMetadataBytes: 0,
+    }), "malformed-record");
+    expect(arrayAccessorCalls).toBe(0);
+    const exoticArray = ["safe"];
+    Object.setPrototypeOf(exoticArray, Object.create(Array.prototype));
+    expectCode(() => create("native-transcripts", {
+      ...representativeValues["native-transcripts"],
+      nativePayload: exoticArray,
+    }), "malformed-record");
+
+    let orderAccessorCalls = 0;
+    const orderAccessor = [...conversationOrder];
+    Object.defineProperty(orderAccessor, "0", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        orderAccessorCalls += 1;
+        return SESSION_ID;
+      },
+    });
+    expectCode(() => create("messages", representativeValues.messages, 0, {
+      conversationOrder: orderAccessor,
+    }), "malformed-record");
+    expect(orderAccessorCalls).toBe(0);
+
+    let dependencyAccessorCalls = 0;
+    const machine = create("machines", representativeValues.machines);
+    const dependencyAccessor: unknown[] = [];
+    Object.defineProperty(dependencyAccessor, "0", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        dependencyAccessorCalls += 1;
+        return { domain: "project", identitySha256: HASH };
+      },
+    });
+    dependencyAccessor.length = 1;
+    expectCode(() => serializePortableRecord({
+      ...machine,
+      dependencies: dependencyAccessor,
+    } as never), "malformed-record");
+    expect(dependencyAccessorCalls).toBe(0);
   });
 
   it("enforces JSON depth, exact nullability, context target exclusivity, DAG sanity, and dependencies", () => {
@@ -1091,8 +1278,14 @@ describe("portable record public seam", () => {
     expect(comparePortableOrder(["é"], ["z"])).toBeGreaterThan(0);
     expect(comparePortableOrder([integer("-2")], [integer("1")])).toBeLessThan(0);
     expect(comparePortableOrder([integer("2")], [integer("10")])).toBeLessThan(0);
+    expect(comparePortableOrder([integer("-9223372036854775808")], [integer("0")])).toBeLessThan(0);
+    expect(comparePortableOrder([integer("0")], [integer("-9223372036854775808")])).toBeGreaterThan(0);
+    expectCode(() => comparePortableOrder([integer("-9223372036854775809")], [integer("0")]), "record-unrepresentable");
     expect(comparePortableOrder(["a", integer("1")], ["a", integer("2")])).toBeLessThan(0);
     expectCode(() => comparePortableOrder([], [null]), "malformed-record");
+    expectCode(() => comparePortableOrder([{ $integer: "01" } as never], [{ $integer: "1" } as never]), "malformed-record");
+    expectCode(() => comparePortableOrder(["contains\u0000nul"], ["safe"]), "malformed-record");
+    expectCode(() => comparePortableOrder([true as never], [false as never]), "malformed-record");
     expect(comparePortableOrder(["\uE000"], ["\u{10000}"])).toBeLessThan(0);
     expect(canonicalJson({ "\uE000": 1, "\u{10000}": 2 })).toBe('{"𐀀":2,"":1}');
   });
@@ -1123,6 +1316,29 @@ describe("portable record public seam", () => {
     expect(dated.value.createdAt).toBe(datedCreatedAt);
     expectCode(() => create("messages", { ...representativeValues.messages, tokenCount: "1.5" }), "malformed-record");
     expectCode(() => create("messages", { ...representativeValues.messages, tokenCount: -0 }), "malformed-record");
+    expectCode(() => create("messages", { ...representativeValues.messages, tokenCount: integer(1) }), "malformed-record");
+    expect(create("session-ingest", {
+      ...representativeValues["session-ingest"],
+      completedAt: "0001-01-01T00:00:00.000000Z",
+    }).value.completedAt).toBe("0001-01-01T00:00:00.000000Z");
+    const exoticDate = new Date("2026-08-13T12:34:56.000Z");
+    Object.setPrototypeOf(exoticDate, Object.create(Date.prototype));
+    expectCode(() => create("session-ingest", {
+      ...representativeValues["session-ingest"],
+      completedAt: exoticDate,
+    }), "malformed-record");
+  });
+
+  it("preserves caller-owned UUID spelling and requires canonical registered UUIDv7 bindings", () => {
+    const uppercaseEventId = "00000000-0000-7000-8000-000000000ABC";
+    expect(create("passive-events", {
+      ...representativeValues["passive-events"],
+      eventId: uppercaseEventId,
+    }).value.eventId).toBe(uppercaseEventId);
+    expectCode(() => create("machines", {
+      identityKey: MACHINE_IDENTITY,
+      machineId: uppercaseEventId,
+    }), "malformed-record");
   });
 
   it("rejects identity, order, dependency, and record digest tampering", () => {
@@ -1156,9 +1372,32 @@ describe("portable record public seam", () => {
     }
     const tooLarge = new Uint8Array(PORTABLE_LIMITS.maxRecordBytes + 1);
     expectCode(() => parsePortableRecord(tooLarge), "record-unrepresentable");
+    expectCode(() => create("messages", {
+      ...representativeValues.messages,
+      content: "x".repeat(PORTABLE_LIMITS.maxRecordBytes),
+    }), "record-unrepresentable");
     expectCode(() => parsePortableRecord(Buffer.from("null\n")), "malformed-record");
     expectCode(() => parsePortableRecord(Buffer.from("{\"domain\":\"machines\"}\n")), "malformed-record");
-  });
+  }, 120_000);
+
+  it("enforces the complete newline-framed 128 MiB record boundary", () => {
+    const empty = create("messages", {
+      ...representativeValues.messages,
+      content: "",
+    });
+    expect(serializePortableRecord(empty).byteLength).toBe(722);
+
+    const exactContentBytes = PORTABLE_LIMITS.maxRecordBytes - 722;
+    const exact = create("messages", {
+      ...representativeValues.messages,
+      content: "x".repeat(exactContentBytes),
+    });
+    expect(exact.value.content).toHaveLength(exactContentBytes);
+    expectCode(() => create("messages", {
+      ...representativeValues.messages,
+      content: "x".repeat(exactContentBytes + 1),
+    }), "record-unrepresentable");
+  }, 120_000);
 
   it("rejects every fixed error code only through safe bounded fields", () => {
     const codes = [
@@ -1213,6 +1452,10 @@ describe("portable record public seam", () => {
     const duplicateVersion = Buffer.from(encoded.toString().replace(/^\{/u, '{"version":1,'));
     expectCode(() => parsePortableRecord(duplicateVersion), "malformed-record");
     expectCode(() => parsePortableRecord(Uint8Array.from([0xff, 0xfe, 0xfd])), "malformed-record");
+    expectCode(() => parsePortableRecord(Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      encoded,
+    ])), "malformed-record");
     expectCode(() => parsePortableRecord(Buffer.from(encoded.toString().replace(/\n$/u, ""))), "malformed-record");
   });
 
@@ -1257,16 +1500,72 @@ describe("portable record public seam", () => {
       checkpointSha256: HASH,
       message: "Portable record stream error: malformed-record",
     });
+    expect(JSON.stringify(json)).toBe(`{"name":"PortableStreamError","code":"malformed-record","retryable":true,"domain":"machines","ordinal":7,"recordCount":8,"manifestSha256":"${HASH}","checkpointSha256":"${HASH}","message":"Portable record stream error: malformed-record"}`);
     expect(JSON.stringify(json)).not.toContain(secret);
     expect(error.cause).toBeUndefined();
     expect(error.stack?.split("\n", 1)[0]).toBe("PortableStreamError: Portable record stream error: malformed-record");
     expect(error.stack).not.toContain(secret);
-    expect(new PortableStreamError("malformed-record").toJSON()).toEqual({
+    const noOptions = new PortableStreamError("malformed-record").toJSON();
+    expect(noOptions).toEqual({
       name: "PortableStreamError",
       code: "malformed-record",
       retryable: false,
       message: "Portable record stream error: malformed-record",
     });
+    expect(JSON.stringify(noOptions)).toBe("{\"name\":\"PortableStreamError\",\"code\":\"malformed-record\",\"retryable\":false,\"message\":\"Portable record stream error: malformed-record\"}");
+    const unsafe = new PortableStreamError("malformed-record", {
+      domain: "secret-domain" as never,
+      ordinal: -1,
+      recordCount: Number.NaN,
+      manifestSha256: "/secret/manifest",
+      checkpointSha256: "password=canary",
+      retryable: "secret-retry" as never,
+    });
+    expect(unsafe.toJSON()).toEqual({
+      name: "PortableStreamError",
+      code: "malformed-record",
+      retryable: false,
+      message: "Portable record stream error: malformed-record",
+    });
+    expect(JSON.stringify(unsafe)).not.toContain("secret");
+    expect(JSON.stringify(unsafe)).not.toContain("password");
+
+    expect(new PortableStreamError("malformed-record", null as never).toJSON()).toEqual({
+      name: "PortableStreamError",
+      code: "malformed-record",
+      retryable: false,
+      message: "Portable record stream error: malformed-record",
+    });
+    let optionAccessorCalls = 0;
+    const accessorOptions = Object.defineProperty({}, "manifestSha256", {
+      enumerable: true,
+      get() {
+        optionAccessorCalls += 1;
+        return "/secret/manifest";
+      },
+    });
+    expect(new PortableStreamError("malformed-record", accessorOptions).toJSON()).toEqual({
+      name: "PortableStreamError",
+      code: "malformed-record",
+      retryable: false,
+      message: "Portable record stream error: malformed-record",
+    });
+    expect(optionAccessorCalls).toBe(0);
+    const trappedOptions = new Proxy({}, {
+      getOwnPropertyDescriptor() {
+        throw new Error("secret option trap");
+      },
+    });
+    expect(new PortableStreamError("malformed-record", trappedOptions).toJSON()).toEqual({
+      name: "PortableStreamError",
+      code: "malformed-record",
+      retryable: false,
+      message: "Portable record stream error: malformed-record",
+    });
+    const unsafeCode = new PortableStreamError("/secret/error-code" as never);
+    expect(unsafeCode.code).toBe("malformed-record");
+    expect(unsafeCode.message).toBe("Portable record stream error: malformed-record");
+    expect(unsafeCode.stack).not.toContain("/secret/error-code");
   });
 
   it("covers canonical scalar, container, and comparator rejection branches", () => {
@@ -1286,11 +1585,36 @@ describe("portable record public seam", () => {
     arrayWithLeadingZero["01"] = 2;
     expectCode(() => canonicalJson(arrayWithLeadingZero), "malformed-record");
     expectCode(() => canonicalJson(new Map()), "malformed-record");
+    const trappedObject = new Proxy({}, {
+      getPrototypeOf() {
+        throw new Error("secret object prototype trap");
+      },
+    });
+    expectCode(() => canonicalJson(trappedObject), "malformed-record");
+    const trappedDescriptorObject = new Proxy({ value: 1 }, {
+      getOwnPropertyDescriptor() {
+        throw new Error("secret property descriptor trap");
+      },
+    });
+    expectCode(() => canonicalJson(trappedDescriptorObject), "malformed-record");
+    const trappedArray = new Proxy([1], {
+      ownKeys() {
+        throw new Error("secret array key trap");
+      },
+    });
+    expectCode(() => canonicalJson(trappedArray), "malformed-record");
+    const trappedArrayPrototype = new Proxy([1], {
+      getPrototypeOf() {
+        throw new Error("secret array prototype trap");
+      },
+    });
+    expectCode(() => canonicalJson(trappedArrayPrototype), "malformed-record");
     expect(canonicalJson(Object.create(null, { a: { value: 1, enumerable: true } }))).toBe('{"a":1}');
     expect(comparePortableOrder([null], [null])).toBe(0);
     expect(comparePortableOrder(["a"], [integer(1)])).toBeLessThan(0);
     expect(comparePortableOrder([integer(1)], ["a"])).toBeGreaterThan(0);
     expect(comparePortableOrder([integer(1)], [integer(1)])).toBe(0);
+    expectCode(() => comparePortableOrder([{ $integer: 1 } as never], [integer(1)]), "malformed-record");
     expect(comparePortableOrder(["aa"], ["a"])).toBeGreaterThan(0);
     expect(comparePortableOrder(["a"], ["aa"])).toBeLessThan(0);
     expect(canonicalJson({ aa: 1, a: 2 })).toBe('{"a":2,"aa":1}');
@@ -1313,6 +1637,7 @@ describe("portable record public seam", () => {
     expectCode(() => create("messages", { ...representativeValues.messages, content: 1 }), "malformed-record");
     expectCode(() => create("message-parts", { ...representativeValues["message-parts"], isIgnored: "false" }), "malformed-record");
     expectCode(() => create("message-parts", { ...representativeValues["message-parts"], stepCost: Infinity }), "malformed-record");
+    expectCode(() => create("message-parts", { ...representativeValues["message-parts"], stepCost: -1 }), "malformed-record");
     expectCode(() => create("native-transcripts", {
       ...representativeValues["native-transcripts"],
       nativePayload: "not-object-or-array",
@@ -1405,6 +1730,10 @@ describe("portable record public seam", () => {
     expectCode(() => parsePortableRecord(Buffer.from(`${referenceCanonicalJson({
       ...messageWire,
       order: "not-an-array",
+    })}\n`)), "malformed-record");
+    expectCode(() => parsePortableRecord(Buffer.from(`${referenceCanonicalJson({
+      ...messageWire,
+      order: [],
     })}\n`)), "malformed-record");
     const part = create("message-parts", representativeValues["message-parts"]);
     const partWire = JSON.parse(Buffer.from(bytes(part)).toString("utf8")) as Record<string, unknown>;

@@ -557,46 +557,52 @@ const PORTABLE_RECORD_SCHEMA_BASE = {
   domainsByOrder: {
     machines: {
       logicalKey: ["identityKey"],
+      identityOrderPrefix: ["identityKey"],
       order: ["identityKey"],
       dependencies: [],
       fields: ["identityKey", "machineId"],
       rules: ["string", "uuidv7|null"],
-      coverage: "identity-sidecar",
+      coverage: ["identity-sidecar"],
     },
     project: {
       logicalKey: ["identity.scope", "identity.projectId"],
+      identityOrderPrefix: ["scope", "projectId"],
       order: ["scope", "projectId"],
       dependencies: [],
       fields: ["identity"],
       rules: ["project-identity"],
-      coverage: "identity-sidecar",
+      coverage: ["identity-sidecar"],
     },
     "project-aliases": {
       logicalKey: ["machineIdentityKey", "normalizedPath"],
+      identityOrderPrefix: ["machineIdentityKey", "normalizedPath"],
       order: ["machineIdentityKey", "normalizedPath", "path"],
       dependencies: ["machines", "project"],
       fields: ["machineIdentityKey", "path", "normalizedPath"],
       rules: ["string", "path", "normalized-path"],
-      coverage: "identity-sidecar",
+      coverage: ["identity-sidecar"],
     },
     conversations: {
       logicalKey: ["conversationFingerprint", "occurrenceOrdinal"],
+      identityOrderPrefix: ["sessionId", "title", "bootstrappedAt", "createdAt", "updatedAt", "occurrenceOrdinal"],
       order: ["sessionId", "title", "bootstrappedAt", "createdAt", "updatedAt", "occurrenceOrdinal"],
       dependencies: ["project"],
       fields: ["conversationFingerprint", "occurrenceOrdinal", "sessionId", "createdAt", "title", "bootstrappedAt", "updatedAt"],
       rules: ["sha256", "nonnegative-safe-integer", "string", "timestamp", "string|null", "timestamp|null", "timestamp"],
-      coverage: "database",
+      coverage: ["database"],
     },
     messages: {
       logicalKey: ["conversationIdentitySha256", "seq"],
+      identityOrderPrefix: ["sessionId", "title", "bootstrappedAt", "conversationCreatedAt", "conversationUpdatedAt", "conversationOccurrenceOrdinal", "seq"],
       order: ["sessionId", "title", "bootstrappedAt", "conversationCreatedAt", "conversationUpdatedAt", "conversationOccurrenceOrdinal", "seq"],
       dependencies: ["conversations"],
       fields: ["conversationIdentitySha256", "seq", "role", "content", "tokenCount", "createdAt"],
       rules: ["sha256", "nonnegative-int64", "role", "string", "nonnegative-int64", "timestamp"],
-      coverage: "database",
+      coverage: ["database"],
     },
     "message-parts": {
       logicalKey: ["messageIdentitySha256", "ordinal"],
+      identityOrderPrefix: ["sessionId", "title", "bootstrappedAt", "conversationCreatedAt", "conversationUpdatedAt", "conversationOccurrenceOrdinal", "messageSeq", "ordinal"],
       order: [
         "sessionId",
         "title",
@@ -614,136 +620,158 @@ const PORTABLE_RECORD_SCHEMA_BASE = {
         "patchFiles", "fileMime", "fileName", "fileUrl", "subtaskPrompt", "subtaskDescription", "subtaskAgent", "stepReason",
         "stepCost", "stepTokensIn", "stepTokensOut", "snapshotHash", "compactionAuto", "metadata",
       ],
-      rules: ["sha256", "string", "string", "part-type", "nonnegative-int64", "nullable-string-fields", "finite-float|null"],
-      coverage: "database",
+      rules: [
+        "sha256", "string", "string", "part-type", "nonnegative-int64", "string|null", "boolean|null",
+        "boolean|null", "string|null", "string|null", "string|null", "string|null", "string|null", "string|null",
+        "string|null", "string|null", "string|null", "string|null", "string|null", "string|null", "string|null",
+        "string|null", "string|null", "string|null", "finite-float-nonnegative|null", "nonnegative-int64|null",
+        "nonnegative-int64|null", "string|null", "boolean|null", "string|null",
+      ],
+      coverage: ["database"],
     },
     "large-files": {
       logicalKey: ["fileId"],
+      identityOrderPrefix: ["fileId"],
       order: ["fileId"],
       dependencies: ["conversations"],
       fields: ["fileId", "conversationIdentitySha256", "fileName", "mimeType", "byteSize", "storageUri", "explorationSummary", "createdAt"],
       rules: ["string", "sha256", "string|null", "string|null", "nonnegative-int64|null", "string", "string|null", "timestamp"],
-      coverage: "database",
+      coverage: ["database"],
     },
     summaries: {
       logicalKey: ["summaryId"],
+      identityOrderPrefix: ["summaryId"],
       order: ["summaryId"],
       dependencies: ["conversations"],
       fields: ["summaryId", "conversationIdentitySha256", "kind", "depth", "content", "tokenCount", "earliestAt", "latestAt", "descendantCount", "descendantTokenCount", "sourceMessageTokenCount", "createdAt"],
       rules: ["string", "sha256", "summary-kind", "nonnegative-int4", "string", "nonnegative-int64", "timestamp|null", "timestamp|null", "nonnegative-int64", "nonnegative-int64", "nonnegative-int64", "timestamp"],
-      coverage: "database",
+      coverage: ["database"],
     },
     "summary-file-links": {
       logicalKey: ["summaryId", "ordinal"],
+      identityOrderPrefix: ["summaryId", "ordinal"],
       order: ["summaryId", "ordinal"],
       dependencies: ["summaries"],
       fields: ["summaryId", "ordinal", "fileId"],
       rules: ["string", "nonnegative-int4", "string"],
-      coverage: "database",
+      coverage: ["database"],
     },
     "summary-message-links": {
       logicalKey: ["summaryId", "messageIdentitySha256"],
+      identityOrderPrefix: ["summaryId", "messageIdentitySha256"],
       order: ["summaryId", "messageIdentitySha256", "ordinal"],
       dependencies: ["summaries", "messages"],
       fields: ["summaryId", "ordinal", "messageIdentitySha256"],
       rules: ["string", "nonnegative-int4", "sha256"],
-      coverage: "database",
+      coverage: ["database"],
     },
     "summary-parent-links": {
       logicalKey: ["summaryId", "parentSummaryId"],
+      identityOrderPrefix: ["summaryId", "parentSummaryId"],
       order: ["summaryId", "parentSummaryId", "ordinal"],
       dependencies: ["summaries"],
       fields: ["summaryId", "ordinal", "parentSummaryId"],
       rules: ["string", "nonnegative-int4", "string"],
-      coverage: "database",
+      coverage: ["database"],
     },
     "context-items": {
       logicalKey: ["conversationIdentitySha256", "ordinal"],
+      identityOrderPrefix: ["sessionId", "title", "bootstrappedAt", "conversationCreatedAt", "conversationUpdatedAt", "conversationOccurrenceOrdinal", "ordinal"],
       order: ["sessionId", "title", "bootstrappedAt", "conversationCreatedAt", "conversationUpdatedAt", "conversationOccurrenceOrdinal", "ordinal"],
       dependencies: ["conversations", "messages|summaries"],
       fields: ["conversationIdentitySha256", "ordinal", "itemType", "messageIdentitySha256", "summaryId", "createdAt"],
       rules: ["sha256", "nonnegative-int4", "context-target", "sha256|null", "string|null", "timestamp"],
-      coverage: "database",
+      coverage: ["database"],
     },
     "promoted-memories": {
       logicalKey: ["memoryId"],
+      identityOrderPrefix: ["memoryId"],
       order: ["memoryId"],
       dependencies: ["project"],
       fields: ["memoryId", "content", "metadata", "sourceProjectId", "sourceSummaryId", "sessionId", "depth", "confidence", "createdAt", "archivedAt"],
       rules: ["string", "string", "json-object", "string|null", "string|null", "string|null", "nonnegative-int4", "finite-float-0..1", "timestamp", "timestamp|null"],
-      coverage: "database",
+      coverage: ["database"],
     },
     "promoted-memory-tags": {
       logicalKey: ["memoryId", "ordinal"],
+      identityOrderPrefix: ["memoryId", "ordinal"],
       order: ["memoryId", "ordinal"],
       dependencies: ["promoted-memories"],
       fields: ["memoryId", "ordinal", "tag"],
       rules: ["string", "nonnegative-int4", "string"],
-      coverage: "database",
+      coverage: ["database"],
     },
     "recall-surfacings": {
       logicalKey: ["memoryId", "sessionId", "surfacedAt", "occurrenceOrdinal"],
+      identityOrderPrefix: ["memoryId", "sessionId", "surfacedAt", "occurrenceOrdinal"],
       order: ["memoryId", "sessionId", "surfacedAt", "occurrenceOrdinal"],
       dependencies: ["project"],
       fields: ["memoryId", "sessionId", "surfacedAt", "occurrenceOrdinal"],
       rules: ["string", "string|null", "timestamp", "nonnegative-safe-integer"],
-      coverage: "database",
+      coverage: ["database"],
     },
     "redaction-counters": {
       logicalKey: ["category"],
+      identityOrderPrefix: ["category"],
       order: ["category"],
       dependencies: ["project"],
       fields: ["category", "count"],
       rules: ["redaction-category", "nonnegative-int64"],
-      coverage: "database",
+      coverage: ["database"],
     },
     "session-ingest": {
       logicalKey: ["sessionId"],
+      identityOrderPrefix: ["sessionId"],
       order: ["sessionId"],
       dependencies: ["project"],
       fields: ["sessionId", "messageCount", "completedAt"],
       rules: ["string", "nonnegative-int64", "timestamp"],
-      coverage: "database",
+      coverage: ["database"],
     },
     "session-instructions": {
       logicalKey: ["machineIdentityKey", "scopeHash"],
+      identityOrderPrefix: ["machineIdentityKey", "scopeHash"],
       order: ["machineIdentityKey", "scopeHash"],
       dependencies: ["machines", "project"],
       fields: ["machineIdentityKey", "scopeHash", "clientName", "sessionId", "worktreePath", "cwdPath", "content", "contentHash", "updatedAt"],
       rules: ["string", "sha256", "client", "string", "path", "path", "string", "sha256", "timestamp"],
-      coverage: "database-and-identity",
+      coverage: ["database-and-identity"],
     },
     "native-transcripts": {
       logicalKey: ["machineIdentityKey", "ingestKey"],
+      identityOrderPrefix: ["machineIdentityKey", "ingestKey"],
       order: ["machineIdentityKey", "ingestKey"],
       dependencies: ["machines", "project"],
       fields: ["machineIdentityKey", "clientName", "formatName", "formatVersion", "nativeSessionId", "sourceLocator", "sourceOrdinal", "observedAt", "ingestedAt", "scrubberVersion", "contentSha256", "ingestKey", "nativePayload"],
       rules: ["string", "string", "string", "string", "string", "path", "nonnegative-int64", "timestamp", "timestamp", "string", "sha256", "sha256", "json-object-or-array"],
-      coverage: "database-or-sidecar",
+      coverage: ["database-or-sidecar"],
     },
     "native-transcript-message-links": {
       logicalKey: ["machineIdentityKey", "ingestKey", "sourceOrdinal"],
+      identityOrderPrefix: ["machineIdentityKey", "ingestKey", "sourceOrdinal"],
       order: ["machineIdentityKey", "ingestKey", "sourceOrdinal"],
       dependencies: ["native-transcripts", "messages"],
       fields: ["machineIdentityKey", "ingestKey", "sourceOrdinal", "conversationIdentitySha256", "messageIdentitySha256"],
       rules: ["string", "sha256", "nonnegative-int4", "sha256", "sha256"],
-      coverage: "database-or-sidecar",
+      coverage: ["database-or-sidecar"],
     },
     "native-transcript-checkpoints": {
       logicalKey: ["machineIdentityKey", "clientName", "sourceLocator"],
+      identityOrderPrefix: ["machineIdentityKey", "clientName", "sourceLocator"],
       order: ["machineIdentityKey", "clientName", "sourceLocator"],
       dependencies: ["machines", "project"],
       fields: ["machineIdentityKey", "clientName", "sourceLocator", "revision", "lastSourceOrdinal", "importedCount", "skippedCount", "quarantinedCount", "checkpoint", "updatedAt"],
       rules: ["string", "string", "path", "nonnegative-safe-integer", "nonnegative-int64", "nonnegative-int64", "nonnegative-int64", "nonnegative-int64", "json-object", "timestamp"],
-      coverage: "database-or-sidecar",
+      coverage: ["database-or-sidecar"],
     },
     "passive-events": {
       logicalKey: ["machineIdentityKey", "eventId"],
+      identityOrderPrefix: ["machineIdentityKey", "eventId"],
       order: ["machineIdentityKey", "eventId", "machineSequence"],
       dependencies: ["machines", "project"],
       fields: ["machineIdentityKey", "eventId", "eventVersion", "machineSequence", "eventType", "sessionId", "sessionSequence", "category", "data", "priority", "sourceHook", "createdAt", "disposition"],
-      rules: ["string", "uuid", "positive-int4", "nonnegative-int64", "string", "string", "nonnegative-safe-integer", "string", "json", "signed-safe-integer", "string", "timestamp", "disposition"],
-      coverage: "database-or-sidecar",
+      rules: ["string", "uuid", "positive-int4", "nonnegative-int64", "string", "string", "nonnegative-safe-integer", "string", "string", "signed-safe-integer", "string", "timestamp", "disposition"],
+      coverage: ["database-or-sidecar"],
     },
   },
 } as const;
@@ -873,19 +901,116 @@ const augmentedDomainsByOrder = Object.fromEntries(
   ]),
 ) as unknown as AugmentedDomainsByOrder;
 
-export const PORTABLE_RECORD_SCHEMA_DESCRIPTOR = deepFreeze({
-  ...PORTABLE_RECORD_SCHEMA_BASE,
-  canonicalization: {
-    ...PORTABLE_RECORD_SCHEMA_BASE.canonicalization,
-    objectKeyOrder: "unsigned-utf16-code-unit-order",
-    tupleStringOrder: "unsigned-utf8-byte-order",
-    json: {
-      ...PORTABLE_RECORD_SCHEMA_BASE.canonicalization.json,
-      objectKeys: "unsigned-utf16-code-unit-order",
-    },
+function stringArray(value: unknown): readonly string[] | null {
+  try {
+    const values = plainDenseArrayElements(value);
+    for (const item of values) if (typeof item !== "string") return null;
+    return values as readonly string[];
+  } catch {
+    return null;
+  }
+}
+
+function sameStrings(left: unknown, right: readonly string[]): boolean {
+  const values = stringArray(left);
+  if (values === null || values.length !== right.length) return false;
+  for (let index = 0; index < values.length; index += 1) {
+    if (values[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+const PORTABLE_CANONICALIZATION_DESCRIPTOR = {
+  ...PORTABLE_RECORD_SCHEMA_BASE.canonicalization,
+  objectKeyOrder: "unsigned-utf16-code-unit-order",
+  tupleStringOrder: "unsigned-utf8-byte-order",
+  json: {
+    ...PORTABLE_RECORD_SCHEMA_BASE.canonicalization.json,
+    objectKeys: "unsigned-utf16-code-unit-order",
   },
+} as const;
+
+/** Validate the frozen schema's executable ordering and reconstruction invariants. */
+export function validatePortableRecordSchemaDescriptor(descriptor: unknown): boolean {
+  try {
+    const root = snapshotExactObject(descriptor, [
+      "version", "domains", "envelope", "dependency", "canonicalization", "limits", "domainsByOrder",
+    ]);
+    if (root.version !== 1) return false;
+    const domains = plainDenseArrayElements(root.domains);
+    if (domains.length !== PORTABLE_RECORD_DOMAIN_ORDER.length) return false;
+    const domainsByOrder = snapshotExactObject(root.domainsByOrder, PORTABLE_RECORD_DOMAIN_ORDER);
+    if (
+      !sameStrings(root.envelope, PORTABLE_RECORD_SCHEMA_BASE.envelope)
+      || !sameStrings(root.dependency, PORTABLE_RECORD_SCHEMA_BASE.dependency)
+      || canonicalJson(root.canonicalization) !== canonicalJson(PORTABLE_CANONICALIZATION_DESCRIPTOR)
+      || canonicalJson(root.limits) !== canonicalJson(PORTABLE_LIMITS)
+    ) return false;
+
+    for (let index = 0; index < PORTABLE_RECORD_DOMAIN_ORDER.length; index += 1) {
+      const domain = PORTABLE_RECORD_DOMAIN_ORDER[index];
+      const inventory = snapshotExactObject(domains[index], ["domain", "domainVersion", "ordinal"]);
+      if (inventory.domain !== domain || inventory.domainVersion !== 1 || inventory.ordinal !== index) return false;
+
+      const expected = PORTABLE_RECORD_SCHEMA_BASE.domainsByOrder[domain];
+      const context = PORTABLE_CONSTRUCTION_CONTEXT_DESCRIPTOR[domain];
+      const candidate = snapshotExactObject(domainsByOrder[domain], [
+        "logicalKey", "identityOrderPrefix", "order", "dependencies", "fields", "rules", "coverage",
+        "constructionContext", "contextValidation",
+        ...(domain === "conversations" ? ["conversationClosure"] : []),
+      ]);
+      const fields = stringArray(candidate.fields);
+      const rules = stringArray(candidate.rules);
+      const order = stringArray(candidate.order);
+      const identityPrefix = stringArray(candidate.identityOrderPrefix);
+      const coverage = stringArray(candidate.coverage);
+      const dependencies = stringArray(candidate.dependencies);
+      if (dependencies === null) return false;
+      for (const dependency of dependencies) {
+        for (const alternative of dependency.split("|")) {
+          if (PORTABLE_RECORD_DOMAIN_ORDER.indexOf(alternative as PortableDomain) >= index) return false;
+        }
+      }
+      if (
+        fields === null
+        || rules === null
+        || fields.length !== rules.length
+        || order === null
+        || identityPrefix === null
+        || identityPrefix.length === 0
+        || identityPrefix.length > order.length
+        || !identityPrefix.every((field, position) => field === order[position])
+        || coverage === null
+        || coverage.length === 0
+        || !sameStrings(candidate.fields, expected.fields)
+        || !sameStrings(candidate.rules, expected.rules)
+        || !sameStrings(candidate.order, expected.order)
+        || !sameStrings(candidate.identityOrderPrefix, expected.identityOrderPrefix)
+        || !sameStrings(candidate.logicalKey, expected.logicalKey)
+        || !sameStrings(dependencies, expected.dependencies)
+        || !sameStrings(candidate.coverage, expected.coverage)
+        || !sameStrings(candidate.constructionContext, context.constructionContext)
+        || !sameStrings(candidate.contextValidation, context.contextValidation)
+        || (
+          domain === "conversations"
+          && canonicalJson(candidate.conversationClosure) !== canonicalJson(CONVERSATION_CLOSURE_DESCRIPTOR)
+        )
+      ) return false;
+
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const portableRecordSchemaDescriptor = deepFreeze({
+  ...PORTABLE_RECORD_SCHEMA_BASE,
+  canonicalization: PORTABLE_CANONICALIZATION_DESCRIPTOR,
   domainsByOrder: augmentedDomainsByOrder,
 } as const);
+
+export const PORTABLE_RECORD_SCHEMA_DESCRIPTOR = portableRecordSchemaDescriptor;
 
 export type PortableRecordValue = PortableRecordValueByDomain[PortableDomain];
 
@@ -929,6 +1054,16 @@ export type PortableStreamErrorCode =
   | "order-regression"
   | "dependency-order";
 
+const PORTABLE_STREAM_ERROR_CODES: readonly PortableStreamErrorCode[] = Object.freeze([
+  "unsupported-version",
+  "unknown-domain",
+  "malformed-record",
+  "record-unrepresentable",
+  "duplicate-identity",
+  "order-regression",
+  "dependency-order",
+]);
+
 export class PortableStreamError extends Error {
   readonly code: PortableStreamErrorCode;
   readonly retryable: boolean;
@@ -939,15 +1074,24 @@ export class PortableStreamError extends Error {
   readonly checkpointSha256?: string;
 
   constructor(code: PortableStreamErrorCode, options: PortableStreamErrorOptions = {}) {
-    super(`Portable record stream error: ${code}`);
+    const normalizedCode = PORTABLE_STREAM_ERROR_CODES.includes(code)
+      ? code
+      : "malformed-record";
+    super(`Portable record stream error: ${normalizedCode}`);
     this.name = "PortableStreamError";
-    this.code = code;
-    this.retryable = options.retryable ?? false;
-    this.domain = options.domain;
-    this.ordinal = options.ordinal;
-    this.recordCount = options.recordCount;
-    this.manifestSha256 = options.manifestSha256;
-    this.checkpointSha256 = options.checkpointSha256;
+    this.code = normalizedCode;
+    const retryable = readErrorOption(options, "retryable");
+    this.retryable = typeof retryable === "boolean" ? retryable : false;
+    const domain = readErrorOption(options, "domain");
+    if (isPortableDomainValue(domain)) this.domain = domain;
+    const ordinal = readErrorOption(options, "ordinal");
+    if (isNonnegativeSafeInteger(ordinal)) this.ordinal = ordinal;
+    const recordCount = readErrorOption(options, "recordCount");
+    if (isNonnegativeSafeInteger(recordCount)) this.recordCount = recordCount;
+    const manifestSha256 = readErrorOption(options, "manifestSha256");
+    if (isLowercaseSha256(manifestSha256)) this.manifestSha256 = manifestSha256;
+    const checkpointSha256 = readErrorOption(options, "checkpointSha256");
+    if (isLowercaseSha256(checkpointSha256)) this.checkpointSha256 = checkpointSha256;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 
@@ -956,17 +1100,18 @@ export class PortableStreamError extends Error {
       name: this.name,
       code: this.code,
       retryable: this.retryable,
-      message: this.message,
     };
     if (this.domain !== undefined) result.domain = this.domain;
     if (this.ordinal !== undefined) result.ordinal = this.ordinal;
     if (this.recordCount !== undefined) result.recordCount = this.recordCount;
     if (this.manifestSha256 !== undefined) result.manifestSha256 = this.manifestSha256;
     if (this.checkpointSha256 !== undefined) result.checkpointSha256 = this.checkpointSha256;
+    result.message = this.message;
     return result;
   }
 }
 
+const MIN_INT64 = -(2n ** 63n);
 const MAX_INT64 = 2n ** 63n - 1n;
 const MAX_INT4 = 2n ** 31n - 1n;
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
@@ -990,14 +1135,68 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function readErrorOption(options: unknown, key: string): unknown {
+  if (!isObject(options)) return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(options, key);
+    return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isPortableDomainValue(value: unknown): value is PortableDomain {
+  return typeof value === "string" && PORTABLE_RECORD_DOMAIN_ORDER.includes(value as PortableDomain);
+}
+
+function isNonnegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isSafeInteger(value)
+    && !Object.is(value, -0)
+    && value >= 0;
+}
+
+function isLowercaseSha256(value: unknown): value is string {
+  return typeof value === "string" && SHA256_PATTERN.test(value);
+}
+
 function ownKeys(value: object): PropertyKey[] {
-  return Reflect.ownKeys(value);
+  try {
+    return Reflect.ownKeys(value);
+  } catch {
+    malformed();
+  }
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (!isObject(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
+    return false;
+  }
+}
+
+function plainDenseArrayElements(value: unknown): unknown[] {
+  let length: number;
+  try {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) malformed();
+    length = (Object.getOwnPropertyDescriptor(value, "length") as { value: number }).value;
+  } catch (error) {
+    if (error instanceof PortableStreamError) throw error;
+    malformed();
+  }
+  const keys = ownKeys(value);
+  if (keys.length !== length + 1) malformed();
+  const elements = new Array<unknown>(length);
+  for (let index = 0; index < length; index += 1) {
+    const key = String(index);
+    const descriptor = ownPropertyDescriptor(value, key);
+    if (descriptor === undefined || !("value" in descriptor)) malformed();
+    elements[index] = descriptor.value;
+  }
+  return elements;
 }
 
 function assertUtf16(value: string): void {
@@ -1014,8 +1213,14 @@ function assertUtf16(value: string): void {
   }
 }
 
-function decimalInteger(value: unknown): bigint {
-  if (isPlainObject(value) && exactKeys(value, ["$integer"])) value = value.$integer;
+type IntegerInputMode = "raw" | "wire";
+
+function decimalInteger(value: unknown, mode: IntegerInputMode): bigint {
+  if (mode === "wire") {
+    if (!isPlainObject(value) || !exactKeys(value, ["$integer"])) malformed();
+    if (typeof value.$integer !== "string") malformed();
+    value = value.$integer;
+  }
   if (typeof value === "bigint") return value;
   if (typeof value === "number") {
     if (!Number.isSafeInteger(value) || Object.is(value, -0)) malformed();
@@ -1043,8 +1248,14 @@ function normalizeTimestamp(value: PortableRawTimestamp): string {
       match = value.match(SIX_DIGIT_TIMESTAMP_PATTERN);
     }
   } else {
-    if (!(value instanceof Date) || Number.isNaN(value.getTime())) malformed();
-    const iso = value.toISOString();
+    if (!(value instanceof Date) || Object.getPrototypeOf(value) !== Date.prototype) malformed();
+    let iso: string;
+    try {
+      if (Number.isNaN(Date.prototype.getTime.call(value))) malformed();
+      iso = Date.prototype.toISOString.call(value);
+    } catch {
+      malformed();
+    }
     value = iso.replace(/(\.\d{3})Z$/, "$1000Z");
     match = value.match(SIX_DIGIT_TIMESTAMP_PATTERN);
   }
@@ -1057,7 +1268,9 @@ function normalizeTimestamp(value: PortableRawTimestamp): string {
   const minute = Number(normalizedMatch[5]);
   const second = Number(normalizedMatch[6]);
   const microsecond = Number(normalizedMatch[7]);
-  const date = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(hour, minute, second, 0);
   if (
     date.getUTCFullYear() !== year ||
     date.getUTCMonth() !== month - 1 ||
@@ -1077,7 +1290,7 @@ function assertSha256(value: unknown): string {
 
 function assertUuid(value: unknown): string {
   if (typeof value !== "string" || !UUID_PATTERN.test(value)) malformed();
-  return value.toLowerCase();
+  return value;
 }
 
 function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
@@ -1116,13 +1329,33 @@ function compareOrderScalar(left: PortableOrderScalar, right: PortableOrderScala
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+function validateOrderScalar(value: unknown): PortableOrderScalar {
+  if (value === null) return null;
+  if (typeof value === "string") {
+    assertUtf16(value);
+    return value;
+  }
+  if (isPlainObject(value)) {
+    return normalizeTaggedInteger(value, MIN_INT64, MAX_INT64, "wire");
+  }
+  malformed();
+}
+
 export function comparePortableOrder(
   left: readonly PortableOrderScalar[],
   right: readonly PortableOrderScalar[],
 ): number {
-  if (left.length !== right.length) malformed();
-  for (let index = 0; index < left.length; index += 1) {
-    const comparison = compareOrderScalar(left[index], right[index]);
+  const leftElements = plainDenseArrayElements(left);
+  const rightElements = plainDenseArrayElements(right);
+  if (leftElements.length !== rightElements.length) malformed();
+  const leftScalars = new Array<PortableOrderScalar>(leftElements.length);
+  const rightScalars = new Array<PortableOrderScalar>(rightElements.length);
+  for (let index = 0; index < leftElements.length; index += 1) {
+    leftScalars[index] = validateOrderScalar(leftElements[index]);
+    rightScalars[index] = validateOrderScalar(rightElements[index]);
+  }
+  for (let index = 0; index < leftScalars.length; index += 1) {
+    const comparison = compareOrderScalar(leftScalars[index], rightScalars[index]);
     if (comparison !== 0) return comparison;
   }
   return 0;
@@ -1147,7 +1380,7 @@ function canonicalJsonValue(
     case "boolean":
       return value ? "true" : "false";
     case "number":
-      if (!Number.isFinite(value) || Object.is(value, -0) || !Number.isSafeInteger(value) && !Number.isFinite(value)) malformed();
+      if (!Number.isFinite(value) || Object.is(value, -0)) malformed();
       if (Number.isInteger(value) && !Number.isSafeInteger(value)) malformed();
       return JSON.stringify(value);
     case "bigint":
@@ -1160,17 +1393,12 @@ function canonicalJsonValue(
   seen.add(value);
   let result: string;
   if (Array.isArray(value)) {
-    const keys = ownKeys(value);
-    for (let index = 0; index < value.length; index += 1) {
-      if (!Object.prototype.hasOwnProperty.call(value, index)) malformed();
+    const elements = plainDenseArrayElements(value);
+    const encoded = new Array<string>(elements.length);
+    for (let index = 0; index < elements.length; index += 1) {
+      encoded[index] = canonicalJsonValue(elements[index], depth + 1, seen, maximumDepth);
     }
-    if (keys.some((key) => {
-      if (typeof key === "symbol") return true;
-      if (key === "length") return false;
-      const index = Number(key);
-      return !Number.isSafeInteger(index) || index < 0 || String(index) !== key || index >= value.length;
-    })) malformed();
-    result = `[${value.map((item) => canonicalJsonValue(item, depth + 1, seen, maximumDepth)).join(",")}]`;
+    result = `[${encoded.join(",")}]`;
   } else {
     if (!isPlainObject(value)) malformed();
     const keys = ownKeys(value);
@@ -1178,7 +1406,7 @@ function canonicalJsonValue(
     const sorted = (keys as string[]).sort(compareUtf16CodeUnits);
     result = `{${sorted
       .map((key) => {
-        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        const descriptor = ownPropertyDescriptor(value, key);
         if (descriptor === undefined || !("value" in descriptor)) malformed();
         return `${canonicalString(key)}:${canonicalJsonValue(descriptor.value, depth + 1, seen, maximumDepth)}`;
       })
@@ -1273,7 +1501,34 @@ function assertDomain(value: unknown): PortableDomain {
 
 function exactKeys(value: object, keys: readonly string[]): boolean {
   const actual = ownKeys(value);
-  return actual.length === keys.length && actual.every((key) => typeof key === "string" && keys.includes(key));
+  if (actual.length !== keys.length) return false;
+  return keys.every((key) => {
+    if (!actual.includes(key)) return false;
+    const descriptor = ownPropertyDescriptor(value, key);
+    return descriptor !== undefined && "value" in descriptor;
+  });
+}
+
+function ownPropertyDescriptor(value: object, key: PropertyKey): PropertyDescriptor | undefined {
+  try {
+    return Object.getOwnPropertyDescriptor(value, key);
+  } catch {
+    malformed();
+  }
+}
+
+function snapshotExactObject(
+  value: unknown,
+  keys: readonly string[],
+  domain?: PortableDomain,
+): Record<string, unknown> {
+  if (!isPlainObject(value) || !exactKeys(value, keys)) malformed(domain === undefined ? {} : { domain });
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const key of keys) {
+    const descriptor = ownPropertyDescriptor(value, key) as PropertyDescriptor & { value: unknown };
+    snapshot[key] = descriptor.value;
+  }
+  return snapshot;
 }
 
 function nonemptyString(value: unknown): string {
@@ -1308,14 +1563,10 @@ function finiteNumber(value: unknown, minimum = -Infinity, maximum = Infinity): 
   return value;
 }
 
-function nullableFiniteNumber(value: unknown): number | null {
-  return value === null ? null : finiteNumber(value);
-}
-
 function assertUuidV7OrNull(value: unknown): string | null {
   if (value === null) return null;
   const uuid = assertUuid(value);
-  if (uuid[14] !== "7") malformed();
+  if (uuid !== uuid.toLowerCase() || uuid[14] !== "7") malformed();
   return uuid;
 }
 
@@ -1324,20 +1575,19 @@ function expectExactObject(
   value: unknown,
   keys: readonly string[],
 ): Record<string, unknown> {
-  if (!isPlainObject(value) || !exactKeys(value, keys)) malformed({ domain });
-  return value;
+  return snapshotExactObject(value, keys, domain);
 }
 
 function normalizeProjectIdentity(value: unknown): PortableProjectIdentity {
-  if (!isPlainObject(value) || !exactKeys(value, ["scope", "projectId"])) malformed();
-  const projectId = portableString(value.projectId);
-  if (value.scope === "local") {
+  const identity = snapshotExactObject(value, ["scope", "projectId"]);
+  const projectId = portableString(identity.projectId);
+  if (identity.scope === "local") {
     assertSha256(projectId);
     return deepFreeze({ scope: "local", projectId });
   }
-  if (value.scope === "shared") {
+  if (identity.scope === "shared") {
     const uuid = assertUuid(projectId);
-    if (uuid !== projectId || uuid[14] !== "7") malformed();
+    if (uuid !== projectId || uuid !== uuid.toLowerCase() || uuid[14] !== "7") malformed();
     return deepFreeze({ scope: "shared", projectId });
   }
   malformed();
@@ -1351,34 +1601,39 @@ function normalizeTaggedInteger(
   value: unknown,
   minimum: bigint,
   maximum: bigint,
+  mode: IntegerInputMode,
 ): PortableSignedInt64 {
-  const integer = decimalInteger(value);
+  const integer = decimalInteger(value, mode);
   if (integer < minimum || integer > maximum) fail("record-unrepresentable");
   return Object.freeze({ $integer: integer.toString() }) as PortableSignedInt64;
 }
 
-function normalizeNonnegativeInt64(value: unknown): PortableNonnegativeInt64 {
-  return normalizeTaggedInteger(value, 0n, MAX_INT64) as unknown as PortableNonnegativeInt64;
+function normalizeNonnegativeInt64(value: unknown, mode: IntegerInputMode): PortableNonnegativeInt64 {
+  return normalizeTaggedInteger(value, 0n, MAX_INT64, mode) as unknown as PortableNonnegativeInt64;
 }
 
-function normalizePositiveInt4(value: unknown): PortablePositiveInt4 {
-  return normalizeTaggedInteger(value, 1n, MAX_INT4) as unknown as PortablePositiveInt4;
+function normalizePositiveInt4(value: unknown, mode: IntegerInputMode): PortablePositiveInt4 {
+  return normalizeTaggedInteger(value, 1n, MAX_INT4, mode) as unknown as PortablePositiveInt4;
 }
 
-function normalizeNonnegativeInt4(value: unknown): PortableNonnegativeInt4 {
-  return normalizeTaggedInteger(value, 0n, MAX_INT4) as unknown as PortableNonnegativeInt4;
+function normalizeNonnegativeInt4(value: unknown, mode: IntegerInputMode): PortableNonnegativeInt4 {
+  return normalizeTaggedInteger(value, 0n, MAX_INT4, mode) as unknown as PortableNonnegativeInt4;
 }
 
-function normalizeSignedSafeInteger(value: unknown): PortableSignedSafeInteger {
-  return normalizeTaggedInteger(value, -MAX_SAFE, MAX_SAFE) as unknown as PortableSignedSafeInteger;
+function normalizeSignedSafeInteger(value: unknown, mode: IntegerInputMode): PortableSignedSafeInteger {
+  return normalizeTaggedInteger(value, -MAX_SAFE, MAX_SAFE, mode) as unknown as PortableSignedSafeInteger;
 }
 
-function normalizeNonnegativeSafeInteger(value: unknown): PortableNonnegativeSafeInteger {
-  return normalizeTaggedInteger(value, 0n, MAX_SAFE) as unknown as PortableNonnegativeSafeInteger;
+function normalizeNonnegativeSafeInteger(value: unknown, mode: IntegerInputMode): PortableNonnegativeSafeInteger {
+  return normalizeTaggedInteger(value, 0n, MAX_SAFE, mode) as unknown as PortableNonnegativeSafeInteger;
 }
 
-function nullableInteger<T>(value: unknown, normalize: (input: unknown) => T): T | null {
-  return value === null ? null : normalize(value);
+function nullableInteger<T>(
+  value: unknown,
+  normalize: (input: unknown, mode: IntegerInputMode) => T,
+  mode: IntegerInputMode,
+): T | null {
+  return value === null ? null : normalize(value, mode);
 }
 
 function nullableTimestamp(value: unknown): PortableTimestamp | null {
@@ -1405,7 +1660,11 @@ function oneOf<T extends string>(value: unknown, values: readonly T[]): T {
   return value as T;
 }
 
-function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableRecordValue {
+function normalizeDomainValue(
+  domain: PortableDomain,
+  input: unknown,
+  mode: IntegerInputMode,
+): PortableRecordValue {
   const fields = PORTABLE_RECORD_SCHEMA_BASE.domainsByOrder[domain].fields;
   const value = expectExactObject(domain, input, fields);
   switch (domain) {
@@ -1425,7 +1684,7 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
     case "conversations": {
       const normalized = deepFreeze({
         conversationFingerprint: assertSha256(value.conversationFingerprint),
-        occurrenceOrdinal: normalizeNonnegativeSafeInteger(value.occurrenceOrdinal),
+        occurrenceOrdinal: normalizeNonnegativeSafeInteger(value.occurrenceOrdinal, mode),
         sessionId: nonemptyString(value.sessionId),
         createdAt: normalizeTimestamp(value.createdAt as PortableRawTimestamp) as PortableTimestamp,
         title: nullableString(value.title),
@@ -1446,10 +1705,10 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
     case "messages":
       return deepFreeze({
         conversationIdentitySha256: assertSha256(value.conversationIdentitySha256),
-        seq: normalizeNonnegativeInt64(value.seq),
+        seq: normalizeNonnegativeInt64(value.seq, mode),
         role: oneOf(value.role, ["system", "user", "assistant", "tool"] as const),
         content: portableString(value.content),
-        tokenCount: normalizeNonnegativeInt64(value.tokenCount),
+        tokenCount: normalizeNonnegativeInt64(value.tokenCount, mode),
         createdAt: normalizeTimestamp(value.createdAt as PortableRawTimestamp) as PortableTimestamp,
       });
     case "message-parts":
@@ -1461,7 +1720,7 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
           "text", "reasoning", "tool", "patch", "file", "subtask", "compaction",
           "step_start", "step_finish", "snapshot", "agent", "retry",
         ] as const),
-        ordinal: normalizeNonnegativeInt64(value.ordinal),
+        ordinal: normalizeNonnegativeInt64(value.ordinal, mode),
         textContent: nullableString(value.textContent),
         isIgnored: nullableBoolean(value.isIgnored),
         isSynthetic: nullableBoolean(value.isSynthetic),
@@ -1481,9 +1740,9 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
         subtaskDescription: nullableString(value.subtaskDescription),
         subtaskAgent: nullableString(value.subtaskAgent),
         stepReason: nullableString(value.stepReason),
-        stepCost: nullableFiniteNumber(value.stepCost),
-        stepTokensIn: nullableInteger(value.stepTokensIn, normalizeNonnegativeInt64),
-        stepTokensOut: nullableInteger(value.stepTokensOut, normalizeNonnegativeInt64),
+        stepCost: value.stepCost === null ? null : finiteNumber(value.stepCost, 0),
+        stepTokensIn: nullableInteger(value.stepTokensIn, normalizeNonnegativeInt64, mode),
+        stepTokensOut: nullableInteger(value.stepTokensOut, normalizeNonnegativeInt64, mode),
         snapshotHash: nullableString(value.snapshotHash),
         compactionAuto: nullableBoolean(value.compactionAuto),
         metadata: nullableString(value.metadata),
@@ -1494,7 +1753,7 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
         conversationIdentitySha256: assertSha256(value.conversationIdentitySha256),
         fileName: nullableString(value.fileName),
         mimeType: nullableString(value.mimeType),
-        byteSize: nullableInteger(value.byteSize, normalizeNonnegativeInt64),
+        byteSize: nullableInteger(value.byteSize, normalizeNonnegativeInt64, mode),
         storageUri: nonemptyString(value.storageUri),
         explorationSummary: nullableString(value.explorationSummary),
         createdAt: normalizeTimestamp(value.createdAt as PortableRawTimestamp) as PortableTimestamp,
@@ -1504,26 +1763,26 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
         summaryId: nonemptyString(value.summaryId),
         conversationIdentitySha256: assertSha256(value.conversationIdentitySha256),
         kind: oneOf(value.kind, ["leaf", "condensed"] as const),
-        depth: normalizeNonnegativeInt4(value.depth),
+        depth: normalizeNonnegativeInt4(value.depth, mode),
         content: portableString(value.content),
-        tokenCount: normalizeNonnegativeInt64(value.tokenCount),
+        tokenCount: normalizeNonnegativeInt64(value.tokenCount, mode),
         earliestAt: nullableTimestamp(value.earliestAt),
         latestAt: nullableTimestamp(value.latestAt),
-        descendantCount: normalizeNonnegativeInt64(value.descendantCount),
-        descendantTokenCount: normalizeNonnegativeInt64(value.descendantTokenCount),
-        sourceMessageTokenCount: normalizeNonnegativeInt64(value.sourceMessageTokenCount),
+        descendantCount: normalizeNonnegativeInt64(value.descendantCount, mode),
+        descendantTokenCount: normalizeNonnegativeInt64(value.descendantTokenCount, mode),
+        sourceMessageTokenCount: normalizeNonnegativeInt64(value.sourceMessageTokenCount, mode),
         createdAt: normalizeTimestamp(value.createdAt as PortableRawTimestamp) as PortableTimestamp,
       });
     case "summary-file-links":
       return deepFreeze({
         summaryId: nonemptyString(value.summaryId),
-        ordinal: normalizeNonnegativeInt4(value.ordinal),
+        ordinal: normalizeNonnegativeInt4(value.ordinal, mode),
         fileId: nonemptyString(value.fileId),
       });
     case "summary-message-links":
       return deepFreeze({
         summaryId: nonemptyString(value.summaryId),
-        ordinal: normalizeNonnegativeInt4(value.ordinal),
+        ordinal: normalizeNonnegativeInt4(value.ordinal, mode),
         messageIdentitySha256: assertSha256(value.messageIdentitySha256),
       });
     case "summary-parent-links": {
@@ -1532,7 +1791,7 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
       if (summaryId === parentSummaryId) malformed({ domain });
       return deepFreeze({
         summaryId,
-        ordinal: normalizeNonnegativeInt4(value.ordinal),
+        ordinal: normalizeNonnegativeInt4(value.ordinal, mode),
         parentSummaryId,
       });
     }
@@ -1548,7 +1807,7 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
       ) malformed({ domain });
       return deepFreeze({
         conversationIdentitySha256: assertSha256(value.conversationIdentitySha256),
-        ordinal: normalizeNonnegativeInt4(value.ordinal),
+        ordinal: normalizeNonnegativeInt4(value.ordinal, mode),
         itemType,
         messageIdentitySha256,
         summaryId,
@@ -1563,7 +1822,7 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
         sourceProjectId: nullableString(value.sourceProjectId),
         sourceSummaryId: nullableString(value.sourceSummaryId),
         sessionId: nullableString(value.sessionId),
-        depth: normalizeNonnegativeInt4(value.depth),
+        depth: normalizeNonnegativeInt4(value.depth, mode),
         confidence: finiteNumber(value.confidence, 0, 1),
         createdAt: normalizeTimestamp(value.createdAt as PortableRawTimestamp) as PortableTimestamp,
         archivedAt: nullableTimestamp(value.archivedAt),
@@ -1571,7 +1830,7 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
     case "promoted-memory-tags":
       return deepFreeze({
         memoryId: nonemptyString(value.memoryId),
-        ordinal: normalizeNonnegativeInt4(value.ordinal),
+        ordinal: normalizeNonnegativeInt4(value.ordinal, mode),
         tag: portableString(value.tag),
       });
     case "recall-surfacings":
@@ -1579,17 +1838,17 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
         memoryId: nonemptyString(value.memoryId),
         sessionId: nullableString(value.sessionId),
         surfacedAt: normalizeTimestamp(value.surfacedAt as PortableRawTimestamp) as PortableTimestamp,
-        occurrenceOrdinal: normalizeNonnegativeSafeInteger(value.occurrenceOrdinal),
+        occurrenceOrdinal: normalizeNonnegativeSafeInteger(value.occurrenceOrdinal, mode),
       });
     case "redaction-counters":
       return deepFreeze({
         category: oneOf(value.category, ["built_in", "global", "project", "gitleaks"] as const),
-        count: normalizeNonnegativeInt64(value.count),
+        count: normalizeNonnegativeInt64(value.count, mode),
       });
     case "session-ingest":
       return deepFreeze({
         sessionId: nonemptyString(value.sessionId),
-        messageCount: normalizeNonnegativeInt64(value.messageCount),
+        messageCount: normalizeNonnegativeInt64(value.messageCount, mode),
         completedAt: normalizeTimestamp(value.completedAt as PortableRawTimestamp) as PortableTimestamp,
       });
     case "session-instructions":
@@ -1612,7 +1871,7 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
         formatVersion: nonemptyString(value.formatVersion),
         nativeSessionId: nonemptyString(value.nativeSessionId),
         sourceLocator: nonemptyString(value.sourceLocator),
-        sourceOrdinal: normalizeNonnegativeInt64(value.sourceOrdinal),
+        sourceOrdinal: normalizeNonnegativeInt64(value.sourceOrdinal, mode),
         observedAt: normalizeTimestamp(value.observedAt as PortableRawTimestamp) as PortableTimestamp,
         ingestedAt: normalizeTimestamp(value.ingestedAt as PortableRawTimestamp) as PortableTimestamp,
         scrubberVersion: nonemptyString(value.scrubberVersion),
@@ -1624,7 +1883,7 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
       return deepFreeze({
         machineIdentityKey: nonemptyString(value.machineIdentityKey),
         ingestKey: assertSha256(value.ingestKey),
-        sourceOrdinal: normalizeNonnegativeInt4(value.sourceOrdinal),
+        sourceOrdinal: normalizeNonnegativeInt4(value.sourceOrdinal, mode),
         conversationIdentitySha256: assertSha256(value.conversationIdentitySha256),
         messageIdentitySha256: assertSha256(value.messageIdentitySha256),
       });
@@ -1633,11 +1892,11 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
         machineIdentityKey: nonemptyString(value.machineIdentityKey),
         clientName: nonemptyString(value.clientName),
         sourceLocator: nonemptyString(value.sourceLocator),
-        revision: normalizeNonnegativeSafeInteger(value.revision),
-        lastSourceOrdinal: normalizeNonnegativeInt64(value.lastSourceOrdinal),
-        importedCount: normalizeNonnegativeInt64(value.importedCount),
-        skippedCount: normalizeNonnegativeInt64(value.skippedCount),
-        quarantinedCount: normalizeNonnegativeInt64(value.quarantinedCount),
+        revision: normalizeNonnegativeSafeInteger(value.revision, mode),
+        lastSourceOrdinal: normalizeNonnegativeInt64(value.lastSourceOrdinal, mode),
+        importedCount: normalizeNonnegativeInt64(value.importedCount, mode),
+        skippedCount: normalizeNonnegativeInt64(value.skippedCount, mode),
+        quarantinedCount: normalizeNonnegativeInt64(value.quarantinedCount, mode),
         checkpoint: cloneCanonicalJsonObject(value.checkpoint),
         updatedAt: normalizeTimestamp(value.updatedAt as PortableRawTimestamp) as PortableTimestamp,
       });
@@ -1645,14 +1904,14 @@ function normalizeDomainValue(domain: PortableDomain, input: unknown): PortableR
       return deepFreeze({
         machineIdentityKey: nonemptyString(value.machineIdentityKey),
         eventId: assertUuid(value.eventId),
-        eventVersion: normalizePositiveInt4(value.eventVersion),
-        machineSequence: normalizeNonnegativeInt64(value.machineSequence),
+        eventVersion: normalizePositiveInt4(value.eventVersion, mode),
+        machineSequence: normalizeNonnegativeInt64(value.machineSequence, mode),
         eventType: nonemptyString(value.eventType),
         sessionId: nonemptyString(value.sessionId),
-        sessionSequence: normalizeNonnegativeSafeInteger(value.sessionSequence),
+        sessionSequence: normalizeNonnegativeSafeInteger(value.sessionSequence, mode),
         category: nonemptyString(value.category),
         data: portableString(value.data),
-        priority: normalizeSignedSafeInteger(value.priority),
+        priority: normalizeSignedSafeInteger(value.priority, mode),
         sourceHook: nonemptyString(value.sourceHook),
         createdAt: normalizeTimestamp(value.createdAt as PortableRawTimestamp) as PortableTimestamp,
         disposition: oneOf(value.disposition, ["pending", "applied", "quarantined"] as const),
@@ -1687,22 +1946,24 @@ function projectDependency(evidence: ConstructionEvidence): PortableDependency {
   return directDependency("project", evidence.projectIdentitySha256 as string);
 }
 
-function normalizeConversationOrder(value: unknown): CanonicalConversationOrder {
-  if (!Array.isArray(value) || value.length !== 6) malformed();
+function normalizeConversationOrder(value: unknown, mode: IntegerInputMode): CanonicalConversationOrder {
+  const elements = plainDenseArrayElements(value);
+  if (elements.length !== 6) malformed();
   return deepFreeze([
-    nonemptyString(value[0]),
-    nullableString(value[1]),
-    nullableTimestamp(value[2]),
-    normalizeTimestamp(value[3] as PortableRawTimestamp) as PortableTimestamp,
-    normalizeTimestamp(value[4] as PortableRawTimestamp) as PortableTimestamp,
-    normalizeNonnegativeSafeInteger(value[5]),
+    nonemptyString(elements[0]),
+    nullableString(elements[1]),
+    nullableTimestamp(elements[2]),
+    normalizeTimestamp(elements[3] as PortableRawTimestamp) as PortableTimestamp,
+    normalizeTimestamp(elements[4] as PortableRawTimestamp) as PortableTimestamp,
+    normalizeNonnegativeSafeInteger(elements[5], mode),
   ] as const);
 }
 
-function normalizeMessageOrder(value: unknown): CanonicalMessageOrder {
-  if (!Array.isArray(value) || value.length !== 7) malformed();
-  const conversation = normalizeConversationOrder(value.slice(0, 6));
-  return deepFreeze([...conversation, normalizeNonnegativeInt64(value[6])] as CanonicalMessageOrder);
+function normalizeMessageOrder(value: unknown, mode: IntegerInputMode): CanonicalMessageOrder {
+  const elements = plainDenseArrayElements(value);
+  if (elements.length !== 7) malformed();
+  const conversation = normalizeConversationOrder(elements.slice(0, 6), mode);
+  return deepFreeze([...conversation, normalizeNonnegativeInt64(elements[6], mode)] as CanonicalMessageOrder);
 }
 
 function conversationFingerprintFromOrder(order: CanonicalConversationOrder): string {
@@ -1721,8 +1982,7 @@ function messageIdentityFromOrder(order: CanonicalMessageOrder): string {
 }
 
 function expectContextObject(value: unknown, keys: readonly string[]): Record<string, unknown> {
-  if (!isPlainObject(value) || !exactKeys(value, keys)) malformed();
-  return value;
+  return snapshotExactObject(value, keys);
 }
 
 function projectEvidence(context: unknown): ConstructionEvidence {
@@ -1746,11 +2006,11 @@ function evidenceFromContext(domain: PortableDomain, context: unknown): Construc
     case "messages":
     case "context-items": {
       const object = expectContextObject(context, ["conversationOrder"]);
-      return { conversationOrder: normalizeConversationOrder(object.conversationOrder) };
+      return { conversationOrder: normalizeConversationOrder(object.conversationOrder, "raw") };
     }
     case "message-parts": {
       const object = expectContextObject(context, ["messageOrder"]);
-      return { messageOrder: normalizeMessageOrder(object.messageOrder) };
+      return { messageOrder: normalizeMessageOrder(object.messageOrder, "raw") };
     }
     case "native-transcripts": {
       const object = expectContextObject(context, [
@@ -2027,21 +2287,26 @@ function canonicalRecord(shape: PortableRecordShape): PortableRecord {
     ...withoutRecordSha256,
     recordSha256: sha256(Buffer.from(canonicalEnvelopeJson(withoutRecordSha256), "utf8")),
   }) as PortableRecord;
+  if (Buffer.byteLength(canonicalEnvelopeJson(record), "utf8") + 1 > PORTABLE_LIMITS.maxRecordBytes) {
+    fail("record-unrepresentable", { domain: shape.domain, ordinal: shape.ordinal });
+  }
   return record;
 }
 
 function parseDependencies(value: unknown): readonly PortableDependency[] {
-  if (!Array.isArray(value)) malformed();
-  return value.map((item) => {
-    if (!isPlainObject(item) || !exactKeys(item, ["domain", "identitySha256"])) malformed();
+  const items = plainDenseArrayElements(value);
+  const dependencies = new Array<PortableDependency>(items.length);
+  for (let index = 0; index < items.length; index += 1) {
+    const item = snapshotExactObject(items[index], ["domain", "identitySha256"]);
     if (typeof item.domain !== "string" || !PORTABLE_RECORD_DOMAIN_ORDER.includes(item.domain as PortableDomain)) {
       malformed();
     }
-    return deepFreeze({
+    dependencies[index] = deepFreeze({
       domain: item.domain as PortableDomain,
       identitySha256: assertSha256(item.identitySha256),
     });
-  });
+  }
+  return dependencies;
 }
 
 function projectDigestFromWire(dependencies: readonly PortableDependency[]): string {
@@ -2069,12 +2334,14 @@ function evidenceFromWire(
       return { projectIdentitySha256: projectDigestFromWire(dependencies) };
     case "messages":
     case "context-items": {
-      if (!Array.isArray(orderValue) || orderValue.length !== 7) malformed();
-      return { conversationOrder: normalizeConversationOrder(orderValue.slice(0, 6)) };
+      const order = plainDenseArrayElements(orderValue);
+      if (order.length !== 7) malformed();
+      return { conversationOrder: normalizeConversationOrder(order.slice(0, 6), "wire") };
     }
     case "message-parts": {
-      if (!Array.isArray(orderValue) || orderValue.length !== 8) malformed();
-      return { messageOrder: normalizeMessageOrder(orderValue.slice(0, 7)) };
+      const order = plainDenseArrayElements(orderValue);
+      if (order.length !== 8) malformed();
+      return { messageOrder: normalizeMessageOrder(order.slice(0, 7), "wire") };
     }
     case "native-transcripts":
       return { projectIdentitySha256: projectDigestFromWire(dependencies) };
@@ -2087,6 +2354,10 @@ function validatePortableRecordEnvelope(value: unknown): asserts value is Record
   if (!isPlainObject(value) || !exactKeys(value, PORTABLE_RECORD_ENVELOPE_KEYS)) malformed();
 }
 
+function snapshotPortableRecordEnvelope(value: unknown): Record<string, unknown> {
+  return snapshotExactObject(value, PORTABLE_RECORD_ENVELOPE_KEYS);
+}
+
 function parseJsonRecord(bytes: Uint8Array): Record<string, unknown> {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength > PORTABLE_LIMITS.maxRecordBytes) {
     fail(bytes instanceof Uint8Array ? "record-unrepresentable" : "malformed-record");
@@ -2095,7 +2366,7 @@ function parseJsonRecord(bytes: Uint8Array): Record<string, unknown> {
   if (bytes.byteLength > 1 && bytes[bytes.byteLength - 2] === 0x0a) malformed();
   let text: string;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, -1));
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes.subarray(0, -1));
   } catch {
     malformed();
   }
@@ -2117,11 +2388,11 @@ export function createPortableRecord<D extends PortableDomain>(
 ): PortableRecord<D>;
 export function createPortableRecord(input: PortableRecordInput): PortableRecord;
 export function createPortableRecord(input: PortableRecordInput): PortableRecord {
-  if (!isPlainObject(input) || !exactKeys(input, ["domain", "ordinal", "value", "context"])) malformed();
-  const domain = assertDomain(input.domain);
-  const ordinal = validateOrdinal(input.ordinal);
-  const value = normalizeDomainValue(domain, input.value);
-  const evidence = evidenceFromContext(domain, input.context);
+  const snapshot = snapshotExactObject(input, ["domain", "ordinal", "value", "context"]);
+  const domain = assertDomain(snapshot.domain);
+  const ordinal = validateOrdinal(snapshot.ordinal);
+  const value = normalizeDomainValue(domain, snapshot.value, "raw");
+  const evidence = evidenceFromContext(domain, snapshot.context);
   return canonicalRecord(buildRecordShape(domain, ordinal, value, evidence));
 }
 
@@ -2138,17 +2409,16 @@ export function parsePortableRecord(bytes: Uint8Array): PortableRecord {
 }
 
 function validatePortableRecord(parsed: unknown): PortableRecord {
-  validatePortableRecordEnvelope(parsed);
-  if (parsed.version !== 1 || parsed.domainVersion !== 1) fail("unsupported-version");
-  const domain = assertDomain(parsed.domain);
-  const ordinal = validateOrdinal(parsed.ordinal);
-  const value = normalizeDomainValue(domain, parsed.value);
-  const evidence = evidenceFromWire(domain, parsed.order, parsed.dependencies);
+  const envelope = snapshotPortableRecordEnvelope(parsed);
+  if (envelope.version !== 1 || envelope.domainVersion !== 1) fail("unsupported-version");
+  const domain = assertDomain(envelope.domain);
+  const ordinal = validateOrdinal(envelope.ordinal);
+  const value = normalizeDomainValue(domain, envelope.value, "wire");
+  const evidence = evidenceFromWire(domain, envelope.order, envelope.dependencies);
   const record = canonicalRecord(buildRecordShape(domain, ordinal, value, evidence));
-  if (canonicalJson(parsed.order) !== canonicalJson(record.order)) malformed();
-  if (parsed.identitySha256 !== record.identitySha256) malformed();
-  if (canonicalJson(parsed.dependencies) !== canonicalJson(record.dependencies)) malformed();
-  if (parsed.recordSha256 !== record.recordSha256) malformed();
-  if (canonicalEnvelopeJson(parsed) !== canonicalEnvelopeJson(record)) malformed();
+  if (canonicalJson(envelope.order) !== canonicalJson(record.order)) malformed();
+  if (envelope.identitySha256 !== record.identitySha256) malformed();
+  if (canonicalJson(envelope.dependencies) !== canonicalJson(record.dependencies)) malformed();
+  if (canonicalEnvelopeJson(envelope) !== canonicalEnvelopeJson(record)) malformed();
   return record;
 }
