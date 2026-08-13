@@ -48,6 +48,45 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve };
 }
 
+type IdleTimerEntry = {
+  handle: ReturnType<typeof setTimeout>;
+  callback: () => void;
+  delayMs: number | undefined;
+  active: boolean;
+};
+
+type IdleTimerHarness = {
+  timers: IdleTimerEntry[];
+  setTimeout: typeof setTimeout;
+  clearTimeout: typeof clearTimeout;
+  fire: (handle: ReturnType<typeof setTimeout>) => void;
+};
+
+function createIdleTimerHarness(): IdleTimerHarness {
+  const timers: IdleTimerEntry[] = [];
+  const setIdleTimeout = ((handler: TimerHandler, timeout?: number) => {
+    const entry: IdleTimerEntry = {
+      handle: Symbol("idle-timeout") as unknown as ReturnType<typeof setTimeout>,
+      callback: handler as () => void,
+      delayMs: timeout,
+      active: true,
+    };
+    timers.push(entry);
+    return entry.handle;
+  }) as typeof setTimeout;
+  const clearIdleTimeout = ((handle: ReturnType<typeof setTimeout>) => {
+    const entry = timers.find(timer => timer.handle === handle);
+    if (entry) entry.active = false;
+  }) as typeof clearTimeout;
+  const fire = (handle: ReturnType<typeof setTimeout>): void => {
+    const entry = timers.find(timer => timer.handle === handle);
+    if (!entry || !entry.active) return;
+    entry.active = false;
+    entry.callback();
+  };
+  return { timers, setTimeout: setIdleTimeout, clearTimeout: clearIdleTimeout, fire };
+}
+
 describe("daemon server", () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
@@ -524,10 +563,11 @@ describe("daemon server", () => {
     const bigBody = "x".repeat(11 * 1024 * 1024); // 11 MB
     const res = await fetch(`http://127.0.0.1:${port}/store`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Connection: "close" },
       body: bigBody,
     });
     expect(res.status).toBe(413);
+    await expect(res.json()).resolves.toEqual({ error: "payload too large" });
   });
 
   it("watches map.json and reformats valid user edits", async () => {
@@ -717,67 +757,64 @@ describe("daemon idle timeout", () => {
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
     config.daemon.idleTimeoutMs = 200;
-    const daemon = await createDaemon(config, { onIdle: () => { idleCalled = true; } });
+    const idleTimers = createIdleTimerHarness();
+    const daemon = await createDaemon(config, {
+      onIdle: () => { idleCalled = true; },
+      _setTimeout: idleTimers.setTimeout,
+      _clearTimeout: idleTimers.clearTimeout,
+    });
 
-    // Wait for idle timeout
-    await new Promise(r => setTimeout(r, 400));
-
-    expect(idleCalled).toBe(true);
-    expect(daemon.idleTriggered).toBe(true);
-    await daemon.stop();
+    try {
+      expect(idleTimers.timers).toHaveLength(1);
+      expect(idleTimers.timers[0]).toMatchObject({ delayMs: 200, active: true });
+      idleTimers.fire(idleTimers.timers[0]!.handle);
+      expect(idleCalled).toBe(true);
+      expect(daemon.idleTriggered).toBe(true);
+    } finally {
+      await daemon.stop();
+    }
+    expect(idleTimers.timers.every(timer => !timer.active)).toBe(true);
   });
 
   it("resets idle timer on request", async () => {
     let idleCalled = false;
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    config.daemon.idleTimeoutMs = 300;
-    const idleTimers: Array<{
-      handle: ReturnType<typeof setTimeout>;
-      callback: () => void;
-      active: boolean;
-    }> = [];
-    const setIdleTimeout = ((handler: TimerHandler) => {
-      const entry = {
-        handle: Symbol("idle-timeout") as unknown as ReturnType<typeof setTimeout>,
-        callback: handler as () => void,
-        active: true,
-      };
-      idleTimers.push(entry);
-      return entry.handle;
-    }) as typeof setTimeout;
-    const clearIdleTimeout = ((handle: ReturnType<typeof setTimeout>) => {
-      const entry = idleTimers.find(entry => entry.handle === handle);
-      if (entry) {
-        entry.active = false;
-      }
-    }) as typeof clearTimeout;
+    config.daemon.idleTimeoutMs = 200;
+    const idleTimers = createIdleTimerHarness();
     const daemon = await createDaemon(config, {
       onIdle: () => { idleCalled = true; },
-      _setTimeout: setIdleTimeout,
-      _clearTimeout: clearIdleTimeout,
+      _setTimeout: idleTimers.setTimeout,
+      _clearTimeout: idleTimers.clearTimeout,
     });
 
     try {
+      expect(idleTimers.timers).toHaveLength(1);
+      expect(idleTimers.timers.map(timer => timer.delayMs)).toEqual([200]);
+      expect(idleTimers.timers[0]!.active).toBe(true);
       const port = daemon.address().port;
       const first = await fetch(`http://127.0.0.1:${port}/health`);
       await first.text();
+      expect(idleTimers.timers.map(timer => timer.delayMs)).toEqual([200, 200]);
+      expect(idleTimers.timers[0]!.active).toBe(false);
+      expect(idleTimers.timers[1]!.active).toBe(true);
       const second = await fetch(`http://127.0.0.1:${port}/health`);
       await second.text();
 
-      expect(idleTimers).toHaveLength(3);
-      expect(idleTimers.filter(entry => !entry.active)).toHaveLength(2);
-      const activeTimers = idleTimers.filter(entry => entry.active);
+      expect(idleTimers.timers.map(timer => timer.delayMs)).toEqual([200, 200, 200]);
+      expect(idleTimers.timers.filter(entry => !entry.active)).toHaveLength(2);
+      const activeTimers = idleTimers.timers.filter(entry => entry.active);
       expect(activeTimers).toHaveLength(1);
       expect(idleCalled).toBe(false);
       expect(daemon.idleTriggered).toBe(false);
 
-      activeTimers[0]!.callback();
+      idleTimers.fire(activeTimers[0]!.handle);
       expect(idleCalled).toBe(true);
       expect(daemon.idleTriggered).toBe(true);
     } finally {
       await daemon.stop();
     }
+    expect(idleTimers.timers.every(timer => !timer.active)).toBe(true);
   });
 });
 
