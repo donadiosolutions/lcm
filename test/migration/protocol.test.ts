@@ -475,6 +475,28 @@ describe("migration manifest protocol", () => {
     );
   });
 
+  it.each([
+    ["revision", { revision: -0 }],
+    ["checkpoint ordinal", { checkpoints: [{ ...checkpoint("domain-1", 1), ordinal: -0 }] }],
+    ["checkpoint record count", { checkpoints: [{ ...checkpoint("domain-1", 1), recordCount: -0 }] }],
+  ] as const)("rejects negative zero persisted semantic integers during parsing: %s", (_label, overrides) => {
+    const persisted = sealManifest({ ...createValidManifest(), ...overrides });
+    expectProtocolError(() => parseMigrationManifest(persisted), "malformed-manifest");
+  });
+
+  it.each([
+    ["checkpoint ordinal", "ordinal"],
+    ["checkpoint record count", "recordCount"],
+  ] as const)("rejects negative zero semantic integers while creating completion successors: %s", (_label, field) => {
+    const pending = beginFrom(manifestInPhase("copying"), "copy-batch");
+    const invalidCheckpoint = { ...checkpoint("domain-1", 1), [field]: -0 } as MigrationCheckpoint;
+    expectProtocolError(() => completeMigrationEffect(pending, {
+      effectId: pending.pendingEffect!.effectId,
+      completedAt: COMPLETE_AT,
+      checkpoint: invalidCheckpoint,
+    }), "invalid-input");
+  });
+
   it("leaves malformed collections unsorted when normalizing a canonical hash", () => {
     expect(migrationManifestCanonicalSha256({ checkpoints: [{ domain: 1, ordinal: "x" }] })).toMatch(/^[0-9a-f]{64}$/u);
     expect(migrationManifestCanonicalSha256({ reports: [{ kind: 1 }] })).toMatch(/^[0-9a-f]{64}$/u);
@@ -553,6 +575,68 @@ describe("migration manifest protocol", () => {
 
     const parentLinked = createMigrationManifest({ ...valid, parentGenerationId: "generation-0" });
     expect(parentLinked.rollbackLineage.parentGenerationId).toBe("generation-0");
+  });
+
+  it.each([
+    ["sqlite -> postgresql", "sqlite", "postgresql", true],
+    ["postgresql -> sqlite", "postgresql", "sqlite", false],
+    ["sqlite -> sqlite", "sqlite", "sqlite", false],
+    ["postgresql -> postgresql", "postgresql", "postgresql", false],
+  ] as const)("enforces the positional backend direction during creation: %s", (
+    _label,
+    sourceBackend,
+    destinationBackend,
+    valid,
+  ) => {
+    const input = {
+      generationId: "backend-direction-create",
+      source: witness(sourceBackend, CREATED_AT),
+      destination: witness(destinationBackend, UPDATED_AT),
+      parentGenerationId: null,
+      preservedSourceGenerationId: "source-generation-1",
+      createdAt: CREATED_AT,
+    };
+
+    if (valid) {
+      const created = createMigrationManifest(input);
+      expect(created.source.backend).toBe("sqlite");
+      expect(created.destination.backend).toBe("postgresql");
+      expect(created.source.identitySha256).toBe(created.destination.identitySha256);
+      expect(created).not.toHaveProperty("role");
+      return;
+    }
+
+    expectProtocolError(() => createMigrationManifest(input), "invalid-input");
+  });
+
+  it.each([
+    ["sqlite -> postgresql", "sqlite", "postgresql", true],
+    ["postgresql -> sqlite", "postgresql", "sqlite", false],
+    ["sqlite -> sqlite", "sqlite", "sqlite", false],
+    ["postgresql -> postgresql", "postgresql", "postgresql", false],
+  ] as const)("enforces the positional backend direction while parsing persisted manifests: %s", (
+    _label,
+    sourceBackend,
+    destinationBackend,
+    valid,
+  ) => {
+    const baseline = createValidManifest();
+    const persisted = sealManifest({
+      ...baseline,
+      source: witness(sourceBackend, CREATED_AT),
+      destination: witness(destinationBackend, UPDATED_AT),
+    });
+
+    if (valid) {
+      const parsed = parseMigrationManifest(persisted);
+      expect(parsed.source.backend).toBe("sqlite");
+      expect(parsed.destination.backend).toBe("postgresql");
+      expect(parsed.source.identitySha256).toBe(parsed.destination.identitySha256);
+      expect(parsed).not.toHaveProperty("role");
+      return;
+    }
+
+    expectProtocolError(() => parseMigrationManifest(persisted), "malformed-manifest");
   });
 
   it("accepts valid rolling-back and rolled-back terminal lineage", () => {

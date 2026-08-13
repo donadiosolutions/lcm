@@ -127,7 +127,11 @@ All create, update, and recovery mutations use the home-level private lock
 before taking that lock, restores the original home mode while working, and
 revalidates the topology before returning. A manifest revision is fully
 written and made durable before its containing directory is synchronized and
-the head is published.
+the head is published. Immutable revision directories are append-only recovery
+evidence and must not be pruned or archived out of the generation. A crash can
+leave only the sealed publication attempt and the committed head; in that row,
+LCM reconstructs the exact prior version-1 head from the retained predecessor
+revision before it removes the final attempt marker.
 
 Head replacement is compare-and-swap. It is bound to the SHA-256 digest of the
 exact bounded head bytes read while locked, independently of the manifest's

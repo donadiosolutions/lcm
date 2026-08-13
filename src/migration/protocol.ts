@@ -184,7 +184,7 @@ function exactKeys(value: RecordValue, expected: readonly string[]): boolean {
 }
 
 function isSafeNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0);
 }
 
 function isIdentifier(value: unknown): value is string {
@@ -412,7 +412,13 @@ function assertUniqueCollections(
   }
 }
 
-function assertCrossFieldInvariants(manifest: Omit<MigrationManifest, "checksumSha256">): void {
+function assertCrossFieldInvariants(
+  manifest: Omit<MigrationManifest, "checksumSha256">,
+  reason: MigrationProtocolReason,
+): void {
+  if (manifest.source.backend !== "sqlite" || manifest.destination.backend !== "postgresql") {
+    protocolError(reason, "migration manifest backend direction is invalid");
+  }
   if ((manifest.revision === 0) !== (manifest.previousManifestSha256 === null)) protocolError("malformed-manifest", "revision predecessor is invalid");
   if (manifest.phase === "rolled-back" || manifest.phase === "aborted") {
     if (manifest.pendingEffect !== null) protocolError("malformed-manifest", "terminal phase cannot have a pending effect");
@@ -502,7 +508,7 @@ export function parseMigrationManifest(value: unknown): MigrationManifest {
     createdAt: manifest.createdAt,
     updatedAt: manifest.updatedAt,
   };
-  assertCrossFieldInvariants(payload);
+  assertCrossFieldInvariants(payload, "malformed-manifest");
   if (migrationManifestCanonicalSha256(payload) !== manifest.checksumSha256) protocolError("checksum-mismatch", "manifest checksum does not match");
   return deepFreeze({ ...payload, checksumSha256: manifest.checksumSha256 });
 }
@@ -538,7 +544,7 @@ export function createMigrationManifest(input: CreateMigrationManifestInput): Mi
     createdAt: input.createdAt,
     updatedAt: input.createdAt,
   } satisfies Omit<MigrationManifest, "checksumSha256">;
-  assertCrossFieldInvariants(payload);
+  assertCrossFieldInvariants(payload, "invalid-input");
   return deepFreeze({ ...payload, checksumSha256: migrationManifestCanonicalSha256(payload) });
 }
 
@@ -618,7 +624,7 @@ function sealMigrationSuccessor(
     previousManifestSha256: current.checksumSha256,
     updatedAt,
   } satisfies Omit<MigrationManifest, "checksumSha256">;
-  assertCrossFieldInvariants(payload);
+  assertCrossFieldInvariants(payload, "unexpected-state");
   return deepFreeze({ ...payload, checksumSha256: migrationManifestCanonicalSha256(payload) });
 }
 
@@ -832,8 +838,14 @@ export function assertMigrationManifestSuccessor(
   previous: MigrationManifest,
   candidate: MigrationManifest,
 ): MigrationManifest {
-  const current = parseMigrationManifest(previous);
-  const next = parseMigrationManifest(candidate);
+  let current: MigrationManifest;
+  let next: MigrationManifest;
+  try {
+    current = parseMigrationManifest(previous);
+    next = parseMigrationManifest(candidate);
+  } catch (error) {
+    return successorValidationError({ cause: error });
+  }
   let expected: MigrationManifest;
   try {
     if (current.pendingEffect === null) {
