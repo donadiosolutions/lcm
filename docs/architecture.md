@@ -17,28 +17,31 @@ different entry points from applying different precedence or validation rules.
 The internal PostgreSQL 18 runtime provides a bounded `pg` pool, verified CA
 and hostname validation, sanitized SQLSTATE errors, abort cancellation,
 transactional migrations, extension readiness, and the complete durable schema
-baseline. Machine and project identity operations use that runtime directly.
-The general application storage factory remains staged while the domain
-adapters tracked by #87, #89, and #91 implement the remaining shared repository
-contracts. The PostgreSQL conversation adapter is available to conformance
-tests, and the native-transcript adapter is available to explicit
-programmatic backfill and conformance. The promoted-memory, recall,
-redaction-administration, and coordination adapters are available to direct
-programmatic callers and conformance under the same staged boundary. None is
-selected by normal daemon or CLI composition. PostgreSQL selection remains
-unavailable to normal production configuration: issues #92 (authoritative
-backend activation) and #224 (normal daemon/CLI transcript routing) are not
-implemented. The publication boundary is nevertheless the prerequisite for
-those future paths. For staged callers, a valid terminal publication witness
-allows the storage-free public health contract to identify the staged backend;
-an unresolved or inconsistent publication blocks both public and authenticated
-health with fixed sanitized `503` responses, while authenticated storage-backed
-routes remain storage-unavailable. Lifecycle admission verifies the public
-process and listener identity before sending the local token, then recognizes
-the authenticated staged response without treating its storage as ready or
-falling back to SQLite. The local SQLite hook outbox and the metadata-only
-transcript quarantine remain local and are not general caches or activation
-paths. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
+baseline. The production PostgreSQL composition root eagerly verifies runtime
+health, server and extension policy, the complete migration ledger, immutable
+schema fingerprints, migration ownership, search configuration, and the exact
+runtime ACL manifest. Only then can an explicit programmatic caller obtain a
+backend factory. Project opening additionally validates terminal backend
+publication evidence and the exact remote machine, project UUID, identity key,
+and normalized selected path before composing all nine repository contracts
+into one `ProjectStorage`. The project object owns its transaction scope,
+health, cancellation, and close lifecycle; no SQL client escapes the storage
+boundary.
+
+The native-transcript adapter remains separate because transcript import is an
+explicit backfill seam rather than a `ProjectStorage` repository. Normal daemon
+and CLI composition still do not select the PostgreSQL factory: issues #92
+(authoritative backend activation) and the remaining #224 routing work are not
+implemented. For those staged routes, a valid terminal publication witness
+allows the storage-free public health contract to identify the selected
+backend, but authenticated storage-backed routes remain unavailable. An
+unresolved or inconsistent publication blocks both public and authenticated
+health with fixed sanitized `503` responses. Lifecycle admission verifies the
+public process and listener identity before sending the local token, then
+recognizes the authenticated staged response without treating its storage as
+ready or falling back to SQLite. The local SQLite hook outbox and the
+metadata-only transcript quarantine remain local and are not general caches or
+activation paths. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
 integrity, indexes, retention, extension policy, and recovery implications.
 
 ## Storage repository architecture

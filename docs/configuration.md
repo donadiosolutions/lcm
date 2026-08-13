@@ -252,21 +252,17 @@ not contain a `storage` object continue to use the per-project databases under
 }
 ```
 
-The PostgreSQL configuration, internal PostgreSQL 18 runtime, and schema
-baseline are available for development and adapter conformance. Machine and
-project identity operations are enabled by #84. The conversation adapter from
-#85 is available for conformance but is not routed through the daemon or CLI.
-The native-transcript adapter from #86 is available to explicit programmatic
-backfill and conformance; it does not add a daemon route or CLI command. Normal
-transcript activation remains #224, and the remaining storage/domain
-repositories stay staged until the #92 cutover; neither issue is implemented.
-PostgreSQL selection remains unavailable to normal production configuration,
-the daemon, and the CLI. SQLite is the only selectable production backend.
-Staged programmatic callers may exercise the PostgreSQL runtime and adapters,
-but those callers do not activate normal storage routes. The staged readiness
-contract keeps storage unavailable and returns sanitized `503` responses for
-storage-backed routes; it never falls back to SQLite after an explicit future
-selection. The internal readiness contract also requires
+The PostgreSQL configuration, internal PostgreSQL 18 runtime, schema baseline,
+and production project-storage factory are available to explicit programmatic
+callers and conformance. The factory composes all nine shared repository
+contracts only after eager runtime-readiness checks and per-project publication
+and identity admission. The native-transcript adapter remains a separate
+explicit backfill seam and does not add a daemon route or CLI command. Normal
+PostgreSQL daemon/CLI selection remains unavailable until #92 and the remaining
+#224 routing work are implemented, so SQLite is still the only active backend
+for those routes. Their staged readiness contract keeps storage unavailable and
+returns sanitized `503` responses; it never falls back to SQLite after an
+explicit PostgreSQL selection. The factory's readiness contract also requires
 the parity extensions at their current default versions in the `public` schema;
 see the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md#required-extensions-and-postgresql-version).
 The separate [backend publication safety guide](backend-publication.md)
@@ -301,6 +297,7 @@ timeout settings in `~/.lcm/config.json`:
   "storage": {
     "backend": "postgresql",
     "postgresql": {
+      "migrationRole": "lcm_migration",
       "poolMax": 5,
       "connectionTimeoutMs": 10000,
       "idleTimeoutMs": 30000,
@@ -312,6 +309,7 @@ timeout settings in `~/.lcm/config.json`:
 
 | Setting | Default | Valid range |
 | --- | ---: | ---: |
+| `migrationRole` | none | non-empty, no control characters, 1-63 UTF-8 bytes |
 | `poolMax` | `5` | `1`-`100` |
 | `connectionTimeoutMs` | `10000` | `1`-`600000` |
 | `idleTimeoutMs` | `30000` | `0`-`3600000` |
@@ -324,7 +322,18 @@ configuration commands:
 ```bash
 export LCM_POSTGRES_URL='postgresql://USER:PASSWORD@HOST:25060/DATABASE'
 export LCM_POSTGRES_CA_FILE='/absolute/path/to/ca-certificate.crt'
+export LCM_POSTGRES_MIGRATION_ROLE='lcm_migration'
 ```
+
+`migrationRole` is the expected owner of the database, the `lcm` schema, and
+all managed schema objects. It is an authorization identity, not a credential,
+so it may be stored in JSON. `LCM_POSTGRES_MIGRATION_ROLE` is the fallback only
+when the JSON setting is absent; a configured JSON value wins. The factory
+compares this value with PostgreSQL catalog ownership and rejects a runtime
+role that is the migration owner, can assume it, or otherwise exceeds the
+reviewed application privileges. Use the exact unquoted PostgreSQL role name
+reported by the catalog; do not put a password or connection URL in this
+setting.
 
 These environment values are for the staged direct programmatic and
 conformance paths only. Do not run `lcm daemon restart` for this PostgreSQL
@@ -358,18 +367,29 @@ concurrent invocations converge. It never installs extensions, repairs drift,
 changes ownership, or grants application privileges.
 
 After migration, apply only the reviewed scripts required by the repositories
-that this runtime role will use:
+that this runtime role will use. The project-storage factory requires the
+readiness script and all six repository-domain scripts:
+[`postgresql-runtime-readiness-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-readiness-grants.sql),
 [`postgresql-runtime-identity-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql),
 [`postgresql-runtime-conversation-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-conversation-grants.sql),
-[`postgresql-runtime-transcript-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql),
+[`postgresql-runtime-summary-context-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-summary-context-grants.sql),
+[`postgresql-runtime-memory-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-memory-grants.sql),
+[`postgresql-runtime-search-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-search-grants.sql),
 and
-[`postgresql-runtime-memory-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-memory-grants.sql).
-Direct issue #90 coordination callers additionally use
 [`postgresql-runtime-coordination-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql).
-Run them as an administrator, substituting the deployment's restricted runtime
-role:
+Apply the separate
+[`postgresql-runtime-transcript-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql)
+only when the explicit native-transcript repository is used. Run every script
+as the migration owner or an administrator with equivalent grant authority,
+substituting the deployment's restricted runtime role. Applying a function
+grant through the runtime role itself creates foreign-grantor ACL evidence and
+is rejected by readiness even if the effective privilege appears equivalent:
 
 ```bash
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file src/storage/postgresql/reference/postgresql-runtime-readiness-grants.sql
+
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql
@@ -380,7 +400,7 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-summary-context-grants.sql
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
@@ -388,7 +408,16 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
+  --file src/storage/postgresql/reference/postgresql-runtime-search-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
   --file src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql
+
+# Optional: explicit native-transcript import only.
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
 ```
 
 The transcript grant permits immutable inserts, provenance reads, and bounded
@@ -412,12 +441,18 @@ the staged programmatic primitives described in
 [PostgreSQL cross-machine coordination](../src/storage/postgresql/reference/postgresql-coordination.md); it does
 not enable the application backend or start a worker.
 
-Finally, for a staged direct or conformance workflow, restore
+Before opening project storage, restore
 `LCM_POSTGRES_URL` to the restricted runtime-role URL, run `lcm machine
-register`, and pair projects explicitly. Do not treat a daemon restart as
-PostgreSQL activation: #92 and #224 are not implemented, and normal
-PostgreSQL selection remains unavailable. Never leave identity commands
-configured with migration-owner credentials. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for
+register`, pair projects explicitly, and complete backend publication. Factory
+construction fails closed on unhealthy TLS/runtime state, ownership or schema
+drift, incomplete migrations, extension/search drift, missing grants, or
+overbroad grants. Project lookup/open fails closed on unresolved or changed
+publication evidence and any remote identity mismatch. Correct the underlying
+state and retry; do not bypass readiness, rewrite publication evidence, or
+switch to SQLite as an automatic recovery path. Do not treat a daemon restart
+as PostgreSQL activation: #92 and the remaining #224 routing work are not
+implemented, and normal PostgreSQL selection remains unavailable. Never leave
+identity commands configured with migration-owner credentials. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for
 the exact extension, role, ownership, ACL, backup, and recovery contracts.
 
 The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,

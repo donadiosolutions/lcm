@@ -388,45 +388,40 @@ provider requirements, and deeper operational guidance.
 SQLite remains the zero-configuration storage backend. LCM also validates the
 configuration and verified-TLS prerequisites for an explicit remote-primary
 PostgreSQL selection and includes an internal PostgreSQL 18 pool, migration
-runner, schema baseline, and isolated conformance harness. Machine/project
-identity is enabled, and the PostgreSQL conversation adapter is available to
-conformance tests. The native-transcript repository from #86 is available for
-explicit backfill and adapter conformance. The promoted-memory, recall,
-redaction-administration, and coordination repositories from #88 are likewise
-available for direct adapter use and shared conformance. Issue #90 extends the
-staged coordination repository with transaction locks, fenced leases,
-passive-inbox claims, cleanup, and diagnostics, but normal daemon/CLI
-activation stays staged until #92/#224. Issue #87 adds independently usable
-summary-DAG, context-item, and large-file repositories with transactional
-graph integrity, deterministic recursive expansion, and optional final-write
-fence validation under the same conversation lock namespace. Issue #91 adds
-durable versioned local hook envelopes, idempotent passive-inbox delivery, and
-a bounded crash-recoverable replication worker. Its status, validation,
-quarantine, and exact-event replay commands are operator-invoked and staged;
-hooks remain offline-only and no PostgreSQL worker starts automatically.
-Selecting `postgresql`
-therefore starts the daemon with an explicitly unavailable storage factory
+runner, schema baseline, project-storage factory, and isolated conformance
+harness. Explicit programmatic callers can create the PostgreSQL factory and
+open a project-scoped `ProjectStorage` containing conversation, summary,
+context, large-file, promoted-memory, recall, redaction-administration,
+lexical-search, and coordination repositories behind one transaction and
+lifecycle boundary. Factory creation eagerly verifies runtime health,
+PostgreSQL 18, extensions, migration history, schema fingerprints, ownership,
+search configuration, and the exact least-privilege ACL manifest. Opening a
+project then requires valid backend-publication evidence and an exact remote
+machine/project/path identity match before exposing any repository.
+
+Normal daemon/CLI activation remains staged until #92/#224. Selecting
+`postgresql` for those routes therefore keeps storage explicitly unavailable
 instead of falling back to SQLite. The health endpoint reports `503` and
-unavailable storage; status and statistics routes return fixed `503` responses, and SQLite
-background scans remain disabled. Project routes first validate machine
-registration and the explicit project binding, then fail safely at the
-unavailable repository boundary. Connection credentials stay out of JSON and
-effective configuration output. Provision the schema as its migration owner
-with `lcm postgres migrate`, then apply the reviewed
-[identity](src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql) and
-[conversation](src/storage/postgresql/reference/postgresql-runtime-conversation-grants.sql) runtime grants,
-plus the separate
-[native-transcript](src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql) grants when
-that repository is used, and the
-[memory and administration](src/storage/postgresql/reference/postgresql-runtime-memory-grants.sql) grants
-for the #88 adapters. Direct distributed-coordination callers also apply the
-separate
-[coordination](src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql) grants. The
-same grant script supplies only the additional column-scoped inbox writes,
-applied-row deletion, and identity-sequence usage required by staged #91
-delivery; it does not grant table-wide writes or sequence inspection. The
-staged summary, context, and large-file adapters use their dedicated
-[summary/context](src/storage/postgresql/reference/postgresql-runtime-summary-context-grants.sql) grants.
+unavailable storage; status and statistics routes return fixed `503`
+responses, and SQLite background scans remain disabled. Hooks remain
+offline-first through the local outbox, and no PostgreSQL replication worker
+starts automatically. Connection credentials stay out of JSON and effective
+configuration output. Configure the non-secret expected migration-owner role,
+provision the schema as that owner with `lcm postgres migrate`, then apply the
+reviewed
+[readiness](src/storage/postgresql/reference/postgresql-runtime-readiness-grants.sql),
+[identity](src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql),
+[conversation](src/storage/postgresql/reference/postgresql-runtime-conversation-grants.sql),
+[summary/context](src/storage/postgresql/reference/postgresql-runtime-summary-context-grants.sql),
+[memory and administration](src/storage/postgresql/reference/postgresql-runtime-memory-grants.sql),
+[lexical-search](src/storage/postgresql/reference/postgresql-runtime-search-grants.sql), and
+[coordination](src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql)
+runtime grants. Apply the separate
+[native-transcript](src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql)
+grants only when the explicit transcript repository is used. Each script
+grants only its reviewed relation, column, sequence, schema, and function
+privileges; the readiness verifier rejects missing, overbroad, or foreign-grantor
+ACLs before domain work.
 See
 [storage backend configuration](docs/configuration.md#storage-backend)
 for operators, the [PostgreSQL schema reference](src/storage/postgresql/reference/postgresql-schema.md) for
