@@ -416,6 +416,74 @@ describe("PostgreSQL 18 project storage factory", () => {
     });
   });
 
+  it("cancels active and pool-queued project work before factory shutdown completes", async () => {
+    await withPostgreSqlTestDatabase("factory-close", async (database) => {
+      await applyAllRuntimeGrants(database);
+      const fixture = await createIdentityFixture(database, "factory-close");
+      const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-close-"));
+      let releaseTransaction!: () => void;
+      const held = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+      let factory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let project: Awaited<ReturnType<
+        Awaited<ReturnType<
+          typeof createPostgreSqlStorageBackendFactoryForTesting
+        >>["openProject"]
+      >> | undefined;
+      let transaction: Promise<void> | undefined;
+      let queued: Promise<unknown> | undefined;
+      try {
+        await establishPublication(homeDir, fixture.machine, [
+          { project: fixture.first, path: fixture.firstPath },
+          { project: fixture.second, path: fixture.secondPath },
+        ]);
+        factory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database, { poolMax: 1 }),
+          homeDir,
+        );
+        project = await factory.openProject(identityContext(fixture));
+
+        let markEntered!: () => void;
+        const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+        transaction = project.transaction(async () => {
+          markEntered();
+          await held;
+        });
+        await entered;
+
+        queued = project.conversations.listConversations();
+        await Promise.resolve();
+        const close = factory.close();
+
+        await expect(queued).rejects.toMatchObject({
+          backend: "postgresql",
+          projectId: fixture.first.projectId,
+        });
+        releaseTransaction();
+        await expect(transaction).rejects.toMatchObject({
+          backend: "postgresql",
+          projectId: fixture.first.projectId,
+        });
+        await expect(close).resolves.toBeUndefined();
+        await expect(factory.health()).resolves.toEqual({
+          status: "closed",
+          backend: "postgresql",
+        });
+      } finally {
+        releaseTransaction();
+        await Promise.allSettled([
+          ...(queued === undefined ? [] : [queued]),
+          ...(transaction === undefined ? [] : [transaction]),
+          ...(project === undefined ? [] : [project.close()]),
+          ...(factory === undefined ? [] : [factory.close()]),
+        ]);
+        rmSync(homeDir, { recursive: true, force: true });
+        rmSync(fixture.projectRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
   it.each([
     ["wrong migration owner", undefined, "lcm_harness_admin"],
     ["ledger drift", "ledger", "lcm_test_migrator"],
