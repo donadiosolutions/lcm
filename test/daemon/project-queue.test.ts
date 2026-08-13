@@ -1,6 +1,19 @@
 import { describe, it, expect } from "vitest";
 import { enqueue } from "../../src/daemon/project-queue.js";
 
+type Deferred = {
+  promise: Promise<void>;
+  resolve: () => void;
+};
+
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 describe("enqueue", () => {
   it("returns the result of fn", async () => {
     const result = await enqueue("proj-result", () => Promise.resolve(42));
@@ -9,42 +22,67 @@ describe("enqueue", () => {
 
   it("operations on the same projectId run sequentially", async () => {
     const order: number[] = [];
+    const entered: string[] = [];
+    const firstEntry = deferred();
+    const releaseFirst = deferred();
+    const secondEntry = deferred();
 
-    // First op takes longer; second should still wait for it
-    const first = enqueue("proj-seq", () =>
-      new Promise<void>((resolve) => setTimeout(() => { order.push(1); resolve(); }, 50))
-    );
-    const second = enqueue("proj-seq", () =>
-      Promise.resolve(void order.push(2))
-    );
+    const first = enqueue("proj-seq", async () => {
+      entered.push("first");
+      firstEntry.resolve();
+      await releaseFirst.promise;
+      order.push(1);
+    });
+    const second = enqueue("proj-seq", async () => {
+      entered.push("second");
+      secondEntry.resolve();
+      order.push(2);
+    });
 
-    await Promise.all([first, second]);
-    expect(order).toEqual([1, 2]);
+    try {
+      await firstEntry.promise;
+      expect(entered).toEqual(["first"]);
+      releaseFirst.resolve();
+      await secondEntry.promise;
+      await Promise.all([first, second]);
+      expect(entered).toEqual(["first", "second"]);
+      expect(order).toEqual([1, 2]);
+    } finally {
+      releaseFirst.resolve();
+      await Promise.allSettled([first, second]);
+    }
   });
 
   it("operations on different projectIds run in parallel", async () => {
     const started: string[] = [];
+    const aEntry = deferred();
+    const releaseA = deferred();
+    const bEntry = deferred();
+    const releaseB = deferred();
 
-    const a = enqueue("proj-a", () =>
-      new Promise<void>((resolve) => {
-        started.push("a");
-        setTimeout(resolve, 50);
-      })
-    );
-    const b = enqueue("proj-b", () =>
-      new Promise<void>((resolve) => {
-        started.push("b");
-        setTimeout(resolve, 50);
-      })
-    );
+    const a = enqueue("proj-a", async () => {
+      started.push("a");
+      aEntry.resolve();
+      await releaseA.promise;
+    });
+    const b = enqueue("proj-b", async () => {
+      started.push("b");
+      bEntry.resolve();
+      await releaseB.promise;
+    });
 
-    // Give both a tick to start
-    await Promise.resolve();
-    // Both should have started before either completes
-    expect(started).toContain("a");
-    expect(started).toContain("b");
-
-    await Promise.all([a, b]);
+    try {
+      await Promise.all([aEntry.promise, bEntry.promise]);
+      expect(started).toHaveLength(2);
+      expect(started).toEqual(expect.arrayContaining(["a", "b"]));
+      releaseA.resolve();
+      releaseB.resolve();
+      await Promise.all([a, b]);
+    } finally {
+      releaseA.resolve();
+      releaseB.resolve();
+      await Promise.allSettled([a, b]);
+    }
   });
 
   it("a failed operation does not block subsequent operations on the same project", async () => {
