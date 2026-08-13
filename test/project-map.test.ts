@@ -2383,6 +2383,7 @@ describe("project map", () => {
 
     let directoryWatcher: ReturnType<typeof watchProjectMap> | undefined;
     let fileWatcher: ReturnType<typeof watchProjectMap> | undefined;
+    let primaryError: { value: unknown } | undefined;
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       nodeFs.watch = fakeWatch as unknown as typeof nodeFs.watch;
@@ -2441,8 +2442,10 @@ describe("project map", () => {
       expect(activeWatcher().path).toBe(dirname(projectMapPath()));
 
       expect(reloadProjectMapCache()).toBe(true);
+    } catch (error) {
+      primaryError = { value: error };
     } finally {
-      const cleanupErrors: unknown[] = [];
+      const cleanupErrors: unknown[] = primaryError ? [primaryError.value] : [];
       for (const watcher of projectWatchers) {
         try {
           watcher.close();
