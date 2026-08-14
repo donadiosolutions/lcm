@@ -187,6 +187,12 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
         membership_count: 0,
         tls: true,
         expected_owner_match: false,
+        expected_owner_count: 1,
+        expected_owner_oid: "100",
+        database_owner_count: 1,
+        database_owner_oid_count: 1,
+        database_owner_oid: "100",
+        database_owner_match: true,
       }]));
     }
     if (operation === "runtimeReadinessExtensions") {
@@ -264,7 +270,6 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
           : ["SELECT", "UPDATE", "USAGE"]
       );
       const required = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required;
-      const optional = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional;
       const objects = (config as { values?: unknown[] }).values?.[0] as string[];
       const rows = [
         ...objects.flatMap((object) => [
@@ -500,6 +505,32 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       readyExecutor({ operationOverrides: { inspectRuntimeRolePolicy: override } }),
       "runtime-role-policy",
     );
+  });
+
+  it.each([
+    ["runtime role owns the current database", mutateRows((rows) => {
+      rows[0]!.database_owner_oid = "200";
+      rows[0]!.database_owner_match = false;
+    })],
+    ["foreign role owns the current database", mutateRows((rows) => {
+      rows[0]!.database_owner_oid = "300";
+      rows[0]!.database_owner_match = false;
+    })],
+    ["database owner evidence is missing", mutateFirstField("database_owner_count", 0)],
+    ["database owner evidence is duplicated", mutateFirstField("database_owner_count", 2)],
+    ["database owner evidence is malformed", mutateFirstField("database_owner_oid", null)],
+    ["expected owner evidence is malformed", mutateFirstField("expected_owner_oid", "not-an-oid")],
+    ["database owner match is malformed", mutateFirstField("database_owner_match", "false")],
+    ["role policy evidence is duplicated", (base: ReadyExecutorBaseResult) => (
+      replaceRows(base, [...base.rows, ...base.rows])
+    )],
+  ] as const)("rejects database-owner authority evidence: %s before domain work", async (_label, override) => {
+    const fake = readyExecutor({ operationOverrides: { inspectRuntimeRolePolicy: override } });
+    await expectReadinessFailure(fake, "runtime-role-policy");
+    expect(fake.queries.map(({ options }) => options.operation)).toEqual([
+      "inspectServerReadiness",
+      "inspectRuntimeRolePolicy",
+    ]);
   });
 
   it.each([

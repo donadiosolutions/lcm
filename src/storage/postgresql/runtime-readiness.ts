@@ -442,6 +442,12 @@ interface RolePolicyRow extends QueryResultRow {
   readonly membership_count: unknown;
   readonly tls: unknown;
   readonly expected_owner_match: unknown;
+  readonly expected_owner_count: unknown;
+  readonly expected_owner_oid: unknown;
+  readonly database_owner_count: unknown;
+  readonly database_owner_oid_count: unknown;
+  readonly database_owner_oid: unknown;
+  readonly database_owner_match: unknown;
 }
 
 interface ServerReadinessRow extends QueryResultRow {
@@ -558,7 +564,12 @@ async function inspectRolePolicy(
   signal: AbortSignal | undefined,
 ): Promise<string> {
   const result = await executor.query<RolePolicyRow, [string]>({
-    text: `WITH RECURSIVE runtime_role AS (
+    text: `WITH RECURSIVE expected_owner AS (
+             SELECT role.oid
+             FROM pg_catalog.pg_roles AS role
+             WHERE role.rolname OPERATOR(pg_catalog.=) $1
+           ),
+           runtime_role AS (
              SELECT role.oid,
                     role.rolname::text AS current_user_name,
                     session_user::text AS session_user_name,
@@ -580,6 +591,28 @@ async function inspectRolePolicy(
              FROM pg_catalog.pg_auth_members AS member
              JOIN memberships
                ON member.member OPERATOR(pg_catalog.=) memberships.role_oid
+           ),
+           database_owner AS (
+             SELECT database.datdba::pg_catalog.text AS database_owner_oid,
+                    database.datdba OPERATOR(pg_catalog.=) expected_owner.oid
+                      AS database_owner_match
+             FROM pg_catalog.pg_database AS database
+             LEFT JOIN expected_owner ON true
+             WHERE database.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
+           ),
+           expected_owner_evidence AS (
+             SELECT pg_catalog.count(*)::pg_catalog.int4 AS expected_owner_count,
+                    pg_catalog.min(owner.oid::pg_catalog.text) AS expected_owner_oid
+             FROM expected_owner AS owner
+           ),
+           database_owner_evidence AS (
+             SELECT pg_catalog.count(*)::pg_catalog.int4 AS database_owner_count,
+                    pg_catalog.count(database_owner.database_owner_oid)::pg_catalog.int4
+                      AS database_owner_oid_count,
+                    pg_catalog.min(database_owner.database_owner_oid) AS database_owner_oid,
+                    pg_catalog.bool_and(database_owner.database_owner_match)
+                      AS database_owner_match
+             FROM database_owner
            )
            SELECT runtime_role.current_user_name,
                   runtime_role.session_user_name,
@@ -597,14 +630,23 @@ async function inspectRolePolicy(
                     WHERE pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
                   ), false) AS tls
                   ,runtime_role.current_user_name OPERATOR(pg_catalog.=) $1
-                    AS expected_owner_match
-           FROM runtime_role`,
+                    AS expected_owner_match,
+                  expected_owner_evidence.expected_owner_count,
+                  expected_owner_evidence.expected_owner_oid,
+                  database_owner_evidence.database_owner_count,
+                  database_owner_evidence.database_owner_oid_count,
+                  database_owner_evidence.database_owner_oid,
+                  database_owner_evidence.database_owner_match
+           FROM runtime_role
+           CROSS JOIN expected_owner_evidence
+           CROSS JOIN database_owner_evidence`,
     values: [expectedOwner],
   }, readinessOptions("inspectRuntimeRolePolicy", signal));
   const row = result.rows[0];
   const runtimeRole = row?.current_user_name;
   if (
-    !row
+    result.rows.length !== 1
+    || !row
     || !isRoleName(runtimeRole)
     || !isRoleName(row.session_user_name)
     || runtimeRole !== row.session_user_name
@@ -618,6 +660,18 @@ async function inspectRolePolicy(
     || row.membership_count !== 0
     || row.tls !== true
     || row.expected_owner_match !== false
+    || !isSafeCount(row.expected_owner_count)
+    || row.expected_owner_count !== 1
+    || typeof row.expected_owner_oid !== "string"
+    || !/^[0-9]+$/u.test(row.expected_owner_oid)
+    || !isSafeCount(row.database_owner_count)
+    || row.database_owner_count !== 1
+    || !isSafeCount(row.database_owner_oid_count)
+    || row.database_owner_oid_count !== 1
+    || typeof row.database_owner_oid !== "string"
+    || !/^[0-9]+$/u.test(row.database_owner_oid)
+    || !isBoolean(row.database_owner_match)
+    || row.database_owner_match !== true
   ) {
     throw readinessError("runtime-role-policy", "inspectRuntimeRolePolicy");
   }

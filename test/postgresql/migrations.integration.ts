@@ -89,6 +89,17 @@ async function applyRuntimeGrantScripts(
   }
 }
 
+async function readCurrentDatabaseOwner(administrator: PostgreSqlRuntime): Promise<string> {
+  const result = await administrator.query<{ database_owner: string }>({
+    text: `SELECT pg_catalog.pg_get_userbyid(database.datdba)::text AS database_owner
+           FROM pg_catalog.pg_database AS database
+           WHERE database.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()`,
+  }, { domain: "factory", operation: "readCurrentDatabaseOwner" });
+  const owner = result.rows.length === 1 ? result.rows[0]?.database_owner : undefined;
+  if (typeof owner !== "string") throw new Error("PostgreSQL database owner readback failed");
+  return owner;
+}
+
 async function waitForSummaryMigrationRelationLock(
   admin: PostgreSqlRuntime,
 ): Promise<void> {
@@ -265,6 +276,48 @@ describe("PostgreSQL migrations and database isolation", () => {
           id: entry.id,
           checksum_sha256: entry.sha256,
         })));
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it.each([
+    ["runtime role", "lcm_test_runtime"],
+    ["foreign role", "lcm_harness_admin"],
+  ] as const)("rejects readiness when the %s owns the current database", async (_label, owner) => {
+    await withPostgreSqlTestDatabase(
+      `runtime-readiness-database-owner-${owner}`,
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+        try {
+          await expect(readCurrentDatabaseOwner(administrator))
+            .resolves.toBe("lcm_test_migrator");
+          await administrator.query({
+            text: `ALTER DATABASE "${database.name}" OWNER TO ${owner}`,
+          }, { domain: "factory", operation: "mutateCurrentDatabaseOwner" });
+          await expect(readCurrentDatabaseOwner(administrator)).resolves.toBe(owner);
+
+          const failure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          expect(failure).toMatchObject({
+            reason: "runtime-role-policy",
+            operation: "inspectRuntimeRolePolicy",
+          });
+          expect(JSON.stringify(failure)).not.toContain(database.name);
+        } finally {
+          try {
+            await administrator.query({
+              text: `ALTER DATABASE "${database.name}" OWNER TO lcm_test_migrator`,
+            }, { domain: "factory", operation: "restoreCurrentDatabaseOwner" });
+            await expect(readCurrentDatabaseOwner(administrator))
+              .resolves.toBe("lcm_test_migrator");
+          } finally {
+            await administrator.close();
+          }
+        }
       },
       { runMigrations: false },
     );
