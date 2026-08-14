@@ -1,14 +1,25 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { Client, type DatabaseError } from "pg";
+import {
+  Client,
+  type DatabaseError,
+  type QueryConfig,
+  type QueryResult,
+  type QueryResultRow,
+} from "pg";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   loadPostgreSqlMigrations,
   loadPostgreSqlSchemaSnapshots,
+  PostgreSqlBaselineDefinitionPreflightError,
   runPostgreSqlMigrations,
 } from "../../src/storage/postgresql/migrations.js";
-import type { PostgreSqlMigration } from "../../src/storage/postgresql/contracts.js";
+import type {
+  PostgreSqlMigration,
+  PostgreSqlQueryExecutor,
+  PostgreSqlQueryOptions,
+} from "../../src/storage/postgresql/contracts.js";
 import {
   POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST,
   verifyPostgreSqlRuntimeSchema,
@@ -417,6 +428,110 @@ describe("PostgreSQL migrations and database isolation", () => {
           reason: "schema-fingerprint",
           operation: "inspectSchemaDefinitions",
         });
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("reports one column ACL object for multiple unsanctioned privileges", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-column-acl-object-count",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        type DefinitionDiagnosticRow = {
+          readonly actual_definition_group_counts: readonly number[];
+          readonly actual_definition_group_hashes: readonly string[];
+          readonly drifted_definition_group_count: number;
+          readonly existing_object_count: number;
+          readonly expected_object_count: number;
+          readonly missing_object_count: number;
+        };
+        let readinessDefinitionRow: DefinitionDiagnosticRow | undefined;
+        const captureReadinessQuery = async <
+          R extends QueryResultRow = QueryResultRow,
+          I extends unknown[] = unknown[],
+        >(
+          config: QueryConfig<I>,
+          options: PostgreSqlQueryOptions,
+        ): Promise<QueryResult<R>> => {
+          const result = await database.runtime.query<R, I>(config, options);
+          if (options.operation === "inspectSchemaDefinitions") {
+            readinessDefinitionRow = result.rows[0] as DefinitionDiagnosticRow | undefined;
+          }
+          return result;
+        };
+        const readinessExecutor: PostgreSqlQueryExecutor = {
+          query: captureReadinessQuery,
+        };
+        try {
+          await database.migrator.query({
+            text: `GRANT SELECT (display_name), UPDATE (display_name)
+                   ON TABLE lcm.projects TO PUBLIC`,
+          }, { domain: "factory", operation: "injectMultipleUnsanctionedColumnPrivileges" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(readinessExecutor, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          const migrationColumnAcl = migrationFailure
+            instanceof PostgreSqlBaselineDefinitionPreflightError
+            ? migrationFailure.actualDefinitionGroups?.find(
+              ({ objectKind }) => objectKind === "column_acl",
+            )
+            : undefined;
+          const latestSnapshot = loadPostgreSqlSchemaSnapshots().at(-1)!;
+          const diagnostic = {
+            readinessFailure,
+            migrationFailure,
+            readinessExpectedObjectCount:
+              readinessDefinitionRow?.expected_object_count,
+            readinessExistingObjectCount:
+              readinessDefinitionRow?.existing_object_count,
+            readinessMissingObjectCount:
+              readinessDefinitionRow?.missing_object_count,
+            readinessDriftedDefinitionGroupCount:
+              readinessDefinitionRow?.drifted_definition_group_count,
+            readinessColumnAclCount:
+              readinessDefinitionRow?.actual_definition_group_counts[4],
+            migrationColumnAclCount: migrationColumnAcl?.objectCount,
+            readinessColumnAclSha256:
+              readinessDefinitionRow?.actual_definition_group_hashes[4],
+            migrationColumnAclSha256: migrationColumnAcl?.definitionSha256,
+          };
+          expect(diagnostic).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              existingObjectCount: 782,
+              expectedObjectCount: 782,
+              missingObjectCount: 0,
+              operation: "preflightBaselineDefinitions",
+            },
+            readinessExpectedObjectCount: 782,
+            readinessExistingObjectCount: 782,
+            readinessMissingObjectCount: 0,
+            readinessDriftedDefinitionGroupCount: 1,
+            readinessColumnAclCount: 225,
+            migrationColumnAclCount: 225,
+            readinessColumnAclSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+            migrationColumnAclSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+          });
+          expect(diagnostic.readinessColumnAclSha256)
+            .toBe(diagnostic.migrationColumnAclSha256);
+          expect(diagnostic.readinessColumnAclSha256)
+            .not.toBe(latestSnapshot.definitionHashes.columnAcl);
+        } finally {
+          await database.migrator.query({
+            text: `REVOKE SELECT (display_name), UPDATE (display_name)
+                   ON TABLE lcm.projects FROM PUBLIC`,
+          }, { domain: "factory", operation: "removeMultipleUnsanctionedColumnPrivileges" });
+        }
       },
       { runMigrations: false },
     );

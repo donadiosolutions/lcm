@@ -704,6 +704,11 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       .not.toContain("ANY ($4::pg_catalog.text[])");
     expect(section("actual_ordinary_columns AS", "actual_identity_sequences AS"))
       .not.toContain("ANY ($4::pg_catalog.text[])");
+    const columnAclGroup = section("SELECT 'column_acl'", "SELECT 'identity_sequence'");
+    expect(columnAclGroup).toContain(
+      "pg_catalog.count(DISTINCT object_identity)::pg_catalog.int4",
+    );
+    expect(columnAclGroup).not.toContain("pg_catalog.count(*)");
   });
 
   it.each([

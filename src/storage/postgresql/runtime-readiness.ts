@@ -1759,7 +1759,7 @@ function definitionQuery(
                         not_null_constraints), E'\\n' ORDER BY table_name, column_name), ''), 'sha256'), 'hex')
              FROM actual_generated_columns
              UNION ALL
-             SELECT 'column_acl', pg_catalog.count(*)::pg_catalog.int4,
+             SELECT 'column_acl', pg_catalog.count(DISTINCT object_identity)::pg_catalog.int4,
                     pg_catalog.encode(public.digest(COALESCE(pg_catalog.string_agg(
                       pg_catalog.concat_ws('|', object_identity, grantee, grantor, privilege_type, is_grantable),
                       E'\\n' ORDER BY object_identity, grantee, grantor, privilege_type, is_grantable), ''), 'sha256'), 'hex')
