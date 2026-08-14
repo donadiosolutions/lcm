@@ -160,6 +160,28 @@ const REQUIRED_EXTENSION_FUNCTION_ROWS = [
   },
 ] as const;
 
+const REQUIRED_EXTENSION_OPERATOR_ROWS = [{
+  schema_name: "public",
+  operator_name: "%",
+  operator_kind: "b",
+  left_type: "text",
+  right_type: "text",
+  result_type: "boolean",
+  extension_name: "pg_trgm",
+  owner_matches_extension: true,
+  implementation_matches: true,
+  commutator_matches: true,
+  negator_absent: true,
+  restriction_matches: true,
+  join_matches: true,
+  can_merge: false,
+  can_hash: false,
+  dependency_count: 3,
+  extension_dependency_count: 1,
+  implementation_dependency_count: 1,
+  namespace_dependency_count: 1,
+}] as const;
+
 function mutateRows(
   mutation: (rows: QueryResultRow[]) => void,
 ): (base: ReadyExecutorBaseResult) => ReadyExecutorBaseResult {
@@ -282,6 +304,9 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
     }
     if (operation === "inspectRequiredExtensionFunctions") {
       return applyOverride(result(REQUIRED_EXTENSION_FUNCTION_ROWS.map((row) => ({ ...row }))));
+    }
+    if (operation === "inspectRequiredExtensionOperator") {
+      return applyOverride(result(REQUIRED_EXTENSION_OPERATOR_ROWS.map((row) => ({ ...row }))));
     }
     if (operation === "runtimeReadinessSearchConfiguration") {
       return applyOverride(result([{
@@ -604,6 +629,83 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       }),
       "extension-preflight",
     );
+  });
+
+  it.each([
+    ["malformed schema", "schema_name", null],
+    ["foreign schema", "schema_name", "foreign"],
+    ["malformed name", "operator_name", null],
+    ["foreign name", "operator_name", "#"],
+    ["malformed kind", "operator_kind", null],
+    ["non-binary kind", "operator_kind", "l"],
+    ["malformed left type", "left_type", null],
+    ["foreign left type", "left_type", "bytea"],
+    ["malformed right type", "right_type", null],
+    ["foreign right type", "right_type", "bytea"],
+    ["malformed result type", "result_type", null],
+    ["foreign result type", "result_type", "integer"],
+    ["malformed extension membership", "extension_name", null],
+    ["foreign extension membership", "extension_name", "foreign"],
+    ["malformed owner match", "owner_matches_extension", "true"],
+    ["foreign owner", "owner_matches_extension", false],
+    ["malformed implementation match", "implementation_matches", "true"],
+    ["foreign implementation", "implementation_matches", false],
+    ["malformed commutator match", "commutator_matches", "true"],
+    ["foreign commutator", "commutator_matches", false],
+    ["malformed negator evidence", "negator_absent", "true"],
+    ["foreign negator", "negator_absent", false],
+    ["malformed restriction match", "restriction_matches", "true"],
+    ["foreign restriction estimator", "restriction_matches", false],
+    ["malformed join match", "join_matches", "true"],
+    ["foreign join estimator", "join_matches", false],
+    ["malformed merge capability", "can_merge", "false"],
+    ["merge capability", "can_merge", true],
+    ["malformed hash capability", "can_hash", "false"],
+    ["hash capability", "can_hash", true],
+    ["malformed dependency count", "dependency_count", "3"],
+    ["extra dependency", "dependency_count", 4],
+    ["malformed extension dependency count", "extension_dependency_count", "1"],
+    ["missing extension dependency", "extension_dependency_count", 0],
+    ["malformed implementation dependency count", "implementation_dependency_count", "1"],
+    ["foreign implementation dependency", "implementation_dependency_count", 0],
+    ["malformed namespace dependency count", "namespace_dependency_count", "1"],
+    ["foreign namespace dependency", "namespace_dependency_count", 0],
+  ] as const)(
+    "rejects malformed or spoofed required operator metadata: %s",
+    async (_label, field, value) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRequiredExtensionOperator: mutateRows((rows) => {
+            rows[0]![field] = value;
+          }),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "extension-preflight");
+      expect(failure.operation).toBe("inspectRequiredExtensionOperator");
+    },
+  );
+
+  it.each([
+    ["missing", (rows: QueryResultRow[]) => { rows.splice(0, 1); }],
+    ["duplicate", (rows: QueryResultRow[]) => { rows.push({ ...rows[0]! }); }],
+  ] as const)("rejects a %s required operator row before later readiness work", async (_label, mutate) => {
+    const fake = readyExecutor({
+      operationOverrides: {
+        inspectRequiredExtensionOperator: mutateRows(mutate),
+      },
+    });
+
+    const failure = await expectReadinessFailure(fake, "extension-preflight");
+    expect(failure.operation).toBe("inspectRequiredExtensionOperator");
+    expect(fake.queries.map(({ options }) => options.operation)).toEqual([
+      "inspectServerReadiness",
+      "inspectRuntimeRolePolicy",
+      "runtimeReadinessExtensions",
+      "runtimeReadinessExtensions:probePgStatStatements",
+      "inspectRequiredExtensionFunctions",
+      "inspectRequiredExtensionOperator",
+    ]);
   });
 
   it("propagates the caller signal to every readiness query", async () => {

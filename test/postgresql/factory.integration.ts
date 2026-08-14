@@ -138,6 +138,7 @@ async function applyAllRuntimeGrants(
 }
 
 interface ExtensionFunctionState {
+  readonly oid: string;
   readonly definition: string;
   readonly extensionName: string | null;
   readonly languageName: string;
@@ -149,7 +150,8 @@ async function inspectExtensionFunctionState(
   operation: string,
 ): Promise<ExtensionFunctionState> {
   const result = await administrator.query({
-    text: `SELECT pg_catalog.pg_get_functiondef(procedure.oid) AS definition,
+    text: `SELECT procedure.oid::pg_catalog.text AS oid,
+                  pg_catalog.pg_get_functiondef(procedure.oid) AS definition,
                   language.lanname::pg_catalog.text AS language_name,
                   (
                     SELECT extension.extname::pg_catalog.text
@@ -170,13 +172,15 @@ async function inspectExtensionFunctionState(
   }, { domain: "factory", operation });
   const row = result.rows[0];
   if (
-    typeof row?.definition !== "string"
+    typeof row?.oid !== "string"
+    || typeof row.definition !== "string"
     || typeof row.language_name !== "string"
     || (typeof row.extension_name !== "string" && row.extension_name !== null)
   ) {
     throw new Error("invalid extension function fixture state");
   }
   return {
+    oid: row.oid,
     definition: row.definition,
     extensionName: row.extension_name,
     languageName: row.language_name,
@@ -207,6 +211,238 @@ async function restoreExtensionFunctionState(
     await administrator.query({
       text: `ALTER EXTENSION ${extensionName} ADD FUNCTION ${functionIdentity}`,
     }, { domain: "factory", operation: "restoreExtensionFunctionMembership" });
+  }
+}
+
+interface ExtensionOperatorDefinitionState {
+  readonly schemaName: string;
+  readonly operatorName: string;
+  readonly operatorKind: string;
+  readonly leftType: string;
+  readonly rightType: string;
+  readonly resultType: string;
+  readonly ownerName: string;
+  readonly extensionName: string | null;
+  readonly extensionOwnerName: string | null;
+  readonly implementationOid: string;
+  readonly implementationIdentity: string;
+  readonly commutatorMatchesSelf: boolean;
+  readonly negatorAbsent: boolean;
+  readonly restrictionOid: string;
+  readonly joinOid: string;
+  readonly canMerge: boolean;
+  readonly canHash: boolean;
+  readonly dependencyCount: number;
+  readonly extensionDependencyCount: number;
+  readonly implementationDependencyCount: number;
+  readonly namespaceDependencyCount: number;
+}
+
+interface ExtensionOperatorState {
+  readonly oid: string;
+  readonly definition: ExtensionOperatorDefinitionState;
+}
+
+const REQUIRED_SIMILARITY_OPERATOR = "public.%(pg_catalog.text, pg_catalog.text)";
+const FOREIGN_SIMILARITY_OPERATOR_FUNCTION =
+  "public.lcm_test_foreign_similarity_operator(pg_catalog.text, pg_catalog.text)";
+
+async function inspectExtensionOperatorState(
+  administrator: PostgreSqlRuntime,
+  operation: string,
+): Promise<ExtensionOperatorState | null> {
+  const result = await administrator.query({
+    text: `SELECT catalog_operator.oid::pg_catalog.text AS oid,
+                  namespace.nspname::pg_catalog.text AS schema_name,
+                  catalog_operator.oprname::pg_catalog.text AS operator_name,
+                  catalog_operator.oprkind::pg_catalog.text AS operator_kind,
+                  catalog_operator.oprleft::pg_catalog.regtype::pg_catalog.text AS left_type,
+                  catalog_operator.oprright::pg_catalog.regtype::pg_catalog.text AS right_type,
+                  catalog_operator.oprresult::pg_catalog.regtype::pg_catalog.text AS result_type,
+                  owner.rolname::pg_catalog.text AS owner_name,
+                  extension.extname::pg_catalog.text AS extension_name,
+                  extension_owner.rolname::pg_catalog.text AS extension_owner_name,
+                  (catalog_operator.oprcode::pg_catalog.oid)::pg_catalog.text
+                    AS implementation_oid,
+                  pg_catalog.concat(
+                    implementation_namespace.nspname,
+                    '.',
+                    implementation.proname,
+                    '(',
+                    pg_catalog.pg_get_function_identity_arguments(implementation.oid),
+                    ')'
+                  ) AS implementation_identity,
+                  catalog_operator.oprcom OPERATOR(pg_catalog.=) catalog_operator.oid
+                    AS commutator_matches_self,
+                  catalog_operator.oprnegate OPERATOR(pg_catalog.=) 0::pg_catalog.oid
+                    AS negator_absent,
+                  (catalog_operator.oprrest::pg_catalog.oid)::pg_catalog.text AS restriction_oid,
+                  (catalog_operator.oprjoin::pg_catalog.oid)::pg_catalog.text AS join_oid,
+                  catalog_operator.oprcanmerge AS can_merge,
+                  catalog_operator.oprcanhash AS can_hash,
+                  (
+                    SELECT pg_catalog.count(*)::pg_catalog.int4
+                    FROM pg_catalog.pg_depend AS dependency
+                    WHERE dependency.classid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_operator')
+                      AND dependency.objid OPERATOR(pg_catalog.=) catalog_operator.oid
+                  ) AS dependency_count,
+                  (
+                    SELECT pg_catalog.count(*)::pg_catalog.int4
+                    FROM pg_catalog.pg_depend AS dependency
+                    WHERE dependency.classid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_operator')
+                      AND dependency.objid OPERATOR(pg_catalog.=) catalog_operator.oid
+                      AND dependency.objsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.refclassid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_extension')
+                      AND dependency.refobjid OPERATOR(pg_catalog.=) extension.oid
+                      AND dependency.refobjsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.deptype OPERATOR(pg_catalog.=) 'e'
+                  ) AS extension_dependency_count,
+                  (
+                    SELECT pg_catalog.count(*)::pg_catalog.int4
+                    FROM pg_catalog.pg_depend AS dependency
+                    WHERE dependency.classid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_operator')
+                      AND dependency.objid OPERATOR(pg_catalog.=) catalog_operator.oid
+                      AND dependency.objsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.refclassid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_proc')
+                      AND dependency.refobjid OPERATOR(pg_catalog.=) implementation.oid
+                      AND dependency.refobjsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.deptype OPERATOR(pg_catalog.=) 'n'
+                  ) AS implementation_dependency_count,
+                  (
+                    SELECT pg_catalog.count(*)::pg_catalog.int4
+                    FROM pg_catalog.pg_depend AS dependency
+                    WHERE dependency.classid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_operator')
+                      AND dependency.objid OPERATOR(pg_catalog.=) catalog_operator.oid
+                      AND dependency.objsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.refclassid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_namespace')
+                      AND dependency.refobjid OPERATOR(pg_catalog.=) namespace.oid
+                      AND dependency.refobjsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.deptype OPERATOR(pg_catalog.=) 'n'
+                  ) AS namespace_dependency_count
+           FROM pg_catalog.pg_operator AS catalog_operator
+           JOIN pg_catalog.pg_namespace AS namespace
+             ON namespace.oid OPERATOR(pg_catalog.=) catalog_operator.oprnamespace
+           JOIN pg_catalog.pg_roles AS owner
+             ON owner.oid OPERATOR(pg_catalog.=) catalog_operator.oprowner
+           JOIN pg_catalog.pg_proc AS implementation
+             ON implementation.oid OPERATOR(pg_catalog.=) catalog_operator.oprcode
+           JOIN pg_catalog.pg_namespace AS implementation_namespace
+             ON implementation_namespace.oid OPERATOR(pg_catalog.=) implementation.pronamespace
+           LEFT JOIN pg_catalog.pg_depend AS extension_dependency
+             ON extension_dependency.classid OPERATOR(pg_catalog.=)
+                  pg_catalog.to_regclass('pg_catalog.pg_operator')
+            AND extension_dependency.objid OPERATOR(pg_catalog.=) catalog_operator.oid
+            AND extension_dependency.objsubid OPERATOR(pg_catalog.=) 0
+            AND extension_dependency.refclassid OPERATOR(pg_catalog.=)
+                  pg_catalog.to_regclass('pg_catalog.pg_extension')
+            AND extension_dependency.refobjsubid OPERATOR(pg_catalog.=) 0
+            AND extension_dependency.deptype OPERATOR(pg_catalog.=) 'e'
+           LEFT JOIN pg_catalog.pg_extension AS extension
+             ON extension.oid OPERATOR(pg_catalog.=) extension_dependency.refobjid
+           LEFT JOIN pg_catalog.pg_roles AS extension_owner
+             ON extension_owner.oid OPERATOR(pg_catalog.=) extension.extowner
+           WHERE namespace.nspname OPERATOR(pg_catalog.=) 'public'
+             AND catalog_operator.oprname OPERATOR(pg_catalog.=) '%'
+             AND catalog_operator.oprleft OPERATOR(pg_catalog.=) 'pg_catalog.text'::pg_catalog.regtype
+             AND catalog_operator.oprright OPERATOR(pg_catalog.=) 'pg_catalog.text'::pg_catalog.regtype`,
+  }, { domain: "factory", operation });
+  if (result.rows.length === 0) return null;
+  const row = result.rows[0];
+  if (
+    result.rows.length !== 1
+    || typeof row?.oid !== "string"
+    || typeof row.schema_name !== "string"
+    || typeof row.operator_name !== "string"
+    || typeof row.operator_kind !== "string"
+    || typeof row.left_type !== "string"
+    || typeof row.right_type !== "string"
+    || typeof row.result_type !== "string"
+    || typeof row.owner_name !== "string"
+    || (typeof row.extension_name !== "string" && row.extension_name !== null)
+    || (typeof row.extension_owner_name !== "string" && row.extension_owner_name !== null)
+    || typeof row.implementation_oid !== "string"
+    || typeof row.implementation_identity !== "string"
+    || typeof row.commutator_matches_self !== "boolean"
+    || typeof row.negator_absent !== "boolean"
+    || typeof row.restriction_oid !== "string"
+    || typeof row.join_oid !== "string"
+    || typeof row.can_merge !== "boolean"
+    || typeof row.can_hash !== "boolean"
+    || typeof row.dependency_count !== "number"
+    || typeof row.extension_dependency_count !== "number"
+    || typeof row.implementation_dependency_count !== "number"
+    || typeof row.namespace_dependency_count !== "number"
+  ) {
+    throw new Error("invalid extension operator fixture state");
+  }
+  return {
+    oid: row.oid,
+    definition: {
+      schemaName: row.schema_name,
+      operatorName: row.operator_name,
+      operatorKind: row.operator_kind,
+      leftType: row.left_type,
+      rightType: row.right_type,
+      resultType: row.result_type,
+      ownerName: row.owner_name,
+      extensionName: row.extension_name,
+      extensionOwnerName: row.extension_owner_name,
+      implementationOid: row.implementation_oid,
+      implementationIdentity: row.implementation_identity,
+      commutatorMatchesSelf: row.commutator_matches_self,
+      negatorAbsent: row.negator_absent,
+      restrictionOid: row.restriction_oid,
+      joinOid: row.join_oid,
+      canMerge: row.can_merge,
+      canHash: row.can_hash,
+      dependencyCount: row.dependency_count,
+      extensionDependencyCount: row.extension_dependency_count,
+      implementationDependencyCount: row.implementation_dependency_count,
+      namespaceDependencyCount: row.namespace_dependency_count,
+    },
+  };
+}
+
+async function restoreExtensionOperatorState(
+  administrator: PostgreSqlRuntime,
+  authoritative: ExtensionOperatorState,
+): Promise<void> {
+  const current = await inspectExtensionOperatorState(
+    administrator,
+    "inspectExtensionOperatorBeforeRestore",
+  );
+  if (current?.definition.extensionName === "pg_trgm") {
+    await administrator.query({
+      text: `ALTER EXTENSION pg_trgm DROP OPERATOR ${REQUIRED_SIMILARITY_OPERATOR}`,
+    }, { domain: "factory", operation: "detachExtensionOperatorBeforeRestore" });
+  }
+  await administrator.query({
+    text: `DROP OPERATOR IF EXISTS ${REQUIRED_SIMILARITY_OPERATOR}`,
+  }, { domain: "factory", operation: "dropReplacedExtensionOperator" });
+  await administrator.query({
+    text: `DROP FUNCTION IF EXISTS ${FOREIGN_SIMILARITY_OPERATOR_FUNCTION}`,
+  }, { domain: "factory", operation: "dropForeignSimilarityOperatorFunction" });
+  await administrator.query({
+    text: `CREATE OPERATOR public.% (
+             LEFTARG = pg_catalog.text,
+             RIGHTARG = pg_catalog.text,
+             FUNCTION = public.similarity_op,
+             COMMUTATOR = OPERATOR(public.%),
+             RESTRICT = pg_catalog.matchingsel,
+             JOIN = pg_catalog.matchingjoinsel
+           )`,
+  }, { domain: "factory", operation: "restoreAuthoritativeExtensionOperator" });
+  if (authoritative.definition.extensionName === "pg_trgm") {
+    await administrator.query({
+      text: `ALTER EXTENSION pg_trgm ADD OPERATOR ${REQUIRED_SIMILARITY_OPERATOR}`,
+    }, { domain: "factory", operation: "restoreExtensionOperatorMembership" });
   }
 }
 
@@ -869,6 +1105,178 @@ describe("PostgreSQL 18 project storage factory", () => {
       });
     },
   );
+
+  it("rejects a replaced pg_trgm percent operator while preserving the canonical implementation", async () => {
+    await withPostgreSqlTestDatabase("factory-extension-operator", async (database) => {
+      await applyAllRuntimeGrants(database);
+      const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-extension-operator-"));
+      const administrator = new PostgreSqlRuntime(settings(database.adminUrl, { poolMax: 1 }));
+      const authoritativeFunction = await inspectExtensionFunctionState(
+        administrator,
+        "public.similarity_op(text, text)",
+        "captureAuthoritativeSimilarityOperatorFunction",
+      );
+      const authoritativeOperator = await inspectExtensionOperatorState(
+        administrator,
+        "captureAuthoritativeSimilarityOperator",
+      );
+      let baselineFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let tamperedFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let factoryError: unknown;
+      let mutationStarted = false;
+      let restoredOperator: ExtensionOperatorState | null | undefined;
+      let restoredFunction: ExtensionFunctionState | undefined;
+      try {
+        expect(authoritativeFunction).toMatchObject({
+          extensionName: "pg_trgm",
+          languageName: "c",
+        });
+        expect(authoritativeOperator?.definition).toMatchObject({
+          schemaName: "public",
+          operatorName: "%",
+          operatorKind: "b",
+          leftType: "text",
+          rightType: "text",
+          resultType: "boolean",
+          ownerName: "lcm_harness_admin",
+          extensionName: "pg_trgm",
+          extensionOwnerName: "lcm_harness_admin",
+          implementationOid: authoritativeFunction.oid,
+          implementationIdentity: "public.similarity_op(text, text)",
+          commutatorMatchesSelf: true,
+          negatorAbsent: true,
+          canMerge: false,
+          canHash: false,
+          dependencyCount: 3,
+          extensionDependencyCount: 1,
+          implementationDependencyCount: 1,
+          namespaceDependencyCount: 1,
+        });
+        if (authoritativeOperator === null) {
+          throw new Error("missing authoritative extension operator fixture state");
+        }
+
+        baselineFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        );
+        await baselineFactory.close();
+        baselineFactory = undefined;
+
+        mutationStarted = true;
+        await administrator.query({
+          text: `ALTER EXTENSION pg_trgm DROP OPERATOR ${REQUIRED_SIMILARITY_OPERATOR}`,
+        }, { domain: "factory", operation: "detachSimilarityOperatorForReplacement" });
+        await administrator.query({
+          text: `DROP OPERATOR ${REQUIRED_SIMILARITY_OPERATOR}`,
+        }, { domain: "factory", operation: "dropAuthoritativeSimilarityOperator" });
+        await administrator.query({
+          text: `CREATE FUNCTION ${FOREIGN_SIMILARITY_OPERATOR_FUNCTION}
+                 RETURNS pg_catalog.bool
+                 LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+                 AS $$ SELECT true $$`,
+        }, { domain: "factory", operation: "createForeignSimilarityOperatorFunction" });
+        await administrator.query({
+          text: `CREATE OPERATOR public.% (
+                   LEFTARG = pg_catalog.text,
+                   RIGHTARG = pg_catalog.text,
+                   FUNCTION = public.lcm_test_foreign_similarity_operator,
+                   COMMUTATOR = OPERATOR(public.%),
+                   RESTRICT = pg_catalog.matchingsel,
+                   JOIN = pg_catalog.matchingjoinsel
+                 )`,
+        }, { domain: "factory", operation: "createReplacedSimilarityOperator" });
+        await administrator.query({
+          text: `ALTER EXTENSION pg_trgm ADD OPERATOR ${REQUIRED_SIMILARITY_OPERATOR}`,
+        }, { domain: "factory", operation: "reattachReplacedSimilarityOperator" });
+
+        const tamperedOperator = await inspectExtensionOperatorState(
+          administrator,
+          "inspectReplacedSimilarityOperator",
+        );
+        const unchangedFunction = await inspectExtensionFunctionState(
+          administrator,
+          "public.similarity_op(text, text)",
+          "inspectUnchangedSimilarityOperatorFunction",
+        );
+        expect(tamperedOperator).not.toBeNull();
+        const {
+          implementationOid: authoritativeImplementationOid,
+          implementationIdentity: authoritativeImplementationIdentity,
+          ...authoritativeMetadata
+        } = authoritativeOperator.definition;
+        const {
+          implementationOid: tamperedImplementationOid,
+          implementationIdentity: tamperedImplementationIdentity,
+          ...tamperedMetadata
+        } = tamperedOperator!.definition;
+        expect(authoritativeImplementationIdentity).toBe("public.similarity_op(text, text)");
+        expect(tamperedImplementationIdentity).toBe(
+          "public.lcm_test_foreign_similarity_operator(text, text)",
+        );
+        expect(tamperedImplementationOid).not.toBe(authoritativeImplementationOid);
+        expect(tamperedMetadata).toEqual(authoritativeMetadata);
+        expect(unchangedFunction).toEqual(authoritativeFunction);
+
+        tamperedFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        ).catch((error: unknown) => {
+          factoryError = error;
+          return undefined;
+        });
+
+        expect(factoryError).toMatchObject({
+          code: "STORAGE_INITIALIZATION_FAILED",
+          backend: "postgresql",
+          operation: "createFactory",
+        });
+        expect(JSON.stringify(factoryError)).not.toContain(
+          "lcm_test_foreign_similarity_operator",
+        );
+
+        await tamperedFactory?.close();
+        tamperedFactory = undefined;
+        await restoreExtensionOperatorState(administrator, authoritativeOperator);
+        restoredOperator = await inspectExtensionOperatorState(
+          administrator,
+          "inspectRestoredSimilarityOperator",
+        );
+        restoredFunction = await inspectExtensionFunctionState(
+          administrator,
+          "public.similarity_op(text, text)",
+          "inspectRestoredSimilarityOperatorFunction",
+        );
+      } finally {
+        try {
+          await baselineFactory?.close().catch(() => undefined);
+          await tamperedFactory?.close().catch(() => undefined);
+          if (mutationStarted && restoredOperator === undefined && authoritativeOperator !== null) {
+            await restoreExtensionOperatorState(administrator, authoritativeOperator);
+            restoredOperator = await inspectExtensionOperatorState(
+              administrator,
+              "inspectFinallyRestoredSimilarityOperator",
+            );
+            restoredFunction = await inspectExtensionFunctionState(
+              administrator,
+              "public.similarity_op(text, text)",
+              "inspectFinallyRestoredSimilarityOperatorFunction",
+            );
+          }
+        } finally {
+          await administrator.close();
+          rmSync(homeDir, { recursive: true, force: true });
+        }
+      }
+
+      expect(restoredOperator?.definition).toEqual(authoritativeOperator.definition);
+      expect(restoredFunction).toEqual(authoritativeFunction);
+    });
+  });
 
   it("fails construction for wrong CA and wrong host without leaking connection data", async () => {
     await withPostgreSqlTestDatabase("factory-tls", async (database) => {

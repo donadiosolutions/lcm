@@ -519,6 +519,28 @@ interface RequiredExtensionFunctionRow extends QueryResultRow {
   readonly configuration_is_null: unknown;
 }
 
+interface RequiredExtensionOperatorRow extends QueryResultRow {
+  readonly schema_name: unknown;
+  readonly operator_name: unknown;
+  readonly operator_kind: unknown;
+  readonly left_type: unknown;
+  readonly right_type: unknown;
+  readonly result_type: unknown;
+  readonly extension_name: unknown;
+  readonly owner_matches_extension: unknown;
+  readonly implementation_matches: unknown;
+  readonly commutator_matches: unknown;
+  readonly negator_absent: unknown;
+  readonly restriction_matches: unknown;
+  readonly join_matches: unknown;
+  readonly can_merge: unknown;
+  readonly can_hash: unknown;
+  readonly dependency_count: unknown;
+  readonly extension_dependency_count: unknown;
+  readonly implementation_dependency_count: unknown;
+  readonly namespace_dependency_count: unknown;
+}
+
 interface OwnershipRow extends QueryResultRow {
   readonly expected_owner_exists: unknown;
   readonly schema_exists: unknown;
@@ -860,6 +882,144 @@ async function inspectRequiredExtensionFunctions(
   }
   if (observed.size !== expectedByIdentity.size) {
     throw readinessError("extension-preflight", "inspectRequiredExtensionFunctions");
+  }
+}
+
+async function inspectRequiredExtensionOperator(
+  executor: PostgreSqlQueryExecutor,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const result = await executor.query<RequiredExtensionOperatorRow, [string, string, string, string]>({
+    text: `SELECT namespace.nspname::pg_catalog.text AS schema_name,
+                  catalog_operator.oprname::pg_catalog.text AS operator_name,
+                  catalog_operator.oprkind::pg_catalog.text AS operator_kind,
+                  pg_catalog.format_type(
+                    catalog_operator.oprleft,
+                    NULL::pg_catalog.int4
+                  ) AS left_type,
+                  pg_catalog.format_type(
+                    catalog_operator.oprright,
+                    NULL::pg_catalog.int4
+                  ) AS right_type,
+                  pg_catalog.format_type(
+                    catalog_operator.oprresult,
+                    NULL::pg_catalog.int4
+                  ) AS result_type,
+                  extension.extname::pg_catalog.text AS extension_name,
+                  catalog_operator.oprowner OPERATOR(pg_catalog.=) extension.extowner
+                    AS owner_matches_extension,
+                  catalog_operator.oprcode OPERATOR(pg_catalog.=)
+                    pg_catalog.to_regprocedure($1) AS implementation_matches,
+                  catalog_operator.oprcom OPERATOR(pg_catalog.=) catalog_operator.oid
+                    AS commutator_matches,
+                  catalog_operator.oprnegate OPERATOR(pg_catalog.=) 0::pg_catalog.oid
+                    AS negator_absent,
+                  catalog_operator.oprrest OPERATOR(pg_catalog.=)
+                    pg_catalog.to_regprocedure($2) AS restriction_matches,
+                  catalog_operator.oprjoin OPERATOR(pg_catalog.=)
+                    pg_catalog.to_regprocedure($3) AS join_matches,
+                  catalog_operator.oprcanmerge AS can_merge,
+                  catalog_operator.oprcanhash AS can_hash,
+                  (
+                    SELECT pg_catalog.count(*)::pg_catalog.int4
+                    FROM pg_catalog.pg_depend AS dependency
+                    WHERE dependency.classid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_operator')
+                      AND dependency.objid OPERATOR(pg_catalog.=) catalog_operator.oid
+                  ) AS dependency_count,
+                  (
+                    SELECT pg_catalog.count(*)::pg_catalog.int4
+                    FROM pg_catalog.pg_depend AS dependency
+                    JOIN pg_catalog.pg_extension AS required_extension
+                      ON required_extension.oid OPERATOR(pg_catalog.=) dependency.refobjid
+                    WHERE dependency.classid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_operator')
+                      AND dependency.objid OPERATOR(pg_catalog.=) catalog_operator.oid
+                      AND dependency.objsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.refclassid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_extension')
+                      AND dependency.refobjsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.deptype OPERATOR(pg_catalog.=) 'e'
+                      AND required_extension.extname OPERATOR(pg_catalog.=) $4
+                  ) AS extension_dependency_count,
+                  (
+                    SELECT pg_catalog.count(*)::pg_catalog.int4
+                    FROM pg_catalog.pg_depend AS dependency
+                    WHERE dependency.classid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_operator')
+                      AND dependency.objid OPERATOR(pg_catalog.=) catalog_operator.oid
+                      AND dependency.objsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.refclassid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_proc')
+                      AND dependency.refobjid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regprocedure($1)
+                      AND dependency.refobjsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.deptype OPERATOR(pg_catalog.=) 'n'
+                  ) AS implementation_dependency_count,
+                  (
+                    SELECT pg_catalog.count(*)::pg_catalog.int4
+                    FROM pg_catalog.pg_depend AS dependency
+                    WHERE dependency.classid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_operator')
+                      AND dependency.objid OPERATOR(pg_catalog.=) catalog_operator.oid
+                      AND dependency.objsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.refclassid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_namespace')
+                      AND dependency.refobjid OPERATOR(pg_catalog.=) namespace.oid
+                      AND dependency.refobjsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.deptype OPERATOR(pg_catalog.=) 'n'
+                  ) AS namespace_dependency_count
+           FROM pg_catalog.pg_operator AS catalog_operator
+           JOIN pg_catalog.pg_namespace AS namespace
+             ON namespace.oid OPERATOR(pg_catalog.=) catalog_operator.oprnamespace
+           LEFT JOIN pg_catalog.pg_depend AS extension_dependency
+             ON extension_dependency.classid OPERATOR(pg_catalog.=)
+                  pg_catalog.to_regclass('pg_catalog.pg_operator')
+            AND extension_dependency.objid OPERATOR(pg_catalog.=) catalog_operator.oid
+            AND extension_dependency.objsubid OPERATOR(pg_catalog.=) 0
+            AND extension_dependency.refclassid OPERATOR(pg_catalog.=)
+                  pg_catalog.to_regclass('pg_catalog.pg_extension')
+            AND extension_dependency.refobjsubid OPERATOR(pg_catalog.=) 0
+            AND extension_dependency.deptype OPERATOR(pg_catalog.=) 'e'
+           LEFT JOIN pg_catalog.pg_extension AS extension
+             ON extension.oid OPERATOR(pg_catalog.=) extension_dependency.refobjid
+           WHERE namespace.nspname OPERATOR(pg_catalog.=) 'public'
+             AND catalog_operator.oprname OPERATOR(pg_catalog.=) '%'
+             AND catalog_operator.oprleft OPERATOR(pg_catalog.=)
+                  'pg_catalog.text'::pg_catalog.regtype
+             AND catalog_operator.oprright OPERATOR(pg_catalog.=)
+                  'pg_catalog.text'::pg_catalog.regtype`,
+    values: [
+      "public.similarity_op(text,text)",
+      "pg_catalog.matchingsel(internal,oid,internal,integer)",
+      "pg_catalog.matchingjoinsel(internal,oid,internal,smallint,internal)",
+      "pg_trgm",
+    ],
+  }, readinessOptions("inspectRequiredExtensionOperator", signal));
+  const row = result.rows[0];
+  if (
+    result.rows.length !== 1
+    || row?.schema_name !== "public"
+    || row.operator_name !== "%"
+    || row.operator_kind !== "b"
+    || row.left_type !== "text"
+    || row.right_type !== "text"
+    || row.result_type !== "boolean"
+    || row.extension_name !== "pg_trgm"
+    || row.owner_matches_extension !== true
+    || row.implementation_matches !== true
+    || row.commutator_matches !== true
+    || row.negator_absent !== true
+    || row.restriction_matches !== true
+    || row.join_matches !== true
+    || row.can_merge !== false
+    || row.can_hash !== false
+    || row.dependency_count !== 3
+    || row.extension_dependency_count !== 1
+    || row.implementation_dependency_count !== 1
+    || row.namespace_dependency_count !== 1
+  ) {
+    throw readinessError("extension-preflight", "inspectRequiredExtensionOperator");
   }
 }
 
@@ -2360,6 +2520,7 @@ export async function verifyPostgreSqlRuntimeSchema(
       signal,
     });
     await inspectRequiredExtensionFunctions(executor, signal);
+    await inspectRequiredExtensionOperator(executor, signal);
     await assertPostgreSqlSearchConfigurationReady(executor, {
       operation: "runtimeReadinessSearchConfiguration",
       signal,
