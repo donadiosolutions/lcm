@@ -276,6 +276,7 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
         superuser: false,
         create_role: false,
         create_database: false,
+        database_create_privilege: false,
         replication: false,
         bypass_rls: false,
         membership_count: 0,
@@ -748,6 +749,44 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
   });
 
   it.each([
+    ["malformed", "false"],
+    ["granted", true],
+  ] as const)(
+    "rejects %s database CREATE privilege evidence before domain work",
+    async (_label, databaseCreatePrivilege) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRuntimeRolePolicy: mutateFirstField(
+            "database_create_privilege",
+            databaseCreatePrivilege,
+          ),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "runtime-role-policy");
+      expect(failure.operation).toBe("inspectRuntimeRolePolicy");
+      expect(fake.queries.map(({ options }) => options.operation)).toEqual([
+        "inspectServerReadiness",
+        "inspectRuntimeRolePolicy",
+      ]);
+    },
+  );
+
+  it("accepts exact false database CREATE privilege evidence", async () => {
+    const fake = readyExecutor();
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+
+    const rolePolicyQuery = fake.queries.find(({ options }) => (
+      options.operation === "inspectRuntimeRolePolicy"
+    ));
+    const text = (rolePolicyQuery?.config as { readonly text?: string } | undefined)?.text ?? "";
+    expect(text).toContain("pg_catalog.has_database_privilege");
+    expect(text).toContain("pg_catalog.current_database()");
+  });
+
+  it.each([
     ["runtime role owns the current database", mutateRows((rows) => {
       rows[0]!.database_owner_oid = "200";
       rows[0]!.database_owner_match = false;
@@ -931,6 +970,10 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     expect(constraintInventory).toContain("ANY ($3::pg_catalog.text[])");
     expect(constraintInventory).toContain("OR (");
     expect(constraintInventory).not.toContain("ANY ($2::pg_catalog.text[])");
+    const indexInventory = section("WITH actual_indexes AS", "actual_triggers AS");
+    expect(indexInventory).toContain("index_metadata.indisready");
+    expect(indexInventory).toContain("index_metadata.indislive");
+    expect(indexInventory).not.toContain("index_metadata.indisvalid");
     const notNullInventory = section(
       "not_null_constraint_entries AS",
       "actual_identity_sequences AS",
@@ -1282,7 +1325,10 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       const text = typeof config === "object" && config !== null && "text" in config
         ? String((config as { text?: unknown }).text)
         : "";
-      expect(text).not.toMatch(/\b(?:CREATE|ALTER|DROP|GRANT|REVOKE|INSERT|UPDATE|DELETE|TRUNCATE)\b/iu);
+      const sqlWithoutStringLiterals = text.replace(/'(?:''|[^'])*'/gu, "''");
+      expect(sqlWithoutStringLiterals).not.toMatch(
+        /\b(?:CREATE|ALTER|DROP|GRANT|REVOKE|INSERT|UPDATE|DELETE|TRUNCATE)\b/iu,
+      );
       expect(text).not.toContain("pg_advisory");
       expect(text).not.toContain("schema_migrations (id");
     }

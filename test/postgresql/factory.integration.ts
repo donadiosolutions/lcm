@@ -137,6 +137,29 @@ async function applyAllRuntimeGrants(
   }
 }
 
+async function readRuntimeDatabaseCreatePrivilege(
+  database: PostgreSqlTestDatabase,
+  operation: string,
+): Promise<boolean> {
+  const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }));
+  try {
+    const result = await runtime.query<{ can_create: boolean }>({
+      text: `SELECT pg_catalog.has_database_privilege(
+                      CURRENT_USER,
+                      pg_catalog.current_database(),
+                      'CREATE'
+                    ) AS can_create`,
+    }, { domain: "factory", operation });
+    const value = result.rows.length === 1 ? result.rows[0]?.can_create : undefined;
+    if (typeof value !== "boolean") {
+      throw new Error("invalid runtime database CREATE privilege fixture state");
+    }
+    return value;
+  } finally {
+    await runtime.close();
+  }
+}
+
 interface ExtensionFunctionState {
   readonly oid: string;
   readonly definition: string;
@@ -883,6 +906,94 @@ describe("PostgreSQL 18 project storage factory", () => {
         });
       } finally {
         rmSync(homeDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("rejects database CREATE granted to the runtime role and accepts after revoke", async () => {
+    await withPostgreSqlTestDatabase("factory-database-create", async (database) => {
+      await applyAllRuntimeGrants(database);
+      const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-database-create-"));
+      const administrator = new PostgreSqlRuntime(settings(database.adminUrl, { poolMax: 1 }));
+      let canonicalFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let grantedFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let restoredFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let factoryError: unknown;
+      try {
+        await expect(readRuntimeDatabaseCreatePrivilege(
+          database,
+          "readCanonicalRuntimeDatabaseCreatePrivilege",
+        )).resolves.toBe(false);
+        canonicalFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        );
+        await canonicalFactory.close();
+        canonicalFactory = undefined;
+
+        await administrator.query({
+          text: `GRANT CREATE ON DATABASE "${database.name}" TO lcm_test_runtime`,
+        }, { domain: "factory", operation: "grantRuntimeDatabaseCreate" });
+        await expect(readRuntimeDatabaseCreatePrivilege(
+          database,
+          "readGrantedRuntimeDatabaseCreatePrivilege",
+        )).resolves.toBe(true);
+
+        grantedFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        ).catch((error: unknown) => {
+          factoryError = error;
+          return undefined;
+        });
+        if (grantedFactory !== undefined) {
+          await grantedFactory.close();
+          grantedFactory = undefined;
+        }
+        expect(factoryError).toMatchObject({
+          code: "STORAGE_INITIALIZATION_FAILED",
+          backend: "postgresql",
+          operation: "createFactory",
+        });
+        expect(JSON.stringify(factoryError)).not.toContain(database.name);
+
+        await administrator.query({
+          text: `REVOKE CREATE ON DATABASE "${database.name}" FROM lcm_test_runtime`,
+        }, { domain: "factory", operation: "revokeRuntimeDatabaseCreate" });
+        await expect(readRuntimeDatabaseCreatePrivilege(
+          database,
+          "readRestoredRuntimeDatabaseCreatePrivilege",
+        )).resolves.toBe(false);
+        restoredFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        );
+        await restoredFactory.close();
+        restoredFactory = undefined;
+      } finally {
+        try {
+          await Promise.allSettled([
+            ...(canonicalFactory === undefined ? [] : [canonicalFactory.close()]),
+            ...(grantedFactory === undefined ? [] : [grantedFactory.close()]),
+            ...(restoredFactory === undefined ? [] : [restoredFactory.close()]),
+          ]);
+          await administrator.query({
+            text: `REVOKE CREATE ON DATABASE "${database.name}" FROM lcm_test_runtime`,
+          }, { domain: "factory", operation: "restoreRuntimeDatabaseCreatePrivilege" });
+          await expect(readRuntimeDatabaseCreatePrivilege(
+            database,
+            "verifyRestoredRuntimeDatabaseCreatePrivilege",
+          )).resolves.toBe(false);
+        } finally {
+          await administrator.close();
+          rmSync(homeDir, { recursive: true, force: true });
+        }
       }
     });
   });

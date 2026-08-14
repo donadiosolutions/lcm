@@ -111,6 +111,44 @@ async function readCurrentDatabaseOwner(administrator: PostgreSqlRuntime): Promi
   return owner;
 }
 
+interface IndexWriteState {
+  readonly indisvalid: boolean;
+  readonly indisready: boolean;
+  readonly indislive: boolean;
+}
+
+async function waitForInvalidReadyLiveIndex(
+  observer: PostgreSqlRuntime,
+  indexName: string,
+): Promise<IndexWriteState> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const state = await observer.query<IndexWriteState>({
+      text: `SELECT index_metadata.indisvalid,
+                    index_metadata.indisready,
+                    index_metadata.indislive
+             FROM pg_catalog.pg_index AS index_metadata
+             JOIN pg_catalog.pg_class AS index_relation
+               ON index_relation.oid OPERATOR(pg_catalog.=) index_metadata.indexrelid
+             JOIN pg_catalog.pg_namespace AS namespace
+               ON namespace.oid OPERATOR(pg_catalog.=) index_relation.relnamespace
+             WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+               AND index_relation.relname OPERATOR(pg_catalog.=) $1`,
+      values: [indexName],
+    }, { domain: "factory", operation: "waitForInvalidReadyLiveIndex" });
+    const row = state.rows[0];
+    if (
+      state.rows.length === 1
+      && row?.indisvalid === false
+      && row.indisready === true
+      && row.indislive === true
+    ) {
+      return row;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timed out waiting for invalid ready live PostgreSQL index");
+}
+
 async function waitForSummaryMigrationRelationLock(
   admin: PostgreSqlRuntime,
 ): Promise<void> {
@@ -893,6 +931,140 @@ describe("PostgreSQL migrations and database isolation", () => {
           await database.migrator.query({
             text: `DROP INDEX IF EXISTS lcm.unexpected_schema_fingerprint_index`,
           }, { domain: "factory", operation: "removeUnexpectedManagedIndex" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects invalid ready live unique indexes that still enforce managed writes", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-invalid-ready-live-index",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+        const blocker = new Client(
+          POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(
+            settings(database.migratorUrl),
+          ),
+        );
+        const creator = new Client(
+          POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(
+            settings(database.migratorUrl),
+          ),
+        );
+        const indexName = "unexpected_invalid_ready_live_index";
+        let creatorPid: number | undefined;
+        let creation: Promise<unknown> | undefined;
+        try {
+          await blocker.connect();
+          await creator.connect();
+          await blocker.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+          await blocker.query("SELECT pg_catalog.count(*) FROM lcm.schema_migrations");
+          creatorPid = (await creator.query<{ pid: number }>(
+            "SELECT pg_catalog.pg_backend_pid() AS pid",
+          )).rows[0]?.pid;
+          if (!Number.isSafeInteger(creatorPid)) {
+            throw new Error("invalid concurrent-index creator backend PID");
+          }
+
+          creation = creator.query(
+            `CREATE UNIQUE INDEX CONCURRENTLY ${indexName}
+             ON lcm.schema_migrations (pg_catalog.lower(checksum_sha256))`,
+          ).then(() => {
+            throw new Error("concurrent index creation unexpectedly completed");
+          }).catch((error: unknown) => error);
+
+          await expect(waitForInvalidReadyLiveIndex(database.migrator, indexName))
+            .resolves.toEqual({
+              indisvalid: false,
+              indisready: true,
+              indislive: true,
+            });
+          await administrator.query({
+            text: "SELECT pg_catalog.pg_cancel_backend($1) AS cancelled",
+            values: [creatorPid],
+          }, { domain: "factory", operation: "cancelInvalidReadyLiveIndexCreation" });
+          await blocker.query("ROLLBACK");
+          await expect(creation).resolves.toMatchObject({ code: "57014" });
+          creation = undefined;
+
+          const migrations = await database.migrator.query<{
+            id: string;
+            checksum_sha256: string;
+          }>({
+            text: `SELECT id, checksum_sha256
+                   FROM lcm.schema_migrations
+                   ORDER BY id
+                   LIMIT 2`,
+          }, { domain: "factory", operation: "readLedgerRowsForInvalidIndexWrite" });
+          const target = migrations.rows[0];
+          const duplicate = migrations.rows[1];
+          if (target === undefined || duplicate === undefined) {
+            throw new Error("missing migration rows for invalid-index write proof");
+          }
+          const writeFailure = await database.migrator.query({
+            text: `UPDATE lcm.schema_migrations
+                   SET checksum_sha256 = $2
+                   WHERE id OPERATOR(pg_catalog.=) $1`,
+            values: [target.id, duplicate.checksum_sha256],
+          }, { domain: "factory", operation: "proveInvalidIndexStillEnforcesWrites" })
+            .catch((error: unknown) => error);
+          expect(writeFailure).toMatchObject({
+            operation: "proveInvalidIndexStillEnforcesWrites",
+            sqlState: "23505",
+          });
+          await expect(database.migrator.query<{ checksum_sha256: string }>({
+            text: `SELECT checksum_sha256
+                   FROM lcm.schema_migrations
+                   WHERE id OPERATOR(pg_catalog.=) $1`,
+            values: [target.id],
+          }, { domain: "factory", operation: "verifyInvalidIndexRejectedWrite" }))
+            .resolves.toMatchObject({
+              rows: [{ checksum_sha256: target.checksum_sha256 }],
+            });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          if (creatorPid !== undefined) {
+            await administrator.query({
+              text: "SELECT pg_catalog.pg_cancel_backend($1) AS cancelled",
+              values: [creatorPid],
+            }, { domain: "factory", operation: "cancelInvalidIndexCreationDuringCleanup" })
+              .catch(() => undefined);
+          }
+          await blocker.query("ROLLBACK").catch(() => undefined);
+          await creation?.catch(() => undefined);
+          await creator.end().catch(() => undefined);
+          await blocker.end().catch(() => undefined);
+          try {
+            await database.migrator.query({
+              text: `DROP INDEX IF EXISTS lcm.${indexName}`,
+            }, { domain: "factory", operation: "removeInvalidReadyLiveIndex" });
+            await expect(database.migrator.query<{ index_oid: string | null }>({
+              text: "SELECT pg_catalog.to_regclass($1)::pg_catalog.text AS index_oid",
+              values: [`lcm.${indexName}`],
+            }, { domain: "factory", operation: "verifyInvalidReadyLiveIndexRemoved" }))
+              .resolves.toMatchObject({ rows: [{ index_oid: null }] });
+          } finally {
+            await administrator.close();
+          }
         }
       },
       { runMigrations: false },

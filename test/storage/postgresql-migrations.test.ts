@@ -1467,6 +1467,10 @@ describe("PostgreSQL migration runner", () => {
       const end = inventorySql.indexOf(nextName, start + name.length);
       return inventorySql.slice(start, end < 0 ? undefined : end);
     };
+    const indexInventory = inventorySection("WITH actual_indexes AS", "actual_triggers AS");
+    expect(indexInventory).toContain("index_metadata.indisready");
+    expect(indexInventory).toContain("index_metadata.indislive");
+    expect(indexInventory).not.toContain("index_metadata.indisvalid");
     const constraintInventory = inventorySection(
       "constraint_trigger_entries AS",
       "not_null_constraint_entries AS",

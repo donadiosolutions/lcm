@@ -1471,7 +1471,6 @@ export async function runPostgreSqlMigrations(
                      ARRAY['r', 'p']::pg_catalog."char"[]
                    )
                    AND index_relation.relkind OPERATOR(pg_catalog.=) 'i'
-                   AND index_metadata.indisvalid
                    AND index_metadata.indisready
                    AND index_metadata.indislive
                    AND relation.relname OPERATOR(pg_catalog.=)

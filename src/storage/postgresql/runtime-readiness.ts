@@ -480,6 +480,7 @@ interface RolePolicyRow extends QueryResultRow {
   readonly superuser: unknown;
   readonly create_role: unknown;
   readonly create_database: unknown;
+  readonly database_create_privilege: unknown;
   readonly replication: unknown;
   readonly bypass_rls: unknown;
   readonly membership_count: unknown;
@@ -704,6 +705,11 @@ async function inspectRolePolicy(
                   runtime_role.rolsuper AS superuser,
                   runtime_role.rolcreaterole AS create_role,
                   runtime_role.rolcreatedb AS create_database,
+                  pg_catalog.has_database_privilege(
+                    runtime_role.oid,
+                    pg_catalog.current_database(),
+                    'CREATE'
+                  ) AS database_create_privilege,
                   runtime_role.rolreplication AS replication,
                   runtime_role.rolbypassrls AS bypass_rls,
                   (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM memberships)
@@ -739,6 +745,7 @@ async function inspectRolePolicy(
     || row.superuser !== false
     || row.create_role !== false
     || row.create_database !== false
+    || row.database_create_privilege !== false
     || row.replication !== false
     || row.bypass_rls !== false
     || row.membership_count !== 0
@@ -1617,7 +1624,6 @@ function definitionQuery(
                  ARRAY['r', 'p']::pg_catalog."char"[]
                )
                AND index_relation.relkind OPERATOR(pg_catalog.=) 'i'
-               AND index_metadata.indisvalid
                AND index_metadata.indisready
                AND index_metadata.indislive
                AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
