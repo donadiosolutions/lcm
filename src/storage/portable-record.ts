@@ -1052,7 +1052,18 @@ export type PortableStreamErrorCode =
   | "record-unrepresentable"
   | "duplicate-identity"
   | "order-regression"
-  | "dependency-order";
+  | "dependency-order"
+  | "malformed-manifest"
+  | "incompatible-schema"
+  | "invalid-limit"
+  | "batch-limit-exceeded"
+  | "checkpoint-mismatch"
+  | "partial-batch"
+  | "source-changed"
+  | "source-invalid"
+  | "source-unavailable"
+  | "aborted"
+  | "closed";
 
 const PORTABLE_STREAM_ERROR_CODES: readonly PortableStreamErrorCode[] = Object.freeze([
   "unsupported-version",
@@ -1062,6 +1073,17 @@ const PORTABLE_STREAM_ERROR_CODES: readonly PortableStreamErrorCode[] = Object.f
   "duplicate-identity",
   "order-regression",
   "dependency-order",
+  "malformed-manifest",
+  "incompatible-schema",
+  "invalid-limit",
+  "batch-limit-exceeded",
+  "checkpoint-mismatch",
+  "partial-batch",
+  "source-changed",
+  "source-invalid",
+  "source-unavailable",
+  "aborted",
+  "closed",
 ]);
 
 export class PortableStreamError extends Error {
