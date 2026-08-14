@@ -674,10 +674,28 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       const end = text.indexOf(nextName, start + name.length);
       return text.slice(start, end < 0 ? undefined : end);
     };
-    expect(section("actual_constraints AS", "actual_generated_columns AS"))
-      .toContain("relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])");
-    expect(section("actual_constraints AS", "actual_generated_columns AS"))
-      .not.toContain("ANY ($2::pg_catalog.text[])");
+    const constraintInventory = section(
+      "constraint_trigger_entries AS",
+      "not_null_constraint_entries AS",
+    );
+    expect(constraintInventory).toContain("^RI_ConstraintTrigger_[ac]_[0-9]+$");
+    expect(constraintInventory).toContain("constraint_metadata.conrelid");
+    expect(constraintInventory).toContain("constraint_metadata.confrelid");
+    expect(constraintInventory).toContain(
+      "referenced_relation.relname OPERATOR(pg_catalog.=)",
+    );
+    expect(constraintInventory).toContain("ANY ($3::pg_catalog.text[])");
+    expect(constraintInventory).toContain("OR (");
+    expect(constraintInventory).not.toContain("ANY ($2::pg_catalog.text[])");
+    const notNullInventory = section(
+      "not_null_constraint_entries AS",
+      "actual_identity_sequences AS",
+    );
+    expect(notNullInventory).toContain(
+      "constraint_metadata.contype OPERATOR(pg_catalog.=) 'n'",
+    );
+    expect(notNullInventory).toContain("not_null_constraint_count");
+    expect(notNullInventory).toContain("not_null_constraints");
     expect(section("actual_generated_columns AS", "actual_ordinary_columns AS"))
       .toContain("relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])");
     expect(section("actual_ordinary_columns AS", "actual_identity_sequences AS"))

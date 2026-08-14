@@ -505,13 +505,13 @@ describe("PostgreSQL migration runner", () => {
       definitionGroupHashes: [
         "58160b3542785f534c03d428d67cc5b1855280946458337b599a544588ced733",
         "ab34552f4ae69dbd972264066f812027f0bdb0d4494f39a909d5c3c1e141484e",
-        "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
-        "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
+        "eb9fdb72171517ac5b9d6162ae3495b8cb94d1d6300a0296aeb1f42c906d12b3",
+        "8d9c9ede1e990727ce8612ea7212fe7fe91f53d8dc3fa24f2de378cbbf4f4921",
         "e2581c7c70cbec57d64bb02ac1520fe27336efb326618b36add668cb1431e98c",
         "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
         "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
         "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
-        "e0daf9a1d97b62f6baf491c35d3b45d5082336538e44da8651afaa1180e11e8a",
+        "f0abf51e9ee2b2ddcbd00ef21b672b8bc0361054c591564d76ad5d0f2928b190",
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       ],
       definitionObjectCount: 782,
@@ -535,22 +535,22 @@ describe("PostgreSQL migration runner", () => {
       {
         migrationId: "0002_schema_baseline",
         constraintSha256:
-          "8bb79c117c498a89c920826ff65b88ad615f871ba3e8607e4b00d1d115d9aa1a",
+          "bcdeb5e8cf1fad3f0c2fd9536c2c51ebe47924b2bb4273ecc0d2f4c216217984",
       },
       {
         migrationId: "0003_machine_identity_key",
         constraintSha256:
-          "4698227bc02a8d777955eb41286a4964dda8da82d1561c9a154b67e2a034906f",
+          "cff2807b3ad6f4465cc953bc79a562716bd1f54eaee2c0eb605f8fbff6ffc137",
       },
       {
         migrationId: "0004_machine_display_name",
         constraintSha256:
-          "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
+          "eb9fdb72171517ac5b9d6162ae3495b8cb94d1d6300a0296aeb1f42c906d12b3",
       },
       {
         migrationId: "0005_summary_context_integrity",
         constraintSha256:
-          "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
+          "eb9fdb72171517ac5b9d6162ae3495b8cb94d1d6300a0296aeb1f42c906d12b3",
       },
     ]);
   });
@@ -1397,7 +1397,7 @@ describe("PostgreSQL migration runner", () => {
       missingObjectCount,
       operation: "preflightBaselineDefinitions",
       remediation:
-        "Restore every missing or changed LCM baseline table, relation ACL, column ACL, index, trigger, rewrite rule, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.",
+        "Remove unregistered foreign keys targeting LCM tables, restore every missing or changed LCM baseline table, relation ACL, column ACL, index, trigger, rewrite rule, constraint (including validated NOT NULL state), identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.",
     });
     const serializedFailure =
       (failure as PostgreSqlBaselineDefinitionPreflightError).toJSON();
@@ -1446,11 +1446,48 @@ describe("PostgreSQL migration runner", () => {
       "pg_catalog.pg_inherits",
       "trigger.tgenabled",
       "trigger.tgconstraint",
+      "trigger.tgconstrrelid",
+      "trigger.tgisinternal",
+      "trigger.tgparentid",
+      "constraint_metadata.confrelid",
+      "constraint_metadata.convalidated",
+      "constraint_metadata.conenforced",
+      "constraint_metadata.connoinherit",
+      "constraint_metadata.conislocal",
+      "constraint_metadata.coninhcount",
+      "constraint_metadata.conparentid",
+      "not_null_constraint_states",
       "rewrite.ev_type",
       "rewrite.is_instead",
       "rewrite.ev_enabled",
       "object_name",
     ]) expect(inventorySql).toContain(catalog);
+    const inventorySection = (name: string, nextName: string): string => {
+      const start = inventorySql.indexOf(name);
+      const end = inventorySql.indexOf(nextName, start + name.length);
+      return inventorySql.slice(start, end < 0 ? undefined : end);
+    };
+    const constraintInventory = inventorySection(
+      "constraint_trigger_entries AS",
+      "not_null_constraint_entries AS",
+    );
+    expect(constraintInventory).toContain("^RI_ConstraintTrigger_[ac]_[0-9]+$");
+    expect(constraintInventory).toContain("constraint_metadata.conrelid");
+    expect(constraintInventory).toContain("constraint_metadata.confrelid");
+    expect(constraintInventory).toContain(
+      "referenced_relation.relname OPERATOR(pg_catalog.=)",
+    );
+    expect(constraintInventory).toContain("ANY ($3::pg_catalog.text[])");
+    expect(constraintInventory).toContain("OR (");
+    const notNullInventory = inventorySection(
+      "not_null_constraint_entries AS",
+      "actual_identity_sequences AS",
+    );
+    expect(notNullInventory).toContain(
+      "constraint_metadata.contype OPERATOR(pg_catalog.=) 'n'",
+    );
+    expect(notNullInventory).toContain("not_null_constraint_count");
+    expect(notNullInventory).toContain("not_null_constraints");
     expect((inventoryCall?.[0] as { values?: unknown[] } | undefined)?.values)
       .toEqual([
         true,

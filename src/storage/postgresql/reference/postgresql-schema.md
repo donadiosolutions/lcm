@@ -123,16 +123,24 @@ does not add row-level security.
   enablement mode and require
   always-enabled mode (`A`), so the identity checks cannot be bypassed by
   `session_replication_role = replica`; disabled, ordinary, or replica-only
-  drift fails readiness. Constraint fingerprints bind the constraint name
-  to its owning table, type, fully qualified definition, and stable
-  enablement-state multiset of their zero or more internal enforcement
-  triggers. Generated-column fingerprints bind the exact table, column,
+  drift fails readiness. Constraint fingerprints bind every supported
+  constraint owned by a managed table and every foreign key targeting one.
+  They include the owning and referenced schema/relation identities, type,
+  canonical definition, validation, enforcement, locality, and inheritance
+  state. Their sorted enforcement-trigger inventory spans both sides of a
+  foreign key and binds each trigger's table, OID-independent canonical name
+  and definition, enablement, internal, deferrability, deferred, and parentage
+  metadata. Generated-column fingerprints bind the exact table, column,
   formatted type, nullability, `attgenerated` state, PostgreSQL-deparsed
   expression, and resolved
-  namespace-qualified collation. Ordinary-column
-  fingerprints bind the exact table and column to its formatted type,
-  nullability, deparsed default, identity state, and resolved
-  namespace-qualified collation. Table fingerprints require ordinary permanent
+  namespace-qualified collation. Ordinary-column fingerprints bind the exact
+  table and column to its formatted type, nullability, deparsed default,
+  identity state, and resolved namespace-qualified collation. Both column
+  fingerprints also bind a deterministic count and sorted canonical inventory
+  of every associated PostgreSQL 18 `NOT NULL` constraint, including its
+  validation, enforcement, locality, and inheritance state. Zero and multiple
+  associated constraints therefore have distinct authority without adding
+  separate objects to the definition total. Table fingerprints require ordinary permanent
   persistence with row-level security disabled and not forced, so `UNLOGGED`,
   temporary, `ENABLE ROW LEVEL SECURITY`, or `FORCE ROW LEVEL SECURITY` drift
   fails closed. The same fingerprint rejects any inheritance or partition
@@ -164,10 +172,24 @@ does not add row-level security.
   Additional operator-created objects remain outside the allowlist and are
   ignored except that any valid, ready, and live index, non-internal trigger,
   supported constraint, generated column, or ordinary column attached to a
-  managed table, or any non-view rewrite rule attached to one, is part of that
-  table's complete definition inventory and fails closed when added or changed.
-  `NOT NULL` constraints are represented by the ordinary-column fingerprint,
-  rather than double-counted as PostgreSQL 18 `pg_constraint` rows.
+  managed table, any foreign key targeting one from another schema or relation,
+  or any non-view rewrite rule attached to one, is part of the complete
+  definition inventory and fails closed when added or changed. `NOT NULL`
+  constraints are represented by the owning column fingerprint, rather than
+  double-counted as PostgreSQL 18 `pg_constraint` rows; an unvalidated or
+  otherwise non-authoritative constraint is rejected even when `attnotnull`
+  remains true.
+  The remaining identity-sequence, relation/column ACL, and table scopes are
+  intentionally retained. Repository SQL addresses only the pinned managed
+  tables; an extra table cannot redirect those writes alone. A new attached
+  identity sequence requires a new or changed managed ordinary column, which
+  the complete column inventory rejects, while an unattached sequence cannot
+  affect managed writes. ACL sanctions cover every pinned managed relation and
+  column after the complete column inventory rejects additions, so privileges
+  on outside objects cannot change repository writes alone. Non-internal
+  triggers remain a complete direct inventory; internal constraint triggers are
+  deliberately excluded from it and are instead bound, on both sides of a
+  foreign key, into the complete constraint fingerprint.
 - The `0005` snapshot carries the complete `0004` inventory forward and adds
   one always-enabled summary-parent trigger definition plus the exact
   `lcm.enforce_summary_parent_dag_integrity()` managed function. It therefore

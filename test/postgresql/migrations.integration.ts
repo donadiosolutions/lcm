@@ -502,6 +502,68 @@ describe("PostgreSQL migrations and database isolation", () => {
     );
   });
 
+  it("rejects inbound foreign keys targeting managed tables", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-inbound-foreign-key",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `CREATE TABLE public.operator_reference (
+                     project_id uuid NOT NULL,
+                     CONSTRAINT operator_reference_project_fk
+                       FOREIGN KEY (project_id)
+                       REFERENCES lcm.projects(project_id)
+                       ON DELETE CASCADE
+                   )`,
+          }, { domain: "factory", operation: "injectInboundManagedForeignKey" });
+          const project = await database.migrator.query<{ project_id: string }>({
+            text: `INSERT INTO lcm.projects (identity_key, display_name)
+                   VALUES (pg_catalog.repeat('b', 64), 'Inbound FK probe')
+                   RETURNING project_id::pg_catalog.text`,
+          }, { domain: "factory", operation: "seedInboundManagedForeignKeyProject" });
+          await database.migrator.query({
+            text: `INSERT INTO public.operator_reference (project_id)
+                   VALUES ($1::pg_catalog.uuid)`,
+            values: [project.rows[0]!.project_id],
+          }, { domain: "factory", operation: "seedInboundManagedForeignKeyReference" });
+          await database.migrator.query({
+            text: "DELETE FROM lcm.projects WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid",
+            values: [project.rows[0]!.project_id],
+          }, { domain: "factory", operation: "exerciseInboundManagedForeignKeyCascade" });
+          const cascade = await database.migrator.query<{ reference_count: string }>({
+            text: `SELECT pg_catalog.count(*)::pg_catalog.text AS reference_count
+                   FROM public.operator_reference`,
+          }, { domain: "factory", operation: "readInboundManagedForeignKeyCascade" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ cascade, readinessFailure, migrationFailure }).toMatchObject({
+            cascade: { rows: [{ reference_count: "0" }] },
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: "DROP TABLE IF EXISTS public.operator_reference",
+          }, { domain: "factory", operation: "removeInboundManagedForeignKey" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
   it("rejects unexpected ordinary columns with write-affecting semantics", async () => {
     await withPostgreSqlTestDatabase(
       "readiness-unexpected-ordinary-column",
@@ -534,6 +596,111 @@ describe("PostgreSQL migrations and database isolation", () => {
           await database.migrator.query({
             text: "ALTER TABLE lcm.session_ingest_log DROP COLUMN IF EXISTS unexpected_write_guard",
           }, { domain: "factory", operation: "removeUnexpectedManagedOrdinaryColumn" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects unvalidated NOT NULL constraints with existing null rows", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unvalidated-not-null",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `DO $lcm$
+                   DECLARE
+                     baseline_constraint name;
+                   BEGIN
+                     SELECT constraint_metadata.conname
+                     INTO STRICT baseline_constraint
+                     FROM pg_catalog.pg_constraint AS constraint_metadata
+                     JOIN pg_catalog.pg_class AS relation
+                       ON relation.oid OPERATOR(pg_catalog.=) constraint_metadata.conrelid
+                     JOIN pg_catalog.pg_namespace AS namespace
+                       ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                     JOIN pg_catalog.pg_attribute AS attribute
+                       ON attribute.attrelid OPERATOR(pg_catalog.=) relation.oid
+                      AND constraint_metadata.conkey OPERATOR(pg_catalog.=)
+                        ARRAY[attribute.attnum]::pg_catalog.int2[]
+                     WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                       AND relation.relname OPERATOR(pg_catalog.=) 'projects'
+                       AND attribute.attname OPERATOR(pg_catalog.=) 'display_name'
+                       AND constraint_metadata.contype OPERATOR(pg_catalog.=) 'n';
+
+                     EXECUTE pg_catalog.format(
+                       'ALTER TABLE lcm.projects DROP CONSTRAINT %I',
+                       baseline_constraint
+                     );
+                     INSERT INTO lcm.projects (identity_key, display_name)
+                     VALUES (pg_catalog.repeat('e', 64), NULL);
+                     EXECUTE pg_catalog.format(
+                       'ALTER TABLE lcm.projects ADD CONSTRAINT %I NOT NULL display_name NOT VALID',
+                       baseline_constraint
+                     );
+                   END
+                   $lcm$`,
+          }, { domain: "factory", operation: "injectUnvalidatedNotNullConstraint" });
+          const invalidState = await database.migrator.query<{
+            attnotnull: boolean;
+            conenforced: boolean;
+            convalidated: boolean;
+            null_rows: string;
+          }>({
+            text: `SELECT attribute.attnotnull,
+                          constraint_metadata.convalidated,
+                          constraint_metadata.conenforced,
+                          (SELECT pg_catalog.count(*)::pg_catalog.text
+                           FROM lcm.projects
+                           WHERE display_name IS NULL) AS null_rows
+                   FROM pg_catalog.pg_constraint AS constraint_metadata
+                   JOIN pg_catalog.pg_class AS relation
+                     ON relation.oid OPERATOR(pg_catalog.=) constraint_metadata.conrelid
+                   JOIN pg_catalog.pg_namespace AS namespace
+                     ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                   JOIN pg_catalog.pg_attribute AS attribute
+                     ON attribute.attrelid OPERATOR(pg_catalog.=) relation.oid
+                    AND constraint_metadata.conkey OPERATOR(pg_catalog.=)
+                      ARRAY[attribute.attnum]::pg_catalog.int2[]
+                   WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                     AND relation.relname OPERATOR(pg_catalog.=) 'projects'
+                     AND attribute.attname OPERATOR(pg_catalog.=) 'display_name'
+                     AND constraint_metadata.contype OPERATOR(pg_catalog.=) 'n'`,
+          }, { domain: "factory", operation: "readUnvalidatedNotNullConstraint" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ invalidState, readinessFailure, migrationFailure }).toMatchObject({
+            invalidState: {
+              rows: [{
+                attnotnull: true,
+                conenforced: true,
+                convalidated: false,
+                null_rows: "1",
+              }],
+            },
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: `ALTER TABLE lcm.projects ALTER COLUMN display_name DROP NOT NULL;
+                   DELETE FROM lcm.projects
+                   WHERE identity_key OPERATOR(pg_catalog.=) pg_catalog.repeat('e', 64);
+                   ALTER TABLE lcm.projects ALTER COLUMN display_name SET NOT NULL`,
+          }, { domain: "factory", operation: "restoreValidatedNotNullConstraint" });
         }
       },
       { runMigrations: false },

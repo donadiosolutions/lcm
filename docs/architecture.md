@@ -159,11 +159,19 @@ authority contains 94 managed-table indexes and explicitly requires zero
 non-view rewrite rules. Identity-trigger
 inventory requires always-enabled mode, rejecting disabled, ordinary, or
 replica-only drift and enforcing checks under `session_replication_role =
-replica`. Constraint inventory includes the enablement state of
-its internal enforcement triggers and binds each name to its definition.
-Ordinary columns retain type, nullability, default, identity, and resolved
-collation metadata; generated columns retain their formatted type, nullability,
-generated state, fully deparsed expression, and resolved collation. Tables must remain permanent with
+replica`. Constraint inventory includes every supported constraint owned by a
+managed table plus every foreign key that targets one. It binds owning and
+referenced relation identities, canonical definitions, validation,
+enforcement, locality, and inheritance state, together with canonicalized
+definitions and enablement, internal, deferrability, and parentage metadata for
+every enforcement trigger on either side of the constraint. Ordinary columns
+retain type, nullability, default, identity, and resolved collation metadata;
+generated columns retain their formatted type, nullability, generated state,
+fully deparsed expression, and resolved collation. Both column fingerprints
+also bind the sorted complete set of associated PostgreSQL 18 `NOT NULL`
+constraints, including canonical identity plus validation, enforcement,
+locality, and inheritance state, without increasing the column object count.
+Tables must remain permanent with
 row-level security neither enabled nor forced, and cannot participate in
 inheritance or partition parent/child relationships.
 Effective relation ACLs normalize the owner plus only the exact reviewed
@@ -176,12 +184,23 @@ Identity sequences retain permanent persistence, allocation parameters,
 internal dependency, and owning table/column. Migration transactions pin
 `quote_all_identifiers = off` before catalog deparsing. Any additional valid,
 ready, and live index, non-internal trigger, supported constraint, generated
-column, or ordinary column attached to a managed table, or any non-view rewrite
-rule attached to one, is included in the complete inventory and fails closed.
-`NOT NULL` constraints are represented by the ordinary-column fingerprint so
-they are not double-counted as PostgreSQL 18 `pg_constraint` rows. Unknown
+column, or ordinary column attached to a managed table, any foreign key
+targeting one from another schema or relation, or any non-view rewrite rule
+attached to one, is included in the complete inventory and fails closed.
+`NOT NULL` constraints are represented by their owning column fingerprint so
+they are not double-counted as PostgreSQL 18 `pg_constraint` rows; an
+unvalidated or otherwise non-authoritative constraint is rejected even when
+`attnotnull` remains true. Unknown
 operator-created objects outside those managed-table boundaries remain outside
-the inventory.
+the inventory. That boundary remains fail-closed for repository writes: the
+repositories address only the pinned managed relations; a new attached identity
+sequence requires a new or changed managed ordinary column and is rejected by
+the complete column inventory, while an unattached sequence cannot affect those
+writes. Relation and column ACL sanctions remain scoped to the pinned managed
+write surface because every managed column is inventoried before its ACL is
+normalized. Non-internal triggers are enumerated directly; internal constraint
+triggers are deliberately excluded there and instead fingerprinted completely
+with their owning constraint.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
 generated identity sequences, or the search-normalization, summary-identity,
 large-file-identity, and session-ingest-identity functions; unknown

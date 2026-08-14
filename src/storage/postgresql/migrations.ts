@@ -453,11 +453,11 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
     ...expectedBaselineDefinitionInventory(),
     definitionHashes: {
       columnAcl: "e2581c7c70cbec57d64bb02ac1520fe27336efb326618b36add668cb1431e98c",
-      constraint: "8bb79c117c498a89c920826ff65b88ad615f871ba3e8607e4b00d1d115d9aa1a",
-      generatedColumn: "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
+      constraint: "bcdeb5e8cf1fad3f0c2fd9536c2c51ebe47924b2bb4273ecc0d2f4c216217984",
+      generatedColumn: "8d9c9ede1e990727ce8612ea7212fe7fe91f53d8dc3fa24f2de378cbbf4f4921",
       identitySequence: "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
       index: "58160b3542785f534c03d428d67cc5b1855280946458337b599a544588ced733",
-      ordinaryColumn: "e0daf9a1d97b62f6baf491c35d3b45d5082336538e44da8651afaa1180e11e8a",
+      ordinaryColumn: "f0abf51e9ee2b2ddcbd00ef21b672b8bc0361054c591564d76ad5d0f2928b190",
       relationAcl: "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
       rewriteRule: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       table: "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
@@ -483,7 +483,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
     ...baseline,
     definitionHashes: {
       ...baseline.definitionHashes,
-      constraint: "4698227bc02a8d777955eb41286a4964dda8da82d1561c9a154b67e2a034906f",
+      constraint: "cff2807b3ad6f4465cc953bc79a562716bd1f54eaee2c0eb605f8fbff6ffc137",
     },
     migrationId: "0003_machine_identity_key",
   };
@@ -491,7 +491,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
     ...machineIdentity,
     definitionHashes: {
       ...machineIdentity.definitionHashes,
-      constraint: "1cf8dc0e9303c7bdd086bcae679edc31493d26f67c81999c8e5b2fba491e0778",
+      constraint: "eb9fdb72171517ac5b9d6162ae3495b8cb94d1d6300a0296aeb1f42c906d12b3",
     },
     migrationId: "0004_machine_display_name",
   };
@@ -808,7 +808,7 @@ export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperation
 
   readonly schemaName = "lcm";
   readonly remediation =
-    "Restore every missing or changed LCM baseline table, relation ACL, column ACL, index, trigger, rewrite rule, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
+    "Remove unregistered foreign keys targeting LCM tables, restore every missing or changed LCM baseline table, relation ACL, column ACL, index, trigger, rewrite rule, constraint (including validated NOT NULL state), identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
 
   override toJSON(): Record<string, unknown> {
     return {
@@ -1508,41 +1508,216 @@ export async function runPostgreSqlMigrations(
                    )
                    AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
                ),
+               constraint_trigger_entries AS (
+                 SELECT trigger.tgconstraint AS constraint_oid,
+                        pg_catalog.concat_ws(
+                          '|',
+                          trigger_namespace.nspname,
+                          trigger_relation.relname,
+                          canonical_trigger.canonical_name,
+                          COALESCE(constraint_relation_namespace.nspname, ''),
+                          COALESCE(constraint_relation.relname, ''),
+                          pg_catalog.replace(
+                            pg_catalog.pg_get_triggerdef(trigger.oid, true),
+                            pg_catalog.quote_ident(trigger.tgname),
+                            pg_catalog.quote_ident(canonical_trigger.canonical_name)
+                          ),
+                          trigger.tgenabled::pg_catalog.text,
+                          trigger.tgisinternal::pg_catalog.text,
+                          trigger.tgdeferrable::pg_catalog.text,
+                          trigger.tginitdeferred::pg_catalog.text,
+                          (trigger.tgparentid OPERATOR(pg_catalog.<>) 0)::pg_catalog.text,
+                          COALESCE(parent_trigger_namespace.nspname, ''),
+                          COALESCE(parent_trigger_relation.relname, ''),
+                          COALESCE(
+                            CASE
+                              WHEN parent_trigger.tgisinternal
+                                AND parent_trigger.tgname OPERATOR(pg_catalog.~)
+                                  '^RI_ConstraintTrigger_[ac]_[0-9]+$'
+                                THEN pg_catalog.regexp_replace(
+                                  parent_trigger.tgname,
+                                  '_[0-9]+$',
+                                  '_<oid>'
+                                )
+                              ELSE parent_trigger.tgname
+                            END,
+                            ''
+                          )
+                        ) AS trigger_fingerprint
+                 FROM pg_catalog.pg_trigger AS trigger
+                 JOIN pg_catalog.pg_class AS trigger_relation
+                   ON trigger_relation.oid OPERATOR(pg_catalog.=) trigger.tgrelid
+                 JOIN pg_catalog.pg_namespace AS trigger_namespace
+                   ON trigger_namespace.oid OPERATOR(pg_catalog.=)
+                     trigger_relation.relnamespace
+                 LEFT JOIN pg_catalog.pg_class AS constraint_relation
+                   ON constraint_relation.oid OPERATOR(pg_catalog.=)
+                     trigger.tgconstrrelid
+                 LEFT JOIN pg_catalog.pg_namespace AS constraint_relation_namespace
+                   ON constraint_relation_namespace.oid OPERATOR(pg_catalog.=)
+                     constraint_relation.relnamespace
+                 LEFT JOIN pg_catalog.pg_trigger AS parent_trigger
+                   ON parent_trigger.oid OPERATOR(pg_catalog.=) trigger.tgparentid
+                 LEFT JOIN pg_catalog.pg_class AS parent_trigger_relation
+                   ON parent_trigger_relation.oid OPERATOR(pg_catalog.=)
+                     parent_trigger.tgrelid
+                 LEFT JOIN pg_catalog.pg_namespace AS parent_trigger_namespace
+                   ON parent_trigger_namespace.oid OPERATOR(pg_catalog.=)
+                     parent_trigger_relation.relnamespace
+                 CROSS JOIN LATERAL (
+                   SELECT CASE
+                     WHEN trigger.tgisinternal
+                       AND trigger.tgname OPERATOR(pg_catalog.~)
+                         '^RI_ConstraintTrigger_[ac]_[0-9]+$'
+                       THEN pg_catalog.regexp_replace(
+                         trigger.tgname,
+                         '_[0-9]+$',
+                         '_<oid>'
+                       )
+                     ELSE trigger.tgname
+                   END AS canonical_name
+                 ) AS canonical_trigger
+                 WHERE trigger.tgconstraint OPERATOR(pg_catalog.<>) 0
+               ),
+               constraint_trigger_states AS (
+                 SELECT constraint_oid,
+                        pg_catalog.count(*)::pg_catalog.int4 AS trigger_count,
+                        pg_catalog.string_agg(
+                          trigger_fingerprint,
+                          E'\\n'
+                          ORDER BY trigger_fingerprint
+                        ) AS trigger_fingerprints
+                 FROM constraint_trigger_entries
+                 GROUP BY constraint_oid
+               ),
                actual_constraints AS (
                  SELECT constraint_metadata.conname AS object_name,
-                        relation.relname AS table_name,
-                        constraint_metadata.contype::pg_catalog.text AS constraint_type,
+                        owning_namespace.nspname AS owning_schema_name,
+                        owning_relation.relname AS owning_table_name,
+                        COALESCE(referenced_namespace.nspname, '')
+                          AS referenced_schema_name,
+                        COALESCE(referenced_relation.relname, '')
+                          AS referenced_table_name,
+                        constraint_metadata.contype::pg_catalog.text
+                          AS constraint_type,
                         pg_catalog.pg_get_constraintdef(
                           constraint_metadata.oid,
                           true
                         ) AS definition,
-                        COALESCE(
-                          constraint_trigger_states.enabled_modes,
-                          ''
-                        ) AS enabled_modes
+                        constraint_metadata.convalidated::pg_catalog.text AS validated,
+                        constraint_metadata.conenforced::pg_catalog.text AS enforced,
+                        constraint_metadata.connoinherit::pg_catalog.text AS no_inherit,
+                        constraint_metadata.conislocal::pg_catalog.text AS is_local,
+                        constraint_metadata.coninhcount::pg_catalog.text AS inherited_count,
+                        (constraint_metadata.conparentid OPERATOR(pg_catalog.<>) 0)
+                          ::pg_catalog.text AS has_parent_constraint,
+                        COALESCE(parent_constraint_namespace.nspname, '')
+                          AS parent_schema_name,
+                        COALESCE(parent_constraint_relation.relname, '')
+                          AS parent_table_name,
+                        COALESCE(parent_constraint.conname, '')
+                          AS parent_constraint_name,
+                        COALESCE(constraint_trigger_states.trigger_count, 0)
+                          ::pg_catalog.text AS enforcement_trigger_count,
+                        COALESCE(constraint_trigger_states.trigger_fingerprints, '')
+                          AS enforcement_triggers
+                 FROM pg_catalog.pg_constraint AS constraint_metadata
+                 JOIN pg_catalog.pg_class AS owning_relation
+                   ON owning_relation.oid OPERATOR(pg_catalog.=)
+                     constraint_metadata.conrelid
+                 JOIN pg_catalog.pg_namespace AS owning_namespace
+                   ON owning_namespace.oid OPERATOR(pg_catalog.=)
+                     owning_relation.relnamespace
+                 LEFT JOIN pg_catalog.pg_class AS referenced_relation
+                   ON referenced_relation.oid OPERATOR(pg_catalog.=)
+                     constraint_metadata.confrelid
+                 LEFT JOIN pg_catalog.pg_namespace AS referenced_namespace
+                   ON referenced_namespace.oid OPERATOR(pg_catalog.=)
+                     referenced_relation.relnamespace
+                 LEFT JOIN pg_catalog.pg_constraint AS parent_constraint
+                   ON parent_constraint.oid OPERATOR(pg_catalog.=)
+                     constraint_metadata.conparentid
+                 LEFT JOIN pg_catalog.pg_class AS parent_constraint_relation
+                   ON parent_constraint_relation.oid OPERATOR(pg_catalog.=)
+                     parent_constraint.conrelid
+                 LEFT JOIN pg_catalog.pg_namespace AS parent_constraint_namespace
+                   ON parent_constraint_namespace.oid OPERATOR(pg_catalog.=)
+                     parent_constraint_relation.relnamespace
+                 LEFT JOIN constraint_trigger_states
+                   ON constraint_trigger_states.constraint_oid
+                     OPERATOR(pg_catalog.=) constraint_metadata.oid
+                 WHERE constraint_metadata.contype OPERATOR(pg_catalog.=) ANY (
+                     ARRAY['c', 'f', 'p', 'u', 'x']::pg_catalog."char"[]
+                   )
+                   AND (
+                     (
+                       owning_namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                       AND owning_relation.relname OPERATOR(pg_catalog.=)
+                         ANY ($3::pg_catalog.text[])
+                     )
+                     OR (
+                       constraint_metadata.contype OPERATOR(pg_catalog.=) 'f'
+                       AND referenced_namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                       AND referenced_relation.relname OPERATOR(pg_catalog.=)
+                         ANY ($3::pg_catalog.text[])
+                     )
+                   )
+               ),
+               not_null_constraint_entries AS (
+                 SELECT constraint_metadata.conrelid AS relation_oid,
+                        constraint_key.attribute_number,
+                        pg_catalog.concat_ws(
+                          '|',
+                          namespace.nspname,
+                          relation.relname,
+                          constraint_metadata.conname,
+                          pg_catalog.pg_get_constraintdef(
+                            constraint_metadata.oid,
+                            true
+                          ),
+                          constraint_metadata.convalidated::pg_catalog.text,
+                          constraint_metadata.conenforced::pg_catalog.text,
+                          constraint_metadata.connoinherit::pg_catalog.text,
+                          constraint_metadata.conislocal::pg_catalog.text,
+                          constraint_metadata.coninhcount::pg_catalog.text,
+                          (constraint_metadata.conparentid OPERATOR(pg_catalog.<>) 0)
+                            ::pg_catalog.text,
+                          COALESCE(parent_constraint_namespace.nspname, ''),
+                          COALESCE(parent_constraint_relation.relname, ''),
+                          COALESCE(parent_constraint.conname, '')
+                        ) AS constraint_fingerprint
                  FROM pg_catalog.pg_constraint AS constraint_metadata
                  JOIN pg_catalog.pg_class AS relation
                    ON relation.oid OPERATOR(pg_catalog.=) constraint_metadata.conrelid
                  JOIN pg_catalog.pg_namespace AS namespace
                    ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
-                 LEFT JOIN (
-                   SELECT trigger.tgconstraint AS constraint_oid,
-                          pg_catalog.string_agg(
-                            trigger.tgenabled::pg_catalog.text,
-                            ''
-                            ORDER BY trigger.tgenabled
-                          ) AS enabled_modes
-                   FROM pg_catalog.pg_trigger AS trigger
-                   WHERE trigger.tgconstraint OPERATOR(pg_catalog.<>) 0
-                   GROUP BY trigger.tgconstraint
-                 ) AS constraint_trigger_states
-                   ON constraint_trigger_states.constraint_oid
-                     OPERATOR(pg_catalog.=) constraint_metadata.oid
+                 CROSS JOIN LATERAL pg_catalog.unnest(constraint_metadata.conkey)
+                   AS constraint_key(attribute_number)
+                 LEFT JOIN pg_catalog.pg_constraint AS parent_constraint
+                   ON parent_constraint.oid OPERATOR(pg_catalog.=)
+                     constraint_metadata.conparentid
+                 LEFT JOIN pg_catalog.pg_class AS parent_constraint_relation
+                   ON parent_constraint_relation.oid OPERATOR(pg_catalog.=)
+                     parent_constraint.conrelid
+                 LEFT JOIN pg_catalog.pg_namespace AS parent_constraint_namespace
+                   ON parent_constraint_namespace.oid OPERATOR(pg_catalog.=)
+                     parent_constraint_relation.relnamespace
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-                   AND constraint_metadata.contype OPERATOR(pg_catalog.=) ANY (
-                     ARRAY['c', 'f', 'p', 'u', 'x']::pg_catalog."char"[]
-                   )
-                   AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
+                   AND relation.relname OPERATOR(pg_catalog.=)
+                     ANY ($3::pg_catalog.text[])
+                   AND constraint_metadata.contype OPERATOR(pg_catalog.=) 'n'
+               ),
+               not_null_constraint_states AS (
+                 SELECT relation_oid,
+                        attribute_number,
+                        pg_catalog.count(*)::pg_catalog.int4 AS constraint_count,
+                        pg_catalog.string_agg(
+                          constraint_fingerprint,
+                          E'\\n'
+                          ORDER BY constraint_fingerprint
+                        ) AS constraint_fingerprints
+                 FROM not_null_constraint_entries
+                 GROUP BY relation_oid, attribute_number
                ),
                actual_generated_columns AS (
                  SELECT relation.relname AS table_name,
@@ -1562,7 +1737,13 @@ export async function runPostgreSqlMigrations(
                           '.',
                           collation_namespace.nspname,
                           collation_metadata.collname
-                        ) AS collation_name
+                        ) AS collation_name,
+                        COALESCE(not_null_constraint_states.constraint_count, 0)
+                          ::pg_catalog.text AS not_null_constraint_count,
+                        COALESCE(
+                          not_null_constraint_states.constraint_fingerprints,
+                          ''
+                        ) AS not_null_constraints
                  FROM pg_catalog.pg_attribute AS attribute
                  JOIN pg_catalog.pg_class AS relation
                    ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
@@ -1577,6 +1758,11 @@ export async function runPostgreSqlMigrations(
                  LEFT JOIN pg_catalog.pg_namespace AS collation_namespace
                    ON collation_namespace.oid OPERATOR(pg_catalog.=)
                      collation_metadata.collnamespace
+                 LEFT JOIN not_null_constraint_states
+                   ON not_null_constraint_states.relation_oid
+                     OPERATOR(pg_catalog.=) attribute.attrelid
+                  AND not_null_constraint_states.attribute_number
+                    OPERATOR(pg_catalog.=) attribute.attnum
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND attribute.attnum OPERATOR(pg_catalog.>) 0
                    AND NOT attribute.attisdropped
@@ -1604,7 +1790,13 @@ export async function runPostgreSqlMigrations(
                           '.',
                           collation_namespace.nspname,
                           collation_metadata.collname
-                        ) AS collation_name
+                        ) AS collation_name,
+                        COALESCE(not_null_constraint_states.constraint_count, 0)
+                          ::pg_catalog.text AS not_null_constraint_count,
+                        COALESCE(
+                          not_null_constraint_states.constraint_fingerprints,
+                          ''
+                        ) AS not_null_constraints
                  FROM pg_catalog.pg_attribute AS attribute
                  JOIN pg_catalog.pg_class AS relation
                    ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
@@ -1619,6 +1811,11 @@ export async function runPostgreSqlMigrations(
                  LEFT JOIN pg_catalog.pg_namespace AS collation_namespace
                    ON collation_namespace.oid OPERATOR(pg_catalog.=)
                      collation_metadata.collnamespace
+                 LEFT JOIN not_null_constraint_states
+                   ON not_null_constraint_states.relation_oid
+                     OPERATOR(pg_catalog.=) attribute.attrelid
+                  AND not_null_constraint_states.attribute_number
+                    OPERATOR(pg_catalog.=) attribute.attnum
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND attribute.attnum OPERATOR(pg_catalog.>) 0
                    AND NOT attribute.attisdropped
@@ -2552,17 +2749,37 @@ export async function runPostgreSqlMigrations(
                           public.digest(
                             COALESCE(
                               pg_catalog.string_agg(
-                                pg_catalog.concat_ws(
-                                  '|',
-                                  table_name,
+                                 pg_catalog.concat_ws(
+                                   '|',
+                                  owning_schema_name,
+                                  owning_table_name,
                                   object_name,
+                                  referenced_schema_name,
+                                  referenced_table_name,
                                   constraint_type,
                                   definition,
-                                  enabled_modes
+                                  validated,
+                                  enforced,
+                                  no_inherit,
+                                  is_local,
+                                  inherited_count,
+                                  has_parent_constraint,
+                                  parent_schema_name,
+                                  parent_table_name,
+                                  parent_constraint_name,
+                                  enforcement_trigger_count,
+                                  enforcement_triggers
                                 ),
                                 E'\\n'
-                                ORDER BY table_name, object_name, constraint_type,
-                                  definition, enabled_modes
+                                ORDER BY owning_schema_name, owning_table_name,
+                                  object_name, referenced_schema_name,
+                                  referenced_table_name, constraint_type,
+                                  definition, validated, enforced, no_inherit,
+                                  is_local, inherited_count,
+                                  has_parent_constraint, parent_schema_name,
+                                  parent_table_name, parent_constraint_name,
+                                  enforcement_trigger_count,
+                                  enforcement_triggers
                               ),
                               ''
                             ),
@@ -2586,7 +2803,9 @@ export async function runPostgreSqlMigrations(
                                   not_null,
                                   generation_kind,
                                   generation_expression,
-                                  collation_name
+                                  collation_name,
+                                  not_null_constraint_count,
+                                  not_null_constraints
                                 ),
                                 E'\\n'
                                 ORDER BY table_name, column_name
@@ -2728,7 +2947,9 @@ export async function runPostgreSqlMigrations(
                                   not_null,
                                   default_expression,
                                   identity_kind,
-                                  collation_name
+                                  collation_name,
+                                  not_null_constraint_count,
+                                  not_null_constraints
                                 ),
                                 E'\\n'
                                 ORDER BY table_name, column_name
