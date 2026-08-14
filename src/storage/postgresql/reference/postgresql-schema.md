@@ -105,17 +105,19 @@ does not add row-level security.
   satisfy the future definition. Before catalog access, the registry rejects
   duplicate snapshot migration IDs and IDs absent from the supplied migration
   history.
-- The `0002` snapshot checks an explicit definition inventory of all 52 named
-  secondary indexes, all 174 table constraints, all three identity-enforcement
-  triggers, all 15 stored generated columns, all six generated identity
-  sequences, all 24 permanent tables, the complete effective ACLs of those
-  tables and six sequences, all 210 ordinary columns, and the exact effective
-  column ACL state of all 225 ordinary and generated columns: 739 definitions
-  total. The ordinary-column allowlist includes
+- The `0002` snapshot checks an explicit definition inventory of all 94 valid,
+  ready, and live indexes attached to the 24 managed tables (including primary
+  and unique-constraint support indexes), all 174 table constraints, all three
+  identity-enforcement triggers, zero non-view rewrite rules, all 15 stored
+  generated columns, all six generated identity sequences, all 24 permanent
+  tables, the complete effective ACLs of those tables and six sequences, all
+  210 ordinary columns, and the exact effective column ACL state of all 225
+  ordinary and generated columns: 781 definitions total. The ordinary-column
+  allowlist includes
   `recall_surfacing.surfaced_at`, and a live-catalog regression requires the
   allowlist to equal the complete ordinary-column inventory of the 24 tables.
   Each allowlisted object must exist, every index must
-  remain valid and ready, and canonical index, trigger, fully qualified
+  remain valid, ready, and live, and canonical index, trigger, fully qualified
   constraint, generation-expression, and ordinary-column definitions must
   retain their pinned fingerprints. Trigger fingerprints include the
   enablement mode and require
@@ -148,20 +150,27 @@ does not add row-level security.
   `PUBLIC`, foreign-grantor, grantable, or out-of-allowlist privilege on a
   column therefore also fails closed.
   Identity-sequence
-  fingerprints bind each exact sequence name to its PostgreSQL data type,
+  Rewrite-rule fingerprints enumerate every non-view rule attached to a managed
+  table and bind its table, name, event, INSTEAD mode, enablement, and deparsed
+  definition. The current snapshots explicitly require zero such rules, with
+  the SHA-256 digest of the empty inventory; any DML rewrite rule therefore
+  fails readiness and migration preflight. Identity-sequence fingerprints bind
+  each exact sequence name to its PostgreSQL data type,
   increment, minimum, maximum, start, cache, cycle state, internal identity
   dependency, owning table/column, and permanent persistence. `SET UNLOGGED`
   drift therefore fails closed. Index ownership
   follows the owning table; triggers and constraints are checked as existence
   and definition inventory.
   Additional operator-created objects remain outside the allowlist and are
-  ignored.
+  ignored except that any valid, ready, and live index, non-internal trigger, or
+  non-view rewrite rule attached to a managed table is part of that table's
+  complete definition inventory and fails closed when added or changed.
 - The `0005` snapshot carries the complete `0004` inventory forward and adds
   one always-enabled summary-parent trigger definition plus the exact
   `lcm.enforce_summary_parent_dag_integrity()` managed function. It therefore
-  checks four application triggers and 740 definitions in total while leaving
-  every table, column, constraint, index, generated column, sequence, and
-  released `0002` artifact unchanged.
+  checks four application triggers, zero non-view rewrite rules, and 782
+  definitions in total; the migration SQL and all non-trigger catalog
+  definitions remain unchanged.
 - Recurring migration readiness fingerprints the bodies and security
   configuration of `lcm.enforce_summary_id_uniqueness()`,
   `lcm.enforce_large_file_id_uniqueness()`,

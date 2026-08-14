@@ -148,12 +148,15 @@ before commit. Selection follows migration history rather than registry order.
 The selected current snapshot verifies its managed inventory and definitions
 before pending SQL; the selected target snapshot repeats both checks after
 pending SQL and ledger writes, so a migration may add managed objects without
-weakening the earlier contract. Definition checks cover all allowlisted
-secondary indexes, triggers, constraints, all 205 ordinary columns, stored
+weakening the earlier contract. Definition checks cover the complete valid,
+ready, and live index inventory attached to every managed table, non-internal
+triggers, non-view rewrite rules, constraints, all 210 ordinary columns, stored
 generated-column expressions, identity sequences, all 24 table persistence
 states, the complete effective ACLs of the tables and sequences, and the exact
-ACL state of all 220 ordinary and generated columns; indexes must remain
-valid and ready and inherit ownership from their tables. Identity-trigger
+ACL state of all 225 ordinary and generated columns; indexes must remain
+valid, ready, and live and inherit ownership from their tables. The current baseline
+authority contains 94 managed-table indexes and explicitly requires zero
+non-view rewrite rules. Identity-trigger
 inventory requires always-enabled mode, rejecting disabled, ordinary, or
 replica-only drift and enforcing checks under `session_replication_role =
 replica`. Constraint inventory includes the enablement state of
@@ -171,8 +174,11 @@ fingerprints preserve every no-ACL identity and accept only the reviewed
 column-limited runtime writes.
 Identity sequences retain permanent persistence, allocation parameters,
 internal dependency, and owning table/column. Migration transactions pin
-`quote_all_identifiers = off` before catalog deparsing. Unknown operator-created
-indexes, triggers, and constraints remain outside the inventory.
+`quote_all_identifiers = off` before catalog deparsing. Any additional valid,
+ready, and live index or non-internal trigger attached to a managed table, or
+any non-view rewrite rule attached to one, is included in the complete
+inventory and fails closed. Unknown operator-created objects outside those
+managed-table boundaries remain outside the inventory.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
 generated identity sequences, or the search-normalization, summary-identity,
 large-file-identity, and session-ingest-identity functions; unknown

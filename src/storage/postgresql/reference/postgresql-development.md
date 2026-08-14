@@ -380,7 +380,7 @@ large-file, and session-ingest identity functions are also fingerprinted by
 stored body and security configuration. Body, language/return type,
 security-definer/leakproof, volatility, parallel-safety, fixed search path, or
 complete normalized ACL drift fails closed.
-The `0002` definition inventory also fingerprints the complete 205-column
+The `0002` definition inventory also fingerprints the complete 210-column
 ordinary inventory of its 24 allowlisted tables, including
 `recall_surfacing.surfaced_at`. Each ordinary column retains its formatted
 type, nullability, deparsed default, identity state, and resolved
@@ -399,7 +399,7 @@ stored ACL is null and normalizes the owning role plus only the exact reviewed
 identity- and conversation-runtime shapes. Explicit owner-only ACLs compare
 equal to defaults, while `PUBLIC`, out-of-shape named-role privileges, grant
 options, foreign grantors, and missing-owner drift fail closed.
-The separate 220-column ACL group includes one canonical identity row for
+The separate 225-column ACL group includes one canonical identity row for
 every ordinary and generated column even when `attacl` is null, then expands
 all explicit column grants with the same reviewed-shape normalization.
 Constraint fingerprints include the owning table and constraint name as well

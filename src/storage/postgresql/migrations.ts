@@ -79,6 +79,7 @@ type ExpectedBaselineDefinitionInventory = {
   readonly managedObjectIdentities: readonly string[];
   readonly ordinaryColumnIdentities: readonly string[];
   readonly relationAclIdentities: readonly string[];
+  readonly rewriteRuleIdentities: readonly string[];
   readonly tableIdentities: readonly string[];
   readonly triggerIdentities: readonly string[];
 };
@@ -91,6 +92,7 @@ export type PostgreSqlSchemaSnapshot = ExpectedBaselineDefinitionInventory & {
     readonly index: string;
     readonly ordinaryColumn: string;
     readonly relationAcl: string;
+    readonly rewriteRule: string;
     readonly table: string;
     readonly trigger: string;
   };
@@ -134,26 +136,42 @@ export const REQUIRED_POSTGRESQL_SERVER_ENCODING = "UTF8" as const;
 
 function expectedBaselineDefinitionInventory(): ExpectedBaselineDefinitionInventory {
 const EXPECTED_BASELINE_INDEX_NAMES = `
-  project_aliases_project_idx conversations_project_order_idx conversations_session_lookup_idx
-  messages_project_created_idx messages_search_document_idx messages_content_trgm_idx
-  message_parts_type_idx native_transcripts_source_order_idx native_transcripts_session_idx
-  native_transcripts_machine_idx native_transcripts_payload_idx transcript_messages_message_idx
-  summaries_identity_lookup_idx summaries_conversation_order_idx summaries_project_recent_idx
-  summaries_search_document_idx summaries_content_trgm_idx summary_messages_message_idx
-  summary_messages_summary_idx summary_parents_parent_idx summary_parents_summary_idx
-  context_items_message_idx context_items_summary_idx large_files_identity_lookup_idx
-  large_files_conversation_order_idx summary_large_files_file_idx summary_large_files_summary_idx
-  promoted_memories_active_order_idx promoted_memories_source_summary_idx
-  promoted_memories_source_project_idx promoted_memories_metadata_idx
-  promoted_memories_search_document_idx promoted_memories_content_trgm_idx
-  promoted_memory_tags_lookup_idx promoted_memory_tags_normalized_lookup_idx
+  context_items_message_idx context_items_pkey context_items_summary_idx
+  conversations_pkey conversations_project_id_conversation_id_key conversations_project_order_idx
+  conversations_session_lookup_idx fenced_leases_expiry_idx fenced_leases_owner_idx
+  fenced_leases_owner_machine_idx fenced_leases_pkey ingest_checkpoints_machine_idx
+  ingest_checkpoints_payload_idx ingest_checkpoints_pkey large_files_conversation_order_idx
+  large_files_identity_lookup_idx large_files_pkey
+  large_files_project_id_conversation_id_file_key_key machines_identity_key_key machines_pkey
+  message_parts_pkey message_parts_project_id_conversation_id_message_id_ordinal_key
+  message_parts_type_idx messages_content_trgm_idx messages_pkey messages_project_created_idx
+  messages_project_id_conversation_id_message_id_key messages_project_id_conversation_id_seq_key
+  messages_search_document_idx native_transcripts_machine_idx native_transcripts_payload_idx
+  native_transcripts_pkey native_transcripts_project_id_machine_id_ingest_key_key
+  native_transcripts_project_id_transcript_id_key native_transcripts_session_idx
+  native_transcripts_source_order_idx passive_event_inbox_claimed_idx
+  passive_event_inbox_machine_id_event_id_key passive_event_inbox_machine_id_machine_sequence_key
+  passive_event_inbox_payload_idx passive_event_inbox_pkey passive_event_inbox_project_idx
+  passive_event_inbox_ready_idx passive_event_inbox_retry_idx project_aliases_machine_id_path_key
+  project_aliases_pkey project_aliases_project_idx projects_identity_key_key projects_pkey
+  promoted_memories_active_order_idx promoted_memories_content_trgm_idx
+  promoted_memories_metadata_idx promoted_memories_pkey promoted_memories_project_id_memory_id_key
+  promoted_memories_search_document_idx promoted_memories_source_project_idx
+  promoted_memories_source_summary_idx promoted_memory_tags_lookup_idx
+  promoted_memory_tags_normalized_lookup_idx promoted_memory_tags_pkey
   promoted_memory_tags_search_document_idx promoted_memory_tags_tag_trgm_idx
-  recall_surfacing_memory_order_idx recall_surfacing_session_order_idx
-  ingest_checkpoints_payload_idx ingest_checkpoints_machine_idx
-  session_ingest_log_identity_lookup_idx session_ingest_log_completed_idx
-  session_instructions_machine_idx passive_event_inbox_ready_idx passive_event_inbox_retry_idx
-  passive_event_inbox_claimed_idx passive_event_inbox_payload_idx passive_event_inbox_project_idx
-  fenced_leases_owner_idx fenced_leases_expiry_idx fenced_leases_owner_machine_idx
+  recall_surfacing_memory_order_idx recall_surfacing_pkey recall_surfacing_session_order_idx
+  redaction_counters_pkey schema_migrations_pkey session_ingest_log_completed_idx
+  session_ingest_log_identity_lookup_idx session_ingest_log_pkey session_instructions_machine_idx
+  session_instructions_pkey session_instructions_project_id_machine_id_scope_hash_key
+  summaries_content_trgm_idx summaries_conversation_order_idx summaries_identity_lookup_idx
+  summaries_pkey summaries_project_id_conversation_id_summary_key_key summaries_project_recent_idx
+  summaries_search_document_idx summary_large_files_file_idx summary_large_files_pkey
+  summary_large_files_summary_idx summary_messages_message_idx summary_messages_pkey
+  summary_messages_project_id_summary_key_ordinal_key summary_messages_summary_idx
+  summary_parents_parent_idx summary_parents_pkey summary_parents_project_id_summary_key_ordinal_key
+  summary_parents_summary_idx transcript_messages_message_idx transcript_messages_pkey
+  transcript_messages_project_id_transcript_id_source_ordinal_key
 `.trim().split(/\s+/u);
 
 const EXPECTED_BASELINE_TRIGGER_IDENTITIES = [
@@ -161,6 +179,8 @@ const EXPECTED_BASELINE_TRIGGER_IDENTITIES = [
   "session_ingest_log|session_ingest_log_enforce_session_id_uniqueness",
   "summaries|summaries_enforce_summary_id_uniqueness",
 ] as const;
+
+const EXPECTED_BASELINE_REWRITE_RULE_IDENTITIES = [] as const;
 
 const EXPECTED_BASELINE_GENERATED_COLUMN_IDENTITIES = [
   "conversations|session_id_sha256",
@@ -422,6 +442,7 @@ const EXPECTED_BASELINE_CONSTRAINT_IDENTITIES =
     managedObjectIdentities: EXPECTED_BASELINE_MANAGED_OBJECT_IDENTITIES,
     ordinaryColumnIdentities: EXPECTED_BASELINE_ORDINARY_COLUMN_IDENTITIES,
     relationAclIdentities: EXPECTED_BASELINE_RELATION_ACL_IDENTITIES,
+    rewriteRuleIdentities: EXPECTED_BASELINE_REWRITE_RULE_IDENTITIES,
     tableIdentities: EXPECTED_BASELINE_TABLE_IDENTITIES,
     triggerIdentities: EXPECTED_BASELINE_TRIGGER_IDENTITIES,
   } as const;
@@ -435,9 +456,10 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       constraint: "8bb79c117c498a89c920826ff65b88ad615f871ba3e8607e4b00d1d115d9aa1a",
       generatedColumn: "78a5508248b93c86a59ea633136154ae4ab7cf3569e020053a1dc0d1c2fc0590",
       identitySequence: "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
-      index: "6d95eda805e9cd5d0b246daaa763a6919262f64e1129dc93f0ee95291276a7fd",
+      index: "58160b3542785f534c03d428d67cc5b1855280946458337b599a544588ced733",
       ordinaryColumn: "e0daf9a1d97b62f6baf491c35d3b45d5082336538e44da8651afaa1180e11e8a",
       relationAcl: "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
+      rewriteRule: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       table: "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
       trigger: "229e8dd0e6a1c953dd18b4220da95be28121db72f4fbba199e1d6808c4b7afcc",
     },
@@ -550,6 +572,11 @@ export function getPostgreSqlSchemaSnapshotExpectations(
       "ordinary_column",
       snapshot.ordinaryColumnIdentities.length,
       snapshot.definitionHashes.ordinaryColumn,
+    ],
+    [
+      "rewrite_rule",
+      snapshot.rewriteRuleIdentities.length,
+      snapshot.definitionHashes.rewriteRule,
     ],
   ] as const;
   return {
@@ -781,7 +808,7 @@ export class PostgreSqlBaselineDefinitionPreflightError extends StorageOperation
 
   readonly schemaName = "lcm";
   readonly remediation =
-    "Restore every missing or changed LCM baseline table, relation ACL, column ACL, index, trigger, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
+    "Restore every missing or changed LCM baseline table, relation ACL, column ACL, index, trigger, rewrite rule, constraint, identity sequence, ordinary column, and generated column from the matching packaged migration artifact or a verified backup, then rerun migrations.";
 
   override toJSON(): Record<string, unknown> {
     return {
@@ -1432,14 +1459,23 @@ export async function runPostgreSqlMigrations(
                  FROM pg_catalog.pg_class AS index_relation
                  JOIN pg_catalog.pg_index AS index_metadata
                    ON index_metadata.indexrelid OPERATOR(pg_catalog.=) index_relation.oid
-                 JOIN pg_catalog.pg_namespace AS namespace
-                   ON namespace.oid OPERATOR(pg_catalog.=) index_relation.relnamespace
-                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                 JOIN pg_catalog.pg_namespace AS index_namespace
+                   ON index_namespace.oid OPERATOR(pg_catalog.=) index_relation.relnamespace
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) index_metadata.indrelid
+                 JOIN pg_catalog.pg_namespace AS relation_namespace
+                   ON relation_namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 WHERE index_namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND relation_namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND relation.relkind OPERATOR(pg_catalog.=) ANY (
+                     ARRAY['r', 'p']::pg_catalog."char"[]
+                   )
                    AND index_relation.relkind OPERATOR(pg_catalog.=) 'i'
                    AND index_metadata.indisvalid
                    AND index_metadata.indisready
-                   AND index_relation.relname OPERATOR(pg_catalog.=)
-                     ANY ($2::pg_catalog.text[])
+                   AND index_metadata.indislive
+                   AND relation.relname OPERATOR(pg_catalog.=)
+                     ANY ($6::pg_catalog.text[])
                ),
                actual_triggers AS (
                  SELECT trigger.tgname AS object_name,
@@ -1452,7 +1488,25 @@ export async function runPostgreSqlMigrations(
                    ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND NOT trigger.tgisinternal
-                   AND relation.relname OPERATOR(pg_catalog.=) ANY ($7::pg_catalog.text[])
+                   AND relation.relname OPERATOR(pg_catalog.=) ANY ($6::pg_catalog.text[])
+               ),
+               actual_rewrite_rules AS (
+                 SELECT relation.relname AS table_name,
+                        rewrite.rulename AS object_name,
+                        rewrite.ev_type::pg_catalog.text AS event_type,
+                        rewrite.is_instead::pg_catalog.text AS is_instead,
+                        rewrite.ev_enabled::pg_catalog.text AS enabled_mode,
+                        pg_catalog.pg_get_ruledef(rewrite.oid, true) AS definition
+                 FROM pg_catalog.pg_rewrite AS rewrite
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid OPERATOR(pg_catalog.=) rewrite.ev_class
+                 JOIN pg_catalog.pg_namespace AS namespace
+                   ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND relation.relkind OPERATOR(pg_catalog.=) ANY (
+                     ARRAY['r', 'p']::pg_catalog."char"[]
+                   )
+                   AND relation.relname OPERATOR(pg_catalog.=) ANY ($6::pg_catalog.text[])
                ),
                actual_constraints AS (
                  SELECT constraint_metadata.conname AS object_name,
@@ -1489,7 +1543,7 @@ export async function runPostgreSqlMigrations(
                      '|',
                      relation.relname,
                      constraint_metadata.conname
-                   ) OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
+                   ) OPERATOR(pg_catalog.=) ANY ($2::pg_catalog.text[])
                ),
                actual_generated_columns AS (
                  SELECT relation.relname AS table_name,
@@ -1530,7 +1584,7 @@ export async function runPostgreSqlMigrations(
                      '|',
                      relation.relname,
                      attribute.attname
-                   ) OPERATOR(pg_catalog.=) ANY ($4::pg_catalog.text[])
+                   ) OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
                ),
                actual_ordinary_columns AS (
                  SELECT relation.relname AS table_name,
@@ -1576,7 +1630,7 @@ export async function runPostgreSqlMigrations(
                      '|',
                      relation.relname,
                      attribute.attname
-                   ) OPERATOR(pg_catalog.=) ANY ($5::pg_catalog.text[])
+                   ) OPERATOR(pg_catalog.=) ANY ($4::pg_catalog.text[])
                ),
                actual_identity_sequences AS (
                  SELECT sequence_relation.relname AS sequence_name,
@@ -1619,7 +1673,7 @@ export async function runPostgreSqlMigrations(
                     dependency.refobjsubid
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND sequence_relation.relname OPERATOR(pg_catalog.=)
-                     ANY ($6::pg_catalog.text[])
+                     ANY ($5::pg_catalog.text[])
                ),
                actual_tables AS (
                  SELECT relation.relname AS table_name,
@@ -1646,7 +1700,7 @@ export async function runPostgreSqlMigrations(
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND relation.relkind OPERATOR(pg_catalog.=) 'r'
                    AND relation.relname OPERATOR(pg_catalog.=)
-                     ANY ($7::pg_catalog.text[])
+                     ANY ($6::pg_catalog.text[])
                ),
                acl_relations AS (
                  SELECT pg_catalog.concat(
@@ -1696,7 +1750,7 @@ export async function runPostgreSqlMigrations(
                    acl_relations.effective_acl
                  ) AS privilege
                  WHERE acl_relations.object_identity OPERATOR(pg_catalog.=)
-                   ANY ($8::pg_catalog.text[])
+                   ANY ($7::pg_catalog.text[])
                    AND NOT (
                      privilege.grantee OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
                      AND privilege.grantee OPERATOR(pg_catalog.<>) acl_relations.owner_oid
@@ -2441,7 +2495,7 @@ export async function runPostgreSqlMigrations(
                      '|',
                      relation.relname,
                      attribute.attname
-                   ) OPERATOR(pg_catalog.=) ANY ($9::pg_catalog.text[])
+                   ) OPERATOR(pg_catalog.=) ANY ($8::pg_catalog.text[])
                ),
                actual_column_acls AS (
                  SELECT DISTINCT object_identity,
@@ -2693,6 +2747,33 @@ export async function runPostgreSqlMigrations(
                           'hex'
                         )
                  FROM actual_ordinary_columns
+                 UNION ALL
+                 SELECT 'rewrite_rule'::pg_catalog.text,
+                        pg_catalog.count(*)::pg_catalog.int4,
+                        pg_catalog.encode(
+                          public.digest(
+                            COALESCE(
+                              pg_catalog.string_agg(
+                                pg_catalog.concat_ws(
+                                  '|',
+                                  table_name,
+                                  object_name,
+                                  event_type,
+                                  is_instead,
+                                  enabled_mode,
+                                  definition
+                                ),
+                                E'\\n'
+                                ORDER BY table_name, object_name, event_type,
+                                  is_instead, enabled_mode, definition
+                              ),
+                              ''
+                            ),
+                            'sha256'
+                          ),
+                          'hex'
+                        )
+                 FROM actual_rewrite_rules
                ),
                expected_groups(
                  object_kind,
@@ -2701,32 +2782,32 @@ export async function runPostgreSqlMigrations(
                ) AS (
                  SELECT *
                  FROM ROWS FROM (
-                   pg_catalog.unnest($11::pg_catalog.text[]),
-                   pg_catalog.unnest($12::pg_catalog.int4[]),
-                   pg_catalog.unnest($13::pg_catalog.text[])
+                   pg_catalog.unnest($10::pg_catalog.text[]),
+                   pg_catalog.unnest($11::pg_catalog.int4[]),
+                   pg_catalog.unnest($12::pg_catalog.text[])
                  )
                )
                SELECT $1::pg_catalog.bool AS baseline_applied,
-                      $10::pg_catalog.int4 AS expected_object_count,
+                      $9::pg_catalog.int4 AS expected_object_count,
                       pg_catalog.sum(actual_groups.existing_count)::pg_catalog.int4
                         AS existing_object_count,
                       pg_catalog.array_agg(
                         actual_groups.existing_count
                         ORDER BY pg_catalog.array_position(
-                          $11::pg_catalog.text[],
+                          $10::pg_catalog.text[],
                           actual_groups.object_kind
                         )
                       ) AS actual_definition_group_counts,
                       pg_catalog.array_agg(
                         actual_groups.definition_sha256
                         ORDER BY pg_catalog.array_position(
-                          $11::pg_catalog.text[],
+                          $10::pg_catalog.text[],
                           actual_groups.object_kind
                         )
                       ) AS actual_definition_group_hashes,
                       CASE
                         WHEN $1::pg_catalog.bool THEN (
-                          $10 - pg_catalog.sum(actual_groups.existing_count)
+                          $9 - pg_catalog.sum(actual_groups.existing_count)
                         )::pg_catalog.int4
                         ELSE 0::pg_catalog.int4
                       END AS missing_object_count,
@@ -2743,7 +2824,6 @@ export async function runPostgreSqlMigrations(
                JOIN actual_groups USING (object_kind)`,
         values: [
           baselineApplied,
-          expectedBaselineDefinitions.indexNames,
           expectedBaselineDefinitions.constraintIdentities,
           expectedBaselineDefinitions.generatedColumnIdentities,
           expectedBaselineDefinitions.ordinaryColumnIdentities,
