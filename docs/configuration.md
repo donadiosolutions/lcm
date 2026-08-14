@@ -441,6 +441,33 @@ the staged programmatic primitives described in
 [PostgreSQL cross-machine coordination](../src/storage/postgresql/reference/postgresql-coordination.md); it does
 not enable the application backend or start a worker.
 
+### Embedded PostgreSQL project lifecycle
+
+After provisioning, explicit embedded callers use the curated factory and pass
+`openProject` a trusted, complete `StorageIdentityContext`; see the
+[exception-safe ESM example](../README.md#storage-backend). Its remote UUIDv7,
+local project-map identity, registered machine UUIDv7, and exact lexical
+selected path must come from authenticated LCM state already established by the
+cwd-aware `lcm project create` or `lcm project link` boundary. The curated
+subpath does not discover, create, link, or repair identity, and callers must
+not substitute a canonical/shared-worktree path for the selected path. Invalid,
+missing, or mismatched identity fails closed; migration witness hashes do not
+supply identity or runtime authorization.
+
+Ordinary callers omit `openProject`'s optional second argument. The factory then
+takes two short authenticated publication snapshots around remote identity work
+and requires them to agree. Only an owning internal coordination boundary that
+already holds a live `BackendPublicationLockToken` may pass it and keep it live
+across the call; the curated subpath exposes no constructor. Never forge a
+token, treat raw journal data as authority, or bypass publication evidence. See
+the [backend publication safety guide](backend-publication.md).
+
+Always close both scopes in `finally`: close `ProjectStorage` first to abort and
+settle only its project work, then close the factory to drain pending opens and
+remaining projects and close the shared runtime. Preserve a primary operation
+failure if either cleanup fails. This explicit lifecycle does not activate the
+staged PostgreSQL daemon/CLI routes or change SQLite's active default.
+
 Before opening project storage, restore
 `LCM_POSTGRES_URL` to the restricted runtime-role URL, run `lcm machine
 register`, pair projects explicitly, and complete backend publication. Factory

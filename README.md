@@ -405,11 +405,87 @@ internal runtime, migration, or testing helpers:
 ```ts
 import {
   createPostgreSqlStorageBackendFactory,
+  type PostgreSqlStorageBackendFactory,
+  type ProjectStorage,
   type ResolvedPostgreSqlConfig,
+  type StorageIdentityContext,
 } from "@donadiosolutions/lcm/storage/postgresql";
 
-const factory = await createPostgreSqlStorageBackendFactory(config);
+type EstablishedPostgreSqlIdentity = StorageIdentityContext & {
+  readonly localProjectId: string;
+  readonly machineId: string;
+  readonly remoteProjectId: string;
+  readonly selectedPath: string;
+};
+
+export async function usePostgreSqlProject(
+  config: ResolvedPostgreSqlConfig,
+  identity: EstablishedPostgreSqlIdentity,
+): Promise<void> {
+  let factory: PostgreSqlStorageBackendFactory | undefined;
+  let project: ProjectStorage | undefined;
+  let operationFailed = false;
+  try {
+    factory = await createPostgreSqlStorageBackendFactory(config);
+    project = await factory.openProject(identity);
+    const health = await project.health();
+    if (health.status !== "healthy") {
+      throw health.error ?? new Error("PostgreSQL project storage is not healthy");
+    }
+    // Use project repositories or project.transaction(...) here.
+  } catch (error) {
+    operationFailed = true;
+    throw error;
+  } finally {
+    let cleanupFailed = false;
+    let cleanupFailure: unknown;
+    try {
+      await project?.close();
+    } catch (error) {
+      cleanupFailed = true;
+      cleanupFailure = error;
+    }
+    try {
+      await factory?.close();
+    } catch (error) {
+      if (!cleanupFailed) cleanupFailure = error;
+      cleanupFailed = true;
+    }
+    if (!operationFailed && cleanupFailed) {
+      throw cleanupFailure;
+    }
+  }
+}
 ```
+
+The caller must receive that complete context from authenticated, already
+established LCM identity state; the curated subpath does not discover, create,
+link, or repair identities. `id` and `remoteProjectId` are the same lowercase
+UUIDv7 established by `lcm project create` or `lcm project link`.
+`localProjectId` and `canonical` come from the established local project-map
+identity for the selected checkout, and `machineId` comes from the registered
+local machine identity. `selectedPath` is the exact lexical absolute path
+chosen by the cwd-aware create/link boundary—for example,
+`resolve(projectPath)`—not a substituted canonical path or shared-worktree
+anchor. Do not synthesize the context from unauthenticated file reads. Missing,
+invalid, or mismatched identity fields fail closed. Migration witness hashes
+are integrity evidence, not identity or runtime-authorization principals.
+
+The second `openProject` argument is optional. The ordinary curated call above
+omits it, so the factory internally captures two short authenticated backend-
+publication witness snapshots around the remote PostgreSQL identity work and
+requires them to agree. Only code already executing inside the owning internal
+coordination boundary with a live `BackendPublicationLockToken` may pass that
+token and must keep it active for the entire call. The curated subpath exposes
+no token constructor. Do not forge a token, read raw journal data as authority,
+or bypass publication evidence; see the
+[backend publication safety guide](docs/backend-publication.md).
+
+Closing `ProjectStorage` aborts and settles only that project's tracked work.
+Closing the factory aborts and drains pending opens, closes any projects still
+registered with it, and closes the shared PostgreSQL runtime. Close the project
+first and the factory second in `finally`, as above; this unregisters the
+project before factory shutdown while preserving any primary operation failure.
 
 Normal daemon/CLI activation remains staged until #92/#224. Selecting
 `postgresql` for those routes therefore keeps storage explicitly unavailable
