@@ -265,6 +265,9 @@ describe("canonical supervisor identity", () => {
     expect(managedLaunchEnvironment({ LCM_POSTGRES_MIGRATION_ROLE: "r" })).toEqual({
       LCM_POSTGRES_MIGRATION_ROLE: "r",
     });
+    expect(managedLaunchEnvironment({ LCM_POSTGRES_MIGRATION_ROLE: " lcm_migration " })).toEqual({
+      LCM_POSTGRES_MIGRATION_ROLE: "lcm_migration",
+    });
     expect(managedLaunchEnvironment({ LCM_POSTGRES_MIGRATION_ROLE: migrationRole })).toEqual({
       LCM_POSTGRES_MIGRATION_ROLE: normalizedMigrationRole,
     });
@@ -296,6 +299,7 @@ describe("canonical supervisor identity", () => {
       if (kind === "systemd-user") {
         const startArgs = runner.calls[1]!.args;
         expect(startArgs).toContain(`LCM_POSTGRES_MIGRATION_ROLE=${normalizedMigrationRole}`);
+        expect(startArgs).not.toContain(`LCM_POSTGRES_MIGRATION_ROLE=${migrationRole}`);
         expect(startArgs).not.toContain(`--setenv=LCM_POSTGRES_MIGRATION_ROLE=${migrationRole}`);
         expect(startArgs.join(" ")).not.toContain("LoadCredential=LCM_POSTGRES_MIGRATION_ROLE");
       } else {
