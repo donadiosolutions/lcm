@@ -541,6 +541,13 @@ on a provider does not justify silently expanding the baseline.
 1. The cluster administrator provisions PostgreSQL 18, preloads services such
    as `pg_stat_statements` when necessary, and installs the exact required
    extensions in `public`. The migrator and runtime use separate login roles.
+   The current database must be owned by the configured
+   `storage.postgresql.migrationRole`; when creating it, use the equivalent of
+   `CREATE DATABASE <db> OWNER <migrationRole>` with validated,
+   identifier-quoted operator inputs. Do not make the restricted `runtimeRole`
+   the database owner. Runtime readiness verifies this database-level owner in
+   `runtime-role-policy` / `inspectRuntimeRolePolicy` and rejects a different
+   owner before migration, schema, ACL, or domain work.
    With `storage.backend` configured, the supported packaged entry point is
    `LCM_POSTGRES_URL="$LCM_POSTGRES_MIGRATION_URL" lcm postgres migrate`; it
    accepts `--json` for automation and closes the migration pool before exit.
@@ -556,7 +563,8 @@ on a provider does not justify silently expanding the baseline.
    migration role is passed as the trusted expected owner; the verifier never
    substitutes `CURRENT_USER`, an observed catalog owner, or an opaque
    migration witness hash. Failed readiness produces sanitized corrective
-   guidance without changing database or cluster state.
+   guidance without changing database or cluster state. The witness hash is
+   not an authorization principal and cannot satisfy the database-owner check.
 3. The migration runner validates packaged SHA-256 artifacts, captures the
    postmaster epoch, requires UTF-8, and performs the functional extension probe
    before opening the DDL transaction. It then opens one transaction, takes a database-scoped

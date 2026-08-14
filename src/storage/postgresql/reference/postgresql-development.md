@@ -31,6 +31,15 @@ verifier as `expectedOwner`; it is not inferred from the catalog, a witness
 hash, or an owner discovered during inspection. The runtime URL's username is
 the separate restricted runtime role.
 
+The current PostgreSQL database itself must be owned by
+`storage.postgresql.migrationRole`. Provision a new database with the
+equivalent of `CREATE DATABASE <db> OWNER <migrationRole>` using validated,
+identifier-quoted operator inputs; do not interpolate untrusted names into
+administrative SQL. The restricted `runtimeRole` must remain a separate role
+and must not own the database. Readiness checks this database-level owner in
+`runtime-role-policy` / `inspectRuntimeRolePolicy` and rejects a different
+owner before extensions, migrations, schema checks, ACL checks, or domain work.
+
 Readiness fails closed unless all of the following are exact: PostgreSQL 18,
 `UTF8` encoding, `UTC` timezone, verified TLS, required extensions and search
 configuration, the ordered complete migration history, the packaged migration
