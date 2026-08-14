@@ -264,6 +264,7 @@ type AuthenticatedManifestState = Readonly<{
   headTemporary: AuthenticatedHeadTemporary | null;
   publicationGroup: AuthenticatedHeadPublicationGroup | null;
   publicationSuccessor: MigrationManifest | null;
+  nestedScratch: AuthenticatedNestedPublicationScratch | null;
   manifest: MigrationManifest;
   generation: string;
   revisions: string;
@@ -432,6 +433,26 @@ function revisionScratchMatch(name: string): RegExpMatchArray | null {
 
 function headScratchMatch(name: string): RegExpMatchArray | null {
   return /^\.head\.json\.[0-9a-f]{24}\.tmp$/u.exec(name);
+}
+
+const NESTED_PUBLICATION_SCRATCH_PATTERN =
+  /^\.\.head\.json\.([0-9a-f]{24})\.(tmp|attempt)\.([0-9a-f]{24})\.tmp$/u;
+
+/**
+ * Recognize exactly one nested atomic-writer scratch shape:
+ * `..head.json.<group>.tmp.<writer>.tmp` or
+ * `..head.json.<group>.attempt.<writer>.tmp`, both hex-24 nonces.
+ */
+function nestedPublicationScratchEntry(
+  name: string,
+): Readonly<{ groupNonce: string; role: "tmp" | "attempt"; writerNonce: string }> | null {
+  const match = NESTED_PUBLICATION_SCRATCH_PATTERN.exec(name);
+  if (match === null) return null;
+  return {
+    groupNonce: match[1]!,
+    role: match[2] as "tmp" | "attempt",
+    writerNonce: match[3]!,
+  };
 }
 
 const HEAD_PUBLICATION_NONCE_PATTERN = /^[0-9a-f]{24}$/u;
@@ -752,7 +773,7 @@ function exactWriterLinkPair(
     && left.content === right.content;
 }
 
-type AuthenticatedHeadContent =
+type AuthenticatedHeadContentBase =
   | Readonly<{
     kind: "absent";
     temporary: AuthenticatedHeadTemporary | null;
@@ -765,6 +786,25 @@ type AuthenticatedHeadContent =
     temporary: AuthenticatedHeadTemporary | null;
     publicationGroup?: AuthenticatedHeadPublicationGroup;
   }>;
+
+type AuthenticatedHeadContent = AuthenticatedHeadContentBase & Readonly<{
+  nestedScratch: AuthenticatedNestedPublicationScratch | null;
+}>;
+
+/**
+ * A nested atomic-writer scratch file belonging to an unfinished head
+ * publication artifact: the writer that materializes the group's own `.tmp`
+ * candidate or `.attempt` record crashed before its final rename.
+ */
+type AuthenticatedNestedPublicationScratch = Readonly<{
+  path: string;
+  name: string;
+  groupNonce: string;
+  role: "tmp" | "attempt";
+  writerNonce: string;
+  finalPath: string;
+  linkState: "pre-link" | "post-link";
+}>;
 
 type AuthenticatedHeadTemporary = Readonly<{
   path: string;
@@ -990,8 +1030,114 @@ function readAuthenticatedHeadContent(
   expectedUid: number | undefined,
 ): AuthenticatedHeadContent {
   try {
-    const entries = readDirectoryEntriesBounded(generation, 5);
-    if (entries.length > 5) return malformedHead("migration manifest head directory is ambiguous");
+    const allEntries = readDirectoryEntriesBounded(generation, 5);
+    if (allEntries.length > 5) return malformedHead("migration manifest head directory is ambiguous");
+    const nestedScratch = authenticateNestedPublicationScratch(generation, allEntries, expectedUid);
+    // A post-link pair is the writer state immediately before the alias unlink,
+    // so both links are hidden from classification: the remaining entries are
+    // exactly the layout the completed writer step would have produced.
+    const hidden = nestedScratch === null
+      ? []
+      : nestedScratch.linkState === "post-link"
+        ? [nestedScratch.name, basename(nestedScratch.finalPath)]
+        : [nestedScratch.name];
+    const entries = allEntries.filter((entry) => !hidden.includes(entry));
+    return { ...classifyAuthenticatedHeadContent(generation, entries, expectedUid), nestedScratch };
+  } catch (error) {
+    if (error instanceof MigrationProtocolError) throw error;
+    throw new MigrationProtocolError(
+      "malformed-manifest",
+      "migration manifest head is invalid",
+      { cause: error },
+    );
+  }
+}
+
+/**
+ * Authenticate at most one nested atomic-writer scratch entry.  Its bytes are
+ * never trusted as manifest content and it is never consumed here; recognition
+ * only proves the generation is mid-publication and needs recovery.
+ */
+function authenticateNestedPublicationScratch(
+  generation: string,
+  entries: readonly string[],
+  expectedUid: number | undefined,
+): AuthenticatedNestedPublicationScratch | null {
+  const matches = entries
+    .map((name) => {
+      const parsed = nestedPublicationScratchEntry(name);
+      return parsed === null ? null : { ...parsed, name };
+    })
+    .filter((entry): entry is AuthenticatedNestedPublicationScratch & { name: string } => entry !== null);
+  if (matches.length === 0) return null;
+  if (matches.length > 1) return malformedHead("migration manifest head directory is ambiguous");
+  const match = matches[0]!;
+  const path = join(generation, match.name);
+  const scratch = readBoundedRegularFileWithStat(path, {
+    allowedRoot: generation,
+    maxBytes: MAX_MANIFEST_BYTES,
+    expectedUid,
+    allowedModes: [0o600],
+    requireSingleLink: false,
+  });
+  if (scratch.nlink !== "1" && scratch.nlink !== "2") {
+    return malformedHead("migration manifest head has invalid link topology");
+  }
+  // The nested writer's own final destination within its group.
+  const finalPath = join(
+    generation,
+    match.role === "tmp"
+      ? `.head.json.${match.groupNonce}.tmp`
+      : `.head.json.${match.groupNonce}.attempt`,
+  );
+  const finalStat = readOptionalBoundedRegularFileWithStat(finalPath, generation, expectedUid);
+  if (scratch.nlink === "1") {
+    // A pre-link scratch is the writer's only link; a final entry alongside it
+    // would mean the nested name is not this writer's exclusive scratch.
+    if (finalStat !== null) {
+      return malformedHead("migration manifest head publication writer scratch has invalid link topology");
+    }
+  } else if (finalStat === null || !exactWriterLinkPair(finalStat, scratch)) {
+    // A post-link scratch must be the exact hard-link twin of its final name.
+    return malformedHead("migration manifest head publication writer scratch has invalid link topology");
+  }
+  return {
+    path,
+    name: match.name,
+    groupNonce: match.groupNonce,
+    role: match.role,
+    writerNonce: match.writerNonce,
+    finalPath,
+    linkState: scratch.nlink === "1" ? "pre-link" : "post-link",
+  };
+}
+
+function readOptionalBoundedRegularFileWithStat(
+  path: string,
+  generation: string,
+  expectedUid: number | undefined,
+): ReturnType<typeof readBoundedRegularFileWithStat> | null {
+  try {
+    lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  return readBoundedRegularFileWithStat(path, {
+    allowedRoot: generation,
+    maxBytes: MAX_MANIFEST_BYTES,
+    expectedUid,
+    allowedModes: [0o600],
+    requireSingleLink: false,
+  });
+}
+
+function classifyAuthenticatedHeadContent(
+  generation: string,
+  entries: readonly string[],
+  expectedUid: number | undefined,
+): AuthenticatedHeadContentBase {
+  {
     const publicationClassification = classifyHeadPublicationGroup(generation, entries);
     if (publicationClassification !== null) {
       const publicationGroup = authenticatePublicationGroup(
@@ -1123,13 +1269,6 @@ function readAuthenticatedHeadContent(
         contentSha256: sha256(scratch.content),
       },
     };
-  } catch (error) {
-    if (error instanceof MigrationProtocolError) throw error;
-    throw new MigrationProtocolError(
-      "malformed-manifest",
-      "migration manifest head is invalid",
-      { cause: error },
-    );
   }
 }
 
@@ -1190,6 +1329,156 @@ function assertHeadTemporarySuccessor(
   const successor = assertMigrationManifestSuccessor(current, candidate.manifest);
   assertHeadMatchesManifest(temporary.head, successor);
   return successor;
+}
+
+/**
+ * Reclaim one nested atomic-writer scratch left behind by a crash inside the
+ * durable pre-link write of a publication candidate or attempt.  The scratch is
+ * only ever removed when its bytes are an exact prefix of the canonical content
+ * the writer would have authored for the single legal one-hop successor, which
+ * makes the cleanup identity-bound rather than name-bound.
+ */
+function reclaimNestedPublicationScratch(
+  state: AuthenticatedManifestState,
+  scratch: AuthenticatedNestedPublicationScratch,
+  expectedUid: number | undefined,
+): void {
+  const successor = state.publicationSuccessor ?? recoverableOneHopSuccessor(state, expectedUid);
+  const nextHeadContent = migrationManifestHeadContent(createMigrationManifestHead({
+    generationId: successor.generationId,
+    revision: successor.revision,
+    manifestSha256: successor.checksumSha256,
+    updatedAt: successor.updatedAt,
+  }));
+  const expected = scratch.role === "tmp"
+    ? nextHeadContent
+    : headPublicationAttemptContent(createHeadPublicationAttempt({
+      version: 1,
+      nonce: scratch.groupNonce,
+      generationId: successor.generationId,
+      expectedHeadRawSha256: sha256(state.headContent),
+      candidateHeadRawSha256: sha256(nextHeadContent),
+      candidateManifestSha256: successor.checksumSha256,
+      candidateRevision: successor.revision,
+    }));
+  if (scratch.linkState === "post-link") {
+    reclaimPostLinkNestedScratch(state, scratch, expected, expectedUid);
+    return;
+  }
+  const observed = readBoundedRegularFileWithStat(scratch.path, {
+    allowedRoot: state.generation,
+    maxBytes: MAX_MANIFEST_BYTES,
+    expectedUid,
+    allowedModes: [0o600],
+    requireSingleLink: true,
+  });
+  // An exact prefix (including the empty and complete cases) is the only shape a
+  // crashed sequential writer can leave; anything else stays on disk untouched.
+  if (!/^[\x00-\x7f]*$/u.test(observed.content) || !expected.startsWith(observed.content)) {
+    return malformedHead("migration manifest head publication writer scratch is invalid");
+  }
+  try {
+    consumeBoundedRegularFile(scratch.path, {
+      allowedRoot: state.generation,
+      maxBytes: MAX_MANIFEST_BYTES,
+      expectedUid,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+      expectedRawSha256: sha256(observed.content),
+    });
+  } catch (error) {
+    throw new MigrationProtocolError(
+      "malformed-manifest",
+      "migration manifest head publication writer scratch is invalid",
+      { cause: error },
+    );
+  }
+  try {
+    syncPrivateDirectory(state.generation, { expectedUid });
+  } catch (error) {
+    throw new MigrationProtocolError(
+      "recovery-required",
+      "migration manifest head publication writer scratch cleanup durability sync failed",
+      { cause: error },
+    );
+  }
+}
+
+/**
+ * Drop the alias half of a completed nested writer link pair.  The final name
+ * is proven to hold the exact canonical bytes the writer intended before the
+ * alias is unlinked, and the final file itself is never consumed.
+ */
+function reclaimPostLinkNestedScratch(
+  state: AuthenticatedManifestState,
+  scratch: AuthenticatedNestedPublicationScratch,
+  expected: string,
+  expectedUid: number | undefined,
+): void {
+  try {
+    const final = readBoundedRegularFileWithStat(scratch.finalPath, {
+      allowedRoot: state.generation,
+      maxBytes: MAX_MANIFEST_BYTES,
+      expectedUid,
+      allowedModes: [0o600],
+      requireSingleLink: false,
+      expectedRawSha256: sha256(expected),
+    });
+    const alias = readBoundedRegularFileWithStat(scratch.path, {
+      allowedRoot: state.generation,
+      maxBytes: MAX_MANIFEST_BYTES,
+      expectedUid,
+      allowedModes: [0o600],
+      requireSingleLink: false,
+      expectedRawSha256: sha256(expected),
+    });
+    if (!exactWriterLinkPair(final, alias)) {
+      throw new Error("migration manifest head publication writer scratch is not an exact link pair");
+    }
+    consumeAuthenticatedWriterAlias(scratch.finalPath, scratch.path, {
+      maxBytes: MAX_MANIFEST_BYTES,
+      expectedUid,
+      allowedModes: [0o600],
+    });
+  } catch (error) {
+    throw new MigrationProtocolError(
+      "malformed-manifest",
+      "migration manifest head publication writer scratch is invalid",
+      { cause: error },
+    );
+  }
+  try {
+    syncPrivateDirectory(state.generation, { expectedUid });
+  } catch (error) {
+    throw new MigrationProtocolError(
+      "recovery-required",
+      "migration manifest head publication writer scratch cleanup durability sync failed",
+      { cause: error },
+    );
+  }
+}
+
+/** Authenticate the single legal one-hop successor a nested scratch can belong to. */
+function recoverableOneHopSuccessor(
+  state: AuthenticatedManifestState,
+  expectedUid: number | undefined,
+): MigrationManifest {
+  const nextRevision = state.manifest.revision + 1;
+  const candidate = exactRecoveryCandidate(
+    state.revisions,
+    state.manifest.generationId,
+    nextRevision,
+    state.manifest.checksumSha256,
+    expectedUid,
+  );
+  if (candidate === null || candidate.kind !== "manifest") {
+    throw new MigrationProtocolError(
+      "unexpected-state",
+      "migration manifest head publication writer scratch has no recoverable successor",
+    );
+  }
+  assertNoRecoverySecondHop(state.revisions, nextRevision);
+  return assertMigrationManifestSuccessor(state.manifest, candidate.manifest);
 }
 
 function assertHeadTemporaryGenesis(
@@ -1898,6 +2187,7 @@ export class MigrationManifestStore {
       () => {
         const authenticatedHead = readAuthenticatedHeadContent(generation, this.#expectedUid);
         const publicationGroup = authenticatedHead.publicationGroup ?? null;
+        const nestedScratch = authenticatedHead.nestedScratch;
         let headContent: string;
         let headAliasPath: string | null;
         if (authenticatedHead.kind === "present") {
@@ -1954,6 +2244,7 @@ export class MigrationManifestStore {
               headTemporary: null,
               publicationGroup,
               publicationSuccessor: manifest,
+              nestedScratch,
               manifest: reconstructed.manifest,
               generation,
               revisions,
@@ -1985,6 +2276,12 @@ export class MigrationManifestStore {
                 "migration manifest has an unfinished head publication group",
               );
             }
+            if (rejectImmediateSuccessor && nestedScratch !== null) {
+              throw new MigrationProtocolError(
+                "recovery-required",
+                "migration manifest has an unfinished head publication writer scratch",
+              );
+            }
             return {
               head,
               headContent,
@@ -1992,12 +2289,21 @@ export class MigrationManifestStore {
               headTemporary,
               publicationGroup,
               publicationSuccessor: successor,
+              nestedScratch,
               manifest,
               generation,
               revisions,
             };
           }
-          if (rejectImmediateSuccessor) assertNoImmediateSuccessor(revisions, head.revision);
+          if (rejectImmediateSuccessor) {
+            assertNoImmediateSuccessor(revisions, head.revision);
+            if (nestedScratch !== null) {
+              throw new MigrationProtocolError(
+                "recovery-required",
+                "migration manifest has an unfinished head publication writer scratch",
+              );
+            }
+          }
           return {
             head,
             headContent,
@@ -2005,6 +2311,7 @@ export class MigrationManifestStore {
             headTemporary,
             publicationGroup,
             publicationSuccessor: null,
+            nestedScratch,
             manifest,
             generation,
             revisions,
@@ -2027,6 +2334,12 @@ export class MigrationManifestStore {
       const current = this.#readOptionalState(generationId, false);
       if (current === null) {
         throw new MigrationProtocolError("unexpected-state", "migration manifest head is absent");
+      }
+      if (current.nestedScratch !== null) {
+        throw new MigrationProtocolError(
+          "recovery-required",
+          "migration manifest has an unfinished head publication writer scratch",
+        );
       }
       if (current.publicationGroup !== null) {
         throw new MigrationProtocolError(
@@ -2105,12 +2418,28 @@ export class MigrationManifestStore {
 
   recover(generationId: string): MigrationManifest {
     return withManifestMutationLock(this.#homeDir, this.#expectedUid, () => {
-      const current = this.#readOptionalState(generationId, false);
-      if (current?.manifest.revision === Number.MAX_SAFE_INTEGER) return current.manifest;
       const generation = migrationManifestGenerationDirectory(generationId, this.#homeDir);
       const root = lcmRoot(this.#homeDir);
       const migrations = migrationRoot(this.#homeDir);
       const revisions = join(generation, "revisions");
+      let current = this.#readOptionalState(generationId, false);
+      // Reclaim a crashed nested writer scratch before any publication or
+      // reducer work begins, then re-read the authenticated state so the rest
+      // of recovery observes the post-cleanup generation directory.
+      if (current !== null && current.nestedScratch !== null) {
+        const scratch = current.nestedScratch;
+        const state = current;
+        withAuthenticatedDirectories(
+          [root, migrations, generation, revisions],
+          this.#expectedUid,
+          () => {
+            reclaimNestedPublicationScratch(state, scratch, this.#expectedUid);
+            return null;
+          },
+        );
+        current = this.#readOptionalState(generationId, false);
+      }
+      if (current?.manifest.revision === Number.MAX_SAFE_INTEGER) return current.manifest;
       if (current !== null && current.publicationGroup !== null) {
         const group = current.publicationGroup;
         if (group.kind === "capture-conflict") {

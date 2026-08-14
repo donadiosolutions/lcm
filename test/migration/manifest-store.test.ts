@@ -48,6 +48,625 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
+describe("migration manifest nested publication-writer scratch recovery", () => {
+  it("keeps candidate pre-link writer scratch recovery-required and does not invoke update", () => {
+    const state = createRow1PublicationState("nested-candidate-pre-link");
+    const groupNonce = /\.head\.json\.([0-9a-f]{24})\.tmp$/u.exec(state.artifacts.tmp)?.[1];
+    if (groupNonce === undefined) throw new Error("publication group nonce is absent");
+    const nestedPath = join(
+      state.generation,
+      `..head.json.${groupNonce}.tmp.${"a".repeat(24)}.tmp`,
+    );
+    const candidateContent = readFileSync(state.artifacts.tmp, "utf8");
+    unlinkSync(state.artifacts.tmp);
+    unlinkSync(state.artifacts.attempt);
+    syncGenerationDirectory(state.generation);
+    writeFileSync(nestedPath, candidateContent.slice(0, -1), { mode: 0o600 });
+
+    const store = new MigrationManifestStore({ homeDir: state.home });
+    expectProtocolReason(() => store.read(state.initial.generationId), "recovery-required");
+
+    let reducerCalls = 0;
+    expectProtocolReason(() => store.update(
+      state.initial.generationId,
+      state.initial.checksumSha256,
+      () => {
+        reducerCalls += 1;
+        return state.candidate;
+      },
+    ), "recovery-required");
+    expect(reducerCalls).toBe(0);
+    expect(store.recover(state.initial.generationId)).toEqual(state.candidate);
+    expect(existsSync(nestedPath)).toBe(false);
+  });
+
+  it("keeps attempt pre-link writer scratch recovery-required and does not invoke update", () => {
+    const state = createRow1PublicationState("nested-attempt-pre-link");
+    const groupNonce = /\.head\.json\.([0-9a-f]{24})\.tmp$/u.exec(state.artifacts.tmp)?.[1];
+    if (groupNonce === undefined) throw new Error("publication group nonce is absent");
+    const nestedPath = join(
+      state.generation,
+      `..head.json.${groupNonce}.attempt.${"b".repeat(24)}.tmp`,
+    );
+    const attemptContent = readFileSync(state.artifacts.attempt, "utf8");
+    unlinkSync(state.artifacts.attempt);
+    syncGenerationDirectory(state.generation);
+    writeFileSync(nestedPath, attemptContent.slice(0, -1), { mode: 0o600 });
+
+    const store = new MigrationManifestStore({ homeDir: state.home });
+    expectProtocolReason(() => store.read(state.initial.generationId), "recovery-required");
+
+    let reducerCalls = 0;
+    expectProtocolReason(() => store.update(
+      state.initial.generationId,
+      state.initial.checksumSha256,
+      () => {
+        reducerCalls += 1;
+        return state.candidate;
+      },
+    ), "recovery-required");
+    expect(reducerCalls).toBe(0);
+    expect(store.recover(state.initial.generationId)).toEqual(state.candidate);
+    expect(existsSync(nestedPath)).toBe(false);
+  });
+
+  it("keeps candidate post-link writer scratch recovery-required and does not invoke update", () => {
+    const state = createRow1PublicationState("nested-candidate-post-link");
+    const groupNonce = /\.head\.json\.([0-9a-f]{24})\.tmp$/u.exec(state.artifacts.tmp)?.[1];
+    if (groupNonce === undefined) throw new Error("publication group nonce is absent");
+    const nestedPath = join(
+      state.generation,
+      `..head.json.${groupNonce}.tmp.${"a".repeat(24)}.tmp`,
+    );
+    unlinkSync(state.artifacts.attempt);
+    syncGenerationDirectory(state.generation);
+    linkSync(state.artifacts.tmp, nestedPath);
+    syncGenerationDirectory(state.generation);
+
+    const candidateStat = lstatSync(state.artifacts.tmp);
+    const nestedStat = lstatSync(nestedPath);
+    expect(candidateStat.dev).toBe(nestedStat.dev);
+    expect(candidateStat.ino).toBe(nestedStat.ino);
+    expect(candidateStat.nlink).toBe(2);
+    expect(nestedStat.nlink).toBe(2);
+
+    const store = new MigrationManifestStore({ homeDir: state.home });
+    expectProtocolReason(() => store.read(state.initial.generationId), "recovery-required");
+
+    let reducerCalls = 0;
+    expectProtocolReason(() => store.update(
+      state.initial.generationId,
+      state.initial.checksumSha256,
+      () => {
+        reducerCalls += 1;
+        return state.candidate;
+      },
+    ), "recovery-required");
+    expect(reducerCalls).toBe(0);
+    expect(store.recover(state.initial.generationId)).toEqual(state.candidate);
+    expect(existsSync(nestedPath)).toBe(false);
+    expect(store.read(state.initial.generationId)).toEqual(state.candidate);
+  });
+
+  it("keeps attempt post-link writer scratch recovery-required and does not invoke update", () => {
+    const state = createRow1PublicationState("nested-attempt-post-link");
+    const groupNonce = /\.head\.json\.([0-9a-f]{24})\.tmp$/u.exec(state.artifacts.tmp)?.[1];
+    if (groupNonce === undefined) throw new Error("publication group nonce is absent");
+    const nestedPath = join(
+      state.generation,
+      `..head.json.${groupNonce}.attempt.${"b".repeat(24)}.tmp`,
+    );
+    linkSync(state.artifacts.attempt, nestedPath);
+    syncGenerationDirectory(state.generation);
+
+    const attemptStat = lstatSync(state.artifacts.attempt);
+    const nestedStat = lstatSync(nestedPath);
+    expect(attemptStat.dev).toBe(nestedStat.dev);
+    expect(attemptStat.ino).toBe(nestedStat.ino);
+    expect(attemptStat.nlink).toBe(2);
+    expect(nestedStat.nlink).toBe(2);
+
+    const store = new MigrationManifestStore({ homeDir: state.home });
+    expectProtocolReason(() => store.read(state.initial.generationId), "recovery-required");
+
+    let reducerCalls = 0;
+    expectProtocolReason(() => store.update(
+      state.initial.generationId,
+      state.initial.checksumSha256,
+      () => {
+        reducerCalls += 1;
+        return state.candidate;
+      },
+    ), "recovery-required");
+    expect(reducerCalls).toBe(0);
+    expect(store.recover(state.initial.generationId)).toEqual(state.candidate);
+    expect(existsSync(nestedPath)).toBe(false);
+    expect(store.read(state.initial.generationId)).toEqual(state.candidate);
+  });
+
+  it("preserves a pre-link candidate scratch whose bytes are not a canonical prefix", () => {
+    const orphan = createNestedCandidateScratchOrphan("nested-candidate-not-prefix");
+    const scratchBytes = Buffer.from("not-a-prefix", "utf8");
+    writeFileSync(orphan.nestedPath, scratchBytes, { mode: 0o600 });
+    syncGenerationDirectory(orphan.state.generation);
+    const headBefore = readFileSync(orphan.state.headPath);
+
+    const store = new MigrationManifestStore({ homeDir: orphan.state.home });
+    expectProtocolReason(
+      () => store.recover(orphan.state.initial.generationId),
+      "malformed-manifest",
+    );
+
+    expect(readFileSync(orphan.nestedPath).equals(scratchBytes)).toBe(true);
+    expect(readFileSync(orphan.state.headPath).equals(headBefore)).toBe(true);
+  });
+
+  it("preserves a pre-link candidate scratch whose bytes are not ASCII", () => {
+    const orphan = createNestedCandidateScratchOrphan("nested-candidate-non-ascii");
+    const scratchBytes = Buffer.from([0xff, 0x7b]);
+    writeFileSync(orphan.nestedPath, scratchBytes, { mode: 0o600 });
+    syncGenerationDirectory(orphan.state.generation);
+    const headBefore = readFileSync(orphan.state.headPath);
+
+    const store = new MigrationManifestStore({ homeDir: orphan.state.home });
+    expectProtocolReason(
+      () => store.recover(orphan.state.initial.generationId),
+      "malformed-manifest",
+    );
+
+    expect(readFileSync(orphan.nestedPath).equals(scratchBytes)).toBe(true);
+    expect(readFileSync(orphan.state.headPath).equals(headBefore)).toBe(true);
+  });
+
+  it("preserves a canonical-prefix pre-link candidate scratch carrying a group-readable mode", () => {
+    const orphan = createNestedCandidateScratchOrphan("nested-candidate-loose-mode");
+    const scratchBytes = Buffer.from(orphan.candidateContent.slice(0, -1), "utf8");
+    writeFileSync(orphan.nestedPath, scratchBytes, { mode: 0o600 });
+    chmodSync(orphan.nestedPath, 0o644);
+    syncGenerationDirectory(orphan.state.generation);
+    const headBefore = readFileSync(orphan.state.headPath);
+
+    const store = new MigrationManifestStore({ homeDir: orphan.state.home });
+    expectProtocolReason(
+      () => store.read(orphan.state.initial.generationId),
+      "malformed-manifest",
+    );
+    expectProtocolReason(
+      () => store.recover(orphan.state.initial.generationId),
+      "malformed-manifest",
+    );
+
+    expect(readFileSync(orphan.nestedPath).equals(scratchBytes)).toBe(true);
+    expect(lstatSync(orphan.nestedPath).mode & 0o777).toBe(0o644);
+    expect(readFileSync(orphan.state.headPath).equals(headBefore)).toBe(true);
+  });
+
+  it("preserves a nested scratch that duplicates the candidate bytes without sharing its inode", () => {
+    const state = createRow1PublicationState("nested-candidate-twin-inode");
+    const groupNonce = /\.head\.json\.([0-9a-f]{24})\.tmp$/u.exec(state.artifacts.tmp)?.[1];
+    if (groupNonce === undefined) throw new Error("publication group nonce is absent");
+    const nestedPath = join(
+      state.generation,
+      `..head.json.${groupNonce}.tmp.${"d".repeat(24)}.tmp`,
+    );
+    unlinkSync(state.artifacts.attempt);
+    syncGenerationDirectory(state.generation);
+    const candidateBytes = readFileSync(state.artifacts.tmp);
+    writeFileSync(nestedPath, candidateBytes, { mode: 0o600 });
+    syncGenerationDirectory(state.generation);
+
+    const finalStat = lstatSync(state.artifacts.tmp);
+    const nestedStat = lstatSync(nestedPath);
+    expect(finalStat.nlink).toBe(1);
+    expect(nestedStat.nlink).toBe(1);
+    expect(finalStat.ino).not.toBe(nestedStat.ino);
+    const headBefore = readFileSync(state.headPath);
+
+    const store = new MigrationManifestStore({ homeDir: state.home });
+    expectProtocolReason(() => store.read(state.initial.generationId), "malformed-manifest");
+    expectProtocolReason(() => store.recover(state.initial.generationId), "malformed-manifest");
+
+    expect(existsSync(state.artifacts.tmp)).toBe(true);
+    expect(existsSync(nestedPath)).toBe(true);
+    expect(readFileSync(state.artifacts.tmp).equals(candidateBytes)).toBe(true);
+    expect(readFileSync(nestedPath).equals(candidateBytes)).toBe(true);
+    expect(readFileSync(state.headPath).equals(headBefore)).toBe(true);
+    expect(lstatSync(state.artifacts.tmp).ino).not.toBe(lstatSync(nestedPath).ino);
+  });
+
+  it("preserves every nested scratch when more than one exact nested name is present", () => {
+    const orphan = createNestedCandidateScratchOrphan("nested-candidate-multiple");
+    const secondPath = join(
+      orphan.state.generation,
+      orphan.nestedPath.replace(/^.*\//u, "").replace("c".repeat(24), "e".repeat(24)),
+    );
+    const firstBytes = Buffer.from(orphan.candidateContent.slice(0, -1), "utf8");
+    const secondBytes = Buffer.from(orphan.candidateContent.slice(0, 8), "utf8");
+    writeFileSync(orphan.nestedPath, firstBytes, { mode: 0o600 });
+    writeFileSync(secondPath, secondBytes, { mode: 0o600 });
+    syncGenerationDirectory(orphan.state.generation);
+    expect(readdirSync(orphan.state.generation).length).toBeLessThanOrEqual(5);
+    const headBefore = readFileSync(orphan.state.headPath);
+
+    const store = new MigrationManifestStore({ homeDir: orphan.state.home });
+    expectProtocolReason(
+      () => store.read(orphan.state.initial.generationId),
+      "malformed-manifest",
+    );
+    expectProtocolReason(
+      () => store.recover(orphan.state.initial.generationId),
+      "malformed-manifest",
+    );
+
+    expect(readFileSync(orphan.nestedPath).equals(firstBytes)).toBe(true);
+    expect(readFileSync(secondPath).equals(secondBytes)).toBe(true);
+    expect(readFileSync(orphan.state.headPath).equals(headBefore)).toBe(true);
+  });
+
+  it("preserves a nested candidate link pair that carries a third hard link", () => {
+    const state = createRow1PublicationState("nested-candidate-third-link");
+    const groupNonce = /\.head\.json\.([0-9a-f]{24})\.tmp$/u.exec(state.artifacts.tmp)?.[1];
+    if (groupNonce === undefined) throw new Error("publication group nonce is absent");
+    const nestedPath = join(
+      state.generation,
+      `..head.json.${groupNonce}.tmp.${"f".repeat(24)}.tmp`,
+    );
+    // The third link lives outside the generation directory so the bounded
+    // five-entry listing still describes an otherwise ordinary layout.
+    const outsidePath = join(state.home, "third-link.tmp");
+    unlinkSync(state.artifacts.attempt);
+    syncGenerationDirectory(state.generation);
+    linkSync(state.artifacts.tmp, nestedPath);
+    linkSync(state.artifacts.tmp, outsidePath);
+    syncGenerationDirectory(state.generation);
+
+    const candidateBytes = readFileSync(state.artifacts.tmp);
+    expect(lstatSync(state.artifacts.tmp).nlink).toBe(3);
+    expect(lstatSync(nestedPath).nlink).toBe(3);
+    expect(lstatSync(outsidePath).nlink).toBe(3);
+    const headBefore = readFileSync(state.headPath);
+
+    const store = new MigrationManifestStore({ homeDir: state.home });
+    expectProtocolReason(() => store.read(state.initial.generationId), "malformed-manifest");
+    expectProtocolReason(() => store.recover(state.initial.generationId), "malformed-manifest");
+
+    expect(existsSync(state.artifacts.tmp)).toBe(true);
+    expect(existsSync(nestedPath)).toBe(true);
+    expect(existsSync(outsidePath)).toBe(true);
+    expect(lstatSync(state.artifacts.tmp).nlink).toBe(3);
+    expect(readFileSync(nestedPath).equals(candidateBytes)).toBe(true);
+    expect(readFileSync(state.headPath).equals(headBefore)).toBe(true);
+  });
+
+  it("preserves a nested candidate scratch linked outside the generation without its final name", () => {
+    const orphan = createNestedCandidateScratchOrphan("nested-candidate-outside-link");
+    const scratchBytes = Buffer.from(orphan.candidateContent.slice(0, -1), "utf8");
+    writeFileSync(orphan.nestedPath, scratchBytes, { mode: 0o600 });
+    // The second link lives outside the generation directory, so the nested
+    // scratch reports post-link topology while its final name stays absent.
+    const outsidePath = join(orphan.state.home, "outside-writer-link.tmp");
+    linkSync(orphan.nestedPath, outsidePath);
+    syncGenerationDirectory(orphan.state.generation);
+    expect(lstatSync(orphan.nestedPath).nlink).toBe(2);
+    expect(existsSync(orphan.state.artifacts.tmp)).toBe(false);
+    const headBefore = readFileSync(orphan.state.headPath);
+
+    const store = new MigrationManifestStore({ homeDir: orphan.state.home });
+    expectProtocolReason(
+      () => store.read(orphan.state.initial.generationId),
+      "malformed-manifest",
+    );
+    expectProtocolReason(
+      () => store.recover(orphan.state.initial.generationId),
+      "malformed-manifest",
+    );
+
+    expect(readFileSync(orphan.nestedPath).equals(scratchBytes)).toBe(true);
+    expect(readFileSync(outsidePath).equals(scratchBytes)).toBe(true);
+    expect(existsSync(orphan.state.artifacts.tmp)).toBe(false);
+    expect(readFileSync(orphan.state.headPath).equals(headBefore)).toBe(true);
+  });
+
+  it("refuses recovery for a nested candidate scratch that has no stored successor", () => {
+    const home = makeHome();
+    const initial = manifest("nested-candidate-no-successor");
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const generation = migrationManifestGenerationDirectory(initial.generationId, home);
+    const headPath = migrationManifestHeadPath(initial.generationId, home);
+    const nestedPath = join(
+      generation,
+      `..head.json.${"1".repeat(24)}.tmp.${"2".repeat(24)}.tmp`,
+    );
+    writeFileSync(nestedPath, "", { mode: 0o600 });
+    syncGenerationDirectory(generation);
+    const headBefore = readFileSync(headPath);
+
+    expectProtocolReason(() => store.read(initial.generationId), "recovery-required");
+    expectProtocolReason(() => store.recover(initial.generationId), "unexpected-state");
+
+    expect(existsSync(nestedPath)).toBe(true);
+    expect(readFileSync(nestedPath, "utf8")).toBe("");
+    expect(readFileSync(headPath).equals(headBefore)).toBe(true);
+  });
+  it("propagates a non-ENOENT stat failure on the nested scratch final target", () => {
+    const orphan = createNestedCandidateScratchOrphan("nested-candidate-final-stat-eio");
+    const scratchBytes = Buffer.from(orphan.candidateContent.slice(0, -1), "utf8");
+    writeFileSync(orphan.nestedPath, scratchBytes, { mode: 0o600 });
+    syncGenerationDirectory(orphan.state.generation);
+    const headBefore = readFileSync(orphan.state.headPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalLstat = nodeFs.lstatSync as typeof lstatSync;
+    const statFailure = Object.assign(new Error("final target stat denied"), { code: "EIO" });
+    let observedFailure: unknown;
+
+    try {
+      withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+        if (path === orphan.state.artifacts.tmp) throw statFailure;
+        return originalLstat(path, options as never);
+      }) as never, () => new MigrationManifestStore({ homeDir: orphan.state.home }).read(
+        orphan.state.initial.generationId,
+      ));
+    } catch (error) {
+      observedFailure = error;
+    }
+
+    expect(observedFailure).toBeInstanceOf(MigrationProtocolError);
+    expect((observedFailure as MigrationProtocolError).reason).toBe("malformed-manifest");
+    expect((observedFailure as MigrationProtocolError).cause).toBe(statFailure);
+    expect(readFileSync(orphan.nestedPath).equals(scratchBytes)).toBe(true);
+    expect(readFileSync(orphan.state.headPath).equals(headBefore)).toBe(true);
+  });
+
+  it("preserves the nested scratch when its recovery consume unlink is denied", () => {
+    const orphan = createNestedCandidateScratchOrphan("nested-candidate-consume-eacces");
+    const scratchBytes = Buffer.from(orphan.candidateContent.slice(0, -1), "utf8");
+    writeFileSync(orphan.nestedPath, scratchBytes, { mode: 0o600 });
+    syncGenerationDirectory(orphan.state.generation);
+    const headBefore = readFileSync(orphan.state.headPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalUnlink = nodeFs.unlinkSync as typeof unlinkSync;
+    const unlinkFailure = Object.assign(new Error("scratch unlink denied"), { code: "EACCES" });
+    let observedFailure: unknown;
+
+    try {
+      withPatchedFs("unlinkSync", ((path: string) => {
+        if (path === orphan.nestedPath) throw unlinkFailure;
+        originalUnlink(path);
+      }) as never, () => new MigrationManifestStore({ homeDir: orphan.state.home }).recover(
+        orphan.state.initial.generationId,
+      ));
+    } catch (error) {
+      observedFailure = error;
+    }
+
+    expect(observedFailure).toBeInstanceOf(MigrationProtocolError);
+    expect((observedFailure as MigrationProtocolError).reason).toBe("malformed-manifest");
+    expect((observedFailure as MigrationProtocolError).message)
+      .toBe("migration manifest head publication writer scratch is invalid");
+    expect((observedFailure as MigrationProtocolError).cause).toBe(unlinkFailure);
+    expect(readFileSync(orphan.nestedPath).equals(scratchBytes)).toBe(true);
+    expect(readFileSync(orphan.state.headPath).equals(headBefore)).toBe(true);
+  });
+
+  it("reports a cleanup durability failure after the nested scratch unlink", () => {
+    const orphan = createNestedCandidateScratchOrphan("nested-candidate-cleanup-sync");
+    const scratchBytes = Buffer.from(orphan.candidateContent.slice(0, -1), "utf8");
+    writeFileSync(orphan.nestedPath, scratchBytes, { mode: 0o600 });
+    syncGenerationDirectory(orphan.state.generation);
+    const headBefore = readFileSync(orphan.state.headPath);
+    const events: string[] = [];
+    const store = new MigrationManifestStore({
+      homeDir: orphan.state.home,
+      observer: (event) => {
+        events.push(event);
+      },
+    });
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as typeof openSync;
+    const originalFsync = nodeFs.fsyncSync as (fd: number) => void;
+    const generationDescriptors = new Set<number>();
+    const syncFailure = Object.assign(new Error("cleanup sync denied"), { code: "EIO" });
+    let observedFailure: unknown;
+
+    try {
+      withPatchedFs("openSync", ((path: string, flags: string | number, mode?: number) => {
+        const fd = mode === undefined
+          ? originalOpen(path, flags as never)
+          : originalOpen(path, flags as never, mode);
+        if (path === orphan.state.generation) generationDescriptors.add(fd);
+        return fd;
+      }) as never, () => withPatchedFs("fsyncSync", ((fd: number) => {
+        // Fail only the cleanup sync that follows the nested scratch unlink so
+        // the fixture and every earlier durability point stay authentic.
+        if (generationDescriptors.has(fd) && !existsSync(orphan.nestedPath)) throw syncFailure;
+        originalFsync(fd);
+      }) as never, () => store.recover(orphan.state.initial.generationId)));
+    } catch (error) {
+      observedFailure = error;
+    }
+
+    expect(observedFailure).toBeInstanceOf(MigrationProtocolError);
+    expect((observedFailure as MigrationProtocolError).reason).toBe("recovery-required");
+    expect((observedFailure as MigrationProtocolError).message)
+      .toBe("migration manifest head publication writer scratch cleanup durability sync failed");
+    expect((observedFailure as MigrationProtocolError).cause).toBe(syncFailure);
+    expect(existsSync(orphan.nestedPath)).toBe(false);
+    expect(readFileSync(orphan.state.headPath).equals(headBefore)).toBe(true);
+    expect(events).toEqual([]);
+    expect(store.recover(orphan.state.initial.generationId)).toEqual(orphan.state.candidate);
+  });
+  it("preserves a post-link nested pair whose alias is replaced before the reclaim recheck", () => {
+    const state = createRow1PublicationState("nested-candidate-reclaim-race");
+    const groupNonce = /\.head\.json\.([0-9a-f]{24})\.tmp$/u.exec(state.artifacts.tmp)?.[1];
+    if (groupNonce === undefined) throw new Error("publication group nonce is absent");
+    const nestedPath = join(
+      state.generation,
+      `..head.json.${groupNonce}.tmp.${"a".repeat(24)}.tmp`,
+    );
+    unlinkSync(state.artifacts.attempt);
+    syncGenerationDirectory(state.generation);
+    linkSync(state.artifacts.tmp, nestedPath);
+    syncGenerationDirectory(state.generation);
+    const candidateBytes = readFileSync(state.artifacts.tmp);
+    expect(lstatSync(nestedPath).nlink).toBe(2);
+    const headBefore = readFileSync(state.headPath);
+
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as typeof openSync;
+    let lastOpened: string | null = null;
+    let raced = false;
+    let observedFailure: unknown;
+
+    try {
+      withPatchedFs("openSync", ((path: string, flags: string | number, mode?: number) => {
+        // Reclaim is the only sequence that opens the final name immediately
+        // before the alias, so this seam fires exactly once between the two
+        // canonical reads that the exact-link-pair recheck compares.
+        if (!raced && path === nestedPath && lastOpened === state.artifacts.tmp) {
+          raced = true;
+          unlinkSync(nestedPath);
+          writeFileSync(nestedPath, candidateBytes, { mode: 0o600 });
+        }
+        lastOpened = path;
+        return mode === undefined
+          ? originalOpen(path, flags as never)
+          : originalOpen(path, flags as never, mode);
+      }) as never, () => new MigrationManifestStore({ homeDir: state.home }).recover(
+        state.initial.generationId,
+      ));
+    } catch (error) {
+      observedFailure = error;
+    }
+
+    expect(raced).toBe(true);
+    expect(observedFailure).toBeInstanceOf(MigrationProtocolError);
+    expect((observedFailure as MigrationProtocolError).reason).toBe("malformed-manifest");
+    expect((observedFailure as MigrationProtocolError).message)
+      .toBe("migration manifest head publication writer scratch is invalid");
+    expect((observedFailure as MigrationProtocolError).cause).toBeInstanceOf(Error);
+    expect(((observedFailure as MigrationProtocolError).cause as Error).message)
+      .toBe("migration manifest head publication writer scratch is not an exact link pair");
+    expect(existsSync(state.artifacts.tmp)).toBe(true);
+    expect(existsSync(nestedPath)).toBe(true);
+    expect(lstatSync(state.artifacts.tmp).ino).not.toBe(lstatSync(nestedPath).ino);
+    expect(readFileSync(state.artifacts.tmp).equals(candidateBytes)).toBe(true);
+    expect(readFileSync(nestedPath).equals(candidateBytes)).toBe(true);
+    expect(readFileSync(state.headPath).equals(headBefore)).toBe(true);
+  });
+
+  it("reports a cleanup durability failure after the post-link alias unlink", () => {
+    const state = createRow1PublicationState("nested-attempt-post-link-cleanup-sync");
+    const groupNonce = /\.head\.json\.([0-9a-f]{24})\.tmp$/u.exec(state.artifacts.tmp)?.[1];
+    if (groupNonce === undefined) throw new Error("publication group nonce is absent");
+    const nestedPath = join(
+      state.generation,
+      `..head.json.${groupNonce}.attempt.${"b".repeat(24)}.tmp`,
+    );
+    linkSync(state.artifacts.attempt, nestedPath);
+    syncGenerationDirectory(state.generation);
+    const headBefore = readFileSync(state.headPath);
+    const events: string[] = [];
+    const store = new MigrationManifestStore({
+      homeDir: state.home,
+      observer: (event) => {
+        events.push(event);
+      },
+    });
+
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as typeof openSync;
+    const originalFsync = nodeFs.fsyncSync as (fd: number) => void;
+    const generationDescriptors = new Set<number>();
+    const syncFailure = Object.assign(new Error("post-link cleanup sync denied"), { code: "EIO" });
+    let syncsAfterUnlink = 0;
+    let observedFailure: unknown;
+
+    try {
+      withPatchedFs("openSync", ((path: string, flags: string | number, mode?: number) => {
+        const fd = mode === undefined
+          ? originalOpen(path, flags as never)
+          : originalOpen(path, flags as never, mode);
+        if (path === state.generation) generationDescriptors.add(fd);
+        return fd;
+      }) as never, () => withPatchedFs("fsyncSync", ((fd: number) => {
+        // The alias consume owns the first generation sync after the unlink;
+        // only the dedicated cleanup sync that follows it is failed here.
+        if (generationDescriptors.has(fd) && !existsSync(nestedPath)) {
+          syncsAfterUnlink += 1;
+          if (syncsAfterUnlink >= 2) throw syncFailure;
+        }
+        originalFsync(fd);
+      }) as never, () => store.recover(state.initial.generationId)));
+    } catch (error) {
+      observedFailure = error;
+    }
+
+    expect(observedFailure).toBeInstanceOf(MigrationProtocolError);
+    expect((observedFailure as MigrationProtocolError).reason).toBe("recovery-required");
+    expect((observedFailure as MigrationProtocolError).message)
+      .toBe("migration manifest head publication writer scratch cleanup durability sync failed");
+    expect((observedFailure as MigrationProtocolError).cause).toBe(syncFailure);
+    expect(existsSync(nestedPath)).toBe(false);
+    expect(existsSync(state.artifacts.attempt)).toBe(true);
+    expect(lstatSync(state.artifacts.attempt).nlink).toBe(1);
+    expect(readFileSync(state.headPath).equals(headBefore)).toBe(true);
+    expect(events).toEqual([]);
+    expect(store.recover(state.initial.generationId)).toEqual(state.candidate);
+  });
+
+  it("keeps a foreign-group nested scratch recovery-required beside an authentic publication group", () => {
+    const state = createRow1PublicationState("nested-foreign-group-scratch");
+    // Reduce the authentic group to its candidate-cleaned shape so the bounded
+    // five-entry listing still admits one extra nested scratch entry.
+    renameSync(state.headPath, state.artifacts.capture);
+    syncGenerationDirectory(state.generation);
+    linkSync(state.artifacts.tmp, state.headPath);
+    syncGenerationDirectory(state.generation);
+    unlinkSync(state.artifacts.tmp);
+    syncGenerationDirectory(state.generation);
+    const groupNonce = /\.head\.json\.([0-9a-f]{24})\.attempt$/u.exec(state.artifacts.attempt)?.[1];
+    if (groupNonce === undefined) throw new Error("publication group nonce is absent");
+    const foreignNonce = "9".repeat(24);
+    expect(foreignNonce).not.toBe(groupNonce);
+    const nestedPath = join(
+      state.generation,
+      `..head.json.${foreignNonce}.attempt.${"c".repeat(24)}.tmp`,
+    );
+    const scratchBytes = Buffer.from("{", "utf8");
+    writeFileSync(nestedPath, scratchBytes, { mode: 0o600 });
+    syncGenerationDirectory(state.generation);
+    expect(existsSync(join(state.generation, `.head.json.${foreignNonce}.attempt`))).toBe(false);
+    expect(readdirSync(state.generation).sort()).toEqual([
+      `..head.json.${foreignNonce}.attempt.${"c".repeat(24)}.tmp`,
+      `.head.json.${groupNonce}.attempt`,
+      `.head.json.${groupNonce}.capture`,
+      "head.json",
+      "revisions",
+    ]);
+    const headBefore = readFileSync(state.headPath);
+    const captureBefore = readFileSync(state.artifacts.capture);
+    const attemptBefore = readFileSync(state.artifacts.attempt);
+
+    const store = new MigrationManifestStore({ homeDir: state.home });
+    let observedFailure: unknown;
+    try {
+      store.read(state.initial.generationId);
+    } catch (error) {
+      observedFailure = error;
+    }
+
+    expect(observedFailure).toBeInstanceOf(MigrationProtocolError);
+    expect((observedFailure as MigrationProtocolError).reason).toBe("recovery-required");
+    expect((observedFailure as MigrationProtocolError).message)
+      .toBe("migration manifest has an unfinished head publication writer scratch");
+    expect(readFileSync(nestedPath).equals(scratchBytes)).toBe(true);
+    expect(readFileSync(state.headPath).equals(headBefore)).toBe(true);
+    expect(readFileSync(state.artifacts.capture).equals(captureBefore)).toBe(true);
+    expect(readFileSync(state.artifacts.attempt).equals(attemptBefore)).toBe(true);
+  });
+});
+
 function makeHome(mode = 0o700): string {
   const home = mkdtempSync(join("/tmp", "lcm-manifest-store-"));
   roots.push(home);
@@ -253,6 +872,31 @@ function syncGenerationDirectory(path: string): void {
   } finally {
     closeSync(descriptor);
   }
+}
+
+/**
+ * Build the authentic pre-link candidate-writer orphan layout: the ordinary
+ * publication finals are removed durably, leaving the generation ready for a
+ * single nested `..head.json.<group>.tmp.<writer>.tmp` scratch to be written by
+ * the caller.
+ */
+function createNestedCandidateScratchOrphan(label: string): Readonly<{
+  state: ReturnType<typeof createRow1PublicationState>;
+  nestedPath: string;
+  candidateContent: string;
+}> {
+  const state = createRow1PublicationState(label);
+  const groupNonce = /\.head\.json\.([0-9a-f]{24})\.tmp$/u.exec(state.artifacts.tmp)?.[1];
+  if (groupNonce === undefined) throw new Error("publication group nonce is absent");
+  const nestedPath = join(
+    state.generation,
+    `..head.json.${groupNonce}.tmp.${"c".repeat(24)}.tmp`,
+  );
+  const candidateContent = readFileSync(state.artifacts.tmp, "utf8");
+  unlinkSync(state.artifacts.tmp);
+  unlinkSync(state.artifacts.attempt);
+  syncGenerationDirectory(state.generation);
+  return { state, nestedPath, candidateContent };
 }
 
 function createRow1PublicationState(label: string): Readonly<{
