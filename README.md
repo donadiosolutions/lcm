@@ -472,14 +472,14 @@ invalid, or mismatched identity fields fail closed. Migration witness hashes
 are integrity evidence, not identity or runtime-authorization principals.
 
 The second `openProject` argument is optional. The ordinary curated call above
-omits it, so the factory internally captures two short authenticated backend-
-publication witness snapshots around the remote PostgreSQL identity work and
-requires them to agree. Only code already executing inside the owning internal
-coordination boundary with a live `BackendPublicationLockToken` may pass that
-token and must keep it active for the entire call. The curated subpath exposes
-no token constructor. Do not forge a token, read raw journal data as authority,
-or bypass publication evidence; see the
-[backend publication safety guide](docs/backend-publication.md).
+omits it, so the factory internally captures two short authenticated
+backend-publication witness snapshots around the remote PostgreSQL identity
+work and requires them to agree. Only code already executing inside the owning
+internal coordination boundary with a live `BackendPublicationLockToken` may
+pass that token and must keep it active for the entire call. The curated
+subpath exports neither the token type nor a token constructor. Do not forge a
+token, read raw journal data as authority, or bypass publication evidence; see
+the [backend publication safety guide](docs/backend-publication.md).
 
 Closing `ProjectStorage` aborts and settles only that project's tracked work.
 Closing the factory aborts and drains pending opens, closes any projects still

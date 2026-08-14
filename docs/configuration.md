@@ -458,9 +458,10 @@ Ordinary callers omit `openProject`'s optional second argument. The factory then
 takes two short authenticated publication snapshots around remote identity work
 and requires them to agree. Only an owning internal coordination boundary that
 already holds a live `BackendPublicationLockToken` may pass it and keep it live
-across the call; the curated subpath exposes no constructor. Never forge a
-token, treat raw journal data as authority, or bypass publication evidence. See
-the [backend publication safety guide](backend-publication.md).
+across the call; the curated subpath exports neither the token type nor a token
+constructor. Never forge a token, treat raw journal data as authority, or
+bypass publication evidence. See the
+[backend publication safety guide](backend-publication.md).
 
 Always close both scopes in `finally`: close `ProjectStorage` first to abort and
 settle only its project work, then close the factory to drain pending opens and
