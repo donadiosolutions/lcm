@@ -74,6 +74,35 @@ describe("PostgreSQL 18 runtime", () => {
     });
   });
 
+  it("forces pg_catalog before public over a hostile database search path", async () => {
+    await withPostgreSqlTestDatabase("runtime-search-path", async (database) => {
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      try {
+        await admin.query({
+          text: `ALTER DATABASE "${database.name}" SET search_path = public, pg_catalog`,
+        }, { domain: "factory", operation: "setHostileDatabaseSearchPath" });
+        const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl));
+        try {
+          await expect(runtime.query<{ search_path: string }>({
+            text: "SHOW search_path",
+          }, { domain: "factory", operation: "readRuntimeSearchPath" })).resolves.toMatchObject({
+            rows: [{ search_path: "pg_catalog, public" }],
+          });
+        } finally {
+          await runtime.close();
+        }
+      } finally {
+        try {
+          await admin.query({
+            text: `ALTER DATABASE "${database.name}" RESET search_path`,
+          }, { domain: "factory", operation: "restoreDatabaseSearchPath" });
+        } finally {
+          await admin.close();
+        }
+      }
+    });
+  });
+
   it("rejects an untrusted CA and a hostname not present in the server certificate", async () => {
     const env = harnessEnvironment();
     const wrongCa = new PostgreSqlRuntime(settings(env.LCM_TEST_POSTGRES_RUNTIME_URL, {
