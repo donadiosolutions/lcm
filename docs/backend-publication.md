@@ -80,7 +80,7 @@ project lookup or open. A caller may either hold the existing live local
 publication lock token for the complete operation or let the factory capture
 two short terminal witnesses under that lock, one before and one after the
 remote identity lookup. The two witnesses must match exactly. The factory also
-requires the remote project UUID, identity key, machine alias, selected path,
+requires the remote project UUID, machine ID/alias, lexical selected path,
 and normalized path to match the local identity context. Publication or
 identity drift fails before any project repository is returned and never
 causes a SQLite fallback.

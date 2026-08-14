@@ -49,8 +49,11 @@ ledger, and every managed object by `migrationRole`. It also checks the
 runtime role policy (including the absence of superuser, ownership,
 membership, role-creation, database-creation, replication, and bypass-RLS
 authority) and both layers of least privilege: exact direct ACL entries and
-the corresponding effective privileges. Additional, `PUBLIC`, grantable, or
-foreign-granted access fails readiness.
+the corresponding effective privileges. Any direct ACL outside the exact
+allowlist—including unexpected `PUBLIC`, grantable, or foreign-granted
+access—fails readiness. The allowlist intentionally retains `PUBLIC USAGE` on
+the `public` schema and sanctioned `PUBLIC EXECUTE` defaults on verified
+extension-owned functions.
 
 The verifier is catalog-only. It does not run migrations, acquire the
 migration lock, write the migration ledger, repair schema or data drift, alter
@@ -540,8 +543,11 @@ queries. See
 Applying these repository grants does not activate the PostgreSQL backend.
 Daemon/CLI routing remains gated by #224 and the #92 cutover. Re-run migration
 readiness after changing grants: the schema fingerprint accepts only the exact
-reviewed runtime-role privilege shapes and fails closed on additional,
-grantable, `PUBLIC`, or foreign-grantor privileges.
+reviewed runtime-role privilege shapes and fails closed on direct ACLs outside
+the exact allowlist, including unexpected `PUBLIC`, grantable, or
+foreign-granted privileges. The allowlist intentionally retains `PUBLIC USAGE`
+on the `public` schema and sanctioned `PUBLIC EXECUTE` defaults on verified
+extension-owned functions.
 
 ## Managed-service operation
 

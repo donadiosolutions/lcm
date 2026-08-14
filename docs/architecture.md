@@ -22,9 +22,10 @@ health, server and extension policy, the complete migration ledger, immutable
 schema fingerprints, migration ownership, search configuration, and the exact
 runtime ACL manifest. Only then can an explicit programmatic caller obtain a
 backend factory. Project opening additionally validates terminal backend
-publication evidence and the exact remote machine, project UUID, identity key,
-and normalized selected path before composing all nine repository contracts
-into one `ProjectStorage`. The project object owns its transaction scope,
+publication evidence and the exact remote project UUID, machine ID/alias,
+lexical selected path, and normalized path before composing all nine repository
+contracts into one `ProjectStorage`. The project object owns its transaction
+scope,
 health, cancellation, and close lifecycle; no SQL client escapes the storage
 boundary.
 Explicit embedded callers use the curated
