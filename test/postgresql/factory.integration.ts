@@ -137,6 +137,79 @@ async function applyAllRuntimeGrants(
   }
 }
 
+interface ExtensionFunctionState {
+  readonly definition: string;
+  readonly extensionName: string | null;
+  readonly languageName: string;
+}
+
+async function inspectExtensionFunctionState(
+  administrator: PostgreSqlRuntime,
+  functionIdentity: string,
+  operation: string,
+): Promise<ExtensionFunctionState> {
+  const result = await administrator.query({
+    text: `SELECT pg_catalog.pg_get_functiondef(procedure.oid) AS definition,
+                  language.lanname::pg_catalog.text AS language_name,
+                  (
+                    SELECT extension.extname::pg_catalog.text
+                    FROM pg_catalog.pg_depend AS dependency
+                    JOIN pg_catalog.pg_extension AS extension
+                      ON extension.oid OPERATOR(pg_catalog.=) dependency.refobjid
+                    WHERE dependency.classid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_proc')
+                      AND dependency.objid OPERATOR(pg_catalog.=) procedure.oid
+                      AND dependency.objsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.deptype OPERATOR(pg_catalog.=) 'e'
+                  ) AS extension_name
+           FROM pg_catalog.pg_proc AS procedure
+           JOIN pg_catalog.pg_language AS language
+             ON language.oid OPERATOR(pg_catalog.=) procedure.prolang
+           WHERE procedure.oid OPERATOR(pg_catalog.=) $1::pg_catalog.regprocedure`,
+    values: [functionIdentity],
+  }, { domain: "factory", operation });
+  const row = result.rows[0];
+  if (
+    typeof row?.definition !== "string"
+    || typeof row.language_name !== "string"
+    || (typeof row.extension_name !== "string" && row.extension_name !== null)
+  ) {
+    throw new Error("invalid extension function fixture state");
+  }
+  return {
+    definition: row.definition,
+    extensionName: row.extension_name,
+    languageName: row.language_name,
+  };
+}
+
+async function restoreExtensionFunctionState(
+  administrator: PostgreSqlRuntime,
+  extensionName: "pgcrypto" | "pg_trgm",
+  functionIdentity: string,
+  authoritative: ExtensionFunctionState,
+): Promise<void> {
+  const current = await inspectExtensionFunctionState(
+    administrator,
+    functionIdentity,
+    "inspectExtensionFunctionBeforeRestore",
+  );
+  if (current.extensionName === extensionName) {
+    await administrator.query({
+      text: `ALTER EXTENSION ${extensionName} DROP FUNCTION ${functionIdentity}`,
+    }, { domain: "factory", operation: "detachExtensionFunctionBeforeRestore" });
+  }
+  await administrator.query({ text: authoritative.definition }, {
+    domain: "factory",
+    operation: "restoreAuthoritativeExtensionFunction",
+  });
+  if (authoritative.extensionName === extensionName) {
+    await administrator.query({
+      text: `ALTER EXTENSION ${extensionName} ADD FUNCTION ${functionIdentity}`,
+    }, { domain: "factory", operation: "restoreExtensionFunctionMembership" });
+  }
+}
+
 async function createIdentityFixture(
   database: PostgreSqlTestDatabase,
   label: string,
@@ -678,6 +751,124 @@ describe("PostgreSQL 18 project storage factory", () => {
       expect(afterConversationCount).toBe(beforeConversationCount);
     });
   });
+
+  it.each([
+    {
+      label: "pgcrypto digest",
+      extensionName: "pgcrypto",
+      functionIdentity: "public.digest(text, text)",
+      replacement: `CREATE OR REPLACE FUNCTION public.digest(text, text)
+                    RETURNS pg_catalog.bytea
+                    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+                    AS $$
+                      SELECT CASE
+                        WHEN $1 OPERATOR(pg_catalog.=) 'factory-corrupt-digest'
+                          THEN pg_catalog.decode(pg_catalog.repeat('00', 32), 'hex')
+                        ELSE public.digest(pg_catalog.convert_to($1, 'UTF8'), $2)
+                      END
+                    $$`,
+    },
+    {
+      label: "pg_trgm similarity",
+      extensionName: "pg_trgm",
+      functionIdentity: "public.similarity(text, text)",
+      replacement: `CREATE OR REPLACE FUNCTION public.similarity(text, text)
+                    RETURNS pg_catalog.float4
+                    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+                    AS $$ SELECT 1::pg_catalog.float4 $$`,
+    },
+  ] as const)(
+    "rejects a replaced $label implementation despite restored extension membership",
+    async ({ extensionName, functionIdentity, replacement }) => {
+      await withPostgreSqlTestDatabase("factory-extension-function", async (database) => {
+        await applyAllRuntimeGrants(database);
+        const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-extension-function-"));
+        const administrator = new PostgreSqlRuntime(settings(database.adminUrl, { poolMax: 1 }));
+        const authoritative = await inspectExtensionFunctionState(
+          administrator,
+          functionIdentity,
+          "captureAuthoritativeExtensionFunction",
+        );
+        let factory: Awaited<ReturnType<
+          typeof createPostgreSqlStorageBackendFactoryForTesting
+        >> | undefined;
+        let factoryError: unknown;
+        let tampered: ExtensionFunctionState | undefined;
+        let restored: ExtensionFunctionState | undefined;
+        try {
+          expect(authoritative).toMatchObject({
+            extensionName,
+            languageName: "c",
+          });
+          await administrator.query({
+            text: `ALTER EXTENSION ${extensionName} DROP FUNCTION ${functionIdentity}`,
+          }, { domain: "factory", operation: "detachExtensionFunctionForReplacement" });
+          await administrator.query({ text: replacement }, {
+            domain: "factory",
+            operation: "replaceExtensionFunctionImplementation",
+          });
+          await administrator.query({
+            text: `ALTER EXTENSION ${extensionName} ADD FUNCTION ${functionIdentity}`,
+          }, { domain: "factory", operation: "reattachReplacedExtensionFunction" });
+          tampered = await inspectExtensionFunctionState(
+            administrator,
+            functionIdentity,
+            "inspectReplacedExtensionFunction",
+          );
+
+          factory = await createPostgreSqlStorageBackendFactoryForTesting(
+            factoryConfig(database),
+            homeDir,
+          ).catch((error: unknown) => {
+            factoryError = error;
+            return undefined;
+          });
+
+          expect(tampered).toMatchObject({
+            extensionName,
+            languageName: "sql",
+          });
+          expect(factoryError).toMatchObject({
+            code: "STORAGE_INITIALIZATION_FAILED",
+            backend: "postgresql",
+            operation: "createFactory",
+          });
+          expect(JSON.stringify(factoryError)).not.toContain(functionIdentity);
+
+          await factory?.close();
+          factory = undefined;
+          await restoreExtensionFunctionState(
+            administrator,
+            extensionName,
+            functionIdentity,
+            authoritative,
+          );
+          restored = await inspectExtensionFunctionState(
+            administrator,
+            functionIdentity,
+            "inspectRestoredExtensionFunction",
+          );
+        } finally {
+          try {
+            await factory?.close().catch(() => undefined);
+            if (restored === undefined) {
+              await restoreExtensionFunctionState(
+                administrator,
+                extensionName,
+                functionIdentity,
+                authoritative,
+              );
+            }
+          } finally {
+            await administrator.close();
+            rmSync(homeDir, { recursive: true, force: true });
+          }
+        }
+
+        expect(restored).toEqual(authoritative);
+      });
+    },
+  );
 
   it("fails construction for wrong CA and wrong host without leaking connection data", async () => {
     await withPostgreSqlTestDatabase("factory-tls", async (database) => {

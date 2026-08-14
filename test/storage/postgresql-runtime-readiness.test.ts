@@ -89,6 +89,77 @@ type ReadyExecutorOverride =
   | { readonly error: unknown }
   | ((base: ReadyExecutorBaseResult) => ReadyExecutorBaseResult | readonly QueryResultRow[]);
 
+const REQUIRED_EXTENSION_FUNCTION_ROWS = [
+  {
+    function_identity: "public.digest(text, text)",
+    extension_name: "pgcrypto",
+    language_name: "c",
+    probin: "$libdir/pgcrypto",
+    prosrc: "pg_digest",
+    return_type: "bytea",
+    security_definer: false,
+    leakproof: false,
+    volatility: "i",
+    parallel_safety: "s",
+    strict: true,
+    returns_set: false,
+    function_kind: "f",
+    no_support_function: true,
+    configuration_is_null: true,
+  },
+  {
+    function_identity: "public.digest(bytea, text)",
+    extension_name: "pgcrypto",
+    language_name: "c",
+    probin: "$libdir/pgcrypto",
+    prosrc: "pg_digest",
+    return_type: "bytea",
+    security_definer: false,
+    leakproof: false,
+    volatility: "i",
+    parallel_safety: "s",
+    strict: true,
+    returns_set: false,
+    function_kind: "f",
+    no_support_function: true,
+    configuration_is_null: true,
+  },
+  {
+    function_identity: "public.similarity(text, text)",
+    extension_name: "pg_trgm",
+    language_name: "c",
+    probin: "$libdir/pg_trgm",
+    prosrc: "similarity",
+    return_type: "real",
+    security_definer: false,
+    leakproof: false,
+    volatility: "i",
+    parallel_safety: "s",
+    strict: true,
+    returns_set: false,
+    function_kind: "f",
+    no_support_function: true,
+    configuration_is_null: true,
+  },
+  {
+    function_identity: "public.similarity_op(text, text)",
+    extension_name: "pg_trgm",
+    language_name: "c",
+    probin: "$libdir/pg_trgm",
+    prosrc: "similarity_op",
+    return_type: "boolean",
+    security_definer: false,
+    leakproof: false,
+    volatility: "s",
+    parallel_safety: "s",
+    strict: true,
+    returns_set: false,
+    function_kind: "f",
+    no_support_function: true,
+    configuration_is_null: true,
+  },
+] as const;
+
 function mutateRows(
   mutation: (rows: QueryResultRow[]) => void,
 ): (base: ReadyExecutorBaseResult) => ReadyExecutorBaseResult {
@@ -208,6 +279,9 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
     }
     if (operation === "runtimeReadinessExtensions:probePgStatStatements") {
       return applyOverride(result([{ stats_reset: new Date() }]));
+    }
+    if (operation === "inspectRequiredExtensionFunctions") {
+      return applyOverride(result(REQUIRED_EXTENSION_FUNCTION_ROWS.map((row) => ({ ...row }))));
     }
     if (operation === "runtimeReadinessSearchConfiguration") {
       return applyOverride(result([{
@@ -467,6 +541,69 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       "public.similarity_op(text, text)",
     ]);
     expect(new Set(identities).size).toBe(identities.length);
+  });
+
+  it.each(REQUIRED_EXTENSION_FUNCTION_ROWS.map(({ function_identity }) => [function_identity]))(
+    "rejects a spoofed C implementation for %s before later readiness work",
+    async (functionIdentity) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRequiredExtensionFunctions: mutateRows((rows) => {
+            const row = rows.find(({ function_identity }) => function_identity === functionIdentity);
+            if (row !== undefined) row.prosrc = "spoofed_entry_point";
+          }),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "extension-preflight");
+      expect(failure.operation).toBe("inspectRequiredExtensionFunctions");
+      expect(fake.queries.map(({ options }) => options.operation)).toEqual([
+        "inspectServerReadiness",
+        "inspectRuntimeRolePolicy",
+        "runtimeReadinessExtensions",
+        "runtimeReadinessExtensions:probePgStatStatements",
+        "inspectRequiredExtensionFunctions",
+      ]);
+    },
+  );
+
+  it.each([
+    ["malformed identity", (rows: QueryResultRow[]) => { rows[0]!.function_identity = null; }],
+    ["unknown identity", (rows: QueryResultRow[]) => {
+      rows[0]!.function_identity = "public.digest(uuid, text)";
+    }],
+    ["wrong extension membership", (rows: QueryResultRow[]) => {
+      rows[0]!.extension_name = "pg_trgm";
+    }],
+    ["non-C language", (rows: QueryResultRow[]) => { rows[0]!.language_name = "sql"; }],
+    ["foreign shared library", (rows: QueryResultRow[]) => {
+      rows[0]!.probin = "$libdir/foreign";
+    }],
+    ["wrong return type", (rows: QueryResultRow[]) => { rows[0]!.return_type = "text"; }],
+    ["security definer", (rows: QueryResultRow[]) => { rows[0]!.security_definer = true; }],
+    ["leakproof", (rows: QueryResultRow[]) => { rows[0]!.leakproof = true; }],
+    ["wrong volatility", (rows: QueryResultRow[]) => { rows[0]!.volatility = "v"; }],
+    ["parallel unsafe", (rows: QueryResultRow[]) => { rows[0]!.parallel_safety = "u"; }],
+    ["non-strict", (rows: QueryResultRow[]) => { rows[0]!.strict = false; }],
+    ["set-returning", (rows: QueryResultRow[]) => { rows[0]!.returns_set = true; }],
+    ["wrong function kind", (rows: QueryResultRow[]) => { rows[0]!.function_kind = "p"; }],
+    ["planner support function", (rows: QueryResultRow[]) => {
+      rows[0]!.no_support_function = false;
+    }],
+    ["procedure configuration", (rows: QueryResultRow[]) => {
+      rows[0]!.configuration_is_null = false;
+    }],
+    ["duplicate overload", (rows: QueryResultRow[]) => { rows.push({ ...rows[0]! }); }],
+    ["missing overload", (rows: QueryResultRow[]) => { rows.splice(0, 1); }],
+  ] as const)("rejects malformed or spoofed required extension metadata: %s", async (_label, mutate) => {
+    await expectReadinessFailure(
+      readyExecutor({
+        operationOverrides: {
+          inspectRequiredExtensionFunctions: mutateRows(mutate),
+        },
+      }),
+      "extension-preflight",
+    );
   });
 
   it("propagates the caller signal to every readiness query", async () => {

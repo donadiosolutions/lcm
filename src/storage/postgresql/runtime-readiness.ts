@@ -59,6 +59,15 @@ export interface PostgreSqlRuntimeReadiness {
 type RelationPrivilegeSpec = readonly [string, readonly string[]];
 type ColumnPrivilegeSpec = readonly [string, string, string];
 
+interface RequiredExtensionFunctionImplementation {
+  readonly functionIdentity: string;
+  readonly extension: "pgcrypto" | "pg_trgm";
+  readonly library: string;
+  readonly symbol: string;
+  readonly returnType: string;
+  readonly volatility: "i" | "s";
+}
+
 function schemaEntry(object: string, privilege: string): PostgreSqlRuntimePrivilegeEntry {
   return { kind: "schema", object, privilege, grantor: "object-owner" };
 }
@@ -305,12 +314,46 @@ const REQUIRED_SEQUENCE_PRIVILEGES = [
   "session_instructions_instruction_id_seq",
 ] as const;
 
+const REQUIRED_EXTENSION_FUNCTION_IMPLEMENTATIONS = [
+  {
+    functionIdentity: "public.digest(text, text)",
+    extension: "pgcrypto",
+    library: "$libdir/pgcrypto",
+    symbol: "pg_digest",
+    returnType: "bytea",
+    volatility: "i",
+  },
+  {
+    functionIdentity: "public.digest(bytea, text)",
+    extension: "pgcrypto",
+    library: "$libdir/pgcrypto",
+    symbol: "pg_digest",
+    returnType: "bytea",
+    volatility: "i",
+  },
+  {
+    functionIdentity: "public.similarity(text, text)",
+    extension: "pg_trgm",
+    library: "$libdir/pg_trgm",
+    symbol: "similarity",
+    returnType: "real",
+    volatility: "i",
+  },
+  {
+    functionIdentity: "public.similarity_op(text, text)",
+    extension: "pg_trgm",
+    library: "$libdir/pg_trgm",
+    symbol: "similarity_op",
+    returnType: "boolean",
+    volatility: "s",
+  },
+] as const satisfies readonly RequiredExtensionFunctionImplementation[];
+
 const REQUIRED_FUNCTION_PRIVILEGES = [
   ["lcm.normalize_search_text(input text)", undefined],
-  ["public.digest(text, text)", "pgcrypto"],
-  ["public.digest(bytea, text)", "pgcrypto"],
-  ["public.similarity(text, text)", "pg_trgm"],
-  ["public.similarity_op(text, text)", "pg_trgm"],
+  ...REQUIRED_EXTENSION_FUNCTION_IMPLEMENTATIONS.map(({ functionIdentity, extension }) => (
+    [functionIdentity, extension] as const
+  )),
 ] as const;
 
 const OPTIONAL_RELATION_PRIVILEGES: readonly RelationPrivilegeSpec[] = [
@@ -456,6 +499,24 @@ interface ServerReadinessRow extends QueryResultRow {
   readonly session_replication_role: unknown;
   readonly timezone: unknown;
   readonly tls: unknown;
+}
+
+interface RequiredExtensionFunctionRow extends QueryResultRow {
+  readonly function_identity: unknown;
+  readonly extension_name: unknown;
+  readonly language_name: unknown;
+  readonly probin: unknown;
+  readonly prosrc: unknown;
+  readonly return_type: unknown;
+  readonly security_definer: unknown;
+  readonly leakproof: unknown;
+  readonly volatility: unknown;
+  readonly parallel_safety: unknown;
+  readonly strict: unknown;
+  readonly returns_set: unknown;
+  readonly function_kind: unknown;
+  readonly no_support_function: unknown;
+  readonly configuration_is_null: unknown;
 }
 
 interface OwnershipRow extends QueryResultRow {
@@ -708,6 +769,97 @@ async function inspectServerReadiness(
     || row.tls !== true
   ) {
     throw readinessError("server-preflight", "inspectServerReadiness");
+  }
+}
+
+async function inspectRequiredExtensionFunctions(
+  executor: PostgreSqlQueryExecutor,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const expectedByIdentity = new Map<string, RequiredExtensionFunctionImplementation>(
+    REQUIRED_EXTENSION_FUNCTION_IMPLEMENTATIONS.map((implementation) => (
+      [implementation.functionIdentity, implementation] as const
+    )),
+  );
+  const result = await executor.query<RequiredExtensionFunctionRow, [readonly string[]]>({
+    text: `SELECT pg_catalog.concat(
+                    namespace.nspname,
+                    '.',
+                    procedure.proname,
+                    '(',
+                    pg_catalog.pg_get_function_identity_arguments(procedure.oid),
+                    ')'
+                  ) AS function_identity,
+                  (
+                    SELECT extension.extname::pg_catalog.text
+                    FROM pg_catalog.pg_depend AS dependency
+                    JOIN pg_catalog.pg_extension AS extension
+                      ON extension.oid OPERATOR(pg_catalog.=) dependency.refobjid
+                    WHERE dependency.classid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_proc')
+                      AND dependency.objid OPERATOR(pg_catalog.=) procedure.oid
+                      AND dependency.objsubid OPERATOR(pg_catalog.=) 0
+                      AND dependency.deptype OPERATOR(pg_catalog.=) 'e'
+                  ) AS extension_name,
+                  language.lanname::pg_catalog.text AS language_name,
+                  procedure.probin,
+                  procedure.prosrc,
+                  pg_catalog.format_type(
+                    procedure.prorettype,
+                    NULL::pg_catalog.int4
+                  ) AS return_type,
+                  procedure.prosecdef AS security_definer,
+                  procedure.proleakproof AS leakproof,
+                  procedure.provolatile::pg_catalog.text AS volatility,
+                  procedure.proparallel::pg_catalog.text AS parallel_safety,
+                  procedure.proisstrict AS strict,
+                  procedure.proretset AS returns_set,
+                  procedure.prokind::pg_catalog.text AS function_kind,
+                  procedure.prosupport OPERATOR(pg_catalog.=) 0::pg_catalog.oid
+                    AS no_support_function,
+                  procedure.proconfig IS NULL AS configuration_is_null
+           FROM pg_catalog.pg_proc AS procedure
+           JOIN pg_catalog.pg_namespace AS namespace
+             ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
+           JOIN pg_catalog.pg_language AS language
+             ON language.oid OPERATOR(pg_catalog.=) procedure.prolang
+           WHERE pg_catalog.concat(
+                    namespace.nspname, '.', procedure.proname, '(',
+                    pg_catalog.pg_get_function_identity_arguments(procedure.oid), ')'
+                 ) OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])
+           ORDER BY function_identity`,
+    values: [[...expectedByIdentity.keys()]],
+  }, readinessOptions("inspectRequiredExtensionFunctions", signal));
+  const observed = new Set<string>();
+  for (const row of result.rows) {
+    if (typeof row.function_identity !== "string") {
+      throw readinessError("extension-preflight", "inspectRequiredExtensionFunctions");
+    }
+    const expected = expectedByIdentity.get(row.function_identity);
+    if (
+      expected === undefined
+      || observed.has(row.function_identity)
+      || row.extension_name !== expected.extension
+      || row.language_name !== "c"
+      || row.probin !== expected.library
+      || row.prosrc !== expected.symbol
+      || row.return_type !== expected.returnType
+      || row.security_definer !== false
+      || row.leakproof !== false
+      || row.volatility !== expected.volatility
+      || row.parallel_safety !== "s"
+      || row.strict !== true
+      || row.returns_set !== false
+      || row.function_kind !== "f"
+      || row.no_support_function !== true
+      || row.configuration_is_null !== true
+    ) {
+      throw readinessError("extension-preflight", "inspectRequiredExtensionFunctions");
+    }
+    observed.add(row.function_identity);
+  }
+  if (observed.size !== expectedByIdentity.size) {
+    throw readinessError("extension-preflight", "inspectRequiredExtensionFunctions");
   }
 }
 
@@ -2207,6 +2359,7 @@ export async function verifyPostgreSqlRuntimeSchema(
       operation: "runtimeReadinessExtensions",
       signal,
     });
+    await inspectRequiredExtensionFunctions(executor, signal);
     await assertPostgreSqlSearchConfigurationReady(executor, {
       operation: "runtimeReadinessSearchConfiguration",
       signal,
