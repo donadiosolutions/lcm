@@ -8,13 +8,14 @@ evidence are being coordinated.
 ## Current status
 
 This boundary is a prerequisite for later backend activation work; it is not
-the activation work itself. Issues #92 and #224 are not implemented.
-PostgreSQL selection remains unavailable to normal production configuration,
-the daemon, and the CLI. SQLite remains the only selectable production storage
-backend. The PostgreSQL runtime, schema, direct repositories, and coordination
-primitives described by the reference documentation are staged for direct
-programmatic use and conformance; they do not make PostgreSQL authoritative for
-normal application routes.
+the daemon/CLI activation work itself. Issue #92 and the remaining #224 routing
+work are not implemented. PostgreSQL selection remains unavailable to normal
+production daemon and CLI composition, so SQLite remains the only active
+backend for those routes. The PostgreSQL runtime, schema, production
+project-storage factory, and coordination primitives described by the
+reference documentation are available to explicit programmatic callers and
+conformance; they do not make PostgreSQL authoritative for normal application
+routes.
 
 Do not configure a production installation expecting PostgreSQL daemon or CLI
 routes to work. The publication boundary is the shared seam that those future
@@ -27,7 +28,9 @@ LCM keeps the following Epic #79 invariants:
 - SQLite is the default backend and remains the normal local behavior.
 - PostgreSQL is a staged remote-primary target, not a currently selectable
   production backend. It does not silently fall back to SQLite and does not
-  yet activate normal `ProjectStorage` routing.
+  yet activate normal daemon/CLI `ProjectStorage` routing. Explicit
+  programmatic callers may use the PostgreSQL factory only after its eager
+  runtime-readiness gate succeeds.
 - Hooks append events to the durable local SQLite outbox first. They do not
   require a live PostgreSQL connection to preserve the event, and an admission
   failure does not discard the local outbox record.
@@ -35,8 +38,8 @@ LCM keeps the following Epic #79 invariants:
   fails closed. LCM never treats a partially written configuration or project
   map as proof that a backend is active.
 - The publication boundary is a shared seam for the not-yet-implemented #92
-  and #224 work. Those features must consume it rather than introduce a second
-  lock, journal, or fencing protocol.
+  and remaining #224 work. Those features must consume it rather than
+  introduce a second lock, journal, or fencing protocol.
 
 For ordinary SQLite installations, this machinery is dormant after the
 private state root is authenticated. It does not change SQLite's storage
@@ -71,6 +74,16 @@ If a PostgreSQL commit or connection response is uncertain, the caller reads
 the exact fenced-lease row back authoritatively before advancing local
 publication state. An absent, changed, expired, or contradictory row remains a
 failure; LCM does not infer success from a lost response.
+
+The PostgreSQL project-storage factory consumes publication evidence at each
+project lookup or open. A caller may either hold the existing live local
+publication lock token for the complete operation or let the factory capture
+two short terminal witnesses under that lock, one before and one after the
+remote identity lookup. The two witnesses must match exactly. The factory also
+requires the remote project UUID, machine ID/alias, lexical selected path,
+and normalized path to match the local identity context. Publication or
+identity drift fails before any project repository is returned and never
+causes a SQLite fallback.
 
 This coordination uses the existing `lcm.fenced_leases` table and advisory
 namespace. Chore #408 adds no schema object, `MAINTAIN` privilege, full-table

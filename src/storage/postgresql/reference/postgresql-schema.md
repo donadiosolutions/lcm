@@ -1,6 +1,7 @@
 # PostgreSQL 18 schema reference
 
-This reference describes the durable PostgreSQL baseline introduced by
+This reference describes the durable PostgreSQL baseline and read-only
+runtime-readiness contract introduced by
 `0001_migration_ledger.sql` and `0002_schema_baseline.sql`. The latter creates
 23 domain tables, backend-neutral project identity, and bounded session lookup
 keys. This is a schema and readiness contract, not an enabled
@@ -104,32 +105,42 @@ does not add row-level security.
   satisfy the future definition. Before catalog access, the registry rejects
   duplicate snapshot migration IDs and IDs absent from the supplied migration
   history.
-- The `0002` snapshot checks an explicit definition inventory of all 52 named
-  secondary indexes, all 174 table constraints, all three identity-enforcement
-  triggers, all 15 stored generated columns, all six generated identity
-  sequences, all 24 permanent tables, the complete effective ACLs of those
-  tables and six sequences, all 210 ordinary columns, and the exact effective
-  column ACL state of all 225 ordinary and generated columns: 739 definitions
-  total. The ordinary-column allowlist includes
+- The `0002` snapshot checks an explicit definition inventory of all 94 valid,
+  ready, and live indexes attached to the 24 managed tables (including primary
+  and unique-constraint support indexes), all 174 table constraints, all three
+  identity-enforcement triggers, zero non-view rewrite rules, all 15 stored
+  generated columns, all six generated identity sequences, all 24 permanent
+  tables, the complete effective ACLs of those tables and six sequences, all
+  210 ordinary columns, and the exact effective column ACL state of all 225
+  ordinary and generated columns: 781 definitions total. The ordinary-column
+  allowlist includes
   `recall_surfacing.surfaced_at`, and a live-catalog regression requires the
   allowlist to equal the complete ordinary-column inventory of the 24 tables.
   Each allowlisted object must exist, every index must
-  remain valid and ready, and canonical index, trigger, fully qualified
+  remain valid, ready, and live, and canonical index, trigger, fully qualified
   constraint, generation-expression, and ordinary-column definitions must
   retain their pinned fingerprints. Trigger fingerprints include the
   enablement mode and require
   always-enabled mode (`A`), so the identity checks cannot be bypassed by
   `session_replication_role = replica`; disabled, ordinary, or replica-only
-  drift fails readiness. Constraint fingerprints bind the constraint name
-  to its owning table, type, fully qualified definition, and stable
-  enablement-state multiset of their zero or more internal enforcement
-  triggers. Generated-column fingerprints bind the exact table, column,
+  drift fails readiness. Constraint fingerprints bind every supported
+  constraint owned by a managed table and every foreign key targeting one.
+  They include the owning and referenced schema/relation identities, type,
+  canonical definition, validation, enforcement, locality, and inheritance
+  state. Their sorted enforcement-trigger inventory spans both sides of a
+  foreign key and binds each trigger's table, OID-independent canonical name
+  and definition, enablement, internal, deferrability, deferred, and parentage
+  metadata. Generated-column fingerprints bind the exact table, column,
   formatted type, nullability, `attgenerated` state, PostgreSQL-deparsed
   expression, and resolved
-  namespace-qualified collation. Ordinary-column
-  fingerprints bind the exact table and column to its formatted type,
-  nullability, deparsed default, identity state, and resolved
-  namespace-qualified collation. Table fingerprints require ordinary permanent
+  namespace-qualified collation. Ordinary-column fingerprints bind the exact
+  table and column to its formatted type, nullability, deparsed default,
+  identity state, and resolved namespace-qualified collation. Both column
+  fingerprints also bind a deterministic count and sorted canonical inventory
+  of every associated PostgreSQL 18 `NOT NULL` constraint, including its
+  validation, enforcement, locality, and inheritance state. Zero and multiple
+  associated constraints therefore have distinct authority without adding
+  separate objects to the definition total. Table fingerprints require ordinary permanent
   persistence with row-level security disabled and not forced, so `UNLOGGED`,
   temporary, `ENABLE ROW LEVEL SECURITY`, or `FORCE ROW LEVEL SECURITY` drift
   fails closed. The same fingerprint rejects any inheritance or partition
@@ -147,20 +158,44 @@ does not add row-level security.
   `PUBLIC`, foreign-grantor, grantable, or out-of-allowlist privilege on a
   column therefore also fails closed.
   Identity-sequence
-  fingerprints bind each exact sequence name to its PostgreSQL data type,
+  Rewrite-rule fingerprints enumerate every non-view rule attached to a managed
+  table and bind its table, name, event, INSTEAD mode, enablement, and deparsed
+  definition. The current snapshots explicitly require zero such rules, with
+  the SHA-256 digest of the empty inventory; any DML rewrite rule therefore
+  fails readiness and migration preflight. Identity-sequence fingerprints bind
+  each exact sequence name to its PostgreSQL data type,
   increment, minimum, maximum, start, cache, cycle state, internal identity
   dependency, owning table/column, and permanent persistence. `SET UNLOGGED`
   drift therefore fails closed. Index ownership
   follows the owning table; triggers and constraints are checked as existence
   and definition inventory.
   Additional operator-created objects remain outside the allowlist and are
-  ignored.
+  ignored except that any valid, ready, and live index, non-internal trigger,
+  supported constraint, generated column, or ordinary column attached to a
+  managed table, any foreign key targeting one from another schema or relation,
+  or any non-view rewrite rule attached to one, is part of the complete
+  definition inventory and fails closed when added or changed. `NOT NULL`
+  constraints are represented by the owning column fingerprint, rather than
+  double-counted as PostgreSQL 18 `pg_constraint` rows; an unvalidated or
+  otherwise non-authoritative constraint is rejected even when `attnotnull`
+  remains true.
+  The remaining identity-sequence, relation/column ACL, and table scopes are
+  intentionally retained. Repository SQL addresses only the pinned managed
+  tables; an extra table cannot redirect those writes alone. A new attached
+  identity sequence requires a new or changed managed ordinary column, which
+  the complete column inventory rejects, while an unattached sequence cannot
+  affect managed writes. ACL sanctions cover every pinned managed relation and
+  column after the complete column inventory rejects additions, so privileges
+  on outside objects cannot change repository writes alone. Non-internal
+  triggers remain a complete direct inventory; internal constraint triggers are
+  deliberately excluded from it and are instead bound, on both sides of a
+  foreign key, into the complete constraint fingerprint.
 - The `0005` snapshot carries the complete `0004` inventory forward and adds
   one always-enabled summary-parent trigger definition plus the exact
   `lcm.enforce_summary_parent_dag_integrity()` managed function. It therefore
-  checks four application triggers and 740 definitions in total while leaving
-  every table, column, constraint, index, generated column, sequence, and
-  released `0002` artifact unchanged.
+  checks four application triggers, zero non-view rewrite rules, and 782
+  definitions in total; the migration SQL and all non-trigger catalog
+  definitions remain unchanged.
 - Recurring migration readiness fingerprints the bodies and security
   configuration of `lcm.enforce_summary_id_uniqueness()`,
   `lcm.enforce_large_file_id_uniqueness()`,
@@ -540,13 +575,31 @@ on a provider does not justify silently expanding the baseline.
 1. The cluster administrator provisions PostgreSQL 18, preloads services such
    as `pg_stat_statements` when necessary, and installs the exact required
    extensions in `public`. The migrator and runtime use separate login roles.
+   The current database must be owned by the configured
+   `storage.postgresql.migrationRole`; when creating it, use the equivalent of
+   `CREATE DATABASE <db> OWNER <migrationRole>` with validated,
+   identifier-quoted operator inputs. Do not make the restricted `runtimeRole`
+   the database owner. Runtime readiness in step 2 verifies this database-level
+   owner in `runtime-role-policy` / `inspectRuntimeRolePolicy` and rejects a
+   different owner before its extension, migration-history, schema, ACL, or
+   domain checks.
    With `storage.backend` configured, the supported packaged entry point is
    `LCM_POSTGRES_URL="$LCM_POSTGRES_MIGRATION_URL" lcm postgres migrate`; it
    accepts `--json` for automation and closes the migration pool before exit.
-2. Runtime health verifies server version, UTF-8 database encoding, extension
-   readiness, and the fingerprinted `lcm.search_v1` text-search contract.
-   Failed readiness produces corrective guidance without changing database or
-   cluster state.
+2. The eager runtime-readiness verifier verifies the exact PostgreSQL 18,
+   `UTF8`, `UTC`, and certificate-verified TLS contract; required extensions
+   and the fingerprinted `lcm.search_v1` text-search contract; the complete
+   ordered migration history and packaged checksums; the latest schema,
+   definition, relation-ACL, column-ACL, and identity-function fingerprints;
+   and ownership of the schema, ledger, and every managed object by the
+   configured `storage.postgresql.migrationRole`. It also verifies the
+   restricted runtime role's owner/membership/attribute policy, exact direct
+   ACL shape, and exact effective least-privilege result. The configured
+   migration role is passed as the trusted expected owner; the verifier never
+   substitutes `CURRENT_USER`, an observed catalog owner, or an opaque
+   migration witness hash. Failed readiness produces sanitized corrective
+   guidance without changing database or cluster state. The witness hash is
+   not an authorization principal and cannot satisfy the database-owner check.
 3. The migration runner validates packaged SHA-256 artifacts, captures the
    postmaster epoch, requires UTF-8, and performs the functional extension probe
    before opening the DDL transaction. It then opens one transaction, takes a database-scoped
@@ -670,16 +723,25 @@ identifier-quoted transfer guidance. Missing, malformed, or contradictory
 ownership catalog values fail closed without exposing the existing owner,
 connection details, or raw database errors.
 
-After schema creation, an administrator grants each implemented repository
-only its exact runtime privileges with the reviewed
+After schema creation, an administrator grants the read-only verifier and
+each implemented repository only their exact runtime privileges with the
+reviewed
+[`postgresql-runtime-readiness-grants.sql`](postgresql-runtime-readiness-grants.sql),
 [`postgresql-runtime-identity-grants.sql`](postgresql-runtime-identity-grants.sql),
 [`postgresql-runtime-conversation-grants.sql`](postgresql-runtime-conversation-grants.sql),
-[`postgresql-runtime-transcript-grants.sql`](postgresql-runtime-transcript-grants.sql),
-and
-[`postgresql-runtime-memory-grants.sql`](postgresql-runtime-memory-grants.sql)
-scripts:
+[`postgresql-runtime-summary-context-grants.sql`](postgresql-runtime-summary-context-grants.sql),
+[`postgresql-runtime-memory-grants.sql`](postgresql-runtime-memory-grants.sql),
+[`postgresql-runtime-search-grants.sql`](postgresql-runtime-search-grants.sql),
+and [`postgresql-runtime-coordination-grants.sql`](postgresql-runtime-coordination-grants.sql)
+scripts. The transcript script is optional because native-transcript
+persistence is outside `ProjectStorage`; readiness accepts its exact optional
+privilege set either absent or present:
 
 ```bash
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file src/storage/postgresql/reference/postgresql-runtime-readiness-grants.sql
+
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql
@@ -690,12 +752,31 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
+  --file src/storage/postgresql/reference/postgresql-runtime-summary-context-grants.sql
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file src/storage/postgresql/reference/postgresql-runtime-memory-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file src/storage/postgresql/reference/postgresql-runtime-search-grants.sql
+
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql
 ```
+
+If native-transcript persistence is explicitly enabled for the caller, also
+apply `postgresql-runtime-transcript-grants.sql` between the conversation and
+summary/context scripts. Omitting it is valid for the core runtime. Every
+script requires the same `lcm_runtime_role`, stops on the first error, and
+commits its own transaction. The readiness script grants exactly `SELECT` on
+`lcm.schema_migrations`, `USAGE` on the `public` schema, and `EXECUTE` on
+`public.digest(text, text)` and `public.digest(bytea, text)`. It grants no
+application-table DML, ownership, sequence access, or migration authority.
+Those catalog and digest privileges are the minimum needed for the read-only
+verifier to inspect the complete ledger and fingerprint material.
 
 Replace `lcm_runtime` with the deployment's runtime role. The script grants
 schema `USAGE` and table `SELECT` where identity readback requires it. Writes

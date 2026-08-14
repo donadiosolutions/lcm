@@ -190,6 +190,8 @@ describe("printHelp — per-command detail", () => {
     const postgresText = out.mock.calls.map(c => c[0]).join("");
     expect(postgresText).toContain("lcm postgres migrate [--json]");
     expect(postgresText).toContain("LCM_POSTGRES_URL");
+    expect(postgresText).toContain("storage.postgresql.migrationRole");
+    expect(postgresText).toContain("LCM_POSTGRES_MIGRATION_ROLE");
     expect(postgresText).toContain("does not install extensions or grant runtime privileges");
   });
 

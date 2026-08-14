@@ -56,6 +56,7 @@ export const MANAGED_LAUNCH_ENV_ALLOWLIST = Object.freeze([
   "LCM_SUMMARY_PROVIDER",
   "LCM_SUMMARY_MODEL",
   "LCM_POSTGRES_CA_FILE",
+  "LCM_POSTGRES_MIGRATION_ROLE",
 ] as const);
 /**
  * Locale and time-zone variables remain part of the bounded child launch, but
@@ -514,12 +515,19 @@ export function managedLaunchEnvironment(
 ): Readonly<Record<string, string>> {
   const result: Record<string, string> = {};
   for (const name of MANAGED_LAUNCH_ENV_ALLOWLIST) {
-    const value = environment[name];
+    const rawValue = environment[name];
+    const value = name === "LCM_POSTGRES_MIGRATION_ROLE" && typeof rawValue === "string"
+      ? rawValue.trim()
+      : rawValue;
+    const maxBytes = name === "LCM_POSTGRES_MIGRATION_ROLE" ? 63 : MANAGED_LAUNCH_ENV_VALUE_MAX_BYTES;
+    const invalidCharacters = name === "LCM_POSTGRES_MIGRATION_ROLE"
+      ? /[\u0000-\u001F\u007F]/u
+      : /[\u0000\r\n]/u;
     if (
       typeof value !== "string"
       || value.length === 0
-      || Buffer.byteLength(value, "utf8") > MANAGED_LAUNCH_ENV_VALUE_MAX_BYTES
-      || /[\u0000\r\n]/u.test(value)
+      || Buffer.byteLength(value, "utf8") > maxBytes
+      || invalidCharacters.test(value)
     ) continue;
     if (name === "XDG_RUNTIME_DIR") {
       try {
@@ -745,6 +753,7 @@ function environmentAssignmentValueLimit(key: string): number {
     || upper === "LCM_CREDENTIAL_DIRECTORY"
     || /^LCM_CREDENTIAL_[A-Z0-9_]+_FILE$/u.test(upper)
   ) return MAX_PATH_METADATA_BYTES;
+  if (upper === "LCM_POSTGRES_MIGRATION_ROLE") return 63;
   if (upper === "LCM_SUPERVISOR_MARKER") return MARKER.length;
   if (upper === "LCM_SUPERVISOR_SCOPE" || upper === "LCM_SUPERVISOR_RUNTIME_DIGEST") return SHA256_HEX_LENGTH;
   if (upper === "LCM_SUPERVISOR_ENV_DIGEST") return MANAGED_LAUNCH_ENV_DIGEST_LENGTH;
@@ -1721,6 +1730,8 @@ function launchEnvironmentValue(
       || name === "LCM_CREDENTIAL_DIRECTORY"
       || /^(?:LCM_CREDENTIAL_[A-Z0-9_]+_FILE|CREDENTIALS_DIRECTORY)$/u.test(name)
       ? MAX_PATH_METADATA_BYTES
+      : name === "LCM_POSTGRES_MIGRATION_ROLE"
+        ? 63
       : MANAGED_LAUNCH_ENV_VALUE_MAX_BYTES;
   if (
     !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)

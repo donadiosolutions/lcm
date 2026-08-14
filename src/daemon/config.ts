@@ -103,7 +103,10 @@ export interface PostgreSqlStorageSettings {
   connectionTimeoutMs: number;
   idleTimeoutMs: number;
   statementTimeoutMs: number;
+  migrationRole?: string;
 }
+
+type PostgreSqlTuningSettings = Omit<PostgreSqlStorageSettings, "migrationRole">;
 
 export interface StoredStorageConfig {
   backend: StorageBackend;
@@ -114,13 +117,16 @@ export type ResolvedStorageConfig =
   | { backend: "sqlite" }
   | {
     backend: "postgresql";
-    postgresql: PostgreSqlStorageSettings & {
+    postgresql: PostgreSqlTuningSettings & {
       url: string;
       caFile: string;
+      migrationRole: string;
     };
   };
 
-export const DEFAULT_POSTGRESQL_STORAGE_SETTINGS: Readonly<PostgreSqlStorageSettings> = Object.freeze({
+export type ResolvedPostgreSqlConfig = Extract<ResolvedStorageConfig, { backend: "postgresql" }>;
+
+export const DEFAULT_POSTGRESQL_STORAGE_SETTINGS: Readonly<PostgreSqlTuningSettings> = Object.freeze({
   poolMax: 5,
   connectionTimeoutMs: 10_000,
   idleTimeoutMs: 30_000,
@@ -842,6 +848,7 @@ const POSTGRESQL_STORAGE_KEYS = new Set([
   "connectionTimeoutMs",
   "idleTimeoutMs",
   "statementTimeoutMs",
+  "migrationRole",
 ]);
 const POSTGRESQL_STORAGE_OVERRIDE_KEYS = new Set([
   ...POSTGRESQL_STORAGE_KEYS,
@@ -880,6 +887,9 @@ function validateStorageSection(value: unknown, allowRuntimeSecrets: boolean): v
   validateOptionalInteger(postgresql, "connectionTimeoutMs", "storage.postgresql", 1, 600_000);
   validateOptionalInteger(postgresql, "idleTimeoutMs", "storage.postgresql", 0, 3_600_000);
   validateOptionalInteger(postgresql, "statementTimeoutMs", "storage.postgresql", 1, 3_600_000);
+  if (storage.backend === "postgresql" && postgresql.migrationRole !== undefined) {
+    normalizePostgreSqlMigrationRole(postgresql.migrationRole, "storage.postgresql.migrationRole");
+  }
   if (allowRuntimeSecrets) {
     validateOptionalString(postgresql, "url", "storage.postgresql");
     validateOptionalString(postgresql, "caFile", "storage.postgresql");
@@ -1209,6 +1219,27 @@ function requiredPostgreSqlSecret(
   return value.trim();
 }
 
+function normalizePostgreSqlMigrationRole(
+  value: unknown,
+  path: "storage.postgresql.migrationRole" | "LCM_POSTGRES_MIGRATION_ROLE",
+): string {
+  if (typeof value !== "string") {
+    throw new ConfigValidationError(path, "must be a string");
+  }
+  const normalized = value.trim();
+  if (normalized === "") {
+    throw new ConfigValidationError(path, "must be a non-empty string");
+  }
+  if (/[\u0000-\u001F\u007F]/u.test(normalized)) {
+    throw new ConfigValidationError(path, "must not contain control characters");
+  }
+  const byteLength = Buffer.byteLength(normalized, "utf8");
+  if (byteLength < 1 || byteLength > 63) {
+    throw new ConfigValidationError(path, "must be between 1 and 63 UTF-8 bytes");
+  }
+  return normalized;
+}
+
 /** Resolve backend selection, environment-only secrets, bounds, and PostgreSQL TLS preflight. */
 export function resolveStorageConfig(
   value: unknown,
@@ -1303,6 +1334,11 @@ export function resolveStorageConfig(
     throw new ConfigValidationError("LCM_POSTGRES_CA_FILE", `must not be empty: ${JSON.stringify(caFile)}`);
   }
 
+  const migrationRole = normalizePostgreSqlMigrationRole(
+    postgresql.migrationRole ?? env.LCM_POSTGRES_MIGRATION_ROLE,
+    postgresql.migrationRole !== undefined ? "storage.postgresql.migrationRole" : "LCM_POSTGRES_MIGRATION_ROLE",
+  );
+
   return {
     backend: "postgresql",
     postgresql: {
@@ -1310,6 +1346,7 @@ export function resolveStorageConfig(
       connectionTimeoutMs: (postgresql.connectionTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.connectionTimeoutMs) as number,
       idleTimeoutMs: (postgresql.idleTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.idleTimeoutMs) as number,
       statementTimeoutMs: (postgresql.statementTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.statementTimeoutMs) as number,
+      migrationRole,
       url,
       caFile: resolvedCaFile,
     },
@@ -1332,6 +1369,7 @@ export function daemonConfigForPersistence(config: DaemonConfig): Record<string,
         connectionTimeoutMs: config.storage.postgresql.connectionTimeoutMs,
         idleTimeoutMs: config.storage.postgresql.idleTimeoutMs,
         statementTimeoutMs: config.storage.postgresql.statementTimeoutMs,
+        migrationRole: config.storage.postgresql.migrationRole,
       },
     };
   const llm = stored.llm as Record<string, unknown>;

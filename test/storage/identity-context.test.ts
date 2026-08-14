@@ -83,13 +83,23 @@ describe("resolveStorageIdentityContext", () => {
     const context = resolveStorageIdentityContext(postgresql, {
       ...local,
       remoteProjectId,
-    }, writeMachine());
+    }, writeMachine(), "/selected/project");
     expect(context).toEqual({
       id: remoteProjectId,
       localProjectId: local.id,
       canonical: local.canonical,
       remoteProjectId,
       machineId,
+      selectedPath: "/selected/project",
     });
+  });
+
+  it("keeps direct legacy resolver callers free of a selected path", () => {
+    const context = resolveStorageIdentityContext(postgresql, {
+      ...local,
+      remoteProjectId,
+    }, writeMachine());
+
+    expect(context).not.toHaveProperty("selectedPath");
   });
 });

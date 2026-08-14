@@ -774,6 +774,7 @@ describe("daemon route publication admission", () => {
       "LCM_CREDENTIAL_LCM_POSTGRES_URL_FILE",
       "LCM_POSTGRES_CA_FILE",
       "LCM_POSTGRES_URL",
+      "LCM_POSTGRES_MIGRATION_ROLE",
     ] as const;
     const previousEnv = Object.fromEntries(credentialEnvNames.map((name) => [name, process.env[name]]));
     const tempHome = mkdtempSync(join(tmpdir(), "lcm-route-credential-admission-"));
@@ -789,6 +790,7 @@ describe("daemon route publication admission", () => {
     process.env.LCM_CREDENTIAL_DIRECTORY = credentialDirectory;
     process.env.LCM_CREDENTIAL_LCM_POSTGRES_URL_FILE = credentialFile;
     delete process.env.LCM_POSTGRES_URL;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
     const lcmDir = join(tempHome, ".lcm");
     mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
     const configPath = join(lcmDir, "config.json");
