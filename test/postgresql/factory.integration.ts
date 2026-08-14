@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   mkdirSync,
   mkdtempSync,
@@ -33,6 +33,7 @@ import {
   type RegisteredMachine,
   type RemoteProject,
 } from "../../src/storage/postgresql/identity-repository.js";
+import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
 import { applyBackendPublicationProjectMapFile } from "../../src/project-map.js";
 import { withStorageBackendConsumerLockAsync } from "../../src/storage/backend.js";
 import {
@@ -55,6 +56,24 @@ const REQUIRED_GRANT_SCRIPTS = [
 ] as const;
 
 const TRANSCRIPT_GRANT_SCRIPT = "postgresql-runtime-transcript-grants.sql";
+
+function quotePostgreSqlRole(role: string): string {
+  if (!/^[a-z][a-z0-9_]{0,62}$/u.test(role)) {
+    throw new Error("unsafe PostgreSQL test role identifier");
+  }
+  return `"${role}"`;
+}
+
+function runtimeUrlForRole(
+  baseUrl: string,
+  role: string,
+  password: string,
+): string {
+  const url = new URL(baseUrl);
+  url.username = role;
+  url.password = password;
+  return url.toString();
+}
 
 function recoveryFile(content: string): BackendPublicationRecoveryFile {
   const bytes = Buffer.from(content);
@@ -92,6 +111,7 @@ async function applyRuntimeGrantScript(
   administrator: PostgreSqlRuntime,
   fileName: string,
   operation: string,
+  runtimeRole: string,
 ): Promise<void> {
   const template = readFileSync(
     join(process.cwd(), "src/storage/postgresql/reference", fileName),
@@ -101,7 +121,7 @@ async function applyRuntimeGrantScript(
     .split("\n")
     .filter((line) => !line.startsWith("\\"))
     .join("\n")
-    .replaceAll(':"lcm_runtime_role"', '"lcm_test_runtime"');
+    .replaceAll(':"lcm_runtime_role"', quotePostgreSqlRole(runtimeRole));
   await administrator.query({ text: sql }, {
     domain: "factory",
     operation,
@@ -113,8 +133,10 @@ async function applyAllRuntimeGrants(
   options: {
     readonly includeTranscript?: boolean;
     readonly omit?: readonly string[];
+    readonly runtimeRole?: string;
   } = {},
 ): Promise<void> {
+  const runtimeRole = options.runtimeRole ?? "lcm_test_runtime";
   const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
   try {
     for (const fileName of REQUIRED_GRANT_SCRIPTS) {
@@ -123,6 +145,7 @@ async function applyAllRuntimeGrants(
         administrator,
         fileName,
         `apply${fileName.replaceAll(/[^A-Za-z0-9]/gu, "")}`,
+        runtimeRole,
       );
     }
     if (options.includeTranscript === true) {
@@ -130,6 +153,7 @@ async function applyAllRuntimeGrants(
         administrator,
         TRANSCRIPT_GRANT_SCRIPT,
         "applyPostgresqlRuntimeTranscriptGrantScript",
+        runtimeRole,
       );
     }
   } finally {
@@ -163,8 +187,9 @@ async function readRuntimeDatabaseCreatePrivilege(
 async function readRuntimeSessionReplicationRoleSetPrivilege(
   database: PostgreSqlTestDatabase,
   operation: string,
+  runtimeUrl = database.runtimeUrl,
 ): Promise<boolean> {
-  const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }));
+  const runtime = new PostgreSqlRuntime(settings(runtimeUrl, { poolMax: 1 }));
   try {
     const result = await runtime.query<{ can_set: boolean }>({
       text: `SELECT pg_catalog.has_parameter_privilege(
@@ -186,8 +211,9 @@ async function readRuntimeSessionReplicationRoleSetPrivilege(
 async function setRuntimeSessionReplicationRoleToReplica(
   database: PostgreSqlTestDatabase,
   operation: string,
+  runtimeUrl = database.runtimeUrl,
 ): Promise<string> {
-  const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }));
+  const runtime = new PostgreSqlRuntime(settings(runtimeUrl, { poolMax: 1 }));
   try {
     await runtime.query({
       text: "SET session_replication_role TO replica",
@@ -1291,9 +1317,18 @@ describe("PostgreSQL 18 project storage factory", () => {
 
   it("rejects runtime parameter SET privilege and recovers after revoke", async () => {
     await withPostgreSqlTestDatabase("factory-parameter-set", async (database) => {
-      await applyAllRuntimeGrants(database);
+      await runPostgreSqlMigrations(database.migrator);
       const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-parameter-set-"));
+      const runtimeRole = `lcm_test_parameter_${process.pid}_${randomBytes(6).toString("hex")}`;
+      const runtimePassword = randomBytes(24).toString("hex");
+      const runtimeRoleIdentifier = quotePostgreSqlRole(runtimeRole);
+      const runtimeUrl = runtimeUrlForRole(
+        database.runtimeUrl,
+        runtimeRole,
+        runtimePassword,
+      );
       const administrator = new PostgreSqlRuntime(settings(database.adminUrl, { poolMax: 1 }));
+      let roleCreated = false;
       let grantedFactory: Awaited<ReturnType<
         typeof createPostgreSqlStorageBackendFactoryForTesting
       >> | undefined;
@@ -1302,25 +1337,39 @@ describe("PostgreSQL 18 project storage factory", () => {
       >> | undefined;
       let factoryError: unknown;
       try {
+        await administrator.query({
+          text: `CREATE ROLE ${runtimeRoleIdentifier}
+                 LOGIN PASSWORD '${runtimePassword}'
+                 NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT`,
+        }, { domain: "factory", operation: "createEphemeralRuntimeRole" });
+        roleCreated = true;
+        await administrator.query({
+          text: `GRANT CONNECT ON DATABASE "${database.name}" TO ${runtimeRoleIdentifier}`,
+        }, { domain: "factory", operation: "grantEphemeralRuntimeDatabaseConnect" });
+        await applyAllRuntimeGrants(database, { runtimeRole });
+
         await expect(readRuntimeSessionReplicationRoleSetPrivilege(
           database,
           "readCanonicalRuntimeSessionReplicationRoleSetPrivilege",
+          runtimeUrl,
         )).resolves.toBe(false);
 
         await administrator.query({
-          text: "GRANT SET ON PARAMETER session_replication_role TO lcm_test_runtime",
+          text: `GRANT SET ON PARAMETER session_replication_role TO ${runtimeRoleIdentifier}`,
         }, { domain: "factory", operation: "grantRuntimeSessionReplicationRoleSetPrivilege" });
         await expect(readRuntimeSessionReplicationRoleSetPrivilege(
           database,
           "readGrantedRuntimeSessionReplicationRoleSetPrivilege",
+          runtimeUrl,
         )).resolves.toBe(true);
         await expect(setRuntimeSessionReplicationRoleToReplica(
           database,
           "probeGrantedRuntimeSessionReplicationRole",
+          runtimeUrl,
         )).resolves.toBe("replica");
 
         grantedFactory = await createPostgreSqlStorageBackendFactoryForTesting(
-          factoryConfig(database),
+          factoryConfig(database, { url: runtimeUrl }),
           homeDir,
         ).catch((error: unknown) => {
           factoryError = error;
@@ -1338,14 +1387,15 @@ describe("PostgreSQL 18 project storage factory", () => {
         expect(JSON.stringify(factoryError)).not.toContain("session_replication_role");
 
         await administrator.query({
-          text: "REVOKE SET ON PARAMETER session_replication_role FROM lcm_test_runtime",
+          text: `REVOKE SET ON PARAMETER session_replication_role FROM ${runtimeRoleIdentifier}`,
         }, { domain: "factory", operation: "revokeRuntimeSessionReplicationRoleSetPrivilege" });
         await expect(readRuntimeSessionReplicationRoleSetPrivilege(
           database,
           "readRestoredRuntimeSessionReplicationRoleSetPrivilege",
+          runtimeUrl,
         )).resolves.toBe(false);
         restoredFactory = await createPostgreSqlStorageBackendFactoryForTesting(
-          factoryConfig(database),
+          factoryConfig(database, { url: runtimeUrl }),
           homeDir,
         );
         await restoredFactory.close();
@@ -1356,19 +1406,30 @@ describe("PostgreSQL 18 project storage factory", () => {
             ...(grantedFactory === undefined ? [] : [grantedFactory.close()]),
             ...(restoredFactory === undefined ? [] : [restoredFactory.close()]),
           ]);
-          await administrator.query({
-            text: "REVOKE SET ON PARAMETER session_replication_role FROM lcm_test_runtime",
-          }, { domain: "factory", operation: "restoreRuntimeSessionReplicationRoleSetPrivilege" });
-          await expect(readRuntimeSessionReplicationRoleSetPrivilege(
-            database,
-            "verifyRestoredRuntimeSessionReplicationRoleSetPrivilege",
-          )).resolves.toBe(false);
+          if (roleCreated) {
+            try {
+              await administrator.query({
+                text: `REVOKE SET ON PARAMETER session_replication_role FROM ${runtimeRoleIdentifier}`,
+              }, { domain: "factory", operation: "restoreRuntimeSessionReplicationRoleSetPrivilege" });
+            } finally {
+              try {
+                await administrator.query({
+                  text: `DROP OWNED BY ${runtimeRoleIdentifier}`,
+                }, { domain: "factory", operation: "dropEphemeralRuntimeRoleOwnedPrivileges" });
+              } finally {
+                await administrator.query({
+                  text: `DROP ROLE ${runtimeRoleIdentifier}`,
+                }, { domain: "factory", operation: "dropEphemeralRuntimeRole" });
+              }
+            }
+            roleCreated = false;
+          }
         } finally {
           await administrator.close();
           rmSync(homeDir, { recursive: true, force: true });
         }
       }
-    });
+    }, { runMigrations: false });
   });
 
   it("rejects replica-mode runtime sessions before factory writes and accepts origin", async () => {
