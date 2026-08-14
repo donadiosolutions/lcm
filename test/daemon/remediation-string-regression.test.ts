@@ -20,8 +20,8 @@ const productionFiles = [
 // aliases and lifecycle seams remain testable without becoming recovery advice.
 const guidanceSurfaceFiles = [
   "README.md", ".codex/skills/lcm-memory/SKILL.md", ".claude/commands/lcm-dogfood.md",
-  ".github/skills/lcm-memory/SKILL.md", ".agents/skills/lcm-context/SKILL.md",
-  ".agents/skills/lcm-dogfood/SKILL.md", ".agents/skills/lcm-dogfood/references/checks.md",
+  ".agents/skills/lcm-context/SKILL.md", ".agents/skills/lcm-dogfood/SKILL.md",
+  ".agents/skills/lcm-dogfood/references/checks.md",
   ".agents/skills/lcm-dogfood/references/known-issues.md",
   ".agents/skills/lcm-e2e/SKILL.md", ".agents/skills/lcm-e2e/checklist.md",
   ".agents/skills/lcm-release/SKILL.md", "docs/README.md", "docs/agent-tools.md",

@@ -256,10 +256,6 @@ const evaluator = readFileSync(new URL(".github/scripts/external-admission.sh", 
 const evaluatorPath = new URL(".github/scripts/external-admission.sh", root).pathname;
 const documentation = readFileSync(new URL("docs/external-admission.md", root), "utf8");
 const workflowDocumentation = readFileSync(new URL("WORKFLOW.md", root), "utf8");
-const copilotInstructions = readFileSync(
-  new URL(".github/copilot-instructions.md", root),
-  "utf8",
-);
 const workflow = loadYaml(source) as ExternalAdmissionWorkflow;
 const job = workflow.jobs["external-admission-evaluator"];
 const evaluatorInvocation =
@@ -1150,7 +1146,6 @@ describe("external admission workflow", () => {
       evaluator,
       documentation,
       workflowDocumentation,
-      copilotInstructions,
     ]) {
       expect(content).not.toMatch(new RegExp(`grep${"tile"}`, "iu"));
     }
