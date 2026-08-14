@@ -198,7 +198,7 @@ or service fails.
 | Release strategy        | Parallel tracks with separate PRs                              |
 | PR review               | Copilot review loop; CodeRabbit is informational               |
 
-## Phase 1: Design (Opus, max effort)
+## Phase 1: Design (maximum-capability review, maximum effort)
 
 1. Study the spec/requirements using brainstorming skill
 2. Ask clarifying questions only for genuinely ambiguous decisions — use defaults above for standard questions
@@ -219,16 +219,16 @@ or service fails.
 7. Once the Copilot loop is complete (max 3 rounds — see Review Loop) and every protected exact-head check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`.
 8. Confirm `gh pr view "${PR_NUMBER}" --repo donadiosolutions/lcm --json state --jq .state` reports `MERGED` before starting implementation. If the merge command or final state check fails, inspect `gh pr checks "${PR_NUMBER}" --repo donadiosolutions/lcm` and resolve the protected-branch failure without an administrator bypass.
 
-## Phase 3: Implementation (Sonnet subagents)
+## Phase 3: Implementation (designated implementation subagents)
 
 1. **Sync first:** Set `TARGET_BRANCH` according to Branch Strategy, then run `git checkout "$TARGET_BRANCH" && git pull --ff-only origin "$TARGET_BRANCH"` to get the latest target (including merged specs)
-2. Dispatch `model: sonnet` subagents with `isolation: worktree` for each task in the plan
+2. Dispatch designated implementation subagents with `isolation: worktree` for each task in the plan
 3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
 4. **Sequential tasks** → launch the dependent branch only after the upstream PR merges, then branch from the updated target branch. If a downstream branch already exists on the old upstream tip, enter its isolated worktree, set `TARGET_BRANCH` and `OLD_UPSTREAM_TIP`, and replay only its downstream commits with `git fetch origin "$TARGET_BRANCH" && git rebase --onto "origin/$TARGET_BRANCH" "${OLD_UPSTREAM_TIP}"`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
 5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
 6. After subagent completes: review the diff, push, open PR, request Copilot review
 
-## Phase 4: Final Review (Opus, max effort)
+## Phase 4: Final Review (maximum-capability review, maximum effort)
 
 1. Review all implementation work against the spec
 2. Run full test suite — all tests must pass
