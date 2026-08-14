@@ -643,6 +643,51 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     );
   });
 
+  it("uses managed-table scope for every write-affecting definition inventory", async () => {
+    const fake = readyExecutor();
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: "lcm_test_migrator",
+    })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+
+    const definitionCall = fake.queries.find(({ options }) => (
+      options.operation === "inspectSchemaDefinitions"
+    ));
+    expect(definitionCall).toBeDefined();
+    const definitionConfig = definitionCall?.config as {
+      readonly text?: string;
+      readonly values?: readonly unknown[];
+    };
+    const snapshot = loadPostgreSqlSchemaSnapshots().at(-1)!;
+    const expectations = getPostgreSqlSchemaSnapshotExpectations(snapshot);
+    expect(definitionConfig.values).toHaveLength(12);
+    expect(definitionConfig.values?.[1]).toEqual(snapshot.identitySequenceIdentities);
+    expect(definitionConfig.values?.[2]).toEqual(snapshot.tableIdentities);
+    expect(definitionConfig.values?.[5]).toBe(expectations.definitionObjectCount);
+    expect(definitionConfig.values?.[6]).toEqual(expectations.definitionGroupKinds);
+    expect(definitionConfig.values?.[7]).toEqual(expectations.definitionGroupCounts);
+    expect(definitionConfig.values?.[8]).toEqual(expectations.definitionGroupHashes);
+    expect(definitionConfig.values?.[9]).toBe("lcm_test_runtime");
+
+    const text = definitionConfig.text ?? "";
+    const section = (name: string, nextName: string): string => {
+      const start = text.indexOf(name);
+      const end = text.indexOf(nextName, start + name.length);
+      return text.slice(start, end < 0 ? undefined : end);
+    };
+    expect(section("actual_constraints AS", "actual_generated_columns AS"))
+      .toContain("relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])");
+    expect(section("actual_constraints AS", "actual_generated_columns AS"))
+      .not.toContain("ANY ($2::pg_catalog.text[])");
+    expect(section("actual_generated_columns AS", "actual_ordinary_columns AS"))
+      .toContain("relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])");
+    expect(section("actual_ordinary_columns AS", "actual_identity_sequences AS"))
+      .toContain("relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])");
+    expect(section("actual_generated_columns AS", "actual_ordinary_columns AS"))
+      .not.toContain("ANY ($4::pg_catalog.text[])");
+    expect(section("actual_ordinary_columns AS", "actual_identity_sequences AS"))
+      .not.toContain("ANY ($4::pg_catalog.text[])");
+  });
+
   it.each([
     ["missing identity row", []],
     ["identity expected count", mutateFirstField("expected_function_count", 0)],

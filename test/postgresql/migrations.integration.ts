@@ -462,6 +462,123 @@ describe("PostgreSQL migrations and database isolation", () => {
     );
   });
 
+  it("rejects unexpected constraints on managed tables", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unexpected-constraint",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `ALTER TABLE lcm.session_ingest_log
+                   ADD CONSTRAINT unexpected_schema_fingerprint_constraint
+                   CHECK (char_length(session_id) >= 0)`,
+          }, { domain: "factory", operation: "injectUnexpectedManagedConstraint" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: `ALTER TABLE lcm.session_ingest_log
+                   DROP CONSTRAINT IF EXISTS unexpected_schema_fingerprint_constraint`,
+          }, { domain: "factory", operation: "removeUnexpectedManagedConstraint" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects unexpected ordinary columns with write-affecting semantics", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unexpected-ordinary-column",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `ALTER TABLE lcm.session_ingest_log
+                   ADD COLUMN unexpected_write_guard text NOT NULL DEFAULT 'injected'`,
+          }, { domain: "factory", operation: "injectUnexpectedManagedOrdinaryColumn" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: "ALTER TABLE lcm.session_ingest_log DROP COLUMN IF EXISTS unexpected_write_guard",
+          }, { domain: "factory", operation: "removeUnexpectedManagedOrdinaryColumn" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects unexpected generated columns on managed tables", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unexpected-generated-column",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `ALTER TABLE lcm.session_ingest_log
+                   ADD COLUMN unexpected_generated_key text
+                   GENERATED ALWAYS AS (md5(session_id)) STORED`,
+          }, { domain: "factory", operation: "injectUnexpectedManagedGeneratedColumn" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: "ALTER TABLE lcm.session_ingest_log DROP COLUMN IF EXISTS unexpected_generated_key",
+          }, { domain: "factory", operation: "removeUnexpectedManagedGeneratedColumn" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
   it("rejects unexpected valid indexes on managed tables", async () => {
     await withPostgreSqlTestDatabase(
       "readiness-unexpected-index",
@@ -1805,10 +1922,10 @@ describe("PostgreSQL migrations and database isolation", () => {
       await expect(runPostgreSqlMigrations(database.migrator))
         .rejects.toMatchObject({
           baselineApplied: true,
-          driftedDefinitionGroupCount: 1,
+          driftedDefinitionGroupCount: 2,
           expectedObjectCount: 782,
-          existingObjectCount: 781,
-          missingObjectCount: 1,
+          existingObjectCount: 782,
+          missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
     });

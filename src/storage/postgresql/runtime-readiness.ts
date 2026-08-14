@@ -1304,7 +1304,7 @@ function definitionQuery(
                AND index_metadata.indisvalid
                AND index_metadata.indisready
                AND index_metadata.indislive
-               AND relation.relname OPERATOR(pg_catalog.=) ANY ($6::pg_catalog.text[])
+               AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
            ),
            actual_triggers AS (
              SELECT trigger.tgname AS object_name,
@@ -1317,7 +1317,7 @@ function definitionQuery(
                ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
              WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                AND NOT trigger.tgisinternal
-               AND relation.relname OPERATOR(pg_catalog.=) ANY ($6::pg_catalog.text[])
+               AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
            ),
            actual_rewrite_rules AS (
              SELECT relation.relname AS table_name,
@@ -1335,7 +1335,7 @@ function definitionQuery(
                AND relation.relkind OPERATOR(pg_catalog.=) ANY (
                  ARRAY['r', 'p']::pg_catalog."char"[]
                )
-               AND relation.relname OPERATOR(pg_catalog.=) ANY ($6::pg_catalog.text[])
+               AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
            ),
            actual_constraints AS (
              SELECT constraint_metadata.conname AS object_name,
@@ -1359,8 +1359,10 @@ function definitionQuery(
                ON constraint_trigger_states.constraint_oid OPERATOR(pg_catalog.=)
                  constraint_metadata.oid
              WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-               AND pg_catalog.concat_ws('|', relation.relname, constraint_metadata.conname)
-                 OPERATOR(pg_catalog.=) ANY ($2::pg_catalog.text[])
+               AND constraint_metadata.contype OPERATOR(pg_catalog.=) ANY (
+                 ARRAY['c', 'f', 'p', 'u', 'x']::pg_catalog."char"[]
+               )
+               AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
            ),
            actual_generated_columns AS (
              SELECT relation.relname AS table_name,
@@ -1385,9 +1387,10 @@ function definitionQuery(
              LEFT JOIN pg_catalog.pg_namespace AS collation_namespace
                ON collation_namespace.oid OPERATOR(pg_catalog.=) collation_metadata.collnamespace
              WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+               AND attribute.attnum OPERATOR(pg_catalog.>) 0
+               AND NOT attribute.attisdropped
                AND attribute.attgenerated OPERATOR(pg_catalog.<>) ''
-               AND pg_catalog.concat_ws('|', relation.relname, attribute.attname)
-                 OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
+               AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
            ),
            actual_ordinary_columns AS (
              SELECT relation.relname AS table_name,
@@ -1415,8 +1418,7 @@ function definitionQuery(
                AND attribute.attnum OPERATOR(pg_catalog.>) 0
                AND NOT attribute.attisdropped
                AND attribute.attgenerated OPERATOR(pg_catalog.=) ''
-               AND pg_catalog.concat_ws('|', relation.relname, attribute.attname)
-                 OPERATOR(pg_catalog.=) ANY ($4::pg_catalog.text[])
+               AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
            ),
            actual_identity_sequences AS (
              SELECT sequence_relation.relname AS sequence_name,
@@ -1448,7 +1450,7 @@ function definitionQuery(
                ON owning_attribute.attrelid OPERATOR(pg_catalog.=) dependency.refobjid
               AND owning_attribute.attnum OPERATOR(pg_catalog.=) dependency.refobjsubid
              WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-               AND sequence_relation.relname OPERATOR(pg_catalog.=) ANY ($5::pg_catalog.text[])
+               AND sequence_relation.relname OPERATOR(pg_catalog.=) ANY ($2::pg_catalog.text[])
            ),
            actual_tables AS (
              SELECT relation.relname AS table_name,
@@ -1465,7 +1467,7 @@ function definitionQuery(
                ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
              WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                AND relation.relkind OPERATOR(pg_catalog.=) 'r'
-               AND relation.relname OPERATOR(pg_catalog.=) ANY ($6::pg_catalog.text[])
+               AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
            ),
            acl_relations AS (
              SELECT pg_catalog.concat(
@@ -1496,14 +1498,14 @@ function definitionQuery(
                     privilege.is_grantable::pg_catalog.text AS is_grantable
              FROM acl_relations
              CROSS JOIN LATERAL pg_catalog.aclexplode(acl_relations.effective_acl) AS privilege
-             WHERE acl_relations.object_identity OPERATOR(pg_catalog.=) ANY ($7::pg_catalog.text[])
+             WHERE acl_relations.object_identity OPERATOR(pg_catalog.=) ANY ($4::pg_catalog.text[])
                AND NOT (
                  privilege.grantee OPERATOR(pg_catalog.=)
-                   (SELECT role.oid FROM pg_catalog.pg_roles AS role WHERE role.rolname OPERATOR(pg_catalog.=) $13)
+                   (SELECT role.oid FROM pg_catalog.pg_roles AS role WHERE role.rolname OPERATOR(pg_catalog.=) $10)
                  AND privilege.grantor OPERATOR(pg_catalog.=) acl_relations.owner_oid
                  AND privilege.is_grantable OPERATOR(pg_catalog.=) false
                  AND pg_catalog.concat(acl_relations.object_identity, '|', privilege.privilege_type)
-                   OPERATOR(pg_catalog.=) ANY ($14::pg_catalog.text[])
+                   OPERATOR(pg_catalog.=) ANY ($11::pg_catalog.text[])
                )
            ),
            raw_column_acls AS (
@@ -1520,7 +1522,7 @@ function definitionQuery(
                       AND privilege.grantor OPERATOR(pg_catalog.=) relation.relowner
                       AND privilege.is_grantable OPERATOR(pg_catalog.=) false
                       AND pg_catalog.concat(relation.relname, '|', attribute.attname, '|', privilege.privilege_type)
-                        OPERATOR(pg_catalog.=) ANY ($15::pg_catalog.text[]),
+                        OPERATOR(pg_catalog.=) ANY ($12::pg_catalog.text[]),
                       false
                     ) AS sanctioned
              FROM pg_catalog.pg_attribute AS attribute
@@ -1531,7 +1533,7 @@ function definitionQuery(
              LEFT JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) AS privilege ON true
              WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                AND pg_catalog.concat_ws('|', relation.relname, attribute.attname)
-                 OPERATOR(pg_catalog.=) ANY ($8::pg_catalog.text[])
+                 OPERATOR(pg_catalog.=) ANY ($5::pg_catalog.text[])
            ),
            actual_column_acls AS (
              SELECT DISTINCT object_identity,
@@ -1605,19 +1607,19 @@ function definitionQuery(
            ),
            expected_groups(object_kind, expected_count, definition_sha256) AS (
              SELECT * FROM ROWS FROM (
-               pg_catalog.unnest($10::pg_catalog.text[]),
-               pg_catalog.unnest($11::pg_catalog.int4[]),
-               pg_catalog.unnest($12::pg_catalog.text[])
+               pg_catalog.unnest($7::pg_catalog.text[]),
+               pg_catalog.unnest($8::pg_catalog.int4[]),
+               pg_catalog.unnest($9::pg_catalog.text[])
              )
            )
            SELECT $1::pg_catalog.bool AS baseline_applied,
-                  $9::pg_catalog.int4 AS expected_object_count,
+                  $6::pg_catalog.int4 AS expected_object_count,
                   pg_catalog.sum(actual_groups.existing_count)::pg_catalog.int4 AS existing_object_count,
                   pg_catalog.array_agg(actual_groups.existing_count ORDER BY pg_catalog.array_position(
-                    $10::pg_catalog.text[], actual_groups.object_kind)) AS actual_definition_group_counts,
+                    $7::pg_catalog.text[], actual_groups.object_kind)) AS actual_definition_group_counts,
                   pg_catalog.array_agg(actual_groups.definition_sha256 ORDER BY pg_catalog.array_position(
-                    $10::pg_catalog.text[], actual_groups.object_kind)) AS actual_definition_group_hashes,
-                  ($9 - pg_catalog.sum(actual_groups.existing_count))::pg_catalog.int4
+                    $7::pg_catalog.text[], actual_groups.object_kind)) AS actual_definition_group_hashes,
+                  ($6 - pg_catalog.sum(actual_groups.existing_count))::pg_catalog.int4
                     AS missing_object_count,
                   pg_catalog.count(*) FILTER (
                     WHERE actual_groups.existing_count OPERATOR(pg_catalog.<>) expected_groups.expected_count
@@ -1627,9 +1629,6 @@ function definitionQuery(
            JOIN actual_groups USING (object_kind)`,
     values: [
       true,
-      snapshot.constraintIdentities,
-      snapshot.generatedColumnIdentities,
-      snapshot.ordinaryColumnIdentities,
       snapshot.identitySequenceIdentities,
       snapshot.tableIdentities,
       snapshot.relationAclIdentities,

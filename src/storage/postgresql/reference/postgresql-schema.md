@@ -162,9 +162,12 @@ does not add row-level security.
   follows the owning table; triggers and constraints are checked as existence
   and definition inventory.
   Additional operator-created objects remain outside the allowlist and are
-  ignored except that any valid, ready, and live index, non-internal trigger, or
-  non-view rewrite rule attached to a managed table is part of that table's
-  complete definition inventory and fails closed when added or changed.
+  ignored except that any valid, ready, and live index, non-internal trigger,
+  supported constraint, generated column, or ordinary column attached to a
+  managed table, or any non-view rewrite rule attached to one, is part of that
+  table's complete definition inventory and fails closed when added or changed.
+  `NOT NULL` constraints are represented by the ordinary-column fingerprint,
+  rather than double-counted as PostgreSQL 18 `pg_constraint` rows.
 - The `0005` snapshot carries the complete `0004` inventory forward and adds
   one always-enabled summary-parent trigger definition plus the exact
   `lcm.enforce_summary_parent_dag_integrity()` managed function. It therefore

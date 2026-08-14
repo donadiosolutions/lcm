@@ -1475,7 +1475,7 @@ export async function runPostgreSqlMigrations(
                    AND index_metadata.indisready
                    AND index_metadata.indislive
                    AND relation.relname OPERATOR(pg_catalog.=)
-                     ANY ($6::pg_catalog.text[])
+                     ANY ($3::pg_catalog.text[])
                ),
                actual_triggers AS (
                  SELECT trigger.tgname AS object_name,
@@ -1488,7 +1488,7 @@ export async function runPostgreSqlMigrations(
                    ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND NOT trigger.tgisinternal
-                   AND relation.relname OPERATOR(pg_catalog.=) ANY ($6::pg_catalog.text[])
+                   AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
                ),
                actual_rewrite_rules AS (
                  SELECT relation.relname AS table_name,
@@ -1506,7 +1506,7 @@ export async function runPostgreSqlMigrations(
                    AND relation.relkind OPERATOR(pg_catalog.=) ANY (
                      ARRAY['r', 'p']::pg_catalog."char"[]
                    )
-                   AND relation.relname OPERATOR(pg_catalog.=) ANY ($6::pg_catalog.text[])
+                   AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
                ),
                actual_constraints AS (
                  SELECT constraint_metadata.conname AS object_name,
@@ -1539,11 +1539,10 @@ export async function runPostgreSqlMigrations(
                    ON constraint_trigger_states.constraint_oid
                      OPERATOR(pg_catalog.=) constraint_metadata.oid
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-                   AND pg_catalog.concat_ws(
-                     '|',
-                     relation.relname,
-                     constraint_metadata.conname
-                   ) OPERATOR(pg_catalog.=) ANY ($2::pg_catalog.text[])
+                   AND constraint_metadata.contype OPERATOR(pg_catalog.=) ANY (
+                     ARRAY['c', 'f', 'p', 'u', 'x']::pg_catalog."char"[]
+                   )
+                   AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
                ),
                actual_generated_columns AS (
                  SELECT relation.relname AS table_name,
@@ -1579,12 +1578,10 @@ export async function runPostgreSqlMigrations(
                    ON collation_namespace.oid OPERATOR(pg_catalog.=)
                      collation_metadata.collnamespace
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                   AND attribute.attnum OPERATOR(pg_catalog.>) 0
+                   AND NOT attribute.attisdropped
                    AND attribute.attgenerated OPERATOR(pg_catalog.<>) ''
-                   AND pg_catalog.concat_ws(
-                     '|',
-                     relation.relname,
-                     attribute.attname
-                   ) OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
+                   AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
                ),
                actual_ordinary_columns AS (
                  SELECT relation.relname AS table_name,
@@ -1626,11 +1623,7 @@ export async function runPostgreSqlMigrations(
                    AND attribute.attnum OPERATOR(pg_catalog.>) 0
                    AND NOT attribute.attisdropped
                    AND attribute.attgenerated OPERATOR(pg_catalog.=) ''
-                   AND pg_catalog.concat_ws(
-                     '|',
-                     relation.relname,
-                     attribute.attname
-                   ) OPERATOR(pg_catalog.=) ANY ($4::pg_catalog.text[])
+                   AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
                ),
                actual_identity_sequences AS (
                  SELECT sequence_relation.relname AS sequence_name,
@@ -1673,7 +1666,7 @@ export async function runPostgreSqlMigrations(
                     dependency.refobjsubid
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND sequence_relation.relname OPERATOR(pg_catalog.=)
-                     ANY ($5::pg_catalog.text[])
+                     ANY ($2::pg_catalog.text[])
                ),
                actual_tables AS (
                  SELECT relation.relname AS table_name,
@@ -1700,7 +1693,7 @@ export async function runPostgreSqlMigrations(
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND relation.relkind OPERATOR(pg_catalog.=) 'r'
                    AND relation.relname OPERATOR(pg_catalog.=)
-                     ANY ($6::pg_catalog.text[])
+                     ANY ($3::pg_catalog.text[])
                ),
                acl_relations AS (
                  SELECT pg_catalog.concat(
@@ -1750,7 +1743,7 @@ export async function runPostgreSqlMigrations(
                    acl_relations.effective_acl
                  ) AS privilege
                  WHERE acl_relations.object_identity OPERATOR(pg_catalog.=)
-                   ANY ($7::pg_catalog.text[])
+                     ANY ($4::pg_catalog.text[])
                    AND NOT (
                      privilege.grantee OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
                      AND privilege.grantee OPERATOR(pg_catalog.<>) acl_relations.owner_oid
@@ -2495,7 +2488,7 @@ export async function runPostgreSqlMigrations(
                      '|',
                      relation.relname,
                      attribute.attname
-                   ) OPERATOR(pg_catalog.=) ANY ($8::pg_catalog.text[])
+                   ) OPERATOR(pg_catalog.=) ANY ($5::pg_catalog.text[])
                ),
                actual_column_acls AS (
                  SELECT DISTINCT object_identity,
@@ -2782,32 +2775,32 @@ export async function runPostgreSqlMigrations(
                ) AS (
                  SELECT *
                  FROM ROWS FROM (
-                   pg_catalog.unnest($10::pg_catalog.text[]),
-                   pg_catalog.unnest($11::pg_catalog.int4[]),
-                   pg_catalog.unnest($12::pg_catalog.text[])
+                   pg_catalog.unnest($7::pg_catalog.text[]),
+                   pg_catalog.unnest($8::pg_catalog.int4[]),
+                   pg_catalog.unnest($9::pg_catalog.text[])
                  )
                )
                SELECT $1::pg_catalog.bool AS baseline_applied,
-                      $9::pg_catalog.int4 AS expected_object_count,
+                      $6::pg_catalog.int4 AS expected_object_count,
                       pg_catalog.sum(actual_groups.existing_count)::pg_catalog.int4
                         AS existing_object_count,
                       pg_catalog.array_agg(
                         actual_groups.existing_count
                         ORDER BY pg_catalog.array_position(
-                          $10::pg_catalog.text[],
+                          $7::pg_catalog.text[],
                           actual_groups.object_kind
                         )
                       ) AS actual_definition_group_counts,
                       pg_catalog.array_agg(
                         actual_groups.definition_sha256
                         ORDER BY pg_catalog.array_position(
-                          $10::pg_catalog.text[],
+                          $7::pg_catalog.text[],
                           actual_groups.object_kind
                         )
                       ) AS actual_definition_group_hashes,
                       CASE
                         WHEN $1::pg_catalog.bool THEN (
-                          $9 - pg_catalog.sum(actual_groups.existing_count)
+                          $6 - pg_catalog.sum(actual_groups.existing_count)
                         )::pg_catalog.int4
                         ELSE 0::pg_catalog.int4
                       END AS missing_object_count,
@@ -2824,9 +2817,6 @@ export async function runPostgreSqlMigrations(
                JOIN actual_groups USING (object_kind)`,
         values: [
           baselineApplied,
-          expectedBaselineDefinitions.constraintIdentities,
-          expectedBaselineDefinitions.generatedColumnIdentities,
-          expectedBaselineDefinitions.ordinaryColumnIdentities,
           expectedBaselineDefinitions.identitySequenceIdentities,
           expectedBaselineDefinitions.tableIdentities,
           expectedBaselineDefinitions.relationAclIdentities,

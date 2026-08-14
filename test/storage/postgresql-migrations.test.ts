@@ -278,11 +278,11 @@ function executor(options: {
         }] as unknown as R[]);
       }
       const expectedObjectCount =
-        (config as { values?: unknown[] }).values?.[8] as number;
+        (config as { values?: unknown[] }).values?.[5] as number;
       const definitionGroupCounts =
-        (config as { values?: unknown[] }).values?.[10] as number[];
+        (config as { values?: unknown[] }).values?.[7] as number[];
       const definitionGroupHashes =
-        (config as { values?: unknown[] }).values?.[11] as string[];
+        (config as { values?: unknown[] }).values?.[8] as string[];
       const actualDefinitionGroupCounts = [...definitionGroupCounts];
       const actualDefinitionGroupHashes = [...definitionGroupHashes];
       if (options.baselineDefinitions === "missing-object") {
@@ -1454,9 +1454,6 @@ describe("PostgreSQL migration runner", () => {
     expect((inventoryCall?.[0] as { values?: unknown[] } | undefined)?.values)
       .toEqual([
         true,
-        expect.arrayContaining(["session_ingest_log|session_ingest_log_pkey"]),
-        expect.arrayContaining(["session_ingest_log|session_id_sha256"]),
-        expect.arrayContaining(["projects|identity_key", "recall_surfacing|surfaced_at"]),
         expect.arrayContaining(["conversations_conversation_id_seq"]),
         expect.arrayContaining(["schema_migrations", "fenced_leases"]),
         expect.arrayContaining(["table|schema_migrations", "sequence|fenced_leases_fencing_token_seq"]),
@@ -1552,7 +1549,7 @@ describe("PostgreSQL migration runner", () => {
       94, 3, 174, 15, 225, 6, 24, 30, 210,
     ]) {
       expect(inventorySql).not.toMatch(
-        new RegExp(`\\b${hardcodedGroupCount}::pg_catalog\\.int4`, "u"),
+        new RegExp(`(?<!\\$)\\b${hardcodedGroupCount}::pg_catalog\\.int4`, "u"),
       );
     }
   });

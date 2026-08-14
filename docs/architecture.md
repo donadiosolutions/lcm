@@ -175,10 +175,13 @@ column-limited runtime writes.
 Identity sequences retain permanent persistence, allocation parameters,
 internal dependency, and owning table/column. Migration transactions pin
 `quote_all_identifiers = off` before catalog deparsing. Any additional valid,
-ready, and live index or non-internal trigger attached to a managed table, or
-any non-view rewrite rule attached to one, is included in the complete
-inventory and fails closed. Unknown operator-created objects outside those
-managed-table boundaries remain outside the inventory.
+ready, and live index, non-internal trigger, supported constraint, generated
+column, or ordinary column attached to a managed table, or any non-view rewrite
+rule attached to one, is included in the complete inventory and fails closed.
+`NOT NULL` constraints are represented by the ordinary-column fingerprint so
+they are not double-counted as PostgreSQL 18 `pg_constraint` rows. Unknown
+operator-created objects outside those managed-table boundaries remain outside
+the inventory.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
 generated identity sequences, or the search-normalization, summary-identity,
 large-file-identity, and session-ingest-identity functions; unknown
