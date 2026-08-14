@@ -86,7 +86,7 @@ describe("PostgreSQL 18 runtime", () => {
           await expect(runtime.query<{ search_path: string }>({
             text: "SHOW search_path",
           }, { domain: "factory", operation: "readRuntimeSearchPath" })).resolves.toMatchObject({
-            rows: [{ search_path: "pg_catalog, public" }],
+            rows: [{ search_path: "pg_catalog,public" }],
           });
         } finally {
           await runtime.close();
