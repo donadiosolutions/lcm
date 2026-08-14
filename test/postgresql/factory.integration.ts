@@ -469,6 +469,246 @@ async function restoreExtensionOperatorState(
   }
 }
 
+const REQUIRED_GIN_TRGM_INDEX_NAMES = [
+  "messages_content_trgm_idx",
+  "promoted_memories_content_trgm_idx",
+  "promoted_memory_tags_tag_trgm_idx",
+  "summaries_content_trgm_idx",
+] as const;
+
+interface GinTrgmIndexState {
+  readonly name: string;
+  readonly definition: string;
+  readonly valid: boolean;
+  readonly ready: boolean;
+  readonly live: boolean;
+}
+
+interface GinTrgmGraphState {
+  readonly operatorClassExtension: string;
+  readonly operatorFamilyExtension: string;
+  readonly comparatorIdentity: string;
+  readonly operatorCount: number;
+  readonly supportFunctionCount: number;
+}
+
+async function inspectGinTrgmIndexes(
+  administrator: PostgreSqlRuntime,
+  operation: string,
+): Promise<readonly GinTrgmIndexState[]> {
+  const result = await administrator.query({
+    text: `SELECT relation.relname::pg_catalog.text AS name,
+                  pg_catalog.pg_get_indexdef(relation.oid) AS definition,
+                  index.indisvalid AS valid,
+                  index.indisready AS ready,
+                  index.indislive AS live
+           FROM pg_catalog.pg_class AS relation
+           JOIN pg_catalog.pg_namespace AS namespace
+             ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+           JOIN pg_catalog.pg_index AS index
+             ON index.indexrelid OPERATOR(pg_catalog.=) relation.oid
+           WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+             AND relation.relname OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])
+           ORDER BY relation.relname`,
+    values: [[...REQUIRED_GIN_TRGM_INDEX_NAMES]],
+  }, { domain: "factory", operation });
+  if (
+    result.rows.length !== REQUIRED_GIN_TRGM_INDEX_NAMES.length
+    || result.rows.some((row) => (
+      typeof row.name !== "string"
+      || typeof row.definition !== "string"
+      || typeof row.valid !== "boolean"
+      || typeof row.ready !== "boolean"
+      || typeof row.live !== "boolean"
+    ))
+  ) {
+    throw new Error("invalid gin_trgm_ops index fixture state");
+  }
+  return result.rows.map((row) => ({
+    name: row.name as string,
+    definition: row.definition as string,
+    valid: row.valid as boolean,
+    ready: row.ready as boolean,
+    live: row.live as boolean,
+  }));
+}
+
+function ginTrgmIndexFingerprint(indexes: readonly GinTrgmIndexState[]): string {
+  return createHash("sha256").update(indexes.map(({ name, definition }) => (
+    `${name}\0${definition}`
+  )).join("\n")).digest("hex");
+}
+
+async function inspectGinTrgmGraph(
+  administrator: PostgreSqlRuntime,
+  operation: string,
+): Promise<GinTrgmGraphState> {
+  const result = await administrator.query({
+    text: `SELECT operator_class_extension.extname::pg_catalog.text
+                    AS operator_class_extension,
+                  operator_family_extension.extname::pg_catalog.text
+                    AS operator_family_extension,
+                  pg_catalog.concat(
+                    comparator_namespace.nspname,
+                    '.',
+                    comparator.proname,
+                    '(',
+                    pg_catalog.pg_get_function_identity_arguments(comparator.oid),
+                    ')'
+                  ) AS comparator_identity,
+                  (
+                    SELECT pg_catalog.count(*)::pg_catalog.int4
+                    FROM pg_catalog.pg_amop AS operator_mapping
+                    WHERE operator_mapping.amopfamily OPERATOR(pg_catalog.=)
+                        operator_family.oid
+                  ) AS operator_count,
+                  (
+                    SELECT pg_catalog.count(*)::pg_catalog.int4
+                    FROM pg_catalog.pg_amproc AS support_mapping
+                    WHERE support_mapping.amprocfamily OPERATOR(pg_catalog.=)
+                        operator_family.oid
+                  ) AS support_function_count
+           FROM pg_catalog.pg_opclass AS operator_class
+           JOIN pg_catalog.pg_namespace AS namespace
+             ON namespace.oid OPERATOR(pg_catalog.=) operator_class.opcnamespace
+           JOIN pg_catalog.pg_am AS access_method
+             ON access_method.oid OPERATOR(pg_catalog.=) operator_class.opcmethod
+           JOIN pg_catalog.pg_opfamily AS operator_family
+             ON operator_family.oid OPERATOR(pg_catalog.=) operator_class.opcfamily
+           JOIN pg_catalog.pg_amproc AS comparator_mapping
+             ON comparator_mapping.amprocfamily OPERATOR(pg_catalog.=) operator_family.oid
+            AND comparator_mapping.amprocnum OPERATOR(pg_catalog.=) 1
+            AND comparator_mapping.amproclefttype OPERATOR(pg_catalog.=)
+                'pg_catalog.text'::pg_catalog.regtype
+            AND comparator_mapping.amprocrighttype OPERATOR(pg_catalog.=)
+                'pg_catalog.text'::pg_catalog.regtype
+           JOIN pg_catalog.pg_proc AS comparator
+             ON comparator.oid OPERATOR(pg_catalog.=) comparator_mapping.amproc
+           JOIN pg_catalog.pg_namespace AS comparator_namespace
+             ON comparator_namespace.oid OPERATOR(pg_catalog.=) comparator.pronamespace
+           JOIN pg_catalog.pg_depend AS operator_class_extension_dependency
+             ON operator_class_extension_dependency.classid OPERATOR(pg_catalog.=)
+                  pg_catalog.to_regclass('pg_catalog.pg_opclass')
+            AND operator_class_extension_dependency.objid OPERATOR(pg_catalog.=)
+                operator_class.oid
+            AND operator_class_extension_dependency.refclassid OPERATOR(pg_catalog.=)
+                  pg_catalog.to_regclass('pg_catalog.pg_extension')
+            AND operator_class_extension_dependency.deptype OPERATOR(pg_catalog.=) 'e'
+           JOIN pg_catalog.pg_extension AS operator_class_extension
+             ON operator_class_extension.oid OPERATOR(pg_catalog.=)
+                operator_class_extension_dependency.refobjid
+           JOIN pg_catalog.pg_depend AS operator_family_extension_dependency
+             ON operator_family_extension_dependency.classid OPERATOR(pg_catalog.=)
+                  pg_catalog.to_regclass('pg_catalog.pg_opfamily')
+            AND operator_family_extension_dependency.objid OPERATOR(pg_catalog.=)
+                operator_family.oid
+            AND operator_family_extension_dependency.refclassid OPERATOR(pg_catalog.=)
+                  pg_catalog.to_regclass('pg_catalog.pg_extension')
+            AND operator_family_extension_dependency.deptype OPERATOR(pg_catalog.=) 'e'
+           JOIN pg_catalog.pg_extension AS operator_family_extension
+             ON operator_family_extension.oid OPERATOR(pg_catalog.=)
+                operator_family_extension_dependency.refobjid
+           WHERE namespace.nspname OPERATOR(pg_catalog.=) 'public'
+             AND operator_class.opcname OPERATOR(pg_catalog.=) 'gin_trgm_ops'
+             AND access_method.amname OPERATOR(pg_catalog.=) 'gin'`,
+  }, { domain: "factory", operation });
+  const row = result.rows[0];
+  if (
+    result.rows.length !== 1
+    || typeof row?.operator_class_extension !== "string"
+    || typeof row.operator_family_extension !== "string"
+    || typeof row.comparator_identity !== "string"
+    || typeof row.operator_count !== "number"
+    || typeof row.support_function_count !== "number"
+  ) {
+    throw new Error("invalid gin_trgm_ops graph fixture state");
+  }
+  return {
+    operatorClassExtension: row.operator_class_extension,
+    operatorFamilyExtension: row.operator_family_extension,
+    comparatorIdentity: row.comparator_identity,
+    operatorCount: row.operator_count,
+    supportFunctionCount: row.support_function_count,
+  };
+}
+
+async function replaceGinTrgmOperatorClass(
+  administrator: PostgreSqlRuntime,
+  authoritativeIndexes: readonly GinTrgmIndexState[],
+): Promise<void> {
+  await administrator.query({
+    text: `${REQUIRED_GIN_TRGM_INDEX_NAMES.map((name) => (
+      `DROP INDEX lcm.${name}`
+    )).join(";\n")};
+           ALTER EXTENSION pg_trgm
+             DROP OPERATOR CLASS public.gin_trgm_ops USING gin;
+           ALTER EXTENSION pg_trgm
+             DROP OPERATOR FAMILY public.gin_trgm_ops USING gin;
+           DROP OPERATOR CLASS public.gin_trgm_ops USING gin;
+           DROP OPERATOR FAMILY public.gin_trgm_ops USING gin;
+           CREATE FUNCTION public.lcm_test_foreign_btint4cmp(integer, integer)
+           RETURNS integer
+           LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+           AS $$ SELECT 0 $$;
+           CREATE OPERATOR FAMILY public.gin_trgm_ops USING gin;
+           CREATE OPERATOR CLASS public.gin_trgm_ops
+           FOR TYPE pg_catalog.text USING gin
+           FAMILY public.gin_trgm_ops AS
+             OPERATOR 1 public.% (pg_catalog.text, pg_catalog.text),
+             FUNCTION 1 public.lcm_test_foreign_btint4cmp(integer, integer),
+             FUNCTION 2 public.gin_extract_value_trgm(text, internal),
+             FUNCTION 3 public.gin_extract_query_trgm(
+               text, internal, smallint, internal, internal, internal, internal
+             ),
+             FUNCTION 4 public.gin_trgm_consistent(
+               internal, smallint, text, integer, internal, internal, internal, internal
+             ),
+             STORAGE pg_catalog.int4;
+           ALTER OPERATOR FAMILY public.gin_trgm_ops USING gin
+             DROP FUNCTION 4 (pg_catalog.text, pg_catalog.text);
+           ALTER OPERATOR FAMILY public.gin_trgm_ops USING gin ADD
+             OPERATOR 3 pg_catalog.~~ (pg_catalog.text, pg_catalog.text),
+             OPERATOR 4 pg_catalog.~~* (pg_catalog.text, pg_catalog.text),
+             OPERATOR 5 pg_catalog.~ (pg_catalog.text, pg_catalog.text),
+             OPERATOR 6 pg_catalog.~* (pg_catalog.text, pg_catalog.text),
+             OPERATOR 7 public.%> (pg_catalog.text, pg_catalog.text),
+             OPERATOR 9 public.%>> (pg_catalog.text, pg_catalog.text),
+             OPERATOR 11 pg_catalog.= (pg_catalog.text, pg_catalog.text),
+             FUNCTION 4 (pg_catalog.text, pg_catalog.text)
+               public.gin_trgm_consistent(
+                 internal, smallint, text, integer, internal, internal, internal, internal
+               ),
+             FUNCTION 6 (pg_catalog.text, pg_catalog.text)
+               public.gin_trgm_triconsistent(
+                 internal, smallint, text, integer, internal, internal, internal
+               );
+           ALTER EXTENSION pg_trgm
+             ADD OPERATOR FAMILY public.gin_trgm_ops USING gin;
+           ALTER EXTENSION pg_trgm
+             ADD OPERATOR CLASS public.gin_trgm_ops USING gin;
+           ${authoritativeIndexes.map(({ definition }) => definition).join(";\n")}`,
+  }, { domain: "factory", operation: "replaceGinTrgmOperatorClass" });
+}
+
+async function restorePackagedGinTrgmObjects(
+  database: PostgreSqlTestDatabase,
+  administrator: PostgreSqlRuntime,
+  authoritativeIndexes: readonly GinTrgmIndexState[],
+): Promise<void> {
+  await administrator.query({
+    text: `${REQUIRED_GIN_TRGM_INDEX_NAMES.map((name) => (
+      `DROP INDEX IF EXISTS lcm.${name}`
+    )).join(";\n")};
+           DROP EXTENSION IF EXISTS pg_trgm CASCADE;
+           DROP OPERATOR CLASS IF EXISTS public.gin_trgm_ops USING gin CASCADE;
+           DROP OPERATOR FAMILY IF EXISTS public.gin_trgm_ops USING gin;
+           DROP FUNCTION IF EXISTS public.lcm_test_foreign_btint4cmp(integer, integer);
+           CREATE EXTENSION pg_trgm WITH SCHEMA public;
+           ${authoritativeIndexes.map(({ definition }) => definition).join(";\n")}`,
+  }, { domain: "factory", operation: "restorePackagedGinTrgmObjects" });
+  await applyAllRuntimeGrants(database);
+}
+
 async function createIdentityFixture(
   database: PostgreSqlTestDatabase,
   label: string,
@@ -1386,6 +1626,129 @@ describe("PostgreSQL 18 project storage factory", () => {
 
       expect(restoredOperator?.definition).toEqual(authoritativeOperator.definition);
       expect(restoredFunction).toEqual(authoritativeFunction);
+    });
+  });
+
+  it("rejects a replaced gin_trgm_ops graph despite authoritative managed index fingerprints", async () => {
+    await withPostgreSqlTestDatabase("factory-gin-trgm-opclass", async (database) => {
+      await applyAllRuntimeGrants(database);
+      const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-gin-trgm-opclass-"));
+      const administrator = new PostgreSqlRuntime(settings(database.adminUrl, { poolMax: 1 }));
+      const authoritativeIndexes = await inspectGinTrgmIndexes(
+        administrator,
+        "captureAuthoritativeGinTrgmIndexes",
+      );
+      const authoritativeGraph = await inspectGinTrgmGraph(
+        administrator,
+        "captureAuthoritativeGinTrgmGraph",
+      );
+      let baselineFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let tamperedFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let restoredFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let factoryError: unknown;
+      let mutationStarted = false;
+      let restored = false;
+      try {
+        expect(authoritativeIndexes).toHaveLength(REQUIRED_GIN_TRGM_INDEX_NAMES.length);
+        expect(authoritativeIndexes.every(({ valid, ready, live }) => valid && ready && live))
+          .toBe(true);
+        expect(authoritativeGraph).toEqual({
+          operatorClassExtension: "pg_trgm",
+          operatorFamilyExtension: "pg_trgm",
+          comparatorIdentity: "pg_catalog.btint4cmp(integer, integer)",
+          operatorCount: 8,
+          supportFunctionCount: 5,
+        });
+
+        baselineFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        );
+        await baselineFactory.close();
+        baselineFactory = undefined;
+
+        mutationStarted = true;
+        await replaceGinTrgmOperatorClass(administrator, authoritativeIndexes);
+        const tamperedIndexes = await inspectGinTrgmIndexes(
+          administrator,
+          "inspectReplacedGinTrgmIndexes",
+        );
+        const tamperedGraph = await inspectGinTrgmGraph(
+          administrator,
+          "inspectReplacedGinTrgmGraph",
+        );
+        expect(tamperedIndexes).toEqual(authoritativeIndexes);
+        expect(ginTrgmIndexFingerprint(tamperedIndexes)).toBe(
+          ginTrgmIndexFingerprint(authoritativeIndexes),
+        );
+        expect(tamperedGraph).toEqual({
+          ...authoritativeGraph,
+          comparatorIdentity: "public.lcm_test_foreign_btint4cmp(integer, integer)",
+        });
+
+        tamperedFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        ).catch((error: unknown) => {
+          factoryError = error;
+          return undefined;
+        });
+
+        expect(factoryError).toMatchObject({
+          code: "STORAGE_INITIALIZATION_FAILED",
+          backend: "postgresql",
+          operation: "createFactory",
+        });
+        expect(JSON.stringify(factoryError)).not.toContain("lcm_test_foreign_btint4cmp");
+
+        await tamperedFactory?.close();
+        tamperedFactory = undefined;
+        await restorePackagedGinTrgmObjects(database, administrator, authoritativeIndexes);
+        restored = true;
+        const restoredIndexes = await inspectGinTrgmIndexes(
+          administrator,
+          "inspectRestoredGinTrgmIndexes",
+        );
+        const restoredGraph = await inspectGinTrgmGraph(
+          administrator,
+          "inspectRestoredGinTrgmGraph",
+        );
+        expect(restoredIndexes).toEqual(authoritativeIndexes);
+        expect(restoredGraph).toEqual(authoritativeGraph);
+
+        restoredFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        );
+      } finally {
+        try {
+          await baselineFactory?.close().catch(() => undefined);
+          await tamperedFactory?.close().catch(() => undefined);
+          await restoredFactory?.close().catch(() => undefined);
+          if (mutationStarted && !restored) {
+            await restorePackagedGinTrgmObjects(database, administrator, authoritativeIndexes);
+            const finallyRestoredIndexes = await inspectGinTrgmIndexes(
+              administrator,
+              "inspectFinallyRestoredGinTrgmIndexes",
+            );
+            const finallyRestoredGraph = await inspectGinTrgmGraph(
+              administrator,
+              "inspectFinallyRestoredGinTrgmGraph",
+            );
+            expect(finallyRestoredIndexes).toEqual(authoritativeIndexes);
+            expect(finallyRestoredGraph).toEqual(authoritativeGraph);
+          }
+        } finally {
+          await administrator.close();
+          rmSync(homeDir, { recursive: true, force: true });
+        }
+      }
     });
   });
 

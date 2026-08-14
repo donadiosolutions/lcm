@@ -89,75 +89,176 @@ type ReadyExecutorOverride =
   | { readonly error: unknown }
   | ((base: ReadyExecutorBaseResult) => ReadyExecutorBaseResult | readonly QueryResultRow[]);
 
+function trustedFunctionRow(input: {
+  readonly functionIdentity: string;
+  readonly extension?: "pgcrypto" | "pg_trgm";
+  readonly language?: "c" | "internal";
+  readonly symbol: string;
+  readonly returnType: string;
+  readonly volatility: "i" | "s";
+  readonly leakproof?: boolean;
+  readonly supportFunctionIdentity?: string;
+}) {
+  const extension = input.extension ?? null;
+  return {
+    function_identity: input.functionIdentity,
+    extension_name: extension,
+    owner_matches_extension: extension === null ? null : true,
+    language_name: input.language ?? (extension === null ? "internal" : "c"),
+    probin: extension === null ? null : `$libdir/${extension}`,
+    prosrc: input.symbol,
+    return_type: input.returnType,
+    security_definer: false,
+    leakproof: input.leakproof ?? false,
+    volatility: input.volatility,
+    parallel_safety: "s",
+    strict: true,
+    returns_set: false,
+    function_kind: "f",
+    support_function_identity: input.supportFunctionIdentity ?? null,
+    configuration_is_null: true,
+    dependency_count: extension === null ? 0 : 2,
+    extension_dependency_count: extension === null ? 0 : 1,
+    namespace_dependency_count: extension === null ? 0 : 1,
+  };
+}
+
 const REQUIRED_EXTENSION_FUNCTION_ROWS = [
-  {
-    function_identity: "public.digest(text, text)",
-    extension_name: "pgcrypto",
-    language_name: "c",
-    probin: "$libdir/pgcrypto",
-    prosrc: "pg_digest",
-    return_type: "bytea",
-    security_definer: false,
-    leakproof: false,
+  trustedFunctionRow({
+    functionIdentity: "public.digest(text, text)",
+    extension: "pgcrypto",
+    symbol: "pg_digest",
+    returnType: "bytea",
     volatility: "i",
-    parallel_safety: "s",
-    strict: true,
-    returns_set: false,
-    function_kind: "f",
-    no_support_function: true,
-    configuration_is_null: true,
-  },
-  {
-    function_identity: "public.digest(bytea, text)",
-    extension_name: "pgcrypto",
-    language_name: "c",
-    probin: "$libdir/pgcrypto",
-    prosrc: "pg_digest",
-    return_type: "bytea",
-    security_definer: false,
-    leakproof: false,
+  }),
+  trustedFunctionRow({
+    functionIdentity: "public.digest(bytea, text)",
+    extension: "pgcrypto",
+    symbol: "pg_digest",
+    returnType: "bytea",
     volatility: "i",
-    parallel_safety: "s",
-    strict: true,
-    returns_set: false,
-    function_kind: "f",
-    no_support_function: true,
-    configuration_is_null: true,
-  },
-  {
-    function_identity: "public.similarity(text, text)",
-    extension_name: "pg_trgm",
-    language_name: "c",
-    probin: "$libdir/pg_trgm",
-    prosrc: "similarity",
-    return_type: "real",
-    security_definer: false,
-    leakproof: false,
+  }),
+  trustedFunctionRow({
+    functionIdentity: "public.similarity(text, text)",
+    extension: "pg_trgm",
+    symbol: "similarity",
+    returnType: "real",
     volatility: "i",
-    parallel_safety: "s",
-    strict: true,
-    returns_set: false,
-    function_kind: "f",
-    no_support_function: true,
-    configuration_is_null: true,
-  },
-  {
-    function_identity: "public.similarity_op(text, text)",
-    extension_name: "pg_trgm",
-    language_name: "c",
-    probin: "$libdir/pg_trgm",
-    prosrc: "similarity_op",
-    return_type: "boolean",
-    security_definer: false,
-    leakproof: false,
+  }),
+  trustedFunctionRow({
+    functionIdentity: "public.similarity_op(text, text)",
+    extension: "pg_trgm",
+    symbol: "similarity_op",
+    returnType: "boolean",
     volatility: "s",
-    parallel_safety: "s",
-    strict: true,
-    returns_set: false,
-    function_kind: "f",
-    no_support_function: true,
-    configuration_is_null: true,
-  },
+  }),
+  ...[
+    ["public.word_similarity_commutator_op(text, text)", "word_similarity_commutator_op"],
+    [
+      "public.strict_word_similarity_commutator_op(text, text)",
+      "strict_word_similarity_commutator_op",
+    ],
+    ["public.word_similarity_op(text, text)", "word_similarity_op"],
+    ["public.strict_word_similarity_op(text, text)", "strict_word_similarity_op"],
+  ].map(([functionIdentity, symbol]) => trustedFunctionRow({
+    functionIdentity: functionIdentity!,
+    extension: "pg_trgm",
+    symbol: symbol!,
+    returnType: "boolean",
+    volatility: "s",
+  })),
+  ...[
+    ["public.gin_extract_value_trgm(text, internal)", "gin_extract_value_trgm", "internal"],
+    [
+      "public.gin_extract_query_trgm(text, internal, smallint, internal, internal, internal, internal)",
+      "gin_extract_query_trgm",
+      "internal",
+    ],
+    [
+      "public.gin_trgm_consistent(internal, smallint, text, integer, internal, internal, internal, internal)",
+      "gin_trgm_consistent",
+      "boolean",
+    ],
+    [
+      "public.gin_trgm_triconsistent(internal, smallint, text, integer, internal, internal, internal)",
+      "gin_trgm_triconsistent",
+      '"char"',
+    ],
+  ].map(([functionIdentity, symbol, returnType]) => trustedFunctionRow({
+    functionIdentity: functionIdentity!,
+    extension: "pg_trgm",
+    symbol: symbol!,
+    returnType: returnType!,
+    volatility: "i",
+  })),
+  trustedFunctionRow({
+    functionIdentity: "pg_catalog.btint4cmp(integer, integer)",
+    symbol: "btint4cmp",
+    returnType: "integer",
+    volatility: "i",
+    leakproof: true,
+  }),
+  trustedFunctionRow({
+    functionIdentity: "pg_catalog.texteq(text, text)",
+    symbol: "texteq",
+    returnType: "boolean",
+    volatility: "i",
+    leakproof: true,
+  }),
+  ...[
+    ["pg_catalog.textlike(text, text)", "textlike", "pg_catalog.textlike_support(internal)"],
+    [
+      "pg_catalog.texticlike(text, text)",
+      "texticlike",
+      "pg_catalog.texticlike_support(internal)",
+    ],
+    [
+      "pg_catalog.textregexeq(text, text)",
+      "textregexeq",
+      "pg_catalog.textregexeq_support(internal)",
+    ],
+    [
+      "pg_catalog.texticregexeq(text, text)",
+      "texticregexeq",
+      "pg_catalog.texticregexeq_support(internal)",
+    ],
+  ].map(([functionIdentity, symbol, supportFunctionIdentity]) => trustedFunctionRow({
+    functionIdentity: functionIdentity!,
+    symbol: symbol!,
+    returnType: "boolean",
+    volatility: "i",
+    supportFunctionIdentity,
+  })),
+  ...[
+    "textlike_support",
+    "texticlike_support",
+    "textregexeq_support",
+    "texticregexeq_support",
+  ].map((symbol) => trustedFunctionRow({
+    functionIdentity: `pg_catalog.${symbol}(internal)`,
+    symbol,
+    returnType: "internal",
+    volatility: "i",
+  })),
+  ...[
+    ["matchingsel", "integer"],
+    ["matchingjoinsel", "smallint, internal"],
+    ["likesel", "integer"],
+    ["likejoinsel", "smallint, internal"],
+    ["iclikesel", "integer"],
+    ["iclikejoinsel", "smallint, internal"],
+    ["regexeqsel", "integer"],
+    ["regexeqjoinsel", "smallint, internal"],
+    ["icregexeqsel", "integer"],
+    ["icregexeqjoinsel", "smallint, internal"],
+    ["eqsel", "integer"],
+    ["eqjoinsel", "smallint, internal"],
+  ].map(([symbol, finalArguments]) => trustedFunctionRow({
+    functionIdentity: `pg_catalog.${symbol}(internal, oid, internal, ${finalArguments})`,
+    symbol: symbol!,
+    returnType: "double precision",
+    volatility: "s",
+  })),
 ] as const;
 
 const REQUIRED_EXTENSION_OPERATOR_ROWS = [{
@@ -181,6 +282,201 @@ const REQUIRED_EXTENSION_OPERATOR_ROWS = [{
   implementation_dependency_count: 1,
   namespace_dependency_count: 1,
 }] as const;
+
+const REQUIRED_GIN_TRGM_OPERATOR_CLASS_ROWS = [{
+  operator_class_schema: "public",
+  operator_class_name: "gin_trgm_ops",
+  operator_family_schema: "public",
+  operator_family_name: "gin_trgm_ops",
+  access_method_name: "gin",
+  input_type: "text",
+  storage_type: "integer",
+  is_default: false,
+  operator_class_extension: "pg_trgm",
+  operator_family_extension: "pg_trgm",
+  operator_class_owner_matches_extension: true,
+  operator_family_owner_matches_extension: true,
+  operator_class_dependency_count: 3,
+  operator_class_family_dependency_count: 1,
+  operator_class_extension_dependency_count: 1,
+  operator_class_namespace_dependency_count: 1,
+  operator_family_dependency_count: 2,
+  operator_family_extension_dependency_count: 1,
+  operator_family_namespace_dependency_count: 1,
+}] as const;
+
+function ginTrgmOperatorRow(input: {
+  readonly strategyNumber: number;
+  readonly operatorIdentity: string;
+  readonly implementationIdentity: string;
+  readonly commutatorIdentity: string | null;
+  readonly negatorIdentity: string | null;
+  readonly restrictionIdentity: string;
+  readonly joinIdentity: string;
+  readonly extension?: "pg_trgm";
+  readonly canMerge?: boolean;
+  readonly canHash?: boolean;
+}) {
+  const extension = input.extension ?? null;
+  return {
+    strategy_number: input.strategyNumber,
+    purpose: "s",
+    left_type: "text",
+    right_type: "text",
+    operator_identity: input.operatorIdentity,
+    operator_kind: "b",
+    result_type: "boolean",
+    implementation_identity: input.implementationIdentity,
+    commutator_identity: input.commutatorIdentity,
+    negator_identity: input.negatorIdentity,
+    restriction_identity: input.restrictionIdentity,
+    join_identity: input.joinIdentity,
+    can_merge: input.canMerge ?? false,
+    can_hash: input.canHash ?? false,
+    sort_family_identity: null,
+    access_method_name: "gin",
+    extension_name: extension,
+    owner_matches_extension: extension === null ? null : true,
+    mapping_dependency_count: extension === null ? 1 : 2,
+    mapping_family_dependency_count: 1,
+    mapping_operator_dependency_count: extension === null ? 0 : 1,
+    operator_dependency_count: extension === null ? 0 : 3,
+    operator_extension_dependency_count: extension === null ? 0 : 1,
+    operator_implementation_dependency_count: extension === null ? 0 : 1,
+    operator_namespace_dependency_count: extension === null ? 0 : 1,
+  };
+}
+
+const REQUIRED_GIN_TRGM_OPERATOR_ROWS = [
+  ginTrgmOperatorRow({
+    strategyNumber: 1,
+    operatorIdentity: "public.%(text, text)",
+    implementationIdentity: "public.similarity_op(text, text)",
+    commutatorIdentity: "public.%(text, text)",
+    negatorIdentity: null,
+    restrictionIdentity: "pg_catalog.matchingsel(internal, oid, internal, integer)",
+    joinIdentity: "pg_catalog.matchingjoinsel(internal, oid, internal, smallint, internal)",
+    extension: "pg_trgm",
+  }),
+  ginTrgmOperatorRow({
+    strategyNumber: 3,
+    operatorIdentity: "pg_catalog.~~(text, text)",
+    implementationIdentity: "pg_catalog.textlike(text, text)",
+    commutatorIdentity: null,
+    negatorIdentity: "pg_catalog.!~~(text, text)",
+    restrictionIdentity: "pg_catalog.likesel(internal, oid, internal, integer)",
+    joinIdentity: "pg_catalog.likejoinsel(internal, oid, internal, smallint, internal)",
+  }),
+  ginTrgmOperatorRow({
+    strategyNumber: 4,
+    operatorIdentity: "pg_catalog.~~*(text, text)",
+    implementationIdentity: "pg_catalog.texticlike(text, text)",
+    commutatorIdentity: null,
+    negatorIdentity: "pg_catalog.!~~*(text, text)",
+    restrictionIdentity: "pg_catalog.iclikesel(internal, oid, internal, integer)",
+    joinIdentity: "pg_catalog.iclikejoinsel(internal, oid, internal, smallint, internal)",
+  }),
+  ginTrgmOperatorRow({
+    strategyNumber: 5,
+    operatorIdentity: "pg_catalog.~(text, text)",
+    implementationIdentity: "pg_catalog.textregexeq(text, text)",
+    commutatorIdentity: null,
+    negatorIdentity: "pg_catalog.!~(text, text)",
+    restrictionIdentity: "pg_catalog.regexeqsel(internal, oid, internal, integer)",
+    joinIdentity: "pg_catalog.regexeqjoinsel(internal, oid, internal, smallint, internal)",
+  }),
+  ginTrgmOperatorRow({
+    strategyNumber: 6,
+    operatorIdentity: "pg_catalog.~*(text, text)",
+    implementationIdentity: "pg_catalog.texticregexeq(text, text)",
+    commutatorIdentity: null,
+    negatorIdentity: "pg_catalog.!~*(text, text)",
+    restrictionIdentity: "pg_catalog.icregexeqsel(internal, oid, internal, integer)",
+    joinIdentity: "pg_catalog.icregexeqjoinsel(internal, oid, internal, smallint, internal)",
+  }),
+  ginTrgmOperatorRow({
+    strategyNumber: 7,
+    operatorIdentity: "public.%>(text, text)",
+    implementationIdentity: "public.word_similarity_commutator_op(text, text)",
+    commutatorIdentity: "public.<%(text, text)",
+    negatorIdentity: null,
+    restrictionIdentity: "pg_catalog.matchingsel(internal, oid, internal, integer)",
+    joinIdentity: "pg_catalog.matchingjoinsel(internal, oid, internal, smallint, internal)",
+    extension: "pg_trgm",
+  }),
+  ginTrgmOperatorRow({
+    strategyNumber: 9,
+    operatorIdentity: "public.%>>(text, text)",
+    implementationIdentity: "public.strict_word_similarity_commutator_op(text, text)",
+    commutatorIdentity: "public.<<%(text, text)",
+    negatorIdentity: null,
+    restrictionIdentity: "pg_catalog.matchingsel(internal, oid, internal, integer)",
+    joinIdentity: "pg_catalog.matchingjoinsel(internal, oid, internal, smallint, internal)",
+    extension: "pg_trgm",
+  }),
+  ginTrgmOperatorRow({
+    strategyNumber: 11,
+    operatorIdentity: "pg_catalog.=(text, text)",
+    implementationIdentity: "pg_catalog.texteq(text, text)",
+    commutatorIdentity: "pg_catalog.=(text, text)",
+    negatorIdentity: "pg_catalog.<>(text, text)",
+    restrictionIdentity: "pg_catalog.eqsel(internal, oid, internal, integer)",
+    joinIdentity: "pg_catalog.eqjoinsel(internal, oid, internal, smallint, internal)",
+    canMerge: true,
+    canHash: true,
+  }),
+] as const;
+
+const REQUIRED_GIN_TRGM_SUPPORT_ROWS = [
+  {
+    support_number: 1,
+    left_type: "text",
+    right_type: "text",
+    function_identity: "pg_catalog.btint4cmp(integer, integer)",
+    dependency_count: 1,
+    family_auto_dependency_count: 1,
+    operator_class_internal_dependency_count: 0,
+    procedure_normal_dependency_count: 0,
+    procedure_auto_dependency_count: 0,
+  },
+  ...[
+    [2, "public.gin_extract_value_trgm(text, internal)"],
+    [
+      3,
+      "public.gin_extract_query_trgm(text, internal, smallint, internal, internal, internal, internal)",
+    ],
+  ].map(([supportNumber, functionIdentity]) => ({
+    support_number: supportNumber,
+    left_type: "text",
+    right_type: "text",
+    function_identity: functionIdentity,
+    dependency_count: 2,
+    family_auto_dependency_count: 0,
+    operator_class_internal_dependency_count: 1,
+    procedure_normal_dependency_count: 1,
+    procedure_auto_dependency_count: 0,
+  })),
+  ...[
+    [
+      4,
+      "public.gin_trgm_consistent(internal, smallint, text, integer, internal, internal, internal, internal)",
+    ],
+    [
+      6,
+      "public.gin_trgm_triconsistent(internal, smallint, text, integer, internal, internal, internal)",
+    ],
+  ].map(([supportNumber, functionIdentity]) => ({
+    support_number: supportNumber,
+    left_type: "text",
+    right_type: "text",
+    function_identity: functionIdentity,
+    dependency_count: 2,
+    family_auto_dependency_count: 1,
+    operator_class_internal_dependency_count: 0,
+    procedure_normal_dependency_count: 0,
+    procedure_auto_dependency_count: 1,
+  })),
+] as const;
 
 function mutateRows(
   mutation: (rows: QueryResultRow[]) => void,
@@ -308,6 +604,17 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
     }
     if (operation === "inspectRequiredExtensionOperator") {
       return applyOverride(result(REQUIRED_EXTENSION_OPERATOR_ROWS.map((row) => ({ ...row }))));
+    }
+    if (operation === "inspectRequiredGinTrgmOperatorClass") {
+      return applyOverride(result(
+        REQUIRED_GIN_TRGM_OPERATOR_CLASS_ROWS.map((row) => ({ ...row })),
+      ));
+    }
+    if (operation === "inspectRequiredGinTrgmOperators") {
+      return applyOverride(result(REQUIRED_GIN_TRGM_OPERATOR_ROWS.map((row) => ({ ...row }))));
+    }
+    if (operation === "inspectRequiredGinTrgmSupportFunctions") {
+      return applyOverride(result(REQUIRED_GIN_TRGM_SUPPORT_ROWS.map((row) => ({ ...row }))));
     }
     if (operation === "runtimeReadinessSearchConfiguration") {
       return applyOverride(result([{
@@ -571,7 +878,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
   });
 
   it.each(REQUIRED_EXTENSION_FUNCTION_ROWS.map(({ function_identity }) => [function_identity]))(
-    "rejects a spoofed C implementation for %s before later readiness work",
+    "rejects a spoofed trusted implementation for %s before later readiness work",
     async (functionIdentity) => {
       const fake = readyExecutor({
         operationOverrides: {
@@ -602,6 +909,12 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     ["wrong extension membership", (rows: QueryResultRow[]) => {
       rows[0]!.extension_name = "pg_trgm";
     }],
+    ["malformed owner evidence", (rows: QueryResultRow[]) => {
+      rows[0]!.owner_matches_extension = "true";
+    }],
+    ["foreign extension owner", (rows: QueryResultRow[]) => {
+      rows[0]!.owner_matches_extension = false;
+    }],
     ["non-C language", (rows: QueryResultRow[]) => { rows[0]!.language_name = "sql"; }],
     ["foreign shared library", (rows: QueryResultRow[]) => {
       rows[0]!.probin = "$libdir/foreign";
@@ -614,11 +927,21 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     ["non-strict", (rows: QueryResultRow[]) => { rows[0]!.strict = false; }],
     ["set-returning", (rows: QueryResultRow[]) => { rows[0]!.returns_set = true; }],
     ["wrong function kind", (rows: QueryResultRow[]) => { rows[0]!.function_kind = "p"; }],
-    ["planner support function", (rows: QueryResultRow[]) => {
-      rows[0]!.no_support_function = false;
+    ["foreign planner support function", (rows: QueryResultRow[]) => {
+      rows[0]!.support_function_identity = "pg_catalog.foreign_support(internal)";
     }],
     ["procedure configuration", (rows: QueryResultRow[]) => {
       rows[0]!.configuration_is_null = false;
+    }],
+    ["malformed dependency count", (rows: QueryResultRow[]) => {
+      rows[0]!.dependency_count = "2";
+    }],
+    ["extra dependency", (rows: QueryResultRow[]) => { rows[0]!.dependency_count = 3; }],
+    ["missing extension dependency", (rows: QueryResultRow[]) => {
+      rows[0]!.extension_dependency_count = 0;
+    }],
+    ["missing namespace dependency", (rows: QueryResultRow[]) => {
+      rows[0]!.namespace_dependency_count = 0;
     }],
     ["duplicate overload", (rows: QueryResultRow[]) => { rows.push({ ...rows[0]! }); }],
     ["missing overload", (rows: QueryResultRow[]) => { rows.splice(0, 1); }],
@@ -632,6 +955,34 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       "extension-preflight",
     );
   });
+
+  it.each([
+    ["foreign built-in extension", "pg_catalog.btint4cmp(integer, integer)", "extension_name", "pg_trgm"],
+    ["malformed built-in owner", "pg_catalog.btint4cmp(integer, integer)", "owner_matches_extension", true],
+    ["built-in dependency", "pg_catalog.btint4cmp(integer, integer)", "dependency_count", 1],
+    ["missing planner support", "pg_catalog.textlike(text, text)", "support_function_identity", null],
+    [
+      "foreign planner support",
+      "pg_catalog.textlike(text, text)",
+      "support_function_identity",
+      "pg_catalog.textregexeq_support(internal)",
+    ],
+  ] as const)(
+    "rejects spoofed trusted built-in procedure metadata: %s",
+    async (_label, functionIdentity, field, value) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRequiredExtensionFunctions: mutateRows((rows) => {
+            const row = rows.find(({ function_identity }) => function_identity === functionIdentity);
+            if (row !== undefined) row[field] = value;
+          }),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "extension-preflight");
+      expect(failure.operation).toBe("inspectRequiredExtensionFunctions");
+    },
+  );
 
   it.each([
     ["malformed schema", "schema_name", null],
@@ -707,6 +1058,230 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       "runtimeReadinessExtensions:probePgStatStatements",
       "inspectRequiredExtensionFunctions",
       "inspectRequiredExtensionOperator",
+    ]);
+  });
+
+  it.each([
+    ["operator class schema", "operator_class_schema", "foreign"],
+    ["operator class name", "operator_class_name", "foreign_ops"],
+    ["operator family schema", "operator_family_schema", "foreign"],
+    ["operator family name", "operator_family_name", "foreign_ops"],
+    ["access method", "access_method_name", "btree"],
+    ["input type", "input_type", "bytea"],
+    ["storage type", "storage_type", "text"],
+    ["default property", "is_default", true],
+    ["operator class extension", "operator_class_extension", "foreign"],
+    ["operator family extension", "operator_family_extension", "foreign"],
+    ["operator class owner", "operator_class_owner_matches_extension", false],
+    ["operator family owner", "operator_family_owner_matches_extension", false],
+    ["operator class dependency count", "operator_class_dependency_count", "3"],
+    ["operator class family dependency", "operator_class_family_dependency_count", 0],
+    ["operator class extension dependency", "operator_class_extension_dependency_count", 0],
+    ["operator class namespace dependency", "operator_class_namespace_dependency_count", 0],
+    ["operator family dependency count", "operator_family_dependency_count", 3],
+    ["operator family extension dependency", "operator_family_extension_dependency_count", 0],
+    ["operator family namespace dependency", "operator_family_namespace_dependency_count", 0],
+  ] as const)(
+    "rejects malformed or spoofed gin_trgm_ops identity metadata: %s",
+    async (_label, field, value) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRequiredGinTrgmOperatorClass: mutateRows((rows) => {
+            rows[0]![field] = value;
+          }),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "extension-preflight");
+      expect(failure.operation).toBe("inspectRequiredGinTrgmOperatorClass");
+    },
+  );
+
+  it.each([
+    ["missing", (rows: QueryResultRow[]) => { rows.splice(0, 1); }],
+    ["duplicate", (rows: QueryResultRow[]) => { rows.push({ ...rows[0]! }); }],
+  ] as const)("rejects a %s gin_trgm_ops identity row fail-fast", async (_label, mutate) => {
+    const fake = readyExecutor({
+      operationOverrides: {
+        inspectRequiredGinTrgmOperatorClass: mutateRows(mutate),
+      },
+    });
+
+    const failure = await expectReadinessFailure(fake, "extension-preflight");
+    expect(failure.operation).toBe("inspectRequiredGinTrgmOperatorClass");
+    expect(fake.queries.map(({ options }) => options.operation)).toEqual([
+      "inspectServerReadiness",
+      "inspectRuntimeRolePolicy",
+      "runtimeReadinessExtensions",
+      "runtimeReadinessExtensions:probePgStatStatements",
+      "inspectRequiredExtensionFunctions",
+      "inspectRequiredExtensionOperator",
+      "inspectRequiredGinTrgmOperatorClass",
+    ]);
+  });
+
+  it.each(REQUIRED_GIN_TRGM_OPERATOR_ROWS.map(({ strategy_number }) => [strategy_number]))(
+    "rejects a redirected gin_trgm_ops strategy %s operator implementation",
+    async (strategyNumber) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRequiredGinTrgmOperators: mutateRows((rows) => {
+            const row = rows.find(({ strategy_number }) => strategy_number === strategyNumber);
+            if (row !== undefined) row.implementation_identity = "public.foreign(text, text)";
+          }),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "extension-preflight");
+      expect(failure.operation).toBe("inspectRequiredGinTrgmOperators");
+    },
+  );
+
+  it.each([
+    ["strategy number", "strategy_number", "1"],
+    ["purpose", "purpose", "o"],
+    ["left type", "left_type", "bytea"],
+    ["right type", "right_type", "bytea"],
+    ["operator identity", "operator_identity", "public.#(text, text)"],
+    ["operator kind", "operator_kind", "l"],
+    ["result type", "result_type", "integer"],
+    ["commutator", "commutator_identity", null],
+    ["negator", "negator_identity", "public.!(text, text)"],
+    ["restriction estimator", "restriction_identity", "pg_catalog.eqsel(internal)"],
+    ["join estimator", "join_identity", "pg_catalog.eqjoinsel(internal)"],
+    ["merge property", "can_merge", true],
+    ["hash property", "can_hash", true],
+    ["sort family", "sort_family_identity", "pg_catalog.integer_ops"],
+    ["access method", "access_method_name", "btree"],
+    ["extension", "extension_name", "foreign"],
+    ["owner", "owner_matches_extension", false],
+    ["mapping dependency count", "mapping_dependency_count", "2"],
+    ["mapping family dependency", "mapping_family_dependency_count", 0],
+    ["mapping operator dependency", "mapping_operator_dependency_count", 0],
+    ["operator dependency count", "operator_dependency_count", 4],
+    ["operator extension dependency", "operator_extension_dependency_count", 0],
+    ["operator implementation dependency", "operator_implementation_dependency_count", 0],
+    ["operator namespace dependency", "operator_namespace_dependency_count", 0],
+  ] as const)(
+    "rejects malformed or spoofed gin_trgm_ops operator metadata: %s",
+    async (_label, field, value) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRequiredGinTrgmOperators: mutateRows((rows) => {
+            rows[0]![field] = value;
+          }),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "extension-preflight");
+      expect(failure.operation).toBe("inspectRequiredGinTrgmOperators");
+    },
+  );
+
+  it.each([
+    ["foreign built-in extension", "extension_name", "pg_trgm"],
+    ["malformed built-in owner", "owner_matches_extension", true],
+    ["extra built-in mapping dependency", "mapping_dependency_count", 2],
+    ["foreign built-in operator dependency", "mapping_operator_dependency_count", 1],
+  ] as const)("rejects spoofed built-in operator metadata: %s", async (_label, field, value) => {
+    const fake = readyExecutor({
+      operationOverrides: {
+        inspectRequiredGinTrgmOperators: mutateRows((rows) => {
+          rows[1]![field] = value;
+        }),
+      },
+    });
+
+    const failure = await expectReadinessFailure(fake, "extension-preflight");
+    expect(failure.operation).toBe("inspectRequiredGinTrgmOperators");
+  });
+
+  it.each([
+    ["missing", (rows: QueryResultRow[]) => { rows.splice(0, 1); }],
+    ["duplicate", (rows: QueryResultRow[]) => { rows.push({ ...rows[0]! }); }],
+    ["extra", (rows: QueryResultRow[]) => {
+      rows.push({ ...rows[0]!, strategy_number: 13, operator_identity: "public.foreign(text, text)" });
+    }],
+  ] as const)("rejects a %s gin_trgm_ops operator mapping fail-fast", async (_label, mutate) => {
+    const fake = readyExecutor({
+      operationOverrides: {
+        inspectRequiredGinTrgmOperators: mutateRows(mutate),
+      },
+    });
+
+    const failure = await expectReadinessFailure(fake, "extension-preflight");
+    expect(failure.operation).toBe("inspectRequiredGinTrgmOperators");
+    expect(fake.queries.at(-1)?.options.operation).toBe("inspectRequiredGinTrgmOperators");
+  });
+
+  it.each(REQUIRED_GIN_TRGM_SUPPORT_ROWS.map(({ support_number }) => [support_number]))(
+    "rejects a redirected gin_trgm_ops support function %s",
+    async (supportNumber) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRequiredGinTrgmSupportFunctions: mutateRows((rows) => {
+            const row = rows.find(({ support_number }) => support_number === supportNumber);
+            if (row !== undefined) row.function_identity = "public.foreign(text, internal)";
+          }),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "extension-preflight");
+      expect(failure.operation).toBe("inspectRequiredGinTrgmSupportFunctions");
+    },
+  );
+
+  it.each([
+    ["support number", "support_number", "1"],
+    ["left type", "left_type", "bytea"],
+    ["right type", "right_type", "bytea"],
+    ["function identity", "function_identity", null],
+    ["dependency count", "dependency_count", "1"],
+    ["family dependency", "family_auto_dependency_count", 0],
+    ["operator class dependency", "operator_class_internal_dependency_count", 1],
+    ["normal procedure dependency", "procedure_normal_dependency_count", 1],
+    ["automatic procedure dependency", "procedure_auto_dependency_count", 1],
+  ] as const)(
+    "rejects malformed or spoofed gin_trgm_ops support metadata: %s",
+    async (_label, field, value) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRequiredGinTrgmSupportFunctions: mutateRows((rows) => {
+            rows[0]![field] = value;
+          }),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "extension-preflight");
+      expect(failure.operation).toBe("inspectRequiredGinTrgmSupportFunctions");
+    },
+  );
+
+  it.each([
+    ["missing", (rows: QueryResultRow[]) => { rows.splice(0, 1); }],
+    ["duplicate", (rows: QueryResultRow[]) => { rows.push({ ...rows[0]! }); }],
+    ["extra", (rows: QueryResultRow[]) => {
+      rows.push({ ...rows[0]!, support_number: 5, function_identity: "public.foreign(text)" });
+    }],
+  ] as const)("rejects a %s gin_trgm_ops support mapping fail-fast", async (_label, mutate) => {
+    const fake = readyExecutor({
+      operationOverrides: {
+        inspectRequiredGinTrgmSupportFunctions: mutateRows(mutate),
+      },
+    });
+
+    const failure = await expectReadinessFailure(fake, "extension-preflight");
+    expect(failure.operation).toBe("inspectRequiredGinTrgmSupportFunctions");
+    expect(fake.queries.map(({ options }) => options.operation).slice(0, 9)).toEqual([
+      "inspectServerReadiness",
+      "inspectRuntimeRolePolicy",
+      "runtimeReadinessExtensions",
+      "runtimeReadinessExtensions:probePgStatStatements",
+      "inspectRequiredExtensionFunctions",
+      "inspectRequiredExtensionOperator",
+      "inspectRequiredGinTrgmOperatorClass",
+      "inspectRequiredGinTrgmOperators",
+      "inspectRequiredGinTrgmSupportFunctions",
     ]);
   });
 
