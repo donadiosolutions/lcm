@@ -12,6 +12,10 @@
     "./storage/native-transcripts": {
       "types": "./dist/src/storage/native-transcripts.d.ts",
       "import": "./dist/src/storage/native-transcripts.js"
+    },
+    "./storage/postgresql": {
+      "types": "./dist/src/storage/postgresql.d.ts",
+      "import": "./dist/src/storage/postgresql.js"
     }
   },
   "bin": {
@@ -37,7 +41,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && mkdir -p dist/src/storage/postgresql/migrations && cp src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/ && cp installer/setup.sh dist/installer/setup.sh && npm run build:runtime && npm run verify:native-transcript-package",
+    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && mkdir -p dist/src/storage/postgresql/migrations && cp src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/ && cp installer/setup.sh dist/installer/setup.sh && npm run build:runtime && npm run verify:native-transcript-package && npm run verify:postgresql-package",
     "build:runtime": "node scripts/build-runtime.mjs",
     "prepublishOnly": "npm run build",
     "changeset": "changeset",
@@ -49,6 +53,7 @@
     "typecheck": "tsc --noEmit && tsc --project tsconfig.postgresql-conformance.json",
     "verify:consumer-topology": "node scripts/verify-consumer-topology.mjs",
     "verify:native-transcript-package": "node scripts/verify-native-transcript-package.mjs && tsc --project tsconfig.native-transcript-package.json",
+    "verify:postgresql-package": "node scripts/verify-postgresql-package.mjs && tsc --project tsconfig.postgresql-package.json",
     "version-packages": "node scripts/version-packages.mjs"
   },
   "dependencies": {

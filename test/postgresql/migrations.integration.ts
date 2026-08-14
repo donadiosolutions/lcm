@@ -270,6 +270,63 @@ describe("PostgreSQL migrations and database isolation", () => {
     );
   });
 
+  it("verifies readiness when PUBLIC schema and extension defaults are revoked", async () => {
+    await withPostgreSqlTestDatabase(
+      "runtime-readiness-hardened-public",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+        try {
+          await administrator.query({
+            text: `REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+                   REVOKE EXECUTE ON FUNCTION
+                     public.digest(text, text),
+                     public.digest(bytea, text),
+                     public.similarity(text, text),
+                     public.similarity_op(text, text)
+                     FROM PUBLIC`,
+          }, { domain: "factory", operation: "revokePublicRuntimeDefaults" });
+        } finally {
+          await administrator.close();
+        }
+
+        await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+          expectedOwner: "lcm_test_migrator",
+        })).resolves.toMatchObject({
+          runtimeRole: "lcm_test_runtime",
+        });
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects a detached extension-owned function", async () => {
+    await withPostgreSqlTestDatabase(
+      "runtime-readiness-detached-extension",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+        try {
+          await administrator.query({
+            text: "ALTER EXTENSION pgcrypto DROP FUNCTION public.digest(text, text)",
+          }, { domain: "factory", operation: "detachRuntimeExtensionFunction" });
+        } finally {
+          await administrator.close();
+        }
+
+        await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+          expectedOwner: "lcm_test_migrator",
+        })).rejects.toMatchObject({
+          reason: "acl-shape",
+          operation: "inspectFunctionAcl",
+        });
+      },
+      { runMigrations: false },
+    );
+  });
+
   it.each(REQUIRED_RUNTIME_GRANT_SCRIPTS)(
     "rejects readiness when %s is omitted",
     async (omittedScript) => {

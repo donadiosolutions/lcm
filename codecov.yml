@@ -169,6 +169,7 @@ component_management:
         - "^src/storage/postgresql/factory\\.ts$"
         - "^src/storage/postgresql/index\\.ts$"
         - "^src/storage/postgresql/runtime\\.ts$"
+        - "^src/storage/postgresql\\.ts$"
     - component_id: "integration-postgresql-schema"
       name: "Integration - PostgreSQL Schema"
       paths:

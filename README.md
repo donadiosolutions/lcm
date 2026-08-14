@@ -399,6 +399,18 @@ search configuration, and the exact least-privilege ACL manifest. Opening a
 project then requires valid backend-publication evidence and an exact remote
 machine/project/path identity match before exposing any repository.
 
+Embedded ESM callers import the curated production seam without exposing
+internal runtime, migration, or testing helpers:
+
+```ts
+import {
+  createPostgreSqlStorageBackendFactory,
+  type ResolvedPostgreSqlConfig,
+} from "@donadiosolutions/lcm/storage/postgresql";
+
+const factory = await createPostgreSqlStorageBackendFactory(config);
+```
+
 Normal daemon/CLI activation remains staged until #92/#224. Selecting
 `postgresql` for those routes therefore keeps storage explicitly unavailable
 instead of falling back to SQLite. The health endpoint reports `503` and

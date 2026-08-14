@@ -73,6 +73,8 @@ function executor(): {
 interface ReadyExecutorOptions {
   readonly includeSequenceRuntimeGrant?: boolean;
   readonly omitLcmPublicDefault?: boolean;
+  readonly omitPublicSchemaUsage?: boolean;
+  readonly omitPublicFunctionExecute?: boolean;
   readonly omitOptionalDirectGrants?: boolean;
   readonly partialOptionalDirectGrants?: boolean;
   readonly partialOptionalEffectiveGrants?: boolean;
@@ -247,6 +249,7 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
           { schema_name, object_identity: schema_name, privilege_type: "CREATE", ...ownerRow },
           { schema_name, object_identity: schema_name, privilege_type: "USAGE", ...ownerRow },
           ...(!(omitLcmPublicDefault && schema_name === "lcm")
+            && !(fixtureOptions.omitPublicSchemaUsage && schema_name === "public")
             ? [{ schema_name, object_identity: schema_name, privilege_type: "USAGE", ...publicRow }]
             : []),
         ]),
@@ -296,7 +299,7 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
       }))));
     }
     if (operation === "inspectFunctionAcl") {
-      const identities = [
+      const identities = [...new Set([
         ...snapshot.managedObjectIdentities
           .filter((identity) => identity.startsWith("function|"))
           .map((identity) => {
@@ -306,17 +309,24 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
         ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required
           .filter(({ kind }) => kind === "function")
           .map(({ object }) => object),
-      ];
+      ])];
       const functions = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required
         .filter(({ kind }) => kind === "function");
       return applyOverride(result([
         ...identities.flatMap((function_identity) => {
           const entry = functions.find((candidate) => candidate.object === function_identity);
+          const extension_name = entry?.object.startsWith("public.digest(")
+            ? "pgcrypto"
+            : entry?.object.startsWith("public.similarity")
+              ? "pg_trgm"
+              : null;
           return [
-            { function_identity, object_identity: function_identity, privilege_type: "EXECUTE", ...ownerRow },
+            { function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...ownerRow },
             ...(entry === undefined ? [] : [
-              { function_identity, object_identity: function_identity, privilege_type: "EXECUTE", ...runtimeRow },
-              ...(entry.extensionOwned ? [{ function_identity, object_identity: function_identity, privilege_type: "EXECUTE", ...publicRow }] : []),
+              { function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...runtimeRow },
+              ...(entry.extension !== undefined && !fixtureOptions.omitPublicFunctionExecute
+                ? [{ function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...publicRow }]
+                : []),
             ]),
           ];
         }),
@@ -633,8 +643,18 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     );
   });
 
+  it.each(aclOperations)("rejects missing ACL rows for %s", async (operation) => {
+    await expectReadinessFailure(
+      readyExecutor({
+        operationOverrides: {
+          [operation]: mutateRows((rows) => { rows.shift(); }),
+        },
+      }),
+      "acl-shape",
+    );
+  });
+
   it.each([
-    ["missing", (rows: QueryResultRow[]) => { rows.pop(); }],
     ["foreign grantee", (rows: QueryResultRow[]) => {
       rows[0]!.grantee_is_owner = false;
       rows[0]!.grantee_name = "foreign_role";
@@ -753,6 +773,36 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
       expectedOwner: "lcm_test_migrator",
     })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+  });
+
+  it("accepts hardened public schema and extension function ACL defaults", async () => {
+    const fake = readyExecutor({
+      omitPublicSchemaUsage: true,
+      omitPublicFunctionExecute: true,
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: "lcm_test_migrator",
+    })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+  });
+
+  it.each([
+    ["missing", null],
+    ["malformed", 17],
+    ["detached", null],
+    ["wrong extension", "foreign_extension"],
+  ] as const)("rejects %s extension ownership evidence for required functions", async (_label, extensionName) => {
+    await expectReadinessFailure(
+      readyExecutor({
+        operationOverrides: {
+          inspectFunctionAcl: mutateRows((rows) => {
+            const row = rows.find(({ function_identity }) => function_identity === "public.digest(text, text)");
+            if (row !== undefined) row.extension_name = extensionName;
+          }),
+        },
+      }),
+      "acl-shape",
+    );
   });
 
   it("accepts readiness when the optional transcript grant set is entirely absent", async () => {

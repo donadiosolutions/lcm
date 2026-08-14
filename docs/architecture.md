@@ -27,6 +27,10 @@ and normalized selected path before composing all nine repository contracts
 into one `ProjectStorage`. The project object owns its transaction scope,
 health, cancellation, and close lifecycle; no SQL client escapes the storage
 boundary.
+Explicit embedded callers use the curated
+`@donadiosolutions/lcm/storage/postgresql` package subpath. It exposes the
+production factory and its minimum configuration/result contracts while
+keeping runtime internals, migrators, and deterministic testing hooks private.
 
 The native-transcript adapter remains separate because transcript import is an
 explicit backfill seam rather than a `ProjectStorage` repository. Normal daemon

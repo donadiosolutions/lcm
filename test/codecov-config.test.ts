@@ -235,6 +235,7 @@ const expectedComponents = [
       "^src/storage/postgresql/factory\\.ts$",
       "^src/storage/postgresql/index\\.ts$",
       "^src/storage/postgresql/runtime\\.ts$",
+      "^src/storage/postgresql\\.ts$",
     ],
   },
   {
@@ -444,7 +445,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(198);
+    expect(productionFiles).toHaveLength(199);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -474,7 +475,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(198);
+    expect(ownershipCounts.size).toBe(199);
   });
 
   test("does not match non-production TypeScript files", () => {

@@ -38,7 +38,7 @@ export interface PostgreSqlRuntimePrivilegeEntry {
   readonly privilege: string;
   readonly column?: string;
   readonly grantor: "object-owner";
-  readonly extensionOwned?: boolean;
+  readonly extension?: "pgcrypto" | "pg_trgm";
 }
 
 export interface PostgreSqlRuntimePrivilegeManifest {
@@ -92,14 +92,14 @@ function sequenceEntry(object: string): PostgreSqlRuntimePrivilegeEntry {
 
 function functionEntry(
   object: string,
-  extensionOwned: boolean,
+  extension: "pgcrypto" | "pg_trgm" | undefined,
 ): PostgreSqlRuntimePrivilegeEntry {
   return {
     kind: "function",
     object,
     privilege: "EXECUTE",
     grantor: "object-owner",
-    ...(extensionOwned ? { extensionOwned: true } : {}),
+    ...(extension === undefined ? {} : { extension }),
   };
 }
 
@@ -306,11 +306,11 @@ const REQUIRED_SEQUENCE_PRIVILEGES = [
 ] as const;
 
 const REQUIRED_FUNCTION_PRIVILEGES = [
-  ["lcm.normalize_search_text(input text)", false],
-  ["public.digest(text, text)", true],
-  ["public.digest(bytea, text)", true],
-  ["public.similarity(text, text)", true],
-  ["public.similarity_op(text, text)", true],
+  ["lcm.normalize_search_text(input text)", undefined],
+  ["public.digest(text, text)", "pgcrypto"],
+  ["public.digest(bytea, text)", "pgcrypto"],
+  ["public.similarity(text, text)", "pg_trgm"],
+  ["public.similarity_op(text, text)", "pg_trgm"],
 ] as const;
 
 const OPTIONAL_RELATION_PRIVILEGES: readonly RelationPrivilegeSpec[] = [
@@ -369,8 +369,8 @@ const requiredPrivileges = [
   ...expandRelationPrivileges(REQUIRED_RELATION_PRIVILEGES),
   ...expandColumnPrivileges(REQUIRED_COLUMN_PRIVILEGES),
   ...REQUIRED_SEQUENCE_PRIVILEGES.map(sequenceEntry),
-  ...REQUIRED_FUNCTION_PRIVILEGES.map(([object, extensionOwned]) => (
-    functionEntry(object, extensionOwned)
+  ...REQUIRED_FUNCTION_PRIVILEGES.map(([object, extension]) => (
+    functionEntry(object, extension)
   )),
 ];
 
@@ -483,6 +483,7 @@ interface SchemaAclRow extends AclRow {
 
 interface FunctionAclRow extends AclRow {
   readonly function_identity: unknown;
+  readonly extension_name: unknown;
 }
 
 interface DefinitionRow extends QueryResultRow {
@@ -897,15 +898,17 @@ async function inspectSchemaAcl(
     ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required,
     ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional,
   ];
-  const expected = new Set<string>();
+  const required = new Set<string>();
+  const allowed = new Set<string>();
   for (const schema of ["lcm", "public"]) {
-    expected.add(["schema", schema, "owner", "owner", "CREATE", false].join("|"));
-    expected.add(["schema", schema, "owner", "owner", "USAGE", false].join("|"));
-    if (schema === "public") expected.add(["schema", schema, "public", "owner", "USAGE", false].join("|"));
+    required.add(["schema", schema, "owner", "owner", "CREATE", false].join("|"));
+    required.add(["schema", schema, "owner", "owner", "USAGE", false].join("|"));
   }
   for (const entry of entries.filter(({ kind }) => kind === "schema")) {
-    expected.add(["schema", entry.object, "runtime", "owner", entry.privilege, false].join("|"));
+    required.add(["schema", entry.object, "runtime", "owner", entry.privilege, false].join("|"));
   }
+  for (const entry of required) allowed.add(entry);
+  allowed.add(["schema", "public", "public", "owner", "USAGE", false].join("|"));
   const actual = new Set<string>();
   for (const row of result.rows) {
     const schemaName = row.schema_name;
@@ -919,7 +922,10 @@ async function inspectSchemaAcl(
     }
     actual.add(identity);
   }
-  if (actual.size !== expected.size || [...actual].some((entry) => !expected.has(entry))) {
+  if (
+    [...actual].some((entry) => !allowed.has(entry))
+    || [...required].some((entry) => !actual.has(entry))
+  ) {
     throw readinessError("acl-shape", "inspectSchemaAcl");
   }
 }
@@ -1125,8 +1131,8 @@ async function inspectFunctionAcl(
                     AS grantor_is_owner,
                   privilege.privilege_type,
                   privilege.is_grantable::pg_catalog.bool AS is_grantable,
-                  EXISTS (
-                    SELECT 1
+                  (
+                    SELECT extension.extname::pg_catalog.text
                     FROM pg_catalog.pg_depend AS dependency
                     JOIN pg_catalog.pg_extension AS extension
                       ON extension.oid OPERATOR(pg_catalog.=) dependency.refobjid
@@ -1134,7 +1140,7 @@ async function inspectFunctionAcl(
                         pg_catalog.to_regclass('pg_catalog.pg_proc')
                       AND dependency.objid OPERATOR(pg_catalog.=) procedure.oid
                       AND dependency.deptype OPERATOR(pg_catalog.=) 'e'
-                  ) AS extension_owned
+                  ) AS extension_name
            FROM pg_catalog.pg_proc AS procedure
            JOIN pg_catalog.pg_namespace AS namespace
              ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
@@ -1157,19 +1163,34 @@ async function inspectFunctionAcl(
     ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required,
     ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional,
   ].filter(({ kind }) => kind === "function");
-  const expected = new Set<string>();
+  const expectedExtensions = new Map<string, string | null>();
   for (const functionIdentity of functionIdentities) {
-    expected.add(["function", functionIdentity, "owner", "owner", "EXECUTE", false].join("|"));
+    expectedExtensions.set(functionIdentity, null);
   }
   for (const entry of entries) {
-    expected.add(["function", entry.object, "runtime", "owner", "EXECUTE", false].join("|"));
-    if (entry.extensionOwned) {
-      expected.add(["function", entry.object, "public", "owner", "EXECUTE", false].join("|"));
+    expectedExtensions.set(entry.object, entry.extension ?? null);
+  }
+  const required = new Set<string>();
+  const allowed = new Set<string>();
+  for (const functionIdentity of functionIdentities) {
+    required.add(["function", functionIdentity, "owner", "owner", "EXECUTE", false].join("|"));
+  }
+  for (const entry of entries) {
+    required.add(["function", entry.object, "runtime", "owner", "EXECUTE", false].join("|"));
+  }
+  for (const entry of required) allowed.add(entry);
+  for (const entry of entries) {
+    if (entry.extension !== undefined) {
+      allowed.add(["function", entry.object, "public", "owner", "EXECUTE", false].join("|"));
     }
   }
   const actual = new Set<string>();
   for (const row of result.rows) {
-    if (typeof row.function_identity !== "string") {
+    if (
+      typeof row.function_identity !== "string"
+      || (typeof row.extension_name !== "string" && row.extension_name !== null)
+      || row.extension_name !== expectedExtensions.get(row.function_identity)
+    ) {
       throw readinessError("acl-shape", "inspectFunctionAcl");
     }
     const identity = actualAclIdentity(
@@ -1183,8 +1204,8 @@ async function inspectFunctionAcl(
     actual.add(["function", row.function_identity, identity.split("|").slice(2).join("|")].join("|"));
   }
   if (
-    actual.size !== expected.size
-    || [...actual].some((entry) => !expected.has(entry))
+    [...actual].some((entry) => !allowed.has(entry))
+    || [...required].some((entry) => !actual.has(entry))
   ) {
     throw readinessError("acl-shape", "inspectFunctionAcl");
   }

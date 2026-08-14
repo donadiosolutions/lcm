@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { isAbsolute } from "node:path";
+import { isAbsolute, posix, win32 } from "node:path";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import type { ResolvedPostgreSqlConfig } from "../../daemon/config.js";
 import { normalizeUuidV7 } from "../../machine-identity.js";
@@ -156,8 +156,15 @@ function exactUuidV7(value: unknown): value is string {
 function validPath(value: unknown): value is string {
   return typeof value === "string"
     && value.length > 0
-    && !value.includes("\0")
+    && !/[\0-\x1f\x7f]/u.test(value)
     && isAbsolute(value);
+}
+
+function validPortableAbsolutePath(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && !/[\0-\x1f\x7f]/u.test(value)
+    && (posix.isAbsolute(value) || win32.isAbsolute(value));
 }
 
 function assertIdentity(
@@ -203,10 +210,13 @@ function assertRemoteIdentity(
   const pathByNormalized = new Map<string, string>();
   let matchingAliases = 0;
   for (const alias of remote.aliases) {
+    const validAliasPath = alias.machineId === identity.machineId
+      ? validPath
+      : validPortableAbsolutePath;
     if (
       !exactUuidV7(alias.machineId)
-      || !validPath(alias.path)
-      || !validPath(alias.normalizedPath)
+      || !validAliasPath(alias.path)
+      || !validAliasPath(alias.normalizedPath)
     ) {
       throw initializationError(identity.id, operation);
     }
@@ -360,7 +370,23 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
     return this.closePromise;
   }
 
-  private async openResolvedProject(
+  private openResolvedProject(
+    identity: StorageIdentityContext,
+    operation: "openExistingProject" | "openProject",
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<ProjectStorage | null> {
+    const work = this.openResolvedProjectAttempt(
+      identity,
+      operation,
+      publicationLockToken,
+    );
+    const settled = work.then(() => undefined, () => undefined);
+    this.pendingOperations.add(settled);
+    void settled.then(() => { this.pendingOperations.delete(settled); });
+    return work;
+  }
+
+  private async openResolvedProjectAttempt(
     identity: StorageIdentityContext,
     operation: "openExistingProject" | "openProject",
     publicationLockToken?: BackendPublicationLockToken,
@@ -388,9 +414,18 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
           identity.machineId!,
           onClose,
         );
-    this.assertOpen(identity.id, operation);
-    this.projects.add(storage);
-    return storage;
+    try {
+      this.assertOpen(identity.id, operation);
+      this.projects.add(storage);
+      return storage;
+    } catch (error) {
+      try {
+        await storage.close();
+      } catch {
+        // Preserve the sanitized admission failure as the primary error.
+      }
+      throw safeFactoryError(error, identity.id, operation);
+    }
   }
 
   private runProjectOperation(
@@ -546,6 +581,6 @@ export async function createPostgreSqlStorageBackendFactoryForTesting(
 
 export function createPostgreSqlStorageBackendFactory(
   config: ResolvedPostgreSqlConfig,
-): Promise<StorageBackendFactory> {
+): Promise<PostgreSqlStorageBackendFactory> {
   return createPostgreSqlStorageBackendFactoryForTesting(config, homedir());
 }

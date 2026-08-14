@@ -9,11 +9,11 @@ import type {
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
 import type { ProjectStorage } from "../../src/storage/contracts.js";
 import {
-  createPostgreSqlStorageBackendFactory,
   createPostgreSqlStorageBackendFactoryForTesting,
   FactorySignalExecutor,
   type PostgreSqlFactoryDependencies,
 } from "../../src/storage/postgresql/factory.js";
+import { createPostgreSqlStorageBackendFactory } from "../../src/storage/postgresql.js";
 import type {
   PostgreSqlQueryOptions,
   PostgreSqlRuntimeHealth,
@@ -436,6 +436,43 @@ describe("PostgreSQL storage backend factory", () => {
     }
   });
 
+  it("accepts portable absolute aliases owned by foreign machines", async () => {
+    const foreignMachineId = "0195d250-0000-7000-8000-000000000003";
+    const aliases = [
+      remoteProject.aliases[0]!,
+      {
+        ...remoteProject.aliases[0]!,
+        machineId: foreignMachineId,
+        path: "C:\\work\\repo",
+        normalizedPath: "C:\\work\\repo",
+      },
+      {
+        ...remoteProject.aliases[0]!,
+        machineId: foreignMachineId,
+        path: "\\\\server\\share\\repo",
+        normalizedPath: "\\\\server\\share\\repo",
+      },
+    ];
+    const { runtime, dependencies } = harness();
+    runtime.query = async () => result(aliases.map((alias) => ({
+      project_id: PROJECT_ID,
+      display_name: "Project",
+      created_at: remoteProject.createdAt,
+      updated_at: remoteProject.updatedAt,
+      machine_id: alias.machineId,
+      path: alias.path,
+      normalized_path: alias.normalizedPath,
+      linked_at: alias.linkedAt,
+    })));
+    const factory = await createPostgreSqlStorageBackendFactoryForTesting(
+      config,
+      "/home/operator",
+      dependencies,
+    );
+
+    await expect(factory.projectExists(identity)).resolves.toBe(true);
+  });
+
   it("rejects journal or state drift before returning a facade", async () => {
     const { dependencies } = harness();
     let captureCount = 0;
@@ -615,6 +652,60 @@ describe("PostgreSQL storage backend factory", () => {
     retryHarness.runtime.closeFailure = undefined;
     await retryFactory.close();
     expect(retryHarness.runtime.closeAttempts).toBe(2);
+  });
+
+  it("closes a facade exactly once when shutdown reenters facade construction", async () => {
+    const { runtime, dependencies } = harness();
+    let factory!: Awaited<ReturnType<typeof createPostgreSqlStorageBackendFactoryForTesting>>;
+    let factoryClose!: Promise<void>;
+    let projectCloseAttempts = 0;
+    const project = {
+      close: () => {
+        projectCloseAttempts += 1;
+        return Promise.resolve();
+      },
+    } as unknown as ProjectStorage;
+    dependencies.createProjectStorage = () => {
+      factoryClose = factory.close();
+      return project;
+    };
+    factory = await createPostgreSqlStorageBackendFactoryForTesting(
+      config,
+      "/home/operator",
+      dependencies,
+    );
+
+    await expect(factory.openProject(identity)).rejects.toMatchObject({
+      code: "STORAGE_CLOSED",
+      operation: "openProject",
+    });
+    await expect(factoryClose).resolves.toBeUndefined();
+    expect(projectCloseAttempts).toBe(1);
+    expect(runtime.closeAttempts).toBe(1);
+  });
+
+  it("preserves the primary closed error when unregistered facade cleanup rejects", async () => {
+    const { runtime, dependencies } = harness();
+    let factory!: Awaited<ReturnType<typeof createPostgreSqlStorageBackendFactoryForTesting>>;
+    let factoryClose!: Promise<void>;
+    const project = {
+      close: () => Promise.reject(new Error("private facade close detail")),
+    } as unknown as ProjectStorage;
+    dependencies.createProjectStorage = () => {
+      factoryClose = factory.close();
+      return project;
+    };
+    factory = await createPostgreSqlStorageBackendFactoryForTesting(
+      config,
+      "/home/operator",
+      dependencies,
+    );
+
+    const error = await factory.openProject(identity).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "STORAGE_CLOSED", operation: "openProject" });
+    expect(JSON.stringify(error)).not.toContain("private facade close detail");
+    await expect(factoryClose).resolves.toBeUndefined();
+    expect(runtime.closeAttempts).toBe(1);
   });
 
   it("keeps serialized errors free of configuration and driver canaries", async () => {

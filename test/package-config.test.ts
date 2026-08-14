@@ -32,7 +32,11 @@ function npmPackInventory(): string[] {
     repositoryRoot,
     "dist/src/storage/native-transcripts.js",
   );
-  if (!existsSync(transcriptRuntime)) {
+  const postgresqlRuntime = resolve(
+    repositoryRoot,
+    "dist/src/storage/postgresql.js",
+  );
+  if (!existsSync(transcriptRuntime) || !existsSync(postgresqlRuntime)) {
     execFileSync("npm", ["run", "build"], {
       cwd: repositoryRoot,
       encoding: "utf8",
@@ -67,10 +71,14 @@ describe("package.json", () => {
   it("uses the generated npm runtime as its executable", () => {
     expect(pkg.bin).toHaveProperty("lcm", "dist/lcm.mjs");
   });
-  it("publishes the staged native-transcript API and its declarations", () => {
+  it("publishes the curated storage APIs and their declarations", () => {
     expect(pkg.exports).toHaveProperty("./storage/native-transcripts", {
       types: "./dist/src/storage/native-transcripts.d.ts",
       import: "./dist/src/storage/native-transcripts.js",
+    });
+    expect(pkg.exports).toHaveProperty("./storage/postgresql", {
+      types: "./dist/src/storage/postgresql.d.ts",
+      import: "./dist/src/storage/postgresql.js",
     });
     expect(pkg.scripts).toHaveProperty(
       "verify:native-transcript-package",
@@ -79,6 +87,11 @@ describe("package.json", () => {
     expect(pkg.scripts.postbuild).toContain(
       "npm run verify:native-transcript-package",
     );
+    expect(pkg.scripts).toHaveProperty(
+      "verify:postgresql-package",
+      "node scripts/verify-postgresql-package.mjs && tsc --project tsconfig.postgresql-package.json",
+    );
+    expect(pkg.scripts.postbuild).toContain("npm run verify:postgresql-package");
   });
   it("has anthropic sdk as optional peer dep", () => expect(pkg.peerDependencies).toHaveProperty("@anthropic-ai/sdk"));
   it("keeps the bundled MCP build graph out of published consumer dependencies", () => {
@@ -149,6 +162,8 @@ describe("package.json", () => {
         expect.arrayContaining([
           "dist/src/storage/native-transcripts.d.ts",
           "dist/src/storage/native-transcripts.js",
+          "dist/src/storage/postgresql.d.ts",
+          "dist/src/storage/postgresql.js",
           "docs/README.md",
           ...POSTGRESQL_REFERENCE_FILES.map(
             (fileName) => `src/storage/postgresql/reference/${fileName}`,

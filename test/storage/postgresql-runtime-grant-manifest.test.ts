@@ -155,19 +155,19 @@ describe("PostgreSQL runtime privilege manifest grant scripts", () => {
     expect(optionalManifestEntries.some((entry) => requiredEntries.has(entry))).toBe(false);
   });
 
-  it("marks only extension-owned public functions as retaining their default PUBLIC execution", () => {
+  it("binds extension functions to their expected extension identities", () => {
     const functionEntries = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required
       .filter(({ kind }) => kind === "function");
 
-    expect(functionEntries.map(({ object, extensionOwned = false }) => ({
+    expect(functionEntries.map(({ object, extension = null }) => ({
       object,
-      extensionOwned,
+      extension,
     }))).toEqual([
-      { object: "lcm.normalize_search_text(input text)", extensionOwned: false },
-      { object: "public.digest(text, text)", extensionOwned: true },
-      { object: "public.digest(bytea, text)", extensionOwned: true },
-      { object: "public.similarity(text, text)", extensionOwned: true },
-      { object: "public.similarity_op(text, text)", extensionOwned: true },
+      { object: "lcm.normalize_search_text(input text)", extension: null },
+      { object: "public.digest(text, text)", extension: "pgcrypto" },
+      { object: "public.digest(bytea, text)", extension: "pgcrypto" },
+      { object: "public.similarity(text, text)", extension: "pg_trgm" },
+      { object: "public.similarity_op(text, text)", extension: "pg_trgm" },
     ]);
   });
 });
