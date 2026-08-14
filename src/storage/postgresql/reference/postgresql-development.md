@@ -36,9 +36,10 @@ The current PostgreSQL database itself must be owned by
 equivalent of `CREATE DATABASE <db> OWNER <migrationRole>` using validated,
 identifier-quoted operator inputs; do not interpolate untrusted names into
 administrative SQL. The restricted `runtimeRole` must remain a separate role
-and must not own the database. Readiness checks this database-level owner in
-`runtime-role-policy` / `inspectRuntimeRolePolicy` and rejects a different
-owner before extensions, migrations, schema checks, ACL checks, or domain work.
+and must not own the database. Runtime readiness checks this database-level
+owner in `runtime-role-policy` / `inspectRuntimeRolePolicy` and rejects a
+different owner before its extension, migration-history, schema, ACL, or domain
+checks.
 
 Readiness fails closed unless all of the following are exact: PostgreSQL 18,
 `UTF8` encoding, `UTC` timezone, verified TLS, required extensions and search

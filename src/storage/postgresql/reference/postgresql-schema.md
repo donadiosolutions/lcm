@@ -545,9 +545,10 @@ on a provider does not justify silently expanding the baseline.
    `storage.postgresql.migrationRole`; when creating it, use the equivalent of
    `CREATE DATABASE <db> OWNER <migrationRole>` with validated,
    identifier-quoted operator inputs. Do not make the restricted `runtimeRole`
-   the database owner. Runtime readiness verifies this database-level owner in
-   `runtime-role-policy` / `inspectRuntimeRolePolicy` and rejects a different
-   owner before migration, schema, ACL, or domain work.
+   the database owner. Runtime readiness in step 2 verifies this database-level
+   owner in `runtime-role-policy` / `inspectRuntimeRolePolicy` and rejects a
+   different owner before its extension, migration-history, schema, ACL, or
+   domain checks.
    With `storage.backend` configured, the supported packaged entry point is
    `LCM_POSTGRES_URL="$LCM_POSTGRES_MIGRATION_URL" lcm postgres migrate`; it
    accepts `--json` for automation and closes the migration pool before exit.
