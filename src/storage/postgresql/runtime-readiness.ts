@@ -453,6 +453,7 @@ interface RolePolicyRow extends QueryResultRow {
 interface ServerReadinessRow extends QueryResultRow {
   readonly server_version_num: unknown;
   readonly server_encoding: unknown;
+  readonly session_replication_role: unknown;
   readonly timezone: unknown;
   readonly tls: unknown;
 }
@@ -686,6 +687,8 @@ async function inspectServerReadiness(
     text: `SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4
                     AS server_version_num,
                   pg_catalog.current_setting('server_encoding') AS server_encoding,
+                  pg_catalog.current_setting('session_replication_role')
+                    AS session_replication_role,
                   pg_catalog.current_setting('TimeZone') AS timezone,
                   COALESCE((
                     SELECT ssl
@@ -699,6 +702,7 @@ async function inspectServerReadiness(
     || !(typeof row.server_version_num === "number"
       && Math.floor(row.server_version_num / 10_000) === 18)
     || row.server_encoding !== "UTF8"
+    || row.session_replication_role !== "origin"
     || typeof row.timezone !== "string"
     || row.timezone.toUpperCase() !== "UTC"
     || row.tls !== true

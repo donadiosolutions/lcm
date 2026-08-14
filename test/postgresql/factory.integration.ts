@@ -578,6 +578,107 @@ describe("PostgreSQL 18 project storage factory", () => {
     });
   });
 
+  it("rejects replica-mode runtime sessions before factory writes and accepts origin", async () => {
+    await withPostgreSqlTestDatabase("factory-replica", async (database) => {
+      await applyAllRuntimeGrants(database);
+      const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-replica-"));
+      const administrator = new PostgreSqlRuntime(settings(database.adminUrl, { poolMax: 1 }));
+      let replicaFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let originFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let replicaError: unknown;
+      let replicaSessionRole: unknown;
+      let originSessionRole: unknown;
+      let beforeConversationCount: unknown;
+      let afterConversationCount: unknown;
+      try {
+        const before = await administrator.query({
+          text: "SELECT pg_catalog.count(*)::pg_catalog.text AS count FROM lcm.conversations",
+        }, { domain: "factory", operation: "readReplicaPreflightWriteCountBefore" });
+        beforeConversationCount = before.rows[0]?.count;
+        await administrator.query({
+          text: `ALTER ROLE lcm_test_runtime IN DATABASE "${database.name}"
+                 SET session_replication_role TO replica`,
+        }, { domain: "factory", operation: "setReplicaRuntimeRoleDefault" });
+
+        const replicaProbe = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }));
+        try {
+          const replicaState = await replicaProbe.query({
+            text: `SELECT pg_catalog.current_setting('session_replication_role')
+                            AS session_replication_role`,
+          }, { domain: "factory", operation: "readReplicaRuntimeSessionState" });
+          replicaSessionRole = replicaState.rows[0]?.session_replication_role;
+        } finally {
+          await replicaProbe.close();
+        }
+
+        replicaFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        ).catch((error: unknown) => {
+          replicaError = error;
+          return undefined;
+        });
+        if (replicaFactory !== undefined) {
+          await replicaFactory.close();
+          replicaFactory = undefined;
+        }
+
+        await administrator.query({
+          text: `ALTER ROLE lcm_test_runtime IN DATABASE "${database.name}"
+                 RESET session_replication_role`,
+        }, { domain: "factory", operation: "resetReplicaRuntimeRoleDefault" });
+
+        const originProbe = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }));
+        try {
+          const originState = await originProbe.query({
+            text: `SELECT pg_catalog.current_setting('session_replication_role')
+                            AS session_replication_role`,
+          }, { domain: "factory", operation: "readOriginRuntimeSessionState" });
+          originSessionRole = originState.rows[0]?.session_replication_role;
+        } finally {
+          await originProbe.close();
+        }
+        originFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        );
+        const after = await administrator.query({
+          text: "SELECT pg_catalog.count(*)::pg_catalog.text AS count FROM lcm.conversations",
+        }, { domain: "factory", operation: "readReplicaPreflightWriteCountAfter" });
+        afterConversationCount = after.rows[0]?.count;
+      } finally {
+        await Promise.allSettled([
+          replicaFactory?.close(),
+          originFactory?.close(),
+        ].filter((operation): operation is Promise<void> => operation !== undefined));
+        try {
+          await administrator.query({
+            text: `ALTER ROLE lcm_test_runtime IN DATABASE "${database.name}"
+                   RESET session_replication_role`,
+          }, { domain: "factory", operation: "restoreRuntimeRoleDefault" });
+        } finally {
+          await administrator.close();
+          rmSync(homeDir, { recursive: true, force: true });
+        }
+      }
+
+      expect(replicaSessionRole).toBe("replica");
+      expect(replicaError).toMatchObject({
+        code: "STORAGE_INITIALIZATION_FAILED",
+        backend: "postgresql",
+        operation: "createFactory",
+      });
+      expect(JSON.stringify(replicaError)).not.toContain("replica");
+      expect(originSessionRole).toBe("origin");
+      expect(originFactory).toBeDefined();
+      expect(afterConversationCount).toBe(beforeConversationCount);
+    });
+  });
+
   it("fails construction for wrong CA and wrong host without leaking connection data", async () => {
     await withPostgreSqlTestDatabase("factory-tls", async (database) => {
       const wrongHostUrl = new URL(database.runtimeUrl);

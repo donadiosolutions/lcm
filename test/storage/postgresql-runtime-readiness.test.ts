@@ -170,6 +170,7 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
       return applyOverride(result([{
         server_version_num: 180004,
         server_encoding: "UTF8",
+        session_replication_role: "origin",
         timezone: "UTC",
         tls: true,
       }]));
@@ -538,14 +539,18 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     ["unsupported major", mutateFirstField("server_version_num", 170000)],
     ["malformed version", mutateFirstField("server_version_num", "180004")],
     ["non-UTF8 encoding", mutateFirstField("server_encoding", "SQL_ASCII")],
+    ["replica session replication role", mutateFirstField("session_replication_role", "replica")],
+    ["local session replication role", mutateFirstField("session_replication_role", "local")],
+    ["malformed session replication role", mutateFirstField("session_replication_role", null)],
     ["non-UTC timezone", mutateFirstField("timezone", "America/Sao_Paulo")],
     ["malformed timezone", mutateFirstField("timezone", null)],
     ["unencrypted connection", mutateFirstField("tls", false)],
   ] as const)("rejects server preflight: %s", async (_label, override) => {
-    await expectReadinessFailure(
-      readyExecutor({ operationOverrides: { inspectServerReadiness: override } }),
-      "server-preflight",
-    );
+    const fake = readyExecutor({ operationOverrides: { inspectServerReadiness: override } });
+    await expectReadinessFailure(fake, "server-preflight");
+    expect(fake.queries.map(({ options }) => options.operation)).toEqual([
+      "inspectServerReadiness",
+    ]);
   });
 
   it("accepts the exact 18.0.0 server version spelling", async () => {
