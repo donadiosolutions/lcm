@@ -160,6 +160,57 @@ async function readRuntimeDatabaseCreatePrivilege(
   }
 }
 
+async function readRuntimeSessionReplicationRoleSetPrivilege(
+  database: PostgreSqlTestDatabase,
+  operation: string,
+): Promise<boolean> {
+  const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }));
+  try {
+    const result = await runtime.query<{ can_set: boolean }>({
+      text: `SELECT pg_catalog.has_parameter_privilege(
+                      CURRENT_USER,
+                      'session_replication_role',
+                      'SET'
+                    ) AS can_set`,
+    }, { domain: "factory", operation });
+    const value = result.rows.length === 1 ? result.rows[0]?.can_set : undefined;
+    if (typeof value !== "boolean") {
+      throw new Error("invalid runtime session_replication_role SET privilege fixture state");
+    }
+    return value;
+  } finally {
+    await runtime.close();
+  }
+}
+
+async function setRuntimeSessionReplicationRoleToReplica(
+  database: PostgreSqlTestDatabase,
+  operation: string,
+): Promise<string> {
+  const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }));
+  try {
+    await runtime.query({
+      text: "SET session_replication_role TO replica",
+    }, { domain: "factory", operation: `${operation}Set` });
+    const result = await runtime.query<{ session_replication_role: string }>({
+      text: `SELECT pg_catalog.current_setting('session_replication_role')
+                      AS session_replication_role`,
+    }, { domain: "factory", operation: `${operation}Readback` });
+    const value = result.rows.length === 1
+      ? result.rows[0]?.session_replication_role
+      : undefined;
+    if (typeof value !== "string") {
+      throw new Error("invalid runtime session_replication_role fixture state");
+    }
+    await runtime.query({
+      text: "RESET session_replication_role",
+    }, { domain: "factory", operation: `${operation}Reset` });
+    return value;
+  } finally {
+    await runtime.close();
+  }
+}
+
 interface ExtensionFunctionState {
   readonly oid: string;
   readonly definition: string;
@@ -1229,6 +1280,88 @@ describe("PostgreSQL 18 project storage factory", () => {
           await expect(readRuntimeDatabaseCreatePrivilege(
             database,
             "verifyRestoredRuntimeDatabaseCreatePrivilege",
+          )).resolves.toBe(false);
+        } finally {
+          await administrator.close();
+          rmSync(homeDir, { recursive: true, force: true });
+        }
+      }
+    });
+  });
+
+  it("rejects runtime parameter SET privilege and recovers after revoke", async () => {
+    await withPostgreSqlTestDatabase("factory-parameter-set", async (database) => {
+      await applyAllRuntimeGrants(database);
+      const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-parameter-set-"));
+      const administrator = new PostgreSqlRuntime(settings(database.adminUrl, { poolMax: 1 }));
+      let grantedFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let restoredFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let factoryError: unknown;
+      try {
+        await expect(readRuntimeSessionReplicationRoleSetPrivilege(
+          database,
+          "readCanonicalRuntimeSessionReplicationRoleSetPrivilege",
+        )).resolves.toBe(false);
+
+        await administrator.query({
+          text: "GRANT SET ON PARAMETER session_replication_role TO lcm_test_runtime",
+        }, { domain: "factory", operation: "grantRuntimeSessionReplicationRoleSetPrivilege" });
+        await expect(readRuntimeSessionReplicationRoleSetPrivilege(
+          database,
+          "readGrantedRuntimeSessionReplicationRoleSetPrivilege",
+        )).resolves.toBe(true);
+        await expect(setRuntimeSessionReplicationRoleToReplica(
+          database,
+          "probeGrantedRuntimeSessionReplicationRole",
+        )).resolves.toBe("replica");
+
+        grantedFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        ).catch((error: unknown) => {
+          factoryError = error;
+          return undefined;
+        });
+        if (grantedFactory !== undefined) {
+          await grantedFactory.close();
+          grantedFactory = undefined;
+        }
+        expect(factoryError).toMatchObject({
+          code: "STORAGE_INITIALIZATION_FAILED",
+          backend: "postgresql",
+          operation: "createFactory",
+        });
+        expect(JSON.stringify(factoryError)).not.toContain("session_replication_role");
+
+        await administrator.query({
+          text: "REVOKE SET ON PARAMETER session_replication_role FROM lcm_test_runtime",
+        }, { domain: "factory", operation: "revokeRuntimeSessionReplicationRoleSetPrivilege" });
+        await expect(readRuntimeSessionReplicationRoleSetPrivilege(
+          database,
+          "readRestoredRuntimeSessionReplicationRoleSetPrivilege",
+        )).resolves.toBe(false);
+        restoredFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        );
+        await restoredFactory.close();
+        restoredFactory = undefined;
+      } finally {
+        try {
+          await Promise.allSettled([
+            ...(grantedFactory === undefined ? [] : [grantedFactory.close()]),
+            ...(restoredFactory === undefined ? [] : [restoredFactory.close()]),
+          ]);
+          await administrator.query({
+            text: "REVOKE SET ON PARAMETER session_replication_role FROM lcm_test_runtime",
+          }, { domain: "factory", operation: "restoreRuntimeSessionReplicationRoleSetPrivilege" });
+          await expect(readRuntimeSessionReplicationRoleSetPrivilege(
+            database,
+            "verifyRestoredRuntimeSessionReplicationRoleSetPrivilege",
           )).resolves.toBe(false);
         } finally {
           await administrator.close();

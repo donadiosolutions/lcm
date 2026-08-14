@@ -799,6 +799,7 @@ interface RolePolicyRow extends QueryResultRow {
   readonly create_role: unknown;
   readonly create_database: unknown;
   readonly database_create_privilege: unknown;
+  readonly session_replication_role_set_privilege: unknown;
   readonly replication: unknown;
   readonly bypass_rls: unknown;
   readonly membership_count: unknown;
@@ -1095,6 +1096,11 @@ async function inspectRolePolicy(
                     pg_catalog.current_database(),
                     'CREATE'
                   ) AS database_create_privilege,
+                  pg_catalog.has_parameter_privilege(
+                    runtime_role.oid,
+                    'session_replication_role',
+                    'SET'
+                  ) AS session_replication_role_set_privilege,
                   runtime_role.rolreplication AS replication,
                   runtime_role.rolbypassrls AS bypass_rls,
                   (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM memberships)
@@ -1131,6 +1137,7 @@ async function inspectRolePolicy(
     || row.create_role !== false
     || row.create_database !== false
     || row.database_create_privilege !== false
+    || row.session_replication_role_set_privilege !== false
     || row.replication !== false
     || row.bypass_rls !== false
     || row.membership_count !== 0

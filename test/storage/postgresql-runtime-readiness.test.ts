@@ -573,6 +573,7 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
         create_role: false,
         create_database: false,
         database_create_privilege: false,
+        session_replication_role_set_privilege: false,
         replication: false,
         bypass_rls: false,
         membership_count: 0,
@@ -1348,6 +1349,31 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     },
   );
 
+  it.each([
+    ["malformed", "false"],
+    ["granted", true],
+    ["null", null],
+  ] as const)(
+    "rejects %s session_replication_role SET privilege evidence before domain work",
+    async (_label, sessionReplicationRoleSetPrivilege) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRuntimeRolePolicy: mutateFirstField(
+            "session_replication_role_set_privilege",
+            sessionReplicationRoleSetPrivilege,
+          ),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "runtime-role-policy");
+      expect(failure.operation).toBe("inspectRuntimeRolePolicy");
+      expect(fake.queries.map(({ options }) => options.operation)).toEqual([
+        "inspectServerReadiness",
+        "inspectRuntimeRolePolicy",
+      ]);
+    },
+  );
+
   it("accepts exact false database CREATE privilege evidence", async () => {
     const fake = readyExecutor();
     await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
@@ -1359,6 +1385,9 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     ));
     const text = (rolePolicyQuery?.config as { readonly text?: string } | undefined)?.text ?? "";
     expect(text).toContain("pg_catalog.has_database_privilege");
+    expect(text).toContain("pg_catalog.has_parameter_privilege");
+    expect(text).toContain("'session_replication_role'");
+    expect(text).toContain("'SET'");
     expect(text).toContain("pg_catalog.current_database()");
   });
 
