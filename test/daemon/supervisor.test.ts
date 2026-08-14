@@ -316,6 +316,26 @@ describe("canonical supervisor identity", () => {
     expect(managedLaunchEnvironment({ LCM_POSTGRES_MIGRATION_ROLE: migrationRole })).toEqual({});
   });
 
+  it("rejects an overlong PostgreSQL migration role reported by systemd", async () => {
+    const root = makeRoot();
+    const migrationRole = "migration_role";
+    const environment = { PATH: "/usr/bin", LCM_POSTGRES_MIGRATION_ROLE: migrationRole };
+    const spec = makeSpec("systemd-user", root);
+    const output = managerText(spec, "active", 444, "running", environment)
+      .replace("Environment=", `Environment=LCM_POSTGRES_MIGRATION_ROLE=${"r".repeat(64)} `);
+    const runner = fakeRunner([{ code: 0, stdout: output }]);
+
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      environment,
+      platform: "linux",
+      uid: 501,
+    }).probe(spec)).resolves.toMatchObject({
+      kind: "registered-invalid-collision",
+      reason: "foreign-job",
+    });
+  });
+
   it.each([
     ["missing", { PATH: "/usr/bin" }],
     ["different", { PATH: "/usr/bin", LCM_POSTGRES_MIGRATION_ROLE: "other_role" }],
