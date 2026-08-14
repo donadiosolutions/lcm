@@ -4,6 +4,7 @@ import {
   PORTABLE_RECORD_DOMAIN_ORDER,
   PortableStreamError,
   canonicalJson,
+  comparePortableOrder,
   createPortableRecord,
   createPortableRecordStream,
   parsePortableRecord,
@@ -660,11 +661,15 @@ describe("logical records survive physical divergence", () => {
     expect(links.map((value) => value.sourceOrdinal.$integer)).toEqual(["0", "1"]);
 
     const parents = recordsOf(SQLITE_BOUND, "summary-parent-links").map(
-      (record) => record.value as { summaryId: string; parentSummaryId: string },
+      (record) => record.value as {
+        summaryId: string;
+        ordinal: { $integer: string };
+        parentSummaryId: string;
+      },
     );
     expect(parents).toEqual([
-      { summaryId: FIXTURE_IDS.SUMMARY_LEAF, ordinal: expect.anything(), parentSummaryId: FIXTURE_IDS.SUMMARY_ROOT },
-      { summaryId: FIXTURE_IDS.SUMMARY_LEAF_TWO, ordinal: expect.anything(), parentSummaryId: FIXTURE_IDS.SUMMARY_ROOT },
+      { summaryId: FIXTURE_IDS.SUMMARY_LEAF, ordinal: { $integer: "0" }, parentSummaryId: FIXTURE_IDS.SUMMARY_ROOT },
+      { summaryId: FIXTURE_IDS.SUMMARY_LEAF_TWO, ordinal: { $integer: "0" }, parentSummaryId: FIXTURE_IDS.SUMMARY_ROOT },
     ]);
 
     const fileLinks = recordsOf(SQLITE_BOUND, "summary-file-links").map(
@@ -762,10 +767,6 @@ describe("logical records survive physical divergence", () => {
   });
 });
 describe("branded integer extrema are rejected before a writer sees them", () => {
-  const contexts = {
-    project: { projectIdentity: SHARED_PROJECT_IDENTITY },
-  };
-
   function build(domain: PortableDomain, overrides: UnknownRecord): PortableRecord {
     const draft = buildDomainDrafts(sqliteBoundGeneration()).find(
       (item) => item.domain === domain,
@@ -839,7 +840,6 @@ describe("branded integer extrema are rejected before a writer sees them", () =>
       "record-unrepresentable",
     );
     expectCode(() => build("messages", { seq: String(-1) }), "record-unrepresentable");
-    void contexts;
   });
 
   it("accepts equivalent extrema from either backend's declared scalar shape", () => {
@@ -912,16 +912,15 @@ describe("the 128 MiB record bound covers the maximum accepted native transcript
     // A scrub replaces a decoded range with a fixed marker; the worst case is a
     // single decoded character replaced by the longest marker.
     const marker = "[redacted]";
-    expect(marker).toHaveLength(10);
+    const encodedMarkerBytes = Buffer.byteLength(JSON.stringify(marker), "utf8") - 2;
     for (const character of ["a", "\u00e9", "\u4e2d", "\u{1f600}", "\"", "\\", "\n", "\u0007"]) {
-      const encodedBefore = JSON.stringify(character).length - 2;
-      const encodedAfter = JSON.stringify(marker).length - 2;
-      // Expansion is measured against the nonempty decoded range, which is at
-      // least one character.
-      expect(encodedAfter / Math.max(1, [...character].length)).toBeLessThanOrEqual(10);
-      expect(encodedBefore).toBeGreaterThanOrEqual(1);
+      const encodedRangeBytes = Buffer.byteLength(JSON.stringify(character), "utf8") - 2;
+      expect(encodedRangeBytes).toBeGreaterThan(0);
+      expect(encodedMarkerBytes / encodedRangeBytes).toBeLessThanOrEqual(10);
     }
-    expect(JSON.stringify(marker).length - 2).toBeLessThanOrEqual(10);
+    const oversizedMarkerBytes = Buffer.byteLength(JSON.stringify("[redacted!]"), "utf8") - 2;
+    const oneByteRange = Buffer.byteLength(JSON.stringify("a"), "utf8") - 2;
+    expect(oversizedMarkerBytes / oneByteRange).toBeGreaterThan(10);
   });
 
   it("keeps number and string token regions disjoint and key reordering size-neutral", () => {
@@ -1028,7 +1027,7 @@ describe("the 128 MiB record bound covers the maximum accepted native transcript
         } as unknown as PortableRecordInput),
       "record-unrepresentable",
     );
-  }, 120_000);
+  });
 
   it("treats an adapter that omits either byte witness as source-invalid", async () => {
     const draft = buildDomainDrafts(sqliteBoundGeneration()).find(
@@ -1245,28 +1244,77 @@ describe("malformed and resumable failures are sanitized and never advance a che
       const full = buildRecords(generation);
       const all = recordsOf(full, domain);
       expect(all.length).toBeGreaterThanOrEqual(2);
+      const draft = buildDomainDrafts(generation).find((item) => item.domain === domain) as {
+        values: readonly UnknownRecord[];
+        contexts: readonly unknown[];
+      };
+      const rebuildFirstAt = (ordinal: number): PortableRecord =>
+        createPortableRecord({
+          domain,
+          ordinal,
+          value: draft.values[0],
+          context: draft.contexts[0],
+        } as unknown as PortableRecordInput);
 
       // Duplicate: page two repeats page one's record, so only the predecessor
       // adjacency check can catch it.
+      const duplicateAtOrdinalOne = rebuildFirstAt(1);
+      expect(duplicateAtOrdinalOne.identitySha256).toBe(all[0].identitySha256);
+      expect(duplicateAtOrdinalOne.ordinal).toBe(1);
+      expect(duplicateAtOrdinalOne.domain).toBe(domain);
+      expect(duplicateAtOrdinalOne.domainVersion).toBe(1);
+      expect(duplicateAtOrdinalOne.dependencies).toEqual(all[0].dependencies);
+      expect(parsePortableRecord(serializePortableRecord(duplicateAtOrdinalOne))).toEqual(
+        duplicateAtOrdinalOne,
+      );
+      expect(serializePortableRecord(duplicateAtOrdinalOne).byteLength).toBeLessThanOrEqual(
+        PORTABLE_LIMITS.maxBatchBytes,
+      );
+      expect(comparePortableOrder(all[0].order, duplicateAtOrdinalOne.order)).toBe(0);
+      // Mutation control: every earlier page/record gate is satisfied above.
+      // Removing the predecessor adjacency predicate would make construction
+      // resolve, so the source-invalid expectation below would fail.
       const duplicate = createFixtureSource({
         description: buildSourceDescription(generation),
         records: full,
         pageSize: 1,
         readOverride: (input): PortableSourcePage | undefined => {
           if (input.domain !== domain || input.afterOrdinal !== 1) return undefined;
-          return { predecessor: all[0], records: [all[0]], complete: true };
+          return { predecessor: all[0], records: [duplicateAtOrdinalOne], complete: true };
         },
       });
       await expectAsyncCode(() => createPortableRecordStream(duplicate), "source-invalid");
 
-      // Regression: page two presents a strictly earlier order tuple.
+      // Regression: two valid records advance the ordinal before page three
+      // presents a strictly earlier order tuple at the expected ordinal.
+      const regressedAtOrdinalTwo = rebuildFirstAt(2);
+      expect(regressedAtOrdinalTwo.ordinal).toBe(2);
+      expect(regressedAtOrdinalTwo.domain).toBe(domain);
+      expect(regressedAtOrdinalTwo.domainVersion).toBe(1);
+      expect(regressedAtOrdinalTwo.dependencies).toEqual(all[0].dependencies);
+      expect(parsePortableRecord(serializePortableRecord(regressedAtOrdinalTwo))).toEqual(
+        regressedAtOrdinalTwo,
+      );
+      expect(serializePortableRecord(regressedAtOrdinalTwo).byteLength).toBeLessThanOrEqual(
+        PORTABLE_LIMITS.maxBatchBytes,
+      );
+      expect(regressedAtOrdinalTwo.identitySha256).not.toBe(all[1].identitySha256);
+      expect(comparePortableOrder(all[1].order, regressedAtOrdinalTwo.order)).toBeGreaterThan(0);
+      // The identity-equality branch is false and only the strict-order branch
+      // rejects. Removing that adjacency predicate makes the expectation fail.
       const regressed = createFixtureSource({
         description: buildSourceDescription(generation),
         records: full,
         pageSize: 1,
         readOverride: (input): PortableSourcePage | undefined => {
-          if (input.domain !== domain || input.afterOrdinal !== 1) return undefined;
-          return { predecessor: all[1], records: [all[0]], complete: true };
+          if (input.domain !== domain) return undefined;
+          if (input.afterOrdinal === 1) {
+            return { predecessor: all[0], records: [all[1]], complete: false };
+          }
+          if (input.afterOrdinal === 2) {
+            return { predecessor: all[1], records: [regressedAtOrdinalTwo], complete: true };
+          }
+          return undefined;
         },
       });
       await expectAsyncCode(() => createPortableRecordStream(regressed), "source-invalid");
