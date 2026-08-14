@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -24,6 +24,12 @@ import {
 } from "../src/storage/backend-publication.js";
 import { PrivateMutationPermitRevokedError } from "../src/private-mutation-lock.js";
 import { withRevocablePrivateMutationPermit } from "../src/private-mutation-lock.js";
+import {
+  assertHomeLockTopology,
+  closeHomeLockTopology,
+  openHomeLockTopology,
+  restoreHomeLockTopologyMode,
+} from "../src/storage/home-lock-topology.js";
 
 const roots: string[] = [];
 
@@ -2284,6 +2290,33 @@ describe("BackendPublicationCoordinator", () => {
 });
 
 describe("revocable mutation permits", () => {
+  it("retains and authenticates an injected owner policy for a normal HOME", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-home-lock-topology-"));
+    roots.push(home);
+    chmodSync(home, 0o755);
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (expectedUid === undefined) throw new Error("HOME lock topology tests require process.getuid");
+
+    const topology = openHomeLockTopology(home, expectedUid);
+    try {
+      expect(() => assertHomeLockTopology(topology)).not.toThrow();
+      restoreHomeLockTopologyMode(topology);
+      expect(statSync(home).mode & 0o7777).toBe(0o755);
+    } finally {
+      closeHomeLockTopology(topology);
+    }
+
+    expect(() => openHomeLockTopology(home, expectedUid + 1)).toThrow("trusted");
+
+    const defaultTopology = openHomeLockTopology();
+    try {
+      expect(defaultTopology.homePath).toBe(resolve(homedir()));
+      expect(() => assertHomeLockTopology(defaultTopology)).not.toThrow();
+    } finally {
+      closeHomeLockTopology(defaultTopology);
+    }
+  });
+
   it("authenticates a normal 0755 HOME without tightening it for first-boot admission", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-consumer-normal-home-"));
     roots.push(home);
@@ -2292,6 +2325,11 @@ describe("revocable mutation permits", () => {
     withBackendPublicationConsumerLock(home, () => {
       expect(statSync(home).mode & 0o7777).toBe(0o755);
     });
+    expect(statSync(home).mode & 0o7777).toBe(0o755);
+
+    expect(() => withBackendPublicationConsumerLock(home, () => {
+      throw new Error("callback failed");
+    })).toThrow("callback failed");
     expect(statSync(home).mode & 0o7777).toBe(0o755);
   });
 

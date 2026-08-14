@@ -47,6 +47,8 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 
 ### Test coverage
 
+- Tests for void/throw-based assertion helpers must assert invocation with `not.toThrow()` rather than inspect their `undefined` return.
+
 - New HTTP routes must have corresponding tests in `test/daemon/routes/`.
 - Tests should cover: happy path, missing required fields (400), and resource-not-found (404).
 - Flag PRs adding routes without tests.
@@ -103,6 +105,7 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Flag `DROP COLUMN`, `DROP TABLE`, `ALTER COLUMN type`, or other destructive DDL outside such a tested staged replacement.
 - Migrations must be idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`).
 - Multi-statement schema bootstrap and repair paths, including schema-version writes, must run in one explicit transaction and roll back every partial DDL or metadata change on failure.
+- When a shared invariant validator accepts a caller-specific protocol reason, every invariant failure in that validator must use the supplied reason; preserve caller-specific taxonomy instead of hard-coding a parse-only reason.
 
 ### Error handling
 
@@ -157,6 +160,13 @@ This repo is a TypeScript SQLite daemon that persists Agent session memories acr
 - Dispatch tests must cover non-default storage-backend propagation through every backend-aware handler, while retaining the default SQLite cases.
 - Staged unsupported storage backends must be selected and fail closed before any legacy SQLite read, write, or enumeration, including portable import/export, stats, and diagnostic paths; never fall back silently to SQLite.
 - SQLite hook-outbox capture and persistence must complete before daemon-readiness checks; token-bearing or other network notification and daemon-dependent work must remain after verified daemon readiness.
+- Bound newly serialized durable content before publishing any of its path topology. Existing-content read limits do not bound new writes.
+- A checksum authenticates one immutable journal snapshot, not its legal relationship to its predecessor. Durable protocol stores must replay and verify the exact predecessor-relative transition before publication.
+- Persisted semantic integers that serialize canonically must reject negative zero even when generic canonical hash utilities normalize arbitrary numbers to zero.
+- When an absent durable resource has a sanitized public meaning, normalize only `ENOENT` from the bounded initial hierarchy open. Preserve unsafe metadata, non-`ENOENT` failures, missing required children of an existing resource, callback failures, and post-open identity races as fail-closed errors.
+- Crash-safe immutable publication tests must cover the interval after creating a destination container and before linking its content. Resume only exact authenticated scratch artifacts emitted by the writer; preserve sealed or ambiguous evidence and fail closed.
+- If immutable publication can leave a same-inode final/scratch hard-link pair, test both read recovery and the next mutation. Before CAS replacement, identity-consume only the exact authenticated alias, verify the final name remains the same inode at one link, and fsync the parent before staging downstream evidence; accepting the pair for reads alone can still wedge forward progress.
+- Durable writers can also crash after fsyncing an exclusive single-link scratch but before link/rename publication. Treat that scratch as incomplete evidence, bind its authenticated bytes to the exact legal immutable revision already published, preserve mismatches, and identity-consume the exact scratch plus fsync its parent before retrying publication; rejecting the writer's own pre-publication scratch can permanently wedge recovery.
 
 ### GitHub Actions and CodeQL
 
