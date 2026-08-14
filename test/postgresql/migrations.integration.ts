@@ -510,8 +510,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
           expectedOwner: "lcm_test_migrator",
         })).rejects.toMatchObject({
-          reason: "acl-shape",
-          operation: "inspectFunctionAcl",
+          reason: "extension-preflight",
+          operation: "inspectRequiredExtensionFunctions",
         });
       },
       { runMigrations: false },
