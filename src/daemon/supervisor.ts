@@ -515,7 +515,10 @@ export function managedLaunchEnvironment(
 ): Readonly<Record<string, string>> {
   const result: Record<string, string> = {};
   for (const name of MANAGED_LAUNCH_ENV_ALLOWLIST) {
-    const value = environment[name];
+    const rawValue = environment[name];
+    const value = name === "LCM_POSTGRES_MIGRATION_ROLE" && typeof rawValue === "string"
+      ? rawValue.trim()
+      : rawValue;
     const maxBytes = name === "LCM_POSTGRES_MIGRATION_ROLE" ? 63 : MANAGED_LAUNCH_ENV_VALUE_MAX_BYTES;
     const invalidCharacters = name === "LCM_POSTGRES_MIGRATION_ROLE"
       ? /[\u0000-\u001F\u007F]/u

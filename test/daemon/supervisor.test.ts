@@ -258,31 +258,33 @@ describe("canonical supervisor identity", () => {
   });
 
   it("carries a valid PostgreSQL migration role through managed launches without credential treatment", async () => {
-    const migrationRole = "r".repeat(63);
+    const migrationRole = "\tlcm_migration\t";
+    const normalizedMigrationRole = "lcm_migration";
     expect(MANAGED_LAUNCH_ENV_ALLOWLIST).toContain("LCM_POSTGRES_MIGRATION_ROLE");
     expect(MANAGED_CREDENTIAL_NAMES).not.toContain("LCM_POSTGRES_MIGRATION_ROLE");
     expect(managedLaunchEnvironment({ LCM_POSTGRES_MIGRATION_ROLE: "r" })).toEqual({
       LCM_POSTGRES_MIGRATION_ROLE: "r",
     });
     expect(managedLaunchEnvironment({ LCM_POSTGRES_MIGRATION_ROLE: migrationRole })).toEqual({
-      LCM_POSTGRES_MIGRATION_ROLE: migrationRole,
+      LCM_POSTGRES_MIGRATION_ROLE: normalizedMigrationRole,
     });
 
     for (const kind of ["systemd-user", "launchd-user"] as const) {
       const root = makeRoot();
       const environment = { PATH: "/usr/bin", LCM_POSTGRES_MIGRATION_ROLE: migrationRole };
+      const launchedEnvironment = { PATH: "/usr/bin", LCM_POSTGRES_MIGRATION_ROLE: normalizedMigrationRole };
       const spec = makeSpec(kind, root);
       expect(spec).not.toHaveProperty("postgresMigrationRole");
       const runner = fakeRunner(kind === "systemd-user"
         ? [
           { code: 1, stderr: "Unit is not-found" },
           { code: 0, stdout: "started" },
-          { code: 0, stdout: managerText(spec, "active", 444, "running", environment) },
+          { code: 0, stdout: managerText(spec, "active", 444, "running", launchedEnvironment) },
         ]
         : [
           { code: 113, stderr: "Could not find service" },
           { code: 0, stdout: "bootstrap" },
-          { code: 0, stdout: launchdPrintText(spec, "running", 444, environment) },
+          { code: 0, stdout: launchdPrintText(spec, "running", 444, launchedEnvironment) },
         ]);
       await expect(createSupervisor(kind, {
         run: runner.run,
@@ -293,12 +295,13 @@ describe("canonical supervisor identity", () => {
 
       if (kind === "systemd-user") {
         const startArgs = runner.calls[1]!.args;
-        expect(startArgs).toContain(`LCM_POSTGRES_MIGRATION_ROLE=${migrationRole}`);
+        expect(startArgs).toContain(`LCM_POSTGRES_MIGRATION_ROLE=${normalizedMigrationRole}`);
         expect(startArgs).not.toContain(`--setenv=LCM_POSTGRES_MIGRATION_ROLE=${migrationRole}`);
         expect(startArgs.join(" ")).not.toContain("LoadCredential=LCM_POSTGRES_MIGRATION_ROLE");
       } else {
         const plist = readFileSync(join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`), "utf8");
-        expect(plist).toContain(`<string>LCM_POSTGRES_MIGRATION_ROLE=${migrationRole}</string>`);
+        expect(plist).toContain(`<string>LCM_POSTGRES_MIGRATION_ROLE=${normalizedMigrationRole}</string>`);
+        expect(plist).not.toContain(`<string>LCM_POSTGRES_MIGRATION_ROLE=${migrationRole}</string>`);
         expect(plist).not.toContain("<key>LCM_POSTGRES_MIGRATION_ROLE</key>");
         expect(plist).not.toContain("LCM_CREDENTIAL_LCM_POSTGRES_MIGRATION_ROLE");
       }
@@ -307,6 +310,7 @@ describe("canonical supervisor identity", () => {
 
   it.each([
     ["empty", ""],
+    ["blank after trim", "   "],
     ["control", "role\u0001value"],
     ["newline", "role\nvalue"],
     ["NUL", "role\u0000value"],
