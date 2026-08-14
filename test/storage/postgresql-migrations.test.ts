@@ -513,7 +513,7 @@ describe("PostgreSQL migration runner", () => {
         "8d9c9ede1e990727ce8612ea7212fe7fe91f53d8dc3fa24f2de378cbbf4f4921",
         "e2581c7c70cbec57d64bb02ac1520fe27336efb326618b36add668cb1431e98c",
         "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
-        "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
+        "58f87970bd0ab0759dd5bbed4be01e086d563cc5f3c3b7f1a2452de673ee9b40",
         "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
         "f0abf51e9ee2b2ddcbd00ef21b672b8bc0361054c591564d76ad5d0f2928b190",
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -535,26 +535,35 @@ describe("PostgreSQL migration runner", () => {
     expect(snapshots.map(({ migrationId, definitionHashes }) => ({
       migrationId,
       constraintSha256: definitionHashes.constraint,
+      tableSha256: definitionHashes.table,
     }))).toEqual([
       {
         migrationId: "0002_schema_baseline",
         constraintSha256:
           "bcdeb5e8cf1fad3f0c2fd9536c2c51ebe47924b2bb4273ecc0d2f4c216217984",
+        tableSha256:
+          "58f87970bd0ab0759dd5bbed4be01e086d563cc5f3c3b7f1a2452de673ee9b40",
       },
       {
         migrationId: "0003_machine_identity_key",
         constraintSha256:
           "cff2807b3ad6f4465cc953bc79a562716bd1f54eaee2c0eb605f8fbff6ffc137",
+        tableSha256:
+          "58f87970bd0ab0759dd5bbed4be01e086d563cc5f3c3b7f1a2452de673ee9b40",
       },
       {
         migrationId: "0004_machine_display_name",
         constraintSha256:
           "eb9fdb72171517ac5b9d6162ae3495b8cb94d1d6300a0296aeb1f42c906d12b3",
+        tableSha256:
+          "58f87970bd0ab0759dd5bbed4be01e086d563cc5f3c3b7f1a2452de673ee9b40",
       },
       {
         migrationId: "0005_summary_context_integrity",
         constraintSha256:
           "eb9fdb72171517ac5b9d6162ae3495b8cb94d1d6300a0296aeb1f42c906d12b3",
+        tableSha256:
+          "58f87970bd0ab0759dd5bbed4be01e086d563cc5f3c3b7f1a2452de673ee9b40",
       },
     ]);
   });
@@ -1431,6 +1440,7 @@ describe("PostgreSQL migration runner", () => {
       "pg_catalog.pg_sequence",
       "pg_catalog.pg_depend",
       "pg_catalog.pg_collation",
+      "pg_catalog.pg_am",
       "pg_catalog.aclexplode",
       "pg_catalog.acldefault",
       "pg_catalog.pg_get_indexdef",
@@ -1443,6 +1453,7 @@ describe("PostgreSQL migration runner", () => {
       "attribute.attidentity",
       "attribute.attacl",
       "relation.relpersistence",
+      "relation.relam",
       "sequence_relation.relpersistence",
       "relation.relrowsecurity",
       "relation.relforcerowsecurity",
@@ -1478,6 +1489,14 @@ describe("PostgreSQL migration runner", () => {
     expect(indexInventory).not.toContain("AND index_metadata.indisvalid");
     expect(inventorySql).toContain("WHERE actual_indexes.is_valid IS DISTINCT FROM true");
     expect(inventorySql).toContain("AS invalid_index_count");
+    const tableInventory = inventorySection("actual_tables AS", "acl_relations AS");
+    expect(tableInventory).toContain("access_method.amname AS access_method");
+    expect(tableInventory).toContain("JOIN pg_catalog.pg_am AS access_method");
+    expect(tableInventory).toContain(
+      "access_method.oid OPERATOR(pg_catalog.=) relation.relam",
+    );
+    expect(inventorySection("SELECT 'table'", "SELECT 'relation_acl'"))
+      .toContain("table_name,\n                                  access_method,\n                                  persistence");
     const constraintInventory = inventorySection(
       "constraint_trigger_entries AS",
       "not_null_constraint_entries AS",

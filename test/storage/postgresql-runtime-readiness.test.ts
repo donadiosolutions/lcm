@@ -1586,6 +1586,14 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     expect(indexInventory).not.toContain("AND index_metadata.indisvalid");
     expect(text).toContain("WHERE actual_indexes.is_valid IS DISTINCT FROM true");
     expect(text).toContain("AS invalid_index_count");
+    const tableInventory = section("actual_tables AS", "acl_relations AS");
+    expect(tableInventory).toContain("access_method.amname AS access_method");
+    expect(tableInventory).toContain("JOIN pg_catalog.pg_am AS access_method");
+    expect(tableInventory).toContain(
+      "access_method.oid OPERATOR(pg_catalog.=) relation.relam",
+    );
+    expect(section("SELECT 'table'", "SELECT 'relation_acl'"))
+      .toContain("table_name, access_method, persistence");
     const notNullInventory = section(
       "not_null_constraint_entries AS",
       "actual_identity_sequences AS",

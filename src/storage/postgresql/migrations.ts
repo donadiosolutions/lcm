@@ -461,7 +461,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       ordinaryColumn: "f0abf51e9ee2b2ddcbd00ef21b672b8bc0361054c591564d76ad5d0f2928b190",
       relationAcl: "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
       rewriteRule: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      table: "5ccf4137ba8c1dbe8462176414b89f30616b26622d9680d77c5e2ae271d2f64d",
+      table: "58f87970bd0ab0759dd5bbed4be01e086d563cc5f3c3b7f1a2452de673ee9b40",
       trigger: "229e8dd0e6a1c953dd18b4220da95be28121db72f4fbba199e1d6808c4b7afcc",
     },
     identityFunctions: [
@@ -1868,6 +1868,7 @@ export async function runPostgreSqlMigrations(
                ),
                actual_tables AS (
                  SELECT relation.relname AS table_name,
+                        access_method.amname AS access_method,
                         relation.relpersistence::pg_catalog.text AS persistence,
                         relation.relrowsecurity::pg_catalog.text AS row_security,
                         relation.relforcerowsecurity::pg_catalog.text
@@ -1888,6 +1889,8 @@ export async function runPostgreSqlMigrations(
                  FROM pg_catalog.pg_class AS relation
                  JOIN pg_catalog.pg_namespace AS namespace
                    ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                 JOIN pg_catalog.pg_am AS access_method
+                   ON access_method.oid OPERATOR(pg_catalog.=) relation.relam
                  WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                    AND relation.relkind OPERATOR(pg_catalog.=) 'r'
                    AND relation.relname OPERATOR(pg_catalog.=)
@@ -2888,6 +2891,7 @@ export async function runPostgreSqlMigrations(
                                 pg_catalog.concat_ws(
                                   '|',
                                   table_name,
+                                  access_method,
                                   persistence,
                                   row_security,
                                   force_row_security,

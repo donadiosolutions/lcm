@@ -2704,6 +2704,74 @@ describe("PostgreSQL migrations and database isolation", () => {
     });
   });
 
+  it("rejects managed table access-method drift", async () => {
+    await withPostgreSqlTestDatabase(
+      "table-access-method-drift",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+        const accessMethodName = `${database.name.slice(0, 47)}_heap_alias`;
+        let accessMethodCreated = false;
+        try {
+          const support = await administrator.query<{ supported: boolean }>({
+            text: `SELECT pg_catalog.to_regprocedure(
+                     'pg_catalog.heap_tableam_handler(internal)'
+                   ) IS NOT NULL AS supported`,
+          }, { domain: "factory", operation: "inspectHeapTableAccessMethodHandler" });
+          expect(support).toMatchObject({ rows: [{ supported: true }] });
+
+          await administrator.query({
+            text: `CREATE ACCESS METHOD "${accessMethodName}"
+                   TYPE TABLE HANDLER pg_catalog.heap_tableam_handler`,
+          }, { domain: "factory", operation: "createHeapTableAccessMethodAlias" });
+          accessMethodCreated = true;
+          await administrator.query({
+            text: `ALTER TABLE lcm.projects
+                   SET ACCESS METHOD "${accessMethodName}"`,
+          }, { domain: "factory", operation: "alterManagedTableAccessMethod" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              expectedObjectCount: 782,
+              existingObjectCount: 782,
+              missingObjectCount: 0,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          try {
+            if (accessMethodCreated) {
+              try {
+                await administrator.query({
+                  text: "ALTER TABLE lcm.projects SET ACCESS METHOD heap",
+                }, { domain: "factory", operation: "restoreManagedTableAccessMethod" });
+              } finally {
+                await administrator.query({
+                  text: `DROP ACCESS METHOD "${accessMethodName}"`,
+                }, { domain: "factory", operation: "dropHeapTableAccessMethodAlias" });
+              }
+            }
+          } finally {
+            await administrator.close();
+          }
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
   it("rejects table row-level-security drift", async () => {
     await withPostgreSqlTestDatabase("table-row-security-drift", async (database) => {
       try {

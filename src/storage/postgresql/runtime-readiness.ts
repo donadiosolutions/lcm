@@ -2984,6 +2984,7 @@ function definitionQuery(
            ),
            actual_tables AS (
              SELECT relation.relname AS table_name,
+                    access_method.amname AS access_method,
                     relation.relpersistence::pg_catalog.text AS persistence,
                     relation.relrowsecurity::pg_catalog.text AS row_security,
                     relation.relforcerowsecurity::pg_catalog.text AS force_row_security,
@@ -2995,6 +2996,8 @@ function definitionQuery(
              FROM pg_catalog.pg_class AS relation
              JOIN pg_catalog.pg_namespace AS namespace
                ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+             JOIN pg_catalog.pg_am AS access_method
+               ON access_method.oid OPERATOR(pg_catalog.=) relation.relam
              WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                AND relation.relkind OPERATOR(pg_catalog.=) 'r'
                AND relation.relname OPERATOR(pg_catalog.=) ANY ($3::pg_catalog.text[])
@@ -3124,7 +3127,7 @@ function definitionQuery(
              UNION ALL
              SELECT 'table', pg_catalog.count(*)::pg_catalog.int4,
                     pg_catalog.encode(public.digest(COALESCE(pg_catalog.string_agg(
-                      pg_catalog.concat_ws('|', table_name, persistence, row_security, force_row_security,
+                      pg_catalog.concat_ws('|', table_name, access_method, persistence, row_security, force_row_security,
                         is_partition, has_parent, has_child), E'\\n' ORDER BY table_name), ''), 'sha256'), 'hex')
              FROM actual_tables
              UNION ALL
