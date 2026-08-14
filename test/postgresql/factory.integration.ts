@@ -1422,7 +1422,6 @@ describe("PostgreSQL 18 project storage factory", () => {
                 }, { domain: "factory", operation: "dropEphemeralRuntimeRole" });
               }
             }
-            roleCreated = false;
           }
         } finally {
           await administrator.close();
