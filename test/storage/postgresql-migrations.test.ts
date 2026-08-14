@@ -70,6 +70,7 @@ function executor(options: {
     | "invalid"
     | "invalid-hash"
     | "inconsistent";
+  baselineInvalidIndexCount?: unknown;
   identityFunctions?: "ready" | "drifted" | "missing" | "invalid" | "inconsistent";
 } = {}) {
   const operations: string[] = [];
@@ -309,6 +310,9 @@ function executor(options: {
           || options.baselineDefinitions === "missing-object"
             ? 1
             : 0,
+        ...(Object.hasOwn(options, "baselineInvalidIndexCount")
+          ? { invalid_index_count: options.baselineInvalidIndexCount }
+          : { invalid_index_count: 0 }),
       }] as unknown as R[]);
     }
     if (context.operation === "readMigrations") return result((options.current ?? []) as unknown as R[]);
@@ -1468,9 +1472,12 @@ describe("PostgreSQL migration runner", () => {
       return inventorySql.slice(start, end < 0 ? undefined : end);
     };
     const indexInventory = inventorySection("WITH actual_indexes AS", "actual_triggers AS");
+    expect(indexInventory).toContain("index_metadata.indisvalid AS is_valid");
     expect(indexInventory).toContain("index_metadata.indisready");
     expect(indexInventory).toContain("index_metadata.indislive");
-    expect(indexInventory).not.toContain("index_metadata.indisvalid");
+    expect(indexInventory).not.toContain("AND index_metadata.indisvalid");
+    expect(inventorySql).toContain("WHERE actual_indexes.is_valid IS DISTINCT FROM true");
+    expect(inventorySql).toContain("AS invalid_index_count");
     const constraintInventory = inventorySection(
       "constraint_trigger_entries AS",
       "not_null_constraint_entries AS",
@@ -1593,6 +1600,40 @@ describe("PostgreSQL migration runner", () => {
         new RegExp(`(?<!\\$)\\b${hardcodedGroupCount}::pg_catalog\\.int4`, "u"),
       );
     }
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["malformed", "0"],
+    ["negative", -1],
+    ["nonzero", 1],
+  ] as const)("rejects %s invalid-index count evidence", async (_label, invalidIndexCount) => {
+    const migrations = loadPostgreSqlMigrations();
+    const current = migrations.slice(0, 2).map(({ id, sha256 }) => ({
+      id,
+      checksum_sha256: sha256,
+    }));
+    const fake = executor({
+      baselineDefinitions: "ready",
+      baselineInvalidIndexCount: invalidIndexCount,
+      current,
+      ledger: true,
+      schemaAcl: "ready",
+      schemaOwnership: "owned",
+    });
+
+    const failure = await runPostgreSqlMigrations(fake.seam, { migrations })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlBaselineDefinitionPreflightError);
+    expect(failure).toMatchObject({
+      baselineApplied: true,
+      driftedDefinitionGroupCount: 0,
+      existingObjectCount: 781,
+      expectedObjectCount: 781,
+      missingObjectCount: 0,
+      operation: "preflightBaselineDefinitions",
+    });
+    expect(fake.operations).not.toContain("preflightIdentityFunctionDefinitions");
   });
 
   it.each([

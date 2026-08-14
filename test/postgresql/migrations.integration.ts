@@ -111,19 +111,51 @@ async function readCurrentDatabaseOwner(administrator: PostgreSqlRuntime): Promi
   return owner;
 }
 
-interface IndexWriteState {
+interface IndexCatalogState extends QueryResultRow {
+  readonly object_name: string;
+  readonly definition: string;
   readonly indisvalid: boolean;
   readonly indisready: boolean;
   readonly indislive: boolean;
 }
 
+interface ManagedIndexInventoryState extends QueryResultRow {
+  readonly index_count: number;
+  readonly index_sha256: string;
+  readonly invalid_index_count: number;
+}
+
 async function waitForInvalidReadyLiveIndex(
   observer: PostgreSqlRuntime,
   indexName: string,
-): Promise<IndexWriteState> {
+): Promise<IndexCatalogState> {
   for (let attempt = 0; attempt < 400; attempt += 1) {
-    const state = await observer.query<IndexWriteState>({
-      text: `SELECT index_metadata.indisvalid,
+    const row = await readIndexCatalogState(
+      observer,
+      indexName,
+      "waitForInvalidReadyLiveIndex",
+    );
+    if (
+      row?.indisvalid === false
+      && row.indisready === true
+      && row.indislive === true
+    ) {
+      return row;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timed out waiting for invalid ready live PostgreSQL index");
+}
+
+async function readIndexCatalogState(
+  observer: PostgreSqlRuntime,
+  indexName: string,
+  operation: string,
+): Promise<IndexCatalogState | null> {
+  const state = await observer.query<IndexCatalogState>({
+    text: `SELECT index_relation.relname AS object_name,
+                    pg_catalog.pg_get_indexdef(index_relation.oid) AS definition,
+                    index_metadata.indisvalid,
                     index_metadata.indisready,
                     index_metadata.indislive
              FROM pg_catalog.pg_index AS index_metadata
@@ -134,19 +166,76 @@ async function waitForInvalidReadyLiveIndex(
              WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                AND index_relation.relname OPERATOR(pg_catalog.=) $1`,
       values: [indexName],
-    }, { domain: "factory", operation: "waitForInvalidReadyLiveIndex" });
-    const row = state.rows[0];
-    if (
-      state.rows.length === 1
-      && row?.indisvalid === false
-      && row.indisready === true
-      && row.indislive === true
-    ) {
-      return row;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
+  }, { domain: "factory", operation });
+  if (state.rows.length === 0) return null;
+  const row = state.rows[0];
+  if (
+    state.rows.length !== 1
+    || row === undefined
+    || row.object_name !== indexName
+    || typeof row.definition !== "string"
+    || typeof row.indisvalid !== "boolean"
+    || typeof row.indisready !== "boolean"
+    || typeof row.indislive !== "boolean"
+  ) {
+    throw new Error("invalid PostgreSQL index catalog fixture state");
   }
-  throw new Error("timed out waiting for invalid ready live PostgreSQL index");
+  return row;
+}
+
+async function readManagedIndexInventory(
+  observer: PostgreSqlRuntime,
+  managedTableNames: readonly string[],
+  operation: string,
+): Promise<ManagedIndexInventoryState> {
+  const result = await observer.query<ManagedIndexInventoryState>({
+    text: `WITH actual_indexes AS (
+             SELECT index_relation.relname AS object_name,
+                    pg_catalog.pg_get_indexdef(index_relation.oid) AS definition,
+                    index_metadata.indisvalid AS is_valid
+             FROM pg_catalog.pg_class AS index_relation
+             JOIN pg_catalog.pg_index AS index_metadata
+               ON index_metadata.indexrelid OPERATOR(pg_catalog.=) index_relation.oid
+             JOIN pg_catalog.pg_namespace AS index_namespace
+               ON index_namespace.oid OPERATOR(pg_catalog.=) index_relation.relnamespace
+             JOIN pg_catalog.pg_class AS relation
+               ON relation.oid OPERATOR(pg_catalog.=) index_metadata.indrelid
+             JOIN pg_catalog.pg_namespace AS relation_namespace
+               ON relation_namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+             WHERE index_namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+               AND relation_namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+               AND relation.relkind OPERATOR(pg_catalog.=) ANY (
+                 ARRAY['r', 'p']::pg_catalog."char"[]
+               )
+               AND index_relation.relkind OPERATOR(pg_catalog.=) 'i'
+               AND index_metadata.indisready
+               AND index_metadata.indislive
+               AND relation.relname OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])
+           )
+           SELECT pg_catalog.count(*)::pg_catalog.int4 AS index_count,
+                  pg_catalog.encode(public.digest(COALESCE(pg_catalog.string_agg(
+                    pg_catalog.concat_ws('|', object_name, definition),
+                    E'\\n' ORDER BY object_name
+                  ), ''), 'sha256'), 'hex') AS index_sha256,
+                  pg_catalog.count(*) FILTER (
+                    WHERE actual_indexes.is_valid IS DISTINCT FROM true
+                  )::pg_catalog.int4 AS invalid_index_count
+           FROM actual_indexes`,
+    values: [managedTableNames],
+  }, { domain: "factory", operation });
+  const row = result.rows[0];
+  if (
+    result.rows.length !== 1
+    || row === undefined
+    || !Number.isSafeInteger(row.index_count)
+    || row.index_count < 0
+    || !/^[0-9a-f]{64}$/u.test(row.index_sha256)
+    || !Number.isSafeInteger(row.invalid_index_count)
+    || row.invalid_index_count < 0
+  ) {
+    throw new Error("invalid managed-index inventory fixture state");
+  }
+  return row;
 }
 
 async function waitForSummaryMigrationRelationLock(
@@ -937,12 +1026,43 @@ describe("PostgreSQL migrations and database isolation", () => {
     );
   });
 
-  it("rejects invalid ready live unique indexes that still enforce managed writes", async () => {
+  it("rejects an invalid ready live replacement with an expected index fingerprint", async () => {
     await withPostgreSqlTestDatabase(
-      "readiness-invalid-ready-live-index",
+      "readiness-invalid-expected-index",
       async (database) => {
         await runPostgreSqlMigrations(database.migrator);
         await applyRuntimeGrantScripts(database);
+        const snapshot = loadPostgreSqlSchemaSnapshots().at(-1);
+        if (snapshot === undefined) throw new Error("missing PostgreSQL schema snapshot fixture");
+        const indexName = "conversations_project_order_idx";
+        const canonicalIndex = await readIndexCatalogState(
+          database.migrator,
+          indexName,
+          "readCanonicalExpectedIndex",
+        );
+        if (
+          canonicalIndex === null
+          || canonicalIndex.indisvalid !== true
+          || canonicalIndex.indisready !== true
+          || canonicalIndex.indislive !== true
+        ) {
+          throw new Error("expected canonical PostgreSQL index is not valid ready live");
+        }
+        const canonicalInventory = await readManagedIndexInventory(
+          database.migrator,
+          snapshot.tableIdentities,
+          "readCanonicalManagedIndexInventory",
+        );
+        if (canonicalInventory.invalid_index_count !== 0) {
+          throw new Error("canonical PostgreSQL index inventory contains an invalid index");
+        }
+        const concurrentDefinition = canonicalIndex.definition.replace(
+          /^CREATE INDEX /u,
+          "CREATE INDEX CONCURRENTLY ",
+        );
+        if (concurrentDefinition === canonicalIndex.definition) {
+          throw new Error("expected standalone PostgreSQL index definition");
+        }
         const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
         const blocker = new Client(
           POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(
@@ -954,14 +1074,28 @@ describe("PostgreSQL migrations and database isolation", () => {
             settings(database.migratorUrl),
           ),
         );
-        const indexName = "unexpected_invalid_ready_live_index";
         let creatorPid: number | undefined;
         let creation: Promise<unknown> | undefined;
+        let mutationStarted = false;
+        const restoreAuthoritativeIndex = async (): Promise<void> => {
+          if (!mutationStarted) return;
+          await database.migrator.query({
+            text: `DROP INDEX IF EXISTS lcm.${indexName}`,
+          }, { domain: "factory", operation: "dropInvalidExpectedIndexForRestore" });
+          await database.migrator.query({
+            text: canonicalIndex.definition,
+          }, { domain: "factory", operation: "restoreAuthoritativeExpectedIndex" });
+          mutationStarted = false;
+        };
         try {
           await blocker.connect();
           await creator.connect();
+          mutationStarted = true;
+          await database.migrator.query({
+            text: `DROP INDEX lcm.${indexName}`,
+          }, { domain: "factory", operation: "dropAuthoritativeExpectedIndex" });
           await blocker.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
-          await blocker.query("SELECT pg_catalog.count(*) FROM lcm.schema_migrations");
+          await blocker.query("SELECT pg_catalog.count(*) FROM lcm.conversations");
           creatorPid = (await creator.query<{ pid: number }>(
             "SELECT pg_catalog.pg_backend_pid() AS pid",
           )).rows[0]?.pid;
@@ -969,84 +1103,164 @@ describe("PostgreSQL migrations and database isolation", () => {
             throw new Error("invalid concurrent-index creator backend PID");
           }
 
-          creation = creator.query(
-            `CREATE UNIQUE INDEX CONCURRENTLY ${indexName}
-             ON lcm.schema_migrations (pg_catalog.lower(checksum_sha256))`,
-          ).then(() => {
+          creation = creator.query(concurrentDefinition).then(() => {
             throw new Error("concurrent index creation unexpectedly completed");
           }).catch((error: unknown) => error);
 
-          await expect(waitForInvalidReadyLiveIndex(database.migrator, indexName))
-            .resolves.toEqual({
-              indisvalid: false,
-              indisready: true,
-              indislive: true,
-            });
+          const waitingIndex = await waitForInvalidReadyLiveIndex(
+            database.migrator,
+            indexName,
+          );
+          expect(waitingIndex).toEqual({
+            ...canonicalIndex,
+            indisvalid: false,
+            indisready: true,
+            indislive: true,
+          });
           await administrator.query({
             text: "SELECT pg_catalog.pg_cancel_backend($1) AS cancelled",
             values: [creatorPid],
-          }, { domain: "factory", operation: "cancelInvalidReadyLiveIndexCreation" });
+          }, { domain: "factory", operation: "cancelInvalidExpectedIndexCreation" });
           await blocker.query("ROLLBACK");
           await expect(creation).resolves.toMatchObject({ code: "57014" });
           creation = undefined;
 
-          const migrations = await database.migrator.query<{
-            id: string;
-            checksum_sha256: string;
-          }>({
-            text: `SELECT id, checksum_sha256
-                   FROM lcm.schema_migrations
-                   ORDER BY id
-                   LIMIT 2`,
-          }, { domain: "factory", operation: "readLedgerRowsForInvalidIndexWrite" });
-          const target = migrations.rows[0];
-          const duplicate = migrations.rows[1];
-          if (target === undefined || duplicate === undefined) {
-            throw new Error("missing migration rows for invalid-index write proof");
-          }
-          const writeFailure = await database.migrator.query({
-            text: `UPDATE lcm.schema_migrations
-                   SET checksum_sha256 = $2
-                   WHERE id OPERATOR(pg_catalog.=) $1`,
-            values: [target.id, duplicate.checksum_sha256],
-          }, { domain: "factory", operation: "proveInvalidIndexStillEnforcesWrites" })
-            .catch((error: unknown) => error);
-          expect(writeFailure).toMatchObject({
-            operation: "proveInvalidIndexStillEnforcesWrites",
-            sqlState: "23505",
+          const invalidIndex = await readIndexCatalogState(
+            database.migrator,
+            indexName,
+            "readCancelledExpectedIndex",
+          );
+          expect(invalidIndex).toEqual({
+            ...canonicalIndex,
+            indisvalid: false,
+            indisready: true,
+            indislive: true,
           });
-          await expect(database.migrator.query<{ checksum_sha256: string }>({
-            text: `SELECT checksum_sha256
-                   FROM lcm.schema_migrations
-                   WHERE id OPERATOR(pg_catalog.=) $1`,
-            values: [target.id],
-          }, { domain: "factory", operation: "verifyInvalidIndexRejectedWrite" }))
-            .resolves.toMatchObject({
-              rows: [{ checksum_sha256: target.checksum_sha256 }],
-            });
+          const invalidInventory = await readManagedIndexInventory(
+            database.migrator,
+            snapshot.tableIdentities,
+            "readInvalidManagedIndexInventory",
+          );
+          expect(invalidInventory).toEqual({
+            ...canonicalInventory,
+            invalid_index_count: 1,
+          });
 
-          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+          type DefinitionDiagnosticRow = QueryResultRow & {
+            readonly actual_definition_group_counts: readonly number[];
+            readonly actual_definition_group_hashes: readonly string[];
+            readonly invalid_index_count: number;
+            readonly missing_object_count: number;
+            readonly drifted_definition_group_count: number;
+          };
+          let readinessDefinitionRow: DefinitionDiagnosticRow | undefined;
+          const readinessExecutor: PostgreSqlQueryExecutor = {
+            query: async <
+              R extends QueryResultRow = QueryResultRow,
+              I extends unknown[] = unknown[],
+            >(
+              config: QueryConfig<I>,
+              options: PostgreSqlQueryOptions,
+            ): Promise<QueryResult<R>> => {
+              const result = await database.runtime.query<R, I>(config, options);
+              if (options.operation === "inspectSchemaDefinitions") {
+                readinessDefinitionRow = result.rows[0] as DefinitionDiagnosticRow | undefined;
+              }
+              return result;
+            },
+          };
+          let migrationDefinitionRow: DefinitionDiagnosticRow | undefined;
+          const migrationExecutor = {
+            query: <
+              R extends QueryResultRow = QueryResultRow,
+              I extends unknown[] = unknown[],
+            >(config: QueryConfig<I>, options: PostgreSqlQueryOptions): Promise<QueryResult<R>> => (
+              database.migrator.query<R, I>(config, options)
+            ),
+            transaction: async <T>(
+              callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
+              options: { domain: "factory"; operation: string; signal?: AbortSignal },
+            ): Promise<T> => database.migrator.transaction(async (transaction) => callback({
+              query: async <
+                R extends QueryResultRow = QueryResultRow,
+                I extends unknown[] = unknown[],
+              >(
+                config: QueryConfig<I>,
+                queryOptions: PostgreSqlQueryOptions,
+              ): Promise<QueryResult<R>> => {
+                const result = await transaction.query<R, I>(config, queryOptions);
+                if (queryOptions.operation === "preflightBaselineDefinitions") {
+                  migrationDefinitionRow = result.rows[0] as DefinitionDiagnosticRow | undefined;
+                }
+                return result;
+              },
+            }), options),
+          };
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(readinessExecutor, {
             expectedOwner: "lcm_test_migrator",
           }).catch((error: unknown) => error);
-          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+          const migrationFailure = await runPostgreSqlMigrations(migrationExecutor)
             .catch((error: unknown) => error);
-          expect({ readinessFailure, migrationFailure }).toMatchObject({
+          expect({
+            readinessFailure,
+            migrationFailure,
+            readinessDefinitionRow,
+            migrationDefinitionRow,
+          }).toMatchObject({
             readinessFailure: {
               reason: "schema-fingerprint",
               operation: "inspectSchemaDefinitions",
             },
             migrationFailure: {
               baselineApplied: true,
-              driftedDefinitionGroupCount: 1,
+              driftedDefinitionGroupCount: 0,
               operation: "preflightBaselineDefinitions",
             },
+            readinessDefinitionRow: {
+              invalid_index_count: 1,
+              missing_object_count: 0,
+              drifted_definition_group_count: 0,
+            },
+            migrationDefinitionRow: {
+              invalid_index_count: 1,
+              missing_object_count: 0,
+              drifted_definition_group_count: 0,
+            },
+          });
+          expect(readinessDefinitionRow?.actual_definition_group_counts[0])
+            .toBe(canonicalInventory.index_count);
+          expect(migrationDefinitionRow?.actual_definition_group_counts[0])
+            .toBe(canonicalInventory.index_count);
+          expect(readinessDefinitionRow?.actual_definition_group_hashes[0])
+            .toBe(canonicalInventory.index_sha256);
+          expect(migrationDefinitionRow?.actual_definition_group_hashes[0])
+            .toBe(canonicalInventory.index_sha256);
+          expect(JSON.stringify([readinessFailure, migrationFailure])).not.toContain(indexName);
+
+          await restoreAuthoritativeIndex();
+          await expect(readIndexCatalogState(
+            database.migrator,
+            indexName,
+            "readRestoredExpectedIndex",
+          )).resolves.toEqual(canonicalIndex);
+          await expect(readManagedIndexInventory(
+            database.migrator,
+            snapshot.tableIdentities,
+            "readRestoredManagedIndexInventory",
+          )).resolves.toEqual(canonicalInventory);
+          await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+          await expect(runPostgreSqlMigrations(database.migrator)).resolves.toMatchObject({
+            applied: [],
           });
         } finally {
           if (creatorPid !== undefined) {
             await administrator.query({
               text: "SELECT pg_catalog.pg_cancel_backend($1) AS cancelled",
               values: [creatorPid],
-            }, { domain: "factory", operation: "cancelInvalidIndexCreationDuringCleanup" })
+            }, { domain: "factory", operation: "cancelExpectedIndexCreationDuringCleanup" })
               .catch(() => undefined);
           }
           await blocker.query("ROLLBACK").catch(() => undefined);
@@ -1054,14 +1268,12 @@ describe("PostgreSQL migrations and database isolation", () => {
           await creator.end().catch(() => undefined);
           await blocker.end().catch(() => undefined);
           try {
-            await database.migrator.query({
-              text: `DROP INDEX IF EXISTS lcm.${indexName}`,
-            }, { domain: "factory", operation: "removeInvalidReadyLiveIndex" });
-            await expect(database.migrator.query<{ index_oid: string | null }>({
-              text: "SELECT pg_catalog.to_regclass($1)::pg_catalog.text AS index_oid",
-              values: [`lcm.${indexName}`],
-            }, { domain: "factory", operation: "verifyInvalidReadyLiveIndexRemoved" }))
-              .resolves.toMatchObject({ rows: [{ index_oid: null }] });
+            await restoreAuthoritativeIndex();
+            await expect(readIndexCatalogState(
+              database.migrator,
+              indexName,
+              "verifyAuthoritativeExpectedIndexRestored",
+            )).resolves.toEqual(canonicalIndex);
           } finally {
             await administrator.close();
           }

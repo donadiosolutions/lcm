@@ -583,6 +583,7 @@ interface DefinitionRow extends QueryResultRow {
   readonly existing_object_count: unknown;
   readonly actual_definition_group_counts: unknown;
   readonly actual_definition_group_hashes: unknown;
+  readonly invalid_index_count: unknown;
   readonly missing_object_count: unknown;
   readonly drifted_definition_group_count: unknown;
 }
@@ -1608,7 +1609,8 @@ function definitionQuery(
   return {
     text: `WITH actual_indexes AS (
              SELECT index_relation.relname AS object_name,
-                    pg_catalog.pg_get_indexdef(index_relation.oid) AS definition
+                    pg_catalog.pg_get_indexdef(index_relation.oid) AS definition,
+                    index_metadata.indisvalid AS is_valid
              FROM pg_catalog.pg_class AS index_relation
              JOIN pg_catalog.pg_index AS index_metadata
                ON index_metadata.indexrelid OPERATOR(pg_catalog.=) index_relation.oid
@@ -2135,6 +2137,9 @@ function definitionQuery(
                     $7::pg_catalog.text[], actual_groups.object_kind)) AS actual_definition_group_counts,
                   pg_catalog.array_agg(actual_groups.definition_sha256 ORDER BY pg_catalog.array_position(
                     $7::pg_catalog.text[], actual_groups.object_kind)) AS actual_definition_group_hashes,
+                  (SELECT pg_catalog.count(*)::pg_catalog.int4
+                   FROM actual_indexes
+                   WHERE actual_indexes.is_valid IS DISTINCT FROM true) AS invalid_index_count,
                   ($6 - pg_catalog.sum(actual_groups.existing_count))::pg_catalog.int4
                     AS missing_object_count,
                   pg_catalog.count(*) FILTER (
@@ -2178,6 +2183,8 @@ async function inspectDefinitions(
     || row.expected_object_count !== expectations.definitionObjectCount
     || !isSafeCount(row.existing_object_count)
     || row.existing_object_count !== expectations.definitionObjectCount
+    || !isSafeCount(row.invalid_index_count)
+    || row.invalid_index_count !== 0
     || row.missing_object_count !== 0
     || row.drifted_definition_group_count !== 0
     || !Array.isArray(row.actual_definition_group_counts)

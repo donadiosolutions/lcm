@@ -116,6 +116,7 @@ type BaselineDefinitionInventoryRow = QueryResultRow & {
   baseline_applied: unknown;
   expected_object_count: unknown;
   existing_object_count: unknown;
+  invalid_index_count: unknown;
   missing_object_count: unknown;
   drifted_definition_group_count: unknown;
 };
@@ -1455,7 +1456,8 @@ export async function runPostgreSqlMigrations(
       await transaction.query<BaselineDefinitionInventoryRow>({
         text: `WITH actual_indexes AS (
                  SELECT index_relation.relname AS object_name,
-                        pg_catalog.pg_get_indexdef(index_relation.oid) AS definition
+                        pg_catalog.pg_get_indexdef(index_relation.oid) AS definition,
+                        index_metadata.indisvalid AS is_valid
                  FROM pg_catalog.pg_class AS index_relation
                  JOIN pg_catalog.pg_index AS index_metadata
                    ON index_metadata.indexrelid OPERATOR(pg_catalog.=) index_relation.oid
@@ -3018,6 +3020,10 @@ export async function runPostgreSqlMigrations(
                           actual_groups.object_kind
                         )
                       ) AS actual_definition_group_hashes,
+                      (SELECT pg_catalog.count(*)::pg_catalog.int4
+                       FROM actual_indexes
+                       WHERE actual_indexes.is_valid IS DISTINCT FROM true)
+                        AS invalid_index_count,
                       CASE
                         WHEN $1::pg_catalog.bool THEN (
                           $6 - pg_catalog.sum(actual_groups.existing_count)
@@ -3063,6 +3069,9 @@ export async function runPostgreSqlMigrations(
     const missingDefinitionObjectCount = sanitizeNonnegativeCount(
       baselineDefinitions.rows[0]?.missing_object_count,
     );
+    const invalidIndexCount = sanitizeNonnegativeCount(
+      baselineDefinitions.rows[0]?.invalid_index_count,
+    );
     const driftedDefinitionGroupCount = sanitizeNonnegativeCount(
       baselineDefinitions.rows[0]?.drifted_definition_group_count,
     );
@@ -3077,6 +3086,8 @@ export async function runPostgreSqlMigrations(
       || expectedDefinitionObjectCount !== snapshotExpectations.definitionObjectCount
       || existingDefinitionObjectCount === null
       || existingDefinitionObjectCount > expectedDefinitionObjectCount
+      || invalidIndexCount === null
+      || invalidIndexCount !== 0
       || missingDefinitionObjectCount === null
       || (baselineApplied
         && existingDefinitionObjectCount + missingDefinitionObjectCount

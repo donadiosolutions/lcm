@@ -339,6 +339,7 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
         existing_object_count: expectations.definitionObjectCount,
         actual_definition_group_counts: expectations.definitionGroupCounts,
         actual_definition_group_hashes: expectations.definitionGroupHashes,
+        invalid_index_count: 0,
         missing_object_count: 0,
         drifted_definition_group_count: 0,
       }]));
@@ -901,6 +902,10 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     ["definition existing count drift", mutateFirstField("existing_object_count", 0)],
     ["definition missing count", mutateFirstField("missing_object_count", 1)],
     ["definition drift count", mutateFirstField("drifted_definition_group_count", 1)],
+    ["invalid index count missing", mutateFirstField("invalid_index_count", undefined)],
+    ["invalid index count malformed", mutateFirstField("invalid_index_count", "0")],
+    ["invalid index count negative", mutateFirstField("invalid_index_count", -1)],
+    ["invalid index count nonzero", mutateFirstField("invalid_index_count", 1)],
     ["definition counts malformed", mutateFirstField("actual_definition_group_counts", "bad")],
     ["definition hashes malformed", mutateFirstField("actual_definition_group_hashes", "bad")],
     ["definition counts length", mutateRows((rows) => {
@@ -971,9 +976,12 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     expect(constraintInventory).toContain("OR (");
     expect(constraintInventory).not.toContain("ANY ($2::pg_catalog.text[])");
     const indexInventory = section("WITH actual_indexes AS", "actual_triggers AS");
+    expect(indexInventory).toContain("index_metadata.indisvalid AS is_valid");
     expect(indexInventory).toContain("index_metadata.indisready");
     expect(indexInventory).toContain("index_metadata.indislive");
-    expect(indexInventory).not.toContain("index_metadata.indisvalid");
+    expect(indexInventory).not.toContain("AND index_metadata.indisvalid");
+    expect(text).toContain("WHERE actual_indexes.is_valid IS DISTINCT FROM true");
+    expect(text).toContain("AS invalid_index_count");
     const notNullInventory = section(
       "not_null_constraint_entries AS",
       "actual_identity_sequences AS",
