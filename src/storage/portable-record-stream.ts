@@ -17,13 +17,7 @@ import type {
   PortableStreamErrorOptions,
 } from "./portable-record.js";
 
-export {
-  PORTABLE_LIMITS,
-  PORTABLE_RECORD_DOMAIN_ORDER,
-  PORTABLE_RECORD_SCHEMA_SHA256,
-  PortableStreamError,
-} from "./portable-record.js";
-export type { PortableDomain, PortableRecord } from "./portable-record.js";
+export * from "./portable-record.js";
 
 export type PortableCoverageEvidence =
   | Readonly<{ state: "available"; evidenceSha256: string }>
@@ -160,7 +154,8 @@ export interface PortableRecordStream {
 }
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const CAPTURED_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const CAPTURED_AT_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{6})Z$/;
 const MANIFEST_KEYS = [
   "version",
   "schemaSha256",
@@ -198,6 +193,27 @@ function isSafeCount(value: unknown): value is number {
 
 function isSha256(value: unknown): value is string {
   return typeof value === "string" && SHA256_PATTERN.test(value);
+}
+
+function isCanonicalCapturedAt(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = value.match(CAPTURED_AT_PATTERN);
+  if (match === null) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(hour, minute, second, 0);
+  return date.getUTCFullYear() === year
+    && date.getUTCMonth() === month - 1
+    && date.getUTCDate() === day
+    && date.getUTCHours() === hour
+    && date.getUTCMinutes() === minute
+    && date.getUTCSeconds() === second;
 }
 
 function ownKeys(value: object, code: PortableStreamErrorCode): (string | symbol)[] {
@@ -358,9 +374,7 @@ function validateSourceDescription(value: unknown): PortableSourceDescription {
     "malformed-manifest",
   );
   if (
-    typeof object.capturedAt !== "string"
-    || !CAPTURED_AT_PATTERN.test(object.capturedAt)
-    || Number.isNaN(Date.parse(object.capturedAt))
+    !isCanonicalCapturedAt(object.capturedAt)
     || !isSha256(object.sourceIdentitySha256)
     || !isSha256(object.sourceWitnessSha256)
   ) fail("malformed-manifest");
@@ -601,7 +615,7 @@ function validateDependencyContract(record: PortableRecord, domain: PortableDoma
   }
 }
 
-interface CreatePortableBatchInput {
+export interface CreatePortableBatchInput {
   readonly manifest: PortableManifest;
   readonly domain: PortableDomain;
   readonly page: PortableSourcePage;
@@ -806,7 +820,6 @@ function sourceVerificationInput(
 interface ScannedDomain {
   readonly manifest: PortableDomainManifest;
   readonly projectIdentitySha256: string | null;
-  readonly projectDependencies: readonly string[];
 }
 
 function invalidSource(): never {
@@ -814,20 +827,18 @@ function invalidSource(): never {
 }
 
 function scanSourcePage(
-  manifestSource: PortableSourceDescription,
   domain: PortableDomain,
   rawPage: PortableSourcePage,
   nextOrdinal: number,
   prefixSha256: string,
   previous: PortableRecord | null,
-  identities: Set<string>,
+  expectedProjectIdentitySha256: string | null,
 ): Readonly<{
   nextOrdinal: number;
   prefixSha256: string;
   previous: PortableRecord | null;
   complete: boolean;
   projectIdentitySha256: string | null;
-  projectDependencies: readonly string[];
 }> {
   let page: Record<string, unknown>;
   let records: unknown[];
@@ -864,7 +875,6 @@ function scanSourcePage(
   let framedBytes = 0;
   let prior = predecessor;
   let projectIdentitySha256: string | null = null;
-  const projectDependencies: string[] = [];
   for (const rawRecord of records) {
     let record: PortableRecord;
     let bytes: Uint8Array;
@@ -880,27 +890,35 @@ function scanSourcePage(
       || record.domain !== domain
       || record.domainVersion !== 1
       || record.ordinal !== nextOrdinal
-      || identities.has(record.identitySha256)
-      || (prior !== null && comparePortableOrder(prior.order, record.order) >= 0)
+      || (prior !== null && (
+        prior.identitySha256 === record.identitySha256
+        || comparePortableOrder(prior.order, record.order) >= 0
+      ))
     ) invalidSource();
-    identities.add(record.identitySha256);
-    if (domain === "project") projectIdentitySha256 = record.identitySha256;
+    if (domain === "project") {
+      if (projectIdentitySha256 !== null) invalidSource();
+      projectIdentitySha256 = record.identitySha256;
+    }
     for (const dependency of record.dependencies) {
-      if (dependency.domain === "project") projectDependencies.push(dependency.identitySha256);
+      if (
+        dependency.domain === "project"
+        && (
+          expectedProjectIdentitySha256 === null
+          || dependency.identitySha256 !== expectedProjectIdentitySha256
+        )
+      ) invalidSource();
     }
     prefixSha256 = appendLengthPrefixed(prefixSha256, bytes);
     nextOrdinal += 1;
     prior = record;
   }
 
-  const coverage = manifestSource.coverage[domain];
   return {
     nextOrdinal,
     prefixSha256,
     previous: prior,
     complete: page.complete,
     projectIdentitySha256,
-    projectDependencies,
   };
 }
 
@@ -908,6 +926,7 @@ async function scanDomain(
   source: PortableRecordSource,
   description: PortableSourceDescription,
   domain: PortableDomain,
+  expectedProjectIdentitySha256: string | null,
 ): Promise<ScannedDomain> {
   const coverage = description.coverage[domain];
   let prefixSha256 = initialDomainPrefix(PORTABLE_RECORD_SCHEMA_SHA256, domain);
@@ -915,15 +934,12 @@ async function scanDomain(
     return {
       manifest: deepFreeze({ domain, domainVersion: 1, coverage, recordCount: 0, prefixSha256 }),
       projectIdentitySha256: null,
-      projectDependencies: deepFreeze([]),
     };
   }
 
   let nextOrdinal = 0;
   let previous: PortableRecord | null = null;
   let projectIdentitySha256: string | null = null;
-  const projectDependencies: string[] = [];
-  const identities = new Set<string>();
   while (true) {
     const page = await readSourcePage(source, {
       domain,
@@ -933,13 +949,12 @@ async function scanDomain(
       maxBytes: PORTABLE_LIMITS.maxBatchBytes as 150994944,
     });
     const scanned = scanSourcePage(
-      description,
       domain,
       page,
       nextOrdinal,
       prefixSha256,
       previous,
-      identities,
+      expectedProjectIdentitySha256,
     );
     nextOrdinal = scanned.nextOrdinal;
     prefixSha256 = scanned.prefixSha256;
@@ -948,7 +963,6 @@ async function scanDomain(
       if (projectIdentitySha256 !== null) invalidSource();
       projectIdentitySha256 = scanned.projectIdentitySha256;
     }
-    projectDependencies.push(...scanned.projectDependencies);
     if (scanned.complete) break;
   }
   return {
@@ -960,7 +974,6 @@ async function scanDomain(
       prefixSha256,
     }),
     projectIdentitySha256,
-    projectDependencies: deepFreeze(projectDependencies),
   };
 }
 
@@ -969,14 +982,13 @@ async function buildManifest(
   description: PortableSourceDescription,
 ): Promise<PortableManifest> {
   const scanned: ScannedDomain[] = [];
+  let projectIdentitySha256: string | null = null;
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
-    scanned.push(await scanDomain(source, description, domain));
-  }
-  const project = scanned.find((entry) => entry.manifest.domain === "project");
-  if (project?.manifest.recordCount !== 1 || project.projectIdentitySha256 === null) invalidSource();
-  for (const entry of scanned) {
-    if (entry.projectDependencies.some((identity) => identity !== project.projectIdentitySha256)) {
-      invalidSource();
+    const entry = await scanDomain(source, description, domain, projectIdentitySha256);
+    scanned.push(entry);
+    if (domain === "project") {
+      if (entry.manifest.recordCount !== 1 || entry.projectIdentitySha256 === null) invalidSource();
+      projectIdentitySha256 = entry.projectIdentitySha256;
     }
   }
   const domains = deepFreeze(scanned.map((entry) => entry.manifest));
@@ -1000,7 +1012,6 @@ export async function createPortableRecordStream(
   try {
     const description = sourceDescription(source);
     manifest = await buildManifest(source, description);
-    checkAbort(undefined);
     const currentDescription = sourceDescription(source);
     if (!sameCanonical(description, currentDescription)) sourceFailure("source-changed");
     await authenticateSource(source, sourceVerificationInput(manifest));
@@ -1030,7 +1041,6 @@ export async function createPortableRecordStream(
     },
 
     readBatch(input: PortableReadBatchInput): Promise<PortableBatch> {
-      checkAbort(input.signal);
       return enqueue(async () => {
         checkAbort(input.signal);
         const prior = input.after === undefined

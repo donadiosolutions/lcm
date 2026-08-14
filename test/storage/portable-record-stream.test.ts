@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
+import * as portableRecordStream from "../../src/storage/portable-record-stream.js";
 import {
   PORTABLE_LIMITS,
   PORTABLE_RECORD_DOMAIN_ORDER,
@@ -8,12 +9,12 @@ import {
   canonicalJson,
   createPortableRecord,
   serializePortableRecord,
-} from "../../src/storage/portable-record.js";
+} from "../../src/storage/portable-record-stream.js";
 import type {
   PortableDomain,
   PortableProjectIdentity,
   PortableRecord,
-} from "../../src/storage/portable-record.js";
+} from "../../src/storage/portable-record-stream.js";
 import {
   createPortableBatch,
   createPortableManifest,
@@ -26,6 +27,7 @@ import {
   verifyPortableCheckpoint,
 } from "../../src/storage/portable-record-stream.js";
 import type {
+  CreatePortableBatchInput,
   PortableBatch,
   PortableCheckpoint,
   PortableCoverageEvidence,
@@ -33,18 +35,23 @@ import type {
   PortableManifest,
   PortableReadBatchInput,
   PortableRecordSource,
+  PortableRecordStream,
   PortableSourceDescription,
   PortableSourcePage,
   PortableSourcePageInput,
   PortableSourceVerificationInput,
   PortableVerification,
 } from "../../src/storage/portable-record-stream.js";
+import type {
+  PortableRecordInput,
+  PortableStreamErrorCode,
+} from "../../src/storage/portable-record-stream.js";
 
 const MACHINE_IDENTITY = "machine-616";
 const PROJECT_ID = "a".repeat(64);
 const HASH = "b".repeat(64);
 const TIMESTAMP = "2026-08-13T12:34:56.123456Z";
-const CAPTURED_AT = "2026-08-13T12:34:56.789Z";
+const CAPTURED_AT = "2026-08-13T12:34:56.789000Z";
 const SESSION_ID = "session-616";
 const TITLE = "Portable stream conversation";
 const PROJECT_IDENTITY: PortableProjectIdentity = Object.freeze({
@@ -630,6 +637,31 @@ function withCheckpointChecksum(
 }
 
 describe("portable record stream public seam", () => {
+  it("re-exports the Task 1 consumer seam from the stream module", () => {
+    const recordInput: PortableRecordInput<"machines"> = {
+      domain: "machines",
+      ordinal: 0,
+      value: { identityKey: "stream-only-import", machineId: null },
+      context: null,
+    };
+    const errorCode: PortableStreamErrorCode = "aborted";
+    const record = portableRecordStream.createPortableRecord(recordInput);
+    const manifest = makeManifest();
+    const batchInput: CreatePortableBatchInput = {
+      manifest,
+      domain: "machines",
+      page: { predecessor: null, records: [records.machines[0]], complete: true },
+      maxRecords: PORTABLE_LIMITS.maxBatchRecords,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    };
+
+    expect(portableRecordStream.parsePortableRecord(
+      portableRecordStream.serializePortableRecord(record),
+    )).toEqual(record);
+    expect(portableRecordStream.canonicalJson({ errorCode })).toBe('{"errorCode":"aborted"}');
+    expect(createPortableBatch(batchInput).records).toEqual([records.machines[0]]);
+  });
+
   it("freezes the exact 22-domain inventory and fixed limits", () => {
     expect(PORTABLE_RECORD_DOMAIN_ORDER).toHaveLength(22);
     expect(PORTABLE_LIMITS).toEqual({
@@ -672,6 +704,25 @@ describe("portable record stream public seam", () => {
     delete withoutChecksum.manifestSha256;
     expect(manifest.manifestSha256).toBe(referenceSha256(withoutChecksum));
     expectDeepFrozen(manifest);
+  });
+
+  it("requires one canonical six-digit UTC capturedAt dialect", () => {
+    const canonical = makeSourceDescription({ capturedAt: "2026-08-13T12:34:56.789000Z" });
+    expect(() => createPortableManifest(makeManifestInput(canonical) as never)).not.toThrow();
+    expectCode(
+      () => createPortableManifest(makeManifestInput(makeSourceDescription({ capturedAt: null as never })) as never),
+      "malformed-manifest",
+    );
+    for (const capturedAt of [
+      "2026-08-13T12:34:56.789Z",
+      "2026-08-13T12:34:56.789000+00:00",
+      "2026-02-30T12:34:56.789000Z",
+    ]) {
+      expectCode(
+        () => createPortableManifest(makeManifestInput(makeSourceDescription({ capturedAt })) as never),
+        "malformed-manifest",
+      );
+    }
   });
 
   it("serializes and parses a manifest with canonical bytes, exact hashes, and immutable output", () => {
@@ -832,7 +883,7 @@ describe("portable record stream public seam", () => {
   });
 
   it("rejects duplicate projects and binds every opaque project dependency to the one project identity", async () => {
-    const duplicateProject = makeRecord("project", { identity: { scope: "local", projectId: "c".repeat(64) } });
+    const duplicateProject = makeRecord("project", { identity: { scope: "local", projectId: "c".repeat(64) } }, 1);
     const sourceRecords = { ...records, project: [records.project[0], duplicateProject] };
     await expectAsyncCode(() => createPortableRecordStream(new FakePortableSource(sourceRecords)), "source-invalid");
 
@@ -853,6 +904,75 @@ describe("portable record stream public seam", () => {
     expect(source.pageCalls.at(-1)).toMatchObject({ domain: "messages", maxRecords: 500, maxBytes: 144 * 1024 * 1024 });
     expect(source.verifyCalls.some((input) => input.manifestSha256 === manifest.manifestSha256)).toBe(true);
     expect(source.verifyCalls.every((input) => input.sourceWitnessSha256 === manifest.source.sourceWitnessSha256)).toBe(true);
+    await stream.close();
+  });
+
+  it("does not retain identity state beyond one bounded source page during the manifest pre-pass", async () => {
+    const machineRecords = Array.from({ length: PORTABLE_LIMITS.maxBatchRecords + 1 }, (_, ordinal) => makeRecord(
+      "machines",
+      { identityKey: `machine-${String(ordinal).padStart(4, "0")}`, machineId: null },
+      ordinal,
+      null,
+    ));
+    const source = new FakePortableSource({ ...records, machines: machineRecords });
+    const NativeSet = globalThis.Set;
+    class PageBoundedSet<T> extends NativeSet<T> {
+      private identityCount = 0;
+
+      override add(value: T): this {
+        if (typeof value === "string" && /^[0-9a-f]{64}$/.test(value)) {
+          this.identityCount += 1;
+          if (this.identityCount > PORTABLE_LIMITS.maxBatchRecords) {
+            throw new Error("manifest pre-pass retained identities across pages");
+          }
+        }
+        return super.add(value);
+      }
+    }
+
+    let stream: PortableRecordStream | undefined;
+    globalThis.Set = PageBoundedSet as SetConstructor;
+    try {
+      stream = await createPortableRecordStream(source);
+    } finally {
+      globalThis.Set = NativeSet;
+    }
+    if (stream === undefined) throw new Error("stream was not created");
+    expect(source.pageCalls.filter((call) => call.domain === "machines")).toHaveLength(2);
+    await stream.close();
+  });
+
+  it.each([
+    {
+      name: "duplicate identity",
+      first: makeRecord("messages", representativeValues.messages, 0, { conversationOrder }),
+      second: makeRecord("messages", representativeValues.messages, 1, { conversationOrder }),
+    },
+    {
+      name: "order regression",
+      first: makeRecord("messages", { ...representativeValues.messages, seq: 1 }, 0, { conversationOrder }),
+      second: makeRecord("messages", representativeValues.messages, 1, { conversationOrder }),
+    },
+  ])("rejects a $name crossing a manifest page boundary", async ({ first, second }) => {
+    const source = new FakePortableSource();
+    source.pageFactory = (input) => {
+      if (input.domain !== "messages") {
+        return { predecessor: null, records: source.recordsByDomain[input.domain], complete: true };
+      }
+      return input.afterOrdinal === 0
+        ? { predecessor: null, records: [first], complete: false }
+        : { predecessor: first, records: [second], complete: true };
+    };
+    await expectAsyncCode(() => createPortableRecordStream(source), "source-invalid");
+  });
+
+  it("accepts an available domain with an authenticated empty page", async () => {
+    const source = new FakePortableSource({ ...records, machines: [] });
+    const stream = await createPortableRecordStream(source);
+    const machines = stream.describe().domains[0];
+    expect(machines).toMatchObject({ domain: "machines", recordCount: 0 });
+    expect(machines.coverage.state).toBe("available");
+    expect(source.pageCalls.filter((call) => call.domain === "machines")).toHaveLength(1);
     await stream.close();
   });
 
@@ -1587,6 +1707,27 @@ describe("portable record stream public seam", () => {
     inFlightAbort.abort();
     release?.();
     await expectAsyncCode(() => read, "aborted");
+    await stream.close();
+  });
+
+  it("returns a rejected Promise instead of throwing synchronously for a pre-aborted read", async () => {
+    const source = new FakePortableSource();
+    const stream = await createPortableRecordStream(source);
+    const controller = new AbortController();
+    controller.abort();
+    let result: Promise<PortableBatch> | undefined;
+
+    expect(() => {
+      result = stream.readBatch({
+        domain: "messages",
+        maxRecords: 1,
+        maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+        signal: controller.signal,
+      });
+    }).not.toThrow();
+    expect(result).toBeInstanceOf(Promise);
+    await expectAsyncCode(() => result as Promise<PortableBatch>, "aborted");
+    expect(source.pageCalls.filter((call) => call.domain === "messages")).toHaveLength(1);
     await stream.close();
   });
 
