@@ -278,11 +278,11 @@ function executor(options: {
         }] as unknown as R[]);
       }
       const expectedObjectCount =
-        (config as { values?: unknown[] }).values?.[10] as number;
+        (config as { values?: unknown[] }).values?.[9] as number;
       const definitionGroupCounts =
-        (config as { values?: unknown[] }).values?.[12] as number[];
+        (config as { values?: unknown[] }).values?.[11] as number[];
       const definitionGroupHashes =
-        (config as { values?: unknown[] }).values?.[13] as string[];
+        (config as { values?: unknown[] }).values?.[12] as string[];
       const actualDefinitionGroupCounts = [...definitionGroupCounts];
       const actualDefinitionGroupHashes = [...definitionGroupHashes];
       if (options.baselineDefinitions === "missing-object") {
@@ -1443,9 +1443,6 @@ describe("PostgreSQL migration runner", () => {
       .toEqual([
         true,
         expect.arrayContaining(["session_ingest_log_identity_lookup_idx"]),
-        expect.arrayContaining([
-          "session_ingest_log|session_ingest_log_enforce_session_id_uniqueness",
-        ]),
         expect.arrayContaining(["session_ingest_log|session_ingest_log_pkey"]),
         expect.arrayContaining(["session_ingest_log|session_id_sha256"]),
         expect.arrayContaining(["projects|identity_key", "recall_surfacing|surfaced_at"]),

@@ -422,6 +422,46 @@ describe("PostgreSQL migrations and database isolation", () => {
     );
   });
 
+  it("rejects unexpected non-internal triggers on managed tables", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unexpected-trigger",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        await database.migrator.query({
+          text: `CREATE TRIGGER unexpected_schema_fingerprint_trigger
+                 BEFORE INSERT ON lcm.session_ingest_log
+                 FOR EACH ROW
+                 EXECUTE FUNCTION lcm.enforce_session_ingest_id_uniqueness()`,
+        }, { domain: "factory", operation: "injectUnexpectedManagedTrigger" });
+        try {
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: `DROP TRIGGER unexpected_schema_fingerprint_trigger
+                   ON lcm.session_ingest_log`,
+          }, { domain: "factory", operation: "removeUnexpectedManagedTrigger" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
   it("keeps the restricted runtime unable to mutate the ledger, create, or migrate", async () => {
     await withPostgreSqlTestDatabase(
       "readiness-runtime-denials",
