@@ -134,9 +134,16 @@ const expectedComponents = [
       "^src/storage/contracts\\.ts$",
       "^src/storage/errors\\.ts$",
       "^src/storage/factory\\.ts$",
+      "^src/storage/home-lock-topology\\.ts$",
       "^src/storage/identity-context\\.ts$",
       "^src/storage/index\\.ts$",
+      "^src/storage/postgresql/project-storage\\.ts$",
     ],
+  },
+  {
+    component_id: "unit-migration-cutover",
+    name: "Unit - Migration and Cutover",
+    paths: ["src/migration/"],
   },
   {
     component_id: "unit-local-event-storage",
@@ -225,8 +232,10 @@ const expectedComponents = [
       "^src/storage/postgresql/client-config\\.ts$",
       "^src/storage/postgresql/contracts\\.ts$",
       "^src/storage/postgresql/errors\\.ts$",
+      "^src/storage/postgresql/factory\\.ts$",
       "^src/storage/postgresql/index\\.ts$",
       "^src/storage/postgresql/runtime\\.ts$",
+      "^src/storage/postgresql\\.ts$",
     ],
   },
   {
@@ -236,6 +245,7 @@ const expectedComponents = [
       "^src/storage/postgresql/extensions\\.ts$",
       "^src/storage/postgresql/migrations\\.ts$",
       "^src/storage/postgresql/provisioning\\.ts$",
+      "^src/storage/postgresql/runtime-readiness\\.ts$",
     ],
   },
   {
@@ -404,7 +414,7 @@ function forbiddenKeysIn(value: unknown, location = "config"): string[] {
 }
 
 describe("Codecov configuration", () => {
-  test("matches the literal 29-component ownership contract", () => {
+  test("matches the literal 30-component ownership contract", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -426,7 +436,7 @@ describe("Codecov configuration", () => {
     const componentNames = components.map((component) => component.name);
     const ownershipPaths = components.flatMap((component) => component.paths);
 
-    expect(components).toHaveLength(29);
+    expect(components).toHaveLength(30);
     expect(new Set(componentIds).size).toBe(componentIds.length);
     expect(new Set(componentNames).size).toBe(componentNames.length);
     expect(new Set(ownershipPaths).size).toBe(ownershipPaths.length);
@@ -435,7 +445,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(191);
+    expect(productionFiles).toHaveLength(199);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -465,7 +475,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(191);
+    expect(ownershipCounts.size).toBe(199);
   });
 
   test("does not match non-production TypeScript files", () => {

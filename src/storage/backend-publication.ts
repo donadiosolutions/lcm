@@ -1,16 +1,8 @@
 import { createHash } from "node:crypto";
 import {
   chmodSync,
-  closeSync,
-  constants,
-  fchmodSync,
-  fstatSync,
-  fsyncSync,
   mkdirSync,
-  openSync,
   readdirSync,
-  realpathSync,
-  statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -31,6 +23,13 @@ import {
   isOwnerOnlyFileMode,
 } from "../security-files.js";
 import type { StorageBackendName } from "./contracts.js";
+import {
+  HomeLockTopologyError,
+  assertHomeLockTopology,
+  closeHomeLockTopology,
+  openHomeLockTopology,
+  restoreHomeLockTopologyMode,
+} from "./home-lock-topology.js";
 
 const MAX_JOURNAL_BYTES = 1 * 1024 * 1024;
 const MAX_MATERIAL_BYTES = 8 * 1024 * 1024;
@@ -636,25 +635,6 @@ export function backendPublicationHistoryDirectory(homeDir?: string): string {
   return join(backendPublicationDirectory(homeDir), "history");
 }
 
-type BackendPublicationLockDirectoryStat = Readonly<{
-  mode: bigint;
-  uid: bigint;
-  dev: bigint;
-  ino: bigint;
-}>;
-
-type BackendPublicationLockParent = Readonly<{
-  homePath: string;
-  parentPath: string;
-  homeFd: number;
-  parentFd: number;
-  homeMode: number;
-  homeDev: bigint;
-  homeIno: bigint;
-  parentDev: bigint;
-  parentIno: bigint;
-}>;
-
 function backendPublicationLockPath(homeDir?: string): string {
   // Keep the admission lock one level above the optional .lcm root so
   // first-boot consumers can acquire the same admission point without
@@ -662,125 +642,39 @@ function backendPublicationLockPath(homeDir?: string): string {
   return join(resolve(homeDir ?? homedir()), ".lcm.backend-publication.lock");
 }
 
-function backendPublicationLockDirectoryStat(fd: number): BackendPublicationLockDirectoryStat {
-  return fstatSync(fd, { bigint: true }) as unknown as BackendPublicationLockDirectoryStat;
-}
-
-function assertBackendPublicationLockDirectory(
-  stat: BackendPublicationLockDirectoryStat,
-  path: string,
-  label: string,
-): void {
-  const requested = resolve(path);
-  const canonical = resolve(realpathSync(path));
-  if (canonical !== requested) return fail("unsafe-storage", `${label} path is not canonical`);
-  const pathStat = statSync(canonical, { bigint: true }) as unknown as BackendPublicationLockDirectoryStat;
-  if (pathStat.dev !== stat.dev || pathStat.ino !== stat.ino) {
-    return fail("unsafe-storage", `${label} changed during validation`);
-  }
-}
-
-function assertBackendPublicationLockParentSecurity(
-  parent: BackendPublicationLockDirectoryStat,
-  home: BackendPublicationLockDirectoryStat,
-): void {
-  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  const parentUid = Number(parent.uid);
-  const homeUid = Number(home.uid);
-  const parentMode = Number(parent.mode & 0o7777n);
-  const homeMode = Number(home.mode & 0o7777n);
-  if (
-    (uid !== undefined && homeUid !== uid)
-    || (uid !== undefined && parentUid !== uid && parentUid !== 0)
-    || ((homeMode & 0o022) !== 0 && (parentMode & 0o077) !== 0)
-    || ((parentMode & 0o022) !== 0 && !(parentUid === 0 && (parentMode & 0o1000) !== 0))
-  ) {
-    return fail("unsafe-storage", "backend publication lock parent is not trusted");
-  }
-}
-
-function assertBackendPublicationLockParent(topology: BackendPublicationLockParent): void {
-  const parent = backendPublicationLockDirectoryStat(topology.parentFd);
-  const home = backendPublicationLockDirectoryStat(topology.homeFd);
-  assertBackendPublicationLockDirectory(parent, topology.parentPath, "backend publication lock grandparent");
-  assertBackendPublicationLockDirectory(home, topology.homePath, "backend publication lock parent");
-  assertBackendPublicationLockParentSecurity(parent, home);
-}
-
-function openBackendPublicationLockParent(homeDir?: string): BackendPublicationLockParent {
-  const homePath = resolve(homeDir ?? homedir());
-  const parentPath = dirname(homePath);
-  const flags = constants.O_RDONLY
-    | constants.O_DIRECTORY
-    | constants.O_NOFOLLOW
-    | constants.O_NONBLOCK;
-  let homeFd: number | undefined;
-  const openedParentFd = openSync(parentPath, flags);
+function withUnsafeStorageMapping<T>(callback: () => T): T {
   try {
-    homeFd = openSync(homePath, flags);
-    const parent = backendPublicationLockDirectoryStat(openedParentFd);
-    const home = backendPublicationLockDirectoryStat(homeFd);
-    assertBackendPublicationLockDirectory(parent, parentPath, "backend publication lock grandparent");
-    assertBackendPublicationLockDirectory(home, homePath, "backend publication lock parent");
-    assertBackendPublicationLockParentSecurity(parent, home);
-    return {
-      homePath,
-      parentPath,
-      homeFd,
-      parentFd: openedParentFd,
-      homeMode: Number(home.mode & 0o7777n),
-      homeDev: home.dev,
-      homeIno: home.ino,
-      parentDev: parent.dev,
-      parentIno: parent.ino,
-    };
+    return callback();
   } catch (error) {
-    if (homeFd !== undefined) closeSync(homeFd);
-    closeSync(openedParentFd);
+    if (error instanceof HomeLockTopologyError) {
+      return fail("unsafe-storage", error.message.replace(/^HOME/u, "backend publication"));
+    }
     throw error;
   }
-}
-
-function restoreBackendPublicationLockParentMode(topology: BackendPublicationLockParent): void {
-  if (topology.homeMode === 0o700) return;
-  const home = backendPublicationLockDirectoryStat(topology.homeFd);
-  if (
-    home.dev === topology.homeDev
-    && home.ino === topology.homeIno
-    && Number(home.mode & 0o7777n) === 0o700
-  ) {
-    fchmodSync(topology.homeFd, topology.homeMode);
-    fsyncSync(topology.homeFd);
-  }
-}
-
-function closeBackendPublicationLockParent(topology: BackendPublicationLockParent): void {
-  closeSync(topology.homeFd);
-  closeSync(topology.parentFd);
 }
 
 function withBackendPublicationLock<T>(
   homeDir: string | undefined,
   callback: () => T,
 ): T {
-  const topology = openBackendPublicationLockParent(homeDir);
+  const topology = withUnsafeStorageMapping(() => openHomeLockTopology(homeDir));
   try {
     return withPrivateMutationLock(
       backendPublicationLockPath(homeDir),
       "backend publication",
       () => {
-        assertBackendPublicationLockParent(topology);
-        restoreBackendPublicationLockParentMode(topology);
+        withUnsafeStorageMapping(() => assertHomeLockTopology(topology));
+        withUnsafeStorageMapping(() => restoreHomeLockTopologyMode(topology));
         const result = callback();
-        assertBackendPublicationLockParent(topology);
+        withUnsafeStorageMapping(() => assertHomeLockTopology(topology));
         return result;
       },
     );
   } finally {
     try {
-      restoreBackendPublicationLockParentMode(topology);
+      withUnsafeStorageMapping(() => restoreHomeLockTopologyMode(topology));
     } finally {
-      closeBackendPublicationLockParent(topology);
+      withUnsafeStorageMapping(() => closeHomeLockTopology(topology));
     }
   }
 }
@@ -789,24 +683,24 @@ async function withBackendPublicationLockAsync<T>(
   homeDir: string | undefined,
   callback: () => Promise<T>,
 ): Promise<T> {
-  const topology = openBackendPublicationLockParent(homeDir);
+  const topology = withUnsafeStorageMapping(() => openHomeLockTopology(homeDir));
   try {
     return await withPrivateMutationLockAsync(
       backendPublicationLockPath(homeDir),
       "backend publication",
       async () => {
-        assertBackendPublicationLockParent(topology);
-        restoreBackendPublicationLockParentMode(topology);
+        withUnsafeStorageMapping(() => assertHomeLockTopology(topology));
+        withUnsafeStorageMapping(() => restoreHomeLockTopologyMode(topology));
         const result = await callback();
-        assertBackendPublicationLockParent(topology);
+        withUnsafeStorageMapping(() => assertHomeLockTopology(topology));
         return result;
       },
     );
   } finally {
     try {
-      restoreBackendPublicationLockParentMode(topology);
+      withUnsafeStorageMapping(() => restoreHomeLockTopologyMode(topology));
     } finally {
-      closeBackendPublicationLockParent(topology);
+      withUnsafeStorageMapping(() => closeHomeLockTopology(topology));
     }
   }
 }

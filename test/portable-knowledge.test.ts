@@ -135,6 +135,7 @@ function configurePostgreSqlBackend(): void {
   writeFileSync(join(home, "config.json"), JSON.stringify({ storage: { backend: "postgresql" } }), { mode: 0o600 });
   vi.stubEnv("LCM_POSTGRES_URL", "postgresql://user:password@db.example.com/lcm");
   vi.stubEnv("LCM_POSTGRES_CA_FILE", caPath);
+  vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE", "lcm_test_migrator");
 }
 
 it("fails closed before portable export or import can access SQLite under PostgreSQL", async () => {

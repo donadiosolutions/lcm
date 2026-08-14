@@ -19,6 +19,7 @@ import {
   cleanupManagedCredentialDirectory,
   createManagedCredentialDirectory,
   managedCredentialPath,
+  MANAGED_CREDENTIAL_NAMES,
   validateManagedCredentialDirectory,
   writeManagedCredentialFiles,
 } from "../../src/daemon/managed-credentials.js";
@@ -254,6 +255,118 @@ describe("canonical supervisor identity", () => {
     expect(() => canonicalSupervisorScope("relative")).toThrow("absolute");
     expect(() => canonicalSupervisorScope(root, () => "relative")).toThrow("canonical");
     expect(() => canonicalSupervisorScope(join(root, "missing"))).toThrow("unavailable");
+  });
+
+  it("carries a valid PostgreSQL migration role through managed launches without credential treatment", async () => {
+    const migrationRole = "\tlcm_migration\t";
+    const normalizedMigrationRole = "lcm_migration";
+    expect(MANAGED_LAUNCH_ENV_ALLOWLIST).toContain("LCM_POSTGRES_MIGRATION_ROLE");
+    expect(MANAGED_CREDENTIAL_NAMES).not.toContain("LCM_POSTGRES_MIGRATION_ROLE");
+    expect(managedLaunchEnvironment({ LCM_POSTGRES_MIGRATION_ROLE: "r" })).toEqual({
+      LCM_POSTGRES_MIGRATION_ROLE: "r",
+    });
+    expect(managedLaunchEnvironment({ LCM_POSTGRES_MIGRATION_ROLE: " lcm_migration " })).toEqual({
+      LCM_POSTGRES_MIGRATION_ROLE: "lcm_migration",
+    });
+    expect(managedLaunchEnvironment({ LCM_POSTGRES_MIGRATION_ROLE: migrationRole })).toEqual({
+      LCM_POSTGRES_MIGRATION_ROLE: normalizedMigrationRole,
+    });
+
+    for (const kind of ["systemd-user", "launchd-user"] as const) {
+      const root = makeRoot();
+      const environment = { PATH: "/usr/bin", LCM_POSTGRES_MIGRATION_ROLE: migrationRole };
+      const launchedEnvironment = { PATH: "/usr/bin", LCM_POSTGRES_MIGRATION_ROLE: normalizedMigrationRole };
+      const spec = makeSpec(kind, root);
+      expect(spec).not.toHaveProperty("postgresMigrationRole");
+      const runner = fakeRunner(kind === "systemd-user"
+        ? [
+          { code: 1, stderr: "Unit is not-found" },
+          { code: 0, stdout: "started" },
+          { code: 0, stdout: managerText(spec, "active", 444, "running", launchedEnvironment) },
+        ]
+        : [
+          { code: 113, stderr: "Could not find service" },
+          { code: 0, stdout: "bootstrap" },
+          { code: 0, stdout: launchdPrintText(spec, "running", 444, launchedEnvironment) },
+        ]);
+      await expect(createSupervisor(kind, {
+        run: runner.run,
+        environment,
+        platform: kind === "systemd-user" ? "linux" : "darwin",
+        uid: 501,
+      }).start(spec)).resolves.toMatchObject({ managerPid: 444 });
+
+      if (kind === "systemd-user") {
+        const startArgs = runner.calls[1]!.args;
+        expect(startArgs).toContain(`LCM_POSTGRES_MIGRATION_ROLE=${normalizedMigrationRole}`);
+        expect(startArgs).not.toContain(`LCM_POSTGRES_MIGRATION_ROLE=${migrationRole}`);
+        expect(startArgs).not.toContain(`--setenv=LCM_POSTGRES_MIGRATION_ROLE=${migrationRole}`);
+        expect(startArgs.join(" ")).not.toContain("LoadCredential=LCM_POSTGRES_MIGRATION_ROLE");
+      } else {
+        const plist = readFileSync(join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`), "utf8");
+        expect(plist).toContain(`<string>LCM_POSTGRES_MIGRATION_ROLE=${normalizedMigrationRole}</string>`);
+        expect(plist).not.toContain(`<string>LCM_POSTGRES_MIGRATION_ROLE=${migrationRole}</string>`);
+        expect(plist).not.toContain("<key>LCM_POSTGRES_MIGRATION_ROLE</key>");
+        expect(plist).not.toContain("LCM_CREDENTIAL_LCM_POSTGRES_MIGRATION_ROLE");
+      }
+    }
+  });
+
+  it.each([
+    ["empty", ""],
+    ["blank after trim", "   "],
+    ["control", "role\u0001value"],
+    ["newline", "role\nvalue"],
+    ["NUL", "role\u0000value"],
+    ["too long", "r".repeat(64)],
+    ["too many UTF-8 bytes", "é".repeat(32)],
+  ] as const)("filters %s PostgreSQL migration roles from managed launches", (_label, migrationRole) => {
+    expect(managedLaunchEnvironment({ LCM_POSTGRES_MIGRATION_ROLE: migrationRole })).toEqual({});
+  });
+
+  it("rejects an overlong PostgreSQL migration role reported by systemd", async () => {
+    const root = makeRoot();
+    const migrationRole = "migration_role";
+    const environment = { PATH: "/usr/bin", LCM_POSTGRES_MIGRATION_ROLE: migrationRole };
+    const spec = makeSpec("systemd-user", root);
+    const output = managerText(spec, "active", 444, "running", environment)
+      .replace("Environment=", `Environment=LCM_POSTGRES_MIGRATION_ROLE=${"r".repeat(64)} `);
+    const runner = fakeRunner([{ code: 0, stdout: output }]);
+
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      environment,
+      platform: "linux",
+      uid: 501,
+    }).probe(spec)).resolves.toMatchObject({
+      kind: "registered-invalid-collision",
+      reason: "foreign-job",
+    });
+  });
+
+  it.each([
+    ["missing", { PATH: "/usr/bin" }],
+    ["different", { PATH: "/usr/bin", LCM_POSTGRES_MIGRATION_ROLE: "other_role" }],
+  ] as const)("rejects %s PostgreSQL migration role during manager digest reconciliation", async (_label, observedEnvironment) => {
+    const migrationRole = "migration_role";
+    for (const kind of ["systemd-user", "launchd-user"] as const) {
+      const root = makeRoot();
+      const environment = { PATH: "/usr/bin", LCM_POSTGRES_MIGRATION_ROLE: migrationRole };
+      const spec = makeSpec(kind, root);
+      const output = kind === "systemd-user"
+        ? managerText(spec, "active", 444, "running", observedEnvironment)
+        : launchdPrintText(spec, "running", 444, observedEnvironment);
+      const runner = fakeRunner([{ code: 0, stdout: output }]);
+      await expect(createSupervisor(kind, {
+        run: runner.run,
+        environment,
+        platform: kind === "systemd-user" ? "linux" : "darwin",
+        uid: 501,
+      }).probe(spec)).resolves.toMatchObject({
+        kind: "registered-stale-config",
+        reason: "metadata-mismatch",
+      });
+    }
   });
 
   it("does not derive identity from a mutable port and validates specifications", () => {

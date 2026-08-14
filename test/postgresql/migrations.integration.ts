@@ -1,14 +1,29 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { Client, type DatabaseError } from "pg";
+import {
+  Client,
+  type DatabaseError,
+  type QueryConfig,
+  type QueryResult,
+  type QueryResultRow,
+} from "pg";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   loadPostgreSqlMigrations,
   loadPostgreSqlSchemaSnapshots,
+  PostgreSqlBaselineDefinitionPreflightError,
   runPostgreSqlMigrations,
 } from "../../src/storage/postgresql/migrations.js";
-import type { PostgreSqlMigration } from "../../src/storage/postgresql/contracts.js";
+import type {
+  PostgreSqlMigration,
+  PostgreSqlQueryExecutor,
+  PostgreSqlQueryOptions,
+} from "../../src/storage/postgresql/contracts.js";
+import {
+  POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST,
+  verifyPostgreSqlRuntimeSchema,
+} from "../../src/storage/postgresql/runtime-readiness.js";
 import {
   PostgreSqlRuntime,
   POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
@@ -39,6 +54,189 @@ CREATE TABLE IF NOT EXISTS lcm.schema_migrations (
   checksum_sha256 text NOT NULL CHECK (checksum_sha256 ~ '^[0-9a-f]{64}$'),
   applied_at timestamptz NOT NULL DEFAULT statement_timestamp()
 );`;
+
+const REQUIRED_RUNTIME_GRANT_SCRIPTS = [
+  "postgresql-runtime-readiness-grants.sql",
+  "postgresql-runtime-identity-grants.sql",
+  "postgresql-runtime-conversation-grants.sql",
+  "postgresql-runtime-summary-context-grants.sql",
+  "postgresql-runtime-memory-grants.sql",
+  "postgresql-runtime-search-grants.sql",
+  "postgresql-runtime-coordination-grants.sql",
+] as const;
+
+const OPTIONAL_RUNTIME_GRANT_SCRIPT = "postgresql-runtime-transcript-grants.sql";
+
+async function applyRuntimeGrantScripts(
+  database: PostgreSqlTestDatabase,
+  options: {
+    readonly includeTranscript?: boolean;
+    readonly omit?: readonly string[];
+  } = {},
+): Promise<void> {
+  const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+  const scripts = options.includeTranscript === true
+    ? [...REQUIRED_RUNTIME_GRANT_SCRIPTS, OPTIONAL_RUNTIME_GRANT_SCRIPT]
+    : REQUIRED_RUNTIME_GRANT_SCRIPTS;
+  try {
+    for (const script of scripts) {
+      if (options.omit?.includes(script)) continue;
+      const template = readFileSync(
+        join(process.cwd(), "src", "storage", "postgresql", "reference", script),
+        "utf8",
+      );
+      const sql = template
+        .split("\n")
+        .filter((line) => !line.startsWith("\\"))
+        .join("\n")
+        .replaceAll(':"lcm_runtime_role"', '"lcm_test_runtime"');
+      await administrator.query({ text: sql }, {
+        domain: "factory",
+        operation: `applyRuntimeGrantScript:${script}`,
+      });
+    }
+  } finally {
+    await administrator.close();
+  }
+}
+
+async function readCurrentDatabaseOwner(administrator: PostgreSqlRuntime): Promise<string> {
+  const result = await administrator.query<{ database_owner: string }>({
+    text: `SELECT pg_catalog.pg_get_userbyid(database.datdba)::text AS database_owner
+           FROM pg_catalog.pg_database AS database
+           WHERE database.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()`,
+  }, { domain: "factory", operation: "readCurrentDatabaseOwner" });
+  const owner = result.rows.length === 1 ? result.rows[0]?.database_owner : undefined;
+  if (typeof owner !== "string") throw new Error("PostgreSQL database owner readback failed");
+  return owner;
+}
+
+interface IndexCatalogState extends QueryResultRow {
+  readonly object_name: string;
+  readonly definition: string;
+  readonly indisvalid: boolean;
+  readonly indisready: boolean;
+  readonly indislive: boolean;
+}
+
+interface ManagedIndexInventoryState extends QueryResultRow {
+  readonly index_count: number;
+  readonly index_sha256: string;
+  readonly invalid_index_count: number;
+}
+
+async function waitForInvalidReadyLiveIndex(
+  observer: PostgreSqlRuntime,
+  indexName: string,
+): Promise<IndexCatalogState> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const row = await readIndexCatalogState(
+      observer,
+      indexName,
+      "waitForInvalidReadyLiveIndex",
+    );
+    if (
+      row?.indisvalid === false
+      && row.indisready === true
+      && row.indislive === true
+    ) {
+      return row;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timed out waiting for invalid ready live PostgreSQL index");
+}
+
+async function readIndexCatalogState(
+  observer: PostgreSqlRuntime,
+  indexName: string,
+  operation: string,
+): Promise<IndexCatalogState | null> {
+  const state = await observer.query<IndexCatalogState>({
+    text: `SELECT index_relation.relname AS object_name,
+                    pg_catalog.pg_get_indexdef(index_relation.oid) AS definition,
+                    index_metadata.indisvalid,
+                    index_metadata.indisready,
+                    index_metadata.indislive
+             FROM pg_catalog.pg_index AS index_metadata
+             JOIN pg_catalog.pg_class AS index_relation
+               ON index_relation.oid OPERATOR(pg_catalog.=) index_metadata.indexrelid
+             JOIN pg_catalog.pg_namespace AS namespace
+               ON namespace.oid OPERATOR(pg_catalog.=) index_relation.relnamespace
+             WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+               AND index_relation.relname OPERATOR(pg_catalog.=) $1`,
+      values: [indexName],
+  }, { domain: "factory", operation });
+  if (state.rows.length === 0) return null;
+  const row = state.rows[0];
+  if (
+    state.rows.length !== 1
+    || row === undefined
+    || row.object_name !== indexName
+    || typeof row.definition !== "string"
+    || typeof row.indisvalid !== "boolean"
+    || typeof row.indisready !== "boolean"
+    || typeof row.indislive !== "boolean"
+  ) {
+    throw new Error("invalid PostgreSQL index catalog fixture state");
+  }
+  return row;
+}
+
+async function readManagedIndexInventory(
+  observer: PostgreSqlRuntime,
+  managedTableNames: readonly string[],
+  operation: string,
+): Promise<ManagedIndexInventoryState> {
+  const result = await observer.query<ManagedIndexInventoryState>({
+    text: `WITH actual_indexes AS (
+             SELECT index_relation.relname AS object_name,
+                    pg_catalog.pg_get_indexdef(index_relation.oid) AS definition,
+                    index_metadata.indisvalid AS is_valid
+             FROM pg_catalog.pg_class AS index_relation
+             JOIN pg_catalog.pg_index AS index_metadata
+               ON index_metadata.indexrelid OPERATOR(pg_catalog.=) index_relation.oid
+             JOIN pg_catalog.pg_namespace AS index_namespace
+               ON index_namespace.oid OPERATOR(pg_catalog.=) index_relation.relnamespace
+             JOIN pg_catalog.pg_class AS relation
+               ON relation.oid OPERATOR(pg_catalog.=) index_metadata.indrelid
+             JOIN pg_catalog.pg_namespace AS relation_namespace
+               ON relation_namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+             WHERE index_namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+               AND relation_namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+               AND relation.relkind OPERATOR(pg_catalog.=) ANY (
+                 ARRAY['r', 'p']::pg_catalog."char"[]
+               )
+               AND index_relation.relkind OPERATOR(pg_catalog.=) 'i'
+               AND index_metadata.indisready
+               AND index_metadata.indislive
+               AND relation.relname OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])
+           )
+           SELECT pg_catalog.count(*)::pg_catalog.int4 AS index_count,
+                  pg_catalog.encode(public.digest(COALESCE(pg_catalog.string_agg(
+                    pg_catalog.concat_ws('|', object_name, definition),
+                    E'\\n' ORDER BY object_name
+                  ), ''), 'sha256'), 'hex') AS index_sha256,
+                  pg_catalog.count(*) FILTER (
+                    WHERE actual_indexes.is_valid IS DISTINCT FROM true
+                  )::pg_catalog.int4 AS invalid_index_count
+           FROM actual_indexes`,
+    values: [managedTableNames],
+  }, { domain: "factory", operation });
+  const row = result.rows[0];
+  if (
+    result.rows.length !== 1
+    || row === undefined
+    || !Number.isSafeInteger(row.index_count)
+    || row.index_count < 0
+    || !/^[0-9a-f]{64}$/u.test(row.index_sha256)
+    || !Number.isSafeInteger(row.invalid_index_count)
+    || row.invalid_index_count < 0
+  ) {
+    throw new Error("invalid managed-index inventory fixture state");
+  }
+  return row;
+}
 
 async function waitForSummaryMigrationRelationLock(
   admin: PostgreSqlRuntime,
@@ -145,6 +343,1024 @@ async function executeRawMigrationExpectingFailure(
 }
 
 describe("PostgreSQL migrations and database isolation", () => {
+  it.each([
+    { label: "without transcript grants", includeTranscript: false },
+    { label: "with transcript grants", includeTranscript: true },
+  ])("verifies PG18 runtime readiness $label", async ({ label, includeTranscript }) => {
+    await withPostgreSqlTestDatabase(
+      `runtime-readiness-${label}`,
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database, { includeTranscript });
+
+        const readiness = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+          expectedOwner: "lcm_test_migrator",
+        });
+        const version = await database.runtime.query<{
+          server_version_num: number;
+          server_encoding: string;
+          timezone: string;
+          role: string;
+          tls: boolean;
+        }>({
+          text: `SELECT
+                   pg_catalog.current_setting('server_version_num')::integer
+                     AS server_version_num,
+                   pg_catalog.current_setting('server_encoding') AS server_encoding,
+                   pg_catalog.current_setting('TimeZone') AS timezone,
+                   CURRENT_USER::text AS role,
+                   COALESCE((
+                     SELECT ssl
+                     FROM pg_catalog.pg_stat_ssl
+                     WHERE pid = pg_catalog.pg_backend_pid()
+                   ), false) AS tls`,
+        }, { domain: "factory", operation: "verifyRuntimeReadinessWitness" });
+        expect(version.rows).toEqual([{
+          server_version_num: expect.any(Number),
+          server_encoding: "UTF8",
+          timezone: "UTC",
+          role: "lcm_test_runtime",
+          tls: true,
+        }]);
+        expect(Math.floor(version.rows[0]!.server_version_num / 10_000)).toBe(18);
+
+        const expectedMigrationIds = loadPostgreSqlMigrations().map(({ id }) => id);
+        expect(readiness).toMatchObject({
+          currentMigrationIds: expectedMigrationIds,
+          expectedOwner: "lcm_test_migrator",
+          runtimeRole: "lcm_test_runtime",
+          managedObjectCount: expect.any(Number),
+          definitionObjectCount: expect.any(Number),
+          privilegeManifestVersion: POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.version,
+        });
+        expect(Object.keys(readiness).sort()).toEqual([
+          "currentMigrationIds",
+          "definitionObjectCount",
+          "expectedOwner",
+          "managedObjectCount",
+          "privilegeManifestVersion",
+          "runtimeRole",
+        ]);
+
+        const ledger = await database.runtime.query<{
+          id: string;
+          checksum_sha256: string;
+        }>({
+          text: `SELECT id, checksum_sha256
+                 FROM lcm.schema_migrations
+                 ORDER BY id`,
+        }, { domain: "factory", operation: "verifyRuntimeMigrationLedger" });
+        expect(ledger.rows).toEqual(loadPostgreSqlMigrations().map((entry) => ({
+          id: entry.id,
+          checksum_sha256: entry.sha256,
+        })));
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it.each([
+    ["runtime role", "lcm_test_runtime"],
+    ["foreign role", "lcm_harness_admin"],
+  ] as const)("rejects readiness when the %s owns the current database", async (_label, owner) => {
+    await withPostgreSqlTestDatabase(
+      `runtime-readiness-database-owner-${owner}`,
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+        try {
+          await expect(readCurrentDatabaseOwner(administrator))
+            .resolves.toBe("lcm_test_migrator");
+          await administrator.query({
+            text: `ALTER DATABASE "${database.name}" OWNER TO ${owner}`,
+          }, { domain: "factory", operation: "mutateCurrentDatabaseOwner" });
+          await expect(readCurrentDatabaseOwner(administrator)).resolves.toBe(owner);
+
+          const failure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          expect(failure).toMatchObject({
+            reason: "runtime-role-policy",
+            operation: "inspectRuntimeRolePolicy",
+          });
+          expect(JSON.stringify(failure)).not.toContain(database.name);
+        } finally {
+          try {
+            await administrator.query({
+              text: `ALTER DATABASE "${database.name}" OWNER TO lcm_test_migrator`,
+            }, { domain: "factory", operation: "restoreCurrentDatabaseOwner" });
+            await expect(readCurrentDatabaseOwner(administrator))
+              .resolves.toBe("lcm_test_migrator");
+          } finally {
+            await administrator.close();
+          }
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("verifies readiness when PUBLIC schema and extension defaults are revoked", async () => {
+    await withPostgreSqlTestDatabase(
+      "runtime-readiness-hardened-public",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+        try {
+          await administrator.query({
+            text: `REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+                   REVOKE EXECUTE ON FUNCTION
+                     public.digest(text, text),
+                     public.digest(bytea, text),
+                     public.similarity(text, text),
+                     public.similarity_op(text, text)
+                     FROM PUBLIC`,
+          }, { domain: "factory", operation: "revokePublicRuntimeDefaults" });
+        } finally {
+          await administrator.close();
+        }
+
+        await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+          expectedOwner: "lcm_test_migrator",
+        })).resolves.toMatchObject({
+          runtimeRole: "lcm_test_runtime",
+        });
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects a detached extension-owned function", async () => {
+    await withPostgreSqlTestDatabase(
+      "runtime-readiness-detached-extension",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+        try {
+          await administrator.query({
+            text: "ALTER EXTENSION pgcrypto DROP FUNCTION public.digest(text, text)",
+          }, { domain: "factory", operation: "detachRuntimeExtensionFunction" });
+        } finally {
+          await administrator.close();
+        }
+
+        await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+          expectedOwner: "lcm_test_migrator",
+        })).rejects.toMatchObject({
+          reason: "extension-preflight",
+          operation: "inspectRequiredExtensionFunctions",
+        });
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it.each(REQUIRED_RUNTIME_GRANT_SCRIPTS)(
+    "rejects readiness when %s is omitted",
+    async (omittedScript) => {
+      await withPostgreSqlTestDatabase(
+        `readiness-omit-${omittedScript}`,
+        async (database) => {
+          await runPostgreSqlMigrations(database.migrator);
+          await applyRuntimeGrantScripts(database, { omit: [omittedScript] });
+
+          await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          })).rejects.toMatchObject({
+            backend: "postgresql",
+            code: "STORAGE_INITIALIZATION_FAILED",
+          });
+        },
+        { runMigrations: false },
+      );
+    },
+  );
+
+  it("rejects an overbroad PUBLIC managed-table grant", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-public-grant",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        await database.migrator.query({
+          text: "GRANT SELECT ON TABLE lcm.projects TO PUBLIC",
+        }, { domain: "factory", operation: "injectReadinessPublicGrant" });
+
+        await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+          expectedOwner: "lcm_test_migrator",
+        })).rejects.toMatchObject({
+          reason: "schema-fingerprint",
+          operation: "inspectSchemaDefinitions",
+        });
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("reports one column ACL object for multiple unsanctioned privileges", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-column-acl-object-count",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        type DefinitionDiagnosticRow = {
+          readonly actual_definition_group_counts: readonly number[];
+          readonly actual_definition_group_hashes: readonly string[];
+          readonly drifted_definition_group_count: number;
+          readonly existing_object_count: number;
+          readonly expected_object_count: number;
+          readonly missing_object_count: number;
+        };
+        let readinessDefinitionRow: DefinitionDiagnosticRow | undefined;
+        const captureReadinessQuery = async <
+          R extends QueryResultRow = QueryResultRow,
+          I extends unknown[] = unknown[],
+        >(
+          config: QueryConfig<I>,
+          options: PostgreSqlQueryOptions,
+        ): Promise<QueryResult<R>> => {
+          const result = await database.runtime.query<R, I>(config, options);
+          if (options.operation === "inspectSchemaDefinitions") {
+            readinessDefinitionRow = result.rows[0] as DefinitionDiagnosticRow | undefined;
+          }
+          return result;
+        };
+        const readinessExecutor: PostgreSqlQueryExecutor = {
+          query: captureReadinessQuery,
+        };
+        try {
+          await database.migrator.query({
+            text: `GRANT SELECT (display_name), UPDATE (display_name)
+                   ON TABLE lcm.projects TO PUBLIC`,
+          }, { domain: "factory", operation: "injectMultipleUnsanctionedColumnPrivileges" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(readinessExecutor, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          const migrationColumnAcl = migrationFailure
+            instanceof PostgreSqlBaselineDefinitionPreflightError
+            ? migrationFailure.actualDefinitionGroups?.find(
+              ({ objectKind }) => objectKind === "column_acl",
+            )
+            : undefined;
+          const latestSnapshot = loadPostgreSqlSchemaSnapshots().at(-1)!;
+          const diagnostic = {
+            readinessFailure,
+            migrationFailure,
+            readinessExpectedObjectCount:
+              readinessDefinitionRow?.expected_object_count,
+            readinessExistingObjectCount:
+              readinessDefinitionRow?.existing_object_count,
+            readinessMissingObjectCount:
+              readinessDefinitionRow?.missing_object_count,
+            readinessDriftedDefinitionGroupCount:
+              readinessDefinitionRow?.drifted_definition_group_count,
+            readinessColumnAclCount:
+              readinessDefinitionRow?.actual_definition_group_counts[4],
+            migrationColumnAclCount: migrationColumnAcl?.objectCount,
+            readinessColumnAclSha256:
+              readinessDefinitionRow?.actual_definition_group_hashes[4],
+            migrationColumnAclSha256: migrationColumnAcl?.definitionSha256,
+          };
+          expect(diagnostic).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              existingObjectCount: 782,
+              expectedObjectCount: 782,
+              missingObjectCount: 0,
+              operation: "preflightBaselineDefinitions",
+            },
+            readinessExpectedObjectCount: 782,
+            readinessExistingObjectCount: 782,
+            readinessMissingObjectCount: 0,
+            readinessDriftedDefinitionGroupCount: 1,
+            readinessColumnAclCount: 225,
+            migrationColumnAclCount: 225,
+            readinessColumnAclSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+            migrationColumnAclSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+          });
+          expect(diagnostic.readinessColumnAclSha256)
+            .toBe(diagnostic.migrationColumnAclSha256);
+          expect(diagnostic.readinessColumnAclSha256)
+            .not.toBe(latestSnapshot.definitionHashes.columnAcl);
+        } finally {
+          await database.migrator.query({
+            text: `REVOKE SELECT (display_name), UPDATE (display_name)
+                   ON TABLE lcm.projects FROM PUBLIC`,
+          }, { domain: "factory", operation: "removeMultipleUnsanctionedColumnPrivileges" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects unexpected non-internal triggers on managed tables", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unexpected-trigger",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        await database.migrator.query({
+          text: `CREATE TRIGGER unexpected_schema_fingerprint_trigger
+                 BEFORE INSERT ON lcm.session_ingest_log
+                 FOR EACH ROW
+                 EXECUTE FUNCTION lcm.enforce_session_ingest_id_uniqueness()`,
+        }, { domain: "factory", operation: "injectUnexpectedManagedTrigger" });
+        try {
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: `DROP TRIGGER unexpected_schema_fingerprint_trigger
+                   ON lcm.session_ingest_log`,
+          }, { domain: "factory", operation: "removeUnexpectedManagedTrigger" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects unexpected constraints on managed tables", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unexpected-constraint",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `ALTER TABLE lcm.session_ingest_log
+                   ADD CONSTRAINT unexpected_schema_fingerprint_constraint
+                   CHECK (char_length(session_id) >= 0)`,
+          }, { domain: "factory", operation: "injectUnexpectedManagedConstraint" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: `ALTER TABLE lcm.session_ingest_log
+                   DROP CONSTRAINT IF EXISTS unexpected_schema_fingerprint_constraint`,
+          }, { domain: "factory", operation: "removeUnexpectedManagedConstraint" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects inbound foreign keys targeting managed tables", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-inbound-foreign-key",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `CREATE TABLE public.operator_reference (
+                     project_id uuid NOT NULL,
+                     CONSTRAINT operator_reference_project_fk
+                       FOREIGN KEY (project_id)
+                       REFERENCES lcm.projects(project_id)
+                       ON DELETE CASCADE
+                   )`,
+          }, { domain: "factory", operation: "injectInboundManagedForeignKey" });
+          const project = await database.migrator.query<{ project_id: string }>({
+            text: `INSERT INTO lcm.projects (identity_key, display_name)
+                   VALUES (pg_catalog.repeat('b', 64), 'Inbound FK probe')
+                   RETURNING project_id::pg_catalog.text`,
+          }, { domain: "factory", operation: "seedInboundManagedForeignKeyProject" });
+          await database.migrator.query({
+            text: `INSERT INTO public.operator_reference (project_id)
+                   VALUES ($1::pg_catalog.uuid)`,
+            values: [project.rows[0]!.project_id],
+          }, { domain: "factory", operation: "seedInboundManagedForeignKeyReference" });
+          await database.migrator.query({
+            text: "DELETE FROM lcm.projects WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid",
+            values: [project.rows[0]!.project_id],
+          }, { domain: "factory", operation: "exerciseInboundManagedForeignKeyCascade" });
+          const cascade = await database.migrator.query<{ reference_count: string }>({
+            text: `SELECT pg_catalog.count(*)::pg_catalog.text AS reference_count
+                   FROM public.operator_reference`,
+          }, { domain: "factory", operation: "readInboundManagedForeignKeyCascade" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ cascade, readinessFailure, migrationFailure }).toMatchObject({
+            cascade: { rows: [{ reference_count: "0" }] },
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: "DROP TABLE IF EXISTS public.operator_reference",
+          }, { domain: "factory", operation: "removeInboundManagedForeignKey" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects unexpected ordinary columns with write-affecting semantics", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unexpected-ordinary-column",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `ALTER TABLE lcm.session_ingest_log
+                   ADD COLUMN unexpected_write_guard text NOT NULL DEFAULT 'injected'`,
+          }, { domain: "factory", operation: "injectUnexpectedManagedOrdinaryColumn" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: "ALTER TABLE lcm.session_ingest_log DROP COLUMN IF EXISTS unexpected_write_guard",
+          }, { domain: "factory", operation: "removeUnexpectedManagedOrdinaryColumn" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects unvalidated NOT NULL constraints with existing null rows", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unvalidated-not-null",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `DO $lcm$
+                   DECLARE
+                     baseline_constraint name;
+                   BEGIN
+                     SELECT constraint_metadata.conname
+                     INTO STRICT baseline_constraint
+                     FROM pg_catalog.pg_constraint AS constraint_metadata
+                     JOIN pg_catalog.pg_class AS relation
+                       ON relation.oid OPERATOR(pg_catalog.=) constraint_metadata.conrelid
+                     JOIN pg_catalog.pg_namespace AS namespace
+                       ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                     JOIN pg_catalog.pg_attribute AS attribute
+                       ON attribute.attrelid OPERATOR(pg_catalog.=) relation.oid
+                      AND constraint_metadata.conkey OPERATOR(pg_catalog.=)
+                        ARRAY[attribute.attnum]::pg_catalog.int2[]
+                     WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                       AND relation.relname OPERATOR(pg_catalog.=) 'projects'
+                       AND attribute.attname OPERATOR(pg_catalog.=) 'display_name'
+                       AND constraint_metadata.contype OPERATOR(pg_catalog.=) 'n';
+
+                     EXECUTE pg_catalog.format(
+                       'ALTER TABLE lcm.projects DROP CONSTRAINT %I',
+                       baseline_constraint
+                     );
+                     INSERT INTO lcm.projects (identity_key, display_name)
+                     VALUES (pg_catalog.repeat('e', 64), NULL);
+                     EXECUTE pg_catalog.format(
+                       'ALTER TABLE lcm.projects ADD CONSTRAINT %I NOT NULL display_name NOT VALID',
+                       baseline_constraint
+                     );
+                   END
+                   $lcm$`,
+          }, { domain: "factory", operation: "injectUnvalidatedNotNullConstraint" });
+          const invalidState = await database.migrator.query<{
+            attnotnull: boolean;
+            conenforced: boolean;
+            convalidated: boolean;
+            null_rows: string;
+          }>({
+            text: `SELECT attribute.attnotnull,
+                          constraint_metadata.convalidated,
+                          constraint_metadata.conenforced,
+                          (SELECT pg_catalog.count(*)::pg_catalog.text
+                           FROM lcm.projects
+                           WHERE display_name IS NULL) AS null_rows
+                   FROM pg_catalog.pg_constraint AS constraint_metadata
+                   JOIN pg_catalog.pg_class AS relation
+                     ON relation.oid OPERATOR(pg_catalog.=) constraint_metadata.conrelid
+                   JOIN pg_catalog.pg_namespace AS namespace
+                     ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+                   JOIN pg_catalog.pg_attribute AS attribute
+                     ON attribute.attrelid OPERATOR(pg_catalog.=) relation.oid
+                    AND constraint_metadata.conkey OPERATOR(pg_catalog.=)
+                      ARRAY[attribute.attnum]::pg_catalog.int2[]
+                   WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+                     AND relation.relname OPERATOR(pg_catalog.=) 'projects'
+                     AND attribute.attname OPERATOR(pg_catalog.=) 'display_name'
+                     AND constraint_metadata.contype OPERATOR(pg_catalog.=) 'n'`,
+          }, { domain: "factory", operation: "readUnvalidatedNotNullConstraint" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ invalidState, readinessFailure, migrationFailure }).toMatchObject({
+            invalidState: {
+              rows: [{
+                attnotnull: true,
+                conenforced: true,
+                convalidated: false,
+                null_rows: "1",
+              }],
+            },
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: `ALTER TABLE lcm.projects ALTER COLUMN display_name DROP NOT NULL;
+                   DELETE FROM lcm.projects
+                   WHERE identity_key OPERATOR(pg_catalog.=) pg_catalog.repeat('e', 64);
+                   ALTER TABLE lcm.projects ALTER COLUMN display_name SET NOT NULL`,
+          }, { domain: "factory", operation: "restoreValidatedNotNullConstraint" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects unexpected generated columns on managed tables", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unexpected-generated-column",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `ALTER TABLE lcm.session_ingest_log
+                   ADD COLUMN unexpected_generated_key text
+                   GENERATED ALWAYS AS (md5(session_id)) STORED`,
+          }, { domain: "factory", operation: "injectUnexpectedManagedGeneratedColumn" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: "ALTER TABLE lcm.session_ingest_log DROP COLUMN IF EXISTS unexpected_generated_key",
+          }, { domain: "factory", operation: "removeUnexpectedManagedGeneratedColumn" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects unexpected valid indexes on managed tables", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unexpected-index",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `CREATE UNIQUE INDEX unexpected_schema_fingerprint_index
+                   ON lcm.session_ingest_log (lower(session_id))`,
+          }, { domain: "factory", operation: "injectUnexpectedManagedIndex" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: `DROP INDEX IF EXISTS lcm.unexpected_schema_fingerprint_index`,
+          }, { domain: "factory", operation: "removeUnexpectedManagedIndex" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects an invalid ready live replacement with an expected index fingerprint", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-invalid-expected-index",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        const snapshot = loadPostgreSqlSchemaSnapshots().at(-1);
+        if (snapshot === undefined) throw new Error("missing PostgreSQL schema snapshot fixture");
+        const indexName = "conversations_project_order_idx";
+        const canonicalIndex = await readIndexCatalogState(
+          database.migrator,
+          indexName,
+          "readCanonicalExpectedIndex",
+        );
+        if (
+          canonicalIndex === null
+          || canonicalIndex.indisvalid !== true
+          || canonicalIndex.indisready !== true
+          || canonicalIndex.indislive !== true
+        ) {
+          throw new Error("expected canonical PostgreSQL index is not valid ready live");
+        }
+        const canonicalInventory = await readManagedIndexInventory(
+          database.migrator,
+          snapshot.tableIdentities,
+          "readCanonicalManagedIndexInventory",
+        );
+        if (canonicalInventory.invalid_index_count !== 0) {
+          throw new Error("canonical PostgreSQL index inventory contains an invalid index");
+        }
+        const concurrentDefinition = canonicalIndex.definition.replace(
+          /^CREATE INDEX /u,
+          "CREATE INDEX CONCURRENTLY ",
+        );
+        if (concurrentDefinition === canonicalIndex.definition) {
+          throw new Error("expected standalone PostgreSQL index definition");
+        }
+        const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+        const blocker = new Client(
+          POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(
+            settings(database.migratorUrl),
+          ),
+        );
+        const creator = new Client(
+          POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(
+            settings(database.migratorUrl),
+          ),
+        );
+        let creatorPid: number | undefined;
+        let creation: Promise<unknown> | undefined;
+        let mutationStarted = false;
+        const restoreAuthoritativeIndex = async (): Promise<void> => {
+          if (!mutationStarted) return;
+          await database.migrator.query({
+            text: `DROP INDEX IF EXISTS lcm.${indexName}`,
+          }, { domain: "factory", operation: "dropInvalidExpectedIndexForRestore" });
+          await database.migrator.query({
+            text: canonicalIndex.definition,
+          }, { domain: "factory", operation: "restoreAuthoritativeExpectedIndex" });
+          mutationStarted = false;
+        };
+        try {
+          await blocker.connect();
+          await creator.connect();
+          mutationStarted = true;
+          await database.migrator.query({
+            text: `DROP INDEX lcm.${indexName}`,
+          }, { domain: "factory", operation: "dropAuthoritativeExpectedIndex" });
+          await blocker.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+          await blocker.query("SELECT pg_catalog.count(*) FROM lcm.conversations");
+          creatorPid = (await creator.query<{ pid: number }>(
+            "SELECT pg_catalog.pg_backend_pid() AS pid",
+          )).rows[0]?.pid;
+          if (!Number.isSafeInteger(creatorPid)) {
+            throw new Error("invalid concurrent-index creator backend PID");
+          }
+
+          creation = creator.query(concurrentDefinition).then(() => {
+            throw new Error("concurrent index creation unexpectedly completed");
+          }).catch((error: unknown) => error);
+
+          const waitingIndex = await waitForInvalidReadyLiveIndex(
+            database.migrator,
+            indexName,
+          );
+          expect(waitingIndex).toEqual({
+            ...canonicalIndex,
+            indisvalid: false,
+            indisready: true,
+            indislive: true,
+          });
+          await administrator.query({
+            text: "SELECT pg_catalog.pg_cancel_backend($1) AS cancelled",
+            values: [creatorPid],
+          }, { domain: "factory", operation: "cancelInvalidExpectedIndexCreation" });
+          await blocker.query("ROLLBACK");
+          await expect(creation).resolves.toMatchObject({ code: "57014" });
+          creation = undefined;
+
+          const invalidIndex = await readIndexCatalogState(
+            database.migrator,
+            indexName,
+            "readCancelledExpectedIndex",
+          );
+          expect(invalidIndex).toEqual({
+            ...canonicalIndex,
+            indisvalid: false,
+            indisready: true,
+            indislive: true,
+          });
+          const invalidInventory = await readManagedIndexInventory(
+            database.migrator,
+            snapshot.tableIdentities,
+            "readInvalidManagedIndexInventory",
+          );
+          expect(invalidInventory).toEqual({
+            ...canonicalInventory,
+            invalid_index_count: 1,
+          });
+
+          type DefinitionDiagnosticRow = QueryResultRow & {
+            readonly actual_definition_group_counts: readonly number[];
+            readonly actual_definition_group_hashes: readonly string[];
+            readonly invalid_index_count: number;
+            readonly missing_object_count: number;
+            readonly drifted_definition_group_count: number;
+          };
+          let readinessDefinitionRow: DefinitionDiagnosticRow | undefined;
+          const readinessExecutor: PostgreSqlQueryExecutor = {
+            query: async <
+              R extends QueryResultRow = QueryResultRow,
+              I extends unknown[] = unknown[],
+            >(
+              config: QueryConfig<I>,
+              options: PostgreSqlQueryOptions,
+            ): Promise<QueryResult<R>> => {
+              const result = await database.runtime.query<R, I>(config, options);
+              if (options.operation === "inspectSchemaDefinitions") {
+                readinessDefinitionRow = result.rows[0] as DefinitionDiagnosticRow | undefined;
+              }
+              return result;
+            },
+          };
+          let migrationDefinitionRow: DefinitionDiagnosticRow | undefined;
+          const migrationExecutor = {
+            query: <
+              R extends QueryResultRow = QueryResultRow,
+              I extends unknown[] = unknown[],
+            >(config: QueryConfig<I>, options: PostgreSqlQueryOptions): Promise<QueryResult<R>> => (
+              database.migrator.query<R, I>(config, options)
+            ),
+            transaction: async <T>(
+              callback: (transaction: PostgreSqlQueryExecutor) => Promise<T>,
+              options: { domain: "factory"; operation: string; signal?: AbortSignal },
+            ): Promise<T> => database.migrator.transaction(async (transaction) => callback({
+              query: async <
+                R extends QueryResultRow = QueryResultRow,
+                I extends unknown[] = unknown[],
+              >(
+                config: QueryConfig<I>,
+                queryOptions: PostgreSqlQueryOptions,
+              ): Promise<QueryResult<R>> => {
+                const result = await transaction.query<R, I>(config, queryOptions);
+                if (queryOptions.operation === "preflightBaselineDefinitions") {
+                  migrationDefinitionRow = result.rows[0] as DefinitionDiagnosticRow | undefined;
+                }
+                return result;
+              },
+            }), options),
+          };
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(readinessExecutor, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(migrationExecutor)
+            .catch((error: unknown) => error);
+          expect({
+            readinessFailure,
+            migrationFailure,
+            readinessDefinitionRow,
+            migrationDefinitionRow,
+          }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 0,
+              operation: "preflightBaselineDefinitions",
+            },
+            readinessDefinitionRow: {
+              invalid_index_count: 1,
+              missing_object_count: 0,
+              drifted_definition_group_count: 0,
+            },
+            migrationDefinitionRow: {
+              invalid_index_count: 1,
+              missing_object_count: 0,
+              drifted_definition_group_count: 0,
+            },
+          });
+          expect(readinessDefinitionRow?.actual_definition_group_counts[0])
+            .toBe(canonicalInventory.index_count);
+          expect(migrationDefinitionRow?.actual_definition_group_counts[0])
+            .toBe(canonicalInventory.index_count);
+          expect(readinessDefinitionRow?.actual_definition_group_hashes[0])
+            .toBe(canonicalInventory.index_sha256);
+          expect(migrationDefinitionRow?.actual_definition_group_hashes[0])
+            .toBe(canonicalInventory.index_sha256);
+          expect(JSON.stringify([readinessFailure, migrationFailure])).not.toContain(indexName);
+
+          await restoreAuthoritativeIndex();
+          await expect(readIndexCatalogState(
+            database.migrator,
+            indexName,
+            "readRestoredExpectedIndex",
+          )).resolves.toEqual(canonicalIndex);
+          await expect(readManagedIndexInventory(
+            database.migrator,
+            snapshot.tableIdentities,
+            "readRestoredManagedIndexInventory",
+          )).resolves.toEqual(canonicalInventory);
+          await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+          await expect(runPostgreSqlMigrations(database.migrator)).resolves.toMatchObject({
+            applied: [],
+          });
+        } finally {
+          if (creatorPid !== undefined) {
+            await administrator.query({
+              text: "SELECT pg_catalog.pg_cancel_backend($1) AS cancelled",
+              values: [creatorPid],
+            }, { domain: "factory", operation: "cancelExpectedIndexCreationDuringCleanup" })
+              .catch(() => undefined);
+          }
+          await blocker.query("ROLLBACK").catch(() => undefined);
+          await creation?.catch(() => undefined);
+          await creator.end().catch(() => undefined);
+          await blocker.end().catch(() => undefined);
+          try {
+            await restoreAuthoritativeIndex();
+            await expect(readIndexCatalogState(
+              database.migrator,
+              indexName,
+              "verifyAuthoritativeExpectedIndexRestored",
+            )).resolves.toEqual(canonicalIndex);
+          } finally {
+            await administrator.close();
+          }
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("rejects unexpected non-view DML rewrite rules on managed tables", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-unexpected-rewrite-rule",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        try {
+          await database.migrator.query({
+            text: `CREATE RULE unexpected_schema_fingerprint_rule AS
+                   ON INSERT TO lcm.session_ingest_log
+                   DO INSTEAD NOTHING`,
+          }, { domain: "factory", operation: "injectUnexpectedManagedRewriteRule" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          await database.migrator.query({
+            text: `DROP RULE IF EXISTS unexpected_schema_fingerprint_rule
+                   ON lcm.session_ingest_log`,
+          }, { domain: "factory", operation: "removeUnexpectedManagedRewriteRule" });
+        }
+      },
+      { runMigrations: false },
+    );
+  });
+
+  it("keeps the restricted runtime unable to mutate the ledger, create, or migrate", async () => {
+    await withPostgreSqlTestDatabase(
+      "readiness-runtime-denials",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+          expectedOwner: "lcm_test_migrator",
+        })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+
+        for (const [operation, text] of [
+          ["denyRuntimeLedgerInsert", "INSERT INTO lcm.schema_migrations (id, checksum_sha256) VALUES ('9999_forbidden', repeat('0', 64))"],
+          ["denyRuntimeLedgerUpdate", "UPDATE lcm.schema_migrations SET checksum_sha256 = repeat('0', 64)"],
+          ["denyRuntimeLedgerDelete", "DELETE FROM lcm.schema_migrations"],
+          ["denyRuntimeLedgerTruncate", "TRUNCATE TABLE lcm.schema_migrations"],
+          ["denyRuntimeSchemaCreate", "CREATE TABLE lcm.runtime_forbidden (id integer)"],
+        ] as const) {
+          await expect(database.runtime.query({ text }, {
+            domain: "factory",
+            operation,
+          })).rejects.toMatchObject({ backend: "postgresql" });
+        }
+
+        const pending = migration(
+          "0006_runtime_forbidden",
+          "CREATE TABLE lcm.runtime_migration_forbidden (id integer)",
+        );
+        await expect(runPostgreSqlMigrations(database.runtime, {
+          migrations: [...loadPostgreSqlMigrations(), pending],
+        })).rejects.toMatchObject({
+          backend: "postgresql",
+          code: "STORAGE_INITIALIZATION_FAILED",
+        });
+      },
+      { runMigrations: false },
+    );
+  });
+
   it.each([
     { label: "0002 baseline", migrationCount: 2, snapshotCount: 1 },
     { label: "0003 machine identity", migrationCount: 3, snapshotCount: 2 },
@@ -1213,8 +2429,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 739,
+          expectedObjectCount: 782,
+          existingObjectCount: 781,
           missingObjectCount: 1,
           operation: "preflightBaselineDefinitions",
         });
@@ -1234,8 +2450,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 740,
+          expectedObjectCount: 782,
+          existingObjectCount: 782,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1330,8 +2546,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 740,
+          expectedObjectCount: 782,
+          existingObjectCount: 782,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1349,8 +2565,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 740,
-            existingObjectCount: 740,
+            expectedObjectCount: 782,
+            existingObjectCount: 782,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -1372,10 +2588,10 @@ describe("PostgreSQL migrations and database isolation", () => {
       await expect(runPostgreSqlMigrations(database.migrator))
         .rejects.toMatchObject({
           baselineApplied: true,
-          driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 739,
-          missingObjectCount: 1,
+          driftedDefinitionGroupCount: 2,
+          expectedObjectCount: 782,
+          existingObjectCount: 782,
+          missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
     });
@@ -1392,8 +2608,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 740,
-            existingObjectCount: 740,
+            expectedObjectCount: 782,
+            existingObjectCount: 782,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -1445,8 +2661,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 740,
+          expectedObjectCount: 782,
+          existingObjectCount: 782,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1463,8 +2679,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 740,
+          expectedObjectCount: 782,
+          existingObjectCount: 782,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1480,12 +2696,80 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 740,
+          expectedObjectCount: 782,
+          existingObjectCount: 782,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
     });
+  });
+
+  it("rejects managed table access-method drift", async () => {
+    await withPostgreSqlTestDatabase(
+      "table-access-method-drift",
+      async (database) => {
+        await runPostgreSqlMigrations(database.migrator);
+        await applyRuntimeGrantScripts(database);
+        const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+        const accessMethodName = `${database.name.slice(0, 47)}_heap_alias`;
+        let accessMethodCreated = false;
+        try {
+          const support = await administrator.query<{ supported: boolean }>({
+            text: `SELECT pg_catalog.to_regprocedure(
+                     'pg_catalog.heap_tableam_handler(internal)'
+                   ) IS NOT NULL AS supported`,
+          }, { domain: "factory", operation: "inspectHeapTableAccessMethodHandler" });
+          expect(support).toMatchObject({ rows: [{ supported: true }] });
+
+          await administrator.query({
+            text: `CREATE ACCESS METHOD "${accessMethodName}"
+                   TYPE TABLE HANDLER pg_catalog.heap_tableam_handler`,
+          }, { domain: "factory", operation: "createHeapTableAccessMethodAlias" });
+          accessMethodCreated = true;
+          await administrator.query({
+            text: `ALTER TABLE lcm.projects
+                   SET ACCESS METHOD "${accessMethodName}"`,
+          }, { domain: "factory", operation: "alterManagedTableAccessMethod" });
+
+          const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+            expectedOwner: "lcm_test_migrator",
+          }).catch((error: unknown) => error);
+          const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+            .catch((error: unknown) => error);
+          expect({ readinessFailure, migrationFailure }).toMatchObject({
+            readinessFailure: {
+              reason: "schema-fingerprint",
+              operation: "inspectSchemaDefinitions",
+            },
+            migrationFailure: {
+              baselineApplied: true,
+              driftedDefinitionGroupCount: 1,
+              expectedObjectCount: 782,
+              existingObjectCount: 782,
+              missingObjectCount: 0,
+              operation: "preflightBaselineDefinitions",
+            },
+          });
+        } finally {
+          try {
+            if (accessMethodCreated) {
+              try {
+                await administrator.query({
+                  text: "ALTER TABLE lcm.projects SET ACCESS METHOD heap",
+                }, { domain: "factory", operation: "restoreManagedTableAccessMethod" });
+              } finally {
+                await administrator.query({
+                  text: `DROP ACCESS METHOD "${accessMethodName}"`,
+                }, { domain: "factory", operation: "dropHeapTableAccessMethodAlias" });
+              }
+            }
+          } finally {
+            await administrator.close();
+          }
+        }
+      },
+      { runMigrations: false },
+    );
   });
 
   it("rejects table row-level-security drift", async () => {
@@ -1499,8 +2783,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 740,
-            existingObjectCount: 740,
+            expectedObjectCount: 782,
+            existingObjectCount: 782,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -1523,8 +2807,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 740,
-            existingObjectCount: 740,
+            expectedObjectCount: 782,
+            existingObjectCount: 782,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -1545,8 +2829,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 740,
+          expectedObjectCount: 782,
+          existingObjectCount: 782,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1583,8 +2867,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 740,
+          expectedObjectCount: 782,
+          existingObjectCount: 782,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1605,8 +2889,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 740,
+          expectedObjectCount: 782,
+          existingObjectCount: 782,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1623,8 +2907,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 740,
-            existingObjectCount: 740,
+            expectedObjectCount: 782,
+            existingObjectCount: 782,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -1646,8 +2930,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 740,
+          expectedObjectCount: 782,
+          existingObjectCount: 782,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -1664,8 +2948,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 740,
-            existingObjectCount: 740,
+            expectedObjectCount: 782,
+            existingObjectCount: 782,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -1694,8 +2978,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 740,
-          existingObjectCount: 740,
+          expectedObjectCount: 782,
+          existingObjectCount: 782,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });

@@ -5,8 +5,11 @@ baseline remain staged until the remaining domain adapters satisfy the shared
 storage contracts and #92 enables cutover. Machine/project identity, the
 conversation repository, the native-transcript repository, and lexical search
 are implemented, but SQLite remains the default domain backend.
-Native-transcript and PostgreSQL lexical-search use is limited to explicit
-programmatic calls and conformance; daemon/CLI activation remains #224. See the
+Issue #615 adds an eager, read-only runtime-readiness verifier for explicit
+PostgreSQL composition-root callers. It does not activate normal daemon/CLI
+routing: SQLite remains the default backend and PostgreSQL routing remains
+staged behind #92 and #224. Native-transcript and PostgreSQL lexical-search use
+is limited to explicit programmatic calls and conformance. See the
 [PostgreSQL schema reference](postgresql-schema.md) for tables, repository
 ordering and atomicity, integrity rules, index families, extension
 prerequisites, retention, and backup implications.
@@ -17,6 +20,54 @@ use full-text search, while 2,047 bytes route losslessly through bounded
 trigram fill. See
 [PostgreSQL lexical search](postgresql-search.md) for query syntax, ranking,
 normalization, scopes, timeouts, grants, benchmark evidence, and diagnostics.
+
+## PostgreSQL runtime readiness
+
+Before an explicit PostgreSQL runtime composition root is admitted, the eager
+verifier connects over the configured, certificate-verified TLS URL and checks
+the complete database contract without changing it. The configured
+`storage.postgresql.migrationRole` is the trusted owner authority passed to the
+verifier as `expectedOwner`; it is not inferred from the catalog, a witness
+hash, or an owner discovered during inspection. The runtime URL's username is
+the separate restricted runtime role.
+
+The current PostgreSQL database itself must be owned by
+`storage.postgresql.migrationRole`. Provision a new database with the
+equivalent of `CREATE DATABASE <db> OWNER <migrationRole>` using validated,
+identifier-quoted operator inputs; do not interpolate untrusted names into
+administrative SQL. The restricted `runtimeRole` must remain a separate role
+and must not own the database. Runtime readiness checks this database-level
+owner in `runtime-role-policy` / `inspectRuntimeRolePolicy` and rejects a
+different owner before its extension, migration-history, schema, ACL, or domain
+checks.
+
+Readiness fails closed unless all of the following are exact: PostgreSQL 18,
+`UTF8` encoding, `UTC` timezone, verified TLS, required extensions and search
+configuration, the ordered complete migration history, the packaged migration
+checksums and current schema fingerprints, and ownership of the schema,
+ledger, and every managed object by `migrationRole`. It also checks the
+runtime role policy (including the absence of superuser, ownership,
+membership, role-creation, database-creation, replication, and bypass-RLS
+authority) and both layers of least privilege: exact direct ACL entries and
+the corresponding effective privileges. Any direct ACL outside the exact
+allowlist—including unexpected `PUBLIC`, grantable, or foreign-granted
+access—fails readiness. The allowlist intentionally retains `PUBLIC USAGE` on
+the `public` schema and sanctioned `PUBLIC EXECUTE` defaults on verified
+extension-owned functions.
+
+The verifier is catalog-only. It does not run migrations, acquire the
+migration lock, write the migration ledger, repair schema or data drift, alter
+ownership, or issue `GRANT`/`REVOKE`. A readiness failure is therefore an
+operator action point, not a request to retry until LCM repairs the database.
+Use the sanitized failure category and remediation, stop PostgreSQL writers
+when schema or migration state is in question, and correct the database with
+the cluster administrator before rerunning the explicit caller. Never edit a
+released ledger row or migration artifact, broaden the runtime role, or use
+the runtime role to perform DDL. Restore a known-good database for unexpected
+fingerprint/history drift, transfer LCM-owned objects to the configured
+`migrationRole` for ownership drift, and apply the reviewed grant set again
+for privilege drift. Rerun the migration command when its ownership or
+fingerprint preflight is the failed contract, then rerun readiness.
 
 ## Run the conformance harness
 
@@ -329,7 +380,7 @@ large-file, and session-ingest identity functions are also fingerprinted by
 stored body and security configuration. Body, language/return type,
 security-definer/leakproof, volatility, parallel-safety, fixed search path, or
 complete normalized ACL drift fails closed.
-The `0002` definition inventory also fingerprints the complete 205-column
+The `0002` definition inventory also fingerprints the complete 210-column
 ordinary inventory of its 24 allowlisted tables, including
 `recall_surfacing.surfaced_at`. Each ordinary column retains its formatted
 type, nullability, deparsed default, identity state, and resolved
@@ -348,7 +399,7 @@ stored ACL is null and normalizes the owning role plus only the exact reviewed
 identity- and conversation-runtime shapes. Explicit owner-only ACLs compare
 equal to defaults, while `PUBLIC`, out-of-shape named-role privileges, grant
 options, foreign grantors, and missing-owner drift fail closed.
-The separate 220-column ACL group includes one canonical identity row for
+The separate 225-column ACL group includes one canonical identity row for
 every ordinary and generated column even when `attacl` is null, then expands
 all explicit column grants with the same reviewed-shape normalization.
 Constraint fingerprints include the owning table and constraint name as well
@@ -387,10 +438,18 @@ migration.
 ## Apply runtime grants
 
 Use separate migration and runtime roles. After the migrator has applied the
-packaged schema, apply only the reviewed scripts for repositories enabled in
-that runtime:
+packaged schema, apply the readiness script and every required repository
+script to the same database. The transcript script is the only optional
+script: native-transcript persistence is outside `ProjectStorage`, and
+readiness accepts the reviewed transcript privilege set either absent or
+present. Apply these scripts with an administrator or the configured
+migration owner, never with the restricted runtime role:
 
 ```bash
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file=src/storage/postgresql/reference/postgresql-runtime-readiness-grants.sql
+
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file=src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql
@@ -401,7 +460,7 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
-  --file=src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
+  --file=src/storage/postgresql/reference/postgresql-runtime-summary-context-grants.sql
 
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
@@ -415,6 +474,24 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file=src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql
 ```
+
+If native-transcript persistence is explicitly enabled for the caller, also
+apply the optional script:
+
+```bash
+psql "$LCM_POSTGRES_ADMIN_URL" \
+  --set=lcm_runtime_role=lcm_runtime \
+  --file=src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
+```
+
+Omitting it is valid for the core runtime. Every script requires the same
+`lcm_runtime_role`, stops on the first error, and commits its own transaction.
+The readiness script grants
+exactly `SELECT` on `lcm.schema_migrations`, `USAGE` on the `public` schema,
+and `EXECUTE` on `public.digest(text, text)` and `public.digest(bytea, text)`.
+It grants no application-table DML, ownership, sequence access, or migration
+authority. Those catalog and digest privileges are the minimum needed for the
+read-only verifier to inspect the complete ledger and fingerprint material.
 
 Replace `lcm_runtime` with the existing runtime role. The scripts quote the
 role as an identifier, stop on the first error, and apply their grants in one
@@ -466,8 +543,11 @@ queries. See
 Applying these repository grants does not activate the PostgreSQL backend.
 Daemon/CLI routing remains gated by #224 and the #92 cutover. Re-run migration
 readiness after changing grants: the schema fingerprint accepts only the exact
-reviewed runtime-role privilege shapes and fails closed on additional,
-grantable, `PUBLIC`, or foreign-grantor privileges.
+reviewed runtime-role privilege shapes and fails closed on direct ACLs outside
+the exact allowlist, including unexpected `PUBLIC`, grantable, or
+foreign-granted privileges. The allowlist intentionally retains `PUBLIC USAGE`
+on the `public` schema and sanctioned `PUBLIC EXECUTE` defaults on verified
+extension-owned functions.
 
 ## Managed-service operation
 

@@ -90,7 +90,7 @@ describe("PostgreSQL client configuration", () => {
       password: "encoded/password",
       database: "override_database",
       application_name: "lcm-migrator",
-      options: "-c timezone=UTC",
+      options: "-c timezone=UTC -c search_path=pg_catalog,public",
       client_encoding: "UTF8",
       replication: "false",
       sslnegotiation: "postgres",

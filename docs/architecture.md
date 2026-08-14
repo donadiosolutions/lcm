@@ -17,28 +17,35 @@ different entry points from applying different precedence or validation rules.
 The internal PostgreSQL 18 runtime provides a bounded `pg` pool, verified CA
 and hostname validation, sanitized SQLSTATE errors, abort cancellation,
 transactional migrations, extension readiness, and the complete durable schema
-baseline. Machine and project identity operations use that runtime directly.
-The general application storage factory remains staged while the domain
-adapters tracked by #87, #89, and #91 implement the remaining shared repository
-contracts. The PostgreSQL conversation adapter is available to conformance
-tests, and the native-transcript adapter is available to explicit
-programmatic backfill and conformance. The promoted-memory, recall,
-redaction-administration, and coordination adapters are available to direct
-programmatic callers and conformance under the same staged boundary. None is
-selected by normal daemon or CLI composition. PostgreSQL selection remains
-unavailable to normal production configuration: issues #92 (authoritative
-backend activation) and #224 (normal daemon/CLI transcript routing) are not
-implemented. The publication boundary is nevertheless the prerequisite for
-those future paths. For staged callers, a valid terminal publication witness
-allows the storage-free public health contract to identify the staged backend;
-an unresolved or inconsistent publication blocks both public and authenticated
-health with fixed sanitized `503` responses, while authenticated storage-backed
-routes remain storage-unavailable. Lifecycle admission verifies the public
-process and listener identity before sending the local token, then recognizes
-the authenticated staged response without treating its storage as ready or
-falling back to SQLite. The local SQLite hook outbox and the metadata-only
-transcript quarantine remain local and are not general caches or activation
-paths. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
+baseline. The production PostgreSQL composition root eagerly verifies runtime
+health, server and extension policy, the complete migration ledger, immutable
+schema fingerprints, migration ownership, search configuration, and the exact
+runtime ACL manifest. Only then can an explicit programmatic caller obtain a
+backend factory. Project opening additionally validates terminal backend
+publication evidence and the exact remote project UUID, machine ID/alias,
+lexical selected path, and normalized path before composing all nine repository
+contracts into one `ProjectStorage`. The project object owns its transaction
+scope, health, cancellation, and close lifecycle; no SQL client escapes the
+storage boundary.
+Explicit embedded callers use the curated
+`@donadiosolutions/lcm/storage/postgresql` package subpath. It exposes the
+production factory and its minimum configuration/result contracts while
+keeping runtime internals, migrators, and deterministic testing hooks private.
+
+The native-transcript adapter remains separate because transcript import is an
+explicit backfill seam rather than a `ProjectStorage` repository. Normal daemon
+and CLI composition still do not select the PostgreSQL factory: issues #92
+(authoritative backend activation) and the remaining #224 routing work are not
+implemented. For those staged routes, a valid terminal publication witness
+allows the storage-free public health contract to identify the selected
+backend, but authenticated storage-backed routes remain unavailable. An
+unresolved or inconsistent publication blocks both public and authenticated
+health with fixed sanitized `503` responses. Lifecycle admission verifies the
+public process and listener identity before sending the local token, then
+recognizes the authenticated staged response without treating its storage as
+ready or falling back to SQLite. The local SQLite hook outbox and the
+metadata-only transcript quarantine remain local and are not general caches or
+activation paths. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
 integrity, indexes, retention, extension policy, and recovery implications.
 
 ## Storage repository architecture
@@ -51,24 +58,27 @@ backend-specific primitive.
 
 SQLite remains the zero-configuration production default. The reusable
 conformance suite is backend-neutral, and the PostgreSQL conversation adapter
-now implements the same conversation, message, and message-part contract.
+implements the same conversation, message, and message-part contract. The
+explicit PostgreSQL composition root combines it with the summary, context,
+large-file, promoted-memory, recall, redaction-administration, lexical-search,
+and coordination adapters behind one complete `ProjectStorage` contract.
 The native-transcript repository adds immutable sanitized client-native
 records, exact message provenance, atomic checkpoint accounting, and
 idempotent ingest-key conflict handling. It intentionally exposes no payload
 update or deletion operation. During this staged phase, embedded backfill code
 receives `NativeTranscriptRepository` explicitly; PostgreSQL callers construct
 `PostgreSqlNativeTranscriptRepository`. The repository is not exposed through
-`ProjectStorage`. That adapter, the PostgreSQL runtime, migration
-runner, identity repository, and isolated test-database lease are shared
-foundations; they do not enable daemon or CLI routing. Until all PostgreSQL
-domain adapters and rollout gates land, selecting `postgresql` leaves general
-storage routes explicitly unavailable behind the staged loopback daemon rather
-than falling back to SQLite. See
+`ProjectStorage`. The production PostgreSQL factory, native-transcript adapter,
+runtime, migration runner, identity repository, and isolated test-database
+lease do not by themselves enable daemon or CLI routing. Until the remaining
+route and rollout gates land, selecting `postgresql` leaves general storage
+routes explicitly unavailable behind the staged loopback daemon rather than
+falling back to SQLite. See
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) for the
 local-scrubbing, checkpoint, quarantine, and rollback boundaries.
 The issue #88 adapters implement the existing `ProjectRepositories` contracts
-for promoted memory, recall, redaction administration, and coordination, but
-remain deliberately absent from the unavailable PostgreSQL storage factory.
+for promoted memory, recall, redaction administration, and coordination and
+are included in the explicit PostgreSQL project-storage factory.
 See [PostgreSQL memory and administration](../src/storage/postgresql/reference/postgresql-memory-administration.md)
 for their metadata, concurrency, purge, and retention contract. Issue #90
 extends the concrete staged `PostgreSqlCoordinationRepository` with distributed
@@ -138,19 +148,30 @@ before commit. Selection follows migration history rather than registry order.
 The selected current snapshot verifies its managed inventory and definitions
 before pending SQL; the selected target snapshot repeats both checks after
 pending SQL and ledger writes, so a migration may add managed objects without
-weakening the earlier contract. Definition checks cover all allowlisted
-secondary indexes, triggers, constraints, all 205 ordinary columns, stored
+weakening the earlier contract. Definition checks cover the complete valid,
+ready, and live index inventory attached to every managed table, non-internal
+triggers, non-view rewrite rules, constraints, all 210 ordinary columns, stored
 generated-column expressions, identity sequences, all 24 table persistence
 states, the complete effective ACLs of the tables and sequences, and the exact
-ACL state of all 220 ordinary and generated columns; indexes must remain
-valid and ready and inherit ownership from their tables. Identity-trigger
+ACL state of all 225 ordinary and generated columns; indexes must remain
+valid, ready, and live and inherit ownership from their tables. The current baseline
+authority contains 94 managed-table indexes and explicitly requires zero
+non-view rewrite rules. Identity-trigger
 inventory requires always-enabled mode, rejecting disabled, ordinary, or
 replica-only drift and enforcing checks under `session_replication_role =
-replica`. Constraint inventory includes the enablement state of
-its internal enforcement triggers and binds each name to its definition.
-Ordinary columns retain type, nullability, default, identity, and resolved
-collation metadata; generated columns retain their formatted type, nullability,
-generated state, fully deparsed expression, and resolved collation. Tables must remain permanent with
+replica`. Constraint inventory includes every supported constraint owned by a
+managed table plus every foreign key that targets one. It binds owning and
+referenced relation identities, canonical definitions, validation,
+enforcement, locality, and inheritance state, together with canonicalized
+definitions and enablement, internal, deferrability, and parentage metadata for
+every enforcement trigger on either side of the constraint. Ordinary columns
+retain type, nullability, default, identity, and resolved collation metadata;
+generated columns retain their formatted type, nullability, generated state,
+fully deparsed expression, and resolved collation. Both column fingerprints
+also bind the sorted complete set of associated PostgreSQL 18 `NOT NULL`
+constraints, including canonical identity plus validation, enforcement,
+locality, and inheritance state, without increasing the column object count.
+Tables must remain permanent with
 row-level security neither enabled nor forced, and cannot participate in
 inheritance or partition parent/child relationships.
 Effective relation ACLs normalize the owner plus only the exact reviewed
@@ -161,16 +182,35 @@ fingerprints preserve every no-ACL identity and accept only the reviewed
 column-limited runtime writes.
 Identity sequences retain permanent persistence, allocation parameters,
 internal dependency, and owning table/column. Migration transactions pin
-`quote_all_identifiers = off` before catalog deparsing. Unknown operator-created
-indexes, triggers, and constraints remain outside the inventory.
+`quote_all_identifiers = off` before catalog deparsing. Any additional valid,
+ready, and live index, non-internal trigger, supported constraint, generated
+column, or ordinary column attached to a managed table, any foreign key
+targeting one from another schema or relation, or any non-view rewrite rule
+attached to one, is included in the complete inventory and fails closed.
+`NOT NULL` constraints are represented by their owning column fingerprint so
+they are not double-counted as PostgreSQL 18 `pg_constraint` rows; an
+unvalidated or otherwise non-authoritative constraint is rejected even when
+`attnotnull` remains true. Unknown
+operator-created objects outside those managed-table boundaries remain outside
+the inventory. That boundary remains fail-closed for repository writes: the
+repositories address only the pinned managed relations; a new attached identity
+sequence requires a new or changed managed ordinary column and is rejected by
+the complete column inventory, while an unattached sequence cannot affect those
+writes. Relation and column ACL sanctions remain scoped to the pinned managed
+write surface because every managed column is inventoried before its ACL is
+normalized. Non-internal triggers are enumerated directly; internal constraint
+triggers are deliberately excluded there and instead fingerprinted completely
+with their owning constraint.
 `PUBLIC` has no privileges on the 24 explicitly listed LCM-owned tables, six
 generated identity sequences, or the search-normalization, summary-identity,
 large-file-identity, and session-ingest-identity functions; unknown
 pre-existing object ACLs are preserved. The normalization function is created
 without replacement, so a same-signature collision fails and rolls back the
-pending migration rather than overwriting operator code. Runtime grants remain
-absent until their owning adapters land and an administrator applies the
-corresponding reviewed script. Normalization-function ACL readiness accepts
+pending migration rather than overwriting operator code. Baseline migrations
+still grant no application privileges. An administrator applies the exact
+reviewed scripts for the restricted runtime role, and the PostgreSQL factory
+rejects construction unless the complete required grant set is present with no
+overbroad managed-object privileges. Normalization-function ACL readiness accepts
 only the owner plus non-`PUBLIC` runtime roles whose entries are
 non-grantable, owner-granted `EXECUTE`; broader privilege shapes fail closed.
 The three advisory-locked exact-identity triggers require `READ COMMITTED`

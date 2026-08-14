@@ -107,6 +107,23 @@ function verifyCli(directory) {
   return result.stdout.trim();
 }
 
+function verifyPostgreSqlApi(directory) {
+  const source = `
+    const api = await import("@donadiosolutions/lcm/storage/postgresql");
+    if (typeof api.createPostgreSqlStorageBackendFactory !== "function") process.exit(2);
+    if ("createPostgreSqlStorageBackendFactoryForTesting" in api) process.exit(3);
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    cwd: directory,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      `packed PostgreSQL API failed in ${directory}\n${result.stdout}\n${result.stderr}`,
+    );
+  }
+}
+
 try {
   const rootRequire = createRequire(join(root, "package.json"));
   const sdkServer = rootRequire.resolve("@modelcontextprotocol/sdk/server/index.js");
@@ -158,6 +175,7 @@ try {
       throw new Error(`${label} packed package changed the independently pinned Hono dependency`);
     }
     verifyNoPublishedBuildDependencies(directory, label);
+    verifyPostgreSqlApi(directory);
     console.log(
       `${label}: lcm=${pkg.version} external-sdk=absent cli=${verifyCli(directory)}`,
     );

@@ -675,6 +675,7 @@ describe("ensureDaemon", () => {
     const effectiveConfig = parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
       LCM_POSTGRES_URL: "postgresql://user:secret@db.example.com/lcm",
       LCM_POSTGRES_CA_FILE: caFile,
+      LCM_POSTGRES_MIGRATION_ROLE: "lcm_test_migrator",
     });
     const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
       if (url.endsWith("/health")) {

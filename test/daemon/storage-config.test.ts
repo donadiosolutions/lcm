@@ -27,6 +27,7 @@ function postgresEnv(caPath = caFile()): Record<string, string> {
   return {
     LCM_POSTGRES_URL: "postgresql://user:password@db.example.com:25060/lcm",
     LCM_POSTGRES_CA_FILE: caPath,
+    LCM_POSTGRES_MIGRATION_ROLE: "lcm_migrator",
   };
 }
 
@@ -52,9 +53,10 @@ describe("storage configuration", () => {
           connectionTimeoutMs: 12_000,
           idleTimeoutMs: 0,
           statementTimeoutMs: 90_000,
+          migrationRole: "stored_migrator",
         },
       },
-    }), {}, postgresEnv());
+    }), {}, { ...postgresEnv(), LCM_POSTGRES_MIGRATION_ROLE: "environment_migrator" });
 
     expect(config.storage).toMatchObject({
       backend: "postgresql",
@@ -63,8 +65,33 @@ describe("storage configuration", () => {
         connectionTimeoutMs: 12_000,
         idleTimeoutMs: 0,
         statementTimeoutMs: 90_000,
+        migrationRole: "stored_migrator",
       },
     });
+  });
+
+  it("requires a PostgreSQL migration role and uses the environment only as a fallback", () => {
+    expect(resolveStorageConfig({ backend: "postgresql" }, postgresEnv())).toMatchObject({
+      backend: "postgresql",
+      postgresql: { migrationRole: "lcm_migrator" },
+    });
+    expect(() => resolveStorageConfig({ backend: "postgresql" }, {
+      LCM_POSTGRES_URL: postgresEnv().LCM_POSTGRES_URL,
+      LCM_POSTGRES_CA_FILE: postgresEnv().LCM_POSTGRES_CA_FILE,
+    })).toThrow("LCM_POSTGRES_MIGRATION_ROLE");
+    expect(resolveStorageConfig({
+      backend: "postgresql",
+      postgresql: { migrationRole: " \nstored_migrator\t " },
+    }, { ...postgresEnv(), LCM_POSTGRES_MIGRATION_ROLE: "environment_migrator" })).toMatchObject({
+      postgresql: { migrationRole: "stored_migrator" },
+    });
+  });
+
+  it("ignores PostgreSQL migration role values for SQLite", () => {
+    expect(resolveStorageConfig({
+      backend: "sqlite",
+      postgresql: { migrationRole: "\u0000not-used" },
+    }, { LCM_POSTGRES_MIGRATION_ROLE: "\u0001also-not-used" })).toEqual({ backend: "sqlite" });
   });
 
   it("applies PostgreSQL defaults when the shared resolver is called directly", () => {
@@ -76,6 +103,7 @@ describe("storage configuration", () => {
         connectionTimeoutMs: 10_000,
         idleTimeoutMs: 30_000,
         statementTimeoutMs: 60_000,
+        migrationRole: "lcm_migrator",
       },
     });
   });
@@ -137,6 +165,7 @@ describe("storage configuration", () => {
         connectionTimeoutMs: 10_000,
         idleTimeoutMs: 30_000,
         statementTimeoutMs: 60_000,
+        migrationRole: "lcm_migrator",
         url: "postgresql://runtime:secret@runtime.example.com/lcm",
         caFile: runtimeCa,
       },
@@ -148,6 +177,7 @@ describe("storage configuration", () => {
     const config = parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
       LCM_POSTGRES_URL: " \npostgresql://trim-user:trim-secret@db.example.com/lcm\t ",
       LCM_POSTGRES_CA_FILE: ` \n${trustedCa}\t `,
+      LCM_POSTGRES_MIGRATION_ROLE: " \ntrim_migrator\t ",
     });
 
     expect(config.storage).toEqual({
@@ -157,6 +187,7 @@ describe("storage configuration", () => {
         connectionTimeoutMs: 10_000,
         idleTimeoutMs: 30_000,
         statementTimeoutMs: 60_000,
+        migrationRole: "trim_migrator",
         url: "postgresql://trim-user:trim-secret@db.example.com/lcm",
         caFile: trustedCa,
       },
@@ -170,6 +201,7 @@ describe("storage configuration", () => {
     const config = parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
       LCM_POSTGRES_URL: encodedUrl,
       LCM_POSTGRES_CA_FILE: trustedCa,
+      LCM_POSTGRES_MIGRATION_ROLE: "lcm_migrator",
     });
 
     expect(config.storage).toMatchObject({
@@ -186,6 +218,7 @@ describe("storage configuration", () => {
     const storage = resolveStorageConfig({ backend: "postgresql" }, {
       LCM_POSTGRES_URL: url,
       LCM_POSTGRES_CA_FILE: caFile(),
+      LCM_POSTGRES_MIGRATION_ROLE: "lcm_migrator",
     });
 
     expect(storage).toMatchObject({ backend: "postgresql", postgresql: { url } });
@@ -216,8 +249,50 @@ describe("storage configuration", () => {
     [{ backend: "sqlite", postgresql: { connectionTimeoutMs: 600_001 } }, "storage.postgresql.connectionTimeoutMs"],
     [{ backend: "sqlite", postgresql: { idleTimeoutMs: -1 } }, "storage.postgresql.idleTimeoutMs"],
     [{ backend: "sqlite", postgresql: { statementTimeoutMs: 0 } }, "storage.postgresql.statementTimeoutMs"],
+    [{ backend: "postgresql", postgresql: { migrationRole: 7 } }, "storage.postgresql.migrationRole"],
+    [{ backend: "postgresql", postgresql: { migrationRole: "   " } }, "storage.postgresql.migrationRole"],
+    [{ backend: "postgresql", postgresql: { migrationRole: "bad\u0000role" } }, "storage.postgresql.migrationRole"],
+    [{ backend: "postgresql", postgresql: { migrationRole: "x".repeat(64) } }, "storage.postgresql.migrationRole"],
+    [{ backend: "postgresql", postgresql: { migrationRole: "é".repeat(32) } }, "storage.postgresql.migrationRole"],
   ])("rejects malformed or out-of-range stored storage configuration %#", (storage, path) => {
-    expect(() => parseStoredConfig(JSON.stringify({ storage }))).toThrow(path);
+    const error = (() => {
+      try {
+        parseStoredConfig(JSON.stringify({ storage }));
+      } catch (caught) {
+        return caught as Error;
+      }
+      throw new Error("expected configuration error");
+    })();
+    expect(error.message).toContain(path);
+    if (path.endsWith("migrationRole")) {
+      expect(error.message).not.toContain("bad");
+      expect(error.message).not.toContain("x".repeat(64));
+      expect(error.message).not.toContain("é");
+    }
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["blank", " \n\t "],
+    ["control", "valid\u007frole"],
+    ["too long", "a".repeat(64)],
+    ["too many UTF-8 bytes", "é".repeat(32)],
+  ])("rejects %s PostgreSQL migration role from the environment safely", (_label, migrationRole) => {
+    const env = {
+      LCM_POSTGRES_URL: postgresEnv().LCM_POSTGRES_URL,
+      LCM_POSTGRES_CA_FILE: postgresEnv().LCM_POSTGRES_CA_FILE,
+      ...(migrationRole === undefined ? {} : { LCM_POSTGRES_MIGRATION_ROLE: migrationRole }),
+    };
+    const error = (() => {
+      try {
+        resolveStorageConfig({ backend: "postgresql" }, env);
+      } catch (caught) {
+        return caught as Error;
+      }
+      throw new Error("expected configuration error");
+    })();
+    expect(error.message).toContain("LCM_POSTGRES_MIGRATION_ROLE");
+    if (migrationRole !== undefined) expect(error.message).not.toContain(migrationRole);
   });
 
   it.each(["url", "caFile"])("rejects persisted PostgreSQL secret key %s", (key) => {
@@ -414,10 +489,30 @@ describe("storage configuration", () => {
         connectionTimeoutMs: 10_000,
         idleTimeoutMs: 30_000,
         statementTimeoutMs: 60_000,
+        migrationRole: "lcm_migrator",
       },
     });
     expect(JSON.stringify(persisted.storage)).not.toContain("password");
     expect(daemonConfigForPersistence(parseDaemonConfig("{}")).storage).toEqual({ backend: "sqlite" });
+  });
+
+  it("persists an environment-derived migration role for an env-free reload", () => {
+    const config = parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, postgresEnv());
+    const persisted = daemonConfigForPersistence(config);
+    const reloaded = parseDaemonConfig(JSON.stringify(persisted), {}, {
+      LCM_POSTGRES_URL: postgresEnv().LCM_POSTGRES_URL,
+      LCM_POSTGRES_CA_FILE: postgresEnv().LCM_POSTGRES_CA_FILE,
+    });
+    expect((persisted.storage as Record<string, unknown>).postgresql).toEqual({
+      poolMax: 5,
+      connectionTimeoutMs: 10_000,
+      idleTimeoutMs: 30_000,
+      statementTimeoutMs: 60_000,
+      migrationRole: "lcm_migrator",
+    });
+    expect(reloaded.storage).toMatchObject({ postgresql: { migrationRole: "lcm_migrator" } });
+    expect(JSON.stringify(persisted.storage)).not.toContain("postgresql://");
+    expect(JSON.stringify(persisted.storage)).not.toContain("caFile");
   });
 
   it("starts the daemon with explicitly unavailable staged PostgreSQL storage", async () => {

@@ -266,11 +266,12 @@ describe("getConfigValue", () => {
       env: {
         LCM_POSTGRES_URL: " \npostgresql://effective-user:effective-password@db.example.com/lcm\t ",
         LCM_POSTGRES_CA_FILE: ` \n${caPath}\t `,
+        LCM_POSTGRES_MIGRATION_ROLE: "effective_migrator",
       },
     });
     expect(storage).toMatchObject({
       backend: "postgresql",
-      postgresql: { url: "[REDACTED]", caFile: caPath, poolMax: 5 },
+      postgresql: { url: "[REDACTED]", caFile: caPath, poolMax: 5, migrationRole: "effective_migrator" },
     });
     expect(getConfigValue({
       configPath,
@@ -279,9 +280,26 @@ describe("getConfigValue", () => {
       env: {
         LCM_POSTGRES_URL: " \npostgresql://effective-user:effective-password@db.example.com/lcm\t ",
         LCM_POSTGRES_CA_FILE: ` \n${caPath}\t `,
+        LCM_POSTGRES_MIGRATION_ROLE: "effective_migrator",
       },
     })).toBe("[REDACTED]");
     expect(JSON.stringify(storage)).not.toContain("effective-password");
+  });
+
+  it("exposes the effective PostgreSQL migration role without redaction", () => {
+    const { directory, configPath } = makeConfig({ storage: { backend: "postgresql" } });
+    const caPath = join(directory, "postgres-ca.crt");
+    writeFileSync(caPath, "trusted-ca");
+    expect(getConfigValue({
+      configPath,
+      path: "storage.postgresql.migrationRole",
+      effective: true,
+      env: {
+        LCM_POSTGRES_URL: "postgresql://effective-user:effective-password@db.example.com/lcm",
+        LCM_POSTGRES_CA_FILE: caPath,
+        LCM_POSTGRES_MIGRATION_ROLE: "effective_migrator",
+      },
+    })).toBe("effective_migrator");
   });
 
   it("masks sensitive extension fields in whole-object reads", () => {
@@ -396,6 +414,7 @@ describe("setConfigValue", () => {
       env: {
         LCM_POSTGRES_URL: "postgresql://user:secret@db.example/lcm",
         LCM_POSTGRES_CA_FILE: caFile,
+        LCM_POSTGRES_MIGRATION_ROLE: "lcm_migrator",
       },
     })).toBe(true);
   });

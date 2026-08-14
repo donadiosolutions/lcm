@@ -97,7 +97,7 @@ export function buildPostgreSqlClientConfig(
       checkServerIdentity: (_hostname, certificate) => checkServerIdentity(parsed.host, certificate),
     },
     application_name: options.applicationName ?? "lcm",
-    options: "-c timezone=UTC",
+    options: "-c timezone=UTC -c search_path=pg_catalog,public",
     client_encoding: "UTF8",
     replication: "false",
     sslnegotiation: "postgres",

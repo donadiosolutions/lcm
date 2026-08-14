@@ -1383,6 +1383,7 @@ describe("strict LLM configuration validation", () => {
       ...env,
       LCM_POSTGRES_URL: "postgresql://user:password@localhost/database",
       LCM_POSTGRES_CA_FILE: import.meta.filename,
+      LCM_POSTGRES_MIGRATION_ROLE: "request_policy_migrator",
     });
 
     expect(parseLlmRequestPolicyConfig(content, env).llm).toEqual({

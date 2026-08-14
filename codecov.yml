@@ -91,8 +91,14 @@ component_management:
         - "^src/storage/contracts\\.ts$"
         - "^src/storage/errors\\.ts$"
         - "^src/storage/factory\\.ts$"
+        - "^src/storage/home-lock-topology\\.ts$"
         - "^src/storage/identity-context\\.ts$"
         - "^src/storage/index\\.ts$"
+        - "^src/storage/postgresql/project-storage\\.ts$"
+    - component_id: "unit-migration-cutover"
+      name: "Unit - Migration and Cutover"
+      paths:
+        - "src/migration/"
     - component_id: "unit-local-event-storage"
       name: "Unit - Local Event Storage"
       paths:
@@ -160,14 +166,17 @@ component_management:
         - "^src/storage/postgresql/client-config\\.ts$"
         - "^src/storage/postgresql/contracts\\.ts$"
         - "^src/storage/postgresql/errors\\.ts$"
+        - "^src/storage/postgresql/factory\\.ts$"
         - "^src/storage/postgresql/index\\.ts$"
         - "^src/storage/postgresql/runtime\\.ts$"
+        - "^src/storage/postgresql\\.ts$"
     - component_id: "integration-postgresql-schema"
       name: "Integration - PostgreSQL Schema"
       paths:
         - "^src/storage/postgresql/extensions\\.ts$"
         - "^src/storage/postgresql/migrations\\.ts$"
         - "^src/storage/postgresql/provisioning\\.ts$"
+        - "^src/storage/postgresql/runtime-readiness\\.ts$"
     - component_id: "integration-postgresql-conversations"
       name: "Integration - PostgreSQL Conversations"
       paths:
