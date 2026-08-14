@@ -343,9 +343,7 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
 
   async health(): Promise<StorageHealth> {
     if (this.closed) return { status: "closed", backend: "postgresql" };
-    while (!this.closed && this.pendingOperations.size > 0) {
-      await Promise.all([...this.pendingOperations]);
-    }
+    await Promise.all([...this.pendingOperations]);
     if (this.closed) return { status: "closed", backend: "postgresql" };
     try {
       return sanitizedRuntimeHealth(await this.runtime.health());

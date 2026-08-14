@@ -536,6 +536,70 @@ describe("PostgreSQL storage backend factory", () => {
     });
   });
 
+  it("waits only for the pending-operation snapshot present when health starts", async () => {
+    const { runtime, dependencies } = harness();
+    let releaseFirstOpen!: () => void;
+    let releaseLaterOpen!: () => void;
+    const firstOpenGate = new Promise<void>((resolve) => {
+      releaseFirstOpen = resolve;
+    });
+    const laterOpenGate = new Promise<void>((resolve) => {
+      releaseLaterOpen = resolve;
+    });
+    const originalQuery = runtime.query.bind(runtime);
+    let queryCount = 0;
+    runtime.query = async (...args) => {
+      queryCount += 1;
+      await (queryCount === 1 ? firstOpenGate : laterOpenGate);
+      return originalQuery(...args);
+    };
+    const factory = await createPostgreSqlStorageBackendFactoryForTesting(
+      config,
+      "/home/operator",
+      dependencies,
+    );
+    const originalHealth = runtime.health.bind(runtime);
+    let runtimeHealthCalls = 0;
+    runtime.healthResult = { status: "unavailable", backend: "postgresql" };
+    runtime.health = () => {
+      runtimeHealthCalls += 1;
+      return originalHealth();
+    };
+
+    const firstOpening = factory.openProject(identity);
+    const health = factory.health();
+    const laterOpening = factory.openProject(identity);
+    const healthCallsBeforeFirstOpenSettled = runtimeHealthCalls;
+    releaseFirstOpen();
+    const firstStorage = await firstOpening;
+    await Promise.resolve();
+    const healthCallsBeforeLaterOpenSettled = runtimeHealthCalls;
+    releaseLaterOpen();
+    const laterStorage = await laterOpening;
+    const healthResult = await health;
+    await firstStorage.close();
+    await laterStorage.close();
+    await factory.close();
+
+    expect({
+      healthCallsBeforeFirstOpenSettled,
+      healthCallsBeforeLaterOpenSettled,
+      healthResult,
+      queryCount,
+      runtimeHealthCalls,
+    }).toEqual({
+      healthCallsBeforeFirstOpenSettled: 0,
+      healthCallsBeforeLaterOpenSettled: 1,
+      healthResult: {
+        status: "unavailable",
+        backend: "postgresql",
+        error: expect.objectContaining({ code: "STORAGE_INITIALIZATION_FAILED" }),
+      },
+      queryCount: 2,
+      runtimeHealthCalls: 1,
+    });
+  });
+
   it("reports healthy state and exercises the identity transaction adapter", async () => {
     const { runtime, dependencies } = harness();
     const factory = await createPostgreSqlStorageBackendFactoryForTesting(
