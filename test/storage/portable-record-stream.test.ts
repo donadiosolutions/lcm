@@ -1422,6 +1422,52 @@ describe("portable record stream public seam", () => {
     throw new Error("operation unexpectedly succeeded");
   });
 
+  it("sanitizes a dependency-array length descriptor trap at the public seam", () => {
+    const manifest = makeManifest();
+    const canary = "dependency-array-length-canary-616";
+    const hostileError = new PortableStreamError("closed");
+    hostileError.message = canary;
+    hostileError.stack = canary;
+    const dependencies = new Proxy(records.messages[0].dependencies, {
+      getOwnPropertyDescriptor: (target, key) => {
+        if (key === "length") throw hostileError;
+        return Object.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const record = { ...records.messages[0], dependencies };
+    try {
+      createPortableBatch(createBatchInput(manifest, "messages", {
+        predecessor: null,
+        records: [record],
+        complete: false,
+      }));
+    } catch (error) {
+      expect(error).not.toBe(hostileError);
+      expectSanitizedError(error, "malformed-record", [canary]);
+      return;
+    }
+    throw new Error("operation unexpectedly succeeded");
+  });
+
+  it("sanitizes a revoked dependency array at the public seam", () => {
+    const manifest = makeManifest();
+    const dependencyArray = Proxy.revocable([], {});
+    dependencyArray.revoke();
+    const record = { ...records.messages[0], dependencies: dependencyArray.proxy };
+    try {
+      createPortableBatch(createBatchInput(manifest, "messages", {
+        predecessor: null,
+        records: [record],
+        complete: false,
+      }));
+    } catch (error) {
+      expectSanitizedError(error, "malformed-record");
+      expect(error).not.toBeInstanceOf(TypeError);
+      return;
+    }
+    throw new Error("operation unexpectedly succeeded");
+  });
+
   it("sanitizes a throwing ordinal accessor while constructing dependency errors", () => {
     const manifest = makeManifest();
     const canary = "ordinal-accessor-canary-616";

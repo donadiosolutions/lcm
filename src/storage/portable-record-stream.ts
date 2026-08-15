@@ -237,8 +237,7 @@ function ownValue(value: object, key: string, code: PortableStreamErrorCode): un
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (descriptor === undefined || !("value" in descriptor)) fail(code);
     return descriptor.value;
-  } catch (error) {
-    if (error instanceof PortableStreamError) throw error;
+  } catch {
     fail(code);
   }
 }
@@ -259,15 +258,25 @@ function snapshot(
 }
 
 function arrayValues(value: unknown, code: PortableStreamErrorCode): unknown[] {
-  if (!Array.isArray(value) || prototypeOf(value, code) !== Array.prototype) fail(code);
-  const keys = ownKeys(value, code);
+  let isArray: boolean;
+  try {
+    isArray = Array.isArray(value);
+  } catch {
+    fail(code);
+  }
+  if (!isArray) fail(code);
+  const array = value as unknown[];
+  if (prototypeOf(array, code) !== Array.prototype) fail(code);
+  const keys = ownKeys(array, code);
+  const length = ownValue(array, "length", code);
   if (
     keys.some((key) => typeof key !== "string" || (key !== "length" && !/^(?:0|[1-9]\d*)$/.test(key)))
-    || keys.length !== value.length + 1
+    || !isSafeCount(length)
+    || keys.length !== length + 1
   ) fail(code);
-  const result = new Array<unknown>(value.length);
-  for (let index = 0; index < value.length; index += 1) {
-    result[index] = ownValue(value, String(index), code);
+  const result = new Array<unknown>(length);
+  for (let index = 0; index < length; index += 1) {
+    result[index] = ownValue(array, String(index), code);
   }
   return result;
 }
@@ -604,7 +613,7 @@ function validateDependencyContract(record: PortableRecord, domain: PortableDoma
   } catch {
     fail("malformed-record", { domain });
   }
-  const dependencies = arrayValues(dependenciesValue, "dependency-order");
+  const dependencies = arrayValues(dependenciesValue, "malformed-record");
   const expected = DOMAIN_DEPENDENCIES[domain].dependencies;
   if ((dependencies.length === 0) !== (expected.length === 0)) {
     fail("dependency-order", { domain, ordinal });
