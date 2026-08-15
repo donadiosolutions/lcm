@@ -1397,12 +1397,15 @@ describe("portable record stream public seam", () => {
   it("sanitizes a throwing dependencies accessor at the public seam", () => {
     const manifest = makeManifest();
     const canary = "dependencies-accessor-canary-616";
+    const hostileError = new PortableStreamError("closed");
+    hostileError.message = canary;
+    hostileError.stack = canary;
     const record = { ...records.messages[0] };
     Object.defineProperty(record, "dependencies", {
       configurable: true,
       enumerable: true,
       get: () => {
-        throw new Error(canary);
+        throw hostileError;
       },
     });
     try {
@@ -1412,6 +1415,7 @@ describe("portable record stream public seam", () => {
         complete: false,
       }));
     } catch (error) {
+      expect(error).not.toBe(hostileError);
       expectSanitizedError(error, "malformed-record", [canary]);
       return;
     }
