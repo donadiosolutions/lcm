@@ -1449,6 +1449,18 @@ describe("portable record stream public seam", () => {
     throw new Error("operation unexpectedly succeeded");
   });
 
+  it("sanitizes a dependency array with a nonstandard prototype at the public seam", () => {
+    const manifest = makeManifest();
+    const dependencies = [...records.messages[0].dependencies];
+    Object.setPrototypeOf(dependencies, null);
+    const record = { ...records.messages[0], dependencies };
+    expectCode(() => createPortableBatch(createBatchInput(manifest, "messages", {
+      predecessor: null,
+      records: [record],
+      complete: false,
+    })), "malformed-record");
+  });
+
   it("sanitizes a revoked dependency array at the public seam", () => {
     const manifest = makeManifest();
     const dependencyArray = Proxy.revocable([], {});
