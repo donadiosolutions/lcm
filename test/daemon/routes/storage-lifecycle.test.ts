@@ -265,7 +265,7 @@ describe("route storage cleanup", () => {
     });
   });
 
-  it("opens a new project without acquiring read admission and returns null only for an absent existing project", async () => {
+  it("opens new projects and returns null only when an existing project is absent", async () => {
     await withTemporaryProject(async ({ cwd, config }) => {
       const project = fakeProject(async () => undefined);
       const openProject = vi.fn(async () => project);
@@ -376,9 +376,27 @@ describe("route storage cleanup", () => {
         factory: preClosedFactory,
         context: { signal: alreadyAborted.signal },
         mode: "create",
-      }, preAbortedOperation)).resolves.toBeNull();
+      }, preAbortedOperation)).rejects.toMatchObject({
+        name: "AbortError",
+        message: "request cancelled",
+      });
       expect(preAbortedOperation).not.toHaveBeenCalled();
       expect(preClosedProject.close).toHaveBeenCalledOnce();
+
+      const preExistingProject = fakeProject(async () => undefined);
+      const preExistingFactory = fakeFactory({ openExistingProject: async () => preExistingProject });
+      const preExistingController = new AbortController();
+      preExistingController.abort();
+      const preExistingOperation = vi.fn(async () => "must not run");
+      await expect(withProjectStorage({
+        config,
+        cwd,
+        factory: preExistingFactory,
+        context: { signal: preExistingController.signal },
+        mode: "existing",
+      }, preExistingOperation)).resolves.toBeNull();
+      expect(preExistingOperation).not.toHaveBeenCalled();
+      expect(preExistingProject.close).toHaveBeenCalledOnce();
     });
   });
 

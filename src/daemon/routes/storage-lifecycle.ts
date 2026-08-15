@@ -128,6 +128,9 @@ export async function withProjectStorage<T>(
       signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted) {
         onAbort();
+        if (request.mode === "create") {
+          throw Object.assign(new Error("request cancelled"), { name: "AbortError" });
+        }
         return null;
       }
       return await operation(project, signal);

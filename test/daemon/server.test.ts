@@ -924,18 +924,28 @@ describe("daemon server", () => {
     ].join("\n") + "\n");
 
     const observedTokens: Array<object | undefined> = [];
+    const admissionTokens: object[] = [];
     const originalProjectPaths = projectModule.projectPaths;
     vi.spyOn(projectModule, "projectPaths").mockImplementation((cwd, publicationLockToken) => {
       if (observedTokens.at(-1) !== publicationLockToken) observedTokens.push(publicationLockToken);
+      if (publicationLockToken !== undefined && admissionTokens.at(-1) !== publicationLockToken) {
+        admissionTokens.push(publicationLockToken);
+      }
       return originalProjectPaths(cwd, publicationLockToken);
     });
-    const transactionStarted = [deferred<object | undefined>(), deferred<object | undefined>()];
+    const transactionStarted = [
+      deferred<{ discoveryToken: object | undefined; admissionToken: object | undefined }>(),
+      deferred<{ discoveryToken: object | undefined; admissionToken: object | undefined }>(),
+    ];
     const releaseTransaction = [deferred<void>(), deferred<void>()];
     let transactionIndex = 0;
     const originalTransaction = SqliteProjectStorage.prototype.transaction;
     const transactionSpy = vi.spyOn(SqliteProjectStorage.prototype, "transaction").mockImplementation(async function (callback) {
       const index = transactionIndex++;
-      transactionStarted[index]?.resolve(observedTokens[index]);
+      transactionStarted[index]?.resolve({
+        discoveryToken: observedTokens.at(-2),
+        admissionToken: admissionTokens.at(-1),
+      });
       await releaseTransaction[index]?.promise;
       return originalTransaction.call(this, callback);
     });
@@ -947,15 +957,17 @@ describe("daemon server", () => {
 
     const scan = scanForTranscripts?.();
     try {
-      const firstToken = await transactionStarted[0].promise;
-      expect(firstToken).toEqual(expect.any(Object));
+      const firstBatch = await transactionStarted[0].promise;
+      expect(firstBatch.discoveryToken).toBeUndefined();
+      expect(firstBatch.admissionToken).toEqual(expect.any(Object));
       await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
         .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
       releaseTransaction[0].resolve();
 
-      const secondToken = await transactionStarted[1].promise;
-      expect(secondToken).toEqual(expect.any(Object));
-      expect(secondToken).not.toBe(firstToken);
+      const secondBatch = await transactionStarted[1].promise;
+      expect(secondBatch.discoveryToken).toBeUndefined();
+      expect(secondBatch.admissionToken).toEqual(expect.any(Object));
+      expect(secondBatch.admissionToken).not.toBe(firstBatch.admissionToken);
       await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
         .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
       releaseTransaction[1].resolve();

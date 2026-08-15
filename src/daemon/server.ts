@@ -700,13 +700,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
               end: (data: string) => { response.body = data; },
             } as unknown as ServerResponse;
 
-            await withPublicationAdmission(async publicationLockToken => {
-              await ingestHandler(mockReq, mockRes, JSON.stringify({
-                session_id: sessionId,
-                cwd: scanCwd,
-                transcript_path: transcriptPath,
-              }), { publicationLockToken, signal });
-            });
+            await ingestHandler(mockReq, mockRes, JSON.stringify({
+              session_id: sessionId,
+              cwd: scanCwd,
+              transcript_path: transcriptPath,
+            }), { withPublicationAdmission, signal });
           }
         }
       }

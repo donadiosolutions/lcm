@@ -96,7 +96,7 @@ export function createStoreHandler(
           depth: metadata.depth ?? 0,
           confidence: 1.0,
         }),
-      ) as string;
+      );
 
       sendJson(res, 200, { stored: true, id });
     } catch (err) {

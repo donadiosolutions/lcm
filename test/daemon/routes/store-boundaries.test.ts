@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { StorageOperationError } from "../../../src/storage/errors.js";
+import type { StorageBackendFactory } from "../../../src/storage/index.js";
+import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
   stat: vi.fn(() => ({ mtimeMs: 1 })),
@@ -150,6 +153,100 @@ describe("store persistence boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "open failed" });
     expect(mocks.projectClose).not.toHaveBeenCalled();
     expect(mocks.factoryClose).toHaveBeenCalledOnce();
+  });
+
+  it("does not report a cancelled create as stored after project open", async () => {
+    const handler = createStoreHandler(config);
+    const controller = new AbortController();
+    mocks.openProject.mockImplementationOnce(async () => {
+      controller.abort();
+      return {
+        promotedMemory: { insert: mocks.insert },
+        close: mocks.projectClose,
+      };
+    });
+
+    await handler(
+      {} as never,
+      response,
+      JSON.stringify({ text: "cancelled", cwd: "/cancelled" }),
+      { signal: controller.signal },
+    );
+
+    expect(mocks.insert).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "request cancelled" });
+    expect(mocks.send.mock.calls.some(([, status, body]) => status === 200 && body?.stored === true)).toBe(false);
+    expect(mocks.projectClose).toHaveBeenCalledOnce();
+  });
+
+  it("returns staged PostgreSQL unavailability before scrubber discovery", async () => {
+    const postgresqlConfig = {
+      ...config,
+      storage: {
+        backend: "postgresql",
+        postgresql: {
+          url: "postgresql://user:secret@db.example/lcm",
+          poolMax: 1,
+          connectionTimeoutMs: 100,
+          idleTimeoutMs: 100,
+          statementTimeoutMs: 100,
+        },
+      },
+    } as const;
+    const handler = createStoreHandler(postgresqlConfig, makeStagedPostgreSqlStorageFactory());
+
+    await handler({} as never, response, JSON.stringify({ text: "value", cwd: "/staged" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, expect.objectContaining({
+      code: "STORAGE_BACKEND_STAGED",
+      error: "store is unavailable while PostgreSQL storage repositories are staged",
+      storageBackend: "postgresql",
+    }));
+    expect(mocks.forProject).not.toHaveBeenCalled();
+  });
+
+  it("maps typed PostgreSQL persistence failures to sanitized 503 responses", async () => {
+    const postgresqlConfig = {
+      ...config,
+      storage: {
+        backend: "postgresql",
+        postgresql: {
+          url: "postgresql://user:secret@db.example/lcm",
+          poolMax: 1,
+          connectionTimeoutMs: 100,
+          idleTimeoutMs: 100,
+          statementTimeoutMs: 100,
+        },
+      },
+    } as const;
+    const injected = {
+      backend: "postgresql",
+      capabilities: {
+        transactions: true,
+        lexicalSearch: true,
+        regexSearch: true,
+        nativeFullTextSearch: "available",
+        coordination: "distributed",
+      },
+      openProject: mocks.openProject,
+      close: mocks.factoryClose,
+    } as unknown as StorageBackendFactory;
+    const error = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      "pid",
+      "promotedMemory",
+      "insert",
+    );
+    mocks.insert.mockImplementationOnce(() => { throw error; });
+
+    await createStoreHandler(postgresqlConfig, injected)(
+      {} as never,
+      response,
+      JSON.stringify({ text: "value", cwd: "/typed-error" }),
+    );
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, error.toJSON());
   });
 
   it("uses an injected factory without taking ownership of it", async () => {

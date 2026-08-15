@@ -395,6 +395,21 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.closeProject).toHaveBeenCalledOnce();
   });
 
+  it("bounds an unavailable create-mode project as cancellation", async () => {
+    mocks.openProject.mockResolvedValueOnce(undefined);
+
+    await expect(promoteEventsForCwd(
+      config,
+      "/cwd",
+      "/events.db",
+    )).resolves.toMatchObject({
+      promoted: 0,
+      skipped: 0,
+      errors: 0,
+      message: "promotion cancelled",
+    });
+  });
+
   it("reports incomplete global drains and closes owned factories when projects fail to open", async () => {
     mocks.collect.mockReturnValueOnce([{
       projectId: "p", cwd: "/cwd", path: "/events.db", metadataMissing: false,

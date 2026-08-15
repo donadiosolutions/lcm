@@ -7,6 +7,11 @@ import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { claudeProjectDirName, createDaemon, readBody, sendJson, type DaemonInstance } from "../../src/daemon/server.js";
 import { clearProjectMapCache } from "../../src/project-map.js";
+import { ScrubEngine } from "../../src/scrub.js";
+import {
+  BackendPublicationJournalError,
+  withBackendPublicationConsumerLockAsync,
+} from "../../src/storage/backend-publication.js";
 
 let home: string;
 let daemon: DaemonInstance | undefined;
@@ -122,6 +127,46 @@ describe("daemon route and lifecycle boundaries", () => {
 });
 
 describe("periodic transcript scan boundaries", () => {
+  it("rethrows backend publication journal failures from the periodic scan", async () => {
+    let scan: (() => Promise<void>) | undefined;
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const handle = { unref: vi.fn() } as unknown as NodeJS.Timeout;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 10 * 60 * 1000 && typeof callback === "function") {
+        scan = async () => { await callback(...args); };
+        return handle;
+      }
+      return realSetInterval(callback, timeout, ...args);
+    }) as typeof setInterval);
+    vi.spyOn(globalThis, "clearInterval").mockImplementation(((timer?: NodeJS.Timeout | number | string) => {
+      if (timer !== handle) realClearInterval(timer as NodeJS.Timeout);
+    }) as typeof clearInterval);
+
+    daemon = await createDaemon(config());
+    const projects = join(home, ".lcm", "projects");
+    mkdirSync(projects, { recursive: true });
+    const project = join(projects, "periodic-error");
+    mkdirSync(project);
+    writeFileSync(join(project, "meta.json"), JSON.stringify({ cwd: home }));
+    const sessionsDir = join(home, ".claude", "projects", claudeProjectDirName(home));
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "periodic-error.jsonl"), `${JSON.stringify({
+      message: { role: "user", content: "periodic error" },
+    })}\n`);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const parse = JSON.parse;
+    vi.spyOn(JSON, "parse").mockImplementation((value: string) => {
+      if (value.includes('"session_id"')) {
+        throw new BackendPublicationJournalError("malformed-journal", "periodic test failure");
+      }
+      return parse(value);
+    });
+
+    await expect(scan!()).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith("[lcm] periodic transcript scan blocked by backend publication admission");
+  });
+
   it("skips absent, malformed, incomplete, and non-directory project entries", async () => {
     let scan: (() => Promise<void>) | undefined;
     const realSetInterval = globalThis.setInterval;
@@ -155,13 +200,26 @@ describe("periodic transcript scan boundaries", () => {
     writeFileSync(join(blockedProject, "meta.json"), JSON.stringify({ cwd: home }));
     const sessionsDir = join(home, ".claude", "projects", claudeProjectDirName(home));
     mkdirSync(sessionsDir, { recursive: true });
-    writeFileSync(join(sessionsDir, "blocked-session.jsonl"), "{}\n");
+    writeFileSync(join(sessionsDir, "blocked-session.jsonl"), `${JSON.stringify({
+      message: { role: "user", content: "blocked publication admission" },
+    })}\n`);
     const publicationDir = join(home, ".lcm", "backend-publication");
     mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
-    writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const journalPath = join(publicationDir, "journal.json");
+    let publicationAvailableDuringPreparation = false;
+    const prepareScrubber = vi.spyOn(ScrubEngine, "forProject").mockImplementation(async () => {
+      try {
+        await withBackendPublicationConsumerLockAsync(home, async () => undefined);
+        publicationAvailableDuringPreparation = true;
+      } catch {
+        // The pre-remediation outer admission wrapper keeps this lock held.
+      }
+      writeFileSync(journalPath, "{", { mode: 0o600 });
+      return { scrubWithCounts: vi.fn() } as never;
+    });
     await expect(scan!()).resolves.toBeUndefined();
-    expect(warn).toHaveBeenCalledWith("[lcm] periodic transcript scan blocked by backend publication admission");
+    expect(prepareScrubber).toHaveBeenCalledOnce();
+    expect(publicationAvailableDuringPreparation).toBe(true);
 
     rmSync(projects, { recursive: true, force: true });
     writeFileSync(projects, "not a directory");

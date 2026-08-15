@@ -115,6 +115,27 @@ describe("session complete persistence boundaries", () => {
     expect(mocks.close).not.toHaveBeenCalled();
   });
 
+  it("does not report a cancelled create as recorded after project open", async () => {
+    const handler = createSessionCompleteHandler(config);
+    const response = {} as never;
+    const controller = new AbortController();
+    mocks.migrate.mockImplementationOnce(() => {
+      controller.abort();
+    });
+
+    await handler(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "cancelled", cwd: "/ok" }),
+      { signal: controller.signal },
+    );
+
+    expect(mocks.run).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "request cancelled" });
+    expect(mocks.send.mock.calls.some(([, status, body]) => status === 200 && body?.recorded === true)).toBe(false);
+    expect(mocks.close).toHaveBeenCalledOnce();
+  });
+
   it("returns a sanitized 503 for typed PostgreSQL transaction failures", async () => {
     const postgresqlConfig = {
       ...config,

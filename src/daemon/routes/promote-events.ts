@@ -779,36 +779,44 @@ async function runSelectedPromotionBatch(
       config.security.sensitivePatterns,
       projectDir(cwd, publicationLockToken),
     );
-  const result = await withProjectStorage(
-    {
-      config,
-      cwd,
-      factory,
-      context,
-      mode: "create",
-    },
-    async project => {
-      if (prepared.events.length === 0) {
-        return {
-          promoted: 0,
-          skipped: 0,
-          correlated: 0,
-          errors: 0,
-          message: "no unprocessed events",
-        };
-      }
-      return promoteEventsBatch(
+  let result: PromoteResult | null;
+  try {
+    result = await withProjectStorage(
+      {
         config,
         cwd,
-        edb,
-        project,
-        activeScrubber!,
-        new Map(),
-        prepared.events,
-        prepared.reinforcementCache,
-      );
-    },
-  );
+        factory,
+        context,
+        mode: "create",
+      },
+      async project => {
+        if (prepared.events.length === 0) {
+          return {
+            promoted: 0,
+            skipped: 0,
+            correlated: 0,
+            errors: 0,
+            message: "no unprocessed events",
+          };
+        }
+        return promoteEventsBatch(
+          config,
+          cwd,
+          edb,
+          project,
+          activeScrubber!,
+          new Map(),
+          prepared.events,
+          prepared.reinforcementCache,
+        );
+      },
+    );
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      return cancelledPromotionResult();
+    }
+    throw error;
+  }
   return result ?? cancelledPromotionResult();
 }
 
