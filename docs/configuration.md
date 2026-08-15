@@ -221,7 +221,8 @@ Prompt-time recall now has a second budget layer after `/prompt-search` ranking.
   recall completely, regardless of `maxInjectedMemoryItems`. SQLite returns an
   empty result immediately. PostgreSQL still performs machine registration,
   explicit project-binding, and storage-availability admission first, so an
-  invalid identity remains `409` and a staged backend remains `503`.
+  invalid identity remains `409` and an unavailable selected backend remains
+  `503`.
 - `restoration.promptSnippetLength` still controls the per-result snippet size before final emission.
 - `restoration.maxInjectedMemoryItems` caps how many deduped hints can survive into the final `<memory-context>` block.
 - `restoration.dedupMinPrefix` dedupes identical or near-identical hints by normalized prefix before emission.
@@ -253,18 +254,15 @@ not contain a `storage` object continue to use the per-project databases under
 ```
 
 The PostgreSQL configuration, internal PostgreSQL 18 runtime, schema baseline,
-and production project-storage factory are available to explicit programmatic
-callers and conformance. The factory composes all nine shared repository
-contracts only after eager runtime-readiness checks and per-project publication
-and identity admission. The native-transcript adapter remains a separate
-explicit backfill seam and does not add a daemon route or CLI command. Normal
-PostgreSQL daemon/CLI selection remains unavailable until #92 and the remaining
-#224 routing work are implemented, so SQLite is still the only active backend
-for those routes. Their staged readiness contract keeps storage unavailable and
-returns sanitized `503` responses; it never falls back to SQLite after an
-explicit PostgreSQL selection. The factory's readiness contract also requires
-the parity extensions at their current default versions in the `public` schema;
-see the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md#required-extensions-and-postgresql-version).
+and production project-storage factory are also used by the daemon and MCP
+storage routes when `storage.backend` is explicitly `postgresql`. The factory
+composes all nine shared repository contracts only after eager runtime-readiness
+checks and per-project publication and identity admission. The native-transcript
+adapter remains a separate explicit backfill seam and does not add a daemon
+route or CLI command. SQLite remains the default; an explicit PostgreSQL
+selection never falls back to a project SQLite database. The factory's
+readiness contract also requires the parity extensions at their current default
+versions in the `public` schema; see the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md#required-extensions-and-postgresql-version).
 The separate [backend publication safety guide](backend-publication.md)
 describes the secure `~/.lcm` root, publication journal, PostgreSQL admission
 fence, and the `503`/doctor behavior when publication evidence is unresolved.
@@ -282,10 +280,13 @@ still not resolved before fail-open dispatch.
 Manual CLI operations and MCP request admission are not covered by that hook
 exception. They resolve the complete effective configuration and fail closed
 when PostgreSQL credentials, TLS preflight, identity registration, explicit
-project binding, or backend support are unavailable. Daemon startup and
-restart may retain the authenticated staged process described above, but its
-storage routes remain fail-closed. The hook behavior therefore does not provide
-SQLite fallback or make the PostgreSQL repository backend available.
+project binding, or backend support are unavailable. The daemon starts one
+selected-backend factory and routes bounded repository batches through it. An
+unbound or invalid project returns sanitized `409` identity guidance; a
+selected-backend initialization or operation failure returns a sanitized `503`.
+The daemon cancels request-scoped work on client disconnect and drains active
+consumers before closing the factory during shutdown. No PostgreSQL failure
+opens a project SQLite database as a recovery path.
 
 The following is the reserved PostgreSQL configuration shape for direct
 development and conformance only; it is not an instruction to activate
@@ -335,20 +336,19 @@ reviewed application privileges. Use the exact unquoted PostgreSQL role name
 reported by the catalog; do not put a password or connection URL in this
 setting.
 
-These environment values are for the staged direct programmatic and
-conformance paths only. Do not run `lcm daemon restart` for this PostgreSQL
-shape: normal PostgreSQL daemon/CLI activation and any associated restart are
-deferred to the unimplemented #92 and #224 work.
+These environment values are used by the daemon and MCP runtime as well as
+direct programmatic callers. Run `lcm daemon restart` after changing the
+selection or credentials so the managed daemon constructs a fresh verified
+factory. The CLI/import-export activation and parity work remain tracked by
+#618; stats, pool diagnostics, status, and doctor presentation remain tracked
+by #619.
 
 ### Provisioning a PostgreSQL database
 
-Provisioning is an explicit administrator workflow for staged development,
-direct programmatic repositories, and conformance. It does not make
-PostgreSQL selection available or activate normal daemon/CLI routing. First
-create a UTF-8 PostgreSQL 18 database, preload `pg_stat_statements`, install
-the required extensions in `public`, and configure `storage.backend` as shown
-above only for that staged workflow. Keep production installations on SQLite
-until #92 and #224 are implemented. Use a dedicated migration role that owns
+Provisioning is an explicit administrator workflow for any PostgreSQL daemon,
+MCP, or programmatic deployment. First create a UTF-8 PostgreSQL 18 database,
+preload `pg_stat_statements`, install the required extensions in `public`, and
+configure `storage.backend` as shown above. Use a dedicated migration role that owns
 the database and any existing `lcm` schema;
 do not use the restricted runtime role for DDL. Then apply the migrations
 packaged with the installed LCM version:
@@ -422,11 +422,12 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 
 The transcript grant permits immutable inserts, provenance reads, and bounded
 checkpoint updates only; it grants no payload update, deletion, truncation, or
-unrelated table access. Applying it makes the programmatic repository usable,
-not the staged daemon/CLI routes. See
+unrelated table access. Applying it makes the explicit native-transcript
+repository usable; native-transcript daemon and CLI routing remains outside
+this issue. See
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) before
 running an explicit backfill.
-The memory grant permits direct use of the staged promoted-memory, recall,
+The memory grant permits direct use of the selected promoted-memory, recall,
 redaction-administration, and session-coordination repositories. Deletes are
 limited to their six owned mutable-state tables; generated search data is
 removed with promoted memory, while identity, conversations, summaries,
@@ -436,10 +437,10 @@ The coordination grant permits project-scoped lease reads, bounded deletes,
 column-limited acquisition/renewal/release updates, fencing-sequence `USAGE`,
 and column-limited passive-inbox claims. It grants no inbox insertion,
 completion, deletion, payload update, table truncation, sequence inspection or
-restart, schema mutation, or unrelated-domain access. Applying it exposes only
-the staged programmatic primitives described in
+restart, schema mutation, or unrelated-domain access. Applying it exposes the
+project-scoped primitives described in
 [PostgreSQL cross-machine coordination](../src/storage/postgresql/reference/postgresql-coordination.md); it does
-not enable the application backend or start a worker.
+not start the separate explicit passive-delivery worker.
 
 ### Embedded PostgreSQL project lifecycle
 
@@ -466,8 +467,9 @@ bypass publication evidence. See the
 Always close both scopes in `finally`: close `ProjectStorage` first to abort and
 settle only its project work, then close the factory to drain pending opens and
 remaining projects and close the shared runtime. Preserve a primary operation
-failure if either cleanup fails. This explicit lifecycle does not activate the
-staged PostgreSQL daemon/CLI routes or change SQLite's active default.
+failure if either cleanup fails. This explicit lifecycle is also the cleanup
+model used by daemon route operations and does not change SQLite's active
+default.
 
 Before opening project storage, restore
 `LCM_POSTGRES_URL` to the restricted runtime-role URL, run `lcm machine
@@ -477,10 +479,10 @@ drift, incomplete migrations, extension/search drift, missing grants, or
 overbroad grants. Project lookup/open fails closed on unresolved or changed
 publication evidence and any remote identity mismatch. Correct the underlying
 state and retry; do not bypass readiness, rewrite publication evidence, or
-switch to SQLite as an automatic recovery path. Do not treat a daemon restart
-as PostgreSQL activation: #92 and the remaining #224 routing work are not
-implemented, and normal PostgreSQL selection remains unavailable. Never leave
-identity commands configured with migration-owner credentials. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for
+switch to SQLite as an automatic recovery path. To roll back an active
+selection, publish a new authenticated selection targeting SQLite through the
+same publication workflow, then restart the daemon. Never leave identity
+commands configured with migration-owner credentials. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for
 the exact extension, role, ownership, ACL, backup, and recovery contracts.
 
 The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,
@@ -497,10 +499,9 @@ environment variables. The CA and URL are the only TLS and endpoint authority.
 For DigitalOcean Managed PostgreSQL 18 Standard Edition, download the cluster
 CA certificate from the database's **Connection Details** page, save it in a
 private user-readable location, and use the displayed connection string without
-its TLS query parameters. These PostgreSQL values are consumed only by the
-staged direct programmatic and conformance paths while #92 and #224 remain
-unimplemented; do not restart the normal daemon or treat this section as
-activation guidance. On Linux, the managed user-systemd launch sends
+its TLS query parameters. These PostgreSQL values are consumed by the daemon,
+MCP, direct programmatic, and conformance paths. On Linux, the managed
+user-systemd launch sends
 `LCM_POSTGRES_URL` through `LoadCredential`; the non-secret CA pathname is
 propagated as a normal environment value. `lcm config get storage --effective`
 shows the CA path and tuning values but replaces the URL with `[REDACTED]`.
@@ -604,7 +605,7 @@ callers that intentionally create a daemon without a token retain the full
 health response. `lcm doctor` treats public health as liveness only and uses the
 authenticated post-validation health result to decide whether passive-learning
 queues can drain, both when validating an already-running managed daemon and
-after starting one. Authenticated healthy storage is ready, authenticated staged
+after starting one. Authenticated healthy storage is ready, authenticated
 storage is unavailable, and a missing or unreadable managed-daemon token leaves
 readiness unverified. In that unverified state, doctor warns that access to the
 daemon token and authenticated diagnostics must be restored before it can

@@ -299,6 +299,43 @@ pre-existing local alias are inserted into the new project in the same
 transaction. If any path has a different owner, none of the paths are
 redirected.
 
+## Activate PostgreSQL daemon routing
+
+Daemon and MCP project routes use PostgreSQL only when all of these boundaries
+are established:
+
+1. `storage.backend` is `postgresql`, the URL and CA file are supplied through
+   the protected runtime environment, and the non-secret `migrationRole` names
+   the schema owner.
+2. The machine has a finalized `~/.lcm/machine.json` whose machine UUID is the
+   registered PostgreSQL machine.
+3. The local project-map entry contains the exact remote project UUID and the
+   selected path is one of that machine's PostgreSQL aliases.
+4. The backend-publication journal is terminal and publishes PostgreSQL for
+   the same config and map witnesses, and the reviewed runtime grant scripts
+   have been applied by the migration owner or an administrator.
+
+The daemon verifies these facts before opening project storage and rechecks
+publication admission at each bounded storage operation. An unbound or
+unregistered project returns a sanitized HTTP `409` with identity guidance.
+TLS, runtime, grant, publication, or selected-backend failures return a
+sanitized `503`; URLs, credentials, filesystem paths, SQL causes, and stack
+traces are not returned. PostgreSQL never causes a project SQLite database to
+be opened as a fallback.
+
+Request cancellation closes the active project, and daemon shutdown aborts and
+drains foreground and passive consumers before closing the shared PostgreSQL
+factory. Hook capture is intentionally independent: it commits to the local
+SQLite outbox first and can be retried after PostgreSQL recovers. To recover
+from an outage, restore the runtime service or grants and retry the operation.
+To roll back selection, publish a new authenticated backend publication whose
+target is SQLite, then restart the daemon; do not edit `map.json` or
+`config.json` independently.
+
+CLI/import-export and portable transfer remain #618-owned. Stats, pool
+diagnostics, status, and doctor presentation remain #619-owned; their current
+limitations do not change the daemon's project identity or publication gate.
+
 ## Same-machine aliases
 
 A local hash or a known local path target adds a local alias. If the target is
@@ -480,46 +517,37 @@ Hooks remain successful when PostgreSQL identity or storage is unavailable.
 User-prompt passive events are written to the local SQLite outbox before remote
 bootstrap and remain available for later promotion.
 
-PostgreSQL domain repositories are still staged. With PostgreSQL selected, the
-daemon starts so identity validation remains reachable, but `GET /health`
-reports unavailable storage. After applicable request and identity validation,
+PostgreSQL domain repositories are active for daemon and MCP project routes.
+With PostgreSQL selected, the daemon starts one verified factory and the
 storage-backed routes including `/compact`, `/ingest`, `/promote`, `/restore`,
 `/store`, `/session-complete`, `/review-stale`, `/prompt-search`,
 `/promote-events`, `/promote-events/all`, `/search`, `/grep`, `/recent`,
-`/describe`, and `/expand`, plus fixed `/status`, `/stats`, and `/stats/pool`,
-return sanitized `503` responses. Before those project routes reach the staged
-backend, an absent project binding, missing or pending registration, or invalid
-machine identity returns `409` with
-`code: "STORAGE_IDENTITY_REQUIRED"` and `storageBackend: "postgresql"`.
-Unbound-project guidance intentionally omits the local hash and filesystem
-path. Machine-file guidance similarly replaces the host-local identity path
-with `<path>` while retaining safe remediation such as `chmod 600`. Run the
-suggested `lcm project create` or
-`lcm project link <project-id>` command from the affected project directory.
-SQLite keeps its existing best-effort empty-result behavior. Every fixed staged
-route response includes the stable machine-readable code
-`STORAGE_BACKEND_STAGED` and `storageBackend: "postgresql"`; clients must not
-authenticate or branch on the human-readable error text. The raw hook-facing
-`POST /prompt-search` endpoint reports that same `503`; the prompt hook/client
-layer treats the response as an unavailable optional hint source and still
-exits successfully with the learning instruction. Passive events are already
-durable in the local SQLite outbox before that request. Setting
-`restoration.promptSearchMaxResults` to `0` suppresses returned hints, but does
-not bypass PostgreSQL identity or storage admission: missing identity still
-returns `409`, and the staged backend still returns `503`. SQLite retains its
-immediate empty-result behavior for this setting. Disabled compaction and an
-empty ingestion batch follow the same rule: PostgreSQL still validates explicit
-identity and backend availability, while SQLite preserves its existing no-op
-responses. The daemon does not run SQLite
-transcript scans or passive-outbox sweeps. Other project operations fail
-at a cause-free unavailable-backend boundary after validating machine
-registration and the explicit project binding. LCM does not fall back to
-SQLite, return false empty results from manual read routes, or advertise
-PostgreSQL data capabilities during this staged state.
-In particular, `/compact` and `/store` perform staged backend admission before
-creating legacy local project metadata or loading project scrub patterns, so a
-rejected PostgreSQL request cannot mutate SQLite-era state or replace the
-documented `503` with a scrubber error.
+`/describe`, and `/expand` execute their bounded batches against the selected
+project. Public `GET /health` is a storage-free liveness response; authenticated
+health reports selected-backend readiness. An absent project binding, missing or
+pending registration, or invalid machine identity returns sanitized `409`
+identity guidance with `code: "STORAGE_IDENTITY_REQUIRED"` and
+`storageBackend: "postgresql"`. Runtime, grant, publication, or operation
+failures return sanitized `503` responses. Unbound-project guidance omits the
+local hash and filesystem path, and machine-file guidance replaces host-local
+identity paths with `<path>`.
+
+SQLite keeps its existing best-effort behavior when SQLite is selected. The
+PostgreSQL routes never open a project SQLite database or return a false empty
+read result as fallback. The raw hook-facing `POST /prompt-search` endpoint
+still lets the prompt hook treat optional hint failure as non-fatal, while
+identity errors remain visible as admission failures. Setting
+`restoration.promptSearchMaxResults` to `0` suppresses returned hints but does
+not bypass PostgreSQL identity or storage admission. Disabled compaction and
+empty ingestion still authenticate the selected backend before returning their
+normal no-op result. Passive hooks write the local SQLite outbox first; the
+daemon's selected-backend consumer processes it in bounded batches.
+
+Request cancellation closes project storage, and daemon shutdown drains active
+routes and passive consumers before closing the shared factory. Recovery means
+restoring PostgreSQL service or grants and retrying. Rollback means publishing
+an authenticated SQLite selection and restarting the daemon; it is not a
+manual edit to `config.json` or `map.json`.
 
 ## Ambiguity and doctor
 
