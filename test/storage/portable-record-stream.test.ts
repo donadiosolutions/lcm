@@ -6,7 +6,6 @@ import {
   PORTABLE_RECORD_DOMAIN_ORDER,
   PORTABLE_RECORD_SCHEMA_SHA256,
   PortableStreamError,
-  canonicalJson,
   createPortableRecord,
   serializePortableRecord,
 } from "../../src/storage/portable-record-stream.js";
@@ -618,10 +617,6 @@ function createBatchInput(
 
 function asPortableBatch(value: unknown): PortableBatch {
   return value as PortableBatch;
-}
-
-function asCheckpoint(value: unknown): PortableCheckpoint {
-  return value as PortableCheckpoint;
 }
 
 function withCheckpointChecksum(
