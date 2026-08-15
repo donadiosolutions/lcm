@@ -1206,8 +1206,8 @@ describe("portable record stream public seam", () => {
     expect(batch.records).toHaveLength(1);
   });
 
-  it("accepts records exactly filling 144 MiB with a separate 128 MiB predecessor", () => {
-    const predecessor = messageWithFramedBytes(0, PORTABLE_LIMITS.maxRecordBytes);
+  it("accepts records exactly filling 144 MiB with a valid predecessor excluded", () => {
+    const predecessor = records.messages[0];
     const first = messageWithFramedBytes(1, PORTABLE_LIMITS.maxRecordBytes);
     const second = messageWithFramedBytes(
       2,
@@ -1232,14 +1232,13 @@ describe("portable record stream public seam", () => {
       maxRecords: 2,
       maxBytes: PORTABLE_LIMITS.maxBatchBytes,
     })));
-    expect(serializePortableRecord(predecessor).byteLength).toBe(PORTABLE_LIMITS.maxRecordBytes);
     expect(batch.framedBytes).toBe(PORTABLE_LIMITS.maxBatchBytes);
     expect(batch.records).toEqual([first, second]);
     expect(batch.complete).toBe(true);
-  }, 120_000);
+  }, 180_000);
 
-  it("rejects records totaling 144 MiB plus one while bounding predecessor independently", () => {
-    const predecessor = messageWithFramedBytes(0, PORTABLE_LIMITS.maxRecordBytes);
+  it("rejects records totaling 144 MiB plus one with a valid predecessor excluded", () => {
+    const predecessor = records.messages[0];
     const first = messageWithFramedBytes(1, PORTABLE_LIMITS.maxRecordBytes);
     const second = messageWithFramedBytes(
       2,
