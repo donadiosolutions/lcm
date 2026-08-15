@@ -379,9 +379,10 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         });
       } else {
         const storageFailure = storageRouteFailureResponse(
-          activeFactory,
+          config.storage.backend,
           err,
           "compact",
+          activeFactory,
         );
         if (storageFailure) {
           sendJson(res, storageFailure.status, storageFailure.body);
@@ -444,9 +445,10 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
               });
             } else {
               const storageFailure = storageRouteFailureResponse(
-                activeFactory,
+                config.storage.backend,
                 err,
                 "compact",
+                activeFactory,
               );
               if (storageFailure) {
                 sendJson(res, storageFailure.status, storageFailure.body);
@@ -668,7 +670,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         });
         return;
       }
-      const storageFailure = storageRouteFailureResponse(activeFactory, err, "compact");
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "compact", activeFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;

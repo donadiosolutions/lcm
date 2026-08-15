@@ -8,6 +8,7 @@ import {
   claudeProjectDirName,
   createDaemon,
   projectTranscriptScanCwds,
+  requestCancellation,
   type DaemonInstance,
 } from "../../src/daemon/server.js";
 import type { BackgroundPublicationAdmission } from "../../src/daemon/passive-event-processor.js";
@@ -366,11 +367,22 @@ describe("daemon server", () => {
       return realSetInterval(handler, timeout, ...args);
     }) as typeof setInterval);
 
+    const releaseQueuedAdmission = deferred<void>();
+    const publicationLock = vi.fn(async (
+      _homeDir: string | undefined,
+      callback: (token: object) => Promise<unknown> | unknown,
+    ) => {
+      await releaseQueuedAdmission.promise;
+      return callback({});
+    });
+
     daemon = await createDaemon(loadDaemonConfig(configPath, {
       daemon: { port: 0, idleTimeoutMs: 0 },
     }), {
       publicationConfigPath: configPath,
       _scanForTranscripts: scanForTranscripts,
+      _assertBackendPublication: () => undefined,
+      _withBackendPublicationConsumerLockAsync: publicationLock as DaemonOptions["_withBackendPublicationConsumerLockAsync"],
     });
 
     const foregroundStarted = deferred<void>();
@@ -394,14 +406,110 @@ describe("daemon server", () => {
     const scanPromise = scheduledScan?.();
     await scanStarted.promise;
 
+    const queuedOperation = vi.fn();
+    const queuedAdmission = backgroundAdmission!(async () => {
+      queuedOperation();
+    });
+    await new Promise<void>(resolve => setImmediate(resolve));
+
     const stopPromise = daemon.stop();
+    await expect(backgroundAdmission!(async () => undefined)).rejects.toMatchObject({ name: "AbortError" });
     await foregroundAborted.promise;
     await scanAborted.promise;
+    releaseQueuedAdmission.resolve();
+    await expect(queuedAdmission).rejects.toMatchObject({ name: "AbortError" });
+    expect(queuedOperation).not.toHaveBeenCalled();
     await stopPromise;
     await scanPromise;
     await foregroundResponse;
     expect(scanForTranscripts).toHaveBeenCalledOnce();
-    await expect(backgroundAdmission?.(async () => undefined)).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("initiates listener close before awaiting a shutdown drain", async () => {
+    const configPath = join(tempHome!, ".lcm", "config.json");
+    mkdirSync(join(tempHome!, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    const proxyStopStarted = deferred<void>();
+    const releaseProxyStop = deferred<void>();
+    const proxyManager = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => {
+        proxyStopStarted.resolve();
+        await releaseProxyStop.promise;
+      }),
+      isHealthy: vi.fn(async () => true),
+      port: 0,
+      available: false,
+    };
+
+    daemon = await createDaemon(loadDaemonConfig(configPath, {
+      daemon: { port: 0, idleTimeoutMs: 0 },
+    }), {
+      publicationConfigPath: configPath,
+      proxyManager,
+    });
+    daemon.registerRoute("POST", "/late-after-shutdown", async (_req, res) => {
+      res.writeHead(200);
+      res.end("{}\n");
+    }, "read");
+
+    const stopPromise = daemon.stop();
+    await proxyStopStarted.promise;
+    try {
+      await expect(fetch(`http://127.0.0.1:${daemon.address().port}/late-after-shutdown`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+        signal: AbortSignal.timeout(500),
+      })).rejects.toThrow();
+    } finally {
+      releaseProxyStop.resolve();
+      await stopPromise;
+    }
+  });
+
+  it("latches an already-aborted daemon signal for a late request", () => {
+    const shutdownController = new AbortController();
+    shutdownController.abort();
+    const req = {
+      complete: true,
+      aborted: true,
+      destroyed: false,
+      once: vi.fn(),
+      off: vi.fn(),
+    } as never;
+    const res = {
+      writableEnded: false,
+      writableFinished: false,
+      once: vi.fn(),
+      off: vi.fn(),
+    } as never;
+
+    const cancellation = requestCancellation(req, res, shutdownController.signal);
+    expect(cancellation.signal.aborted).toBe(true);
+    cancellation.cleanup();
+
+    const destroyedRequest = {
+      complete: false,
+      aborted: false,
+      destroyed: true,
+      once: vi.fn(),
+      off: vi.fn(),
+    } as never;
+    const destroyedResponse = {
+      writableEnded: false,
+      writableFinished: false,
+      destroyed: false,
+      once: vi.fn(),
+      off: vi.fn(),
+    } as never;
+    const destroyedCancellation = requestCancellation(
+      destroyedRequest,
+      destroyedResponse,
+      new AbortController().signal,
+    );
+    expect(destroyedCancellation.signal.aborted).toBe(true);
+    destroyedCancellation.cleanup();
   });
 
   it("preserves a PostgreSQL factory-construction failure before an active factory exists", async () => {
@@ -587,21 +695,11 @@ describe("daemon server", () => {
       });
       expect(response.status).toBe(503);
       const unavailable = await response.json();
-      if (request.operation === "prompt-search") {
-        expect(unavailable).toMatchObject({
-          name: "StorageOperationError",
-          code: "STORAGE_INITIALIZATION_FAILED",
-          backend: "postgresql",
-          domain: "factory",
-          operation: expect.any(String),
-        });
-      } else {
-        expect(unavailable).toEqual({
-          code: "STORAGE_BACKEND_STAGED",
-          error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
-          storageBackend: "postgresql",
-        });
-      }
+      expect(unavailable).toEqual({
+        code: "STORAGE_BACKEND_STAGED",
+        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
+        storageBackend: "postgresql",
+      });
       expect(JSON.stringify(unavailable)).not.toContain("secret");
     }
 
@@ -654,21 +752,11 @@ describe("daemon server", () => {
       }
       expect(response.status).toBe(503);
       const unavailable = await response.json();
-      if (request.operation === "compact" || request.operation === "store") {
-        expect(unavailable).toEqual({
-          code: "STORAGE_BACKEND_STAGED",
-          error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
-          storageBackend: "postgresql",
-        });
-      } else {
-        expect(unavailable).toMatchObject({
-          name: "StorageOperationError",
-          code: "STORAGE_INITIALIZATION_FAILED",
-          backend: "postgresql",
-          domain: "factory",
-          operation: expect.any(String),
-        });
-      }
+      expect(unavailable).toEqual({
+        code: "STORAGE_BACKEND_STAGED",
+        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
+        storageBackend: "postgresql",
+      });
       expect(JSON.stringify(unavailable)).not.toContain(tempHome);
       expect(JSON.stringify(unavailable)).not.toContain("secret");
     }

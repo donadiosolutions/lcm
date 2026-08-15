@@ -350,9 +350,10 @@ export function createPromoteEventsHandler(
       // Log detailed failure but avoid exposing internal error/stack info to the client
       await safeLogError("promote-events", error, { cwd });
       const storageFailure = storageRouteFailureResponse(
-        activeFactory,
+        config.storage.backend,
         error,
         "promote-events",
+        activeFactory,
       );
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
@@ -480,7 +481,7 @@ export function createPromoteAllEventsHandler(
             unprocessedBefore: sidecar.unprocessed,
           });
         } catch (error) {
-          if (storageRouteFailureResponse(activeFactory, error, "promote-events-all")) {
+          if (storageRouteFailureResponse(config.storage.backend, error, "promote-events-all", activeFactory)) {
             throw error;
           }
           result.errors++;
@@ -504,9 +505,10 @@ export function createPromoteAllEventsHandler(
     } catch (error) {
       await safeLogError("promote-events", error, {});
       const storageFailure = storageRouteFailureResponse(
-        activeFactory,
+        config.storage.backend,
         error,
         "promote-events-all",
+        activeFactory,
       );
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);

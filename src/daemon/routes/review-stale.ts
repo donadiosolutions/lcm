@@ -113,7 +113,7 @@ export function createReviewStaleHandler(config: DaemonConfig, storageFactory?: 
 
       sendJson(res, 200, { stale, total: stale.length });
     } catch (err) {
-      const storageFailure = storageRouteFailureResponse(activeFactory, err, "review-stale");
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "review-stale", activeFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;

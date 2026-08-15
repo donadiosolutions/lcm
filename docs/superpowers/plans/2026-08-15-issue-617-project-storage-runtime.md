@@ -109,11 +109,18 @@ git commit -S --signoff -m "feat(storage): activate selected backend factory"
 - Modify: `test/daemon/routes/storage-lifecycle.test.ts`
 - Modify: `test/daemon/routes/server-route-admission.test.ts`
 - Modify: `test/daemon/server.test.ts`
+- Mechanically update current `storageRouteFailureResponse(...)` callers to pass
+  `config.storage.backend`: `src/daemon/routes/compact.ts`,
+  `src/daemon/routes/ingest.ts`, `src/daemon/routes/promote-events.ts`,
+  `src/daemon/routes/promote.ts`, `src/daemon/routes/prompt-search.ts`,
+  `src/daemon/routes/restore.ts`, `src/daemon/routes/review-stale.ts`,
+  `src/daemon/routes/session-complete.ts`, and `src/daemon/routes/store.ts`
 
 **Interfaces:**
 - Produces: `ProjectStorageRequest`
 - Produces: `withProjectStorage<T>(request, operation): Promise<T | null>`
 - Extends: `RouteExecutionContext.signal?: AbortSignal`
+- Updates: `storageRouteFailureResponse(selectedBackend, error, operation, legacyStagedFactory?)`
 
 - [ ] **Step 1: Write RED lifecycle tests**
 
@@ -156,20 +163,27 @@ Map identity errors to the existing 409 body. Key classification from the
 selected `config.storage.backend`, not an already-constructed factory. Only
 under explicit PostgreSQL selection, map a cause-free `StorageOperationError`
 to HTTP 503 with its `toJSON()` fields; preserve SQLite read degradation and
-route-specific error behavior. Remove staged-factory type checks from route
-failure classification; keep staged diagnostic helpers only where #619 still
-owns stats/status presentation.
+route-specific error behavior. Production route calls pass the selected backend
+explicitly; an optional `activeFactory` is forwarded only so the legacy staged
+fixture retains its diagnostic payload, while the selected backend remains the
+authoritative generic classifier. Keep staged diagnostic helpers only where
+#619 still owns stats/status presentation.
 
 - [ ] **Step 4: Make the daemon own one async factory and pass bounded admission**
 
 Await `createStorageBackendFactory` before route registration. Pass a per-request
 abort signal to every built-in route and the background publication callback
-only to built-in mutators. Mark those storage mutators operation-scoped;
-preserve the existing assertion-only read path and retained admission for
-custom routes/overrides. Remove only the PostgreSQL gates on promote-event
-notify, periodic transcript ingest, and passive-processor start; retain stats,
-pool-stats, and status gates for #619. Ensure startup failure and `stop()` close
-any constructed factory exactly once.
+only to built-in mutators. Keep the pre-existing retained admission for every
+built-in mutator that has not yet adopted `withProjectStorage`; compact alone
+is operation-scoped in Task 2 because it already has its specialized admitted
+repository proxy. Tasks 5 and 6 switch each route to operation-scoped admission
+in the same commit that migrates its storage batch. Preserve the existing
+assertion-only read path and retained admission for custom routes/overrides.
+Remove only the PostgreSQL gates on promote-event notify, periodic transcript
+ingest, and passive-processor start; retain stats, pool-stats, and status gates
+for #619. Ensure startup failure and `stop()` close any constructed factory
+exactly once, with listener close initiated immediately after shutdown abort
+and before draining active work.
 
 Create one daemon-wide shutdown `AbortController`. For each HTTP request,
 combine that signal with a request controller triggered by `req.aborted` or a
@@ -181,7 +195,10 @@ both startup-failure and normal-stop cleanup.
 
 - [ ] **Step 5: Run focused tests and coverage**
 
-Run the Task 2 test command and focused coverage for both changed production files at 100%.
+Run the Task 2 test command and focused coverage for every changed production
+file at 100%. The route edits are mechanical classifier call-site changes only;
+do not integrate Tasks 3–7 route batches, hooks, MCP, or passive-processor
+migrations in Task 2.
 
 - [ ] **Step 6: Commit**
 
@@ -336,7 +353,9 @@ outside the admission callback. Preserve transaction atomicity by keeping
 transaction-scoped repository work inside one helper operation. Before current
 route-local non-fatal handling, rethrow a `StorageOperationError` under explicit
 PostgreSQL selection so an authoritative backend failure cannot be reported as
-success.
+success. A route changes its built-in publication mode from retained to
+operation-scoped in this same commit, after its storage batch is inside
+`withProjectStorage`; Task 2 does not preclassify these unmigrated mutators.
 
 - [ ] **Step 4: Run focused tests and coverage**
 
@@ -389,10 +408,14 @@ Remove staged PostgreSQL responses and preserve compaction's per-method proxy.
 Attach the route signal directly to compaction's opened project and detach it
 in cleanup. Change the passive promotion API so the processor invokes local
 discovery without admission, then supplies its publication callback only to
-the selected-project open/repository batch. Make `/promote-events/all` scan
-first and call the same per-project seam; never retain one token across the
-scan. Rethrow typed PostgreSQL storage failures before per-event non-fatal
-handling. Preserve debounce policy and the local SQLite outbox format.
+the selected-project open/repository batch. Compact remains operation-scoped
+from Task 2 because its specialized per-method admitted repository proxy
+already bounds storage calls; promote-events and `/promote-events/all` remain
+retained until this task migrates their storage batches, then switch to
+operation-scoped mode in the same commit. Make `/promote-events/all` scan first
+and call the same per-project seam; never retain one token across the scan.
+Rethrow typed PostgreSQL storage failures before per-event non-fatal handling.
+Preserve debounce policy and the local SQLite outbox format.
 
 - [ ] **Step 4: Run focused tests and coverage**
 

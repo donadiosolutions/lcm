@@ -159,24 +159,20 @@ describe("route storage cleanup", () => {
         error: "grep is unavailable while PostgreSQL storage repositories are staged",
         storageBackend: "postgresql",
       });
-    expect(storageRouteFailureResponse(staged, stagedError, "grep")).toEqual({
+    expect(storageRouteFailureResponse("postgresql", stagedError, "grep", staged)).toEqual({
       status: 503,
       body: {
-        name: "StorageOperationError",
-        code: "STORAGE_INITIALIZATION_FAILED",
-        backend: "postgresql",
-        projectId: "project",
-        domain: "factory",
-        operation: "openExistingProject",
-        retryable: false,
-        message: "postgresql storage initialization failed for project project",
+        code: "STORAGE_BACKEND_STAGED",
+        error: "grep is unavailable while PostgreSQL storage repositories are staged",
+        storageBackend: "postgresql",
       },
     });
+    expect(storageRouteFailureResponse("sqlite", stagedError, "grep", staged)).toBeNull();
   });
 
   it("recognizes only typed PostgreSQL identity admission failures", () => {
     expect(storageIdentityRequiredResponse(new Error("other"))).toBeNull();
-    expect(storageRouteFailureResponse(undefined, new Error("other"), "store")).toBeNull();
+    expect(storageRouteFailureResponse("sqlite", new Error("other"), "store")).toBeNull();
     expect(storageIdentityRequiredResponse(
       new StorageIdentityConfigurationError("binding required"),
     )).toEqual({
@@ -185,7 +181,7 @@ describe("route storage cleanup", () => {
       storageBackend: "postgresql",
     });
     expect(storageRouteFailureResponse(
-      undefined,
+      "postgresql",
       new StorageIdentityConfigurationError("binding required"),
       "store",
     )).toEqual({
@@ -370,16 +366,18 @@ describe("route storage cleanup", () => {
       alreadyAborted.abort();
       const preClosedProject = fakeProject(async () => undefined);
       const preClosedFactory = fakeFactory({ openProject: async () => preClosedProject });
+      const preAbortedOperation = vi.fn(async (_storage: ProjectStorage, signal: AbortSignal) => {
+        expect(signal.aborted).toBe(true);
+        return "already-aborted";
+      });
       await expect(withProjectStorage({
         config,
         cwd,
         factory: preClosedFactory,
         context: { signal: alreadyAborted.signal },
         mode: "create",
-      }, async (_storage, signal) => {
-        expect(signal.aborted).toBe(true);
-        return "already-aborted";
-      })).resolves.toBe("already-aborted");
+      }, preAbortedOperation)).resolves.toBeNull();
+      expect(preAbortedOperation).not.toHaveBeenCalled();
       expect(preClosedProject.close).toHaveBeenCalledOnce();
     });
   });
@@ -393,16 +391,13 @@ describe("route storage cleanup", () => {
       "store",
       { retryable: true },
     );
-    const postgresqlConfig = { storage: { backend: "postgresql" } } as DaemonConfig;
-    const sqliteConfig = { storage: { backend: "sqlite" } } as DaemonConfig;
-
-    expect(storageRouteFailureResponse(postgresqlConfig, error, "store")).toEqual({
+    expect(storageRouteFailureResponse("postgresql", error, "store")).toEqual({
       status: 503,
       body: error.toJSON(),
     });
-    expect(storageRouteFailureResponse(sqliteConfig, error, "store")).toBeNull();
+    expect(storageRouteFailureResponse("sqlite", error, "store")).toBeNull();
     expect(storageRouteFailureResponse(
-      postgresqlConfig,
+      "postgresql",
       new StorageIdentityConfigurationError("binding required"),
       "store",
     )).toEqual({
@@ -430,5 +425,10 @@ describe("route storage cleanup", () => {
       mode: "create",
     }, async () => "must not run")).rejects.toBe(error);
     expect(storageFactorySeam.create).toHaveBeenCalledOnce();
+    expect(storageRouteFailureResponse("postgresql", error, "createFactory")).toEqual({
+      status: 503,
+      body: error.toJSON(),
+    });
+    expect(storageRouteFailureResponse("sqlite", error, "createFactory")).toBeNull();
   });
 });

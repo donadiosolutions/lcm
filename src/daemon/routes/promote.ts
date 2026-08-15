@@ -145,7 +145,7 @@ export function createPromoteHandler(
           } catch { /* non-fatal */ }
         }
     } catch (err) {
-      const storageFailure = storageRouteFailureResponse(activeFactory, err, "promote");
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "promote", activeFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;

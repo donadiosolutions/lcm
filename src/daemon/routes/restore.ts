@@ -170,7 +170,7 @@ export function createRestoreHandler(
         return project ?? null;
       };
       const rethrowStorageAdmissionFailure = (error: unknown): void => {
-        if (storageRouteFailureResponse(activeFactory, error, "restore")) throw error;
+        if (storageRouteFailureResponse(config.storage.backend, error, "restore", activeFactory)) throw error;
       };
 
       // Post-compaction detection
@@ -303,7 +303,7 @@ export function createRestoreHandler(
       }
       sendJson(res, 200, responseBody);
     } catch (err) {
-      const storageFailure = storageRouteFailureResponse(activeFactory, err, "restore");
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "restore", activeFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;

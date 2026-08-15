@@ -177,7 +177,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       });
     } catch (err) {
       await safeLogError("ingest", err, { cwd, sessionId: session_id });
-      const storageFailure = storageRouteFailureResponse(activeFactory, err, "ingest");
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "ingest", activeFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;

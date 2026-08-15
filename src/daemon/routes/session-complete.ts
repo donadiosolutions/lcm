@@ -41,9 +41,10 @@ export function createSessionCompleteHandler(config: DaemonConfig, storageFactor
       sendJson(res, 200, { recorded: true });
     } catch (err) {
       const storageFailure = storageRouteFailureResponse(
-        activeFactory,
+        config.storage.backend,
         err,
         "session-complete",
+        activeFactory,
       );
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);

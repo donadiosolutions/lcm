@@ -73,6 +73,7 @@ export type RouteHandler = (
 ) => Promise<void>;
 export type RouteAdmission = "read" | "mutating";
 type BuiltInRoutePublicationMode = "retained" | "operation-scoped";
+type RequestLifecycleEvent = "cancelled" | "settled";
 type RegisteredRoute = Readonly<{
   handler: RouteHandler;
   admission: RouteAdmission;
@@ -115,8 +116,16 @@ export type DaemonOptions = {
   publicationConfigPath?: string;
   /** @internal Test-only publication admission seam. */
   _assertBackendPublication?: (homeDir: string | undefined, backend: DaemonConfig["storage"]["backend"]) => void;
+  /** @internal Test-only async publication-lock seam. */
+  _withBackendPublicationConsumerLockAsync?: typeof withBackendPublicationConsumerLockAsync;
+  /** @internal Test-only request lifecycle observer. */
+  _onRequestLifecycle?: (event: RequestLifecycleEvent, signal: AbortSignal) => void;
   /** @internal Test-only observer for the closed built-in route registry. */
-  _onBuiltInRouteRegistered?: (key: string, admission: RouteAdmission) => void;
+  _onBuiltInRouteRegistered?: (
+    key: string,
+    admission: RouteAdmission,
+    publicationMode: BuiltInRoutePublicationMode,
+  ) => void;
 };
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -288,10 +297,11 @@ type RequestCancellation = Readonly<{
   cleanup: () => void;
 }>;
 
-function requestCancellation(
+export function requestCancellation(
   req: IncomingMessage,
   res: ServerResponse,
   shutdownSignal: AbortSignal,
+  onAbort?: (signal: AbortSignal) => void,
 ): RequestCancellation {
   const requestController = new AbortController();
   const combinedController = new AbortController();
@@ -300,7 +310,9 @@ function requestCancellation(
     requestController.abort();
   };
   const abortCombined = (): void => {
+    if (combinedController.signal.aborted) return;
     combinedController.abort();
+    onAbort?.(combinedController.signal);
   };
   const onRequestAborted = (): void => abortRequest();
   const onRequestClose = (): void => {
@@ -310,11 +322,14 @@ function requestCancellation(
     if (!res.writableEnded && !res.writableFinished) abortRequest();
   };
 
-  requestController.signal.addEventListener("abort", abortCombined);
-  shutdownSignal.addEventListener("abort", abortCombined);
+  requestController.signal.addEventListener("abort", abortCombined, { once: true });
+  if (shutdownSignal.aborted) abortCombined();
+  else shutdownSignal.addEventListener("abort", abortCombined, { once: true });
   if (typeof req.once === "function") req.once("aborted", onRequestAborted);
   if (typeof req.once === "function") req.once("close", onRequestClose);
   if (typeof res.once === "function") res.once("close", onResponseClose);
+  if (req.aborted || (req.destroyed && !req.complete)) abortRequest();
+  if (res.destroyed) abortRequest();
 
   return {
     signal: combinedController.signal,
@@ -412,6 +427,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   }
   const publicationConfigPath = options?.publicationConfigPath ?? defaultConfigPath();
   const publicationHome = backendPublicationHomeForConfigPath(publicationConfigPath);
+  const withConsumerPublicationLockAsync = options?._withBackendPublicationConsumerLockAsync
+    ?? withBackendPublicationConsumerLockAsync;
+  const assertDaemonNotShuttingDown = (): void => {
+    if (!shutdownController.signal.aborted) return;
+    throw Object.assign(new Error("daemon is shutting down"), { name: "AbortError" });
+  };
   const assertRequestAdmission = (lockToken?: BackendPublicationLockToken): void => {
     if (options?._assertBackendPublication !== undefined) {
       options._assertBackendPublication(publicationHome, config.storage.backend);
@@ -420,24 +441,29 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     assertDaemonRequestStorageAdmission(config, publicationConfigPath, lockToken);
   };
   const withBackgroundPublicationAdmission: BackgroundPublicationAdmission = async operation => {
-    if (shutdownController.signal.aborted) {
-      throw Object.assign(new Error("daemon is shutting down"), { name: "AbortError" });
-    }
-    return withBackendPublicationConsumerLockAsync(publicationHome, async publicationLockToken => {
+    assertDaemonNotShuttingDown();
+    return withConsumerPublicationLockAsync(publicationHome, async publicationLockToken => {
+      assertDaemonNotShuttingDown();
       assertRequestAdmission(publicationLockToken);
+      assertDaemonNotShuttingDown();
       return operation(publicationLockToken);
     });
   };
   const withRequestPublicationAdmission = (
     retainedToken: BackendPublicationLockToken,
-  ): RoutePublicationAdmission => async operation => withBackendPublicationConsumerLockAsync(
-    publicationHome,
-    async publicationLockToken => {
-      assertRequestAdmission(publicationLockToken);
-      return operation(publicationLockToken);
-    },
-    { lockToken: retainedToken },
-  );
+  ): RoutePublicationAdmission => async operation => {
+    assertDaemonNotShuttingDown();
+    return withConsumerPublicationLockAsync(
+      publicationHome,
+      async publicationLockToken => {
+        assertDaemonNotShuttingDown();
+        assertRequestAdmission(publicationLockToken);
+        assertDaemonNotShuttingDown();
+        return operation(publicationLockToken);
+      },
+      { lockToken: retainedToken },
+    );
+  };
   const createFactory = options?._createStorageBackendFactory ?? createStorageBackendFactory;
   let storageFactory: StorageBackendFactory;
   try {
@@ -476,7 +502,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   ): void => {
     const key = `${method} ${path}`;
     routes.set(key, { handler, admission, publicationMode });
-    options?._onBuiltInRouteRegistered?.(key, admission);
+    options?._onBuiltInRouteRegistered?.(key, admission, publicationMode);
   };
 
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -540,14 +566,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/promote",
     createPromoteHandler(config, storageFactory),
     "mutating",
-    "operation-scoped",
   );
   registerBuiltInRoute(
     "POST",
     "/restore",
     createRestoreHandler(config, storageFactory),
     "mutating",
-    "operation-scoped",
   );
   registerBuiltInRoute("POST", "/grep", createGrepHandler(config, storageFactory), "read");
   registerBuiltInRoute("POST", "/search", createSearchHandler(config, storageFactory), "read");
@@ -558,7 +582,6 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/store",
     createStoreHandler(config, storageFactory),
     "mutating",
-    "operation-scoped",
   );
   registerBuiltInRoute("POST", "/recent", createRecentHandler(config, storageFactory), "read");
   registerBuiltInRoute(
@@ -566,7 +589,6 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/ingest",
     createIngestHandler(config, storageFactory),
     "mutating",
-    "operation-scoped",
   );
   registerBuiltInRoute("POST", "/prompt-search", createPromptSearchHandler(config, storageFactory), "read");
   registerBuiltInRoute(
@@ -574,7 +596,6 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/session-complete",
     createSessionCompleteHandler(config, storageFactory),
     "mutating",
-    "operation-scoped",
   );
   const passiveEventProcessor = new PassiveEventProcessor(
     config,
@@ -587,14 +608,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/promote-events",
     createPromoteEventsHandler(config, storageFactory),
     "mutating",
-    "operation-scoped",
   );
   registerBuiltInRoute(
     "POST",
     "/promote-events/all",
     createPromoteAllEventsHandler(config, storageFactory),
     "mutating",
-    "operation-scoped",
   );
   registerBuiltInRoute(
     "POST",
@@ -619,7 +638,6 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/review-stale",
     createReviewStaleHandler(config, storageFactory),
     "mutating",
-    "operation-scoped",
   );
   // Status handler is registered after listen() when we know the actual port
   const projectMapWatcher = watchProjectMap();
@@ -717,7 +735,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
 
   const server: Server = createServer(async (req, res) => {
     resetIdleTimer();
-    const cancellation = requestCancellation(req, res, shutdownController.signal);
+    const cancellation = requestCancellation(
+      req,
+      res,
+      shutdownController.signal,
+      signal => options?._onRequestLifecycle?.("cancelled", signal),
+    );
     const requestSignal = cancellation.signal;
     let bufferedResponse: BufferedServerResponse | undefined;
     try {
@@ -739,9 +762,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         }
       }
 
+      assertDaemonNotShuttingDown();
       const body = req.method !== "GET" ? await readBody(req) : "";
       if (route.admission === "mutating") {
         if (route.publicationMode === "operation-scoped") {
+          assertDaemonNotShuttingDown();
           assertRequestAdmission();
           await route.handler(req, res, body, {
             withPublicationAdmission: withBackgroundPublicationAdmission,
@@ -750,7 +775,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           return;
         }
         bufferedResponse = new BufferedServerResponse(res);
-        await withBackendPublicationConsumerLockAsync(publicationHome, async (lockToken) => {
+        await withConsumerPublicationLockAsync(publicationHome, async (lockToken) => {
+          assertDaemonNotShuttingDown();
           assertRequestAdmission(lockToken);
           await route.handler(req, bufferedResponse as unknown as ServerResponse, body, {
             publicationLockToken: lockToken,
@@ -791,6 +817,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       sendJsonIfWritable(res, status, { error: message });
     } finally {
       cancellation.cleanup();
+      options?._onRequestLifecycle?.("settled", requestSignal);
     }
   });
 
@@ -850,6 +877,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         address: () => addr,
         stop: async () => {
           shutdownController.abort();
+          const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
           await settleCleanup(() => clearInterval(ingestInterval));
           await settleCleanup(() => activeIngestScan);
           await settleCleanup(() => projectMapWatcher.close());
@@ -858,7 +886,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           if (proxyManager) {
             await settleCleanup(() => proxyManager.stop());
           }
-          await settleCleanup(() => new Promise<void>((r) => server.close(() => r())));
+          await settleCleanup(() => serverClosed);
           await settleCleanup(closeStorageFactory);
         },
         registerRoute: (method, path, handler, requestedAdmission) => {

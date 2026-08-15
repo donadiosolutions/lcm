@@ -110,7 +110,7 @@ export function createStoreHandler(
 
       sendJson(res, 200, { stored: true, id });
     } catch (err) {
-      const storageFailure = storageRouteFailureResponse(activeFactory, err, "store");
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "store", activeFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;

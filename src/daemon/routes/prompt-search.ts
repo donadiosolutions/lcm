@@ -348,9 +348,10 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
       sendJson(res, 200, debugResponse ? { hints, ids, debug: debugResponse } : { hints, ids });
     } catch (error) {
       const storageFailure = storageRouteFailureResponse(
-        activeFactory,
+        config.storage.backend,
         error,
         "prompt-search",
+        activeFactory,
       );
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);

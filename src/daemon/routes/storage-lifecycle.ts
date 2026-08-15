@@ -2,9 +2,10 @@ import type {
   ProjectStorage,
   StorageBackendFactory,
   StorageIdentityContext,
+  StorageBackendName,
 } from "../../storage/index.js";
 import { createStorageBackendFactory } from "../../storage/index.js";
-import type { DaemonConfig, ResolvedStorageConfig } from "../config.js";
+import type { DaemonConfig } from "../config.js";
 import { projectIdentity } from "../project.js";
 import type { RouteExecutionContext } from "../server.js";
 import { StorageOperationError } from "../../storage/errors.js";
@@ -125,7 +126,10 @@ export async function withProjectStorage<T>(
       if (project === undefined) return null;
 
       signal.addEventListener("abort", onAbort, { once: true });
-      if (signal.aborted) onAbort();
+      if (signal.aborted) {
+        onAbort();
+        return null;
+      }
       return await operation(project, signal);
     } finally {
       signal.removeEventListener("abort", onAbort);
@@ -197,17 +201,21 @@ export function storageIdentityRequiredResponse(
  * before selected-backend storage is opened.
  */
 export function storageRouteFailureResponse(
-  source: DaemonConfig | ResolvedStorageConfig | StorageBackendFactory | undefined,
+  selectedBackend: StorageBackendName,
   error: unknown,
   operation: string,
+  legacyStagedFactory?: StorageBackendFactory,
 ): StorageRouteFailureResponse | null {
   const identityRequired = storageIdentityRequiredResponse(error);
   if (identityRequired) return { status: 409, body: identityRequired };
-  const selectedBackend = source === undefined
-    ? undefined
-    : "storage" in source
-      ? source.storage.backend
-      : source.backend;
+
+  // The optional factory exists only for the legacy staged PostgreSQL test
+  // fixture. Production route classification is keyed by selectedBackend.
+  const stagedUnavailable = selectedBackend !== "postgresql" || legacyStagedFactory === undefined
+    ? null
+    : stagedPostgreSqlUnavailableResponse(legacyStagedFactory, error, operation);
+  if (stagedUnavailable) return { status: 503, body: stagedUnavailable };
+
   if (selectedBackend !== "postgresql" || !(error instanceof StorageOperationError)) return null;
   void operation;
   return { status: 503, body: error.toJSON() };
