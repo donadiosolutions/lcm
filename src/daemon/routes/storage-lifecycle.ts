@@ -3,6 +3,10 @@ import type {
   StorageBackendFactory,
   StorageIdentityContext,
 } from "../../storage/index.js";
+import { createStorageBackendFactory } from "../../storage/index.js";
+import type { DaemonConfig, ResolvedStorageConfig } from "../config.js";
+import { projectIdentity } from "../project.js";
+import type { RouteExecutionContext } from "../server.js";
 import { StorageOperationError } from "../../storage/errors.js";
 import { StorageIdentityConfigurationError } from "../../storage/identity-context.js";
 import { MachineIdentityFileError } from "../../machine-identity.js";
@@ -32,8 +36,21 @@ export type StorageRouteFailureResponse =
     }
   | {
       readonly status: 503;
-      readonly body: StagedPostgreSqlUnavailableResponse;
+      readonly body: Record<string, unknown>;
     };
+
+export type ProjectStorageRequest = Readonly<{
+  readonly config: DaemonConfig;
+  readonly cwd: string;
+  readonly factory?: StorageBackendFactory;
+  readonly context?: RouteExecutionContext;
+  readonly mode: "create" | "existing";
+}>;
+
+export type ProjectStorageOperation<T> = (
+  storage: ProjectStorage,
+  signal: AbortSignal,
+) => Promise<T> | T;
 
 async function settleClose(resource: AsyncClosable | undefined): Promise<void> {
   if (!resource) return;
@@ -58,6 +75,74 @@ export async function openExistingProject(
   publicationLockToken?: BackendPublicationLockToken,
 ): Promise<ProjectStorage | null> {
   return factory.openExistingProject(identity, publicationLockToken);
+}
+
+/**
+ * Resolve, open, use, and close one project-storage scope.
+ *
+ * Mutating routes pass their operation-scoped publication callback. Read routes
+ * deliberately omit it so identity/open/operation/close stay on the existing
+ * assertion-only path and do not acquire a new interprocess consumer lock.
+ */
+export async function withProjectStorage<T>(
+  request: ProjectStorageRequest,
+  operation: ProjectStorageOperation<T>,
+): Promise<T | null> {
+  const signal = request.context?.signal ?? new AbortController().signal;
+  let activeFactory = request.factory;
+  let ownedFactory: StorageBackendFactory | undefined;
+
+  const run = async (publicationLockToken?: BackendPublicationLockToken): Promise<T | null> => {
+    if (activeFactory === undefined) {
+      activeFactory = await createStorageBackendFactory(
+        request.config.storage,
+        undefined,
+        undefined,
+        publicationLockToken,
+      );
+      ownedFactory = activeFactory;
+    }
+
+    const identity = projectIdentity(
+      request.cwd,
+      request.config.storage,
+      publicationLockToken,
+    );
+    let project: ProjectStorage | undefined;
+    let projectClose: Promise<void> | undefined;
+    const closeProject = (): Promise<void> => {
+      projectClose ??= closeRouteStorage(project);
+      return projectClose;
+    };
+    const onAbort = (): void => {
+      void closeProject();
+    };
+
+    try {
+      project = request.mode === "existing"
+        ? await openExistingProject(activeFactory, identity, publicationLockToken) ?? undefined
+        : await activeFactory.openProject(identity, publicationLockToken);
+      if (project === undefined) return null;
+
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      return await operation(project, signal);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      await closeProject();
+    }
+  };
+
+  try {
+    if (request.context?.withPublicationAdmission !== undefined) {
+      return await request.context.withPublicationAdmission(run);
+    }
+    return await run(request.context?.publicationLockToken);
+  } finally {
+    // An owned factory is closed only after the admission callback has
+    // returned, so project cleanup and publication revalidation complete first.
+    await closeRouteStorage(ownedFactory);
+  }
 }
 
 export function stagedPostgreSqlUnavailableResponse(
@@ -109,15 +194,21 @@ export function storageIdentityRequiredResponse(
 /**
  * Classify storage admission failures after a route has performed its normal
  * request validation. Identity failures take precedence because they happen
- * before the staged factory is opened.
+ * before selected-backend storage is opened.
  */
 export function storageRouteFailureResponse(
-  factory: StorageBackendFactory | undefined,
+  source: DaemonConfig | ResolvedStorageConfig | StorageBackendFactory | undefined,
   error: unknown,
   operation: string,
 ): StorageRouteFailureResponse | null {
   const identityRequired = storageIdentityRequiredResponse(error);
   if (identityRequired) return { status: 409, body: identityRequired };
-  const unavailable = stagedPostgreSqlUnavailableResponse(factory, error, operation);
-  return unavailable ? { status: 503, body: unavailable } : null;
+  const selectedBackend = source === undefined
+    ? undefined
+    : "storage" in source
+      ? source.storage.backend
+      : source.backend;
+  if (selectedBackend !== "postgresql" || !(error instanceof StorageOperationError)) return null;
+  void operation;
+  return { status: 503, body: error.toJSON() };
 }

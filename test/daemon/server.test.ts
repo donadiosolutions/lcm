@@ -18,6 +18,7 @@ import { projectDbPath, projectDir } from "../../src/daemon/project.js";
 import { recoverMachineIdentity } from "../../src/machine-identity.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
+import { StorageOperationError } from "../../src/storage/errors.js";
 import {
   BackendPublicationJournalError,
   withBackendPublicationConfigLockAsync,
@@ -337,7 +338,117 @@ describe("daemon server", () => {
     }
   });
 
-  it("starts with staged PostgreSQL storage and validates route identity before unavailability", async () => {
+  it("aborts foreground requests and scheduled scans before shutdown drains them", async () => {
+    const configPath = join(tempHome!, ".lcm", "config.json");
+    mkdirSync(join(tempHome!, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    const scanStarted = deferred<AbortSignal>();
+    const scanAborted = deferred<void>();
+    let backgroundAdmission: BackgroundPublicationAdmission | undefined;
+    const scanForTranscripts = vi.fn(async (_withAdmission: BackgroundPublicationAdmission, signal?: AbortSignal) => {
+      backgroundAdmission = _withAdmission;
+      scanStarted.resolve(signal!);
+      if (signal?.aborted) {
+        scanAborted.resolve();
+        return;
+      }
+      await new Promise<void>(resolve => signal?.addEventListener("abort", () => {
+        scanAborted.resolve();
+        resolve();
+      }, { once: true }));
+    });
+    let scheduledScan: (() => Promise<void>) | undefined;
+    const realSetInterval = globalThis.setInterval;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 10 * 60 * 1000 && typeof handler === "function") {
+        scheduledScan = () => handler(...args) as Promise<void>;
+      }
+      return realSetInterval(handler, timeout, ...args);
+    }) as typeof setInterval);
+
+    daemon = await createDaemon(loadDaemonConfig(configPath, {
+      daemon: { port: 0, idleTimeoutMs: 0 },
+    }), {
+      publicationConfigPath: configPath,
+      _scanForTranscripts: scanForTranscripts,
+    });
+
+    const foregroundStarted = deferred<void>();
+    const foregroundAborted = deferred<void>();
+    daemon.registerRoute("POST", "/shutdown-foreground", async (_req, res, _body, context) => {
+      foregroundStarted.resolve();
+      expect(context?.signal).toBeDefined();
+      context?.signal?.addEventListener("abort", () => {
+        foregroundAborted.resolve();
+        if (!res.writableEnded) res.end();
+      }, { once: true });
+      await foregroundAborted.promise;
+    }, "read");
+
+    const foregroundResponse = fetch(`http://127.0.0.1:${daemon.address().port}/shutdown-foreground`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    await foregroundStarted.promise;
+    const scanPromise = scheduledScan?.();
+    await scanStarted.promise;
+
+    const stopPromise = daemon.stop();
+    await foregroundAborted.promise;
+    await scanAborted.promise;
+    await stopPromise;
+    await scanPromise;
+    await foregroundResponse;
+    expect(scanForTranscripts).toHaveBeenCalledOnce();
+    await expect(backgroundAdmission?.(async () => undefined)).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("preserves a PostgreSQL factory-construction failure before an active factory exists", async () => {
+    const error = new StorageOperationError(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "createFactory",
+    );
+    const caPath = join(tempHome!, "postgres-ca.pem");
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const config = loadDaemonConfig("/missing", {
+      storage: { backend: "postgresql" },
+      daemon: { port: 0, idleTimeoutMs: 0 },
+    }, {
+      LCM_POSTGRES_URL: "postgresql://user:secret@db.example.test/lcm",
+      LCM_POSTGRES_CA_FILE: caPath,
+      LCM_POSTGRES_MIGRATION_ROLE: "lcm_test_migrator",
+    });
+
+    await expect(createDaemon(config, {
+      _assertBackendPublication: () => undefined,
+      _createStorageBackendFactory: async () => { throw error; },
+    })).rejects.toBe(error);
+  });
+
+  it("closes a constructed factory once when daemon startup cannot listen", async () => {
+    const blocker = createServer();
+    await new Promise<void>(resolve => blocker.listen(0, "127.0.0.1", resolve));
+    const port = (blocker.address() as { port: number }).port;
+    const factory = makeStagedPostgreSqlStorageFactory();
+    const close = vi.spyOn(factory, "close");
+    try {
+      await expect(createDaemon(loadDaemonConfig("/missing", {
+        daemon: { port, idleTimeoutMs: 0 },
+      }), {
+        _assertBackendPublication: () => undefined,
+        _createStorageBackendFactory: async () => factory,
+      })).rejects.toThrow();
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      await new Promise<void>(resolve => blocker.close(() => resolve()));
+    }
+  });
+
+  it("starts with selected PostgreSQL storage and preserves staged diagnostic gates", async () => {
     const scanForTranscripts = vi.fn(async () => undefined);
     const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
     const caPath = join(tempHome!, "postgres-ca.pem");
@@ -371,8 +482,8 @@ describe("daemon server", () => {
     });
     const port = daemon.address().port;
 
-    expect(setIntervalSpy).not.toHaveBeenCalledWith(expect.any(Function), 10 * 60 * 1000);
-    expect(setIntervalSpy).not.toHaveBeenCalledWith(expect.any(Function), 5 * 60 * 1000);
+    expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 10 * 60 * 1000);
+    expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 5 * 60 * 1000);
     expect(scanForTranscripts).not.toHaveBeenCalled();
 
     const healthResponse = await fetch(`http://127.0.0.1:${port}/health`);
@@ -476,11 +587,21 @@ describe("daemon server", () => {
       });
       expect(response.status).toBe(503);
       const unavailable = await response.json();
-      expect(unavailable).toEqual({
-        code: "STORAGE_BACKEND_STAGED",
-        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
-        storageBackend: "postgresql",
-      });
+      if (request.operation === "prompt-search") {
+        expect(unavailable).toMatchObject({
+          name: "StorageOperationError",
+          code: "STORAGE_INITIALIZATION_FAILED",
+          backend: "postgresql",
+          domain: "factory",
+          operation: expect.any(String),
+        });
+      } else {
+        expect(unavailable).toEqual({
+          code: "STORAGE_BACKEND_STAGED",
+          error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
+          storageBackend: "postgresql",
+        });
+      }
       expect(JSON.stringify(unavailable)).not.toContain("secret");
     }
 
@@ -526,13 +647,28 @@ describe("daemon server", () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(request.body),
       });
+      if (request.operation === "promote-events-notify") {
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ queued: true });
+        continue;
+      }
       expect(response.status).toBe(503);
       const unavailable = await response.json();
-      expect(unavailable).toEqual({
-        code: "STORAGE_BACKEND_STAGED",
-        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
-        storageBackend: "postgresql",
-      });
+      if (request.operation === "compact" || request.operation === "store") {
+        expect(unavailable).toEqual({
+          code: "STORAGE_BACKEND_STAGED",
+          error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
+          storageBackend: "postgresql",
+        });
+      } else {
+        expect(unavailable).toMatchObject({
+          name: "StorageOperationError",
+          code: "STORAGE_INITIALIZATION_FAILED",
+          backend: "postgresql",
+          domain: "factory",
+          operation: expect.any(String),
+        });
+      }
       expect(JSON.stringify(unavailable)).not.toContain(tempHome);
       expect(JSON.stringify(unavailable)).not.toContain("secret");
     }
