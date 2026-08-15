@@ -318,9 +318,10 @@ tested across adapters.
 Issue #81 covers domain contracts, the SQLite adapter, transaction semantics,
 and repository-backed SQLite composition paths. Bespoke SQLite import/export,
 aggregate stats, status, connection-pool diagnostics, and administrative SQL
-remain deliberately outside this first migration. Issue #224 will route those
-surfaces through backend-neutral workflows after the PostgreSQL domains and
-conformance harness are complete. Their temporary SQLite implementation is not
+remain deliberately outside this first migration. Issue #616 now defines the
+versioned, backend-neutral portable record and resumable stream contract for
+later adapter and migration work; it does not activate CLI, daemon, cutover, or
+runtime backend routing. Their temporary SQLite implementation is not
 permission for new application code to bypass repositories.
 
 ### Local hook outbox exception

@@ -137,6 +137,8 @@ const expectedComponents = [
       "^src/storage/home-lock-topology\\.ts$",
       "^src/storage/identity-context\\.ts$",
       "^src/storage/index\\.ts$",
+      "^src/storage/portable-record\\.ts$",
+      "^src/storage/portable-record-stream\\.ts$",
       "^src/storage/postgresql/project-storage\\.ts$",
     ],
   },
@@ -445,7 +447,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(199);
+    expect(productionFiles).toHaveLength(201);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -475,7 +477,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(199);
+    expect(ownershipCounts.size).toBe(201);
   });
 
   test("does not match non-production TypeScript files", () => {

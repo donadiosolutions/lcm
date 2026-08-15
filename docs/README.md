@@ -45,6 +45,9 @@ operations. They are not required for normal LCM use.
 
 - [Architecture](architecture.md) — storage selection, repositories, the data
   model, compaction, context assembly, and expansion.
+- [Portable record stream](portable-record-stream.md) — the versioned,
+  backend-neutral record, manifest, checkpoint, and adapter compatibility
+  contract.
 - [Claude Code hook protocol](hook-protocol.md) — hook payloads, durability, and
   lifecycle behavior.
 - [Canonical tag schema](tag-schema.md) — the tag vocabulary shared by agents
