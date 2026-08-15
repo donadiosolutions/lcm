@@ -1,20 +1,17 @@
 import type { DaemonConfig } from "../config.js";
-import { projectIdentity } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { createRetrievalEngine } from "../../retrieval.js";
 import { ExpansionOrchestrator } from "../../expansion.js";
 import { validateCwd } from "../validate-cwd.js";
-import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
+import type { StorageBackendFactory } from "../../storage/index.js";
 import {
-  closeRouteStorage,
-  openExistingProject,
-  stagedPostgreSqlUnavailableResponse,
-  storageIdentityRequiredResponse,
+  storageRouteFailureResponse,
+  withProjectStorage,
 } from "./storage-lifecycle.js";
 
 export function createExpandHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
-  return async (_req, res, body) => {
+  return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
     const { nodeId, depth = 1 } = input;
 
@@ -38,35 +35,20 @@ export function createExpandHandler(config: DaemonConfig, storageFactory?: Stora
       return;
     }
 
-    let project: ProjectStorage | undefined;
-    let ownedFactory: StorageBackendFactory | undefined;
-    let activeFactory: StorageBackendFactory | undefined;
     try {
-      const identity = projectIdentity(cwd, config.storage);
-      activeFactory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(config.storage));
-      project = await openExistingProject(activeFactory, identity) ?? undefined;
-      if (!project) {
-        sendJson(res, 200, { expanded: null, error: "project not found" });
-        return;
-      }
-      const retrieval = createRetrievalEngine(project);
-      const orchestrator = new ExpansionOrchestrator(retrieval);
-      const result = await orchestrator.expand({ summaryIds: [nodeId], maxDepth: depth });
-      sendJson(res, 200, result);
+      const result = await withProjectStorage(
+        { config, cwd, factory: storageFactory, context, mode: "existing" },
+        async (project) => new ExpansionOrchestrator(createRetrievalEngine(project))
+          .expand({ summaryIds: [nodeId], maxDepth: depth }),
+      );
+      sendJson(res, 200, result ?? { expanded: null, error: "project not found" });
     } catch (err) {
-      const identityRequired = storageIdentityRequiredResponse(err);
-      if (identityRequired) {
-        sendJson(res, 409, identityRequired);
-        return;
-      }
-      const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, err, "expand");
-      if (unavailable) {
-        sendJson(res, 503, unavailable);
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "expand", storageFactory);
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
         return;
       }
       sendJson(res, 200, { expanded: null, error: err instanceof Error ? err.message : "expansion failed" });
-    } finally {
-      await closeRouteStorage(project, ownedFactory);
     }
   };
 }

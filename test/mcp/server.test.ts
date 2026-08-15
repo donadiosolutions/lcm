@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { __lcmMcpTestHooks, getMcpToolDefinitions, handleDaemonRequest } from "../../src/mcp/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
+import * as storageBackend from "../../src/storage/backend.js";
 
 const ensureDaemonMcpMock = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: false }));
 
@@ -95,6 +96,24 @@ describe("handleDaemonRequest", () => {
     const res = await handleDaemonRequest(client, "/search", { q: "foo" }, opts);
     expect(res.isError).toBeUndefined();
     expect(res.content[0].text).toContain('"result": "ok"');
+  });
+
+  it.each([
+    ["/grep", { query: "q" }],
+    ["/search", { query: "q" }],
+    ["/describe", { nodeId: "sum_1" }],
+    ["/expand", { nodeId: "sum_1" }],
+  ])("routes %s through the daemon without the staged SQLite selector", async (route, body) => {
+    const selector = vi.spyOn(storageBackend, "selectStorageBackend");
+    const client = { post: vi.fn().mockResolvedValue({ route }) };
+    try {
+      const res = await handleDaemonRequest(client, route, body, opts);
+      expect(res.isError).toBeUndefined();
+      expect(client.post).toHaveBeenCalledWith(route, body);
+      expect(selector).not.toHaveBeenCalled();
+    } finally {
+      selector.mockRestore();
+    }
   });
 
   it("refuses a request whose publication scope is not canonical", async () => {
