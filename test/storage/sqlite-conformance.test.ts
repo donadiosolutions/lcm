@@ -31,12 +31,26 @@ import { exerciseSummaryContextRepositoryConformance } from "./summary-context-c
 
 const selectedFactoryMock = vi.hoisted(() => ({
   createPostgreSql: vi.fn(),
+  constructSqlite: vi.fn(),
 }));
 
 vi.mock("../../src/storage/postgresql/factory.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/storage/postgresql/factory.js")>()),
   createPostgreSqlStorageBackendFactoryWithHome: selectedFactoryMock.createPostgreSql,
 }));
+
+vi.mock("../../src/storage/sqlite/factory.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/storage/sqlite/factory.js")>();
+  return {
+    ...actual,
+    SqliteStorageBackendFactory: class extends actual.SqliteStorageBackendFactory {
+      constructor(...args: ConstructorParameters<typeof actual.SqliteStorageBackendFactory>) {
+        selectedFactoryMock.constructSqlite(...args);
+        super(...args);
+      }
+    },
+  };
+});
 
 function harness(): StorageContractHarness {
   const root = createTemporaryDirectory("lcm-storage-contract-");
@@ -563,6 +577,7 @@ describe("SQLite storage backend conformance", () => {
     };
     const delegatedFactory = { backend: "postgresql" } as StorageBackendFactory;
     selectedFactoryMock.createPostgreSql.mockResolvedValue(delegatedFactory);
+    selectedFactoryMock.constructSqlite.mockClear();
     const effectiveHome = homedir();
 
     await expect(createStorageBackendFactory(
@@ -578,10 +593,12 @@ describe("SQLite storage backend conformance", () => {
       postgresqlConfig,
       effectiveHome,
     );
+    expect(selectedFactoryMock.constructSqlite).not.toHaveBeenCalled();
   });
 
   it("preserves sanitized PostgreSQL construction failures without a SQLite fallback", async () => {
     selectedFactoryMock.createPostgreSql.mockReset();
+    selectedFactoryMock.constructSqlite.mockClear();
     const failure = new StorageOperationError(
       "STORAGE_INITIALIZATION_FAILED",
       "postgresql",
@@ -613,6 +630,7 @@ describe("SQLite storage backend conformance", () => {
       postgresqlConfig,
       "/home/operator",
     );
+    expect(selectedFactoryMock.constructSqlite).not.toHaveBeenCalled();
   });
 
   it("exposes frozen capabilities and normalized cause-free errors", () => {
