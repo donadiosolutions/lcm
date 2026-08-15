@@ -143,7 +143,7 @@ vi.mock("../../../src/storage/index.js", () => ({
     if (state.identityError !== undefined) throw state.identityError;
     return state.identity(local.canonical, storageConfig, local);
   },
-  createStorageBackendFactory: () => ({
+  createStorageBackendFactory: async () => ({
     openProject: async (...args: unknown[]) => {
       state.openProject(...args);
       if (state.openProjectError !== undefined) throw state.openProjectError;
@@ -224,7 +224,7 @@ import type {
   RoutePublicationAdmission,
 } from "../../../src/daemon/server.js";
 import type { StorageBackendFactory } from "../../../src/storage/index.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
+import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
 
@@ -408,6 +408,49 @@ describe("compact route coverage", () => {
       error: "backend publication admission blocked",
     });
     expect(closeAfterAdmissionFailure).toHaveBeenCalledOnce();
+  });
+
+  it("closes the long-lived project when the request signal aborts during inference", async () => {
+    const controller = new AbortController();
+    let inferenceStarted!: () => void;
+    const started = new Promise<void>(resolve => { inferenceStarted = resolve; });
+    state.compactionStorageProbe = async () => {
+      inferenceStarted();
+      await new Promise<void>(resolve => {
+        controller.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      await Promise.resolve();
+      expect(state.projectClose).toHaveBeenCalledOnce();
+    };
+    const output = response();
+    const request = createCompactHandler(config());
+    const compact = request(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "abort-during-inference", cwd: "/tmp" }),
+      { ...testCompactContext, signal: controller.signal },
+    );
+
+    await started;
+    controller.abort();
+    await compact;
+
+    expect(state.projectClose).toHaveBeenCalledOnce();
+  });
+
+  it("closes a project when admission observes an already-aborted signal", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const output = response();
+
+    await createCompactHandler(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "already-aborted", cwd: "/tmp" }),
+      { ...testCompactContext, signal: controller.signal },
+    );
+
+    expect(state.projectClose).toHaveBeenCalledOnce();
   });
 
   it("keeps transcript transaction repositories inside one admission", async () => {
@@ -624,6 +667,30 @@ describe("compact route coverage", () => {
     });
   });
 
+  it("authenticates selected PostgreSQL storage when summarization is disabled", async () => {
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        poolMax: 1,
+        connectionTimeoutMs: 100,
+        idleTimeoutMs: 100,
+        statementTimeoutMs: 100,
+      },
+    };
+    state.summarizer = undefined;
+
+    const body = await call(JSON.stringify({ session_id: "disabled-postgresql", cwd: "/tmp" }), value);
+
+    expect(body).toMatchObject({
+      actionTaken: false,
+      summary: "Summarization disabled — no summarizer configured.",
+    });
+    expect(state.openProject).toHaveBeenCalledOnce();
+    expect(state.projectClose).toHaveBeenCalledOnce();
+  });
+
   it("labels an unknown runtime provider through the defensive fallback", async () => {
     state.provider = "future-provider";
     state.summarizer = undefined;
@@ -738,7 +805,7 @@ describe("compact route coverage", () => {
     };
     const handler = createCompactHandler(
       value,
-      new UnavailablePostgreSqlStorageBackendFactory(),
+      makeStagedPostgreSqlStorageFactory(),
     );
     const first = response();
     const firstCall = handler(

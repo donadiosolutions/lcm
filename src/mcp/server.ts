@@ -18,10 +18,8 @@ import { lcmStoreTool } from "./tools/lcm-store.js";
 import { lcmStatsTool } from "./tools/lcm-stats.js";
 import { lcmDoctorTool } from "./tools/lcm-doctor.js";
 import {
-  selectStorageBackend,
   selectStorageBackendForConfig,
   assertStorageBackendPublication,
-  StorageBackendUnavailableError,
 } from "../storage/backend.js";
 import {
   BackendPublicationJournalError,
@@ -232,21 +230,17 @@ function assertMcpStorageAdmission(
   }
   const homeDir = backendPublicationHomeForConfigPath(configPath);
   assertStorageBackendPublication({ backend: config.storage.backend, homeDir });
-  selectStorageBackend({ backend: config.storage.backend, homeDir });
   return config;
 }
 
 /**
  * Keep MCP failures useful without crossing the process/configuration boundary
- * with an arbitrary exception message.  The storage backend refusal is a
- * fixed, user-facing diagnostic and contains no request or host data.
+ * with an arbitrary exception message.  Publication refusal is a fixed,
+ * user-facing diagnostic and contains no request or host data.
  */
 function safeMcpError(err: unknown): string {
   if (err instanceof BackendPublicationJournalError) {
     return "lcm error: backend publication admission blocked; complete or recover the publication before retrying";
-  }
-  if (err instanceof StorageBackendUnavailableError) {
-    return `lcm error: ${err.message}`;
   }
   // Private-use sentinels keep the shared scrubber from interpreting protected labels as secrets.
   const redactionKeyMarker = "\uE000";
@@ -283,7 +277,7 @@ export async function handleDaemonRequest(
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
   try {
     if (opts.publicationConfigPath === undefined) {
-      selectStorageBackend(opts.storage);
+      assertStorageBackendPublication(opts.storage);
     } else {
       assertMcpStorageAdmission(opts.publicationConfigPath, opts.storage.backend);
     }

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { StorageOperationError } from "../../../src/storage/errors.js";
 
 const mocks = vi.hoisted(() => ({
   ensure: vi.fn(),
@@ -25,7 +26,7 @@ vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: mocks.migrate }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
 vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => ({
+  createStorageBackendFactory: async () => ({
     openProject: async () => {
       mocks.getConnection();
       try {
@@ -112,5 +113,57 @@ describe("session complete persistence boundaries", () => {
 
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "open failed" });
     expect(mocks.close).not.toHaveBeenCalled();
+  });
+
+  it("does not report a cancelled create as recorded after project open", async () => {
+    const handler = createSessionCompleteHandler(config);
+    const response = {} as never;
+    const controller = new AbortController();
+    mocks.migrate.mockImplementationOnce(() => {
+      controller.abort();
+    });
+
+    await handler(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "cancelled", cwd: "/ok" }),
+      { signal: controller.signal },
+    );
+
+    expect(mocks.run).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "request cancelled" });
+    expect(mocks.send.mock.calls.some(([, status, body]) => status === 200 && body?.recorded === true)).toBe(false);
+    expect(mocks.close).toHaveBeenCalledOnce();
+  });
+
+  it("returns a sanitized 503 for typed PostgreSQL transaction failures", async () => {
+    const postgresqlConfig = {
+      ...config,
+      storage: {
+        backend: "postgresql",
+        postgresql: {
+          url: "postgresql://user:secret@db.example/lcm",
+          poolMax: 1,
+          connectionTimeoutMs: 100,
+          idleTimeoutMs: 100,
+          statementTimeoutMs: 100,
+        },
+      },
+    } as const;
+    mocks.run.mockRejectedValueOnce(new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      "project",
+      "coordination",
+      "recordSessionIngest",
+    ));
+    const response = {} as never;
+
+    await createSessionCompleteHandler(postgresqlConfig)({} as never, response, JSON.stringify({ session_id: "s", cwd: "/ok" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, expect.objectContaining({
+      code: "STORAGE_OPERATION_FAILED",
+      backend: "postgresql",
+    }));
   });
 });

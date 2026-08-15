@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { StorageOperationError } from "../../../src/storage/errors.js";
 import { makeMockStorageFactory } from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
@@ -43,9 +44,12 @@ describe("review-stale persistence boundaries", () => {
     mocks.findStale.mockResolvedValue([]);
     mocks.openProject.mockResolvedValue({
       promotedMemory: { getById: mocks.getById, archive: mocks.archive, revive: mocks.revive, findStale: mocks.findStale },
+      transaction: async (operation: (repositories: unknown) => Promise<unknown>) => operation({
+        promotedMemory: { getById: mocks.getById, archive: mocks.archive, revive: mocks.revive, findStale: mocks.findStale },
+      }),
       close: mocks.projectClose,
     });
-    mocks.createFactory.mockReturnValue(makeMockStorageFactory({
+    mocks.createFactory.mockImplementation(async () => makeMockStorageFactory({
       projectExists: mocks.projectExists,
       openProject: mocks.openProject,
       close: mocks.factoryClose,
@@ -124,5 +128,36 @@ describe("review-stale persistence boundaries", () => {
     await handler({} as never, response, JSON.stringify({ cwd: "/ok" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "review-stale failed" });
     expect(mocks.projectClose).toHaveBeenCalled();
+  });
+
+  it("returns a sanitized 503 for typed PostgreSQL repository failures", async () => {
+    const postgresqlConfig = {
+      ...config,
+      storage: {
+        backend: "postgresql",
+        postgresql: {
+          url: "postgresql://user:secret@db.example/lcm",
+          poolMax: 1,
+          connectionTimeoutMs: 100,
+          idleTimeoutMs: 100,
+          statementTimeoutMs: 100,
+        },
+      },
+    } as const;
+    mocks.findStale.mockRejectedValueOnce(new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      "project",
+      "promotedMemory",
+      "findStale",
+    ));
+    const response = {} as never;
+
+    await createReviewStaleHandler(postgresqlConfig)({} as never, response, JSON.stringify({ cwd: "/pg" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, expect.objectContaining({
+      code: "STORAGE_OPERATION_FAILED",
+      backend: "postgresql",
+    }));
   });
 });

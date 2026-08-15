@@ -1,8 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerResponse } from "node:http";
-import { loadDaemonConfig } from "../../../src/daemon/config.js";
-import type { StorageBackendFactory } from "../../../src/storage/index.js";
-import { makeMockStorageFactory } from "./mock-storage-factory.js";
+import { loadDaemonConfig, type DaemonConfig } from "../../../src/daemon/config.js";
+import type { ProjectStorage, StorageBackendFactory } from "../../../src/storage/index.js";
+import { StorageOperationError } from "../../../src/storage/errors.js";
+import type { RouteExecutionContext } from "../../../src/daemon/server.js";
+import {
+  makeMockStorageFactory,
+} from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => true),
@@ -76,7 +80,6 @@ import { createPoolStatsHandler } from "../../../src/daemon/routes/pool-stats.js
 import { createStatsHandler } from "../../../src/daemon/routes/stats.js";
 import { createSearchHandler } from "../../../src/daemon/routes/search.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 
 const config = loadDaemonConfig("/tmp/lcm-persistence-routes");
@@ -93,11 +96,48 @@ function injectedFactory(): StorageBackendFactory {
   });
 }
 
+function postgresqlConfig(): DaemonConfig {
+  const value = loadDaemonConfig("/tmp/lcm-persistence-routes-postgresql");
+  value.storage = {
+    backend: "postgresql",
+    postgresql: {
+      url: "postgresql://user:secret@db.example/lcm",
+      poolMax: 5,
+      connectionTimeoutMs: 10_000,
+      idleTimeoutMs: 30_000,
+      statementTimeoutMs: 60_000,
+    },
+  };
+  return value;
+}
+
+function postgresqlFactory(factory: StorageBackendFactory): StorageBackendFactory {
+  return {
+    ...factory,
+    backend: "postgresql",
+    capabilities: {
+      ...factory.capabilities,
+      coordination: "distributed",
+    },
+  };
+}
+
+function storageFailure(domain: "factory" | "lexical-search" | "summaries", operation: string): StorageOperationError {
+  return new StorageOperationError(
+    "STORAGE_OPERATION_FAILED",
+    "postgresql",
+    "/ok",
+    domain,
+    operation,
+  );
+}
+
 async function invoke(
   handler: ReturnType<typeof createDescribeHandler>,
   body: Record<string, unknown> | string,
+  context?: RouteExecutionContext,
 ): Promise<void> {
-  await handler({} as never, response, typeof body === "string" ? body : JSON.stringify(body));
+  await handler({} as never, response, typeof body === "string" ? body : JSON.stringify(body), context);
 }
 
 function expectLast(status: number, payload: unknown): void {
@@ -133,7 +173,7 @@ describe("persistence read route boundaries", () => {
       close: mocks.projectClose,
     };
     mocks.openProject.mockResolvedValue(project);
-    mocks.createFactory.mockImplementation(() => injectedFactory());
+    mocks.createFactory.mockImplementation(async () => injectedFactory());
   });
 
   it("covers describe validation, absence, success, and typed failures", async () => {
@@ -162,23 +202,21 @@ describe("persistence read route boundaries", () => {
     const ownedCloseCount = mocks.factoryClose.mock.calls.length;
     await invoke(createDescribeHandler(config, injectedFactory()), { nodeId: "n", cwd: "/ok" });
     expect(mocks.factoryClose).toHaveBeenCalledTimes(ownedCloseCount);
-    await invoke(
-      createDescribeHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
-      { nodeId: "n", cwd: "/ok" },
-    );
+    mocks.describe.mockRejectedValueOnce(storageFailure("summaries", "describe"));
+    await invoke(createDescribeHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())), { nodeId: "n", cwd: "/ok" });
     expectLast(503, {
-      code: "STORAGE_BACKEND_STAGED",
-      error: "describe is unavailable while PostgreSQL storage repositories are staged",
-      storageBackend: "postgresql",
+      ...storageFailure("summaries", "describe").toJSON(),
     });
   });
 
   it("uses the injected backend without consulting a local SQLite path", async () => {
     mocks.exists.mockReturnValue(false);
     mocks.projectExists.mockResolvedValue(true);
-    await invoke(createDescribeHandler(config, injectedFactory()), { nodeId: "n", cwd: "/remote" });
+    const factory = postgresqlFactory(injectedFactory());
+    await invoke(createDescribeHandler(postgresqlConfig(), factory), { nodeId: "n", cwd: "/remote" });
     expectLast(200, { node: { id: "node" } });
     expect(mocks.openProject).toHaveBeenCalledWith({ id: "/remote", canonical: "/remote" });
+    expect(mocks.createFactory).not.toHaveBeenCalled();
   });
 
   it("does not emit a second response when both cleanup operations reject", async () => {
@@ -214,14 +252,11 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
     expectLast(200, { expanded: null, error: "expansion failed" });
     await invoke(createExpandHandler(config, injectedFactory()), { nodeId: "n", cwd: "/ok" });
-    await invoke(
-      createExpandHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
-      { nodeId: "n", cwd: "/ok" },
-    );
+    const failure = storageFailure("summaries", "expand");
+    mocks.expand.mockRejectedValueOnce(failure);
+    await invoke(createExpandHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())), { nodeId: "n", cwd: "/ok" });
     expectLast(503, {
-      code: "STORAGE_BACKEND_STAGED",
-      error: "expand is unavailable while PostgreSQL storage repositories are staged",
-      storageBackend: "postgresql",
+      ...failure.toJSON(),
     });
   });
 
@@ -245,14 +280,11 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { query: "q", cwd: "/ok" });
     expectLast(200, { matches: [] });
     await invoke(createGrepHandler(config, injectedFactory()), { query: "q", cwd: "/ok" });
-    await invoke(
-      createGrepHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
-      { query: "q", cwd: "/ok" },
-    );
+    const failure = storageFailure("lexical-search", "grep");
+    mocks.grep.mockRejectedValueOnce(failure);
+    await invoke(createGrepHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())), { query: "q", cwd: "/ok" });
     expectLast(503, {
-      code: "STORAGE_BACKEND_STAGED",
-      error: "grep is unavailable while PostgreSQL storage repositories are staged",
-      storageBackend: "postgresql",
+      ...failure.toJSON(),
     });
   });
 
@@ -287,14 +319,11 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { cwd: "/ok" });
     expectLast(200, { summaries: [] });
     await invoke(createRecentHandler(config, injectedFactory()), { cwd: "/ok" });
-    await invoke(
-      createRecentHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
-      { cwd: "/ok" },
-    );
+    const failure = storageFailure("summaries", "recent");
+    mocks.recentSummaries.mockRejectedValueOnce(failure);
+    await invoke(createRecentHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())), { cwd: "/ok" });
     expectLast(503, {
-      code: "STORAGE_BACKEND_STAGED",
-      error: "recent is unavailable while PostgreSQL storage repositories are staged",
-      storageBackend: "postgresql",
+      ...failure.toJSON(),
     });
   });
 
@@ -356,19 +385,78 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { episodic: [], promoted: [] });
     await invoke(createSearchHandler(config, injectedFactory()), { query: "q", cwd: "/ok", layers: [] });
 
-    const stagedFactory = new UnavailablePostgreSqlStorageBackendFactory();
-    await invoke(createSearchHandler(config, stagedFactory), { query: "q", cwd: "/ok" });
+    const stagedFactory = postgresqlFactory(injectedFactory());
+    const openFailure = storageFailure("factory", "openExistingProject");
+    vi.spyOn(stagedFactory, "openExistingProject").mockRejectedValueOnce(openFailure);
+    await invoke(createSearchHandler(postgresqlConfig(), stagedFactory), { query: "q", cwd: "/ok" });
     expectLast(503, {
-      code: "STORAGE_BACKEND_STAGED",
-      error: "search is unavailable while PostgreSQL storage repositories are staged",
-      storageBackend: "postgresql",
+      ...openFailure.toJSON(),
     });
 
-    const nonStorageFailure = new UnavailablePostgreSqlStorageBackendFactory();
+    const nonStorageFailure = postgresqlFactory(injectedFactory());
     vi.spyOn(nonStorageFailure, "openExistingProject")
       .mockRejectedValueOnce(new Error("unrelated failure"));
     await invoke(createSearchHandler(config, nonStorageFailure), { query: "q", cwd: "/ok" });
     expectLast(200, { episodic: [], promoted: [] });
+  });
+
+  it("rethrows typed PostgreSQL failures from both layered search operations", async () => {
+    const factory = postgresqlFactory(injectedFactory());
+    const episodicFailure = storageFailure("lexical-search", "search-messages");
+    mocks.grep.mockRejectedValueOnce(episodicFailure);
+    await invoke(createSearchHandler(postgresqlConfig(), factory), { query: "q", cwd: "/ok" });
+    expectLast(503, { ...episodicFailure.toJSON() });
+
+    const promotedFailure = storageFailure("lexical-search", "search-promoted");
+    mocks.promotedSearch.mockRejectedValueOnce(promotedFailure);
+    await invoke(createSearchHandler(postgresqlConfig(), factory), { query: "q", cwd: "/ok", layers: ["promoted"] });
+    expectLast(503, { ...promotedFailure.toJSON() });
+  });
+
+  it("validates every manual read request before selected storage admission", async () => {
+    const openExistingProject = vi.fn(async () => {
+      throw new Error("storage admission should not run for invalid input");
+    });
+    const factory = { ...postgresqlFactory(injectedFactory()), openExistingProject };
+    const cases = [
+      [createSearchHandler(postgresqlConfig(), factory), { query: "q", cwd: "/invalid" }],
+      [createGrepHandler(postgresqlConfig(), factory), { query: "q", cwd: "/invalid" }],
+      [createRecentHandler(postgresqlConfig(), factory), { cwd: "/invalid" }],
+      [createDescribeHandler(postgresqlConfig(), factory), { nodeId: "n", cwd: "/invalid" }],
+      [createExpandHandler(postgresqlConfig(), factory), { nodeId: "n", cwd: "/invalid" }],
+    ] as const;
+
+    for (const [handler, body] of cases) {
+      mocks.validate.mockImplementationOnce(() => { throw new Error("invalid cwd"); });
+      await invoke(handler, body);
+    }
+
+    expect(openExistingProject).not.toHaveBeenCalled();
+  });
+
+  it("passes the live publication token and request cancellation into read storage", async () => {
+    const token = {} as never;
+    const openExistingProject = vi.fn(async (_identity: unknown, observedToken: unknown): Promise<ProjectStorage> => ({
+      close: mocks.projectClose,
+      observedToken,
+    } as unknown as ProjectStorage));
+    const factory = { ...injectedFactory(), openExistingProject };
+    const controller = new AbortController();
+    let release: ((value: { id: string }) => void) | undefined;
+    mocks.describe.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+
+    const pending = invoke(
+      createDescribeHandler(config, factory),
+      { nodeId: "n", cwd: "/ok" },
+      { publicationLockToken: token, signal: controller.signal },
+    );
+    await vi.waitFor(() => expect(openExistingProject).toHaveBeenCalled());
+    expect(mocks.projectIdentity).toHaveBeenCalledWith("/ok", config.storage, token);
+    expect(openExistingProject).toHaveBeenCalledWith({ id: "/ok", canonical: "/ok" }, token);
+    controller.abort();
+    await vi.waitFor(() => expect(mocks.projectClose).toHaveBeenCalled());
+    release?.({ id: "node" });
+    await pending;
   });
 
   it.each([

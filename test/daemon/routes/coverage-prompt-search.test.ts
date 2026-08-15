@@ -4,6 +4,7 @@ import type { SearchResult } from "../../../src/db/promoted.js";
 import type { RecallFeedback } from "../../../src/db/recall.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
 import type { ProjectStorage, StorageBackendFactory } from "../../../src/storage/index.js";
+import { StorageOperationError } from "../../../src/storage/errors.js";
 import { makeMockStorageFactory } from "./mock-storage-factory.js";
 
 const state = vi.hoisted(() => ({
@@ -36,7 +37,7 @@ vi.mock("../../../src/daemon/project.js", () => ({
 }));
 
 vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => {
+  createStorageBackendFactory: async () => {
     const openProject = async () => {
       if (state.connectionError !== undefined) throw state.connectionError;
       return {
@@ -92,16 +93,22 @@ type PromptSearchResponse = {
 type MockResponse = {
   res: ServerResponse;
   json: () => PromptSearchResponse;
+  status: () => number;
 };
 
 function response(): MockResponse {
   let payload = "";
+  let statusCode = 200;
   return {
     res: {
-      writeHead: vi.fn().mockReturnThis(),
+      writeHead: vi.fn((status: number) => {
+        statusCode = status;
+        return undefined;
+      }),
       end: vi.fn((body?: string) => { payload = body ?? ""; }),
     } as unknown as ServerResponse,
     json: () => JSON.parse(payload || "{}") as PromptSearchResponse,
+    status: () => statusCode,
   };
 }
 
@@ -230,11 +237,70 @@ describe("prompt-search route coverage", () => {
     expect(state.closed).toEqual([]);
   });
 
+  it("keeps the disabled PostgreSQL response shape when the project is absent", async () => {
+    state.exists = false;
+    expect(await call(
+      JSON.stringify({ query: "q", cwd: "/tmp" }),
+      (value) => {
+        value.storage = {
+          backend: "postgresql",
+          postgresql: {
+            url: "postgresql://user:secret@db.example/lcm",
+            poolMax: 5,
+            connectionTimeoutMs: 10_000,
+            idleTimeoutMs: 30_000,
+            statementTimeoutMs: 60_000,
+          },
+        };
+        value.restoration.promptSearchMaxResults = 0;
+      },
+    )).toEqual({ hints: [], ids: [] });
+  });
+
   it("closes an opened database after an internal failure", async () => {
     state.migrationError = new Error("migration failed");
     expect(await call(JSON.stringify({ query: "q", cwd: "/tmp" }))).toEqual({ hints: [] });
     expect(state.closed).toEqual(["project"]);
     expect(state.factoryClosed).toBe(1);
+  });
+
+  it("returns a cause-free 503 for PostgreSQL lexical-search failure", async () => {
+    const failure = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      "/tmp",
+      "lexical-search",
+      "search-promoted",
+    );
+    const projectClose = vi.fn(async () => undefined);
+    const factory = makeMockStorageFactory({
+      projectExists: vi.fn(async () => true),
+      openProject: vi.fn(async () => ({
+        lexicalSearch: { searchPromoted: vi.fn().mockRejectedValue(failure) },
+        recall: { getFeedback: vi.fn(async () => new Map()), logSurfacing: vi.fn(async () => undefined) },
+        close: projectClose,
+      } as unknown as ProjectStorage)),
+    });
+    const postgres = config();
+    postgres.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://user:secret@db.example/lcm",
+        poolMax: 5,
+        connectionTimeoutMs: 10_000,
+        idleTimeoutMs: 30_000,
+        statementTimeoutMs: 60_000,
+      },
+    };
+    const output = response();
+    await createPromptSearchHandler(postgres, { ...factory, backend: "postgresql" })(
+      {} as never,
+      output.res,
+      JSON.stringify({ query: "q", cwd: "/tmp" }),
+    );
+    expect(output.status()).toBe(503);
+    expect(output.json()).toEqual(failure.toJSON());
+    expect(projectClose).toHaveBeenCalledOnce();
   });
 
   it("does not close a database when opening it fails", async () => {

@@ -1,19 +1,16 @@
 import type { DaemonConfig } from "../config.js";
-import { projectIdentity } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { createRetrievalEngine } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
-import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
+import type { StorageBackendFactory } from "../../storage/index.js";
 import {
-  closeRouteStorage,
-  openExistingProject,
-  stagedPostgreSqlUnavailableResponse,
-  storageIdentityRequiredResponse,
+  storageRouteFailureResponse,
+  withProjectStorage,
 } from "./storage-lifecycle.js";
 
 export function createGrepHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
-  return async (_req, res, body) => {
+  return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
     const { query, scope, mode, since } = input;
 
@@ -35,34 +32,24 @@ export function createGrepHandler(config: DaemonConfig, storageFactory?: Storage
       return;
     }
 
-    let project: ProjectStorage | undefined;
-    let ownedFactory: StorageBackendFactory | undefined;
-    let activeFactory: StorageBackendFactory | undefined;
     try {
-      const identity = projectIdentity(cwd, config.storage);
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await openExistingProject(activeFactory, identity) ?? undefined;
-      if (!project) {
-        sendJson(res, 200, { matches: [] });
-        return;
-      }
-      const engine = createRetrievalEngine(project);
-      const result = await engine.grep({ query, mode: mode ?? "full_text", scope: scope ?? "both", since });
-      sendJson(res, 200, result);
+      const result = await withProjectStorage(
+        { config, cwd, factory: storageFactory, context, mode: "existing" },
+        async (project) => createRetrievalEngine(project).grep({
+          query,
+          mode: mode ?? "full_text",
+          scope: scope ?? "both",
+          since,
+        }),
+      );
+      sendJson(res, 200, result ?? { matches: [] });
     } catch (error) {
-      const identityRequired = storageIdentityRequiredResponse(error);
-      if (identityRequired) {
-        sendJson(res, 409, identityRequired);
-        return;
-      }
-      const unavailable = stagedPostgreSqlUnavailableResponse(activeFactory, error, "grep");
-      if (unavailable) {
-        sendJson(res, 503, unavailable);
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, error, "grep", storageFactory);
+      if (storageFailure) {
+        sendJson(res, storageFailure.status, storageFailure.body);
         return;
       }
       sendJson(res, 200, { matches: [] });
-    } finally {
-      await closeRouteStorage(project, ownedFactory);
     }
   };
 }

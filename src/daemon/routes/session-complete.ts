@@ -1,11 +1,10 @@
 import type { DaemonConfig } from "../config.js";
-import { projectIdentity } from "../project.js";
 import { sanitizeError } from "../safe-error.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { validateCwd } from "../validate-cwd.js";
-import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
+import type { StorageBackendFactory } from "../../storage/index.js";
+import { storageRouteFailureResponse, withProjectStorage } from "./storage-lifecycle.js";
 
 export function createSessionCompleteHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body, context) => {
@@ -22,28 +21,21 @@ export function createSessionCompleteHandler(config: DaemonConfig, storageFactor
       sendJson(res, 400, { error: err instanceof Error ? err.message : "invalid cwd" });
       return;
     }
-    let project: ProjectStorage | undefined;
-    let ownedFactory: StorageBackendFactory | undefined;
-    let activeFactory: StorageBackendFactory | undefined;
     try {
-      const identity = projectIdentity(cwd, config.storage, context?.publicationLockToken);
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
-        config.storage,
-        undefined,
-        undefined,
-        context?.publicationLockToken,
-      ));
-      project = await activeFactory.openProject(identity, context?.publicationLockToken);
-      await project.transaction(async (repositories) => {
-        const messageCount = await repositories.conversations.getMessageCountBySessionId(session_id);
-        await repositories.coordination.recordSessionIngest(session_id, messageCount);
-      });
+      await withProjectStorage(
+        { config, cwd, factory: storageFactory, context, mode: "create" },
+        async (project) => project.transaction(async (repositories) => {
+          const messageCount = await repositories.conversations.getMessageCountBySessionId(session_id);
+          await repositories.coordination.recordSessionIngest(session_id, messageCount);
+        }),
+      );
       sendJson(res, 200, { recorded: true });
     } catch (err) {
       const storageFailure = storageRouteFailureResponse(
-        activeFactory,
+        config.storage.backend,
         err,
         "session-complete",
+        storageFactory,
       );
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
@@ -52,8 +44,6 @@ export function createSessionCompleteHandler(config: DaemonConfig, storageFactor
       sendJson(res, 500, {
         error: sanitizeError(err instanceof Error ? err.message : "session completion failed"),
       });
-    } finally {
-      await closeRouteStorage(project, ownedFactory);
     }
   };
 }

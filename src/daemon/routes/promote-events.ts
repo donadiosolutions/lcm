@@ -1,7 +1,7 @@
 import type { EventRow, PatternReinforcementStats } from "../../hooks/events-db.js";
 import { eventsDbPath, existingEventsDbPath } from "../../db/events-path.js";
 import { deduplicateAndInsert } from "../../promotion/dedup.js";
-import { sendJson, type RouteHandler } from "../server.js";
+import { sendJson, type RouteExecutionContext, type RouteHandler } from "../server.js";
 import { isMissingCwdError, validateCwd } from "../validate-cwd.js";
 import { projectDir, projectIdentity } from "../project.js";
 import type { DaemonConfig } from "../config.js";
@@ -20,9 +20,10 @@ import {
 import type { BackendPublicationLockToken } from "../../storage/backend-publication.js";
 import {
   closeRouteStorage,
-  stagedPostgreSqlFactoryUnavailableResponse,
   storageRouteFailureResponse,
+  withProjectStorage,
 } from "./storage-lifecycle.js";
+import { StorageOperationError } from "../../storage/errors.js";
 
 const AUTO_TAGS: Record<string, string> = {
   decision: "type:preference",
@@ -43,6 +44,11 @@ const MIN_REINFORCED_PATTERN_SESSIONS = 2;
 const AUTO_PROMOTABLE_PATTERN_CATEGORIES = new Set(["file", "mcp", "skill", "subagent"]);
 const EMPTY_REINFORCEMENT: PatternReinforcementStats = { totalCount: 0, distinctSessions: 0 };
 const sidecarPromotionLocks = new Map<string, Promise<void>>();
+
+type PromotionExecutionContext = Pick<
+  RouteExecutionContext,
+  "publicationLockToken" | "withPublicationAdmission" | "signal"
+>;
 
 export type PromoteTerminalOutcome = {
   kind: "parked";
@@ -205,6 +211,14 @@ async function withLockedCwdPromotion<T>(
   });
 }
 
+function promotionExecutionContext(
+  publicationLockToken: BackendPublicationLockToken | undefined,
+  context: PromotionExecutionContext | undefined,
+): PromotionExecutionContext | undefined {
+  if (context !== undefined) return context;
+  return publicationLockToken === undefined ? undefined : { publicationLockToken };
+}
+
 function existingEventsDbPathForPromotion(
   cwd: string,
   publicationLockToken?: BackendPublicationLockToken,
@@ -323,7 +337,7 @@ export function createPromoteEventsHandler(
 
     let ownedFactory: StorageBackendFactory | undefined;
     const activeFactory = storageFactory
-      ?? (ownedFactory = createStorageBackendFactory(
+      ?? (ownedFactory = await createStorageBackendFactory(
         config.storage,
         undefined,
         undefined,
@@ -331,12 +345,13 @@ export function createPromoteEventsHandler(
       ));
     try {
       const result = input.drain === true
-        ? await drainEventsForCwd(
+      ? await drainEventsForCwd(
             config,
             cwd,
             undefined,
             activeFactory,
             context?.publicationLockToken,
+            context,
           )
         : await promoteEventsForCwd(
             config,
@@ -344,15 +359,17 @@ export function createPromoteEventsHandler(
             undefined,
             activeFactory,
             context?.publicationLockToken,
+            context,
           );
       sendJson(res, 200, result);
     } catch (error) {
       // Log detailed failure but avoid exposing internal error/stack info to the client
       await safeLogError("promote-events", error, { cwd });
       const storageFailure = storageRouteFailureResponse(
-        activeFactory,
+        config.storage.backend,
         error,
         "promote-events",
+        activeFactory,
       );
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
@@ -373,21 +390,13 @@ export function createPromoteAllEventsHandler(
   return async (_req, res, _body, context) => {
     let ownedFactory: StorageBackendFactory | undefined;
     const activeFactory = storageFactory
-      ?? (ownedFactory = createStorageBackendFactory(
+      ?? (ownedFactory = await createStorageBackendFactory(
         config.storage,
         undefined,
         undefined,
         context?.publicationLockToken,
       ));
     try {
-      const staged = stagedPostgreSqlFactoryUnavailableResponse(
-        activeFactory,
-        "promote-events-all",
-      );
-      if (staged) {
-        sendJson(res, 503, staged);
-        return;
-      }
       const result: PromoteAllResult = {
         promoted: 0,
         skipped: 0,
@@ -466,6 +475,7 @@ export function createPromoteAllEventsHandler(
             sidecar.path,
             activeFactory,
             context?.publicationLockToken,
+            context,
           );
           result.promoted += projectResult.promoted;
           result.skipped += projectResult.skipped;
@@ -480,7 +490,7 @@ export function createPromoteAllEventsHandler(
             unprocessedBefore: sidecar.unprocessed,
           });
         } catch (error) {
-          if (storageRouteFailureResponse(activeFactory, error, "promote-events-all")) {
+          if (storageRouteFailureResponse(config.storage.backend, error, "promote-events-all", activeFactory)) {
             throw error;
           }
           result.errors++;
@@ -504,9 +514,10 @@ export function createPromoteAllEventsHandler(
     } catch (error) {
       await safeLogError("promote-events", error, {});
       const storageFailure = storageRouteFailureResponse(
-        activeFactory,
+        config.storage.backend,
         error,
         "promote-events-all",
+        activeFactory,
       );
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
@@ -525,6 +536,7 @@ export async function drainEventsForCwd(
   sidecarPathOverride?: string,
   storageFactory?: StorageBackendFactory,
   publicationLockToken?: BackendPublicationLockToken,
+  context?: PromotionExecutionContext,
 ): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
   return withLockedCwdPromotion(
     cwd,
@@ -536,6 +548,7 @@ export async function drainEventsForCwd(
         sidecarPath,
         storageFactory,
         publicationLockToken,
+        context,
       ),
     (parkingResult) => {
       const result: PromoteResult & { batches: number; incomplete?: boolean } = {
@@ -545,7 +558,7 @@ export async function drainEventsForCwd(
       if (!result.terminal) result.incomplete = true;
       return result;
     },
-    publicationLockToken,
+    context?.publicationLockToken ?? publicationLockToken,
   );
 }
 
@@ -555,6 +568,7 @@ async function drainEventsForCwdUnlocked(
   sidecarPath: string,
   storageFactory?: StorageBackendFactory,
   publicationLockToken?: BackendPublicationLockToken,
+  context?: PromotionExecutionContext,
 ): Promise<PromoteResult & { batches: number; incomplete?: boolean }> {
   const result: PromoteResult & { batches: number; incomplete?: boolean } = {
     promoted: 0,
@@ -565,34 +579,28 @@ async function drainEventsForCwdUnlocked(
   };
 
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
-  let project: ProjectStorage | undefined;
   let ownedFactory: StorageBackendFactory | undefined;
   try {
-    const identity = projectIdentity(cwd, config.storage, publicationLockToken);
-    const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+    const edb = await outboxFactory.open(sidecarPath);
+    await edb.clearMissingCwd();
+    const executionContext = promotionExecutionContext(publicationLockToken, context);
+    const effectiveToken = executionContext?.publicationLockToken;
+    const factory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
       config.storage,
       undefined,
       undefined,
-      publicationLockToken,
+      effectiveToken,
     ));
-    if (config.storage.backend === "postgresql") {
-      project = await factory.openProject(identity, publicationLockToken);
-    }
-    const edb = await outboxFactory.open(sidecarPath);
-    await edb.clearMissingCwd();
-    project ??= await factory.openProject(identity, publicationLockToken);
-    const scrubber = await ScrubEngine.forProject(
-      config.security.sensitivePatterns,
-      projectDir(cwd, publicationLockToken),
-    );
     for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
-      const batchResult = await promoteEventsBatch(
+      const prepared = await preparePromotionBatch(config, edb);
+      const batchResult = await runSelectedPromotionBatch(
         config,
         cwd,
         edb,
-        project,
-        scrubber,
-        new Map(),
+        factory,
+        executionContext,
+        prepared,
+        effectiveToken,
       );
       if (batchResult.message === "no unprocessed events") {
         result.message = result.batches === 0
@@ -615,7 +623,7 @@ async function drainEventsForCwdUnlocked(
       }
     }
   } finally {
-    await closeRouteStorage(project, outboxFactory, ownedFactory);
+    await closeRouteStorage(outboxFactory, ownedFactory);
   }
 
   result.incomplete = true;
@@ -629,6 +637,7 @@ export async function promoteEventsForCwd(
   sidecarPathOverride?: string,
   storageFactory?: StorageBackendFactory,
   publicationLockToken?: BackendPublicationLockToken,
+  context?: PromotionExecutionContext,
 ): Promise<PromoteResult> {
   return withLockedCwdPromotion(
     cwd,
@@ -640,9 +649,10 @@ export async function promoteEventsForCwd(
         sidecarPath,
         storageFactory,
         publicationLockToken,
+        context,
       ),
     (result) => result,
-    publicationLockToken,
+    context?.publicationLockToken ?? publicationLockToken,
   );
 }
 
@@ -652,32 +662,162 @@ async function promoteEventsForCwdUnlocked(
   sidecarPath: string,
   storageFactory?: StorageBackendFactory,
   publicationLockToken?: BackendPublicationLockToken,
+  context?: PromotionExecutionContext,
 ): Promise<PromoteResult> {
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
-  let project: ProjectStorage | undefined;
   let ownedFactory: StorageBackendFactory | undefined;
   try {
-    const identity = projectIdentity(cwd, config.storage, publicationLockToken);
-    const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+    const edb = await outboxFactory.open(sidecarPath);
+    await edb.clearMissingCwd();
+    const prepared = await preparePromotionBatch(config, edb);
+    const executionContext = promotionExecutionContext(publicationLockToken, context);
+    const effectiveToken = executionContext?.publicationLockToken;
+    const factory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
       config.storage,
       undefined,
       undefined,
-      publicationLockToken,
+      effectiveToken,
     ));
-    if (config.storage.backend === "postgresql") {
-      project = await factory.openProject(identity, publicationLockToken);
+    if (prepared.events.length === 0) {
+      const empty = await runSelectedPromotionBatch(
+        config,
+        cwd,
+        edb,
+        factory,
+        executionContext,
+        prepared,
+        effectiveToken,
+      );
+      return empty;
     }
-    const edb = await outboxFactory.open(sidecarPath);
-    await edb.clearMissingCwd();
-    project ??= await factory.openProject(identity, publicationLockToken);
     const scrubber = await ScrubEngine.forProject(
+      config.security.sensitivePatterns,
+      projectDir(cwd, effectiveToken),
+    );
+    return await runSelectedPromotionBatch(
+      config,
+      cwd,
+      edb,
+      factory,
+      executionContext,
+      prepared,
+      effectiveToken,
+      scrubber,
+    );
+  } finally {
+    await closeRouteStorage(outboxFactory, ownedFactory);
+  }
+}
+
+type PreparedPromotionBatch = Readonly<{
+  events: EventRow[];
+  reinforcementCache: Map<string, PreparedPatternReinforcement>;
+}>;
+
+type PreparedPatternReinforcement =
+  | { kind: "value"; value: PatternReinforcementStats }
+  | { kind: "error"; error: unknown };
+
+async function preparePromotionBatch(
+  config: DaemonConfig,
+  edb: LocalHookOutboxRepository,
+): Promise<PreparedPromotionBatch> {
+  const events = await edb.getUnprocessed();
+  if (events.length === 0) {
+    return { events, reinforcementCache: new Map() };
+  }
+
+  correlateErrors(events);
+  const thresholds = config.compaction.promotionThresholds;
+  const reinforcementCache = new Map<string, PreparedPatternReinforcement>();
+  for (const event of events) {
+    if (event.priority !== 3 || !AUTO_PROMOTABLE_PATTERN_CATEGORIES.has(event.category)) continue;
+    const key = `${event.type}\u0000${event.category}\u0000${event.data}`;
+    if (reinforcementCache.has(key)) continue;
+    try {
+      reinforcementCache.set(key, {
+        kind: "value",
+        value: await edb.getPatternReinforcement(
+          event.type,
+          event.category,
+          event.data,
+          thresholds.insightsMaxAgeDays ?? 90,
+        ),
+      });
+    } catch (error) {
+      // Keep the local sidecar read outside selected storage admission while
+      // preserving the prior per-event best-effort behavior.
+      reinforcementCache.set(key, { kind: "error", error });
+    }
+  }
+  return { events, reinforcementCache };
+}
+
+function cancelledPromotionResult(): PromoteResult {
+  return {
+    promoted: 0,
+    skipped: 0,
+    correlated: 0,
+    errors: 0,
+    message: "promotion cancelled",
+  };
+}
+
+async function runSelectedPromotionBatch(
+  config: DaemonConfig,
+  cwd: string,
+  edb: LocalHookOutboxRepository,
+  factory: StorageBackendFactory,
+  context: PromotionExecutionContext | undefined,
+  prepared: PreparedPromotionBatch,
+  publicationLockToken: BackendPublicationLockToken | undefined,
+  scrubber?: ScrubEngine,
+): Promise<PromoteResult> {
+  const activeScrubber = prepared.events.length === 0
+    ? undefined
+    : scrubber ?? await ScrubEngine.forProject(
       config.security.sensitivePatterns,
       projectDir(cwd, publicationLockToken),
     );
-    return await promoteEventsBatch(config, cwd, edb, project, scrubber, new Map());
-  } finally {
-    await closeRouteStorage(project, outboxFactory, ownedFactory);
+  let result: PromoteResult | null;
+  try {
+    result = await withProjectStorage(
+      {
+        config,
+        cwd,
+        factory,
+        context,
+        mode: "create",
+      },
+      async project => {
+        if (prepared.events.length === 0) {
+          return {
+            promoted: 0,
+            skipped: 0,
+            correlated: 0,
+            errors: 0,
+            message: "no unprocessed events",
+          };
+        }
+        return promoteEventsBatch(
+          config,
+          cwd,
+          edb,
+          project,
+          activeScrubber!,
+          new Map(),
+          prepared.events,
+          prepared.reinforcementCache,
+        );
+      },
+    );
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      return cancelledPromotionResult();
+    }
+    throw error;
   }
+  return result ?? cancelledPromotionResult();
 }
 
 async function promoteEventsBatch(
@@ -687,39 +827,24 @@ async function promoteEventsBatch(
   project: ProjectStorage,
   scrubber: ScrubEngine,
   scrubCache: Map<string, string>,
+  events: EventRow[],
+  reinforcementCache: Map<string, PreparedPatternReinforcement>,
 ): Promise<PromoteResult> {
   const result: PromoteResult = { promoted: 0, skipped: 0, correlated: 0, errors: 0 };
-
-  const events = await edb.getUnprocessed();
-  if (events.length === 0) {
-    return { ...result, message: "no unprocessed events" };
-  }
-
-  // Correlate error→fix pairs
-  correlateErrors(events);
 
       const thresholds = config.compaction.promotionThresholds;
       const eventConf = thresholds.eventConfidence ?? {
         decision: 0.5, plan: 0.7, errorFix: 0.4, batch: 0.3, pattern: 0.2,
       };
-      const reinforcementCache = new Map<string, PatternReinforcementStats>();
-      const getPatternReinforcement = async (event: EventRow): Promise<PatternReinforcementStats> => {
+      const getPatternReinforcement = (event: EventRow): PatternReinforcementStats => {
         if (event.priority !== 3 || !AUTO_PROMOTABLE_PATTERN_CATEGORIES.has(event.category)) {
           return EMPTY_REINFORCEMENT;
         }
 
         const key = `${event.type}\u0000${event.category}\u0000${event.data}`;
-        const cached = reinforcementCache.get(key);
-        if (cached) return cached;
-
-        const stats = await edb.getPatternReinforcement(
-          event.type,
-          event.category,
-          event.data,
-          thresholds.insightsMaxAgeDays ?? 90,
-        );
-        reinforcementCache.set(key, stats);
-        return stats;
+        const prepared = reinforcementCache.get(key)!;
+        if (prepared.kind === "error") throw prepared.error;
+        return prepared.value;
       };
 
       const processedIds: number[] = [];
@@ -733,7 +858,7 @@ async function promoteEventsBatch(
           }
           const autoTag = (event as EventRow & { auto_tag?: string }).auto_tag;
           const tag = autoTag ?? AUTO_TAGS[event.category] ?? `category:${event.category}`;
-          const reinforcement = await getPatternReinforcement(event);
+          const reinforcement = getPatternReinforcement(event);
           const reinforced = isReinforcedPattern(reinforcement);
           let confidence: number;
           let newEntryConfidence: number | undefined;
@@ -811,6 +936,9 @@ async function promoteEventsBatch(
           processedIds.push(event.event_id);
           result.promoted++;
         } catch (error) {
+          if (config.storage.backend === "postgresql" && error instanceof StorageOperationError) {
+            throw error;
+          }
           result.errors++;
           await safeLogError("promote-events", error, { cwd, sessionId: event.session_id });
           // Do not add to processedIds — transient errors (DB busy, dedup failure) should

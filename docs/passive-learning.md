@@ -162,11 +162,12 @@ lcm events promote --all
 
 Sidecars that are missing project metadata are reported separately because their hash cannot be reversed back to a project path automatically.
 
-### Staged PostgreSQL Replication
+### Separate PostgreSQL event delivery
 
-When PostgreSQL storage is configured, issue #91 provides a staged drain worker
-for explicit composition. It is not started automatically and does not activate
-normal PostgreSQL daemon routing. The worker:
+When PostgreSQL storage is configured, issue #91 provides a separate explicit
+event-delivery worker for the local outbox. It is not started automatically by
+the daemon and is distinct from the daemon's selected `ProjectStorage` route
+consumer. The worker:
 
 1. acquires and renews the existing #90 fenced drain lease;
 2. claims a ready local sequence prefix in a bounded batch;
@@ -197,7 +198,8 @@ They require PostgreSQL configuration, a registered machine, and a linked
 remote project. `status` and `validate` expose the durable checkpoints;
 `quarantine` lists local compatibility failures and remote poison rows; and
 `replay` retries one exact local or remote event. These commands do not start
-replication.
+replication. CLI/import-export remains #618-owned; passive-learning stats and
+doctor presentation remain #619-owned.
 
 ### Learned Insights
 
@@ -275,7 +277,7 @@ The UserPromptSubmit extractor includes guards against false-positive decisions.
 | Pre-compact | Events promoted before context is compacted |
 | Daemon available during capture | Hooks notify `/promote-events/notify`; daemon processes queued events in the background |
 | Daemon unavailable | Events queued in sidecar, processed by startup/session lifecycle drains or manual remediation later |
-| PostgreSQL unavailable | Hooks continue local commits; staged replication retries with bounded backoff and does not bypass an earlier local sequence blocker |
+| PostgreSQL unavailable | Hooks continue local commits; selected project-storage batches fail closed and the local outbox remains retryable |
 | Hard kill (SIGKILL) | Events survive in sidecar, scavenged on next SessionStart |
 | Stale sidecars in other projects | `lcm events promote --all` drains all metadata-backed sidecars |
 | Recorded cwd remains unavailable for three observations at least five minutes apart | Durable reversible parking state is recorded; event rows stay unprocessed and retain payload, history, and delivery state |

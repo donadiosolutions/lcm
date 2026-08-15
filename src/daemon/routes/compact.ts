@@ -353,7 +353,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
     let admittedIdentity: StorageIdentityContext & { readonly localProjectId: string };
     try {
       const initialAdmission = await withPublicationAdmission(async publicationLockToken => {
-        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+        activeFactory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
           config.storage,
           undefined,
           undefined,
@@ -379,9 +379,10 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         });
       } else {
         const storageFailure = storageRouteFailureResponse(
-          activeFactory,
+          config.storage.backend,
           err,
           "compact",
+          activeFactory,
         );
         if (storageFailure) {
           sendJson(res, storageFailure.status, storageFailure.body);
@@ -401,6 +402,13 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         ? { remoteProjectId: admittedIdentity.remoteProjectId }
         : {}),
     };
+    let openedProject: ProjectStorage | undefined;
+    let openedProjectClose: Promise<void> | undefined;
+    let detachProjectAbort: (() => void) | undefined;
+    const closeOpenedProject = async (): Promise<void> => {
+      openedProjectClose ??= closeRouteStorage(openedProject);
+      await openedProjectClose;
+    };
     const withProjectAdmission: RoutePublicationAdmission = async operation =>
       withPublicationAdmission(async publicationLockToken => {
         const currentIdentity = projectIdentity(cwd, config.storage, publicationLockToken);
@@ -413,17 +421,24 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         return operation(publicationLockToken);
       });
     const openProjectWithAdmission = async (): Promise<ProjectStorage> => {
-      let openedProject: ProjectStorage | undefined;
       try {
-        return await withProjectAdmission(async publicationLockToken => {
+        const project = await withProjectAdmission(async publicationLockToken => {
           const project = await activeFactory!.openProject(admittedIdentity, publicationLockToken);
           openedProject = project;
           return project;
         });
+        const signal = context?.signal;
+        if (signal !== undefined) {
+          const closeOnAbort = (): void => { void closeOpenedProject(); };
+          signal.addEventListener("abort", closeOnAbort, { once: true });
+          detachProjectAbort = () => signal.removeEventListener("abort", closeOnAbort);
+          if (signal.aborted) closeOnAbort();
+        }
+        return project;
       } catch (error) {
         // The admission wrapper can fail after its operation returns while it
         // revalidates publication state. Keep cleanup possible in that case.
-        await closeRouteStorage(openedProject, undefined);
+        await closeOpenedProject();
         throw error;
       }
     };
@@ -434,8 +449,8 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
       try {
         if (config.storage.backend === "postgresql") {
           try {
-            const duplicateProject = await openProjectWithAdmission();
-            await closeRouteStorage(duplicateProject, undefined);
+            await openProjectWithAdmission();
+            await closeOpenedProject();
           } catch (err) {
             if (err instanceof BackendPublicationJournalError) {
               sendJson(res, 503, {
@@ -444,9 +459,10 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
               });
             } else {
               const storageFailure = storageRouteFailureResponse(
-                activeFactory,
+                config.storage.backend,
                 err,
                 "compact",
+                activeFactory,
               );
               if (storageFailure) {
                 sendJson(res, storageFailure.status, storageFailure.body);
@@ -655,7 +671,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
             retry: effectiveRetry,
           };
         } finally {
-          await closeRouteStorage(project, undefined);
+          await closeOpenedProject();
         }
       });
 
@@ -668,13 +684,14 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         });
         return;
       }
-      const storageFailure = storageRouteFailureResponse(activeFactory, err, "compact");
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "compact", activeFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;
       }
       sendJson(res, 500, { error: err instanceof Error ? err.message : "compact failed" });
     } finally {
+      detachProjectAbort?.();
       await closeRouteStorage(undefined, ownedFactory);
       compactingNow.delete(session_id);
     }

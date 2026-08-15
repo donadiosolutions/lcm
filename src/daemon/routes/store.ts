@@ -7,14 +7,12 @@ import { sanitizeError } from "../safe-error.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import {
-  createStorageBackendFactory,
-  type ProjectStorage,
   type StorageBackendFactory,
 } from "../../storage/index.js";
 import {
-  closeRouteStorage,
   stagedPostgreSqlFactoryUnavailableResponse,
   storageRouteFailureResponse,
+  withProjectStorage,
 } from "./storage-lifecycle.js";
 
 /** Cache entry for a per-project ScrubEngine. */
@@ -75,49 +73,39 @@ export function createStoreHandler(
       return;
     }
 
-    let project: ProjectStorage | undefined;
-    let ownedFactory: StorageBackendFactory | undefined;
-    let activeFactory: StorageBackendFactory | undefined;
     try {
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
-        config.storage,
-        undefined,
-        undefined,
-        context?.publicationLockToken,
-      ));
-      const identity = projectIdentity(projectPath, config.storage, context?.publicationLockToken);
-      const stagedFailure = stagedPostgreSqlFactoryUnavailableResponse(
-        activeFactory,
-        "store",
-      );
+      // Reject an unbound project before local scrubber discovery. The
+      // lifecycle helper repeats this resolution under its live token.
+      projectIdentity(projectPath, config.storage, context?.publicationLockToken);
+      const stagedFailure = stagedPostgreSqlFactoryUnavailableResponse(storageFactory, "store");
       if (stagedFailure) {
         sendJson(res, 503, stagedFailure);
         return;
       }
-      project = await activeFactory.openProject(identity, context?.publicationLockToken);
       const scrubber = await getScrubEngine(config, projectDir(projectPath, context?.publicationLockToken));
       const scrubbedText = scrubber.scrub(text);
       const scrubbedTags = tags.map((tag: string) => scrubber.scrub(tag));
 
-      const id = await project.promotedMemory.insert({
-        content: scrubbedText,
-        tags: scrubbedTags,
-        sourceProjectId: metadata.projectId ?? "manual",
-        sessionId: metadata.sessionId ?? "manual",
-        depth: metadata.depth ?? 0,
-        confidence: 1.0,
-      });
+      const id = await withProjectStorage(
+        { config, cwd: projectPath, factory: storageFactory, context, mode: "create" },
+        async (project) => project.promotedMemory.insert({
+          content: scrubbedText,
+          tags: scrubbedTags,
+          sourceProjectId: metadata.projectId ?? "manual",
+          sessionId: metadata.sessionId ?? "manual",
+          depth: metadata.depth ?? 0,
+          confidence: 1.0,
+        }),
+      );
 
       sendJson(res, 200, { stored: true, id });
     } catch (err) {
-      const storageFailure = storageRouteFailureResponse(activeFactory, err, "store");
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "store", storageFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;
       }
       sendJson(res, 500, { error: sanitizeError(err instanceof Error ? err.message : "store failed") });
-    } finally {
-      await closeRouteStorage(project, ownedFactory);
     }
   };
 }

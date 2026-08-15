@@ -16,9 +16,9 @@ import { ensureProjectDir, projectDbPath, projectId } from "../../../src/daemon/
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
 import { withBackendPublicationConsumerLockAsync } from "../../../src/storage/backend-publication.js";
 import { createStorageBackendFactory } from "../../../src/storage/index.js";
+import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 import { recoverMachineIdentity } from "../../../src/machine-identity.js";
 import {
   clearProjectMapCache,
@@ -226,7 +226,7 @@ describe("promote-events route", () => {
 
     const output = mockRes();
     const config = makeConfig();
-    const factory = createStorageBackendFactory(config.storage);
+    const factory = await createStorageBackendFactory(config.storage);
     try {
       await withBackendPublicationConsumerLockAsync(homeDir, async (publicationLockToken) => {
         await createPromoteEventsHandler(config, factory)(
@@ -897,7 +897,7 @@ describe("promote-events route", () => {
     const output = mockRes();
     await createPromoteAllEventsHandler(
       config,
-      new UnavailablePostgreSqlStorageBackendFactory(),
+      makeStagedPostgreSqlStorageFactory(),
     )(request, output.res, "");
 
     expect(output.res.writeHead).toHaveBeenCalledWith(
@@ -911,21 +911,25 @@ describe("promote-events route", () => {
     });
   });
 
-  it("returns the exact staged response before scanning an empty sidecar directory", async () => {
+  it("scans an empty sidecar directory before returning its aggregate result", async () => {
     const output = mockRes();
     await createPromoteAllEventsHandler(
       makeConfig(),
-      new UnavailablePostgreSqlStorageBackendFactory(),
+      makeStagedPostgreSqlStorageFactory(),
     )(request, output.res, "");
 
-    expect(output.res.writeHead).toHaveBeenCalledWith(
-      503,
-      { "Content-Type": "application/json" },
-    );
+    expect(output.res.writeHead).toHaveBeenCalledWith(200, { "Content-Type": "application/json" });
     expect(output.getBody()).toEqual({
-      code: "STORAGE_BACKEND_STAGED",
-      error: "promote-events-all is unavailable while PostgreSQL storage repositories are staged",
-      storageBackend: "postgresql",
+      promoted: 0,
+      skipped: 0,
+      correlated: 0,
+      errors: 0,
+      scanned: 0,
+      sidecarsWithUnprocessed: 0,
+      processedProjects: 0,
+      orphanedProjects: 0,
+      failedProjects: 0,
+      projects: [],
     });
   });
 
@@ -978,7 +982,7 @@ describe("promote-events route", () => {
 
     const output = mockRes();
     const config = makeConfig();
-    const factory = createStorageBackendFactory(config.storage);
+    const factory = await createStorageBackendFactory(config.storage);
     try {
       await withBackendPublicationConsumerLockAsync(homeDir, async (publicationLockToken) => {
         await createPromoteAllEventsHandler(config, factory)(

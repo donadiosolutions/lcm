@@ -8,7 +8,6 @@ import { daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { fenceContent } from "../daemon/content-fence.js";
 import { safeLogError } from "./hook-errors.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
-import { selectStorageBackend, StorageBackendUnavailableError } from "../storage/backend.js";
 import {
   clearDaemonNotice,
   maybeEmitDaemonNotice,
@@ -55,16 +54,14 @@ export async function handlePreCompact(
   const pidFilePath = daemonPidPath();
   let ensureResult: EnsureResultWithRefusal;
   try {
-    selectStorageBackend(storage);
+    assertHookPublicationFence();
   } catch (error) {
     if (isBackendPublicationJournalError(error) && !isBackendPublicationEvidenceMissing(error)) {
       return { exitCode: 0, stdout: "" };
     }
     await safeLogError(
       "PreCompact",
-      isBackendPublicationEvidenceMissing(error) && storage.backend === "postgresql"
-        ? new StorageBackendUnavailableError("postgresql")
-        : error,
+      error,
       {},
     );
     return { exitCode: 0, stdout: "" };

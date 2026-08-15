@@ -1,16 +1,14 @@
 import type { DaemonConfig } from "../config.js";
-import { projectIdentity } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { SearchResult } from "../../db/promoted.js";
 import type { RecallFeedback } from "../../db/recall.js";
 import { selectMemoryHintsWithinBudget } from "../../hooks/memory-context.js";
 import { validateCwd } from "../validate-cwd.js";
-import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
+import type { StorageBackendFactory } from "../../storage/index.js";
 import {
-  closeRouteStorage,
-  openExistingProject,
   storageRouteFailureResponse,
+  withProjectStorage,
 } from "./storage-lifecycle.js";
 
 const CANDIDATE_LIMIT_MULTIPLIER = 5;
@@ -200,7 +198,7 @@ function validatePromptSearchInput(input: unknown): PromptSearchRequest {
 }
 
 export function createPromptSearchHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
-  return async (_req, res, body) => {
+  return async (_req, res, body, context) => {
     let input: PromptSearchRequest;
     try {
       input = validatePromptSearchInput(JSON.parse(body || "{}"));
@@ -235,130 +233,118 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
       return;
     }
 
-    let project: ProjectStorage | undefined;
-    let ownedFactory: StorageBackendFactory | undefined;
-    let activeFactory: StorageBackendFactory | undefined;
     try {
-      const identity = projectIdentity(validatedCwd, config.storage);
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
-      project = await openExistingProject(activeFactory, identity) ?? undefined;
-      if (config.restoration.promptSearchMaxResults === 0) {
-        sendJson(res, 200, { hints: [], ids: [] });
-        return;
-      }
-      if (!project) {
-        sendJson(res, 200, { hints: [] });
-        return;
-      }
-      const maxResults = config.restoration.promptSearchMaxResults;
-      const minScore = config.restoration.promptSearchMinScore;
-      const snippetLength = config.restoration.promptSnippetLength;
-      const maxInjectedMemoryBytes = config.restoration.maxInjectedMemoryBytes;
-      const reservedForLearningInstruction = config.restoration.reservedForLearningInstruction;
-      const maxInjectedMemoryItems = config.restoration.maxInjectedMemoryItems;
-      const dedupMinPrefix = config.restoration.dedupMinPrefix;
-      const halfLife = config.restoration.recencyHalfLifeHours;
-      const crossSessionAffinity = config.restoration.crossSessionAffinity;
-      const recallUsageBoost = config.restoration.recallUsageBoost;
-      const recallUsageSmoothing = config.restoration.recallUsageSmoothing;
-      const surfacingCooldownWindow = config.restoration.surfacingCooldownWindow;
-      const resurfaceMargin = config.restoration.resurfaceMargin;
-      const unusedSurfacingPenalty = config.restoration.unusedSurfacingPenalty;
-      const staleAfterDays = config.restoration.staleAfterDays;
-      const staleSurfacingWithoutUseLimit = config.restoration.staleSurfacingWithoutUseLimit;
-      const stalePenalty = config.restoration.stalePenalty;
-      const allowStaleOnStrongMatch = config.restoration.allowStaleOnStrongMatch;
+      const result = await withProjectStorage(
+        { config, cwd: validatedCwd, factory: storageFactory, context, mode: "existing" },
+        async (project) => {
+          const maxResults = config.restoration.promptSearchMaxResults;
+          if (maxResults === 0) return { hints: [], ids: [] };
 
-      const candidateLimit = Math.max(maxResults * CANDIDATE_LIMIT_MULTIPLIER, MIN_CANDIDATE_LIMIT);
-      const results = await project.lexicalSearch.searchPromoted(query, candidateLimit);
+          const minScore = config.restoration.promptSearchMinScore;
+          const snippetLength = config.restoration.promptSnippetLength;
+          const maxInjectedMemoryBytes = config.restoration.maxInjectedMemoryBytes;
+          const reservedForLearningInstruction = config.restoration.reservedForLearningInstruction;
+          const maxInjectedMemoryItems = config.restoration.maxInjectedMemoryItems;
+          const dedupMinPrefix = config.restoration.dedupMinPrefix;
+          const halfLife = config.restoration.recencyHalfLifeHours;
+          const crossSessionAffinity = config.restoration.crossSessionAffinity;
+          const recallUsageBoost = config.restoration.recallUsageBoost;
+          const recallUsageSmoothing = config.restoration.recallUsageSmoothing;
+          const surfacingCooldownWindow = config.restoration.surfacingCooldownWindow;
+          const resurfaceMargin = config.restoration.resurfaceMargin;
+          const unusedSurfacingPenalty = config.restoration.unusedSurfacingPenalty;
+          const staleAfterDays = config.restoration.staleAfterDays;
+          const staleSurfacingWithoutUseLimit = config.restoration.staleSurfacingWithoutUseLimit;
+          const stalePenalty = config.restoration.stalePenalty;
+          const allowStaleOnStrongMatch = config.restoration.allowStaleOnStrongMatch;
 
-      const now = Date.now();
-      const feedbackById = await project.recall.getFeedback(results.map((result) => result.id));
-      const ranked = rankResults(results, feedbackById, {
-          querySessionId: session_id,
-          now,
-          halfLife,
-          crossSessionAffinity,
-          recallUsageBoost,
-          recallUsageSmoothing,
-          surfacingCooldownWindow,
-          unusedSurfacingPenalty,
-          staleAfterDays,
-          staleSurfacingWithoutUseLimit,
-          stalePenalty,
-          allowStaleOnStrongMatch,
-        });
-      const filtered = applyCooldown(
-        ranked,
-        minScore,
-        resurfaceMargin,
-      );
+          const candidateLimit = Math.max(maxResults * CANDIDATE_LIMIT_MULTIPLIER, MIN_CANDIDATE_LIMIT);
+          const results = await project.lexicalSearch.searchPromoted(query, candidateLimit);
 
-      // Cap ranked results before selecting the best-fitting subset for the byte budget.
-      const selection = selectMemoryHintsWithinBudget(
-        filtered.slice(0, maxResults).map((result) => ({
-          id: result.id,
-          hint: result.content.length > snippetLength
-            ? result.content.slice(0, snippetLength) + "..."
-            : result.content,
-        })),
-        {
-          totalByteBudget: maxInjectedMemoryBytes,
-          reservedForLearningInstruction,
-          learningInstructionBytes: learningInstructionBytes ?? 0,
-          maxEmitted: maxInjectedMemoryItems,
-          dedupMinPrefix,
+          const now = Date.now();
+          const feedbackById = await project.recall.getFeedback(results.map((result) => result.id));
+          const ranked = rankResults(results, feedbackById, {
+            querySessionId: session_id,
+            now,
+            halfLife,
+            crossSessionAffinity,
+            recallUsageBoost,
+            recallUsageSmoothing,
+            surfacingCooldownWindow,
+            unusedSurfacingPenalty,
+            staleAfterDays,
+            staleSurfacingWithoutUseLimit,
+            stalePenalty,
+            allowStaleOnStrongMatch,
+          });
+          const filtered = applyCooldown(ranked, minScore, resurfaceMargin);
+
+          // Cap ranked results before selecting the best-fitting subset for the byte budget.
+          const selection = selectMemoryHintsWithinBudget(
+            filtered.slice(0, maxResults).map((result) => ({
+              id: result.id,
+              hint: result.content.length > snippetLength
+                ? result.content.slice(0, snippetLength) + "..."
+                : result.content,
+            })),
+            {
+              totalByteBudget: maxInjectedMemoryBytes,
+              reservedForLearningInstruction,
+              learningInstructionBytes: learningInstructionBytes ?? 0,
+              maxEmitted: maxInjectedMemoryItems,
+              dedupMinPrefix,
+            },
+          );
+
+          const { hints, ids } = selection;
+          const debugResponse = isDebug
+            ? {
+                candidates: ranked.map((result) => ({
+                  id: result.id,
+                  baseScore: result.baseScore,
+                  finalScore: result.finalScore,
+                  rank: result.rank,
+                  usageCount: result.feedback.usageCount,
+                  surfacingCount: result.feedback.surfacingCount,
+                  lastSurfacedAt: result.feedback.lastSurfacedAt,
+                  cooledDown: result.cooledDown,
+                  usageBoost: result.usageBoost,
+                  unusedPenalty: result.unusedPenalty,
+                  stalePenalty: result.stalePenalty,
+                  surfaced: ids.includes(result.id),
+                })),
+                budget: {
+                  availableHintBytes: selection.availableHintBytes,
+                  usedHintBytes: selection.usedHintBytes,
+                  emittedCount: hints.length,
+                  dedupedCount: selection.dedupedCount,
+                  droppedForBudget: selection.droppedForBudget,
+                },
+              }
+            : undefined;
+
+          // Log surfacing events (best-effort, never throws)
+          try {
+            if (logSurfacing) {
+              await project.recall.logSurfacing(ids, session_id ?? null);
+            }
+          } catch { /* non-fatal */ }
+
+          return debugResponse ? { hints, ids, debug: debugResponse } : { hints, ids };
         },
       );
-
-      const { hints, ids } = selection;
-      const debugResponse = isDebug
-        ? {
-            candidates: ranked.map((result) => ({
-              id: result.id,
-              baseScore: result.baseScore,
-              finalScore: result.finalScore,
-              rank: result.rank,
-              usageCount: result.feedback.usageCount,
-              surfacingCount: result.feedback.surfacingCount,
-              lastSurfacedAt: result.feedback.lastSurfacedAt,
-              cooledDown: result.cooledDown,
-              usageBoost: result.usageBoost,
-              unusedPenalty: result.unusedPenalty,
-              stalePenalty: result.stalePenalty,
-              surfaced: ids.includes(result.id),
-            })),
-            budget: {
-              availableHintBytes: selection.availableHintBytes,
-              usedHintBytes: selection.usedHintBytes,
-              emittedCount: hints.length,
-              dedupedCount: selection.dedupedCount,
-              droppedForBudget: selection.droppedForBudget,
-            },
-          }
-        : undefined;
-
-      // Log surfacing events (best-effort, never throws)
-      try {
-        if (logSurfacing) {
-          await project.recall.logSurfacing(ids, session_id ?? null);
-        }
-      } catch { /* non-fatal */ }
-
-      sendJson(res, 200, debugResponse ? { hints, ids, debug: debugResponse } : { hints, ids });
-    } catch (error) {
-      const storageFailure = storageRouteFailureResponse(
-        activeFactory,
-        error,
-        "prompt-search",
+      sendJson(
+        res,
+        200,
+        result ?? (config.restoration.promptSearchMaxResults === 0 ? { hints: [], ids: [] } : { hints: [] }),
       );
+    } catch (error) {
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, error, "prompt-search", storageFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;
       }
       sendJson(res, 200, { hints: [] });
-    } finally {
-      await closeRouteStorage(project, ownedFactory);
     }
   };
 }

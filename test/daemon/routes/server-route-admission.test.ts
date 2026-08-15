@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -13,7 +14,11 @@ import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { projectDbPath } from "../../../src/daemon/project.js";
 import { PrivateMutationLockContentionError } from "../../../src/private-mutation-lock.js";
 import { SqliteProjectStorage } from "../../../src/storage/sqlite/project-storage.js";
-import { withBackendPublicationConsumerLockAsync } from "../../../src/storage/backend-publication.js";
+import {
+  BackendPublicationJournalError,
+  withBackendPublicationConsumerLockAsync,
+} from "../../../src/storage/backend-publication.js";
+import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -28,27 +33,27 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve };
 }
 
-const EXPECTED_BUILT_IN_ROUTE_ADMISSIONS: readonly [string, RouteAdmission][] = [
-  ["GET /health", "read"],
-  ["POST /compact", "mutating"],
-  ["POST /promote", "mutating"],
-  ["POST /restore", "mutating"],
-  ["POST /grep", "read"],
-  ["POST /search", "read"],
-  ["POST /expand", "read"],
-  ["POST /describe", "read"],
-  ["POST /store", "mutating"],
-  ["POST /recent", "read"],
-  ["POST /ingest", "mutating"],
-  ["POST /prompt-search", "read"],
-  ["POST /session-complete", "mutating"],
-  ["POST /promote-events", "mutating"],
-  ["POST /promote-events/all", "mutating"],
-  ["POST /promote-events/notify", "read"],
-  ["GET /stats", "read"],
-  ["GET /stats/pool", "read"],
-  ["POST /review-stale", "mutating"],
-  ["POST /status", "read"],
+const EXPECTED_BUILT_IN_ROUTE_ADMISSIONS: readonly [string, RouteAdmission, "retained" | "operation-scoped"][] = [
+  ["GET /health", "read", "retained"],
+  ["POST /compact", "mutating", "operation-scoped"],
+  ["POST /promote", "mutating", "operation-scoped"],
+  ["POST /restore", "mutating", "operation-scoped"],
+  ["POST /grep", "read", "retained"],
+  ["POST /search", "read", "retained"],
+  ["POST /expand", "read", "retained"],
+  ["POST /describe", "read", "retained"],
+  ["POST /store", "mutating", "operation-scoped"],
+  ["POST /recent", "read", "retained"],
+  ["POST /ingest", "mutating", "operation-scoped"],
+  ["POST /prompt-search", "read", "retained"],
+  ["POST /session-complete", "mutating", "operation-scoped"],
+  ["POST /promote-events", "mutating", "operation-scoped"],
+  ["POST /promote-events/all", "mutating", "operation-scoped"],
+  ["POST /promote-events/notify", "read", "retained"],
+  ["GET /stats", "read", "retained"],
+  ["GET /stats/pool", "read", "retained"],
+  ["POST /review-stale", "mutating", "operation-scoped"],
+  ["POST /status", "read", "retained"],
 ];
 
 describe("daemon route publication admission", () => {
@@ -63,7 +68,7 @@ describe("daemon route publication admission", () => {
     mkdirSync(join(tempHome, "project"), { recursive: true, mode: 0o700 });
     const configPath = join(lcmDir, "config.json");
     writeFileSync(configPath, "{}\n", { mode: 0o600 });
-    const registrations: Array<[string, RouteAdmission]> = [];
+    const registrations: Array<[string, RouteAdmission, "retained" | "operation-scoped"]> = [];
     let daemon: DaemonInstance | undefined;
 
     try {
@@ -71,7 +76,7 @@ describe("daemon route publication admission", () => {
         daemon: { port: 0, idleTimeoutMs: 0 },
       }), {
         publicationConfigPath: configPath,
-        _onBuiltInRouteRegistered: (key, admission) => registrations.push([key, admission]),
+        _onBuiltInRouteRegistered: (key, admission, publicationMode) => registrations.push([key, admission, publicationMode]),
       });
 
       expect(registrations).toEqual(EXPECTED_BUILT_IN_ROUTE_ADMISSIONS);
@@ -126,6 +131,115 @@ describe("daemon route publication admission", () => {
         releaseCustomHandler.resolve();
         await expect(customResponsePromise).resolves.toMatchObject({ status: 200 });
       }
+    } finally {
+      if (daemon) await daemon.stop();
+      rmSync(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it("passes a real combined request signal and aborts it on request and connection close", async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-route-request-cancellation-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    const lcmDir = join(tempHome, ".lcm");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    const configPath = join(lcmDir, "config.json");
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    let daemon: DaemonInstance | undefined;
+    let observePartialBody = false;
+    const partialCancellationObserved = deferred<AbortSignal>();
+    const partialRequestSettled = deferred<AbortSignal>();
+
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, {
+        daemon: { port: 0, idleTimeoutMs: 0 },
+      }), {
+        publicationConfigPath: configPath,
+        _onRequestLifecycle: (event, signal) => {
+          if (!observePartialBody) return;
+          if (event === "cancelled") partialCancellationObserved.resolve(signal);
+          else partialRequestSettled.resolve(signal);
+        },
+      });
+
+      const requestHandlerStarted = deferred<void>();
+      const requestAborted = deferred<void>();
+      daemon.registerRoute("POST", "/request-cancellation", async (_req, res, _body, context) => {
+        requestHandlerStarted.resolve();
+        expect(context?.signal).toBeDefined();
+        context?.signal?.addEventListener("abort", () => requestAborted.resolve(), { once: true });
+        await requestAborted.promise;
+        if (!res.writableEnded) res.end();
+      }, "read");
+
+      const requestController = new AbortController();
+      const requestPromise = fetch(`http://127.0.0.1:${daemon.address().port}/request-cancellation`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+        signal: requestController.signal,
+      }).catch(() => undefined);
+      await requestHandlerStarted.promise;
+      requestController.abort();
+      await expect(Promise.race([
+        requestAborted.promise.then(() => "aborted" as const),
+        new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), 250)),
+      ])).resolves.toBe("aborted");
+      await requestPromise.catch(() => undefined);
+
+      const connectionHandlerStarted = deferred<void>();
+      const connectionAborted = deferred<void>();
+      daemon.registerRoute("POST", "/connection-cancellation", async (_req, res, _body, context) => {
+        connectionHandlerStarted.resolve();
+        expect(context?.signal).toBeDefined();
+        context?.signal?.addEventListener("abort", () => connectionAborted.resolve(), { once: true });
+        await connectionAborted.promise;
+        if (!res.writableEnded) res.end();
+      }, "read");
+
+      const client = httpRequest({
+        host: "127.0.0.1",
+        port: daemon.address().port,
+        method: "POST",
+        path: "/connection-cancellation",
+        headers: { "Content-Type": "application/json", "Content-Length": "2" },
+      });
+      client.on("error", () => undefined);
+      client.end("{}");
+      await connectionHandlerStarted.promise;
+      client.destroy();
+      await expect(Promise.race([
+        connectionAborted.promise.then(() => "aborted" as const),
+        new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), 250)),
+      ])).resolves.toBe("aborted");
+
+      observePartialBody = true;
+      const partialClient = httpRequest({
+        host: "127.0.0.1",
+        port: daemon.address().port,
+        method: "POST",
+        path: "/connection-cancellation",
+        headers: { "Content-Type": "application/json", "Content-Length": "100" },
+      });
+      partialClient.on("error", () => undefined);
+      partialClient.write("{");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      partialClient.destroy();
+      await new Promise<void>(resolve => partialClient.once("close", () => resolve()));
+      await expect(Promise.race([
+        partialCancellationObserved.promise.then(signal => signal.aborted ? "cancelled" as const : "not-cancelled" as const),
+        new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), 250)),
+      ])).resolves.toBe("cancelled");
+      await expect(Promise.race([
+        partialRequestSettled.promise.then(() => "settled" as const),
+        new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), 250)),
+      ])).resolves.toBe("settled");
     } finally {
       if (daemon) await daemon.stop();
       rmSync(tempHome, { recursive: true, force: true });
@@ -617,6 +731,47 @@ describe("daemon route publication admission", () => {
     }
   });
 
+  it("maps a buffered backend-publication failure without leaking generated output", async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-route-buffered-publication-error-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    const lcmDir = join(tempHome, ".lcm");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    const configPath = join(lcmDir, "config.json");
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    let daemon: DaemonInstance | undefined;
+
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, {
+        daemon: { port: 0, idleTimeoutMs: 0 },
+      }), { publicationConfigPath: configPath });
+      daemon.registerRoute("POST", "/ingest", async (_req, res) => {
+        res.end("must be discarded");
+        throw new BackendPublicationJournalError("unexpected-state", "publication state changed");
+      }, "read");
+
+      const response = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual({
+        status: "blocked",
+        error: "backend publication admission blocked",
+      });
+    } finally {
+      if (daemon) await daemon.stop();
+      rmSync(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
   it("discards mutating output on handler failure and post-validation corruption without unhandled rejections", async () => {
     const originalHome = process.env.HOME;
     const originalUserProfile = process.env.USERPROFILE;
@@ -694,7 +849,7 @@ describe("daemon route publication admission", () => {
     }
   });
 
-  it("holds the retained lock across a real SQLite mutating transaction", async () => {
+  it("keeps a real SQLite mutating transaction under the retained route lock", async () => {
     const originalHome = process.env.HOME;
     const originalUserProfile = process.env.USERPROFILE;
     const tempHome = mkdtempSync(join(tmpdir(), "lcm-route-real-mutator-"));
@@ -802,10 +957,11 @@ describe("daemon route publication admission", () => {
     process.env.LCM_POSTGRES_CA_FILE = caPath;
     writeFileSync(configPath, JSON.stringify(storageConfig) + "\n", { mode: 0o600 });
     let daemon: DaemonInstance | undefined;
-    const admissionOptions: DaemonOptions = {
-      publicationConfigPath: configPath,
-      _assertBackendPublication: () => undefined,
-    };
+      const admissionOptions: DaemonOptions = {
+        publicationConfigPath: configPath,
+        _assertBackendPublication: () => undefined,
+        _createStorageBackendFactory: async () => makeStagedPostgreSqlStorageFactory(),
+      };
 
     try {
       const startupConfig = loadDaemonConfig("/nonexistent/startup-config.json", {

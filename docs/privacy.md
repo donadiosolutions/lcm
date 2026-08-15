@@ -17,7 +17,9 @@ On first startup after upgrading from older releases, lcm automatically migrates
 
 No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
 An explicitly configured PostgreSQL backend is a user-operated remote-primary
-store; the data sent there is described below.
+store; daemon project writes and reads use it only after the publication and
+identity gates described below. Hook capture remains local and the data sent to
+PostgreSQL is described below.
 
 ## What leaves your machine
 
@@ -36,7 +38,9 @@ that you configure explicitly:
 
 When using an external summarizer, only the text being summarized is sent — not your full history. The summarizer receives a batch of recent messages to compress into a summary.
 
-The PostgreSQL native-transcript repository stores only client-native JSON
+The daemon's PostgreSQL project routes store scrubbed messages, summaries,
+promoted memories, and related repository data only after local validation and
+redaction. The PostgreSQL native-transcript repository stores only client-native JSON
 records that passed local decoding, scrubbing, residual-secret validation, and
 canonicalization. Here, “raw transcript” means that sanitized native record and
 its provenance; LCM never sends the verbatim pre-redaction source record to
@@ -44,13 +48,16 @@ PostgreSQL. Failed records produce only bounded metadata in private local
 quarantine stores separated by project and transcript client. The client
 identity exists only in the opaque database namespace, not in quarantine rows,
 so identical Claude and Codex metadata cannot deduplicate across clients.
-Native-transcript daemon and CLI routing is not active yet; explicit backfill
-and adapter use are documented in
+Native-transcript daemon and CLI routing is not active; explicit backfill and
+adapter use are documented in
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md).
 
 ## Secret redaction
 
-Long Context Manager (LCM) scrubs secrets from message content **before writing to SQLite** and **before sending to the summarizer**. Redaction happens at both write points to ensure secrets are never persisted or transmitted.
+Long Context Manager (LCM) scrubs secrets from message content **before writing
+to the selected project backend (SQLite or PostgreSQL)** and **before sending
+to the summarizer**. Redaction happens at both write points to ensure secrets
+are never persisted or transmitted in cleartext.
 
 The same redaction boundary applies to passive hook events, promoted memories,
 manual-store content and tags, and portable exports/imports. It combines the
@@ -58,7 +65,7 @@ bundled Gitleaks rules, built-in patterns, global `security.sensitivePatterns`,
 and the project's `sensitive-patterns.txt`. Previously captured passive events
 are scrubbed again before promotion.
 
-For PostgreSQL native transcripts, the staged embedded caller must explicitly
+For PostgreSQL native transcripts, the embedded caller must explicitly
 load and pass both effective custom-pattern arrays: global
 `security.sensitivePatterns` as `globalPatterns` and the project's
 `sensitive-patterns.txt` as `projectPatterns`. The API does not load them
@@ -139,7 +146,10 @@ lcm sensitive purge --yes
 lcm uninstall
 ```
 
-SQLite database files are stored in `~/.lcm/projects/`. You can delete individual project directories manually to remove their history.
+SQLite-selected project database files are stored in `~/.lcm/projects/`.
+PostgreSQL-selected project data is retained by the configured PostgreSQL
+operator; changing selection does not copy it into SQLite. You can delete
+individual local project directories manually to remove local history.
 
 These local commands do not delete PostgreSQL data. Native transcript rows are
 append-only and the issue #86 repository exposes no deletion operation.
@@ -169,8 +179,8 @@ The `Security` section of the doctor output shows:
 
 - SQLite remains the default and keeps data in `~/.lcm/`.
 - An explicitly configured PostgreSQL destination receives only data admitted
-  by its repository; native transcripts are scrubbed and validated locally
-  first.
+  by its repository; daemon messages and native transcripts are scrubbed and
+  validated locally first. Native-transcript daemon routing remains inactive.
 - External summarizer (optional) receives only the text to be summarized, after scrubbing.
 - Built-in patterns redact common secret formats automatically.
 - Add project-specific patterns with `lcm sensitive add`.

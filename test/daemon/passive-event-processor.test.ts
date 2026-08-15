@@ -12,7 +12,6 @@ import {
   type BackgroundPublicationAdmission,
 } from "../../src/daemon/passive-event-processor.js";
 import type { PromoteResult, promoteEventsForCwd } from "../../src/daemon/routes/promote-events.js";
-import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import {
   assertBackendPublicationConsumerAccess,
   BackendPublicationJournalError,
@@ -352,6 +351,35 @@ describe("PassiveEventProcessor", () => {
     expect(deps.clearInterval).toHaveBeenCalledTimes(1);
   });
 
+  it("propagates an external daemon abort and detaches it during stop", () => {
+    const { deps } = timerDeps();
+    const external = new AbortController();
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      signal: external.signal,
+      promoteEventsForCwd: vi.fn(),
+    });
+
+    external.abort();
+    processor.stop();
+    expect(external.signal.aborted).toBe(true);
+  });
+
+  it("honors a daemon signal that was already aborted at construction", () => {
+    const { deps } = timerDeps();
+    const external = new AbortController();
+    external.abort();
+
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      signal: external.signal,
+      promoteEventsForCwd: vi.fn(),
+    });
+
+    processor.stop();
+    expect(external.signal.aborted).toBe(true);
+  });
+
   it("passes the daemon-owned storage factory to background promotion", async () => {
     const { deps } = timerDeps();
     const storageFactory = { backend: "sqlite" } as never;
@@ -376,11 +404,15 @@ describe("PassiveEventProcessor", () => {
       "/tmp",
       undefined,
       storageFactory,
-      expect.any(Object),
+      undefined,
+      expect.objectContaining({
+        withPublicationAdmission: expect.any(Function),
+        signal: expect.any(Object),
+      }),
     );
   });
 
-  it("holds live admission for a notified promotion batch and revokes its token after completion", async () => {
+  it("passes bounded admission to a notified promotion batch without retaining it around promotion work", async () => {
     const { home, configPath } = publicationFixture();
     const { deps } = timerDeps();
     let releasePromotion: () => void = () => undefined;
@@ -392,9 +424,12 @@ describe("PassiveEventProcessor", () => {
       _cwd,
       _sidecarPath,
       _storageFactory,
-      publicationLockToken,
+      _publicationLockToken,
+      context,
     ) => {
-      capturedToken = publicationLockToken;
+      await context?.withPublicationAdmission?.(token => {
+        capturedToken = token;
+      });
       markPromotionStarted();
       await new Promise<void>(resolve => {
         releasePromotion = resolve;
@@ -416,14 +451,17 @@ describe("PassiveEventProcessor", () => {
       const drain = processor.flushOnce();
       await promotionStarted;
       expect(capturedToken).toEqual(expect.any(Object));
-      await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
-        .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+      await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined)).resolves.toBeUndefined();
       expect(promoteEventsForCwd).toHaveBeenCalledWith(
         expect.any(Object),
         "/tmp",
         undefined,
         undefined,
-        capturedToken,
+        undefined,
+        expect.objectContaining({
+          withPublicationAdmission: expect.any(Function),
+          signal: expect.any(Object),
+        }),
       );
 
       let shutdownComplete = false;
@@ -444,7 +482,7 @@ describe("PassiveEventProcessor", () => {
     }
   });
 
-  it("holds live admission for an independent sweep batch only after sidecar scanning", async () => {
+  it("passes bounded admission to an independent sweep batch only after sidecar scanning", async () => {
     const { home, configPath } = publicationFixture();
     const { deps } = timerDeps();
     let releaseScan: () => void = () => undefined;
@@ -466,9 +504,12 @@ describe("PassiveEventProcessor", () => {
       _cwd,
       _sidecarPath,
       _storageFactory,
-      publicationLockToken,
+      _publicationLockToken,
+      context,
     ) => {
-      capturedToken = publicationLockToken;
+      await context?.withPublicationAdmission?.(token => {
+        capturedToken = token;
+      });
       markPromotionStarted();
       await new Promise<void>(resolve => {
         releasePromotion = resolve;
@@ -491,14 +532,17 @@ describe("PassiveEventProcessor", () => {
       releaseScan();
       await promotionStarted;
       expect(capturedToken).toEqual(expect.any(Object));
-      await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
-        .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+      await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined)).resolves.toBeUndefined();
       expect(promoteEventsForCwd).toHaveBeenCalledWith(
         expect.any(Object),
         "/tmp",
         "/events/tmp.db",
         undefined,
-        capturedToken,
+        undefined,
+        expect.objectContaining({
+          withPublicationAdmission: expect.any(Function),
+          signal: expect.any(Object),
+        }),
       );
       releasePromotion();
       await sweep;
@@ -515,19 +559,26 @@ describe("PassiveEventProcessor", () => {
     const blockedCwd = mkdtempSync(join(tmpdir(), "lcm-passive-blocked-"));
     const healthyCwd = mkdtempSync(join(tmpdir(), "lcm-passive-healthy-"));
     const admissionFailure = new BackendPublicationJournalError("unexpected-state", "blocked");
-    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockResolvedValue({
-      promoted: 0,
-      skipped: 0,
-      correlated: 0,
-      errors: 0,
-      message: "no unprocessed events",
-    });
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(async (...args) =>
+      args[5]?.withPublicationAdmission?.(() => {
+        admissionCalls++;
+        if (admissionCalls === 1) throw admissionFailure;
+        return {
+          promoted: 0,
+          skipped: 0,
+          correlated: 0,
+          errors: 0,
+          message: "no unprocessed events",
+        };
+      }) ?? {
+        promoted: 0,
+        skipped: 0,
+        correlated: 0,
+        errors: 0,
+        message: "no unprocessed events",
+      });
     let admissionCalls = 0;
-    const withPublicationAdmission: PublicationAdmission = async operation => {
-      admissionCalls++;
-      if (admissionCalls === 1) throw admissionFailure;
-      return operation({});
-    };
+    const withPublicationAdmission: PublicationAdmission = async operation => operation({});
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
       promoteEventsForCwd,
@@ -544,13 +595,17 @@ describe("PassiveEventProcessor", () => {
         admissionFailure,
         { cwd: blockedCwd },
       );
-      expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+      expect(promoteEventsForCwd).toHaveBeenCalledTimes(2);
       expect(promoteEventsForCwd).toHaveBeenCalledWith(
         expect.any(Object),
         healthyCwd,
         undefined,
         undefined,
-        expect.any(Object),
+        undefined,
+        expect.objectContaining({
+          withPublicationAdmission: expect.any(Function),
+          signal: expect.any(Object),
+        }),
       );
     } finally {
       processor.stop();
@@ -566,18 +621,14 @@ describe("PassiveEventProcessor", () => {
       sidecar({ cwd: "/blocked", path: "/events/blocked.db", unprocessed: 1 }),
       sidecar({ cwd: "/healthy", path: "/events/healthy.db", unprocessed: 1 }),
     ]);
-    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockResolvedValue({
-      promoted: 1,
-      skipped: 0,
-      correlated: 0,
-      errors: 0,
-    });
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(async (...args) =>
+      args[5]?.withPublicationAdmission?.(() => {
+        admissionCalls++;
+        if (admissionCalls === 1) throw admissionFailure;
+        return { promoted: 1, skipped: 0, correlated: 0, errors: 0 };
+      }) ?? { promoted: 1, skipped: 0, correlated: 0, errors: 0 });
     let admissionCalls = 0;
-    const withPublicationAdmission: PublicationAdmission = async operation => {
-      admissionCalls++;
-      if (admissionCalls === 1) throw admissionFailure;
-      return operation({});
-    };
+    const withPublicationAdmission: PublicationAdmission = async operation => operation({});
     const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
       ...deps,
       collectEventSidecars,
@@ -592,13 +643,17 @@ describe("PassiveEventProcessor", () => {
       admissionFailure,
       { cwd: "/blocked" },
     );
-    expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+    expect(promoteEventsForCwd).toHaveBeenCalledTimes(2);
     expect(promoteEventsForCwd).toHaveBeenCalledWith(
       expect.any(Object),
       "/healthy",
       "/events/healthy.db",
       undefined,
-      expect.any(Object),
+      undefined,
+      expect.objectContaining({
+        withPublicationAdmission: expect.any(Function),
+        signal: expect.any(Object),
+      }),
     );
   });
 
@@ -628,6 +683,38 @@ describe("PassiveEventProcessor", () => {
     await Promise.all([drain, shutdown]);
     expect(shutdownComplete).toBe(true);
     await expect(processor.stopAndWait()).resolves.toBeUndefined();
+  });
+
+  it("aborts background promotion context before completing processor shutdown", async () => {
+    const { deps } = timerDeps();
+    let signal: AbortSignal | undefined;
+    let markStarted!: () => void;
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(async (...args) => {
+      signal = args[5]?.signal;
+      markStarted();
+      return new Promise<PromoteResult>(resolve => {
+        signal?.addEventListener("abort", () => resolve({
+          promoted: 0,
+          skipped: 0,
+          correlated: 0,
+          errors: 0,
+          message: "promotion cancelled",
+        }), { once: true });
+      });
+    });
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      promoteEventsForCwd,
+    });
+
+    processor.notify({ cwd: "/tmp", priority: 1 });
+    const drain = processor.flushOnce();
+    await started;
+    const shutdown = processor.stopAndWait();
+    await vi.waitFor(() => expect(signal?.aborted).toBe(true));
+    await Promise.all([drain, shutdown]);
+    expect(signal?.aborted).toBe(true);
   });
 });
 

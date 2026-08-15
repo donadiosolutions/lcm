@@ -4,7 +4,7 @@
 </p>
 
 <p align="center">
-  DAG-based summarization, SQLite-backed message persistence, promoted long-term memory, MCP retrieval tools
+  DAG-based summarization, selected-backend message persistence, promoted long-term memory, MCP retrieval tools
 </p>
 
 <p align="center">
@@ -32,7 +32,8 @@
 
 `Lossless Context Manager` replaces sliding-window forgetfulness with a persistent memory runtime for both humans and agents.
 
-- Every message is stored in a project SQLite database.
+- Every message is stored in the selected project backend; SQLite remains the
+  zero-configuration default and PostgreSQL is an explicit remote-primary option.
 - Older context is compacted into a DAG of summaries instead of being dropped.
 - Durable decisions and findings are promoted into cross-session memory.
 - Claude Code and Codex have native hook integrations, while VS Code uses connector-based workflows on the same backend today.
@@ -51,7 +52,7 @@ flowchart LR
   CC --> D["lcm daemon"]
   CX --> D
 
-  D --> DB[("project SQLite DAG")]
+  D --> DB[("selected project-storage DAG")]
   D --> PM[("promoted memory FTS5")]
   D --> TOOLS["MCP tools<br/>search / grep / expand / describe / store / stats / doctor"]
 ```
@@ -389,15 +390,17 @@ SQLite remains the zero-configuration storage backend. LCM also validates the
 configuration and verified-TLS prerequisites for an explicit remote-primary
 PostgreSQL selection and includes an internal PostgreSQL 18 pool, migration
 runner, schema baseline, project-storage factory, and isolated conformance
-harness. Explicit programmatic callers can create the PostgreSQL factory and
-open a project-scoped `ProjectStorage` containing conversation, summary,
-context, large-file, promoted-memory, recall, redaction-administration,
-lexical-search, and coordination repositories behind one transaction and
-lifecycle boundary. Factory creation eagerly verifies runtime health,
-PostgreSQL 18, extensions, migration history, schema fingerprints, ownership,
-search configuration, and the exact least-privilege ACL manifest. Opening a
-project then requires valid backend-publication evidence and an exact remote
-machine/project/path identity match before exposing any repository.
+harness. The daemon and MCP project routes use that verified factory when the
+published selection is PostgreSQL. They open a project-scoped `ProjectStorage`
+containing conversation, summary, context, large-file, promoted-memory,
+recall, redaction-administration, lexical-search, and coordination repositories
+behind one transaction and lifecycle boundary. Factory creation eagerly
+verifies runtime health, PostgreSQL 18, extensions, migration history, schema
+fingerprints, ownership, search configuration, and the exact least-privilege
+ACL manifest. Opening a project then requires valid backend-publication
+evidence and an exact remote machine/project/path identity match before
+exposing any repository. A PostgreSQL route never falls back to project
+SQLite; hooks retain their intentional local SQLite outbox.
 
 Embedded ESM callers import the curated production seam without exposing
 internal runtime, migration, or testing helpers:
@@ -487,16 +490,13 @@ registered with it, and closes the shared PostgreSQL runtime. Close the project
 first and the factory second in `finally`, as above; this unregisters the
 project before factory shutdown while preserving any primary operation failure.
 
-Normal daemon/CLI activation remains staged until #92/#224. Selecting
-`postgresql` for those routes therefore keeps storage explicitly unavailable
-instead of falling back to SQLite. The health endpoint reports `503` and
-unavailable storage; status and statistics routes return fixed `503`
-responses, and SQLite background scans remain disabled. Hooks remain
-offline-first through the local outbox, and no PostgreSQL replication worker
-starts automatically. Connection credentials stay out of JSON and effective
-configuration output. Configure the non-secret expected migration-owner role,
-provision the schema as that owner with `lcm postgres migrate`, then apply the
-reviewed
+Daemon project routes fail closed with sanitized `409` identity responses or
+`503` storage responses when identity, publication, TLS, grants, or runtime
+availability are missing. Request cancellation and daemon shutdown close and
+drain selected project storage. Connection credentials stay out of JSON and
+effective configuration output. Configure the non-secret expected
+migration-owner role, provision the schema as that owner with `lcm postgres
+migrate`, then apply the reviewed
 [readiness](src/storage/postgresql/reference/postgresql-runtime-readiness-grants.sql),
 [identity](src/storage/postgresql/reference/postgresql-runtime-identity-grants.sql),
 [conversation](src/storage/postgresql/reference/postgresql-runtime-conversation-grants.sql),
@@ -528,6 +528,11 @@ crash-recovery semantics.
 The [PostgreSQL summary, context, and large-file guide](src/storage/postgresql/reference/postgresql-summary-context.md)
 defines graph, coverage, context-range, ordering, lock/fence, grant, query-plan,
 diagnostic, and recovery semantics.
+
+Issue #617 activates daemon and MCP project-storage routing. CLI/import-export
+and portable transfer remain #618-owned; aggregate stats, pool diagnostics,
+status, and doctor parity remain #619-owned. Those limitations do not weaken
+the daemon's publication, identity, cancellation, shutdown, or privacy gates.
 
 ## Development
 

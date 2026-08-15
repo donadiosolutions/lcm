@@ -44,7 +44,7 @@ import {
 } from "./lifecycle-scope.js";
 import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
-import { createStorageBackendFactory } from "../storage/index.js";
+import { createStorageBackendFactory, type StorageBackendFactory } from "../storage/index.js";
 import { assertStorageBackendPublication } from "../storage/backend.js";
 import { readBoundedRegularFile } from "../security-files.js";
 import {
@@ -63,6 +63,7 @@ export type RoutePublicationAdmission = <T>(
 export type RouteExecutionContext = Readonly<{
   publicationLockToken?: BackendPublicationLockToken;
   withPublicationAdmission?: RoutePublicationAdmission;
+  signal?: AbortSignal;
 }>;
 export type RouteHandler = (
   req: IncomingMessage,
@@ -72,6 +73,7 @@ export type RouteHandler = (
 ) => Promise<void>;
 export type RouteAdmission = "read" | "mutating";
 type BuiltInRoutePublicationMode = "retained" | "operation-scoped";
+type RequestLifecycleEvent = "cancelled" | "settled";
 type RegisteredRoute = Readonly<{
   handler: RouteHandler;
   admission: RouteAdmission;
@@ -98,19 +100,32 @@ export type DaemonOptions = {
   /** @internal Deterministic idle-timer seams for lifecycle tests. */
   _clearTimeout?: typeof clearTimeout;
   /** @internal Deterministic periodic-ingest seam for lifecycle tests. */
-  _scanForTranscripts?: (withPublicationAdmission: BackgroundPublicationAdmission) => Promise<void>;
+  _scanForTranscripts?: (
+    withPublicationAdmission: BackgroundPublicationAdmission,
+    signal?: AbortSignal,
+  ) => Promise<void>;
   /** @internal Deterministic packaged-runtime identity seam for health tests. */
   _runtimeDigest?: string;
   /** @internal Explicit owned daemon identity for lifecycle isolation tests. */
   _testIdentity?: DaemonLifecycleTestIdentity;
   /** @internal Deterministic auth-token read seam for preflight ordering tests. */
   _readAuthToken?: typeof readAuthToken;
+  /** @internal Deterministic storage-factory seam for daemon unit tests. */
+  _createStorageBackendFactory?: typeof createStorageBackendFactory;
   /** Canonical daemon config path used for request-time publication admission. */
   publicationConfigPath?: string;
   /** @internal Test-only publication admission seam. */
   _assertBackendPublication?: (homeDir: string | undefined, backend: DaemonConfig["storage"]["backend"]) => void;
+  /** @internal Test-only async publication-lock seam. */
+  _withBackendPublicationConsumerLockAsync?: typeof withBackendPublicationConsumerLockAsync;
+  /** @internal Test-only request lifecycle observer. */
+  _onRequestLifecycle?: (event: RequestLifecycleEvent, signal: AbortSignal) => void;
   /** @internal Test-only observer for the closed built-in route registry. */
-  _onBuiltInRouteRegistered?: (key: string, admission: RouteAdmission) => void;
+  _onBuiltInRouteRegistered?: (
+    key: string,
+    admission: RouteAdmission,
+    publicationMode: BuiltInRoutePublicationMode,
+  ) => void;
 };
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -277,6 +292,57 @@ function clearIdleTimer(timer: ReturnType<typeof setTimeout> | null, clearTimer:
   return null;
 }
 
+type RequestCancellation = Readonly<{
+  signal: AbortSignal;
+  cleanup: () => void;
+}>;
+
+export function requestCancellation(
+  req: IncomingMessage,
+  res: ServerResponse,
+  shutdownSignal: AbortSignal,
+  onAbort?: (signal: AbortSignal) => void,
+): RequestCancellation {
+  const requestController = new AbortController();
+  const combinedController = new AbortController();
+
+  const abortRequest = (): void => {
+    requestController.abort();
+  };
+  const abortCombined = (): void => {
+    if (combinedController.signal.aborted) return;
+    combinedController.abort();
+    onAbort?.(combinedController.signal);
+  };
+  const onRequestAborted = (): void => abortRequest();
+  const onRequestClose = (): void => {
+    if (!req.complete) abortRequest();
+  };
+  const onResponseClose = (): void => {
+    if (!res.writableEnded && !res.writableFinished) abortRequest();
+  };
+
+  requestController.signal.addEventListener("abort", abortCombined, { once: true });
+  if (shutdownSignal.aborted) abortCombined();
+  else shutdownSignal.addEventListener("abort", abortCombined, { once: true });
+  if (typeof req.once === "function") req.once("aborted", onRequestAborted);
+  if (typeof req.once === "function") req.once("close", onRequestClose);
+  if (typeof res.once === "function") res.once("close", onResponseClose);
+  if (req.aborted || (req.destroyed && !req.complete)) abortRequest();
+  if (res.destroyed) abortRequest();
+
+  return {
+    signal: combinedController.signal,
+    cleanup: () => {
+      requestController.signal.removeEventListener("abort", abortCombined);
+      shutdownSignal.removeEventListener("abort", abortCombined);
+      if (typeof req.off === "function") req.off("aborted", onRequestAborted);
+      if (typeof req.off === "function") req.off("close", onRequestClose);
+      if (typeof res.off === "function") res.off("close", onResponseClose);
+    },
+  };
+}
+
 function stagedPostgreSqlUnavailableHandler(operation: string): RouteHandler {
   return async (_req, res) => {
     sendJson(res, 503, stagedPostgreSqlUnavailablePayload(operation));
@@ -343,6 +409,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const listenPort = normalizeDaemonPort(config.daemon.port, { allowZero: true });
   const idleTimeoutMs = normalizeIdleTimeoutMs(config.daemon.idleTimeoutMs);
   const runtimeDigest = options?._runtimeDigest ?? RUNTIME_DIGEST;
+  const shutdownController = new AbortController();
   const hasTestIdentity = Object.prototype.hasOwnProperty.call(options ?? {}, "_testIdentity");
   if (hasTestIdentity && !isDaemonLifecycleTestIdentity(options?._testIdentity)) {
     throw new Error("Daemon test identity is incomplete or malformed");
@@ -360,6 +427,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   }
   const publicationConfigPath = options?.publicationConfigPath ?? defaultConfigPath();
   const publicationHome = backendPublicationHomeForConfigPath(publicationConfigPath);
+  const withConsumerPublicationLockAsync = options?._withBackendPublicationConsumerLockAsync
+    ?? withBackendPublicationConsumerLockAsync;
+  const assertDaemonNotShuttingDown = (): void => {
+    if (!shutdownController.signal.aborted) return;
+    throw Object.assign(new Error("daemon is shutting down"), { name: "AbortError" });
+  };
   const assertRequestAdmission = (lockToken?: BackendPublicationLockToken): void => {
     if (options?._assertBackendPublication !== undefined) {
       options._assertBackendPublication(publicationHome, config.storage.backend);
@@ -367,34 +440,56 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }
     assertDaemonRequestStorageAdmission(config, publicationConfigPath, lockToken);
   };
-  const withBackgroundPublicationAdmission: BackgroundPublicationAdmission = async operation =>
-    withBackendPublicationConsumerLockAsync(publicationHome, async publicationLockToken => {
+  const withBackgroundPublicationAdmission: BackgroundPublicationAdmission = async operation => {
+    assertDaemonNotShuttingDown();
+    return withConsumerPublicationLockAsync(publicationHome, async publicationLockToken => {
+      assertDaemonNotShuttingDown();
       assertRequestAdmission(publicationLockToken);
+      assertDaemonNotShuttingDown();
       return operation(publicationLockToken);
     });
+  };
   const withRequestPublicationAdmission = (
     retainedToken: BackendPublicationLockToken,
-  ): RoutePublicationAdmission => async operation => withBackendPublicationConsumerLockAsync(
-    publicationHome,
-    async publicationLockToken => {
-      assertRequestAdmission(publicationLockToken);
-      return operation(publicationLockToken);
-    },
-    { lockToken: retainedToken },
-  );
-  const storageFactory = createStorageBackendFactory(
-    config.storage,
-    publicationHome,
-    options?._assertBackendPublication === undefined
-      ? undefined
-      : ({ homeDir, backend }) => options._assertBackendPublication!(homeDir, backend),
-  );
+  ): RoutePublicationAdmission => async operation => {
+    assertDaemonNotShuttingDown();
+    return withConsumerPublicationLockAsync(
+      publicationHome,
+      async publicationLockToken => {
+        assertDaemonNotShuttingDown();
+        assertRequestAdmission(publicationLockToken);
+        assertDaemonNotShuttingDown();
+        return operation(publicationLockToken);
+      },
+      { lockToken: retainedToken },
+    );
+  };
+  const createFactory = options?._createStorageBackendFactory ?? createStorageBackendFactory;
+  let storageFactory: StorageBackendFactory;
+  try {
+    storageFactory = await createFactory(
+      config.storage,
+      publicationHome,
+      options?._assertBackendPublication === undefined
+        ? undefined
+        : ({ homeDir, backend }) => options._assertBackendPublication!(homeDir, backend),
+    );
+  } catch (error) {
+    shutdownController.abort();
+    throw error;
+  }
   const sqliteStorage = config.storage.backend === "sqlite";
   let constructedProcessor: PassiveEventProcessor | undefined;
   let constructedWatcher: ReturnType<typeof watchProjectMap> | undefined;
   let constructedIngestInterval: ReturnType<typeof setInterval> | undefined;
   let constructedIngestScan: Promise<void> | undefined;
   let startupCleanupStarted = false;
+  let storageFactoryClosed = false;
+  const closeStorageFactory = async (): Promise<void> => {
+    if (storageFactoryClosed) return;
+    storageFactoryClosed = true;
+    await storageFactory.close();
+  };
   try {
   const routes = new Map<string, RegisteredRoute>();
 
@@ -407,7 +502,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   ): void => {
     const key = `${method} ${path}`;
     routes.set(key, { handler, admission, publicationMode });
-    options?._onBuiltInRouteRegistered?.(key, admission);
+    options?._onBuiltInRouteRegistered?.(key, admission, publicationMode);
   };
 
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -466,31 +561,75 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "mutating",
     "operation-scoped",
   );
-  registerBuiltInRoute("POST", "/promote", createPromoteHandler(config, storageFactory), "mutating");
-  registerBuiltInRoute("POST", "/restore", createRestoreHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute(
+    "POST",
+    "/promote",
+    createPromoteHandler(config, storageFactory),
+    "mutating",
+    "operation-scoped",
+  );
+  registerBuiltInRoute(
+    "POST",
+    "/restore",
+    createRestoreHandler(config, storageFactory),
+    "mutating",
+    "operation-scoped",
+  );
   registerBuiltInRoute("POST", "/grep", createGrepHandler(config, storageFactory), "read");
   registerBuiltInRoute("POST", "/search", createSearchHandler(config, storageFactory), "read");
   registerBuiltInRoute("POST", "/expand", createExpandHandler(config, storageFactory), "read");
   registerBuiltInRoute("POST", "/describe", createDescribeHandler(config, storageFactory), "read");
-  registerBuiltInRoute("POST", "/store", createStoreHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute(
+    "POST",
+    "/store",
+    createStoreHandler(config, storageFactory),
+    "mutating",
+    "operation-scoped",
+  );
   registerBuiltInRoute("POST", "/recent", createRecentHandler(config, storageFactory), "read");
-  registerBuiltInRoute("POST", "/ingest", createIngestHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute(
+    "POST",
+    "/ingest",
+    createIngestHandler(config, storageFactory),
+    "mutating",
+    "operation-scoped",
+  );
   registerBuiltInRoute("POST", "/prompt-search", createPromptSearchHandler(config, storageFactory), "read");
-  registerBuiltInRoute("POST", "/session-complete", createSessionCompleteHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute(
+    "POST",
+    "/session-complete",
+    createSessionCompleteHandler(config, storageFactory),
+    "mutating",
+    "operation-scoped",
+  );
   const passiveEventProcessor = new PassiveEventProcessor(
     config,
     PASSIVE_EVENT_PROCESSOR_DEFAULTS,
-    { storageFactory, withPublicationAdmission: withBackgroundPublicationAdmission },
+    {
+      storageFactory,
+      withPublicationAdmission: withBackgroundPublicationAdmission,
+      signal: shutdownController.signal,
+    },
   );
   constructedProcessor = passiveEventProcessor;
-  registerBuiltInRoute("POST", "/promote-events", createPromoteEventsHandler(config, storageFactory), "mutating");
-  registerBuiltInRoute("POST", "/promote-events/all", createPromoteAllEventsHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute(
+    "POST",
+    "/promote-events",
+    createPromoteEventsHandler(config, storageFactory),
+    "mutating",
+    "operation-scoped",
+  );
+  registerBuiltInRoute(
+    "POST",
+    "/promote-events/all",
+    createPromoteAllEventsHandler(config, storageFactory),
+    "mutating",
+    "operation-scoped",
+  );
   registerBuiltInRoute(
     "POST",
     "/promote-events/notify",
-    sqliteStorage
-      ? createPromoteEventsNotifyHandler(passiveEventProcessor)
-      : stagedPostgreSqlUnavailableHandler("promote-events-notify"),
+    createPromoteEventsNotifyHandler(passiveEventProcessor),
     "read",
   );
   registerBuiltInRoute(
@@ -505,7 +644,13 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     sqliteStorage ? createPoolStatsHandler() : stagedPostgreSqlUnavailableHandler("pool stats"),
     "read",
   );
-  registerBuiltInRoute("POST", "/review-stale", createReviewStaleHandler(config, storageFactory), "mutating");
+  registerBuiltInRoute(
+    "POST",
+    "/review-stale",
+    createReviewStaleHandler(config, storageFactory),
+    "mutating",
+    "operation-scoped",
+  );
   // Status handler is registered after listen() when we know the actual port
   const projectMapWatcher = watchProjectMap();
   constructedWatcher = projectMapWatcher;
@@ -514,7 +659,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const INGEST_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
   const ingestHandler = createIngestHandler(config, storageFactory);
 
-  const scanForTranscripts = async (withPublicationAdmission: BackgroundPublicationAdmission) => {
+  const scanForTranscripts = async (
+    withPublicationAdmission: BackgroundPublicationAdmission,
+    signal: AbortSignal = shutdownController.signal,
+  ) => {
     try {
       const { readdirSync, existsSync, readFileSync } = await import("node:fs");
       const { join } = await import("node:path");
@@ -552,13 +700,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
               end: (data: string) => { response.body = data; },
             } as unknown as ServerResponse;
 
-            await withPublicationAdmission(async publicationLockToken => {
-              await ingestHandler(mockReq, mockRes, JSON.stringify({
-                session_id: sessionId,
-                cwd: scanCwd,
-                transcript_path: transcriptPath,
-              }), { publicationLockToken });
-            });
+            await ingestHandler(mockReq, mockRes, JSON.stringify({
+              session_id: sessionId,
+              cwd: scanCwd,
+              transcript_path: transcriptPath,
+            }), { withPublicationAdmission, signal });
           }
         }
       }
@@ -573,7 +719,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     if (activeIngestScan) return activeIngestScan;
     const scan = Promise.resolve()
       .then(() => {
-        return (options?._scanForTranscripts ?? scanForTranscripts)(withBackgroundPublicationAdmission);
+        return (options?._scanForTranscripts ?? scanForTranscripts)(
+          withBackgroundPublicationAdmission,
+          shutdownController.signal,
+        );
       })
       .catch((error: unknown) => {
         if (error instanceof BackendPublicationJournalError) {
@@ -590,51 +739,66 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     return scan;
   };
 
-  const ingestInterval = sqliteStorage
-    ? setInterval(runScheduledTranscriptScan, INGEST_INTERVAL_MS)
-    : undefined;
+  const ingestInterval = setInterval(runScheduledTranscriptScan, INGEST_INTERVAL_MS);
   constructedIngestInterval = ingestInterval;
   ingestInterval?.unref(); // don't prevent process exit
 
   const server: Server = createServer(async (req, res) => {
     resetIdleTimer();
-    const key = `${req.method} ${req.url?.split("?")[0]}`;
-    const route = routes.get(key);
-    if (!route) { sendJson(res, 404, { error: "not found" }); return; }
-    // Public health is intentionally storage-free. Supplying credentials opts
-    // into authenticated diagnostics and therefore must fail closed.
-    if (serverToken) {
-      const rawAuth = req.headers["authorization"];
-      const authHeader = (Array.isArray(rawAuth) ? rawAuth[0] : rawAuth) ?? "";
-      const publicHealth = key === "GET /health" && rawAuth === undefined;
-      if (!publicHealth && authHeader.trim() !== `Bearer ${serverToken}`) {
-        sendJson(res, 401, { error: "unauthorized" });
-        return;
-      }
-    }
+    const cancellation = requestCancellation(
+      req,
+      res,
+      shutdownController.signal,
+      signal => options?._onRequestLifecycle?.("cancelled", signal),
+    );
+    const requestSignal = cancellation.signal;
     let bufferedResponse: BufferedServerResponse | undefined;
     try {
+      const key = `${req.method} ${req.url?.split("?")[0]}`;
+      const route = routes.get(key);
+      if (!route) {
+        sendJsonIfWritable(res, 404, { error: "not found" });
+        return;
+      }
+      // Public health is intentionally storage-free. Supplying credentials opts
+      // into authenticated diagnostics and therefore must fail closed.
+      if (serverToken) {
+        const rawAuth = req.headers["authorization"];
+        const authHeader = (Array.isArray(rawAuth) ? rawAuth[0] : rawAuth) ?? "";
+        const publicHealth = key === "GET /health" && rawAuth === undefined;
+        if (!publicHealth && authHeader.trim() !== `Bearer ${serverToken}`) {
+          sendJsonIfWritable(res, 401, { error: "unauthorized" });
+          return;
+        }
+      }
+
+      assertDaemonNotShuttingDown();
       const body = req.method !== "GET" ? await readBody(req) : "";
       if (route.admission === "mutating") {
         if (route.publicationMode === "operation-scoped") {
+          assertDaemonNotShuttingDown();
+          assertRequestAdmission();
           await route.handler(req, res, body, {
             withPublicationAdmission: withBackgroundPublicationAdmission,
+            signal: requestSignal,
           });
           return;
         }
         bufferedResponse = new BufferedServerResponse(res);
-        await withBackendPublicationConsumerLockAsync(publicationHome, async (lockToken) => {
+        await withConsumerPublicationLockAsync(publicationHome, async (lockToken) => {
+          assertDaemonNotShuttingDown();
           assertRequestAdmission(lockToken);
           await route.handler(req, bufferedResponse as unknown as ServerResponse, body, {
             publicationLockToken: lockToken,
             withPublicationAdmission: withRequestPublicationAdmission(lockToken),
+            signal: requestSignal,
           });
         });
         bufferedResponse.flush();
         bufferedResponse = undefined;
       } else {
         assertRequestAdmission();
-        await route.handler(req, res, body);
+        await route.handler(req, res, body, { signal: requestSignal });
       }
     } catch (err: unknown) {
       if (bufferedResponse !== undefined) {
@@ -652,7 +816,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         return;
       }
       if (err instanceof BackendPublicationJournalError) {
-        sendJson(res, 503, {
+        sendJsonIfWritable(res, 503, {
           status: "blocked",
           error: "backend publication admission blocked",
         });
@@ -660,7 +824,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       }
       const status = (err as { statusCode?: number })?.statusCode ?? 500;
       const message = status === 413 ? "payload too large" : sanitizeError(err instanceof Error ? err.message : "internal error");
-      sendJson(res, status, { error: message });
+      sendJsonIfWritable(res, status, { error: message });
+    } finally {
+      cancellation.cleanup();
+      options?._onRequestLifecycle?.("settled", requestSignal);
     }
   });
 
@@ -675,7 +842,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
 
   const cleanupStartupFailure = async (): Promise<void> => {
     startupCleanupStarted = true;
-    if (ingestInterval) await settleCleanup(() => clearInterval(ingestInterval));
+    shutdownController.abort();
+    await settleCleanup(() => clearInterval(ingestInterval));
     await settleCleanup(() => activeIngestScan);
     await settleCleanup(() => projectMapWatcher.close());
     await settleCleanup(() => passiveEventProcessor.stopAndWait());
@@ -683,7 +851,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     if (proxyManager) {
       await settleCleanup(() => proxyManager.stop());
     }
-    await settleCleanup(() => storageFactory.close());
+    await settleCleanup(closeStorageFactory);
   };
 
   return await new Promise((resolve, reject) => {
@@ -713,13 +881,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           : stagedPostgreSqlUnavailableHandler("status"),
         "read",
       );
-      if (sqliteStorage) passiveEventProcessor.start();
-      else passiveEventProcessor.stop();
+      passiveEventProcessor.start();
 
       resolve({
         address: () => addr,
         stop: async () => {
-          if (ingestInterval) await settleCleanup(() => clearInterval(ingestInterval));
+          shutdownController.abort();
+          const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
+          await settleCleanup(() => clearInterval(ingestInterval));
           await settleCleanup(() => activeIngestScan);
           await settleCleanup(() => projectMapWatcher.close());
           await settleCleanup(() => passiveEventProcessor.stopAndWait());
@@ -727,8 +896,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           if (proxyManager) {
             await settleCleanup(() => proxyManager.stop());
           }
-          await settleCleanup(() => new Promise<void>((r) => server.close(() => r())));
-          await storageFactory.close();
+          await settleCleanup(() => serverClosed);
+          await settleCleanup(closeStorageFactory);
         },
         registerRoute: (method, path, handler, requestedAdmission) => {
           const key = `${method} ${path}`;
@@ -750,6 +919,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   });
   } catch (error) {
     if (startupCleanupStarted) throw error;
+    shutdownController.abort();
     if (constructedIngestInterval) {
       const ingestInterval = constructedIngestInterval;
       await settleCleanup(() => clearInterval(ingestInterval));
@@ -763,7 +933,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const processor = constructedProcessor;
       await settleCleanup(() => processor.stopAndWait());
     }
-    await settleCleanup(() => storageFactory.close());
+    await settleCleanup(closeStorageFactory);
     throw error;
   }
 }

@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import type { EventsDb as EventsDbType } from "../../src/hooks/events-db.js";
-import * as storageBackend from "../../src/storage/backend.js";
 import * as localEnqueue from "../../src/hooks/local-enqueue.js";
 import * as publicationFence from "../../src/hooks/publication-fence.js";
 import * as hookConfig from "../../src/hooks/config.js";
@@ -167,7 +166,6 @@ describe("handleUserPromptSubmit", () => {
     const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {
       order.push("repair");
     });
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
     mockExtractUserPromptEvents.mockReturnValueOnce([]);
     mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
     try {
@@ -181,7 +179,6 @@ describe("handleUserPromptSubmit", () => {
     } finally {
       fence.mockRestore();
       repair.mockRestore();
-      select.mockRestore();
     }
   });
 
@@ -195,7 +192,6 @@ describe("handleUserPromptSubmit", () => {
     const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {
       order.push("repair");
     });
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
     mockExtractUserPromptEvents.mockReturnValueOnce([event]);
     mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
     try {
@@ -211,7 +207,6 @@ describe("handleUserPromptSubmit", () => {
       append.mockRestore();
       fence.mockRestore();
       repair.mockRestore();
-      select.mockRestore();
     }
   });
 
@@ -227,7 +222,6 @@ describe("handleUserPromptSubmit", () => {
       .mockResolvedValueOnce({ inserted: 1, pendingCount: 1 });
     const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {});
     const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
     mockExtractUserPromptEvents.mockReturnValueOnce([event]);
     mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
     try {
@@ -243,7 +237,6 @@ describe("handleUserPromptSubmit", () => {
       append.mockRestore();
       repair.mockRestore();
       fence.mockRestore();
-      select.mockRestore();
       if (previousClient === undefined) delete process.env.LCM_CLIENT;
       else process.env.LCM_CLIENT = previousClient;
     }
@@ -255,7 +248,6 @@ describe("handleUserPromptSubmit", () => {
       .mockRejectedValueOnce(new Error("enqueue failed"));
     const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {});
     const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
     mockExtractUserPromptEvents.mockReturnValueOnce([event]);
     mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
     try {
@@ -271,7 +263,6 @@ describe("handleUserPromptSubmit", () => {
       append.mockRestore();
       repair.mockRestore();
       fence.mockRestore();
-      select.mockRestore();
     }
   });
 
@@ -321,7 +312,6 @@ describe("handleUserPromptSubmit", () => {
     process.env.HOME = home;
     const root = vi.spyOn(publicationFence, "assertHookRootEstablished").mockImplementation(() => {});
     const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
     const notice = vi.spyOn(daemonNotice, "maybeEmitDaemonNotice");
     mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
     try {
@@ -341,7 +331,6 @@ describe("handleUserPromptSubmit", () => {
     } finally {
       root.mockRestore();
       fence.mockRestore();
-      select.mockRestore();
       notice.mockRestore();
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
@@ -350,9 +339,9 @@ describe("handleUserPromptSubmit", () => {
   });
 
   it("uses a recognized daemon refusal reason during admission remediation", async () => {
-    const root = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
     const notice = vi.spyOn(daemonNotice, "maybeEmitDaemonNotice");
+    const post = vi.fn();
     mockEnsureDaemon.mockResolvedValueOnce({
       connected: false,
       port: 3737,
@@ -362,11 +351,15 @@ describe("handleUserPromptSubmit", () => {
     try {
       const result = await handleUserPromptSubmit(
         JSON.stringify({ prompt: "hello", cwd: "/proj" }),
-        asDaemonClient({ post: vi.fn() }),
+        asDaemonClient({ post }),
         3737,
-        { backend: "sqlite" },
+        { backend: "postgresql" },
       );
       expect(result.stdout).toContain("<learning-instruction>");
+      expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+        expectedStorageBackend: "postgresql",
+      }));
+      expect(post).not.toHaveBeenCalled();
       expect(notice).toHaveBeenCalledTimes(1);
       expect(notice).toHaveBeenCalledWith({
         scope: join(homedir(), ".lcm"),
@@ -374,8 +367,7 @@ describe("handleUserPromptSubmit", () => {
         reason: "live-no-response",
       });
     } finally {
-      root.mockRestore();
-      select.mockRestore();
+      fence.mockRestore();
       notice.mockRestore();
     }
   });
@@ -385,7 +377,6 @@ describe("handleUserPromptSubmit", () => {
     const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents")
       .mockRejectedValueOnce(new Error("scrub failed"));
     const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
     mockExtractUserPromptEvents.mockReturnValueOnce([event]);
     mockEnsureDaemon.mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
     const client = asDaemonClient({ post: vi.fn().mockResolvedValue({ hints: [] }) });
@@ -401,7 +392,6 @@ describe("handleUserPromptSubmit", () => {
     } finally {
       scrub.mockRestore();
       fence.mockRestore();
-      select.mockRestore();
     }
   });
 
@@ -411,7 +401,6 @@ describe("handleUserPromptSubmit", () => {
       daemonPort: undefined,
     } as never);
     const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
     mockExtractUserPromptEvents.mockReturnValue([]);
     mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
     try {
@@ -419,12 +408,10 @@ describe("handleUserPromptSubmit", () => {
         JSON.stringify({ prompt: "hello", cwd: "/proj" }),
         asDaemonClient({ post: vi.fn() }),
       )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
-      expect(select).toHaveBeenCalledWith({ backend: "sqlite" });
       expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({ port: 3737 }));
     } finally {
       config.mockRestore();
       fence.mockRestore();
-      select.mockRestore();
     }
   });
 
@@ -434,7 +421,6 @@ describe("handleUserPromptSubmit", () => {
       daemonPort: 3737,
     } as never);
     const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
     mockExtractUserPromptEvents.mockReturnValue([]);
     const post = vi.spyOn(DaemonClient.prototype, "post")
       .mockResolvedValue({ hints: ["constructed-client-hint"] });
@@ -454,28 +440,25 @@ describe("handleUserPromptSubmit", () => {
     } finally {
       config.mockRestore();
       fence.mockRestore();
-      select.mockRestore();
       post.mockRestore();
     }
   });
 
-  it("sanitizes an ordinary backend-selection failure after admission", async () => {
+  it("sanitizes an ordinary publication admission failure after admission", async () => {
     const selectionError = new Error("backend selection failed");
-    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
-    const select = vi.spyOn(storageBackend, "selectStorageBackend")
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence")
       .mockImplementationOnce(() => { throw selectionError; });
     mockExtractUserPromptEvents.mockReturnValue([]);
     try {
       await expect(handleUserPromptSubmit(
-        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        JSON.stringify({ prompt: "hello", cwd: "/proj", client: "codex" }),
         asDaemonClient({ post: vi.fn() }),
         3737,
         { backend: "sqlite" },
       )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
-      expect(select).toHaveBeenCalledWith({ backend: "sqlite" });
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
     } finally {
       fence.mockRestore();
-      select.mockRestore();
     }
   });
 
@@ -536,7 +519,7 @@ describe("handleUserPromptSubmit", () => {
     }
   });
 
-  it("distinguishes missing evidence from an unresolved backend selection", async () => {
+  it("distinguishes missing evidence from an unresolved publication admission", async () => {
     const evidenceError = new BackendPublicationJournalError(
       "publication-evidence-missing",
       "publication evidence is absent",
@@ -545,26 +528,26 @@ describe("handleUserPromptSubmit", () => {
       "unresolved-publication",
       "publication remains unresolved",
     );
-    const select = vi.spyOn(storageBackend, "selectStorageBackend")
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence")
       .mockImplementationOnce(() => { throw evidenceError; })
       .mockImplementationOnce(() => { throw unresolvedError; });
-    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
     mockExtractUserPromptEvents.mockReturnValue([]);
+    const input = JSON.stringify({ prompt: "hello", cwd: "/proj", client: "codex" });
     try {
       await expect(handleUserPromptSubmit(
-        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        input,
         asDaemonClient({ post: vi.fn() }),
         3737,
         { backend: "sqlite" },
       )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
       await expect(handleUserPromptSubmit(
-        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        input,
         asDaemonClient({ post: vi.fn() }),
         3737,
         { backend: "sqlite" },
       )).rejects.toBe(unresolvedError);
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
     } finally {
-      select.mockRestore();
       fence.mockRestore();
     }
   });
@@ -578,7 +561,6 @@ describe("handleUserPromptSubmit", () => {
       "unresolved-publication",
       "publication remains unresolved",
     );
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockReturnValue({ backend: "sqlite" });
     const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
     mockExtractUserPromptEvents.mockReturnValue([]);
     mockEnsureDaemon
@@ -594,7 +576,6 @@ describe("handleUserPromptSubmit", () => {
       await expect(handleUserPromptSubmit(input, asDaemonClient({ post: vi.fn() }), 3737, { backend: "sqlite" }))
         .resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
     } finally {
-      select.mockRestore();
       fence.mockRestore();
     }
   });
@@ -650,7 +631,7 @@ describe("handleUserPromptSubmit", () => {
     }
   });
 
-  it("queues local events before checking an unavailable PostgreSQL daemon", async () => {
+  it("keeps local event enqueue before selected PostgreSQL daemon transport", async () => {
     const order: string[] = [];
     const mockInsertEvent = vi.fn(() => { order.push("insert"); });
     const mockClose = vi.fn(() => { order.push("close"); });
@@ -666,9 +647,9 @@ describe("handleUserPromptSubmit", () => {
     ]);
     mockEnsureDaemon.mockImplementation(async () => {
       order.push("ensure");
-      return { connected: false, port: 3737, spawned: false };
+      return { connected: true, port: 3737, spawned: false };
     });
-    const client = { post: vi.fn() };
+    const client = { post: vi.fn().mockResolvedValue({ hints: [] }) };
 
     const home = mkdtempSync(join(tmpdir(), "lcm-user-prompt-storage-"));
     const previousHome = process.env.HOME;
@@ -693,16 +674,22 @@ describe("handleUserPromptSubmit", () => {
       rmSync(home, { recursive: true, force: true });
     }
 
-    expect(order).toEqual(["insert", "close"]);
     expect(mockInsertEvent).toHaveBeenCalledWith(
       "s1",
       { type: "decision", category: "decision", data: "use PostgreSQL", priority: 1 },
       "UserPromptSubmit",
     );
     expect(mockClose).toHaveBeenCalled();
-    expect(mockEnsureDaemon).not.toHaveBeenCalled();
-    expect(firePromoteEventsNotifyRequest).not.toHaveBeenCalled();
-    expect(client.post).not.toHaveBeenCalled();
+    expect(order).toEqual(["insert", "close", "ensure"]);
+    expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+      expectedStorageBackend: "postgresql",
+    }));
+    expect(firePromoteEventsNotifyRequest).toHaveBeenCalledWith(3737, expect.objectContaining({
+      sourceHook: "UserPromptSubmit",
+    }));
+    expect(client.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({
+      query: "we decided to use PostgreSQL",
+    }));
     expect(result).toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
   });
 
@@ -752,10 +739,6 @@ describe("handleUserPromptSubmit", () => {
         security: { sensitivePatterns: [] },
       };
     });
-    const backend = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementation(() => {
-      order.push("backend");
-      return { backend: "sqlite" };
-    });
     const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {
       order.push("repair");
     });
@@ -782,7 +765,7 @@ describe("handleUserPromptSubmit", () => {
         client,
       )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
       expect(order[0]).toBe("enqueue");
-      for (const action of ["project", "repair", "config", "backend", "daemon", "search"]) {
+      for (const action of ["project", "repair", "config", "daemon", "search"]) {
         const actionIndex = order.indexOf(action);
         expect(actionIndex).toBeGreaterThan(0);
         expect(order.slice(0, actionIndex).filter((entry) => entry === "fence").length).toBeGreaterThan(0);
@@ -791,7 +774,6 @@ describe("handleUserPromptSubmit", () => {
     } finally {
       append.mockRestore();
       config.mockRestore();
-      backend.mockRestore();
       repair.mockRestore();
       fence.mockRestore();
       project.mockRestore();
@@ -813,24 +795,24 @@ describe("handleUserPromptSubmit", () => {
     )).rejects.toBe(publicationError);
   });
 
-  it("sanitizes unexpected storage-selection failures before the protocol-safe return", async () => {
+  it("sanitizes unexpected publication admission failures before the protocol-safe return", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-user-prompt-storage-throw-"));
     const previousHome = process.env.HOME;
     const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementationOnce(() => {
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementationOnce(() => {
       throw new Error("secret /tmp/private-config pid=4242");
     });
     process.env.HOME = home;
     try {
       const result = await handleUserPromptSubmit(
-        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        JSON.stringify({ prompt: "hello", cwd: "/proj", client: "codex" }),
         asDaemonClient({ post: vi.fn() }),
       );
       expect(result).toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
       expect(stderrWrite.mock.calls.flat().join(" ")).not.toMatch(/secret|private-config|4242/u);
       expect(mockEnsureDaemon).not.toHaveBeenCalled();
     } finally {
-      selectStorageBackend.mockRestore();
+      fence.mockRestore();
       stderrWrite.mockRestore();
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;

@@ -12,6 +12,7 @@ import {
 } from "../../src/daemon/config.js";
 import { createDaemon } from "../../src/daemon/server.js";
 import { parsePostgreSqlUrl } from "../../src/storage/postgresql/client-config.js";
+import { makeStagedPostgreSqlStorageFactory } from "./routes/mock-storage-factory.js";
 
 const tempDirs: string[] = [];
 
@@ -521,7 +522,10 @@ describe("storage configuration", () => {
       { storage: { backend: "postgresql" }, daemon: { port: 0, idleTimeoutMs: 0 } },
       postgresEnv(),
     );
-    const daemon = await createDaemon(config, { _assertBackendPublication: () => undefined });
+    const daemon = await createDaemon(config, {
+      _assertBackendPublication: () => undefined,
+      _createStorageBackendFactory: async () => makeStagedPostgreSqlStorageFactory(),
+    });
     try {
       const response = await fetch(`http://127.0.0.1:${daemon.address().port}/health`);
       await expect(response.json()).resolves.toMatchObject({

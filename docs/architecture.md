@@ -34,18 +34,18 @@ keeping runtime internals, migrators, and deterministic testing hooks private.
 
 The native-transcript adapter remains separate because transcript import is an
 explicit backfill seam rather than a `ProjectStorage` repository. Normal daemon
-and CLI composition still do not select the PostgreSQL factory: issues #92
-(authoritative backend activation) and the remaining #224 routing work are not
-implemented. For those staged routes, a valid terminal publication witness
-allows the storage-free public health contract to identify the selected
-backend, but authenticated storage-backed routes remain unavailable. An
-unresolved or inconsistent publication blocks both public and authenticated
-health with fixed sanitized `503` responses. Lifecycle admission verifies the
-public process and listener identity before sending the local token, then
-recognizes the authenticated staged response without treating its storage as
-ready or falling back to SQLite. The local SQLite hook outbox and the
-metadata-only transcript quarantine remain local and are not general caches or
-activation paths. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
+and MCP composition now select the verified PostgreSQL factory when the
+published backend is explicitly `postgresql`. A valid terminal publication
+witness, registered machine, and exact project binding are required before a
+project opens. Unresolved or inconsistent publication, identity, or runtime
+state fails closed with sanitized `409` identity or `503` storage responses;
+the daemon never opens a project SQLite database as fallback. Request
+cancellation closes the active project, and daemon shutdown aborts and drains
+background consumers before closing the shared factory. The local SQLite hook
+outbox and metadata-only transcript quarantine remain local and are not
+general caches or activation paths. CLI/import-export remains #618-owned,
+while stats, pool diagnostics, status, and doctor presentation remain
+#619-owned. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
 integrity, indexes, retention, extension policy, and recovery implications.
 
 ## Storage repository architecture
@@ -65,15 +65,15 @@ and coordination adapters behind one complete `ProjectStorage` contract.
 The native-transcript repository adds immutable sanitized client-native
 records, exact message provenance, atomic checkpoint accounting, and
 idempotent ingest-key conflict handling. It intentionally exposes no payload
-update or deletion operation. During this staged phase, embedded backfill code
-receives `NativeTranscriptRepository` explicitly; PostgreSQL callers construct
+update or deletion operation. Embedded backfill code receives
+`NativeTranscriptRepository` explicitly; PostgreSQL callers construct
 `PostgreSqlNativeTranscriptRepository`. The repository is not exposed through
-`ProjectStorage`. The production PostgreSQL factory, native-transcript adapter,
-runtime, migration runner, identity repository, and isolated test-database
-lease do not by themselves enable daemon or CLI routing. Until the remaining
-route and rollout gates land, selecting `postgresql` leaves general storage
-routes explicitly unavailable behind the staged loopback daemon rather than
-falling back to SQLite. See
+`ProjectStorage`. The production PostgreSQL factory, runtime, migration
+runner, identity repository, and isolated test-database lease support the
+daemon's selected project-storage routes. CLI/import-export and portable
+transfer remain #618-owned, while aggregate stats, status, pool diagnostics,
+and doctor parity remain #619-owned. Selecting `postgresql` never falls back to
+SQLite. See
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) for the
 local-scrubbing, checkpoint, quarantine, and rollback boundaries.
 The issue #88 adapters implement the existing `ProjectRepositories` contracts
@@ -313,24 +313,23 @@ Do not add a generic query escape hatch to avoid updating an adapter. A missing
 contract operation is an architecture change that must be implemented and
 tested across adapters.
 
-### Staged integration boundary
+### Integration boundary
 
 Issue #81 covers domain contracts, the SQLite adapter, transaction semantics,
 and repository-backed SQLite composition paths. Bespoke SQLite import/export,
 aggregate stats, status, connection-pool diagnostics, and administrative SQL
-remain deliberately outside this first migration. Issue #616 now defines the
+remain deliberately outside this runtime increment. Issue #616 defines the
 versioned, backend-neutral portable record and resumable stream contract for
-later adapter and migration work; it does not activate CLI, daemon, cutover, or
-runtime backend routing. Their temporary SQLite implementation is not
-permission for new application code to bypass repositories.
+#618 import/export work; it is not a second daemon routing seam. New application
+code still uses the selected `ProjectStorage` repositories.
 
 ### Local hook outbox exception
 
 `LocalHookOutboxRepository` is an intentionally SQLite-only boundary. Hooks use
 it to capture passive events quickly even when the daemon or authoritative
-project backend is unavailable. A later daemon pass reads the outbox, promotes
-eligible events through the selected project's repositories, and marks local
-entries processed only according to the existing retry rules. Each event also
+project backend is unavailable. A bounded daemon consumer reads the outbox,
+promotes eligible events through the selected project's repositories, and marks
+local entries processed only according to the existing retry rules. Each event also
 has a versioned transport UUID, durable machine identity, installation-global
 exact-`bigint` sequence, and local delivery checkpoint. Sequence reservation is
 transactional and gap-safe.
@@ -370,8 +369,8 @@ local pending/claimed/retry
 Uncertain insertion and applied commits require immutable readback. Remote
 prune completion requires either a successful exact delete or missing-row
 readback. A present nonterminal, mismatched, or quarantined row is never treated
-as pruned. The worker and its operator CLI remain staged; #92 and #224 retain
-normal PostgreSQL activation and application routing.
+as pruned. The worker and its operator CLI remain a separate explicit delivery
+path; they do not replace or weaken #617's daemon project-storage routing.
 
 ## Data model
 
@@ -420,7 +419,7 @@ as opaque text. Issue #85 preserves canonical message content
 without claiming that every oversized post-normalization parser token is
 lexically retrievable. The pinned PostgreSQL 18 safe parsed-lexeme maximum is
 2,046 UTF-8 bytes; #89 must implement and test lossless handling at that
-post-normalization boundary before #224 enables PostgreSQL application writes.
+post-normalization boundary before PostgreSQL application writes are accepted.
 PostgreSQL get-or-create and contiguous-append short transactions establish
 `READ COMMITTED` before their first advisory or row lock on every retry, so a
 stricter database default cannot retain a pre-lock snapshot and overlook the

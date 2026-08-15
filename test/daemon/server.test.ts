@@ -8,6 +8,7 @@ import {
   claudeProjectDirName,
   createDaemon,
   projectTranscriptScanCwds,
+  requestCancellation,
   type DaemonInstance,
 } from "../../src/daemon/server.js";
 import type { BackgroundPublicationAdmission } from "../../src/daemon/passive-event-processor.js";
@@ -18,6 +19,7 @@ import { projectDbPath, projectDir } from "../../src/daemon/project.js";
 import { recoverMachineIdentity } from "../../src/machine-identity.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
+import { StorageOperationError } from "../../src/storage/errors.js";
 import {
   BackendPublicationJournalError,
   withBackendPublicationConfigLockAsync,
@@ -31,6 +33,7 @@ import {
   resolveProjectIdentity,
   setRemoteProjectBinding,
 } from "../../src/project-map.js";
+import { makeStagedPostgreSqlStorageFactory } from "./routes/mock-storage-factory.js";
 
 const testIdentity = {
   ownerId: "server-tests",
@@ -336,7 +339,224 @@ describe("daemon server", () => {
     }
   });
 
-  it("starts with staged PostgreSQL storage and validates route identity before unavailability", async () => {
+  it("aborts foreground requests and scheduled scans before shutdown drains them", async () => {
+    const configPath = join(tempHome!, ".lcm", "config.json");
+    mkdirSync(join(tempHome!, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    const scanStarted = deferred<AbortSignal>();
+    const scanAborted = deferred<void>();
+    let backgroundAdmission: BackgroundPublicationAdmission | undefined;
+    const scanForTranscripts = vi.fn(async (_withAdmission: BackgroundPublicationAdmission, signal?: AbortSignal) => {
+      backgroundAdmission = _withAdmission;
+      scanStarted.resolve(signal!);
+      if (signal?.aborted) {
+        scanAborted.resolve();
+        return;
+      }
+      await new Promise<void>(resolve => signal?.addEventListener("abort", () => {
+        scanAborted.resolve();
+        resolve();
+      }, { once: true }));
+    });
+    let scheduledScan: (() => Promise<void>) | undefined;
+    const realSetInterval = globalThis.setInterval;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 10 * 60 * 1000 && typeof handler === "function") {
+        scheduledScan = () => handler(...args) as Promise<void>;
+      }
+      return realSetInterval(handler, timeout, ...args);
+    }) as typeof setInterval);
+
+    const releaseQueuedAdmission = deferred<void>();
+    const publicationLock = vi.fn(async (
+      _homeDir: string | undefined,
+      callback: (token: object) => Promise<unknown> | unknown,
+    ) => {
+      await releaseQueuedAdmission.promise;
+      return callback({});
+    });
+
+    daemon = await createDaemon(loadDaemonConfig(configPath, {
+      daemon: { port: 0, idleTimeoutMs: 0 },
+    }), {
+      publicationConfigPath: configPath,
+      _scanForTranscripts: scanForTranscripts,
+      _assertBackendPublication: () => undefined,
+      _withBackendPublicationConsumerLockAsync: publicationLock as DaemonOptions["_withBackendPublicationConsumerLockAsync"],
+    });
+
+    const foregroundStarted = deferred<void>();
+    const foregroundAborted = deferred<void>();
+    daemon.registerRoute("POST", "/shutdown-foreground", async (_req, res, _body, context) => {
+      foregroundStarted.resolve();
+      expect(context?.signal).toBeDefined();
+      context?.signal?.addEventListener("abort", () => {
+        foregroundAborted.resolve();
+        if (!res.writableEnded) res.end();
+      }, { once: true });
+      await foregroundAborted.promise;
+    }, "read");
+
+    const foregroundResponse = fetch(`http://127.0.0.1:${daemon.address().port}/shutdown-foreground`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    await foregroundStarted.promise;
+    const scanPromise = scheduledScan?.();
+    await scanStarted.promise;
+
+    const queuedOperation = vi.fn();
+    const queuedAdmission = backgroundAdmission!(async () => {
+      queuedOperation();
+    });
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    const stopPromise = daemon.stop();
+    await expect(backgroundAdmission!(async () => undefined)).rejects.toMatchObject({ name: "AbortError" });
+    await foregroundAborted.promise;
+    await scanAborted.promise;
+    releaseQueuedAdmission.resolve();
+    await expect(queuedAdmission).rejects.toMatchObject({ name: "AbortError" });
+    expect(queuedOperation).not.toHaveBeenCalled();
+    await stopPromise;
+    await scanPromise;
+    await foregroundResponse;
+    expect(scanForTranscripts).toHaveBeenCalledOnce();
+  });
+
+  it("initiates listener close before awaiting a shutdown drain", async () => {
+    const configPath = join(tempHome!, ".lcm", "config.json");
+    mkdirSync(join(tempHome!, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    const proxyStopStarted = deferred<void>();
+    const releaseProxyStop = deferred<void>();
+    const proxyManager = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => {
+        proxyStopStarted.resolve();
+        await releaseProxyStop.promise;
+      }),
+      isHealthy: vi.fn(async () => true),
+      port: 0,
+      available: false,
+    };
+
+    daemon = await createDaemon(loadDaemonConfig(configPath, {
+      daemon: { port: 0, idleTimeoutMs: 0 },
+    }), {
+      publicationConfigPath: configPath,
+      proxyManager,
+    });
+    daemon.registerRoute("POST", "/late-after-shutdown", async (_req, res) => {
+      res.writeHead(200);
+      res.end("{}\n");
+    }, "read");
+
+    const stopPromise = daemon.stop();
+    await proxyStopStarted.promise;
+    try {
+      await expect(fetch(`http://127.0.0.1:${daemon.address().port}/late-after-shutdown`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+        signal: AbortSignal.timeout(500),
+      })).rejects.toThrow();
+    } finally {
+      releaseProxyStop.resolve();
+      await stopPromise;
+    }
+  });
+
+  it("latches an already-aborted daemon signal for a late request", () => {
+    const shutdownController = new AbortController();
+    shutdownController.abort();
+    const req = {
+      complete: true,
+      aborted: true,
+      destroyed: false,
+      once: vi.fn(),
+      off: vi.fn(),
+    } as never;
+    const res = {
+      writableEnded: false,
+      writableFinished: false,
+      once: vi.fn(),
+      off: vi.fn(),
+    } as never;
+
+    const cancellation = requestCancellation(req, res, shutdownController.signal);
+    expect(cancellation.signal.aborted).toBe(true);
+    cancellation.cleanup();
+
+    const destroyedRequest = {
+      complete: false,
+      aborted: false,
+      destroyed: true,
+      once: vi.fn(),
+      off: vi.fn(),
+    } as never;
+    const destroyedResponse = {
+      writableEnded: false,
+      writableFinished: false,
+      destroyed: false,
+      once: vi.fn(),
+      off: vi.fn(),
+    } as never;
+    const destroyedCancellation = requestCancellation(
+      destroyedRequest,
+      destroyedResponse,
+      new AbortController().signal,
+    );
+    expect(destroyedCancellation.signal.aborted).toBe(true);
+    destroyedCancellation.cleanup();
+  });
+
+  it("preserves a PostgreSQL factory-construction failure before an active factory exists", async () => {
+    const error = new StorageOperationError(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "createFactory",
+    );
+    const caPath = join(tempHome!, "postgres-ca.pem");
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const config = loadDaemonConfig("/missing", {
+      storage: { backend: "postgresql" },
+      daemon: { port: 0, idleTimeoutMs: 0 },
+    }, {
+      LCM_POSTGRES_URL: "postgresql://user:secret@db.example.test/lcm",
+      LCM_POSTGRES_CA_FILE: caPath,
+      LCM_POSTGRES_MIGRATION_ROLE: "lcm_test_migrator",
+    });
+
+    await expect(createDaemon(config, {
+      _assertBackendPublication: () => undefined,
+      _createStorageBackendFactory: async () => { throw error; },
+    })).rejects.toBe(error);
+  });
+
+  it("closes a constructed factory once when daemon startup cannot listen", async () => {
+    const blocker = createServer();
+    await new Promise<void>(resolve => blocker.listen(0, "127.0.0.1", resolve));
+    const port = (blocker.address() as { port: number }).port;
+    const factory = makeStagedPostgreSqlStorageFactory();
+    const close = vi.spyOn(factory, "close");
+    try {
+      await expect(createDaemon(loadDaemonConfig("/missing", {
+        daemon: { port, idleTimeoutMs: 0 },
+      }), {
+        _assertBackendPublication: () => undefined,
+        _createStorageBackendFactory: async () => factory,
+      })).rejects.toThrow();
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      await new Promise<void>(resolve => blocker.close(() => resolve()));
+    }
+  });
+
+  it("starts with selected PostgreSQL storage and preserves staged diagnostic gates", async () => {
     const scanForTranscripts = vi.fn(async () => undefined);
     const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
     const caPath = join(tempHome!, "postgres-ca.pem");
@@ -366,11 +586,12 @@ describe("daemon server", () => {
     daemon = await createDaemon(config, {
       _scanForTranscripts: scanForTranscripts,
       _assertBackendPublication: () => undefined,
+      _createStorageBackendFactory: async () => makeStagedPostgreSqlStorageFactory(),
     });
     const port = daemon.address().port;
 
-    expect(setIntervalSpy).not.toHaveBeenCalledWith(expect.any(Function), 10 * 60 * 1000);
-    expect(setIntervalSpy).not.toHaveBeenCalledWith(expect.any(Function), 5 * 60 * 1000);
+    expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 10 * 60 * 1000);
+    expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 5 * 60 * 1000);
     expect(scanForTranscripts).not.toHaveBeenCalled();
 
     const healthResponse = await fetch(`http://127.0.0.1:${port}/health`);
@@ -524,6 +745,11 @@ describe("daemon server", () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(request.body),
       });
+      if (request.operation === "promote-events-notify") {
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toEqual({ queued: true });
+        continue;
+      }
       expect(response.status).toBe(503);
       const unavailable = await response.json();
       expect(unavailable).toEqual({
@@ -698,18 +924,28 @@ describe("daemon server", () => {
     ].join("\n") + "\n");
 
     const observedTokens: Array<object | undefined> = [];
+    const admissionTokens: object[] = [];
     const originalProjectPaths = projectModule.projectPaths;
     vi.spyOn(projectModule, "projectPaths").mockImplementation((cwd, publicationLockToken) => {
       if (observedTokens.at(-1) !== publicationLockToken) observedTokens.push(publicationLockToken);
+      if (publicationLockToken !== undefined && admissionTokens.at(-1) !== publicationLockToken) {
+        admissionTokens.push(publicationLockToken);
+      }
       return originalProjectPaths(cwd, publicationLockToken);
     });
-    const transactionStarted = [deferred<object | undefined>(), deferred<object | undefined>()];
+    const transactionStarted = [
+      deferred<{ discoveryToken: object | undefined; admissionToken: object | undefined }>(),
+      deferred<{ discoveryToken: object | undefined; admissionToken: object | undefined }>(),
+    ];
     const releaseTransaction = [deferred<void>(), deferred<void>()];
     let transactionIndex = 0;
     const originalTransaction = SqliteProjectStorage.prototype.transaction;
     const transactionSpy = vi.spyOn(SqliteProjectStorage.prototype, "transaction").mockImplementation(async function (callback) {
       const index = transactionIndex++;
-      transactionStarted[index]?.resolve(observedTokens[index]);
+      transactionStarted[index]?.resolve({
+        discoveryToken: observedTokens.at(-2),
+        admissionToken: admissionTokens.at(-1),
+      });
       await releaseTransaction[index]?.promise;
       return originalTransaction.call(this, callback);
     });
@@ -721,15 +957,17 @@ describe("daemon server", () => {
 
     const scan = scanForTranscripts?.();
     try {
-      const firstToken = await transactionStarted[0].promise;
-      expect(firstToken).toEqual(expect.any(Object));
+      const firstBatch = await transactionStarted[0].promise;
+      expect(firstBatch.discoveryToken).toBeUndefined();
+      expect(firstBatch.admissionToken).toEqual(expect.any(Object));
       await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
         .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
       releaseTransaction[0].resolve();
 
-      const secondToken = await transactionStarted[1].promise;
-      expect(secondToken).toEqual(expect.any(Object));
-      expect(secondToken).not.toBe(firstToken);
+      const secondBatch = await transactionStarted[1].promise;
+      expect(secondBatch.discoveryToken).toBeUndefined();
+      expect(secondBatch.admissionToken).toEqual(expect.any(Object));
+      expect(secondBatch.admissionToken).not.toBe(firstBatch.admissionToken);
       await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
         .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
       releaseTransaction[1].resolve();
@@ -927,6 +1165,7 @@ describe("daemon auth", () => {
       tokenPath,
       _testIdentity: testIdentity,
       _assertBackendPublication: () => undefined,
+      _createStorageBackendFactory: async () => makeStagedPostgreSqlStorageFactory(),
     });
     const port = daemon.address().port;
     try {

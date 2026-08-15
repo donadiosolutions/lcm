@@ -7,39 +7,33 @@ evidence are being coordinated.
 
 ## Current status
 
-This boundary is a prerequisite for later backend activation work; it is not
-the daemon/CLI activation work itself. Issue #92 and the remaining #224 routing
-work are not implemented. PostgreSQL selection remains unavailable to normal
-production daemon and CLI composition, so SQLite remains the only active
-backend for those routes. The PostgreSQL runtime, schema, production
-project-storage factory, and coordination primitives described by the
-reference documentation are available to explicit programmatic callers and
-conformance; they do not make PostgreSQL authoritative for normal application
-routes.
-
-Do not configure a production installation expecting PostgreSQL daemon or CLI
-routes to work. The publication boundary is the shared seam that those future
-activation paths must consume when #92 and #224 are implemented.
+This boundary is now consumed by the daemon and MCP project-storage routes.
+SQLite remains the default, while an explicitly published PostgreSQL selection
+becomes authoritative only after runtime readiness, machine identity, project
+binding, and terminal publication evidence all verify. Issue #618 still owns
+CLI/import-export and portable transfer; #619 still owns stats, pool
+diagnostics, status, and doctor parity. Those boundaries do not weaken daemon
+route admission or authorize a SQLite fallback.
 
 ## Current backend boundaries
 
 LCM keeps the following Epic #79 invariants:
 
 - SQLite is the default backend and remains the normal local behavior.
-- PostgreSQL is a staged remote-primary target, not a currently selectable
-  production backend. It does not silently fall back to SQLite and does not
-  yet activate normal daemon/CLI `ProjectStorage` routing. Explicit
-  programmatic callers may use the PostgreSQL factory only after its eager
-  runtime-readiness gate succeeds.
+- PostgreSQL is an explicit remote-primary target for daemon and MCP
+  `ProjectStorage` routing. It does not silently fall back to SQLite. The
+  daemon constructs one eagerly verified factory and admits each bounded
+  project-storage batch only after the published selection and identity are
+  authenticated.
 - Hooks append events to the durable local SQLite outbox first. They do not
   require a live PostgreSQL connection to preserve the event, and an admission
   failure does not discard the local outbox record.
 - A missing, unresolved, malformed, inconsistent, or unsafe publication state
   fails closed. LCM never treats a partially written configuration or project
   map as proof that a backend is active.
-- The publication boundary is a shared seam for the not-yet-implemented #92
-  and remaining #224 work. Those features must consume it rather than
-  introduce a second lock, journal, or fencing protocol.
+- The publication boundary is the single coordination seam for active daemon
+  and MCP routing. Future #618/#619 work must consume it rather than introduce
+  a second lock, journal, or fencing protocol.
 
 For ordinary SQLite installations, this machinery is dormant after the
 private state root is authenticated. It does not change SQLite's storage
@@ -202,11 +196,12 @@ evidence. Do not edit, delete, rename, or bulk-clean the directory. The current
 command surface does not provide a general journal-editing command. Run
 `lcm doctor`, preserve its sanitized output, and let the owning publication
 recovery flow resume or abort the authenticated journal; rerun `lcm doctor`
-after the flow reaches a terminal state. Do not use `lcm daemon restart` to
-activate the staged PostgreSQL target: normal PostgreSQL daemon/CLI activation
-and any associated restart remain deferred to the unimplemented #92 and #224
-work. An ambiguous filesystem or database result is intentionally retained for
-inspection rather than silently repaired.
+after the flow reaches a terminal state. Once the journal is terminal, restart
+the daemon to reload the selected backend. To roll back an active selection,
+publish a new authenticated publication targeting SQLite and restart; do not
+edit `config.json` or `map.json` independently. An ambiguous filesystem or
+database result is intentionally retained for inspection rather than silently
+repaired.
 
 Consumers accept only an authenticated terminal journal with matching
 configuration, project-map, target-backend, recovery-material, and remote-fence
@@ -360,9 +355,8 @@ health waits.
 
 - **Daemon and health:** an unresolved or inconsistent publication returns a
   sanitized HTTP `503` with `status: "blocked"` and no filesystem, SQL, URL,
-  credential, or raw driver detail. A staged PostgreSQL witness that is valid
-  but not terminally usable reports storage unavailable rather than pretending
-  that normal PostgreSQL routes are active.
+  credential, or raw driver detail. A valid terminal PostgreSQL witness still
+  requires runtime readiness and project identity before a route opens storage.
 - **MCP:** startup and each routed request authenticate a fresh publication
   witness. A blocked request is reported as `lcm error: backend publication
 admission blocked; complete or recover the publication before retrying`.
@@ -370,7 +364,8 @@ admission blocked; complete or recover the publication before retrying`.
 - **CLI and hooks:** backend selection, project-map/configuration mutation,
   daemon lifecycle, and publication-dependent work fail closed without SQLite
   fallback. Hook capture still preserves the event in the local SQLite outbox
-  before later publication-gated work is attempted.
+  before later publication-gated work is attempted. Daemon request cancellation
+  and shutdown drain active project work before the shared factory closes.
 - **Doctor:** `lcm doctor` emits a sanitized `backend-publication` failure with
   guidance appropriate to missing evidence, an unresolved journal, backend
   mismatch, or unsafe state. It continues unrelated diagnostics, but skips
@@ -386,7 +381,7 @@ admission fails, the wrapper exits `0` with no output so it cannot block the
 agent's own compaction. Explicit retry or timeout overrides only validate the
 secret-free LLM request-policy projection; they do not resolve PostgreSQL
 credentials before dispatch. This exception does not make PostgreSQL
-selection available, bypass publication admission for storage work, or permit
+selection changes, bypass publication admission for storage work, or permit
 SQLite fallback for normal routes.
 
 The safe operator sequence is therefore: preserve the evidence, run
@@ -398,12 +393,12 @@ configured backend until the corresponding publication evidence is terminal.
 ## PostgreSQL privilege and deployment posture
 
 Provision PostgreSQL with the migration role, then apply only the reviewed
-runtime grant scripts needed by the direct staged repositories as an
+runtime grant scripts needed by the daemon's project repositories as an
 administrator. The runtime role must not own the schema or run migrations.
 The [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md)
 and [configuration guide](configuration.md#provisioning-a-postgresql-database)
-contain the complete staged deployment sequence. Applying that sequence does
-not make PostgreSQL selection available or implement #92/#224.
+contain the complete deployment sequence. Applying that sequence enables the
+selected daemon project routes; #618 and #619 remain outside this boundary.
 
 The final audit found the SQL changes already implemented for chore #408
 sufficient; this documentation lane required no additional SQL correction:
@@ -424,9 +419,8 @@ sufficient; this documentation lane required no additional SQL correction:
   domain tables. Readiness rejects broader, `PUBLIC`, grantable, or
   foreign-grantor privilege shapes.
 
-Applying the selected scripts exposes direct staged repository and
-coordination primitives to the same configured runtime role; it does not
-activate normal PostgreSQL daemon/CLI routing. Keep `LCM_POSTGRES_URL`
+Applying the selected scripts exposes the project-storage and coordination
+primitives to the same configured runtime role. Keep `LCM_POSTGRES_URL`
 restricted to that reviewed runtime role after migration and grant deployment,
 and keep the migration role separate from the daemon.
 
@@ -436,4 +430,4 @@ and keep the migration role separate from the daemon.
 - [Managed daemon recovery](daemon-restart-recovery.md)
 - [PostgreSQL cross-machine coordination](../src/storage/postgresql/reference/postgresql-coordination.md)
 - [PostgreSQL schema and privilege reference](../src/storage/postgresql/reference/postgresql-schema.md)
-- [Architecture and staged activation](architecture.md)
+- [Architecture and runtime activation](architecture.md)
