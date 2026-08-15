@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventRow, PatternReinforcementStats } from "../../../src/hooks/events-db.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
+import { StorageOperationError } from "../../../src/storage/errors.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
@@ -25,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   scrub: vi.fn((text: string) => text),
   identity: vi.fn(() => ({ id: "pid", canonical: "/cwd" })),
   openOutbox: vi.fn(),
+  scrubberFactory: vi.fn(),
   eventsPath: vi.fn(() => "/events.db"),
   existingEventsPath: vi.fn(),
 }));
@@ -66,7 +68,7 @@ vi.mock("../../../src/storage/index.js", () => ({
 vi.mock("../../../src/hooks/hook-errors.js", () => ({ safeLogError: mocks.log }));
 vi.mock("../../../src/db/event-sidecars.js", () => ({ collectEventSidecars: mocks.collect }));
 vi.mock("../../../src/scrub.js", () => ({
-  ScrubEngine: { forProject: async () => ({ scrub: mocks.scrub }) },
+  ScrubEngine: { forProject: (...args: unknown[]) => mocks.scrubberFactory(...args) },
 }));
 
 import {
@@ -142,6 +144,7 @@ describe("promote-events unit boundaries", () => {
     mocks.dedup.mockResolvedValue("id");
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
+    mocks.scrubberFactory.mockResolvedValue({ scrub: mocks.scrub });
     mocks.identity.mockReturnValue({ id: "pid", canonical: "/cwd" });
     mocks.eventsPath.mockReturnValue("/events.db");
     mocks.existingEventsPath.mockReturnValue(undefined);
@@ -158,7 +161,7 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "failed to promote events" });
   });
 
-  it("fails identity before opening the local outbox for direct, drain, all, and notify paths", async () => {
+  it("fails selected-project identity after local outbox preparation for direct, drain, all, and notify paths", async () => {
     const identityFailure = new Error("PostgreSQL project binding is required");
     mocks.identity.mockImplementation(() => { throw identityFailure; });
 
@@ -221,7 +224,7 @@ describe("promote-events unit boundaries", () => {
       identityFailure,
       { cwd: "/cwd" },
     );
-    expect(mocks.openOutbox).not.toHaveBeenCalled();
+    expect(mocks.openOutbox).toHaveBeenCalled();
     expect(mocks.openProject).not.toHaveBeenCalled();
   });
 
@@ -251,10 +254,10 @@ describe("promote-events unit boundaries", () => {
       error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
       storageBackend: "postgresql",
     });
-    expect(mocks.openOutbox).not.toHaveBeenCalled();
+    expect(mocks.openOutbox).toHaveBeenCalledOnce();
   });
 
-  it("admits PostgreSQL storage before opening either promotion outbox", async () => {
+  it("prepares the local outbox before selected PostgreSQL admission", async () => {
     const staged = makeStagedPostgreSqlStorageFactory();
 
     await expect(drainEventsForCwd(
@@ -263,20 +266,133 @@ describe("promote-events unit boundaries", () => {
       "/events.db",
       staged,
     )).rejects.toThrow("postgresql storage initialization failed for project pid");
-    expect(mocks.openOutbox).not.toHaveBeenCalled();
+    expect(mocks.openOutbox).toHaveBeenCalledOnce();
 
     const response = {} as never;
-    await createPromoteEventsHandler(postgresqlConfig, staged)(
+    const runtimeFactory = {
+      backend: "postgresql",
+      capabilities: {
+        transactions: true,
+        lexicalSearch: true,
+        regexSearch: true,
+        nativeFullTextSearch: "available",
+        coordination: "distributed",
+      },
+      openProject: staged.openProject,
+      close: staged.close,
+    } as never;
+    await createPromoteEventsHandler(postgresqlConfig, runtimeFactory)(
       {} as never,
       response,
       JSON.stringify({ cwd: "/cwd" }),
     );
     expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
-      code: "STORAGE_BACKEND_STAGED",
-      error: "promote-events is unavailable while PostgreSQL storage repositories are staged",
-      storageBackend: "postgresql",
+      name: "StorageOperationError",
+      code: "STORAGE_INITIALIZATION_FAILED",
+      backend: "postgresql",
+      projectId: "pid",
+      domain: "factory",
+      operation: "openProject",
+      retryable: false,
+      message: "postgresql storage initialization failed for project pid",
     });
-    expect(mocks.openOutbox).not.toHaveBeenCalled();
+    expect(mocks.openOutbox).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps local promotion preparation outside admission and the selected batch inside", async () => {
+    const sequence: string[] = [];
+    const events = [event({ data: "admit only the selected batch" })];
+    mocks.openOutbox.mockImplementation(() => { sequence.push("outbox-open"); });
+    mocks.events.mockImplementation(() => {
+      sequence.push("outbox-read");
+      return events;
+    });
+    mocks.scrubberFactory.mockImplementation(async () => {
+      sequence.push("scrubber");
+      return { scrub: mocks.scrub };
+    });
+    mocks.openProject.mockImplementation(async () => {
+      sequence.push("project-open");
+      return projectStorage();
+    });
+    mocks.dedup.mockImplementation(async () => {
+      sequence.push("repository-batch");
+      return "id";
+    });
+    const withPublicationAdmission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
+      sequence.push("admission");
+      return operation({});
+    });
+
+    await promoteEventsForCwd(
+      config,
+      "/cwd",
+      "/events.db",
+      { openProject: mocks.openProject, close: mocks.closeFactory } as never,
+      undefined,
+      { withPublicationAdmission },
+    );
+
+    expect(sequence.indexOf("outbox-open")).toBeLessThan(sequence.indexOf("admission"));
+    expect(sequence.indexOf("outbox-read")).toBeLessThan(sequence.indexOf("admission"));
+    expect(sequence.indexOf("scrubber")).toBeLessThan(sequence.indexOf("admission"));
+    expect(sequence.indexOf("admission")).toBeLessThan(sequence.indexOf("project-open"));
+    expect(sequence.indexOf("project-open")).toBeLessThan(sequence.indexOf("repository-batch"));
+  });
+
+  it("escapes typed PostgreSQL event failures as sanitized route storage responses", async () => {
+    mocks.events.mockReturnValueOnce([event({ data: "typed failure" })]);
+    const failure = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      "pid",
+      "promotion",
+      "deduplicateAndInsert",
+    );
+    mocks.dedup.mockRejectedValueOnce(failure);
+    const factory = {
+      backend: "postgresql",
+      openProject: mocks.openProject,
+      close: mocks.closeFactory,
+    } as never;
+    const response = {} as never;
+
+    await createPromoteEventsHandler(postgresqlConfig, factory)(
+      {} as never,
+      response,
+      JSON.stringify({ cwd: "/cwd" }),
+      { withPublicationAdmission: testPublicationAdmission },
+    );
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, failure.toJSON());
+    expect(mocks.log).toHaveBeenCalledWith("promote-events", failure, { cwd: "/cwd" });
+  });
+
+  it("returns a bounded cancellation result when admission observes an aborted signal", async () => {
+    const controller = new AbortController();
+    mocks.openProject.mockImplementation(async () => {
+      controller.abort();
+      return projectStorage();
+    });
+    const factory = {
+      openProject: mocks.openProject,
+      close: mocks.closeFactory,
+    } as never;
+
+    await expect(promoteEventsForCwd(
+      config,
+      "/cwd",
+      "/events.db",
+      factory,
+      undefined,
+      { withPublicationAdmission: testPublicationAdmission, signal: controller.signal },
+    )).resolves.toMatchObject({
+      promoted: 0,
+      skipped: 0,
+      errors: 0,
+      message: "promotion cancelled",
+    });
+    expect(mocks.closeProject).toHaveBeenCalledOnce();
   });
 
   it("reports incomplete global drains and closes owned factories when projects fail to open", async () => {
@@ -301,9 +417,9 @@ describe("promote-events unit boundaries", () => {
     mocks.events.mockReturnValueOnce([]);
     await expect(drainEventsForCwd(config, "/cwd", "/events.db"))
       .resolves.toMatchObject({ batches: 0, message: "no unprocessed events" });
-    expect(mocks.identity.mock.invocationCallOrder[0])
-      .toBeLessThan(mocks.openOutbox.mock.invocationCallOrder[0]);
     expect(mocks.openOutbox.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.identity.mock.invocationCallOrder[0]);
+    expect(mocks.identity.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.openProject.mock.invocationCallOrder[0]);
   });
 
@@ -351,6 +467,24 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, expect.objectContaining({
       message: "no unprocessed events",
     }));
+  });
+
+  it("uses the legacy token argument when no promotion context is supplied", async () => {
+    const publicationLockToken = {};
+    const factory = { openProject: mocks.openProject, close: mocks.closeFactory } as never;
+
+    await expect(promoteEventsForCwd(
+      config,
+      "/cwd",
+      "/events.db",
+      factory,
+      publicationLockToken,
+    )).resolves.toMatchObject({ message: "no unprocessed events" });
+
+    expect(mocks.openProject).toHaveBeenCalledWith(
+      { id: "pid", canonical: "/cwd" },
+      publicationLockToken,
+    );
   });
 
   it("settles every cleanup failure without replacing a successful result", async () => {
@@ -406,6 +540,20 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.events).not.toHaveBeenCalled();
     expect(mocks.mark).not.toHaveBeenCalled();
     expect(mocks.observeMissingCwd).toHaveBeenCalledOnce();
+  });
+
+  it("returns a no-sidecar parking result after a missing cwd has no discovered sidecar", async () => {
+    mocks.validate
+      .mockImplementationOnce(() => { throw missingCwdError; })
+      .mockImplementationOnce((cwd: string) => cwd);
+    mocks.existingEventsPath.mockReturnValue(undefined);
+
+    await expect(promoteEventsForCwd(config, "/missing-cwd"))
+      .resolves.toMatchObject({
+        terminal: { kind: "parked", reason: "unavailable-cwd" },
+        message: "no sidecar events to park for unavailable cwd",
+      });
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
   });
 
   it.each(["EACCES", "EPERM"] as const)(
@@ -507,6 +655,23 @@ describe("promote-events unit boundaries", () => {
     expect(result).toMatchObject({ promoted: 7, skipped: 1, correlated: 2, errors: 1 });
     expect(mocks.setPrev).toHaveBeenCalledWith(2, 1);
     expect(mocks.mark).toHaveBeenCalledWith(expect.arrayContaining([1, 2, 3, 4, 5, 6, 8, 9]));
+  });
+
+  it("keeps local reinforcement read failures in SQLite per-event best-effort handling", async () => {
+    const failure = new Error("reinforcement read failed");
+    mocks.events.mockReturnValueOnce([
+      event({ event_id: 1, category: "file", type: "file", data: "reinforcement failure", priority: 3 }),
+    ]);
+    mocks.reinforcement.mockImplementationOnce(() => { throw failure; });
+
+    await expect(promoteEventsForCwd(config, "/cwd", "/events.db"))
+      .resolves.toMatchObject({ promoted: 0, skipped: 0, errors: 1 });
+    expect(mocks.log).toHaveBeenCalledWith(
+      "promote-events",
+      failure,
+      { cwd: "/cwd", sessionId: "session" },
+    );
+    expect(mocks.dedup).not.toHaveBeenCalled();
   });
 
   it("scopes tier 3 eligibility to the current project attribution", async () => {

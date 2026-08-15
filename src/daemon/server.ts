@@ -605,7 +605,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const passiveEventProcessor = new PassiveEventProcessor(
     config,
     PASSIVE_EVENT_PROCESSOR_DEFAULTS,
-    { storageFactory, withPublicationAdmission: withBackgroundPublicationAdmission },
+    {
+      storageFactory,
+      withPublicationAdmission: withBackgroundPublicationAdmission,
+      signal: shutdownController.signal,
+    },
   );
   constructedProcessor = passiveEventProcessor;
   registerBuiltInRoute(
@@ -613,12 +617,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/promote-events",
     createPromoteEventsHandler(config, storageFactory),
     "mutating",
+    "operation-scoped",
   );
   registerBuiltInRoute(
     "POST",
     "/promote-events/all",
     createPromoteAllEventsHandler(config, storageFactory),
     "mutating",
+    "operation-scoped",
   );
   registerBuiltInRoute(
     "POST",

@@ -410,6 +410,49 @@ describe("compact route coverage", () => {
     expect(closeAfterAdmissionFailure).toHaveBeenCalledOnce();
   });
 
+  it("closes the long-lived project when the request signal aborts during inference", async () => {
+    const controller = new AbortController();
+    let inferenceStarted!: () => void;
+    const started = new Promise<void>(resolve => { inferenceStarted = resolve; });
+    state.compactionStorageProbe = async () => {
+      inferenceStarted();
+      await new Promise<void>(resolve => {
+        controller.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      await Promise.resolve();
+      expect(state.projectClose).toHaveBeenCalledOnce();
+    };
+    const output = response();
+    const request = createCompactHandler(config());
+    const compact = request(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "abort-during-inference", cwd: "/tmp" }),
+      { ...testCompactContext, signal: controller.signal },
+    );
+
+    await started;
+    controller.abort();
+    await compact;
+
+    expect(state.projectClose).toHaveBeenCalledOnce();
+  });
+
+  it("closes a project when admission observes an already-aborted signal", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const output = response();
+
+    await createCompactHandler(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "already-aborted", cwd: "/tmp" }),
+      { ...testCompactContext, signal: controller.signal },
+    );
+
+    expect(state.projectClose).toHaveBeenCalledOnce();
+  });
+
   it("keeps transcript transaction repositories inside one admission", async () => {
     state.existingMeta = true;
     state.messages = [{ role: "user", content: "transcript", tokenCount: 1 }];
@@ -622,6 +665,30 @@ describe("compact route coverage", () => {
       requestTimeoutMs: 75_000,
       retry: null,
     });
+  });
+
+  it("authenticates selected PostgreSQL storage when summarization is disabled", async () => {
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        poolMax: 1,
+        connectionTimeoutMs: 100,
+        idleTimeoutMs: 100,
+        statementTimeoutMs: 100,
+      },
+    };
+    state.summarizer = undefined;
+
+    const body = await call(JSON.stringify({ session_id: "disabled-postgresql", cwd: "/tmp" }), value);
+
+    expect(body).toMatchObject({
+      actionTaken: false,
+      summary: "Summarization disabled — no summarizer configured.",
+    });
+    expect(state.openProject).toHaveBeenCalledOnce();
+    expect(state.projectClose).toHaveBeenCalledOnce();
   });
 
   it("labels an unknown runtime provider through the defensive fallback", async () => {

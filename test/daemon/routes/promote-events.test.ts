@@ -911,21 +911,25 @@ describe("promote-events route", () => {
     });
   });
 
-  it("returns the exact staged response before scanning an empty sidecar directory", async () => {
+  it("scans an empty sidecar directory before returning its aggregate result", async () => {
     const output = mockRes();
     await createPromoteAllEventsHandler(
       makeConfig(),
       makeStagedPostgreSqlStorageFactory(),
     )(request, output.res, "");
 
-    expect(output.res.writeHead).toHaveBeenCalledWith(
-      503,
-      { "Content-Type": "application/json" },
-    );
+    expect(output.res.writeHead).toHaveBeenCalledWith(200, { "Content-Type": "application/json" });
     expect(output.getBody()).toEqual({
-      code: "STORAGE_BACKEND_STAGED",
-      error: "promote-events-all is unavailable while PostgreSQL storage repositories are staged",
-      storageBackend: "postgresql",
+      promoted: 0,
+      skipped: 0,
+      correlated: 0,
+      errors: 0,
+      scanned: 0,
+      sidecarsWithUnprocessed: 0,
+      processedProjects: 0,
+      orphanedProjects: 0,
+      failedProjects: 0,
+      projects: [],
     });
   });
 
