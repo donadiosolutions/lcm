@@ -98,8 +98,9 @@ The following rules apply to both adapter output and every parsed byte stream:
   `Z` (for example, `2026-01-02T03:04:05.123456Z`). Raw adapter values may be
   normalized from a valid `Date` or supported database timestamp, but the wire
   value retains six-digit precision and is checked for a real calendar date.
-- JSON is canonical UTF-8. Objects use unsigned UTF-8 code-unit key order;
-  arrays preserve order and duplicates. JSON numbers are finite and safely
+- JSON is canonical UTF-8. Objects use unsigned UTF-16 code-unit key order;
+  arrays preserve order and duplicates. Portable tuple/order string scalars
+  use unsigned UTF-8 byte order. JSON numbers are finite and safely
   representable in ECMAScript JSON. Strings are well-formed UTF-16 and contain
   no NUL. Maximum JSON depth is 100.
 - Objects must be plain objects with exactly the declared own keys; arrays must
