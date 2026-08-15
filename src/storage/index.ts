@@ -21,6 +21,7 @@ export {
   createPortableBatch,
   createPortableManifest,
   createPortableRecord,
+  createPortableRecordStream,
   negotiatePortableManifest,
   parsePortableCheckpoint,
   parsePortableManifest,
