@@ -1,11 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SearchResult } from "../../../src/db/promoted.js";
+import { StorageOperationError } from "../../../src/storage/errors.js";
 
 const state = vi.hoisted(() => ({
   cwdError: undefined as unknown,
   exists: true,
   existsSequence: [] as boolean[],
   migrationError: undefined as unknown,
+  identityError: undefined as unknown,
+  orientationError: undefined as unknown,
+  phaseError: undefined as "instruction-read" | "summary" | "project-search" | "instruction-write" | "passive" | undefined,
+  storageError: undefined as unknown,
   rows: [] as Array<{ content: string }>,
   promoted: [] as SearchResult[],
   passive: [] as SearchResult[],
@@ -58,12 +63,20 @@ vi.mock("../../../src/daemon/validate-cwd.js", () => ({
 
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDbPath: (cwd: string) => `${cwd}/lcm.db`,
-  projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
+  projectIdentity: (cwd: string) => {
+    if (state.identityError !== undefined) throw state.identityError;
+    return { id: "pid", canonical: cwd };
+  },
 }));
 vi.mock("../../../src/git-project.js", () => ({
   resolveGitProjectAnchor: () => state.anchors.shift() ?? null,
 }));
-vi.mock("../../../src/daemon/orientation.js", () => ({ buildOrientationPrompt: () => "orientation" }));
+vi.mock("../../../src/daemon/orientation.js", () => ({
+  buildOrientationPrompt: () => {
+    if (state.orientationError !== undefined) throw state.orientationError;
+    return "orientation";
+  },
+}));
 vi.mock("../../../src/daemon/content-fence.js", () => ({ fenceContent: (content: string, label: string) => `<${label}>${content}</${label}>` }));
 vi.mock("../../../src/security-files.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../../src/security-files.js")>()),
@@ -122,16 +135,23 @@ vi.mock("../../../src/storage/index.js", () => ({
       if (state.migrationError !== undefined) throw state.migrationError;
       return {
         summaries: {
-          listRecentSummariesForSession: async () => state.rows,
+          listRecentSummariesForSession: async () => {
+            if (state.phaseError === "summary") throw state.storageError;
+            return state.rows;
+          },
         },
         lexicalSearch: {
-          searchPromoted: async (query: string) =>
-            query === "source passive capture" ? state.passive : state.promoted,
+          searchPromoted: async (query: string) => {
+            if (query === "source passive capture" && state.phaseError === "passive") throw state.storageError;
+            if (query !== "source passive capture" && state.phaseError === "project-search") throw state.storageError;
+            return query === "source passive capture" ? state.passive : state.promoted;
+          },
         },
         coordination: {
           getSessionInstructions: async (
             scope: (typeof state.instructionGets)[number],
           ) => {
+            if (state.phaseError === "instruction-read") throw state.storageError;
             state.instructionGets.push(scope);
             return state.instructionRow;
           },
@@ -141,12 +161,14 @@ vi.mock("../../../src/storage/index.js", () => ({
             hash: string,
           ) => {
             state.instructionUpserts.push({ scope, content, hash });
+            if (state.phaseError === "instruction-write") throw state.storageError;
             if (state.instructionUpsertError !== undefined) {
               throw state.instructionUpsertError;
             }
           },
           deleteSessionInstructions: async () => {
             state.instructionDeletes += 1;
+            if (state.phaseError === "instruction-write") throw state.storageError;
             if (state.instructionDeleteError !== undefined) {
               throw state.instructionDeleteError;
             }
@@ -212,6 +234,10 @@ describe("restore route coverage", () => {
     state.exists = true;
     state.existsSequence = [];
     state.migrationError = undefined;
+    state.identityError = undefined;
+    state.orientationError = undefined;
+    state.phaseError = undefined;
+    state.storageError = undefined;
     state.rows = [];
     state.promoted = [];
     state.passive = [];
@@ -491,6 +517,56 @@ describe("restore route coverage", () => {
     state.migrationError = new Error("broken database");
     expect(await call(JSON.stringify({ session_id: "s", cwd: "/tmp" }))).toEqual({ context: "orientation" });
     expect(state.closed.length).toBeGreaterThan(0);
+  });
+
+  it("maps typed PostgreSQL failures from identity, opening, and every repository phase", async () => {
+    const typed = () => new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      "project",
+      "restore",
+      "restore",
+    );
+    const postgresql = {
+      ...config(),
+      storage: {
+        backend: "postgresql",
+        postgresql: {
+          url: "postgresql://user:secret@db.example/lcm",
+          poolMax: 1,
+          connectionTimeoutMs: 100,
+          idleTimeoutMs: 100,
+          statementTimeoutMs: 100,
+        },
+      },
+    } as Parameters<typeof createRestoreHandler>[0];
+
+    state.identityError = typed();
+    expect(await call(JSON.stringify({ session_id: "s", cwd: "/tmp" }), postgresql)).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+    });
+    state.identityError = undefined;
+
+    state.migrationError = typed();
+    expect(await call(JSON.stringify({ session_id: "s", cwd: "/tmp" }), postgresql)).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+    });
+    state.migrationError = undefined;
+
+    state.instructionContent = "rules";
+    for (const phase of ["instruction-read", "summary", "project-search", "instruction-write", "passive"] as const) {
+      state.phaseError = phase;
+      state.storageError = typed();
+      expect(await call(JSON.stringify({ session_id: `s-${phase}`, cwd: "/tmp" }), postgresql)).toMatchObject({
+        code: "STORAGE_OPERATION_FAILED",
+      });
+      state.phaseError = undefined;
+    }
+
+    state.orientationError = typed();
+    expect(await call(JSON.stringify({ session_id: "s", cwd: "/tmp" }), postgresql)).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+    });
   });
 
   it("reports Error and non-Error outer failures", async () => {

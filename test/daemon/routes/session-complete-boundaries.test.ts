@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { StorageOperationError } from "../../../src/storage/errors.js";
 
 const mocks = vi.hoisted(() => ({
   ensure: vi.fn(),
@@ -112,5 +113,36 @@ describe("session complete persistence boundaries", () => {
 
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "open failed" });
     expect(mocks.close).not.toHaveBeenCalled();
+  });
+
+  it("returns a sanitized 503 for typed PostgreSQL transaction failures", async () => {
+    const postgresqlConfig = {
+      ...config,
+      storage: {
+        backend: "postgresql",
+        postgresql: {
+          url: "postgresql://user:secret@db.example/lcm",
+          poolMax: 1,
+          connectionTimeoutMs: 100,
+          idleTimeoutMs: 100,
+          statementTimeoutMs: 100,
+        },
+      },
+    } as const;
+    mocks.run.mockRejectedValueOnce(new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      "project",
+      "coordination",
+      "recordSessionIngest",
+    ));
+    const response = {} as never;
+
+    await createSessionCompleteHandler(postgresqlConfig)({} as never, response, JSON.stringify({ session_id: "s", cwd: "/ok" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, expect.objectContaining({
+      code: "STORAGE_OPERATION_FAILED",
+      backend: "postgresql",
+    }));
   });
 });

@@ -566,12 +566,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/promote",
     createPromoteHandler(config, storageFactory),
     "mutating",
+    "operation-scoped",
   );
   registerBuiltInRoute(
     "POST",
     "/restore",
     createRestoreHandler(config, storageFactory),
     "mutating",
+    "operation-scoped",
   );
   registerBuiltInRoute("POST", "/grep", createGrepHandler(config, storageFactory), "read");
   registerBuiltInRoute("POST", "/search", createSearchHandler(config, storageFactory), "read");
@@ -582,6 +584,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/store",
     createStoreHandler(config, storageFactory),
     "mutating",
+    "operation-scoped",
   );
   registerBuiltInRoute("POST", "/recent", createRecentHandler(config, storageFactory), "read");
   registerBuiltInRoute(
@@ -589,6 +592,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/ingest",
     createIngestHandler(config, storageFactory),
     "mutating",
+    "operation-scoped",
   );
   registerBuiltInRoute("POST", "/prompt-search", createPromptSearchHandler(config, storageFactory), "read");
   registerBuiltInRoute(
@@ -596,6 +600,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/session-complete",
     createSessionCompleteHandler(config, storageFactory),
     "mutating",
+    "operation-scoped",
   );
   const passiveEventProcessor = new PassiveEventProcessor(
     config,
@@ -638,6 +643,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "/review-stale",
     createReviewStaleHandler(config, storageFactory),
     "mutating",
+    "operation-scoped",
   );
   // Status handler is registered after listen() when we know the actual port
   const projectMapWatcher = watchProjectMap();

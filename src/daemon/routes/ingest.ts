@@ -13,8 +13,8 @@ import { normalizeTranscriptClient, parseTranscriptForClient } from "../../trans
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
-import { createStorageBackendFactory, type ProjectStorage, type StorageBackendFactory } from "../../storage/index.js";
-import { closeRouteStorage, storageRouteFailureResponse } from "./storage-lifecycle.js";
+import type { StorageBackendFactory } from "../../storage/index.js";
+import { storageRouteFailureResponse, withProjectStorage } from "./storage-lifecycle.js";
 
 function isParsedMessage(value: unknown): value is ParsedMessage {
   if (!value || typeof value !== "object") return false;
@@ -61,85 +61,71 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       return;
     }
 
-    const paths = projectPaths(cwd, context?.publicationLockToken);
-    let sqliteMessages: ParsedMessage[] | undefined;
-    if (config.storage.backend === "sqlite") {
-      sqliteMessages = resolveMessages(input, cwd);
-      if (sqliteMessages.length === 0) {
-        sendJson(res, 200, { ingested: 0, totalTokens: 0 });
-        return;
-      }
-    }
-
-    let project: ProjectStorage | undefined;
-    let ownedFactory: StorageBackendFactory | undefined;
-    let activeFactory: StorageBackendFactory | undefined;
     try {
-      const identity = projectIdentity(cwd, config.storage, context?.publicationLockToken);
-      let resolvedMessages: ParsedMessage[];
-      if (config.storage.backend === "postgresql") {
-        activeFactory = storageFactory
-          ?? (ownedFactory = await createStorageBackendFactory(
-            config.storage,
-            undefined,
-            undefined,
-            context?.publicationLockToken,
-          ));
-        project = await activeFactory.openProject(identity, context?.publicationLockToken);
-        resolvedMessages = resolveMessages(input, cwd);
-      } else {
-        resolvedMessages = sqliteMessages as ParsedMessage[];
-      }
-      if (resolvedMessages.length === 0) {
+      // Preserve the route's early identity/configuration rejection while the
+      // lifecycle helper re-resolves the identity with its live admission token.
+      projectIdentity(cwd, config.storage, context?.publicationLockToken);
+      const paths = projectPaths(cwd, context?.publicationLockToken);
+      const resolvedMessages = resolveMessages(input, cwd);
+      if (config.storage.backend === "sqlite" && resolvedMessages.length === 0) {
         sendJson(res, 200, { ingested: 0, totalTokens: 0 });
         return;
       }
-      ensureProjectDir(cwd, context?.publicationLockToken);
-      const scrubber = await ScrubEngine.forProject(
-        config.security?.sensitivePatterns ?? [],
-        paths.dir,
-      );
-      if (!project) {
-        activeFactory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
-          config.storage,
-          undefined,
-          undefined,
-          context?.publicationLockToken,
-        ));
-        project = await activeFactory.openProject(identity, context?.publicationLockToken);
-      }
-      const ingest = await project.transaction(async (repositories) => {
-        const row = await repositories.coordination.getSessionIngest(session_id);
-        if (row && resolvedMessages.length <= row.messageCount) return null;
+      const scrubber = resolvedMessages.length > 0
+        ? await (async () => {
+            ensureProjectDir(cwd, context?.publicationLockToken);
+            return ScrubEngine.forProject(
+              config.security?.sensitivePatterns ?? [],
+              paths.dir,
+            );
+          })()
+        : undefined;
 
-        const conversation = await repositories.conversations.getOrCreateConversation(session_id);
-        const storedCount = await repositories.conversations.getMessageCount(conversation.conversationId);
-        const newMessages = resolvedMessages.slice(storedCount);
-        if (newMessages.length === 0) return null;
+      const ingest = await withProjectStorage(
+        { config, cwd, factory: storageFactory, context, mode: "create" },
+        async (project) => {
+          if (resolvedMessages.length === 0) return null;
 
-        const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
-        const inputs = newMessages.map((m, i) => {
-          const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project: projectCount } = scrubber.scrubWithCounts(m.content);
-          totalCounts.gitleaks += gitleaks;
-          totalCounts.builtIn += builtIn;
-          totalCounts.global += globalCount;
-          totalCounts.project += projectCount;
+          const persisted = await project.transaction(async (repositories) => {
+            const row = await repositories.coordination.getSessionIngest(session_id);
+            if (row && resolvedMessages.length <= row.messageCount) return null;
+
+            const conversation = await repositories.conversations.getOrCreateConversation(session_id);
+            const storedCount = await repositories.conversations.getMessageCount(conversation.conversationId);
+            const newMessages = resolvedMessages.slice(storedCount);
+            if (newMessages.length === 0) return null;
+
+            const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
+            const inputs = newMessages.map((m, i) => {
+              const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project: projectCount } = scrubber!.scrubWithCounts(m.content);
+              totalCounts.gitleaks += gitleaks;
+              totalCounts.builtIn += builtIn;
+              totalCounts.global += globalCount;
+              totalCounts.project += projectCount;
+              return {
+                conversationId: conversation.conversationId,
+                seq: storedCount + i,
+                role: m.role as "user" | "assistant" | "system" | "tool",
+                content: scrubbedContent,
+                tokenCount: m.tokenCount,
+              };
+            });
+            const records = await repositories.conversations.createMessagesBulk(inputs);
+            await repositories.redactionAdmin.upsertCounts(totalCounts);
+            await repositories.context.appendContextMessages(
+              conversation.conversationId,
+              records.map((record) => record.messageId),
+            );
+            return { conversationId: conversation.conversationId, records, totalCounts };
+          });
+
+          if (!persisted) return null;
           return {
-            conversationId: conversation.conversationId,
-            seq: storedCount + i,
-            role: m.role as "user" | "assistant" | "system" | "tool",
-            content: scrubbedContent,
-            tokenCount: m.tokenCount,
+            ...persisted,
+            totalTokens: await project.context.getContextTokenCount(persisted.conversationId),
           };
-        });
-        const records = await repositories.conversations.createMessagesBulk(inputs);
-        await repositories.redactionAdmin.upsertCounts(totalCounts);
-        await repositories.context.appendContextMessages(
-          conversation.conversationId,
-          records.map((record) => record.messageId),
-        );
-        return { conversationId: conversation.conversationId, records, totalCounts };
-      });
+        },
+      );
 
       if (!ingest) {
         sendJson(res, 200, { ingested: 0, totalTokens: 0 });
@@ -162,8 +148,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         // non-fatal: meta.json update failure shouldn't fail the ingest
       }
 
-      const totalTokens = await project.context.getContextTokenCount(ingest.conversationId);
-      const { records, totalCounts } = ingest;
+      const { records, totalCounts, totalTokens } = ingest;
       const totalRedacted = totalCounts.gitleaks + totalCounts.builtIn + totalCounts.global + totalCounts.project;
       const redactionCategories: string[] = [];
       if (totalCounts.gitleaks > 0) redactionCategories.push("gitleaks");
@@ -177,14 +162,12 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       });
     } catch (err) {
       await safeLogError("ingest", err, { cwd, sessionId: session_id });
-      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "ingest", activeFactory);
+      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "ingest", storageFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;
       }
       sendJson(res, 500, { error: "ingest failed", code: "INGEST_FAILED" });
-    } finally {
-      await closeRouteStorage(project, ownedFactory);
     }
   };
 }

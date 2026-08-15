@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { StorageOperationError } from "../../../src/storage/errors.js";
 import { makeMockStorageFactory } from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
@@ -180,5 +181,40 @@ describe("promote persistence boundaries", () => {
       promoted: 0,
       conversations: 0,
     });
+  });
+
+  it("does not swallow typed PostgreSQL repository failures from deduplication", async () => {
+    const postgresqlConfig = {
+      ...config,
+      storage: {
+        backend: "postgresql",
+        postgresql: {
+          url: "postgresql://user:secret@db.example/lcm",
+          poolMax: 1,
+          connectionTimeoutMs: 100,
+          idleTimeoutMs: 100,
+          statementTimeoutMs: 100,
+        },
+      },
+    } as const;
+    mocks.conversations.mockResolvedValueOnce([{ conversationId: 1, sessionId: "s" }]);
+    mocks.summaries.mockResolvedValueOnce([
+      { content: "promote", depth: 1, tokenCount: 1, sourceMessageTokenCount: 3 },
+    ]);
+    mocks.shouldPromote.mockReturnValueOnce({ promote: true, tags: [], confidence: 0.5 });
+    mocks.dedup.mockRejectedValueOnce(new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      "project",
+      "repository",
+      "promote",
+    ));
+
+    await createPromoteHandler(postgresqlConfig)({} as never, response, JSON.stringify({ cwd: "/pg" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, expect.objectContaining({
+      code: "STORAGE_OPERATION_FAILED",
+      backend: "postgresql",
+    }));
   });
 });

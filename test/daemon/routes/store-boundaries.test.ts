@@ -169,4 +169,25 @@ describe("store persistence boundaries", () => {
     expect(mocks.send).toHaveBeenCalledTimes(sendsBefore + 1);
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { stored: true, id: "stored-id" });
   });
+
+  it("does scrubber work before admission and keeps the repository write inside it", async () => {
+    const order: string[] = [];
+    mocks.forProject.mockImplementationOnce(async () => {
+      order.push("scrubber");
+      return { scrub: (text: string) => { order.push("scrub"); return `scrubbed:${text}`; } };
+    });
+    mocks.insert.mockImplementationOnce(() => { order.push("insert"); return "stored-id"; });
+    const admission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
+      order.push("admission");
+      return operation({});
+    });
+
+    await createStoreHandler(config)({} as never, response, JSON.stringify({ text: "value", cwd: "/ordered" }), {
+      withPublicationAdmission: admission,
+      signal: new AbortController().signal,
+    });
+
+    expect(order).toEqual(["scrubber", "scrub", "admission", "insert"]);
+    expect(admission).toHaveBeenCalledOnce();
+  });
 });

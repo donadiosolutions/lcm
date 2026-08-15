@@ -267,7 +267,7 @@ describe("ingest persistence boundaries", () => {
     });
   });
 
-  it("rejects staged PostgreSQL before reading a file-backed transcript", async () => {
+  it("reports staged PostgreSQL after transcript discovery stays outside admission", async () => {
     const handler = createIngestHandler(
       postgresqlConfig,
       makeStagedPostgreSqlStorageFactory(),
@@ -283,9 +283,9 @@ describe("ingest persistence boundaries", () => {
       error: "ingest is unavailable while PostgreSQL storage repositories are staged",
       storageBackend: "postgresql",
     });
-    expect(mocks.safeTranscript).not.toHaveBeenCalled();
-    expect(mocks.exists).not.toHaveBeenCalled();
-    expect(mocks.parse).not.toHaveBeenCalled();
+    expect(mocks.safeTranscript).toHaveBeenCalled();
+    expect(mocks.exists).toHaveBeenCalled();
+    expect(mocks.parse).toHaveBeenCalled();
   });
 
   it("reuses the admitted PostgreSQL project for non-empty ingestion", async () => {
@@ -302,8 +302,8 @@ describe("ingest persistence boundaries", () => {
       totalTokens: 7,
     });
     expect(mocks.getConnection).toHaveBeenCalledOnce();
-    expect(mocks.getConnection.mock.invocationCallOrder[0])
-      .toBeLessThan(mocks.ensureProject.mock.invocationCallOrder[0]);
+    expect(mocks.ensureProject.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.getConnection.mock.invocationCallOrder[0]);
   });
 
   it("keeps successful SQLite identity ahead of local persistence setup", async () => {
@@ -320,5 +320,21 @@ describe("ingest persistence boundaries", () => {
       .toBeLessThan(mocks.forProject.mock.invocationCallOrder[0]);
     expect(mocks.forProject.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.getConnection.mock.invocationCallOrder[0]);
+  });
+
+  it("runs the selected repository batch inside operation-scoped admission and authenticates PostgreSQL no-ops", async () => {
+    const admission = vi.fn(async (operation: (token: object) => Promise<unknown>) => operation({}));
+    const signal = new AbortController().signal;
+    const handler = createIngestHandler(postgresqlConfig);
+
+    await handler({} as never, response, JSON.stringify({
+      session_id: "postgresql-empty",
+      cwd: "/ok",
+      transcript_path: "/missing",
+    }), { withPublicationAdmission: admission, signal });
+
+    expect(admission).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 0, totalTokens: 0 });
+    expect(mocks.getConnection).toHaveBeenCalledOnce();
   });
 });
