@@ -1394,6 +1394,54 @@ describe("portable record stream public seam", () => {
     }, { priorCheckpoint: forgedPrior })), "checkpoint-mismatch");
   });
 
+  it("sanitizes a throwing dependencies accessor at the public seam", () => {
+    const manifest = makeManifest();
+    const canary = "dependencies-accessor-canary-616";
+    const record = { ...records.messages[0] };
+    Object.defineProperty(record, "dependencies", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        throw new Error(canary);
+      },
+    });
+    try {
+      createPortableBatch(createBatchInput(manifest, "messages", {
+        predecessor: null,
+        records: [record],
+        complete: false,
+      }));
+    } catch (error) {
+      expectSanitizedError(error, "malformed-record", [canary]);
+      return;
+    }
+    throw new Error("operation unexpectedly succeeded");
+  });
+
+  it("sanitizes a throwing ordinal accessor while constructing dependency errors", () => {
+    const manifest = makeManifest();
+    const canary = "ordinal-accessor-canary-616";
+    const record = { ...records.messages[0], dependencies: [] };
+    Object.defineProperty(record, "ordinal", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        throw new Error(canary);
+      },
+    });
+    try {
+      createPortableBatch(createBatchInput(manifest, "messages", {
+        predecessor: null,
+        records: [record],
+        complete: false,
+      }));
+    } catch (error) {
+      expectSanitizedError(error, "malformed-record", [canary]);
+      return;
+    }
+    throw new Error("operation unexpectedly succeeded");
+  });
+
   it("rejects dependency order, wrong dependency identity, appended records, and terminal omission", () => {
     const manifest = makeManifest();
     const wrongDependency = {

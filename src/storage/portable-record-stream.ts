@@ -596,23 +596,28 @@ const DOMAIN_DEPENDENCIES = PORTABLE_RECORD_SCHEMA_DESCRIPTOR.domainsByOrder as 
 
 function validateDependencyContract(record: PortableRecord, domain: PortableDomain): void {
   if (!isObject(record)) fail("malformed-record", { domain });
-  const dependencies = arrayValues(record.dependencies, "dependency-order");
-  const expected = DOMAIN_DEPENDENCIES[domain].dependencies;
-  if ((dependencies.length === 0) !== (expected.length === 0)) {
-    fail("dependency-order", { domain, ordinal: record.ordinal });
-  }
-  const seenDomains = new Set<string>();
-  for (const dependency of dependencies) {
-    const item = snapshot(dependency, ["domain", "identitySha256"], "dependency-order");
-    if (
-      typeof item.domain !== "string"
-      || !expected.some((candidate) => candidate.split("|").includes(item.domain as string))
-      || !isSha256(item.identitySha256)
-    ) fail("dependency-order", { domain, ordinal: record.ordinal });
-    seenDomains.add(item.domain);
-  }
-  if (expected.some((candidate) => !candidate.split("|").some((domainName) => seenDomains.has(domainName)))) {
-    fail("dependency-order", { domain, ordinal: record.ordinal });
+  try {
+    const dependencies = arrayValues(record.dependencies, "dependency-order");
+    const expected = DOMAIN_DEPENDENCIES[domain].dependencies;
+    if ((dependencies.length === 0) !== (expected.length === 0)) {
+      fail("dependency-order", { domain, ordinal: record.ordinal });
+    }
+    const seenDomains = new Set<string>();
+    for (const dependency of dependencies) {
+      const item = snapshot(dependency, ["domain", "identitySha256"], "dependency-order");
+      if (
+        typeof item.domain !== "string"
+        || !expected.some((candidate) => candidate.split("|").includes(item.domain as string))
+        || !isSha256(item.identitySha256)
+      ) fail("dependency-order", { domain, ordinal: record.ordinal });
+      seenDomains.add(item.domain);
+    }
+    if (expected.some((candidate) => !candidate.split("|").some((domainName) => seenDomains.has(domainName)))) {
+      fail("dependency-order", { domain, ordinal: record.ordinal });
+    }
+  } catch (error) {
+    if (error instanceof PortableStreamError) throw error;
+    fail("malformed-record", { domain });
   }
 }
 
