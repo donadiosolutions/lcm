@@ -1340,6 +1340,11 @@ describe("portable record stream public seam", () => {
     } as never)), "partial-batch");
     expectCode(() => createPortableBatch(createBatchInput(manifest, "messages", {
       predecessor: null,
+      records: [null],
+      complete: false,
+    } as never)), "malformed-record");
+    expectCode(() => createPortableBatch(createBatchInput(manifest, "messages", {
+      predecessor: null,
       records: [],
       complete: false,
     })), "partial-batch");
