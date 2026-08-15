@@ -25,7 +25,7 @@ vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: mocks.migrate }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
 vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => ({
+  createStorageBackendFactory: async () => ({
     openProject: async () => {
       mocks.getConnection();
       try {

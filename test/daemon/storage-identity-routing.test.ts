@@ -28,9 +28,9 @@ import type {
   StorageIdentityContext,
 } from "../../src/storage/index.js";
 import * as storageFactoryModule from "../../src/storage/factory.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../src/storage/factory.js";
 import { UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
 import { withBackendPublicationConsumerLockAsync } from "../../src/storage/backend-publication.js";
+import { makeStagedPostgreSqlStorageFactory } from "./routes/mock-storage-factory.js";
 
 const testPublicationAdmission: RoutePublicationAdmission = operation =>
   withBackendPublicationConsumerLockAsync(process.env.HOME, operation, { allowUnresolved: true });
@@ -162,16 +162,10 @@ describe("daemon storage identity routing", () => {
     expect(UNBOUND_POSTGRESQL_PROJECT_MESSAGE).not.toContain(cwd);
   });
 
-  it("validates PostgreSQL identity before opening the unavailable default factory", async () => {
+  it("validates PostgreSQL identity before opening the injected factory", async () => {
     resolveProjectIdentity(cwd);
-    const realCreateStorageBackendFactory = storageFactoryModule.createStorageBackendFactory;
-    vi.spyOn(storageFactoryModule, "createStorageBackendFactory").mockImplementation(
-      (storageConfig, homeDir) => realCreateStorageBackendFactory(
-        storageConfig,
-        homeDir,
-        () => undefined,
-      ),
-    );
+    vi.spyOn(storageFactoryModule, "createStorageBackendFactory")
+      .mockResolvedValue(makeStagedPostgreSqlStorageFactory());
     const response = {
       writeHead: vi.fn(),
       end: vi.fn(),
@@ -216,7 +210,7 @@ describe("daemon storage identity routing", () => {
       security: { sensitivePatterns: [], notify_on_filter: false },
     } as unknown as DaemonConfig;
 
-    await createCompactHandler(config, new UnavailablePostgreSqlStorageBackendFactory())(
+    await createCompactHandler(config, makeStagedPostgreSqlStorageFactory())(
       {} as never,
       response as never,
       JSON.stringify({ session_id: "disabled", cwd }),
@@ -229,7 +223,7 @@ describe("daemon storage identity routing", () => {
 
     setRemoteProjectBinding(PROJECT_ID, { hash: local.id });
     response.end.mockClear();
-    await createCompactHandler(config, new UnavailablePostgreSqlStorageBackendFactory())(
+    await createCompactHandler(config, makeStagedPostgreSqlStorageFactory())(
       {} as never,
       response as never,
       JSON.stringify({ session_id: "disabled", cwd }),
@@ -239,7 +233,7 @@ describe("daemon storage identity routing", () => {
     ));
 
     response.end.mockClear();
-    await createIngestHandler(config, new UnavailablePostgreSqlStorageBackendFactory())(
+    await createIngestHandler(config, makeStagedPostgreSqlStorageFactory())(
       {} as never,
       response as never,
       JSON.stringify({ session_id: "empty", cwd, messages: [] }),
@@ -270,7 +264,7 @@ describe("daemon storage identity routing", () => {
       security: { sensitivePatterns: [], notify_on_filter: false },
     } as unknown as DaemonConfig;
 
-    await createCompactHandler(config, new UnavailablePostgreSqlStorageBackendFactory())(
+    await createCompactHandler(config, makeStagedPostgreSqlStorageFactory())(
       {} as never,
       response as never,
       JSON.stringify({ session_id: "staged-before-local-io", cwd }),
@@ -281,7 +275,7 @@ describe("daemon storage identity routing", () => {
     expect(existsSync(join(localProjectDir, "meta.json"))).toBe(false);
 
     response.end.mockClear();
-    await createStoreHandler(config, new UnavailablePostgreSqlStorageBackendFactory())(
+    await createStoreHandler(config, makeStagedPostgreSqlStorageFactory())(
       {} as never,
       response as never,
       JSON.stringify({ text: "remember", cwd }),
@@ -312,7 +306,7 @@ describe("daemon storage identity routing", () => {
       close: closeFactory,
     } as unknown as StorageBackendFactory;
     vi.spyOn(storageFactoryModule, "createStorageBackendFactory")
-      .mockReturnValue(factory);
+      .mockResolvedValue(factory);
     const response = {
       writeHead: vi.fn(),
       end: vi.fn(),

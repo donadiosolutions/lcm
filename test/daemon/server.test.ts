@@ -31,6 +31,7 @@ import {
   resolveProjectIdentity,
   setRemoteProjectBinding,
 } from "../../src/project-map.js";
+import { makeStagedPostgreSqlStorageFactory } from "./routes/mock-storage-factory.js";
 
 const testIdentity = {
   ownerId: "server-tests",
@@ -366,6 +367,7 @@ describe("daemon server", () => {
     daemon = await createDaemon(config, {
       _scanForTranscripts: scanForTranscripts,
       _assertBackendPublication: () => undefined,
+      _createStorageBackendFactory: async () => makeStagedPostgreSqlStorageFactory(),
     });
     const port = daemon.address().port;
 
@@ -927,6 +929,7 @@ describe("daemon auth", () => {
       tokenPath,
       _testIdentity: testIdentity,
       _assertBackendPublication: () => undefined,
+      _createStorageBackendFactory: async () => makeStagedPostgreSqlStorageFactory(),
     });
     const port = daemon.address().port;
     try {

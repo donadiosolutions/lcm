@@ -16,9 +16,9 @@ import { ensureProjectDir, projectDbPath, projectId } from "../../../src/daemon/
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
 import { withBackendPublicationConsumerLockAsync } from "../../../src/storage/backend-publication.js";
 import { createStorageBackendFactory } from "../../../src/storage/index.js";
+import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 import { recoverMachineIdentity } from "../../../src/machine-identity.js";
 import {
   clearProjectMapCache,
@@ -226,7 +226,7 @@ describe("promote-events route", () => {
 
     const output = mockRes();
     const config = makeConfig();
-    const factory = createStorageBackendFactory(config.storage);
+    const factory = await createStorageBackendFactory(config.storage);
     try {
       await withBackendPublicationConsumerLockAsync(homeDir, async (publicationLockToken) => {
         await createPromoteEventsHandler(config, factory)(
@@ -897,7 +897,7 @@ describe("promote-events route", () => {
     const output = mockRes();
     await createPromoteAllEventsHandler(
       config,
-      new UnavailablePostgreSqlStorageBackendFactory(),
+      makeStagedPostgreSqlStorageFactory(),
     )(request, output.res, "");
 
     expect(output.res.writeHead).toHaveBeenCalledWith(
@@ -915,7 +915,7 @@ describe("promote-events route", () => {
     const output = mockRes();
     await createPromoteAllEventsHandler(
       makeConfig(),
-      new UnavailablePostgreSqlStorageBackendFactory(),
+      makeStagedPostgreSqlStorageFactory(),
     )(request, output.res, "");
 
     expect(output.res.writeHead).toHaveBeenCalledWith(
@@ -978,7 +978,7 @@ describe("promote-events route", () => {
 
     const output = mockRes();
     const config = makeConfig();
-    const factory = createStorageBackendFactory(config.storage);
+    const factory = await createStorageBackendFactory(config.storage);
     try {
       await withBackendPublicationConsumerLockAsync(homeDir, async (publicationLockToken) => {
         await createPromoteAllEventsHandler(config, factory)(

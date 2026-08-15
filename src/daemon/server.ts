@@ -105,6 +105,8 @@ export type DaemonOptions = {
   _testIdentity?: DaemonLifecycleTestIdentity;
   /** @internal Deterministic auth-token read seam for preflight ordering tests. */
   _readAuthToken?: typeof readAuthToken;
+  /** @internal Deterministic storage-factory seam for daemon unit tests. */
+  _createStorageBackendFactory?: typeof createStorageBackendFactory;
   /** Canonical daemon config path used for request-time publication admission. */
   publicationConfigPath?: string;
   /** @internal Test-only publication admission seam. */
@@ -382,7 +384,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     },
     { lockToken: retainedToken },
   );
-  const storageFactory = createStorageBackendFactory(
+  const createFactory = options?._createStorageBackendFactory ?? createStorageBackendFactory;
+  const storageFactory = await createFactory(
     config.storage,
     publicationHome,
     options?._assertBackendPublication === undefined

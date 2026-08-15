@@ -7,8 +7,8 @@ import {
   storageRouteFailureResponse,
 } from "../../../src/daemon/routes/storage-lifecycle.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
+import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 
 describe("route storage cleanup", () => {
   it("ignores absent resources", async () => {
@@ -42,7 +42,7 @@ describe("route storage cleanup", () => {
   });
 
   it("recognizes only typed failures from the staged PostgreSQL factory", async () => {
-    const staged = new UnavailablePostgreSqlStorageBackendFactory();
+    const staged = makeStagedPostgreSqlStorageFactory();
     const identity = { id: "project", canonical: "/project" } as never;
     const stagedError = await staged.openExistingProject(identity)
       .catch((error: unknown) => error);

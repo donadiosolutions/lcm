@@ -143,7 +143,7 @@ vi.mock("../../../src/storage/index.js", () => ({
     if (state.identityError !== undefined) throw state.identityError;
     return state.identity(local.canonical, storageConfig, local);
   },
-  createStorageBackendFactory: () => ({
+  createStorageBackendFactory: async () => ({
     openProject: async (...args: unknown[]) => {
       state.openProject(...args);
       if (state.openProjectError !== undefined) throw state.openProjectError;
@@ -224,7 +224,7 @@ import type {
   RoutePublicationAdmission,
 } from "../../../src/daemon/server.js";
 import type { StorageBackendFactory } from "../../../src/storage/index.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
+import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
 
@@ -738,7 +738,7 @@ describe("compact route coverage", () => {
     };
     const handler = createCompactHandler(
       value,
-      new UnavailablePostgreSqlStorageBackendFactory(),
+      makeStagedPostgreSqlStorageFactory(),
     );
     const first = response();
     const firstCall = handler(

@@ -2,6 +2,7 @@ import type {
   ProjectStorage,
   StorageBackendFactory,
 } from "../../../src/storage/index.js";
+import { StorageOperationError } from "../../../src/storage/errors.js";
 
 type MockStorageFactoryOptions = {
   projectExists?: StorageBackendFactory["projectExists"];
@@ -27,5 +28,39 @@ export function makeMockStorageFactory(options: MockStorageFactoryOptions): Stor
     openProject: options.openProject,
     health: async () => ({ status: "healthy", backend: "sqlite" }),
     close: options.close ?? (async () => undefined),
+  };
+}
+
+/** Test-only replacement for the removed staged PostgreSQL factory. */
+export function makeStagedPostgreSqlStorageFactory(): StorageBackendFactory {
+  let closed = false;
+  const failure = (identity: { id?: string }, operation: string): StorageOperationError =>
+    new StorageOperationError(
+      closed ? "STORAGE_CLOSED" : "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      identity.id,
+      "factory",
+      operation,
+    );
+  return {
+    backend: "postgresql",
+    capabilities: {
+      transactions: false,
+      lexicalSearch: false,
+      regexSearch: false,
+      nativeFullTextSearch: "unavailable",
+      coordination: "distributed",
+    },
+    projectExists: async identity => { throw failure(identity, "projectExists"); },
+    openExistingProject: async identity => { throw failure(identity, "openExistingProject"); },
+    openProject: async identity => { throw failure(identity, "openProject"); },
+    health: async () => closed
+      ? { status: "closed", backend: "postgresql" }
+      : {
+          status: "unavailable",
+          backend: "postgresql",
+          error: failure({}, "health"),
+        },
+    close: async () => { closed = true; },
   };
 }

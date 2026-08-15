@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventRow, PatternReinforcementStats } from "../../../src/hooks/events-db.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
+import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
   events: vi.fn(() => [] as EventRow[]),
@@ -61,7 +61,7 @@ vi.mock("../../../src/daemon/project.js", () => ({
   projectIdentity: mocks.identity,
 }));
 vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => ({ openProject: mocks.openProject, close: mocks.closeFactory }),
+  createStorageBackendFactory: async () => ({ openProject: mocks.openProject, close: mocks.closeFactory }),
 }));
 vi.mock("../../../src/hooks/hook-errors.js", () => ({ safeLogError: mocks.log }));
 vi.mock("../../../src/db/event-sidecars.js", () => ({ collectEventSidecars: mocks.collect }));
@@ -255,7 +255,7 @@ describe("promote-events unit boundaries", () => {
   });
 
   it("admits PostgreSQL storage before opening either promotion outbox", async () => {
-    const staged = new UnavailablePostgreSqlStorageBackendFactory();
+    const staged = makeStagedPostgreSqlStorageFactory();
 
     await expect(drainEventsForCwd(
       postgresqlConfig,

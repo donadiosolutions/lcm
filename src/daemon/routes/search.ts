@@ -43,7 +43,7 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
       let activeFactory: StorageBackendFactory | undefined;
       try {
         const identity = projectIdentity(cwd, config.storage);
-        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+        activeFactory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(config.storage));
         project = await openExistingProject(activeFactory, identity) ?? undefined;
         if (project) {
 

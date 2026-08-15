@@ -45,7 +45,7 @@ describe("review-stale persistence boundaries", () => {
       promotedMemory: { getById: mocks.getById, archive: mocks.archive, revive: mocks.revive, findStale: mocks.findStale },
       close: mocks.projectClose,
     });
-    mocks.createFactory.mockReturnValue(makeMockStorageFactory({
+    mocks.createFactory.mockImplementation(async () => makeMockStorageFactory({
       projectExists: mocks.projectExists,
       openProject: mocks.openProject,
       close: mocks.factoryClose,

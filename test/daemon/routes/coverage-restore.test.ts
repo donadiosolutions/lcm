@@ -112,7 +112,7 @@ vi.mock("../../../src/db/promoted.js", () => ({
   },
 }));
 vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => {
+  createStorageBackendFactory: async () => {
     const projectExists = async () => {
       state.projectExistsCount += 1;
       return state.existsSequence.shift() ?? state.exists;

@@ -50,7 +50,7 @@ export function createReviewStaleHandler(config: DaemonConfig, storageFactory?: 
     let activeFactory: StorageBackendFactory | undefined;
     try {
       const identity = projectIdentity(cwd, config.storage, context?.publicationLockToken);
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+      activeFactory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
         config.storage,
         undefined,
         undefined,

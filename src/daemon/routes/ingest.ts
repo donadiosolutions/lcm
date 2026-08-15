@@ -79,7 +79,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       let resolvedMessages: ParsedMessage[];
       if (config.storage.backend === "postgresql") {
         activeFactory = storageFactory
-          ?? (ownedFactory = createStorageBackendFactory(
+          ?? (ownedFactory = await createStorageBackendFactory(
             config.storage,
             undefined,
             undefined,
@@ -100,7 +100,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         paths.dir,
       );
       if (!project) {
-        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+        activeFactory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
           config.storage,
           undefined,
           undefined,

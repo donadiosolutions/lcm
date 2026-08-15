@@ -240,7 +240,7 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
     let activeFactory: StorageBackendFactory | undefined;
     try {
       const identity = projectIdentity(validatedCwd, config.storage);
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(config.storage));
+      activeFactory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(config.storage));
       project = await openExistingProject(activeFactory, identity) ?? undefined;
       if (config.restoration.promptSearchMaxResults === 0) {
         sendJson(res, 200, { hints: [], ids: [] });

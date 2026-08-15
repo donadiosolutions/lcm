@@ -23,7 +23,7 @@ const testIdentity = {
 } as const;
 
 state.healthFactory.mockImplementation(async () => state.health);
-state.createFactory.mockImplementation(() => ({
+state.createFactory.mockImplementation(async () => ({
   backend: "sqlite",
   capabilities: {},
   projectExists: vi.fn().mockResolvedValue(false),
@@ -304,7 +304,9 @@ describe("mocked server states unavailable from Node HTTP", () => {
       },
     };
 
-    await expect(createDaemon(config)).rejects.toThrow("listen failed");
+    await expect(createDaemon(config, {
+      _createStorageBackendFactory: state.createFactory,
+    })).rejects.toThrow("listen failed");
     expect(state.closeFactory).toHaveBeenCalledOnce();
   });
 

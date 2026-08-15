@@ -36,7 +36,7 @@ vi.mock("../../../src/daemon/project.js", () => ({
 }));
 
 vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => {
+  createStorageBackendFactory: async () => {
     const openProject = async () => {
       if (state.connectionError !== undefined) throw state.connectionError;
       return {

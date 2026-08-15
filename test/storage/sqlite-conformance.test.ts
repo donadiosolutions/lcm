@@ -1,14 +1,13 @@
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
+import type { ResolvedStorageConfig } from "../../src/daemon/config.js";
 import { projectIdentity } from "../../src/daemon/project.js";
 import { sqliteStorageCapabilities, requireStorageCapability } from "../../src/storage/capabilities.js";
-import {
-  createStorageBackendFactory,
-  UnavailablePostgreSqlStorageBackendFactory,
-} from "../../src/storage/factory.js";
-import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import { createStorageBackendFactory } from "../../src/storage/factory.js";
+import type { StorageBackendFactory } from "../../src/storage/contracts.js";
 import { normalizeStorageError, StorageOperationError } from "../../src/storage/errors.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import { SqliteExecutor } from "../../src/storage/sqlite/executor.js";
@@ -29,6 +28,15 @@ import {
   exerciseRedactionAdminRepositoryConformance,
 } from "./memory-conformance.js";
 import { exerciseSummaryContextRepositoryConformance } from "./summary-context-conformance.js";
+
+const selectedFactoryMock = vi.hoisted(() => ({
+  createPostgreSql: vi.fn(),
+}));
+
+vi.mock("../../src/storage/postgresql/factory.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/storage/postgresql/factory.js")>()),
+  createPostgreSqlStorageBackendFactoryWithHome: selectedFactoryMock.createPostgreSql,
+}));
 
 function harness(): StorageContractHarness {
   const root = createTemporaryDirectory("lcm-storage-contract-");
@@ -531,74 +539,80 @@ describe("SQLite storage backend conformance", () => {
     }
   });
 
-  it("selects SQLite and exposes a cause-free staged PostgreSQL boundary", async () => {
-    expect(createStorageBackendFactory({ backend: "sqlite" })).toBeInstanceOf(SqliteStorageBackendFactory);
-    const postgresqlConfig = {
+  it("resolves SQLite asynchronously and delegates PostgreSQL to the eager factory", async () => {
+    const publicationCheck = vi.fn();
+    const sqlitePromise = createStorageBackendFactory(
+      { backend: "sqlite" },
+      undefined,
+      publicationCheck,
+    );
+    expect(sqlitePromise).toBeInstanceOf(Promise);
+    await expect(sqlitePromise).resolves.toBeInstanceOf(SqliteStorageBackendFactory);
+
+    const postgresqlConfig: ResolvedStorageConfig = {
       backend: "postgresql",
       postgresql: {
         poolMax: 5,
         connectionTimeoutMs: 10_000,
         idleTimeoutMs: 30_000,
         statementTimeoutMs: 60_000,
+        migrationRole: "lcm_migrator",
         url: "postgresql://example.test/lcm",
         caFile: "/safe/ca.pem",
       },
-    } as const;
-    expect(() => createStorageBackendFactory(postgresqlConfig)).toThrow(BackendPublicationJournalError);
-
-    const factory = new UnavailablePostgreSqlStorageBackendFactory();
-    expect(factory).toBeInstanceOf(UnavailablePostgreSqlStorageBackendFactory);
-    expect(factory.backend).toBe("postgresql");
-    expect(factory.capabilities).toEqual({
-      transactions: false,
-      lexicalSearch: false,
-      regexSearch: false,
-      nativeFullTextSearch: "unavailable",
-      coordination: "distributed",
-    });
-    expect(Object.isFrozen(factory.capabilities)).toBe(true);
-    await expect(factory.health()).resolves.toMatchObject({
-      status: "unavailable",
-      backend: "postgresql",
-      error: {
-        code: "STORAGE_INITIALIZATION_FAILED",
-        backend: "postgresql",
-        projectId: undefined,
-        domain: "factory",
-        operation: "health",
-      },
-    });
-
-    const identity = {
-      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
-      localProjectId: "local-hash",
-      canonical: "/work/project",
-      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
-      machineId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012",
     };
-    await expect(factory.projectExists(identity)).rejects.toMatchObject({
-      code: "STORAGE_INITIALIZATION_FAILED",
-      projectId: identity.id,
-      operation: "projectExists",
-    });
-    await expect(factory.openExistingProject(identity)).rejects.toMatchObject({
-      code: "STORAGE_INITIALIZATION_FAILED",
-      projectId: identity.id,
-      operation: "openExistingProject",
-    });
-    await expect(factory.openProject(identity)).rejects.toMatchObject({
-      code: "STORAGE_INITIALIZATION_FAILED",
-      projectId: identity.id,
-      operation: "openProject",
-    });
+    const delegatedFactory = { backend: "postgresql" } as StorageBackendFactory;
+    selectedFactoryMock.createPostgreSql.mockResolvedValue(delegatedFactory);
+    const effectiveHome = homedir();
 
-    await factory.close();
-    await factory.close();
-    await expect(factory.health()).resolves.toEqual({ status: "closed", backend: "postgresql" });
-    await expect(factory.projectExists(identity)).rejects.toMatchObject({
-      code: "STORAGE_CLOSED",
-      projectId: identity.id,
-    });
+    await expect(createStorageBackendFactory(
+      postgresqlConfig,
+      undefined,
+      publicationCheck,
+    )).resolves.toBe(delegatedFactory);
+    expect(publicationCheck).toHaveBeenLastCalledWith({
+      backend: "postgresql",
+      homeDir: effectiveHome,
+    }, undefined);
+    expect(selectedFactoryMock.createPostgreSql).toHaveBeenCalledWith(
+      postgresqlConfig,
+      effectiveHome,
+    );
+  });
+
+  it("preserves sanitized PostgreSQL construction failures without a SQLite fallback", async () => {
+    selectedFactoryMock.createPostgreSql.mockReset();
+    const failure = new StorageOperationError(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "createFactory",
+    );
+    selectedFactoryMock.createPostgreSql.mockRejectedValue(failure);
+    const publicationCheck = vi.fn();
+    const postgresqlConfig: ResolvedStorageConfig = {
+      backend: "postgresql",
+      postgresql: {
+        poolMax: 5,
+        connectionTimeoutMs: 10_000,
+        idleTimeoutMs: 30_000,
+        statementTimeoutMs: 60_000,
+        migrationRole: "lcm_migrator",
+        url: "postgresql://example.test/lcm",
+        caFile: "/safe/ca.pem",
+      },
+    };
+
+    await expect(createStorageBackendFactory(
+      postgresqlConfig,
+      "/home/operator",
+      publicationCheck,
+    )).rejects.toBe(failure);
+    expect(selectedFactoryMock.createPostgreSql).toHaveBeenCalledWith(
+      postgresqlConfig,
+      "/home/operator",
+    );
   });
 
   it("exposes frozen capabilities and normalized cause-free errors", () => {

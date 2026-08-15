@@ -154,7 +154,7 @@ export function createRestoreHandler(
         const identity = resolveRouteIdentity()!;
         activeFactory = storageFactory
           ?? ownedFactory
-          ?? (ownedFactory = createStorageBackendFactory(
+          ?? (ownedFactory = await createStorageBackendFactory(
             config.storage,
             undefined,
             undefined,

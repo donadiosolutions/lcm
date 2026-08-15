@@ -4,7 +4,6 @@ import type {
   StorageIdentityContext,
 } from "../../storage/index.js";
 import { StorageOperationError } from "../../storage/errors.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../storage/factory.js";
 import { StorageIdentityConfigurationError } from "../../storage/identity-context.js";
 import { MachineIdentityFileError } from "../../machine-identity.js";
 import {
@@ -78,7 +77,13 @@ export function stagedPostgreSqlFactoryUnavailableResponse(
   factory: StorageBackendFactory | undefined,
   operation: string,
 ): StagedPostgreSqlUnavailableResponse | null {
-  return factory instanceof UnavailablePostgreSqlStorageBackendFactory
+  const capabilities = factory?.capabilities;
+  return factory?.backend === "postgresql"
+    && capabilities?.transactions === false
+    && capabilities.lexicalSearch === false
+    && capabilities.regexSearch === false
+    && capabilities.nativeFullTextSearch === "unavailable"
+    && capabilities.coordination === "distributed"
     ? stagedPostgreSqlUnavailablePayload(operation)
     : null;
 }

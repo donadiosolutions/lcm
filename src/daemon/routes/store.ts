@@ -79,7 +79,7 @@ export function createStoreHandler(
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
     try {
-      activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+      activeFactory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
         config.storage,
         undefined,
         undefined,

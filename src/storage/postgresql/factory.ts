@@ -542,7 +542,7 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
 }
 
 /** Internal composition seam with an explicit home root and deterministic dependencies. */
-export async function createPostgreSqlStorageBackendFactoryForTesting(
+export async function createPostgreSqlStorageBackendFactoryWithHome(
   config: ResolvedPostgreSqlConfig,
   homeDir: string,
   dependencies: PostgreSqlFactoryDependencies = DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES,
@@ -577,8 +577,12 @@ export async function createPostgreSqlStorageBackendFactoryForTesting(
   }
 }
 
+/** Compatibility alias for deterministic factory tests. */
+export const createPostgreSqlStorageBackendFactoryForTesting =
+  createPostgreSqlStorageBackendFactoryWithHome;
+
 export function createPostgreSqlStorageBackendFactory(
   config: ResolvedPostgreSqlConfig,
 ): Promise<PostgreSqlStorageBackendFactory> {
-  return createPostgreSqlStorageBackendFactoryForTesting(config, homedir());
+  return createPostgreSqlStorageBackendFactoryWithHome(config, homedir());
 }

@@ -70,7 +70,7 @@ describe("promote persistence boundaries", () => {
     mocks.dedup.mockResolvedValue(undefined);
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
-    mocks.createFactory.mockImplementation(() => makeMockStorageFactory({
+    mocks.createFactory.mockImplementation(async () => makeMockStorageFactory({
       projectExists: mocks.projectExists,
       openProject: mocks.openProject,
       close: mocks.factoryClose,

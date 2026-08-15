@@ -10,6 +10,7 @@ import type { StorageIdentityContext } from "../../src/storage/contracts.js";
 import type { ProjectStorage } from "../../src/storage/contracts.js";
 import {
   createPostgreSqlStorageBackendFactoryForTesting,
+  createPostgreSqlStorageBackendFactoryWithHome,
   FactorySignalExecutor,
   type PostgreSqlFactoryDependencies,
 } from "../../src/storage/postgresql/factory.js";
@@ -226,7 +227,7 @@ describe("PostgreSQL storage backend factory", () => {
       return runtime;
     };
 
-    const factory = await createPostgreSqlStorageBackendFactoryForTesting(
+    const factory = await createPostgreSqlStorageBackendFactoryWithHome(
       config,
       "/home/operator",
       dependencies,
@@ -253,6 +254,8 @@ describe("PostgreSQL storage backend factory", () => {
       },
     });
     expect(Object.isFrozen(factory.capabilities)).toBe(true);
+    expect(createPostgreSqlStorageBackendFactoryForTesting)
+      .toBe(createPostgreSqlStorageBackendFactoryWithHome);
     expect(createPostgreSqlStorageBackendFactory.length).toBe(1);
 
     const storage = await factory.openProject(identity);

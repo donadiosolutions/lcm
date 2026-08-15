@@ -36,7 +36,7 @@ vi.mock("../../../src/scrub.js", () => ({ ScrubEngine: { forProject: mocks.forPr
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
 vi.mock("../../../src/daemon/safe-error.js", () => ({ sanitizeError: (message: string) => message }));
 vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => ({
+  createStorageBackendFactory: async () => ({
     openProject: mocks.openProject,
     close: mocks.factoryClose,
   }),

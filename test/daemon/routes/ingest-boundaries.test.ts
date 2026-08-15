@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
 import { createStorageBackendFactory } from "../../../src/storage/index.js";
+import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => true),
@@ -68,7 +68,7 @@ vi.mock("../../../src/store/summary-store.js", () => ({
   SummaryStore: class { appendContextMessages = mocks.append; getContextTokenCount = mocks.tokens; },
 }));
 vi.mock("../../../src/storage/index.js", () => ({
-  createStorageBackendFactory: () => ({
+  createStorageBackendFactory: async () => ({
     openProject: async () => {
       mocks.getConnection();
       const repositories = {
@@ -270,7 +270,7 @@ describe("ingest persistence boundaries", () => {
   it("rejects staged PostgreSQL before reading a file-backed transcript", async () => {
     const handler = createIngestHandler(
       postgresqlConfig,
-      new UnavailablePostgreSqlStorageBackendFactory(),
+      makeStagedPostgreSqlStorageFactory(),
     );
     await handler({} as never, response, JSON.stringify({
       session_id: "staged",
@@ -289,7 +289,7 @@ describe("ingest persistence boundaries", () => {
   });
 
   it("reuses the admitted PostgreSQL project for non-empty ingestion", async () => {
-    const factory = createStorageBackendFactory(config.storage);
+    const factory = await createStorageBackendFactory(config.storage);
     const handler = createIngestHandler(postgresqlConfig, factory);
     await handler({} as never, response, JSON.stringify({
       session_id: "postgresql-ingest",

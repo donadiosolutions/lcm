@@ -2,7 +2,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerResponse } from "node:http";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import type { StorageBackendFactory } from "../../../src/storage/index.js";
-import { makeMockStorageFactory } from "./mock-storage-factory.js";
+import {
+  makeMockStorageFactory,
+  makeStagedPostgreSqlStorageFactory,
+} from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => true),
@@ -76,7 +79,6 @@ import { createPoolStatsHandler } from "../../../src/daemon/routes/pool-stats.js
 import { createStatsHandler } from "../../../src/daemon/routes/stats.js";
 import { createSearchHandler } from "../../../src/daemon/routes/search.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
-import { UnavailablePostgreSqlStorageBackendFactory } from "../../../src/storage/factory.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 
 const config = loadDaemonConfig("/tmp/lcm-persistence-routes");
@@ -133,7 +135,7 @@ describe("persistence read route boundaries", () => {
       close: mocks.projectClose,
     };
     mocks.openProject.mockResolvedValue(project);
-    mocks.createFactory.mockImplementation(() => injectedFactory());
+    mocks.createFactory.mockImplementation(async () => injectedFactory());
   });
 
   it("covers describe validation, absence, success, and typed failures", async () => {
@@ -163,7 +165,7 @@ describe("persistence read route boundaries", () => {
     await invoke(createDescribeHandler(config, injectedFactory()), { nodeId: "n", cwd: "/ok" });
     expect(mocks.factoryClose).toHaveBeenCalledTimes(ownedCloseCount);
     await invoke(
-      createDescribeHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      createDescribeHandler(config, makeStagedPostgreSqlStorageFactory()),
       { nodeId: "n", cwd: "/ok" },
     );
     expectLast(503, {
@@ -215,7 +217,7 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { expanded: null, error: "expansion failed" });
     await invoke(createExpandHandler(config, injectedFactory()), { nodeId: "n", cwd: "/ok" });
     await invoke(
-      createExpandHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      createExpandHandler(config, makeStagedPostgreSqlStorageFactory()),
       { nodeId: "n", cwd: "/ok" },
     );
     expectLast(503, {
@@ -246,7 +248,7 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { matches: [] });
     await invoke(createGrepHandler(config, injectedFactory()), { query: "q", cwd: "/ok" });
     await invoke(
-      createGrepHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      createGrepHandler(config, makeStagedPostgreSqlStorageFactory()),
       { query: "q", cwd: "/ok" },
     );
     expectLast(503, {
@@ -288,7 +290,7 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { summaries: [] });
     await invoke(createRecentHandler(config, injectedFactory()), { cwd: "/ok" });
     await invoke(
-      createRecentHandler(config, new UnavailablePostgreSqlStorageBackendFactory()),
+      createRecentHandler(config, makeStagedPostgreSqlStorageFactory()),
       { cwd: "/ok" },
     );
     expectLast(503, {
@@ -356,7 +358,7 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { episodic: [], promoted: [] });
     await invoke(createSearchHandler(config, injectedFactory()), { query: "q", cwd: "/ok", layers: [] });
 
-    const stagedFactory = new UnavailablePostgreSqlStorageBackendFactory();
+    const stagedFactory = makeStagedPostgreSqlStorageFactory();
     await invoke(createSearchHandler(config, stagedFactory), { query: "q", cwd: "/ok" });
     expectLast(503, {
       code: "STORAGE_BACKEND_STAGED",
@@ -364,7 +366,7 @@ describe("persistence read route boundaries", () => {
       storageBackend: "postgresql",
     });
 
-    const nonStorageFailure = new UnavailablePostgreSqlStorageBackendFactory();
+    const nonStorageFailure = makeStagedPostgreSqlStorageFactory();
     vi.spyOn(nonStorageFailure, "openExistingProject")
       .mockRejectedValueOnce(new Error("unrelated failure"));
     await invoke(createSearchHandler(config, nonStorageFailure), { query: "q", cwd: "/ok" });

@@ -323,7 +323,7 @@ export function createPromoteEventsHandler(
 
     let ownedFactory: StorageBackendFactory | undefined;
     const activeFactory = storageFactory
-      ?? (ownedFactory = createStorageBackendFactory(
+      ?? (ownedFactory = await createStorageBackendFactory(
         config.storage,
         undefined,
         undefined,
@@ -373,7 +373,7 @@ export function createPromoteAllEventsHandler(
   return async (_req, res, _body, context) => {
     let ownedFactory: StorageBackendFactory | undefined;
     const activeFactory = storageFactory
-      ?? (ownedFactory = createStorageBackendFactory(
+      ?? (ownedFactory = await createStorageBackendFactory(
         config.storage,
         undefined,
         undefined,
@@ -569,7 +569,7 @@ async function drainEventsForCwdUnlocked(
   let ownedFactory: StorageBackendFactory | undefined;
   try {
     const identity = projectIdentity(cwd, config.storage, publicationLockToken);
-    const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+    const factory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
       config.storage,
       undefined,
       undefined,
@@ -658,7 +658,7 @@ async function promoteEventsForCwdUnlocked(
   let ownedFactory: StorageBackendFactory | undefined;
   try {
     const identity = projectIdentity(cwd, config.storage, publicationLockToken);
-    const factory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+    const factory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
       config.storage,
       undefined,
       undefined,

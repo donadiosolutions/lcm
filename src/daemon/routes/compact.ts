@@ -353,7 +353,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
     let admittedIdentity: StorageIdentityContext & { readonly localProjectId: string };
     try {
       const initialAdmission = await withPublicationAdmission(async publicationLockToken => {
-        activeFactory = storageFactory ?? (ownedFactory = createStorageBackendFactory(
+        activeFactory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
           config.storage,
           undefined,
           undefined,
