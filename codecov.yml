@@ -94,6 +94,8 @@ component_management:
         - "^src/storage/home-lock-topology\\.ts$"
         - "^src/storage/identity-context\\.ts$"
         - "^src/storage/index\\.ts$"
+        - "^src/storage/portable-record\\.ts$"
+        - "^src/storage/portable-record-stream\\.ts$"
         - "^src/storage/postgresql/project-storage\\.ts$"
     - component_id: "unit-migration-cutover"
       name: "Unit - Migration and Cutover"
