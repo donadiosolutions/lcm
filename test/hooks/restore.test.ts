@@ -9,7 +9,7 @@ import {
 } from "../../src/hooks/restore.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
-import * as storageBackend from "../../src/storage/backend.js";
+import * as publicationFence from "../../src/hooks/publication-fence.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 const securityFilesMock = vi.hoisted(() => ({
@@ -58,40 +58,73 @@ describe("handleSessionStart", () => {
     }
   });
 
-  it("emits a sanitized notice for an unavailable PostgreSQL backend", async () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-restore-storage-"));
-    const previousHome = process.env.HOME;
-    const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-    process.env.HOME = home;
+  it("continues to daemon transport for selected PostgreSQL", async () => {
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
+    mockEnsureDaemon.mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
+    const post = vi.fn().mockResolvedValue({ context: "PostgreSQL restore context" });
     try {
-      const post = vi.fn();
+      await expect(handleSessionStart("{}", { post }, 3737, {
+        backend: "postgresql",
+      })).resolves.toEqual({ exitCode: 0, stdout: "PostgreSQL restore context" });
+      expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+        expectedStorageBackend: "postgresql",
+      }));
+      expect(post).toHaveBeenCalledWith("/restore", {});
+    } finally {
+      fence.mockRestore();
+    }
+  });
+
+  it("does not fall back to SQLite when the selected PostgreSQL daemon refuses admission", async () => {
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
+    mockEnsureDaemon.mockResolvedValueOnce({
+      connected: false,
+      port: 3737,
+      spawned: false,
+      refusalReason: "backend-mismatch",
+    });
+    const post = vi.fn();
+    try {
       await expect(handleSessionStart("{}", { post }, 3737, {
         backend: "postgresql",
       })).resolves.toEqual({ exitCode: 0, stdout: "" });
-      await expect(handleSessionStart("{}", { post }, 3737, {
-        backend: "postgresql",
-      })).resolves.toEqual({ exitCode: 0, stdout: "" });
-      expect(stderrWrite).toHaveBeenCalledWith(
-        "lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.\n",
-      );
-      expect(stderrWrite).toHaveBeenCalledTimes(1);
-      expect(readFileSync(join(home, ".lcm", "daemon-remediation.v1.json"), "utf8")).toContain("ambiguous");
-      expect(stderrWrite.mock.calls.flat().join(" ")).not.toContain("not available in this release");
-      expect(mockEnsureDaemon).not.toHaveBeenCalled();
+      expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+        expectedStorageBackend: "postgresql",
+      }));
       expect(post).not.toHaveBeenCalled();
     } finally {
-      stderrWrite.mockRestore();
+      fence.mockRestore();
+    }
+  });
+
+  it("bounds missing publication evidence before SessionStart daemon admission", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-restore-publication-missing-"));
+    const previousHome = process.env.HOME;
+    const publicationError = new BackendPublicationJournalError(
+      "publication-evidence-missing",
+      "publication evidence is absent",
+    );
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence")
+      .mockImplementationOnce(() => { throw publicationError; });
+    process.env.HOME = home;
+    try {
+      await expect(handleSessionStart("{}", { post: vi.fn() }, 3737, {
+        backend: "postgresql",
+      })).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    } finally {
+      fence.mockRestore();
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
       rmSync(home, { recursive: true, force: true });
     }
   });
 
-  it("sanitizes unexpected storage-selection failures before emitting a notice", async () => {
+  it("sanitizes unexpected publication admission failures before emitting a notice", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-restore-storage-throw-"));
     const previousHome = process.env.HOME;
     const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementationOnce(() => {
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementationOnce(() => {
       throw new Error("secret /tmp/private-config pid=4242");
     });
     process.env.HOME = home;
@@ -103,7 +136,7 @@ describe("handleSessionStart", () => {
       expect(stderrWrite.mock.calls.flat().join(" ")).not.toMatch(/secret|private-config|4242/u);
       expect(mockEnsureDaemon).not.toHaveBeenCalled();
     } finally {
-      selectStorageBackend.mockRestore();
+      fence.mockRestore();
       stderrWrite.mockRestore();
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
@@ -111,17 +144,18 @@ describe("handleSessionStart", () => {
     }
   });
 
-  it("rethrows publication journal errors during storage selection", async () => {
+  it("rethrows publication journal errors during hook publication admission", async () => {
     const publicationError = new BackendPublicationJournalError(
       "unresolved-publication",
       "publication remains unresolved",
     );
-    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend")
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence")
       .mockImplementationOnce(() => { throw publicationError; });
     try {
       await expect(handleSessionStart("{}", { post: vi.fn() })).rejects.toBe(publicationError);
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
     } finally {
-      selectStorageBackend.mockRestore();
+      fence.mockRestore();
     }
   });
 
@@ -532,6 +566,7 @@ describe("handleSessionStart", () => {
   it("uses the lexical canonical scope when daemon state is not created yet", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-restore-remediation-"));
     const previousHome = process.env.HOME;
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
     process.env.HOME = home;
     try {
       mockEnsureDaemon.mockResolvedValue({
@@ -545,6 +580,7 @@ describe("handleSessionStart", () => {
         stdout: "",
       });
     } finally {
+      fence.mockRestore();
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
       rmSync(home, { recursive: true, force: true });

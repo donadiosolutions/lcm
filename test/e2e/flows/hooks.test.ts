@@ -90,31 +90,35 @@ describe("Flow 15: PreCompact hook", { timeout: 60_000 }, () => {
     }
   });
 
-  it("returns exit 0 without output when PostgreSQL is unavailable", async () => {
+  it("continues to daemon transport when PostgreSQL is selected", async () => {
     const h = handle!;
     const client = new DaemonClient(`http://127.0.0.1:${h.daemonPort}`);
     const lifecycle = await import("../../../src/daemon/lifecycle.js");
-    const storageBackend = await import("../../../src/storage/backend.js");
     const ensureDaemon = vi.spyOn(lifecycle, "ensureDaemon").mockResolvedValue({
       connected: true,
       port: h.daemonPort,
       spawned: false,
     });
-    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend");
     const { handlePreCompact } = await import("../../../src/hooks/compact.js");
 
     try {
-      await expect(handlePreCompact(
+      await h.client.post("/ingest", {
+        session_id: "e2e-precompact-postgresql",
+        cwd: h.tmpDir,
+        messages: [{ role: "user", content: "PostgreSQL daemon transport fixture", tokenCount: 8 }],
+      });
+      const result = await handlePreCompact(
         JSON.stringify({ session_id: "e2e-precompact-postgresql", cwd: h.tmpDir }),
         client,
         h.daemonPort,
         { backend: "postgresql" },
-      )).resolves.toEqual({ exitCode: 0, stdout: "" });
-      expect(selectStorageBackend).toHaveBeenCalledOnce();
-      expect(selectStorageBackend).toHaveBeenCalledWith({ backend: "postgresql" });
-      expect(ensureDaemon).not.toHaveBeenCalled();
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("No compaction needed.");
+      expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+        expectedStorageBackend: "postgresql",
+      }));
     } finally {
-      selectStorageBackend.mockRestore();
       ensureDaemon.mockRestore();
     }
   });

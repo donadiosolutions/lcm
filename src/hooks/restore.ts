@@ -8,7 +8,6 @@ import { homedir } from "node:os";
 import { daemonPidPath, lcmHomeDir, tmpDir } from "../runtime-paths.js";
 import { fenceContent } from "../daemon/content-fence.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
-import { selectStorageBackend } from "../storage/backend.js";
 import {
   deleteRegularFile,
   assertPrivateDirectory,
@@ -187,7 +186,7 @@ export async function handleSessionStart(
   const pidFilePath = daemonPidPath();
   let ensureResult: EnsureResultWithRefusal;
   try {
-    selectStorageBackend(storage);
+    assertHookPublicationFence();
   } catch (error) {
     if (isBackendPublicationEvidenceMissing(error)) {
       emitAdmissionNotice(undefined, "ambiguous");

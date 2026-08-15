@@ -11,7 +11,6 @@ import { safeLogError } from "./hook-errors.js";
 import { configPath as defaultConfigPath, daemonPidPath, daemonTokenPath, lcmHomeDir } from "../runtime-paths.js";
 import { readAuthToken } from "../daemon/auth.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
-import { selectStorageBackend, StorageBackendUnavailableError } from "../storage/backend.js";
 import {
   clearDaemonNotice,
   maybeEmitDaemonNotice,
@@ -152,14 +151,12 @@ export async function handleSessionEnd(
   }>;
   try {
     try {
-      selectStorageBackend(storage);
+      assertHookPublicationFence();
     } catch (error) {
       if (isBackendPublicationJournalError(error) && !isBackendPublicationEvidenceMissing(error)) throw error;
       await safeLogError(
         "SessionEnd",
-        isBackendPublicationEvidenceMissing(error) && storage.backend === "postgresql"
-          ? new StorageBackendUnavailableError("postgresql")
-          : error,
+        error,
         {},
       );
       return { exitCode: 0, stdout: "" };

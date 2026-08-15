@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handlePreCompact } from "../../src/hooks/compact.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
-import * as storageBackend from "../../src/storage/backend.js";
+import * as publicationFence from "../../src/hooks/publication-fence.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 const promotionState = vi.hoisted(() => ({ error: undefined as Error | undefined }));
@@ -43,55 +43,74 @@ function mockDaemonClient(post: ReturnType<typeof vi.fn>): DaemonClient {
 describe("handlePreCompact", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(publicationFence.assertHookPublicationFence).mockReset();
+    vi.mocked(publicationFence.assertHookPublicationFence).mockImplementation(() => {});
     promotionState.error = undefined;
   });
 
-  it("keeps installed PreCompact best-effort when publication selection is unavailable", async () => {
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementationOnce(() => {
+  it("keeps installed PreCompact best-effort when publication admission is unresolved", async () => {
+    vi.mocked(publicationFence.assertHookPublicationFence).mockImplementationOnce(() => {
       throw new BackendPublicationJournalError("malformed-journal", "publication journal is malformed");
     });
-    try {
-      await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()), 3737, { backend: "postgresql" }))
-        .resolves.toEqual({ exitCode: 0, stdout: "" });
-      expect(mockEnsureDaemon).not.toHaveBeenCalled();
-      expect(mockSafeLogError).not.toHaveBeenCalled();
-    } finally {
-      select.mockRestore();
-    }
+
+    await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()), 3737, { backend: "postgresql" }))
+      .resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(mockSafeLogError).not.toHaveBeenCalled();
   });
 
-  it("reports PostgreSQL unavailability when publication evidence is missing", async () => {
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementationOnce(() => {
-      throw new BackendPublicationJournalError("publication-evidence-missing", "publication evidence is missing");
-    });
-    try {
-      await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()), 3737, { backend: "postgresql" }))
-        .resolves.toEqual({ exitCode: 0, stdout: "" });
-      expect(mockSafeLogError).toHaveBeenCalledWith(
-        "PreCompact",
-        expect.objectContaining({ name: "StorageBackendUnavailableError" }),
-        {},
-      );
-    } finally {
-      select.mockRestore();
-    }
-  });
-
-  it("preserves the publication error when SQLite evidence is missing", async () => {
-    const publicationError = new BackendPublicationJournalError(
-      "publication-evidence-missing",
-      "publication evidence is missing",
-    );
-    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementationOnce(() => {
+  it("logs missing publication evidence without converting it to PostgreSQL staged support", async () => {
+    const publicationError = new BackendPublicationJournalError("publication-evidence-missing", "publication evidence is missing");
+    vi.mocked(publicationFence.assertHookPublicationFence).mockImplementationOnce(() => {
       throw publicationError;
     });
-    try {
-      await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()), 3737, { backend: "sqlite" }))
-        .resolves.toEqual({ exitCode: 0, stdout: "" });
-      expect(mockSafeLogError).toHaveBeenCalledWith("PreCompact", publicationError, {});
-    } finally {
-      select.mockRestore();
-    }
+
+    await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()), 3737, { backend: "postgresql" }))
+      .resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(mockSafeLogError).toHaveBeenCalledWith("PreCompact", publicationError, {});
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+  });
+
+  it("preserves missing publication evidence for a SQLite selection", async () => {
+    const publicationError = new BackendPublicationJournalError("publication-evidence-missing", "publication evidence is missing");
+    vi.mocked(publicationFence.assertHookPublicationFence).mockImplementationOnce(() => {
+      throw publicationError;
+    });
+
+    await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()), 3737, { backend: "sqlite" }))
+      .resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(mockSafeLogError).toHaveBeenCalledWith("PreCompact", publicationError, {});
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+  });
+
+  it("continues to daemon transport for selected PostgreSQL", async () => {
+    mockEnsureDaemon.mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
+    const post = vi.fn().mockResolvedValue({ summary: "PostgreSQL compacted" });
+
+    await expect(handlePreCompact("{}", mockDaemonClient(post), 3737, { backend: "postgresql" }))
+      .resolves.toEqual({ exitCode: 0, stdout: "PostgreSQL compacted" });
+    expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+      expectedStorageBackend: "postgresql",
+    }));
+    expect(post).toHaveBeenCalledWith("/compact", expect.objectContaining({ client: "claude" }));
+    expect(mockSafeLogError).not.toHaveBeenCalled();
+  });
+
+  it("does not fall back to SQLite when the selected PostgreSQL daemon refuses admission", async () => {
+    mockEnsureDaemon.mockResolvedValueOnce({
+      connected: false,
+      port: 3737,
+      spawned: false,
+      refusalReason: "backend-mismatch",
+    });
+    const post = vi.fn();
+
+    await expect(handlePreCompact("{}", mockDaemonClient(post), 3737, { backend: "postgresql" }))
+      .resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+      expectedStorageBackend: "postgresql",
+    }));
+    expect(post).not.toHaveBeenCalled();
   });
 
   it("keeps the compact result best-effort when post-compaction admission fails", async () => {
@@ -114,20 +133,6 @@ describe("handlePreCompact", () => {
     } finally {
       promotionState.error = undefined;
     }
-  });
-
-  it("treats an unavailable PostgreSQL backend as a benign hook miss", async () => {
-    const post = vi.fn();
-    await expect(handlePreCompact("{}", mockDaemonClient(post), 3737, {
-      backend: "postgresql",
-    })).resolves.toEqual({ exitCode: 0, stdout: "" });
-    expect(mockEnsureDaemon).not.toHaveBeenCalled();
-    expect(mockSafeLogError).toHaveBeenCalledWith(
-      "PreCompact",
-      expect.objectContaining({ name: "StorageBackendUnavailableError" }),
-      {},
-    );
-    expect(post).not.toHaveBeenCalled();
   });
 
   it("fails open when daemon admission throws", async () => {

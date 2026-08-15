@@ -15,7 +15,6 @@ import {
 } from "./daemon-notice.js";
 import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remediation.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
-import { selectStorageBackend } from "../storage/backend.js";
 import { appendLocalHookEvents } from "./local-enqueue.js";
 import {
   assertHookPublicationFence,
@@ -203,7 +202,6 @@ export async function handleUserPromptSubmit(
 
     try {
       assertHookPublicationFence();
-      selectStorageBackend(selectedStorage);
     } catch (error) {
       if (isBackendPublicationJournalError(error)) {
         if (isBackendPublicationEvidenceMissing(error)) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };

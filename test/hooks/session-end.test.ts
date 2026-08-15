@@ -6,7 +6,7 @@ import { handleSessionEnd } from "../../src/hooks/session-end.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { loadDaemonConfig, type DaemonConfig } from "../../src/daemon/config.js";
 import { safeLogError } from "../../src/hooks/hook-errors.js";
-import * as storageBackend from "../../src/storage/backend.js";
+import * as publicationFence from "../../src/hooks/publication-fence.js";
 import * as daemonNotice from "../../src/hooks/daemon-notice.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
@@ -76,24 +76,57 @@ describe("handleSessionEnd", () => {
     vi.mocked(loadDaemonConfig).mockReturnValue(defaultConfig);
   });
 
-  it("treats an unavailable PostgreSQL backend as a benign hook miss", async () => {
+  it("continues to daemon transport for selected PostgreSQL", async () => {
     const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
     const client = createMockClient({ ingested: 1 });
-    await expect(handleSessionEnd("{}", client, 3737, {
-      backend: "postgresql",
-    })).resolves.toEqual({ exitCode: 0, stdout: "" });
-    expect(ensureDaemon).not.toHaveBeenCalled();
-    expect(safeLogError).toHaveBeenCalledWith("SessionEnd", expect.objectContaining({ name: "StorageBackendUnavailableError" }), {});
-    expect(client.post).not.toHaveBeenCalled();
-    expect(mockHttpReq.end).not.toHaveBeenCalled();
+    try {
+      await expect(handleSessionEnd(JSON.stringify({ session_id: "s1", cwd: "/proj" }), client, 3737, {
+        backend: "postgresql",
+      })).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+        expectedStorageBackend: "postgresql",
+      }));
+      expect(client.post).toHaveBeenCalledWith("/ingest", {
+        session_id: "s1",
+        cwd: "/proj",
+        client: "claude",
+      });
+      expect(safeLogError).not.toHaveBeenCalled();
+    } finally {
+      fence.mockRestore();
+    }
   });
 
-  it("converts missing publication evidence into the PostgreSQL unavailable diagnostic", async () => {
+  it("does not fall back to SQLite when the selected PostgreSQL daemon refuses admission", async () => {
+    const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
+    vi.mocked(ensureDaemon).mockResolvedValueOnce({
+      connected: false,
+      port: 3737,
+      spawned: false,
+      refusalReason: "backend-mismatch",
+    });
+    const client = createMockClient({ ingested: 1 });
+    try {
+      await expect(handleSessionEnd("{}", client, 3737, {
+        backend: "postgresql",
+      })).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+        expectedStorageBackend: "postgresql",
+      }));
+      expect(client.post).not.toHaveBeenCalled();
+    } finally {
+      fence.mockRestore();
+    }
+  });
+
+  it("keeps missing publication evidence bounded without a PostgreSQL staged diagnostic", async () => {
     const publicationError = new BackendPublicationJournalError(
       "publication-evidence-missing",
       "publication evidence is absent",
     );
-    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend")
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence")
       .mockImplementationOnce(() => { throw publicationError; });
     try {
       await expect(handleSessionEnd("{}", createMockClient({ ingested: 1 }), 3737, {
@@ -101,11 +134,12 @@ describe("handleSessionEnd", () => {
       })).resolves.toEqual({ exitCode: 0, stdout: "" });
       expect(safeLogError).toHaveBeenCalledWith(
         "SessionEnd",
-        expect.objectContaining({ name: "StorageBackendUnavailableError" }),
+        publicationError,
         {},
       );
+      expect((await import("../../src/daemon/lifecycle.js")).ensureDaemon).not.toHaveBeenCalled();
     } finally {
-      selectStorageBackend.mockRestore();
+      fence.mockRestore();
     }
   });
 
@@ -114,7 +148,7 @@ describe("handleSessionEnd", () => {
       "publication-evidence-missing",
       "publication evidence is absent",
     );
-    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend")
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence")
       .mockImplementationOnce(() => { throw publicationError; });
     try {
       await expect(handleSessionEnd("{}", createMockClient({ ingested: 1 }))).resolves.toEqual({
@@ -123,21 +157,22 @@ describe("handleSessionEnd", () => {
       });
       expect(safeLogError).toHaveBeenCalledWith("SessionEnd", publicationError, {});
     } finally {
-      selectStorageBackend.mockRestore();
+      fence.mockRestore();
     }
   });
 
-  it("rethrows an unresolved publication from backend selection", async () => {
+  it("rethrows an unresolved publication from hook publication admission", async () => {
     const publicationError = new BackendPublicationJournalError(
       "unresolved-publication",
       "publication remains unresolved",
     );
-    const selectStorageBackend = vi.spyOn(storageBackend, "selectStorageBackend")
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence")
       .mockImplementationOnce(() => { throw publicationError; });
     try {
       await expect(handleSessionEnd("{}", createMockClient({ ingested: 1 }))).rejects.toBe(publicationError);
+      expect((await import("../../src/daemon/lifecycle.js")).ensureDaemon).not.toHaveBeenCalled();
     } finally {
-      selectStorageBackend.mockRestore();
+      fence.mockRestore();
     }
   });
 
@@ -450,6 +485,7 @@ describe("handleSessionEnd", () => {
   it("emits bounded remediation when the canonical state root is absent", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-session-end-remediation-"));
     const previousHome = process.env.HOME;
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
     process.env.HOME = home;
     try {
       const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
@@ -464,6 +500,7 @@ describe("handleSessionEnd", () => {
         stdout: "",
       });
     } finally {
+      fence.mockRestore();
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
       rmSync(home, { recursive: true, force: true });
