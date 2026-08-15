@@ -595,7 +595,7 @@ const DOMAIN_DEPENDENCIES = PORTABLE_RECORD_SCHEMA_DESCRIPTOR.domainsByOrder as 
 >;
 
 function validateDependencyContract(record: PortableRecord, domain: PortableDomain): void {
-  if (typeof record !== "object" || record === null) fail("malformed-record", { domain });
+  if (!isObject(record)) fail("malformed-record", { domain });
   const dependencies = arrayValues(record.dependencies, "dependency-order");
   const expected = DOMAIN_DEPENDENCIES[domain].dependencies;
   if ((dependencies.length === 0) !== (expected.length === 0)) {
