@@ -1,75 +1,22 @@
 ---
 name: lcm-memory
-description: Long Context Manager (LCM) — search and store persistent memory across sessions
+description: "Agents MUST immediately store every newly recognized durable decision, preference, root cause, pattern, gotcha, solution, and reusable workflow, including its rationale. Use automatically injected memory first; automatic/passive capture is complementary and never a substitute for explicit durable storage."
 ---
 
 # Long Context Manager (LCM)
 
-> **Before responding to code tasks, check memory first.**
-> Code task? → `lcm search` FIRST. Completed work? → `lcm store` BEFORE done.
+## Required Workflow
 
-You have access to a persistent memory system that survives across conversations.
+- `lcm_search` / `lcm search "query"` — Recall relevant durable and episodic memory. Use automatically injected memory first; run this operation only when injected context is absent or insufficient.
+- `lcm_grep` / `lcm grep "pattern" --mode regex` — Find an exact keyword or regular-expression match in prior context. Run only when injected context and broad recall are insufficient and a precise match is needed.
+- `lcm_store` / `lcm store "memory with rationale"` — Persist durable knowledge with enough context to reuse later. Agents MUST immediately store every newly recognized durable decision, preference, root cause, pattern, gotcha, solution, and reusable workflow, including its rationale.
+- Automatic/passive capture is complementary and never a substitute for explicit durable storage.
+- When recalled memory affects the work, record feedback with `lcm_store` using both tags `signal:memory_used` and `memory_id:<actual-id>`. If MCP tools are unavailable, use `lcm store "memory-used feedback" --tag signal:memory_used --tag memory_id:<actual-id>`.
 
-## Workflow
+## Advanced Operations
 
-Code task received → `lcm search` FIRST → Work → `lcm store` → Done
-Non-code task → Just respond normally
+Use these advanced operations only on demand:
 
-## Commands
-
-### 1. Search Memory
-Retrieve relevant context before starting work.
-```bash
-lcm search "How is authentication implemented?"
-```
-
-### 2. Grep Memory
-Regex pattern search for precise matches.
-```bash
-lcm grep "createDaemon|startMcpServer" --mode regex
-```
-
-### 3. Describe Memory
-Inspect a specific node returned by search or grep.
-```bash
-lcm describe sum_abc123def456
-```
-
-### 4. Expand Memory
-Recover lower-level detail from a summary node.
-```bash
-lcm expand sum_abc123def456 --depth 2
-```
-
-### 5. Store Knowledge
-Persist important knowledge after completing work.
-```bash
-lcm store "Auth middleware uses JWT with 24h expiry. See src/middleware/auth.ts"
-```
-
-### 6. Stats
-Show token savings and compression ratios.
-```bash
-lcm stats
-```
-
-## Decision Table
-
-| Task Type | Search? | Store? |
-|-----------|---------|--------|
-| Add/create/implement feature | MUST | MUST |
-| Fix/debug/resolve bug | MUST | MUST |
-| Refactor/optimize/move code | MUST | MUST |
-| Write/add tests | MUST | MUST |
-| "How does X work?" (codebase) | MUST | Only if insights |
-| General concept question | NO | NO |
-| Meta task (run tests, build) | NO | NO |
-| Git task (commit, PR, push) | NO | NO |
-
-## Error Handling
-
-- If `lcm` is not found: run `npm install -g @donadiosolutions/lcm`
-- If daemon is unavailable: run `lcm doctor`, then `lcm daemon restart`
-- If a connector is stale after an upgrade: rerun `lcm connectors install <agent>`, then `lcm connectors doctor <agent>`
-- If search returns nothing: memory may be empty — proceed normally
-- Check status: `lcm doctor`
+- `lcm_describe` / `lcm describe <nodeId>` — Inspect a recalled node before retrieving more detail. Run only on demand when node metadata will guide deeper retrieval.
+- `lcm_expand` / `lcm expand <nodeId> --depth N` — Recover source detail from a recalled summary node. Run only on demand when the available summary is insufficient.
+- `lcm_doctor` / `lcm doctor` — Inspect LCM installation health. Run only on demand when troubleshooting LCM.

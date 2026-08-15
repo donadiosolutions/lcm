@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
@@ -9,6 +9,7 @@ import pkg from "../package.json";
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const PACKAGE_INVENTORY_TEST_TIMEOUT_MS = 45_000;
 const PACKAGE_COMMAND_TIMEOUT_MS = 30_000;
+const FRESH_BUILD_TEST_TIMEOUT_MS = 90_000;
 const POSTGRESQL_REFERENCE_FILES = [
   "postgresql-coordination.md",
   "postgresql-development.md",
@@ -180,6 +181,57 @@ describe("package.json", () => {
         || /\.(?:rs|rlib|a|dylib|so|exe)$/iu.test(path),
       );
       expect(forbiddenArtifacts).toEqual([]);
+    },
+  );
+
+  it(
+    "cleans retired connector templates and packs the canonical skill after a fresh build",
+    { timeout: FRESH_BUILD_TEST_TIMEOUT_MS },
+    () => {
+      const sourceSkill = resolve(
+        repositoryRoot,
+        "src/connectors/templates/skill/SKILL.md",
+      );
+      const stagedTemplates = resolve(
+        repositoryRoot,
+        "dist/src/connectors/templates",
+      );
+      const stagedSkill = resolve(stagedTemplates, "skill/SKILL.md");
+      const retiredTemplates = [
+        resolve(stagedTemplates, "mcp-base.md"),
+        resolve(stagedTemplates, "sections/mcp-workflow.md"),
+      ];
+
+      mkdirSync(resolve(stagedTemplates, "sections"), { recursive: true });
+      for (const retiredTemplate of retiredTemplates) {
+        writeFileSync(retiredTemplate, "stale asset that a fresh build must remove\n");
+      }
+
+      execFileSync("npm", ["run", "build"], {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        stdio: "pipe",
+        maxBuffer: 32 * 1024 * 1024,
+        timeout: FRESH_BUILD_TEST_TIMEOUT_MS - 10_000,
+      });
+
+      expect(readFileSync(stagedSkill, "utf8")).toBe(
+        readFileSync(sourceSkill, "utf8"),
+      );
+      for (const retiredTemplate of retiredTemplates) {
+        expect(existsSync(retiredTemplate), retiredTemplate).toBe(false);
+      }
+
+      const packagePaths = npmPackInventory();
+      expect(packagePaths).toContain(
+        "dist/src/connectors/templates/skill/SKILL.md",
+      );
+      expect(packagePaths).not.toContain(
+        "dist/src/connectors/templates/mcp-base.md",
+      );
+      expect(packagePaths).not.toContain(
+        "dist/src/connectors/templates/sections/mcp-workflow.md",
+      );
     },
   );
 

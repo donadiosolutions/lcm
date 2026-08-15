@@ -119,9 +119,14 @@ lcm connectors install codex --type rules
 
 Reinstalling generated Markdown connectors is byte-idempotent: the Codex skill
 `.codex/skills/lcm-memory/SKILL.md` remains byte-identical to its canonical
-template with exactly one final newline, and normal rules append installs remove
-and reappend their managed block without changing the established LF or CRLF
-style. One-run healing is limited to recognized current or legacy managed
+template with exactly one final newline. The skill and explicit rules fallback
+share one catalog of operation names, purposes, lifecycle triggers, and CLI/MCP
+spellings. Their lean workflow uses automatically injected memory first,
+requires immediate explicit storage of every newly recognized durable learning
+with its rationale, and treats automatic capture as complementary rather than a
+substitute. Normal rules append installs remove and reappend their managed block
+without changing the established LF or CRLF style. One-run healing is limited to
+recognized current or legacy managed
 blocks, the maximal union of their overlapping or touching recognized ranges,
 and a current marker followed only by one or more exact `# Workflow Instruction`
 lines as a recoverable header-only partial region. These recognized regions are

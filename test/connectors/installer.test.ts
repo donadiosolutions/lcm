@@ -866,7 +866,8 @@ describe('installConnector — Codex native hooks', () => {
     expect(rules).toContain(LCM_MARKERS.START);
     expect(countOccurrences(rules, LCM_MARKERS.START)).toBe(2);
     expect(rules).toContain('lcm search');
-    expect(rules).toContain('lcm --help');
+    expect(rules).toContain('MUST immediately store every newly recognized durable decision');
+    expect(rules).toContain('`signal:memory_used` and `memory_id:<actual-id>`');
     expect(rules).not.toContain('@lcm');
     expect(rules).not.toContain('LCM_CONNECTOR_START');
     expect(rules).not.toMatch(/claude/i);
@@ -966,7 +967,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(content).not.toContain(LEGACY_LCM_MARKERS.END);
     expect(content).not.toContain('old managed content');
     expect(content).not.toContain('@lcm Codex');
-    expect(content).toContain('lcm --help');
+    expect(content).toContain('MUST immediately store every newly recognized durable decision');
   });
 
   it('migrates the deprecated codex_hooks feature flag when installing hooks', () => {

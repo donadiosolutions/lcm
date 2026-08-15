@@ -13,6 +13,14 @@ export type MemoryHintSelection = {
 };
 
 const MEMORY_CONTEXT_INTRO = "Relevant context from previous sessions (use lcm_expand for details):";
+export const MEMORY_FEEDBACK_INSTRUCTION = fenceContent([
+  "If surfaced memory affects the work, record how it helped with `lcm_store`, using both `signal:memory_used` and `memory_id:<id>` for each memory used.",
+  "If `lcm_store` is unavailable, use the CLI fallback: `lcm store \"how this memory affected the work\" --tag signal:memory_used --tag memory_id:<id>`.",
+].join("\n"), "memory-feedback");
+
+export function buildMemoryFeedbackInstruction(ids: string[]): string | null {
+  return ids.length > 0 ? MEMORY_FEEDBACK_INSTRUCTION : null;
+}
 
 function normalizeHint(hint: string): string {
   return hint.trim().replace(/\s+/g, " ").toLowerCase();

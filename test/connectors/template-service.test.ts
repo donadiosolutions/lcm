@@ -1,8 +1,14 @@
 import { readFileSync } from 'node:fs';
-import { describe, it, expect } from 'vitest';
-import { generateRulesContent, generateMcpContent, generateSkillContent, generateContent } from '../../src/connectors/template-service.js';
+import { describe, expect, it } from 'vitest';
+import * as templateService from '../../src/connectors/template-service.js';
 import { LCM_MARKERS } from '../../src/connectors/constants.js';
 import type { Agent } from '../../src/connectors/types.js';
+
+const {
+  generateContent,
+  generateRulesContent,
+  generateSkillContent,
+} = templateService;
 
 const mockAgent: Agent = {
   id: 'test-agent',
@@ -34,103 +40,87 @@ const codexAgent: Agent = {
   },
 };
 
+const durableStorageRequirement =
+  'Agents MUST immediately store every newly recognized durable decision, preference, root cause, pattern, gotcha, solution, and reusable workflow, including its rationale.';
+const feedbackCliFallback =
+  '`lcm store "memory-used feedback" --tag signal:memory_used --tag memory_id:<actual-id>`';
+
 function countOccurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
 }
 
-const canonicalTagSchema = readFileSync(new URL('../../docs/tag-schema.md', import.meta.url), 'utf8');
+function expectLeanBindingGuidance(content: string): void {
+  expect(content).toContain(durableStorageRequirement);
+  expect(content).toContain('Automatic/passive capture is complementary and never a substitute');
+  expect(content).toContain('Use automatically injected memory first');
+  expect(content).toContain('only when injected context is absent or insufficient');
+  expect(content).toContain('`lcm_store`');
+  expect(content).toContain('`signal:memory_used` and `memory_id:<actual-id>`');
+  expect(content).toContain(feedbackCliFallback);
+
+  for (const category of [
+    'decision',
+    'preference',
+    'root cause',
+    'pattern',
+    'gotcha',
+    'solution',
+    'reusable workflow',
+  ]) {
+    expect(content).toContain(category);
+  }
+
+  expect(content).toContain('including its rationale');
+  expect(content).toContain('only on demand');
+  expect(content).toContain('lcm_describe');
+  expect(content).toContain('lcm_expand');
+  expect(content).toContain('lcm_doctor');
+
+  for (const excluded of [
+    /\bimport\b/iu,
+    /\bdiagnose\b/iu,
+    /\bstats\b/iu,
+    /\blcm_stats\b/iu,
+    /Tag conventions/iu,
+    /\brestart\b/iu,
+    /\brecovery loop\b/iu,
+    /connectors install/iu,
+    /\bserializ(?:e|ed|ation)\b/iu,
+    /one (?:read|operation) at a time/iu,
+    /## (?:Available Commands|Decision Table|Error Handling)/iu,
+    /lcm --help/iu,
+  ]) {
+    expect(content).not.toMatch(excluded);
+  }
+}
 
 describe('generateRulesContent', () => {
-  it('contains lcm search command', () => {
-    const content = generateRulesContent(mockAgent);
-    expect(content).toContain('lcm search');
-  });
+  it('renders one deterministic managed fallback whose body starts with the parser heading', () => {
+    const first = generateRulesContent(mockAgent);
+    const second = generateRulesContent(mockAgent);
 
-  it('contains LCM_MARKERS.START', () => {
-    const content = generateRulesContent(mockAgent);
-    expect(content).toContain(LCM_MARKERS.START);
-  });
-
-  it('contains LCM_MARKERS.END', () => {
-    const content = generateRulesContent(mockAgent);
-    expect(content).toContain(LCM_MARKERS.END);
-  });
-
-  it('contains exactly one managed lcm block', () => {
-    const content = generateRulesContent(mockAgent);
-    expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
-  });
-
-  it('substitutes all template variables (no {{}} placeholders remain)', () => {
-    const content = generateRulesContent(mockAgent);
-    expect(content).not.toMatch(/\{\{[^}]+\}\}/);
-  });
-
-  it('includes header when agent has one', () => {
-    const content = generateRulesContent(mockAgentWithHeader);
-    expect(content).toContain('trigger: always_on');
-  });
-
-  it('does not include header when agent has none', () => {
-    const content = generateRulesContent(mockAgent);
-    expect(content).not.toContain('trigger:');
-  });
-
-  it('contains available commands without the removed directives', () => {
-    const content = generateRulesContent(mockAgent);
-    expect(content).toContain('## Available Commands');
-    expect(content).toContain('lcm search "query"');
-    expect(content).toContain('lcm grep "pattern" --mode regex');
-    expect(content).toContain('lcm describe <nodeId>');
-    expect(content).toContain('lcm expand <nodeId> --depth N');
-    expect(content).toContain('lcm store');
-    expect(content).toContain(
-      '`lcm store "content" --tag type:solution --tag scope:lcm` — Store a solution related to LCM',
+    expect(Buffer.from(second).equals(Buffer.from(first))).toBe(true);
+    expect(first).toContain(`${LCM_MARKERS.START}\n# Workflow Instruction`);
+    expect(first.slice(first.indexOf(LCM_MARKERS.START))).toMatch(
+      /^<!-- lcm -->\n# Workflow Instruction/u,
     );
-    expect(content).toContain('## Tag conventions');
-    expect(content).toContain('Use these basic conventions by default; add others as needed:');
-    expect(content).toContain('`type:` — Kind of learning, such as `solution`, `decision`, `root-cause`, `workflow`, or `gotcha`');
-    expect(content).toContain('`project:` — Project or repository, such as `lcm`');
-    expect(content).toContain('`scope:` — Component or domain, such as `connectors`, `hooks`, or `codecov`');
-    for (const scopeTag of ['scope:connectors', 'scope:hooks', 'scope:codecov']) {
-      expect(canonicalTagSchema).toContain(`| \`${scopeTag}\` |`);
-    }
-    expect(content).toContain('`source:` — Origin, such as `session`, `adversarial-review`, or `ci`');
-    expect(content).toContain('`priority:` — Importance, from `P0` to `P3`');
-    expect(content).toContain('`category:` — Event category, such as `intent` or `mcp`');
-    expect(content).toContain(
-      '`signal:` — Memory signal, such as `memory_used`, `reinforced`, or `review`; pair `signal:memory_used` with `memory_id:<id>`',
-    );
-    expect(content).not.toContain('`memory_id:` —');
-    for (const tag of [
-      'category:intent',
-      'category:mcp',
-      'signal:memory_used',
-      'signal:reinforced',
-      'signal:review',
-    ]) {
-      expect(canonicalTagSchema).toContain(`| \`${tag}\` |`);
-    }
-    expect(canonicalTagSchema).toContain(
-      '| `memory_id:<id>` | The referenced promoted-memory identifier; pair with `signal:memory_used` so recall usage counting can attribute the memory |',
-    );
-    expect(content).not.toContain('`lcm store "content" --tag <tag>`');
-    expect(content).not.toContain('--tags');
-    expect(content).not.toContain('repeatable aliases');
-    expect(content).not.toContain('--tag,');
-    expect(content).toContain('lcm doctor');
-    expect(content).toContain('lcm diagnose');
-    expect(content).toContain('`lcm import`');
-    expect(content).toContain('lcm import --all');
-    expect(content).toContain('Run `lcm --help` for all options.');
-    expect(content).not.toContain('lcm stats');
-    expect(content).not.toContain('lcm import --codex');
-    expect(content).not.toContain('lcm import --provider all');
-    expect(content).not.toContain('lcm compact --all');
+    expect(first).toContain(LCM_MARKERS.END);
+    expect(countOccurrences(first, LCM_MARKERS.START)).toBe(2);
+    expect(first).not.toMatch(/\{\{[^}]+\}\}/u);
   });
 
-  it('omits legacy markers, footer tag, and extra separator', () => {
+  it('includes an agent header only when configured', () => {
+    expect(generateRulesContent(mockAgentWithHeader)).toContain('trigger: always_on');
+    expect(generateRulesContent(mockAgent)).not.toContain('trigger:');
+  });
+
+  it('enforces the lean durable-memory policy without excluded operational bloat', () => {
+    expectLeanBindingGuidance(generateRulesContent(mockAgent));
+  });
+
+  it('omits legacy markers, footer tags, separators, and agent-specific prose', () => {
     const content = generateRulesContent(mockAgent);
+
     expect(content).not.toContain('LCM_CONNECTOR_START');
     expect(content).not.toContain('LCM_CONNECTOR_END');
     expect(content).not.toContain('@lcm');
@@ -140,128 +130,70 @@ describe('generateRulesContent', () => {
   });
 
   it('keeps Codex generated rules free of Claude-specific text', () => {
-    const content = generateRulesContent(codexAgent);
-    expect(content).not.toMatch(/claude/i);
-  });
-});
-
-describe('generateMcpContent', () => {
-  it('contains lcm_search MCP tool', () => {
-    const content = generateMcpContent(mockAgent);
-    expect(content).toContain('lcm_search');
-  });
-
-  it('contains LCM_MARKERS.START', () => {
-    const content = generateMcpContent(mockAgent);
-    expect(content).toContain(LCM_MARKERS.START);
-  });
-
-  it('contains LCM_MARKERS.END', () => {
-    const content = generateMcpContent(mockAgent);
-    expect(content).toContain(LCM_MARKERS.END);
-  });
-
-  it('contains exactly one managed lcm block', () => {
-    const content = generateMcpContent(mockAgent);
-    expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
-  });
-
-  it('substitutes all template variables', () => {
-    const content = generateMcpContent(mockAgent);
-    expect(content).not.toMatch(/\{\{[^}]+\}\}/);
-  });
-
-  it('contains lcm_store tool', () => {
-    const content = generateMcpContent(mockAgent);
-    expect(content).toContain('lcm_store');
-  });
-
-  it('omits footer tag and extra separator', () => {
-    const content = generateMcpContent(mockAgent);
-    expect(content).not.toContain('@lcm');
-    expect(content).not.toContain('Test Agent');
-    expect(content).not.toContain('\n---\n');
-  });
-
-  it('keeps Codex generated MCP guidance free of Claude-specific text', () => {
-    const content = generateMcpContent(codexAgent);
-    expect(content).not.toMatch(/claude/i);
+    expect(generateRulesContent(codexAgent)).not.toMatch(/claude/iu);
   });
 });
 
 describe('generateSkillContent', () => {
-  it('contains lcm search command', () => {
-    const content = generateSkillContent(mockAgent);
-    expect(content).toContain('lcm search');
+  it('renders deterministically and remains byte-identical to the canonical packaged skill', () => {
+    const canonical = readFileSync(
+      new URL('../../src/connectors/templates/skill/SKILL.md', import.meta.url),
+      'utf8',
+    );
+    const first = generateSkillContent(mockAgent);
+    const second = generateSkillContent(codexAgent);
+
+    expect(canonical.endsWith('\n')).toBe(true);
+    expect(canonical.endsWith('\n\n')).toBe(false);
+    expect(Buffer.from(first).equals(Buffer.from(canonical))).toBe(true);
+    expect(Buffer.from(second).equals(Buffer.from(first))).toBe(true);
   });
 
-  it('contains lcm store command', () => {
+  it('makes immediate durable storage binding in both discovery metadata and the body', () => {
     const content = generateSkillContent(mockAgent);
-    expect(content).toContain('lcm store');
+    const frontmatter = content.match(/^---\n([\s\S]*?)\n---\n/u)?.[1];
+    const body = content.replace(/^---\n[\s\S]*?\n---\n/u, '');
+
+    expect(frontmatter).toContain(durableStorageRequirement);
+    expect(body).toContain(durableStorageRequirement);
+    expectLeanBindingGuidance(body);
   });
 
-  it('uses canonical daemon and connector recovery guidance', () => {
-    const content = generateSkillContent(mockAgent);
-    expect(content).toContain('lcm doctor');
-    expect(content).toContain('lcm daemon restart');
-    expect(content).toContain('lcm connectors install <agent>');
-    expect(content).toContain('lcm connectors doctor <agent>');
-    expect(content).not.toContain('lcm daemon start --detach');
-    expect(content).not.toContain('lcm daemon start --foreground');
-    expect(content).not.toContain('pkill');
+  it('shares the exact catalog-rendered operational wording with the rules fallback', () => {
+    const skillGuidance = generateSkillContent(mockAgent).match(
+      /# Long Context Manager \(LCM\)\n\n([\s\S]*?)\n$/u,
+    )?.[1];
+    const rulesGuidance = generateRulesContent(mockAgent).match(
+      /# Workflow Instruction\n\n([\s\S]*?)\n<!-- lcm -->$/u,
+    )?.[1];
+
+    expect(skillGuidance).toBeDefined();
+    expect(rulesGuidance).toBe(skillGuidance);
   });
 
-  it('contains a describe example with a node id', () => {
-    const content = generateSkillContent(mockAgent);
-    expect(content).toContain('lcm describe sum_abc123def456');
-  });
-
-  it('contains an expand example with explicit depth', () => {
-    const content = generateSkillContent(mockAgent);
-    expect(content).toContain('lcm expand sum_abc123def456 --depth 2');
-  });
-
-  it('does not contain LCM start marker (standalone file)', () => {
-    const content = generateSkillContent(mockAgent);
-    expect(content).not.toContain(LCM_MARKERS.START);
-  });
-
-  it('does not contain LCM end marker (standalone file)', () => {
-    const content = generateSkillContent(mockAgent);
-    expect(content).not.toContain(LCM_MARKERS.END);
-  });
-
-  it('contains YAML frontmatter', () => {
-    const content = generateSkillContent(mockAgent);
-    expect(content).toContain('name: lcm-memory');
-  });
-
-  it('keeps generated Codex skill content free of Claude-specific text', () => {
+  it('is a standalone lcm-memory skill without connector markers or agent-specific prose', () => {
     const content = generateSkillContent(codexAgent);
-    expect(content).not.toMatch(/claude/i);
+
+    expect(content).toContain('name: lcm-memory');
+    expect(content).not.toContain(LCM_MARKERS.START);
+    expect(content).not.toContain(LCM_MARKERS.END);
+    expect(content).not.toMatch(/claude/iu);
   });
 });
 
 describe('generateContent dispatch', () => {
-  it('delegates rules to generateRulesContent', () => {
-    const content = generateContent(mockAgent, 'rules');
-    expect(content).toContain(LCM_MARKERS.START);
-    expect(content).toContain('lcm search');
-    expect(content).toContain('lcm --help');
-  });
-
-  it('delegates mcp to generateMcpContent', () => {
-    const content = generateContent(mockAgent, 'mcp');
-    expect(content).toContain('lcm_search');
-  });
-
-  it('delegates skill to generateSkillContent', () => {
-    const content = generateContent(mockAgent, 'skill');
-    expect(content).toContain('lcm store');
-    expect(content).not.toContain(LCM_MARKERS.START);
+  it('delegates rules and skill rendering', () => {
+    expect(generateContent(mockAgent, 'rules')).toBe(generateRulesContent(mockAgent));
+    expect(generateContent(mockAgent, 'skill')).toBe(generateSkillContent(mockAgent));
   });
 
   it('throws for hook type', () => {
-    expect(() => generateContent(mockAgent, 'hook')).toThrow('Hook connectors are managed by the structured connector installer');
+    expect(() => generateContent(mockAgent, 'hook')).toThrow(
+      'Hook connectors are managed by the structured connector installer',
+    );
+  });
+
+  it('does not expose the retired MCP template generator', () => {
+    expect(templateService).not.toHaveProperty('generateMcpContent');
   });
 });

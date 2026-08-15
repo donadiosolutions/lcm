@@ -19,7 +19,7 @@ const productionFiles = [
 // Implementation and test files are intentionally excluded so compatibility
 // aliases and lifecycle seams remain testable without becoming recovery advice.
 const guidanceSurfaceFiles = [
-  "README.md", ".agents/skills/lcm-context/SKILL.md", ".agents/skills/lcm-dogfood/SKILL.md",
+  "README.md", ".agents/skills/lcm-dogfood/SKILL.md",
   ".agents/skills/lcm-dogfood/references/checks.md",
   ".agents/skills/lcm-dogfood/references/known-issues.md",
   ".agents/skills/lcm-e2e/SKILL.md", ".agents/skills/lcm-e2e/checklist.md",
@@ -30,9 +30,7 @@ const guidanceSurfaceFiles = [
   "docs/issue-triage.md", "docs/passive-learning.md", "docs/privacy.md",
   "docs/project-identity.md", "docs/releasing.md", "docs/tag-schema.md",
   "docs/vscode-codex.md", "src/cli-help.ts", "src/connectors/templates/base.md",
-  "src/connectors/templates/mcp-base.md",
   "src/connectors/templates/sections/command-reference.md",
-  "src/connectors/templates/sections/mcp-workflow.md",
   "src/connectors/templates/sections/workflow.md",
   "src/connectors/templates/skill/SKILL.md",
   "src/connectors/templates/claude/skills/lcm-context/SKILL.md",
