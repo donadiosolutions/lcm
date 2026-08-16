@@ -480,6 +480,29 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(201);
   });
 
+  test("keeps the dogfooding fix files exclusively in their intended components", () => {
+    const config = readCodecovConfig();
+    expect(config).toBeDefined();
+    if (config === undefined) {
+      return;
+    }
+
+    const components = validateComponents(configuredComponents(config));
+    const expectedOwners = [
+      ["bin/lcm.ts", "unit-cli"],
+      ["src/daemon/config.ts", "unit-daemon-core"],
+      ["src/connectors/installer.ts", "unit-connectors"],
+    ] as const;
+
+    for (const [file, expectedOwner] of expectedOwners) {
+      expect(productionFiles).toContain(file);
+      const owners = components
+        .filter((component) => component.ownershipPaths.some((path) => matchesOwnershipPath(file, path)))
+        .map((component) => component.component_id);
+      expect(owners).toEqual([expectedOwner]);
+    }
+  });
+
   test("does not match non-production TypeScript files", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();

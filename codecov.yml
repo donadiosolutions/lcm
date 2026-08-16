@@ -6,6 +6,7 @@ component_management:
     - component_id: "unit-cli"
       name: "Unit - CLI"
       paths:
+        # Keep the #691 command-routing entrypoint exclusively in Unit - CLI.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
@@ -35,6 +36,7 @@ component_management:
     - component_id: "unit-connectors"
       name: "Unit - Connectors"
       paths:
+        # Codex MCP absence classification (#716) remains connector-owned.
         - "src/connectors/"
     - component_id: "unit-hooks"
       name: "Unit - Hooks"
@@ -44,6 +46,7 @@ component_management:
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
+        # The #691 configuration snapshot seam remains daemon-core-owned.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"

@@ -53,6 +53,34 @@ for example `lcm export --tags decision,architecture`.
 An unknown command writes an error and the complete command list to the
 terminal, completes both outputs, and then exits with status 1.
 
+## Healthy-daemon read routing
+
+The following daemon-backed reads use a migration-free preflight when the
+managed daemon is healthy:
+
+| Command | Read performed by the daemon |
+|---|---|
+| `lcm search <query>` | Search episodic and promoted memory |
+| `lcm grep <query>` | Search messages and summaries by exact text or regular expression |
+| `lcm describe <nodeId>` | Read summary or stored-memory metadata |
+| `lcm expand <nodeId>` | Expand a summary into source detail |
+| `lcm status` | Read daemon and project status |
+| `lcm stats --pool` | Read daemon connection-pool statistics |
+
+Before using this route, LCM reads a bounded, no-follow configuration snapshot
+without taking the private mutation/publication lock. It then requires a
+present daemon token, authenticated healthy health response, matching storage
+backend, and an unchanged configuration witness. This lets ordinary reads
+continue while a publication consumer holds the exclusive lock.
+
+The route is fail closed. A missing or unreadable configuration, missing token,
+failed or ambiguous health check, backend mismatch, or configuration change
+between the two snapshot reads returns to the existing authenticated migration
+and daemon-lifecycle path. LCM never treats an uncertain snapshot as permission
+to bypass migration, signal an unknown process, or mutate state. Commands that
+are not one of the six reads above retain their existing migration and locking
+behavior.
+
 ## Daemon-dependent resilience
 
 `lcm doctor` limits the complete daemon health exchange to two seconds. The
