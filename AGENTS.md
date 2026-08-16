@@ -14,8 +14,12 @@
   `npm run test:ci` reports 100% lines, 100% branches, 100% functions, and
   100% statements and passes the per-file threshold for the complete collected
   scope.
-- Use focused Vitest coverage runs while developing individual subsystems, but
-  never lower any threshold or narrow the collected scope.
+- For local development and pre-push verification, run only the tests relevant
+  to the code being changed and its direct integration boundaries. If the
+  impact is uncertain, err on the side of caution and widen the local test
+  scope before pushing. Do not run unrelated local suites solely to duplicate
+  the complete CI run; rely on CI to exercise the complete collected scope and
+  enforce the 100% coverage gate.
 - Do not use coverage exclusions, `v8 ignore` directives, skipped tests, or
   untested production wrappers to satisfy the gate. Cover behavior through
   observable public seams and deterministic failure injection.
