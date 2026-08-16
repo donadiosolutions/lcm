@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 import fastUri from "fast-uri";
@@ -9,6 +9,7 @@ import pkg from "../package.json";
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const PACKAGE_INVENTORY_TEST_TIMEOUT_MS = 45_000;
 const PACKAGE_COMMAND_TIMEOUT_MS = 30_000;
+const FRESH_BUILD_TEST_TIMEOUT_MS = 90_000;
 const POSTGRESQL_REFERENCE_FILES = [
   "postgresql-coordination.md",
   "postgresql-development.md",
@@ -180,6 +181,61 @@ describe("package.json", () => {
         || /\.(?:rs|rlib|a|dylib|so|exe)$/iu.test(path),
       );
       expect(forbiddenArtifacts).toEqual([]);
+    },
+  );
+
+  it(
+    "packs only canonical guidance sources after a fresh build",
+    { timeout: FRESH_BUILD_TEST_TIMEOUT_MS },
+    () => {
+      const sourceGuidance = resolve(repositoryRoot, "src/connectors/templates/guidance");
+      const stagedTemplates = resolve(
+        repositoryRoot,
+        "dist/src/connectors/templates",
+      );
+      const stagedGuidance = resolve(stagedTemplates, "guidance");
+      const retiredTemplates = [
+        resolve(stagedTemplates, "../operation-catalog.js"),
+        resolve(stagedTemplates, "../operation-catalog.d.ts"),
+        resolve(stagedTemplates, "../operation-catalog.js.map"),
+        resolve(stagedTemplates, "base.md"),
+        resolve(stagedTemplates, "operation-catalog.ts"),
+        resolve(stagedTemplates, "sections/workflow.md"),
+        resolve(stagedTemplates, "sections/command-reference.md"),
+        resolve(stagedTemplates, "skill/SKILL.md"),
+        resolve(stagedTemplates, "claude/skills/lcm-context/SKILL.md"),
+      ];
+
+      for (const retiredTemplate of retiredTemplates) {
+        mkdirSync(dirname(retiredTemplate), { recursive: true });
+        writeFileSync(retiredTemplate, "stale asset that a fresh build must remove\n");
+      }
+
+      execFileSync("npm", ["run", "build"], {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        stdio: "pipe",
+        maxBuffer: 32 * 1024 * 1024,
+        timeout: FRESH_BUILD_TEST_TIMEOUT_MS - 10_000,
+      });
+
+      expect(readdirSync(stagedGuidance).sort()).toEqual(readdirSync(sourceGuidance).sort());
+      for (const file of readdirSync(sourceGuidance)) {
+        expect(readFileSync(resolve(stagedGuidance, file), "utf8")).toBe(
+          readFileSync(resolve(sourceGuidance, file), "utf8"),
+        );
+      }
+      for (const retiredTemplate of retiredTemplates) {
+        expect(existsSync(retiredTemplate), retiredTemplate).toBe(false);
+      }
+
+      const packagePaths = npmPackInventory();
+      for (const file of readdirSync(sourceGuidance)) {
+        expect(packagePaths).toContain(`dist/src/connectors/templates/guidance/${file}`);
+      }
+      for (const retiredTemplate of retiredTemplates) {
+        expect(packagePaths).not.toContain(relative(repositoryRoot, retiredTemplate));
+      }
     },
   );
 

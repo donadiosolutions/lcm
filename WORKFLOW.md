@@ -8,13 +8,12 @@ This document is a living record. **Update it whenever you learn something:**
 
 - A step that failed or caused rework → add it to Common Pitfalls
 - A new default answer that proved correct → add it to the Defaults table
-- A Copilot interaction pattern that worked (or didn't) → update the Copilot section
 - A phase that needed reordering or an extra step → revise the phase
 - A new tool, command, or technique that saved time → document it
 
 **When to update:** At the end of every feature cycle (after the implementation PR merges), review this doc against what actually happened. If reality diverged from the doc, fix the doc — not reality.
 
-**How to update:** Create a `docs/TOPIC` branch, push, complete the Copilot review loop, and require every protected exact-head check to pass. Set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`. Same flow as any other docs change.
+**How to update:** Create a `docs/TOPIC` branch, push, and require every protected exact-head check to pass. Set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`. Same flow as any other docs change.
 
 ## Branch Strategy
 
@@ -196,9 +195,9 @@ or service fails.
 | Install behavior        | Auto-write files (match ByteRover (brv) UX)                    |
 | State tracking          | Filesystem scan (no state files)                               |
 | Release strategy        | Parallel tracks with separate PRs                              |
-| PR review               | Copilot review loop; CodeRabbit is informational               |
+| PR review               | Required protected reviews and checks; CodeRabbit is informational |
 
-## Phase 1: Design (Opus, max effort)
+## Phase 1: Design (maximum-capability review, maximum effort)
 
 1. Study the spec/requirements using brainstorming skill
 2. Ask clarifying questions only for genuinely ambiguous decisions — use defaults above for standard questions
@@ -210,25 +209,23 @@ or service fails.
 
 ## Phase 2: Spec Review via PR
 
-1. **Sync first:** Set `TARGET_BRANCH` according to Branch Strategy, then run `git checkout "$TARGET_BRANCH" && git pull --ff-only origin "$TARGET_BRANCH"` before branching — stale local bases cause Copilot to review unrelated code
+1. **Sync first:** Set `TARGET_BRANCH` according to Branch Strategy, then run `git checkout "$TARGET_BRANCH" && git pull --ff-only origin "$TARGET_BRANCH"` before branching — stale local bases can include unrelated code in the pull request
 2. Create a `docs/TOPIC` branch from the selected target branch
 3. Ensure only documentation files are in the diff — specs, plans, workflow docs
 4. Push and open PR
-5. Request Copilot review (add `copilot-pull-request-reviewer[bot]` to reviewers)
-6. Run review loop (see Copilot Review Loop below)
-7. Once the Copilot loop is complete (max 3 rounds — see Review Loop) and every protected exact-head check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`.
-8. Confirm `gh pr view "${PR_NUMBER}" --repo donadiosolutions/lcm --json state --jq .state` reports `MERGED` before starting implementation. If the merge command or final state check fails, inspect `gh pr checks "${PR_NUMBER}" --repo donadiosolutions/lcm` and resolve the protected-branch failure without an administrator bypass.
+5. Once every protected exact-head check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`.
+6. Confirm `gh pr view "${PR_NUMBER}" --repo donadiosolutions/lcm --json state --jq .state` reports `MERGED` before starting implementation. If the merge command or final state check fails, inspect `gh pr checks "${PR_NUMBER}" --repo donadiosolutions/lcm` and resolve the protected-branch failure without an administrator bypass.
 
-## Phase 3: Implementation (Sonnet subagents)
+## Phase 3: Implementation (designated implementation subagents)
 
 1. **Sync first:** Set `TARGET_BRANCH` according to Branch Strategy, then run `git checkout "$TARGET_BRANCH" && git pull --ff-only origin "$TARGET_BRANCH"` to get the latest target (including merged specs)
-2. Dispatch `model: sonnet` subagents with `isolation: worktree` for each task in the plan
+2. Dispatch designated implementation subagents with `isolation: worktree` for each task in the plan
 3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
 4. **Sequential tasks** → launch the dependent branch only after the upstream PR merges, then branch from the updated target branch. If a downstream branch already exists on the old upstream tip, enter its isolated worktree, set `TARGET_BRANCH` and `OLD_UPSTREAM_TIP`, and replay only its downstream commits with `git fetch origin "$TARGET_BRANCH" && git rebase --onto "origin/$TARGET_BRANCH" "${OLD_UPSTREAM_TIP}"`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
 5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
-6. After subagent completes: review the diff, push, open PR, request Copilot review
+6. After subagent completes: review the diff, push, and open a PR
 
-## Phase 4: Final Review (Opus, max effort)
+## Phase 4: Final Review (maximum-capability review, maximum effort)
 
 1. Review all implementation work against the spec
 2. Run full test suite — all tests must pass
@@ -238,83 +235,11 @@ or service fails.
 ## Phase 5: Implementation PR + Automated Review
 
 1. Push implementation branch, open PR
-2. Request Copilot review (add to reviewers list)
-3. Run review loop (see below)
-4. Once the Copilot loop is complete and every protected exact-head check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`
-5. Confirm the implementation PR reports `MERGED` before beginning post-merge validation or dependent work.
+2. Once every protected exact-head check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`
+3. Confirm the implementation PR reports `MERGED` before beginning post-merge validation or dependent work.
 
-## Copilot Interaction
+## Common Git and PR Pitfalls
 
-### Actions
-
-- **Trigger code review:** Add `copilot-pull-request-reviewer` to PR reviewers via `gh pr edit --add-reviewer`
-- **Re-trigger review** (after pushing fixes): `gh pr edit --remove-reviewer` then `--add-reviewer` (see Exact Commands)
-- **Delegate work** (have Copilot open a PR): Tag `@copilot` in a PR comment
-- **Reply to Copilot comments:** Start inline replies with `@copilot`
-- **Never** tag `@copilot` in comments when you want a review — it opens a new PR instead
-
-### Exact Commands
-
-```bash
-# Request review (and re-trigger after fixes)
-gh pr edit {n} --repo {owner}/{repo} --remove-reviewer copilot-pull-request-reviewer
-sleep 2
-gh pr edit {n} --repo {owner}/{repo} --add-reviewer copilot-pull-request-reviewer
-```
-
-**Why `gh pr edit` and not the REST API:**
-The REST `requested_reviewers` endpoint returns **422** for bot reviewers ("Reviews may only be requested from collaborators"). `gh pr edit` uses the GraphQL API internally and handles bot reviewers correctly. Confirmed working on PR #56.
-
-**Methods that do NOT work:**
-
-- `gh api -X POST .../requested_reviewers -f 'reviewers[]=copilot-pull-request-reviewer'` — 422 for bots
-- Empty commits — Copilot does not reliably trigger on diffs with no substantive changes
-- Tagging `@copilot` in comments — opens a new PR instead of reviewing
-
-### Polling for Review Completion
-
-Copilot reviews take 1-3 minutes. Do NOT sleep-poll in a loop. Use background commands.
-
-```bash
-# 1. Check if review request is still pending (Copilot hasn't started):
-gh pr view {n} --json reviewRequests --jq '.reviewRequests[].login'
-# Empty = Copilot picked it up. "copilot-pull-request-reviewer[bot]" = still pending.
-
-# 2. Check review count (compare before/after):
-gh api repos/{owner}/{repo}/pulls/{n}/reviews --jq '. | length'
-
-# 3. Most reliable: check timeline for reviewed event:
-gh api 'repos/{owner}/{repo}/issues/{n}/timeline?per_page=100' \
-  --jq '[.[] | select(.event == "review_requested" or .event == "reviewed")] | .[-2:]'
-# If last event is "reviewed" → review complete.
-# If last event is "review_requested" → still in progress.
-
-# 4. Get latest review details:
-gh api repos/{owner}/{repo}/pulls/{n}/reviews \
-  --jq '.[-1] | {state: .state, body: .body[:300]}'
-
-# 5. Get new inline comments (after a timestamp):
-gh api repos/{owner}/{repo}/pulls/{n}/comments \
-  --jq '[.[] | select(.created_at > "TIMESTAMP")] | .[] | {path: .path, line: .line, body: .body[:250]}'
-```
-
-### Copilot Review Loop
-
-1. Request review (POST to requested_reviewers)
-2. Launch one background polling command that sleeps for 180 seconds before checking the review count and comments
-3. When notified, check latest review state and new comments
-4. If comments found:
-   a. **Batch ALL fixes** into a single commit (do not fix-push-review one at a time)
-   b. Push once
-   c. Re-trigger review (DELETE + POST)
-5. **Max 3 rounds.** After round 3, stop the Copilot loop if only minor nits remain. Do not chase zero Copilot comments indefinitely; all protected exact-head checks and actionable review threads are still required before merge.
-6. Review is "clean" when: 0 new comments, or only context-specific nits that Copilot can't understand (e.g., Agent conventions)
-
-### Common Pitfalls
-
-- **Stale diff**: Always sync the selected target branch before creating topic branches. If that target has unpushed local commits, the PR diff includes unrelated code and Copilot reviews the wrong things.
-- **@copilot in comments**: Opens a new PR instead of triggering review. Always use the reviewers API.
-- **REST API 422 for Copilot bot**: The `requested_reviewers` REST endpoint rejects bot slugs. Use `gh pr edit --add-reviewer` instead.
-- **Empty commits don't trigger Copilot**: Copilot only reviews on substantive diffs. Use `gh pr edit` re-request instead.
+- **Stale diff**: Always sync the selected target branch before creating topic branches. If that target has unpushed local commits, the PR diff includes unrelated code.
 - **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Set `TARGET_BRANCH` according to Branch Strategy, `CLEAN_BRANCH` to the new branch name, and `DOCS_COMMIT_SHA` to the documentation commit, then use `git checkout -B "${CLEAN_BRANCH}" "origin/${TARGET_BRANCH}" && git cherry-pick "${DOCS_COMMIT_SHA}"`.
 - **Sequential PR chains**: Create PR B from the updated target branch only after PR A lands. If PR B already contains commits based on PR A's old tip, enter PR B's isolated worktree, set `TARGET_BRANCH` and `OLD_PR_A_TIP`, and replay only its own commits with `git fetch origin "$TARGET_BRANCH" && git rebase --onto "origin/$TARGET_BRANCH" "${OLD_PR_A_TIP}"`. Omit the branch argument so Git rebases the branch already checked out in that worktree instead of attempting a conflicting cross-worktree checkout.

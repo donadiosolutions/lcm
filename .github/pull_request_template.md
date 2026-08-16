@@ -1,6 +1,6 @@
 ## Summary
 
-<!-- What changed? Be specific — Copilot uses this for review context. -->
+<!-- What changed? Be specific. -->
 
 ## Motivation / Why
 
@@ -32,20 +32,6 @@ A major package Changeset also selects Breaking changes.
 ## Related issues
 
 <!-- Closes #N -->
-
-## Copilot review focus areas
-
-> This repo is a TypeScript SQLite daemon (Long Context Manager (LCM) / lcm).
-> Please pay extra attention to:
-
-- **DB connection pattern**: All DB access uses `getLcmConnection()`/`closeLcmConnection()`? No `new DatabaseSync()` directly?
-- **PRAGMA enforcement**: New connections set `journal_mode=WAL` and `foreign_keys=ON`?
-- **Type safety**: No `any` types added without explicit justification? All function signatures typed?
-- **`collectStats()` hot path**: Is `collectStats()` (~13s) called in any request handler or hot path? It must not be.
-- **Test coverage**: New routes have corresponding tests in `test/daemon/routes/`?
-- **SQLite transactions**: Are multi-step writes wrapped in transactions to prevent partial writes?
-- **Error handling**: Do route handlers return structured error responses, not raw exceptions?
-- **Migration safety**: Are schema migrations additive-only (no DROP COLUMN, no type changes)?
 
 ## Checklist
 

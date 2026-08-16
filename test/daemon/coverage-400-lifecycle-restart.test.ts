@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   linkSync,
   lstatSync,
@@ -182,6 +183,11 @@ function root(prefix = "lcm-coverage-restart-"): string {
   return value;
 }
 
+function privateDirectory(path: string): void {
+  mkdirSync(path, { recursive: true });
+  chmodSync(path, 0o700);
+}
+
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
@@ -228,7 +234,8 @@ function hermetic(options: EnsureDaemonOptions, environment: NodeJS.ProcessEnv =
     sleep: options._sleepOverride ?? (async () => undefined),
     realpath: options._realpathOverride ?? (path => path),
   };
-  for (const directory of [seams.homeDir, seams.runtimeDir, seams.credentialDir, seams.procRoot]) mkdirSync(directory, { recursive: true });
+  privateDirectory(seams.homeDir);
+  for (const directory of [seams.runtimeDir, seams.credentialDir, seams.procRoot]) mkdirSync(directory, { recursive: true });
   return { ...options, _hermeticTestSeams: seams };
 }
 
@@ -520,7 +527,9 @@ function testScopeFixture(prefix = "scope-"): { root: string; scope: DaemonLifec
   const stateDir = join(homeDir, ".lcm");
   const credentialDir = join(homeDir, "credentials");
   const entrypoint = join(runtimeDir, "daemon.mjs");
-  for (const path of [homeDir, runtimeDir, stateDir, credentialDir]) mkdirSync(path, { recursive: true });
+  privateDirectory(homeDir);
+  privateDirectory(stateDir);
+  for (const path of [runtimeDir, credentialDir]) mkdirSync(path, { recursive: true });
   writeFileSync(entrypoint, "setTimeout(() => {}, 60_000);\n");
   const dependencies = {
     fetch: vi.fn().mockRejectedValue(new Error("offline")),
@@ -2474,7 +2483,7 @@ describe("legacy restart and terminal cleanup coverage", () => {
       ...baseOptions(dir),
       validateBeforeRestart: () => {
         rmSync(dir, { recursive: true, force: true });
-        mkdirSync(dir, { recursive: true });
+        privateDirectory(dir);
       },
     });
     expect(result.warning).toContain("hermetic state changed during restart validation");

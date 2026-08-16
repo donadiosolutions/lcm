@@ -65,6 +65,7 @@ const state = vi.hoisted(() => ({
   installConnector: vi.fn(() => ({ path: "/hook", requiresRestart: false })),
   removeConnector: vi.fn(() => true),
   installed: [] as Array<{ agentId: string; type: string; path: string }>,
+  storedCodexTransport: undefined as "cli" | "mcp" | undefined,
   batchResult: { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] },
   batchError: undefined as unknown,
   batchPatch: { lastResult: { ok: true } } as Record<string, unknown>,
@@ -136,6 +137,7 @@ vi.mock("../../src/worktree-reconciliation.js", () => ({
 vi.mock("../../src/config-manager.js", () => ({
   getConfigValue: vi.fn(() => "value"), formatConfigValue: vi.fn((value: unknown) => String(value)),
   normalizeConfigPath: vi.fn((path: string) => path), setConfigValue: vi.fn(() => "stored"),
+  readConnectorTransport: vi.fn(() => state.storedCodexTransport),
 }));
 vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
   if (state.batchError !== undefined) throw state.batchError;
@@ -154,11 +156,15 @@ vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
 } }));
 vi.mock("../../src/hooks/dispatch.js", () => ({ dispatchHook: state.dispatchHook }));
 vi.mock("../../src/connectors/registry.js", () => ({
-  AGENTS: [{ id: "codex", name: "Codex", category: "agent", defaultTypes: ["hook", "mcp"], supportedTypes: ["hook", "mcp"] }],
+  AGENTS: [{
+    id: "codex", name: "Codex", category: "cli", defaultTransport: "cli",
+    capabilities: { cli: { guidance: ["skill"] }, mcp: { guidance: ["skill"], mcpAdapter: true } },
+  }],
   findAgent: vi.fn((name: string) => name === "codex" ? ({ id: "codex", name: "Codex" }) : undefined),
 }));
 vi.mock("../../src/connectors/installer.js", () => ({
-  listConnectors: vi.fn(() => state.installed), installConnector: state.installConnector, removeConnector: state.removeConnector,
+  listConnectors: vi.fn(() => state.installed), listConnectorInventory: undefined,
+  installConnector: state.installConnector, removeConnector: state.removeConnector,
 }));
 vi.mock("../../src/import.js", () => ({
   cwdToProjectHash: vi.fn(() => "cwd-hash"), findSessionFiles: vi.fn(() => ["one", "two"]),
@@ -232,6 +238,7 @@ beforeEach(() => {
   });
   state.files.clear(); state.exists.clear(); state.entries = []; state.readError = undefined;
   state.fileText = "{}"; state.packageVersion = "1.4.0"; state.installed = [];
+  state.storedCodexTransport = undefined;
   state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] };
   state.batchError = undefined;
   state.batchPatch = { lastResult: { ok: true } };
@@ -656,6 +663,7 @@ describe("runCli lifecycle and connector boundaries", () => {
     state.installed = [{ agentId: "codex", type: "hook", path: "/hook" }];
     expect(await invoke(["connectors", "list"])).toBeUndefined();
     expect(await invoke(["connectors", "list", "--format", "json"])).toBeUndefined();
+    expect(await invoke(["connectors", "doctor"])).toBeUndefined();
     state.installConnector.mockImplementationOnce(() => { throw new Error("install failed"); });
     expect((await invoke(["connectors", "install", "codex"]))?.message).toBe("exit:1");
     state.removeConnector.mockImplementationOnce(() => { throw new Error("remove failed"); });

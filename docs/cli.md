@@ -16,6 +16,23 @@ lcm project link --help
 lcm connectors install --help
 ```
 
+Connector installation manages one complete transport bundle per agent:
+
+```bash
+lcm connectors install <agent> [--transport cli|mcp] [--global]
+lcm connectors remove <agent> [--global]
+```
+
+An explicit transport wins over stored
+`connectors.transports.<agent-id>`, which wins over the registry default;
+implicit defaults are not persisted. Claude Code, Qwen Code, and Zed default
+to MCP. Codex and every other agent default to CLI, while Cline and Augment
+are CLI-only until verifiable MCP adapters exist. CLI bundles use skill
+guidance or rules fallback plus native hooks where implemented. MCP bundles use
+MCP-only guidance plus native hooks where implemented; guidance never falls
+back between transports. Removal is whole-bundle. The former component
+selection option is removed.
+
 Nested help is resolved before command execution. A help request therefore
 never starts the daemon, changes a machine or project identity, installs or removes
 a connector, or performs another command action. For known commands, this
@@ -26,7 +43,7 @@ The store command accepts one tag per occurrence using either long spelling;
 the aliases can be mixed and retain command-line order:
 
 ```bash
-lcm store "Use ensureDaemon before background promote" --tag type:solution --tags scope:lcm
+lcm store 'Use ensureDaemon before background promote' --tag type:solution --tag scope:project --tag project:lcm --tag 'source:<actual-thread-uuid>'
 ```
 
 In `lcm store`, `--tag` and `--tags` are repeatable single-tag aliases. This is

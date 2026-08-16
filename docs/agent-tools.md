@@ -4,20 +4,23 @@ LCM provides seven MCP tools for agents to search, inspect, store, and recall in
 
 ## Usage patterns
 
-### Escalation pattern: grep → describe → expand
+### Recall order
 
-Most recall tasks follow this escalation:
+Use the least-expensive available context in this order:
 
-1. **`lcm_grep`** — Find relevant summaries or messages by keyword/regex
-2. **`lcm_describe`** — Inspect a specific summary's metadata and lineage (cheap, no DAG traversal)
-3. **`lcm_expand`** — Deep recall: decompress a summary node into its full source content
+1. **Injected memory** — Use the memory already present in the current context.
+2. **`lcm_search`** — Broadly recall related knowledge across sessions when the injected memory is absent or insufficient.
+3. **`lcm_grep`** — Find an exact keyword, error message, or function name only when broad recall is insufficient and a precise match is needed.
+4. **`lcm_describe`** — Inspect a specific summary's metadata and lineage (cheap, no DAG traversal).
+5. **`lcm_expand`** — Decompress a summary node into its full source content when the required detail was compressed away.
 
-Start with grep. If the snippet is enough, stop. If you need metadata, use describe. If you need details that were compressed away, use expand.
+Do not start with `lcm_grep`: use broad recall first, then narrow to an exact
+match only when necessary.
 
 ### When to search vs. grep
 
-- **`lcm_search`** — Use when looking for knowledge across sessions in natural language. Returns ranked results from both episodic (SQLite) and semantic memory layers.
-- **`lcm_grep`** — Use when you know an exact keyword, error message, or function name from a specific session.
+- **`lcm_search`** — Use after checking injected memory when looking for knowledge across sessions in natural language. Returns ranked results from both episodic (SQLite) and semantic memory layers.
+- **`lcm_grep`** — Use only after broad `lcm_search` recall is insufficient and you need an exact keyword, error message, or function name.
 
 ### When to expand
 
@@ -33,7 +36,7 @@ Summaries are lossy by design. The "Expand for details about:" footer at the end
 
 ### lcm_search
 
-Hybrid search across episodic memory (SQLite FTS5) and semantic memory. Returns two separate ranked lists. Use when looking for project knowledge spanning multiple sessions.
+Hybrid search across episodic memory (SQLite FTS5) and semantic memory. Returns two separate ranked lists. Use when looking for project knowledge spanning multiple sessions. Results can include passively captured context after it has been indexed, in addition to explicitly stored durable memories.
 
 **Parameters:**
 
@@ -73,10 +76,10 @@ Search conversation history by keyword or regex across raw messages and summarie
 
 ```
 # Search for an error message across all history
-lcm_grep(query: "ECONNREFUSED")
+lcm_grep(query: 'ECONNREFUSED')
 
 # Search only summaries for a specific term
-lcm_grep(query: "config\\.threshold", scope: "summaries")
+lcm_grep(query: 'config\\.threshold', scope: 'summaries')
 ```
 
 ### lcm_describe
@@ -119,7 +122,9 @@ lcm_expand(nodeId: "sum_def456", depth: 2)
 
 ### lcm_store
 
-Store a memory into Long Context Manager (LCM)'s semantic layer. Use to persist decisions, findings, reasoning outcomes, or any knowledge worth retrieving in future sessions.
+Store a memory into Long Context Manager (LCM)'s semantic layer. Immediately
+store each newly recognized durable decision, preference, root cause, pattern,
+gotcha, solution, or reusable workflow, including its rationale.
 
 **Parameters:**
 
@@ -134,14 +139,14 @@ Store a memory into Long Context Manager (LCM)'s semantic layer. Use to persist 
 ```
 # Store an architectural decision
 lcm_store(
-  text: "Auth uses JWT with 24h expiry. Tokens stored in httpOnly cookies.",
-  tags: ["type:decision", "scope:security", "project:lcm"]
+  text: "Decision: Auth uses JWT with 24h expiry and httpOnly cookies. Rationale: this preserves stateless API verification while preventing client-side script access to tokens.",
+  tags: ["type:decision", "scope:project", "project:lcm", "source:<actual-thread-uuid>"]
 )
 
 # Store a solution with sprint tag
 lcm_store(
   text: "Fixed ECONNREFUSED by calling ensureDaemon before the request.",
-  tags: ["type:solution", "scope:lcm", "sprint:sp4"]
+  tags: ["type:solution", "scope:project", "project:lcm", "source:<actual-thread-uuid>"]
 )
 ```
 
@@ -170,12 +175,14 @@ Add instructions to your agent's system prompt so it knows when to use LCM tools
 ```markdown
 ## Memory & Context
 
-Use LCM tools for recall:
-1. `lcm_search` — Hybrid search across all memory layers (broad recall)
-2. `lcm_grep` — Search by keyword/regex (exact match)
-3. `lcm_describe` — Inspect a specific summary's metadata (cheap, no expansion)
-4. `lcm_expand` — Expand a summary node into source content (when you need lost detail)
-5. `lcm_store` — Persist a decision or finding for future sessions
+Use LCM tools for recall in this order:
+1. Use memory already injected into the current context.
+2. Call `lcm_search` for broad recall when injected memory is absent or insufficient.
+3. Call `lcm_grep` only when broad recall is insufficient and an exact match is needed; prefer single quotes for regex or shell-sensitive patterns.
+4. Call `lcm_describe` for metadata and lineage when a specific result needs inspection.
+5. Call `lcm_expand` only when a summary has compressed away detail you need.
+6. Call `lcm_store` immediately for each newly recognized durable decision, preference, root cause, pattern, gotcha, solution, or reusable workflow. Include its rationale and exactly one `type:<classification>` tag, literal `scope:project` or `scope:user`, `project:<repo>`, and optional `source:<actual-thread-uuid>` when a real UUID is available.
+7. When recalled memory affects the work, store one feedback memory per used memory with exactly one `type:feedback`, literal `scope:project` or `scope:user`, `project:<repo>`, optional `source:<actual-thread-uuid>` when a real UUID is available, and both `signal:memory_used` and `memory_id:<id>`.
 
 When summaries in context have an "Expand for details about:" footer
 listing something you need, use `lcm_expand` with that summary's node ID.

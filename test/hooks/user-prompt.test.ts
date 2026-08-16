@@ -47,6 +47,8 @@ import { ensureProjectDir } from "../../src/daemon/project.js";
 import { extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 import { firePromoteEventsNotifyRequest } from "../../src/hooks/session-end.js";
+import { MEMORY_FEEDBACK_INSTRUCTION, memoryFeedbackInstruction } from "../../src/hooks/memory-context.js";
+import * as memoryContext from "../../src/hooks/memory-context.js";
 
 const mockEnsureDaemon = vi.mocked(ensureDaemon);
 const mockEventsDbPath = vi.mocked(eventsDbPath);
@@ -58,6 +60,12 @@ type ClientFixture = {
   health?: ReturnType<typeof vi.fn>;
   post: ReturnType<typeof vi.fn>;
 };
+
+const EMPTY_HOOK_RESULT = { exitCode: 0, stdout: "" };
+
+function countOccurrences(value: string, needle: string): number {
+  return value.split(needle).length - 1;
+}
 
 function asDaemonClient(client: ClientFixture): DaemonClient {
   // DaemonClient has private runtime state; these hook tests exercise only its public post seam.
@@ -91,7 +99,7 @@ describe("handleUserPromptSubmit", () => {
     else process.env.CLAUDE_PROJECT_DIR = originalClaudeProjectDir;
   });
 
-  it("returns hint when daemon returns matches", async () => {
+  it("emits context plus exactly one compact feedback block for multiple actual ids", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const client = {
       health: vi.fn(),
@@ -107,12 +115,23 @@ describe("handleUserPromptSubmit", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("<memory-context>");
     expect(result.stdout).toContain("PostgreSQL");
+    expect(countOccurrences(result.stdout, "<memory-feedback>")).toBe(1);
+    expect(countOccurrences(result.stdout, "</memory-feedback>")).toBe(1);
+    expect(result.stdout).toContain("When recalled memory affects the work");
+    expect(result.stdout).toContain("lcm_store");
+    expect(result.stdout).not.toContain("lcm store ");
+    expect(result.stdout).toContain("signal:memory_used");
+    expect(result.stdout).toContain("memory_id:<id>");
+    const feedback = result.stdout.slice(result.stdout.indexOf("<memory-feedback>"));
+    expect(feedback).not.toContain("uuid-1");
+    expect(feedback).not.toContain("uuid-2");
+    expect(result.stdout).not.toContain("<learning-instruction>");
     expect(client.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({
-      learningInstructionBytes: expect.any(Number),
+      learningInstructionBytes: Buffer.byteLength(MEMORY_FEEDBACK_INSTRUCTION, "utf8"),
     }));
   });
 
-  it("includes surfaced-memory-ids comment when ids are returned", async () => {
+  it("keeps one surfaced id in metadata while feedback remains generic", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const client = {
       health: vi.fn(),
@@ -126,9 +145,12 @@ describe("handleUserPromptSubmit", () => {
       asDaemonClient(client),
     );
     expect(result.stdout).toContain("<!-- surfaced-memory-ids: abc-123 -->");
+    expect(result.stdout).toContain("signal:memory_used");
+    expect(result.stdout).toContain("memory_id:<id>");
+    expect(result.stdout.slice(result.stdout.indexOf("<memory-feedback>"))).not.toContain("abc-123");
   });
 
-  it("omits surfaced-memory-ids comment when ids are absent", async () => {
+  it("emits memory context without feedback when surfaced ids are absent", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const client = {
       health: vi.fn(),
@@ -140,7 +162,10 @@ describe("handleUserPromptSubmit", () => {
       JSON.stringify({ session_id: "s1", cwd: "/proj", prompt: "what framework?" }),
       asDaemonClient(client),
     );
+    expect(result.stdout).toContain("<memory-context>");
     expect(result.stdout).not.toContain("surfaced-memory-ids");
+    expect(result.stdout).not.toContain("<memory-feedback>");
+    expect(result.stdout).not.toContain("lcm_store");
   });
 
   it("returns empty when daemon returns no matches", async () => {
@@ -153,9 +178,43 @@ describe("handleUserPromptSubmit", () => {
       JSON.stringify({ session_id: "s1", cwd: "/proj", prompt: "hello" }),
       asDaemonClient(client),
     );
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("<learning-instruction>");
-    expect(result.stdout).not.toContain("<memory-context>");
+    expect(result).toEqual(EMPTY_HOOK_RESULT);
+  });
+
+  it("keeps feedback transport-pure and ignores a raw-input transport override", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = {
+      health: vi.fn(),
+      post: vi.fn().mockResolvedValue({ hints: ["Use the CLI path"], ids: ["id-cli"] }),
+    };
+    const result = await handleUserPromptSubmit(
+      JSON.stringify({ session_id: "s1", cwd: "/proj", prompt: "which path?", transport: "mcp" }),
+      asDaemonClient(client),
+      undefined,
+      undefined,
+      "cli",
+    );
+    expect(result.stdout).toContain("lcm store '");
+    expect(result.stdout).not.toContain("lcm_store");
+    expect(result.stdout).toContain("surfaced-memory-ids: id-cli");
+    expect(result.stdout.slice(result.stdout.indexOf("<memory-feedback>"))).not.toContain("id-cli");
+    expect(client.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({
+      learningInstructionBytes: Buffer.byteLength(memoryFeedbackInstruction("cli"), "utf8"),
+    }));
+  });
+
+  it("infers CLI feedback for a legacy Codex command without prompt-time config reads", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = {
+      health: vi.fn(),
+      post: vi.fn().mockResolvedValue({ hints: ["Codex memory"], ids: ["id-codex"] }),
+    };
+    const result = await handleUserPromptSubmit(
+      JSON.stringify({ client: "codex", session_id: "s1", cwd: "/proj", prompt: "search" }),
+      asDaemonClient(client),
+    );
+    expect(result.stdout).toContain("lcm store '");
+    expect(result.stdout).not.toContain("lcm_store");
   });
 
   it("repairs non-Codex hooks for an eventless prompt after publication admission", async () => {
@@ -174,11 +233,31 @@ describe("handleUserPromptSubmit", () => {
         asDaemonClient({ post: vi.fn() }),
         3737,
         { backend: "sqlite" },
-      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
       expect(order).toEqual(["fence", "repair", "fence", "fence"]);
     } finally {
       fence.mockRestore();
       repair.mockRestore();
+    }
+  });
+
+  it("propagates an explicit current transport to non-Codex auto-heal", async () => {
+    const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {});
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
+    mockExtractUserPromptEvents.mockReturnValueOnce([]);
+    mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj", session_id: "s1" }),
+        asDaemonClient({ post: vi.fn() }),
+        3737,
+        { backend: "sqlite" },
+        "cli",
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
+      expect(repair).toHaveBeenCalledWith(undefined, "cli");
+    } finally {
+      repair.mockRestore();
+      fence.mockRestore();
     }
   });
 
@@ -200,7 +279,7 @@ describe("handleUserPromptSubmit", () => {
         asDaemonClient({ post: vi.fn() }),
         3737,
         { backend: "sqlite" },
-      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
       expect(append).not.toHaveBeenCalled();
       expect(order).toEqual(["fence", "repair", "fence", "fence"]);
     } finally {
@@ -230,7 +309,7 @@ describe("handleUserPromptSubmit", () => {
         asDaemonClient({ post: vi.fn() }),
         3737,
         { backend: "sqlite" },
-      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
       expect(append).toHaveBeenCalledTimes(1);
       expect(repair).not.toHaveBeenCalled();
     } finally {
@@ -256,7 +335,7 @@ describe("handleUserPromptSubmit", () => {
         asDaemonClient({ post: vi.fn() }),
         3737,
         { backend: "sqlite" },
-      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
       expect(append).toHaveBeenCalledTimes(1);
       expect(repair).not.toHaveBeenCalled();
     } finally {
@@ -294,15 +373,14 @@ describe("handleUserPromptSubmit", () => {
     }
   });
 
-  it("returns learning-instruction when daemon unreachable", async () => {
+  it("fails open with empty output when the daemon is unavailable", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: false, port: 3737, spawned: false });
     const client = { health: vi.fn(), post: vi.fn() };
     const result = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "remember this", cwd: "/proj", session_id: "s1" }),
       asDaemonClient(client),
     );
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("<learning-instruction>");
+    expect(result).toEqual(EMPTY_HOOK_RESULT);
     expect(client.post).not.toHaveBeenCalled();
   });
 
@@ -321,7 +399,7 @@ describe("handleUserPromptSubmit", () => {
         3737,
         { backend: "sqlite" },
       );
-      expect(result.stdout).toContain("<learning-instruction>");
+      expect(result).toEqual(EMPTY_HOOK_RESULT);
       expect(notice).toHaveBeenCalledTimes(1);
       expect(notice).toHaveBeenCalledWith({
         scope: join(home, ".lcm"),
@@ -355,7 +433,7 @@ describe("handleUserPromptSubmit", () => {
         3737,
         { backend: "postgresql" },
       );
-      expect(result.stdout).toContain("<learning-instruction>");
+      expect(result).toEqual(EMPTY_HOOK_RESULT);
       expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({
         expectedStorageBackend: "postgresql",
       }));
@@ -386,7 +464,7 @@ describe("handleUserPromptSubmit", () => {
         client,
         3737,
         { backend: "sqlite" },
-      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
       expect(scrub).toHaveBeenCalledWith([event], "/proj");
       expect(client.post).toHaveBeenCalledWith("/prompt-search", expect.any(Object));
     } finally {
@@ -407,7 +485,7 @@ describe("handleUserPromptSubmit", () => {
       await expect(handleUserPromptSubmit(
         JSON.stringify({ prompt: "hello", cwd: "/proj" }),
         asDaemonClient({ post: vi.fn() }),
-      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
       expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({ port: 3737 }));
     } finally {
       config.mockRestore();
@@ -455,7 +533,7 @@ describe("handleUserPromptSubmit", () => {
         asDaemonClient({ post: vi.fn() }),
         3737,
         { backend: "sqlite" },
-      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
       expect(mockEnsureDaemon).not.toHaveBeenCalled();
     } finally {
       fence.mockRestore();
@@ -483,7 +561,7 @@ describe("handleUserPromptSubmit", () => {
         asDaemonClient({ post: vi.fn().mockResolvedValue({ hints: [] }) }),
         3737,
         { backend: "sqlite" },
-      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
       expect(scrub).toHaveBeenNthCalledWith(2, [event], "/proj", []);
       expect(append).toHaveBeenCalledWith(expect.objectContaining({ events: [event] }));
     } finally {
@@ -511,7 +589,7 @@ describe("handleUserPromptSubmit", () => {
         3737,
         { backend: "sqlite" },
       );
-      expect(result.stdout).toContain("<learning-instruction>");
+      expect(result).toEqual(EMPTY_HOOK_RESULT);
       expect(mockEnsureDaemon).not.toHaveBeenCalled();
     } finally {
       append.mockRestore();
@@ -539,7 +617,7 @@ describe("handleUserPromptSubmit", () => {
         asDaemonClient({ post: vi.fn() }),
         3737,
         { backend: "sqlite" },
-      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
       await expect(handleUserPromptSubmit(
         input,
         asDaemonClient({ post: vi.fn() }),
@@ -570,11 +648,11 @@ describe("handleUserPromptSubmit", () => {
     const input = JSON.stringify({ prompt: "hello", cwd: "/proj" });
     try {
       await expect(handleUserPromptSubmit(input, asDaemonClient({ post: vi.fn() }), 3737, { backend: "sqlite" }))
-        .resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+        .resolves.toEqual(EMPTY_HOOK_RESULT);
       await expect(handleUserPromptSubmit(input, asDaemonClient({ post: vi.fn() }), 3737, { backend: "sqlite" }))
         .rejects.toBe(unresolvedError);
       await expect(handleUserPromptSubmit(input, asDaemonClient({ post: vi.fn() }), 3737, { backend: "sqlite" }))
-        .resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+        .resolves.toEqual(EMPTY_HOOK_RESULT);
     } finally {
       fence.mockRestore();
     }
@@ -610,7 +688,7 @@ describe("handleUserPromptSubmit", () => {
     }
   });
 
-  it("returns the protocol-safe instruction for missing evidence from prompt search", async () => {
+  it("returns protocol-safe empty output for missing evidence from prompt search", async () => {
     const publicationError = new BackendPublicationJournalError(
       "publication-evidence-missing",
       "publication evidence is absent",
@@ -625,7 +703,7 @@ describe("handleUserPromptSubmit", () => {
         3737,
         { backend: "sqlite" },
       );
-      expect(result).toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      expect(result).toEqual(EMPTY_HOOK_RESULT);
     } finally {
       fence.mockRestore();
     }
@@ -690,7 +768,7 @@ describe("handleUserPromptSubmit", () => {
     expect(client.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({
       query: "we decided to use PostgreSQL",
     }));
-    expect(result).toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+    expect(result).toEqual(EMPTY_HOOK_RESULT);
   });
 
   it("keeps local enqueue before selected project metadata and daemon admission", async () => {
@@ -713,7 +791,7 @@ describe("handleUserPromptSubmit", () => {
         asDaemonClient({ post: vi.fn() }),
         3737,
         { backend: "sqlite" },
-      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
       expect(order).toEqual(["enqueue", "project", "ensure"]);
     } finally {
       append.mockRestore();
@@ -763,7 +841,7 @@ describe("handleUserPromptSubmit", () => {
       await expect(handleUserPromptSubmit(
         JSON.stringify({ prompt: "we chose SQLite", cwd: inputCwd, session_id: "s1" }),
         client,
-      )).resolves.toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
       expect(order[0]).toBe("enqueue");
       for (const action of ["project", "repair", "config", "daemon", "search"]) {
         const actionIndex = order.indexOf(action);
@@ -808,7 +886,7 @@ describe("handleUserPromptSubmit", () => {
         JSON.stringify({ prompt: "hello", cwd: "/proj", client: "codex" }),
         asDaemonClient({ post: vi.fn() }),
       );
-      expect(result).toEqual({ exitCode: 0, stdout: expect.stringContaining("<learning-instruction>") });
+      expect(result).toEqual(EMPTY_HOOK_RESULT);
       expect(stderrWrite.mock.calls.flat().join(" ")).not.toMatch(/secret|private-config|4242/u);
       expect(mockEnsureDaemon).not.toHaveBeenCalled();
     } finally {
@@ -820,7 +898,7 @@ describe("handleUserPromptSubmit", () => {
     }
   });
 
-  it("returns learning-instruction when prompt is missing", async () => {
+  it("returns empty output when the prompt is missing", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const client = {
       health: vi.fn(),
@@ -830,14 +908,30 @@ describe("handleUserPromptSubmit", () => {
       JSON.stringify({ session_id: "s1", cwd: "/proj" }),
       asDaemonClient(client),
     );
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("<learning-instruction>");
+    expect(result).toEqual(EMPTY_HOOK_RESULT);
+    expect(client.post).not.toHaveBeenCalled();
   });
 
-  it.each([null, 42, "   "])("returns learning instruction for invalid prompt %j", async (prompt) => {
+  it.each([null, 42, "   "])("returns empty output for invalid prompt %j", async (prompt) => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const result = await handleUserPromptSubmit(JSON.stringify({ prompt }), asDaemonClient({ post: vi.fn() }));
-    expect(result.stdout).toContain("<learning-instruction>");
+    expect(result).toEqual(EMPTY_HOOK_RESULT);
+  });
+
+  it("fails open with empty output when the project root is unavailable", async () => {
+    const root = vi.spyOn(publicationFence, "assertHookRootEstablished")
+      .mockImplementationOnce(() => { throw new Error("project root unavailable"); });
+    const client = asDaemonClient({ post: vi.fn() });
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj" }),
+        client,
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
+      expect(client.post).not.toHaveBeenCalled();
+    } finally {
+      root.mockRestore();
+    }
   });
 
   it("falls back to process cwd and skips sidecar persistence without a session", async () => {
@@ -851,20 +945,28 @@ describe("handleUserPromptSubmit", () => {
     expect(MockEventsDb).not.toHaveBeenCalled();
   });
 
-  it("handles a missing hints property and prompt-search failure", async () => {
+  it("fails open for missing or unusable hints and prompt-search failure", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     mockExtractUserPromptEvents.mockReturnValue([]);
     const missing = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "hello", session_id: "s1" }),
       asDaemonClient({ post: vi.fn().mockResolvedValue({}) }),
     );
-    expect(missing.stdout).toContain("<learning-instruction>");
+    expect(missing).toEqual(EMPTY_HOOK_RESULT);
+
+    const unusable = await handleUserPromptSubmit(
+      JSON.stringify({ prompt: "hello", session_id: "s1" }),
+      asDaemonClient({ post: vi.fn().mockResolvedValue({
+        hints: ["   ", 42 as unknown as string],
+      }) }),
+    );
+    expect(unusable).toEqual(EMPTY_HOOK_RESULT);
 
     const failed = await handleUserPromptSubmit(
       JSON.stringify({ prompt: "hello", session_id: "s1" }),
       asDaemonClient({ post: vi.fn().mockRejectedValue(new Error("failed")) }),
     );
-    expect(failed.stdout).toContain("<learning-instruction>");
+    expect(failed).toEqual(EMPTY_HOOK_RESULT);
   });
 
   it("keeps the prompt hook successful when prompt-search reports staged PostgreSQL", async () => {
@@ -883,14 +985,13 @@ describe("handleUserPromptSubmit", () => {
       asDaemonClient({ post: vi.fn().mockRejectedValue(stagedError) }),
     );
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("<learning-instruction>");
+    expect(result).toEqual(EMPTY_HOOK_RESULT);
     expect(result.stdout).not.toContain("STORAGE_BACKEND_STAGED");
   });
 
   it("handles empty stdin and logs extraction errors using the environment cwd", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
-    expect((await handleUserPromptSubmit("", asDaemonClient({ post: vi.fn() }))).stdout).toContain("<learning-instruction>");
+    expect(await handleUserPromptSubmit("", asDaemonClient({ post: vi.fn() }))).toEqual(EMPTY_HOOK_RESULT);
     process.env.CLAUDE_PROJECT_DIR = "/env-project";
     mockExtractUserPromptEvents.mockImplementationOnce(() => { throw new Error("failed"); });
     await handleUserPromptSubmit(
@@ -899,7 +1000,7 @@ describe("handleUserPromptSubmit", () => {
     );
   });
 
-  it("includes learning-instruction block in output", async () => {
+  it("never emits static learning guidance when memory context has no ids", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const mockClient = {
       health: vi.fn(),
@@ -909,13 +1010,13 @@ describe("handleUserPromptSubmit", () => {
       JSON.stringify({ prompt: "test query", cwd: "/tmp/test", session_id: "s1" }),
       asDaemonClient(mockClient),
     );
-    expect(result.stdout).toContain("<learning-instruction>");
-    expect(result.stdout).toContain("lcm_store");
-    expect(result.stdout).toContain("type:decision");
-    expect(result.stdout).toContain("</learning-instruction>");
+    expect(result.stdout).toContain("<memory-context>");
+    expect(result.stdout).not.toContain("<learning-instruction>");
+    expect(result.stdout).not.toContain("<memory-feedback>");
+    expect(result.stdout).not.toContain("lcm_store");
   });
 
-  it("includes signal:memory_used recall instruction", async () => {
+  it("includes conditional signal:memory_used feedback without expanding the surfaced id", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const mockClient = {
       health: vi.fn(),
@@ -927,9 +1028,10 @@ describe("handleUserPromptSubmit", () => {
     );
     expect(result.stdout).toContain("signal:memory_used");
     expect(result.stdout).toContain("memory_id:<id>");
+    expect(result.stdout).not.toContain("memory_id:uuid-1");
   });
 
-  it("includes learning-instruction even when no memory-context hints", async () => {
+  it("emits no guidance when no memory-context hints are returned", async () => {
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const mockClient = {
       health: vi.fn(),
@@ -939,8 +1041,22 @@ describe("handleUserPromptSubmit", () => {
       JSON.stringify({ prompt: "test query", cwd: "/tmp/test", session_id: "s1" }),
       asDaemonClient(mockClient),
     );
-    expect(result.stdout).toContain("<learning-instruction>");
-    expect(result.stdout).not.toContain("<memory-context>");
+    expect(result).toEqual(EMPTY_HOOK_RESULT);
+  });
+
+  it("returns empty output when context construction yields no block", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const buildContext = vi.spyOn(memoryContext, "buildMemoryContextWithFeedback")
+      .mockReturnValueOnce(null);
+    try {
+      const result = await handleUserPromptSubmit(
+        JSON.stringify({ session_id: "s1", cwd: "/proj", prompt: "remember" }),
+        asDaemonClient({ post: vi.fn().mockResolvedValue({ hints: ["hint"] }) }),
+      );
+      expect(result).toEqual(EMPTY_HOOK_RESULT);
+    } finally {
+      buildContext.mockRestore();
+    }
   });
 
   it("extracts decision events to sidecar before prompt-search", async () => {
@@ -1146,7 +1262,7 @@ describe("handleUserPromptSubmit", () => {
         JSON.stringify({ prompt: "hello", cwd: "/proj" }),
         asDaemonClient({ health: vi.fn(), post: vi.fn() }),
       );
-      expect(result.stdout).toContain("<learning-instruction>");
+      expect(result).toEqual(EMPTY_HOOK_RESULT);
 
       mockEnsureDaemon.mockResolvedValueOnce({
         connected: false,

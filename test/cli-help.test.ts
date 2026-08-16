@@ -86,12 +86,17 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("lcm daemon restart");
   });
 
-  it("prints both ordered store tag aliases", () => {
+  it("prints the canonical durable-store tag set", () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     printHelp("store");
     const text = out.mock.calls.map(c => c[0]).join("");
     expect(text).toContain("--tag, --tags <tag>");
-    expect(text).toContain("--tag type:solution --tags scope:lcm");
+    expect(text).toContain("lcm store 'Auth uses JWT with 24h expiry' --tag 'type:solution' --tag 'scope:project' --tag 'project:lcm' --tag 'source:<actual-thread-uuid>'");
+    expect(text).toContain("lcm store 'Use ensureDaemon before background promote' --tag 'type:solution' --tag 'scope:project' --tag 'project:lcm' --tag 'source:<actual-thread-uuid>'");
+    expect(text).not.toContain('lcm store "Auth uses JWT with 24h expiry"');
+    expect(text).not.toContain('lcm store "Use ensureDaemon before background promote"');
+    expect(text).not.toContain("Store a plain-text memory");
+    expect(text).not.toContain("scope:lcm");
   });
 
   it("prints daemon restart help", () => {
@@ -224,7 +229,14 @@ describe("printHelp — per-command detail", () => {
     printHelp("connectors");
     const text = out.mock.calls.map(c => c[0]).join("");
     expect(text).toContain("--global");
+    expect(text).toContain("--transport cli|mcp");
+    expect(text).not.toContain("--type");
+    expect(text).toContain("CLI transport");
+    expect(text).toContain("MCP transport");
     expect(text).toContain("Install the GitHub Copilot workspace skill for VS Code");
     expect(text).toContain("Install Codex into ~/.codex");
+    expect(text).not.toContain("hooks, skill, and rules");
+    expect(text).toContain("native hook + skill");
+    expect(text).toContain("does not mutate MCP configuration");
   });
 });

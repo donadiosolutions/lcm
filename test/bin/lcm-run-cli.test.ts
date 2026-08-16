@@ -32,6 +32,8 @@ const state = vi.hoisted(() => ({
   })),
   fileText: JSON.stringify({ version: "1.4.0", entries: [] }),
   installed: [] as Array<{ agentId: string; type: string; path: string }>,
+  codexMcpInspection: { state: "absent" as "installed" | "absent" | "unknown" } as { state: "installed" | "absent" | "unknown"; reason?: "collision" | "unavailable" },
+  storedCodexTransport: undefined as "cli" | "mcp" | undefined,
   installResult: { path: "/connector", requiresRestart: false } as Record<string, unknown>,
   removeResult: true,
   batchResult: { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] },
@@ -72,6 +74,7 @@ const state = vi.hoisted(() => ({
   })),
   daemonClientInstances: 0,
   listConnectors: vi.fn(() => state.installed),
+  listConnectorInventory: vi.fn(() => ({ installed: state.installed, codexMcp: state.codexMcpInspection })),
   installConnector: vi.fn(() => state.installResult),
   removeConnector: vi.fn(() => state.removeResult),
   inspectCodexPostToolHook: vi.fn(() => ({
@@ -192,11 +195,29 @@ vi.mock("../../src/doctor/doctor.js", () => ({ runDoctor: vi.fn(async () => stat
 vi.mock("../../src/diagnose.js", () => ({ diagnose: vi.fn(async () => ({ ok: true })), formatDiagnoseResult: vi.fn(() => "diagnosed") }));
 vi.mock("../../src/sensitive.js", () => ({ handleSensitive: vi.fn(async () => ({ stdout: state.sensitiveStdout, exitCode: 0 })) }));
 vi.mock("../../src/connectors/registry.js", () => ({
-  AGENTS: [{ id: "codex", name: "Codex", category: "agent", defaultType: "hook", supportedTypes: ["hook"] }],
+  AGENTS: [
+    {
+      id: "codex", name: "Codex", category: "cli", defaultTransport: "cli",
+      capabilities: { cli: { guidance: ["skill"] }, mcp: { guidance: ["skill"], mcpAdapter: true } },
+    },
+    {
+      id: "cursor", name: "Cursor", category: "ai-ide", defaultTransport: "cli",
+      capabilities: { cli: { guidance: ["skill", "rules"] }, mcp: { guidance: ["skill"], mcpAdapter: true } },
+    },
+    {
+      id: "cline", name: "Cline", category: "vscode-ext", defaultTransport: "cli",
+      capabilities: { cli: { guidance: ["rules"] } },
+    },
+    {
+      id: "qwen-code", name: "Qwen Code", category: "cli", defaultTransport: "mcp",
+      capabilities: { cli: { guidance: ["skill", "rules"] }, mcp: { guidance: ["rules"], mcpAdapter: true } },
+    },
+  ],
   findAgent: vi.fn((name: string) => name === "codex" ? ({ id: "codex", name: "Codex" }) : undefined),
 }));
 vi.mock("../../src/connectors/installer.js", () => ({
   listConnectors: state.listConnectors,
+  listConnectorInventory: vi.fn(() => ({ installed: state.installed, codexMcp: state.codexMcpInspection })),
   installConnector: state.installConnector,
   removeConnector: state.removeConnector,
 }));
@@ -222,6 +243,7 @@ vi.mock("../../src/config-manager.js", () => ({
   getConfigValue: state.configGetValue,
   formatConfigValue: vi.fn((value: unknown) => JSON.stringify(value)), normalizeConfigPath: vi.fn((path: string) => path),
   setConfigValue: state.configSetValue,
+  readConnectorTransport: vi.fn(() => state.storedCodexTransport),
 }));
 vi.mock("../../installer/install.js", () => ({ install: vi.fn(async () => undefined) }));
 vi.mock("../../installer/uninstall.js", () => ({ uninstall: vi.fn(async () => undefined) }));
@@ -287,6 +309,8 @@ beforeEach(() => {
   state.ensureDaemon.mockResolvedValue({ connected: true, spawned: false, restartedForParent: false, pid: 42 });
   state.health.mockResolvedValue(true);
   state.installed = [];
+  state.codexMcpInspection = { state: "absent" };
+  state.storedCodexTransport = undefined;
   state.installResult = { path: "/connector", requiresRestart: false };
   state.removeResult = true;
   state.inspectCodexPostToolHook.mockReturnValue({
@@ -1091,13 +1115,228 @@ describe("runCli failure and alternate presentation branches", () => {
     state.installResult = { manual: "manual steps" };
     expect(await invoke(["connectors", "install", "codex", "--global"])).toBeUndefined();
     state.installResult = { paths: ["/one", ""], requiresRestart: true };
-    expect(await invoke(["connectors", "install", "codex", "--type", "hook"])).toBeUndefined();
+    expect(await invoke(["connectors", "install", "codex", "--transport", "mcp"])).toBeUndefined();
     state.removeResult = false;
     expect(await invoke(["connectors", "remove", "codex", "--global"])).toBeUndefined();
     state.installed = [{ agentId: "codex", type: "hook", path: "/hook" }];
     expect(await invoke(["connectors", "list"])).toBeUndefined();
     expect(await invoke(["connectors", "list", "--format", "json"])).toBeUndefined();
     expect(await invoke(["connectors", "doctor", "codex"])).toBeUndefined();
+  });
+
+  it("lists transport vocabulary and keeps installed surfaces explicit", async () => {
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    state.installed = [
+      { agentId: "codex", type: "hook", path: "/hook" },
+      { agentId: "codex", type: "skill", path: "/skill" },
+      { agentId: "cursor", type: "mcp", path: "/cursor-mcp" },
+      { agentId: "cline", type: "skill", path: "/cline-skill" },
+    ];
+
+    expect(await invoke(["connectors", "list", "--format", "json"])).toBeUndefined();
+
+    const payload = JSON.parse(stdout.mock.calls.map(([value]) => String(value)).join("")) as {
+      agents: Array<Record<string, unknown>>;
+    };
+    const codex = payload.agents.find(agent => agent.id === "codex");
+    expect(codex).toMatchObject({
+      defaultTransport: "cli",
+      supportedTransports: ["cli", "mcp"],
+      installed: ["hook", "skill"],
+      installedTransports: ["cli"],
+    });
+    expect(codex).not.toHaveProperty("defaultType");
+    expect(codex).not.toHaveProperty("defaultTypes");
+    expect(codex).not.toHaveProperty("supportedTypes");
+    expect(payload.agents.find(agent => agent.id === "cursor")).toMatchObject({
+      installed: ["mcp"], installedTransports: ["mcp"],
+    });
+    expect(payload.agents.find(agent => agent.id === "cline")).toMatchObject({
+      installed: ["skill"], installedTransports: ["cli"],
+    });
+    expect(payload.agents.find(agent => agent.id === "qwen-code")).toMatchObject({
+      installed: [], installedTransports: [],
+    });
+  });
+
+  it("uses transport vocabulary in the human-readable connector list", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect(await invoke(["connectors", "list"])).toBeUndefined();
+
+    const text = log.mock.calls.flat().map(value => String(value)).join("\n");
+    expect(text).toContain("Default transport");
+    expect(text).toContain("Supported transports");
+    expect(text).not.toContain("Default  ");
+  });
+
+  it("does not infer a Codex CLI transport when native MCP inspection is unknown", async () => {
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    state.installed = [
+      { agentId: "codex", type: "hook", path: "/hook" },
+      { agentId: "codex", type: "skill", path: "/skill" },
+    ];
+    state.codexMcpInspection = { state: "unknown", reason: "collision" };
+
+    expect(await invoke(["connectors", "list", "--format", "json"])).toBeUndefined();
+    const payload = JSON.parse(stdout.mock.calls.map(([value]) => String(value)).join("")) as {
+      agents: Array<Record<string, unknown>>;
+    };
+    const codex = payload.agents.find(agent => agent.id === "codex");
+    expect(codex).toMatchObject({ installedTransports: [], mcpInspection: "unknown" });
+
+    expect(await invoke(["connectors", "list"])).toBeUndefined();
+    const text = log.mock.calls.flat().map(value => String(value)).join("\n");
+    expect(text).toContain("transport unknown");
+    expect(text).not.toContain("(CLI)");
+    expect(text).not.toContain("(MCP)");
+  });
+
+  it("reports native Codex MCP health as unknown instead of claiming a transport", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    state.installed = [{ agentId: "codex", type: "hook", path: "/hook" }];
+    state.codexMcpInspection = { state: "unknown", reason: "unavailable" };
+
+    expect((await invoke(["connectors", "doctor", "codex"]))?.message).toBe("exit:1");
+    const text = log.mock.calls.flat().map(value => String(value)).join("\n");
+    expect(text).toContain("native MCP inspection unknown");
+    expect(text).not.toContain("(CLI)");
+    expect(text).not.toContain("(MCP)");
+  });
+
+  it("does not fail all-agent doctor when unused Codex MCP inspection is unavailable", async () => {
+    state.codexMcpInspection = { state: "unknown", reason: "unavailable" };
+
+    expect(await invoke(["connectors", "doctor"])).toBeUndefined();
+  });
+
+  it("does not fail all-agent doctor for an installed Codex CLI transport", async () => {
+    state.installed = [{ agentId: "codex", type: "hook", path: "/hook" }];
+    state.codexMcpInspection = { state: "unknown", reason: "unavailable" };
+
+    expect(await invoke(["connectors", "doctor"])).toBeUndefined();
+  });
+
+  it("fails all-agent doctor for an installed Codex MCP transport when inspection is unavailable", async () => {
+    state.installed = [{ agentId: "codex", type: "mcp", path: "codex mcp" }];
+    state.codexMcpInspection = { state: "unknown", reason: "unavailable" };
+
+    expect((await invoke(["connectors", "doctor"]))?.message).toBe("exit:1");
+  });
+
+  it("does not fail all-agent doctor for a stored Codex CLI transport", async () => {
+    state.storedCodexTransport = "cli";
+    state.codexMcpInspection = { state: "unknown", reason: "unavailable" };
+
+    expect(await invoke(["connectors", "doctor"])).toBeUndefined();
+  });
+
+  it("fails all-agent doctor for a stored Codex MCP transport when inspection is unavailable", async () => {
+    state.storedCodexTransport = "mcp";
+    state.codexMcpInspection = { state: "unknown", reason: "unavailable" };
+
+    expect((await invoke(["connectors", "doctor"]))?.message).toBe("exit:1");
+  });
+
+  it("keeps all-agent doctor fail-closed for a Codex MCP collision", async () => {
+    state.codexMcpInspection = { state: "unknown", reason: "collision" };
+
+    expect((await invoke(["connectors", "doctor"]))?.message).toBe("exit:1");
+  });
+
+  it("reports a verified native Codex MCP transport in JSON and text", async () => {
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    state.installed = [{ agentId: "codex", type: "mcp", path: "codex mcp" }];
+    state.codexMcpInspection = { state: "installed" };
+
+    expect(await invoke(["connectors", "list", "--format", "json"])).toBeUndefined();
+    const payload = JSON.parse(stdout.mock.calls.map(([value]) => String(value)).join("")) as {
+      agents: Array<Record<string, unknown>>;
+    };
+    expect(payload.agents.find(agent => agent.id === "codex")).toMatchObject({
+      installed: ["mcp"], installedTransports: ["mcp"], mcpInspection: "installed",
+    });
+
+    expect(await invoke(["connectors", "list"])).toBeUndefined();
+    expect(log.mock.calls.flat().map(value => String(value)).join("\n")).toContain("(MCP)");
+  });
+
+  it("reports independently active Codex CLI and MCP transports", async () => {
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    state.installed = [
+      { agentId: "codex", type: "hook", path: "/hook" },
+      { agentId: "codex", type: "skill", path: "/skill" },
+      { agentId: "codex", type: "mcp", path: "codex mcp" },
+    ];
+    state.codexMcpInspection = { state: "installed" };
+
+    expect(await invoke(["connectors", "list", "--format", "json"])).toBeUndefined();
+    const payload = JSON.parse(stdout.mock.calls.map(([value]) => String(value)).join("")) as {
+      agents: Array<Record<string, unknown>>;
+    };
+    expect(payload.agents.find(agent => agent.id === "codex")).toMatchObject({
+      installed: ["hook", "skill", "mcp"],
+      installedTransports: ["cli", "mcp"],
+      mcpInspection: "installed",
+    });
+
+    expect(await invoke(["connectors", "list"])).toBeUndefined();
+    expect(log.mock.calls.flat().map(value => String(value)).join("\n"))
+      .toContain("hook, skill, mcp (CLI, MCP)");
+  });
+
+  it("routes connector transport options and rejects stale selectors", async () => {
+    const cwd = process.cwd();
+
+    expect(await invoke(["connectors", "install", "codex"])).toBeUndefined();
+    expect(state.installConnector).toHaveBeenLastCalledWith(
+      "codex", undefined, cwd, { persistTransport: false, queryCodexMcp: false },
+    );
+
+    expect(await invoke(["connectors", "install", "codex", "--transport", "cli"])).toBeUndefined();
+    expect(state.installConnector).toHaveBeenLastCalledWith(
+      "codex", "cli", cwd, { persistTransport: true, queryCodexMcp: true },
+    );
+
+    expect(await invoke(["connectors", "install", "codex", "--transport", "mcp"])).toBeUndefined();
+    expect(state.installConnector).toHaveBeenLastCalledWith(
+      "codex", "mcp", cwd, { persistTransport: true, queryCodexMcp: false },
+    );
+
+    state.installConnector.mockClear();
+    expect(await invoke(["connectors", "install", "codex", "--type", "hook"])).toBeInstanceOf(Error);
+    expect(state.installConnector).not.toHaveBeenCalled();
+    expect(await invoke(["connectors", "install", "codex", "--bogus"])).toBeInstanceOf(Error);
+    expect(state.installConnector).not.toHaveBeenCalled();
+  });
+
+  it("removes the complete connector bundle and handles structured outcomes", async () => {
+    const cwd = process.cwd();
+    state.removeResult = { success: true, removed: false, paths: [], failures: [] };
+    expect(await invoke(["connectors", "remove", "codex"])).toBeUndefined();
+    expect(state.removeConnector).toHaveBeenLastCalledWith("codex", cwd, {});
+
+    state.removeResult = { success: false };
+    expect((await invoke(["connectors", "remove", "codex"]))?.message).toBe("exit:1");
+
+    state.removeResult = { success: false, failures: ["mcp: collision"] };
+    expect((await invoke(["connectors", "remove", "codex"]))?.message).toBe("exit:1");
+
+    state.removeResult = true;
+    expect(await invoke(["connectors", "remove", "codex"])).toBeUndefined();
+  });
+
+  it("uses the safe fallback when native Codex MCP inspection has no reason", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    state.installed = [{ agentId: "codex", type: "hook", path: "/hook" }];
+    state.codexMcpInspection = { state: "unknown" };
+
+    expect((await invoke(["connectors", "doctor", "codex"]))?.message).toBe("exit:1");
+    expect(log.mock.calls.flat().map(value => String(value)).join("\n"))
+      .toContain("native MCP inspection unknown (unavailable)");
   });
 
   it("runs foreground cleanup and signal callbacks", async () => {

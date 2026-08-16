@@ -111,6 +111,34 @@ describe("doctor hook validation", () => {
     expect(written.theme).toBe("dark");
   });
 
+  it("removes only the owned MCP entry for stored Claude CLI transport", async () => {
+    const home = doctorHome();
+    const settings = JSON.stringify({
+      ...mergeClaudeSettings({}, BINARY),
+      mcpServers: {
+        lcm: { type: "stdio", command: process.execPath, args: [BINARY, "mcp"] },
+        unrelated: { command: "other" },
+      },
+    });
+    const writtenFiles = new Map<string, string>();
+    const results = await runDoctor({
+      _claudeTransport: "cli",
+      existsSync: () => true,
+      readFileSync: (p: string) => p.endsWith("settings.json") ? settings : baseReadFileSync(p, settings),
+      writeFileSync: (p: string, data: string) => { writtenFiles.set(p, data); },
+      mkdirSync: vi.fn(),
+      spawnSync: () => ({ status: 0, stdout: "/usr/local/bin/lcm\n", stderr: "" }),
+      fetch: vi.fn().mockResolvedValue({ ok: false }),
+      homedir: home,
+      platform: "darwin",
+    });
+    expect(results.find(r => r.name === "mcp-lcm")).toMatchObject({ status: "warn", fixApplied: true });
+    const repaired = JSON.parse(writtenFiles.get(`${home}/.claude/settings.json`)!);
+    expect(repaired.mcpServers).toEqual({ unrelated: { command: "other" } });
+    expect(repaired.hooks.UserPromptSubmit.at(-1).hooks[0].command)
+      .toContain("user-prompt --transport cli");
+  });
+
   it("does not adopt unrelated Claude settings as a managed LCM installation", async () => {
     const settings = JSON.stringify({
       theme: "dark",

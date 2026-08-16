@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "n
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { mergeClaudeSettings } from "./installer/settings.js";
+import type { ConnectorTransport } from "./connectors/types.js";
 import { packageExecutable } from "./runtime-root.js";
 import {
   daemonConfigForPersistence,
@@ -26,6 +27,7 @@ import {
   readBoundedRegularFileWithStat,
 } from "./security-files.js";
 import { selectStorageBackend } from "./storage/backend.js";
+import { resolveAgentTransport } from "./connectors/registry.js";
 
 const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 
@@ -40,6 +42,7 @@ export interface EnsureCoreDeps {
   atomicWritePrivateFileDurable?: typeof atomicWritePrivateFileDurable;
   ensureRuntimeHome?: (homeDir: string) => void;
   binaryPath?: string;
+  transport?: ConnectorTransport;
   ensureDaemon: (opts: {
     port: number;
     pidFilePath: string;
@@ -53,8 +56,9 @@ export interface EnsureCoreDeps {
 }
 
 function defaultDeps(): EnsureCoreDeps {
+  const configPath = defaultConfigPath();
   return {
-    configPath: defaultConfigPath(),
+    configPath,
     settingsPath: join(homedir(), ".claude", "settings.json"),
     existsSync,
     readFileSync: (p, enc) => readFileSync(p, enc as BufferEncoding),
@@ -64,6 +68,7 @@ function defaultDeps(): EnsureCoreDeps {
     atomicWritePrivateFileDurable,
     ensureRuntimeHome: (homeDir) => { bootstrapLcmHome(homeDir); },
     binaryPath: packageExecutable(import.meta.url, 2),
+    transport: resolveAgentTransport("claude-code", undefined, { configPath }).transport,
     ensureDaemon: async (opts) => {
       const { ensureDaemon } = await import("./daemon/lifecycle.js");
       return ensureDaemon(opts);
@@ -149,7 +154,7 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
   if (deps.existsSync(deps.settingsPath)) {
     try {
       const existing = JSON.parse(deps.readFileSync(deps.settingsPath, "utf-8"));
-      const merged = mergeClaudeSettings(existing, binaryPath);
+      const merged = mergeClaudeSettings(existing, binaryPath, process.execPath, deps.transport);
       if (JSON.stringify(existing) !== JSON.stringify(merged)) {
         deps.mkdirSync(dirname(deps.settingsPath), { recursive: true });
         deps.writeFileSync(deps.settingsPath, JSON.stringify(merged, null, 2));

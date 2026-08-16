@@ -1,3 +1,7 @@
+import { fenceContent } from "../daemon/content-fence.js";
+import { renderFeedback, renderMemoryContext } from "../connectors/template-service.js";
+import type { ConnectorTransport } from "../connectors/types.js";
+
 export type MemoryHintCandidate = {
   id: string;
   hint: string;
@@ -12,7 +16,29 @@ export type MemoryHintSelection = {
   droppedForBudget: number;
 };
 
-const MEMORY_CONTEXT_INTRO = "Relevant context from previous sessions (use lcm_expand for details):";
+/** The default is the Claude/other-agent legacy transport. */
+export const DEFAULT_MEMORY_TRANSPORT: ConnectorTransport = "mcp";
+
+/**
+ * Kept as a compatibility export for callers that only need the default
+ * reservation. Prompt hooks use `memoryFeedbackInstruction` so the selected
+ * transport is reserved exactly.
+ */
+export const MEMORY_FEEDBACK_INSTRUCTION = fenceContent(
+  renderFeedback(DEFAULT_MEMORY_TRANSPORT, ["reserved"]),
+  "memory-feedback",
+);
+
+export function memoryFeedbackInstruction(transport: ConnectorTransport): string {
+  return fenceContent(renderFeedback(transport, ["reserved"]), "memory-feedback");
+}
+
+export function buildMemoryFeedbackInstruction(
+  ids: string[],
+  transport: ConnectorTransport = DEFAULT_MEMORY_TRANSPORT,
+): string | null {
+  return ids.length > 0 ? fenceContent(renderFeedback(transport, ids), "memory-feedback") : null;
+}
 
 function normalizeHint(hint: string): string {
   return hint.trim().replace(/\s+/g, " ").toLowerCase();
@@ -76,7 +102,27 @@ export function buildMemoryContext(hints: string[], ids: string[] = []): string 
   const idsComment = ids.length > 0
     ? `\n<!-- surfaced-memory-ids: ${ids.join(",")} -->`
     : "";
-  return fenceContent(`${MEMORY_CONTEXT_INTRO}\n${snippets}${idsComment}`, "memory-context");
+  // The standalone renderer owns the recurring header prose. This helper
+  // intentionally omits feedback; prompt output adds it for the selected
+  // transport through `buildMemoryContextWithFeedback`.
+  return fenceContent(renderMemoryContext(DEFAULT_MEMORY_TRANSPORT, `${snippets}${idsComment}`, []), "memory-context");
+}
+
+export function buildMemoryContextWithFeedback(
+  hints: string[],
+  ids: string[],
+  transport: ConnectorTransport,
+): string | null {
+  if (hints.length === 0) return null;
+  const snippets = hints.map((hint) => `- ${hint}`).join("\n");
+  const idsComment = ids.length > 0
+    ? `\n<!-- surfaced-memory-ids: ${ids.join(",")} -->`
+    : "";
+  const context = renderMemoryContext(transport, `${snippets}${idsComment}`, []);
+  const feedback = ids.length > 0
+    ? `\n${memoryFeedbackInstruction(transport)}`
+    : "";
+  return fenceContent(`${context}${feedback}`, "memory-context");
 }
 
 export function selectMemoryHintsWithinBudget(
@@ -149,4 +195,3 @@ export function selectMemoryHintsWithinBudget(
     droppedForBudget,
   };
 }
-import { fenceContent } from "../daemon/content-fence.js";

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, lstatSync, readdirSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { spawnSync, spawn } from "node:child_process";
@@ -10,7 +10,11 @@ import {
   mergeClaudeSettings,
   REQUIRED_HOOKS,
   ensureLcmMd,
+  installClaudeSkill,
+  removeClaudeLegacyAssets,
+  resolveClaudeTransport,
 } from "../../installer/install.js";
+import { renderGuidance } from "../connectors/template-service.js";
 import { NATIVE_PATTERNS, ScrubEngine, readGitleaksSyncDate } from "../scrub.js";
 import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
 import { collectEventStats, collectDetailedEventStats } from "../db/events-stats.js";
@@ -79,6 +83,8 @@ function defaultDeps(): DoctorDeps {
     readFileSync: (p, enc) => readFileSync(p, enc as BufferEncoding),
     writeFileSync,
     mkdirSync: (p, o) => mkdirSync(p, o),
+    lstatSync,
+    readdirSync,
     spawnSync: (cmd, args, opts) => {
       const r = spawnSync(cmd, args, { encoding: "utf-8", ...opts });
       return { status: r.status, stdout: r.stdout as string, stderr: r.stderr as string };
@@ -1180,6 +1186,8 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     }
   } else {
   const settingsPath = join(deps.homedir, ".claude", "settings.json");
+  const claudeTransport = deps._claudeTransport
+    ?? resolveClaudeTransport(configPath(deps.homedir));
   const claudeSettingsExists = deps.existsSync(settingsPath);
   let settingsData: unknown = {};
   let settingsError: string | undefined;
@@ -1213,7 +1221,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
   } else {
     try {
       lcmBinary = runtimePath;
-      const merged = mergeClaudeSettings(settingsData, lcmBinary) as Record<string, unknown>;
+      const merged = mergeClaudeSettings(settingsData, lcmBinary, process.execPath, claudeTransport) as Record<string, unknown>;
       const beforeHooks = (settingsData as Record<string, unknown>)?.hooks;
       if (JSON.stringify(beforeHooks) === JSON.stringify(merged.hooks)) {
         if (JSON.stringify(settingsData) !== JSON.stringify(merged)) {
@@ -1259,13 +1267,28 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       status: "fail",
       message: `Could not parse ${settingsPath}: ${settingsError}\n     Fix the JSON, then run: lcm install`,
     });
+  } else if (claudeTransport === "cli") {
+    if (lcmBinary && hasCanonicalClaudeMcpEntry(mcpServers?.lcm, lcmBinary)) {
+      try {
+        const merged = structuredClone(currentSettings) as Record<string, unknown>;
+        const servers = merged.mcpServers as Record<string, unknown>;
+        delete servers.lcm;
+        if (Object.keys(servers).length === 0) delete merged.mcpServers;
+        deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
+        results.push({ name: "mcp-lcm", category: "Settings", status: "warn", message: "Removed the owned Claude MCP entry for CLI transport", fixApplied: true });
+      } catch {
+        results.push({ name: "mcp-lcm", category: "Settings", status: "fail", message: "Owned Claude MCP entry could not be removed — run: lcm install" });
+      }
+    } else {
+      results.push({ name: "mcp-lcm", category: "Settings", status: "pass", message: "Claude CLI transport does not use MCP" });
+    }
   } else if (lcmBinary && hasCanonicalClaudeMcpEntry(mcpServers?.lcm, lcmBinary)) {
     results.push(claudeSettingsCleaned
       ? { name: "mcp-lcm", category: "Settings", status: "warn", message: "Removed the legacy lossless-claude MCP registration", fixApplied: true }
       : { name: "mcp-lcm", category: "Settings", status: "pass", message: "mcpServers.lcm uses the npm-installed runtime" });
   } else if (currentSettings && lcmBinary) {
     try {
-      const merged = mergeClaudeSettings(currentSettings, lcmBinary!);
+      const merged = mergeClaudeSettings(currentSettings, lcmBinary!, process.execPath, claudeTransport);
       if (merged.mcpServers === null || typeof merged.mcpServers !== "object" || Array.isArray(merged.mcpServers)) {
         merged.mcpServers = {};
       }
@@ -1280,43 +1303,43 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     results.push({ name: "mcp-lcm", category: "Settings", status: "fail", message: "mcpServers.lcm could not be validated — run: lcm install" });
   }
 
-  // ── lcm.md (Claude Code memory guidance file) ──
-  const lcmMdPath = join(deps.homedir, ".claude", "lcm.md");
-  const claudeMdPath = join(deps.homedir, ".claude", "CLAUDE.md");
-  const lcmMdExists = deps.existsSync(lcmMdPath);
-  const claudeMdHasRef = (() => {
-    if (!deps.existsSync(claudeMdPath)) return false;
-    try {
-      const claudeContent = deps.readFileSync(claudeMdPath, "utf-8");
-      const lcmBlockMatch = claudeContent.match(/<!--\s*lcm:start\s*-->[\s\S]*?<!--\s*lcm:end\s*-->/);
-      if (!lcmBlockMatch) return false;
-      return /@lcm\.md/.test(lcmBlockMatch[0]);
-    } catch {
-      return false;
-    }
-  })();
-
-  const { LCM_MD_CONTENT } = await import("../daemon/orientation.js");
-  const lcmMdStale = lcmMdExists
-    ? (() => { try { return deps.readFileSync(lcmMdPath, "utf-8") !== LCM_MD_CONTENT; } catch { return true; } })()
-    : false;
-
+  // ── canonical lcm-memory skill ──
+  const skillPath = join(deps.homedir, ".claude", "skills", "lcm-memory", "SKILL.md");
+  const renderedSkill = deps.renderClaudeSkill?.(claudeTransport)
+    ?? renderGuidance("skill", claudeTransport);
   if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
     results.push({ name: "lcm-md", category: "Settings", status: "pass", message: "Claude Code integration is not installed" });
   } else if (settingsError) {
-    results.push({ name: "lcm-md", category: "Settings", status: "fail", message: "lcm.md could not be validated because Claude settings are malformed" });
-  } else if (lcmMdExists && claudeMdHasRef && !lcmMdStale) {
-    results.push({ name: "lcm-md", category: "Settings", status: "pass", message: "~/.claude/lcm.md installed and referenced in CLAUDE.md" });
+    results.push({ name: "lcm-md", category: "Settings", status: "fail", message: "lcm-memory skill could not be validated because Claude settings are malformed" });
   } else {
     try {
-      const { lcmMdWritten, claudeMdPatched } = ensureLcmMd(deps, LCM_MD_CONTENT, deps.homedir);
-      const detail = [
-        !lcmMdExists ? "wrote ~/.claude/lcm.md" : lcmMdWritten ? "updated stale ~/.claude/lcm.md" : null,
-        claudeMdPatched ? "added @lcm.md to CLAUDE.md" : null,
-      ].filter(Boolean).join(", ");
-      results.push({ name: "lcm-md", category: "Settings", status: "warn", message: `lcm.md restored (${detail})`, fixApplied: true });
+      const skillExists = deps.existsSync(skillPath);
+      const skillCurrent = skillExists && (() => {
+        try { return deps.readFileSync(skillPath, "utf-8") === renderedSkill; } catch { return false; }
+      })();
+      if (skillCurrent) {
+        results.push({ name: "lcm-md", category: "Settings", status: "pass", message: "canonical Claude lcm-memory skill is installed" });
+      } else {
+        installClaudeSkill({
+          existsSync: deps.existsSync,
+          readFileSync: deps.readFileSync,
+          writeFileSync: deps.writeFileSync,
+          mkdirSync: deps.mkdirSync,
+          renderClaudeSkill: deps.renderClaudeSkill,
+        }, claudeTransport, deps.homedir);
+        results.push({ name: "lcm-md", category: "Settings", status: "warn", message: "canonical Claude lcm-memory skill repaired", fixApplied: true });
+      }
+      const { LCM_MD_CONTENT } = await import("../daemon/orientation.js");
+      removeClaudeLegacyAssets({
+        existsSync: deps.existsSync,
+        readFileSync: deps.readFileSync,
+        writeFileSync: deps.writeFileSync,
+        mkdirSync: deps.mkdirSync,
+        lstatSync: deps.lstatSync,
+        readdirSync: deps.readdirSync,
+      }, deps.homedir, LCM_MD_CONTENT);
     } catch (err) {
-      results.push({ name: "lcm-md", category: "Settings", status: "fail", message: `lcm.md repair failed: ${err instanceof Error ? err.message : String(err)} — run: lcm install` });
+      results.push({ name: "lcm-md", category: "Settings", status: "fail", message: `lcm-memory skill repair failed: ${err instanceof Error ? err.message : String(err)} — run: lcm install` });
     }
   }
   }

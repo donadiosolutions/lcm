@@ -7,6 +7,19 @@
 
 Without a canonical schema, the same decision gets stored as `decision:X`, `category:decision`, or just `decision` — making `lcm_search` with tag filters unreliable. The canonical schema enforces consistent `<prefix>:<value>` pairs so any agent can construct a precise search filter.
 
+## Durable store guidance
+
+When an agent recognizes durable knowledge, it should store the rationale
+immediately. Every durable store should use one `type:<classification>` tag,
+the literal `scope:project` or `scope:user`, and `project:<repo>`. Add
+`source:<actual-thread-uuid>` when the current agent exposes a real thread UUID.
+This is required agent guidance for retrieval quality, not a new runtime
+rejection rule: legacy or incomplete tags remain accepted by `lcm_store`.
+
+When a recalled memory directly informs the work, add both
+`signal:memory_used` and `memory_id:<id>` in one feedback store per memory
+used. Do not add the signal without its paired memory identifier.
+
 ## Schema
 
 All tags follow the `<prefix>:<value>` format. Free-text tags (no colon) are allowed but are not searchable by category — prefer canonical tags for anything you intend to filter on later.
@@ -22,6 +35,7 @@ All tags follow the `<prefix>:<value>` format. Free-text tags (no colon) are all
 | `type:gotcha` | A non-obvious pitfall, footgun, or surprising behavior |
 | `type:solution` | A specific fix or answer to a concrete problem |
 | `type:workflow` | A step-by-step process or runbook |
+| `type:feedback` | Feedback about how a recalled memory affected the current work |
 | `type:feat` | A feature addition or enhancement |
 | `type:fix` | A bug fix |
 | `type:chore` | Maintenance, refactoring, or tooling work |
@@ -30,6 +44,8 @@ All tags follow the `<prefix>:<value>` format. Free-text tags (no colon) are all
 
 | Value | When to use |
 |-------|-------------|
+| `scope:project` | Durable knowledge belonging to the current repository or project |
+| `scope:user` | Durable knowledge belonging to the user across repositories |
 | `scope:token-budget` | Token window management, quota, efficiency |
 | `scope:model-selection` | Haiku vs Sonnet vs Opus routing decisions |
 | `scope:architecture` | System design, component structure, data flow |
@@ -43,6 +59,12 @@ All tags follow the `<prefix>:<value>` format. Free-text tags (no colon) are all
 | `scope:connectors` | Connector integrations, installation, and generated templates |
 | `scope:hooks` | Hook behavior, lifecycle, and integration |
 | `scope:codecov` | Codecov coverage components, flags, and thresholds |
+
+`scope:project` and `scope:user` are the only literal scope values for new
+durable stores. The other scope values listed above are supplemental
+legacy/domain filters; they never replace the required literal scope and must
+not be used as a substitute for it. Do not invent another runtime scope
+prefix.
 
 ### `priority:` — how urgent or important?
 
@@ -78,8 +100,14 @@ Format: `sprint:spN` (e.g. `sprint:sp3`). Use the sprint declared in the current
 
 ### `source:` — where did this insight come from?
 
+Prefer `source:<actual-thread-uuid>` when the current agent exposes a real
+thread UUID. The named source values below are supplemental legacy/provenance
+labels; retain them only when useful, and do not treat them as replacements for
+the actual thread UUID when one is available.
+
 | Value | When to use |
 |-------|-------------|
+| `source:<actual-thread-uuid>` | Preferred conditional source when a real current thread UUID is available |
 | `source:adversarial-review` | From an Enthusiast/Adversary/Judge review cycle |
 | `source:session` | From a Co-CEO working session |
 | `source:ci` | From automated CI output |
@@ -109,12 +137,19 @@ Format: `sprint:spN` (e.g. `sprint:sp3`). Use the sprint declared in the current
 
 ## Combining tags
 
-A single `lcm_store` entry should use 2–4 canonical tags, covering at minimum `type:` and one of `project:` or `scope:`. Sprint and source tags are recommended for traceability.
+A durable `lcm_store` entry should use one `type:<classification>`, literal
+`scope:project` or `scope:user`, and `project:<repo>`; add
+`source:<actual-thread-uuid>` when available. Other canonical tags such as
+`priority:`, `category:`, or `signal:` can add useful retrieval context. The
+guidance is normative for new agent stores but does not reject legacy tags at
+runtime.
 
 **Example — good:**
 ```
-["type:solution", "scope:lcm", "project:lcm", "sprint:sp3", "source:session"]
+["type:decision", "scope:project", "project:lcm", "source:<actual-thread-uuid>"]
 ```
+
+The stored text must include the decision's rationale, not only its outcome.
 
 **Example — bad (avoid):**
 ```

@@ -1,8 +1,9 @@
-import { readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, lstatSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { removeManagedClaudeSettings } from "../src/installer/settings.js";
+import { removeClaudeLegacyAssets } from "./install.js";
 import {
   legacyLaunchdPlistName,
   legacyLcmSlug,
@@ -19,6 +20,9 @@ export interface TeardownDeps {
   rmSync: (path: string, options?: { recursive?: boolean; force?: boolean }) => void;
   readFileSync: (path: string, encoding: string) => string;
   writeFileSync: (path: string, data: string) => void;
+  lstatSync?: typeof import("node:fs").lstatSync;
+  readdirSync?: typeof import("node:fs").readdirSync;
+  dryRun?: boolean;
 }
 
 const defaultDeps: TeardownDeps = {
@@ -27,6 +31,8 @@ const defaultDeps: TeardownDeps = {
   rmSync,
   readFileSync: readFileSync as any,
   writeFileSync,
+  lstatSync,
+  readdirSync,
 };
 
 export function teardownDaemonService(deps: TeardownDeps = defaultDeps): void {
@@ -101,22 +107,21 @@ export async function uninstall(deps: TeardownDeps = defaultDeps): Promise<void>
     const path = join(claudeHome, "commands", name);
     if (deps.existsSync(path)) deps.rmSync(path, { force: true });
   }
-  const skillPath = join(claudeHome, "skills", "lcm-context");
-  if (deps.existsSync(skillPath)) deps.rmSync(skillPath, { recursive: true, force: true });
-  const lcmMdPath = join(claudeHome, "lcm.md");
-  if (deps.existsSync(lcmMdPath)) deps.rmSync(lcmMdPath, { force: true });
-
-  const claudeMdPath = join(claudeHome, "CLAUDE.md");
-  if (deps.existsSync(claudeMdPath)) {
-    try {
-      const existing = deps.readFileSync(claudeMdPath, "utf-8");
-      const updated = existing
-        .replace(/^[ \t]*<!--\s*lcm:start\s*-->[\s\S]*?^[ \t]*<!--\s*lcm:end\s*-->[ \t]*(?:\r?\n)?/m, "")
-        .trimEnd();
-      if (updated !== existing.trimEnd()) deps.writeFileSync(claudeMdPath, updated ? `${updated}\n` : "");
-    } catch (err) {
-      console.warn(`Warning: could not update ${claudeMdPath}: ${err instanceof Error ? err.message : err}`);
-    }
+  try {
+    removeClaudeLegacyAssets({
+      existsSync: deps.existsSync,
+      readFileSync: deps.readFileSync,
+      writeFileSync: deps.writeFileSync,
+      mkdirSync,
+      lstatSync: deps.lstatSync,
+      readdirSync: deps.readdirSync,
+      rmSync: deps.rmSync,
+      dryRun: deps.dryRun,
+      removeCurrentSkill: true,
+    }, homedir());
+  } catch (err) {
+    const claudeMdPath = join(claudeHome, "CLAUDE.md");
+    console.warn(`Warning: could not update ${claudeMdPath}: ${err instanceof Error ? err.message : err}`);
   }
 
   console.log("lcm uninstalled.");

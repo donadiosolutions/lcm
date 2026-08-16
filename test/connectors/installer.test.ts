@@ -2,10 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { installConnector, removeConnector, listConnectors } from '../../src/connectors/installer.js';
-import { LCM_MARKERS } from '../../src/connectors/constants.js';
+import { installConnector, removeConnector, listConnectors, listConnectorInventory } from '../../src/connectors/installer.js';
+import { LCM_MANAGED_SKILL_MARKER, LCM_MARKERS } from '../../src/connectors/constants.js';
 import { AGENTS } from '../../src/connectors/registry.js';
-import { mergeClaudeSettings } from '../../src/installer/settings.js';
+import { canonicalHookCommand, hasManagedClaudeSettings, mergeClaudeSettings } from '../../src/installer/settings.js';
+import { renderGuidance } from '../../src/connectors/template-service.js';
+import { readConnectorTransport, setConnectorTransport } from '../../src/config-manager.js';
 
 let tmpDir: string;
 
@@ -13,6 +15,23 @@ const LEGACY_LCM_MARKERS = {
   START: '<!-- [LCM_CONNECTOR_START] -->',
   END: '<!-- [LCM_CONNECTOR_END] -->',
 } as const;
+
+describe('settings transport validation', () => {
+  it('rejects an unsupported transport for UserPromptSubmit commands', () => {
+    expect(() => canonicalHookCommand('/opt/npm/bin/lcm', 'user-prompt', '/usr/bin/node', 'linux', 'invalid' as never))
+      .toThrow('Unsupported hook transport: invalid');
+  });
+
+  it('recognizes transport-stamped legacy hooks as managed', () => {
+    expect(hasManagedClaudeSettings({
+      hooks: {
+        UserPromptSubmit: [{
+          hooks: [{ type: 'command', command: 'lcm user-prompt --transport cli' }],
+        }],
+      },
+    })).toBe(true);
+  });
+});
 
 function countOccurrences(value: string, needle: string): number {
   return value.split(needle).length - 1;
@@ -35,6 +54,23 @@ function legacyRulesContent(eol: TestMarkdownEol): string {
     'Legacy generated content',
     LEGACY_LCM_MARKERS.END,
   ].join(eol);
+}
+
+function managedSkillContent(content: string): string {
+  const eol = content.includes('\r\n') ? '\r\n' : '\n';
+  let contentEnd = content.length;
+  while (contentEnd > 0) {
+    const character = content.charCodeAt(contentEnd - 1);
+    if (character !== 0x0a && character !== 0x0d) break;
+    contentEnd -= 1;
+  }
+  const normalized = content.slice(0, contentEnd) + eol;
+  if (!normalized.startsWith(`---${eol}`)) return `${LCM_MANAGED_SKILL_MARKER}${eol}${normalized}`;
+  const endMarker = `${eol}---${eol}`;
+  const end = normalized.indexOf(endMarker, `---${eol}`.length);
+  if (end === -1) return `${LCM_MANAGED_SKILL_MARKER}${eol}${normalized}`;
+  const frontmatterEnd = end + endMarker.length;
+  return `${normalized.slice(0, frontmatterEnd)}${LCM_MANAGED_SKILL_MARKER}${eol}${normalized.slice(frontmatterEnd)}`;
 }
 
 async function withMockedGeneratedContent<T>(
@@ -736,10 +772,72 @@ describe('installConnector — skill', () => {
     expect(content).toContain('lcm store');
   });
 
-  it('does not add markers to skill file', () => {
+  it('places the machine ownership marker after valid YAML frontmatter', () => {
     const result = installConnector('claude-code', 'skill', tmpDir);
     const content = readFileSync(result.path, 'utf-8');
+    expect(content).toMatch(new RegExp(`^---\\n[\\s\\S]*?\\n---\\n${LCM_MANAGED_SKILL_MARKER.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\n`));
+    expect(content.slice(0, content.indexOf(LCM_MANAGED_SKILL_MARKER))).not.toContain(LCM_MANAGED_SKILL_MARKER);
     expect(content).not.toContain(LCM_MARKERS.START);
+  });
+
+  it('migrates the exact current unmarked skill without treating it as a collision', () => {
+    const result = installConnector('claude-code', 'skill', tmpDir);
+    const legacy = readFileSync(result.path, 'utf-8').replace(`${LCM_MANAGED_SKILL_MARKER}\n`, '');
+    writeFileSync(result.path, legacy);
+
+    expect(() => installConnector('claude-code', 'skill', tmpDir)).not.toThrow();
+    expect(readFileSync(result.path, 'utf-8')).toContain(LCM_MANAGED_SKILL_MARKER);
+  });
+
+  it('migrates a known historical generated skill', () => {
+    const skillPath = join(tmpDir, '.claude', 'skills', 'lcm-memory', 'SKILL.md');
+    mkdirSync(dirname(skillPath), { recursive: true });
+    writeFileSync(skillPath, readFileSync(new URL('./fixtures/historical-skill-v0.md', import.meta.url), 'utf-8'));
+
+    expect(() => installConnector('claude-code', 'skill', tmpDir)).not.toThrow();
+    expect(readFileSync(skillPath, 'utf-8')).toContain(LCM_MANAGED_SKILL_MARKER);
+  });
+
+  it('rejects an arbitrary skill collision before mutation', () => {
+    const skillPath = join(tmpDir, '.claude', 'skills', 'lcm-memory', 'SKILL.md');
+    mkdirSync(dirname(skillPath), { recursive: true });
+    const collision = '# User-authored skill\n\nDo not replace me.\n';
+    writeFileSync(skillPath, collision);
+
+    expect(() => installConnector('claude-code', 'skill', tmpDir)).toThrow(/skill.*collision|refus.*skill/i);
+    expect(readFileSync(skillPath, 'utf-8')).toBe(collision);
+    expect(listConnectors(tmpDir).some((entry) => entry.path === skillPath)).toBe(false);
+  });
+
+  it('does not grant ownership to a marker in the wrong position', () => {
+    const skillPath = join(tmpDir, '.claude', 'skills', 'lcm-memory', 'SKILL.md');
+    mkdirSync(dirname(skillPath), { recursive: true });
+    const collision = `---\nname: user-authored\n${LCM_MANAGED_SKILL_MARKER}\n---\n`;
+    writeFileSync(skillPath, collision);
+
+    expect(() => installConnector('claude-code', 'skill', tmpDir)).toThrow(/skill.*collision|refus.*skill/i);
+    expect(readFileSync(skillPath, 'utf-8')).toBe(collision);
+    expect(listConnectors(tmpDir).some((entry) => entry.path === skillPath)).toBe(false);
+  });
+
+  it('converges a marked user edit and remains byte-idempotent', () => {
+    const first = installConnector('claude-code', 'skill', tmpDir);
+    const edited = `${readFileSync(first.path, 'utf-8')}\nUser customization that convergence may replace.\n`;
+    writeFileSync(first.path, edited);
+
+    installConnector('claude-code', 'skill', tmpDir);
+    const converged = readFileSync(first.path, 'utf-8');
+    installConnector('claude-code', 'skill', tmpDir);
+    expect(readFileSync(first.path, 'utf-8')).toBe(converged);
+    expect(converged).toContain(LCM_MANAGED_SKILL_MARKER);
+  });
+
+  it('does not duplicate a marker when the standalone template already carries it', async () => {
+    const canonical = renderGuidance('skill', 'cli');
+    await withMockedGeneratedContent(canonical, (install) => {
+      const result = install('claude-code', 'skill', tmpDir);
+      expect(countOccurrences(readFileSync(result.path, 'utf-8'), LCM_MANAGED_SKILL_MARKER)).toBe(1);
+    });
   });
 
   it('returns requiresRestart: true for skill', () => {
@@ -772,6 +870,7 @@ describe('installConnector — Codex native hooks', () => {
     ['normalizes LF-only content', '\n', '\n'],
     ['preserves CRLF for CRLF-only content', '\r\n', '\r\n'],
     ['normalizes CR-only content', '\r', '\n'],
+    ['handles a long CRLF run before a non-newline tail', `Heading${'\r\n'.repeat(32)}Tail`, `Heading${'\r\n'.repeat(32)}Tail`],
   ])('%s', async (_description, input, expected) => {
     vi.resetModules();
     vi.doMock('../../src/connectors/template-service.js', () => ({
@@ -781,17 +880,14 @@ describe('installConnector — Codex native hooks', () => {
     try {
       const { installConnector: installMockedConnector } = await import('../../src/connectors/installer.js');
       const result = installMockedConnector('codex', 'skill', tmpDir);
-      expect(readFileSync(result.path, 'utf-8')).toBe(expected);
+      expect(readFileSync(result.path, 'utf-8')).toBe(managedSkillContent(expected));
     } finally {
       vi.doUnmock('../../src/connectors/template-service.js');
     }
   });
 
   it('preserves CRLF canonical bytes across repeated Codex skill installs', async () => {
-    const canonical = readFileSync(
-      new URL('../../src/connectors/templates/skill/SKILL.md', import.meta.url),
-      'utf-8',
-    );
+    const canonical = renderGuidance('skill', 'cli');
     const canonicalCrLf = canonical.replaceAll('\n', '\r\n');
     const skillPath = join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md');
     vi.resetModules();
@@ -816,10 +912,7 @@ describe('installConnector — Codex native hooks', () => {
   });
 
   it('reinstalls the Codex skill byte-identically to the canonical template', () => {
-    const canonical = readFileSync(
-      new URL('../../src/connectors/templates/skill/SKILL.md', import.meta.url),
-      'utf-8',
-    );
+    const canonical = renderGuidance('skill', 'cli');
     const skillPath = join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md');
 
     installConnector('codex', 'skill', tmpDir);
@@ -835,18 +928,18 @@ describe('installConnector — Codex native hooks', () => {
     expect(secondInstall).toBe(firstInstall);
   });
 
-  it('installs hooks, skill, and global rules by default', () => {
+  it('installs hooks and the CLI skill by default', () => {
     const result = installConnector('codex', undefined, tmpDir);
 
     expect(result.success).toBe(true);
     expect(result.path).toContain(join(tmpDir, '.codex', 'hooks.json'));
     expect(result.path).toContain(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'));
-    expect(result.path).toContain(join(tmpDir, '.codex', 'AGENTS.md'));
+    expect(result.path).not.toContain(join(tmpDir, '.codex', 'AGENTS.md'));
 
     const hooksPath = join(tmpDir, '.codex', 'hooks.json');
     const hooks = JSON.parse(readFileSync(hooksPath, 'utf-8'));
     expect(hooks.hooks.SessionStart[0].hooks[0].command).toBe('lcm restore --client codex');
-    expect(hooks.hooks.UserPromptSubmit[0].hooks[0].command).toBe('lcm user-prompt --client codex');
+    expect(hooks.hooks.UserPromptSubmit[0].hooks[0].command).toBe('lcm user-prompt --client codex --transport cli');
     expect(hooks.hooks.PostToolUse[0].hooks[0].command).toBe('lcm post-tool --client codex');
     expect(hooks.hooks.PreCompact[0].matcher).toBe('manual|auto');
     expect(hooks.hooks.PreCompact[0].hooks[0]).toEqual({
@@ -862,20 +955,63 @@ describe('installConnector — Codex native hooks', () => {
     expect(skill).toContain('lcm search');
     expect(skill).not.toMatch(/claude/i);
 
-    const rules = readFileSync(join(tmpDir, '.codex', 'AGENTS.md'), 'utf-8');
-    expect(rules).toContain(LCM_MARKERS.START);
-    expect(countOccurrences(rules, LCM_MARKERS.START)).toBe(2);
-    expect(rules).toContain('lcm search');
-    expect(rules).toContain('lcm --help');
-    expect(rules).not.toContain('@lcm');
-    expect(rules).not.toContain('LCM_CONNECTOR_START');
-    expect(rules).not.toMatch(/claude/i);
+    expect(existsSync(join(tmpDir, '.codex', 'AGENTS.md'))).toBe(false);
 
     const config = readFileSync(join(tmpDir, '.codex', 'config.toml'), 'utf-8');
     expect(config).toContain('[features]');
     expect(config).toContain('hooks = true');
     expect(config).not.toContain('codex_hooks');
     expect(config).not.toMatch(/claude/i);
+  });
+
+  it('migrates only recognized Codex managed rules after the CLI bundle verifies', () => {
+    const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
+    mkdirSync(dirname(rulesPath), { recursive: true });
+    const generated = renderGuidance('rules', 'cli');
+    const existing = [
+      '# Personal Codex rules',
+      'Keep this byte.',
+      generated.trimEnd(),
+      '<!-- lcm -->',
+      'ordinary user text',
+      '<!-- lcm -->',
+      'Keep this byte too.',
+      '',
+    ].join('\n');
+    writeFileSync(rulesPath, existing);
+
+    installConnector('codex', undefined, tmpDir);
+    const migrated = readFileSync(rulesPath, 'utf8');
+    expect(migrated).toBe([
+      '# Personal Codex rules',
+      'Keep this byte.',
+      '<!-- lcm -->',
+      'ordinary user text',
+      '<!-- lcm -->',
+      'Keep this byte too.',
+      '',
+    ].join('\n'));
+
+    const firstInstall = readFileSync(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'), 'utf8');
+    installConnector('codex', undefined, tmpDir);
+    expect(readFileSync(rulesPath, 'utf8')).toBe(migrated);
+    expect(readFileSync(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'), 'utf8')).toBe(firstInstall);
+  });
+
+  it('preserves malformed and partial Codex managed markers during default migration', () => {
+    const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
+    mkdirSync(dirname(rulesPath), { recursive: true });
+    const partial = [
+      '# Personal Codex rules',
+      LCM_MARKERS.START,
+      '# Workflow Instruction',
+      'User-authored continuation must remain.',
+      '',
+    ].join('\r\n');
+    writeFileSync(rulesPath, partial);
+
+    installConnector('codex', undefined, tmpDir);
+    expect(readFileSync(rulesPath, 'utf8')).toBe(partial);
   });
 
   it('idempotently ensures Codex rules in ~/.codex/AGENTS.md', () => {
@@ -966,7 +1102,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(content).not.toContain(LEGACY_LCM_MARKERS.END);
     expect(content).not.toContain('old managed content');
     expect(content).not.toContain('@lcm Codex');
-    expect(content).toContain('lcm --help');
+    expect(content).toContain('lcm store');
   });
 
   it('migrates the deprecated codex_hooks feature flag when installing hooks', () => {
@@ -1328,9 +1464,312 @@ describe('removeConnector — skill', () => {
   it('returns false when skill not installed', () => {
     expect(removeConnector('claude-code', 'skill', tmpDir)).toBe(false);
   });
+
+  it('preserves an arbitrary collision and reports bundle removal failure without clearing transport', () => {
+    const configPath = join(tmpDir, 'config.json');
+    const skillPath = join(tmpDir, '.claude', 'skills', 'lcm-memory', 'SKILL.md');
+    mkdirSync(dirname(skillPath), { recursive: true });
+    const collision = '# User-owned skill\n';
+    writeFileSync(skillPath, collision);
+    writeFileSync(configPath, JSON.stringify({ connectors: { transports: { 'claude-code': 'cli' } } }) + '\n');
+
+    const result = removeConnector('claude-code', tmpDir, { configPath });
+    expect(result).toMatchObject({ success: false });
+    expect(readFileSync(skillPath, 'utf-8')).toBe(collision);
+    expect(readFileSync(configPath, 'utf-8')).toContain('claude-code');
+  });
+});
+
+describe('removeConnector — complete Claude bundle', () => {
+  function canonicalNativeMcpEntry() {
+    return {
+      type: 'stdio',
+      command: process.execPath,
+      args: [join(process.cwd(), 'dist', 'lcm.mjs'), 'mcp'],
+    };
+  }
+
+  function withGlobalClaudeSettings<T>(
+    settings: Record<string, unknown>,
+    callback: (settingsPath: string, configPath: string, cwd: string) => T,
+  ): T {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const cwd = join(tmpDir, 'project');
+      const configPath = join(tmpDir, 'config.json');
+      const settingsPath = join(tmpDir, '.claude', 'settings.json');
+      mkdirSync(cwd, { recursive: true });
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+      return callback(settingsPath, configPath, cwd);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  }
+
+  it('removes the canonical native MCP entry from global settings while preserving unrelated settings', () => {
+    withGlobalClaudeSettings({
+      theme: 'dark',
+      mcpServers: {
+        lcm: canonicalNativeMcpEntry(),
+        other: { type: 'stdio', command: 'other', args: [] },
+      },
+    }, (settingsPath, configPath, cwd) => {
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+
+      const result = removeConnector('claude-code', cwd, { configPath });
+
+      expect(result).toMatchObject({ success: true, removed: true });
+      expect(JSON.parse(readFileSync(settingsPath, 'utf-8'))).toEqual({
+        theme: 'dark',
+        mcpServers: { other: { type: 'stdio', command: 'other', args: [] } },
+      });
+      expect(readConnectorTransport(configPath, 'claude-code')).toBeUndefined();
+    });
+  });
+
+  it('refuses an unverified native MCP collision without changing settings or transport', () => {
+    withGlobalClaudeSettings({
+      mcpServers: {
+        lcm: { type: 'stdio', command: process.execPath, args: [join(process.cwd(), 'dist', 'lcm.mjs'), 'mcp', '--user'] },
+      },
+      unrelated: { keep: true },
+    }, (settingsPath, configPath, cwd) => {
+      const before = readFileSync(settingsPath, 'utf-8');
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+
+      const result = removeConnector('claude-code', cwd, { configPath });
+
+      expect(result).toMatchObject({ success: false });
+      expect(result).toEqual(expect.objectContaining({
+        failures: expect.arrayContaining([expect.stringMatching(/native Claude MCP|Refusing to remove/iu)]),
+      }));
+      expect(readFileSync(settingsPath, 'utf-8')).toBe(before);
+      expect(readConnectorTransport(configPath, 'claude-code')).toBe('mcp');
+    });
+  });
+
+  it('refuses malformed native MCP settings without changing settings or transport', () => {
+    withGlobalClaudeSettings({ mcpServers: [] }, (settingsPath, configPath, cwd) => {
+      const before = readFileSync(settingsPath, 'utf-8');
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+
+      const result = removeConnector('claude-code', cwd, { configPath });
+
+      expect(result).toMatchObject({ success: false });
+      expect(result).toEqual(expect.objectContaining({
+        failures: expect.arrayContaining([expect.stringMatching(/mcpServers must contain a JSON object/iu)]),
+      }));
+      expect(readFileSync(settingsPath, 'utf-8')).toBe(before);
+      expect(readConnectorTransport(configPath, 'claude-code')).toBe('mcp');
+    });
+  });
+
+  it('leaves unrelated native MCP settings untouched when the lcm key is absent', () => {
+    withGlobalClaudeSettings({
+      mcpServers: { other: { type: 'stdio', command: 'other', args: [] } },
+    }, (settingsPath, configPath, cwd) => {
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+      const before = readFileSync(settingsPath, 'utf-8');
+
+      const result = removeConnector('claude-code', cwd, { configPath });
+
+      expect(result).toMatchObject({ success: true, removed: false });
+      expect(readFileSync(settingsPath, 'utf-8')).toBe(before);
+      expect(readConnectorTransport(configPath, 'claude-code')).toBeUndefined();
+    });
+  });
+
+  it('fails closed when native MCP readback still contains the removed entry', () => {
+    withGlobalClaudeSettings({ mcpServers: { lcm: canonicalNativeMcpEntry() } }, (settingsPath, configPath, cwd) => {
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+      const originalParse = JSON.parse.bind(JSON);
+      let parseCount = 0;
+      const parseSpy = vi.spyOn(JSON, 'parse').mockImplementation((text: string) => {
+        const parsed = originalParse(text) as Record<string, unknown>;
+        parseCount += 1;
+        if (parseCount === 2) parsed.mcpServers = { lcm: canonicalNativeMcpEntry() };
+        return parsed;
+      });
+      try {
+        const result = removeConnector('claude-code', cwd, { configPath });
+
+        expect(result).toMatchObject({ success: false });
+        expect(result).toEqual(expect.objectContaining({
+          failures: expect.arrayContaining([expect.stringMatching(/remained after removal/iu)]),
+        }));
+        expect(readConnectorTransport(configPath, 'claude-code')).toBe('mcp');
+      } finally {
+        parseSpy.mockRestore();
+      }
+      expect(JSON.parse(readFileSync(settingsPath, 'utf-8')).mcpServers).toBeUndefined();
+    });
+  });
+
+  it('removes the bundle safely when Claude has no native hook path', () => {
+    const agent = AGENTS.find((candidate) => candidate.id === 'claude-code');
+    expect(agent).toBeDefined();
+    const previousHookPath = agent!.configPaths.hook;
+    delete agent!.configPaths.hook;
+    try {
+      const configPath = join(tmpDir, 'config.json');
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+
+      const result = removeConnector('claude-code', tmpDir, { configPath });
+
+      expect(result).toMatchObject({ success: true, removed: false });
+      expect(readConnectorTransport(configPath, 'claude-code')).toBeUndefined();
+    } finally {
+      if (previousHookPath === undefined) delete agent!.configPaths.hook;
+      else agent!.configPaths.hook = previousHookPath;
+    }
+  });
+
+  it('reports primitive native settings failures without clearing transport', () => {
+    withGlobalClaudeSettings({ mcpServers: { lcm: canonicalNativeMcpEntry() } }, (_settingsPath, configPath, cwd) => {
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+      const parseSpy = vi.spyOn(JSON, 'parse').mockImplementation(() => {
+        throw 'native settings parse failed';
+      });
+      try {
+        const result = removeConnector('claude-code', cwd, { configPath });
+
+        expect(result).toMatchObject({ success: false });
+        expect(result).toEqual(expect.objectContaining({
+          failures: expect.arrayContaining(['native-mcp: native settings parse failed']),
+        }));
+      } finally {
+        parseSpy.mockRestore();
+      }
+      expect(readConnectorTransport(configPath, 'claude-code')).toBe('mcp');
+    });
+  });
+
+  it('removes a canonical native MCP entry from a Claude CLI bundle', () => {
+    withGlobalClaudeSettings({ mcpServers: { lcm: canonicalNativeMcpEntry() } }, (settingsPath, configPath, cwd) => {
+      const installed = installConnector('claude-code', 'cli', cwd, { configPath });
+      expect(installed.success).toBe(true);
+
+      writeFileSync(settingsPath, `${JSON.stringify({ mcpServers: { lcm: canonicalNativeMcpEntry() } }, null, 2)}\n`);
+      const result = removeConnector('claude-code', cwd, { configPath });
+
+      expect(result).toMatchObject({ success: true, removed: true });
+      expect(JSON.parse(readFileSync(settingsPath, 'utf-8')).mcpServers).toBeUndefined();
+      expect(readConnectorTransport(configPath, 'claude-code')).toBeUndefined();
+    });
+  });
+
+  it('is idempotent after removing the canonical native MCP entry', () => {
+    withGlobalClaudeSettings({ mcpServers: { lcm: canonicalNativeMcpEntry() } }, (settingsPath, configPath, cwd) => {
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+      const first = removeConnector('claude-code', cwd, { configPath });
+      const afterFirst = readFileSync(settingsPath, 'utf-8');
+      const second = removeConnector('claude-code', cwd, { configPath });
+
+      expect(first).toMatchObject({ success: true, removed: true });
+      expect(second).toMatchObject({ success: true, removed: false });
+      expect(readFileSync(settingsPath, 'utf-8')).toBe(afterFirst);
+      expect(readConnectorTransport(configPath, 'claude-code')).toBeUndefined();
+    });
+  });
 });
 
 describe('listConnectors', () => {
+  it('recognizes Claude hooks stamped for a stored CLI transport', () => {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const settingsPath = join(tmpDir, '.claude', 'settings.json');
+      const configPath = join(tmpDir, '.lcm', 'config.json');
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      setConnectorTransport(configPath, 'claude-code', 'cli');
+      writeFileSync(
+        settingsPath,
+        JSON.stringify(mergeClaudeSettings({}, join(process.cwd(), 'dist', 'lcm.mjs'), process.execPath, 'cli')),
+      );
+
+      const expectedHook = expect.objectContaining({ agentId: 'claude-code', type: 'hook', path: settingsPath });
+      expect(listConnectors(tmpDir)).toEqual(expect.arrayContaining([
+        expectedHook,
+      ]));
+      expect(listConnectorInventory(tmpDir, {
+        codexMcpRunner: { get: () => [], add: () => undefined, remove: () => undefined },
+      }).installed).toEqual(expect.arrayContaining([
+        expectedHook,
+      ]));
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it('recognizes Claude hooks stamped for a stored MCP transport', () => {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const settingsPath = join(tmpDir, '.claude', 'settings.json');
+      const configPath = join(tmpDir, '.lcm', 'config.json');
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+      writeFileSync(
+        settingsPath,
+        JSON.stringify(mergeClaudeSettings({}, join(process.cwd(), 'dist', 'lcm.mjs'), process.execPath, 'mcp')),
+      );
+
+      expect(listConnectors(tmpDir)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentId: 'claude-code', type: 'hook', path: settingsPath }),
+      ]));
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it('uses Claude MCP as the default when no transport is stored', () => {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const settingsPath = join(tmpDir, '.claude', 'settings.json');
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(
+        settingsPath,
+        JSON.stringify(mergeClaudeSettings({}, join(process.cwd(), 'dist', 'lcm.mjs'), process.execPath, 'mcp')),
+      );
+
+      expect(listConnectors(tmpDir)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentId: 'claude-code', type: 'hook', path: settingsPath }),
+      ]));
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it('recognizes either exact Claude transport variant when stored selection is invalid', () => {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const settingsPath = join(tmpDir, '.claude', 'settings.json');
+      const configPath = join(tmpDir, '.lcm', 'config.json');
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      mkdirSync(dirname(configPath), { recursive: true });
+      writeFileSync(configPath, JSON.stringify({ connectors: { transports: { 'claude-code': 'invalid' } } }) + '\n', { mode: 0o600 });
+      writeFileSync(
+        settingsPath,
+        JSON.stringify(mergeClaudeSettings({}, join(process.cwd(), 'dist', 'lcm.mjs'), process.execPath, 'cli')),
+      );
+
+      expect(listConnectors(tmpDir)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentId: 'claude-code', type: 'hook', path: settingsPath }),
+      ]));
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
   it('finds installed rules connector', () => {
     installConnector('claude-code', 'rules', tmpDir);
     const list = listConnectors(tmpDir);

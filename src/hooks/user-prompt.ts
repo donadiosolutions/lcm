@@ -5,7 +5,11 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { safeLogError } from "./hook-errors.js";
-import { buildMemoryContext } from "./memory-context.js";
+import {
+  buildMemoryContextWithFeedback,
+  memoryFeedbackInstruction,
+} from "./memory-context.js";
+import type { ConnectorTransport } from "../connectors/types.js";
 import { configPath as defaultConfigPath, daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { firePromoteEventsNotifyRequest } from "./session-end.js";
 import {
@@ -36,6 +40,16 @@ type PromoteEventsNotification = {
 };
 
 type EnsureResultWithRefusal = Readonly<{ connected: boolean; refusalReason?: unknown }>;
+
+function isConnectorTransport(value: unknown): value is ConnectorTransport {
+  return value === "cli" || value === "mcp";
+}
+
+/** Resolve once from trusted hook context or legacy client identity. */
+function resolvePromptTransport(input: Record<string, unknown>, selected?: ConnectorTransport): ConnectorTransport {
+  if (isConnectorTransport(selected)) return selected;
+  return input.client === "codex" || process.env.LCM_CLIENT === "codex" ? "cli" : "mcp";
+}
 
 function canonicalRemediationScope(): Readonly<{ scope: string; stateRoot: string }> {
   const root = lcmHomeDir(homedir());
@@ -76,34 +90,26 @@ function resolveHookCwd(inputCwd: unknown): string {
   return process.cwd();
 }
 
-const LEARNING_INSTRUCTION = `<learning-instruction>
-When you recognize a durable insight, call lcm_store immediately:
-- decision: architectural/design choice with trade-offs
-- preference: user working style or tool preference
-- root-cause: bug cause that took effort to uncover
-- pattern: codebase convention not documented elsewhere
-- gotcha: non-obvious pitfall or footgun
-- solution: non-trivial fix worth remembering
-- workflow: multi-step process that works
-
-Tag prefixes: type: | scope: | project: | sprint: | source: | priority: | owner: | signal:
-Usage: lcm_store(text: "concise insight with why", tags: ["type:decision", "project:<repo>"])
-
-When you act on a surfaced memory (use it to inform a decision, avoid a known pitfall, or reference it in your work), emit:
-lcm_store(text: "Acted on memory <id> — <one-line how>", tags: ["signal:memory_used", "memory_id:<id>"])
-</learning-instruction>`;
+function emptyHookResponse(): { exitCode: number; stdout: string } {
+  return { exitCode: 0, stdout: "" };
+}
 
 export async function handleUserPromptSubmit(
   stdin: string,
   client?: DaemonClient,
   port?: number,
   storage?: StorageBackendSelection,
+  transport?: ConnectorTransport,
 ): Promise<{ exitCode: number; stdout: string }> {
   try {
     const input = JSON.parse(stdin || "{}");
     if (!input.prompt || typeof input.prompt !== "string" || !input.prompt.trim()) {
-      return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+      return emptyHookResponse();
     }
+    // `input.transport` is untrusted hook stdin and is deliberately ignored.
+    // Generated hook commands supply the selected transport through the
+    // out-of-band argument above; legacy commands infer from client identity.
+    const selectedTransport = resolvePromptTransport(input as Record<string, unknown>, transport);
     const cwd = resolveHookCwd(input.cwd);
     try {
       // Missing topology is an operator/bootstrap failure, not an unresolved
@@ -112,7 +118,7 @@ export async function handleUserPromptSubmit(
       // publication transition.
       assertHookRootEstablished();
     } catch {
-      return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+      return emptyHookResponse();
     }
     let notification: PromoteEventsNotification | undefined;
     // Hook repair is allowed when no local enqueue is needed, and only after
@@ -160,7 +166,7 @@ export async function handleUserPromptSubmit(
       }
     } catch (e) {
       if (isBackendPublicationJournalError(e)) {
-        if (isBackendPublicationEvidenceMissing(e)) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+        if (isBackendPublicationEvidenceMissing(e)) return emptyHookResponse();
         throw e;
       }
       await safeLogError("UserPromptSubmit", e, {
@@ -178,7 +184,11 @@ export async function handleUserPromptSubmit(
     if (hookRepairAllowed && hookClient !== "codex") {
       assertHookPublicationFence();
       const { validateAndFixHooks } = await import("./auto-heal.js");
-      validateAndFixHooks();
+      // An explicit CLI invocation is authoritative for this repair. When no
+      // transport was supplied, auto-heal resolves the stored/default choice
+      // itself so a stored CLI selection is not downgraded to MCP.
+      if (transport === undefined) validateAndFixHooks();
+      else validateAndFixHooks(undefined, transport);
     }
 
     let effectiveStorage = storage;
@@ -204,11 +214,11 @@ export async function handleUserPromptSubmit(
       assertHookPublicationFence();
     } catch (error) {
       if (isBackendPublicationJournalError(error)) {
-        if (isBackendPublicationEvidenceMissing(error)) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+        if (isBackendPublicationEvidenceMissing(error)) return emptyHookResponse();
         throw error;
       }
       emitAdmissionNotice(undefined, "ambiguous");
-      return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+      return emptyHookResponse();
     }
     let ensureResult: EnsureResultWithRefusal;
     try {
@@ -224,15 +234,15 @@ export async function handleUserPromptSubmit(
       });
     } catch (error) {
       if (isBackendPublicationJournalError(error)) {
-        if (isBackendPublicationEvidenceMissing(error)) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+        if (isBackendPublicationEvidenceMissing(error)) return emptyHookResponse();
         throw error;
       }
       emitAdmissionNotice(undefined, "ambiguous");
-      return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+      return emptyHookResponse();
     }
     if (!ensureResult.connected) {
       emitAdmissionNotice(ensureResult, "not-running");
-      return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+      return emptyHookResponse();
     }
     clearAdmissionNotice();
 
@@ -255,20 +265,28 @@ export async function handleUserPromptSubmit(
       query: input.prompt,
       cwd,
       session_id: input.session_id,
-      learningInstructionBytes: Buffer.byteLength(LEARNING_INSTRUCTION, "utf8"),
+      learningInstructionBytes: Buffer.byteLength(memoryFeedbackInstruction(selectedTransport), "utf8"),
     });
 
-    if (!result.hints || result.hints.length === 0) {
-      return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+    if (!Array.isArray(result.hints) || result.hints.length === 0) {
+      return emptyHookResponse();
     }
 
-    const hint = buildMemoryContext(result.hints, result.ids ?? [])!;
-    return { exitCode: 0, stdout: `${hint}\n${LEARNING_INSTRUCTION}` };
+    const hints = result.hints.filter(
+      (hint): hint is string => typeof hint === "string" && hint.trim().length > 0,
+    );
+    if (hints.length === 0) return emptyHookResponse();
+
+    const ids = Array.isArray(result.ids)
+      ? result.ids.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      : [];
+    const context = buildMemoryContextWithFeedback(hints, ids, selectedTransport);
+    return context ? { exitCode: 0, stdout: context } : emptyHookResponse();
   } catch (error) {
     if (isBackendPublicationJournalError(error)) {
-      if (isBackendPublicationEvidenceMissing(error)) return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+      if (isBackendPublicationEvidenceMissing(error)) return emptyHookResponse();
       throw error;
     }
-    return { exitCode: 0, stdout: LEARNING_INSTRUCTION };
+    return emptyHookResponse();
   }
 }

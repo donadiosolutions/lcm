@@ -102,6 +102,35 @@ vi.mock("node:fs", async (importOriginal) => ({
   readFileSync: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
 }));
 
+// Keep this route unit isolated from the daemon's eager route-registration graph.
+// The production route only needs the response seam from server.ts here.
+vi.mock("../../../src/daemon/server.js", async () => {
+  const { sanitizeError } = await import("../../../src/daemon/safe-error.js");
+  return {
+    sendJson: (
+      res: {
+        writeHead: (status: number, headers: Record<string, string>) => void;
+        end: (body: string) => void;
+      },
+      status: number,
+      data: unknown,
+    ): void => {
+      const safe =
+        data !== null
+        && typeof data === "object"
+        && "error" in data
+        && typeof (data as Record<string, unknown>).error === "string"
+          ? {
+              ...(data as Record<string, unknown>),
+              error: sanitizeError((data as Record<string, unknown>).error as string),
+            }
+          : data;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(safe));
+    },
+  };
+});
+
 const db = vi.hoisted(() => ({
   prepare: (sql: string) => ({
     get: () => sql.includes("session_instruction_cache") ? undefined : undefined,

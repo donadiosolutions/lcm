@@ -19,9 +19,8 @@ const productionFiles = [
 // Implementation and test files are intentionally excluded so compatibility
 // aliases and lifecycle seams remain testable without becoming recovery advice.
 const guidanceSurfaceFiles = [
-  "README.md", ".codex/skills/lcm-memory/SKILL.md", ".claude/commands/lcm-dogfood.md",
-  ".github/skills/lcm-memory/SKILL.md", ".agents/skills/lcm-context/SKILL.md",
-  ".agents/skills/lcm-dogfood/SKILL.md", ".agents/skills/lcm-dogfood/references/checks.md",
+  "README.md", ".agents/skills/lcm-dogfood/SKILL.md",
+  ".agents/skills/lcm-dogfood/references/checks.md",
   ".agents/skills/lcm-dogfood/references/known-issues.md",
   ".agents/skills/lcm-e2e/SKILL.md", ".agents/skills/lcm-e2e/checklist.md",
   ".agents/skills/lcm-release/SKILL.md", "docs/README.md", "docs/agent-tools.md",
@@ -30,13 +29,7 @@ const guidanceSurfaceFiles = [
   "docs/external-admission.md", "docs/fts5.md", "docs/hook-protocol.md",
   "docs/issue-triage.md", "docs/passive-learning.md", "docs/privacy.md",
   "docs/project-identity.md", "docs/releasing.md", "docs/tag-schema.md",
-  "docs/vscode-codex.md", "src/cli-help.ts", "src/connectors/templates/base.md",
-  "src/connectors/templates/mcp-base.md",
-  "src/connectors/templates/sections/command-reference.md",
-  "src/connectors/templates/sections/mcp-workflow.md",
-  "src/connectors/templates/sections/workflow.md",
-  "src/connectors/templates/skill/SKILL.md",
-  "src/connectors/templates/claude/skills/lcm-context/SKILL.md",
+  "docs/vscode-codex.md", "src/cli-help.ts",
   "src/connectors/templates/claude/commands/lcm-compact.md",
   "src/connectors/templates/claude/commands/lcm-curate.md",
   "src/connectors/templates/claude/commands/lcm-diagnose.md",

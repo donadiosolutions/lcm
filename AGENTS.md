@@ -14,8 +14,12 @@
   `npm run test:ci` reports 100% lines, 100% branches, 100% functions, and
   100% statements and passes the per-file threshold for the complete collected
   scope.
-- Use focused Vitest coverage runs while developing individual subsystems, but
-  never lower any threshold or narrow the collected scope.
+- For local development and pre-push verification, run only the tests relevant
+  to the code being changed and its direct integration boundaries. If the
+  impact is uncertain, err on the side of caution and widen the local test
+  scope before pushing. Do not run unrelated local suites solely to duplicate
+  the complete CI run; rely on CI to exercise the complete collected scope and
+  enforce the 100% coverage gate.
 - Do not use coverage exclusions, `v8 ignore` directives, skipped tests, or
   untested production wrappers to satisfy the gate. Cover behavior through
   observable public seams and deterministic failure injection.
@@ -113,26 +117,7 @@ gh issue create \
 
 Then carry on with the original task. This ensures bugs are tracked and can be assigned to another agent without holding up the current work.
 
-## Copilot Code Review Workflow
-
-Copilot reviews PRs targeting `main` automatically. The ruleset has `review_on_push: true` — every push triggers a fresh review. No manual re-request needed.
-
-### Custom instructions
-
-`.github/copilot-instructions.md` contains project-specific review rules that Copilot reads server-side. When you learn a new pattern from a review round (something Copilot flagged that was a real issue), add it to that file so it's caught automatically next time.
-
-### Reducing review rounds
-
-Most multi-round Copilot reviews happen because of preventable issues. Before pushing a PR:
-
-1. **Doc/code alignment** — if you changed a flag or behavior, check whether help text, SKILL.md tables, or README entries need updating
-2. **Shell scripts** — use `--ff-only` for `git pull`, env var overrides for timeouts; see `gh` CLI notes below
-3. **JSON files** — use in-place string replacement, never `JSON.stringify` (it reformats the file)
-4. **Merge strategies** — sync PRs use `--merge` (never `--rebase` — fails on merge commits)
-5. **Consistency** — if the same flag/strategy appears in multiple places, verify they all match
-6. **GitHub Actions workflows** — always declare `permissions:` explicitly; add `actions/setup-node` before using `node`; make branch/PR creation idempotent (check if branch/PR exists before creating)
-
-### gh CLI conventions (v2.88.1)
+## GitHub CLI conventions (v2.88.1)
 
 Some flags that look reasonable don't exist in the installed version:
 
@@ -145,9 +130,8 @@ Some flags that look reasonable don't exist in the installed version:
 - **`gh pr merge --yes` does not exist** — omit it; the command is non-interactive by default
 - **`gh pr list --json number`** works fine for listing/querying
 
-### Handling review comments
+## Handling review comments
 
-- **Suggestion commits**: for trivial fixes, accept Copilot's suggestion directly on GitHub (zero tokens)
 - **Simple fixes** (renames, string updates): dispatch a haiku subagent
 - **Logic changes**: dispatch a sonnet subagent
 - Never implement fixes inline in the main session — always dispatch a subagent

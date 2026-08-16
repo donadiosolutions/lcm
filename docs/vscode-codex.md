@@ -1,6 +1,8 @@
 # VS Code and Codex setup
 
-This repository has the shared memory backend needed for VS Code and Codex. Codex now has native hooks plus skill and rules connectors; GitHub Copilot in VS Code remains rules based.
+This repository has the shared memory backend needed for VS Code and Codex.
+Codex supports complete CLI or MCP connector bundles; GitHub Copilot in VS Code
+uses the CLI guidance bundle.
 
 For normal use, install and update the published package through npm:
 
@@ -30,7 +32,7 @@ If you do not want a global link, run `node dist/lcm.mjs ...` instead of
 For GitHub Copilot in VS Code:
 
 ```bash
-lcm connectors install github-copilot
+lcm connectors install github-copilot --transport cli
 lcm connectors doctor github-copilot
 ```
 
@@ -51,12 +53,42 @@ lcm connectors install codex
 lcm connectors doctor codex
 ```
 
-This writes the default Codex connector set:
+This writes the default Codex CLI bundle:
 
 - `~/.codex/hooks.json`
 - `~/.codex/config.toml` with `[features].hooks = true`
 - `.codex/skills/lcm-memory/SKILL.md`
-- `~/.codex/AGENTS.md`
+
+The default is exactly the native hook plus the `lcm-memory` skill. A
+fresh/default Codex CLI install does not add, remove, or inspect MCP
+configuration.
+
+Connector installation selects one complete transport bundle:
+
+```bash
+lcm connectors install <agent> [--transport cli|mcp] [--global]
+lcm connectors remove <agent> [--global]
+```
+
+The precedence order is explicit `--transport`, then stored
+`connectors.transports.<agent-id>`, then the registry default; implicit defaults
+are not persisted. Claude Code, Qwen Code, and Zed default to MCP. Codex and
+every other agent default to CLI. Cline and Augment are CLI-only until
+verifiable MCP adapters exist. Guidance never falls back between transports,
+and removal removes the whole LCM-owned bundle.
+
+To opt Codex into MCP, use:
+
+```bash
+lcm connectors install codex --transport mcp
+lcm connectors doctor codex
+```
+
+The MCP bundle uses native `codex mcp` commands for Codex registration and
+requires no TOML editing. Use
+`lcm connectors install codex --transport cli` to converge back to the CLI
+bundle. Explicit or stored CLI convergence may remove only the exact
+LCM-owned MCP registration.
 
 The hook connector installs these Codex events:
 
@@ -110,18 +142,16 @@ trimmed command beginning with `lcm store` is suppressed to avoid a feedback
 loop from LCM's own storage calls. There is no new configuration option for
 these fixed capture rules.
 
-If you only want the Codex skill or rules instead of the default set:
-
-```bash
-lcm connectors install codex --type skill
-lcm connectors install codex --type rules
-```
-
 Reinstalling generated Markdown connectors is byte-idempotent: the Codex skill
 `.codex/skills/lcm-memory/SKILL.md` remains byte-identical to its canonical
-template with exactly one final newline, and normal rules append installs remove
-and reappend their managed block without changing the established LF or CRLF
-style. One-run healing is limited to recognized current or legacy managed
+template with exactly one final newline. The skill and explicit rules fallback
+share one catalog of operation names, purposes, lifecycle triggers, and CLI/MCP
+spellings. Their lean workflow uses automatically injected memory first,
+requires immediate explicit storage of every newly recognized durable learning
+with its rationale, and treats automatic capture as complementary rather than a
+substitute. Normal rules append installs remove and reappend their managed block
+without changing the established LF or CRLF style. One-run healing is limited to
+recognized current or legacy managed
 blocks, the maximal union of their overlapping or touching recognized ranges,
 and a current marker followed only by one or more exact `# Workflow Instruction`
 lines as a recoverable header-only partial region. These recognized regions are
@@ -143,20 +173,19 @@ lcm import --codex
 lcm import --provider all
 ```
 
-## Current shortcomings
+## Current limitations
 
-1. `lcm install` configures Claude Code's npm-owned native integration. Use `lcm connectors install codex` for Codex and `lcm connectors install github-copilot` for VS Code.
-2. GitHub Copilot in VS Code is skill-based today. There is no automatic session restore, turn ingestion, prompt-time search injection, or compaction hook.
-3. The GitHub Copilot connector does not register MCP automatically. The current supported path is instructions/skill guidance plus the `lcm` CLI.
-4. Codex MCP config lives in `.codex/config.toml`, but the connector installer does not edit TOML yet. `lcm connectors install codex --type mcp` only prints manual instructions.
-5. Codex `Stop` hooks are turn-scoped, not final-session hooks. LCM therefore uses rolling snapshots and thresholded compaction instead of marking Codex sessions complete on each `Stop`; the `PreCompact` snapshot hook fills the pre-compaction gap.
-6. Claude Code and Codex use native integrations, but their setup commands remain different.
+1. GitHub Copilot in VS Code is skill-based today. There is no automatic session restore, turn ingestion, prompt-time search injection, or compaction hook.
+2. The GitHub Copilot connector does not register MCP automatically. The current supported path is instructions/skill guidance plus the `lcm` CLI.
+3. Codex MCP is opt-in. The explicit MCP bundle uses native `codex mcp` commands; default/fresh Codex CLI installation remains hook+skill and does not inspect MCP.
+4. Codex `Stop` hooks are turn-scoped, not final-session hooks. LCM therefore uses rolling snapshots and thresholded compaction instead of marking Codex sessions complete on each `Stop`; the `PreCompact` snapshot hook fills the pre-compaction gap.
+5. Claude Code and Codex use native integrations, but their setup commands remain different.
 
 ## Improvement candidates
 
 1. Add first-class `lcm setup vscode` and `lcm setup codex` commands instead of overloading `lcm install`.
-2. Add TOML read/write support so Codex MCP setup can be automated.
-3. Add a real VS Code runtime adapter for restore, writeback, and prompt-time recall instead of rules-only guidance.
+2. Extend native Codex MCP adapter coverage only after each adapter is verifiable; Cline and Augment remain CLI-only until then.
+3. Add a real VS Code runtime adapter for restore, writeback, and prompt-time recall instead of skill-only guidance.
 4. Connector diagnostics now validate the exact Codex PostToolUse structure and
    its pure native-exec capture path; no database or hook-file writes are part
    of the check.
