@@ -22,6 +22,7 @@ sensitive-patterns-test.txt
 # Superpowers local state
 .superpowers/
 .pebbles/
+docs/superpowers/
 
 # xgh local state (inbox, cache) — specs and plans are tracked
 .xgh/inbox/
