@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, symlinkSync, lstatSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
@@ -242,6 +242,24 @@ describe("runDoctor canonical Claude skill check", () => {
     expect(check?.status).toBe("warn");
     expect(check?.fixApplied).toBe(true);
     expect(written[join(defaultDoctorHome, ".claude", "skills", "lcm-memory", "SKILL.md")]).toBeDefined();
+  });
+
+  it("uses filesystem inspection before removing a recognized legacy skill", async () => {
+    const legacySkillPath = join(defaultDoctorHome, ".claude", "skills", "lcm-context");
+    mkdirSync(legacySkillPath, { recursive: true });
+    writeFileSync(join(legacySkillPath, "SKILL.md"), "legacy lcm guidance\n");
+    const baseReadFileSync = minimalDeps().readFileSync;
+
+    const results = await runDoctor(minimalDeps({
+      readFileSync: (path: string, encoding: string) => path.startsWith(`${legacySkillPath}/`)
+        ? readFileSync(path, encoding as BufferEncoding)
+        : baseReadFileSync(path, encoding),
+      lstatSync,
+      readdirSync,
+    }));
+
+    expect(results.find((result) => result.name === "lcm-md")?.status).toBe("pass");
+    expect(existsSync(legacySkillPath)).toBe(false);
   });
 });
 

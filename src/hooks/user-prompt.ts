@@ -184,7 +184,11 @@ export async function handleUserPromptSubmit(
     if (hookRepairAllowed && hookClient !== "codex") {
       assertHookPublicationFence();
       const { validateAndFixHooks } = await import("./auto-heal.js");
-      validateAndFixHooks();
+      // An explicit CLI invocation is authoritative for this repair. When no
+      // transport was supplied, auto-heal resolves the stored/default choice
+      // itself so a stored CLI selection is not downgraded to MCP.
+      if (transport === undefined) validateAndFixHooks();
+      else validateAndFixHooks(undefined, transport);
     }
 
     let effectiveStorage = storage;

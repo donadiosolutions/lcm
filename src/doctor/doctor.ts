@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, lstatSync, readdirSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { spawnSync, spawn } from "node:child_process";
@@ -83,6 +83,8 @@ function defaultDeps(): DoctorDeps {
     readFileSync: (p, enc) => readFileSync(p, enc as BufferEncoding),
     writeFileSync,
     mkdirSync: (p, o) => mkdirSync(p, o),
+    lstatSync,
+    readdirSync,
     spawnSync: (cmd, args, opts) => {
       const r = spawnSync(cmd, args, { encoding: "utf-8", ...opts });
       return { status: r.status, stdout: r.stdout as string, stderr: r.stderr as string };
@@ -1333,6 +1335,8 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         readFileSync: deps.readFileSync,
         writeFileSync: deps.writeFileSync,
         mkdirSync: deps.mkdirSync,
+        lstatSync: deps.lstatSync,
+        readdirSync: deps.readdirSync,
       }, deps.homedir, LCM_MD_CONTENT);
     } catch (err) {
       results.push({ name: "lcm-md", category: "Settings", status: "fail", message: `lcm-memory skill repair failed: ${err instanceof Error ? err.message : String(err)} — run: lcm install` });

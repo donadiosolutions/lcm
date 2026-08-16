@@ -257,6 +257,7 @@ const defaultDeps: ServiceDeps = {
   existsSync,
   chmodSync,
   lstatSync,
+  readdirSync,
   rmSync,
   atomicWritePrivateFile,
   atomicWritePrivateFileDurable,
@@ -686,20 +687,21 @@ function removeRecognizedClaudeLegacy(
   }
   const legacySkill = join(claudeDir, "skills", "lcm-context");
   if (deps.existsSync(legacySkill)) {
-    let owned = true;
+    let owned = false;
     if (deps.lstatSync !== undefined && deps.readdirSync !== undefined) {
-      const stat = deps.lstatSync(legacySkill);
-      if (!stat.isDirectory()) owned = false;
-      else {
-        const entries = deps.readdirSync(legacySkill)
-          .filter((entry): entry is string => typeof entry === "string");
-        owned = entries.length > 0 && entries.every((entry) => {
-          if (!entry.endsWith(".md")) return false;
-          try {
-            return deps.readFileSync(join(legacySkill, entry), "utf-8").toLowerCase().includes("lcm");
-          } catch { return false; }
-        });
-      }
+      try {
+        const stat = deps.lstatSync(legacySkill);
+        if (stat.isDirectory()) {
+          const entries = deps.readdirSync(legacySkill)
+            .filter((entry): entry is string => typeof entry === "string");
+          owned = entries.length > 0 && entries.every((entry) => {
+            if (!entry.endsWith(".md")) return false;
+            try {
+              return deps.readFileSync(join(legacySkill, entry), "utf-8").toLowerCase().includes("lcm");
+            } catch { return false; }
+          });
+        }
+      } catch { /* preserve unrecognized or unreadable legacy collisions */ }
     }
     if (owned) {
       if (deps.dryRun) console.log(`[dry-run] would remove ${legacySkill}`);

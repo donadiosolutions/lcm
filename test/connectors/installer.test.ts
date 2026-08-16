@@ -7,7 +7,7 @@ import { LCM_MANAGED_SKILL_MARKER, LCM_MARKERS } from '../../src/connectors/cons
 import { AGENTS } from '../../src/connectors/registry.js';
 import { canonicalHookCommand, hasManagedClaudeSettings, mergeClaudeSettings } from '../../src/installer/settings.js';
 import { renderGuidance } from '../../src/connectors/template-service.js';
-import { setConnectorTransport } from '../../src/config-manager.js';
+import { readConnectorTransport, setConnectorTransport } from '../../src/config-manager.js';
 
 let tmpDir: string;
 
@@ -1477,6 +1477,202 @@ describe('removeConnector — skill', () => {
     expect(result).toMatchObject({ success: false });
     expect(readFileSync(skillPath, 'utf-8')).toBe(collision);
     expect(readFileSync(configPath, 'utf-8')).toContain('claude-code');
+  });
+});
+
+describe('removeConnector — complete Claude bundle', () => {
+  function canonicalNativeMcpEntry() {
+    return {
+      type: 'stdio',
+      command: process.execPath,
+      args: [join(process.cwd(), 'dist', 'lcm.mjs'), 'mcp'],
+    };
+  }
+
+  function withGlobalClaudeSettings<T>(
+    settings: Record<string, unknown>,
+    callback: (settingsPath: string, configPath: string, cwd: string) => T,
+  ): T {
+    const originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    try {
+      const cwd = join(tmpDir, 'project');
+      const configPath = join(tmpDir, 'config.json');
+      const settingsPath = join(tmpDir, '.claude', 'settings.json');
+      mkdirSync(cwd, { recursive: true });
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+      return callback(settingsPath, configPath, cwd);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  }
+
+  it('removes the canonical native MCP entry from global settings while preserving unrelated settings', () => {
+    withGlobalClaudeSettings({
+      theme: 'dark',
+      mcpServers: {
+        lcm: canonicalNativeMcpEntry(),
+        other: { type: 'stdio', command: 'other', args: [] },
+      },
+    }, (settingsPath, configPath, cwd) => {
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+
+      const result = removeConnector('claude-code', cwd, { configPath });
+
+      expect(result).toMatchObject({ success: true, removed: true });
+      expect(JSON.parse(readFileSync(settingsPath, 'utf-8'))).toEqual({
+        theme: 'dark',
+        mcpServers: { other: { type: 'stdio', command: 'other', args: [] } },
+      });
+      expect(readConnectorTransport(configPath, 'claude-code')).toBeUndefined();
+    });
+  });
+
+  it('refuses an unverified native MCP collision without changing settings or transport', () => {
+    withGlobalClaudeSettings({
+      mcpServers: {
+        lcm: { type: 'stdio', command: process.execPath, args: [join(process.cwd(), 'dist', 'lcm.mjs'), 'mcp', '--user'] },
+      },
+      unrelated: { keep: true },
+    }, (settingsPath, configPath, cwd) => {
+      const before = readFileSync(settingsPath, 'utf-8');
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+
+      const result = removeConnector('claude-code', cwd, { configPath });
+
+      expect(result).toMatchObject({ success: false });
+      expect(result).toEqual(expect.objectContaining({
+        failures: expect.arrayContaining([expect.stringMatching(/native Claude MCP|Refusing to remove/iu)]),
+      }));
+      expect(readFileSync(settingsPath, 'utf-8')).toBe(before);
+      expect(readConnectorTransport(configPath, 'claude-code')).toBe('mcp');
+    });
+  });
+
+  it('refuses malformed native MCP settings without changing settings or transport', () => {
+    withGlobalClaudeSettings({ mcpServers: [] }, (settingsPath, configPath, cwd) => {
+      const before = readFileSync(settingsPath, 'utf-8');
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+
+      const result = removeConnector('claude-code', cwd, { configPath });
+
+      expect(result).toMatchObject({ success: false });
+      expect(result).toEqual(expect.objectContaining({
+        failures: expect.arrayContaining([expect.stringMatching(/mcpServers must contain a JSON object/iu)]),
+      }));
+      expect(readFileSync(settingsPath, 'utf-8')).toBe(before);
+      expect(readConnectorTransport(configPath, 'claude-code')).toBe('mcp');
+    });
+  });
+
+  it('leaves unrelated native MCP settings untouched when the lcm key is absent', () => {
+    withGlobalClaudeSettings({
+      mcpServers: { other: { type: 'stdio', command: 'other', args: [] } },
+    }, (settingsPath, configPath, cwd) => {
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+      const before = readFileSync(settingsPath, 'utf-8');
+
+      const result = removeConnector('claude-code', cwd, { configPath });
+
+      expect(result).toMatchObject({ success: true, removed: false });
+      expect(readFileSync(settingsPath, 'utf-8')).toBe(before);
+      expect(readConnectorTransport(configPath, 'claude-code')).toBeUndefined();
+    });
+  });
+
+  it('fails closed when native MCP readback still contains the removed entry', () => {
+    withGlobalClaudeSettings({ mcpServers: { lcm: canonicalNativeMcpEntry() } }, (settingsPath, configPath, cwd) => {
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+      const originalParse = JSON.parse.bind(JSON);
+      let parseCount = 0;
+      const parseSpy = vi.spyOn(JSON, 'parse').mockImplementation((text: string) => {
+        const parsed = originalParse(text) as Record<string, unknown>;
+        parseCount += 1;
+        if (parseCount === 2) parsed.mcpServers = { lcm: canonicalNativeMcpEntry() };
+        return parsed;
+      });
+      try {
+        const result = removeConnector('claude-code', cwd, { configPath });
+
+        expect(result).toMatchObject({ success: false });
+        expect(result).toEqual(expect.objectContaining({
+          failures: expect.arrayContaining([expect.stringMatching(/remained after removal/iu)]),
+        }));
+        expect(readConnectorTransport(configPath, 'claude-code')).toBe('mcp');
+      } finally {
+        parseSpy.mockRestore();
+      }
+      expect(JSON.parse(readFileSync(settingsPath, 'utf-8')).mcpServers).toBeUndefined();
+    });
+  });
+
+  it('removes the bundle safely when Claude has no native hook path', () => {
+    const agent = AGENTS.find((candidate) => candidate.id === 'claude-code');
+    expect(agent).toBeDefined();
+    const previousHookPath = agent!.configPaths.hook;
+    delete agent!.configPaths.hook;
+    try {
+      const configPath = join(tmpDir, 'config.json');
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+
+      const result = removeConnector('claude-code', tmpDir, { configPath });
+
+      expect(result).toMatchObject({ success: true, removed: false });
+      expect(readConnectorTransport(configPath, 'claude-code')).toBeUndefined();
+    } finally {
+      if (previousHookPath === undefined) delete agent!.configPaths.hook;
+      else agent!.configPaths.hook = previousHookPath;
+    }
+  });
+
+  it('reports primitive native settings failures without clearing transport', () => {
+    withGlobalClaudeSettings({ mcpServers: { lcm: canonicalNativeMcpEntry() } }, (_settingsPath, configPath, cwd) => {
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+      const parseSpy = vi.spyOn(JSON, 'parse').mockImplementation(() => {
+        throw 'native settings parse failed';
+      });
+      try {
+        const result = removeConnector('claude-code', cwd, { configPath });
+
+        expect(result).toMatchObject({ success: false });
+        expect(result).toEqual(expect.objectContaining({
+          failures: expect.arrayContaining(['native-mcp: native settings parse failed']),
+        }));
+      } finally {
+        parseSpy.mockRestore();
+      }
+      expect(readConnectorTransport(configPath, 'claude-code')).toBe('mcp');
+    });
+  });
+
+  it('removes a canonical native MCP entry from a Claude CLI bundle', () => {
+    withGlobalClaudeSettings({ mcpServers: { lcm: canonicalNativeMcpEntry() } }, (settingsPath, configPath, cwd) => {
+      const installed = installConnector('claude-code', 'cli', cwd, { configPath });
+      expect(installed.success).toBe(true);
+
+      writeFileSync(settingsPath, `${JSON.stringify({ mcpServers: { lcm: canonicalNativeMcpEntry() } }, null, 2)}\n`);
+      const result = removeConnector('claude-code', cwd, { configPath });
+
+      expect(result).toMatchObject({ success: true, removed: true });
+      expect(JSON.parse(readFileSync(settingsPath, 'utf-8')).mcpServers).toBeUndefined();
+      expect(readConnectorTransport(configPath, 'claude-code')).toBeUndefined();
+    });
+  });
+
+  it('is idempotent after removing the canonical native MCP entry', () => {
+    withGlobalClaudeSettings({ mcpServers: { lcm: canonicalNativeMcpEntry() } }, (settingsPath, configPath, cwd) => {
+      setConnectorTransport(configPath, 'claude-code', 'mcp');
+      const first = removeConnector('claude-code', cwd, { configPath });
+      const afterFirst = readFileSync(settingsPath, 'utf-8');
+      const second = removeConnector('claude-code', cwd, { configPath });
+
+      expect(first).toMatchObject({ success: true, removed: true });
+      expect(second).toMatchObject({ success: true, removed: false });
+      expect(readFileSync(settingsPath, 'utf-8')).toBe(afterFirst);
+      expect(readConnectorTransport(configPath, 'claude-code')).toBeUndefined();
+    });
   });
 });
 

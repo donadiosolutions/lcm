@@ -174,6 +174,19 @@ describe("installer defensive branches", () => {
     }
   });
 
+  it("uses the process cwd when object installer options omit cwd", () => {
+    const originalCwd = process.cwd();
+    process.chdir(directory);
+    try {
+      expect(installConnector("cursor", undefined, {
+        configPath: join(directory, "object-fallback-config.json"),
+      }).success).toBe(true);
+      expect(existsSync(join(directory, ".cursor", "skills", "lcm-memory", "SKILL.md"))).toBe(true);
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
   it("covers a rules fallback when a listed agent has no skill path", () => {
     const agent = AGENTS.find((candidate) => candidate.id === "github-copilot")!;
     const original = agent.configPaths.skill;
@@ -693,7 +706,7 @@ describe("installer defensive branches", () => {
   });
 
   it("covers argument, transport, removal, and inventory fallbacks", () => {
-    expect(installConnector("cursor", undefined, { configPath: join(directory, "object-config.json") }).success).toBe(true);
+    expect(installConnector("cursor", undefined, { cwd: directory, configPath: join(directory, "object-config.json") }).success).toBe(true);
     const configPath = join(directory, "config.json");
     expect(() => installConnector("cursor", "bogus" as never, directory, { configPath })).toThrow(/choose cli or mcp/iu);
     expect(() => installConnector("cursor", "rules", directory)).not.toThrow();

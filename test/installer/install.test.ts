@@ -827,6 +827,46 @@ describe("Claude skill and legacy guidance seams", () => {
     warn.mockRestore();
   });
 
+  it("preserves the legacy skill when inspection seams are omitted", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const rmSync = vi.fn();
+    try {
+      removeClaudeLegacyAssets({
+        existsSync: (path: string) => path === legacySkillPath,
+        readFileSync: vi.fn(),
+        writeFileSync: vi.fn(),
+        mkdirSync: vi.fn(),
+        rmSync,
+      }, home);
+
+      expect(rmSync).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("unrecognized Claude legacy skill collision"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("preserves the legacy skill when inspection fails", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const rmSync = vi.fn();
+    try {
+      removeClaudeLegacyAssets({
+        existsSync: (path: string) => path === legacySkillPath,
+        readFileSync: vi.fn(),
+        writeFileSync: vi.fn(),
+        mkdirSync: vi.fn(),
+        lstatSync: () => { throw new Error("inspection failed"); },
+        readdirSync: vi.fn(),
+        rmSync,
+      }, home);
+
+      expect(rmSync).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("unrecognized Claude legacy skill collision"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("covers legacy directory contents, dry-run removal, and unreadable metadata", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -901,6 +941,12 @@ describe("install", () => {
       writeFileSync: vi.fn((path: string, content: string) => { writes.push(path); files.set(path, content); }),
       rmSync: vi.fn((path: string) => { for (const file of files.keys()) if (file === path || file.startsWith(`${path}/`)) files.delete(file); }),
       mkdirSync: vi.fn(),
+      lstatSync: vi.fn((path: string) => ({
+        isSymbolicLink: () => false,
+        isFile: () => path.endsWith("config.json"),
+        isDirectory: () => path === join(home, ".claude", "skills", "lcm-context"),
+      }) as never),
+      readdirSync: vi.fn(() => ["SKILL.md"]),
       renderClaudeSkill: () => "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\ncanonical\n",
       runDoctor: vi.fn().mockResolvedValue([]),
     } as any);
@@ -914,6 +960,20 @@ describe("install", () => {
     expect(writes.indexOf(join(home, ".claude/skills/lcm-memory/SKILL.md"))).toBeLessThan(
       writes.indexOf(join(home, ".claude/CLAUDE.md")),
     );
+  });
+
+  it("preserves a legacy skill collision when injected install dependencies omit inspection", async () => {
+    const legacySkillPath = join(homedir(), ".claude", "skills", "lcm-context");
+    const rmSync = vi.fn();
+    const deps = makeDeps({
+      existsSync: vi.fn((path: string) => path.endsWith("config.json") || path === legacySkillPath),
+      rmSync,
+      renderClaudeSkill: () => "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\ncanonical\n",
+    });
+
+    await install(deps);
+
+    expect(rmSync).not.toHaveBeenCalledWith(legacySkillPath, expect.anything());
   });
 
   it("does not add Claude MCP for stored CLI transport", async () => {

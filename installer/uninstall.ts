@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, lstatSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
@@ -31,6 +31,8 @@ const defaultDeps: TeardownDeps = {
   rmSync,
   readFileSync: readFileSync as any,
   writeFileSync,
+  lstatSync,
+  readdirSync,
 };
 
 export function teardownDaemonService(deps: TeardownDeps = defaultDeps): void {

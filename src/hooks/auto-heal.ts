@@ -2,7 +2,9 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } fr
 import { homedir } from "node:os";
 import { join, dirname, isAbsolute } from "node:path";
 import { mergeClaudeSettings } from "../installer/settings.js";
-import { lcmPath } from "../runtime-paths.js";
+import { configPath as defaultConfigPath, lcmPath } from "../runtime-paths.js";
+import { resolveAgentTransport } from "../connectors/registry.js";
+import type { ConnectorTransport } from "../connectors/types.js";
 
 export interface AutoHealDeps {
   readFileSync: (path: string, encoding: string) => string;
@@ -14,6 +16,8 @@ export interface AutoHealDeps {
   logPath: string;
   binaryPath: string;
   nodePath?: string;
+  configPath?: string;
+  transport?: ConnectorTransport;
 }
 
 function defaultDeps(): AutoHealDeps {
@@ -26,16 +30,25 @@ function defaultDeps(): AutoHealDeps {
     settingsPath: join(homedir(), ".claude", "settings.json"),
     logPath: lcmPath("auto-heal.log"),
     binaryPath: isAbsolute(process.argv[1] ?? "") ? process.argv[1] : "",
+    configPath: defaultConfigPath(),
   };
 }
 
-export function validateAndFixHooks(deps: AutoHealDeps = defaultDeps()): void {
+export function validateAndFixHooks(
+  deps: AutoHealDeps = defaultDeps(),
+  currentTransport?: ConnectorTransport,
+): void {
   try {
     if (!deps.existsSync(deps.settingsPath)) return;
 
     if (!deps.binaryPath) throw new Error("cannot resolve absolute LCM executable for hook repair");
     const settings: unknown = JSON.parse(deps.readFileSync(deps.settingsPath, "utf-8"));
-    const merged = mergeClaudeSettings(settings, deps.binaryPath, deps.nodePath);
+    const transport = resolveAgentTransport(
+      "claude-code",
+      currentTransport ?? deps.transport,
+      { configPath: deps.configPath ?? defaultConfigPath() },
+    ).transport;
+    const merged = mergeClaudeSettings(settings, deps.binaryPath, deps.nodePath, transport);
     if (JSON.stringify(settings) === JSON.stringify(merged)) return;
     deps.mkdirSync(dirname(deps.settingsPath), { recursive: true });
     deps.writeFileSync(deps.settingsPath, JSON.stringify(merged, null, 2));

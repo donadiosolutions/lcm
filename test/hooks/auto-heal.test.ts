@@ -1,6 +1,36 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { validateAndFixHooks, type AutoHealDeps } from "../../src/hooks/auto-heal.js";
 import { canonicalHookCommand, mergeClaudeSettings } from "../../src/installer/settings.js";
+import type { ConnectorTransport } from "../../src/connectors/types.js";
+
+const transportConfigDirectories: string[] = [];
+
+afterEach(() => {
+  for (const directory of transportConfigDirectories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function makeTransportConfig(stored?: ConnectorTransport): string {
+  const directory = mkdtempSync(join(tmpdir(), "lcm-auto-heal-transport-"));
+  transportConfigDirectories.push(directory);
+  const configPath = join(directory, "config.json");
+  writeFileSync(configPath, JSON.stringify(stored === undefined
+    ? {}
+    : { connectors: { transports: { "claude-code": stored } } }), { mode: 0o600 });
+  return configPath;
+}
+
+function makeMalformedTransportConfig(): string {
+  const directory = mkdtempSync(join(tmpdir(), "lcm-auto-heal-transport-malformed-"));
+  transportConfigDirectories.push(directory);
+  const configPath = join(directory, "config.json");
+  writeFileSync(configPath, JSON.stringify({ connectors: { transports: { "claude-code": "invalid" } } }), { mode: 0o600 });
+  return configPath;
+}
 
 function makeDeps(overrides: Partial<AutoHealDeps> = {}): AutoHealDeps {
   return {
@@ -13,6 +43,7 @@ function makeDeps(overrides: Partial<AutoHealDeps> = {}): AutoHealDeps {
     logPath: "/tmp/test-auto-heal.log",
     binaryPath: "/opt/npm/bin/lcm",
     nodePath: "/usr/bin/node",
+    transport: "mcp",
     ...overrides,
   };
 }
@@ -62,6 +93,77 @@ describe("validateAndFixHooks", () => {
     });
     validateAndFixHooks(deps);
     expect(deps.writeFileSync).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["stored CLI", "cli", "cli"],
+    ["stored MCP", "mcp", "mcp"],
+    ["registry default", undefined, "mcp"],
+  ] as const)("uses the authoritative Claude transport for non-Codex hook repair: %s", (_label, stored, expected) => {
+    const configPath = makeTransportConfig(stored);
+    const deps = makeDeps({
+      configPath,
+      transport: undefined,
+      readFileSync: vi.fn().mockReturnValue(JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [{ matcher: "", hooks: [{
+            type: "command",
+            command: "lcm user-prompt --transport cli",
+          }] }],
+        },
+      })),
+    });
+
+    validateAndFixHooks(deps);
+
+    expect(deps.writeFileSync).toHaveBeenCalledTimes(1);
+    const written = JSON.parse((deps.writeFileSync as ReturnType<typeof vi.fn>).mock.calls[0][1]);
+    expect(written.hooks.UserPromptSubmit.at(-1).hooks[0].command)
+      .toBe(canonicalHookCommand("/opt/npm/bin/lcm", "user-prompt", "/usr/bin/node", process.platform, expected));
+  });
+
+  it("uses an explicit current transport in preference to the stored Claude transport", () => {
+    const deps = makeDeps({
+      configPath: makeTransportConfig("mcp"),
+      transport: undefined,
+      readFileSync: vi.fn().mockReturnValue(JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [{ matcher: "", hooks: [{
+            type: "command",
+            command: "lcm user-prompt --transport mcp",
+          }] }],
+        },
+      })),
+    });
+
+    validateAndFixHooks(deps, "cli");
+
+    const written = JSON.parse((deps.writeFileSync as ReturnType<typeof vi.fn>).mock.calls[0][1]);
+    expect(written.hooks.UserPromptSubmit.at(-1).hooks[0].command)
+      .toBe(canonicalHookCommand("/opt/npm/bin/lcm", "user-prompt", "/usr/bin/node", process.platform, "cli"));
+  });
+
+  it("does not rewrite hooks when the stored Claude transport is malformed", () => {
+    const deps = makeDeps({
+      configPath: makeMalformedTransportConfig(),
+      transport: undefined,
+      readFileSync: vi.fn().mockReturnValue(JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [{ matcher: "", hooks: [{
+            type: "command",
+            command: "lcm user-prompt --transport mcp",
+          }] }],
+        },
+      })),
+    });
+
+    validateAndFixHooks(deps);
+
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+    expect(deps.appendFileSync).toHaveBeenCalledWith(
+      deps.logPath,
+      expect.stringContaining("claude-code"),
+    );
   });
 
   it("preserves mcpServers.lcm when cleaning duplicate hooks", () => {

@@ -217,6 +217,18 @@ describe("teardownDaemonService", () => {
 // ─── uninstall ──────────────────────────────────────────────────────────────
 
 describe("uninstall", () => {
+  it("preserves a legacy skill collision when inspection dependencies are omitted", async () => {
+    const legacySkillPath = join(homedir(), ".claude", "skills", "lcm-context");
+    const deps = makeDeps(true, {
+      rmSync: vi.fn(),
+      readFileSync: vi.fn((path: string) => path.endsWith("settings.json") ? "{}" : ""),
+    });
+
+    await uninstall(deps);
+
+    expect(deps.rmSync).not.toHaveBeenCalledWith(legacySkillPath, expect.anything());
+  });
+
   it("removes settings via deps.writeFileSync when settings.json exists", async () => {
     const writeFileMock = vi.fn();
     const deps: TeardownDeps = {

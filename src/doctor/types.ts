@@ -11,6 +11,8 @@ export interface DoctorDeps {
   readFileSync: (path: string, encoding: string) => string;
   writeFileSync: (path: string, content: string) => void;
   mkdirSync: (path: string, opts?: { recursive: boolean }) => void;
+  lstatSync?: typeof import("node:fs").lstatSync;
+  readdirSync?: typeof import("node:fs").readdirSync;
   spawnSync: (cmd: string, args: string[], opts?: object) => { status: number | null; stdout: string; stderr: string };
   fetch: typeof globalThis.fetch;
   homedir: string;

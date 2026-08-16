@@ -22,6 +22,7 @@ import { findAgent, AGENTS, resolveAgentTransport } from "./registry.js";
 import { CODEX_CONFIG_PATH, LEGACY_CODEX_HOOKS_PATHS, hasCodexHooks, installCodexHooks, removeCodexHooks } from "./codex-hooks.js";
 import {
   canonicalHookCommand,
+  hasCanonicalClaudeMcpEntry,
   removeManagedClaudeHooks,
   REQUIRED_HOOKS,
 } from "../installer/settings.js";
@@ -808,6 +809,45 @@ function removeClaudeHooks(filePath: string): boolean {
     throw error;
   }
   return removed;
+}
+
+function removeClaudeNativeMcp(filePath: string): boolean {
+  let removed = false;
+  let verifiedBytes: Buffer;
+  try {
+    verifiedBytes = updateRegularFileNoFollow(filePath, (content) => {
+      const settings = parseJsonObject(filePath, content);
+      const servers = settings.mcpServers;
+      if (servers === undefined) return undefined;
+      if (servers === null || typeof servers !== "object" || Array.isArray(servers)) {
+        throw new Error(`${filePath}.mcpServers must contain a JSON object`);
+      }
+
+      const mcpServers = servers as Record<string, unknown>;
+      if (mcpServers.lcm === undefined) return undefined;
+      const runtimePath = packageExecutable(import.meta.url, 3);
+      if (!hasCanonicalClaudeMcpEntry(mcpServers.lcm, runtimePath, process.execPath, process.platform)) {
+        throw new Error(`Refusing to remove a non-LCM native MCP entry named lcm in ${filePath}`);
+      }
+
+      delete mcpServers.lcm;
+      if (Object.keys(mcpServers).length === 0) delete settings.mcpServers;
+      removed = true;
+      return Buffer.from(JSON.stringify(settings, null, 2) + "\n", "utf-8");
+    }, 0o666, false);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  if (!removed) return false;
+
+  const verified = parseJsonObject(filePath, verifiedBytes);
+  const servers = verified.mcpServers;
+  if (servers !== undefined && servers !== null && typeof servers === "object" && !Array.isArray(servers)
+      && (servers as Record<string, unknown>).lcm !== undefined) {
+    throw new Error(`Claude native MCP entry remained after removal at ${filePath}`);
+  }
+  return true;
 }
 
 function hasClaudeHooks(filePath: string, transports: readonly ConnectorTransport[] = ["cli", "mcp"]): boolean {
@@ -1614,6 +1654,14 @@ function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInst
       ? defaultCodexMcpRunner(cwd, options.codexCliRunner)
       : options.codexMcpRunner ?? defaultCodexMcpRunner(cwd))
     : undefined;
+  if (agent.id === "claude-code") {
+    const settingsPath = surfacePath(agent, "hook", cwd);
+    if (settingsPath) {
+      try { removed = removeClaudeNativeMcp(settingsPath) || removed; } catch (error) {
+        failures.push(`native-mcp: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
   for (const surface of ["hook", "skill", "rules", "mcp"] as const) {
     try {
       removed = removeSurface(agent, surface, cwd, codexMcp, true) || removed;

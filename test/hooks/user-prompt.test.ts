@@ -241,6 +241,26 @@ describe("handleUserPromptSubmit", () => {
     }
   });
 
+  it("propagates an explicit current transport to non-Codex auto-heal", async () => {
+    const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {});
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
+    mockExtractUserPromptEvents.mockReturnValueOnce([]);
+    mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj", session_id: "s1" }),
+        asDaemonClient({ post: vi.fn() }),
+        3737,
+        { backend: "sqlite" },
+        "cli",
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
+      expect(repair).toHaveBeenCalledWith(undefined, "cli");
+    } finally {
+      repair.mockRestore();
+      fence.mockRestore();
+    }
+  });
+
   it("repairs non-Codex hooks when events have no session to enqueue", async () => {
     const event = { type: "decision", category: "decision", data: "choice", priority: 1 };
     const order: string[] = [];
