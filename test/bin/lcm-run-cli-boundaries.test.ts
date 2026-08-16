@@ -65,6 +65,7 @@ const state = vi.hoisted(() => ({
   installConnector: vi.fn(() => ({ path: "/hook", requiresRestart: false })),
   removeConnector: vi.fn(() => true),
   installed: [] as Array<{ agentId: string; type: string; path: string }>,
+  storedCodexTransport: undefined as "cli" | "mcp" | undefined,
   batchResult: { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] },
   batchError: undefined as unknown,
   batchPatch: { lastResult: { ok: true } } as Record<string, unknown>,
@@ -136,6 +137,7 @@ vi.mock("../../src/worktree-reconciliation.js", () => ({
 vi.mock("../../src/config-manager.js", () => ({
   getConfigValue: vi.fn(() => "value"), formatConfigValue: vi.fn((value: unknown) => String(value)),
   normalizeConfigPath: vi.fn((path: string) => path), setConfigValue: vi.fn(() => "stored"),
+  readConnectorTransport: vi.fn(() => state.storedCodexTransport),
 }));
 vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
   if (state.batchError !== undefined) throw state.batchError;
@@ -236,6 +238,7 @@ beforeEach(() => {
   });
   state.files.clear(); state.exists.clear(); state.entries = []; state.readError = undefined;
   state.fileText = "{}"; state.packageVersion = "1.4.0"; state.installed = [];
+  state.storedCodexTransport = undefined;
   state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] };
   state.batchError = undefined;
   state.batchPatch = { lastResult: { ok: true } };

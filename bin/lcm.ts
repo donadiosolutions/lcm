@@ -2369,6 +2369,7 @@ export async function runCli(
       }
       const { AGENTS } = await import("../src/connectors/registry.js");
       const { listConnectors, listConnectorInventory } = await import("../src/connectors/installer.js");
+      const { readConnectorTransport } = await import("../src/config-manager.js");
       const { findAgent } = await import("../src/connectors/registry.js");
       const found = agentName ? findAgent(agentName) : undefined;
       const agents = found ? [found] : agentName ? [] : AGENTS;
@@ -2394,7 +2395,17 @@ export async function runCli(
 
         if ((agent as any).id === "codex" && inventory.codexMcp.state === "unknown") {
           console.log(`  ⚠ Codex: native MCP inspection unknown (${inventory.codexMcp.reason ?? "unavailable"})`);
-          failures += 1;
+          const installedCodexMcp = (agentConnectors as any[]).some((connector) => connector.type === "mcp");
+          const storedCodexMcp = inventory.codexMcp.reason === "unavailable"
+            && agentName === undefined
+            && !installedCodexMcp
+            && readConnectorTransport(defaultConfigPath(), "codex") === "mcp";
+          if (inventory.codexMcp.reason !== "unavailable"
+            || agentName !== undefined
+            || installedCodexMcp
+            || storedCodexMcp) {
+            failures += 1;
+          }
         }
 
         if ((agent as any).id !== "codex" || agentName === undefined) continue;

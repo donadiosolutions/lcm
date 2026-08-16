@@ -27,6 +27,7 @@ import {
   readBoundedRegularFileWithStat,
 } from "./security-files.js";
 import { selectStorageBackend } from "./storage/backend.js";
+import { resolveAgentTransport } from "./connectors/registry.js";
 
 const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 
@@ -55,8 +56,9 @@ export interface EnsureCoreDeps {
 }
 
 function defaultDeps(): EnsureCoreDeps {
+  const configPath = defaultConfigPath();
   return {
-    configPath: defaultConfigPath(),
+    configPath,
     settingsPath: join(homedir(), ".claude", "settings.json"),
     existsSync,
     readFileSync: (p, enc) => readFileSync(p, enc as BufferEncoding),
@@ -66,6 +68,7 @@ function defaultDeps(): EnsureCoreDeps {
     atomicWritePrivateFileDurable,
     ensureRuntimeHome: (homeDir) => { bootstrapLcmHome(homeDir); },
     binaryPath: packageExecutable(import.meta.url, 2),
+    transport: resolveAgentTransport("claude-code", undefined, { configPath }).transport,
     ensureDaemon: async (opts) => {
       const { ensureDaemon } = await import("./daemon/lifecycle.js");
       return ensureDaemon(opts);
