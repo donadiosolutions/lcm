@@ -6,14 +6,17 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command, Option } from "commander";
 import { packageRootFor } from "../src/runtime-root.js";
-import { DaemonClient } from "../src/daemon/client.js";
+import { DaemonClient, type DaemonHealth } from "../src/daemon/client.js";
 import {
   ConfigValidationError,
+  daemonConfigSnapshotWitnessEqual,
   LLM_REASONING_EFFORTS,
+  readDaemonConfigSnapshot,
   reasoningEffortsForProvider,
   resolveLlmRequestPolicy,
   supportsFastMode,
   supportsRequestTimeout,
+  type DaemonConfig,
   type LlmInvocationRequestPolicy,
   type LlmProvider,
   type LlmRequestPolicyConfig,
@@ -391,7 +394,24 @@ function resolveCustomHelpRequest(cliArgv: string[]): CustomHelpRequest | undefi
   return { command };
 }
 
-export function registerMemoryCommands(program: Command): void {
+function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
+  const action = actionCommand.name();
+  const topLevel = actionCommand.parent?.name() === "lcm";
+  if (topLevel && (action === "search" || action === "grep" || action === "describe" || action === "expand")) return false;
+  if (topLevel && action === "status") return false;
+  if (topLevel && action === "stats") return actionCommand.opts<Record<string, unknown>>().pool !== true;
+  if (topLevel && (action === "diagnose" || action === "help")) return false;
+  if (action === "list" && actionCommand.parent?.name() === "connectors") return false;
+  if (topLevel && ["daemon", "config", "machine", "project", "postgres", "events", "connectors"].includes(action)) return false;
+  return true;
+}
+
+type DaemonClientProvider = (options?: { readonly preflightStorage?: boolean }) => Promise<DaemonClient>;
+
+export function registerMemoryCommands(
+  program: Command,
+  readClient: DaemonClientProvider = createDaemonClientOrExit,
+): void {
   program
     .command("search <query>")
     .description("Search memory across episodic and promoted layers")
@@ -405,7 +425,7 @@ export function registerMemoryCommands(program: Command): void {
       const tags = normalizeStringList(opts.tag) ?? [];
       ensureAllowedValues(layers, ["episodic", "promoted"], "--layer");
 
-      const client = await createDaemonClientOrExit();
+      const client = await readClient();
       const result = await client.post("/search", {
         cwd: process.cwd(),
         query,
@@ -428,7 +448,7 @@ export function registerMemoryCommands(program: Command): void {
       const mode = ensureAllowedValue(opts.mode, ["full_text", "regex"], "--mode");
       const scope = ensureAllowedValue(opts.scope, ["messages", "summaries", "both"], "--scope");
 
-      const client = await createDaemonClientOrExit();
+      const client = await readClient();
       const result = await client.post("/grep", {
         cwd: process.cwd(),
         query,
@@ -450,7 +470,7 @@ export function registerMemoryCommands(program: Command): void {
         printHelp("describe"); exit(0);
       }
 
-      const client = await createDaemonClientOrExit();
+      const client = await readClient();
       const result = await client.post("/describe", { cwd: process.cwd(), nodeId });
       printJson(result);
     });
@@ -467,7 +487,7 @@ export function registerMemoryCommands(program: Command): void {
         printHelp("expand"); exit(0);
       }
 
-      const client = await createDaemonClientOrExit();
+      const client = await readClient();
       const result = await client.post("/expand", {
         cwd: process.cwd(),
         nodeId,
@@ -1143,9 +1163,15 @@ function clearDaemonRemediationMarker(): void {
   clearDaemonRemediation(daemonRemediationScope());
 }
 
-async function createDaemonClientOrExit(
+type DaemonClientWithConfig = Readonly<{
+  client: DaemonClient;
+  config: DaemonConfig;
+  health?: DaemonHealth;
+}>;
+
+async function createDaemonClientOrExitWithConfig(
   options: { readonly preflightStorage?: boolean } = {},
-): Promise<DaemonClient> {
+): Promise<DaemonClientWithConfig> {
   const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
   const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
@@ -1176,7 +1202,58 @@ async function createDaemonClientOrExit(
   }
   clearDaemonRemediationMarker();
 
-  return new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
+  return {
+    client: new DaemonClient(`http://127.0.0.1:${port}`, tokenPath),
+    config,
+  };
+}
+
+async function createDaemonClientOrExit(
+  options: { readonly preflightStorage?: boolean } = {},
+): Promise<DaemonClient> {
+  return (await createDaemonClientOrExitWithConfig(options)).client;
+}
+
+async function createDaemonReadClientOrExit(
+  preflightSeams?: RootBootstrapRetrySeams,
+  options: { readonly preflightStorage?: boolean } = {},
+): Promise<DaemonClientWithConfig> {
+  const configPath = defaultConfigPath();
+  try {
+    const first = readDaemonConfigSnapshot(configPath);
+    const tokenPath = daemonTokenPath();
+    const { readAuthToken } = await import("../src/daemon/auth.js");
+    const token = readAuthToken(tokenPath);
+    if (typeof token === "string" && token.length > 0) {
+      const port = first.config.daemon?.port ?? 3737;
+      const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
+      const health = await client.health();
+      if (
+        (health?.status === "ok" || health?.status === "healthy")
+        && health.storageBackend === first.config.storage.backend
+        && typeof health.entrypoint === "string"
+        && health.entrypoint.length > 0
+      ) {
+        const second = readDaemonConfigSnapshot(configPath);
+        if (
+          second.config.storage.backend === first.config.storage.backend
+          && daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
+        ) {
+          return { client, config: second.config, health };
+        }
+      }
+    }
+  } catch {
+    // Any snapshot, token, health, or witness failure falls back to the
+    // existing authenticated migration and lifecycle path below.
+  }
+
+  await migrateLegacyHomeWithRetry({
+    migrate: preflightSeams?.migrate ?? migrateLegacyHomeIfNeeded,
+    sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
+    attempt: preflightSeams?.attempt,
+  });
+  return createDaemonClientOrExitWithConfig(options);
 }
 
 /** @internal CLI entry seam; defaults preserve the published executable behavior. */
@@ -1199,11 +1276,6 @@ export async function runCli(
 
   const internalDaemonTestIdentity = resolveInternalDaemonTestIdentity(cliArgv);
   const migrate = preflightSeams?.migrate ?? migrateLegacyHomeIfNeeded;
-  await migrateLegacyHomeWithRetry({
-    migrate,
-    sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
-    attempt: preflightSeams?.attempt,
-  });
   const { readFileSync } = await import("node:fs");
   const { join } = await import("node:path");
   const pkgPath = join(packageRootFor(import.meta.url, 2), "package.json");
@@ -1729,18 +1801,15 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("status"); exit(0);
       }
-      const { loadDaemonConfig } = await import("../src/daemon/config.js");
-      const { join } = await import("node:path");
-      const { homedir } = await import("node:os");
-      const config = loadDaemonConfig(defaultConfigPath());
       const jsonFlag: boolean = opts.json ?? false;
-      const client = await createDaemonClientOrExit({ preflightStorage: false });
+      const readClient = await createDaemonReadClientOrExit(preflightSeams, { preflightStorage: false });
+      const { client, config } = readClient;
 
       let daemonStatus = "down";
       let statusData: any = null;
 
       try {
-        const health = await client.health();
+        const health = readClient.health ?? await client.health();
         if (health) {
           daemonStatus = "up";
           if (health.status === "unavailable") {
@@ -1819,7 +1888,7 @@ export async function runCli(
 
       if (opts.pool) {
         const jsonFlag: boolean = opts.json ?? false;
-        const client = await createDaemonClientOrExit();
+        const { client } = await createDaemonReadClientOrExit(preflightSeams);
 
         let poolData: any = null;
         try {
@@ -2151,7 +2220,10 @@ export async function runCli(
   registerMachineCommand(program);
   registerProjectCommand(program);
   registerPostgreSqlCommand(program);
-  registerMemoryCommands(program);
+  registerMemoryCommands(
+    program,
+    async (options) => (await createDaemonReadClientOrExit(preflightSeams, options)).client,
+  );
 
   // ─── diagnose ──────────────────────────────────────────────────────────────
   program
@@ -2866,6 +2938,15 @@ export async function runCli(
         exit(1);
       }
     });
+
+  program.hook("preAction", async (_thisCommand, actionCommand) => {
+    if (!shouldRunRootBootstrapMigration(actionCommand)) return;
+    await migrateLegacyHomeWithRetry({
+      migrate,
+      sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
+      attempt: preflightSeams?.attempt,
+    });
+  });
 
   // ─── Unknown command fallback ──────────────────────────────────────────────
   let unknownCommandCompletion: Promise<void> | undefined;
