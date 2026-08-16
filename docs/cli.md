@@ -43,7 +43,7 @@ The store command accepts one tag per occurrence using either long spelling;
 the aliases can be mixed and retain command-line order:
 
 ```bash
-lcm store "Use ensureDaemon before background promote" --tag type:solution --tag scope:project --tag project:lcm --tag "source:<actual-thread-uuid>"
+lcm store 'Use ensureDaemon before background promote' --tag type:solution --tag scope:project --tag project:lcm --tag 'source:<actual-thread-uuid>'
 ```
 
 In `lcm store`, `--tag` and `--tags` are repeatable single-tag aliases. This is

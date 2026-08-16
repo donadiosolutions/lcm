@@ -1,10 +1,21 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync, chmodSync, lstatSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  ftruncateSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { Agent, ConnectorSurface, ConnectorTransport } from "./types.js";
-import { CONNECTOR_SURFACES, requiresRestart } from "./types.js";
+import { CONNECTOR_SURFACES } from "./types.js";
 import { LCM_HISTORICAL_SKILL_SHA256, LCM_MANAGED_SKILL_MARKER, LCM_MARKERS } from "./constants.js";
 import { generateContent } from "./template-service.js";
 import { findAgent, AGENTS, resolveAgentTransport } from "./registry.js";
@@ -446,73 +457,258 @@ function skillCollision(filePath: string): Error {
   return new Error(`Refusing to overwrite an unowned LCM skill at ${filePath}`);
 }
 
-function preflightSkill(filePath: string, generated: string): void {
-  if (!existsSync(filePath)) return;
-  let stats;
-  try { stats = lstatSync(filePath); } catch (error) { throw new Error(`Unable to inspect LCM skill at ${filePath}`, { cause: error }); }
+const NO_FOLLOW_FLAGS = constants.O_NOFOLLOW;
+
+function openNoFollow(filePath: string, flags: number, mode?: number): number {
+  const safeFlags = flags | NO_FOLLOW_FLAGS;
+  return mode === undefined
+    ? openSync(filePath, safeFlags)
+    : openSync(filePath, safeFlags, mode);
+}
+
+function descriptorStats(descriptor: number, filePath: string): ReturnType<typeof fstatSync> {
+  const stats = fstatSync(descriptor);
   if (!stats.isFile()) throw skillCollision(filePath);
-  const existing = readFileSync(filePath);
+  return stats;
+}
+
+function readDescriptor(descriptor: number, filePath: string): Buffer {
+  const stats = descriptorStats(descriptor, filePath);
+  const size = Number(stats.size);
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw new Error(`Unable to read LCM file at ${filePath}: invalid file size`);
+  }
+  const content = Buffer.alloc(size);
+  let offset = 0;
+  while (offset < size) {
+    const bytesRead = readSync(descriptor, content, offset, size - offset, offset);
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  return offset === size ? content : content.subarray(0, offset);
+}
+
+function writeDescriptor(descriptor: number, content: Buffer): void {
+  ftruncateSync(descriptor, 0);
+  let offset = 0;
+  while (offset < content.length) {
+    const bytesWritten = writeSync(descriptor, content, offset, content.length - offset, offset);
+    if (bytesWritten <= 0) throw new Error("LCM connector write made no progress");
+    offset += bytesWritten;
+  }
+}
+
+function readRegularFileNoFollow(filePath: string): Buffer {
+  const descriptor = openNoFollow(filePath, constants.O_RDONLY);
+  try {
+    return readDescriptor(descriptor, filePath);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function readOptionalRegularFileNoFollow(filePath: string): Buffer | undefined {
+  try {
+    return readRegularFileNoFollow(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function writeRegularFileNoFollow(filePath: string, content: Buffer, mode = 0o666): Buffer {
+  const descriptor = openNoFollow(filePath, constants.O_RDWR | constants.O_CREAT, mode);
+  try {
+    descriptorStats(descriptor, filePath);
+    writeDescriptor(descriptor, content);
+    return readDescriptor(descriptor, filePath);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function updateRegularFileNoFollow(
+  filePath: string,
+  update: (existing: Buffer, created: boolean) => Buffer | undefined,
+  mode = 0o666,
+  create = true,
+): Buffer {
+  let descriptor: number;
+  let created = false;
+  if (create) {
+    try {
+      descriptor = openNoFollow(filePath, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL, mode);
+      created = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      descriptor = openNoFollow(filePath, constants.O_RDWR);
+    }
+  } else {
+    descriptor = openNoFollow(filePath, constants.O_RDWR);
+  }
+  try {
+    descriptorStats(descriptor, filePath);
+    const existing = readDescriptor(descriptor, filePath);
+    const updated = update(existing, created);
+    if (updated === undefined) return existing;
+    writeDescriptor(descriptor, updated);
+    return readDescriptor(descriptor, filePath);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function pathStillIdentifiesDescriptor(filePath: string, stats: ReturnType<typeof fstatSync>): boolean {
+  try {
+    const current = lstatSync(filePath);
+    return current.isFile() && current.dev === stats.dev && current.ino === stats.ino;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function unlinkRegularFileNoFollow(filePath: string): boolean {
+  let descriptor: number;
+  try {
+    descriptor = openNoFollow(filePath, constants.O_RDONLY);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  try {
+    const stats = descriptorStats(descriptor, filePath);
+    if (!pathStillIdentifiesDescriptor(filePath, stats)) return false;
+    unlinkSync(filePath);
+    return true;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function preflightSkill(filePath: string, generated: string): void {
+  let existing: Buffer | undefined;
+  try {
+    existing = readOptionalRegularFileNoFollow(filePath);
+  } catch (error) {
+    if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+      throw skillCollision(filePath);
+    }
+    throw new Error(`Unable to inspect LCM skill at ${filePath}`, { cause: error });
+  }
+  if (existing === undefined) return;
   if (!isOwnedSkill(existing, generated)) throw skillCollision(filePath);
 }
 
 function installSkill(content: string, filePath: string): void {
   preflightSkill(filePath, content);
   const expected = Buffer.from(managedSkillContent(content), 'utf-8');
-  if (existsSync(filePath) && readFileSync(filePath).equals(expected)) return;
   mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, expected);
-  if (!readFileSync(filePath).equals(expected)) throw new Error(`Installed LCM skill failed ownership verification at ${filePath}`);
+  let descriptor: number | undefined;
+  let created = false;
+  try {
+    try {
+      descriptor = openNoFollow(
+        filePath,
+        constants.O_RDWR | constants.O_CREAT | constants.O_EXCL,
+        0o666,
+      );
+      created = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      descriptor = openNoFollow(filePath, constants.O_RDWR);
+    }
+    descriptorStats(descriptor, filePath);
+    if (!created) {
+      const existing = readDescriptor(descriptor, filePath);
+      if (!isOwnedSkill(existing, content)) throw skillCollision(filePath);
+      if (existing.equals(expected)) return;
+    }
+    writeDescriptor(descriptor, expected);
+    if (!pathStillIdentifiesDescriptor(filePath, fstatSync(descriptor))) {
+      throw new Error(`Installed LCM skill path changed during ownership verification at ${filePath}`);
+    }
+    if (!readDescriptor(descriptor, filePath).equals(expected)) {
+      throw new Error(`Installed LCM skill failed ownership verification at ${filePath}`);
+    }
+  } catch (error) {
+    if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+      throw skillCollision(filePath);
+    }
+    throw error;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
 }
 
 function removeSkill(filePath: string, generated: string | readonly string[], strict = false): boolean {
-  if (!existsSync(filePath)) return false;
-  let stats;
-  try { stats = lstatSync(filePath); } catch (error) {
-    if (!strict && (error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+  let descriptor: number;
+  try {
+    descriptor = openNoFollow(filePath, constants.O_RDONLY);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+      if (strict) throw skillCollision(filePath);
+      return false;
+    }
     throw new Error(`Unable to inspect LCM skill at ${filePath}`, { cause: error });
   }
-  if (!stats.isFile()) {
-    if (strict) throw skillCollision(filePath);
-    return false;
+  try {
+    let stats: ReturnType<typeof fstatSync>;
+    try {
+      stats = descriptorStats(descriptor, filePath);
+    } catch (error) {
+      if (!strict && error instanceof Error && error.message.startsWith("Refusing to overwrite an unowned LCM skill")) {
+        return false;
+      }
+      throw error;
+    }
+    const content = readDescriptor(descriptor, filePath);
+    if (!isOwnedSkill(content, generated)) {
+      if (strict) throw new Error(`Refusing to remove an unowned LCM skill at ${filePath}`);
+      return false;
+    }
+    if (!pathStillIdentifiesDescriptor(filePath, stats)) {
+      if (strict) throw new Error(`Refusing to remove a changed LCM skill at ${filePath}`);
+      return false;
+    }
+    unlinkSync(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  } finally {
+    closeSync(descriptor);
   }
-  const content = readFileSync(filePath);
-  if (!isOwnedSkill(content, generated)) {
-    if (strict) throw new Error(`Refusing to remove an unowned LCM skill at ${filePath}`);
-    return false;
-  }
-  unlinkSync(filePath);
-  return true;
 }
 
 // Strategy 1: Markdown targets (rules, skill)
 function installMarkdown(content: string, filePath: string, writeMode: 'append' | 'overwrite'): void {
   mkdirSync(dirname(filePath), { recursive: true });
   if (writeMode === 'append') {
-    let existing = '';
-    try {
-      existing = readFileSync(filePath, 'utf-8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    // Remove old markers if present before re-appending.
-    writeFileSync(filePath, appendMarkdown(existing, content));
+    updateRegularFileNoFollow(filePath, (existing) => (
+      // Remove old markers if present before re-appending.
+      Buffer.from(appendMarkdown(existing.toString('utf-8'), content), 'utf-8')
+    ));
   } else {
-    writeFileSync(filePath, normalizeMarkdownEof(content));
+    updateRegularFileNoFollow(filePath, () => Buffer.from(normalizeMarkdownEof(content), 'utf-8'));
   }
 }
 
 // Strategy 2: Structured targets (MCP JSON)
 function installMcpJson(filePath: string, strict = false): void {
   mkdirSync(dirname(filePath), { recursive: true });
-  let existing: Record<string, unknown> = {};
-  if (existsSync(filePath)) {
-    try {
-      existing = readJsonObject(filePath);
-    } catch (error) {
-      if (strict) throw error;
-      if (!(error instanceof SyntaxError) && !(error instanceof Error && error.message === `${filePath} must contain a JSON object`)) throw error;
+  let changed = false;
+  const verifiedBytes = updateRegularFileNoFollow(filePath, (existingBytes, created) => {
+    let existing: Record<string, unknown> = {};
+    if (!created) {
+      try {
+        existing = parseJsonObject(filePath, existingBytes);
+      } catch (error) {
+        if (strict) throw error;
+        if (!(error instanceof SyntaxError) && !(error instanceof Error && error.message === `${filePath} must contain a JSON object`)) throw error;
+      }
     }
-  }
   const servers = existing.mcpServers;
   if (servers === undefined) {
     existing.mcpServers = {};
@@ -520,14 +716,17 @@ function installMcpJson(filePath: string, strict = false): void {
     if (strict) throw new Error(`${filePath}.mcpServers must contain a JSON object`);
     existing.mcpServers = {};
   }
-  const mcpServers = existing.mcpServers as Record<string, unknown>;
-  if (mcpServers.lcm !== undefined && !isOwnedMcpEntry(mcpServers.lcm)) {
-    throw new Error(`Refusing to overwrite a non-LCM MCP entry named lcm in ${filePath}`);
-  }
-  if (isOwnedMcpEntry(mcpServers.lcm)) return;
-  mcpServers.lcm = { type: 'stdio', command: 'lcm', args: ['mcp'] };
-  writeFileSync(filePath, JSON.stringify(existing, null, 2) + '\n');
-  const verified = readJsonObject(filePath);
+    const mcpServers = existing.mcpServers as Record<string, unknown>;
+    if (mcpServers.lcm !== undefined && !isOwnedMcpEntry(mcpServers.lcm)) {
+      throw new Error(`Refusing to overwrite a non-LCM MCP entry named lcm in ${filePath}`);
+    }
+    if (isOwnedMcpEntry(mcpServers.lcm)) return undefined;
+    mcpServers.lcm = { type: 'stdio', command: 'lcm', args: ['mcp'] };
+    changed = true;
+    return Buffer.from(JSON.stringify(existing, null, 2) + '\n', 'utf-8');
+  });
+  if (!changed) return;
+  const verified = parseJsonObject(filePath, verifiedBytes);
   if (!isOwnedMcpEntry(verified.mcpServers && (verified.mcpServers as Record<string, unknown>).lcm)) {
     throw new Error(`Installed MCP entry failed ownership verification at ${filePath}`);
   }
@@ -535,34 +734,41 @@ function installMcpJson(filePath: string, strict = false): void {
 
 function removeMcpJson(filePath: string, strict = false): boolean {
   if (filePath.endsWith('.toml')) return false; // TOML removal not supported
-  let config: unknown;
+  let removed = false;
   try {
-    config = JSON.parse(readFileSync(filePath, 'utf-8'));
+    updateRegularFileNoFollow(filePath, (content) => {
+      let config: unknown;
+      try {
+        config = JSON.parse(content.toString('utf-8'));
+      } catch (error) {
+        if (!strict) return undefined;
+        throw new Error(`Unable to parse MCP configuration at ${filePath}`, { cause: error });
+      }
+      if (config === null || typeof config !== 'object' || Array.isArray(config)) {
+        if (strict) throw new Error(`${filePath} must contain a JSON object`);
+        return undefined;
+      }
+      const root = config as Record<string, unknown>;
+      const servers = root.mcpServers;
+      if (servers !== undefined && (servers === null || typeof servers !== 'object' || Array.isArray(servers))) {
+        if (strict) throw new Error(`${filePath}.mcpServers must contain a JSON object`);
+        return undefined;
+      }
+      const lcm = (servers as Record<string, unknown> | undefined)?.lcm;
+      if (lcm === undefined) return undefined;
+      if (!isOwnedMcpEntry(lcm)) {
+        if (strict) throw new Error(`Refusing to remove a non-LCM MCP entry named lcm in ${filePath}`);
+        return undefined;
+      }
+      delete (servers as Record<string, unknown>).lcm;
+      removed = true;
+      return Buffer.from(JSON.stringify(root, null, 2) + '\n', 'utf-8');
+    }, 0o666, false);
   } catch (error) {
-    if (!strict) return false;
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    throw new Error(`Unable to parse MCP configuration at ${filePath}`, { cause: error });
+    throw error;
   }
-  if (config === null || typeof config !== 'object' || Array.isArray(config)) {
-    if (strict) throw new Error(`${filePath} must contain a JSON object`);
-    return false;
-  }
-  const root = config as Record<string, unknown>;
-  const servers = root.mcpServers;
-  if (servers !== undefined && (servers === null || typeof servers !== 'object' || Array.isArray(servers))) {
-    if (strict) throw new Error(`${filePath}.mcpServers must contain a JSON object`);
-    return false;
-  }
-  const lcm = (servers as Record<string, unknown> | undefined)?.lcm;
-  if (lcm === undefined) return false;
-  if (!isOwnedMcpEntry(lcm)) {
-    if (strict) throw new Error(`Refusing to remove a non-LCM MCP entry named lcm in ${filePath}`);
-    return false;
-  }
-  const mcpServers = servers as Record<string, unknown>;
-  delete mcpServers.lcm;
-  writeFileSync(filePath, JSON.stringify(root, null, 2) + '\n');
-  return true;
+  return removed;
 }
 
 function isOwnedMcpEntry(value: unknown): value is Record<string, unknown> & { command: "lcm"; args: ["mcp"] } {
@@ -575,30 +781,36 @@ function isOwnedMcpEntry(value: unknown): value is Record<string, unknown> & { c
     && entry.args[0] === "mcp";
 }
 
-function readJsonObject(filePath: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(readFileSync(filePath, "utf-8"));
+function parseJsonObject(filePath: string, content: Buffer): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(content.toString("utf-8"));
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`${filePath} must contain a JSON object`);
   }
   return parsed as Record<string, unknown>;
 }
 
+function readJsonObject(filePath: string): Record<string, unknown> {
+  return parseJsonObject(filePath, readRegularFileNoFollow(filePath));
+}
+
 function removeClaudeHooks(filePath: string): boolean {
-  let existing: Record<string, unknown>;
+  let removed = false;
   try {
-    existing = readJsonObject(filePath);
+    updateRegularFileNoFollow(filePath, (content) => {
+      const existing = parseJsonObject(filePath, content);
+      const cleaned = removeManagedClaudeHooks(existing);
+      if (JSON.stringify(existing) === JSON.stringify(cleaned)) return undefined;
+      removed = true;
+      return Buffer.from(JSON.stringify(cleaned, null, 2) + "\n", "utf-8");
+    }, 0o666, false);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
-  const cleaned = removeManagedClaudeHooks(existing);
-  if (JSON.stringify(existing) === JSON.stringify(cleaned)) return false;
-  writeFileSync(filePath, JSON.stringify(cleaned, null, 2) + "\n");
-  return true;
+  return removed;
 }
 
 function hasClaudeHooks(filePath: string, transports: readonly ConnectorTransport[] = ["cli", "mcp"]): boolean {
-  if (!existsSync(filePath)) return false;
   try {
     const existing = readJsonObject(filePath);
     const hooks = existing.hooks;
@@ -816,14 +1028,28 @@ function removeComponent(agent: Agent, surface: ConnectorSurface, cwd: string, s
     ], strictSkill);
   }
 
-  let content: string;
-  try { content = readFileSync(resolvedPath, "utf-8"); } catch { return false; }
-  if (!hasManagedBlock(content)) return false;
-  const cleaned = removeMarkers(content);
-  const eol = establishedMarkdownEol(cleaned);
-  if (cleaned === "") unlinkSync(resolvedPath);
-  else writeFileSync(resolvedPath, normalizeMarkdownEof(cleaned, eol));
-  return true;
+  let descriptor: number;
+  try {
+    descriptor = openNoFollow(resolvedPath, constants.O_RDWR);
+  } catch {
+    return false;
+  }
+  try {
+    const stats = descriptorStats(descriptor, resolvedPath);
+    const content = readDescriptor(descriptor, resolvedPath).toString("utf-8");
+    if (!hasManagedBlock(content)) return false;
+    const cleaned = removeMarkers(content);
+    const eol = establishedMarkdownEol(cleaned);
+    if (cleaned === "") {
+      if (!pathStillIdentifiesDescriptor(resolvedPath, stats)) return false;
+      unlinkSync(resolvedPath);
+    } else {
+      writeDescriptor(descriptor, Buffer.from(normalizeMarkdownEof(cleaned, eol), "utf-8"));
+    }
+    return true;
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 function legacyDefaultSurfaces(agent: Agent): readonly ConnectorSurface[] {
@@ -1091,16 +1317,30 @@ type OwnedFileSnapshot = { readonly path: string; readonly content?: Buffer; rea
 function snapshotOwnedFiles(paths: readonly string[]): OwnedFileSnapshot[] {
   const snapshots: OwnedFileSnapshot[] = [];
   for (const path of [...new Set(paths)]) {
-    if (!existsSync(path)) {
-      snapshots.push({ path });
-      continue;
+    let descriptor: number;
+    try {
+      descriptor = openNoFollow(path, constants.O_RDONLY);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        snapshots.push({ path });
+        continue;
+      }
+      if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+        snapshots.push({ path, nonFile: true });
+        continue;
+      }
+      throw error;
     }
-    const stats = statSync(path);
-    if (!stats.isFile()) {
-      snapshots.push({ path, nonFile: true });
-      continue;
+    try {
+      const stats = fstatSync(descriptor);
+      if (!stats.isFile()) {
+        snapshots.push({ path, nonFile: true });
+        continue;
+      }
+      snapshots.push({ path, content: readDescriptor(descriptor, path), mode: stats.mode & 0o777 });
+    } finally {
+      closeSync(descriptor);
     }
-    snapshots.push({ path, content: readFileSync(path), mode: stats.mode & 0o777 });
   }
   return snapshots;
 }
@@ -1120,15 +1360,13 @@ function restoreOwnedFiles(snapshots: readonly OwnedFileSnapshot[]): void {
   for (const snapshot of snapshots) {
     if (snapshot.nonFile) continue;
     if (snapshot.content === undefined) {
-      if (existsSync(snapshot.path)) {
-        try { unlinkSync(snapshot.path); } catch { /* preserve a non-file user surface */ }
-      }
+      try { unlinkRegularFileNoFollow(snapshot.path); } catch { /* preserve a non-file user surface */ }
       continue;
     }
     mkdirSync(dirname(snapshot.path), { recursive: true });
     // A file snapshot always records its mode; absent snapshots have no content
     // and return through the branch above.
-    writeFileSync(snapshot.path, snapshot.content, { mode: snapshot.mode! });
+    writeRegularFileNoFollow(snapshot.path, snapshot.content, snapshot.mode!);
   }
 }
 
@@ -1177,9 +1415,11 @@ function verifySurface(
   const path = surfacePath(agent, surface, cwd);
   if (!path) throw new Error(`No config path defined for ${agent.name} with type ${surface}`);
   if (surface === "skill") {
-    if (!existsSync(path)) throw new Error(`Installed skill is missing at ${path}`);
     const expected = Buffer.from(managedSkillContent(generateContent(agent, surface, transport)), 'utf-8');
-    if (!readFileSync(path).equals(expected)) throw new Error(`Installed skill failed ownership verification at ${path}`);
+    let installed: Buffer | undefined;
+    try { installed = readOptionalRegularFileNoFollow(path); } catch { installed = undefined; }
+    if (installed === undefined) throw new Error(`Installed skill is missing at ${path}`);
+    if (!installed.equals(expected)) throw new Error(`Installed skill failed ownership verification at ${path}`);
     return;
   }
   if (surface === "hook") {
@@ -1187,12 +1427,18 @@ function verifySurface(
     return;
   }
   if (surface === "rules") {
-    if (!existsSync(path)) throw new Error(`Installed rules are missing at ${path}`);
-    if (!hasManagedBlock(readFileSync(path, "utf-8"))) throw new Error(`Installed rules failed ownership verification at ${path}`);
+    const installed = readOptionalRegularFileNoFollow(path);
+    if (installed === undefined) throw new Error(`Installed rules are missing at ${path}`);
+    if (!hasManagedBlock(installed.toString("utf-8"))) throw new Error(`Installed rules failed ownership verification at ${path}`);
     return;
   }
-  if (!existsSync(path)) throw new Error(`Installed MCP configuration is missing at ${path}`);
-  const config = readJsonObject(path);
+  let config: Record<string, unknown>;
+  try {
+    config = readJsonObject(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Installed MCP configuration is missing at ${path}`);
+    throw error;
+  }
   if (!isOwnedMcpEntry(config.mcpServers && (config.mcpServers as Record<string, unknown>).lcm)) {
     throw new Error(`Installed MCP entry failed ownership verification at ${path}`);
   }
@@ -1412,15 +1658,18 @@ export function listConnectors(cwd: string = process.cwd()): InstalledConnector[
 
       if (type === 'mcp') {
         if (resolvedPath.endsWith('.toml')) continue; // Skip TOML files
-        if (existsSync(resolvedPath)) {
-          try {
-            const config = JSON.parse(readFileSync(resolvedPath, 'utf-8'));
-            if (isOwnedMcpEntry(config.mcpServers?.lcm)) {
+        try {
+          const content = readOptionalRegularFileNoFollow(resolvedPath);
+          if (content !== undefined) {
+            const config = JSON.parse(content.toString('utf-8')) as Record<string, unknown>;
+            const servers = config.mcpServers;
+            if (servers && typeof servers === "object" && !Array.isArray(servers)
+              && isOwnedMcpEntry((servers as Record<string, unknown>).lcm)) {
               installed.push({ agentId: agent.id, agentName: agent.name, type, path: resolvedPath });
             }
-          } catch {
-            // ignore malformed JSON
           }
+        } catch {
+          // ignore malformed JSON
         }
       } else if (type === 'hook' && agent.id === 'codex') {
         if (hasCodexHooks(resolvedPath)) {
@@ -1432,25 +1681,26 @@ export function listConnectors(cwd: string = process.cwd()): InstalledConnector[
         }
       } else if (type === 'skill') {
         const skillPath = join(resolvedPath, 'lcm-memory', 'SKILL.md');
-        if (existsSync(skillPath) && (() => {
-          try {
-            return lstatSync(skillPath).isFile() && isOwnedSkill(readFileSync(skillPath), [
-              generateContent(agent, type, "cli"),
-              generateContent(agent, type, "mcp"),
-            ]);
-          } catch {
-            return false;
+        try {
+          const content = readOptionalRegularFileNoFollow(skillPath);
+          if (content !== undefined && isOwnedSkill(content, [
+            generateContent(agent, type, "cli"),
+            generateContent(agent, type, "mcp"),
+          ])) {
+            installed.push({ agentId: agent.id, agentName: agent.name, type, path: skillPath });
           }
-        })()) {
-          installed.push({ agentId: agent.id, agentName: agent.name, type, path: skillPath });
+        } catch {
+          // ignore malformed or unsafe skills
         }
       } else {
         // rules / hook
-        if (existsSync(resolvedPath)) {
-          const content = readFileSync(resolvedPath, 'utf-8');
-          if (hasManagedBlock(content)) {
+        try {
+          const content = readOptionalRegularFileNoFollow(resolvedPath);
+          if (content !== undefined && hasManagedBlock(content.toString('utf-8'))) {
             installed.push({ agentId: agent.id, agentName: agent.name, type, path: resolvedPath });
           }
+        } catch {
+          // ignore missing or malformed rules
         }
       }
     }

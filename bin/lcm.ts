@@ -2216,6 +2216,16 @@ export async function runCli(
         ? listConnectorInventory(connectorCwd)
         : { installed: listConnectors(connectorCwd), codexMcp: { state: "absent" as const } };
       const installed = inventory.installed;
+      const installedTransportsFor = (agent: any, installedSurfaces: string[]): string[] => {
+        if (agent.id === "codex") {
+          return CONNECTOR_TRANSPORTS.filter(transport => transport === "cli"
+            ? inventory.codexMcp.state !== "unknown" && installedSurfaces.some(surface => surface !== "mcp")
+            : inventory.codexMcp.state === "installed");
+        }
+        return installedSurfaces.includes("mcp")
+          ? ["mcp"]
+          : installedSurfaces.length > 0 ? ["cli"] : [];
+      };
 
       if (format === "json") {
         const result = AGENTS.map((a: any) => {
@@ -2224,13 +2234,7 @@ export async function runCli(
           const supportedTransports = CONNECTOR_TRANSPORTS.filter(
             transport => a.capabilities[transport] !== undefined,
           );
-          const installedTransports = a.id === "codex"
-            ? inventory.codexMcp.state === "installed"
-              ? ["mcp"]
-              : inventory.codexMcp.state === "absent" && installedSurfaces.length > 0 ? ["cli"] : []
-            : installedSurfaces.includes("mcp")
-              ? ["mcp"]
-              : installedSurfaces.length > 0 ? ["cli"] : [];
+          const installedTransports = installedTransportsFor(a, installedSurfaces);
           const result = {
             id: a.id,
             name: a.name,
@@ -2248,13 +2252,15 @@ export async function runCli(
       } else {
         const rows = AGENTS.map((agent: any) => {
           const agentInstalled = installed.filter((c: any) => c.agentId === agent.id);
-          let installedDisplay = agentInstalled.length > 0 ? agentInstalled.map((c: any) => c.type).join(", ") : "-";
+          const installedSurfaces = agentInstalled.map((c: any) => c.type);
+          const installedTransports = installedTransportsFor(agent, installedSurfaces);
+          let installedDisplay = installedSurfaces.length > 0 ? installedSurfaces.join(", ") : "-";
           if (agent.id === "codex") {
             installedDisplay = inventory.codexMcp.state === "unknown"
               ? `${installedDisplay} (transport unknown)`
-              : inventory.codexMcp.state === "installed"
-                ? `${installedDisplay} (MCP)`
-                : agentInstalled.length > 0 ? `${installedDisplay} (CLI)` : installedDisplay;
+              : installedTransports.length > 0
+                ? `${installedDisplay} (${installedTransports.map(transport => transport.toUpperCase()).join(", ")})`
+                : installedDisplay;
           }
           return {
             agent: agent.name,

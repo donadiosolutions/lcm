@@ -59,9 +59,12 @@ function legacyRulesContent(eol: TestMarkdownEol): string {
 function managedSkillContent(content: string): string {
   const eol = content.includes('\r\n') ? '\r\n' : '\n';
   const normalized = content.replace(/(?:\r\n|\r|\n)+$/u, '') + eol;
-  const frontmatter = normalized.match(/^---(?:\r\n|\n)[\s\S]*?---(?:\r\n|\n)/u);
-  if (!frontmatter) return `${LCM_MANAGED_SKILL_MARKER}${eol}${normalized}`;
-  return `${frontmatter[0]}${LCM_MANAGED_SKILL_MARKER}${eol}${normalized.slice(frontmatter[0].length)}`;
+  if (!normalized.startsWith(`---${eol}`)) return `${LCM_MANAGED_SKILL_MARKER}${eol}${normalized}`;
+  const endMarker = `${eol}---${eol}`;
+  const end = normalized.indexOf(endMarker, `---${eol}`.length);
+  if (end === -1) return `${LCM_MANAGED_SKILL_MARKER}${eol}${normalized}`;
+  const frontmatterEnd = end + endMarker.length;
+  return `${normalized.slice(0, frontmatterEnd)}${LCM_MANAGED_SKILL_MARKER}${eol}${normalized.slice(frontmatterEnd)}`;
 }
 
 async function withMockedGeneratedContent<T>(

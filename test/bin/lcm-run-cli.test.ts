@@ -1220,6 +1220,31 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(log.mock.calls.flat().map(value => String(value)).join("\n")).toContain("(MCP)");
   });
 
+  it("reports independently active Codex CLI and MCP transports", async () => {
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    state.installed = [
+      { agentId: "codex", type: "hook", path: "/hook" },
+      { agentId: "codex", type: "skill", path: "/skill" },
+      { agentId: "codex", type: "mcp", path: "codex mcp" },
+    ];
+    state.codexMcpInspection = { state: "installed" };
+
+    expect(await invoke(["connectors", "list", "--format", "json"])).toBeUndefined();
+    const payload = JSON.parse(stdout.mock.calls.map(([value]) => String(value)).join("")) as {
+      agents: Array<Record<string, unknown>>;
+    };
+    expect(payload.agents.find(agent => agent.id === "codex")).toMatchObject({
+      installed: ["hook", "skill", "mcp"],
+      installedTransports: ["cli", "mcp"],
+      mcpInspection: "installed",
+    });
+
+    expect(await invoke(["connectors", "list"])).toBeUndefined();
+    expect(log.mock.calls.flat().map(value => String(value)).join("\n"))
+      .toContain("hook, skill, mcp (CLI, MCP)");
+  });
+
   it("routes connector transport options and rejects stale selectors", async () => {
     const cwd = process.cwd();
 
