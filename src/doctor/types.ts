@@ -24,4 +24,7 @@ export interface DoctorDeps {
   _assertBackendPublication?: (homeDir: string, backend: "sqlite" | "postgresql") => void;
   /** Internal bounded config-read seam used by deterministic doctor tests. */
   _readBoundedConfig?: (path: string, maxBytes: number) => string;
+  /** Test seam for transport-aware Claude guidance repair. */
+  _claudeTransport?: "cli" | "mcp";
+  renderClaudeSkill?: (transport: "cli" | "mcp") => string;
 }

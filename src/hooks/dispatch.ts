@@ -3,9 +3,11 @@ import { configPath as defaultConfigPath } from "../runtime-paths.js";
 import {
   rethrowBackendPublicationJournalError,
 } from "./publication-fence.js";
+import type { ConnectorTransport } from "../connectors/types.js";
 
 export const HOOK_COMMANDS = ["compact", "post-tool", "restore", "session-end", "session-snapshot", "user-prompt"] as const;
 export type HookCommand = typeof HOOK_COMMANDS[number];
+export type HookExecutionContext = Readonly<{ transport?: ConnectorTransport }>;
 
 export function isHookCommand(cmd: string): cmd is HookCommand {
   return (HOOK_COMMANDS as readonly string[]).includes(cmd);
@@ -23,6 +25,7 @@ function hookClientFromPayload(stdinText: string): string | undefined {
 export async function dispatchHook(
   command: HookCommand,
   stdinText: string,
+  context: HookExecutionContext = {},
 ): Promise<{ exitCode: number; stdout: string }> {
   let verifiedSnapshotPort: number | undefined;
   // Early return for post-tool — runs on EVERY tool call, must skip bootstrap for performance
@@ -68,7 +71,9 @@ export async function dispatchHook(
   // Its handler loads the config lazily inside the publication fence.
   if (command === "user-prompt") {
     const { handleUserPromptSubmit } = await import("./user-prompt.js");
-    return handleUserPromptSubmit(stdinText);
+    return context.transport === undefined
+      ? handleUserPromptSubmit(stdinText)
+      : handleUserPromptSubmit(stdinText, undefined, undefined, undefined, context.transport);
   }
 
   const { DaemonClient } = await import("../daemon/client.js");

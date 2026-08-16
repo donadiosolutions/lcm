@@ -68,15 +68,17 @@ describe("MCP tool definitions", () => {
     expect(tool!.description).toContain("episodic");
   });
 
-  it("lcm_store advertises canonical prefixes and the memory usage pair", () => {
+  it("lcm_store describes fields without embedding agent policy", () => {
     const tool = getMcpToolDefinitions().find((t: any) => t.name === "lcm_store");
     const description = tool!.inputSchema.properties.tags.description;
-    expect(description).toContain("category");
-    expect(description).toContain("signal");
-    expect(description).toContain("memory_id");
-    expect(description).toContain("signal:memory_used");
-    expect(description).toContain("memory_id:<id>");
-    expect(description).toContain("paired");
+    expect(tool!.description).toContain("Store a memory");
+    expect(tool!.description).toContain("lcm_search");
+    expect(description).toContain("Optional string tags");
+    expect(description).toContain("<prefix>:<value>");
+    for (const policyText of ["Immediately", "type:", "scope:", "signal:", "memory_id", "rationale", "feedback"]) {
+      expect(tool!.description).not.toContain(policyText);
+      expect(description).not.toContain(policyText);
+    }
   });
 });
 

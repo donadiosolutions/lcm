@@ -46,7 +46,7 @@ Humans and agents use the same backend. The integration surface differs by clien
 flowchart LR
   subgraph Clients["Clients"]
     CC["Claude Code<br/>hooks + MCP"]
-    CX["Codex<br/>hooks + MCP"]
+    CX["Codex<br/>hooks + optional MCP"]
   end
 
   CC --> D["lcm daemon"]
@@ -63,7 +63,7 @@ flowchart LR
 |---|---|---|---|---|---|
 | Claude Code | Yes | Yes | Yes, via transcript/hooks | Yes | Primary hook-based integration |
 | GitHub Copilot (VS Code) | No | Yes, via rules | No | No | Repo-local skill can teach Copilot to call `lcm`, but there is no automatic restore or turn capture yet |
-| Codex | Yes | Yes | Yes, via native hooks | Yes, thresholded | `lcm connectors install codex` writes native Codex hooks, the Codex skill, and user-level rules for restore, prompt hints, passive learning, rolling transcript snapshots, and thresholded compaction |
+| Codex | Yes | Yes | Yes, via native hooks | Yes, thresholded | `lcm connectors install codex` writes native Codex hooks and the LCM skill for restore, prompt hints, passive learning, rolling transcript snapshots, and thresholded compaction |
 
 ## LCM Model
 
@@ -131,14 +131,16 @@ Install the `lcm` binary first:
 npm install -g @donadiosolutions/lcm
 ```
 
-Then install the repo-local Copilot connector:
+Then install the repo-local Copilot connector. It is CLI-only, so the explicit
+transport is optional but shown here:
 
 ```bash
-lcm connectors install github-copilot
+lcm connectors install github-copilot --transport cli
 lcm connectors doctor github-copilot
 ```
 
-This creates a workspace skill under `.github/skills/lcm-memory/SKILL.md` so Copilot can search and store memory through the `lcm` CLI.
+This creates a workspace skill under `.github/skills/lcm-memory/SKILL.md` so
+Copilot can search and store memory through the `lcm` CLI.
 
 ### Codex
 
@@ -155,11 +157,13 @@ lcm connectors install codex
 lcm connectors doctor codex
 ```
 
-This installs the default Codex connector set:
+This installs the default Codex CLI bundle:
 
 - Native hooks in `~/.codex/hooks.json` and Codex's current `hooks` feature in `~/.codex/config.toml`
 - The LCM skill in `~/.codex/skills/lcm-memory/SKILL.md`
-- User-level rules in `~/.codex/AGENTS.md`
+
+The default is exactly the native hook plus the `lcm-memory` skill. It does not
+add, remove, or inspect MCP configuration on a fresh/default Codex install.
 
 The native hooks use:
 
@@ -187,7 +191,27 @@ identity before indexing Codex history, so sessions started in subdirectories
 are included immediately. `lcm export --all` reconciles every metadata-backed
 candidate and exports each final canonical project only once.
 
-If you also want MCP inside Codex, run `lcm connectors install codex --type mcp`. Today that prints the TOML block you must add manually to `.codex/config.toml`.
+To explicitly select MCP for Codex, run `lcm connectors install codex --transport mcp`.
+The installer manages Codex MCP through native `codex mcp` commands; no TOML
+editing is required. Switch back with
+`lcm connectors install codex --transport cli`.
+
+### Connector transports
+
+Install one complete bundle per agent:
+
+```bash
+lcm connectors install <agent> [--transport cli|mcp] [--global]
+lcm connectors remove <agent> [--global]
+```
+
+An explicit `--transport` wins over the stored
+`connectors.transports.<agent-id>` choice, which wins over the registry
+default. Implicit defaults are not persisted. MCP is the default only for
+Claude Code, Qwen Code, and Zed; Codex and every other agent default to CLI.
+Cline and Augment are CLI-only until verifiable MCP adapters exist. Transport
+guidance is pure to the selected transport: there is no fallback between MCP
+and CLI tool instructions. Removal deletes the whole LCM-owned bundle.
 
 See [`docs/vscode-codex.md`](docs/vscode-codex.md) for the current VS Code/Codex setup path and remaining limitations.
 
@@ -288,8 +312,8 @@ lcm import-knowledge <f>   # import a knowledge JSON file
 
 # Connectors (wire lcm into other AI agents)
 lcm connectors list        # list available agents and installed connectors
-lcm connectors install <a> # install a connector for an agent
-lcm connectors remove <a>  # remove a connector for an agent
+lcm connectors install <agent> [--transport cli|mcp] [--global] # install one bundle
+lcm connectors remove <agent> [--global]                      # remove the whole bundle
 lcm connectors doctor      # check connector health
 
 # Sensitive data

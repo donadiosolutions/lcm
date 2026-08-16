@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildMemoryFeedbackInstruction,
   buildMemoryContext,
+  buildMemoryContextWithFeedback,
+  memoryFeedbackInstruction,
   selectMemoryHintsWithinBudget,
 } from "../../src/hooks/memory-context.js";
 
@@ -34,15 +36,27 @@ describe("memory context", () => {
     expect(manyIds).toBe(oneId);
     expect(oneId?.match(/<memory-feedback>/gu)).toHaveLength(1);
     expect(oneId?.match(/<\/memory-feedback>/gu)).toHaveLength(1);
-    expect(oneId).toContain("If surfaced memory affects the work");
+    expect(oneId).toContain("When recalled memory affects the work");
     expect(oneId).toContain("lcm_store");
     expect(oneId).toContain("signal:memory_used");
     expect(oneId).toContain("memory_id:<id>");
-    expect(oneId).toContain("CLI fallback");
-    expect(oneId).toContain("lcm store");
+    expect(oneId).not.toContain("lcm store ");
     expect(oneId).not.toContain("actual-1");
     expect(oneId).not.toContain("actual-2");
     expect(buildMemoryFeedbackInstruction([])).toBeNull();
+  });
+
+  it("returns no context when the selected transport receives no hints", () => {
+    expect(buildMemoryContextWithFeedback([], [], "cli")).toBeNull();
+  });
+
+  it("renders selected transport context and feedback independently", () => {
+    expect(memoryFeedbackInstruction("cli")).toContain("lcm store '");
+    const withoutIds = buildMemoryContextWithFeedback(["hint"], [], "cli");
+    expect(withoutIds).toContain("<memory-context>");
+    expect(withoutIds).not.toContain("<memory-feedback>");
+    const withIds = buildMemoryContextWithFeedback(["hint"], ["id-1"], "cli");
+    expect(withIds).toContain("<memory-feedback>");
   });
 
   it("deduplicates exact and prefix-equivalent normalized hints", () => {
@@ -54,6 +68,16 @@ describe("memory context", () => {
     ], options);
     expect(result.ids).toEqual(["one"]);
     expect(result.dedupedCount).toBe(2);
+  });
+
+  it("keeps template-looking hint content inert during selection", () => {
+    const result = selectMemoryHintsWithinBudget([
+      { id: "balanced", hint: "Balanced {{name}}" },
+      { id: "unclosed", hint: "Unclosed {{" },
+    ], options);
+
+    expect(result.ids).toEqual(["balanced", "unclosed"]);
+    expect(result.hints).toEqual(["Balanced {{name}}", "Unclosed {{"]);
   });
 
   it("truncates Unicode hints to the longest fitting prefix", () => {

@@ -1,6 +1,6 @@
 export const lcmStoreTool = {
   name: "lcm_store",
-  description: "Store a memory into Long Context Manager (LCM)'s semantic layer. Use to persist decisions, findings, reasoning outcomes, or any knowledge worth retrieving in future sessions. Stored memories are searchable via lcm_search.",
+  description: "Store a memory in Long Context Manager (LCM)'s semantic layer. Stored memories can be retrieved with lcm_search.",
   inputSchema: {
     type: "object" as const,
     properties: {
@@ -8,7 +8,7 @@ export const lcmStoreTool = {
       tags: {
         type: "array",
         items: { type: "string" },
-        description: "Canonical tags following the <prefix>:<value> schema (see docs/tag-schema.md). Use at least type: and one of project: or scope:. Examples: ['type:solution', 'scope:lcm', 'project:lcm', 'sprint:sp3', 'source:session']. Valid prefixes: type, scope, priority, owner, project, sprint, source, category, signal, memory_id. Pair signal:memory_used with memory_id:<id> so recall usage counting can attribute the referenced promoted memory; these tags must be paired.",
+        description: "Optional string tags associated with the memory. Each tag uses the <prefix>:<value> format.",
       },
       metadata: {
         type: "object",

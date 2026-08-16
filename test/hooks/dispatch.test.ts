@@ -148,6 +148,18 @@ describe("dispatchHook", () => {
     expect(handleSessionSnapshot).toHaveBeenCalledWith('{"test":true}');
   });
 
+  it("passes the trusted transport to UserPromptSubmit", async () => {
+    vi.mocked(handleUserPromptSubmit).mockClear();
+    await dispatchHook("user-prompt", '{"prompt":"remember"}', { transport: "cli" });
+    expect(handleUserPromptSubmit).toHaveBeenCalledWith(
+      '{"prompt":"remember"}',
+      undefined,
+      undefined,
+      undefined,
+      "cli",
+    );
+  });
+
   it("propagates the configured PostgreSQL backend to every backend-aware handler", async () => {
     const postgresqlStorage: StorageBackendSelection = { backend: "postgresql" };
     const mapping = [

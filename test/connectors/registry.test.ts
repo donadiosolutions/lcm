@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { AGENTS, findAgent, getAgentsByCategory } from "../../src/connectors/registry.js";
-import { CONNECTOR_TYPES, requiresRestart } from "../../src/connectors/types.js";
+import {
+  AGENTS,
+  findAgent,
+  getAgentsByCategory,
+  resolveAgentTransport,
+} from "../../src/connectors/registry.js";
+import { CONNECTOR_TRANSPORTS, requiresRestart } from "../../src/connectors/types.js";
 
 describe("connector registry", () => {
   it("has exactly 22 agents", () => {
@@ -12,14 +17,11 @@ describe("connector registry", () => {
       expect(agent.id).toBeTruthy();
       expect(agent.name).toBeTruthy();
       expect(agent.category).toBeTruthy();
-      expect(CONNECTOR_TYPES).toContain(agent.defaultType);
-      expect(agent.supportedTypes.length).toBeGreaterThan(0);
-      expect(agent.supportedTypes).toContain(agent.defaultType);
-      if (agent.defaultTypes) {
-        for (const defaultType of agent.defaultTypes) {
-          expect(CONNECTOR_TYPES).toContain(defaultType);
-          expect(agent.supportedTypes).toContain(defaultType);
-        }
+      expect(CONNECTOR_TRANSPORTS).toContain(agent.defaultTransport);
+      expect(agent.capabilities.cli.guidance.length).toBeGreaterThan(0);
+      if (agent.capabilities.mcp) {
+        expect(agent.capabilities.mcp.mcpAdapter).toBe(true);
+        expect(agent.capabilities.mcp.guidance.length).toBeGreaterThan(0);
       }
     }
   });
@@ -29,18 +31,16 @@ describe("connector registry", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("configPaths and supportedTypes are aligned", () => {
+  it("config paths expose only declared bundle capabilities", () => {
     for (const agent of AGENTS) {
-      // configPaths keys must be in supportedTypes
-      for (const key of Object.keys(agent.configPaths)) {
-        expect(agent.supportedTypes, `${agent.id}: configPath "${key}" not in supportedTypes`).toContain(key);
+      if (agent.configPaths.hook) {
+        expect(agent.capabilities.cli.nativeHook || agent.capabilities.mcp?.nativeHook).toBe(true);
       }
-      // supportedTypes must have a configPath (hook uses the structured native installer,
-      // and except mcp when it's the defaultType with no path — means manual configuration)
-      for (const type of agent.supportedTypes) {
-        if (type === 'hook') continue;
-        if (type === 'mcp' && !agent.configPaths['mcp']) continue;
-        expect(agent.configPaths, `${agent.id}: supportedType "${type}" has no configPath`).toHaveProperty(type);
+      if (agent.configPaths.mcp) {
+        expect(agent.capabilities.mcp?.mcpAdapter).toBe(true);
+      }
+      if (agent.configPaths.skill) {
+        expect(agent.capabilities.cli.guidance.includes("skill")).toBe(true);
       }
     }
   });
@@ -57,14 +57,23 @@ describe("connector registry", () => {
     expect(findAgent("nonexistent")).toBeUndefined();
   });
 
-  it("Codex defaults to hooks, skill, and rules", () => {
-    expect(findAgent("codex")?.defaultTypes).toEqual(["hook", "skill", "rules"]);
+  it("rejects transport resolution for an unknown agent", () => {
+    expect(() => resolveAgentTransport("nonexistent")).toThrow("Unknown agent: nonexistent");
   });
 
-  it("requiresRestart returns false only for rules", () => {
-    expect(requiresRestart("rules")).toBe(false);
-    expect(requiresRestart("hook")).toBe(true);
+  it("records transport defaults and the Codex bundle preference", () => {
+    expect(findAgent("codex")?.defaultTransport).toBe("cli");
+    expect(findAgent("codex")?.capabilities.cli).toMatchObject({
+      guidance: ["skill"],
+      nativeHook: true,
+    });
+    expect(findAgent("claude-code")?.defaultTransport).toBe("mcp");
+    expect(findAgent("qwen-code")?.defaultTransport).toBe("mcp");
+    expect(findAgent("zed")?.defaultTransport).toBe("mcp");
+  });
+
+  it("requiresRestart is true for both public transports", () => {
+    expect(requiresRestart("cli")).toBe(true);
     expect(requiresRestart("mcp")).toBe(true);
-    expect(requiresRestart("skill")).toBe(true);
   });
 });

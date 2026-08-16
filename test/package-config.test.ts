@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 import fastUri from "fast-uri";
@@ -185,25 +185,29 @@ describe("package.json", () => {
   );
 
   it(
-    "cleans retired connector templates and packs the canonical skill after a fresh build",
+    "packs only canonical guidance sources after a fresh build",
     { timeout: FRESH_BUILD_TEST_TIMEOUT_MS },
     () => {
-      const sourceSkill = resolve(
-        repositoryRoot,
-        "src/connectors/templates/skill/SKILL.md",
-      );
+      const sourceGuidance = resolve(repositoryRoot, "src/connectors/templates/guidance");
       const stagedTemplates = resolve(
         repositoryRoot,
         "dist/src/connectors/templates",
       );
-      const stagedSkill = resolve(stagedTemplates, "skill/SKILL.md");
+      const stagedGuidance = resolve(stagedTemplates, "guidance");
       const retiredTemplates = [
-        resolve(stagedTemplates, "mcp-base.md"),
-        resolve(stagedTemplates, "sections/mcp-workflow.md"),
+        resolve(stagedTemplates, "../operation-catalog.js"),
+        resolve(stagedTemplates, "../operation-catalog.d.ts"),
+        resolve(stagedTemplates, "../operation-catalog.js.map"),
+        resolve(stagedTemplates, "base.md"),
+        resolve(stagedTemplates, "operation-catalog.ts"),
+        resolve(stagedTemplates, "sections/workflow.md"),
+        resolve(stagedTemplates, "sections/command-reference.md"),
+        resolve(stagedTemplates, "skill/SKILL.md"),
+        resolve(stagedTemplates, "claude/skills/lcm-context/SKILL.md"),
       ];
 
-      mkdirSync(resolve(stagedTemplates, "sections"), { recursive: true });
       for (const retiredTemplate of retiredTemplates) {
+        mkdirSync(dirname(retiredTemplate), { recursive: true });
         writeFileSync(retiredTemplate, "stale asset that a fresh build must remove\n");
       }
 
@@ -215,23 +219,23 @@ describe("package.json", () => {
         timeout: FRESH_BUILD_TEST_TIMEOUT_MS - 10_000,
       });
 
-      expect(readFileSync(stagedSkill, "utf8")).toBe(
-        readFileSync(sourceSkill, "utf8"),
-      );
+      expect(readdirSync(stagedGuidance).sort()).toEqual(readdirSync(sourceGuidance).sort());
+      for (const file of readdirSync(sourceGuidance)) {
+        expect(readFileSync(resolve(stagedGuidance, file), "utf8")).toBe(
+          readFileSync(resolve(sourceGuidance, file), "utf8"),
+        );
+      }
       for (const retiredTemplate of retiredTemplates) {
         expect(existsSync(retiredTemplate), retiredTemplate).toBe(false);
       }
 
       const packagePaths = npmPackInventory();
-      expect(packagePaths).toContain(
-        "dist/src/connectors/templates/skill/SKILL.md",
-      );
-      expect(packagePaths).not.toContain(
-        "dist/src/connectors/templates/mcp-base.md",
-      );
-      expect(packagePaths).not.toContain(
-        "dist/src/connectors/templates/sections/mcp-workflow.md",
-      );
+      for (const file of readdirSync(sourceGuidance)) {
+        expect(packagePaths).toContain(`dist/src/connectors/templates/guidance/${file}`);
+      }
+      for (const retiredTemplate of retiredTemplates) {
+        expect(packagePaths).not.toContain(relative(repositoryRoot, retiredTemplate));
+      }
     },
   );
 

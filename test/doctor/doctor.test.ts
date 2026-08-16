@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
+import { renderGuidance } from "../../src/connectors/template-service.js";
 import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js";
 import { legacyLcmMcpServerName } from "../../src/legacy-names.js";
 import { LCM_MD_CONTENT } from "../../src/daemon/orientation.js";
@@ -78,6 +79,7 @@ function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
       if (path.endsWith("package.json")) return JSON.stringify({ version: "0.5.0" });
       if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
       if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
+      if (path.endsWith("lcm-memory/SKILL.md")) return renderGuidance("skill", "mcp");
       return "{}";
     },
     writeFileSync: vi.fn(),
@@ -220,26 +222,26 @@ describe("runDoctor security section", () => {
   });
 });
 
-describe("runDoctor lcm-md check", () => {
-  it("passes when lcm.md exists and CLAUDE.md has managed block", async () => {
+describe("runDoctor canonical Claude skill check", () => {
+  it("passes when the canonical lcm-memory skill exists", async () => {
     const results = await runDoctor(minimalDeps({ cwd: "/tmp/nonexistent-project-xyz" }));
     const check = results.find((r) => r.name === "lcm-md");
     expect(check?.status).toBe("pass");
-    expect(check?.message).toContain("lcm.md");
+    expect(check?.message).toContain("lcm-memory");
   });
 
-  it("auto-restores and reports fixApplied when lcm.md is missing", async () => {
+  it("repairs the canonical skill when it is missing", async () => {
     const written: Record<string, string> = {};
     const deps = minimalDeps({
       cwd: "/tmp/nonexistent-project-xyz",
-      existsSync: (p: string) => !p.endsWith("lcm.md"),
+      existsSync: (p: string) => !p.endsWith("lcm.md") && !p.endsWith("lcm-memory/SKILL.md"),
       writeFileSync: vi.fn((p: string, c: string) => { written[p] = c; }),
     });
     const results = await runDoctor(deps);
     const check = results.find((r) => r.name === "lcm-md");
     expect(check?.status).toBe("warn");
     expect(check?.fixApplied).toBe(true);
-    expect(written[join(defaultDoctorHome, ".claude", "lcm.md")]).toBeDefined();
+    expect(written[join(defaultDoctorHome, ".claude", "skills", "lcm-memory", "SKILL.md")]).toBeDefined();
   });
 });
 

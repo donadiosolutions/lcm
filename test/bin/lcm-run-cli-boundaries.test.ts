@@ -154,11 +154,15 @@ vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
 } }));
 vi.mock("../../src/hooks/dispatch.js", () => ({ dispatchHook: state.dispatchHook }));
 vi.mock("../../src/connectors/registry.js", () => ({
-  AGENTS: [{ id: "codex", name: "Codex", category: "agent", defaultTypes: ["hook", "mcp"], supportedTypes: ["hook", "mcp"] }],
+  AGENTS: [{
+    id: "codex", name: "Codex", category: "cli", defaultTransport: "cli",
+    capabilities: { cli: { guidance: ["skill"] }, mcp: { guidance: ["skill"], mcpAdapter: true } },
+  }],
   findAgent: vi.fn((name: string) => name === "codex" ? ({ id: "codex", name: "Codex" }) : undefined),
 }));
 vi.mock("../../src/connectors/installer.js", () => ({
-  listConnectors: vi.fn(() => state.installed), installConnector: state.installConnector, removeConnector: state.removeConnector,
+  listConnectors: vi.fn(() => state.installed), listConnectorInventory: undefined,
+  installConnector: state.installConnector, removeConnector: state.removeConnector,
 }));
 vi.mock("../../src/import.js", () => ({
   cwdToProjectHash: vi.fn(() => "cwd-hash"), findSessionFiles: vi.fn(() => ["one", "two"]),
@@ -656,6 +660,7 @@ describe("runCli lifecycle and connector boundaries", () => {
     state.installed = [{ agentId: "codex", type: "hook", path: "/hook" }];
     expect(await invoke(["connectors", "list"])).toBeUndefined();
     expect(await invoke(["connectors", "list", "--format", "json"])).toBeUndefined();
+    expect(await invoke(["connectors", "doctor"])).toBeUndefined();
     state.installConnector.mockImplementationOnce(() => { throw new Error("install failed"); });
     expect((await invoke(["connectors", "install", "codex"]))?.message).toBe("exit:1");
     state.removeConnector.mockImplementationOnce(() => { throw new Error("remove failed"); });

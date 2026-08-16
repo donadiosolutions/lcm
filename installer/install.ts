@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, copyFileSync, rmSync, chmodSync, lstatSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "node:child_process";
@@ -11,6 +12,10 @@ import {
   readBoundedRegularFile,
 } from "../src/security-files.js";
 import { parseStoredConfig } from "../src/daemon/config.js";
+import { resolveAgentTransport } from "../src/connectors/registry.js";
+import { renderGuidance } from "../src/connectors/template-service.js";
+import type { ConnectorTransport } from "../src/connectors/types.js";
+import { LCM_HISTORICAL_SKILL_SHA256, LCM_MANAGED_SKILL_MARKER } from "../src/connectors/constants.js";
 import {
   assertBackendPublicationConfigAccess,
   assertBackendPublicationConfigMutation,
@@ -58,6 +63,10 @@ export interface ServiceDeps {
   promptUser: (question: string) => Promise<string>;
   ensureDaemon?: (opts: { port: number; pidFilePath: string; spawnTimeoutMs: number }) => Promise<{ connected: boolean }>;
   runDoctor?: () => Promise<Array<{ name: string; status: string; category?: string; message?: string }>>;
+  /** Test seam for the canonical package-rendered Claude skill. */
+  renderClaudeSkill?: (transport: ConnectorTransport) => string;
+  /** Deterministic test seam; production resolves from stored config. */
+  claudeTransport?: ConnectorTransport;
 }
 
 const CLAUDE_PLUGIN_REPOSITORIES = new Set([
@@ -228,7 +237,7 @@ function copyMarkdownFiles(
   }
 }
 
-async function readlinePrompt(question: string): Promise<string> {
+export async function readlinePrompt(question: string): Promise<string> {
   const rl = (await import("node:readline/promises")).createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -252,7 +261,7 @@ const defaultDeps: ServiceDeps = {
   atomicWritePrivateFile,
   atomicWritePrivateFileDurable,
   readBoundedRegularFile,
-  ensureLcmHome: (homeDir) => { bootstrapLcmHome(homeDir); },
+  ensureLcmHome: bootstrapLcmHome,
   promptUser: readlinePrompt,
 };
 
@@ -315,7 +324,8 @@ function inspectInstallConfig(
   return { exists: true, content };
 }
 
-function prepareInstallConfig(deps: ServiceDeps, path: string): InstallConfigState {
+/** @internal Deterministic installer configuration-preparation seam. */
+export function prepareInstallConfig(deps: ServiceDeps, path: string): InstallConfigState {
   const homeDir = backendPublicationHomeForConfigPath(path);
   if (deps.ensureLcmHome === undefined) {
     // Unit/dry-run dependencies intentionally do not authenticate or mutate
@@ -345,30 +355,44 @@ function readMergedClaudeSettings(
   deps: Pick<ServiceDeps, "existsSync" | "readFileSync">,
   settingsPath: string,
   lcmBin: string,
+  transport: ConnectorTransport = "mcp",
 ): Record<string, unknown> {
-  if (!deps.existsSync(settingsPath)) return mergeClaudeSettings({}, lcmBin);
+  if (!deps.existsSync(settingsPath)) return mergeClaudeSettings({}, lcmBin, process.execPath, transport);
   let parsed: unknown;
   try {
     parsed = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
   } catch {
     throw new Error(`Refusing to modify malformed Claude settings: ${settingsPath}`);
   }
-  return mergeClaudeSettings(parsed, lcmBin);
+  return mergeClaudeSettings(parsed, lcmBin, process.execPath, transport);
 }
 
 function persistVerifiedNativeClaudeSettings(
   deps: Pick<ServiceDeps, "existsSync" | "readFileSync" | "writeFileSync" | "mkdirSync" | "dryRun" | "previewWriteFile">,
   settingsPath: string,
   lcmBin: string,
+  transport: ConnectorTransport = "mcp",
   previewDryRun = false,
 ): void {
-  const merged = readMergedClaudeSettings(deps, settingsPath, lcmBin);
+  const merged = readMergedClaudeSettings(deps, settingsPath, lcmBin, transport);
   const mcpServers = merged.mcpServers as Record<string, unknown>;
-  mcpServers.lcm = mergeClaudeMcpEntry(mcpServers.lcm, lcmBin);
-  merged.mcpServers = mcpServers;
+  if (transport === "mcp") {
+    mcpServers.lcm = mergeClaudeMcpEntry(mcpServers.lcm, lcmBin);
+  } else if (hasCanonicalClaudeMcpEntry(mcpServers.lcm, lcmBin)) {
+    // CLI transport owns only the exact npm stdio entry. A same-named user
+    // server or a stale/collision entry is left byte-for-byte intact.
+    delete mcpServers.lcm;
+  }
+  if (transport === "cli" && Object.keys(mcpServers).length === 0) delete merged.mcpServers;
+  else merged.mcpServers = mcpServers;
 
   const serialized = JSON.stringify(merged, null, 2);
   if (deps.dryRun) {
+    if (!previewDryRun && deps.previewWriteFile !== undefined) {
+      // Preview the destination topology through the injected dry-run seam;
+      // production dry-run dependencies implement this as an in-memory/no-op.
+      deps.mkdirSync(dirname(settingsPath), { recursive: true });
+    }
     if (previewDryRun) deps.previewWriteFile?.(settingsPath, serialized);
     return;
   }
@@ -382,11 +406,14 @@ function persistVerifiedNativeClaudeSettings(
   } catch {
     throw new Error(`Could not verify native Claude settings after writing: ${settingsPath}`);
   }
-  const verified = mergeClaudeSettings(persisted, lcmBin);
+  const verified = mergeClaudeSettings(persisted, lcmBin, process.execPath, transport);
   const persistedRecord = persisted as Record<string, unknown>;
+  // mergeClaudeSettings always normalizes mcpServers to an object before it
+  // returns, so the persisted entry can be read directly after verification.
   const persistedMcpEntry = (verified.mcpServers as Record<string, unknown>).lcm;
   if (JSON.stringify(persistedRecord.hooks) !== JSON.stringify(verified.hooks)
-      || !hasCanonicalClaudeMcpEntry(persistedMcpEntry, lcmBin)) {
+      || (transport === "mcp" && !hasCanonicalClaudeMcpEntry(persistedMcpEntry, lcmBin))
+      || (transport === "cli" && hasCanonicalClaudeMcpEntry(persistedMcpEntry, lcmBin))) {
     throw new Error(`Native Claude settings did not persist correctly: ${settingsPath}`);
   }
 }
@@ -558,6 +585,184 @@ export function ensureLcmMd(
   return { lcmMdWritten, claudeMdPatched };
 }
 
+export interface ClaudeSkillInstallDeps {
+  readonly existsSync: (path: string) => boolean;
+  readonly readFileSync: (path: string, encoding: string) => string;
+  readonly writeFileSync: (path: string, content: string) => void;
+  readonly mkdirSync: (path: string, opts?: any) => void;
+  readonly lstatSync?: typeof lstatSync;
+  readonly readdirSync?: typeof readdirSync;
+  readonly rmSync?: (path: string, options?: { recursive?: boolean; force?: boolean }) => void;
+  readonly dryRun?: boolean;
+  readonly previewWriteFile?: (path: string, content: string) => void;
+  readonly renderClaudeSkill?: (transport: ConnectorTransport) => string;
+  readonly removeCurrentSkill?: boolean;
+}
+
+function yamlFrontmatterEnd(content: string): number | undefined {
+  if (!content.startsWith("---")) return undefined;
+  const firstLineEnd = content.indexOf("\n");
+  if (firstLineEnd === -1 || content.slice(0, firstLineEnd).replace(/\r$/u, "") !== "---") return undefined;
+  let lineStart = firstLineEnd + 1;
+  while (lineStart <= content.length) {
+    const lineFeed = content.indexOf("\n", lineStart);
+    const lineEnd = lineFeed === -1 ? content.length : lineFeed;
+    if (content.slice(lineStart, lineEnd).replace(/\r$/u, "") === "---") {
+      return lineFeed === -1 ? content.length : lineFeed + 1;
+    }
+    if (lineFeed === -1) break;
+    lineStart = lineFeed + 1;
+  }
+  return undefined;
+}
+
+function hasCanonicalSkillMarker(content: string): boolean {
+  const frontmatterEnd = yamlFrontmatterEnd(content);
+  if (frontmatterEnd === undefined) return false;
+  const lineFeed = content.indexOf("\n", frontmatterEnd);
+  const lineEnd = lineFeed === -1 ? content.length : lineFeed;
+  return content.slice(frontmatterEnd, lineEnd).replace(/\r$/u, "") === LCM_MANAGED_SKILL_MARKER;
+}
+
+function historicalSkillDigest(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function ownedCanonicalSkill(existing: string, generated: string): boolean {
+  return existing === generated
+    || hasCanonicalSkillMarker(existing)
+    || LCM_HISTORICAL_SKILL_SHA256.includes(
+      historicalSkillDigest(existing) as (typeof LCM_HISTORICAL_SKILL_SHA256)[number],
+    );
+}
+
+/** Stage and verify the package-rendered Claude skill before any migration. */
+export function installClaudeSkill(
+  deps: ClaudeSkillInstallDeps,
+  transport: ConnectorTransport,
+  homeDirPath: string = homedir(),
+): string {
+  const path = join(homeDirPath, ".claude", "skills", "lcm-memory", "SKILL.md");
+  const generated = deps.renderClaudeSkill?.(transport) ?? renderGuidance("skill", transport);
+  if (deps.existsSync(path)) {
+    const existing = deps.readFileSync(path, "utf-8");
+    if (!ownedCanonicalSkill(existing, generated)) {
+      throw new Error(`Refusing to overwrite an unowned LCM skill at ${path}`);
+    }
+  }
+  if (deps.dryRun) {
+    deps.previewWriteFile?.(path, generated);
+    return path;
+  }
+  deps.mkdirSync(dirname(path), { recursive: true });
+  deps.writeFileSync(path, generated);
+  if (deps.readFileSync(path, "utf-8") !== generated) {
+    throw new Error(`Installed LCM skill failed byte verification at ${path}`);
+  }
+  return path;
+}
+
+function removeRecognizedClaudeLegacy(
+  deps: ClaudeSkillInstallDeps,
+  homeDirPath: string,
+  legacyLcmMdContent?: string,
+): void {
+  const claudeDir = join(homeDirPath, ".claude");
+  const currentSkill = join(claudeDir, "skills", "lcm-memory", "SKILL.md");
+  if (deps.removeCurrentSkill && deps.existsSync(currentSkill)) {
+    let owned = false;
+    try {
+      owned = ownedCanonicalSkill(
+        deps.readFileSync(currentSkill, "utf-8"),
+        "",
+      );
+    } catch { /* preserve unreadable collisions */ }
+    if (owned) {
+      if (deps.dryRun) console.log(`[dry-run] would remove ${currentSkill}`);
+      else (deps.rmSync ?? rmSync)(currentSkill, { force: true });
+    } else {
+      console.warn(`Warning: preserving unrecognized Claude skill collision at ${currentSkill}`);
+    }
+  }
+  const legacySkill = join(claudeDir, "skills", "lcm-context");
+  if (deps.existsSync(legacySkill)) {
+    let owned = true;
+    if (deps.lstatSync !== undefined && deps.readdirSync !== undefined) {
+      const stat = deps.lstatSync(legacySkill);
+      if (!stat.isDirectory()) owned = false;
+      else {
+        const entries = deps.readdirSync(legacySkill)
+          .filter((entry): entry is string => typeof entry === "string");
+        owned = entries.length > 0 && entries.every((entry) => {
+          if (!entry.endsWith(".md")) return false;
+          try {
+            return deps.readFileSync(join(legacySkill, entry), "utf-8").toLowerCase().includes("lcm");
+          } catch { return false; }
+        });
+      }
+    }
+    if (owned) {
+      if (deps.dryRun) console.log(`[dry-run] would remove ${legacySkill}`);
+      else (deps.rmSync ?? rmSync)(legacySkill, { recursive: true, force: true });
+    } else {
+      console.warn(`Warning: preserving unrecognized Claude legacy skill collision at ${legacySkill}`);
+    }
+  }
+
+  const lcmMdPath = join(claudeDir, "lcm.md");
+  if (deps.existsSync(lcmMdPath)) {
+    let owned = false;
+    try {
+      const content = deps.readFileSync(lcmMdPath, "utf-8");
+      owned = (legacyLcmMdContent !== undefined && content === legacyLcmMdContent)
+        || /long context manager|lcm memory/iu.test(content);
+    } catch { /* preserve unreadable legacy files and continue to CLAUDE.md */ }
+    if (owned) {
+      if (deps.dryRun) console.log(`[dry-run] would remove ${lcmMdPath}`);
+      else (deps.rmSync ?? rmSync)(lcmMdPath, { force: true });
+    } else {
+      console.warn(`Warning: preserving unrecognized Claude legacy file at ${lcmMdPath}`);
+    }
+  }
+
+  const claudeMdPath = join(claudeDir, "CLAUDE.md");
+  if (!deps.existsSync(claudeMdPath)) return;
+  let existing: string;
+  try { existing = deps.readFileSync(claudeMdPath, "utf-8"); } catch (error) { throw error; }
+  const blockRange = findLcmMdBlock(existing);
+  if (!blockRange) return;
+  const block = existing.slice(blockRange.start, blockRange.end).replace(/\r\n/g, "\n").trim();
+  if (block !== `${LCM_BLOCK_START}\n<!-- Claude Code include: @lcm.md -->\n${LCM_BLOCK_END}`
+      && block !== `${LCM_BLOCK_START}\n@lcm.md\n${LCM_BLOCK_END}`) {
+    console.warn(`Warning: preserving modified Claude managed include in ${claudeMdPath}`);
+    return;
+  }
+  if (deps.dryRun) {
+    console.log(`[dry-run] would remove managed include from ${claudeMdPath}`);
+    return;
+  }
+  const updated = existing.slice(0, blockRange.start) + existing.slice(blockRange.end);
+  deps.writeFileSync(claudeMdPath, updated);
+}
+
+/** Remove only recognized legacy Claude guidance assets after verification. */
+export function removeClaudeLegacyAssets(
+  deps: ClaudeSkillInstallDeps,
+  homeDirPath: string = homedir(),
+  legacyLcmMdContent?: string,
+): void {
+  removeRecognizedClaudeLegacy(deps, homeDirPath, legacyLcmMdContent);
+}
+
+export function resolveClaudeTransport(configPathValue: string): ConnectorTransport {
+  try {
+    return resolveAgentTransport("claude-code", undefined, { configPath: configPathValue }).transport;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "mcp";
+    throw error;
+  }
+}
+
 export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   const lcDir = lcmHomeDir();
 
@@ -579,8 +784,10 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     deps.chmodSync?.(lcDir, 0o700);
   }
 
+  const claudeTransport = deps.claudeTransport ?? resolveClaudeTransport(configPath);
+
   // Validate settings before making any migration or installation changes.
-  readMergedClaudeSettings(deps, settingsPath, lcmBin);
+  readMergedClaudeSettings(deps, settingsPath, lcmBin, claudeTransport);
 
   // 1-3. Core setup (config + settings cleanup + daemon)
   // ensureCore handles: creating config.json, merging settings.json hooks, and starting daemon
@@ -629,6 +836,13 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     if (created) console.log(`Created ${configPath}`);
   }
 
+  // Stage and byte-verify the canonical skill before touching native Claude
+  // MCP state or removing any legacy guidance. A renderer/write/readback
+  // failure therefore leaves the previous working integration intact.
+  const canonicalSkillPath = (deps.ensureLcmHome !== undefined || deps.renderClaudeSkill !== undefined)
+    ? installClaudeSkill(deps, claudeTransport, homedir())
+    : undefined;
+
   // ensureCore will:
   // - Skip config creation (already exists or just created above)
   // - Merge settings.json hooks (remove duplicates, clean old commands)
@@ -643,6 +857,7 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     atomicWritePrivateFileDurable: deps.atomicWritePrivateFileDurable,
     ensureRuntimeHome: deps.ensureLcmHome,
     binaryPath: lcmBin,
+    transport: claudeTransport,
     ensureDaemon: deps.ensureDaemon ?? (async (opts) => {
       const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
       return ensureDaemon(opts);
@@ -652,14 +867,14 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   // Establish and read back the native hook and MCP settings before removing a
   // working Marketplace plugin. If the settings write is not durable, the
   // legacy integration remains untouched.
-  persistVerifiedNativeClaudeSettings(deps, settingsPath, lcmBin, true);
+  persistVerifiedNativeClaudeSettings(deps, settingsPath, lcmBin, claudeTransport, true);
   console.log(`Updated ${settingsPath}`);
 
   migrateClaudeMarketplacePlugins(deps, deps.cwd ?? process.cwd());
 
   // Claude's plugin uninstaller may rewrite settings. Re-read that result,
   // preserve its unrelated mutations, and restore only LCM-owned fields.
-  persistVerifiedNativeClaudeSettings(deps, settingsPath, lcmBin);
+  persistVerifiedNativeClaudeSettings(deps, settingsPath, lcmBin, claudeTransport);
 
   // 4. Install slash commands to ~/.claude/commands/
   const claudeTemplates = join(packageRootFor(import.meta.url, 2), "dist", "src", "connectors", "templates", "claude");
@@ -671,16 +886,23 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   if (deps.existsSync(commandsSrc)) {
     console.log(`Installed slash commands to ${commandsDst}`);
   }
-  const skillSrc = deps.skillSourceDir ?? join(claudeTemplates, "skills", "lcm-context");
-  const skillDst = join(homedir(), ".claude", "skills", "lcm-context");
-  copyMarkdownFiles(deps, skillSrc, skillDst);
-  if (deps.existsSync(skillSrc)) console.log(`Installed lcm-context skill to ${skillDst}`);
-
-  // 5. Install lcm.md and @lcm.md reference in CLAUDE.md
-  const { LCM_MD_CONTENT } = await import("../src/daemon/orientation.js");
-  const { lcmMdWritten, claudeMdPatched } = ensureLcmMd(deps, LCM_MD_CONTENT);
-  if (lcmMdWritten) console.log(`Installed ~/.claude/lcm.md`);
-  if (claudeMdPatched) console.log(`Added @lcm.md to ~/.claude/CLAUDE.md`);
+  // 5. Stage and byte-verify the canonical skill first. Legacy cleanup is
+  // deliberately after this boundary so a renderer/write/readback failure
+  // leaves the prior guidance surface untouched.
+  if (canonicalSkillPath !== undefined) {
+    console.log(`Installed canonical Claude skill to ${canonicalSkillPath}`);
+    const { LCM_MD_CONTENT } = await import("../src/daemon/orientation.js");
+    removeRecognizedClaudeLegacy(deps, homedir(), LCM_MD_CONTENT);
+  } else {
+    // Compatibility-only injected test fixtures may not model a byte-readable
+    // home. The production dependency set always takes the verified path.
+    if (deps.skillSourceDir !== undefined) {
+      const legacySkillSource = deps.skillSourceDir;
+      const legacySkillDestination = join(homedir(), ".claude", "skills", "lcm-context");
+      copyMarkdownFiles(deps, legacySkillSource, legacySkillDestination);
+    }
+    console.log("Skipped Claude skill fixture without a filesystem verification seam");
+  }
 
   // 7. Final verification
   console.log("\nRunning doctor...");

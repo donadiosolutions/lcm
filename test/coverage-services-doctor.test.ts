@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { renderGuidance } from "../src/connectors/template-service.js";
 
 type FakeStdin = EventEmitter & {
   write: ReturnType<typeof vi.fn>;
@@ -88,7 +89,7 @@ vi.mock("node:child_process", () => ({
 import { formatResultsPlain, printResults, runDoctor } from "../src/doctor/doctor.js";
 import { LCM_MD_CONTENT } from "../src/daemon/orientation.js";
 import { ScrubEngine } from "../src/scrub.js";
-import { REQUIRED_HOOKS } from "../installer/install.js";
+import { mergeClaudeSettings, REQUIRED_HOOKS } from "../installer/install.js";
 import type { CheckResult, DoctorDeps } from "../src/doctor/types.js";
 
 function isolatedPath(name: string): string {
@@ -134,12 +135,13 @@ function makeDeps(options: {
       if (path.endsWith("package.json")) return JSON.stringify(options.pkg ?? { version: "1.2.3" });
       if (path.endsWith("CLAUDE.md")) return options.claudeMd ?? "<!-- lcm:start -->\n@lcm.md\n<!-- lcm:end -->";
       if (path.endsWith("lcm.md")) return options.lcmMd ?? LCM_MD_CONTENT;
+      if (path.endsWith("lcm-memory/SKILL.md")) return renderGuidance("skill", "mcp");
       if (path.startsWith("/proc/")) return options.procEnviron ?? "";
       return "{}";
     },
-    writeFileSync: (_path, content) => {
+    writeFileSync: (path, content) => {
       if (options.writeError) throw options.writeError;
-      options.writes?.push(content);
+      if (path.endsWith("settings.json")) options.writes?.push(content);
     },
     mkdirSync: vi.fn(),
     spawnSync: (...args) => mocks.spawnSync(...args),
@@ -1015,14 +1017,22 @@ describe("doctor service coverage", () => {
     }
   });
 
-  it("covers settings parse/repair/read failures and lcm.md repair failures", async () => {
+  it("covers the explicit Claude process summarizer branch", async () => {
+    const results = await runDoctor(makeDeps({
+      config: { llm: { provider: "claude-process" } },
+    }));
+
+    expect(results.some((result) => result.name === "claude-process")).toBe(true);
+  });
+
+  it("covers settings parse/repair/read failures and canonical skill cleanup failures", async () => {
     const settingsWithDuplicate = {
       hooks: { SessionStart: [{ hooks: [{ command: "lcm restore" }] }] },
     };
     let results = await runDoctor(makeDeps({
       settings: settingsWithDuplicate,
       writeError: new Error("cannot write"),
-      exists: (path) => !path.endsWith("lcm.md"),
+      exists: (path) => !path.endsWith("lcm.md") && !path.endsWith("lcm-memory/SKILL.md"),
     }));
     expect(results.find((result) => result.name === "hooks")?.message).toContain("Could not manage native Claude Code hooks");
     expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
@@ -1035,13 +1045,89 @@ describe("doctor service coverage", () => {
       readError: (path) => path.endsWith("CLAUDE.md") ? new Error("cannot read claude") : undefined,
     }));
     expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
-    expect(results.find((result) => result.name === "lcm-md")?.status).toBe("warn");
+    expect(results.filter((result) => result.name === "lcm-md").at(-1)).toMatchObject({
+      status: "fail",
+      message: expect.stringContaining("lcm-memory skill repair failed: cannot read claude"),
+    });
 
     results = await runDoctor(makeDeps({
       readError: (path) => path.endsWith("settings.json") || path.endsWith("lcm.md") ? new Error("cannot read") : undefined,
     }));
     expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
     expect(results.find((result) => result.name === "lcm-md")?.status).toBe("fail");
+  });
+
+  it("covers non-Error settings parsing and transport-specific Claude repair branches", async () => {
+    let results = await runDoctor(makeDeps({
+      readError: (path) => path.endsWith("settings.json") ? "plain settings failure" : undefined,
+    }));
+    expect(results.find((result) => result.name === "hooks")?.message).toContain("plain settings failure");
+
+    const runtimePath = join(process.cwd(), "dist", "lcm.mjs");
+    const cliHooks = mergeClaudeSettings({}, runtimePath, process.execPath, "cli").hooks;
+    const canonicalMcp = {
+      type: "stdio",
+      command: process.execPath,
+      args: [runtimePath, "mcp"],
+    };
+    const writes: string[] = [];
+    results = await runDoctor({
+      ...makeDeps({
+        settings: { hooks: cliHooks, mcpServers: { lcm: canonicalMcp } },
+        writes,
+      }),
+      _claudeTransport: "cli",
+    });
+    expect(results.find((result) => result.name === "mcp-lcm")).toMatchObject({
+      status: "warn",
+      fixApplied: true,
+      message: "Removed the owned Claude MCP entry for CLI transport",
+    });
+    expect(JSON.parse(writes.at(-1)!)).not.toHaveProperty("mcpServers");
+
+    results = await runDoctor({
+      ...makeDeps({ settings: { hooks: cliHooks, mcpServers: {} } }),
+      _claudeTransport: "cli",
+    });
+    expect(results.find((result) => result.name === "mcp-lcm")).toMatchObject({
+      status: "pass",
+      message: "Claude CLI transport does not use MCP",
+    });
+
+    results = await runDoctor({
+      ...makeDeps({
+        settings: { hooks: cliHooks, mcpServers: { lcm: canonicalMcp }, },
+        writeError: new Error("cannot remove MCP"),
+      }),
+      _claudeTransport: "cli",
+    });
+    expect(results.find((result) => result.name === "mcp-lcm")).toMatchObject({
+      status: "fail",
+      message: "Owned Claude MCP entry could not be removed — run: lcm install",
+    });
+  });
+
+  it("covers MCP repair failure and unreadable canonical skill recovery", async () => {
+    const runtimePath = join(process.cwd(), "dist", "lcm.mjs");
+    const mcpHooks = mergeClaudeSettings({}, runtimePath, process.execPath, "mcp").hooks;
+
+    let results = await runDoctor(makeDeps({
+      settings: { hooks: mcpHooks, mcpServers: { lcm: {} } },
+      writeError: new Error("cannot repair MCP"),
+    }));
+    expect(results.find((result) => result.name === "mcp-lcm")).toMatchObject({
+      status: "fail",
+      message: "mcpServers.lcm could not be repaired — run: lcm install",
+    });
+
+    results = await runDoctor(makeDeps({
+      settings: { hooks: mcpHooks, mcpServers: { lcm: {} } },
+      readError: (path) => path.endsWith("lcm-memory/SKILL.md") ? new Error("skill unreadable") : undefined,
+    }));
+    expect(results.find((result) => result.name === "lcm-md")).toMatchObject({
+      status: "fail",
+      message: expect.stringContaining("skill unreadable"),
+    });
   });
 
   it("gives matching actionable JSON guidance for malformed Claude settings", async () => {
@@ -1216,20 +1302,20 @@ describe("doctor service coverage", () => {
     expect(results.find((result) => result.name === "events-staleness")?.message).toContain("h ago");
   });
 
-  it("covers multiple duplicate hook repair failure and lcm.md patch-only/non-Error repair paths", async () => {
+  it("covers multiple duplicate hook repair failure and canonical skill cleanup paths", async () => {
     const hooks: Record<string, unknown[]> = {};
     for (const { event, command } of REQUIRED_HOOKS) hooks[event] = [{ hooks: [{ command: `lcm ${command}` }] }];
     let results = await runDoctor(makeDeps({ settings: { hooks }, writeError: "plain write failure" }));
     expect(results.find((result) => result.name === "hooks")?.message).toContain("Could not manage native Claude Code hooks");
 
     results = await runDoctor(makeDeps({ claudeMd: "no reference" }));
-    expect(results.find((result) => result.name === "lcm-md")?.message).toContain("added @lcm.md");
+    expect(results.find((result) => result.name === "lcm-md")?.message).toContain("canonical Claude lcm-memory skill is installed");
 
     results = await runDoctor(makeDeps({
       exists: (path) => !path.endsWith("lcm.md"),
       writeError: "plain write failure",
     }));
-    expect(results.find((result) => result.name === "lcm-md")?.message).toContain("plain write failure");
+    expect(results.filter((result) => result.name === "lcm-md").at(-1)?.message).toContain("plain write failure");
   });
 
   it("formats future captures as just now in verbose project output", async () => {

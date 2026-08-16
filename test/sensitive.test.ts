@@ -108,6 +108,8 @@ describe("lcm sensitive", () => {
     tempBase = join(tmpdir(), `lcm-sensitive-${Math.random().toString(36).slice(2)}`);
     _projectBase.current = tempBase;
     cwd = join(tempBase, "project");
+    mkdirSync(tempBase, { mode: 0o700 });
+    chmodSync(tempBase, 0o700);
     mkdirSync(cwd, { recursive: true });
     configPath = join(tempBase, ".lcm", "config.json");
     mkdirSync(join(tempBase, ".lcm"), { mode: 0o700 });

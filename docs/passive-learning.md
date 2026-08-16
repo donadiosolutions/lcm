@@ -1,6 +1,12 @@
 # Passive Learning
 
-Passive learning captures insights from your Claude Code sessions automatically — no manual `lcm_store()` calls needed. It observes tool usage patterns, user decisions, and session events, then promotes high-signal observations into cross-session memory.
+Passive learning captures bounded context from your Claude Code and Codex
+sessions automatically. It observes tool usage patterns, user decisions, and
+session events, then promotes high-signal observations into cross-session
+memory. This makes prior-session context searchable, but it does not replace
+explicit durable rationale: agents should still call `lcm_store` immediately
+when they recognize a durable decision, preference, root cause, pattern,
+gotcha, solution, or reusable workflow.
 
 ## How It Works
 
@@ -150,7 +156,7 @@ When the daemon processes queued events, it applies three promotion tiers:
 
 ### Error→Fix Correlation
 
-When a tool error is followed by a successful command with a matching prefix (within 20 events), the system correlates them as an error→fix pair. These are tagged `category:solution` and promoted with higher priority.
+When a tool error is followed by a successful command with a matching prefix (within 20 events), the system correlates them as an error→fix pair. These are tagged `type:solution` and promoted with higher priority.
 
 ### Manual Backlog Drain
 

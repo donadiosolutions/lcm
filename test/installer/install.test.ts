@@ -11,6 +11,10 @@ import {
   hasCanonicalClaudeMcpEntry,
   hasManagedClaudeSettings,
   mergeClaudeMcpEntry,
+  installClaudeSkill,
+  removeClaudeLegacyAssets,
+  readlinePrompt,
+  resolveClaudeTransport,
   type ServiceDeps,
 } from "../../installer/install.js";
 import { homedir } from "node:os";
@@ -618,9 +622,361 @@ describe("Claude Marketplace migration", () => {
   });
 });
 
+describe("Claude skill and legacy guidance seams", () => {
+  const home = "/tmp/lcm-installer-guidance-coverage";
+  const skillPath = join(home, ".claude", "skills", "lcm-memory", "SKILL.md");
+  const legacySkillPath = join(home, ".claude", "skills", "lcm-context");
+  const lcmMdPath = join(home, ".claude", "lcm.md");
+  const claudeMdPath = join(home, ".claude", "CLAUDE.md");
+
+  it("renders and byte-verifies the canonical skill through the default renderer", () => {
+    const files = new Map<string, string>();
+    const deps = {
+      existsSync: vi.fn((path: string) => files.has(path)),
+      readFileSync: vi.fn((path: string) => files.get(path) ?? ""),
+      writeFileSync: vi.fn((path: string, content: string) => { files.set(path, content); }),
+      mkdirSync: vi.fn(),
+    };
+
+    expect(installClaudeSkill(deps, "cli", home)).toBe(skillPath);
+    expect(files.get(skillPath)).toContain("lcm-managed-skill:v1");
+    expect(deps.mkdirSync).toHaveBeenCalledWith(dirname(skillPath), { recursive: true });
+  });
+
+  it("preserves an unowned skill collision and rejects a failed readback", () => {
+    const collision = new Map([[skillPath, "user-owned guidance"]]);
+    const collisionDeps = {
+      existsSync: (path: string) => collision.has(path),
+      readFileSync: (path: string) => collision.get(path) ?? "",
+      writeFileSync: vi.fn(),
+      mkdirSync: vi.fn(),
+    };
+    expect(() => installClaudeSkill(collisionDeps, "mcp", home)).toThrow("unowned LCM skill");
+
+    let reads = 0;
+    const generated = "---\n<!-- lcm-managed-skill:v1 -->\ncanonical\n";
+    const mismatchDeps = {
+      existsSync: () => false,
+      readFileSync: () => { reads += 1; return reads === 1 ? "" : "different"; },
+      writeFileSync: vi.fn(),
+      mkdirSync: vi.fn(),
+      renderClaudeSkill: () => generated,
+    };
+    expect(() => installClaudeSkill(mismatchDeps, "mcp", home)).toThrow("byte verification");
+  });
+
+  it.each([
+    [
+      "a marker embedded in YAML frontmatter",
+      `---\nname: user-authored\n${"<!-- lcm-managed-skill:v1 -->"}\n---\nuser content\n`,
+    ],
+    [
+      "a marker embedded in the document body",
+      `---\nname: user-authored\n---\nuser content\n<!-- lcm-managed-skill:v1 -->\n`,
+    ],
+    [
+      "a marker separated from frontmatter by a blank line",
+      `---\nname: user-authored\n---\n\n<!-- lcm-managed-skill:v1 -->\nuser content\n`,
+    ],
+  ])("does not own or overwrite %s", (_description, collision) => {
+    const files = new Map([[skillPath, collision]]);
+    const deps = {
+      existsSync: (path: string) => files.has(path),
+      readFileSync: (path: string) => files.get(path) ?? "",
+      writeFileSync: vi.fn((path: string, content: string) => { files.set(path, content); }),
+      mkdirSync: vi.fn(),
+      renderClaudeSkill: () => "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\ncanonical\n",
+    };
+
+    expect(() => installClaudeSkill(deps, "mcp", home)).toThrow("unowned LCM skill");
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+    expect(files.get(skillPath)).toBe(collision);
+  });
+
+  it("accepts an exact historical generated skill during migration", () => {
+    const historical = fsReadFileSync(new URL("../connectors/fixtures/historical-skill-v0.md", import.meta.url), "utf-8");
+    const files = new Map([[skillPath, historical]]);
+    const deps = {
+      existsSync: (path: string) => files.has(path),
+      readFileSync: (path: string) => files.get(path) ?? "",
+      writeFileSync: (path: string, content: string) => { files.set(path, content); },
+      mkdirSync: vi.fn(),
+      renderClaudeSkill: () => "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\ncanonical\n",
+    };
+
+    expect(() => installClaudeSkill(deps, "mcp", home)).not.toThrow();
+    expect(files.get(skillPath)).toContain("<!-- lcm-managed-skill:v1 -->");
+  });
+
+  const canonicalSkill = "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\ncanonical\n";
+  const skillDepsForExisting = (existing: string, generated = canonicalSkill) => {
+    const files = new Map([[skillPath, existing]]);
+    const writes = vi.fn((path: string, content: string) => { files.set(path, content); });
+    return {
+      files,
+      writes,
+      deps: {
+        existsSync: (path: string) => files.has(path),
+        readFileSync: (path: string) => files.get(path) ?? "",
+        writeFileSync: writes,
+        mkdirSync: vi.fn(),
+        renderClaudeSkill: () => generated,
+      },
+    };
+  };
+
+  it.each([
+    ["without a leading frontmatter opener", "<!-- lcm-managed-skill:v1 -->\nbody\n"],
+    ["with an opener that has no first newline", "---"],
+    ["with an inline frontmatter opener", "--- name: user-authored\n---\n<!-- lcm-managed-skill:v1 -->\n"],
+    ["with unterminated frontmatter", "---\nname: user-authored"],
+    ["with a closing delimiter at EOF but no marker", "---\nname: user-authored\n---"],
+  ])("does not own a skill %s", (_description, existing) => {
+    const { deps, files, writes } = skillDepsForExisting(existing);
+
+    expect(() => installClaudeSkill(deps, "mcp", home)).toThrow("unowned LCM skill");
+    expect(writes).not.toHaveBeenCalled();
+    expect(files.get(skillPath)).toBe(existing);
+  });
+
+  it("recognizes CRLF frontmatter and marker delimiters", () => {
+    const existing = "---\r\nname: lcm-memory\r\n---\r\n<!-- lcm-managed-skill:v1 -->\r\nold\r\n";
+    const { deps, files, writes } = skillDepsForExisting(existing);
+
+    expect(() => installClaudeSkill(deps, "mcp", home)).not.toThrow();
+    expect(writes).toHaveBeenCalledOnce();
+    expect(files.get(skillPath)).toBe(canonicalSkill);
+  });
+
+  it("recognizes a managed marker at EOF immediately after frontmatter", () => {
+    const existing = "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->";
+    const { deps, files, writes } = skillDepsForExisting(existing);
+
+    expect(() => installClaudeSkill(deps, "mcp", home)).not.toThrow();
+    expect(writes).toHaveBeenCalledOnce();
+    expect(files.get(skillPath)).toBe(canonicalSkill);
+  });
+
+  it("accepts exact generated bytes as owned", () => {
+    const { deps, files, writes } = skillDepsForExisting(canonicalSkill);
+
+    expect(() => installClaudeSkill(deps, "mcp", home)).not.toThrow();
+    expect(writes).toHaveBeenCalledOnce();
+    expect(files.get(skillPath)).toBe(canonicalSkill);
+  });
+
+  it("previews a managed skill without mutating files during dry-run", () => {
+    const preview = vi.fn();
+    const deps = {
+      existsSync: () => true,
+      readFileSync: () => "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\nold\n",
+      writeFileSync: vi.fn(),
+      mkdirSync: vi.fn(),
+      previewWriteFile: preview,
+      dryRun: true,
+      renderClaudeSkill: () => "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\nnew\n",
+    };
+    expect(installClaudeSkill(deps, "cli", home)).toBe(skillPath);
+    expect(preview).toHaveBeenCalledWith(skillPath, "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\nnew\n");
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("removes recognized legacy assets and preserves modified or unreadable collisions", () => {
+    const files = new Map<string, string>([
+      [skillPath, "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\nold\n"],
+      [legacySkillPath, "directory"],
+      [join(legacySkillPath, "SKILL.md"), "LCM legacy guidance"],
+      [lcmMdPath, "Long Context Manager legacy guidance"],
+      [claudeMdPath, `before\n<!-- lcm:start -->\n@lcm.md\n<!-- lcm:end -->\nafter\n`],
+    ]);
+    const removed: string[] = [];
+    const deps = {
+      existsSync: (path: string) => files.has(path),
+      readFileSync: (path: string) => files.get(path) ?? "",
+      writeFileSync: (path: string, content: string) => { files.set(path, content); },
+      mkdirSync: vi.fn(),
+      lstatSync: (path: string) => ({ isDirectory: () => path === legacySkillPath }) as never,
+      readdirSync: () => ["SKILL.md"],
+      rmSync: (path: string) => { removed.push(path); },
+      removeCurrentSkill: true,
+    };
+
+    removeClaudeLegacyAssets(deps, home);
+    expect(removed).toEqual([skillPath, legacySkillPath, lcmMdPath]);
+    expect(files.get(claudeMdPath)).toBe("before\nafter\n");
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const collisionDeps = {
+      existsSync: (path: string) => [skillPath, legacySkillPath, lcmMdPath, claudeMdPath].includes(path),
+      readFileSync: (path: string) => {
+        if (path === skillPath) throw new Error("unreadable skill");
+        if (path === lcmMdPath) return "user-owned file";
+        if (path === claudeMdPath) return `<!-- lcm:start -->\nuser edit\n<!-- lcm:end -->`;
+        return "user-owned legacy";
+      },
+      writeFileSync: vi.fn(),
+      mkdirSync: vi.fn(),
+      lstatSync: () => ({ isDirectory: () => false }) as never,
+      readdirSync: vi.fn(),
+      rmSync: vi.fn(),
+      removeCurrentSkill: true,
+    };
+    removeClaudeLegacyAssets(collisionDeps, home);
+    expect(collisionDeps.rmSync).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("covers legacy directory contents, dry-run removal, and unreadable metadata", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const makeDeps = (entries: unknown[], read: (path: string) => string, dryRun = false) => ({
+        existsSync: (path: string) => path === legacySkillPath || path === lcmMdPath || path === claudeMdPath,
+        readFileSync: read,
+        writeFileSync: vi.fn(),
+        mkdirSync: vi.fn(),
+        lstatSync: () => ({ isDirectory: () => true }) as never,
+        readdirSync: () => entries,
+        rmSync: vi.fn(),
+        dryRun,
+        removeCurrentSkill: false,
+      });
+      removeClaudeLegacyAssets(makeDeps(["notes.txt"], () => "user"), home);
+      const unreadable = makeDeps(["SKILL.md"], () => { throw new Error("read failed"); });
+      unreadable.existsSync = (path: string) => path === legacySkillPath || path === lcmMdPath;
+      removeClaudeLegacyAssets(unreadable, home);
+      removeClaudeLegacyAssets(makeDeps(["SKILL.md"], () => "LCM", true), home);
+
+      const dryRunAll = makeDeps(["SKILL.md"], () => "LCM", true);
+      dryRunAll.existsSync = (path: string) => [skillPath, legacySkillPath, lcmMdPath, claudeMdPath].includes(path);
+      dryRunAll.readFileSync = (path: string) => path === claudeMdPath
+        ? `before\n<!-- lcm:start -->\n@lcm.md\n<!-- lcm:end -->\nafter\n`
+        : path === skillPath ? "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\nowned\n" : "LCM memory";
+      dryRunAll.removeCurrentSkill = true;
+      removeClaudeLegacyAssets(dryRunAll, home);
+
+      const defaultRemoval = makeDeps(["SKILL.md"], () => "LCM");
+      defaultRemoval.existsSync = (path: string) => path === legacySkillPath || path === lcmMdPath;
+      delete (defaultRemoval as { rmSync?: unknown }).rmSync;
+      removeClaudeLegacyAssets(defaultRemoval, home);
+
+      removeClaudeLegacyAssets({
+        existsSync: (path: string) => path === skillPath || path === lcmMdPath,
+        readFileSync: (path: string) => path === skillPath
+          ? "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\nowned\n"
+          : "LCM memory legacy guidance",
+        writeFileSync: vi.fn(),
+        mkdirSync: vi.fn(),
+        removeCurrentSkill: true,
+      }, home);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("would remove"));
+    } finally {
+      log.mockRestore();
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("Claude transport resolution", () => {
+  it("defaults to MCP when the stored config is absent", () => {
+    expect(resolveClaudeTransport("/tmp/lcm-no-such-config/.lcm/config.json")).toBe("mcp");
+  });
+});
+
 // ─── install ────────────────────────────────────────────────────────────────
 
 describe("install", () => {
+  it("installs the rendered Claude lcm-memory skill and verifies its bytes before legacy cleanup", async () => {
+    const home = homedir();
+    const files = new Map<string, string>([
+      [join(home, ".claude/skills/lcm-context/SKILL.md"), "legacy lcm guidance"],
+      [join(home, ".claude/lcm.md"), "# Long Context Manager\n"],
+      [join(home, ".claude/CLAUDE.md"), "before\n<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\nafter\n"],
+    ]);
+    const writes: string[] = [];
+    const deps = makeDeps({
+      existsSync: vi.fn((path: string) => path.endsWith("config.json") || [...files.keys()].some((file) => file === path || file.startsWith(`${path}/`))),
+      readFileSync: vi.fn((path: string) => files.get(path) ?? "{}"),
+      writeFileSync: vi.fn((path: string, content: string) => { writes.push(path); files.set(path, content); }),
+      rmSync: vi.fn((path: string) => { for (const file of files.keys()) if (file === path || file.startsWith(`${path}/`)) files.delete(file); }),
+      mkdirSync: vi.fn(),
+      renderClaudeSkill: () => "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\ncanonical\n",
+      runDoctor: vi.fn().mockResolvedValue([]),
+    } as any);
+
+    await install(deps);
+
+    expect(files.get(join(home, ".claude/skills/lcm-memory/SKILL.md"))).toContain("canonical");
+    expect(files.has(join(home, ".claude/skills/lcm-context/SKILL.md"))).toBe(false);
+    expect(files.has(join(home, ".claude/lcm.md"))).toBe(false);
+    expect(files.get(join(home, ".claude/CLAUDE.md"))).toBe("before\nafter\n");
+    expect(writes.indexOf(join(home, ".claude/skills/lcm-memory/SKILL.md"))).toBeLessThan(
+      writes.indexOf(join(home, ".claude/CLAUDE.md")),
+    );
+  });
+
+  it("does not add Claude MCP for stored CLI transport", async () => {
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    let settings = JSON.stringify({ mcpServers: { unrelated: { command: "other" } } });
+    const deps = makeDeps({
+      existsSync: vi.fn((path: string) => path.endsWith("config.json") || path === settingsPath),
+      readFileSync: vi.fn((path: string) => path === settingsPath ? settings : "{}"),
+      writeFileSync: vi.fn((path: string, content: string) => { if (path === settingsPath) settings = content; }),
+      runDoctor: vi.fn().mockResolvedValue([]),
+    });
+    const configPath = join(homedir(), ".lcm", "config.json");
+    (deps as ServiceDeps).claudeTransport = "cli";
+
+    await install(deps);
+
+    const installed = JSON.parse(settings);
+    expect(installed.mcpServers).toEqual({ unrelated: { command: "other" } });
+    expect(installed.hooks.UserPromptSubmit.at(-1).hooks[0].command)
+      .toContain("user-prompt --transport cli");
+    expect(configPath).toContain("config.json");
+  });
+
+  it("removes only the exact owned Claude MCP entry for CLI transport", async () => {
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const binaryPath = "/opt/npm/bin/lcm";
+    let settings = JSON.stringify({
+      mcpServers: {
+        lcm: { type: "stdio", command: process.execPath, args: [binaryPath, "mcp"] },
+      },
+    });
+    const deps = makeDeps({
+      existsSync: vi.fn((path: string) => path.endsWith("config.json") || path === settingsPath),
+      readFileSync: vi.fn((path: string) => path === settingsPath ? settings : "{}"),
+      writeFileSync: vi.fn((path: string, content: string) => { if (path === settingsPath) settings = content; }),
+      binaryPath,
+      claudeTransport: "cli",
+      runDoctor: vi.fn().mockResolvedValue([]),
+    });
+
+    await install(deps);
+
+    const installed = JSON.parse(settings);
+    expect(installed.mcpServers).toBeUndefined();
+  });
+
+  it("fails before native settings or legacy removal when canonical skill generation fails", async () => {
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const legacySkillPath = join(homedir(), ".claude", "skills", "lcm-context");
+    const writeFileSync = vi.fn();
+    const rmSync = vi.fn();
+    const deps = makeDeps({
+      existsSync: vi.fn((path: string) => path === settingsPath || path.endsWith("config.json") || path === legacySkillPath),
+      writeFileSync,
+      rmSync,
+      renderClaudeSkill: () => { throw new Error("renderer failed"); },
+    });
+
+    await expect(install(deps)).rejects.toThrow("renderer failed");
+    expect(writeFileSync).not.toHaveBeenCalledWith(settingsPath, expect.any(String));
+    expect(rmSync).not.toHaveBeenCalledWith(legacySkillPath, expect.anything());
+  });
+
   it("core install works with zero external dependencies", async () => {
     const originalApiKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = "test-key";
@@ -696,6 +1052,22 @@ describe("install", () => {
     expect(atomicWritePrivateFile).toHaveBeenCalledWith(
       expect.stringContaining("config.json"),
       expect.stringContaining('"provider": "auto"'),
+    );
+  });
+
+  it("uses the durable atomic writer when that production seam is provided", async () => {
+    const atomicWritePrivateFileDurable = vi.fn();
+    const deps = makeDeps({
+      existsSync: vi.fn().mockReturnValue(false),
+      atomicWritePrivateFileDurable,
+    });
+
+    await install(deps);
+
+    expect(atomicWritePrivateFileDurable).toHaveBeenCalledWith(
+      expect.stringContaining("config.json"),
+      expect.stringContaining('"provider": "auto"'),
+      { requireAbsent: true },
     );
   });
 

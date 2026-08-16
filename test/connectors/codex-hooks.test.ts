@@ -32,6 +32,8 @@ describe("Codex hook configuration boundaries", () => {
       .toBe("[features]\nhooks = true\n[other]\nx = 1\n");
     expect(setCodexHooksFeature("[features] # settings\ncodex_hooks = true\nhooks = false\n"))
       .toBe("[features] # settings\nhooks = true\n");
+    expect(setCodexHooksFeature("[features]\nhooks = false\ncodex_hooks = true\n"))
+      .toBe("[features]\nhooks = true\n");
     expect(setCodexHooksFeature("[features]\nvalue = 1\n[other]\nx = 1\n"))
       .toBe("[features]\nvalue = 1\nhooks = true\n[other]\nx = 1\n");
   });
@@ -60,6 +62,30 @@ describe("Codex hook configuration boundaries", () => {
     writeFileSync(hooksPath, JSON.stringify({ hooks: [] }));
     installCodexHooks(hooksPath, configPath);
     expect(hasCodexHooks(hooksPath)).toBe(true);
+  });
+
+  it("stamps only UserPromptSubmit and converges legacy or stamped prompt hooks", () => {
+    writeFileSync(hooksPath, JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [{ hooks: [
+          { type: "command", command: "lcm user-prompt --client codex" },
+          { type: "command", command: "lcm user-prompt --client codex --transport mcp" },
+          { type: "command", command: "lcm user-prompt --client codex --transport invalid" },
+        ] }],
+      },
+    }));
+    installCodexHooks(hooksPath, configPath);
+    const result = JSON.parse(readFileSync(hooksPath, "utf-8"));
+    const commands = result.hooks.UserPromptSubmit.flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
+    expect(commands).toEqual(["lcm user-prompt --client codex --transport invalid", "lcm user-prompt --client codex --transport cli"]);
+    expect(result.hooks.PostToolUse[0].hooks[0].command).toBe("lcm post-tool --client codex");
+  });
+
+  it("rejects an unsupported transport before writing Codex hooks", () => {
+    expect(() => installCodexHooks(hooksPath, configPath, "invalid" as never)).toThrow(
+      "Unsupported hook transport: invalid",
+    );
+    expect(existsSync(hooksPath)).toBe(false);
   });
 
   it("preserves malformed groups and custom metadata while stripping LCM hooks", () => {

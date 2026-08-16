@@ -55,6 +55,7 @@ import type {
   PostgreSqlPassiveEventRecord,
   PostgreSqlPassiveEventRepository,
 } from "../src/storage/postgresql/passive-event-repository.js";
+import { CONNECTOR_TRANSPORTS } from "../src/connectors/types.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -1609,6 +1610,7 @@ export async function runCli(
     .description("Dispatch the user-prompt hook")
     .helpOption(false)
     .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
+    .addOption(new Option("--transport <transport>", "Hook transport (internal)").choices(["cli", "mcp"]).hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
@@ -1617,7 +1619,7 @@ export async function runCli(
       }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("user-prompt", input);
+      const r = await dispatchHook("user-prompt", input, { transport: opts.transport });
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -2207,39 +2209,71 @@ export async function runCli(
         printHelp("connectors"); exit(0);
       }
       const format: string = opts.format ?? "text";
-      const { listConnectors } = await import("../src/connectors/installer.js");
+      const { listConnectors, listConnectorInventory } = await import("../src/connectors/installer.js");
       const { AGENTS } = await import("../src/connectors/registry.js");
-      const installed = listConnectors(opts.global ? homedir() : process.cwd());
+      const connectorCwd = opts.global ? homedir() : process.cwd();
+      const inventory = typeof listConnectorInventory === "function"
+        ? listConnectorInventory(connectorCwd)
+        : { installed: listConnectors(connectorCwd), codexMcp: { state: "absent" as const } };
+      const installed = inventory.installed;
 
       if (format === "json") {
-        const result = AGENTS.map((a: any) => ({
-          id: a.id,
-          name: a.name,
-          category: a.category,
-          defaultType: a.defaultTypes ?? a.defaultType,
-          supportedTypes: a.supportedTypes,
-          installed: installed.filter((c: any) => c.agentId === a.id).map((c: any) => c.type),
-        }));
+        const result = AGENTS.map((a: any) => {
+          const agentInstalled = installed.filter((c: any) => c.agentId === a.id);
+          const installedSurfaces = agentInstalled.map((c: any) => c.type);
+          const supportedTransports = CONNECTOR_TRANSPORTS.filter(
+            transport => a.capabilities[transport] !== undefined,
+          );
+          const installedTransports = a.id === "codex"
+            ? inventory.codexMcp.state === "installed"
+              ? ["mcp"]
+              : inventory.codexMcp.state === "absent" && installedSurfaces.length > 0 ? ["cli"] : []
+            : installedSurfaces.includes("mcp")
+              ? ["mcp"]
+              : installedSurfaces.length > 0 ? ["cli"] : [];
+          const result = {
+            id: a.id,
+            name: a.name,
+            category: a.category,
+            defaultTransport: a.defaultTransport,
+            supportedTransports,
+            installed: installedSurfaces,
+            installedTransports,
+          };
+          return a.id === "codex"
+            ? { ...result, mcpInspection: inventory.codexMcp.state }
+            : result;
+        });
         stdout.write(JSON.stringify({ agents: result }, null, 2) + "\n");
       } else {
         const rows = AGENTS.map((agent: any) => {
           const agentInstalled = installed.filter((c: any) => c.agentId === agent.id);
+          let installedDisplay = agentInstalled.length > 0 ? agentInstalled.map((c: any) => c.type).join(", ") : "-";
+          if (agent.id === "codex") {
+            installedDisplay = inventory.codexMcp.state === "unknown"
+              ? `${installedDisplay} (transport unknown)`
+              : inventory.codexMcp.state === "installed"
+                ? `${installedDisplay} (MCP)`
+                : agentInstalled.length > 0 ? `${installedDisplay} (CLI)` : installedDisplay;
+          }
           return {
             agent: agent.name,
-            installed: agentInstalled.length > 0 ? agentInstalled.map((c: any) => c.type).join(", ") : "-",
-            defaults: (agent.defaultTypes ?? [agent.defaultType]).join(", "),
-            supported: agent.supportedTypes.join(", "),
+            installed: installedDisplay,
+            defaultTransport: agent.defaultTransport,
+            supportedTransports: CONNECTOR_TRANSPORTS
+              .filter(transport => agent.capabilities[transport] !== undefined)
+              .join(", "),
           };
         });
         const agentWidth = Math.max("Agent".length, ...rows.map((row) => row.agent.length));
         const installedWidth = Math.max("Installed".length, ...rows.map((row) => row.installed.length));
-        const defaultWidth = Math.max("Default".length, ...rows.map((row) => row.defaults.length));
+        const defaultWidth = Math.max("Default transport".length, ...rows.map((row) => row.defaultTransport.length));
 
         console.log("\n  Available agents:\n");
-        console.log(`  ${"Agent".padEnd(agentWidth)}  ${"Installed".padEnd(installedWidth)}  ${"Default".padEnd(defaultWidth)}  Supported`);
+        console.log(`  ${"Agent".padEnd(agentWidth)}  ${"Installed".padEnd(installedWidth)}  ${"Default transport".padEnd(defaultWidth)}  Supported transports`);
         console.log("  " + "─".repeat(70));
         for (const row of rows) {
-          console.log(`  ${row.agent.padEnd(agentWidth)}  ${row.installed.padEnd(installedWidth)}  ${row.defaults.padEnd(defaultWidth)}  ${row.supported}`);
+          console.log(`  ${row.agent.padEnd(agentWidth)}  ${row.installed.padEnd(installedWidth)}  ${row.defaultTransport.padEnd(defaultWidth)}  ${row.supportedTransports}`);
         }
         console.log();
       }
@@ -2248,7 +2282,7 @@ export async function runCli(
   connectorsCmd
     .command("install <agent>")
     .description("Install a connector for an agent")
-    .option("--type <type>", "Connector type: rules, hook, mcp, or skill")
+    .addOption(new Option("--transport <transport>", "Connector transport: cli or mcp").choices(["cli", "mcp"]))
     .option("--global", "Install into the global agent config in your home directory")
     .helpOption(false)
     .option("-h, --help", "Show help")
@@ -2257,15 +2291,19 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("connectors"); exit(0);
       }
-      if (!agentName) { console.error("Usage: lcm connectors install <agent> [--type rules|hook|mcp|skill] [--global]"); exit(1); }
-      const type: any = opts.type;
+      if (!agentName) { console.error("Usage: lcm connectors install <agent> [--transport cli|mcp] [--global]"); exit(1); }
+      const transport: "cli" | "mcp" | undefined = opts.transport;
+      const cwd = opts.global ? homedir() : process.cwd();
       const { installConnector } = await import("../src/connectors/installer.js");
       try {
-        const result = installConnector(agentName, type, opts.global ? homedir() : process.cwd());
+        const result = installConnector(agentName, transport, cwd, {
+          persistTransport: transport !== undefined,
+          queryCodexMcp: transport === "cli",
+        });
         if ((result as any).manual) {
           console.log(`\n  ${(result as any).manual}\n`);
         } else {
-          console.log(`\n  ✓ Installed ${type ?? "default"} connector for ${agentName}`);
+          console.log(`\n  ✓ Installed ${transport ?? "default"} connector for ${agentName}`);
           const paths = Array.isArray((result as any).paths) ? (result as any).paths : [(result as any).path];
           for (const path of paths.filter((path: string) => path.length > 0)) {
             console.log(`    Path: ${path}`);
@@ -2282,7 +2320,6 @@ export async function runCli(
   connectorsCmd
     .command("remove <agent>")
     .description("Remove a connector for an agent")
-    .option("--type <type>", "Connector type: rules, hook, mcp, or skill")
     .option("--global", "Remove from the global agent config in your home directory")
     .helpOption(false)
     .option("-h, --help", "Show help")
@@ -2291,11 +2328,17 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("connectors"); exit(0);
       }
-      if (!agentName) { console.error("Usage: lcm connectors remove <agent> [--type rules|hook|mcp|skill] [--global]"); exit(1); }
-      const type: any = opts.type;
+      if (!agentName) { console.error("Usage: lcm connectors remove <agent> [--global]"); exit(1); }
+      const cwd = opts.global ? homedir() : process.cwd();
       const { removeConnector } = await import("../src/connectors/installer.js");
       try {
-        const removed = removeConnector(agentName, type, opts.global ? homedir() : process.cwd());
+        const result = removeConnector(agentName, cwd, {});
+        if (typeof result === "object" && result !== null && !result.success) {
+          const failures = Array.isArray(result.failures) ? result.failures : [];
+          const detail = failures.length > 0 ? `: ${failures.join("; ")}` : "";
+          throw new Error(`Failed to remove connector for ${agentName}${detail}`);
+        }
+        const removed = typeof result === "boolean" ? result : result.removed;
         if (removed) {
           console.log(`\n  ✓ Removed connector for ${agentName}\n`);
         } else {
@@ -2319,14 +2362,18 @@ export async function runCli(
         printHelp("connectors"); exit(0);
       }
       const { AGENTS } = await import("../src/connectors/registry.js");
-      const { listConnectors } = await import("../src/connectors/installer.js");
+      const { listConnectors, listConnectorInventory } = await import("../src/connectors/installer.js");
       const { findAgent } = await import("../src/connectors/registry.js");
       const found = agentName ? findAgent(agentName) : undefined;
       const agents = found ? [found] : agentName ? [] : AGENTS;
 
       if (agents.length === 0) { console.error(`  Unknown agent: ${agentName}`); exit(1); }
 
-      const installed = listConnectors(opts.global ? homedir() : process.cwd());
+      const connectorCwd = opts.global ? homedir() : process.cwd();
+      const inventory = typeof listConnectorInventory === "function"
+        ? listConnectorInventory(connectorCwd)
+        : { installed: listConnectors(connectorCwd), codexMcp: { state: "absent" as const } };
+      const installed = inventory.installed;
       console.log("\n  Connector health:\n");
       let failures = 0;
       for (const agent of agents) {
@@ -2337,6 +2384,11 @@ export async function runCli(
           for (const c of agentConnectors as any[]) {
             console.log(`  ✓ ${(agent as any).name}: ${c.type} at ${c.path}`);
           }
+        }
+
+        if ((agent as any).id === "codex" && inventory.codexMcp.state === "unknown") {
+          console.log(`  ⚠ Codex: native MCP inspection unknown (${inventory.codexMcp.reason ?? "unavailable"})`);
+          failures += 1;
         }
 
         if ((agent as any).id !== "codex" || agentName === undefined) continue;

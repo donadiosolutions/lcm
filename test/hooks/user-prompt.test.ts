@@ -47,7 +47,8 @@ import { ensureProjectDir } from "../../src/daemon/project.js";
 import { extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 import { firePromoteEventsNotifyRequest } from "../../src/hooks/session-end.js";
-import { MEMORY_FEEDBACK_INSTRUCTION } from "../../src/hooks/memory-context.js";
+import { MEMORY_FEEDBACK_INSTRUCTION, memoryFeedbackInstruction } from "../../src/hooks/memory-context.js";
+import * as memoryContext from "../../src/hooks/memory-context.js";
 
 const mockEnsureDaemon = vi.mocked(ensureDaemon);
 const mockEventsDbPath = vi.mocked(eventsDbPath);
@@ -116,9 +117,9 @@ describe("handleUserPromptSubmit", () => {
     expect(result.stdout).toContain("PostgreSQL");
     expect(countOccurrences(result.stdout, "<memory-feedback>")).toBe(1);
     expect(countOccurrences(result.stdout, "</memory-feedback>")).toBe(1);
-    expect(result.stdout).toContain("If surfaced memory affects the work");
+    expect(result.stdout).toContain("When recalled memory affects the work");
     expect(result.stdout).toContain("lcm_store");
-    expect(result.stdout).toContain("CLI fallback");
+    expect(result.stdout).not.toContain("lcm store ");
     expect(result.stdout).toContain("signal:memory_used");
     expect(result.stdout).toContain("memory_id:<id>");
     const feedback = result.stdout.slice(result.stdout.indexOf("<memory-feedback>"));
@@ -178,6 +179,42 @@ describe("handleUserPromptSubmit", () => {
       asDaemonClient(client),
     );
     expect(result).toEqual(EMPTY_HOOK_RESULT);
+  });
+
+  it("keeps feedback transport-pure and ignores a raw-input transport override", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = {
+      health: vi.fn(),
+      post: vi.fn().mockResolvedValue({ hints: ["Use the CLI path"], ids: ["id-cli"] }),
+    };
+    const result = await handleUserPromptSubmit(
+      JSON.stringify({ session_id: "s1", cwd: "/proj", prompt: "which path?", transport: "mcp" }),
+      asDaemonClient(client),
+      undefined,
+      undefined,
+      "cli",
+    );
+    expect(result.stdout).toContain("lcm store '");
+    expect(result.stdout).not.toContain("lcm_store");
+    expect(result.stdout).toContain("surfaced-memory-ids: id-cli");
+    expect(result.stdout.slice(result.stdout.indexOf("<memory-feedback>"))).not.toContain("id-cli");
+    expect(client.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({
+      learningInstructionBytes: Buffer.byteLength(memoryFeedbackInstruction("cli"), "utf8"),
+    }));
+  });
+
+  it("infers CLI feedback for a legacy Codex command without prompt-time config reads", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = {
+      health: vi.fn(),
+      post: vi.fn().mockResolvedValue({ hints: ["Codex memory"], ids: ["id-codex"] }),
+    };
+    const result = await handleUserPromptSubmit(
+      JSON.stringify({ client: "codex", session_id: "s1", cwd: "/proj", prompt: "search" }),
+      asDaemonClient(client),
+    );
+    expect(result.stdout).toContain("lcm store '");
+    expect(result.stdout).not.toContain("lcm_store");
   });
 
   it("repairs non-Codex hooks for an eventless prompt after publication admission", async () => {
@@ -985,6 +1022,21 @@ describe("handleUserPromptSubmit", () => {
       asDaemonClient(mockClient),
     );
     expect(result).toEqual(EMPTY_HOOK_RESULT);
+  });
+
+  it("returns empty output when context construction yields no block", async () => {
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const buildContext = vi.spyOn(memoryContext, "buildMemoryContextWithFeedback")
+      .mockReturnValueOnce(null);
+    try {
+      const result = await handleUserPromptSubmit(
+        JSON.stringify({ session_id: "s1", cwd: "/proj", prompt: "remember" }),
+        asDaemonClient({ post: vi.fn().mockResolvedValue({ hints: ["hint"] }) }),
+      );
+      expect(result).toEqual(EMPTY_HOOK_RESULT);
+    } finally {
+      buildContext.mockRestore();
+    }
   });
 
   it("extracts decision events to sidecar before prompt-search", async () => {

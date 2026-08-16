@@ -1,5 +1,6 @@
 import { isAbsolute, win32 } from "node:path";
 import { legacyLcmCommand, legacyLcmMcpServerName } from "../legacy-names.js";
+import type { ConnectorTransport } from "../connectors/types.js";
 
 export const REQUIRED_HOOKS: { event: string; command: string }[] = [
   { event: "PostToolUse", command: "post-tool" },
@@ -20,6 +21,7 @@ export function canonicalHookCommand(
   command: string,
   nodePath = process.execPath,
   platform: NodeJS.Platform = process.platform,
+  transport: ConnectorTransport = "mcp",
 ): string {
   const pathIsAbsolute = platform === "win32" ? win32.isAbsolute : isAbsolute;
   if (!pathIsAbsolute(runtimePath)) {
@@ -28,7 +30,11 @@ export function canonicalHookCommand(
   if (!pathIsAbsolute(nodePath)) {
     throw new Error(`Node executable path must be absolute: ${nodePath}`);
   }
-  return `${quoteCommandPath(nodePath, platform)} ${quoteCommandPath(runtimePath, platform)} ${command}`;
+  if (command === "user-prompt" && transport !== "cli" && transport !== "mcp") {
+    throw new Error(`Unsupported hook transport: ${transport}`);
+  }
+  const suffix = command === "user-prompt" ? ` --transport ${transport}` : "";
+  return `${quoteCommandPath(nodePath, platform)} ${quoteCommandPath(runtimePath, platform)} ${command}${suffix}`;
 }
 
 function isManagedCommand(value: unknown, command: string): boolean {
@@ -37,12 +43,18 @@ function isManagedCommand(value: unknown, command: string): boolean {
   const current = `lcm ${command}`;
   const legacy = legacyLcmCommand(current);
   if (trimmed === current || trimmed === legacy) return true;
+  if (command === "user-prompt" &&
+      (trimmed === `${current} --transport cli` || trimmed === `${current} --transport mcp` ||
+       trimmed === `${legacy} --transport cli` || trimmed === `${legacy} --transport mcp`)) return true;
   if (command === "compact --hook" &&
       (trimmed === "lcm compact" || trimmed === legacyLcmCommand("lcm compact"))) return true;
   // Native npm installations quote their absolute executable. Older direct
   // installations may have used an unquoted absolute executable.
-  const suffix = ` ${command}`;
-  if (!trimmed.endsWith(suffix)) return false;
+  const suffixes = command === "user-prompt"
+    ? [` ${command}`, ` ${command} --transport cli`, ` ${command} --transport mcp`]
+    : [` ${command}`];
+  const suffix = suffixes.find((candidate) => trimmed.endsWith(candidate));
+  if (suffix === undefined) return false;
   const executable = trimmed.slice(0, -suffix.length).trimEnd();
   const singleQuotedMatch = /(?:^|\s)'((?:[^']|'\\'')*)'$/.exec(executable);
   const executableMatch = /(?:^|\s)(?:"((?:\\?""|\\.|[^"\\])+)"|([^"'\s]+))$/.exec(executable);
@@ -150,7 +162,12 @@ export function hasManagedClaudeSettings(existing: unknown): boolean {
   return false;
 }
 
-export function mergeClaudeSettings(existing: unknown, runtimePath: string, nodePath = process.execPath): any {
+export function mergeClaudeSettings(
+  existing: unknown,
+  runtimePath: string,
+  nodePath = process.execPath,
+  transport: ConnectorTransport = "mcp",
+): any {
   const settings = asSettingsObject(existing);
   const hooks = settings.hooks === undefined
     ? {}
@@ -180,7 +197,7 @@ export function mergeClaudeSettings(existing: unknown, runtimePath: string, node
     });
     preserved.push({
       matcher: "",
-      hooks: [{ type: "command", command: canonicalHookCommand(runtimePath, command, nodePath) }],
+      hooks: [{ type: "command", command: canonicalHookCommand(runtimePath, command, nodePath, process.platform, transport) }],
     });
     hooks[event] = preserved;
   }

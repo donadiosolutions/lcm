@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "n
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { mergeClaudeSettings } from "./installer/settings.js";
+import type { ConnectorTransport } from "./connectors/types.js";
 import { packageExecutable } from "./runtime-root.js";
 import {
   daemonConfigForPersistence,
@@ -40,6 +41,7 @@ export interface EnsureCoreDeps {
   atomicWritePrivateFileDurable?: typeof atomicWritePrivateFileDurable;
   ensureRuntimeHome?: (homeDir: string) => void;
   binaryPath?: string;
+  transport?: ConnectorTransport;
   ensureDaemon: (opts: {
     port: number;
     pidFilePath: string;
@@ -149,7 +151,7 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
   if (deps.existsSync(deps.settingsPath)) {
     try {
       const existing = JSON.parse(deps.readFileSync(deps.settingsPath, "utf-8"));
-      const merged = mergeClaudeSettings(existing, binaryPath);
+      const merged = mergeClaudeSettings(existing, binaryPath, process.execPath, deps.transport);
       if (JSON.stringify(existing) !== JSON.stringify(merged)) {
         deps.mkdirSync(dirname(deps.settingsPath), { recursive: true });
         deps.writeFileSync(deps.settingsPath, JSON.stringify(merged, null, 2));

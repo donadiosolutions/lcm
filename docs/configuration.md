@@ -98,7 +98,7 @@ Install the repo-local connector:
 
 ```bash
 npm install -g @donadiosolutions/lcm
-lcm connectors install github-copilot
+lcm connectors install github-copilot --transport cli
 lcm connectors doctor github-copilot
 ```
 
@@ -128,9 +128,40 @@ same session, the flat transcript is preferred; other similarly named files and
 subagent transcripts remain independent. Files with equal modification times
 are imported deterministically by session ID and then path.
 
-The default Codex connector writes native hooks to `~/.codex/hooks.json`, enables Codex's current `hooks` feature in `~/.codex/config.toml`, installs the LCM skill at `.codex/skills/lcm-memory/SKILL.md`, and ensures the LCM rules block is present in `~/.codex/AGENTS.md`. Its hook set restores memory at session start, searches memory before prompts, captures passive tool-use signals, snapshots transcript deltas on `Stop`, and force-snapshots transcript deltas on `PreCompact` before manual or automatic Codex compaction. Use `lcm connectors install codex --type skill` or `lcm connectors install codex --type rules` only when you want one guidance surface without hooks.
+The default Codex connector is the CLI bundle. It writes native hooks to
+`~/.codex/hooks.json`, enables Codex's current `hooks` feature in
+`~/.codex/config.toml`, and installs the LCM skill at
+`.codex/skills/lcm-memory/SKILL.md`.
+The default is exactly the native hook plus the `lcm-memory` skill. It does not
+manage an `AGENTS.md` rules block.
+Its hook set restores memory at session start, searches memory before prompts,
+captures passive tool-use signals, snapshots
+transcript deltas on `Stop`, and force-snapshots transcript deltas on
+`PreCompact` before manual or automatic Codex compaction. A fresh/default Codex
+CLI install does not add, remove, or inspect MCP configuration.
 
-For current limitations and the manual MCP step for Codex TOML config, see [`docs/vscode-codex.md`](vscode-codex.md).
+Select one complete connector bundle with the transport option:
+
+```bash
+lcm connectors install <agent> [--transport cli|mcp] [--global]
+lcm connectors remove <agent> [--global]
+```
+
+An explicit transport takes precedence over the stored
+`connectors.transports.<agent-id>` value, which takes precedence over the
+registry default. Implicit defaults are not persisted. MCP is the default only
+for Claude Code, Qwen Code, and Zed; Codex and every other agent default to
+CLI. Cline and Augment remain CLI-only until verifiable MCP adapters exist.
+CLI bundles use skill guidance when supported, rules as a fallback, and native
+hooks where implemented. MCP bundles use the MCP connector and transport-pure
+guidance, plus native hooks where implemented. There is no fallback between
+MCP and CLI guidance. Removal is whole-bundle and clears the stored choice
+after the bundle is removed.
+
+For Codex, choose MCP explicitly with
+`lcm connectors install codex --transport mcp`. LCM uses the native `codex mcp`
+commands for that bundle; no TOML editing is required. Return to the
+default CLI bundle with `lcm connectors install codex --transport cli`.
 
 Set recommended environment variables:
 
@@ -144,7 +175,8 @@ Restart Claude Code after installing or repairing the native integration.
 ## Connector scope
 
 The connector manager can install into either the current project or your global
-agent config. For Codex, the global target is `~/.codex/`. GitHub Copilot is repo-scoped in this project today.
+agent config. For Codex, the global target is `~/.codex/`. GitHub Copilot is
+repo-scoped in this project today.
 
 ```bash
 # Install the Codex native hook connector globally instead of into the current repo
@@ -158,7 +190,8 @@ lcm connectors remove codex --global
 Use the global flag when you want Codex to pick up the connector from your
 user-level config rather than a single repository checkout.
 
-`lcm install` does not configure VS Code or Codex connectors today. Use `lcm connectors install ...` for those clients.
+`lcm install` does not configure VS Code or Codex connectors today. Use
+`lcm connectors install ...` for those clients.
 
 ## Tuning guide
 

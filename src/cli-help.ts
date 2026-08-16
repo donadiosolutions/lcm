@@ -209,8 +209,8 @@ const HELP: Record<string, CommandHelp> = {
       ["--tag, --tags <tag>", "Attach a tag to the stored memory (repeatable; aliases may be mixed)"],
     ],
     examples: [
-      ["lcm store \"Auth uses JWT with 24h expiry\"", "Store a plain-text memory"],
-      ["lcm store \"Use ensureDaemon before background promote\" --tag type:solution --tags scope:lcm", "Store a tagged memory; aliases preserve occurrence order"],
+      ["lcm store 'Auth uses JWT with 24h expiry' --tag 'type:solution' --tag 'scope:project' --tag 'project:lcm' --tag 'source:<actual-thread-uuid>'", "Store a canonically tagged memory"],
+      ["lcm store 'Use ensureDaemon before background promote' --tag 'type:solution' --tag 'scope:project' --tag 'project:lcm' --tag 'source:<actual-thread-uuid>'", "Store another canonically tagged memory"],
     ],
     notes: "Each --tag or --tags occurrence attaches one tag; the spellings may be mixed and preserve command-line order. This differs from export --tags, which accepts a comma-separated filter. For known commands, --help is resolved before required arguments and command actions.",
   },
@@ -343,8 +343,8 @@ const HELP: Record<string, CommandHelp> = {
     usage: "lcm connectors <list|install|remove|doctor> [options]",
     options: [
       ["list [--format text|json] [--global]", "List connectors in the current project or your global agent config"],
-      ["install <agent> [--type rules|hook|mcp|skill] [--global]", "Install a connector for an agent"],
-      ["remove <agent> [--type rules|hook|mcp|skill] [--global]", "Remove a connector for an agent"],
+      ["install <agent> [--transport cli|mcp] [--global]", "Install the complete CLI or MCP transport bundle for an agent"],
+      ["remove <agent> [--global]", "Remove the complete connector bundle for an agent"],
       ["doctor [agent] [--global]", "Check connector health in the current project or global agent config"],
     ],
     examples: [
@@ -352,10 +352,9 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm connectors list --global", "Show connectors from your global agent config"],
       ["lcm connectors list --format json", "Machine-readable connector list"],
       ["lcm connectors install github-copilot", "Install the GitHub Copilot workspace skill for VS Code"],
-      ["lcm connectors install codex", "Install Codex hooks, skill, and rules"],
+      ["lcm connectors install codex", "Install Codex's native hook + skill CLI transport (the default)"],
       ["lcm connectors install codex --global", "Install Codex into ~/.codex instead of the current project"],
-      ["lcm connectors install codex --type skill", "Install only the Codex skill"],
-      ["lcm connectors install codex --type rules", "Install only the Codex rules"],
+      ["lcm connectors install codex --transport mcp", "Install Codex's MCP transport explicitly"],
       ["lcm connectors remove codex", "Remove the Codex connector"],
       ["lcm connectors remove codex --global", "Remove Codex from your global config"],
       ["lcm connectors doctor", "Check health of all connectors"],
@@ -363,7 +362,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm connectors doctor github-copilot", "Check GitHub Copilot connector health"],
       ["lcm connectors doctor codex", "Check Codex connector health"],
     ],
-    notes: "Connector types: 'rules' (agent instruction file), 'hook' (native lifecycle hooks), 'mcp' (MCP server), 'skill' (skill file). GitHub Copilot uses a repo-local skill under .github/skills/. Codex defaults to hooks in ~/.codex/hooks.json, a skill in .codex/skills/, and rules in ~/.codex/AGENTS.md.",
+    notes: "Transport choices: CLI runs the agent's command-line workflow and uses the complete CLI bundle; MCP connects the agent to lcm's MCP server. GitHub Copilot uses a repo-local skill under .github/skills/. Codex defaults to a native hook + skill, and the default installation does not mutate MCP configuration.",
   },
 
   sensitive: {
@@ -522,8 +521,8 @@ const GROUPS = [
     label: "Connectors",
     commands: [
       { name: "connectors list [--format text|json]", summary: "List available agents and installed connectors" },
-      { name: "connectors install <agent> [--type ...] [--global]", summary: "Install connector for a coding agent" },
-      { name: "connectors remove <agent> [--type ...] [--global]", summary: "Remove connector for a coding agent" },
+      { name: "connectors install <agent> [--transport cli|mcp] [--global]", summary: "Install connector for a coding agent" },
+      { name: "connectors remove <agent> [--global]", summary: "Remove connector for a coding agent" },
       { name: "connectors doctor [agent] [--global]", summary: "Check connector health" },
     ],
   },

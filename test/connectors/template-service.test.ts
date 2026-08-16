@@ -1,199 +1,204 @@
-import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
-import * as templateService from '../../src/connectors/template-service.js';
-import { LCM_MARKERS } from '../../src/connectors/constants.js';
-import type { Agent } from '../../src/connectors/types.js';
-
-const {
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import {
   generateContent,
   generateRulesContent,
   generateSkillContent,
-} = templateService;
+  renderFeedback,
+  renderGuidance,
+  renderMemoryContext,
+  renderTemplate,
+} from "../../src/connectors/template-service.js";
+import { LCM_MANAGED_SKILL_MARKER, LCM_MARKERS } from "../../src/connectors/constants.js";
+import type { Agent } from "../../src/connectors/types.js";
 
 const mockAgent: Agent = {
-  id: 'test-agent',
-  name: 'Test Agent',
-  category: 'cli',
-  defaultType: 'rules',
-  supportedTypes: ['rules', 'mcp', 'skill'],
-  configPaths: {
-    rules: 'TEST.md',
-    mcp: '.test/mcp.json',
-    skill: '.test/skills/',
-  },
-};
-
-const mockAgentWithHeader: Agent = {
-  ...mockAgent,
-  header: '---\ntrigger: always_on\n---',
-};
-
-const codexAgent: Agent = {
-  ...mockAgent,
-  id: 'codex',
-  name: 'Codex',
-  configPaths: {
-    rules: '~/.codex/AGENTS.md',
-    hook: '~/.codex/hooks.json',
-    mcp: '.codex/config.toml',
-    skill: '.codex/skills/',
-  },
+  id: "test-agent",
+  name: "Test Agent",
+  category: "cli",
+  defaultTransport: "cli",
+  capabilities: { cli: { guidance: ["rules"] } },
+  configPaths: { rules: "TEST.md" },
+  header: "---\ntrigger: always_on\n---",
 };
 
 const durableStorageRequirement =
-  'Agents MUST immediately store every newly recognized durable decision, preference, root cause, pattern, gotcha, solution, and reusable workflow, including its rationale.';
-const feedbackCliFallback =
-  '`lcm store "memory-used feedback" --tag signal:memory_used --tag memory_id:<actual-id>`';
+  "Agents **MUST** immediately store every newly recognized durable decision, preference, root cause, pattern, gotcha, solution, and reusable workflow, including its rationale.";
+const sourceFiles = [
+  "skill.md.tmpl",
+  "rules.md.tmpl",
+  "body.md",
+  "operations.cli.md",
+  "operations.mcp.md",
+  "feedback.cli.md",
+  "feedback.mcp.md",
+  "memory-context.md.tmpl",
+] as const;
 
-function countOccurrences(value: string, needle: string): number {
-  return value.split(needle).length - 1;
-}
+describe("strict guidance renderer", () => {
+  it("rejects unknown supplied keys, missing values, and unresolved placeholders", () => {
+    expect(() => renderTemplate("{{known}}", { known: "ok", extra: "no" })).toThrow(
+      "Unknown template key: extra",
+    );
+    expect(() => renderTemplate("{{known}}", {})).toThrow("Missing template value: known");
+    expect(renderTemplate("{{known}}", { known: "{{still_unresolved}}" })).toBe(
+      "{{still_unresolved}}",
+    );
+  });
 
-function expectLeanBindingGuidance(content: string): void {
-  expect(content).toContain(durableStorageRequirement);
-  expect(content).toContain('Automatic/passive capture is complementary and never a substitute');
-  expect(content).toContain('Use automatically injected memory first');
-  expect(content).toContain('only when injected context is absent or insufficient');
-  expect(content).toContain('`lcm_store`');
-  expect(content).toContain('`signal:memory_used` and `memory_id:<actual-id>`');
-  expect(content).toContain(feedbackCliFallback);
+  it("requires own string values and rejects malformed placeholder syntax", () => {
+    const inherited = Object.create({ known: "inherited" }) as Record<string, string>;
+    expect(() => renderTemplate("{{known}}", inherited)).toThrow("Missing template value: known");
+    expect(() => renderTemplate("{{known}}", { known: undefined as unknown as string })).toThrow(
+      "Missing template value: known",
+    );
+    for (const malformed of ["{{}}", "{{ known}}", "{{known }}", "{{k n}}", "{{known"]) {
+      expect(() => renderTemplate(malformed, { known: "value" })).toThrow(/Malformed template placeholder/u);
+    }
+    expect(() => renderTemplate("{{known}} {{", { known: "value" })).toThrow(
+      /Malformed template placeholder/u,
+    );
+  });
 
-  for (const category of [
-    'decision',
-    'preference',
-    'root cause',
-    'pattern',
-    'gotcha',
-    'solution',
-    'reusable workflow',
-  ]) {
-    expect(content).toContain(category);
-  }
+  it("renders each canonical source with no unresolved placeholders", () => {
+    const templateRoot = join(process.cwd(), "src/connectors/templates/guidance");
+    expect(readdirSync(templateRoot).sort()).toEqual([...sourceFiles].sort());
+    for (const file of sourceFiles) {
+      const source = readFileSync(join(templateRoot, file), "utf8");
+      const values = Object.fromEntries(
+        [...source.matchAll(/\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}/gu)].map((match) => [match[1], "value"]),
+      );
+      expect(renderTemplate(source, values)).not.toMatch(/\{\{[^}]+\}\}/u);
+    }
+  });
 
-  expect(content).toContain('including its rationale');
-  expect(content).toContain('only on demand');
-  expect(content).toContain('lcm_describe');
-  expect(content).toContain('lcm_expand');
-  expect(content).toContain('lcm_doctor');
+  it("keeps recurring prose in Markdown sources rather than TypeScript", () => {
+    const implementation = readFileSync(
+      new URL("../../src/connectors/template-service.ts", import.meta.url),
+      "utf8",
+    );
+    expect(implementation).not.toContain("Agents **MUST** immediately store");
+    expect(implementation).not.toContain("memory-used feedback");
+  });
+});
 
-  for (const excluded of [
-    /\bimport\b/iu,
-    /\bdiagnose\b/iu,
-    /\bstats\b/iu,
-    /\blcm_stats\b/iu,
-    /Tag conventions/iu,
-    /\brestart\b/iu,
-    /\brecovery loop\b/iu,
-    /connectors install/iu,
-    /\bserializ(?:e|ed|ation)\b/iu,
-    /one (?:read|operation) at a time/iu,
-    /## (?:Available Commands|Decision Table|Error Handling)/iu,
-    /lcm --help/iu,
-  ]) {
-    expect(content).not.toMatch(excluded);
-  }
-}
+describe("transport-pure guidance", () => {
+  it("renders deterministic, byte-idempotent CLI skill and rules", () => {
+    const first = renderGuidance("skill", "cli");
+    const second = renderGuidance("skill", "cli");
+    expect(second).toBe(first);
+    expect(first).toContain('description: "Agents **MUST** immediately store');
+    expect(first).toContain(LCM_MANAGED_SKILL_MARKER);
+    expect(first).toContain("## When to retrieve");
+    expect(first).toContain("## When to store");
+    expect(first).toContain("## When to skip");
+    expect(first).toContain("## Retrieval workflow");
+    expect(first).toContain("## Storage classification");
+    expect(first.match(new RegExp(durableStorageRequirement.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "gu"))).toHaveLength(2);
+    expect(first).toContain("lcm grep '<pattern>' --mode regex");
+    expect(first).toContain("Prefer single quotes");
+    expect(first).toContain("lcm doctor --help");
+    expect(first).not.toMatch(/lcm_(?:search|grep|describe|expand|store|doctor)/u);
+    expect(first.match(/^description: .*$/mu)?.[0]).toBe(
+      'description: "Agents **MUST** immediately store every newly recognized durable decision, preference, root cause, pattern, gotcha, solution, and reusable workflow, including its rationale."',
+    );
+    const whenToStore = first.match(/## When to store\n\n([\s\S]*?)(?=\n## |$)/u)?.[1] ?? "";
+    expect(whenToStore.match(new RegExp(durableStorageRequirement.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "gu"))).toHaveLength(1);
+    const searchExplanation = first.match(/## When to retrieve\n\n([\s\S]*?)(?=\n### CLI operations)/u)?.[1] ?? "";
+    const captureWording = first.match(/[^\n]*(?:automatic|passive)[^\n]*/giu) ?? [];
+    expect(captureWording).toHaveLength(1);
+    expect(searchExplanation).toContain(captureWording[0]);
+    for (const prohibited of ["Advanced Operations", "only on demand", "lcm import", "lcm diagnose", "lcm stats", "lcm_stats", "restart loop", "serialization", "availability fallback"]) {
+      expect(first.toLowerCase()).not.toContain(prohibited.toLowerCase());
+    }
+  });
 
-describe('generateRulesContent', () => {
-  it('renders one deterministic managed fallback whose body starts with the parser heading', () => {
-    const first = generateRulesContent(mockAgent);
-    const second = generateRulesContent(mockAgent);
-
-    expect(Buffer.from(second).equals(Buffer.from(first))).toBe(true);
-    expect(first).toContain(`${LCM_MARKERS.START}\n# Workflow Instruction`);
-    expect(first.slice(first.indexOf(LCM_MARKERS.START))).toMatch(
+  it("renders deterministic, MCP-only skill and rules", () => {
+    const skill = renderGuidance("skill", "mcp");
+    const rules = renderGuidance("rules", "mcp");
+    expect(skill).toBe(renderGuidance("skill", "mcp"));
+    expect(skill).toContain("lcm_search");
+    expect(skill).toContain("lcm_grep");
+    expect(skill).toContain("lcm_describe");
+    expect(skill).toContain("lcm_expand");
+    expect(skill).toContain("lcm_store");
+    expect(skill).toContain("lcm_doctor");
+    expect(skill).not.toMatch(/\blcm\s+(?:search|grep|describe|expand|store|doctor)\b/iu);
+    expect(skill).not.toMatch(/\bregex\b|\blayers\b/iu);
+    expect(skill).toContain(
+      "exactly one `type:<classification>` tag, literal `scope:project` or `scope:user`, `project:<repo>`, and optional `source:<actual-thread-uuid>`",
+    );
+    expect(skill).toContain("literal `scope:project` or `scope:user`, `project:<repo>`");
+    expect(rules).toContain("# Workflow Instruction");
+    expect(rules.slice(rules.indexOf(LCM_MARKERS.START))).toMatch(
       /^<!-- lcm -->\n# Workflow Instruction/u,
     );
-    expect(first).toContain(LCM_MARKERS.END);
-    expect(countOccurrences(first, LCM_MARKERS.START)).toBe(2);
-    expect(first).not.toMatch(/\{\{[^}]+\}\}/u);
+    const cli = renderGuidance("skill", "cli");
+    const classificationMapping = "`type:<classification>` uses one of `decision`, `preference`, `root-cause`, `pattern`, `gotcha`, `solution`, or `workflow`; `workflow` is a reusable procedure and `solution` is a concrete fix or answer";
+    expect(cli).toContain(classificationMapping);
+    expect(skill).toContain(classificationMapping);
+    const readOnlyBoundary = "Read-only work still performs required LCM retrieval and durable storage unless the user explicitly forbids memory access or storage; LCM memory operations do not modify project files, Git, host configuration, or services.";
+    expect(cli).toContain(readOnlyBoundary);
+    expect(skill).toContain(readOnlyBoundary);
   });
 
-  it('includes an agent header only when configured', () => {
-    expect(generateRulesContent(mockAgentWithHeader)).toContain('trigger: always_on');
-    expect(generateRulesContent(mockAgent)).not.toContain('trigger:');
+  it("uses the exact memory header and emits feedback only for actual IDs", () => {
+    expect(renderMemoryContext("cli", "", [])).toBe("");
+    expect(renderMemoryContext("mcp", "", ["memory-1"])).toBe("");
+    expect(renderMemoryContext("mcp", "- surfaced memory", ["memory-1"])).toContain(
+      "Relevant context from previous sessions:",
+    );
+    expect(renderFeedback("cli", [])).toBe("");
+    expect(renderFeedback("cli", ["memory-1", "memory-2"])).toContain(
+      "one feedback memory per used memory",
+    );
+    expect(renderFeedback("cli", ["memory-1"])).toContain("memory_id:<id>");
+    expect(renderFeedback("cli", ["memory-1", "memory-2"])).toBe(
+      renderFeedback("cli", ["memory-1"]),
+    );
+    expect(renderFeedback("cli", ["memory-1"], { repository: "real-repo", threadId: "real-thread" })).toBe(
+      renderFeedback("cli", ["memory-1"], { repository: "other-repo", threadId: "other-thread" }),
+    );
+    expect(renderFeedback("cli", ["memory-1"])).toContain("project:<repo>");
+    expect(renderFeedback("cli", ["memory-1"])).toContain("source:<actual-thread-uuid>");
+    expect(renderFeedback("mcp", ["memory-1"])).toContain("lcm_store");
+    expect(renderFeedback("mcp", ["memory-1"])).not.toContain("lcm store");
+    expect(renderFeedback("cli", ["memory-1"])).not.toContain("lcm_store");
+    for (const tag of ["type:feedback", "scope:project", "project:<repo>", "source:<actual-thread-uuid>", "signal:memory_used", "memory_id:<id>"]) {
+      expect(renderFeedback("cli", ["memory-1"])).toContain(tag);
+      expect(renderFeedback("mcp", ["memory-1"])).toContain(tag);
+    }
+    const sourceGuidance = "Use `source:<actual-thread-uuid>` with the real UUID when available; omit that source tag when unavailable.";
+    expect(renderFeedback("cli", ["memory-1"])).toContain(sourceGuidance);
+    expect(renderFeedback("mcp", ["memory-1"])).toContain(sourceGuidance);
   });
 
-  it('enforces the lean durable-memory policy without excluded operational bloat', () => {
-    expectLeanBindingGuidance(generateRulesContent(mockAgent));
+  it("keeps balanced and unclosed braces in injected memory inert", () => {
+    expect(renderMemoryContext("cli", "memory with {{name}}", [])).toContain(
+      "memory with {{name}}",
+    );
+    expect(renderMemoryContext("cli", "memory with {{", [])).toContain("memory with {{");
   });
 
-  it('omits legacy markers, footer tags, separators, and agent-specific prose', () => {
-    const content = generateRulesContent(mockAgent);
+  it("renders the optional CLI source tag when a thread id is supplied", () => {
+    const rules = renderGuidance("rules", "cli", { threadId: "thread-123" });
 
-    expect(content).not.toContain('LCM_CONNECTOR_START');
-    expect(content).not.toContain('LCM_CONNECTOR_END');
-    expect(content).not.toContain('@lcm');
-    expect(content).not.toContain('Test Agent');
-    expect(content).not.toContain('\n---\n');
-    expect(content).not.toContain('You are a coding agent.');
-  });
-
-  it('keeps Codex generated rules free of Claude-specific text', () => {
-    expect(generateRulesContent(codexAgent)).not.toMatch(/claude/iu);
+    expect(rules).toContain("--tag 'source:thread-123'");
   });
 });
 
-describe('generateSkillContent', () => {
-  it('renders deterministically and remains byte-identical to the canonical packaged skill', () => {
-    const canonical = readFileSync(
-      new URL('../../src/connectors/templates/skill/SKILL.md', import.meta.url),
-      'utf8',
+describe("legacy compatibility seams", () => {
+  it("selects a transport while keeping the old default CLI call deterministic", () => {
+    expect(generateSkillContent(mockAgent)).toBe(renderGuidance("skill", "cli"));
+    expect(generateRulesContent(mockAgent)).toBe(renderGuidance("rules", "cli", mockAgent.header));
+    expect(generateContent(mockAgent, "rules")).toBe(generateRulesContent(mockAgent));
+    expect(generateContent(mockAgent, "skill")).toBe(generateSkillContent(mockAgent));
+  });
+
+  it("rejects hook content because hooks are managed by the structured installer", () => {
+    expect(() => generateContent(mockAgent, "hook" as never)).toThrow(
+      "Hook connectors are managed by the structured connector installer",
     );
-    const first = generateSkillContent(mockAgent);
-    const second = generateSkillContent(codexAgent);
-
-    expect(canonical.endsWith('\n')).toBe(true);
-    expect(canonical.endsWith('\n\n')).toBe(false);
-    expect(Buffer.from(first).equals(Buffer.from(canonical))).toBe(true);
-    expect(Buffer.from(second).equals(Buffer.from(first))).toBe(true);
-  });
-
-  it('makes immediate durable storage binding in both discovery metadata and the body', () => {
-    const content = generateSkillContent(mockAgent);
-    const frontmatter = content.match(/^---\n([\s\S]*?)\n---\n/u)?.[1];
-    const body = content.replace(/^---\n[\s\S]*?\n---\n/u, '');
-
-    expect(frontmatter).toContain(durableStorageRequirement);
-    expect(body).toContain(durableStorageRequirement);
-    expectLeanBindingGuidance(body);
-  });
-
-  it('shares the exact catalog-rendered operational wording with the rules fallback', () => {
-    const skillGuidance = generateSkillContent(mockAgent).match(
-      /# Long Context Manager \(LCM\)\n\n([\s\S]*?)\n$/u,
-    )?.[1];
-    const rulesGuidance = generateRulesContent(mockAgent).match(
-      /# Workflow Instruction\n\n([\s\S]*?)\n<!-- lcm -->$/u,
-    )?.[1];
-
-    expect(skillGuidance).toBeDefined();
-    expect(rulesGuidance).toBe(skillGuidance);
-  });
-
-  it('is a standalone lcm-memory skill without connector markers or agent-specific prose', () => {
-    const content = generateSkillContent(codexAgent);
-
-    expect(content).toContain('name: lcm-memory');
-    expect(content).not.toContain(LCM_MARKERS.START);
-    expect(content).not.toContain(LCM_MARKERS.END);
-    expect(content).not.toMatch(/claude/iu);
-  });
-});
-
-describe('generateContent dispatch', () => {
-  it('delegates rules and skill rendering', () => {
-    expect(generateContent(mockAgent, 'rules')).toBe(generateRulesContent(mockAgent));
-    expect(generateContent(mockAgent, 'skill')).toBe(generateSkillContent(mockAgent));
-  });
-
-  it('throws for hook type', () => {
-    expect(() => generateContent(mockAgent, 'hook')).toThrow(
-      'Hook connectors are managed by the structured connector installer',
-    );
-  });
-
-  it('does not expose the retired MCP template generator', () => {
-    expect(templateService).not.toHaveProperty('generateMcpContent');
   });
 });

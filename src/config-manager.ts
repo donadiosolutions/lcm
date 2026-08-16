@@ -1,11 +1,4 @@
-import {
-  chmodSync,
-  mkdirSync,
-  mkdtempSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import {
   normalizeLlmProvider,
@@ -36,10 +29,12 @@ import {
 import {
   atomicWritePrivateFileDurable,
   consumeBoundedRegularFile,
+  ensurePrivateDirectory,
   readBoundedRegularFile,
   syncPrivateDirectory,
   OWNER_ONLY_FILE_MODES,
 } from "./security-files.js";
+import type { ConnectorTransport } from "./connectors/types.js";
 
 const DENIED_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 const REDACTED = "[REDACTED]";
@@ -241,18 +236,22 @@ function canonicalizeLlmProviderTransition(
   if (!supportsFastMode(provider)) delete llm.fastMode;
 }
 
-function writeConfigAtomic(configPath: string, content: string): void {
+function writeConfigAtomic(
+  configPath: string,
+  content: string,
+  observedContent: string | null = null,
+): void {
   const directory = dirname(configPath);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const tempDirectory = mkdtempSync(join(directory, ".lcm-config-"));
-  const tempPath = join(tempDirectory, "config.json");
-  try {
-    writeFileSync(tempPath, content, { encoding: "utf-8", mode: 0o600, flag: "wx" });
-    chmodSync(tempPath, 0o600);
-    renameSync(tempPath, configPath);
-  } finally {
-    rmSync(tempDirectory, { recursive: true, force: true });
-  }
+  ensurePrivateDirectory(directory);
+  atomicWritePrivateFileDurable(configPath, content, {
+    expectedContentSha256: observedContent === null
+      ? null
+      : createHash("sha256").update(observedContent).digest("hex"),
+    maxExistingBytes: MAX_CONFIG_BYTES,
+    requireAbsent: observedContent === null,
+    finalMode: 0o600,
+  });
+  syncPrivateDirectory(directory);
 }
 
 function configBackend(content: string): "sqlite" | "postgresql" {
@@ -387,8 +386,143 @@ export function setConfigValue(options: SetConfigValueOptions): unknown {
       undefined,
       lockToken,
     );
-    writeConfigAtomic(options.configPath, persistedContent);
+    writeConfigAtomic(options.configPath, persistedContent, file.observedContent);
     return maskConfigSecrets(valueAtPath(canonical, segments, path), segments);
+  });
+}
+
+const CONNECTOR_TRANSPORT_VALUES = new Set<ConnectorTransport>(["cli", "mcp"]);
+
+function connectorTransportValue(value: unknown, path: string): ConnectorTransport {
+  if (typeof value !== "string" || !CONNECTOR_TRANSPORT_VALUES.has(value as ConnectorTransport)) {
+    throw new ConfigManagerError(`${path} must be one of "cli" or "mcp".`);
+  }
+  return value as ConnectorTransport;
+}
+
+function readConnectorTransportFromStored(
+  stored: Record<string, unknown>,
+  agentId: string,
+): ConnectorTransport | undefined {
+  const transports = connectorTransportsFromStored(stored);
+  if (transports === undefined) return undefined;
+  const value = transports[agentId];
+  return value === undefined
+    ? undefined
+    : connectorTransportValue(value, `connectors.transports.${agentId}`);
+}
+
+function connectorTransportsFromStored(
+  stored: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const connectors = stored.connectors;
+  if (connectors === undefined) return undefined;
+  if (!isRecord(connectors)) throw new ConfigManagerError("connectors must be an object.");
+  const transports = connectors.transports;
+  if (transports === undefined) return undefined;
+  if (!isRecord(transports)) throw new ConfigManagerError("connectors.transports must be an object.");
+  for (const [storedAgentId, value] of Object.entries(transports)) {
+    connectorTransportValue(value, `connectors.transports.${storedAgentId}`);
+  }
+  return transports;
+}
+
+function persistConnectorTransportConfig(
+  configPath: string,
+  stored: Record<string, unknown>,
+  file: { readonly observedContent: string | null },
+  currentBackend: "sqlite" | "postgresql",
+  lockToken: Parameters<typeof assertBackendPublicationConfigAccess>[4],
+): void {
+  const candidateContent = JSON.stringify(stored);
+  const env = resolveDaemonConfigEnv({});
+  delete env.LCM_SUMMARY_PROVIDER;
+  delete env.LCM_SUMMARY_MODEL;
+  parseDaemonConfig(candidateContent, {}, env);
+  const canonical = parseStoredConfig(candidateContent);
+  const persistedContent = `${JSON.stringify(canonical, null, 2)}\n`;
+  const candidateBackend = configBackend(candidateContent);
+  assertBackendPublicationConfigMutation(
+    configPath,
+    currentBackend,
+    candidateBackend,
+    persistedContent,
+    file.observedContent,
+    undefined,
+    lockToken,
+  );
+  writeConfigAtomic(configPath, persistedContent, file.observedContent);
+}
+
+/** Read one validated stored connector transport under the configuration lock. */
+export function readConnectorTransport(configPath: string, agentId: string): ConnectorTransport | undefined {
+  return withBackendPublicationConfigLock(configPath, (lockToken) => {
+    const file = readConfigContent(configPath);
+    const stored = parseStoredConfig(file.content);
+    const backend = configBackend(file.content);
+    assertBackendPublicationConfigAccess(configPath, backend, file.observedContent, undefined, lockToken);
+    return readConnectorTransportFromStored(stored, agentId);
+  });
+}
+
+/** Persist one validated connector transport while retaining all other settings. */
+export function setConnectorTransport(
+  configPath: string,
+  agentId: string,
+  transport: ConnectorTransport,
+): void {
+  connectorTransportValue(transport, `connectors.transports.${agentId}`);
+  parseConfigPath(`connectors.transports.${agentId}`);
+  withBackendPublicationConfigLock(configPath, (lockToken) => {
+    const file = readConfigContent(configPath);
+    const stored = structuredClone(parseStoredConfig(file.content));
+    const currentBackend = configBackend(file.content);
+    assertBackendPublicationConfigAccess(
+      configPath,
+      currentBackend,
+      file.observedContent,
+      undefined,
+      lockToken,
+    );
+    const connectors = stored.connectors;
+    if (connectors !== undefined && !isRecord(connectors)) {
+      throw new ConfigManagerError("connectors must be an object.");
+    }
+    const connectorObject = connectors ?? {};
+    if (connectors === undefined) stored.connectors = connectorObject;
+    const transports = connectorTransportsFromStored(stored) ?? {};
+    if (connectorObject.transports === undefined) connectorObject.transports = transports;
+    transports[agentId] = transport;
+    persistConnectorTransportConfig(configPath, stored, file, currentBackend, lockToken);
+  });
+}
+
+/** Remove one stored connector transport without removing unrelated settings. */
+export function clearConnectorTransport(configPath: string, agentId: string): boolean {
+  return withBackendPublicationConfigLock(configPath, (lockToken) => {
+    const file = readConfigContent(configPath);
+    const stored = structuredClone(parseStoredConfig(file.content));
+    const currentBackend = configBackend(file.content);
+    assertBackendPublicationConfigAccess(
+      configPath,
+      currentBackend,
+      file.observedContent,
+      undefined,
+      lockToken,
+    );
+    const connectors = stored.connectors;
+    if (connectors === undefined) return false;
+    if (!isRecord(connectors)) throw new ConfigManagerError("connectors must be an object.");
+    const transports = connectorTransportsFromStored(stored);
+    if (transports === undefined) return false;
+    if (!Object.hasOwn(transports, agentId)) return false;
+
+    delete transports[agentId];
+    if (Object.keys(transports).length === 0) delete connectors.transports;
+    if (Object.keys(connectors).length === 0) delete stored.connectors;
+
+    persistConnectorTransportConfig(configPath, stored, file, currentBackend, lockToken);
+    return true;
   });
 }
 

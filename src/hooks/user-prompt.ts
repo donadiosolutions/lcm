@@ -6,10 +6,10 @@ import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { safeLogError } from "./hook-errors.js";
 import {
-  buildMemoryContext,
-  buildMemoryFeedbackInstruction,
-  MEMORY_FEEDBACK_INSTRUCTION,
+  buildMemoryContextWithFeedback,
+  memoryFeedbackInstruction,
 } from "./memory-context.js";
+import type { ConnectorTransport } from "../connectors/types.js";
 import { configPath as defaultConfigPath, daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { firePromoteEventsNotifyRequest } from "./session-end.js";
 import {
@@ -40,6 +40,16 @@ type PromoteEventsNotification = {
 };
 
 type EnsureResultWithRefusal = Readonly<{ connected: boolean; refusalReason?: unknown }>;
+
+function isConnectorTransport(value: unknown): value is ConnectorTransport {
+  return value === "cli" || value === "mcp";
+}
+
+/** Resolve once from trusted hook context or legacy client identity. */
+function resolvePromptTransport(input: Record<string, unknown>, selected?: ConnectorTransport): ConnectorTransport {
+  if (isConnectorTransport(selected)) return selected;
+  return input.client === "codex" || process.env.LCM_CLIENT === "codex" ? "cli" : "mcp";
+}
 
 function canonicalRemediationScope(): Readonly<{ scope: string; stateRoot: string }> {
   const root = lcmHomeDir(homedir());
@@ -89,12 +99,17 @@ export async function handleUserPromptSubmit(
   client?: DaemonClient,
   port?: number,
   storage?: StorageBackendSelection,
+  transport?: ConnectorTransport,
 ): Promise<{ exitCode: number; stdout: string }> {
   try {
     const input = JSON.parse(stdin || "{}");
     if (!input.prompt || typeof input.prompt !== "string" || !input.prompt.trim()) {
       return emptyHookResponse();
     }
+    // `input.transport` is untrusted hook stdin and is deliberately ignored.
+    // Generated hook commands supply the selected transport through the
+    // out-of-band argument above; legacy commands infer from client identity.
+    const selectedTransport = resolvePromptTransport(input as Record<string, unknown>, transport);
     const cwd = resolveHookCwd(input.cwd);
     try {
       // Missing topology is an operator/bootstrap failure, not an unresolved
@@ -246,7 +261,7 @@ export async function handleUserPromptSubmit(
       query: input.prompt,
       cwd,
       session_id: input.session_id,
-      learningInstructionBytes: Buffer.byteLength(MEMORY_FEEDBACK_INSTRUCTION, "utf8"),
+      learningInstructionBytes: Buffer.byteLength(memoryFeedbackInstruction(selectedTransport), "utf8"),
     });
 
     if (!Array.isArray(result.hints) || result.hints.length === 0) {
@@ -258,10 +273,11 @@ export async function handleUserPromptSubmit(
     );
     if (hints.length === 0) return emptyHookResponse();
 
-    const ids = result.ids ?? [];
-    const context = buildMemoryContext(hints, ids)!;
-    const feedback = buildMemoryFeedbackInstruction(ids);
-    return { exitCode: 0, stdout: feedback ? `${context}\n${feedback}` : context };
+    const ids = Array.isArray(result.ids)
+      ? result.ids.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      : [];
+    const context = buildMemoryContextWithFeedback(hints, ids, selectedTransport);
+    return context ? { exitCode: 0, stdout: context } : emptyHookResponse();
   } catch (error) {
     if (isBackendPublicationJournalError(error)) {
       if (isBackendPublicationEvidenceMissing(error)) return emptyHookResponse();

@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import type { ConnectorTransport } from "./types.js";
 
 export const CODEX_HOOKS_PATH = "~/.codex/hooks.json";
 export const CODEX_CONFIG_PATH = "~/.codex/config.toml";
@@ -33,11 +34,15 @@ type CodexHooksConfig = {
   [key: string]: unknown;
 };
 
-function lcmCommand(command: string): string {
-  return `lcm ${command} --client codex`;
+function lcmCommand(command: string, transport: ConnectorTransport = "cli"): string {
+  if (transport !== "cli" && transport !== "mcp") {
+    throw new Error(`Unsupported hook transport: ${transport}`);
+  }
+  const suffix = command === "user-prompt" ? ` --transport ${transport}` : "";
+  return `lcm ${command} --client codex${suffix}`;
 }
 
-function codexLcmHooks(): Record<string, CodexHookGroup[]> {
+function codexLcmHooks(transport: ConnectorTransport = "cli"): Record<string, CodexHookGroup[]> {
   return {
     SessionStart: [
       {
@@ -57,7 +62,7 @@ function codexLcmHooks(): Record<string, CodexHookGroup[]> {
         hooks: [
           {
             type: "command",
-            command: lcmCommand("user-prompt"),
+            command: lcmCommand("user-prompt", transport),
             timeout: 30,
             statusMessage: "Searching LCM memory",
           },
@@ -126,10 +131,11 @@ function readHooksConfig(path: string): CodexHooksConfig {
 }
 
 function isLcmHookCommand(command: unknown): boolean {
-  return (
-    typeof command === "string" &&
-    /\blcm\s+(restore|user-prompt|post-tool|session-snapshot)\b/.test(command)
-  );
+  if (typeof command !== "string") return false;
+  if (/\blcm\s+user-prompt\s+--client\s+codex(?:\s+--transport\s+(?:cli|mcp))?$/.test(command)) {
+    return true;
+  }
+  return /\blcm\s+(restore|post-tool|session-snapshot)\b/.test(command);
 }
 
 function stripLcmHooks(config: CodexHooksConfig): { config: CodexHooksConfig; removed: boolean } {
@@ -233,12 +239,16 @@ export function setCodexHooksFeature(content: string): string {
   return `${lines.join("\n")}\n`;
 }
 
-export function installCodexHooks(hooksPath: string, configPath: string): void {
+export function installCodexHooks(
+  hooksPath: string,
+  configPath: string,
+  transport: ConnectorTransport = "cli",
+): void {
   mkdirSync(dirname(hooksPath), { recursive: true });
   enableCodexHooksFeature(configPath);
 
   const { config } = stripLcmHooks(readHooksConfig(hooksPath));
-  const lcmHooks = codexLcmHooks();
+  const lcmHooks = codexLcmHooks(transport);
   for (const [event, groups] of Object.entries(lcmHooks)) {
     config.hooks[event] = [...(config.hooks[event] ?? []), ...groups];
   }
