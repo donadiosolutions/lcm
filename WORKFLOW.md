@@ -1,245 +1,38 @@
 # Development Workflow
 
-This workflow is the default for all non-trivial features. When superpowers brainstorming asks design questions, these defaults apply unless the user overrides.
+This file contains repository-specific policy and overrides only. Use the applicable Superpowers workflows for implementation mechanics; where this file explicitly conflicts with them, this file wins.
 
-## Continuous Improvement
+## Planning artifacts
 
-This document is a living record. **Update it whenever you learn something:**
+- Do not add design, spec, or implementation-plan documents to the repository by default. Use the relevant issue/PR body as the durable source of truth when one exists; workflow-local scratch may be used as needed. Create tracked documents only when the user asks for one.
+- A docs-only spec PR is not a mandatory pre-implementation phase.
 
-- A step that failed or caused rework → add it to Common Pitfalls
-- A new default answer that proved correct → add it to the Defaults table
-- A phase that needed reordering or an extra step → revise the phase
-- A new tool, command, or technique that saved time → document it
-
-**When to update:** At the end of every feature cycle (after the implementation PR merges), review this doc against what actually happened. If reality diverged from the doc, fix the doc — not reality.
-
-**How to update:** Create a `docs/TOPIC` branch, push, and require every protected exact-head check to pass. Set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`. Same flow as any other docs change.
-
-## Branch Strategy
+## Branch and PR policy
 
 ```text
-ordinary feat/docs/fix branches → main (default, protected)
-maintenance fix branches        → maintenance/<major>.<minor>.x (protected)
+ordinary feat/docs/fix branches → main
+maintenance fix branches        → maintenance/<major>.<minor>.x
 ```
 
-- **`main`** — Default target for ordinary feature, documentation, and fix
-  pull requests. It is protected: pull requests, required checks, and reviews
-  are required; no force push. Pushing a matching stable `vX.Y.Z` or beta
-  `vX.Y.Z-beta.N` tag triggers draft-release creation.
-- **`maintenance/<major>.<minor>.x`** — Target for fixes to an existing
-  maintenance line. Create the topic branch from that exact maintenance branch
-  and target the pull request back to it. The maintenance branch must be
-  protected before external admission can accept the pull request, with the
-  required CI and CodeQL checks enabled for pull requests targeting that
-  maintenance namespace.
-- **Topic branches** — Use `feat/TOPIC`, `docs/TOPIC`, or `fix/TOPIC` as
-  appropriate, based on the selected target branch, and use an isolated worktree
-  for each concurrent change.
+- Before branching, fetch the selected target and create `feat/TOPIC`, `docs/TOPIC`, or `fix/TOPIC` from its current remote head; do not branch from a stale local base.
+- All work targeting a protected branch lands through a PR with a merge commit. Do not squash-merge, rebase-merge, force-push, or use administrator bypasses except for a documented emergency or one manifested by the maintainer.
+- A maintenance target must already be protected and configured with its required checks before admission.
+- Use separate PRs for independent changes. Dependent work waits for its upstream PR to merge, then starts from or rebases onto the updated target branch; do not base dependent work on an unmerged topic branch.
+- The root/coordinator owns pushes, PR creation, and merges. Implementation subagents commit only.
+- For user-requested implementation, the default integration path is: push → open PR → resolve failures/review findings until every required exact-head gate passes → merge. Do not stop to ask which integration method to use unless the user requested otherwise.
+- Confirm the PR is `MERGED` before post-merge validation or dependent work begins.
 
-Ordinary and maintenance pull requests follow the same protected flow: every
-required exact-head check and review must pass, and the pull request must merge
-with a merge commit. Use `main` as `TARGET_BRANCH` for ordinary work or the
-selected protected `maintenance/<major>.<minor>.x` branch for a maintenance fix
-in every sync, branch, rebase, and pull-request target operation below.
+## Admission and CI invariants
 
-Independent changes may be developed in parallel on isolated branches and
-worktrees. Dependent work must wait for its upstream PR to merge, then fetch
-and rebase onto the updated target branch before it is merged.
+- Required protected reviews and exact-head checks are authoritative. Do not infer merge readiness from an aggregate `ci` success while another required check is still incomplete.
+- Before changing external admission, read `docs/external-admission.md`. Preserve fail-closed exact-head CI+DCO admission and the rule that write-capable evaluation uses trusted workflow code only and never executes or consumes PR-controlled code, artifacts, or caches.
+- CI dependency/image/database caches are initialization state, not reusable test state. Preserve exact dependency-cache validation, digest validation for cached images, a secret-free PostgreSQL template, and fresh run-scoped credentials/resources for each conformance leg.
+- npm publishing remains on GitHub-hosted runners because trusted provenance does not accept self-hosted runners.
 
-The repository does not use a merge queue. Merge protected pull requests
-directly with merge commits only after every required exact-head check and
-review passes. Do not squash or rebase PRs: release publication depends on
-maintenance and forward-port commits remaining ancestors of `main`. Routine
-administrator bypasses remain prohibited except for documented emergencies.
+## Release flow
 
-The required `external-admission` status separates pull-request admission from
-merge-group validation for DCO, which does not report on synthetic queue
-commits. Authenticated DCO `check_run` events and lifecycle events from the
-canonical `.github/workflows/ci.yml` workflow drive `external-admission.yml`;
-pull-request lifecycle events do not start this write-capable workflow. Every
-accepted DCO event, canonical CI event, or default-branch
-`external-admission-reconcile` dispatch is a wake-up for the stateless reducer:
-it evaluates the latest exact-head snapshot and exits instead of polling on a
-runner. A workflow or check-run event ID is wake-up context only, never state
-authority; the reducer selects the latest authenticated CI and DCO evidence
-for the exact head. Recovery dispatch with the exact PR head SHA provides
-fail-closed reconciliation if an event is delayed or lost; see the
-[external-admission recovery guide](docs/external-admission.md).
-
-Every eligible pull request requires authenticated DCO and exact-head canonical
-CI. Only one open, non-draft pull request in the exact repository, targeting a
-protected `main` or protected `maintenance/X.Y.x` base, can satisfy admission.
-Only `pull_request` runs of `.github/workflows/ci.yml` for the exact repository
-and head SHA can satisfy its CI requirement; push and synthetic merge-group runs
-are rejected before a runner starts. The reducer reads live base protection and
-revalidates base and pull-request eligibility before success. An aggregate `ci`
-check may succeed while a trailing workflow job is still running, so incomplete
-current checks remain pending until the next trusted event. Invalid, ambiguous,
-ineligible, or terminally unsuccessful evidence is a terminal failure.
-
-Every accepted event replaces stale successful admission with `pending` before
-checkout or PR association, then evaluates the latest exact-head snapshot.
-Commit-associated PRs and check runs are paginated and flattened. The reducer
-revalidates live base protection, PR uniqueness and eligibility, authenticated
-CI and DCO evidence, and CI-run provenance at the initial, current, and final
-snapshots before success. The executable evaluator and policy are sparsely
-checked out from the trusted workflow revision with persisted credentials
-disabled. Although a `workflow_run` handler receives a write-capable token, the
-evaluator never downloads CI artifacts or caches and never checks out or
-executes PR-controlled content.
-
-The initial transition from the legacy review-provider policy required one
-documented maintainer bootstrap because the default-branch evaluator could not
-admit its own replacement. That exact head was manually required to pass CI,
-DCO, Socket, CodeQL, coverage, and review gates. Subsequent admission changes
-use the normal protected no-bypass flow.
-
-After PR-head admission, the separate
-`external-admission-merge-group.yml` workflow runs a permissionless Actions
-check named `external-admission` on each synthetic `merge_group` commit. It does
-not publish a commit status. This exception applies only to DCO, which cannot
-report on that commit: CI, both default CodeQL analyses, the security-extended
-CodeQL analysis, and both Socket checks still run against the synthetic commit
-before it may merge.
-
-CodeRabbit reports remain informational and best-effort and are not encoded as
-an admission requirement.
-
-### Release Flow
-
-1. Changesets accumulate on PRs targeting `main` (`.changeset/*.md` files).
-2. `changesets/action` creates or updates the version PR. Manual dispatch with
-   `channel=beta` enters beta mode; `channel=stable` exits an active beta.
-3. Merge the version PR, then create and push its exact signed annotated stable
-   or `beta.N` tag.
-4. The tag-triggered `publish.yml` job runs the complete validation suite,
-   generates Highlights with Codex, and creates a draft GitHub release.
-5. A maintainer reviews and publishes that draft manually.
-6. Only the `release: published` job publishes npm: beta versions update the
-   `beta` dist-tag, while stable versions update `latest`.
-
-The manual release helper performs the tag step idempotently: it pushes or fetches a valid one-sided signed annotated tag, requires exact tag-object and peeled-commit equality when both copies exist, and refuses to move, replace, or overwrite conflicts. It locates the resulting tag-triggered workflow using both the tag name and merge commit SHA, verifies the draft release and that npm remains unpublished, then returns control for manual publication.
-
-### CI Triggers
-
-| Workflow                             | Trigger                                                                              | Purpose                                                                                 |
-| ------------------------------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
-| `ci.yml`                             | Push to main and release + all PRs + merge groups (`checks_requested`)               | Type-check, test, and build; upload Codecov reports outside merge groups                |
-| `external-admission.yml`             | Authenticated DCO checks, canonical PR CI lifecycle, default-branch exact-SHA repository dispatch | Statelessly require exact-head canonical CI and DCO for every eligible pull request |
-| `external-admission-merge-group.yml` | Merge groups (`checks_requested`)                                                    | Run the required `external-admission` Actions check on the synthetic merge-group commit |
-| `codeql.yml`                         | Push to main + PRs targeting main or `maintenance/**` + merge groups (`checks_requested`)                | Required CodeQL analysis and SARIF upload                                               |
-| `codeql-extended.yml`                | Scheduled + manual dispatch + PRs targeting main or `maintenance/**` + merge groups (`checks_requested`) | Required security-extended CodeQL analysis and SARIF upload                             |
-| `version-pr.yml`                     | Push to main + manual `beta`/`stable` dispatch                                      | Auto-create version PRs and enter or exit Changesets beta mode                          |
-| `publish.yml`                        | Stable/beta tag pushes + GitHub release publication                                  | Create draft releases from tags; publish npm only after manual draft publication        |
-
-### CI Environment Caches
-
-The canonical CI workflow initializes its dependency environment in one
-Blacksmith job before Core CI and the PostgreSQL matrix begin. The repository
-local `.github/actions/setup-ci` composite action is the only installation
-entrypoint used by those jobs. It maintains exact, fallback-free caches for:
-
-- `node_modules`, keyed by the Node version, runner OS and architecture, and
-  the complete npm installation contract: `package.json`, `package-lock.json`,
-  and `.npmrc`;
-- the digest-pinned PostgreSQL and Node images used by the conformance harness;
-- a cleanly stopped PostgreSQL 18 cluster containing a secret-free
-  `lcm_harness_template` database with the required extensions.
-
-An exact `node_modules` hit skips `npm ci` only after the cache stamp, platform,
-Node version, npm installation-contract digest, package inventory, and
-`npm ls --all` all validate. Image restores are checked against their
-repository digests.
-Image and template archives carry SHA-256 sidecars, and PostgreSQL template
-archives also reject unsafe or incomplete paths before use.
-
-The PostgreSQL cache is immutable initialization state, not a reusable test
-database. Each matrix leg extracts it into a new labeled volume, clones a unique
-control database, generates new passwords and TLS material, inserts its own run
-sentinel, and cleans every run-scoped container, network, volume, and secret.
-The cached cluster contains no login-capable harness roles, credentials,
-private keys, run identifiers, test databases, or sentinels.
-
-Environment initialization, Core CI, PostgreSQL conformance, and both CodeQL
-profiles use Blacksmith runners. The small aggregate check and read-only
-Codecov upload jobs use GitHub-hosted runners. Publishing remains GitHub-hosted
-because npm trusted provenance does not accept self-hosted runners.
-
-The CI workflow keeps coverage reporting in separate read-only jobs. Checkout
-uses the job token to fetch `github.repository` at the workflow's `github.sha`,
-but `persist-credentials: false` ensures credentials are not persisted. The jobs
-consume the fixed test artifact and never execute repository code. This matches
-the tree that produced the artifact, including the synthetic merge commit used by
-pull-request runs, while `override_pr` associates the uploads with the PR. The
-trusted job has OIDC permission and handles pushes and same-repository PRs,
-including Dependabot PRs. A mutually exclusive fork-PR job omits OIDC permission
-and uses Codecov's tokenless upload path. Both reporting jobs are skipped for
-`merge_group`; the synthetic commit runs the full coverage suite in CI while its
-separate merge-group workflow supplies the required `external-admission` check.
-Keep each upload job's job-level `if` as `!cancelled()` combined with, not
-replacing, its existing event/trust predicates, including the `merge_group`
-exclusion; retain `needs: ci` and `fail_ci_if_error: true` on every Codecov
-upload action. Uploads are attempted after non-cancelled aggregate `ci` failures
-while that required `ci` check remains red.
-Uploads cannot succeed if the reports were not produced or if the Codecov uploader
-or service fails.
-
-## Defaults (predefined answers for brainstorming)
-
-| Question                | Default Answer                                                 |
-| ----------------------- | -------------------------------------------------------------- |
-| Spec location           | PR or issue body unless the user asks for a tracked document   |
-| Visual companion        | No (CLI project, no visual questions)                          |
-| Implementation approach | Parallel tracks — breaking changes isolated from additive work |
-| Registry/config format  | TypeScript (type-safe, compile-time checks)                    |
-| Install behavior        | Auto-write files (match ByteRover (brv) UX)                    |
-| State tracking          | Filesystem scan (no state files)                               |
-| Release strategy        | Parallel tracks with separate PRs                              |
-| PR review               | Required protected reviews and checks; CodeRabbit is informational |
-
-## Phase 1: Design (maximum-capability review, maximum effort)
-
-1. Study the spec/requirements using brainstorming skill
-2. Ask clarifying questions only for genuinely ambiguous decisions — use defaults above for standard questions
-3. Propose 2-3 approaches with trade-offs, recommend one
-4. Present design sections incrementally, get user approval
-5. Write the design spec in the PR or issue body unless the user asks for a tracked document
-6. Run spec review loop (code-reviewer agent + user review)
-7. Write the implementation plan in the PR or issue body unless the user asks for a tracked document
-
-## Phase 2: Spec Review via PR
-
-1. **Sync first:** Set `TARGET_BRANCH` according to Branch Strategy, then run `git checkout "$TARGET_BRANCH" && git pull --ff-only origin "$TARGET_BRANCH"` before branching — stale local bases can include unrelated code in the pull request
-2. Create a `docs/TOPIC` branch from the selected target branch
-3. Ensure only documentation files are in the diff — specs, plans, workflow docs
-4. Push and open PR
-5. Once every protected exact-head check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`.
-6. Confirm `gh pr view "${PR_NUMBER}" --repo donadiosolutions/lcm --json state --jq .state` reports `MERGED` before starting implementation. If the merge command or final state check fails, inspect `gh pr checks "${PR_NUMBER}" --repo donadiosolutions/lcm` and resolve the protected-branch failure without an administrator bypass.
-
-## Phase 3: Implementation (designated implementation subagents)
-
-1. **Sync first:** Set `TARGET_BRANCH` according to Branch Strategy, then run `git checkout "$TARGET_BRANCH" && git pull --ff-only origin "$TARGET_BRANCH"` to get the latest target (including merged specs)
-2. Dispatch designated implementation subagents with `isolation: worktree` for each task in the plan
-3. **Independent tasks** → launch in parallel (e.g., PR A: delete files, PR D: add new module)
-4. **Sequential tasks** → launch the dependent branch only after the upstream PR merges, then branch from the updated target branch. If a downstream branch already exists on the old upstream tip, enter its isolated worktree, set `TARGET_BRANCH` and `OLD_UPSTREAM_TIP`, and replay only its downstream commits with `git fetch origin "$TARGET_BRANCH" && git rebase --onto "origin/$TARGET_BRANCH" "${OLD_UPSTREAM_TIP}"`. Omitting the branch argument rebases the already checked-out downstream branch without asking Git to check it out in another worktree.
-5. Each subagent: implement code + tests, run `npm test`, commit (do NOT push)
-6. After subagent completes: review the diff, push, and open a PR
-
-## Phase 4: Final Review (maximum-capability review, maximum effort)
-
-1. Review all implementation work against the spec
-2. Run full test suite — all tests must pass
-3. Fix any issues found
-4. Ensure changeset file exists if user-facing changes
-
-## Phase 5: Implementation PR + Automated Review
-
-1. Push implementation branch, open PR
-2. Once every protected exact-head check passes, set `PR_NUMBER` to the pull request number and merge it with `gh pr merge "${PR_NUMBER}" --repo donadiosolutions/lcm --merge`
-3. Confirm the implementation PR reports `MERGED` before beginning post-merge validation or dependent work.
-
-## Common Git and PR Pitfalls
-
-- **Stale diff**: Always sync the selected target branch before creating topic branches. If that target has unpushed local commits, the PR diff includes unrelated code.
-- **Code in docs PRs**: Cherry-pick only docs commits if the branch has mixed content. Set `TARGET_BRANCH` according to Branch Strategy, `CLEAN_BRANCH` to the new branch name, and `DOCS_COMMIT_SHA` to the documentation commit, then use `git checkout -B "${CLEAN_BRANCH}" "origin/${TARGET_BRANCH}" && git cherry-pick "${DOCS_COMMIT_SHA}"`.
-- **Sequential PR chains**: Create PR B from the updated target branch only after PR A lands. If PR B already contains commits based on PR A's old tip, enter PR B's isolated worktree, set `TARGET_BRANCH` and `OLD_PR_A_TIP`, and replay only its own commits with `git fetch origin "$TARGET_BRANCH" && git rebase --onto "origin/$TARGET_BRANCH" "${OLD_PR_A_TIP}"`. Omit the branch argument so Git rebases the branch already checked out in that worktree instead of attempting a conflicting cross-worktree checkout.
+1. User-facing changes targeting `main` include the appropriate `.changeset/*.md` entry.
+2. `changesets/action` creates or updates the version PR; manual `channel=beta` and `channel=stable` dispatches enter or exit beta mode.
+3. After the version PR merges, create and push its exact signed annotated `vX.Y.Z` or `vX.Y.Z-beta.N` tag. Never move or overwrite a conflicting release tag.
+4. The tag-triggered `publish.yml` validation creates a draft GitHub release. A maintainer reviews and publishes the draft manually.
+5. npm publication happens only from the `release: published` path: beta releases update `beta`; stable releases update `latest`.
