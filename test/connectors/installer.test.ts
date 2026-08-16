@@ -58,7 +58,13 @@ function legacyRulesContent(eol: TestMarkdownEol): string {
 
 function managedSkillContent(content: string): string {
   const eol = content.includes('\r\n') ? '\r\n' : '\n';
-  const normalized = content.replace(/(?:\r\n|\r|\n)+$/u, '') + eol;
+  let contentEnd = content.length;
+  while (contentEnd > 0) {
+    const character = content.charCodeAt(contentEnd - 1);
+    if (character !== 0x0a && character !== 0x0d) break;
+    contentEnd -= 1;
+  }
+  const normalized = content.slice(0, contentEnd) + eol;
   if (!normalized.startsWith(`---${eol}`)) return `${LCM_MANAGED_SKILL_MARKER}${eol}${normalized}`;
   const endMarker = `${eol}---${eol}`;
   const end = normalized.indexOf(endMarker, `---${eol}`.length);
@@ -864,6 +870,7 @@ describe('installConnector — Codex native hooks', () => {
     ['normalizes LF-only content', '\n', '\n'],
     ['preserves CRLF for CRLF-only content', '\r\n', '\r\n'],
     ['normalizes CR-only content', '\r', '\n'],
+    ['handles a long CRLF run before a non-newline tail', `Heading${'\r\n'.repeat(32)}Tail`, `Heading${'\r\n'.repeat(32)}Tail`],
   ])('%s', async (_description, input, expected) => {
     vi.resetModules();
     vi.doMock('../../src/connectors/template-service.js', () => ({

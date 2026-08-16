@@ -457,7 +457,7 @@ function skillCollision(filePath: string): Error {
   return new Error(`Refusing to overwrite an unowned LCM skill at ${filePath}`);
 }
 
-const NO_FOLLOW_FLAGS = constants.O_NOFOLLOW;
+const NO_FOLLOW_FLAGS = constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
 function openNoFollow(filePath: string, flags: number, mode?: number): number {
   const safeFlags = flags | NO_FOLLOW_FLAGS;
