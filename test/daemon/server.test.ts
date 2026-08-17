@@ -1169,6 +1169,7 @@ describe("daemon auth", () => {
       res.end(JSON.stringify({ ok: true }));
     }, "read");
     try {
+      chmodSync(lcmDir, 0o755);
       const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/legacy-root-read`);
       expect(response.status).toBe(200);
       expect(handled).toBe(true);
@@ -1236,6 +1237,7 @@ describe("daemon auth", () => {
       res.end("unexpected");
     }, "read");
     try {
+      chmodSync(lcmDir, mode);
       const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/root-race-read`);
       expect(response.status).toBe(500);
       expect(snapshotReads).toBe(2);

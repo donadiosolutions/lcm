@@ -87,6 +87,10 @@ describe("persisted connector transport configuration", () => {
     })).toThrow("Configuration changed during lock-free connector transport inspection");
   });
 
+  it("propagates non-absence failures from the initial connector snapshot probe", () => {
+    expect(() => readConnectorTransportSnapshot("\0", "codex")).toThrow();
+  });
+
   it("creates a missing config only when a transport is explicitly set", () => {
     const { configPath } = makeHome();
 
@@ -177,6 +181,7 @@ describe("persisted connector transport configuration", () => {
     mutate(configPath);
 
     expect(() => readConnectorTransport(configPath, "codex")).toThrow();
+    expect(() => readConnectorTransportSnapshot(configPath, "codex")).toThrow();
     expect(() => clearConnectorTransport(configPath, "codex")).toThrow();
     expect(() => setConnectorTransport(configPath, "codex", "cli")).toThrow();
   });
