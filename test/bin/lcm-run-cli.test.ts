@@ -701,7 +701,12 @@ describe("runCli daemon-backed and utility actions", () => {
 
   it("never authorizes the read fast path from public health without a token", async () => {
     state.authToken = null;
-    state.health.mockResolvedValue({ status: "ok", storageBackend: "sqlite", entrypoint: "/daemon" });
+    state.health.mockResolvedValue({
+      status: "healthy",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
     const migrate = vi.fn();
     const sleep = vi.fn(async (_delayMs: number) => undefined);
 
@@ -709,6 +714,7 @@ describe("runCli daemon-backed and utility actions", () => {
 
     expect(migrate).toHaveBeenCalledOnce();
     expect(state.ensureDaemon).toHaveBeenCalledOnce();
+    expect(state.health).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -1148,11 +1154,12 @@ describe("runCli failure and alternate presentation branches", () => {
   it("covers daemon-down status and pool failures", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-    state.health.mockResolvedValueOnce(false).mockResolvedValueOnce(false);
+    state.authToken = null;
+    state.health.mockResolvedValueOnce(null);
     expect(await invoke(["status"])).toBeUndefined();
     expect(log).toHaveBeenCalledWith("daemon: down · provider: openai");
 
-    state.health.mockResolvedValueOnce(false).mockResolvedValueOnce(false);
+    state.health.mockResolvedValueOnce(null);
     expect(await invoke(["status", "--json"])).toBeUndefined();
     expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({
       daemon: { status: "down" },
