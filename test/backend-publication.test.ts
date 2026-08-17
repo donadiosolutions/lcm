@@ -2324,6 +2324,19 @@ describe("BackendPublicationCoordinator", () => {
     )).not.toThrow();
   });
 
+  it("rejects lock-free reads when the publication directory exists without a journal", () => {
+    const home = makeHome();
+    const configPath = join(home, ".lcm", "config.json");
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    mkdirSync(backendPublicationDirectory(home), { mode: 0o700 });
+
+    expect(() => assertBackendPublicationConfigReadAccess(
+      configPath,
+      "sqlite",
+      configReadWitness(configPath),
+    )).toThrowError(expect.objectContaining({ reason: "publication-evidence-missing" }));
+  });
+
   it("validates lock-free reads against terminal evidence and the exact config witness", async () => {
     const { home, fake } = await preparedFixture();
     await coordinator(home, fake.driver).resume();

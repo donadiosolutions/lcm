@@ -1081,6 +1081,30 @@ describe("daemon idle timeout", () => {
 });
 
 describe("daemon auth", () => {
+  it("maps an unbuffered public-health payload error without exposing details", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-public-health-error-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    const tokenPath = join(lcmDir, "daemon.token");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    ensureAuthToken(tokenPath);
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, { tokenPath, _testIdentity: testIdentity });
+    authDaemon.registerRoute("GET", "/health", async () => {
+      throw Object.assign(new Error("private oversized diagnostic"), { statusCode: 413 });
+    }, "read");
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/health`);
+      expect(response.status).toBe(413);
+      await expect(response.json()).resolves.toEqual({ error: "payload too large" });
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("does not emit the authenticated health marker for a tokenless daemon", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-tokenless-"));
     const config = loadDaemonConfig(join(dir, "missing-config.json"), { daemon: { port: 0, idleTimeoutMs: 0 } });
@@ -1148,6 +1172,67 @@ describe("daemon auth", () => {
       await holder;
       await authDaemon.stop();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("discards a read response when publication evidence changes during the handler", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-read-race-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    const tokenPath = join(lcmDir, "daemon.token");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    ensureAuthToken(tokenPath);
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      tokenPath,
+      _testIdentity: testIdentity,
+    });
+    authDaemon.registerRoute("GET", "/racing-read", async (_req, res) => {
+      res.end(JSON.stringify({ leaked: true }));
+      mkdirSync(join(lcmDir, "backend-publication"), { mode: 0o700 });
+    }, "read");
+
+    try {
+      const token = readAuthToken(tokenPath)!;
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/racing-read`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual({
+        status: "blocked",
+        error: "backend publication admission blocked",
+      });
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("discards a buffered read when terminal publication evidence changes during the handler", async () => {
+    const config = loadDaemonConfig("/nonexistent", { daemon: { port: 0, idleTimeoutMs: 0 } });
+    let handlerStarted = false;
+    const authDaemon = await createDaemon(config, {
+      _testIdentity: testIdentity,
+      _assertBackendPublication: () => ({
+        journalChecksumSha256: handlerStarted ? "b".repeat(64) : "a".repeat(64),
+      }),
+    });
+    authDaemon.registerRoute("GET", "/terminal-racing-read", async (_req, res) => {
+      handlerStarted = true;
+      res.end(JSON.stringify({ leaked: true }));
+    }, "read");
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/terminal-racing-read`);
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual({
+        status: "blocked",
+        error: "backend publication admission blocked",
+      });
+    } finally {
+      await authDaemon.stop();
     }
   });
 

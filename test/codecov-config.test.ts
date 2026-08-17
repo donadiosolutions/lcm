@@ -480,7 +480,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(201);
   });
 
-  test("keeps the dogfooding fix files exclusively in their intended components", () => {
+  test("keeps the dogfooding response-fence files exclusively in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {

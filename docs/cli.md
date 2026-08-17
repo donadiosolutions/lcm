@@ -80,12 +80,22 @@ available—a matching storage backend, and an unchanged configuration witness.
 This lets ordinary reads continue while a publication consumer holds the
 exclusive lock without reusing a stale packaged daemon after a rebuild.
 
+Authenticated daemon read responses are buffered until request-time admission
+is repeated after the handler finishes. LCM compares both the configuration
+witness and terminal publication-journal checksum before releasing up to 10 MiB
+of buffered output. If publication begins, completes, aborts, or changes
+evidence during the handler, the buffered result is discarded and the request
+returns a blocked response instead of leaking a stale or mixed-backend result.
+An existing publication directory without a journal is incomplete evidence,
+not the legacy SQLite no-evidence case.
+
 The route is fail closed. An unreadable, malformed, oversized, symlinked, or
 otherwise invalid configuration, missing token, failed or ambiguous health
 check, backend mismatch, or configuration change between the two snapshot
 reads returns to the existing authenticated migration and daemon-lifecycle
 path. Daemon request admission independently rejects an unsafe or replaced
-private root before reading storage. LCM never treats an uncertain snapshot as
+private root before reading storage and revalidates it before releasing the
+buffered response. LCM never treats an uncertain snapshot as
 permission to bypass migration, signal an unknown process, or mutate state.
 Mutation-requiring commands retain their existing migration and locking
 behavior; pure exits and explicit read exceptions such as help, diagnose,

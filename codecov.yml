@@ -47,7 +47,7 @@ component_management:
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
-        # Keep the #691 read-admission and runtime-identity seams exclusively here.
+        # Keep the #691 pre/post read-admission response fence and runtime identity here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
@@ -89,7 +89,7 @@ component_management:
     - component_id: "unit-storage-abstractions"
       name: "Unit - Storage Abstractions"
       paths:
-        # Keep the #691 publication read-admission seam exclusively here.
+        # Keep the #691 journal witness and incomplete-evidence admission seam here.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
         - "^src/storage/capabilities\\.ts$"

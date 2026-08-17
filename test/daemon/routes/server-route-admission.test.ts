@@ -634,7 +634,7 @@ describe("daemon route publication admission", () => {
       }), { publicationConfigPath: configPath });
       for (const [operation, invoke, expected] of [
         ["status", (res: Parameters<Exclude<import("../../../src/daemon/server.js").RouteHandler, never>>[1]) => res.writeHead(99), "Invalid status code: 99"],
-        ["overflow", (res: Parameters<Exclude<import("../../../src/daemon/server.js").RouteHandler, never>>[1]) => res.write(new Uint8Array(10 * 1024 * 1024 + 1)), "mutating response exceeds the response size limit"],
+        ["overflow", (res: Parameters<Exclude<import("../../../src/daemon/server.js").RouteHandler, never>>[1]) => res.write(new Uint8Array(10 * 1024 * 1024 + 1)), "buffered response exceeds the response size limit"],
       ] as const) {
         daemon.registerRoute("POST", "/ingest", async (_req, res) => {
           invoke(res);
