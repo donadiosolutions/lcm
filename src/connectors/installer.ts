@@ -1252,8 +1252,9 @@ function parseCodexMcpJson(stdout: string): unknown {
 }
 
 function isCodexMcpAbsence(error: CodexCliCommandError): boolean {
-  return Number.isInteger(error.status)
-    && error.status !== 0
+  return typeof error.status === "number"
+    && Number.isSafeInteger(error.status)
+    && error.status > 0
     && (error.stderr === "No MCP server named 'lcm' found."
       || error.stderr === "Error: No MCP server named 'lcm' found.");
 }
