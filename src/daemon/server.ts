@@ -6,6 +6,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
+import { lstatSync } from "node:fs";
 import { dirname } from "node:path";
 import {
   daemonConfigSnapshotWitnessEqual,
@@ -52,7 +53,11 @@ import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
 import { createStorageBackendFactory, type StorageBackendFactory } from "../storage/index.js";
 import { assertStorageBackendPublication } from "../storage/backend.js";
-import { readBoundedRegularFile } from "../security-files.js";
+import {
+  assertPrivateDirectory,
+  openPrivateDirectory,
+  readBoundedRegularFile,
+} from "../security-files.js";
 import {
   assertBackendPublicationConfigAccess,
   assertBackendPublicationConfigReadAccess,
@@ -119,6 +124,8 @@ export type DaemonOptions = {
   _readAuthToken?: typeof readAuthToken;
   /** @internal Deterministic storage-factory seam for daemon unit tests. */
   _createStorageBackendFactory?: typeof createStorageBackendFactory;
+  /** @internal Deterministic config-snapshot seam for daemon read-admission tests. */
+  _readDaemonConfigSnapshot?: typeof readDaemonConfigSnapshot;
   /** Canonical daemon config path used for request-time publication admission. */
   publicationConfigPath?: string;
   /** @internal Test-only publication admission seam. */
@@ -408,32 +415,47 @@ function assertDaemonReadStorageAdmission(
     homeDir: string | undefined,
     backend: DaemonConfig["storage"]["backend"],
   ) => void,
+  readSnapshot: typeof readDaemonConfigSnapshot = readDaemonConfigSnapshot,
 ): void {
   if (assertBackendPublicationOverride !== undefined) {
     assertBackendPublicationOverride(publicationHome, startupConfig.storage.backend);
     return;
   }
-  const first = readDaemonConfigSnapshot(publicationConfigPath);
-  if (first.config.storage.backend !== startupConfig.storage.backend) {
-    throw new BackendPublicationJournalError(
-      "unexpected-state",
-      "daemon request backend differs from the authenticated startup backend",
+  const publicationRoot = dirname(publicationConfigPath);
+  const privateRoot = openPrivateDirectory(publicationRoot);
+  try {
+    const assertReadRoot = (): void => {
+      if (lstatSync(publicationRoot).isSymbolicLink()) {
+        throw new Error("private LCM root must not be a symbolic link");
+      }
+      assertPrivateDirectory(privateRoot, publicationRoot, privateRoot.witness);
+    };
+    assertReadRoot();
+    const first = readSnapshot(publicationConfigPath);
+    if (first.config.storage.backend !== startupConfig.storage.backend) {
+      throw new BackendPublicationJournalError(
+        "unexpected-state",
+        "daemon request backend differs from the authenticated startup backend",
+      );
+    }
+    assertBackendPublicationConfigReadAccess(
+      publicationConfigPath,
+      first.config.storage.backend,
+      first.witness,
     );
-  }
-  assertBackendPublicationConfigReadAccess(
-    publicationConfigPath,
-    first.config.storage.backend,
-    first.witness,
-  );
-  const second = readDaemonConfigSnapshot(publicationConfigPath);
-  if (
-    second.config.storage.backend !== startupConfig.storage.backend
-    || !daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
-  ) {
-    throw new BackendPublicationJournalError(
-      "unexpected-state",
-      "daemon request config changed during lock-free read admission",
-    );
+    const second = readSnapshot(publicationConfigPath);
+    if (
+      second.config.storage.backend !== startupConfig.storage.backend
+      || !daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
+    ) {
+      throw new BackendPublicationJournalError(
+        "unexpected-state",
+        "daemon request config changed during lock-free read admission",
+      );
+    }
+    assertReadRoot();
+  } finally {
+    privateRoot.close();
   }
 }
 
@@ -811,10 +833,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       }
       // Public health is intentionally storage-free. Supplying credentials opts
       // into authenticated diagnostics and therefore must fail closed.
+      const rawAuth = req.headers["authorization"];
+      const publicHealth = serverToken !== null && key === "GET /health" && rawAuth === undefined;
       if (serverToken) {
-        const rawAuth = req.headers["authorization"];
         const authHeader = (Array.isArray(rawAuth) ? rawAuth[0] : rawAuth) ?? "";
-        const publicHealth = key === "GET /health" && rawAuth === undefined;
         if (!publicHealth && authHeader.trim() !== `Bearer ${serverToken}`) {
           sendJsonIfWritable(res, 401, { error: "unauthorized" });
           return;
@@ -846,12 +868,15 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         bufferedResponse.flush();
         bufferedResponse = undefined;
       } else {
-        assertDaemonReadStorageAdmission(
-          config,
-          publicationConfigPath,
-          publicationHome,
-          options?._assertBackendPublication,
-        );
+        if (!publicHealth) {
+          assertDaemonReadStorageAdmission(
+            config,
+            publicationConfigPath,
+            publicationHome,
+            options?._assertBackendPublication,
+            options?._readDaemonConfigSnapshot,
+          );
+        }
         await route.handler(req, res, body, { signal: requestSignal });
       }
     } catch (err: unknown) {

@@ -1,6 +1,15 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -12,7 +21,11 @@ import {
   type DaemonInstance,
 } from "../../src/daemon/server.js";
 import type { BackgroundPublicationAdmission } from "../../src/daemon/passive-event-processor.js";
-import { loadDaemonConfig } from "../../src/daemon/config.js";
+import {
+  loadDaemonConfig,
+  parseDaemonConfig,
+  readDaemonConfigSnapshot,
+} from "../../src/daemon/config.js";
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
 import * as projectModule from "../../src/daemon/project.js";
 import { projectDbPath, projectDir } from "../../src/daemon/project.js";
@@ -1132,6 +1145,73 @@ describe("daemon auth", () => {
     } finally {
       release.resolve();
       await holder;
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a symlinked canonical .lcm root during read admission", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-symlink-root-"));
+    const realLcmDir = join(dir, ".lcm-real");
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    mkdirSync(realLcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(realLcmDir, "config.json"), "{}", { mode: 0o600 });
+    symlinkSync(realLcmDir, lcmDir, "dir");
+    const config = parseDaemonConfig("{}", { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      _createStorageBackendFactory: async () => makeStagedPostgreSqlStorageFactory(),
+      _testIdentity: testIdentity,
+    });
+    let handled = false;
+    authDaemon.registerRoute("GET", "/symlink-root-read", async (_req, res) => {
+      handled = true;
+      res.end("unexpected");
+    }, "read");
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/symlink-root-read`);
+      expect(response.status).toBe(500);
+      expect(handled).toBe(false);
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects canonical .lcm root replacement between lock-free snapshots", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-root-race-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    const originalLcmDir = join(dir, ".lcm-original");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    let snapshotReads = 0;
+    const readSnapshot = (path: string) => {
+      snapshotReads += 1;
+      if (snapshotReads === 2) {
+        renameSync(lcmDir, originalLcmDir);
+        symlinkSync(originalLcmDir, lcmDir, "dir");
+      }
+      return readDaemonConfigSnapshot(path);
+    };
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      _readDaemonConfigSnapshot: readSnapshot,
+      _testIdentity: testIdentity,
+    });
+    let handled = false;
+    authDaemon.registerRoute("GET", "/root-race-read", async (_req, res) => {
+      handled = true;
+      res.end("unexpected");
+    }, "read");
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/root-race-read`);
+      expect(response.status).toBe(500);
+      expect(snapshotReads).toBe(2);
+      expect(handled).toBe(false);
+    } finally {
       await authDaemon.stop();
       rmSync(dir, { recursive: true, force: true });
     }

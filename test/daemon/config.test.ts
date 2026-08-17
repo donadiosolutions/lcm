@@ -74,7 +74,9 @@ describe("readDaemonConfigSnapshot", () => {
   it("uses validated defaults and an absent-file witness when config is missing", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-config-snapshot-missing-"));
     try {
-      const snapshot = readDaemonConfigSnapshot(join(root, "config.json"));
+      const lcmDir = join(root, ".lcm");
+      mkdirSync(lcmDir, { mode: 0o700 });
+      const snapshot = readDaemonConfigSnapshot(join(lcmDir, "config.json"));
       expect(snapshot.config.daemon.port).toBe(DEFAULT_DAEMON_PORT);
       expect(snapshot.config.storage.backend).toBe("sqlite");
       expect(snapshot.witness).toMatchObject({
