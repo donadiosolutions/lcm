@@ -46,7 +46,7 @@ component_management:
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
-        # Keep the #691 read-admission seams in client/config/server exclusively here.
+        # Keep the #691 read-admission and runtime-identity seams exclusively here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
@@ -160,6 +160,7 @@ component_management:
       name: "Integration - Service Managers and Legacy Migration"
       paths:
         - "^src/daemon/health-observation\\.ts$"
+        # Lifecycle consumes the same canonical #691 entrypoint comparison as the CLI.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"

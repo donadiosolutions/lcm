@@ -81,6 +81,13 @@ const state = vi.hoisted(() => ({
   dispatchHook: vi.fn(async () => ({ stdout: "", exitCode: 0 })),
 }));
 
+vi.mock("../../src/daemon/version.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/daemon/version.js")>()),
+  PKG_VERSION: "1.4.2",
+  PACKAGED_RUNTIME_ENTRYPOINT: "/daemon",
+  RUNTIME_DIGEST: "runtime",
+}));
+
 const fakeStdin = vi.hoisted(() => ({ isTTY: true, destroy: vi.fn(), on: vi.fn() }));
 
 vi.mock("node:process", async importOriginal => ({
@@ -505,7 +512,13 @@ describe("runCli identity boundaries", () => {
 
 describe("runCli lifecycle and connector boundaries", () => {
   it("does not bootstrap the root before an authenticated healthy daemon read", async () => {
-    state.health.mockResolvedValue({ status: "ok", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" });
+    state.health.mockResolvedValue({
+      status: "ok",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
 
     expect(await invoke(["search", "q"])).toBeUndefined();
 

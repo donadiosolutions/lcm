@@ -68,16 +68,17 @@ managed daemon is healthy:
 | `lcm stats --pool` | Read daemon connection-pool statistics |
 
 Before using this route, LCM reads a bounded, no-follow configuration snapshot
-without taking the private mutation/publication lock. If the private LCM root
-is safe but `config.json` is absent, the snapshot uses validated defaults and
-records an absent witness; absence alone is not a reason to fall back. For an
-existing file, the snapshot must be readable, well-formed, within the size
-limit, a regular non-symlink file, and otherwise valid. LCM then requires a
-present daemon token, authenticated healthy health response with both private
-identity markers—non-empty `entrypoint` and authenticated non-empty
-`runtimeDigest`—a matching storage backend, and an unchanged configuration
-witness. This lets ordinary reads continue while a publication consumer holds
-the exclusive lock.
+without taking the private mutation/publication lock. If `config.json` is
+absent, the snapshot uses validated defaults and records an absent witness;
+absence alone is not a reason to fall back. For an existing file, the snapshot
+must be readable, well-formed, within the size limit, a regular non-symlink
+file, and otherwise valid. LCM then requires a present daemon token and an
+authenticated healthy health response from the current
+LCM version with both private identity markers—a matching packaged `entrypoint`
+and authenticated matching packaged `runtimeDigest` when those identities are
+available—a matching storage backend, and an unchanged configuration witness.
+This lets ordinary reads continue while a publication consumer holds the
+exclusive lock without reusing a stale packaged daemon after a rebuild.
 
 The route is fail closed. An unreadable, malformed, oversized, symlinked, or
 otherwise invalid configuration, missing token, failed or ambiguous health

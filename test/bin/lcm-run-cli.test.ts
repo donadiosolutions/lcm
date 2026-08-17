@@ -104,6 +104,13 @@ const state = vi.hoisted(() => ({
   createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })),
 }));
 
+vi.mock("../../src/daemon/version.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/daemon/version.js")>()),
+  PKG_VERSION: "1.4.2",
+  PACKAGED_RUNTIME_ENTRYPOINT: "/daemon",
+  RUNTIME_DIGEST: "runtime",
+}));
+
 const fakeStdin = vi.hoisted(() => ({
   isTTY: true,
   destroy: vi.fn(),
@@ -651,7 +658,13 @@ describe("runCli registration and help dispatch", () => {
 
 describe("runCli daemon-backed and utility actions", () => {
   it("routes all six daemon reads through an authenticated healthy daemon without migration", async () => {
-    state.health.mockResolvedValue({ status: "healthy", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" });
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
     const migrate = vi.fn();
     const sleep = vi.fn(async (_delayMs: number) => undefined);
     const root = actualFs.mkdtempSync("/tmp/lcm-cli-concurrent-");
@@ -703,6 +716,7 @@ describe("runCli daemon-backed and utility actions", () => {
     state.authToken = null;
     state.health.mockResolvedValue({
       status: "healthy",
+      version: "1.4.2",
       storageBackend: "sqlite",
       entrypoint: "/daemon",
       runtimeDigest: "runtime",
@@ -718,9 +732,12 @@ describe("runCli daemon-backed and utility actions", () => {
   });
 
   it.each([
-    ["a tokenless daemon marker", { status: "ok", storageBackend: "sqlite", entrypoint: "/daemon" }],
-    ["an empty entrypoint", { status: "ok", storageBackend: "sqlite", entrypoint: "", runtimeDigest: "runtime" }],
-    ["an empty runtime marker", { status: "ok", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "" }],
+    ["a stale version", { status: "ok", version: "1.4.1", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" }],
+    ["a tokenless daemon marker", { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon" }],
+    ["an empty entrypoint", { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "", runtimeDigest: "runtime" }],
+    ["another entrypoint", { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/other", runtimeDigest: "runtime" }],
+    ["an empty runtime marker", { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "" }],
+    ["another runtime digest", { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "other" }],
   ])("does not treat %s as authenticated with a stale token", async (_label, health) => {
     state.health.mockResolvedValue(health);
     const migrate = vi.fn();

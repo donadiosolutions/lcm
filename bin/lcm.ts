@@ -45,11 +45,17 @@ import {
   DAEMON_TEST_ENTRYPOINT_OPTION,
   DAEMON_TEST_OWNER_OPTION,
   type DaemonLifecycleTestIdentity,
+  daemonEntrypointMatches,
   isCanonicalLifecycleTestDirectory,
   isCanonicalLifecycleTestRegularFile,
   isCanonicalOrMissingLifecycleTestStateFile,
   isDaemonLifecycleTestIdentity,
 } from "../src/daemon/lifecycle-scope.js";
+import {
+  PACKAGED_RUNTIME_ENTRYPOINT,
+  PKG_VERSION,
+  RUNTIME_DIGEST,
+} from "../src/daemon/version.js";
 import type {
   LocalHookEventRow,
   LocalHookOutboxRepository,
@@ -1230,11 +1236,19 @@ async function createDaemonReadClientOrExit(
       const health = await client.health();
       if (
         (health?.status === "ok" || health?.status === "healthy")
+        && typeof PKG_VERSION === "string"
+        && health.version === PKG_VERSION
         && health.storageBackend === first.config.storage.backend
         && typeof health.entrypoint === "string"
         && health.entrypoint.length > 0
+        && daemonEntrypointMatches(
+          health.entrypoint,
+          PACKAGED_RUNTIME_ENTRYPOINT,
+          process.platform,
+        )
         && typeof health.runtimeDigest === "string"
         && health.runtimeDigest.length > 0
+        && (RUNTIME_DIGEST === undefined || health.runtimeDigest === RUNTIME_DIGEST)
       ) {
         const second = readDaemonConfigSnapshot(configPath);
         if (

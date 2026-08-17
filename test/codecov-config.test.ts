@@ -494,6 +494,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
       ["src/daemon/server.ts", "unit-daemon-core"],
+      ["src/daemon/version.ts", "unit-daemon-core"],
+      ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
     ] as const;
 

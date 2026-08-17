@@ -11,12 +11,20 @@ const state = vi.hoisted(() => ({
   afterHealth: undefined as (() => void) | undefined,
 }));
 
+vi.mock("../../src/daemon/version.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/daemon/version.js")>()),
+  PKG_VERSION: "test",
+  PACKAGED_RUNTIME_ENTRYPOINT: "/opt/lcm/lcm.mjs",
+  RUNTIME_DIGEST: "runtime",
+}));
+
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: class {
     async health() {
       state.afterHealth?.();
       return {
         status: "ok",
+        version: "test",
         storageBackend: "sqlite",
         entrypoint: "/opt/lcm/lcm.mjs",
         runtimeDigest: "runtime",
