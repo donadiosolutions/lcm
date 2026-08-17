@@ -46,7 +46,7 @@ component_management:
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
-        # The #691 configuration snapshot seam remains daemon-core-owned.
+        # Keep the #691 read-admission seams in client/config/server exclusively here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
@@ -88,6 +88,7 @@ component_management:
     - component_id: "unit-storage-abstractions"
       name: "Unit - Storage Abstractions"
       paths:
+        # Keep the #691 publication read-admission seam exclusively here.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
         - "^src/storage/capabilities\\.ts$"
