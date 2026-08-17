@@ -1139,7 +1139,7 @@ describe("external admission workflow", () => {
     expect(documentation).toContain("CI and DCO");
     expect(documentation).toContain("-f event_type=external-admission-reconcile");
     expect(documentation).toContain("client_payload[head_sha]");
-    expect(workflowDocumentation).toContain("CI and DCO");
+    expect(workflowDocumentation).toContain("CI+DCO");
     for (const content of [
       source,
       policySource,

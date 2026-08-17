@@ -19,10 +19,7 @@ const productionFiles = [
 // Implementation and test files are intentionally excluded so compatibility
 // aliases and lifecycle seams remain testable without becoming recovery advice.
 const guidanceSurfaceFiles = [
-  "README.md", ".agents/skills/lcm-dogfood/SKILL.md",
-  ".agents/skills/lcm-dogfood/references/checks.md",
-  ".agents/skills/lcm-dogfood/references/known-issues.md",
-  ".agents/skills/lcm-e2e/SKILL.md", ".agents/skills/lcm-e2e/checklist.md",
+  "README.md",
   ".agents/skills/lcm-release/SKILL.md", "docs/README.md", "docs/agent-tools.md",
   "docs/architecture.md", "docs/cli.md", "docs/configuration.md",
   "docs/daemon-restart-recovery.md",
