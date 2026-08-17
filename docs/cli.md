@@ -90,7 +90,9 @@ permission to bypass migration, signal an unknown process, or mutate state.
 Mutation-requiring commands retain their existing migration and locking
 behavior; pure exits and explicit read exceptions such as help, diagnose,
 usage-only parent actions, `connectors list`, and `connectors doctor` remain
-exempt according to the command-routing policy.
+exempt according to the command-routing policy. When connector inspection is
+unavailable, `connectors doctor` reads its stored transport hint through the
+same bounded, stable, lock-free configuration admission.
 
 ## Daemon-dependent resilience
 

@@ -255,6 +255,7 @@ vi.mock("../../src/config-manager.js", () => ({
   formatConfigValue: vi.fn((value: unknown) => JSON.stringify(value)), normalizeConfigPath: vi.fn((path: string) => path),
   setConfigValue: state.configSetValue,
   readConnectorTransport: vi.fn(() => state.storedCodexTransport),
+  readConnectorTransportSnapshot: vi.fn(() => state.storedCodexTransport),
 }));
 vi.mock("../../installer/install.js", () => ({ install: vi.fn(async () => undefined) }));
 vi.mock("../../installer/uninstall.js", () => ({ uninstall: vi.fn(async () => undefined) }));

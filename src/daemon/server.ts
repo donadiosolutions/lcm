@@ -63,6 +63,7 @@ import {
   assertBackendPublicationConfigReadAccess,
   BackendPublicationJournalError,
   backendPublicationHomeForConfigPath,
+  openBackendPublicationReadRoot,
   type BackendPublicationLockToken,
   withBackendPublicationConsumerLockAsync,
 } from "../storage/backend-publication.js";
@@ -422,9 +423,15 @@ function assertDaemonReadStorageAdmission(
     return;
   }
   const publicationRoot = dirname(publicationConfigPath);
-  const privateRoot = openPrivateDirectory(publicationRoot);
+  if (lstatSync(publicationRoot).isSymbolicLink()) {
+    throw new Error("private LCM root must not be a symbolic link");
+  }
+  const privateRoot = publicationHome === undefined
+    ? openPrivateDirectory(publicationRoot)
+    : openBackendPublicationReadRoot(publicationHome);
   try {
     const assertReadRoot = (): void => {
+      if (privateRoot === undefined) return;
       if (lstatSync(publicationRoot).isSymbolicLink()) {
         throw new Error("private LCM root must not be a symbolic link");
       }
@@ -455,7 +462,7 @@ function assertDaemonReadStorageAdmission(
     }
     assertReadRoot();
   } finally {
-    privateRoot.close();
+    privateRoot?.close();
   }
 }
 

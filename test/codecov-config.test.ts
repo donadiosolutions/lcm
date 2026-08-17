@@ -490,6 +490,7 @@ describe("Codecov configuration", () => {
     const components = validateComponents(configuredComponents(config));
     const expectedOwners = [
       ["bin/lcm.ts", "unit-cli"],
+      ["src/config-manager.ts", "unit-configuration-security"],
       ["src/connectors/installer.ts", "unit-connectors"],
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],

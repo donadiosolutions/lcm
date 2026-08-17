@@ -148,6 +148,7 @@ vi.mock("../../src/config-manager.js", () => ({
   getConfigValue: vi.fn(() => "value"), formatConfigValue: vi.fn((value: unknown) => String(value)),
   normalizeConfigPath: vi.fn((path: string) => path), setConfigValue: vi.fn(() => "stored"),
   readConnectorTransport: vi.fn(() => state.storedCodexTransport),
+  readConnectorTransportSnapshot: vi.fn(() => state.storedCodexTransport),
 }));
 vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
   if (state.batchError !== undefined) throw state.batchError;

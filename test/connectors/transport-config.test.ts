@@ -16,8 +16,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   clearConnectorTransport,
   readConnectorTransport,
+  readConnectorTransportSnapshot,
   setConnectorTransport,
 } from "../../src/config-manager.js";
+import { withBackendPublicationConfigLockAsync } from "../../src/storage/backend-publication.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -56,8 +58,33 @@ describe("persisted connector transport configuration", () => {
     const { configPath } = makeHome();
 
     expect(readConnectorTransport(configPath, "codex")).toBeUndefined();
+    expect(readConnectorTransportSnapshot(configPath, "codex")).toBeUndefined();
     expect(clearConnectorTransport(configPath, "codex")).toBe(false);
     expect(existsSync(configPath)).toBe(false);
+  });
+
+  it("reads a stable connector snapshot while the publication lock is held", async () => {
+    const { configPath } = makeHome({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    });
+
+    await withBackendPublicationConfigLockAsync(configPath, async () => {
+      expect(readConnectorTransportSnapshot(configPath, "codex")).toBe("mcp");
+    });
+  });
+
+  it("rejects connector config drift between lock-free snapshots", () => {
+    const { configPath } = makeHome({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    });
+
+    expect(() => readConnectorTransportSnapshot(configPath, "codex", {
+      _afterFirstSnapshotForTesting: () => {
+        writeFileSync(configPath, JSON.stringify({ version: 1 }), { mode: 0o600 });
+      },
+    })).toThrow("Configuration changed during lock-free connector transport inspection");
   });
 
   it("creates a missing config only when a transport is explicitly set", () => {

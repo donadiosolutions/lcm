@@ -1215,6 +1215,13 @@ function openOptionalRootDirectory(homeDir?: string): ReturnType<typeof openPriv
   }
 }
 
+/** Open the canonical LCM root using the consumer path's legacy-read compatibility rule. */
+export function openBackendPublicationReadRoot(
+  homeDir?: string,
+): ReturnType<typeof openPrivateDirectory> | undefined {
+  return openOptionalRootDirectory(homeDir);
+}
+
 function consumerLockCallback<T>(
   homeDir: string | undefined,
   callback: (token: BackendPublicationLockToken) => T,

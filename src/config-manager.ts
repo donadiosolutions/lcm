@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import { lstatSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
   normalizeLlmProvider,
+  daemonConfigSnapshotWitnessEqual,
   parseDaemonConfig,
   parseStoredConfig,
   reasoningEffortsForProvider,
@@ -11,12 +13,14 @@ import {
   type LlmApiMode,
   type LlmProvider,
   type LlmReasoningEffort,
+  type DaemonConfigSnapshotWitness,
 } from "./daemon/config.js";
 import { isSensitiveKey } from "./secret-key.js";
 import { sanitizeUrlValueForDisplay } from "./url-display.js";
 import { lcmHomeDir } from "./runtime-paths.js";
 import {
   assertBackendPublicationConfigAccess,
+  assertBackendPublicationConfigReadAccess,
   assertBackendPublicationConfigMutation,
   assertBackendPublicationPermit,
   captureBackendPublicationState,
@@ -31,6 +35,7 @@ import {
   consumeBoundedRegularFile,
   ensurePrivateDirectory,
   readBoundedRegularFile,
+  readBoundedRegularFileWithStat,
   syncPrivateDirectory,
   OWNER_ONLY_FILE_MODES,
 } from "./security-files.js";
@@ -463,6 +468,74 @@ export function readConnectorTransport(configPath: string, agentId: string): Con
     assertBackendPublicationConfigAccess(configPath, backend, file.observedContent, undefined, lockToken);
     return readConnectorTransportFromStored(stored, agentId);
   });
+}
+
+type ConnectorTransportSnapshotOptions = Readonly<{
+  /** @internal Deterministic config-drift seam for tests. */
+  _afterFirstSnapshotForTesting?: () => void;
+}>;
+
+type ConnectorConfigSnapshot = Readonly<{
+  content: string;
+  witness: DaemonConfigSnapshotWitness;
+}>;
+
+function readConnectorConfigSnapshot(configPath: string): ConnectorConfigSnapshot {
+  let initiallyPresent = false;
+  try {
+    lstatSync(configPath);
+    initiallyPresent = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  try {
+    const observed = readBoundedRegularFileWithStat(configPath, {
+      allowedRoot: dirname(configPath),
+      maxBytes: MAX_CONFIG_BYTES,
+      allowedModes: OWNER_ONLY_FILE_MODES,
+    });
+    return {
+      content: observed.content,
+      witness: {
+        presence: "present",
+        rawSha256: createHash("sha256").update(observed.content).digest("hex"),
+        byteLength: Buffer.byteLength(observed.content),
+        dev: observed.exactDev,
+        ino: observed.exactIno,
+        mtimeMs: observed.mtimeMs,
+      },
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || initiallyPresent) throw error;
+    return {
+      content: "{}",
+      witness: {
+        presence: "absent",
+        rawSha256: null,
+        byteLength: 0,
+        dev: null,
+        ino: null,
+        mtimeMs: null,
+      },
+    };
+  }
+}
+
+/** Read one validated stored connector transport without taking the publication lock. */
+export function readConnectorTransportSnapshot(
+  configPath: string,
+  agentId: string,
+  options: ConnectorTransportSnapshotOptions = {},
+): ConnectorTransport | undefined {
+  const first = readConnectorConfigSnapshot(configPath);
+  const backend = configBackend(first.content);
+  assertBackendPublicationConfigReadAccess(configPath, backend, first.witness);
+  options._afterFirstSnapshotForTesting?.();
+  const second = readConnectorConfigSnapshot(configPath);
+  if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
+    throw new ConfigManagerError("Configuration changed during lock-free connector transport inspection.");
+  }
+  return readConnectorTransportFromStored(parseStoredConfig(second.content), agentId);
 }
 
 /** Persist one validated connector transport while retaining all other settings. */

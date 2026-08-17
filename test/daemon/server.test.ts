@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { createServer } from "node:http";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -1145,6 +1146,33 @@ describe("daemon auth", () => {
     } finally {
       release.resolve();
       await holder;
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("admits legacy non-private SQLite roots when publication evidence is absent", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-legacy-root-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o755 });
+    chmodSync(lcmDir, 0o755);
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      _testIdentity: testIdentity,
+    });
+    let handled = false;
+    authDaemon.registerRoute("GET", "/legacy-root-read", async (_req, res) => {
+      handled = true;
+      res.end(JSON.stringify({ ok: true }));
+    }, "read");
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/legacy-root-read`);
+      expect(response.status).toBe(200);
+      expect(handled).toBe(true);
+    } finally {
       await authDaemon.stop();
       rmSync(dir, { recursive: true, force: true });
     }
