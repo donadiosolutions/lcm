@@ -1207,12 +1207,13 @@ describe("daemon auth", () => {
     }
   });
 
-  it("rejects canonical .lcm root replacement between lock-free snapshots", async () => {
+  it.each([0o700, 0o755])("rejects canonical .lcm root replacement between lock-free snapshots at mode %o", async (mode) => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-root-race-"));
     const lcmDir = join(dir, ".lcm");
     const configPath = join(lcmDir, "config.json");
     const originalLcmDir = join(dir, ".lcm-original");
-    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    mkdirSync(lcmDir, { recursive: true, mode });
+    chmodSync(lcmDir, mode);
     writeFileSync(configPath, "{}", { mode: 0o600 });
     let snapshotReads = 0;
     const readSnapshot = (path: string) => {

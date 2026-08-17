@@ -431,10 +431,10 @@ function assertDaemonReadStorageAdmission(
     : openBackendPublicationReadRoot(publicationHome);
   try {
     const assertReadRoot = (): void => {
-      if (privateRoot === undefined) return;
       if (lstatSync(publicationRoot).isSymbolicLink()) {
         throw new Error("private LCM root must not be a symbolic link");
       }
+      if (privateRoot === undefined) return;
       assertPrivateDirectory(privateRoot, publicationRoot, privateRoot.witness);
     };
     assertReadRoot();
