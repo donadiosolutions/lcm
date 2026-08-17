@@ -7,9 +7,14 @@ import { withPrivateMutationLockAsync } from "../../src/private-mutation-lock.js
 const originalHome = process.env.HOME;
 const originalUserProfile = process.env.USERPROFILE;
 
+const state = vi.hoisted(() => ({
+  afterHealth: undefined as (() => void) | undefined,
+}));
+
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: class {
     async health() {
+      state.afterHealth?.();
       return {
         status: "ok",
         storageBackend: "sqlite",
@@ -52,6 +57,7 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => {
 });
 
 afterEach(() => {
+  state.afterHealth = undefined;
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
   if (originalUserProfile === undefined) delete process.env.USERPROFILE;
@@ -106,6 +112,30 @@ describe("runCli healthy-daemon reads during publication", () => {
     } finally {
       release();
       if (holder !== undefined) await holder;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back closed when the config backend changes after authenticated health", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-cli-config-drift-"));
+    const lcmDir = join(home, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    const tokenPath = join(lcmDir, "daemon.token");
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    mkdirSync(lcmDir, { mode: 0o700 });
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    writeFileSync(tokenPath, "test-token", { mode: 0o600 });
+    state.afterHealth = () => {
+      state.afterHealth = undefined;
+      writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" } }), { mode: 0o600 });
+    };
+
+    try {
+      const { runCli } = await import("../../bin/lcm.js");
+      await expect(runCli(["node", "lcm", "search", "dogfood"]))
+        .rejects.toThrow("unexpected migration while publication lock is held");
+    } finally {
       rmSync(home, { recursive: true, force: true });
     }
   });

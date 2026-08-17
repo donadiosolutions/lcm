@@ -1144,8 +1144,18 @@ describe("runCli failure and alternate presentation branches", () => {
   });
 
   it("covers daemon-down status and pool failures", async () => {
-    state.health.mockResolvedValueOnce(false);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    state.health.mockResolvedValueOnce(false).mockResolvedValueOnce(false);
     expect(await invoke(["status"])).toBeUndefined();
+    expect(log).toHaveBeenCalledWith("daemon: down · provider: openai");
+
+    state.health.mockResolvedValueOnce(false).mockResolvedValueOnce(false);
+    expect(await invoke(["status", "--json"])).toBeUndefined();
+    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({
+      daemon: { status: "down" },
+    });
+
     state.get.mockRejectedValueOnce(new Error("pool failed"));
     expect((await invoke(["stats", "--pool"]))?.message).toBe("exit:1");
     state.get.mockRejectedValueOnce("pool failed");

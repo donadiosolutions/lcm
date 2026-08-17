@@ -2339,6 +2339,18 @@ describe("BackendPublicationCoordinator", () => {
       .toThrowError(expect.objectContaining({ reason: "unexpected-state" }));
   });
 
+  it("admits the source backend through an aborted terminal publication journal", async () => {
+    const { home, fake } = await preparedFixture();
+    await coordinator(home, fake.driver).abort();
+    const configPath = join(home, ".lcm", "config.json");
+
+    expect(() => assertBackendPublicationConfigReadAccess(
+      configPath,
+      "sqlite",
+      configReadWitness(configPath),
+    )).not.toThrow();
+  });
+
 });
 
 describe("revocable mutation permits", () => {

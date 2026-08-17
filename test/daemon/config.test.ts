@@ -175,6 +175,18 @@ describe("readDaemonConfigSnapshot", () => {
     }
   });
 
+  it("fails closed when the initial config probe hits a non-missing path error", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-config-snapshot-not-directory-"));
+    const nonDirectory = join(root, "not-a-directory");
+    try {
+      writeFileSync(nonDirectory, "not a directory");
+      expect(() => readDaemonConfigSnapshot(join(nonDirectory, "config.json")))
+        .toThrowError(expect.objectContaining({ code: "ENOTDIR" }));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("compares every config witness field without hiding an earlier mismatch", () => {
     const base = {
       presence: "present" as const,

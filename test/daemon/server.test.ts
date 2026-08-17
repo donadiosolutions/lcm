@@ -1217,6 +1217,49 @@ describe("daemon auth", () => {
     }
   });
 
+  it("rejects a backend change between lock-free config snapshots", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-config-drift-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    let snapshotReads = 0;
+    const initialSnapshot = readDaemonConfigSnapshot(configPath);
+    const readSnapshot = (path: string) => {
+      snapshotReads += 1;
+      if (snapshotReads === 2) {
+        return {
+          config: {
+            ...initialSnapshot.config,
+            storage: { ...initialSnapshot.config.storage, backend: "postgresql" as const },
+          },
+          witness: initialSnapshot.witness,
+        };
+      }
+      return readDaemonConfigSnapshot(path);
+    };
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      _readDaemonConfigSnapshot: readSnapshot,
+      _testIdentity: testIdentity,
+    });
+    let handled = false;
+    authDaemon.registerRoute("GET", "/config-drift-read", async (_req, res) => {
+      handled = true;
+      res.end("unexpected");
+    }, "read");
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/config-drift-read`);
+      expect(response.status).toBe(503);
+      expect(snapshotReads).toBe(2);
+      expect(handled).toBe(false);
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("returns 401 for POST without auth token when tokenPath is set", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-"));
     const tokenPath = join(dir, "daemon.token");

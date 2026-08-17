@@ -1225,7 +1225,7 @@ async function createDaemonReadClientOrExit(
     const { readAuthToken } = await import("../src/daemon/auth.js");
     const token = readAuthToken(tokenPath);
     if (typeof token === "string" && token.length > 0) {
-      const port = first.config.daemon?.port ?? 3737;
+      const port = first.config.daemon.port;
       const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
       const health = await client.health();
       if (
