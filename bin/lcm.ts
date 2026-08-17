@@ -1241,6 +1241,7 @@ async function createDaemonReadClientOrExit(
         && health.storageBackend === first.config.storage.backend
         && typeof health.entrypoint === "string"
         && health.entrypoint.length > 0
+        && PACKAGED_RUNTIME_ENTRYPOINT !== undefined
         && daemonEntrypointMatches(
           health.entrypoint,
           PACKAGED_RUNTIME_ENTRYPOINT,
@@ -1248,7 +1249,8 @@ async function createDaemonReadClientOrExit(
         )
         && typeof health.runtimeDigest === "string"
         && health.runtimeDigest.length > 0
-        && (RUNTIME_DIGEST === undefined || health.runtimeDigest === RUNTIME_DIGEST)
+        && RUNTIME_DIGEST !== undefined
+        && health.runtimeDigest === RUNTIME_DIGEST
       ) {
         const second = readDaemonConfigSnapshot(configPath);
         if (

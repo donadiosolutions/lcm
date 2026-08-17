@@ -75,8 +75,11 @@ must be readable, well-formed, within the size limit, a regular non-symlink
 file, and otherwise valid. LCM then requires a present daemon token and an
 authenticated healthy health response from the current
 LCM version with both private identity markers—a matching packaged `entrypoint`
-and authenticated matching packaged `runtimeDigest` when those identities are
-available—a matching storage backend, and an unchanged configuration witness.
+and authenticated matching packaged `runtimeDigest`. If the invoking CLI cannot
+resolve or hash its local packaged entrypoint, it falls back to the locked
+lifecycle path rather than treating either missing identity as a wildcard. The
+health response must also report a matching storage backend, and the
+configuration witness must remain unchanged.
 This lets ordinary reads continue while a publication consumer holds the
 exclusive lock without reusing a stale packaged daemon after a rebuild.
 

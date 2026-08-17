@@ -67,6 +67,8 @@ const state = vi.hoisted(() => ({
   packageVersion: "1.4.0" as unknown,
   packageFileReads: 0,
   storageBackend: "sqlite" as "sqlite" | "postgresql",
+  packagedRuntimeEntrypoint: "/daemon" as string | undefined,
+  runtimeDigest: "runtime" as string | undefined,
   provisionResult: {
     applied: ["0001_migration_ledger"],
     current: ["0001_migration_ledger"],
@@ -107,8 +109,8 @@ const state = vi.hoisted(() => ({
 vi.mock("../../src/daemon/version.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/version.js")>()),
   PKG_VERSION: "1.4.2",
-  PACKAGED_RUNTIME_ENTRYPOINT: "/daemon",
-  RUNTIME_DIGEST: "runtime",
+  get PACKAGED_RUNTIME_ENTRYPOINT() { return state.packagedRuntimeEntrypoint; },
+  get RUNTIME_DIGEST() { return state.runtimeDigest; },
 }));
 
 const fakeStdin = vi.hoisted(() => ({
@@ -354,6 +356,8 @@ beforeEach(() => {
   state.runtimePidPath = "/lcm/daemon.pid";
   state.runtimeTokenPath = "/lcm/daemon.token";
   state.storageBackend = "sqlite";
+  state.packagedRuntimeEntrypoint = "/daemon";
+  state.runtimeDigest = "runtime";
   state.provisionResult = {
     applied: ["0001_migration_ledger"],
     current: ["0001_migration_ledger"],
@@ -730,6 +734,32 @@ describe("runCli daemon-backed and utility actions", () => {
     expect(migrate).toHaveBeenCalledOnce();
     expect(state.ensureDaemon).toHaveBeenCalledOnce();
     expect(state.health).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["entrypoint", undefined, "runtime"],
+    ["runtime digest", "/daemon", undefined],
+  ] as const)("falls back when the local packaged %s is unavailable", async (
+    _label,
+    entrypoint,
+    runtimeDigest,
+  ) => {
+    state.packagedRuntimeEntrypoint = entrypoint;
+    state.runtimeDigest = runtimeDigest;
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    expect(await invoke(["search", "query"], { migrate, sleep })).toBeUndefined();
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.ensureDaemon).toHaveBeenCalledOnce();
   });
 
   it.each([
