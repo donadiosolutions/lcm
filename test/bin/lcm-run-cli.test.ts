@@ -743,6 +743,7 @@ describe("runCli daemon-backed and utility actions", () => {
       ["connectors"],
       ["diagnose"],
       ["connectors", "list"],
+      ["connectors", "doctor", "codex"],
     ];
 
     for (const args of pureCases) await invoke(args, { migrate, sleep });
@@ -764,6 +765,7 @@ describe("runCli daemon-backed and utility actions", () => {
       ["events", "status"],
       ["sensitive", "list"],
       ["project", "list"],
+      ["connectors", "install", "codex"],
     ];
 
     for (const args of mutationCases) {

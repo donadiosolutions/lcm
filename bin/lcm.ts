@@ -401,7 +401,7 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   if (topLevel && action === "status") return false;
   if (topLevel && action === "stats") return actionCommand.opts<Record<string, unknown>>().pool !== true;
   if (topLevel && (action === "diagnose" || action === "help")) return false;
-  if (action === "list" && actionCommand.parent?.name() === "connectors") return false;
+  if ((action === "list" || action === "doctor") && actionCommand.parent?.name() === "connectors") return false;
   if (topLevel && ["daemon", "config", "machine", "project", "postgres", "events", "connectors"].includes(action)) return false;
   return true;
 }

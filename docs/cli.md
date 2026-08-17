@@ -80,14 +80,16 @@ witness. This lets ordinary reads continue while a publication consumer holds
 the exclusive lock.
 
 The route is fail closed. An unreadable, malformed, oversized, symlinked, or
-otherwise invalid configuration, an unsafe private root, missing token, failed
-or ambiguous health check, backend mismatch, or configuration change between
-the two snapshot reads returns to the existing authenticated migration and
-daemon-lifecycle path. LCM never treats an uncertain snapshot as permission to
-bypass migration, signal an unknown process, or mutate state. Mutation-requiring
-commands retain their existing migration and locking behavior; pure exits and
-explicit read exceptions such as help, diagnose, usage-only parent actions, and
-`connectors list` remain exempt according to the command-routing policy.
+otherwise invalid configuration, missing token, failed or ambiguous health
+check, backend mismatch, or configuration change between the two snapshot
+reads returns to the existing authenticated migration and daemon-lifecycle
+path. Daemon request admission independently rejects an unsafe or replaced
+private root before reading storage. LCM never treats an uncertain snapshot as
+permission to bypass migration, signal an unknown process, or mutate state.
+Mutation-requiring commands retain their existing migration and locking
+behavior; pure exits and explicit read exceptions such as help, diagnose,
+usage-only parent actions, `connectors list`, and `connectors doctor` remain
+exempt according to the command-routing policy.
 
 ## Daemon-dependent resilience
 
