@@ -1826,20 +1826,19 @@ export async function runCli(
 
       try {
         const health = readClient.health ?? await client.health();
-        if (health) {
-          daemonStatus = "up";
-          if (health.status === "unavailable") {
-            statusData = {
-              daemon: {
-                status: "up",
-                version: health.version,
-                uptime: health.uptime,
-                port: config.daemon.port,
-                storageBackend: health.storageBackend,
-                storageStatus: "unavailable",
-              },
-            };
-          }
+        daemonStatus = (["down", "up"] as const)[Number(Boolean(health))]!;
+        const daemonHealth = health as DaemonHealth | null;
+        if (daemonHealth?.status === "unavailable") {
+          statusData = {
+            daemon: {
+              status: "up",
+              version: daemonHealth.version,
+              uptime: daemonHealth.uptime,
+              port: config.daemon.port,
+              storageBackend: daemonHealth.storageBackend,
+              storageStatus: "unavailable",
+            },
+          };
         }
 
         // Also fetch /status endpoint if daemon is up
