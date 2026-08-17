@@ -68,18 +68,26 @@ managed daemon is healthy:
 | `lcm stats --pool` | Read daemon connection-pool statistics |
 
 Before using this route, LCM reads a bounded, no-follow configuration snapshot
-without taking the private mutation/publication lock. It then requires a
-present daemon token, authenticated healthy health response, matching storage
-backend, and an unchanged configuration witness. This lets ordinary reads
-continue while a publication consumer holds the exclusive lock.
+without taking the private mutation/publication lock. If the private LCM root
+is safe but `config.json` is absent, the snapshot uses validated defaults and
+records an absent witness; absence alone is not a reason to fall back. For an
+existing file, the snapshot must be readable, well-formed, within the size
+limit, a regular non-symlink file, and otherwise valid. LCM then requires a
+present daemon token, authenticated healthy health response with both private
+identity markers—non-empty `entrypoint` and authenticated non-empty
+`runtimeDigest`—a matching storage backend, and an unchanged configuration
+witness. This lets ordinary reads continue while a publication consumer holds
+the exclusive lock.
 
-The route is fail closed. A missing or unreadable configuration, missing token,
-failed or ambiguous health check, backend mismatch, or configuration change
-between the two snapshot reads returns to the existing authenticated migration
-and daemon-lifecycle path. LCM never treats an uncertain snapshot as permission
-to bypass migration, signal an unknown process, or mutate state. Commands that
-are not one of the six reads above retain their existing migration and locking
-behavior.
+The route is fail closed. An unreadable, malformed, oversized, symlinked, or
+otherwise invalid configuration, an unsafe private root, missing token, failed
+or ambiguous health check, backend mismatch, or configuration change between
+the two snapshot reads returns to the existing authenticated migration and
+daemon-lifecycle path. LCM never treats an uncertain snapshot as permission to
+bypass migration, signal an unknown process, or mutate state. Mutation-requiring
+commands retain their existing migration and locking behavior; pure exits and
+explicit read exceptions such as help, diagnose, usage-only parent actions, and
+`connectors list` remain exempt according to the command-routing policy.
 
 ## Daemon-dependent resilience
 
