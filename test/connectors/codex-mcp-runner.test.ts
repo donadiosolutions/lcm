@@ -304,14 +304,51 @@ describe("native Codex MCP runner", () => {
     });
   });
 
-  it("distinguishes the supported native MCP absence from inspection failure", () => {
+  it.each([
+    ["legacy", "No MCP server named 'lcm' found.\n"],
+    ["Codex 0.147.0", "Error: No MCP server named 'lcm' found.\n"],
+  ] as const)("distinguishes the supported %s native MCP absence from inspection failure", (_label, stderr) => {
     withTempHome((cwd) => {
       const absent = listConnectorInventory(cwd, {
-        codexCliRunner: () => ({ status: 1, stderr: "No MCP server named 'lcm' found." }),
+        codexCliRunner: () => ({ status: 1, stderr }),
       });
       expect(absent.codexMcp).toEqual({ state: "absent" });
       expect(absent.installed.some((entry) => entry.agentId === "codex" && entry.type === "mcp")).toBe(false);
+    });
+  });
 
+  it.each([
+    ["null status", { status: null, stderr: "No MCP server named 'lcm' found.\n" }],
+    ["zero status", { status: 0, stderr: "No MCP server named 'lcm' found.\n" }],
+    ["negative status", { status: -1, stderr: "No MCP server named 'lcm' found.\n" }],
+    ["fractional status", { status: 1.5, stderr: "No MCP server named 'lcm' found.\n" }],
+    ["NaN status", { status: Number.NaN, stderr: "No MCP server named 'lcm' found.\n" }],
+    ["another server", { status: 1, stderr: "No MCP server named 'other' found.\n" }],
+    ["substantive prefix", { status: 1, stderr: "prefix: No MCP server named 'lcm' found.\n" }],
+    ["substantive suffix", { status: 1, stderr: "No MCP server named 'lcm' found. detail\n" }],
+    ["multiple lines", { status: 1, stderr: "warning\nNo MCP server named 'lcm' found.\n" }],
+    ["diagnostic in stdout", { status: 1, stdout: "No MCP server named 'lcm' found.\n", stderr: "" }],
+    ["ANSI decoration", { status: 1, stderr: "\u001b[31mNo MCP server named 'lcm' found.\u001b[0m\n" }],
+    ["curly quotes", { status: 1, stderr: "No MCP server named ‘lcm’ found.\n" }],
+    ["case difference", { status: 1, stderr: "No MCP server named 'LCM' found.\n" }],
+    ["internal whitespace", { status: 1, stderr: "No  MCP server named 'lcm' found.\n" }],
+    ["localized diagnostic", { status: 1, stderr: "Nenhum servidor MCP chamado 'lcm' foi encontrado.\n" }],
+    ["empty stderr", { status: 1, stderr: "" }],
+    ["permission error", { status: 1, stderr: "permission denied\n" }],
+    ["result.error", { status: 1, stderr: "No MCP server named 'lcm' found.\n", error: new Error("runner exploded") }],
+  ] as const)("does not classify %s as native MCP absence", (_label, result) => {
+    withTempHome((cwd) => {
+      const inspection = listConnectorInventory(cwd, {
+        codexCliRunner: () => result,
+      });
+      expect(inspection.codexMcp).toEqual(result.status === 0
+        ? { state: "unknown", reason: "collision" }
+        : { state: "unknown", reason: "unavailable" });
+    });
+  });
+
+  it("preserves unavailable semantics for a permission failure", () => {
+    withTempHome((cwd) => {
       const unavailable = listConnectorInventory(cwd, {
         codexCliRunner: () => ({ status: 9, stderr: "permission denied" }),
       });

@@ -1,4 +1,15 @@
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, type TestContext } from "vitest";
@@ -15,7 +26,9 @@ import {
   LLM_REASONING_EFFORTS,
   OPENAI_REASONING_EFFORTS,
   __configTestUtils,
+  daemonConfigSnapshotWitnessEqual,
   loadDaemonConfig,
+  readDaemonConfigSnapshot,
   parseDaemonConfig,
   parseLlmRequestPolicyConfig,
   parseStoredConfig,
@@ -55,6 +68,140 @@ it("exposes the bounded-read seam with the observed config bytes", () => {
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+describe("readDaemonConfigSnapshot", () => {
+  it("uses validated defaults and an absent-file witness when config is missing", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-config-snapshot-missing-"));
+    try {
+      const lcmDir = join(root, ".lcm");
+      mkdirSync(lcmDir, { mode: 0o700 });
+      const snapshot = readDaemonConfigSnapshot(join(lcmDir, "config.json"));
+      expect(snapshot.config.daemon.port).toBe(DEFAULT_DAEMON_PORT);
+      expect(snapshot.config.storage.backend).toBe("sqlite");
+      expect(snapshot.witness).toMatchObject({
+        presence: "absent",
+        rawSha256: null,
+        byteLength: 0,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses a bounded no-follow regular-file read and full configuration validation", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-config-snapshot-boundary-"));
+    const path = join(root, "config.json");
+    try {
+      writeFileSync(path, JSON.stringify({ daemon: { port: 4242 } }));
+      const snapshot = readDaemonConfigSnapshot(path);
+      expect(snapshot.config.daemon.port).toBe(4242);
+      expect(snapshot.witness).toMatchObject({ presence: "present", byteLength: Buffer.byteLength(JSON.stringify({ daemon: { port: 4242 } })) });
+
+      const outside = join(root, "outside.json");
+      writeFileSync(outside, "{}");
+      rmSync(path);
+      symlinkSync(outside, path);
+      expect(() => readDaemonConfigSnapshot(path)).toThrow();
+
+      rmSync(path);
+      writeFileSync(path, "x".repeat(4 * 1024 * 1024 + 1));
+      expect(() => readDaemonConfigSnapshot(path)).toThrow("size limit");
+
+      rmSync(path);
+      writeFileSync(path, "{\"llm\":");
+      expect(() => readDaemonConfigSnapshot(path)).toThrow(ConfigValidationError);
+      expect(() => readDaemonConfigSnapshot(path)).toThrow("malformed JSON");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform === "linux")("rejects a FIFO without blocking the caller", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-config-snapshot-fifo-"));
+    const fifo = join(root, "config.json");
+    try {
+      execFileSync("mkfifo", [fifo]);
+      expect(() => readDaemonConfigSnapshot(fifo)).toThrow("regular file");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("changes the content witness when an atomic replacement occurs between reads", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-config-snapshot-witness-"));
+    const path = join(root, "config.json");
+    const replacement = join(root, "config.replacement.json");
+    try {
+      writeFileSync(path, "{}");
+      const first = readDaemonConfigSnapshot(path);
+      writeFileSync(replacement, JSON.stringify({ daemon: { port: 4242 } }));
+      renameSync(replacement, path);
+      const second = readDaemonConfigSnapshot(path);
+      expect(second.config.daemon.port).toBe(4242);
+      expect(second.witness.rawSha256).not.toBe(first.witness.rawSha256);
+      expect(second.witness.ino).not.toBe(first.witness.ino);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves exact descriptor identities in the content witness", () => {
+    const witness = __configTestUtils.makeSnapshotWitness({
+      content: "{}",
+      exactDev: "9007199254740993",
+      exactIno: "9007199254740995",
+      mtimeMs: 1,
+    });
+
+    expect(witness).toMatchObject({
+      presence: "present",
+      dev: "9007199254740993",
+      ino: "9007199254740995",
+      byteLength: 2,
+    });
+  });
+
+  it("fails closed when a present config disappears during bounded admission", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-config-snapshot-disappeared-"));
+    const path = join(root, "config.json");
+    try {
+      writeFileSync(path, "{}");
+      expect(() => readDaemonConfigSnapshot(path, undefined, {
+        _beforeOpenForTesting: () => rmSync(path),
+      })).toThrowError(expect.objectContaining({ code: "ENOENT" }));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when the initial config probe hits a non-missing path error", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-config-snapshot-not-directory-"));
+    const nonDirectory = join(root, "not-a-directory");
+    try {
+      writeFileSync(nonDirectory, "not a directory");
+      expect(() => readDaemonConfigSnapshot(join(nonDirectory, "config.json")))
+        .toThrowError(expect.objectContaining({ code: "ENOTDIR" }));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("compares every config witness field without hiding an earlier mismatch", () => {
+    const base = {
+      presence: "present" as const,
+      rawSha256: "a",
+      byteLength: 2,
+      dev: "3",
+      ino: "4",
+      mtimeMs: 5,
+    };
+    expect(daemonConfigSnapshotWitnessEqual(base, { ...base })).toBe(true);
+    for (const field of ["presence", "rawSha256", "byteLength", "dev", "ino", "mtimeMs"] as const) {
+      const changed = { ...base, [field]: field === "presence" ? "absent" : field === "byteLength" || field === "mtimeMs" ? 99 : "changed" };
+      expect(daemonConfigSnapshotWitnessEqual(base, changed)).toBe(false);
+    }
+  });
 });
 
 describe("known configuration schema validation", () => {

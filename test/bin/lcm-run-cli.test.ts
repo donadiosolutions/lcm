@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { join } from "node:path";
 import { ConfigValidationError } from "../../src/daemon/config.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
@@ -14,6 +16,7 @@ const state = vi.hoisted(() => ({
   }) : ({ ok: true, promoted: 1, processed: 1, skipped: 0, errors: 0, processedProjects: 1 })),
   get: vi.fn(async () => ({ totalConnections: 2, activeConnections: 1, idleConnections: 1, connections: [{ refs: 1, status: "active", path: "/db" }] })),
   health: vi.fn(async (): Promise<unknown> => true),
+  readAuthToken: vi.fn(() => state.authToken),
   dispatchHook: vi.fn(async () => ({ stdout: "hook-output", exitCode: 0 })),
   loadConfig: vi.fn(() => ({
     daemon: state.daemonPort === undefined ? undefined : { port: state.daemonPort },
@@ -40,6 +43,7 @@ const state = vi.hoisted(() => ({
   importResult: { imported: 1, skipped: 0 },
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
   provider: "openai",
+  authToken: "test-token" as string | null,
   entries: [] as Array<{ name: string; isDirectory: () => boolean }>,
   exists: true,
   readError: undefined as Error | undefined,
@@ -63,6 +67,8 @@ const state = vi.hoisted(() => ({
   packageVersion: "1.4.0" as unknown,
   packageFileReads: 0,
   storageBackend: "sqlite" as "sqlite" | "postgresql",
+  packagedRuntimeEntrypoint: "/daemon" as string | undefined,
+  runtimeDigest: "runtime" as string | undefined,
   provisionResult: {
     applied: ["0001_migration_ledger"],
     current: ["0001_migration_ledger"],
@@ -98,6 +104,13 @@ const state = vi.hoisted(() => ({
   migrateLegacyHome: vi.fn(),
   ensureAuthToken: vi.fn(),
   createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })),
+}));
+
+vi.mock("../../src/daemon/version.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/daemon/version.js")>()),
+  PKG_VERSION: "1.4.2",
+  get PACKAGED_RUNTIME_ENTRYPOINT() { return state.packagedRuntimeEntrypoint; },
+  get RUNTIME_DIGEST() { return state.runtimeDigest; },
 }));
 
 const fakeStdin = vi.hoisted(() => ({
@@ -189,7 +202,7 @@ vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
   start = vi.fn(); stop = vi.fn(); sessionDone = vi.fn(); printSummary = vi.fn();
 } }));
 vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
-vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: state.ensureAuthToken }));
+vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: state.ensureAuthToken, readAuthToken: state.readAuthToken }));
 vi.mock("../../src/stats.js", () => ({ collectStats: vi.fn(() => ({ ok: true })), printStats: vi.fn() }));
 vi.mock("../../src/doctor/doctor.js", () => ({ runDoctor: vi.fn(async () => state.doctorResults), printResults: vi.fn() }));
 vi.mock("../../src/diagnose.js", () => ({ diagnose: vi.fn(async () => ({ ok: true })), formatDiagnoseResult: vi.fn(() => "diagnosed") }));
@@ -244,6 +257,7 @@ vi.mock("../../src/config-manager.js", () => ({
   formatConfigValue: vi.fn((value: unknown) => JSON.stringify(value)), normalizeConfigPath: vi.fn((path: string) => path),
   setConfigValue: state.configSetValue,
   readConnectorTransport: vi.fn(() => state.storedCodexTransport),
+  readConnectorTransportSnapshot: vi.fn(() => state.storedCodexTransport),
 }));
 vi.mock("../../installer/install.js", () => ({ install: vi.fn(async () => undefined) }));
 vi.mock("../../installer/uninstall.js", () => ({ uninstall: vi.fn(async () => undefined) }));
@@ -308,6 +322,7 @@ beforeEach(() => {
   fakeStdin.isTTY = true;
   state.ensureDaemon.mockResolvedValue({ connected: true, spawned: false, restartedForParent: false, pid: 42 });
   state.health.mockResolvedValue(true);
+  state.authToken = "test-token";
   state.installed = [];
   state.codexMcpInspection = { state: "absent" };
   state.storedCodexTransport = undefined;
@@ -341,6 +356,8 @@ beforeEach(() => {
   state.runtimePidPath = "/lcm/daemon.pid";
   state.runtimeTokenPath = "/lcm/daemon.token";
   state.storageBackend = "sqlite";
+  state.packagedRuntimeEntrypoint = "/daemon";
+  state.runtimeDigest = "runtime";
   state.provisionResult = {
     applied: ["0001_migration_ledger"],
     current: ["0001_migration_ledger"],
@@ -645,6 +662,183 @@ describe("runCli registration and help dispatch", () => {
 });
 
 describe("runCli daemon-backed and utility actions", () => {
+  it("routes all six daemon reads through an authenticated healthy daemon without migration", async () => {
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+    const root = actualFs.mkdtempSync("/tmp/lcm-cli-concurrent-");
+    actualFs.mkdirSync(join(root, ".lcm"), { recursive: true });
+    const previousRuntime = {
+      home: state.runtimeHome,
+      pid: state.runtimePidPath,
+      token: state.runtimeTokenPath,
+    };
+    state.runtimeHome = root;
+    state.runtimePidPath = join(root, ".lcm", "daemon.pid");
+    state.runtimeTokenPath = join(root, ".lcm", "daemon.token");
+    const reads = [
+      ["search", "query"],
+      ["grep", "query"],
+      ["describe", "node"],
+      ["expand", "node"],
+      ["status"],
+      ["stats", "--pool"],
+    ];
+
+    try {
+      const results = await Promise.all(reads.map((args) => invoke(args, { migrate, sleep })));
+
+      expect(results).toEqual(reads.map(() => undefined));
+      expect(migrate).not.toHaveBeenCalled();
+      expect(state.ensureDaemon).not.toHaveBeenCalled();
+      expect(state.health).toHaveBeenCalled();
+    } finally {
+      state.runtimeHome = previousRuntime.home;
+      state.runtimePidPath = previousRuntime.pid;
+      state.runtimeTokenPath = previousRuntime.token;
+      actualFs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to one authenticated migration when the read fast path cannot authorize", async () => {
+    state.health.mockResolvedValue({ status: "ok", storageBackend: "postgresql" });
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    expect(await invoke(["search", "query"], { migrate, sleep })).toBeUndefined();
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.ensureDaemon).toHaveBeenCalledOnce();
+  });
+
+  it("never authorizes the read fast path from public health without a token", async () => {
+    state.authToken = null;
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    expect(await invoke(["search", "query"], { migrate, sleep })).toBeUndefined();
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.ensureDaemon).toHaveBeenCalledOnce();
+    expect(state.health).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["entrypoint", undefined, "runtime"],
+    ["runtime digest", "/daemon", undefined],
+  ] as const)("falls back when the local packaged %s is unavailable", async (
+    _label,
+    entrypoint,
+    runtimeDigest,
+  ) => {
+    state.packagedRuntimeEntrypoint = entrypoint;
+    state.runtimeDigest = runtimeDigest;
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    expect(await invoke(["search", "query"], { migrate, sleep })).toBeUndefined();
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.ensureDaemon).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["a stale version", { status: "ok", version: "1.4.1", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" }],
+    ["a tokenless daemon marker", { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon" }],
+    ["an empty entrypoint", { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "", runtimeDigest: "runtime" }],
+    ["another entrypoint", { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/other", runtimeDigest: "runtime" }],
+    ["an empty runtime marker", { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "" }],
+    ["another runtime digest", { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "other" }],
+  ])("does not treat %s as authenticated with a stale token", async (_label, health) => {
+    state.health.mockResolvedValue(health);
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    expect(await invoke(["search", "query"], { migrate, sleep })).toBeUndefined();
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.ensureDaemon).toHaveBeenCalledOnce();
+  });
+
+  it("keeps pure exits and usage-only parents free of startup migration", async () => {
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+    const pureCases = [
+      [],
+      ["--version"],
+      ["unknown"],
+      ["help"],
+      ["daemon"],
+      ["config"],
+      ["machine"],
+      ["project"],
+      ["postgres"],
+      ["events"],
+      ["connectors"],
+      ["diagnose"],
+      ["connectors", "list"],
+      ["connectors", "doctor", "codex"],
+    ];
+
+    for (const args of pureCases) await invoke(args, { migrate, sleep });
+
+    expect(migrate).not.toHaveBeenCalled();
+  });
+
+  it("keeps mutation and unclassified actions on the migration path", async () => {
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+    const mutationCases = [
+      ["store", "text"],
+      ["daemon", "start"],
+      ["daemon", "restart"],
+      ["stats"],
+      ["doctor"],
+      ["config", "get", "daemon.port"],
+      ["machine", "show"],
+      ["events", "status"],
+      ["sensitive", "list"],
+      ["project", "list"],
+      ["connectors", "install", "codex"],
+    ];
+
+    for (const args of mutationCases) {
+      await invoke(args, { migrate, sleep });
+    }
+
+    expect(migrate).toHaveBeenCalledTimes(mutationCases.length);
+  });
+
+  it("propagates private mutation-lock contention from the routed migration", async () => {
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const migrate = vi.fn(() => { throw contention; });
+
+    await expect(runCli(["node", "lcm", "store", "text"], {
+      migrate,
+      sleep: async (_delayMs: number) => undefined,
+    })).rejects.toBe(contention);
+  });
+
   it.each([
     ["search", "needle", "--limit", "2", "--layer", "episodic", "--tag", "decision"],
     ["grep", "needle", "--mode", "regex", "--scope", "messages", "--since", "2026-01-01"],
@@ -684,6 +878,7 @@ describe("runCli daemon-backed and utility actions", () => {
     ["events", "promote"],
   ])("rejects daemon-backed command %# before lifecycle mutation when PostgreSQL is selected", async (...args) => {
     state.storageBackend = "postgresql";
+    state.authToken = null;
 
     await expect(runCli(["node", "lcm", ...args])).rejects.toBeInstanceOf(BackendPublicationJournalError);
     expect(state.ensureDaemon).not.toHaveBeenCalled();
@@ -1005,8 +1200,19 @@ describe("runCli failure and alternate presentation branches", () => {
   });
 
   it("covers daemon-down status and pool failures", async () => {
-    state.health.mockResolvedValueOnce(false);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    state.authToken = null;
+    state.health.mockReset().mockResolvedValue(null);
     expect(await invoke(["status"])).toBeUndefined();
+    expect(log).toHaveBeenCalledWith("daemon: down · provider: openai");
+
+    expect(await invoke(["status", "--json"])).toBeUndefined();
+    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({
+      daemon: { status: "down" },
+    });
+    expect(state.health).toHaveBeenCalledTimes(2);
+
     state.get.mockRejectedValueOnce(new Error("pool failed"));
     expect((await invoke(["stats", "--pool"]))?.message).toBe("exit:1");
     state.get.mockRejectedValueOnce("pool failed");
@@ -1026,7 +1232,7 @@ describe("runCli failure and alternate presentation branches", () => {
     };
     state.storageBackend = "postgresql";
 
-    state.health.mockResolvedValueOnce(stagedHealth);
+    state.health.mockResolvedValueOnce(stagedHealth).mockResolvedValueOnce(stagedHealth);
     expect(await invoke(["status"])).toBeUndefined();
     const text = log.mock.calls.map(([message]) => String(message)).join("\n");
     expect(text).toContain("Daemon: up");
@@ -1035,7 +1241,7 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(state.post).not.toHaveBeenCalled();
 
     log.mockClear();
-    state.health.mockResolvedValueOnce(stagedHealth);
+    state.health.mockResolvedValueOnce(stagedHealth).mockResolvedValueOnce(stagedHealth);
     expect(await invoke(["status", "--json"])).toBeUndefined();
     expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({
       daemon: {

@@ -1,5 +1,5 @@
 import * as realHttp from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -180,10 +180,14 @@ describe("mocked server states unavailable from Node HTTP", () => {
 
   it("uses the first value of an authorization header array", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-server-array-auth-"));
+    const lcmDir = join(dir, ".lcm");
+    const publicationConfigPath = join(lcmDir, "config.json");
+    mkdirSync(lcmDir, { mode: 0o700 });
+    writeFileSync(publicationConfigPath, "{}", { mode: 0o600 });
     const tokenPath = join(dir, "token"); ensureAuthToken(tokenPath);
     const daemon = await createDaemon(
       loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }),
-      { tokenPath, _testIdentity: testIdentity },
+      { tokenPath, publicationConfigPath, _testIdentity: testIdentity },
     );
     try {
       let status = 0;
@@ -207,6 +211,10 @@ describe("mocked server states unavailable from Node HTTP", () => {
 
   it("keeps public health storage-free and requires valid credentials for full diagnostics", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-server-health-auth-"));
+    const lcmDir = join(dir, ".lcm");
+    const publicationConfigPath = join(lcmDir, "config.json");
+    mkdirSync(lcmDir, { mode: 0o700 });
+    writeFileSync(publicationConfigPath, "{}", { mode: 0o600 });
     const tokenPath = join(dir, "token");
     ensureAuthToken(tokenPath);
     const token = readAuthToken(tokenPath)!;
@@ -214,7 +222,7 @@ describe("mocked server states unavailable from Node HTTP", () => {
     const runtimeDigest = "b".repeat(64);
     const daemon = await createDaemon(
       loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }),
-      { tokenPath, _runtimeDigest: runtimeDigest, _testIdentity: testIdentity },
+      { tokenPath, publicationConfigPath, _runtimeDigest: runtimeDigest, _testIdentity: testIdentity },
     );
     const request = async (authorization?: string): Promise<{ status: number; body: Record<string, unknown> }> => {
       let status = 0;
@@ -326,7 +334,9 @@ describe("mocked server states unavailable from Node HTTP", () => {
         }),
       },
     };
-    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }));
+    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }), {
+      _assertBackendPublication: () => undefined,
+    });
     try {
       let status = 0;
       let body = "";
@@ -355,7 +365,9 @@ describe("mocked server states unavailable from Node HTTP", () => {
 
   it("rejects unhealthy storage admission without inventing an error payload", async () => {
     state.health = { status: "degraded", backend: "sqlite" };
-    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }));
+    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }), {
+      _assertBackendPublication: () => undefined,
+    });
     try {
       let status = 0;
       let body = "";

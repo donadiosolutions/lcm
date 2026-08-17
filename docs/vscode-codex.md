@@ -84,6 +84,19 @@ lcm connectors install codex --transport mcp
 lcm connectors doctor codex
 ```
 
+The Codex MCP connector treats an absent `lcm` registration as absent only for
+a positive safe-integer exit status and either exact
+`codex mcp get lcm --json` diagnostic:
+`No MCP server named 'lcm' found.` and
+`Error: No MCP server named 'lcm' found.`. The latter is the diagnostic emitted
+by Codex 0.147.0. The connector trims the diagnostic before this exact match,
+but otherwise fails closed: a zero or negative exit status, a non-integer status, a
+different server name, extra output, or any other near-match is reported as an
+unavailable/error state rather than being treated as an absent registration.
+If native inspection is unavailable, connector doctor reads the stored Codex
+transport through a bounded, stable configuration snapshot without taking the
+publication mutation lock.
+
 The MCP bundle uses native `codex mcp` commands for Codex registration and
 requires no TOML editing. Use
 `lcm connectors install codex --transport cli` to converge back to the CLI

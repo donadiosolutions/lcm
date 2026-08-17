@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
-import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "./version.js";
 import type { StorageBackend } from "./config.js";
@@ -55,6 +55,7 @@ import {
   daemonLifecycleTestIdentityArgs,
   type DaemonLifecycleHermeticTestSeams,
   type DaemonLifecycleTestScope,
+  daemonEntrypointMatches,
   isDaemonLifecycleHermeticTestSeams,
   isDaemonLifecycleTestScope,
   isVitestWorkerEntrypoint,
@@ -923,32 +924,16 @@ function processEntrypointMatches(
   procRoot = "/proc",
   realpath: (path: string) => string = realpathSync,
 ): boolean {
-  if (isVitestWorkerEntrypoint(health.entrypoint)) return false;
+  if (typeof health.entrypoint === "string") {
+    return daemonEntrypointMatches(health.entrypoint, expectedEntrypoint, platform, realpath);
+  }
   if (expectedEntrypoint === undefined) return true;
-  const pathApi = platform === "win32" ? win32 : posix;
-  const normalize = (path: string): string => {
-    let canonical = path;
-    if (pathApi.isAbsolute(path)) {
-      try {
-        canonical = realpath(path);
-      } catch {
-        // Legacy or remote health paths may no longer exist. Preserve the
-        // direct normalized comparison instead of treating resolution failure
-        // as evidence that two different paths are equivalent.
-      }
-    }
-    const normalized = pathApi.normalize(canonical);
-    return platform === "win32" ? normalized.toLowerCase() : normalized;
-  };
-  const matches = (actual: string): boolean =>
-    actual === expectedEntrypoint || normalize(actual) === normalize(expectedEntrypoint);
-  if (typeof health.entrypoint === "string") return matches(health.entrypoint);
   if (platform !== "linux" || health.pid === undefined) return false;
   try {
     const args = readFileSync(join(procRoot, String(health.pid), "cmdline"), "utf-8")
       .split("\0")
       .filter((arg) => arg.length > 0);
-    return args.some(matches);
+    return args.some(actual => daemonEntrypointMatches(actual, expectedEntrypoint, platform, realpath));
   } catch {
     return false;
   }

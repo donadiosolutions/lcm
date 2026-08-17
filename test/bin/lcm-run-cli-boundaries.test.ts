@@ -9,6 +9,9 @@ const state = vi.hoisted(() => ({
   post: vi.fn(async () => ({ processed: 1, promoted: 1 })),
   get: vi.fn(async () => ({ totalConnections: 1, activeConnections: 0, idleConnections: 1, connections: [] })),
   health: vi.fn(async () => true),
+  readAuthToken: vi.fn(() => state.authToken),
+  authToken: "test-token" as string | null,
+  migrateLegacyHome: vi.fn(),
   loadConfig: vi.fn(() => ({
     daemon: { port: 3737 },
     storage: { backend: "sqlite" },
@@ -78,6 +81,13 @@ const state = vi.hoisted(() => ({
   dispatchHook: vi.fn(async () => ({ stdout: "", exitCode: 0 })),
 }));
 
+vi.mock("../../src/daemon/version.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/daemon/version.js")>()),
+  PKG_VERSION: "1.4.2",
+  PACKAGED_RUNTIME_ENTRYPOINT: "/daemon",
+  RUNTIME_DIGEST: "runtime",
+}));
+
 const fakeStdin = vi.hoisted(() => ({ isTTY: true, destroy: vi.fn(), on: vi.fn() }));
 
 vi.mock("node:process", async importOriginal => ({
@@ -111,7 +121,7 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/runtime-paths.js")>()),
   configPath: () => "/lcm/.lcm/config.json", daemonPidPath: () => "/lcm/daemon.pid",
   daemonTokenPath: () => "/lcm/daemon.token", lcmHomeDir: () => "/lcm",
-  migrateLegacyHomeIfNeeded: vi.fn(), projectsDir: () => "/lcm/projects",
+  migrateLegacyHomeIfNeeded: state.migrateLegacyHome, projectsDir: () => "/lcm/projects",
 }));
 vi.mock("../../src/daemon/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()), loadDaemonConfig: state.loadConfig,
@@ -119,7 +129,7 @@ vi.mock("../../src/daemon/config.js", async importOriginal => ({
 vi.mock("../../src/daemon/lifecycle.js", () => ({ ensureDaemon: state.ensureDaemon, restartDaemon: state.restartDaemon }));
 vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class { post = state.post; get = state.get; health = state.health; } }));
 vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
-vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn() }));
+vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn(), readAuthToken: state.readAuthToken }));
 vi.mock("../../src/cli-help.js", () => ({ printHelp: vi.fn() }));
 vi.mock("../../src/identity-service.js", () => ({
   listProjects: state.projectList,
@@ -138,6 +148,7 @@ vi.mock("../../src/config-manager.js", () => ({
   getConfigValue: vi.fn(() => "value"), formatConfigValue: vi.fn((value: unknown) => String(value)),
   normalizeConfigPath: vi.fn((path: string) => path), setConfigValue: vi.fn(() => "stored"),
   readConnectorTransport: vi.fn(() => state.storedCodexTransport),
+  readConnectorTransportSnapshot: vi.fn(() => state.storedCodexTransport),
 }));
 vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
   if (state.batchError !== undefined) throw state.batchError;
@@ -244,6 +255,8 @@ beforeEach(() => {
   state.batchPatch = { lastResult: { ok: true } };
   state.importPatch = { lastResult: { ok: true } };
   state.health.mockResolvedValue(true);
+  state.authToken = "test-token";
+  state.migrateLegacyHome.mockReset();
   state.portableResult = { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false };
   state.projectList.mockResolvedValue({
     local: [{ hash: "hash", canonical: "/canonical", aliases: ["/alias"], remoteProjectId: "remote-id" }],
@@ -499,6 +512,21 @@ describe("runCli identity boundaries", () => {
 });
 
 describe("runCli lifecycle and connector boundaries", () => {
+  it("does not bootstrap the root before an authenticated healthy daemon read", async () => {
+    state.health.mockResolvedValue({
+      status: "ok",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+
+    expect(await invoke(["search", "q"])).toBeUndefined();
+
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+  });
+
   it("ignores timeout after stdin end has resolved", async () => {
     fakeStdin.isTTY = false;
     let timeout: (() => void) | undefined;

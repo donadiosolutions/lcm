@@ -8,6 +8,7 @@ import {
   BackendPublicationCoordinator,
   BackendPublicationJournalError,
   assertBackendPublicationConsumerAccess,
+  assertBackendPublicationConfigReadAccess,
   backendPublicationDirectory,
   backendPublicationJournalPath,
   backendPublicationCanonicalSha256,
@@ -232,6 +233,23 @@ function rewriteJournal(
 
 function sha256(content: string): string {
   return createHash("sha256").update(content).digest("hex");
+}
+
+function configReadWitness(path: string): {
+  presence: "absent" | "present";
+  rawSha256: string | null;
+  byteLength: number;
+  dev: string | null;
+  ino: string | null;
+} {
+  const witness = captureBackendPublicationFileWitness(path, join(path, ".."), 4 * 1024 * 1024).witness;
+  return {
+    presence: witness.presence,
+    rawSha256: witness.rawSha256,
+    byteLength: witness.byteLength,
+    dev: witness.dev,
+    ino: witness.ino,
+  };
 }
 
 function rewriteMaterial(home: string, content: string): void {
@@ -2285,6 +2303,65 @@ describe("BackendPublicationCoordinator", () => {
       projectMap: { ...targetState(input).projectMap, dev: "9007199254740993", ino: "9007199254740997", parentDev: "7", parentIno: "11" },
     }));
     await expect(coordinator(matchingHome, matching.driver).resume()).rejects.toMatchObject({ reason: "unexpected-state" });
+  });
+
+  it("admits lock-free SQLite config reads without publication evidence", () => {
+    const home = makeHome();
+    const configPath = join(home, ".lcm", "config.json");
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    const witness = configReadWitness(configPath);
+
+    expect(() => assertBackendPublicationConfigReadAccess(configPath, "sqlite", witness)).not.toThrow();
+    expect(() => assertBackendPublicationConfigReadAccess(configPath, "postgresql", witness))
+      .toThrowError(expect.objectContaining({ reason: "publication-evidence-missing" }));
+
+    const unscopedPath = join(home, "config.json");
+    writeFileSync(unscopedPath, "{}", { mode: 0o600 });
+    expect(() => assertBackendPublicationConfigReadAccess(
+      unscopedPath,
+      "sqlite",
+      configReadWitness(unscopedPath),
+    )).not.toThrow();
+  });
+
+  it("rejects lock-free reads when the publication directory exists without a journal", () => {
+    const home = makeHome();
+    const configPath = join(home, ".lcm", "config.json");
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    mkdirSync(backendPublicationDirectory(home), { mode: 0o700 });
+
+    expect(() => assertBackendPublicationConfigReadAccess(
+      configPath,
+      "sqlite",
+      configReadWitness(configPath),
+    )).toThrowError(expect.objectContaining({ reason: "publication-evidence-missing" }));
+  });
+
+  it("validates lock-free reads against terminal evidence and the exact config witness", async () => {
+    const { home, fake } = await preparedFixture();
+    await coordinator(home, fake.driver).resume();
+    const configPath = join(home, ".lcm", "config.json");
+    const witness = configReadWitness(configPath);
+
+    expect(() => assertBackendPublicationConfigReadAccess(configPath, "postgresql", witness)).not.toThrow();
+    expect(() => assertBackendPublicationConfigReadAccess(configPath, "sqlite", witness))
+      .toThrowError(expect.objectContaining({ reason: "backend-mismatch" }));
+
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    expect(() => assertBackendPublicationConfigReadAccess(configPath, "postgresql", witness))
+      .toThrowError(expect.objectContaining({ reason: "unexpected-state" }));
+  });
+
+  it("admits the source backend through an aborted terminal publication journal", async () => {
+    const { home, fake } = await preparedFixture();
+    await coordinator(home, fake.driver).abort();
+    const configPath = join(home, ".lcm", "config.json");
+
+    expect(() => assertBackendPublicationConfigReadAccess(
+      configPath,
+      "sqlite",
+      configReadWitness(configPath),
+    )).not.toThrow();
   });
 
 });

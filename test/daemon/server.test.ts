@@ -1,6 +1,16 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -12,7 +22,11 @@ import {
   type DaemonInstance,
 } from "../../src/daemon/server.js";
 import type { BackgroundPublicationAdmission } from "../../src/daemon/passive-event-processor.js";
-import { loadDaemonConfig } from "../../src/daemon/config.js";
+import {
+  loadDaemonConfig,
+  parseDaemonConfig,
+  readDaemonConfigSnapshot,
+} from "../../src/daemon/config.js";
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
 import * as projectModule from "../../src/daemon/project.js";
 import { projectDbPath, projectDir } from "../../src/daemon/project.js";
@@ -1067,6 +1081,301 @@ describe("daemon idle timeout", () => {
 });
 
 describe("daemon auth", () => {
+  it("maps an unbuffered public-health payload error without exposing details", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-public-health-error-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    const tokenPath = join(lcmDir, "daemon.token");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    ensureAuthToken(tokenPath);
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, { tokenPath, _testIdentity: testIdentity });
+    authDaemon.registerRoute("GET", "/health", async () => {
+      throw Object.assign(new Error("private oversized diagnostic"), { statusCode: 413 });
+    }, "read");
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/health`);
+      expect(response.status).toBe(413);
+      await expect(response.json()).resolves.toEqual({ error: "payload too large" });
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not emit the authenticated health marker for a tokenless daemon", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-tokenless-"));
+    const config = loadDaemonConfig(join(dir, "missing-config.json"), { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, { _testIdentity: testIdentity });
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/health`, {
+        headers: { Authorization: "Bearer stale-local-token" },
+      });
+      const health = await response.json() as Record<string, unknown>;
+      expect(response.status).toBe(200);
+      expect(health.entrypoint).toBe(testIdentity.entrypoint);
+      expect(health).not.toHaveProperty("runtimeDigest");
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("serves authenticated reads while publication ownership is held but blocks mutations", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-read-lock-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    const tokenPath = join(lcmDir, "daemon.token");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    ensureAuthToken(tokenPath);
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      tokenPath,
+      _testIdentity: testIdentity,
+    });
+    authDaemon.registerRoute("GET", "/custom-read", async (_req, res) => {
+      res.end(JSON.stringify({ ok: true }));
+    }, "read");
+    const token = readAuthToken(tokenPath)!;
+    const headers = { Authorization: `Bearer ${token}` };
+    const acquired = deferred<void>();
+    const release = deferred<void>();
+    const holder = withBackendPublicationConfigLockAsync(configPath, async () => {
+      acquired.resolve();
+      await release.promise;
+    });
+
+    try {
+      await acquired.promise;
+      const port = authDaemon.address().port;
+      const [health, pool, custom, mutation] = await Promise.all([
+        fetch(`http://127.0.0.1:${port}/health`, { headers }),
+        fetch(`http://127.0.0.1:${port}/stats/pool`, { headers }),
+        fetch(`http://127.0.0.1:${port}/custom-read`, { headers }),
+        fetch(`http://127.0.0.1:${port}/store`, {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "application/json" },
+          body: JSON.stringify({ text: "must remain blocked", cwd: dir }),
+        }),
+      ]);
+
+      expect(health.status).toBe(200);
+      expect(pool.status).toBe(200);
+      expect(custom.status).toBe(200);
+      expect(mutation.status).toBe(500);
+    } finally {
+      release.resolve();
+      await holder;
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("discards a read response when publication evidence changes during the handler", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-read-race-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    const tokenPath = join(lcmDir, "daemon.token");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    ensureAuthToken(tokenPath);
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      tokenPath,
+      _testIdentity: testIdentity,
+    });
+    authDaemon.registerRoute("GET", "/racing-read", async (_req, res) => {
+      res.end(JSON.stringify({ leaked: true }));
+      mkdirSync(join(lcmDir, "backend-publication"), { mode: 0o700 });
+    }, "read");
+
+    try {
+      const token = readAuthToken(tokenPath)!;
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/racing-read`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual({
+        status: "blocked",
+        error: "backend publication admission blocked",
+      });
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("discards a buffered read when terminal publication evidence changes during the handler", async () => {
+    const config = loadDaemonConfig("/nonexistent", { daemon: { port: 0, idleTimeoutMs: 0 } });
+    let handlerStarted = false;
+    const authDaemon = await createDaemon(config, {
+      _testIdentity: testIdentity,
+      _assertBackendPublication: () => ({
+        journalChecksumSha256: handlerStarted ? "b".repeat(64) : "a".repeat(64),
+      }),
+    });
+    authDaemon.registerRoute("GET", "/terminal-racing-read", async (_req, res) => {
+      handlerStarted = true;
+      res.end(JSON.stringify({ leaked: true }));
+    }, "read");
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/terminal-racing-read`);
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual({
+        status: "blocked",
+        error: "backend publication admission blocked",
+      });
+    } finally {
+      await authDaemon.stop();
+    }
+  });
+
+  it("admits legacy non-private SQLite roots when publication evidence is absent", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-legacy-root-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o755 });
+    chmodSync(lcmDir, 0o755);
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      _testIdentity: testIdentity,
+    });
+    let handled = false;
+    authDaemon.registerRoute("GET", "/legacy-root-read", async (_req, res) => {
+      handled = true;
+      res.end(JSON.stringify({ ok: true }));
+    }, "read");
+    try {
+      chmodSync(lcmDir, 0o755);
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/legacy-root-read`);
+      expect(response.status).toBe(200);
+      expect(handled).toBe(true);
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a symlinked canonical .lcm root during read admission", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-symlink-root-"));
+    const realLcmDir = join(dir, ".lcm-real");
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    mkdirSync(realLcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(realLcmDir, "config.json"), "{}", { mode: 0o600 });
+    symlinkSync(realLcmDir, lcmDir, "dir");
+    const config = parseDaemonConfig("{}", { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      _createStorageBackendFactory: async () => makeStagedPostgreSqlStorageFactory(),
+      _testIdentity: testIdentity,
+    });
+    let handled = false;
+    authDaemon.registerRoute("GET", "/symlink-root-read", async (_req, res) => {
+      handled = true;
+      res.end("unexpected");
+    }, "read");
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/symlink-root-read`);
+      expect(response.status).toBe(500);
+      expect(handled).toBe(false);
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([0o700, 0o755])("rejects canonical .lcm root replacement between lock-free snapshots at mode %o", async (mode) => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-root-race-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    const originalLcmDir = join(dir, ".lcm-original");
+    mkdirSync(lcmDir, { recursive: true, mode });
+    chmodSync(lcmDir, mode);
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    let snapshotReads = 0;
+    const readSnapshot = (path: string) => {
+      snapshotReads += 1;
+      if (snapshotReads === 2) {
+        renameSync(lcmDir, originalLcmDir);
+        symlinkSync(originalLcmDir, lcmDir, "dir");
+      }
+      return readDaemonConfigSnapshot(path);
+    };
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      _readDaemonConfigSnapshot: readSnapshot,
+      _testIdentity: testIdentity,
+    });
+    let handled = false;
+    authDaemon.registerRoute("GET", "/root-race-read", async (_req, res) => {
+      handled = true;
+      res.end("unexpected");
+    }, "read");
+    try {
+      chmodSync(lcmDir, mode);
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/root-race-read`);
+      expect(response.status).toBe(500);
+      expect(snapshotReads).toBe(2);
+      expect(handled).toBe(false);
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a backend change between lock-free config snapshots", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-config-drift-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    let snapshotReads = 0;
+    const initialSnapshot = readDaemonConfigSnapshot(configPath);
+    const readSnapshot = (path: string) => {
+      snapshotReads += 1;
+      if (snapshotReads === 2) {
+        return {
+          config: {
+            ...initialSnapshot.config,
+            storage: { ...initialSnapshot.config.storage, backend: "postgresql" as const },
+          },
+          witness: initialSnapshot.witness,
+        };
+      }
+      return readDaemonConfigSnapshot(path);
+    };
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      _readDaemonConfigSnapshot: readSnapshot,
+      _testIdentity: testIdentity,
+    });
+    let handled = false;
+    authDaemon.registerRoute("GET", "/config-drift-read", async (_req, res) => {
+      handled = true;
+      res.end("unexpected");
+    }, "read");
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/config-drift-read`);
+      expect(response.status).toBe(503);
+      expect(snapshotReads).toBe(2);
+      expect(handled).toBe(false);
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("returns 401 for POST without auth token when tokenPath is set", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-"));
     const tokenPath = join(dir, "daemon.token");

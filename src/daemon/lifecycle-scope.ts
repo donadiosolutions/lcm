@@ -1,6 +1,6 @@
 import type { spawn, spawnSync } from "node:child_process";
 import { lstatSync, realpathSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { isAbsolute, join, posix, relative, resolve, win32 } from "node:path";
 import { LCM_HOME_DIRNAME } from "../runtime-paths.js";
 
 const TEST_UNIT_PREFIX = "lcm-test-daemon-";
@@ -210,6 +210,33 @@ function hasOnlyDataProperties(
 
 export function isVitestWorkerEntrypoint(entrypoint: string | undefined): boolean {
   return typeof entrypoint === "string" && VITEST_WORKER_PATTERN.test(entrypoint);
+}
+
+/** Compare an authenticated daemon entrypoint using lifecycle's canonical path rules. */
+export function daemonEntrypointMatches(
+  actualEntrypoint: string | undefined,
+  expectedEntrypoint: string | undefined,
+  platform: NodeJS.Platform,
+  realpath: (path: string) => string = realpathSync,
+): boolean {
+  if (isVitestWorkerEntrypoint(actualEntrypoint)) return false;
+  if (expectedEntrypoint === undefined) return true;
+  if (actualEntrypoint === undefined) return false;
+  const pathApi = platform === "win32" ? win32 : posix;
+  const normalize = (path: string): string => {
+    let canonical = path;
+    if (pathApi.isAbsolute(path)) {
+      try {
+        canonical = realpath(path);
+      } catch {
+        // Preserve normalized direct comparison when a legacy path disappeared.
+      }
+    }
+    const normalized = pathApi.normalize(canonical);
+    return platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  return actualEntrypoint === expectedEntrypoint
+    || normalize(actualEntrypoint) === normalize(expectedEntrypoint);
 }
 
 export function createDaemonLifecycleTestScope(input: ScopeInput): DaemonLifecycleTestScope {

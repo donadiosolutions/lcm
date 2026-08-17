@@ -6,8 +6,16 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
+import { lstatSync } from "node:fs";
 import { dirname } from "node:path";
-import { parseDaemonConfig, resolveDaemonConfigEnv, type DaemonConfig } from "./config.js";
+import {
+  daemonConfigSnapshotWitnessEqual,
+  parseDaemonConfig,
+  readDaemonConfigSnapshot,
+  resolveDaemonConfigEnv,
+  type DaemonConfig,
+  type DaemonConfigSnapshotWitness,
+} from "./config.js";
 import { sanitizeError } from "./safe-error.js";
 import { stagedPostgreSqlUnavailablePayload } from "./staged-postgresql.js";
 import { readAuthToken } from "./auth.js";
@@ -46,11 +54,17 @@ import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
 import { createStorageBackendFactory, type StorageBackendFactory } from "../storage/index.js";
 import { assertStorageBackendPublication } from "../storage/backend.js";
-import { readBoundedRegularFile } from "../security-files.js";
+import {
+  assertPrivateDirectory,
+  openPrivateDirectory,
+  readBoundedRegularFile,
+} from "../security-files.js";
 import {
   assertBackendPublicationConfigAccess,
+  assertBackendPublicationConfigReadAccess,
   BackendPublicationJournalError,
   backendPublicationHomeForConfigPath,
+  openBackendPublicationReadRoot,
   type BackendPublicationLockToken,
   withBackendPublicationConsumerLockAsync,
 } from "../storage/backend-publication.js";
@@ -112,10 +126,15 @@ export type DaemonOptions = {
   _readAuthToken?: typeof readAuthToken;
   /** @internal Deterministic storage-factory seam for daemon unit tests. */
   _createStorageBackendFactory?: typeof createStorageBackendFactory;
+  /** @internal Deterministic config-snapshot seam for daemon read-admission tests. */
+  _readDaemonConfigSnapshot?: typeof readDaemonConfigSnapshot;
   /** Canonical daemon config path used for request-time publication admission. */
   publicationConfigPath?: string;
   /** @internal Test-only publication admission seam. */
-  _assertBackendPublication?: (homeDir: string | undefined, backend: DaemonConfig["storage"]["backend"]) => void;
+  _assertBackendPublication?: (
+    homeDir: string | undefined,
+    backend: DaemonConfig["storage"]["backend"],
+  ) => Readonly<{ journalChecksumSha256: string | null }> | void;
   /** @internal Test-only async publication-lock seam. */
   _withBackendPublicationConsumerLockAsync?: typeof withBackendPublicationConsumerLockAsync;
   /** @internal Test-only request lifecycle observer. */
@@ -130,7 +149,7 @@ export type DaemonOptions = {
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_REQUEST_CONFIG_BYTES = 4 * 1024 * 1024;
-const MAX_MUTATING_RESPONSE_BYTES = MAX_BODY_BYTES;
+const MAX_BUFFERED_RESPONSE_BYTES = MAX_BODY_BYTES;
 
 export function claudeProjectDirName(cwd: string): string {
   const sanitized = cwd
@@ -195,10 +214,10 @@ function responseWriteAfterEndError(): Error & { code: string } {
 }
 
 /**
- * Mutating handlers run under a retained publication permit. Their response
- * must not reach the client until that permit's post-callback revalidation has
- * completed, so this bounded response mirrors the response methods used by
- * route handlers while keeping the real transport untouched.
+ * Admitted handlers must not reach the client until their retained mutation
+ * permit or lock-free read witness has passed post-handler revalidation. This
+ * bounded response mirrors the response methods used by route handlers while
+ * keeping the real transport untouched.
  */
 class BufferedServerResponse {
   private readonly headers = new Map<string, BufferedHeader>();
@@ -247,8 +266,8 @@ class BufferedServerResponse {
   ): boolean {
     if (this.ended) throw responseWriteAfterEndError();
     const bufferedChunk = typeof chunk === "string" ? Buffer.from(chunk, encoding) : Buffer.from(chunk);
-    if (this.bodyBytes + bufferedChunk.byteLength > MAX_MUTATING_RESPONSE_BYTES) {
-      throw Object.assign(new Error("mutating response exceeds the response size limit"), { statusCode: 500 });
+    if (this.bodyBytes + bufferedChunk.byteLength > MAX_BUFFERED_RESPONSE_BYTES) {
+      throw Object.assign(new Error("buffered response exceeds the response size limit"), { statusCode: 500 });
     }
     this.chunks.push(bufferedChunk);
     this.bodyBytes += bufferedChunk.byteLength;
@@ -285,6 +304,16 @@ function isResponseWritable(res: ServerResponse): boolean {
 function sendJsonIfWritable(res: ServerResponse, status: number, data: unknown): void {
   if (!isResponseWritable(res)) return;
   sendJson(res, status, data);
+}
+
+function requestErrorResponse(err: unknown): Readonly<{ status: number; message: string }> {
+  const status = (err as { statusCode?: number })?.statusCode ?? 500;
+  return Object.freeze({
+    status,
+    message: status === 413
+      ? "payload too large"
+      : sanitizeError(err instanceof Error ? err.message : "internal error"),
+  });
 }
 
 function clearIdleTimer(timer: ReturnType<typeof setTimeout> | null, clearTimer: typeof clearTimeout): null {
@@ -386,6 +415,88 @@ function assertDaemonRequestStorageAdmission(
     backend: requestConfig.storage.backend,
     homeDir: backendPublicationHomeForConfigPath(publicationConfigPath),
   }, lockToken);
+}
+
+/**
+ * Admit a read route without taking publication mutation ownership. The
+ * bounded snapshot is checked before and after the lock-free publication
+ * admission so config replacement cannot authorize a mixed read.
+ */
+type DaemonReadStorageAdmissionWitness = Readonly<{
+  config: DaemonConfigSnapshotWitness | null;
+  journalChecksumSha256: string | null;
+}>;
+
+function daemonReadStorageAdmissionWitnessEqual(
+  left: DaemonReadStorageAdmissionWitness,
+  right: DaemonReadStorageAdmissionWitness,
+): boolean {
+  return left.journalChecksumSha256 === right.journalChecksumSha256
+    && (left.config === null
+      ? right.config === null
+      : right.config !== null && daemonConfigSnapshotWitnessEqual(left.config, right.config));
+}
+
+function assertDaemonReadStorageAdmission(
+  startupConfig: DaemonConfig,
+  publicationConfigPath: string,
+  publicationHome: string | undefined,
+  assertBackendPublicationOverride?: DaemonOptions["_assertBackendPublication"],
+  readSnapshot: typeof readDaemonConfigSnapshot = readDaemonConfigSnapshot,
+): DaemonReadStorageAdmissionWitness {
+  if (assertBackendPublicationOverride !== undefined) {
+    const publicationWitness = assertBackendPublicationOverride(publicationHome, startupConfig.storage.backend);
+    return Object.freeze({
+      config: null,
+      journalChecksumSha256: publicationWitness?.journalChecksumSha256 ?? null,
+    });
+  }
+  const publicationRoot = dirname(publicationConfigPath);
+  if (lstatSync(publicationRoot).isSymbolicLink()) {
+    throw new Error("private LCM root must not be a symbolic link");
+  }
+  const privateRoot = publicationHome === undefined
+    ? openPrivateDirectory(publicationRoot)
+    : openBackendPublicationReadRoot(publicationHome);
+  try {
+    const assertReadRoot = (): void => {
+      if (lstatSync(publicationRoot).isSymbolicLink()) {
+        throw new Error("private LCM root must not be a symbolic link");
+      }
+      if (privateRoot === undefined) return;
+      assertPrivateDirectory(privateRoot, publicationRoot, privateRoot.witness);
+    };
+    assertReadRoot();
+    const first = readSnapshot(publicationConfigPath);
+    if (first.config.storage.backend !== startupConfig.storage.backend) {
+      throw new BackendPublicationJournalError(
+        "unexpected-state",
+        "daemon request backend differs from the authenticated startup backend",
+      );
+    }
+    const publicationWitness = assertBackendPublicationConfigReadAccess(
+      publicationConfigPath,
+      first.config.storage.backend,
+      first.witness,
+    );
+    const second = readSnapshot(publicationConfigPath);
+    if (
+      second.config.storage.backend !== startupConfig.storage.backend
+      || !daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
+    ) {
+      throw new BackendPublicationJournalError(
+        "unexpected-state",
+        "daemon request config changed during lock-free read admission",
+      );
+    }
+    assertReadRoot();
+    return Object.freeze({
+      config: second.witness,
+      journalChecksumSha256: publicationWitness.journalChecksumSha256,
+    });
+  } finally {
+    privateRoot?.close();
+  }
 }
 
 async function settleCleanup(callback: () => void | Promise<void>): Promise<void> {
@@ -762,10 +873,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       }
       // Public health is intentionally storage-free. Supplying credentials opts
       // into authenticated diagnostics and therefore must fail closed.
+      const rawAuth = req.headers["authorization"];
+      const publicHealth = serverToken !== null && key === "GET /health" && rawAuth === undefined;
       if (serverToken) {
-        const rawAuth = req.headers["authorization"];
         const authHeader = (Array.isArray(rawAuth) ? rawAuth[0] : rawAuth) ?? "";
-        const publicHealth = key === "GET /health" && rawAuth === undefined;
         if (!publicHealth && authHeader.trim() !== `Bearer ${serverToken}`) {
           sendJsonIfWritable(res, 401, { error: "unauthorized" });
           return;
@@ -797,8 +908,34 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         bufferedResponse.flush();
         bufferedResponse = undefined;
       } else {
-        assertRequestAdmission();
-        await route.handler(req, res, body, { signal: requestSignal });
+        if (publicHealth) {
+          await route.handler(req, res, body, { signal: requestSignal });
+        } else {
+          bufferedResponse = new BufferedServerResponse(res);
+          const admissionWitness = assertDaemonReadStorageAdmission(
+            config,
+            publicationConfigPath,
+            publicationHome,
+            options?._assertBackendPublication,
+            options?._readDaemonConfigSnapshot,
+          );
+          await route.handler(req, bufferedResponse as unknown as ServerResponse, body, { signal: requestSignal });
+          const finalWitness = assertDaemonReadStorageAdmission(
+            config,
+            publicationConfigPath,
+            publicationHome,
+            options?._assertBackendPublication,
+            options?._readDaemonConfigSnapshot,
+          );
+          if (!daemonReadStorageAdmissionWitnessEqual(admissionWitness, finalWitness)) {
+            throw new BackendPublicationJournalError(
+              "unexpected-state",
+              "daemon read storage admission changed during request execution",
+            );
+          }
+          bufferedResponse.flush();
+          bufferedResponse = undefined;
+        }
       }
     } catch (err: unknown) {
       if (bufferedResponse !== undefined) {
@@ -810,8 +947,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           });
           return;
         }
-        const status = (err as { statusCode?: number })?.statusCode ?? 500;
-        const message = status === 413 ? "payload too large" : sanitizeError(err instanceof Error ? err.message : "internal error");
+        const { status, message } = requestErrorResponse(err);
         sendJsonIfWritable(res, status, { error: message });
         return;
       }
@@ -822,8 +958,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         });
         return;
       }
-      const status = (err as { statusCode?: number })?.statusCode ?? 500;
-      const message = status === 413 ? "payload too large" : sanitizeError(err instanceof Error ? err.message : "internal error");
+      const { status, message } = requestErrorResponse(err);
       sendJsonIfWritable(res, status, { error: message });
     } finally {
       cancellation.cleanup();

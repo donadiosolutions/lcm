@@ -1251,14 +1251,20 @@ function parseCodexMcpJson(stdout: string): unknown {
   }
 }
 
+function isCodexMcpAbsence(error: CodexCliCommandError): boolean {
+  return typeof error.status === "number"
+    && Number.isSafeInteger(error.status)
+    && error.status > 0
+    && (error.stderr === "No MCP server named 'lcm' found."
+      || error.stderr === "Error: No MCP server named 'lcm' found.");
+}
+
 function defaultCodexMcpRunner(cwd: string, cliRunner: CodexCliRunner = defaultCodexCliRunner): CodexMcpRunner {
   const get = (): readonly CodexMcpEntry[] => {
     try {
       return normalizeCodexMcpEntries(parseCodexMcpJson(runNativeCodexMcp(cwd, ["mcp", "get", "lcm", "--json"], cliRunner)));
     } catch (error) {
-      if (error instanceof CodexCliCommandError
-        && error.status !== 0
-        && error.stderr === "No MCP server named 'lcm' found.") {
+      if (error instanceof CodexCliCommandError && isCodexMcpAbsence(error)) {
         return [];
       }
       throw error;

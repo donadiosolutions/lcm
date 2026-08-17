@@ -1,7 +1,12 @@
+import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { lcmPath } from "../runtime-paths.js";
-import { consumeBoundedRegularFile, readBoundedRegularFile } from "../security-files.js";
+import {
+  consumeBoundedRegularFile,
+  readBoundedRegularFile,
+  readBoundedRegularFileWithStat,
+} from "../security-files.js";
 import { hasUrlQueryComponent, sanitizeUrlForDisplay } from "../url-display.js";
 import { MANAGED_CREDENTIAL_NAMES } from "./managed-credentials.js";
 import {
@@ -189,6 +194,32 @@ export type DaemonConfig = {
   security: SecurityConfig;
   hooks: { snapshotIntervalSec: number; disableAutoCompact: boolean };
 };
+
+export type DaemonConfigSnapshotWitness = Readonly<{
+  presence: "absent" | "present";
+  rawSha256: string | null;
+  byteLength: number;
+  dev: string | null;
+  ino: string | null;
+  mtimeMs: number | null;
+}>;
+
+export type DaemonConfigSnapshot = Readonly<{
+  config: DaemonConfig;
+  witness: DaemonConfigSnapshotWitness;
+}>;
+
+type DaemonConfigSnapshotObservation = Readonly<{
+  content: string;
+  exactDev: string;
+  exactIno: string;
+  mtimeMs: number;
+}>;
+
+type DaemonConfigSnapshotOptions = Readonly<{
+  /** @internal Deterministic post-open disappearance seam for tests. */
+  _beforeOpenForTesting?: () => void;
+}>;
 
 type DaemonConfigDefaults = Omit<DaemonConfig, "storage"> & { storage: StoredStorageConfig };
 
@@ -1654,9 +1685,82 @@ export function loadDaemonConfig(configPath: string, overrides?: unknown, env?: 
   return loadDaemonConfigWithHooks(configPath, overrides, env);
 }
 
+function makeSnapshotWitness(
+  observed: DaemonConfigSnapshotObservation,
+): DaemonConfigSnapshotWitness {
+  return Object.freeze({
+    presence: "present",
+    rawSha256: createHash("sha256").update(observed.content).digest("hex"),
+    byteLength: Buffer.byteLength(observed.content),
+    // Preserve the descriptor's exact identity; number-valued stat fields can
+    // lose precision for large filesystem device/inode values.
+    dev: observed.exactDev,
+    ino: observed.exactIno,
+    mtimeMs: observed.mtimeMs,
+  });
+}
+
+/** Read and validate one bounded config snapshot without acquiring a mutation lock. */
+export function readDaemonConfigSnapshot(
+  configPath: string,
+  env: Record<string, string | undefined> = process.env,
+  options: DaemonConfigSnapshotOptions = {},
+): DaemonConfigSnapshot {
+  const resolvedEnv = resolveDaemonConfigEnv(env);
+  let initiallyPresent = false;
+  try {
+    lstatSync(configPath);
+    initiallyPresent = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  let content: string;
+  let witness: DaemonConfigSnapshotWitness;
+  try {
+    const observed = readBoundedRegularFileWithStat(configPath, {
+      allowedRoot: dirname(configPath),
+      maxBytes: MAX_CONFIG_BYTES,
+      _beforeOpenForTesting: options._beforeOpenForTesting,
+    });
+    content = observed.content;
+    witness = makeSnapshotWitness(observed);
+  } catch (error) {
+    if (
+      (error as NodeJS.ErrnoException).code !== "ENOENT"
+      || initiallyPresent
+    ) throw error;
+    content = "{}";
+    witness = Object.freeze({
+      presence: "absent",
+      rawSha256: null,
+      byteLength: 0,
+      dev: null,
+      ino: null,
+      mtimeMs: null,
+    });
+  }
+  return Object.freeze({
+    config: parseDaemonConfig(content, undefined, resolvedEnv),
+    witness,
+  });
+}
+
+export function daemonConfigSnapshotWitnessEqual(
+  left: DaemonConfigSnapshotWitness,
+  right: DaemonConfigSnapshotWitness,
+): boolean {
+  return left.presence === right.presence
+    && left.rawSha256 === right.rawSha256
+    && left.byteLength === right.byteLength
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.mtimeMs === right.mtimeMs;
+}
+
 /** Internal pure seams used by configuration boundary tests. */
 export const __configTestUtils = {
   migrateLegacyPromotionThresholds,
+  makeSnapshotWitness,
   loadAfterBoundedRead: (
     configPath: string,
     afterBoundedRead: ConfigLoadTestHooks["afterBoundedRead"],

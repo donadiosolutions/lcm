@@ -53,6 +53,60 @@ for example `lcm export --tags decision,architecture`.
 An unknown command writes an error and the complete command list to the
 terminal, completes both outputs, and then exits with status 1.
 
+## Healthy-daemon read routing
+
+The following daemon-backed reads use a migration-free preflight when the
+managed daemon is healthy:
+
+| Command | Read performed by the daemon |
+|---|---|
+| `lcm search <query>` | Search episodic and promoted memory |
+| `lcm grep <query>` | Search messages and summaries by exact text or regular expression |
+| `lcm describe <nodeId>` | Read summary or stored-memory metadata |
+| `lcm expand <nodeId>` | Expand a summary into source detail |
+| `lcm status` | Read daemon and project status |
+| `lcm stats --pool` | Read daemon connection-pool statistics |
+
+Before using this route, LCM reads a bounded, no-follow configuration snapshot
+without taking the private mutation/publication lock. If `config.json` is
+absent, the snapshot uses validated defaults and records an absent witness;
+absence alone is not a reason to fall back. For an existing file, the snapshot
+must be readable, well-formed, within the size limit, a regular non-symlink
+file, and otherwise valid. LCM then requires a present daemon token and an
+authenticated healthy health response from the current
+LCM version with both private identity markers—a matching packaged `entrypoint`
+and authenticated matching packaged `runtimeDigest`. If the invoking CLI cannot
+resolve or hash its local packaged entrypoint, it falls back to the locked
+lifecycle path rather than treating either missing identity as a wildcard. The
+health response must also report a matching storage backend, and the
+configuration witness must remain unchanged.
+This lets ordinary reads continue while a publication consumer holds the
+exclusive lock without reusing a stale packaged daemon after a rebuild.
+
+Authenticated daemon read responses are buffered until request-time admission
+is repeated after the handler finishes. LCM compares both the configuration
+witness and terminal publication-journal checksum before releasing up to 10 MiB
+of buffered output. If publication begins, completes, aborts, or changes
+evidence during the handler, the buffered result is discarded and the request
+returns a blocked response instead of leaking a stale or mixed-backend result.
+An existing publication directory without a journal is incomplete evidence,
+not the legacy SQLite no-evidence case.
+
+The route is fail closed. An unreadable, malformed, oversized, symlinked, or
+otherwise invalid configuration, missing token, failed or ambiguous health
+check, backend mismatch, or configuration change between the two snapshot
+reads returns to the existing authenticated migration and daemon-lifecycle
+path. Daemon request admission independently rejects an unsafe or replaced
+private root before reading storage and revalidates it before releasing the
+buffered response. LCM never treats an uncertain snapshot as
+permission to bypass migration, signal an unknown process, or mutate state.
+Mutation-requiring commands retain their existing migration and locking
+behavior; pure exits and explicit read exceptions such as help, diagnose,
+usage-only parent actions, `connectors list`, and `connectors doctor` remain
+exempt according to the command-routing policy. When connector inspection is
+unavailable, `connectors doctor` reads its stored transport hint through the
+same bounded, stable, lock-free configuration admission.
+
 ## Daemon-dependent resilience
 
 `lcm doctor` limits the complete daemon health exchange to two seconds. The

@@ -782,7 +782,7 @@ describe("installer defensive branches", () => {
     vi.doMock("node:child_process", () => ({
       spawnSync: vi.fn(() => ({
         status: 1,
-        stderr: "No MCP server named 'lcm' found.",
+        stderr: "Error: No MCP server named 'lcm' found.",
       })),
     }));
     try {
