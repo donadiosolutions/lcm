@@ -1233,6 +1233,8 @@ async function createDaemonReadClientOrExit(
         && health.storageBackend === first.config.storage.backend
         && typeof health.entrypoint === "string"
         && health.entrypoint.length > 0
+        && typeof health.runtimeDigest === "string"
+        && health.runtimeDigest.length > 0
       ) {
         const second = readDaemonConfigSnapshot(configPath);
         if (

@@ -505,7 +505,7 @@ describe("runCli identity boundaries", () => {
 
 describe("runCli lifecycle and connector boundaries", () => {
   it("does not bootstrap the root before an authenticated healthy daemon read", async () => {
-    state.health.mockResolvedValue({ status: "ok", storageBackend: "sqlite", entrypoint: "/daemon" });
+    state.health.mockResolvedValue({ status: "ok", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" });
 
     expect(await invoke(["search", "q"])).toBeUndefined();
 

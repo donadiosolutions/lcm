@@ -92,6 +92,15 @@ export type BackendPublicationStateWitness = Readonly<{
   projectMap: BackendPublicationFileWitness;
 }>;
 
+/** Descriptor-bound subset used by non-mutating daemon config admission. */
+export type BackendPublicationConfigReadWitness = Readonly<{
+  presence: "absent" | "present";
+  rawSha256: string | null;
+  byteLength: number;
+  dev: string | null;
+  ino: string | null;
+}>;
+
 export type BackendPublicationRecoveryFile =
   | Readonly<{ presence: "absent" }>
   | Readonly<{
@@ -1444,6 +1453,26 @@ function currentConfigWitness(homeDir: string | undefined, content: string | nul
   return current;
 }
 
+function assertConfigReadWitness(
+  configPath: string,
+  expected: BackendPublicationConfigReadWitness,
+): void {
+  const actual = captureBackendPublicationFileWitness(
+    configPath,
+    dirname(configPath),
+    MAX_RECOVERY_FILE_BYTES,
+  ).witness;
+  if (
+    actual.presence !== expected.presence
+    || actual.rawSha256 !== expected.rawSha256
+    || actual.byteLength !== expected.byteLength
+    || actual.dev !== expected.dev
+    || actual.ino !== expected.ino
+  ) {
+    return fail("unexpected-state", "current config witness does not match the read admission snapshot");
+  }
+}
+
 function currentProjectMapWitness(homeDir: string | undefined, content: string): BackendPublicationFileWitness {
   const current = captureBackendPublicationState(homeDir).projectMap;
   assertRawContentWitness(current, content, "current project map");
@@ -1550,6 +1579,32 @@ export function assertBackendPublicationConfigAccess(
     homeDir,
     (token) => assertBackendPublicationConfigAccessUnlocked(configPath, homeDir, backend, content, permit),
   );
+}
+
+/**
+ * Validate a daemon config snapshot against publication state without taking
+ * the exclusive consumer lock. Callers must perform their own bounded
+ * double-read race check around this admission.
+ */
+export function assertBackendPublicationConfigReadAccess(
+  configPath: string,
+  backend: StorageBackendName,
+  witness: BackendPublicationConfigReadWitness,
+): void {
+  const homeDir = backendPublicationHomeForConfigPath(configPath);
+  if (homeDir === undefined) return;
+  const journal = readConsumerPublicationJournal(homeDir);
+  if (journal === null) {
+    if (backend === "postgresql") {
+      return fail("publication-evidence-missing", "PostgreSQL selection has no completed backend publication evidence");
+    }
+    return;
+  }
+  const expectedBackend = journal.phase === "completed" ? journal.targetBackend : journal.sourceBackend;
+  if (backend !== expectedBackend) {
+    return fail("backend-mismatch", "stored backend does not match completed publication evidence");
+  }
+  assertConfigReadWitness(configPath, witness);
 }
 
 function assertBackendPublicationConfigMutationUnlocked(

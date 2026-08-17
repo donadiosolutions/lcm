@@ -7,7 +7,13 @@ import {
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import { dirname } from "node:path";
-import { parseDaemonConfig, resolveDaemonConfigEnv, type DaemonConfig } from "./config.js";
+import {
+  daemonConfigSnapshotWitnessEqual,
+  parseDaemonConfig,
+  readDaemonConfigSnapshot,
+  resolveDaemonConfigEnv,
+  type DaemonConfig,
+} from "./config.js";
 import { sanitizeError } from "./safe-error.js";
 import { stagedPostgreSqlUnavailablePayload } from "./staged-postgresql.js";
 import { readAuthToken } from "./auth.js";
@@ -49,6 +55,7 @@ import { assertStorageBackendPublication } from "../storage/backend.js";
 import { readBoundedRegularFile } from "../security-files.js";
 import {
   assertBackendPublicationConfigAccess,
+  assertBackendPublicationConfigReadAccess,
   BackendPublicationJournalError,
   backendPublicationHomeForConfigPath,
   type BackendPublicationLockToken,
@@ -386,6 +393,48 @@ function assertDaemonRequestStorageAdmission(
     backend: requestConfig.storage.backend,
     homeDir: backendPublicationHomeForConfigPath(publicationConfigPath),
   }, lockToken);
+}
+
+/**
+ * Admit a read route without taking publication mutation ownership. The
+ * bounded snapshot is checked before and after the lock-free publication
+ * admission so config replacement cannot authorize a mixed read.
+ */
+function assertDaemonReadStorageAdmission(
+  startupConfig: DaemonConfig,
+  publicationConfigPath: string,
+  publicationHome: string | undefined,
+  assertBackendPublicationOverride?: (
+    homeDir: string | undefined,
+    backend: DaemonConfig["storage"]["backend"],
+  ) => void,
+): void {
+  if (assertBackendPublicationOverride !== undefined) {
+    assertBackendPublicationOverride(publicationHome, startupConfig.storage.backend);
+    return;
+  }
+  const first = readDaemonConfigSnapshot(publicationConfigPath);
+  if (first.config.storage.backend !== startupConfig.storage.backend) {
+    throw new BackendPublicationJournalError(
+      "unexpected-state",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+  }
+  assertBackendPublicationConfigReadAccess(
+    publicationConfigPath,
+    first.config.storage.backend,
+    first.witness,
+  );
+  const second = readDaemonConfigSnapshot(publicationConfigPath);
+  if (
+    second.config.storage.backend !== startupConfig.storage.backend
+    || !daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
+  ) {
+    throw new BackendPublicationJournalError(
+      "unexpected-state",
+      "daemon request config changed during lock-free read admission",
+    );
+  }
 }
 
 async function settleCleanup(callback: () => void | Promise<void>): Promise<void> {
@@ -797,7 +846,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         bufferedResponse.flush();
         bufferedResponse = undefined;
       } else {
-        assertRequestAdmission();
+        assertDaemonReadStorageAdmission(
+          config,
+          publicationConfigPath,
+          publicationHome,
+          options?._assertBackendPublication,
+        );
         await route.handler(req, res, body, { signal: requestSignal });
       }
     } catch (err: unknown) {

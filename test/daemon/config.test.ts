@@ -26,6 +26,7 @@ import {
   LLM_REASONING_EFFORTS,
   OPENAI_REASONING_EFFORTS,
   __configTestUtils,
+  daemonConfigSnapshotWitnessEqual,
   loadDaemonConfig,
   readDaemonConfigSnapshot,
   parseDaemonConfig,
@@ -157,6 +158,35 @@ describe("readDaemonConfigSnapshot", () => {
       ino: "9007199254740995",
       byteLength: 2,
     });
+  });
+
+  it("fails closed when a present config disappears during bounded admission", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-config-snapshot-disappeared-"));
+    const path = join(root, "config.json");
+    try {
+      writeFileSync(path, "{}");
+      expect(() => readDaemonConfigSnapshot(path, undefined, {
+        _beforeOpenForTesting: () => rmSync(path),
+      })).toThrowError(expect.objectContaining({ code: "ENOENT" }));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("compares every config witness field without hiding an earlier mismatch", () => {
+    const base = {
+      presence: "present" as const,
+      rawSha256: "a",
+      byteLength: 2,
+      dev: "3",
+      ino: "4",
+      mtimeMs: 5,
+    };
+    expect(daemonConfigSnapshotWitnessEqual(base, { ...base })).toBe(true);
+    for (const field of ["presence", "rawSha256", "byteLength", "dev", "ino", "mtimeMs"] as const) {
+      const changed = { ...base, [field]: field === "presence" ? "absent" : field === "byteLength" || field === "mtimeMs" ? 99 : "changed" };
+      expect(daemonConfigSnapshotWitnessEqual(base, changed)).toBe(false);
+    }
   });
 });
 

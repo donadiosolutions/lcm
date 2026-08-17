@@ -216,6 +216,11 @@ type DaemonConfigSnapshotObservation = Readonly<{
   mtimeMs: number;
 }>;
 
+type DaemonConfigSnapshotOptions = Readonly<{
+  /** @internal Deterministic post-open disappearance seam for tests. */
+  _beforeOpenForTesting?: () => void;
+}>;
+
 type DaemonConfigDefaults = Omit<DaemonConfig, "storage"> & { storage: StoredStorageConfig };
 
 const DEFAULTS: DaemonConfigDefaults = {
@@ -1699,19 +1704,31 @@ function makeSnapshotWitness(
 export function readDaemonConfigSnapshot(
   configPath: string,
   env: Record<string, string | undefined> = process.env,
+  options: DaemonConfigSnapshotOptions = {},
 ): DaemonConfigSnapshot {
   const resolvedEnv = resolveDaemonConfigEnv(env);
+  let initiallyPresent = false;
+  try {
+    lstatSync(configPath);
+    initiallyPresent = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   let content: string;
   let witness: DaemonConfigSnapshotWitness;
   try {
     const observed = readBoundedRegularFileWithStat(configPath, {
       allowedRoot: dirname(configPath),
       maxBytes: MAX_CONFIG_BYTES,
+      _beforeOpenForTesting: options._beforeOpenForTesting,
     });
     content = observed.content;
     witness = makeSnapshotWitness(observed);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if (
+      (error as NodeJS.ErrnoException).code !== "ENOENT"
+      || initiallyPresent
+    ) throw error;
     content = "{}";
     witness = Object.freeze({
       presence: "absent",

@@ -651,7 +651,7 @@ describe("runCli registration and help dispatch", () => {
 
 describe("runCli daemon-backed and utility actions", () => {
   it("routes all six daemon reads through an authenticated healthy daemon without migration", async () => {
-    state.health.mockResolvedValue({ status: "ok", storageBackend: "sqlite", entrypoint: "/daemon" });
+    state.health.mockResolvedValue({ status: "healthy", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" });
     const migrate = vi.fn();
     const sleep = vi.fn(async (_delayMs: number) => undefined);
     const root = actualFs.mkdtempSync("/tmp/lcm-cli-concurrent-");
@@ -711,8 +711,12 @@ describe("runCli daemon-backed and utility actions", () => {
     expect(state.ensureDaemon).toHaveBeenCalledOnce();
   });
 
-  it("does not treat a public health response as authenticated when a stale token is present", async () => {
-    state.health.mockResolvedValue({ status: "ok", storageBackend: "sqlite" });
+  it.each([
+    ["a tokenless daemon marker", { status: "ok", storageBackend: "sqlite", entrypoint: "/daemon" }],
+    ["an empty entrypoint", { status: "ok", storageBackend: "sqlite", entrypoint: "", runtimeDigest: "runtime" }],
+    ["an empty runtime marker", { status: "ok", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "" }],
+  ])("does not treat %s as authenticated with a stale token", async (_label, health) => {
+    state.health.mockResolvedValue(health);
     const migrate = vi.fn();
     const sleep = vi.fn(async (_delayMs: number) => undefined);
 

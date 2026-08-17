@@ -14,6 +14,7 @@ vi.mock("../../src/daemon/client.js", () => ({
         status: "ok",
         storageBackend: "sqlite",
         entrypoint: "/opt/lcm/lcm.mjs",
+        runtimeDigest: "runtime",
       };
     }
 

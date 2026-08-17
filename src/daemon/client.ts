@@ -18,6 +18,8 @@ export type DaemonHealth = {
   uptime: number;
   pid: number;
   entrypoint?: string;
+  /** Present only on authenticated health responses from token-bearing daemons. */
+  runtimeDigest?: string;
   storage?: {
     status: string;
     error?: {

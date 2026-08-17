@@ -1067,6 +1067,76 @@ describe("daemon idle timeout", () => {
 });
 
 describe("daemon auth", () => {
+  it("does not emit the authenticated health marker for a tokenless daemon", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-tokenless-"));
+    const config = loadDaemonConfig(join(dir, "missing-config.json"), { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, { _testIdentity: testIdentity });
+    try {
+      const response = await fetch(`http://127.0.0.1:${authDaemon.address().port}/health`, {
+        headers: { Authorization: "Bearer stale-local-token" },
+      });
+      const health = await response.json() as Record<string, unknown>;
+      expect(response.status).toBe(200);
+      expect(health.entrypoint).toBe(testIdentity.entrypoint);
+      expect(health).not.toHaveProperty("runtimeDigest");
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("serves authenticated reads while publication ownership is held but blocks mutations", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-read-lock-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    const tokenPath = join(lcmDir, "daemon.token");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    ensureAuthToken(tokenPath);
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      tokenPath,
+      _testIdentity: testIdentity,
+    });
+    authDaemon.registerRoute("GET", "/custom-read", async (_req, res) => {
+      res.end(JSON.stringify({ ok: true }));
+    }, "read");
+    const token = readAuthToken(tokenPath)!;
+    const headers = { Authorization: `Bearer ${token}` };
+    const acquired = deferred<void>();
+    const release = deferred<void>();
+    const holder = withBackendPublicationConfigLockAsync(configPath, async () => {
+      acquired.resolve();
+      await release.promise;
+    });
+
+    try {
+      await acquired.promise;
+      const port = authDaemon.address().port;
+      const [health, pool, custom, mutation] = await Promise.all([
+        fetch(`http://127.0.0.1:${port}/health`, { headers }),
+        fetch(`http://127.0.0.1:${port}/stats/pool`, { headers }),
+        fetch(`http://127.0.0.1:${port}/custom-read`, { headers }),
+        fetch(`http://127.0.0.1:${port}/store`, {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "application/json" },
+          body: JSON.stringify({ text: "must remain blocked", cwd: dir }),
+        }),
+      ]);
+
+      expect(health.status).toBe(200);
+      expect(pool.status).toBe(200);
+      expect(custom.status).toBe(200);
+      expect(mutation.status).toBe(500);
+    } finally {
+      release.resolve();
+      await holder;
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("returns 401 for POST without auth token when tokenPath is set", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-"));
     const tokenPath = join(dir, "daemon.token");
