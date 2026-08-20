@@ -160,7 +160,7 @@ describe("connector transport core", () => {
     }
   });
 
-  it("keeps an explicit Codex CLI bundle to native hook plus skill", () => {
+  it("keeps an explicit Codex CLI bundle to native hook, skill, and minimal rules", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-codex-cli-bundle-"));
     const home = join(directory, "home");
     const originalHome = process.env.HOME;
@@ -170,11 +170,82 @@ describe("connector transport core", () => {
         configPath: join(directory, "config.json"),
         codexMcpRunner: { get: () => [], add: () => undefined, remove: () => undefined },
       });
-      expect(result.paths).toHaveLength(2);
+      expect(result.paths).toHaveLength(3);
       expect(result.paths.some((path) => path.endsWith("hooks.json"))).toBe(true);
       expect(result.paths.some((path) => path.endsWith("SKILL.md"))).toBe(true);
+      expect(result.paths.some((path) => path.endsWith("AGENTS.md"))).toBe(true);
+      expect(readFileSync(join(home, ".codex", "AGENTS.md"), "utf8")).toBe(
+        "<!-- lcm -->\n"
+        + "**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n"
+        + "<!-- lcm -->\n",
+      );
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("removes only the managed Codex rule when converging from CLI to MCP", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-codex-mcp-convergence-"));
+    const home = join(directory, "home");
+    const configPath = join(directory, "config.json");
+    const rulesPath = join(home, ".codex", "AGENTS.md");
+    const originalHome = process.env.HOME;
+    process.env.HOME = home;
+    let entries: readonly Record<string, unknown>[] = [];
+    const runner = {
+      get: () => entries,
+      add: () => { entries = [{
+        name: "lcm",
+        enabled: true,
+        disabled_reason: null,
+        transport: { type: "stdio", command: "lcm", args: ["mcp"], env: null, env_vars: [], cwd: null },
+        enabled_tools: null,
+        disabled_tools: null,
+        startup_timeout_sec: null,
+        tool_timeout_sec: null,
+      }]; },
+      remove: () => { entries = []; },
+    };
+    try {
+      mkdirSync(join(home, ".codex"), { recursive: true });
+      writeFileSync(rulesPath, "Personal Codex rules");
+      installConnector("codex", "cli", directory, { configPath, codexMcpRunner: runner });
+      expect(readFileSync(rulesPath, "utf8")).toContain("use the $lcm-memory skill");
+
+      const result = installConnector("codex", "mcp", directory, { configPath, codexMcpRunner: runner });
+
       expect(result.paths.some((path) => path.endsWith("AGENTS.md"))).toBe(false);
-      expect(existsSync(join(home, ".codex", "AGENTS.md"))).toBe(false);
+      expect(readFileSync(rulesPath, "utf8")).toBe("Personal Codex rules\n");
+      expect(entries).toHaveLength(1);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("restores prior Codex AGENTS.md bytes when CLI bundle verification rolls back", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-codex-rules-rollback-"));
+    const home = join(directory, "home");
+    const configPath = join(directory, "config.json");
+    const rulesPath = join(home, ".codex", "AGENTS.md");
+    const original = "Personal Codex rules without a terminal newline";
+    const originalHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      mkdirSync(join(home, ".codex"), { recursive: true });
+      writeFileSync(rulesPath, original);
+
+      expect(() => installConnector("codex", "cli", directory, {
+        configPath,
+        codexMcpRunner: { get: () => [], add: () => undefined, remove: () => undefined },
+        failAt: "complete",
+      })).toThrow("Injected connector installer failure at complete");
+
+      expect(readFileSync(rulesPath, "utf8")).toBe(original);
+      expect(readConnectorTransport(configPath, "codex")).toBeUndefined();
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;
@@ -301,6 +372,9 @@ describe("connector transport core", () => {
       installConnector("codex", undefined, directory, { configPath, codexMcpRunner: runner, queryCodexMcp: false });
       expect(present).toBe(false);
       expect(readConnectorTransport(configPath, "codex")).toBe("cli");
+      expect(readFileSync(join(home, ".codex", "AGENTS.md"), "utf8")).toContain(
+        "use the $lcm-memory skill",
+      );
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;

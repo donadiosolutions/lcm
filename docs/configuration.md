@@ -131,9 +131,10 @@ are imported deterministically by session ID and then path.
 The default Codex connector is the CLI bundle. It writes native hooks to
 `~/.codex/hooks.json`, enables Codex's current `hooks` feature in
 `~/.codex/config.toml`, and installs the LCM skill at
-`.codex/skills/lcm-memory/SKILL.md`.
-The default is exactly the native hook plus the `lcm-memory` skill. It does not
-manage an `AGENTS.md` rules block.
+`.codex/skills/lcm-memory/SKILL.md`. It also appends one minimal managed rule to
+`~/.codex/AGENTS.md` that requires Codex to use the `lcm-memory` skill before
+doing any work. Existing user content is preserved with one blank line before
+the managed entry.
 Its hook set restores memory at session start, searches memory before prompts,
 captures passive tool-use signals, snapshots
 transcript deltas on `Stop`, and force-snapshots transcript deltas on
@@ -161,7 +162,9 @@ after the bundle is removed.
 For Codex, choose MCP explicitly with
 `lcm connectors install codex --transport mcp`. LCM uses the native `codex mcp`
 commands for that bundle; no TOML editing is required. Return to the
-default CLI bundle with `lcm connectors install codex --transport cli`.
+default CLI bundle with `lcm connectors install codex --transport cli`. The
+explicit MCP bundle does not retain or install the CLI-only managed
+`~/.codex/AGENTS.md` entry.
 
 Set recommended environment variables:
 

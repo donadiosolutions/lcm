@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 const repositoryRoot = process.cwd();
 const guidanceRoot = join(repositoryRoot, "src/connectors/templates/guidance");
 const guidanceFiles = [
+  "codex-rules.md.tmpl",
   "skill.md.tmpl",
   "rules.md.tmpl",
   "body.md",
@@ -39,7 +40,7 @@ function productionTypeScriptFiles(directory: string): string[] {
 }
 
 describe("guidance prose authority", () => {
-  it("keeps recurring durable-memory policy anchors in the eight Markdown sources", () => {
+  it("keeps recurring durable-memory policy anchors in the Markdown sources", () => {
     expect(readdirSync(guidanceRoot).sort()).toEqual([...guidanceFiles].sort());
     const guidance = guidanceFiles.map((file) => readFileSync(join(guidanceRoot, file), "utf8")).join("\n");
     const production = productionTypeScriptFiles(join(repositoryRoot, "src"))

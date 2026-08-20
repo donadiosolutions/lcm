@@ -58,8 +58,11 @@ This writes the default Codex CLI bundle:
 - `~/.codex/hooks.json`
 - `~/.codex/config.toml` with `[features].hooks = true`
 - `.codex/skills/lcm-memory/SKILL.md`
+- `~/.codex/AGENTS.md` with one minimal managed memory-retrieval rule
 
-The default is exactly the native hook plus the `lcm-memory` skill. A
+The `AGENTS.md` entry requires Codex to use the `lcm-memory` skill before doing
+any work; the skill remains the detailed operational guidance. Existing user
+content is preserved with one blank line before the managed entry. A
 fresh/default Codex CLI install does not add, remove, or inspect MCP
 configuration.
 
@@ -100,8 +103,9 @@ publication mutation lock.
 The MCP bundle uses native `codex mcp` commands for Codex registration and
 requires no TOML editing. Use
 `lcm connectors install codex --transport cli` to converge back to the CLI
-bundle. Explicit or stored CLI convergence may remove only the exact
-LCM-owned MCP registration.
+bundle. The MCP bundle does not retain or install the CLI-only managed
+`~/.codex/AGENTS.md` entry. Explicit or stored CLI convergence may remove only
+the exact LCM-owned MCP registration.
 
 The hook connector installs these Codex events:
 

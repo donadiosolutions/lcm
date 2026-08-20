@@ -928,13 +928,13 @@ describe('installConnector — Codex native hooks', () => {
     expect(secondInstall).toBe(firstInstall);
   });
 
-  it('installs hooks and the CLI skill by default', () => {
+  it('installs hooks, the CLI skill, and the minimal global rule by default', () => {
     const result = installConnector('codex', undefined, tmpDir);
 
     expect(result.success).toBe(true);
     expect(result.path).toContain(join(tmpDir, '.codex', 'hooks.json'));
     expect(result.path).toContain(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'));
-    expect(result.path).not.toContain(join(tmpDir, '.codex', 'AGENTS.md'));
+    expect(result.path).toContain(join(tmpDir, '.codex', 'AGENTS.md'));
 
     const hooksPath = join(tmpDir, '.codex', 'hooks.json');
     const hooks = JSON.parse(readFileSync(hooksPath, 'utf-8'));
@@ -955,7 +955,11 @@ describe('installConnector — Codex native hooks', () => {
     expect(skill).toContain('lcm search');
     expect(skill).not.toMatch(/claude/i);
 
-    expect(existsSync(join(tmpDir, '.codex', 'AGENTS.md'))).toBe(false);
+    expect(readFileSync(join(tmpDir, '.codex', 'AGENTS.md'), 'utf8')).toBe(
+      '<!-- lcm -->\n'
+      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n'
+      + '<!-- lcm -->\n',
+    );
 
     const config = readFileSync(join(tmpDir, '.codex', 'config.toml'), 'utf-8');
     expect(config).toContain('[features]');
@@ -964,7 +968,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(config).not.toMatch(/claude/i);
   });
 
-  it('migrates only recognized Codex managed rules after the CLI bundle verifies', () => {
+  it('migrates recognized Codex rules while preserving ordinary marker pairs', () => {
     const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
     mkdirSync(dirname(rulesPath), { recursive: true });
     const generated = renderGuidance('rules', 'cli');
@@ -990,6 +994,10 @@ describe('installConnector — Codex native hooks', () => {
       '<!-- lcm -->',
       'Keep this byte too.',
       '',
+      '<!-- lcm -->',
+      '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.',
+      '<!-- lcm -->',
+      '',
     ].join('\n'));
 
     const firstInstall = readFileSync(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'), 'utf8');
@@ -1011,7 +1019,12 @@ describe('installConnector — Codex native hooks', () => {
     writeFileSync(rulesPath, partial);
 
     installConnector('codex', undefined, tmpDir);
-    expect(readFileSync(rulesPath, 'utf8')).toBe(partial);
+    expect(readFileSync(rulesPath, 'utf8')).toBe(
+      partial.trimEnd()
+      + '\r\n\r\n<!-- lcm -->\r\n'
+      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\r\n'
+      + '<!-- lcm -->\r\n',
+    );
   });
 
   it('idempotently ensures Codex rules in ~/.codex/AGENTS.md', () => {
@@ -1021,7 +1034,18 @@ describe('installConnector — Codex native hooks', () => {
     const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
     const content = readFileSync(rulesPath, 'utf-8');
     expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
-    expect(content).toContain('lcm search');
+    expect(content).toBe(
+      '<!-- lcm -->\n'
+      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n'
+      + '<!-- lcm -->\n',
+    );
+  });
+
+  it('deletes Codex AGENTS.md when only the minimal managed rule remains', () => {
+    installConnector('codex', 'rules', tmpDir);
+
+    expect(removeConnector('codex', 'rules', tmpDir)).toBe(true);
+    expect(existsSync(join(tmpDir, '.codex', 'AGENTS.md'))).toBe(false);
   });
 
   it('preserves existing user content when installing Codex rules', () => {
@@ -1034,10 +1058,41 @@ describe('installConnector — Codex native hooks', () => {
     const content = readFileSync(rulesPath, 'utf-8');
     expect(content).toContain('# Personal Codex rules');
     expect(content).toContain('Never overwrite this.');
-    expect(content).toContain(LCM_MARKERS.START);
-    expect(content).toContain(LCM_MARKERS.END);
-    expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
-    expect(content).toContain('lcm search');
+    expect(content).toBe(
+      '# Personal Codex rules\n\nNever overwrite this.\n\n'
+      + '<!-- lcm -->\n'
+      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n'
+      + '<!-- lcm -->\n',
+    );
+  });
+
+  it('uses the established CRLF style and one blank line after content without a terminal newline', () => {
+    const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
+    mkdirSync(join(tmpDir, '.codex'), { recursive: true });
+    writeFileSync(rulesPath, 'Keep  \t\r\nSecond line');
+
+    installConnector('codex', 'rules', tmpDir);
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(
+      'Keep  \t\r\nSecond line\r\n\r\n'
+      + '<!-- lcm -->\r\n'
+      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\r\n'
+      + '<!-- lcm -->\r\n',
+    );
+  });
+
+  it('treats an existing empty Codex rules file like a fresh file', () => {
+    const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
+    mkdirSync(join(tmpDir, '.codex'), { recursive: true });
+    writeFileSync(rulesPath, '');
+
+    installConnector('codex', 'rules', tmpDir);
+
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(
+      '<!-- lcm -->\n'
+      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n'
+      + '<!-- lcm -->\n',
+    );
   });
 
   it('updates only the marked Codex rules block on reinstall', () => {
@@ -1068,7 +1123,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(content).toContain('Keep this after.');
     expect(content).toContain('Keep this before.\nKeep this after.');
     expect(content).not.toContain('old managed content');
-    expect(content).toContain('lcm search');
+    expect(content).toContain('use the $lcm-memory skill');
   });
 
   it('migrates legacy bracketed Codex rules markers on reinstall', () => {
@@ -1102,7 +1157,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(content).not.toContain(LEGACY_LCM_MARKERS.END);
     expect(content).not.toContain('old managed content');
     expect(content).not.toContain('@lcm Codex');
-    expect(content).toContain('lcm store');
+    expect(content).toContain('use the $lcm-memory skill');
   });
 
   it('migrates the deprecated codex_hooks feature flag when installing hooks', () => {

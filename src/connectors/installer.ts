@@ -152,7 +152,9 @@ function findStandaloneManagedMarkerLines(content: string): MarkerLine[] {
 }
 
 function isGeneratedLcmBlock(content: string, start: MarkerLine, end: MarkerLine): boolean {
-  return /^# Workflow Instruction(?:\r\n|\n|\r|$)/u.test(content.slice(start.lineEnd, end.lineStart));
+  const body = content.slice(start.lineEnd, end.lineStart);
+  return /^# Workflow Instruction(?:\r\n|\n|\r|$)/u.test(body)
+    || /^\*\*Before doing any kind of work\*\*, inspection or simply project understanding, \*\*use the \$lcm-memory skill\*\* to recover project memories\.(?:\r\n|\n|\r)?$/u.test(body);
 }
 
 function isWorkflowInstructionOnly(content: string, startIdx: number, endIdx: number): boolean {
@@ -380,13 +382,14 @@ function normalizeMarkdownEof(content: string, eol: MarkdownEol = establishedMar
   return normalizeMarkdownLineEndings(trimMarkdownLineBreaksAtEnd(content), eol) + eol;
 }
 
-function appendMarkdown(existing: string, content: string): string {
+function appendMarkdown(existing: string, content: string, blankLineBeforeManagedBlock = false): string {
   const cleaned = removeMarkers(existing);
   const eol = establishedMarkdownEol(cleaned, content);
   const normalizedExisting = normalizeMarkdownLineEndings(trimMarkdownLineBreaksAtEnd(cleaned), eol);
   const normalizedContent = normalizeMarkdownEof(content, eol);
   if (!normalizedExisting) return normalizedContent;
-  return `${normalizedExisting}${eol}${normalizedContent}`;
+  const separator = blankLineBeforeManagedBlock ? `${eol}${eol}` : eol;
+  return `${normalizedExisting}${separator}${normalizedContent}`;
 }
 
 function yamlFrontmatterEnd(content: string): number | undefined {
@@ -684,12 +687,17 @@ function removeSkill(filePath: string, generated: string | readonly string[], st
 }
 
 // Strategy 1: Markdown targets (rules, skill)
-function installMarkdown(content: string, filePath: string, writeMode: 'append' | 'overwrite'): void {
+function installMarkdown(
+  content: string,
+  filePath: string,
+  writeMode: 'append' | 'overwrite',
+  blankLineBeforeManagedBlock = false,
+): void {
   mkdirSync(dirname(filePath), { recursive: true });
   if (writeMode === 'append') {
     updateRegularFileNoFollow(filePath, (existing) => (
       // Remove old markers if present before re-appending.
-      Buffer.from(appendMarkdown(existing.toString('utf-8'), content), 'utf-8')
+      Buffer.from(appendMarkdown(existing.toString('utf-8'), content, blankLineBeforeManagedBlock), 'utf-8')
     ));
   } else {
     updateRegularFileNoFollow(filePath, () => Buffer.from(normalizeMarkdownEof(content), 'utf-8'));
@@ -1049,7 +1057,12 @@ function installComponent(
     return { success: true, path: skillPath, requiresRestart: surfaceRequiresRestart(surface) };
   }
 
-  installMarkdown(generateContent(agent, surface, transport), resolvedPath, agent.writeMode ?? "overwrite");
+  installMarkdown(
+    generateContent(agent, surface, transport),
+    resolvedPath,
+    agent.writeMode ?? "overwrite",
+    agent.id === "codex",
+  );
   return { success: true, path: resolvedPath, requiresRestart: surfaceRequiresRestart(surface) };
 }
 
@@ -1093,7 +1106,7 @@ function removeComponent(agent: Agent, surface: ConnectorSurface, cwd: string, s
 }
 
 function legacyDefaultSurfaces(agent: Agent): readonly ConnectorSurface[] {
-  if (agent.id === "codex") return ["hook", "skill"];
+  if (agent.id === "codex") return ["hook", "skill", "rules"];
   if (["claude-code", "gemini-cli", "opencode", "warp", "auggie-cli", "cursor", "windsurf", "trae", "qoder", "antigravity", "github-copilot", "roo-code", "kilo-code", "amp", "kiro", "junie", "openclaw"].includes(agent.id)) {
     return [agent.configPaths.skill ? "skill" : "rules"];
   }
@@ -1104,7 +1117,6 @@ function installLegacyDefault(agent: Agent, cwd: string): InstallResult {
   const targets = legacyDefaultSurfaces(agent);
   const results = targets.map((surface) => installComponent(agent, surface, cwd, false, "cli"));
   for (const surface of targets) verifySurface(agent, surface, cwd, undefined, "cli");
-  if (agent.id === "codex") removeComponent(agent, "rules", cwd);
   const paths = results.map((result) => result.path).filter((path) => path.length > 0);
   return {
     success: results.every((result) => result.success),
@@ -1427,6 +1439,7 @@ function bundleSurfaces(agent: Agent, transport: ConnectorTransport): ConnectorS
   const guidance = capabilities.guidance.find((surface) => Boolean(agent.configPaths[surface]));
   if (!guidance) throw new Error(`Agent "${agent.name}" has no guidance surface for connector transport "${transport}"`);
   const surfaces: ConnectorSurface[] = [guidance];
+  if (agent.id === "codex" && transport === "cli" && guidance !== "rules") surfaces.push("rules");
   if (capabilities.nativeHook && agent.configPaths.hook) surfaces.push("hook");
   if (transport === "mcp" && capabilities.mcpAdapter) surfaces.push("mcp");
   return surfaces;

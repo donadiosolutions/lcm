@@ -161,9 +161,12 @@ This installs the default Codex CLI bundle:
 
 - Native hooks in `~/.codex/hooks.json` and Codex's current `hooks` feature in `~/.codex/config.toml`
 - The LCM skill in `~/.codex/skills/lcm-memory/SKILL.md`
+- A minimal managed memory-retrieval rule in `~/.codex/AGENTS.md`
 
-The default is exactly the native hook plus the `lcm-memory` skill. It does not
-add, remove, or inspect MCP configuration on a fresh/default Codex install.
+The managed `AGENTS.md` entry tells Codex to use the `lcm-memory` skill before
+doing any work; the skill remains the detailed operational guidance. The
+default CLI bundle does not add, remove, or inspect MCP configuration. An
+explicit Codex MCP bundle does not retain or install the CLI-only rules entry.
 
 The native hooks use:
 
