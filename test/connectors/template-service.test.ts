@@ -11,6 +11,7 @@ import {
   renderTemplate,
 } from "../../src/connectors/template-service.js";
 import { LCM_MANAGED_SKILL_MARKER, LCM_MARKERS } from "../../src/connectors/constants.js";
+import { findAgent } from "../../src/connectors/registry.js";
 import type { Agent } from "../../src/connectors/types.js";
 
 const mockAgent: Agent = {
@@ -26,6 +27,7 @@ const mockAgent: Agent = {
 const durableStorageRequirement =
   "Agents **MUST** immediately store every newly recognized durable decision, preference, root cause, pattern, gotcha, solution, and reusable workflow, including its rationale.";
 const sourceFiles = [
+  "codex-rules.md.tmpl",
   "skill.md.tmpl",
   "rules.md.tmpl",
   "body.md",
@@ -84,6 +86,16 @@ describe("strict guidance renderer", () => {
 });
 
 describe("transport-pure guidance", () => {
+  it("renders only the minimal always-on memory rule for Codex", () => {
+    const codex = findAgent("codex")!;
+
+    expect(generateRulesContent(codex, "cli")).toBe(
+      "<!-- lcm -->\n"
+      + "**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n"
+      + "<!-- lcm -->\n",
+    );
+  });
+
   it("renders deterministic, byte-idempotent CLI skill and rules", () => {
     const first = renderGuidance("skill", "cli");
     const second = renderGuidance("skill", "cli");

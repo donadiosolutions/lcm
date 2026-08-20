@@ -108,6 +108,13 @@ function renderBody(transport: ConnectorTransport, options: GuidanceRenderOption
   }).trim();
 }
 
+function renderCodexRules(): string {
+  return renderTemplate(loadGuidanceFile("codex-rules.md.tmpl"), {
+    marker: LCM_MARKERS.START,
+    endMarker: LCM_MARKERS.END,
+  }).trimEnd() + "\n";
+}
+
 /** Render canonical guidance for the selected transport. */
 export function renderGuidance(
   kind: GuidanceKind,
@@ -132,6 +139,7 @@ export function renderGuidance(
 }
 
 export function generateRulesContent(agent: Agent, transport: ConnectorTransport = "cli"): string {
+  if (agent.id === "codex") return renderCodexRules();
   return renderGuidance("rules", transport, agent.header);
 }
 

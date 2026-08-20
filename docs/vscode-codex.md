@@ -58,8 +58,11 @@ This writes the default Codex CLI bundle:
 - `~/.codex/hooks.json`
 - `~/.codex/config.toml` with `[features].hooks = true`
 - `.codex/skills/lcm-memory/SKILL.md`
+- `~/.codex/AGENTS.md` with one minimal managed memory-retrieval rule
 
-The default is exactly the native hook plus the `lcm-memory` skill. A
+The `AGENTS.md` entry requires Codex to use the `lcm-memory` skill before doing
+any work; the skill remains the detailed operational guidance. Existing user
+content is preserved with one blank line before the managed entry. A
 fresh/default Codex CLI install does not add, remove, or inspect MCP
 configuration.
 
@@ -100,8 +103,9 @@ publication mutation lock.
 The MCP bundle uses native `codex mcp` commands for Codex registration and
 requires no TOML editing. Use
 `lcm connectors install codex --transport cli` to converge back to the CLI
-bundle. Explicit or stored CLI convergence may remove only the exact
-LCM-owned MCP registration.
+bundle. The MCP bundle does not retain or install the CLI-only managed
+`~/.codex/AGENTS.md` entry. Explicit or stored CLI convergence may remove only
+the exact LCM-owned MCP registration.
 
 The hook connector installs these Codex events:
 
@@ -190,7 +194,9 @@ lcm import --provider all
 
 1. GitHub Copilot in VS Code is skill-based today. There is no automatic session restore, turn ingestion, prompt-time search injection, or compaction hook.
 2. The GitHub Copilot connector does not register MCP automatically. The current supported path is instructions/skill guidance plus the `lcm` CLI.
-3. Codex MCP is opt-in. The explicit MCP bundle uses native `codex mcp` commands; default/fresh Codex CLI installation remains hook+skill and does not inspect MCP.
+3. Codex MCP is opt-in. The explicit MCP bundle uses native `codex mcp`
+   commands; default/fresh Codex CLI installation remains hook+skill+minimal
+   rules and does not inspect MCP.
 4. Codex `Stop` hooks are turn-scoped, not final-session hooks. LCM therefore uses rolling snapshots and thresholded compaction instead of marking Codex sessions complete on each `Stop`; the `PreCompact` snapshot hook fills the pre-compaction gap.
 5. Claude Code and Codex use native integrations, but their setup commands remain different.
 
