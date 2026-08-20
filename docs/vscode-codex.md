@@ -194,7 +194,9 @@ lcm import --provider all
 
 1. GitHub Copilot in VS Code is skill-based today. There is no automatic session restore, turn ingestion, prompt-time search injection, or compaction hook.
 2. The GitHub Copilot connector does not register MCP automatically. The current supported path is instructions/skill guidance plus the `lcm` CLI.
-3. Codex MCP is opt-in. The explicit MCP bundle uses native `codex mcp` commands; default/fresh Codex CLI installation remains hook+skill and does not inspect MCP.
+3. Codex MCP is opt-in. The explicit MCP bundle uses native `codex mcp`
+   commands; default/fresh Codex CLI installation remains hook+skill+minimal
+   rules and does not inspect MCP.
 4. Codex `Stop` hooks are turn-scoped, not final-session hooks. LCM therefore uses rolling snapshots and thresholded compaction instead of marking Codex sessions complete on each `Stop`; the `PreCompact` snapshot hook fills the pre-compaction gap.
 5. Claude Code and Codex use native integrations, but their setup commands remain different.
 
