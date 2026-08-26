@@ -133,7 +133,9 @@ The default Codex connector is the CLI bundle. It writes native hooks to
 `~/.codex/config.toml`, and installs the LCM skill at
 `.codex/skills/lcm-memory/SKILL.md`. It also appends one minimal managed rule to
 `~/.codex/AGENTS.md` that requires Codex to use the `lcm-memory` skill before
-doing any work. Existing user content is preserved with one blank line before
+starting substantive work or when it needs further project understanding.
+Passive hook injection can satisfy routine context recovery without another
+explicit search. Existing user content is preserved with one blank line before
 the managed entry.
 Its hook set restores memory at session start, searches memory before prompts,
 captures passive tool-use signals, snapshots

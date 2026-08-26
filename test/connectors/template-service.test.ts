@@ -91,7 +91,7 @@ describe("transport-pure guidance", () => {
 
     expect(generateRulesContent(codex, "cli")).toBe(
       "<!-- lcm -->\n"
-      + "**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n"
+      + "**Before starting any substantive kind of work** or when needing to gather further project understanding, **use the $lcm-memory skill**.\n"
       + "<!-- lcm -->\n",
     );
   });
