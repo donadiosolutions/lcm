@@ -957,7 +957,7 @@ describe('installConnector — Codex native hooks', () => {
 
     expect(readFileSync(join(tmpDir, '.codex', 'AGENTS.md'), 'utf8')).toBe(
       '<!-- lcm -->\n'
-      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n'
+      + '**Before starting any substantive kind of work** or when needing to gather further project understanding, **use the $lcm-memory skill**.\n'
       + '<!-- lcm -->\n',
     );
 
@@ -995,7 +995,7 @@ describe('installConnector — Codex native hooks', () => {
       'Keep this byte too.',
       '',
       '<!-- lcm -->',
-      '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.',
+      '**Before starting any substantive kind of work** or when needing to gather further project understanding, **use the $lcm-memory skill**.',
       '<!-- lcm -->',
       '',
     ].join('\n'));
@@ -1004,6 +1004,27 @@ describe('installConnector — Codex native hooks', () => {
     installConnector('codex', undefined, tmpDir);
     expect(readFileSync(rulesPath, 'utf8')).toBe(migrated);
     expect(readFileSync(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'), 'utf8')).toBe(firstInstall);
+  });
+
+  it('migrates the prior minimal Codex rule to the substantive-work wording', () => {
+    const rulesPath = join(tmpDir, '.codex', 'AGENTS.md');
+    mkdirSync(dirname(rulesPath), { recursive: true });
+    writeFileSync(
+      rulesPath,
+      '# Personal Codex rules\n\n'
+      + '<!-- lcm -->\n'
+      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n'
+      + '<!-- lcm -->\n',
+    );
+
+    installConnector('codex', 'rules', tmpDir);
+
+    expect(readFileSync(rulesPath, 'utf8')).toBe(
+      '# Personal Codex rules\n\n'
+      + '<!-- lcm -->\n'
+      + '**Before starting any substantive kind of work** or when needing to gather further project understanding, **use the $lcm-memory skill**.\n'
+      + '<!-- lcm -->\n',
+    );
   });
 
   it('preserves malformed and partial Codex managed markers during default migration', () => {
@@ -1022,7 +1043,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(readFileSync(rulesPath, 'utf8')).toBe(
       partial.trimEnd()
       + '\r\n\r\n<!-- lcm -->\r\n'
-      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\r\n'
+      + '**Before starting any substantive kind of work** or when needing to gather further project understanding, **use the $lcm-memory skill**.\r\n'
       + '<!-- lcm -->\r\n',
     );
   });
@@ -1036,7 +1057,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(countOccurrences(content, LCM_MARKERS.START)).toBe(2);
     expect(content).toBe(
       '<!-- lcm -->\n'
-      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n'
+      + '**Before starting any substantive kind of work** or when needing to gather further project understanding, **use the $lcm-memory skill**.\n'
       + '<!-- lcm -->\n',
     );
   });
@@ -1061,7 +1082,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(content).toBe(
       '# Personal Codex rules\n\nNever overwrite this.\n\n'
       + '<!-- lcm -->\n'
-      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n'
+      + '**Before starting any substantive kind of work** or when needing to gather further project understanding, **use the $lcm-memory skill**.\n'
       + '<!-- lcm -->\n',
     );
   });
@@ -1076,7 +1097,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(readFileSync(rulesPath, 'utf-8')).toBe(
       'Keep  \t\r\nSecond line\r\n\r\n'
       + '<!-- lcm -->\r\n'
-      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\r\n'
+      + '**Before starting any substantive kind of work** or when needing to gather further project understanding, **use the $lcm-memory skill**.\r\n'
       + '<!-- lcm -->\r\n',
     );
   });
@@ -1090,7 +1111,7 @@ describe('installConnector — Codex native hooks', () => {
 
     expect(readFileSync(rulesPath, 'utf-8')).toBe(
       '<!-- lcm -->\n'
-      + '**Before doing any kind of work**, inspection or simply project understanding, **use the $lcm-memory skill** to recover project memories.\n'
+      + '**Before starting any substantive kind of work** or when needing to gather further project understanding, **use the $lcm-memory skill**.\n'
       + '<!-- lcm -->\n',
     );
   });

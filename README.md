@@ -164,7 +164,9 @@ This installs the default Codex CLI bundle:
 - A minimal managed memory-retrieval rule in `~/.codex/AGENTS.md`
 
 The managed `AGENTS.md` entry tells Codex to use the `lcm-memory` skill before
-doing any work; the skill remains the detailed operational guidance. The
+starting substantive work or when it needs further project understanding. The
+skill remains the detailed operational guidance, while passive hook injection
+can satisfy routine context recovery without another explicit search. The
 default CLI bundle does not add, remove, or inspect MCP configuration. An
 explicit Codex MCP bundle does not retain or install the CLI-only rules entry.
 

@@ -60,11 +60,12 @@ This writes the default Codex CLI bundle:
 - `.codex/skills/lcm-memory/SKILL.md`
 - `~/.codex/AGENTS.md` with one minimal managed memory-retrieval rule
 
-The `AGENTS.md` entry requires Codex to use the `lcm-memory` skill before doing
-any work; the skill remains the detailed operational guidance. Existing user
-content is preserved with one blank line before the managed entry. A
-fresh/default Codex CLI install does not add, remove, or inspect MCP
-configuration.
+The `AGENTS.md` entry requires Codex to use the `lcm-memory` skill before
+starting substantive work or when it needs further project understanding. The
+skill remains the detailed operational guidance, while passive hook injection
+can satisfy routine context recovery without another explicit search. Existing
+user content is preserved with one blank line before the managed entry. A fresh
+or default Codex CLI install does not add, remove, or inspect MCP configuration.
 
 Connector installation selects one complete transport bundle:
 

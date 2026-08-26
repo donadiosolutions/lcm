@@ -154,6 +154,7 @@ function findStandaloneManagedMarkerLines(content: string): MarkerLine[] {
 function isGeneratedLcmBlock(content: string, start: MarkerLine, end: MarkerLine): boolean {
   const body = content.slice(start.lineEnd, end.lineStart);
   return /^# Workflow Instruction(?:\r\n|\n|\r|$)/u.test(body)
+    || /^\*\*Before starting any substantive kind of work\*\* or when needing to gather further project understanding, \*\*use the \$lcm-memory skill\*\*\.(?:\r\n|\n|\r)?$/u.test(body)
     || /^\*\*Before doing any kind of work\*\*, inspection or simply project understanding, \*\*use the \$lcm-memory skill\*\* to recover project memories\.(?:\r\n|\n|\r)?$/u.test(body);
 }
 
