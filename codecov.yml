@@ -6,7 +6,7 @@ component_management:
     - component_id: "unit-cli"
       name: "Unit - CLI"
       paths:
-        # Keep the #691 command-routing entrypoint exclusively in Unit - CLI.
+        # Keep the #691 command-routing and #726 diagnostic entrypoint exclusively in Unit - CLI.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
@@ -42,7 +42,7 @@ component_management:
     - component_id: "unit-hooks"
       name: "Unit - Hooks"
       paths:
-        # Includes native hook adapters under the existing hooks directory ownership.
+        # Includes native adapters and the #726 publication-diagnostic flow.
         - "src/hooks/"
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"

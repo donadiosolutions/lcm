@@ -5,6 +5,7 @@ import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
 import { appendLocalHookEvents } from "./local-enqueue.js";
 import {
+  BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC,
   assertHookPublicationFence,
   isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
@@ -35,6 +36,7 @@ export async function handlePostToolUse(
   _port?: number,
 ): Promise<{ exitCode: number; stdout: string }> {
   let cwd: string | undefined;
+  let enqueued = false;
   try {
     const input = JSON.parse(stdin) as PostToolHookInput;
     const { session_id, tool_name } = input;
@@ -64,6 +66,7 @@ export async function handlePostToolUse(
       events,
       sourceHook: "PostToolUse",
     });
+    enqueued = true;
 
     // Project metadata is a selected-state consumer. Re-admit immediately
     // before its own coordinator-aware operation; do not retain this lock over
@@ -83,7 +86,24 @@ export async function handlePostToolUse(
     // daemon's bounded background scan process them; never use a payload port
     // for a token-bearing request.
   } catch (error) {
-    if (isBackendPublicationJournalError(error)) throw error;
+    if (isBackendPublicationJournalError(error)) {
+      try {
+        await safeLogError(
+          "PostToolUse",
+          `${BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC} (reason: ${error.reason})`,
+          { cwd },
+        );
+      } catch {
+        // Preserve the original publication error when diagnostic logging fails.
+      }
+      if (enqueued) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ systemMessage: BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC }),
+        };
+      }
+      throw error;
+    }
     await safeLogError("PostToolUse", error, { cwd });
   }
 

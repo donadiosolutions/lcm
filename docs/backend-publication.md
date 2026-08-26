@@ -366,6 +366,29 @@ admission blocked; complete or recover the publication before retrying`.
   fallback. Hook capture still preserves the event in the local SQLite outbox
   before later publication-gated work is attempted. Daemon request cancellation
   and shutdown drain active project work before the shared factory closes.
+- **PostToolUse publication refusal:** after the local event is durably
+  appended, a malformed, tampered, unsafe, mismatched, or unresolved
+  publication admission failure is recorded with this fixed diagnostic:
+
+  ```text
+  lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.
+  ```
+
+  After enqueue, the PostToolUse handler stops before selected-state work and
+  returns code `0` with stdout containing exactly
+  `{"systemMessage":"<the fixed diagnostic>"}`. This is a protocol-safe
+  observer result, not a successful selected-state admission and not a hook
+  process failure. A direct top-level CLI rejection still prints exactly that
+  line and exits `1` for publication failures that occur before durable enqueue
+  or in other direct CLI commands. The original typed publication error remains
+  internal control flow so its message, cause, stack, paths, URLs, credentials,
+  and journal residue cannot reach the user diagnostic. If the sidecar error
+  log cannot be written, the hook falls back to the flat log at
+  `~/.lcm/logs/events.log`; the local log appends only the closed reason token,
+  for example `(reason: malformed-journal)`, and a logger failure never
+  replaces the original publication error. Missing publication evidence and
+  typed private lock contention remain exit-`0` best-effort outcomes after
+  durable enqueue and do not emit a `systemMessage`.
 - **Doctor:** `lcm doctor` emits a sanitized `backend-publication` failure with
   guidance appropriate to missing evidence, an unresolved journal, backend
   mismatch, or unsafe state. It continues unrelated diagnostics, but skips
@@ -384,11 +407,23 @@ credentials before dispatch. This exception does not make PostgreSQL
 selection changes, bypass publication admission for storage work, or permit
 SQLite fallback for normal routes.
 
-The safe operator sequence is therefore: preserve the evidence, run
-`lcm doctor`, resolve the authenticated publication through its owning flow,
-then rerun doctor and restart the managed daemon. Never force a backend by
-deleting `journal.json`, removing a fenced lease row manually, or changing the
-configured backend until the corresponding publication evidence is terminal.
+The safe operator sequence is therefore:
+
+1. Preserve the durable local event and all publication evidence. Do not edit,
+   delete, rename, or bulk-clean the journal, material, map, or lease evidence.
+2. Run `lcm doctor` and preserve its sanitized output. If the sidecar error log
+   is unavailable, inspect the fixed-diagnostic record in
+   `~/.lcm/logs/events.log`.
+3. Resolve the authenticated publication through its owning recovery or
+   publication flow; only that owner may complete or abort the evidence.
+4. Rerun `lcm doctor`, then retry the hook or restart the managed daemon after
+   the publication reaches a terminal state. A structured PostToolUse
+   `systemMessage` is an admission refusal to act on, not proof that selected
+   state was accepted.
+
+Never force a backend by deleting `journal.json`, removing a fenced lease row
+manually, or changing the configured backend until the corresponding
+publication evidence is terminal.
 
 ## PostgreSQL privilege and deployment posture
 

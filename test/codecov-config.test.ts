@@ -480,7 +480,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(201);
   });
 
-  test("keeps the dogfooding response-fence files exclusively in their intended components", () => {
+  test("keeps response-fence and publication-diagnostic files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -498,6 +498,9 @@ describe("Codecov configuration", () => {
       ["src/daemon/version.ts", "unit-daemon-core"],
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
+      ["src/hooks/event-scrubbing.ts", "unit-hooks"],
+      ["src/hooks/post-tool.ts", "unit-hooks"],
+      ["src/hooks/publication-fence.ts", "unit-hooks"],
     ] as const;
 
     for (const [file, expectedOwner] of expectedOwners) {

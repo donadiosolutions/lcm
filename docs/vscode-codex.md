@@ -160,6 +160,26 @@ trimmed command beginning with `lcm store` is suppressed to avoid a feedback
 loop from LCM's own storage calls. There is no new configuration option for
 these fixed capture rules.
 
+If selected-state publication admission is blocked after a PostToolUse event
+has been durably appended, the event remains preserved locally. Missing
+publication evidence and typed private lock contention are successful
+best-effort hook outcomes. Other malformed, tampered, unsafe, mismatched, or
+unresolved evidence fails closed for selected-state work and surfaces this exact
+fixed diagnostic. After the event is durable, the PostToolUse hook returns code
+`0` with a JSON `systemMessage` containing that same line, so Codex can render
+actionable feedback without treating the observer process as failed. A direct
+invocation that fails before durable enqueue retains the fixed stderr diagnostic
+and exit code `1`. Selected-state work remains refused:
+
+```text
+lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.
+```
+
+The diagnostic never includes the raw publication error, cause, stack, path,
+URL, credential, or journal contents. Follow the preserve-evidence, `lcm
+doctor`, and owning-publication-recovery sequence in
+[`backend-publication.md`](backend-publication.md) before retrying Codex.
+
 Reinstalling generated Markdown connectors is byte-idempotent: the Codex skill
 `.codex/skills/lcm-memory/SKILL.md` remains byte-identical to its canonical
 template with exactly one final newline. The skill and explicit rules fallback
