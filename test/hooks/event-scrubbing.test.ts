@@ -11,6 +11,7 @@ import { projectDir } from "../../src/daemon/project.js";
 import { ScrubEngine } from "../../src/scrub.js";
 import * as hookConfig from "../../src/hooks/config.js";
 import * as runtimePaths from "../../src/runtime-paths.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 const dirs: string[] = [];
@@ -132,6 +133,31 @@ describe("passive event scrubbing", () => {
     }], cwd);
     expect(events[0]).toMatchObject({ data: "keep [REDACTED]", tags: ["[REDACTED]"] });
     expect(path).toHaveBeenCalled();
+    expect(load).toHaveBeenCalledWith(persistedPath);
+  });
+
+  it("preserves persisted patterns during publication lock contention", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-lock-contention-"));
+    const configRoot = mkdtempSync(join(tmpdir(), "lcm-event-lock-contention-root-"));
+    dirs.push(cwd, configRoot);
+    const persistedPath = join(configRoot, "config.json");
+    writeFileSync(persistedPath, JSON.stringify({
+      security: { sensitivePatterns: ["CONTENDED-[0-9]+", 42] },
+    }), { mode: 0o600 });
+    chmodSync(persistedPath, 0o600);
+    vi.spyOn(runtimePaths, "configPath").mockReturnValue(persistedPath);
+    const load = vi.spyOn(hookConfig, "loadHookConfig").mockImplementation(() => {
+      throw new PrivateMutationLockContentionError("publication lock is busy");
+    });
+
+    const events = await scrubExtractedEvents([{
+      type: "decision",
+      category: "decision",
+      data: "keep CONTENDED-123",
+      priority: 1,
+    }], cwd);
+
+    expect(events[0]?.data).toBe("keep [REDACTED]");
     expect(load).toHaveBeenCalledWith(persistedPath);
   });
 

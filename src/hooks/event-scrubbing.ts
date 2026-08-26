@@ -5,6 +5,7 @@ import { loadHookConfig } from "./config.js";
 import { localProjectDir } from "../daemon/project.js";
 import { configPath } from "../runtime-paths.js";
 import { ScrubEngine } from "../scrub.js";
+import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import {
   isBackendPublicationJournalError,
 } from "./publication-fence.js";
@@ -60,7 +61,9 @@ function persistedSensitivePatterns(): string[] {
   try {
     return loadHookConfig(configPath()).security.sensitivePatterns;
   } catch (error) {
-    if (!isBackendPublicationJournalError(error)) throw error;
+    if (!isBackendPublicationJournalError(error) && !(error instanceof PrivateMutationLockContentionError)) {
+      throw error;
+    }
     try {
       const content = readBoundedRegularFile(configPath(), {
         allowedRoot: dirname(configPath()),

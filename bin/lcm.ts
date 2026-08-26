@@ -33,6 +33,8 @@ import {
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import { BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC } from "../src/hooks/publication-fence.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
 import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
 import {
@@ -2988,7 +2990,9 @@ export async function runCli(
 /** @internal Top-level rejection handler kept separate for deterministic tests. */
 export function handleCliError(err: unknown): never {
   console.error(
-    err instanceof ConfigValidationError
+    err instanceof BackendPublicationJournalError
+      ? BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC
+      : err instanceof ConfigValidationError
       || err instanceof StorageBackendUnavailableError
       || err instanceof BootstrapLockContentionError
       ? err.message

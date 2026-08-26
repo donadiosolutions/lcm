@@ -5,6 +5,9 @@ import { PrivateMutationLockContentionError } from "../../src/private-mutation-l
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
+const FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC =
+  "lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.";
+
 const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
   printHelp: vi.fn(),
@@ -497,6 +500,25 @@ describe("runCli registration and help dispatch", () => {
     const onError = vi.fn();
     runMainIfInvoked("/missing/lcm.js", "/missing/lcm.js", async () => { throw failure; }, onError);
     await vi.waitFor(() => expect(onError).toHaveBeenCalledWith(failure));
+  });
+
+  it("renders a direct publication admission failure as one fixed diagnostic", () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const malicious = new BackendPublicationJournalError(
+      "malformed-journal",
+      "raw publication secret /tmp/private https://user:password@example.test/path\u001b[31m",
+      { cause: new Error("raw cause") },
+    );
+
+    expect(() => handleCliError(malicious)).toThrow("exit:1");
+    expect(consoleError).toHaveBeenCalledOnce();
+    expect(consoleError).toHaveBeenCalledWith(FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC);
+    const rendered = JSON.stringify(consoleError.mock.calls);
+    expect(rendered).not.toContain(malicious.message);
+    expect(rendered).not.toContain("raw cause");
+    expect(rendered).not.toContain("/tmp/private");
+    expect(rendered).not.toContain("https://user:password");
+    expect(rendered).not.toContain("\\u001b");
   });
 
   it("waits for the stdin timeout when a pipe never closes", async () => {
@@ -1072,6 +1094,7 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(state.codexPostToolFunctionalCoverage).toHaveBeenCalledOnce();
     expect(log.mock.calls.flat().join("\n")).toContain("✓ Codex: PostToolUse hook installed");
     expect(log.mock.calls.flat().join("\n")).toContain("✓ Codex: native exec capture functional");
+    expect(state.dispatchHook).not.toHaveBeenCalled();
   });
 
   it("skips the pure functional check when Codex structure is incomplete", async () => {

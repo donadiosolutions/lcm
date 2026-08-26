@@ -21,6 +21,10 @@ import { BackendPublicationJournalError } from "../storage/backend-publication.j
 
 const MAX_HOOK_EVIDENCE_BYTES = 4 * 1024 * 1024;
 
+/** Fixed, closed-vocabulary diagnostic for fail-closed publication admission. */
+export const BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC =
+  "lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.";
+
 /** The hook token is the coordinator's token, not a parallel hook authority. */
 export type HookPublicationLockToken = BackendPublicationLockToken;
 

@@ -11,8 +11,17 @@ import * as eventScrubbing from "../../src/hooks/event-scrubbing.js";
 import * as localEnqueue from "../../src/hooks/local-enqueue.js";
 import * as projectModule from "../../src/daemon/project.js";
 import * as hookErrors from "../../src/hooks/hook-errors.js";
+import * as hookConfig from "../../src/hooks/config.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import * as backendPublication from "../../src/storage/backend-publication.js";
+
+const FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC =
+  "lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.";
+
+function publicationAdmissionLogMessage(reason: string): string {
+  return `${FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC} (reason: ${reason})`;
+}
 
 // Mock eventsDbPath to use temp directory
 vi.mock("../../src/db/events-path.js", () => ({
@@ -104,7 +113,7 @@ describe("handlePostToolUse", () => {
     expect(result.stdout).toBe("");
   });
 
-  it("enqueues before selected project metadata and rethrows publication failures after durability", async () => {
+  it("enqueues before selected project metadata and returns a diagnostic after refusal", async () => {
     const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-order-cwd-"));
     extraDirs.push(inputCwd);
     const order: string[] = [];
@@ -116,6 +125,7 @@ describe("handlePostToolUse", () => {
       order.push("project");
       throw new BackendPublicationJournalError("unresolved-publication", "publication unresolved");
     });
+    const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValue(undefined);
     try {
       await expect(handlePostToolUse(JSON.stringify({
         session_id: "test-session",
@@ -123,12 +133,295 @@ describe("handlePostToolUse", () => {
         cwd: inputCwd,
         tool_input: { question: "Use SQLite?" },
         tool_response: "yes",
-      }))).rejects.toBeInstanceOf(BackendPublicationJournalError);
+      }))).resolves.toEqual({
+        exitCode: 0,
+        stdout: JSON.stringify({ systemMessage: FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC }),
+      });
       expect(order).toEqual(["enqueue", "project"]);
       expect(append).toHaveBeenCalledWith(expect.objectContaining({ cwd: inputCwd }));
     } finally {
       append.mockRestore();
       ensure.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it("safe-logs typed lock contention after enqueue and preserves the successful hook outcome", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-contention-cwd-"));
+    extraDirs.push(inputCwd);
+    const event = { type: "decision", category: "decision", data: "Use SQLite?", priority: 1 } as const;
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents").mockResolvedValue([event]);
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockResolvedValue({ inserted: 1, pendingCount: 1 });
+    const ensure = vi.spyOn(projectModule, "ensureProjectDir").mockImplementation(() => {
+      throw contention;
+    });
+    const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValue(undefined);
+
+    try {
+      await expect(handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Use SQLite?" },
+        tool_response: "yes",
+      }))).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(append.mock.invocationCallOrder[0]).toBeLessThan(ensure.mock.invocationCallOrder[0]!);
+      expect(log).toHaveBeenCalledOnce();
+      expect(log).toHaveBeenCalledWith("PostToolUse", contention, { cwd: inputCwd });
+    } finally {
+      scrub.mockRestore();
+      append.mockRestore();
+      ensure.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it("preserves global redaction patterns when config admission contends before enqueue", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-pre-enqueue-contention-cwd-"));
+    extraDirs.push(inputCwd);
+    writeFileSync(join(homeDir, ".lcm", "config.json"), JSON.stringify({
+      security: { sensitivePatterns: ["CONTENDED-[0-9]+"] },
+    }), { mode: 0o600 });
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const load = vi.spyOn(hookConfig, "loadHookConfig").mockImplementation(() => {
+      throw contention;
+    });
+    const ensure = vi.spyOn(projectModule, "ensureProjectDir").mockImplementation(() => {
+      throw contention;
+    });
+    const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValue(undefined);
+
+    try {
+      await expect(handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Use CONTENDED-123?" },
+        tool_response: "yes",
+      }))).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(readPersistedEvents(inputCwd)).toEqual([
+        expect.objectContaining({
+          data: "Q: Use [REDACTED]?\nA: yes",
+          source_hook: "PostToolUse",
+        }),
+      ]);
+      expect(load).toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith("PostToolUse", contention, { cwd: inputCwd });
+    } finally {
+      load.mockRestore();
+      ensure.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it("rethrows a publication error that prevents enqueue", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-pre-enqueue-publication-cwd-"));
+    extraDirs.push(inputCwd);
+    const publicationError = new BackendPublicationJournalError(
+      "malformed-journal",
+      "raw pre-enqueue publication failure",
+    );
+    const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents")
+      .mockRejectedValue(publicationError);
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockResolvedValue({ inserted: 1, pendingCount: 1 });
+    const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValue(undefined);
+
+    try {
+      await expect(handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Use SQLite?" },
+        tool_response: "yes",
+      }))).rejects.toBe(publicationError);
+      expect(append).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledOnce();
+      expect(log).toHaveBeenCalledWith(
+        "PostToolUse",
+        publicationAdmissionLogMessage(publicationError.reason),
+        { cwd: inputCwd },
+      );
+    } finally {
+      scrub.mockRestore();
+      append.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it.each([
+    "invalid-input",
+    "unsafe-storage",
+    "malformed-journal",
+    "checksum-mismatch",
+    "unexpected-state",
+    "unresolved-publication",
+    "permit-mismatch",
+    "backend-mismatch",
+  ] as const)("returns a fixed diagnostic for the exact %s publication error after enqueue", async (reason) => {
+    const inputCwd = mkdtempSync(join(tmpdir(), `post-tool-${reason}-cwd-`));
+    extraDirs.push(inputCwd);
+    const event = { type: "decision", category: "decision", data: "Use SQLite?", priority: 1 } as const;
+    const publicationError = new BackendPublicationJournalError(
+      reason,
+      `malicious raw ${reason} /tmp/private-token https://user:password@example.test/path`,
+      { cause: new Error("raw cause") },
+    );
+    const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents").mockResolvedValue([event]);
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockResolvedValue({ inserted: 1, pendingCount: 1 });
+    const ensure = vi.spyOn(projectModule, "ensureProjectDir").mockImplementation(() => {
+      throw publicationError;
+    });
+    const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValue(undefined);
+
+    try {
+      const result = await handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Use SQLite?" },
+        tool_response: "yes",
+      }));
+      expect(result).toEqual({
+        exitCode: 0,
+        stdout: JSON.stringify({ systemMessage: FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC }),
+      });
+      expect(append.mock.invocationCallOrder[0]).toBeLessThan(ensure.mock.invocationCallOrder[0]!);
+      expect(log).toHaveBeenCalledOnce();
+      expect(log).toHaveBeenCalledWith(
+        "PostToolUse",
+        publicationAdmissionLogMessage(reason),
+        { cwd: inputCwd },
+      );
+      const output = JSON.parse(result.stdout) as Record<string, unknown>;
+      expect(Object.keys(output)).toEqual(["systemMessage"]);
+      expect(output.systemMessage).toBe(FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC);
+      const logged = JSON.stringify(log.mock.calls);
+      expect(logged).not.toContain(publicationError.message);
+      expect(logged).not.toContain("raw cause");
+    } finally {
+      scrub.mockRestore();
+      append.mockRestore();
+      ensure.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it("returns the fixed system message when fixed-diagnostic logging rejects", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-log-rejection-cwd-"));
+    extraDirs.push(inputCwd);
+    const event = { type: "decision", category: "decision", data: "Use SQLite?", priority: 1 } as const;
+    const publicationError = new BackendPublicationJournalError("unexpected-state", "raw publication failure");
+    const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents").mockResolvedValue([event]);
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockResolvedValue({ inserted: 1, pendingCount: 1 });
+    const ensure = vi.spyOn(projectModule, "ensureProjectDir").mockImplementation(() => {
+      throw publicationError;
+    });
+    const log = vi.spyOn(hookErrors, "safeLogError").mockRejectedValue(new Error("logger failed"));
+
+    try {
+      await expect(handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Use SQLite?" },
+        tool_response: "yes",
+      }))).resolves.toEqual({
+        exitCode: 0,
+        stdout: JSON.stringify({ systemMessage: FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC }),
+      });
+      expect(log).toHaveBeenCalledOnce();
+      expect(log).toHaveBeenCalledWith("PostToolUse", publicationAdmissionLogMessage(publicationError.reason), { cwd: inputCwd });
+    } finally {
+      scrub.mockRestore();
+      append.mockRestore();
+      ensure.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it("keeps durable missing publication evidence as a successful hook outcome without fixed logging", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-missing-evidence-cwd-"));
+    extraDirs.push(inputCwd);
+    const event = { type: "decision", category: "decision", data: "Use SQLite?", priority: 1 } as const;
+    const publicationError = new BackendPublicationJournalError(
+      "publication-evidence-missing",
+      "raw missing evidence",
+    );
+    const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents").mockResolvedValue([event]);
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockResolvedValue({ inserted: 1, pendingCount: 1 });
+    const ensure = vi.spyOn(projectModule, "ensureProjectDir").mockImplementation(() => {
+      throw publicationError;
+    });
+    const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValue(undefined);
+
+    try {
+      await expect(handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Use SQLite?" },
+        tool_response: "yes",
+      }))).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(log).not.toHaveBeenCalled();
+    } finally {
+      scrub.mockRestore();
+      append.mockRestore();
+      ensure.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it("persists a composed native Codex event before returning a publication diagnostic", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-native-publication-cwd-"));
+    extraDirs.push(inputCwd);
+    process.env.TEST_EVENTS_DIR = inputCwd;
+    const command = `npm install ${"capture-test ".repeat(400)}`;
+    const publicationError = new BackendPublicationJournalError(
+      "unexpected-state",
+      "raw native publication failure",
+    );
+    const ensure = vi.spyOn(projectModule, "ensureProjectDir").mockImplementation(() => {
+      throw publicationError;
+    });
+    const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValue(undefined);
+
+    try {
+      const result = await handlePostToolUse(JSON.stringify({
+        client: "codex",
+        session_id: "native-codex-publication-session",
+        tool_name: "functions.exec_command",
+        cwd: inputCwd,
+        tool_input: { cmd: command },
+        tool_output: { isError: false, stdout: "raw output must not persist" },
+        tool_response: { exitCode: 0, stderr: "raw response must not persist" },
+      }));
+      expect(result).toEqual({
+        exitCode: 0,
+        stdout: JSON.stringify({ systemMessage: FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC }),
+      });
+      const rows = readPersistedEvents(inputCwd);
+      expect(rows).toEqual([
+        expect.objectContaining({
+          session_id: "native-codex-publication-session",
+          type: "env_install",
+          source_hook: "PostToolUse",
+          data: expect.stringMatching(/^npm install /),
+        }),
+      ]);
+      const data = String(rows[0]?.data);
+      expect(data.length).toBeLessThanOrEqual(2003);
+      expect(data).toContain("capture-test");
+      expect(JSON.stringify(rows)).not.toContain("raw output");
+      expect(JSON.stringify(rows)).not.toContain("raw response");
+      expect(log).toHaveBeenCalledWith(
+        "PostToolUse",
+        publicationAdmissionLogMessage(publicationError.reason),
+        { cwd: inputCwd },
+      );
+    } finally {
+      ensure.mockRestore();
+      log.mockRestore();
     }
   });
 

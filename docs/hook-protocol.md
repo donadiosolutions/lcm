@@ -156,7 +156,41 @@ Invoked after every tool call. lcm extracts structured events (decisions, errors
 | `tool_output` | string | Plaintext output (if available) |
 | `hook_event_name` | string | `"PostToolUse"` |
 
-**Response:** Always exit code `0`. This hook runs on every tool call and must be fast; it does no network I/O and only writes to a local sidecar SQLite database.
+**Response:** Normal capture exits with code `0`. This hook runs on every tool
+call and must be fast; it does no network I/O and only writes to a local
+sidecar SQLite database. The local event is appended before any selected-state
+publication admission is attempted. After that durable boundary:
+
+- missing publication evidence is treated as a successful best-effort outcome
+  (`0`) and does not emit a failure diagnostic;
+- typed private publication-lock contention is also a successful best-effort
+  outcome (`0`), while its ordinary typed error is recorded safely;
+- malformed, tampered, unsafe, mismatched, or unresolved publication evidence
+  remains fail-closed for selected-state work. After the local event is
+  preserved, the hook stops before selected-state mutation, records the fixed
+  diagnostic below, and returns code `0` with a protocol-safe JSON
+  `systemMessage` on stdout. This is a successful observer-hook protocol
+  result, not permission to continue selected-state work and not a hook
+  process failure.
+
+If publication admission fails before the local event can be durably appended,
+the hook does not report a successful observer result; the direct top-level CLI
+path retains its fixed stderr diagnostic and exit code `1`.
+
+The fixed diagnostic is:
+
+```text
+lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.
+```
+
+Raw publication messages, causes, stacks, paths, URLs, credentials, and journal
+contents are never included in that user-facing line.
+
+For a post-enqueue refusal, stdout contains exactly one JSON property:
+
+```json
+{"systemMessage":"lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying."}
+```
 
 The `daemon_port` payload field is ignored. PostToolUse never sends the daemon
 bearer token or captured event data to a payload-selected listener; queued
