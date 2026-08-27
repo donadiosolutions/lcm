@@ -9,11 +9,13 @@ import { packageRootFor } from "../src/runtime-root.js";
 import { DaemonClient, type DaemonHealth } from "../src/daemon/client.js";
 import {
   ConfigValidationError,
+  DEFAULT_LLM_MAX_CONCURRENCY,
   daemonConfigSnapshotWitnessEqual,
   LLM_REASONING_EFFORTS,
   readDaemonConfigSnapshot,
   reasoningEffortsForProvider,
   resolveLlmRequestPolicy,
+  MAX_LLM_MAX_CONCURRENCY,
   supportsFastMode,
   supportsRequestTimeout,
   type DaemonConfig,
@@ -132,7 +134,52 @@ type CompactOptions = CompactRequestPolicyOptions & {
   hook?: boolean;
   client?: unknown;
   help?: boolean;
+  maxConcurrency?: string;
 };
+
+/** Parse the canonical unsigned decimal form accepted by --max-concurrency. */
+export function parseCompactConcurrency(value: unknown): number {
+  if (typeof value !== "string" || !/^(?:0|[1-9]\d*)$/u.test(value)) {
+    throw new ConfigValidationError(
+      "compact.maxConcurrency",
+      "--max-concurrency requires canonical unsigned decimal text",
+    );
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < DEFAULT_LLM_MAX_CONCURRENCY || parsed > MAX_LLM_MAX_CONCURRENCY) {
+    throw new ConfigValidationError(
+      "compact.maxConcurrency",
+      `--max-concurrency must be an integer between ${DEFAULT_LLM_MAX_CONCURRENCY} and ${MAX_LLM_MAX_CONCURRENCY}`,
+    );
+  }
+  return parsed;
+}
+
+/** Resolve one compact invocation's effective worker concurrency. */
+export function resolveCompactConcurrency(
+  config: Pick<DaemonConfig, "llm">,
+  options: { maxConcurrency?: string; replay?: boolean } = {},
+): number {
+  const explicit = options.maxConcurrency === undefined
+    ? undefined
+    : parseCompactConcurrency(options.maxConcurrency);
+  if (options.replay === true && explicit !== undefined && explicit > 1) {
+    throw new ConfigValidationError(
+      "compact.maxConcurrency",
+      "--max-concurrency values above 1 are not supported with --replay",
+    );
+  }
+  if (explicit !== undefined) return explicit;
+  if (options.replay === true) return 1;
+  const stored = config.llm.maxConcurrency ?? DEFAULT_LLM_MAX_CONCURRENCY;
+  if (!Number.isSafeInteger(stored) || stored < DEFAULT_LLM_MAX_CONCURRENCY || stored > MAX_LLM_MAX_CONCURRENCY) {
+    throw new ConfigValidationError(
+      "llm.maxConcurrency",
+      `must be an integer between ${DEFAULT_LLM_MAX_CONCURRENCY} and ${MAX_LLM_MAX_CONCURRENCY}`,
+    );
+  }
+  return stored;
+}
 
 function numericOption(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
@@ -1511,6 +1558,7 @@ export async function runCli(
     .option("--retry-initial-delay-ms <ms>", "Override OpenAI-compatible initial retry delay")
     .option("--retry-max-delay-ms <ms>", "Override OpenAI-compatible maximum retry delay")
     .option("--retry-multiplier <n>", "Override OpenAI-compatible retry multiplier")
+    .option("--max-concurrency <n>", "Limit concurrent compaction requests (1-32)")
     .option("-v, --verbose", "Show per-session token details")
     .addOption(new Option("--hook", "Hook dispatch mode (internal)").hideHelp())
     .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
@@ -1548,20 +1596,23 @@ export async function runCli(
           console.error(`  --${fastMode ? "fast-mode" : "no-fast-mode"} requires llm.provider="auto", "claude-process", or "codex-process"`);
           exit(1);
         }
+        const maxConcurrency = resolveCompactConcurrency(config, { maxConcurrency: opts.maxConcurrency, replay });
         const port = config.daemon?.port ?? 3737;
         const pidFilePath = daemonPidPath();
-        const daemonResult = await ensureDaemon({
-          port,
-          pidFilePath,
-          spawnTimeoutMs: 10000,
-          expectedStorageBackend: config.storage.backend,
-          enforceUserManagerParent: true,
-        });
-        if (!daemonResult.connected) {
-          console.error(`Could not connect to daemon: ${daemonUnavailableMessage(daemonResult, "not-running")}`);
-          exit(1);
+        if (!dryRun) {
+          const daemonResult = await ensureDaemon({
+            port,
+            pidFilePath,
+            spawnTimeoutMs: 10000,
+            expectedStorageBackend: config.storage.backend,
+            enforceUserManagerParent: true,
+          });
+          if (!daemonResult.connected) {
+            console.error(`Could not connect to daemon: ${daemonUnavailableMessage(daemonResult, "not-running")}`);
+            exit(1);
+          }
+          clearDaemonRemediationMarker();
         }
-        clearDaemonRemediationMarker();
         const noPromote: boolean = !opts.promote;
         const minTokens = config.compaction.autoCompactMinTokens;
         const cwd = all ? undefined : process.cwd();
@@ -1583,7 +1634,7 @@ export async function runCli(
         let totalPromoted = 0;
         try {
           const { compacted, failures, compactedProjects } = await batchCompact({
-            minTokens, dryRun, port, cwd, replay, verbose, tokenPath, reasoningEffort, fastMode, requestPolicy,
+            minTokens, dryRun, port, cwd, replay, verbose, tokenPath, reasoningEffort, fastMode, requestPolicy, maxConcurrency,
             onProgress: (patch: Partial<ProgressState>): void => {
               Object.assign(compactState, patch);
               if (patch.lastResult) compactRenderer.sessionDone();
@@ -1594,7 +1645,7 @@ export async function runCli(
 
           // Auto-promote after a successful compact: new summaries are prime promotion candidates.
           let promotionFailures = 0;
-          if (compacted > 0 && !noPromote) {
+          if (!dryRun && compacted > 0 && !noPromote) {
             compactState.phases[1]!.status = "active";
             for (const promoteCwd of compactedProjects) {
               compactState.currentProject = promoteCwd;

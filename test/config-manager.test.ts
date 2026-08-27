@@ -397,6 +397,35 @@ describe("getConfigValue", () => {
 });
 
 describe("setConfigValue", () => {
+  it("round-trips maxConcurrency and preserves it across provider transitions", () => {
+    const { configPath } = makeConfig({
+      llm: {
+        provider: "openai",
+        model: "local-model",
+        baseUrl: "http://localhost:11435/v1",
+        apiMode: "responses",
+        maxConcurrency: 8,
+      },
+    });
+
+    expect(getConfigValue({ configPath, path: "llm.maxConcurrency" })).toBe(8);
+    expect(setConfigValue({
+      configPath,
+      path: "llm.provider",
+      value: "disabled",
+      env: {},
+    })).toBe("disabled");
+    expect(getConfigValue({ configPath, path: "llm.maxConcurrency" })).toBe(8);
+    expect(setConfigValue({
+      configPath,
+      path: "llm.maxConcurrency",
+      value: "17",
+      json: true,
+      env: {},
+    })).toBe(17);
+    expect(getConfigValue({ configPath, path: "llm.maxConcurrency" })).toBe(17);
+  });
+
   it("preserves an explicitly selected PostgreSQL backend while setting a local value", () => {
     const { directory, configPath } = makeConfig({
       llm: { provider: "disabled" },

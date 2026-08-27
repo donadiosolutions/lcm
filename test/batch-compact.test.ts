@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { batchCompact, findUncompacted, formatLlmDiagnostic } from "../src/batch-compact.js";
+import { batchCompact, findUncompacted, formatLlmDiagnostic, runBatchWorkerPool } from "../src/batch-compact.js";
 import { DaemonClient } from "../src/daemon/client.js";
 import { closeLcmConnection, getLcmConnection, getPoolStats } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
@@ -711,6 +711,214 @@ describe("batch compaction discovery", () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining("Found 1 uncompacted conversation ("));
     expect(log).toHaveBeenCalledWith(" done");
     expect(log).toHaveBeenCalledWith(expect.stringContaining("1 session compacted"));
+  });
+
+  it("limits concurrent compaction requests, keeps the oldest active session current, and orders projects by discovery", async () => {
+    const firstCwd = makeDir("compact-pool-a");
+    const firstPaths = projectPaths(firstCwd);
+    ensureProjectDir(firstCwd);
+    writeFileSync(firstPaths.metaPath, JSON.stringify({ cwd: firstPaths.canonical }));
+    seedConversation(firstPaths.dbPath);
+
+    const secondCwd = makeDir("compact-pool-b");
+    const secondPaths = projectPaths(secondCwd);
+    ensureProjectDir(secondCwd);
+    writeFileSync(secondPaths.metaPath, JSON.stringify({ cwd: secondPaths.canonical }));
+    seedConversation(secondPaths.dbPath);
+
+    const expectedProjectOrder = [...new Set(findUncompacted(100, true).map(conv => conv.cwd))];
+    expect(expectedProjectOrder).toEqual(expect.arrayContaining([
+      firstPaths.canonical,
+      secondPaths.canonical,
+    ]));
+
+    const releases = [0, 1].map(() => {
+      let release!: () => void;
+      const pending = new Promise<void>(resolve => { release = resolve; });
+      return { pending, release };
+    });
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockImplementation(async (_path, body) => {
+      const index = body.cwd === firstPaths.canonical ? 0 : 1;
+      await releases[index]!.pending;
+      return { tokensBefore: 250, tokensAfter: 50 };
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    const pending = batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      maxConcurrency: 2,
+      onProgress: patch => progress.push(patch),
+    });
+    await vi.waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+    const active = progress.filter(patch => patch.activeSessions !== undefined);
+    expect(active.at(-1)?.activeSessions).toHaveLength(2);
+    expect(active.at(-1)?.current).toMatchObject({ sessionId: "session-1" });
+
+    releases[1]!.release();
+    await vi.waitFor(() => expect(progress.at(-1)?.activeSessions).toHaveLength(1));
+    expect(progress.at(-1)?.current).toMatchObject({ sessionId: "session-1" });
+    releases[0]!.release();
+
+    await expect(pending).resolves.toMatchObject({
+      compacted: 2,
+      compactedProjects: expectedProjectOrder,
+    });
+    expect(progress.at(-1)?.activeSessions).toEqual([]);
+    expect(progress.at(-1)?.current).toBeUndefined();
+    expect(log.mock.calls.filter(([line]) => String(line).includes("done")).length).toBe(2);
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining("compacting:"));
+  });
+
+  it("clamps replay compaction to one in-flight request", async () => {
+    const cwd = makeDir("compact-replay-serial");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversations(paths.dbPath);
+
+    const releases = [0, 1].map(() => {
+      let release!: () => void;
+      const pending = new Promise<void>(resolve => { release = resolve; });
+      return { pending, release };
+    });
+    let call = 0;
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockImplementation(async () => {
+      const index = call++;
+      await releases[index]!.pending;
+      return { tokensBefore: 250, tokensAfter: 50 };
+    });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    const pending = batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      replay: true,
+      maxConcurrency: 32,
+    });
+    await vi.waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    releases[0]!.release();
+    await vi.waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+    releases[1]!.release();
+
+    await expect(pending).resolves.toMatchObject({ compacted: 2 });
+  });
+});
+
+describe("batch worker pool", () => {
+  it.each([1, 32])("accepts the %d worker concurrency boundary", async maxConcurrency => {
+    let peak = 0;
+    let active = 0;
+    const results = await runBatchWorkerPool({
+      items: [10, 20],
+      maxConcurrency,
+      worker: async item => {
+        active++;
+        peak = Math.max(peak, active);
+        await Promise.resolve();
+        active--;
+        return item * 2;
+      },
+    });
+
+    expect(peak).toBeLessThanOrEqual(maxConcurrency);
+    expect(results.map(result => result.index)).toEqual(expect.arrayContaining([0, 1]));
+  });
+
+  it("rejects a non-positive worker concurrency", async () => {
+    await expect(runBatchWorkerPool({
+      items: [1],
+      maxConcurrency: 0,
+      worker: item => item,
+    })).rejects.toThrow("maxConcurrency");
+  });
+
+  it("does not claim work when cancellation is already requested", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const claimed: number[] = [];
+
+    await expect(runBatchWorkerPool({
+      items: [1, 2],
+      maxConcurrency: 2,
+      signal: controller.signal,
+      onClaim: (_item, index) => claimed.push(index),
+      worker: item => item,
+    })).resolves.toEqual([]);
+    expect(claimed).toEqual([]);
+  });
+
+  it("caps in-flight workers, reduces settled results synchronously, and preserves indexes", async () => {
+    const active = new Set<number>();
+    let peak = 0;
+    const started: number[] = [];
+    const reduced: Array<{ index: number; value?: number; error?: unknown }> = [];
+    const gates = [0, 1, 2, 3].map(() => {
+      let release!: () => void;
+      const promise = new Promise<void>(resolve => { release = resolve; });
+      return { promise, release };
+    });
+
+    const pending = runBatchWorkerPool({
+      items: [10, 20, 30, 40],
+      maxConcurrency: 2,
+      worker: async (item, index) => {
+        started.push(index);
+        active.add(index);
+        peak = Math.max(peak, active.size);
+        await gates[index]!.promise;
+        active.delete(index);
+        return item * 2;
+      },
+      onResult: result => reduced.push(result),
+    });
+
+    await vi.waitFor(() => expect(started).toEqual([0, 1]));
+    gates[1]!.release();
+    await vi.waitFor(() => expect(started).toEqual([0, 1, 2]));
+    gates[2]!.release();
+    gates[0]!.release();
+    await vi.waitFor(() => expect(started).toEqual([0, 1, 2, 3]));
+    gates[3]!.release();
+
+    const results = await pending;
+    expect(peak).toBe(2);
+    expect(results.map(result => result.index)).toEqual([1, 2, 0, 3]);
+    expect(reduced).toEqual(results);
+  });
+
+  it("stops claiming immediately after cancellation while awaiting admitted workers", async () => {
+    const controller = new AbortController();
+    const started: number[] = [];
+    const gates = [0, 1].map(() => {
+      let release!: () => void;
+      const promise = new Promise<void>(resolve => { release = resolve; });
+      return { promise, release };
+    });
+
+    const pending = runBatchWorkerPool({
+      items: [1, 2, 3],
+      maxConcurrency: 2,
+      signal: controller.signal,
+      worker: async (_item, index) => {
+        started.push(index);
+        await gates[index]!.promise;
+        return index;
+      },
+    });
+
+    await vi.waitFor(() => expect(started).toEqual([0, 1]));
+    controller.abort();
+    gates[0]!.release();
+    gates[1]!.release();
+    await expect(pending).resolves.toHaveLength(2);
+    expect(started).toEqual([0, 1]);
   });
 });
 

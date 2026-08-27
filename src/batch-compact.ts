@@ -2,7 +2,12 @@ import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { runLcmMigrations } from "./db/migration.js";
 import { closeLcmConnection, getLcmConnection } from "./db/connection.js";
-import type { ProgressPhaseError, ProgressState } from "./cli/progress-state.js";
+import {
+  progressCurrentSession,
+  type ProgressCurrentSession,
+  type ProgressPhaseError,
+  type ProgressState,
+} from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
 import { configPath, projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
@@ -27,6 +32,19 @@ export interface BatchCompactResult {
   compactedProjects: string[];
 }
 
+export type BatchWorkerCompletion<TItem, TResult> =
+  | { readonly index: number; readonly item: TItem; readonly value: TResult }
+  | { readonly index: number; readonly item: TItem; readonly error: unknown };
+
+export type BatchWorkerPoolOptions<TItem, TResult> = Readonly<{
+  items: readonly TItem[];
+  maxConcurrency: number;
+  signal?: AbortSignal;
+  worker: (item: TItem, index: number) => Promise<TResult> | TResult;
+  onClaim?: (item: TItem, index: number) => void;
+  onResult?: (result: BatchWorkerCompletion<TItem, TResult>) => void;
+}>;
+
 type ReplayContextRow = {
   ordinal: number;
   item_type: "message" | "summary";
@@ -48,6 +66,51 @@ const MANUAL_COMPACT_LEAF_MIN_FANOUT = 3;
 const MANUAL_COMPACT_CONDENSED_MIN_FANOUT = 2;
 const MANUAL_COMPACT_SUMMARY_CHUNK_TOKENS = 20_000;
 const MANUAL_COMPACT_MIN_CONDENSED_TOKENS = 2_000;
+
+/** Run a fixed-size worker pool over immutable discovery indexes. */
+export async function runBatchWorkerPool<TItem, TResult>(
+  options: BatchWorkerPoolOptions<TItem, TResult>,
+): Promise<BatchWorkerCompletion<TItem, TResult>[]> {
+  if (!Number.isSafeInteger(options.maxConcurrency) || options.maxConcurrency < 1) {
+    throw new RangeError("maxConcurrency must be a positive safe integer");
+  }
+
+  const completions: BatchWorkerCompletion<TItem, TResult>[] = [];
+  const active = new Set<Promise<void>>();
+  let nextIndex = 0;
+
+  const claim = (): void => {
+    while (
+      active.size < options.maxConcurrency
+      && nextIndex < options.items.length
+      && options.signal?.aborted !== true
+    ) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const item = options.items[index]!;
+      options.onClaim?.(item, index);
+      const task = Promise.resolve()
+        .then(() => options.worker(item, index))
+        .then(value => ({ index, item, value } as BatchWorkerCompletion<TItem, TResult>))
+        .catch(error => ({ index, item, error } as BatchWorkerCompletion<TItem, TResult>))
+        .then((result) => {
+          completions.push(result);
+          options.onResult?.(result);
+        })
+        .finally(() => {
+          active.delete(task);
+        });
+      active.add(task);
+    }
+  };
+
+  claim();
+  while (active.size > 0) {
+    await Promise.race(active);
+    claim();
+  }
+  return completions;
+}
 
 export function formatLlmDiagnostic(input: {
   providerLabel?: string;
@@ -263,11 +326,17 @@ export async function batchCompact(opts: {
   reasoningEffort?: LlmReasoningEffort;
   fastMode?: boolean;
   requestPolicy?: LlmInvocationRequestPolicy;
+  /** Effective compact worker count; replay callers should resolve this to one. */
+  maxConcurrency?: number;
+  /** Stops future claims while admitted requests are allowed to settle. */
+  signal?: AbortSignal;
   /** Called with state patches as each session is processed — used by the ninja renderer */
   onProgress?: (patch: Partial<ProgressState>) => void;
 }): Promise<BatchCompactResult> {
   const configFile = configPath();
-  selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
+  const config = loadDaemonConfig(configFile);
+  selectStorageBackendForConfig(configFile, config.storage);
+  const maxConcurrency = opts.replay ? 1 : opts.maxConcurrency ?? config.llm.maxConcurrency;
   const discovery = discoverUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay);
   const conversations = discovery.conversations;
   const onProgress = opts.onProgress;
@@ -314,36 +383,48 @@ export async function batchCompact(opts: {
   let tokensIn = 0;
   let tokensOut = 0;
   const progressErrors: { sessionId: string; message: string }[] = [];
-  const compactedProjects = new Set<string>();
+  const compactedProjectIndexes = new Map<string, number>();
+  const activeSessions = new Map<number, ProgressCurrentSession>();
   const client = new DaemonClient(`http://127.0.0.1:${opts.port}`, opts.tokenPath);
+  type CompactResponse = {
+    summary?: string;
+    skipped?: boolean;
+    actionTaken?: boolean;
+    tokensBefore?: number;
+    tokensAfter?: number;
+    providerLabel?: string;
+    apiMode?: LlmApiMode;
+    reasoningEffort?: LlmReasoningEffort | null;
+    fastMode?: boolean | null;
+    requestTimeoutMs?: number | null;
+    retry?: LlmRetryPolicy | null;
+  };
 
-  for (const conv of conversations) {
-    const label = `${conv.cwd} conv #${conv.conversationId} (${conv.messages} msgs, ${(conv.tokens / 1000).toFixed(1)}k tokens)`;
+  const progressActivePatch = (): Partial<ProgressState> => opts.dryRun
+    ? {}
+    : {
+      activeSessions: [...activeSessions.values()],
+      current: progressCurrentSession([...activeSessions.values()]),
+    };
 
-    if (opts.dryRun) {
-      console.log(`  [dry-run] would compact: ${label}`);
-      completedCount++;
-      onProgress?.({ completed: completedCount });
-      continue;
-    }
-
-    const sessionStart = Date.now();
-    onProgress?.({ current: { sessionId: conv.sessionId, messages: conv.messages, tokens: conv.tokens, startedAt: sessionStart } });
-    process.stdout.write(`  compacting: ${label}...`);
-    try {
-      const data = await client.post<{
-        summary?: string;
-        skipped?: boolean;
-        actionTaken?: boolean;
-        tokensBefore?: number;
-        tokensAfter?: number;
-        providerLabel?: string;
-        apiMode?: LlmApiMode;
-        reasoningEffort?: LlmReasoningEffort | null;
-        fastMode?: boolean | null;
-        requestTimeoutMs?: number | null;
-        retry?: LlmRetryPolicy | null;
-      }>("/compact", {
+  await runBatchWorkerPool<UncompactedConversation, CompactResponse>({
+    items: conversations,
+    maxConcurrency,
+    signal: opts.signal,
+    onClaim: opts.dryRun
+      ? undefined
+      : (conv, index) => {
+        activeSessions.set(index, {
+          sessionId: conv.sessionId,
+          messages: conv.messages,
+          tokens: conv.tokens,
+          startedAt: Date.now(),
+        });
+        onProgress?.(progressActivePatch());
+      },
+    worker: async (conv) => {
+      if (opts.dryRun) return {};
+      return client.post<CompactResponse>("/compact", {
         session_id: conv.sessionId,
         cwd: conv.cwd,
         skip_ingest: true,
@@ -358,17 +439,42 @@ export async function batchCompact(opts: {
           multiplier: opts.requestPolicy.retry.multiplier,
         } } : {}),
       });
+    },
+    onResult: (result) => {
+      const conv = result.item;
+      const label = `${conv.cwd} conv #${conv.conversationId} (${conv.messages} msgs, ${(conv.tokens / 1000).toFixed(1)}k tokens)`;
+      const sessionStart = activeSessions.get(result.index)?.startedAt ?? Date.now();
+      activeSessions.delete(result.index);
+      const activePatch = progressActivePatch();
 
-      if (data.skipped) {
+      if ("error" in result) {
+        const errMsg = result.error instanceof Error ? result.error.message : "unknown error";
+        console.log(` FAILED (${errMsg})`);
+        progressErrors.push({ sessionId: conv.sessionId, message: errMsg });
+        onProgress?.({
+          ...activePatch,
+          completed: completedCount,
+          errors: progressErrors,
+          lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, elapsed: Date.now() - sessionStart },
+        });
+        return;
+      }
+
+      const data = result.value;
+      if (opts.dryRun) {
+        console.log(`  [dry-run] would compact: ${label}`);
+        completedCount++;
+        onProgress?.({ ...activePatch, completed: completedCount });
+      } else if (data?.skipped) {
         skipped++;
         completedCount++;
         console.log(" skipped (already in progress)");
         onProgress?.({
+          ...activePatch,
           completed: completedCount,
-          current: undefined,
           lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, elapsed: Date.now() - sessionStart },
         });
-      } else if (data.actionTaken === false) {
+      } else if (data?.actionTaken === false) {
         unchanged++;
         completedCount++;
         const tokensBefore = data.tokensBefore ?? conv.tokens;
@@ -376,13 +482,13 @@ export async function batchCompact(opts: {
         const summary = data.summary?.trim() || "No compaction needed.";
         console.log(` unchanged (${summary})`);
         onProgress?.({
+          ...activePatch,
           completed: completedCount,
-          current: undefined,
           lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore, tokensAfter, provider: formatLlmDiagnostic(data), elapsed: Date.now() - sessionStart },
         });
       } else {
-        const tokensBefore = data.tokensBefore ?? conv.tokens;
-        const tokensAfter = data.tokensAfter ?? tokensBefore;
+        const tokensBefore = data?.tokensBefore ?? conv.tokens;
+        const tokensAfter = data?.tokensAfter ?? tokensBefore;
         if (opts.verbose && tokensBefore > 0) {
           const pct = Math.round((1 - tokensAfter / tokensBefore) * 100);
           console.log(` done  (${(tokensBefore / 1000).toFixed(1)}k → ${(tokensAfter / 1000).toFixed(1)}k tokens, ${pct}% reduction)`);
@@ -391,16 +497,20 @@ export async function batchCompact(opts: {
         }
         compacted++;
         completedCount++;
-        compactedProjects.add(normalizeProjectPath(conv.cwd));
+        const project = normalizeProjectPath(conv.cwd);
+        const earliestIndex = compactedProjectIndexes.get(project);
+        if (earliestIndex === undefined || result.index < earliestIndex) {
+          compactedProjectIndexes.set(project, result.index);
+        }
         messagesIn += conv.messages;
         tokensIn += tokensBefore;
         tokensOut += tokensAfter;
         onProgress?.({
+          ...activePatch,
           completed: completedCount,
           messagesIn,
           tokensIn,
           tokensOut,
-          current: undefined,
           lastResult: {
             sessionId: conv.sessionId,
             messages: conv.messages,
@@ -411,18 +521,8 @@ export async function batchCompact(opts: {
           },
         });
       }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : "unknown error";
-      console.log(` FAILED (${errMsg})`);
-      progressErrors.push({ sessionId: conv.sessionId, message: errMsg });
-      onProgress?.({
-        completed: completedCount,
-        current: undefined,
-        errors: progressErrors,
-        lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, elapsed: Date.now() - sessionStart },
-      });
-    }
-  }
+    },
+  });
 
   if (!opts.dryRun) {
     if (tokensIn > 0) {
@@ -439,6 +539,8 @@ export async function batchCompact(opts: {
     unchanged,
     skipped,
     failures: phaseErrors.length + progressErrors.length,
-    compactedProjects: [...compactedProjects],
+    compactedProjects: [...compactedProjectIndexes.entries()]
+      .sort((left, right) => left[1] - right[1])
+      .map(([project]) => project),
   };
 }

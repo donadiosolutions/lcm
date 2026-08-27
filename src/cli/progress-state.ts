@@ -62,6 +62,8 @@ export interface ProgressState {
 
   /** Current session being processed */
   current?: ProgressCurrentSession;
+  /** Every session currently admitted to the compact worker pool. */
+  activeSessions: ProgressCurrentSession[];
 
   /** Last completed session (drives line 3 of ninja display) */
   lastResult?: ProgressLastResult;
@@ -91,8 +93,29 @@ export function makeProgressState(opts: {
     tokensIn: 0,
     tokensOut: 0,
     messagesIn: 0,
+    activeSessions: [],
     startedAt: Date.now(),
     dryRun: opts.dryRun ?? false,
     aborted: false,
   };
+}
+
+/** Return the oldest active session, preserving insertion order for ties. */
+export function progressCurrentSession(
+  sessions: readonly ProgressCurrentSession[],
+): ProgressCurrentSession | undefined {
+  let oldest: ProgressCurrentSession | undefined;
+  for (const session of sessions) {
+    if (oldest === undefined || session.startedAt < oldest.startedAt) oldest = session;
+  }
+  return oldest;
+}
+
+/** Replace active-session accounting and its representative current value. */
+export function updateProgressActiveSessions(
+  state: ProgressState,
+  sessions: readonly ProgressCurrentSession[],
+): void {
+  state.activeSessions = [...sessions];
+  state.current = progressCurrentSession(state.activeSessions);
 }

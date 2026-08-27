@@ -62,6 +62,7 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("--retry-initial-delay-ms <ms>");
     expect(text).toContain("--retry-max-delay-ms <ms>");
     expect(text).toContain("--retry-multiplier <n>");
+    expect(text).toContain("--max-concurrency <n>");
     expect(text).toContain("Codex process: minimal, low, medium, high, xhigh");
     expect(text).toContain("Stored llm.provider=auto configuration accepts the shared low, medium, high, and xhigh values");
     expect(text).toContain("invocation overrides under auto validate against the actual resolved process provider");
@@ -70,6 +71,10 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("lcm compact --reasoning-effort high");
     expect(text).toContain("lcm compact --timeout-ms 300000");
     expect(text).toContain("lcm compact --retry-max-attempts 4");
+    expect(text).toContain("lcm compact --all --max-concurrency 4");
+    expect(text).toContain("llm.maxConcurrency defaults to 1");
+    expect(text).toContain("--replay clamps stored concurrency to 1");
+    expect(text).toContain("--dry-run validates configuration and discovery without starting the daemon");
     expect(text).toContain("Retry flags remain OpenAI-compatible-only");
     expect(text).toContain("Examples:");
   });
