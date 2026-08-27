@@ -404,7 +404,7 @@ describe("Codex Responses zero-tools gateway", () => {
         "X-Codex-Beta-Features": "feature-a,feature-b",
         "X-OpenAI-Internal-Codex-Responses-Lite": "true",
         "OpenAI-Beta": "responses=experimental",
-        "X-ResponsesAPI-Include-Timing-Metrics": "true",
+        "X-ResponsesAPI-Include-Timing-Metrics": "must-not-forward",
         "X-Api-Key": "hostile-api-key",
         Cookie: "hostile-cookie",
         "X-Forwarded-For": "198.51.100.7",
@@ -454,8 +454,8 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(capture?.headers["x-openai-subagent"]).toBe("compact");
     expect(capture?.headers["x-codex-beta-features"]).toBe("feature-a,feature-b");
     expect(capture?.headers["x-openai-internal-codex-responses-lite"]).toBe("true");
-    expect(capture?.headers["openai-beta"]).toBe("responses=experimental");
-    expect(capture?.headers["x-responsesapi-include-timing-metrics"]).toBe("true");
+    expect(capture?.headers["openai-beta"]).toBeUndefined();
+    expect(capture?.headers["x-responsesapi-include-timing-metrics"]).toBeUndefined();
     expect(capture?.headers["x-api-key"]).toBeUndefined();
     expect(capture?.headers.cookie).toBeUndefined();
     expect(capture?.headers["x-forwarded-for"]).toBeUndefined();
@@ -638,6 +638,9 @@ describe("Codex Responses zero-tools gateway", () => {
       { model: "gpt-5.4", reasoning: { summary: "unsupported" } },
       { model: "gpt-5.4", reasoning: { context: "unsupported" } },
       { model: "gpt-5.4", service_tier: "unsupported" },
+      { model: "gpt-5.4", reasoning: { effort: "max" } },
+      { model: "gpt-5.4", service_tier: "auto" },
+      { model: "gpt-5.4", service_tier: "scale" },
     ]) {
       const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
       gateways.push(gateway);

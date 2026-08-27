@@ -26,11 +26,10 @@ const REASONING_EFFORTS = new Set([
   "medium",
   "high",
   "xhigh",
-  "max",
 ]);
 const REASONING_SUMMARIES = new Set(["none", "auto", "concise", "detailed"]);
 const REASONING_CONTEXTS = new Set(["current_turn", "all_turns"]);
-const SERVICE_TIERS = new Set(["default", "fast", "priority", "flex", "auto", "scale"]);
+const SERVICE_TIERS = new Set(["default", "fast", "priority", "flex"]);
 
 /**
  * Headers Codex 0.149.1 attaches to Responses requests.  This list is
@@ -52,8 +51,6 @@ const CODEX_METADATA_HEADERS = [
   "x-openai-subagent",
   "x-codex-beta-features",
   "x-openai-internal-codex-responses-lite",
-  "openai-beta",
-  "x-responsesapi-include-timing-metrics",
 ] as const;
 
 type FetchFn = typeof fetch;
