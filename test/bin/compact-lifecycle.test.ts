@@ -528,6 +528,33 @@ describe("compact invocation lifecycle", () => {
     vi.useRealTimers();
   });
 
+  it("normalizes managed restart rejection and incomplete restart results", async () => {
+    const lifecycle = {
+      started: () => true,
+      stopHeartbeat: vi.fn(),
+      target: { invocationId, command: "compact" as const, daemonInstanceId },
+    } as never;
+    const base = {
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation: vi.fn(async () => response("cancelling", 1)), health: vi.fn(async () => null) }),
+      awaitLocalWork: async () => undefined,
+      originalHealth: { status: "healthy", version: "1.4.2", storageBackend: "sqlite" as const, daemonInstanceId, pid: 9, uptime: 1 },
+      proveProviderWitnessGone: async () => false,
+      proveOldInstanceGone: async () => false,
+      onDiagnostic: vi.fn(),
+    };
+    const rejected = await cancelAndDrainCompactInvocation({
+      ...base,
+      restart: async () => { throw "restart primitive"; },
+    } as never);
+    expect(rejected.diagnostic).toBe("managed daemon restart was not verified");
+    const incomplete = await cancelAndDrainCompactInvocation({
+      ...base,
+      restart: async () => undefined as never,
+    } as never);
+    expect(incomplete.diagnostic).toMatch(/managed daemon restart did not settle/);
+  });
+
   it("treats a missing provider witness reader as unavailable proof", async () => {
     const lifecycle = {
       started: () => true,
