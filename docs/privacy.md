@@ -45,7 +45,10 @@ It constructs a fresh minimized Responses payload rather than forwarding the
 CLI's inherited instructions, input, tool inventory, client metadata, or
 prompt-cache key. The payload explicitly uses `tools: []`,
 `tool_choice: "none"`, `parallel_tool_calls: false`, `store: false`, and
-`stream: true`; `include` and `stream_options` are omitted. Managed
+`stream: true` in the standard Responses dialect. Responses Lite instead uses
+an explicit empty `additional_tools` inventory and omits top-level `tools`.
+Both dialects discard inherited prompt/input/tools state; `include` and
+`stream_options` are omitted. Managed
 authentication is forwarded only through an explicit header allowlist, and the
 gateway selects the exact ChatGPT or OpenAI endpoint described in
 [configuration](configuration.md). It never persists or logs credentials,

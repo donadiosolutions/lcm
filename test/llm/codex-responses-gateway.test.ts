@@ -251,6 +251,16 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(() => utils.validateRequestEncoding({ "content-encoding": "gzip" })).toThrow();
     expect(() => utils.validateRequestEncoding({ "content-encoding": "identity" })).not.toThrow();
     expect(() => utils.buildUpstreamHeaders({ "x-client-request-id": "x".repeat(16 * 1024 + 1) }, "Bearer token", undefined)).toThrow();
+    expect(utils.responsesLiteEnabled({})).toBe(false);
+    expect(utils.responsesLiteEnabled({ "x-openai-internal-codex-responses-lite": "true" })).toBe(true);
+    expect(() => utils.responsesLiteEnabled({ "x-openai-internal-codex-responses-lite": "false" })).toThrow();
+    expect(() => utils.responsesLiteEnabled({ "x-openai-internal-codex-responses-lite": ["true"] })).toThrow();
+    expect(utils.buildPayload("prompt", { model: "gpt-5.4" }, true)).toMatchObject({
+      input: [
+        { type: "additional_tools", role: "developer", tools: [] },
+        { type: "message", role: "user" },
+      ],
+    });
   });
 
   it("covers backpressure, abort, and safe error response paths", async () => {
@@ -402,7 +412,6 @@ describe("Codex Responses zero-tools gateway", () => {
         "X-Oai-Attestation": "attestation-123",
         "X-OpenAI-Subagent": "compact",
         "X-Codex-Beta-Features": "feature-a,feature-b",
-        "X-OpenAI-Internal-Codex-Responses-Lite": "true",
         "OpenAI-Beta": "responses=experimental",
         "X-ResponsesAPI-Include-Timing-Metrics": "must-not-forward",
         "X-Api-Key": "hostile-api-key",
@@ -453,7 +462,7 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(capture?.headers["x-oai-attestation"]).toBe("attestation-123");
     expect(capture?.headers["x-openai-subagent"]).toBe("compact");
     expect(capture?.headers["x-codex-beta-features"]).toBe("feature-a,feature-b");
-    expect(capture?.headers["x-openai-internal-codex-responses-lite"]).toBe("true");
+    expect(capture?.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
     expect(capture?.headers["openai-beta"]).toBeUndefined();
     expect(capture?.headers["x-responsesapi-include-timing-metrics"]).toBeUndefined();
     expect(capture?.headers["x-api-key"]).toBeUndefined();
@@ -485,7 +494,77 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(body.parallel_tool_calls).toBe(false);
     expect(body.store).toBe(false);
     expect(body.stream).toBe(true);
-    expect(JSON.stringify(body)).not.toMatch(/ATTACK|secret|cache|unknown|tool-\d/);
+    expect(JSON.stringify(body)).not.toMatch(/ATTACK|secret|cache|unknown|tool-\d|additional_tools|lite-hostile/);
+  });
+
+  it("preserves Responses Lite dialect while replacing its hostile additional_tools input", async () => {
+    let capture: Capture | undefined;
+    const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      capture = {
+        body: JSON.parse(await readBody(req)) as unknown,
+        headers: req.headers,
+        method: req.method ?? "",
+        url: req.url ?? "",
+      };
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end("data: lite-ok\n\n");
+    });
+    upstreams.push(upstream);
+    const upstreamUrl = await listen(upstream);
+    const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
+    gateways.push(gateway);
+
+    const response = await fetch(`${gateway.baseUrl}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer managed-token",
+        "X-OpenAI-Internal-Codex-Responses-Lite": "true",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.6",
+        instructions: "HOSTILE-LITE-INSTRUCTIONS",
+        input: [{
+          type: "additional_tools",
+          role: "developer",
+          tools: Array.from({ length: 12 }, (_, index) => ({
+            type: "function",
+            name: `lite-hostile-tool-${index}`,
+          })),
+        }],
+        tools: Array.from({ length: 12 }, (_, index) => ({ type: "function", name: `tool-${index}` })),
+        tool_choice: "auto",
+        parallel_tool_calls: true,
+        previous_response_id: "lite-previous-secret",
+        client_metadata: { secret: "lite-metadata-secret" },
+        prompt_cache_key: "lite-cache-secret",
+        unknown_field: "lite-unknown-secret",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("data: lite-ok\n\n");
+    expect(capture?.headers["x-openai-internal-codex-responses-lite"]).toBe("true");
+    expect(capture?.headers.authorization).toBe("Bearer managed-token");
+    const body = capture?.body as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual([
+      "input",
+      "model",
+      "parallel_tool_calls",
+      "store",
+      "stream",
+      "tool_choice",
+    ]);
+    expect(body.model).toBe("gpt-5.6");
+    expect(body.input).toEqual([
+      { type: "additional_tools", role: "developer", tools: [] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: PROMPT }] },
+    ]);
+    expect(body.tools).toBeUndefined();
+    expect(body.tool_choice).toBe("none");
+    expect(body.parallel_tool_calls).toBe(false);
+    expect(body.store).toBe(false);
+    expect(body.stream).toBe(true);
+    expect(JSON.stringify(body)).not.toMatch(/HOSTILE|lite-hostile|previous|metadata|cache|unknown/);
   });
 
   it.each([
@@ -531,6 +610,8 @@ describe("Codex Responses zero-tools gateway", () => {
       { Authorization: "Bearer " },
       { Authorization: "Bearer token,other" },
       { Authorization: "Bearer token", "ChatGPT-Account-Id": "acct with spaces" },
+      { Authorization: "Bearer token", "X-OpenAI-Internal-Codex-Responses-Lite": "false" },
+      { Authorization: "Bearer token", "X-OpenAI-Internal-Codex-Responses-Lite": "TRUE" },
     ];
     for (const headers of cases) {
       const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
@@ -594,6 +675,7 @@ describe("Codex Responses zero-tools gateway", () => {
     for (const headers of [
       { Authorization: ["Bearer one", "Bearer two"] },
       { Authorization: "Bearer one", "ChatGPT-Account-Id": ["acct-one", "acct-two"] },
+      { Authorization: "Bearer one", "X-OpenAI-Internal-Codex-Responses-Lite": ["true", "true"] },
     ]) {
       const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
       gateways.push(gateway);
@@ -631,6 +713,17 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(body.reasoning).toEqual({ effort: "minimal", summary: "none", context: "all_turns" });
     expect(body.service_tier).toBe("priority");
 
+    const max = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
+    gateways.push(max);
+    const maxResponse = await fetch(`${max.baseUrl}/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer test-token" },
+      body: JSON.stringify({ model: "gpt-5.4", reasoning: { effort: "max" } }),
+    });
+    expect(maxResponse.status).toBe(200);
+    const maxBody = JSON.parse(captured[1]) as Record<string, unknown>;
+    expect(maxBody.reasoning).toEqual({ effort: "max" });
+
     for (const invalid of [
       { model: "" },
       { model: "gpt-5.4", reasoning: "invalid" },
@@ -638,7 +731,6 @@ describe("Codex Responses zero-tools gateway", () => {
       { model: "gpt-5.4", reasoning: { summary: "unsupported" } },
       { model: "gpt-5.4", reasoning: { context: "unsupported" } },
       { model: "gpt-5.4", service_tier: "unsupported" },
-      { model: "gpt-5.4", reasoning: { effort: "max" } },
       { model: "gpt-5.4", service_tier: "auto" },
       { model: "gpt-5.4", service_tier: "scale" },
     ]) {

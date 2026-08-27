@@ -140,6 +140,7 @@ async function runCodexSummarizer(
     let child: ChildProcessWithoutNullStreams;
     let finishPromise: Promise<void> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let abortCompletionWait: ((error: Error) => void) | undefined;
 
     const finishRun = (
       primaryError?: unknown,
@@ -147,16 +148,22 @@ async function runCodexSummarizer(
     ): Promise<void> => {
       if (finishPromise !== undefined) return finishPromise;
       finishPromise = (async () => {
-        if (timer !== undefined) clearTimeout(timer);
         let finalError = primaryError === undefined
           ? undefined
           : primaryError instanceof Error ? primaryError : new Error(String(primaryError));
         let summary: string | undefined;
         if (finalError === undefined && completionWork !== undefined) {
+          let rejectDeadline!: (error: Error) => void;
+          const deadline = new Promise<never>((_resolve, reject) => {
+            rejectDeadline = reject;
+          });
+          abortCompletionWait = (error) => rejectDeadline(error);
           try {
-            summary = await completionWork();
+            summary = await Promise.race([completionWork(), deadline]);
           } catch (error) {
             finalError = error instanceof Error ? error : new Error(String(error));
+          } finally {
+            abortCompletionWait = undefined;
           }
         }
         try {
@@ -166,6 +173,7 @@ async function runCodexSummarizer(
             finalError = error instanceof Error ? error : new Error(String(error));
           }
         }
+        if (timer !== undefined) clearTimeout(timer);
         cleanupTempDir(deps.rmSync, tempDir);
         if (finalError !== undefined) reject(finalError);
         else resolve(summary as string);
@@ -184,13 +192,17 @@ async function runCodexSummarizer(
     }
 
     timer = setTimeout(() => {
-      if (finishPromise !== undefined) return;
+      const timeoutError = new Error(`codex process timed out after ${Math.round(deps.timeoutMs / 1000)}s`);
+      if (finishPromise !== undefined) {
+        abortCompletionWait?.(timeoutError);
+        return;
+      }
       try {
         child.kill();
       } catch {
         // ignore kill failures during timeout cleanup
       }
-      void finishRun(new Error(`codex process timed out after ${Math.round(deps.timeoutMs / 1000)}s`));
+      void finishRun(timeoutError);
     }, deps.timeoutMs);
 
     try {

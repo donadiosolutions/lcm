@@ -379,10 +379,10 @@ describe("createCodexProcessSummarizer", () => {
       await vi.runAllTicks();
       expect(gateway.waitForCompletion).toHaveBeenCalledOnce();
 
-      // The timeout expires while the accepted child-close path is waiting for
-      // the gateway's complete upstream stream. It must not kill the child or
-      // replace the original terminal outcome with a timeout.
-      await vi.advanceTimersByTimeAsync(30);
+      // The accepted child-close path is waiting for the gateway's complete
+      // upstream stream, but remains before the request deadline. It must not
+      // kill the child or replace the original terminal outcome.
+      await vi.advanceTimersByTimeAsync(10);
       expect(child.kill).not.toHaveBeenCalled();
       resolveGateway?.();
       await expect(promise).resolves.toBe("summary");
@@ -393,6 +393,48 @@ describe("createCodexProcessSummarizer", () => {
       child.emit("error", new Error("late child error"));
       child.stdin.emit("error", new Error("late stdin error"));
       await vi.runAllTicks();
+      expect(close).toHaveBeenCalledOnce();
+      expect(rmSyncMock).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the deadline active after child close and closes a stalled gateway", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeHangingChild();
+      const gateway = makeGateway({
+        waitForCompletion: vi.fn(() => new Promise<void>(() => {})),
+      });
+      const close = gateway.close;
+      const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+      const spawn = vi.fn().mockReturnValue(child);
+      const summarizer = createCodexProcessSummarizer({
+        ...baseDeps(child),
+        spawn: spawn as unknown as SpawnFn,
+        rmSync: rmSyncMock,
+        timeoutMs: 20,
+        _createGateway: vi.fn().mockResolvedValue(gateway),
+      } as never);
+
+      const promise = summarizer("private transcript", false);
+      while (spawn.mock.calls.length === 0) await Promise.resolve();
+      child.emit("close", 0);
+      await vi.runAllTicks();
+      expect(gateway.waitForCompletion).toHaveBeenCalledOnce();
+
+      let settled = false;
+      const observed = promise.catch((error: unknown) => {
+        settled = true;
+        return error;
+      });
+      await vi.advanceTimersByTimeAsync(20);
+      await vi.runAllTicks();
+      expect(settled).toBe(true);
+      const error = await observed;
+      expect(error).toMatchObject({ message: "codex process timed out after 0s" });
+      expect(child.kill).not.toHaveBeenCalled();
       expect(close).toHaveBeenCalledOnce();
       expect(rmSyncMock).toHaveBeenCalledOnce();
     } finally {

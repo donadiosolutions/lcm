@@ -26,6 +26,7 @@ const REASONING_EFFORTS = new Set([
   "medium",
   "high",
   "xhigh",
+  "max",
 ]);
 const REASONING_SUMMARIES = new Set(["none", "auto", "concise", "detailed"]);
 const REASONING_CONTEXTS = new Set(["current_turn", "all_turns"]);
@@ -170,6 +171,13 @@ function validateRequestEncoding(headers: IncomingHttpHeaders): void {
   }
 }
 
+function responsesLiteEnabled(headers: IncomingHttpHeaders): boolean {
+  const raw = headers["x-openai-internal-codex-responses-lite"];
+  if (raw === undefined) return false;
+  if (Array.isArray(raw) || raw !== "true") throw new GatewayInputError(400);
+  return true;
+}
+
 function validateContentLength(headers: IncomingHttpHeaders): number | undefined {
   const raw = typeof headers["content-length"] === "string"
     ? headers["content-length"]
@@ -276,23 +284,28 @@ function validatedServiceTier(value: unknown): string | undefined {
   return value;
 }
 
-function buildPayload(prompt: string, input: PlainRecord): PlainRecord {
+function buildPayload(prompt: string, input: PlainRecord, responsesLite = false): PlainRecord {
   const model = boundedModel(input.model);
   const reasoning = validatedReasoning(input.reasoning);
   const serviceTier = validatedServiceTier(input.service_tier);
   const payload: PlainRecord = {
     model,
-    input: [{
-      type: "message",
-      role: "user",
-      content: [{ type: "input_text", text: prompt }],
-    }],
-    tools: [],
+    input: responsesLite
+      ? [
+          { type: "additional_tools", role: "developer", tools: [] },
+          { type: "message", role: "user", content: [{ type: "input_text", text: prompt }] },
+        ]
+      : [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: prompt }],
+        }],
     tool_choice: "none",
     parallel_tool_calls: false,
     store: false,
     stream: true,
   };
+  if (!responsesLite) payload.tools = [];
   if (reasoning !== undefined) payload.reasoning = reasoning;
   if (serviceTier !== undefined) payload.service_tier = serviceTier;
   return payload;
@@ -540,8 +553,9 @@ export async function createCodexResponsesGateway(
       const declaredLength = validateContentLength(request.headers);
       const authorization = requireAuthorization(request.headers);
       const accountId = optionalAccountId(request.headers);
+      const responsesLite = responsesLiteEnabled(request.headers);
       const body = parseRequestBody(await readRequestBody(request, declaredLength));
-      const payload = buildPayload(options.prompt, body);
+      const payload = buildPayload(options.prompt, body, responsesLite);
       const headers = buildUpstreamHeaders(request.headers, authorization, accountId);
       requestAccepted = true;
 
@@ -675,6 +689,7 @@ export const __codexResponsesGatewayTestUtils = {
   isPlainObject,
   hasRawDuplicateHeader,
   validateRequestEncoding,
+  responsesLiteEnabled,
   validateContentLength,
   readRequestBody,
   parseRequestBody,

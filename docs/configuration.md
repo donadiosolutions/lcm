@@ -912,8 +912,10 @@ directory with user configuration, rules, and hooks disabled, and receives only
 the fixed `LCM compaction bootstrap.` stdin string. The gateway keeps the real
 LCM summarizer prompt and transcript in memory, replaces all inherited
 `instructions` and `input` content, and sends a minimized Responses request
-with `tools: []`, `tool_choice: "none"`, `parallel_tool_calls: false`,
-`store: false`, and `stream: true`.
+with no tools. The standard Responses dialect uses top-level `tools: []`; the
+Responses Lite dialect uses an explicit empty `additional_tools` inventory.
+Both force `tool_choice: "none"`, `parallel_tool_calls: false`, `store: false`,
+and `stream: true`.
 
 Only the validated model, reasoning controls, and supported service tier are
 retained from Codex's request. `instructions`, `previous_response_id`,
