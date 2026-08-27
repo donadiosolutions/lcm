@@ -83,6 +83,8 @@ export type RouteExecutionContext = Readonly<{
   publicationLockToken?: BackendPublicationLockToken;
   withPublicationAdmission?: RoutePublicationAdmission;
   signal?: AbortSignal;
+  /** Narrow invocation-control seam used by invocation-aware compact routes. */
+  invocationCoordinator?: InvocationCoordinator;
 }>;
 export type RouteHandler = (
   req: IncomingMessage,
@@ -920,6 +922,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           await route.handler(req, res, body, {
             withPublicationAdmission: withBackgroundPublicationAdmission,
             signal: requestSignal,
+            invocationCoordinator,
           });
           return;
         }
@@ -931,13 +934,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             publicationLockToken: lockToken,
             withPublicationAdmission: withRequestPublicationAdmission(lockToken),
             signal: requestSignal,
+            invocationCoordinator,
           });
         });
         bufferedResponse.flush();
         bufferedResponse = undefined;
       } else {
         if (publicHealth) {
-          await route.handler(req, res, body, { signal: requestSignal });
+          await route.handler(req, res, body, { signal: requestSignal, invocationCoordinator });
         } else {
           bufferedResponse = new BufferedServerResponse(res);
           const admissionWitness = assertDaemonReadStorageAdmission(
@@ -947,7 +951,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             options?._assertBackendPublication,
             options?._readDaemonConfigSnapshot,
           );
-          await route.handler(req, bufferedResponse as unknown as ServerResponse, body, { signal: requestSignal });
+          await route.handler(req, bufferedResponse as unknown as ServerResponse, body, {
+            signal: requestSignal,
+            invocationCoordinator,
+          });
           const finalWitness = assertDaemonReadStorageAdmission(
             config,
             publicationConfigPath,

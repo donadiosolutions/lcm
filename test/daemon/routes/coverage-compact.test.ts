@@ -41,6 +41,7 @@ const state = vi.hoisted(() => ({
       }),
   ensureProject: vi.fn(),
   queuedKeys: [] as string[],
+  queuedSignals: [] as Array<AbortSignal | undefined>,
   beforeQueuedWork: undefined as (() => void) | undefined,
   transactionActive: false,
   scrubber: vi.fn(async () => ({ scrubWithCounts: (content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }) })),
@@ -49,6 +50,9 @@ const state = vi.hoisted(() => ({
   projectHealth: vi.fn(async () => ({ status: "healthy" })),
   factoryClose: vi.fn(async () => undefined),
   openProjectError: undefined as unknown,
+  compactInputObserver: undefined as ((input: unknown) => void | Promise<void>) | undefined,
+  compactInput: undefined as unknown,
+  writeFileSync: vi.fn(),
   compactionStorageProbe: undefined as ((storage: {
     health: () => Promise<unknown>;
     close: () => Promise<void>;
@@ -95,8 +99,9 @@ vi.mock("../../../src/daemon/project.js", () => ({
 }));
 
 vi.mock("../../../src/daemon/project-queue.js", () => ({
-  enqueue: (id: string, work: () => unknown) => {
+  enqueue: (id: string, work: () => unknown, signal?: AbortSignal) => {
     state.queuedKeys.push(id);
+    state.queuedSignals.push(signal);
     state.beforeQueuedWork?.();
     return work();
   },
@@ -197,7 +202,9 @@ vi.mock("../../../src/compaction.js", () => ({
       largeFiles: { scalar: string };
     }) {}
 
-    compact = async () => {
+    compact = async (input: unknown) => {
+      state.compactInput = input;
+      await state.compactInputObserver?.(input);
       await state.compactionStorageProbe?.(this.storage);
       return state.compactResult;
     };
@@ -210,7 +217,7 @@ vi.mock("node:fs", async (importOriginal) => ({
     if (state.metaError !== undefined) throw state.metaError;
     return state.metaText;
   },
-  writeFileSync: vi.fn(),
+  writeFileSync: state.writeFileSync,
 }));
 
 // Keep this route unit isolated from the daemon's eager route-registration graph.
@@ -246,6 +253,7 @@ import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import {
   buildCompactionMessage,
   createCompactHandler as createCompactHandlerProduction,
+  justCompactedMap,
 } from "../../../src/daemon/routes/compact.js";
 import type {
   RouteExecutionContext,
@@ -256,6 +264,14 @@ import type { StorageBackendFactory } from "../../../src/storage/index.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
+import {
+  createAbortError,
+} from "../../../src/daemon/cancellation.js";
+import {
+  createInvocationCoordinator,
+  InvocationCoordinatorError,
+  type InvocationCoordinator,
+} from "../../../src/daemon/invocation-coordinator.js";
 
 // Intentional unit-test admission seam: the production route receives a live
 // token from the daemon server; this mocked boundary supplies an explicit
@@ -281,8 +297,13 @@ function config() {
 
 function response() {
   let payload = "";
+  let status = 200;
   return {
-    res: { writeHead: vi.fn().mockReturnThis(), end: vi.fn((body?: string) => { payload = body ?? ""; }) } as never,
+    res: {
+      writeHead: vi.fn((code: number) => { status = code; }),
+      end: vi.fn((body?: string) => { payload = body ?? ""; }),
+    } as never,
+    status: () => status,
     json: () => JSON.parse(payload || "{}") as Record<string, unknown>,
   };
 }
@@ -336,6 +357,7 @@ describe("compact route coverage", () => {
     state.ensureProject.mockClear();
     state.ensureProject.mockReturnValue("/tmp/project");
     state.queuedKeys = [];
+    state.queuedSignals = [];
     state.beforeQueuedWork = undefined;
     state.transactionActive = false;
     state.scrubber.mockClear();
@@ -344,6 +366,11 @@ describe("compact route coverage", () => {
     state.projectHealth.mockClear();
     state.factoryClose.mockClear();
     state.openProjectError = undefined;
+    state.compactInputObserver = undefined;
+    state.compactInput = undefined;
+    state.writeFileSync.mockReset();
+    state.writeFileSync.mockImplementation(() => undefined);
+    justCompactedMap.clear();
     state.compactionStorageProbe = undefined;
   });
 
@@ -640,6 +667,371 @@ describe("compact route coverage", () => {
       status: "blocked",
       error: "backend publication admission blocked",
     });
+  });
+
+  it("rejects an unknown invocation before opening project storage", async () => {
+    const coordinator = createInvocationCoordinator({
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({
+        session_id: "unknown-invocation",
+        cwd: "/tmp",
+        invocation_id: "22222222-2222-4222-8222-222222222222",
+      }),
+      { ...testCompactContext, invocationCoordinator: coordinator },
+    );
+
+    expect(output.json()).toMatchObject({ error: expect.stringMatching(/unknown|invocation/i) });
+    expect(state.openProject).not.toHaveBeenCalled();
+    await coordinator.shutdown();
+  });
+
+  it("rejects malformed invocation identifiers before control lookup", async () => {
+    const output = response();
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "malformed-invocation", cwd: "/tmp", invocation_id: "not-a-uuid" }),
+      testCompactContext,
+    );
+
+    expect(output.status()).toBe(400);
+    expect(output.json()).toEqual({ error: "invocation_id must be a canonical UUID" });
+    expect(state.openProject).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when an invocation id has no coordinator context", async () => {
+    const output = response();
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({
+        session_id: "missing-invocation-context",
+        cwd: "/tmp",
+        invocation_id: "22222222-2222-4222-8222-222222222222",
+      }),
+      testCompactContext,
+    );
+
+    expect(output.status()).toBe(503);
+    expect(output.json()).toEqual({ error: "invocation control unavailable" });
+    expect(state.openProject).not.toHaveBeenCalled();
+  });
+
+  it("returns cancellation when an admitted request is already aborted", async () => {
+    const invocationId = "77777777-7777-4777-8777-777777777777";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    const requestController = new AbortController();
+    requestController.abort();
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "already-aborted-invocation", cwd: "/tmp", invocation_id: invocationId }),
+      {
+        ...testCompactContext,
+        signal: requestController.signal,
+        invocationCoordinator: coordinator,
+      },
+    );
+
+    expect(output.status()).toBe(499);
+    expect(output.json()).toMatchObject({ status: "cancelled" });
+    expect(state.openProject).not.toHaveBeenCalled();
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    await coordinator.shutdown();
+  });
+
+  it("returns coordinator cancellation errors from initial admission", async () => {
+    const invocationId = "88888888-8888-4888-8888-888888888888";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    const output = response();
+    const admission: RoutePublicationAdmission = async () => {
+      throw new InvocationCoordinatorError("cancelled", "invocation is cancelling", 409);
+    };
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "initial-commit-cancel", cwd: "/tmp", invocation_id: invocationId }),
+      { withPublicationAdmission: admission, invocationCoordinator: coordinator },
+    );
+
+    expect(output.status()).toBe(409);
+    expect(output.json()).toEqual({ error: "invocation admission failed" });
+    expect(state.openProject).not.toHaveBeenCalled();
+    await coordinator.shutdown();
+  });
+
+  it("uses a bounded fallback when invocation admission throws a non-Error", async () => {
+    const invocationId = "99999999-9999-4999-8999-999999999999";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const base = createInvocationCoordinator({ daemonInstanceId });
+    base.start({ invocationId, command: "compact", daemonInstanceId });
+    const coordinator = {
+      ...base,
+      heartbeat: () => { throw "not-an-error"; },
+    } as unknown as InvocationCoordinator;
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "non-error-admission", cwd: "/tmp", invocation_id: invocationId }),
+      { ...testCompactContext, invocationCoordinator: coordinator },
+    );
+
+    expect(output.status()).toBe(409);
+    expect(output.json()).toEqual({ error: "invocation admission failed" });
+    expect(state.openProject).not.toHaveBeenCalled();
+    await base.shutdown();
+  });
+
+  it("cancels the invocation when an abort-ignoring provider returns", async () => {
+    const invocationId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    const requestController = new AbortController();
+    const cancel = vi.spyOn(coordinator, "cancel");
+    state.compactInputObserver = async () => {
+      requestController.abort();
+    };
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "provider-return-cancel", cwd: "/tmp", invocation_id: invocationId }),
+      {
+        ...testCompactContext,
+        signal: requestController.signal,
+        invocationCoordinator: coordinator,
+      },
+    );
+
+    expect(output.status()).toBe(499);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(state.writeFileSync).not.toHaveBeenCalled();
+    expect(justCompactedMap.has("provider-return-cancel")).toBe(false);
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    await coordinator.shutdown();
+  });
+
+  it("cancels an invocation through the request signal listener", async () => {
+    const invocationId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    const requestController = new AbortController();
+    const cancel = vi.spyOn(coordinator, "cancel");
+    cancel.mockRejectedValueOnce(new Error("cancel control unavailable"));
+    const output = response();
+    let releaseGate!: () => void;
+    state.summarizerGate = new Promise<void>(resolve => { releaseGate = resolve; });
+
+    const pending = createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "listener-cancel", cwd: "/tmp", invocation_id: invocationId }),
+      {
+        ...testCompactContext,
+        signal: requestController.signal,
+        invocationCoordinator: coordinator,
+      },
+    );
+    await Promise.resolve();
+    requestController.abort();
+    releaseGate();
+    await pending;
+
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(output.status()).toBe(499);
+    await coordinator.shutdown();
+  });
+
+  it("does not write a cancellation response after response headers are sent", async () => {
+    const invocationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    const requestController = new AbortController();
+    state.compactInputObserver = () => { requestController.abort(); };
+    const output = response();
+    Object.defineProperty(output.res, "headersSent", { value: true, configurable: true });
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "headers-sent-cancel", cwd: "/tmp", invocation_id: invocationId }),
+      {
+        ...testCompactContext,
+        signal: requestController.signal,
+        invocationCoordinator: coordinator,
+      },
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.res.end).not.toHaveBeenCalled();
+    await coordinator.shutdown();
+  });
+
+  it("propagates intentional metadata cancellation without setting justCompacted", async () => {
+    const invocationId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    state.writeFileSync.mockImplementation(() => { throw createAbortError(); });
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "metadata-abort", cwd: "/tmp", invocation_id: invocationId }),
+      { ...testCompactContext, invocationCoordinator: coordinator },
+    );
+
+    expect(output.status()).toBe(499);
+    expect(state.writeFileSync).toHaveBeenCalledOnce();
+    expect(justCompactedMap.has("metadata-abort")).toBe(false);
+    await coordinator.shutdown();
+  });
+
+  it("admits invocation work before queue entry and releases it after settlement", async () => {
+    const invocationId = "33333333-3333-4333-8333-333333333333";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "admitted-invocation", cwd: "/tmp", invocation_id: invocationId }),
+      { ...testCompactContext, invocationCoordinator: coordinator },
+    );
+
+    expect(output.status()).toBe(200);
+    expect(state.queuedKeys).toEqual(["pid"]);
+    expect(state.queuedSignals).toHaveLength(1);
+    expect(state.queuedSignals[0]?.aborted).toBe(false);
+    expect(state.compactInput).toMatchObject({
+      signal: expect.objectContaining({ aborted: false }),
+      acquireCommit: expect.any(Function),
+    });
+    expect(coordinator.snapshot(invocationId)).toMatchObject({
+      state: "active",
+      activeCount: 0,
+      workCount: 0,
+      commitCount: 0,
+    });
+    await coordinator.shutdown();
+  });
+
+  it("cancels the matching invocation on request disconnect before project open", async () => {
+    const invocationId = "44444444-4444-4444-8444-444444444444";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    let releaseSummarizer!: () => void;
+    state.summarizerGate = new Promise<void>(resolve => { releaseSummarizer = resolve; });
+    const requestController = new AbortController();
+    const output = response();
+
+    const pending = createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "disconnect-before-open", cwd: "/tmp", invocation_id: invocationId }),
+      {
+        ...testCompactContext,
+        signal: requestController.signal,
+        invocationCoordinator: coordinator,
+      },
+    );
+    await Promise.resolve();
+    requestController.abort();
+    releaseSummarizer();
+    await pending;
+
+    expect(output.status()).toBe(499);
+    expect(output.json()).toMatchObject({ status: "cancelled" });
+    expect(state.openProject).not.toHaveBeenCalled();
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    await coordinator.shutdown();
+  });
+
+  it("finishes a pre-latched metadata commit but rejects later writes", async () => {
+    const invocationId = "55555555-5555-4555-8555-555555555555";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const base = createInvocationCoordinator({ daemonInstanceId });
+    base.start({ invocationId, command: "compact", daemonInstanceId });
+    const requestController = new AbortController();
+    let abortOnCommit = true;
+    const coordinator = {
+      ...base,
+      acquireCommit: (target: Parameters<typeof base.acquireCommit>[0]) => {
+        const permit = base.acquireCommit(target);
+        if (abortOnCommit) {
+          abortOnCommit = false;
+          requestController.abort();
+        }
+        return permit;
+      },
+    } as unknown as InvocationCoordinator;
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "metadata-latch", cwd: "/tmp", invocation_id: invocationId }),
+      {
+        ...testCompactContext,
+        signal: requestController.signal,
+        invocationCoordinator: coordinator,
+      },
+    );
+
+    expect(output.status()).toBe(499);
+    expect(state.writeFileSync).toHaveBeenCalledOnce();
+    expect(justCompactedMap.has("metadata-latch")).toBe(false);
+    expect(base.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    await base.shutdown();
+  });
+
+  it("returns a bounded response when commit admission reports cancellation", async () => {
+    const invocationId = "66666666-6666-4666-8666-666666666666";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const base = createInvocationCoordinator({ daemonInstanceId });
+    base.start({ invocationId, command: "compact", daemonInstanceId });
+    const coordinator = {
+      ...base,
+      acquireCommit: () => {
+        throw new InvocationCoordinatorError("cancelled", "invocation is cancelling", 409);
+      },
+    } as unknown as InvocationCoordinator;
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "commit-cancel-error", cwd: "/tmp", invocation_id: invocationId }),
+      { ...testCompactContext, invocationCoordinator: coordinator },
+    );
+
+    expect(output.status()).toBe(409);
+    expect(output.json()).toEqual({ error: "invocation admission failed" });
+    expect(justCompactedMap.has("commit-cancel-error")).toBe(false);
+    await base.shutdown();
   });
 
   it("sanitizes an initial publication admission failure", async () => {

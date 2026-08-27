@@ -4,6 +4,7 @@ import type { SummaryRecord, ContextItemRecord } from "./store/summary-store.js"
 import { extractFileIdsFromContent } from "./large-files.js";
 import type { ScrubEngine } from "./scrub.js";
 import type { ConversationRepository, ProjectStorage } from "./storage/index.js";
+import { isAbortError, throwIfAborted } from "./daemon/cancellation.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -64,12 +65,33 @@ type CompactionSummarizeOptions = {
   previousSummary?: string;
   isCondensed?: boolean;
   depth?: number;
+  signal?: AbortSignal;
 };
 export type CompactionSummarizeFn = (
   text: string,
   aggressive?: boolean,
   options?: CompactionSummarizeOptions,
 ) => Promise<string>;
+
+/** A single durable write admission that remains valid until release. */
+export type CompactionCommitPermit = Readonly<{
+  release: () => void;
+}>;
+
+/** Acquire one linearizable durable-write permit for this invocation. */
+export type CompactionCommitAdmission = () =>
+  | CompactionCommitPermit
+  | PromiseLike<CompactionCommitPermit>;
+
+/** Optional invocation-owned cancellation and durable-write context. */
+export type CompactionInvocationContext = Readonly<{
+  signal?: AbortSignal;
+  acquireCommit?: CompactionCommitAdmission;
+}>;
+
+type CompactionInputContext = CompactionInvocationContext & {
+  context?: CompactionInvocationContext;
+};
 type PassResult = { summaryId: string; level: CompactionLevel };
 type LeafChunkSelection = {
   items: ContextItemRecord[];
@@ -182,6 +204,29 @@ export class CompactionEngine {
     private config: CompactionConfig,
   ) {}
 
+  private resolveInvocationContext(input: CompactionInputContext): CompactionInvocationContext {
+    return {
+      signal: input.signal ?? input.context?.signal,
+      acquireCommit: input.acquireCommit ?? input.context?.acquireCommit,
+    };
+  }
+
+  /** Run one durable transaction under a non-revocable commit permit. */
+  private async withCommitPermit<T>(
+    context: CompactionInvocationContext,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    throwIfAborted(context.signal);
+    const permit = context.acquireCommit === undefined
+      ? { release: (): void => undefined }
+      : await context.acquireCommit();
+    try {
+      return await operation();
+    } finally {
+      permit.release();
+    }
+  }
+
   // ── evaluate ─────────────────────────────────────────────────────────────
 
   /** Evaluate whether compaction is needed. */
@@ -189,8 +234,11 @@ export class CompactionEngine {
     conversationId: number,
     tokenBudget: number,
     observedTokenCount?: number,
+    signal?: AbortSignal,
   ): Promise<CompactionDecision> {
+    throwIfAborted(signal);
     const storedTokens = await this.storage.context.getContextTokenCount(conversationId);
+    throwIfAborted(signal);
     const liveTokens =
       typeof observedTokenCount === "number" &&
       Number.isFinite(observedTokenCount) &&
@@ -224,12 +272,14 @@ export class CompactionEngine {
    * `leafChunkTokens`. This lets callers trigger a soft incremental leaf pass
    * before the full context threshold is breached.
    */
-  async evaluateLeafTrigger(conversationId: number): Promise<{
+  async evaluateLeafTrigger(conversationId: number, signal?: AbortSignal): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
-    const rawTokensOutsideTail = await this.countRawTokensOutsideFreshTail(conversationId);
+    throwIfAborted(signal);
+    const rawTokensOutsideTail = await this.countRawTokensOutsideFreshTail(conversationId, signal);
+    throwIfAborted(signal);
     const threshold = this.resolveLeafChunkTokens();
     return {
       shouldCompact: rawTokensOutsideTail >= threshold,
@@ -250,7 +300,7 @@ export class CompactionEngine {
     hardTrigger?: boolean;
     /** Seed context from a prior session's final summary (used in replay import). */
     previousSummaryContent?: string;
-  }): Promise<CompactionResult> {
+  } & CompactionInputContext): Promise<CompactionResult> {
     return this.compactFullSweep(input);
   }
 
@@ -265,12 +315,18 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     previousSummaryContent?: string;
-  }): Promise<CompactionResult> {
+  } & CompactionInputContext): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force } = input;
 
+    const context = this.resolveInvocationContext(input);
+    const signal = context.signal;
+    const hasInvocationContext = signal !== undefined || context.acquireCommit !== undefined;
+    throwIfAborted(signal);
     const tokensBefore = await this.storage.context.getContextTokenCount(conversationId);
+    throwIfAborted(signal);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+    const leafTrigger = await this.evaluateLeafTrigger(conversationId, signal);
+    throwIfAborted(signal);
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {
@@ -281,7 +337,10 @@ export class CompactionEngine {
       };
     }
 
-    const leafChunk = await this.selectOldestLeafChunk(conversationId);
+    const leafChunk = hasInvocationContext
+      ? await this.selectOldestLeafChunk(conversationId, signal)
+      : await this.selectOldestLeafChunk(conversationId);
+    throwIfAborted(signal);
     if (leafChunk.items.length === 0) {
       return {
         actionTaken: false,
@@ -291,26 +350,32 @@ export class CompactionEngine {
       };
     }
 
-    const previousSummaryContent =
-      input.previousSummaryContent ??
-      (await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items));
+    const previousSummaryContent = input.previousSummaryContent ?? (hasInvocationContext
+      ? await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items, signal)
+      : await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items));
 
-    const leafResult = await this.leafPass(
-      conversationId,
-      leafChunk.items,
-      summarize,
-      previousSummaryContent,
-    );
+    const leafResult = hasInvocationContext
+      ? await this.leafPass(
+          conversationId,
+          leafChunk.items,
+          summarize,
+          previousSummaryContent,
+          context,
+        )
+      : await this.leafPass(conversationId, leafChunk.items, summarize, previousSummaryContent);
     const tokensAfterLeaf = await this.storage.context.getContextTokenCount(conversationId);
+    throwIfAborted(signal);
 
-    await this.persistCompactionEvents({
+    const persistLeafInput = {
       conversationId,
       tokensBefore,
       tokensAfterLeaf,
       tokensAfterFinal: tokensAfterLeaf,
       leafResult: { summaryId: leafResult.summaryId, level: leafResult.level },
       condenseResult: null,
-    });
+      ...(hasInvocationContext ? { context } : {}),
+    } as const;
+    await this.persistCompactionEvents(persistLeafInput);
 
     let tokensAfter = tokensAfterLeaf;
     let condensed = false;
@@ -321,28 +386,32 @@ export class CompactionEngine {
     const condensedMinChunkTokens = this.resolveCondensedMinChunkTokens();
     if (incrementalMaxDepth > 0) {
       for (let targetDepth = 0; targetDepth < incrementalMaxDepth; targetDepth++) {
+        throwIfAborted(signal);
         const fanout = this.resolveFanoutForDepth(targetDepth, false);
-        const chunk = await this.selectOldestChunkAtDepth(conversationId, targetDepth);
+        const chunk = hasInvocationContext
+          ? await this.selectOldestChunkAtDepth(conversationId, targetDepth, undefined, signal)
+          : await this.selectOldestChunkAtDepth(conversationId, targetDepth);
+        throwIfAborted(signal);
         if (chunk.items.length < fanout || chunk.summaryTokens < condensedMinChunkTokens) {
           break;
         }
 
         const passTokensBefore = await this.storage.context.getContextTokenCount(conversationId);
-        const condenseResult = await this.condensedPass(
-          conversationId,
-          chunk.items,
-          targetDepth,
-          summarize,
-        );
+        const condenseResult = hasInvocationContext
+          ? await this.condensedPass(conversationId, chunk.items, targetDepth, summarize, context)
+          : await this.condensedPass(conversationId, chunk.items, targetDepth, summarize);
         const passTokensAfter = await this.storage.context.getContextTokenCount(conversationId);
-        await this.persistCompactionEvents({
+        throwIfAborted(signal);
+        const persistCondenseInput = {
           conversationId,
           tokensBefore: passTokensBefore,
           tokensAfterLeaf: passTokensBefore,
           tokensAfterFinal: passTokensAfter,
           leafResult: null,
           condenseResult,
-        });
+          ...(hasInvocationContext ? { context } : {}),
+        } as const;
+        await this.persistCompactionEvents(persistCondenseInput);
 
         tokensAfter = passTokensAfter;
         condensed = true;
@@ -380,12 +449,18 @@ export class CompactionEngine {
     hardTrigger?: boolean;
     /** Seed context from a prior session's final summary (used in replay import). */
     previousSummaryContent?: string;
-  }): Promise<CompactionResult> {
+  } & CompactionInputContext): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
 
+    const context = this.resolveInvocationContext(input);
+    const signal = context.signal;
+    const hasInvocationContext = signal !== undefined || context.acquireCommit !== undefined;
+    throwIfAborted(signal);
     const tokensBefore = await this.storage.context.getContextTokenCount(conversationId);
+    throwIfAborted(signal);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
-    const leafTrigger = await this.evaluateLeafTrigger(conversationId);
+    const leafTrigger = await this.evaluateLeafTrigger(conversationId, signal);
+    throwIfAborted(signal);
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
       return {
@@ -396,7 +471,9 @@ export class CompactionEngine {
       };
     }
 
+    throwIfAborted(signal);
     const contextItems = await this.storage.context.getContextItems(conversationId);
+    throwIfAborted(signal);
     if (contextItems.length === 0) {
       return {
         actionTaken: false,
@@ -417,7 +494,11 @@ export class CompactionEngine {
 
     // Phase 1: leaf passes over oldest raw chunks outside the protected tail.
     while (true) {
-      const leafChunk = await this.selectOldestLeafChunk(conversationId);
+      throwIfAborted(signal);
+      const leafChunk = hasInvocationContext
+        ? await this.selectOldestLeafChunk(conversationId, signal)
+        : await this.selectOldestLeafChunk(conversationId);
+      throwIfAborted(signal);
       if (leafChunk.items.length === 0) {
         break;
       }
@@ -425,27 +506,37 @@ export class CompactionEngine {
       // For first leaf pass: use caller's seed if provided, otherwise resolve from store
       if (isFirstLeafPass) {
         const MAX_PREVIOUS_SUMMARY_LENGTH = 50_000;
-        const seedSummary = input.previousSummaryContent ?? (await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items));
+        const seedSummary = input.previousSummaryContent ?? (hasInvocationContext
+          ? await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items, signal)
+          : await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items));
+        throwIfAborted(signal);
         previousSummaryContent = seedSummary ? seedSummary.slice(0, MAX_PREVIOUS_SUMMARY_LENGTH) : undefined;
         isFirstLeafPass = false;
       }
 
       const passTokensBefore = await this.storage.context.getContextTokenCount(conversationId);
-      const leafResult = await this.leafPass(
-        conversationId,
-        leafChunk.items,
-        summarize,
-        previousSummaryContent,
-      );
+      throwIfAborted(signal);
+      const leafResult = hasInvocationContext
+        ? await this.leafPass(
+            conversationId,
+            leafChunk.items,
+            summarize,
+            previousSummaryContent,
+            context,
+          )
+        : await this.leafPass(conversationId, leafChunk.items, summarize, previousSummaryContent);
       const passTokensAfter = await this.storage.context.getContextTokenCount(conversationId);
-      await this.persistCompactionEvents({
+      throwIfAborted(signal);
+      const persistLeafInput = {
         conversationId,
         tokensBefore: passTokensBefore,
         tokensAfterLeaf: passTokensAfter,
         tokensAfterFinal: passTokensAfter,
         leafResult: { summaryId: leafResult.summaryId, level: leafResult.level },
         condenseResult: null,
-      });
+        ...(hasInvocationContext ? { context } : {}),
+      } as const;
+      await this.persistCompactionEvents(persistLeafInput);
 
       actionTaken = true;
       createdSummaryId = leafResult.summaryId;
@@ -460,43 +551,59 @@ export class CompactionEngine {
 
     // Phase 2: depth-aware condensed passes, always processing shallowest depth first.
     while (true) {
-      const candidate = await this.selectShallowestCondensationCandidate({
-        conversationId,
-        hardTrigger: hardTrigger === true,
-      });
+      throwIfAborted(signal);
+      const candidate = hasInvocationContext
+        ? await this.selectShallowestCondensationCandidate({
+            conversationId,
+            hardTrigger: hardTrigger === true,
+          }, signal)
+        : await this.selectShallowestCondensationCandidate({
+            conversationId,
+            hardTrigger: hardTrigger === true,
+          });
+      throwIfAborted(signal);
       if (!candidate) {
         break;
+      } else {
+        const passTokensBefore = await this.storage.context.getContextTokenCount(conversationId);
+        throwIfAborted(signal);
+        const condenseResult = hasInvocationContext
+          ? await this.condensedPass(
+              conversationId,
+              candidate.chunk.items,
+              candidate.targetDepth,
+              summarize,
+              context,
+            )
+          : await this.condensedPass(conversationId, candidate.chunk.items, candidate.targetDepth, summarize);
+        const passTokensAfter = await this.storage.context.getContextTokenCount(conversationId);
+        throwIfAborted(signal);
+        const persistCondenseInput = {
+          conversationId,
+          tokensBefore: passTokensBefore,
+          tokensAfterLeaf: passTokensBefore,
+          tokensAfterFinal: passTokensAfter,
+          leafResult: null,
+          condenseResult,
+          ...(hasInvocationContext ? { context } : {}),
+        } as const;
+        await this.persistCompactionEvents(persistCondenseInput);
+
+        actionTaken = true;
+        condensed = true;
+        createdSummaryId = condenseResult.summaryId;
+        level = condenseResult.level;
+
+        if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
+          break;
+        }
+        previousTokens = passTokensAfter;
       }
-
-      const passTokensBefore = await this.storage.context.getContextTokenCount(conversationId);
-      const condenseResult = await this.condensedPass(
-        conversationId,
-        candidate.chunk.items,
-        candidate.targetDepth,
-        summarize,
-      );
-      const passTokensAfter = await this.storage.context.getContextTokenCount(conversationId);
-      await this.persistCompactionEvents({
-        conversationId,
-        tokensBefore: passTokensBefore,
-        tokensAfterLeaf: passTokensBefore,
-        tokensAfterFinal: passTokensAfter,
-        leafResult: null,
-        condenseResult,
-      });
-
-      actionTaken = true;
-      condensed = true;
-      createdSummaryId = condenseResult.summaryId;
-      level = condenseResult.level;
-
-      if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
-        break;
-      }
-      previousTokens = passTokensAfter;
     }
 
+    throwIfAborted(signal);
     const tokensAfter = await this.storage.context.getContextTokenCount(conversationId);
+    throwIfAborted(signal);
 
     return {
       actionTaken,
@@ -517,8 +624,11 @@ export class CompactionEngine {
     targetTokens?: number;
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
-  }): Promise<{ success: boolean; rounds: number; finalTokens: number }> {
+  } & CompactionInputContext): Promise<{ success: boolean; rounds: number; finalTokens: number }> {
     const { conversationId, tokenBudget, summarize } = input;
+    const context = this.resolveInvocationContext(input);
+    const signal = context.signal;
+    throwIfAborted(signal);
     const targetTokens =
       typeof input.targetTokens === "number" &&
       Number.isFinite(input.targetTokens) &&
@@ -527,6 +637,7 @@ export class CompactionEngine {
         : tokenBudget;
 
     const storedTokens = await this.storage.context.getContextTokenCount(conversationId);
+    throwIfAborted(signal);
     const liveTokens =
       typeof input.currentTokens === "number" &&
       Number.isFinite(input.currentTokens) &&
@@ -543,12 +654,15 @@ export class CompactionEngine {
     }
 
     for (let round = 1; round <= this.config.maxRounds; round++) {
+      throwIfAborted(signal);
       const result = await this.compact({
         conversationId,
         tokenBudget,
         summarize,
         force: true,
+        context,
       });
+      throwIfAborted(signal);
 
       if (result.tokensAfter <= targetTokens) {
         return {
@@ -571,7 +685,9 @@ export class CompactionEngine {
     }
 
     // Exhausted all rounds
+    throwIfAborted(signal);
     const finalTokens = await this.storage.context.getContextTokenCount(conversationId);
+    throwIfAborted(signal);
     return {
       success: finalTokens <= targetTokens,
       rounds: this.config.maxRounds,
@@ -628,8 +744,10 @@ export class CompactionEngine {
   }
 
   /** Resolve message token count with a content-length fallback. */
-  private async getMessageTokenCount(messageId: number): Promise<number> {
+  private async getMessageTokenCount(messageId: number, signal?: AbortSignal): Promise<number> {
+    throwIfAborted(signal);
     const message = await this.storage.conversations.getMessageById(messageId);
+    throwIfAborted(signal);
     if (!message) {
       return 0;
     }
@@ -644,19 +762,22 @@ export class CompactionEngine {
   }
 
   /** Sum raw message tokens outside the protected fresh tail. */
-  private async countRawTokensOutsideFreshTail(conversationId: number): Promise<number> {
+  private async countRawTokensOutsideFreshTail(conversationId: number, signal?: AbortSignal): Promise<number> {
+    throwIfAborted(signal);
     const contextItems = await this.storage.context.getContextItems(conversationId);
+    throwIfAborted(signal);
     const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
     let rawTokens = 0;
 
     for (const item of contextItems) {
+      throwIfAborted(signal);
       if (item.ordinal >= freshTailOrdinal) {
         break;
       }
       if (item.itemType !== "message" || item.messageId == null) {
         continue;
       }
-      rawTokens += await this.getMessageTokenCount(item.messageId);
+      rawTokens += await this.getMessageTokenCount(item.messageId, signal);
     }
 
     return rawTokens;
@@ -668,26 +789,30 @@ export class CompactionEngine {
    * The selected chunk size is capped by `leafChunkTokens`, but we always pick
    * at least one message when any compactable message exists.
    */
-  private async selectOldestLeafChunk(conversationId: number): Promise<LeafChunkSelection> {
+  private async selectOldestLeafChunk(conversationId: number, signal?: AbortSignal): Promise<LeafChunkSelection> {
+    throwIfAborted(signal);
     const contextItems = await this.storage.context.getContextItems(conversationId);
+    throwIfAborted(signal);
     const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
     const threshold = this.resolveLeafChunkTokens();
 
     let rawTokensOutsideTail = 0;
     for (const item of contextItems) {
+      throwIfAborted(signal);
       if (item.ordinal >= freshTailOrdinal) {
         break;
       }
       if (item.itemType !== "message" || item.messageId == null) {
         continue;
       }
-      rawTokensOutsideTail += await this.getMessageTokenCount(item.messageId);
+      rawTokensOutsideTail += await this.getMessageTokenCount(item.messageId, signal);
     }
 
     const chunk: ContextItemRecord[] = [];
     let chunkTokens = 0;
     let started = false;
     for (const item of contextItems) {
+      throwIfAborted(signal);
       if (item.ordinal >= freshTailOrdinal) {
         break;
       }
@@ -701,7 +826,7 @@ export class CompactionEngine {
         break;
       }
 
-      const messageTokens = await this.getMessageTokenCount(item.messageId);
+      const messageTokens = await this.getMessageTokenCount(item.messageId, signal);
       if (chunk.length > 0 && chunkTokens + messageTokens > threshold) {
         break;
       }
@@ -725,13 +850,17 @@ export class CompactionEngine {
   private async resolvePriorLeafSummaryContext(
     conversationId: number,
     messageItems: ContextItemRecord[],
+    signal?: AbortSignal,
   ): Promise<string | undefined> {
+    throwIfAborted(signal);
     if (messageItems.length === 0) {
       return undefined;
     }
 
     const startOrdinal = Math.min(...messageItems.map((item) => item.ordinal));
-    const priorSummaryItems = (await this.storage.context.getContextItems(conversationId))
+    const priorSummaryItems = (await this.storage.context.getContextItems(conversationId));
+    throwIfAborted(signal);
+    const filteredPriorSummaryItems = priorSummaryItems
       .filter(
         (item) =>
           item.ordinal < startOrdinal &&
@@ -740,13 +869,15 @@ export class CompactionEngine {
       )
       .slice(-2);
 
-    if (priorSummaryItems.length === 0) {
+    if (filteredPriorSummaryItems.length === 0) {
       return undefined;
     }
 
     const summaryContents: string[] = [];
-    for (const item of priorSummaryItems) {
+    for (const item of filteredPriorSummaryItems) {
+      throwIfAborted(signal);
       const summary = await this.storage.summaries.getSummary(item.summaryId!);
+      throwIfAborted(signal);
       const content = summary?.content.trim();
       if (content) {
         summaryContents.push(content);
@@ -850,22 +981,28 @@ export class CompactionEngine {
   private async selectShallowestCondensationCandidate(params: {
     conversationId: number;
     hardTrigger: boolean;
-  }): Promise<CondensedPhaseCandidate | null> {
+  }, signal?: AbortSignal): Promise<CondensedPhaseCandidate | null> {
     const { conversationId, hardTrigger } = params;
+    throwIfAborted(signal);
     const contextItems = await this.storage.context.getContextItems(conversationId);
+    throwIfAborted(signal);
     const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
     const minChunkTokens = this.resolveCondensedMinChunkTokens();
     const depthLevels = await this.storage.context.getDistinctDepthsInContext(conversationId, {
       maxOrdinalExclusive: freshTailOrdinal,
     });
+    throwIfAborted(signal);
 
     for (const targetDepth of depthLevels) {
+      throwIfAborted(signal);
       const fanout = this.resolveFanoutForDepth(targetDepth, hardTrigger);
       const chunk = await this.selectOldestChunkAtDepth(
         conversationId,
         targetDepth,
         freshTailOrdinal,
+        signal,
       );
+      throwIfAborted(signal);
       if (chunk.items.length < fanout) {
         continue;
       }
@@ -888,8 +1025,11 @@ export class CompactionEngine {
     conversationId: number,
     targetDepth: number,
     freshTailOrdinalOverride?: number,
+    signal?: AbortSignal,
   ): Promise<CondensedChunkSelection> {
+    throwIfAborted(signal);
     const contextItems = await this.storage.context.getContextItems(conversationId);
+    throwIfAborted(signal);
     const freshTailOrdinal =
       typeof freshTailOrdinalOverride === "number"
         ? freshTailOrdinalOverride
@@ -899,6 +1039,7 @@ export class CompactionEngine {
     const chunk: ContextItemRecord[] = [];
     let summaryTokens = 0;
     for (const item of contextItems) {
+      throwIfAborted(signal);
       if (item.ordinal >= freshTailOrdinal) {
         break;
       }
@@ -910,6 +1051,7 @@ export class CompactionEngine {
       }
 
       const summary = await this.storage.summaries.getSummary(item.summaryId);
+      throwIfAborted(signal);
       if (!summary) {
         if (chunk.length > 0) {
           break;
@@ -942,13 +1084,17 @@ export class CompactionEngine {
     conversationId: number,
     summaryItems: ContextItemRecord[],
     targetDepth: number,
+    signal?: AbortSignal,
   ): Promise<string | undefined> {
+    throwIfAborted(signal);
     if (summaryItems.length === 0) {
       return undefined;
     }
 
     const startOrdinal = Math.min(...summaryItems.map((item) => item.ordinal));
-    const priorSummaryItems = (await this.storage.context.getContextItems(conversationId))
+    const priorSummaryItems = (await this.storage.context.getContextItems(conversationId));
+    throwIfAborted(signal);
+    const filteredPriorSummaryItems = priorSummaryItems
       .filter(
         (item) =>
           item.ordinal < startOrdinal &&
@@ -956,13 +1102,15 @@ export class CompactionEngine {
           typeof item.summaryId === "string",
       )
       .slice(-4);
-    if (priorSummaryItems.length === 0) {
+    if (filteredPriorSummaryItems.length === 0) {
       return undefined;
     }
 
     const summaryContents: string[] = [];
-    for (const item of priorSummaryItems) {
+    for (const item of filteredPriorSummaryItems) {
+      throwIfAborted(signal);
       const summary = await this.storage.summaries.getSummary(item.summaryId!);
+      throwIfAborted(signal);
       if (!summary || summary.depth !== targetDepth) {
         continue;
       }
@@ -986,9 +1134,13 @@ export class CompactionEngine {
     sourceText: string;
     summarize: CompactionSummarizeFn;
     options?: CompactionSummarizeOptions;
+    context?: CompactionInvocationContext;
   }): Promise<{ content: string; level: CompactionLevel }> {
+    const signal = params.context?.signal ?? params.options?.signal;
+    throwIfAborted(signal);
     const rawText = params.sourceText.trim();
     const sourceText = this.config.scrubber ? this.config.scrubber.scrub(rawText) : rawText;
+    throwIfAborted(signal);
     if (!sourceText) {
       return {
         content: "[Truncated from 0 tokens]",
@@ -997,11 +1149,21 @@ export class CompactionEngine {
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
 
-    let summaryText = await params.summarize(sourceText, false, params.options);
+    throwIfAborted(signal);
+    let summaryText = await params.summarize(sourceText, false, {
+      ...params.options,
+      ...(signal === undefined ? {} : { signal }),
+    });
+    throwIfAborted(signal);
     let level: CompactionLevel = "normal";
 
     if (estimateTokens(summaryText) >= inputTokens) {
-      summaryText = await params.summarize(sourceText, true, params.options);
+      throwIfAborted(signal);
+      summaryText = await params.summarize(sourceText, true, {
+        ...params.options,
+        ...(signal === undefined ? {} : { signal }),
+      });
+      throwIfAborted(signal);
       level = "aggressive";
 
       if (estimateTokens(summaryText) >= inputTokens) {
@@ -1027,15 +1189,18 @@ export class CompactionEngine {
     messageItems: ContextItemRecord[],
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
+    context: CompactionInvocationContext = {},
   ): Promise<{ summaryId: string; level: CompactionLevel; content: string }> {
     // Fetch full message content for each context item
     const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
       [];
     for (const item of messageItems) {
+      throwIfAborted(context.signal);
       if (item.messageId == null) {
         continue;
       }
       const msg = await this.storage.conversations.getMessageById(item.messageId);
+      throwIfAborted(context.signal);
       if (msg) {
         messageContents.push({
           messageId: msg.messageId,
@@ -1059,7 +1224,9 @@ export class CompactionEngine {
         previousSummary: previousSummaryContent,
         isCondensed: false,
       },
+      context,
     });
+    throwIfAborted(context.signal);
 
     // Persist the leaf summary
     const summaryId = generateSummaryId(summary.content);
@@ -1097,7 +1264,7 @@ export class CompactionEngine {
     const startOrdinal = Math.min(...ordinals);
     const endOrdinal = Math.max(...ordinals);
 
-    await this.storage.transaction(async (repositories) => {
+    await this.withCommitPermit(context, async () => this.storage.transaction(async (repositories) => {
       await repositories.summaries.insertSummary(summaryInput);
       await repositories.summaries.linkSummaryToMessages(summaryId, messageIds);
       await repositories.context.replaceContextRangeWithSummary({
@@ -1106,7 +1273,7 @@ export class CompactionEngine {
         endOrdinal,
         summaryId,
       });
-    });
+    }));
 
     return { summaryId, level: summary.level, content: summary.content };
   }
@@ -1121,14 +1288,17 @@ export class CompactionEngine {
     summaryItems: ContextItemRecord[],
     targetDepth: number,
     summarize: CompactionSummarizeFn,
+    context: CompactionInvocationContext = {},
   ): Promise<PassResult> {
     // Fetch full summary records
     const summaryRecords: SummaryRecord[] = [];
     for (const item of summaryItems) {
+      throwIfAborted(context.signal);
       if (item.summaryId == null) {
         continue;
       }
       const rec = await this.storage.summaries.getSummary(item.summaryId);
+      throwIfAborted(context.signal);
       if (rec) {
         summaryRecords.push(rec);
       }
@@ -1151,8 +1321,9 @@ export class CompactionEngine {
     );
     const previousSummaryContent =
       targetDepth === 0
-        ? await this.resolvePriorSummaryContextAtDepth(conversationId, summaryItems, targetDepth)
+        ? await this.resolvePriorSummaryContextAtDepth(conversationId, summaryItems, targetDepth, context.signal)
         : undefined;
+    throwIfAborted(context.signal);
     const condensed = await this.summarizeWithEscalation({
       sourceText: concatenated,
       summarize,
@@ -1161,7 +1332,9 @@ export class CompactionEngine {
         isCondensed: true,
         depth: targetDepth + 1,
       },
+      context,
     });
+    throwIfAborted(context.signal);
 
     // Persist the condensed summary
     const summaryId = generateSummaryId(condensed.content);
@@ -1226,7 +1399,7 @@ export class CompactionEngine {
     const startOrdinal = Math.min(...ordinals);
     const endOrdinal = Math.max(...ordinals);
 
-    await this.storage.transaction(async (repositories) => {
+    await this.withCommitPermit(context, async () => this.storage.transaction(async (repositories) => {
       await repositories.summaries.insertSummary(summaryInput);
       await repositories.summaries.linkSummaryToParents(summaryId, parentSummaryIds);
       await repositories.context.replaceContextRangeWithSummary({
@@ -1235,7 +1408,7 @@ export class CompactionEngine {
         endOrdinal,
         summaryId,
       });
-    });
+    }));
 
     return { summaryId, level: condensed.level };
   }
@@ -1253,6 +1426,7 @@ export class CompactionEngine {
     tokensAfterFinal: number;
     leafResult: { summaryId: string; level: CompactionLevel } | null;
     condenseResult: { summaryId: string; level: CompactionLevel } | null;
+    context?: CompactionInvocationContext;
   }): Promise<void> {
     const {
       conversationId,
@@ -1267,7 +1441,10 @@ export class CompactionEngine {
       return;
     }
 
+    throwIfAborted(input.context?.signal);
+
     const conversation = await this.storage.conversations.getConversation(conversationId);
+    throwIfAborted(input.context?.signal);
     if (!conversation) {
       return;
     }
@@ -1288,6 +1465,7 @@ export class CompactionEngine {
         createdSummaryId: leafResult.summaryId,
         createdSummaryIds,
         condensedPassOccurred,
+        context: input.context,
       });
     }
 
@@ -1302,6 +1480,7 @@ export class CompactionEngine {
         createdSummaryId: condenseResult.summaryId,
         createdSummaryIds,
         condensedPassOccurred,
+        context: input.context,
       });
     }
   }
@@ -1317,7 +1496,9 @@ export class CompactionEngine {
     createdSummaryId: string;
     createdSummaryIds: string[];
     condensedPassOccurred: boolean;
+    context?: CompactionInvocationContext;
   }): Promise<void> {
+    throwIfAborted(input.context?.signal);
     const content = `LCM compaction ${input.pass} pass (${input.level}): ${input.tokensBefore} -> ${input.tokensAfter}`;
     const metadata = JSON.stringify({
       conversationId: input.conversationId,
@@ -1353,8 +1534,10 @@ export class CompactionEngine {
     };
 
     try {
-      await this.storage.transaction((repositories) => writeEvent(repositories.conversations));
-    } catch {
+      await this.withCommitPermit(input.context ?? {}, async () =>
+        this.storage.transaction((repositories) => writeEvent(repositories.conversations)));
+    } catch (error) {
+      if (isAbortError(error)) throw error;
       // Compaction should still succeed if event persistence fails.
     }
   }

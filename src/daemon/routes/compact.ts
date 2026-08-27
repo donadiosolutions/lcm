@@ -19,6 +19,19 @@ import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler, RoutePublicationAdmission } from "../server.js";
 import { CompactionEngine, MANUAL_COMPACT_FRESH_TAIL_COUNT } from "../../compaction.js";
+import type { CompactionCommitPermit, CompactionInvocationContext } from "../../compaction.js";
+import {
+  composeAbortSignals,
+  isAbortError,
+  throwIfAborted,
+} from "../cancellation.js";
+import {
+  isCanonicalInvocationId,
+  InvocationCoordinatorError,
+  type InvocationAdmission,
+  type InvocationCoordinator,
+  type InvocationTarget,
+} from "../invocation-coordinator.js";
 import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
 import { ScrubEngine } from "../../scrub.js";
 import {
@@ -47,6 +60,7 @@ import {
 interface CompactRequestBody {
   session_id: string;
   cwd: string;
+  invocation_id?: unknown;
   transcript_path?: string;
   skip_ingest?: boolean;
   client?: CompactClient;
@@ -65,6 +79,9 @@ function validateCompactRequestBody(input: Record<string, unknown>): string | un
   }
   if (typeof input.cwd !== "string" || input.cwd.length === 0) {
     return "cwd must be a non-empty string";
+  }
+  if (input.invocation_id !== undefined && !isCanonicalInvocationId(input.invocation_id)) {
+    return "invocation_id must be a canonical UUID";
   }
   if (input.transcript_path !== undefined && typeof input.transcript_path !== "string") {
     return "transcript_path must be a string";
@@ -244,6 +261,35 @@ function sameStorageIdentity(
     && expected.remoteProjectId === actual.remoteProjectId;
 }
 
+function routeInvocationTarget(
+  invocationId: string,
+  coordinator: InvocationCoordinator,
+): InvocationTarget {
+  return {
+    invocationId,
+    command: "compact",
+    daemonInstanceId: coordinator.daemonInstanceId,
+  };
+}
+
+function localCommitAdmission(signal: AbortSignal | undefined): () => CompactionCommitPermit {
+  return () => {
+    throwIfAborted(signal);
+    return {
+      release: () => undefined,
+    };
+  };
+}
+
+function sendCancellationIfWritable(res: { headersSent?: boolean; writableEnded?: boolean; destroyed?: boolean; writable?: boolean }, status = 499): void {
+  if (res.headersSent || res.writableEnded || res.destroyed || res.writable === false) return;
+  sendJson(res as never, status, { status: "cancelled", error: "compact cancelled" });
+}
+
+function isInvocationCancellation(error: unknown): boolean {
+  return error instanceof InvocationCoordinatorError && error.code === "cancelled";
+}
+
 
 export function createCompactHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   const getSummarizer = makeSummarizerCache(config);
@@ -252,6 +298,11 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
     let parsed: unknown;
     let ownedFactory: StorageBackendFactory | undefined;
     let activeFactory: StorageBackendFactory | undefined;
+    let invocationAdmission: InvocationAdmission | undefined;
+    let invocationTarget: InvocationTarget | undefined;
+    let invocationSignalCleanup: (() => void) | undefined;
+    let detachInvocationCancellation: (() => void) | undefined;
+    let signal = context?.signal;
     try {
       parsed = JSON.parse(body || "{}");
     } catch {
@@ -350,6 +401,52 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
     const effectiveRequestTimeoutMs = effectiveRequestPolicy?.requestTimeoutMs ?? null;
     const effectiveRetry = effectiveProvider === "openai" ? effectiveRequestPolicy!.retry : null;
 
+    const invocationId = typeof input.invocation_id === "string" ? input.invocation_id : undefined;
+    let coordinator: InvocationCoordinator | undefined;
+    if (invocationId !== undefined) {
+      coordinator = context?.invocationCoordinator;
+      if (coordinator === undefined) {
+        sendJson(res, 503, { error: "invocation control unavailable" });
+        return;
+      }
+      invocationTarget = routeInvocationTarget(invocationId, coordinator);
+      try {
+        coordinator.heartbeat(invocationTarget);
+        invocationAdmission = coordinator.admitWork(invocationTarget);
+      } catch (error) {
+        const status = typeof (error as { statusCode?: unknown })?.statusCode === "number"
+          ? (error as { statusCode: number }).statusCode
+          : 409;
+        sendJson(res, status, {
+          error: error instanceof Error ? error.message : "invocation admission failed",
+        });
+        return;
+      }
+      const invocationComposition = composeAbortSignals([signal, invocationAdmission.signal]);
+      signal = invocationComposition.signal;
+      invocationSignalCleanup = invocationComposition.cleanup;
+
+      // A disconnect cancels only this invocation. The coordinator signal also
+      // aborts this route when a control request or lease expiry cancels it.
+      if (context?.signal !== undefined) {
+        const onRequestCancellation = (): void => {
+          void coordinator!.cancel(invocationTarget!).catch(() => undefined);
+        };
+        context.signal.addEventListener("abort", onRequestCancellation, { once: true });
+        detachInvocationCancellation = () => context.signal?.removeEventListener("abort", onRequestCancellation);
+        if (context.signal.aborted) onRequestCancellation();
+      }
+    }
+
+    const acquireCommit = invocationTarget !== undefined && coordinator !== undefined
+      ? (): CompactionCommitPermit => coordinator!.acquireCommit(invocationTarget!)
+      : localCommitAdmission(signal);
+    const releaseInvocation = (): void => {
+      detachInvocationCancellation?.();
+      invocationSignalCleanup?.();
+      invocationAdmission?.release();
+    };
+
     let admittedIdentity: StorageIdentityContext & { readonly localProjectId: string };
     try {
       const initialAdmission = await withPublicationAdmission(async publicationLockToken => {
@@ -366,13 +463,21 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         };
       });
       admittedIdentity = initialAdmission.identity;
+      if (invocationTarget !== undefined) throwIfAborted(signal);
       if (initialAdmission.stagedFailure) {
         sendJson(res, 503, initialAdmission.stagedFailure);
         await closeRouteStorage(undefined, ownedFactory);
+        releaseInvocation();
         return;
       }
     } catch (err) {
-      if (err instanceof BackendPublicationJournalError) {
+      if (isAbortError(err)) {
+        sendCancellationIfWritable(res);
+      } else if (isInvocationCancellation(err)) {
+        sendJson(res, (err as InvocationCoordinatorError).statusCode, {
+          error: "invocation admission failed",
+        });
+      } else if (err instanceof BackendPublicationJournalError) {
         sendJson(res, 503, {
           status: "blocked",
           error: "backend publication admission blocked",
@@ -393,6 +498,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         }
       }
       await closeRouteStorage(undefined, ownedFactory);
+      releaseInvocation();
       return;
     }
     const localIdentity = {
@@ -427,7 +533,6 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
           openedProject = project;
           return project;
         });
-        const signal = context?.signal;
         if (signal !== undefined) {
           const closeOnAbort = (): void => { void closeOpenedProject(); };
           signal.addEventListener("abort", closeOnAbort, { once: true });
@@ -440,6 +545,15 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         // revalidates publication state. Keep cleanup possible in that case.
         await closeOpenedProject();
         throw error;
+      }
+    };
+    const withCommitAdmission = async <T>(operation: () => Promise<T>): Promise<T> => {
+      throwIfAborted(signal);
+      const permit = await acquireCommit();
+      try {
+        return await operation();
+      } finally {
+        permit.release();
       }
     };
 
@@ -478,6 +592,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         sendJson(res, 200, { skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
       } finally {
         await closeRouteStorage(undefined, ownedFactory);
+        releaseInvocation();
       }
       return;
     }
@@ -493,12 +608,14 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
     const providerLabel = providerLabels[effectiveProvider] ?? effectiveProvider;
 
     try {
+      if (invocationTarget !== undefined) throwIfAborted(signal);
       const summarize = await getSummarizer(
         effectiveProvider,
         effectiveReasoningEffort,
         effectiveFastMode,
         effectiveRequestPolicy,
       );
+      if (invocationTarget !== undefined) throwIfAborted(signal);
       if (!summarize) {
         if (config.storage.backend === "postgresql") {
           const stagedProject = await openProjectWithAdmission();
@@ -523,24 +640,30 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
       const pid = admittedIdentity.localProjectId;
       const result = await enqueue(pid, async () => {
         try {
+          throwIfAborted(signal);
           const localProjectDir = await withProjectAdmission(() =>
             ensureProjectDirForIdentity(localIdentity));
+          throwIfAborted(signal);
 
           const scrubber = await ScrubEngine.forProject(
             config.security?.sensitivePatterns ?? [],
             localProjectDir,
           );
+          throwIfAborted(signal);
 
           const conversation = await admittedProject.conversations.getOrCreateConversation(session_id);
+          throwIfAborted(signal);
 
           // Ingest new messages from the transcript into the DB.
           const safeTranscriptPath = transcript_path ? isSafeTranscriptPath(transcript_path, cwd) : false;
           if (!skip_ingest && safeTranscriptPath && existsSync(safeTranscriptPath)) {
             const parsed = parseTranscriptForClient(safeTranscriptPath, normalizeTranscriptClient(client));
-            await admittedProject.transaction(async (repositories) => {
+            await withCommitAdmission(() => admittedProject.transaction(async (repositories) => {
+              throwIfAborted(signal);
               const storedCount = await repositories.conversations.getMessageCount(
                 conversation.conversationId,
               );
+              throwIfAborted(signal);
               const newMessages = parsed.slice(storedCount);
               if (newMessages.length > 0) {
                 const ingestCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
@@ -565,11 +688,12 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
                   records.map((record) => record.messageId),
                 );
               }
-            });
+            }));
           }
 
           // Check if there's anything to compact
           const tokenCount = await admittedProject.context.getContextTokenCount(conversation.conversationId);
+          throwIfAborted(signal);
 
           if (tokenCount === 0) {
             return {
@@ -604,11 +728,16 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
             summarize,
             force: true,
             previousSummaryContent: validatedPreviousSummary,
+            signal,
+            acquireCommit,
           });
+          throwIfAborted(signal);
 
           // Gather stats for the compaction message (always, regardless of actionTaken)
           const allSummaries = await admittedProject.summaries.getSummariesByConversation(conversation.conversationId);
+          throwIfAborted(signal);
           const finalMsgCount = await admittedProject.conversations.getMessageCount(conversation.conversationId);
+          throwIfAborted(signal);
           const maxDepth = allSummaries.length > 0 ? Math.max(...allSummaries.map((s) => s.depth)) : 0;
 
           // Promotion is now handled by the standalone /promote route
@@ -616,7 +745,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
 
           // Update meta.json
           try {
-            await withProjectAdmission(() => {
+            await withCommitAdmission(() => withProjectAdmission(() => {
               const metaPath = join(localProjectDir, "meta.json");
               let meta: Record<string, unknown> = {};
               try {
@@ -627,14 +756,18 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
               meta.cwd = localIdentity.canonical;
               meta.lastCompact = new Date().toISOString();
               writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
-            });
+            }));
           } catch (error) {
             if (error instanceof BackendPublicationJournalError) throw error;
+            if (isAbortError(error)) throw error;
             // Meta persistence remains best-effort for ordinary filesystem failures.
           }
 
           // Set justCompacted flag
-          justCompactedMap.set(session_id, Date.now());
+          await withCommitAdmission(async () => {
+            justCompactedMap.set(session_id, Date.now());
+          });
+          throwIfAborted(signal);
 
           const summaryMsg = compactResult.actionTaken
             ? buildCompactionMessage({
@@ -650,6 +783,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
           let latestSummaryContent: string | undefined;
           if (compactResult.createdSummaryId) {
             const summaryRecord = await admittedProject.summaries.getSummary(compactResult.createdSummaryId);
+            throwIfAborted(signal);
             latestSummaryContent = summaryRecord?.content;
           } else if (allSummaries.length > 0) {
             // Fall back to the most recent existing summary when no new summary was created
@@ -673,10 +807,20 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         } finally {
           await closeOpenedProject();
         }
-      });
+      }, signal);
 
       sendJson(res, 200, result);
     } catch (err) {
+      if (isAbortError(err)) {
+        sendCancellationIfWritable(res);
+        return;
+      }
+      if (isInvocationCancellation(err)) {
+        sendJson(res, (err as InvocationCoordinatorError).statusCode, {
+          error: "invocation admission failed",
+        });
+        return;
+      }
       if (err instanceof BackendPublicationJournalError) {
         sendJson(res, 503, {
           status: "blocked",
@@ -694,6 +838,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
       detachProjectAbort?.();
       await closeRouteStorage(undefined, ownedFactory);
       compactingNow.delete(session_id);
+      releaseInvocation();
     }
   };
 }
