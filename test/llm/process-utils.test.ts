@@ -478,6 +478,115 @@ describe("owned process lifecycle utilities", () => {
     await expect(fallbackPending).resolves.toBe(true);
   });
 
+  it("uses the detached child PID as a Darwin process group and cleans descendants after leader close", async () => {
+    const processChild = child(8001);
+    let groupAlive = true;
+    const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === "SIGTERM") groupAlive = false;
+    });
+    const teardown = createOwnedProcessTeardown({
+      child: processChild,
+      platform: "darwin",
+      detachedProcessGroup: true,
+      processBirthTime: () => "birth-8001",
+      isProcessGroupAlive: () => groupAlive,
+      killProcess,
+    });
+    processChild.emit("close");
+    await expect(teardown.terminate("close")).resolves.toBe(true);
+    expect(teardown.processGroupId).toBe(8001);
+    expect(killProcess).toHaveBeenCalledWith(-8001, "SIGTERM");
+  });
+
+  it("escalates a detached Darwin group from TERM to KILL before settling", async () => {
+    vi.useFakeTimers();
+    try {
+      const processChild = child(8002);
+      let groupAlive = true;
+      const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+        if (signal === "SIGKILL") groupAlive = false;
+      });
+      const teardown = createOwnedProcessTeardown({
+        child: processChild,
+        platform: "darwin",
+        detachedProcessGroup: true,
+        processBirthTime: () => "birth-8002",
+        isProcessGroupAlive: () => groupAlive,
+        killProcess,
+      });
+      const pending = teardown.terminate("abort");
+      expect(killProcess).toHaveBeenCalledWith(-8002, "SIGTERM");
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(killProcess).toHaveBeenCalledWith(-8002, "SIGKILL");
+      processChild.emit("close");
+      await expect(pending).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refuses detached groups with invalid or mismatched identities", async () => {
+    const mismatchedChild = child(8003);
+    const mismatched = createOwnedProcessTeardown({
+      child: mismatchedChild,
+      platform: "darwin",
+      detachedProcessGroup: true,
+      processGroupId: 9003,
+      processBirthTime: () => "birth-8003",
+      isProcessGroupAlive: () => true,
+    });
+    expect(mismatched.groupValidated).toBe(false);
+    const mismatchedPending = mismatched.terminate();
+    mismatchedChild.emit("close");
+    await expect(mismatchedPending).resolves.toBe(true);
+    expect(mismatchedChild.kill).toHaveBeenCalledWith("SIGTERM");
+
+    const invalidChild = child(8004);
+    const invalid = createOwnedProcessTeardown({
+      child: invalidChild,
+      platform: "darwin",
+      detachedProcessGroup: true,
+      processGroupId: 0,
+      processBirthTime: () => "birth-8004",
+      isProcessGroupAlive: () => true,
+    });
+    expect(invalid.groupValidated).toBe(false);
+    const invalidPending = invalid.terminate();
+    invalidChild.emit("close");
+    await expect(invalidPending).resolves.toBe(true);
+  });
+
+  it("keeps non-detached Darwin callers on the shared-group-safe direct path", async () => {
+    const processChild = child(8005);
+    const teardown = createOwnedProcessTeardown({
+      child: processChild,
+      platform: "darwin",
+      detachedProcessGroup: false,
+      processGroupId: 8005,
+      processBirthTime: () => "birth-8005",
+    });
+    expect(teardown.groupValidated).toBe(false);
+    const pending = teardown.terminate();
+    processChild.emit("close");
+    await expect(pending).resolves.toBe(true);
+    expect(processChild.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("falls back to the direct child for detached Windows providers", async () => {
+    const processChild = child(8006);
+    const teardown = createOwnedProcessTeardown({
+      child: processChild,
+      platform: "win32",
+      detachedProcessGroup: true,
+      processBirthTime: () => "birth-8006",
+    });
+    expect(teardown.groupValidated).toBe(false);
+    const pending = teardown.terminate();
+    processChild.emit("close");
+    await expect(pending).resolves.toBe(true);
+    expect(processChild.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
   it("disables group signaling when birth capture fails", async () => {
     const processChild = child(7762);
     const teardown = createOwnedProcessTeardown({

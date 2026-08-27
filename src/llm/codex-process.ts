@@ -43,6 +43,7 @@ export type CodexProcessDeps = {
   _createGateway?: (options: CodexResponsesGatewayOptions) => Promise<CodexResponsesGateway>;
   /** @internal deterministic process lifecycle seams. */
   platform?: NodeJS.Platform;
+  detachedProcessGroup?: boolean;
   killProcess?: (pid: number, signal?: NodeJS.Signals | number) => void;
   processGroupId?: number;
   daemonProcessGroupId?: number;
@@ -149,6 +150,7 @@ async function runCodexSummarizer(
     fastMode?: boolean;
     createGateway: (options: CodexResponsesGatewayOptions) => Promise<CodexResponsesGateway>;
     platform?: NodeJS.Platform;
+    detachedProcessGroup?: boolean;
     killProcess?: (pid: number, signal?: NodeJS.Signals | number) => void;
     processGroupId?: number;
     daemonProcessGroupId?: number;
@@ -306,6 +308,8 @@ async function runCodexSummarizer(
     teardown = createOwnedProcessTeardown({
       child,
       platform: deps.platform,
+      detachedProcessGroup: deps.detachedProcessGroup
+        ?? ((deps.platform ?? process.platform) !== "win32" && deps.processGroupId === undefined),
       processGroupId: deps.processGroupId,
       daemonProcessGroupId: deps.daemonProcessGroupId,
       killProcess: deps.killProcess,
@@ -437,6 +441,7 @@ export function createCodexProcessSummarizer(opts: CodexProcessDeps = {}): LcmSu
     timeoutMs: opts.timeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS,
     createGateway: opts._createGateway ?? createCodexResponsesGateway,
     platform: opts.platform,
+    detachedProcessGroup: opts.detachedProcessGroup,
     killProcess: opts.killProcess,
     processGroupId: opts.processGroupId,
     daemonProcessGroupId: opts.daemonProcessGroupId,

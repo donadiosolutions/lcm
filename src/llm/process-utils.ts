@@ -59,6 +59,13 @@ export type OwnedProcessTeardownOptions = Readonly<{
   child: ProcessChild;
   /** Override the host platform for deterministic tests. */
   platform?: NodeJS.Platform;
+  /**
+   * Proves that this child was spawned detached and therefore owns a fresh
+   * process group whose PGID is the child's PID.  This is intentionally
+   * opt-in: ordinary callers must still provide an independently observed
+   * group identity and daemon-group witness before group signaling.
+   */
+  detachedProcessGroup?: boolean;
   /** The child-owned process group, when it has been independently validated. */
   processGroupId?: number;
   /** The daemon's process group; a matching group is never signaled. */
@@ -126,15 +133,23 @@ function defaultProcessGroupAlive(pgid: number): boolean {
 function resolveOwnedProcessGroup(options: OwnedProcessTeardownOptions, pid: number | undefined): number | undefined {
   const platform = options.platform ?? process.platform;
   if (!POSIX_PROCESS_GROUP_PLATFORMS.has(platform) || pid === undefined) return undefined;
-  const candidate = positivePid(options.processGroupId)
-    ?? (platform === "linux" ? linuxProcessGroupId(pid) : undefined);
+  const candidate = options.detachedProcessGroup
+    ? options.processGroupId === undefined ? pid : positivePid(options.processGroupId)
+    : positivePid(options.processGroupId)
+      ?? (platform === "linux" ? linuxProcessGroupId(pid) : undefined);
   if (candidate === undefined) return undefined;
+
+  // A detached spawn creates a new session/process group with the child PID
+  // as its PGID.  Requiring that exact relationship prevents an arbitrary
+  // caller-supplied group from turning this proof into a shared-group kill.
+  if (options.detachedProcessGroup && candidate !== pid) return undefined;
 
   const daemonGroup = positivePid(options.daemonProcessGroupId)
     ?? (platform === "linux" ? linuxProcessGroupId(process.pid) : undefined);
-  // Without a daemon-group witness on non-Linux hosts, direct-child cleanup is
-  // the safest equivalent: never guess at a group that might be shared.
-  if (daemonGroup === undefined || candidate === daemonGroup) return undefined;
+  // Detached spawn is a structural ownership proof even when a non-Linux host
+  // cannot expose the daemon's current PGID.  Ordinary callers still require
+  // that witness, preserving the shared-group safeguard.
+  if (candidate === daemonGroup || (!options.detachedProcessGroup && daemonGroup === undefined)) return undefined;
   return candidate;
 }
 
@@ -177,6 +192,7 @@ export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions)
   let childClosed = false;
   let termination: Promise<boolean> | undefined;
   let groupInvalidated = false;
+  let groupProbeFailed = false;
   let groupDisappearedLatched = groupId === undefined;
   let settlementPromise: Promise<boolean> | undefined;
   let resolveSettlement: ((result: boolean) => void) | undefined;
@@ -198,14 +214,21 @@ export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions)
         groupDisappearedLatched = true;
         return true;
       }
+      groupProbeFailed = false;
     } catch {
       // An unverifiable group remains evidence-bearing; do not claim it gone.
+      groupProbeFailed = true;
     }
     return false;
   }
 
   function groupIdentityStillOwned(): boolean {
     if (groupId === undefined || groupInvalidated || groupDisappearedLatched) return false;
+    // A detached leader may have exited while descendants keep the PGID
+    // alive.  Its PID birth/PGID probes necessarily fail after close; the
+    // explicit detached-spawn proof plus the immediately preceding group-live
+    // probe is the ownership evidence for this post-leader phase.
+    if (options.detachedProcessGroup && childClosed) return true;
     const processId = pid as number;
     const capturedBirth = expectedBirth as string;
     let observedBirth: string | null;
@@ -231,7 +254,7 @@ export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions)
         groupInvalidated = true;
         return false;
       }
-    } else if (childClosed) {
+    } else if (childClosed && !options.detachedProcessGroup) {
       // Once the child handle has closed, the captured PGID alone is no
       // longer enough to authenticate a negative-group signal. Without a
       // current PGID probe, fail closed rather than risking PID/PGID reuse.
@@ -242,8 +265,14 @@ export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions)
   }
 
   const signalTarget = (signal: NodeJS.Signals): void => {
-    const disappearanceObserved = signal === "SIGKILL" || childClosed ? groupDisappeared() : false;
-    if (groupId === undefined || disappearanceObserved || !groupIdentityStillOwned()) {
+    // Detached groups must be observed alive immediately before every
+    // negative-PGID signal.  This prevents a leader-close race from turning a
+    // reused/disappeared PGID into a kill target; disappearance is latched by
+    // groupDisappeared() and all later signals fall back to the child handle.
+    const disappearanceObserved = options.detachedProcessGroup
+      ? groupDisappeared()
+      : signal === "SIGKILL" || childClosed ? groupDisappeared() : false;
+    if (groupId === undefined || disappearanceObserved || groupProbeFailed || !groupIdentityStillOwned()) {
       if (!childClosed) safeChildSignal(options.child, signal);
       return;
     }

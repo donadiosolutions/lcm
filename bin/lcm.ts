@@ -222,6 +222,14 @@ export function isStrictInvocationControlSnapshot(
     && snapshot.commitCount === 0;
 }
 
+function isStrictTerminalInvocationControlSnapshot(
+  value: unknown,
+  target: InvocationControlRequest,
+): value is InvocationControlResponse {
+  return isStrictInvocationControlSnapshot(value, target, "cancelled")
+    || isStrictInvocationControlSnapshot(value, target, "finished");
+}
+
 function isInvocationTargetResponse(
   value: unknown,
   target: InvocationControlRequest,
@@ -598,7 +606,7 @@ export async function cancelAndDrainCompactInvocation(
   const strictCancel = firstCancel.settled
     && firstCancel.error === undefined
     && firstCancel.value !== undefined
-    && isStrictInvocationControlSnapshot(firstCancel.value, options.lifecycle.target, "cancelled");
+    && isStrictTerminalInvocationControlSnapshot(firstCancel.value, options.lifecycle.target);
   const providerGone = providerProof.settled
     && providerProof.error === undefined
     && providerProof.value === true;
@@ -652,7 +660,7 @@ export async function cancelAndDrainCompactInvocation(
       const strictRetry = retry.settled
         && retry.error === undefined
         && retry.value !== undefined
-        && isStrictInvocationControlSnapshot(retry.value, options.lifecycle.target, "cancelled");
+        && isStrictTerminalInvocationControlSnapshot(retry.value, options.lifecycle.target);
       const retryProviderGone = retryProviderProof.settled
         && retryProviderProof.error === undefined
         && retryProviderProof.value === true;

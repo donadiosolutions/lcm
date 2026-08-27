@@ -71,10 +71,14 @@ describe("createClaudeProcessSummarizer", () => {
     (child as FakeChild & { pid: number }).pid = 4312;
     const controller = new AbortController();
     const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
-    const killProcess = vi.fn();
-    const isProcessGroupAlive = vi.fn(() => false);
+    let groupAlive = true;
+    const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === "SIGTERM") groupAlive = false;
+    });
+    const isProcessGroupAlive = vi.fn(() => groupAlive);
     const summarizer = createClaudeProcessSummarizer({
       spawn,
+      detachedProcessGroup: false,
       killProcess,
       processGroupId: 4312,
       processGroupIdProbe: () => 4312,
@@ -212,7 +216,10 @@ describe("createClaudeProcessSummarizer", () => {
   it("routes asynchronous Claude stdin errors through teardown", async () => {
     const child = makeHangingChild();
     (child as FakeChild & { pid: number }).pid = 4615;
-    const killProcess = vi.fn();
+    let groupAlive = true;
+    const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === "SIGTERM") groupAlive = false;
+    });
     const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
     const summarizer = createClaudeProcessSummarizer({
       spawn,
@@ -221,7 +228,7 @@ describe("createClaudeProcessSummarizer", () => {
       processGroupIdProbe: () => 4615,
       daemonProcessGroupId: 4613,
       processBirthTime: () => "birth-4615",
-      isProcessGroupAlive: () => false,
+      isProcessGroupAlive: () => groupAlive,
     } as never);
 
     const pending = summarizer("private transcript", false);

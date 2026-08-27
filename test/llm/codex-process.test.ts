@@ -204,13 +204,17 @@ describe("createCodexProcessSummarizer", () => {
     (child as FakeChild & { pid: number }).pid = 9312;
     const gateway = makeGateway({ close: vi.fn().mockResolvedValue(undefined) });
     const createGateway = vi.fn().mockResolvedValue(gateway);
-    const killProcess = vi.fn();
-    const isProcessGroupAlive = vi.fn(() => false);
+    let groupAlive = true;
+    const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === "SIGTERM") groupAlive = false;
+    });
+    const isProcessGroupAlive = vi.fn(() => groupAlive);
     const rmSyncMock = vi.fn() as unknown as RmSyncFn;
     const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
     const summarizer = createCodexProcessSummarizer({
       ...baseDeps(child, { spawn, rmSync: rmSyncMock }),
       _createGateway: createGateway,
+      detachedProcessGroup: false,
       killProcess,
       processGroupId: 9312,
       processGroupIdProbe: () => 9312,

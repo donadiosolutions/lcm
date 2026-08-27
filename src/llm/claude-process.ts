@@ -30,6 +30,7 @@ type ClaudeProcessDeps = {
   timeoutMs?: number;
   /** @internal deterministic process lifecycle seams. */
   platform?: NodeJS.Platform;
+  detachedProcessGroup?: boolean;
   killProcess?: (pid: number, signal?: NodeJS.Signals | number) => void;
   processGroupId?: number;
   daemonProcessGroupId?: number;
@@ -132,6 +133,8 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
         teardown = createOwnedProcessTeardown({
           child: proc,
           platform,
+          detachedProcessGroup: opts.detachedProcessGroup
+            ?? (platform !== "win32" && opts.processGroupId === undefined),
           processGroupId: opts.processGroupId,
           daemonProcessGroupId: opts.daemonProcessGroupId,
           killProcess: opts.killProcess,

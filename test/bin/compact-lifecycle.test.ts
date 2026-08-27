@@ -345,6 +345,51 @@ describe("compact invocation lifecycle", () => {
     vi.useRealTimers();
   });
 
+  it("accepts a strict finished tombstone when a cancel follows a lost finish response", async () => {
+    const cancelInvocation = vi.fn(async () => response("finished"));
+    const lifecycle = {
+      started: () => true,
+      stopHeartbeat: vi.fn(),
+      target: { invocationId, command: "compact" as const, daemonInstanceId },
+    } as never;
+
+    await expect(cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation }),
+      proveProviderWitnessGone: async () => true,
+      awaitLocalWork: async () => undefined,
+    })).resolves.toMatchObject({ daemonZero: true, localSettled: true });
+  });
+
+  it("accepts a strict finished tombstone from the healthy-daemon cancellation retry", async () => {
+    const healthSnapshot = {
+      status: "healthy" as const,
+      version: "1.4.2",
+      storageBackend: "sqlite" as const,
+      daemonInstanceId,
+      pid: 9,
+      uptime: 1,
+    };
+    const cancelInvocation = vi.fn()
+      .mockResolvedValueOnce(response("cancelling", 1))
+      .mockResolvedValueOnce(response("finished"));
+    const lifecycle = {
+      started: () => true,
+      stopHeartbeat: vi.fn(),
+      target: { invocationId, command: "compact" as const, daemonInstanceId },
+    } as never;
+
+    await expect(cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation, health: async () => healthSnapshot }),
+      originalHealth: healthSnapshot,
+      health: async () => healthSnapshot,
+      proveProviderWitnessGone: async () => true,
+      awaitLocalWork: async () => undefined,
+    })).resolves.toMatchObject({ daemonZero: true, localSettled: true });
+    expect(cancelInvocation).toHaveBeenCalledTimes(2);
+  });
+
   it("requires old-instance and provider disappearance proof before accepting restart", async () => {
     const oldHealth = {
       status: "healthy",
