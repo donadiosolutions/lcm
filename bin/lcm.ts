@@ -2570,7 +2570,9 @@ export async function runCli(
                 promotionFailures++;
                 const message = error instanceof Error ? error.message : "request failed";
                 compactState.phaseErrors.push({ phase: "Promote", target: promoteCwd, message });
-                console.error(`  promotion failed for ${promoteCwd}: ${message}`);
+                console.error(
+                  `  promotion failed for ${sanitizeTerminalText(promoteCwd)}: ${sanitizeTerminalText(message)}`,
+                );
               }
             }
             compactState.currentProject = undefined;
@@ -3777,7 +3779,10 @@ export async function runCli(
             console.log(`  ${cwd}: ${result.processed} scanned${convLabel}, ${result.promoted} promoted`);
           }
         } catch (err) {
-          if (verbose) console.error(`  promote failed for ${cwd}: ${err instanceof Error ? err.message : "request failed"}`);
+          if (verbose) {
+            const message = err instanceof Error ? err.message : "request failed";
+            console.error(`  promote failed for ${sanitizeTerminalText(cwd)}: ${sanitizeTerminalText(message)}`);
+          }
           continue;
         }
       }

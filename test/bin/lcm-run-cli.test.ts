@@ -2062,9 +2062,12 @@ describe("runCli failure and alternate presentation branches", () => {
   });
 
   it("fails compact when automatic promotion fails while keeping explicit promote best-effort", async () => {
-    state.post.mockRejectedValueOnce(new Error("promote failed"));
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    state.post.mockRejectedValueOnce(new Error("promote\u001b[31m\nfailed"));
     expect(await invoke(["compact"])).toBeUndefined();
     expect(process.exitCode).toBe(1);
+    expect(error.mock.calls.flat().join("\n")).toContain("promote failed");
+    expect(error.mock.calls.flat().join("\n")).not.toContain("\u001b");
     expect(state.ensureDaemon).toHaveBeenCalledTimes(1);
     process.exitCode = undefined;
     state.post.mockRejectedValueOnce("promote failed");
