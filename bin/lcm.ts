@@ -715,17 +715,25 @@ export async function cancelAndDrainCompactInvocation(
     }
   }
 
+  let restartDeadline: number | undefined;
+  const boundedRestart = async <T>(
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<BoundedResult<T>> => {
+    restartDeadline ??= now() + timeoutMs;
+    return await bounded(operation, restartDeadline);
+  };
+
   const proveReplacement = async (restart: CompactManagedRestartResult): Promise<boolean> => {
     type BooleanBoundedResult = BoundedResult<boolean>;
     const oldGoneResult: BooleanBoundedResult = options.proveOldInstanceGone === undefined
       ? { settled: true, value: restart.restarted === true && restart.stoppedPid !== undefined, timedOut: false }
-      : await bounded(async () => await options.proveOldInstanceGone!({
+      : await boundedRestart(async () => await options.proveOldInstanceGone!({
         originalHealth: options.originalHealth ?? undefined,
         restart,
       }));
     const providersGoneResult: BooleanBoundedResult = options.proveProviderWitnessGone === undefined
       ? { settled: true, value: false, timedOut: false }
-      : await bounded(async () => await options.proveProviderWitnessGone!({
+      : await boundedRestart(async () => await options.proveProviderWitnessGone!({
         daemonInstanceId: options.originalHealth?.daemonInstanceId
           ?? options.lifecycle.target.daemonInstanceId,
       }));
@@ -738,7 +746,7 @@ export async function cancelAndDrainCompactInvocation(
       session.providerWitnessGone = providersGone;
     }
     if (!restart.connected || !oldGone || !providersGone) return false;
-    const replacementResult = await bounded(signal => health(options.createFreshClient(), { signal }));
+    const replacementResult = await boundedRestart(signal => health(options.createFreshClient(), { signal }));
     const replacement = replacementResult.value;
     replacementVerified = replacementResult.settled
       && replacementResult.error === undefined
@@ -757,7 +765,7 @@ export async function cancelAndDrainCompactInvocation(
     if (session.restart !== undefined) {
       if (await proveReplacement(session.restart)) daemonZero = true;
     } else if (session.restartPromise !== undefined) {
-      const pendingRestart = await bounded(async () => await session.restartPromise!);
+      const pendingRestart = await boundedRestart(async () => await session.restartPromise!);
       if (pendingRestart.settled
         && pendingRestart.error === undefined
         && pendingRestart.value !== undefined) {
@@ -781,7 +789,7 @@ export async function cancelAndDrainCompactInvocation(
     restartAttempted = true;
     if (session !== undefined) session.restartAttempted = true;
     try {
-      const restartResult = await bounded(signal => options.restart!({
+      const restartResult = await boundedRestart(signal => options.restart!({
         originalHealth: options.originalHealth ?? undefined,
         signal,
       }));

@@ -1499,6 +1499,49 @@ describe("compact invocation lifecycle", () => {
     await expect(lifecycle.finish()).rejects.toThrow(/finish|snapshot|zero/i);
   });
 
+  it("gives managed restart a fresh deadline after cancellation consumes its budget", async () => {
+    let clock = 0;
+    let latestTimerDelay = -1;
+    let restartBudget = -1;
+    const setTimer = vi.fn((_: () => void, delay?: number) => {
+      latestTimerDelay = delay ?? 0;
+      return 17 as unknown as ReturnType<typeof setTimeout>;
+    }) as unknown as typeof setTimeout;
+    const lifecycle = {
+      started: () => true,
+      stopHeartbeat: vi.fn(),
+      target: { invocationId, command: "compact" as const, daemonInstanceId },
+    } as never;
+    const cancelInvocation = vi.fn(async () => {
+      clock = 10;
+      return response("cancelling", 1);
+    });
+
+    await cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation, health: async () => null }),
+      originalHealth: {
+        status: "healthy",
+        version: "1.4.2",
+        storageBackend: "sqlite",
+        daemonInstanceId,
+        pid: 9,
+        uptime: 1,
+      },
+      restart: async () => {
+        restartBudget = latestTimerDelay;
+        return { connected: false, restarted: false };
+      },
+      timeoutMs: 10,
+      now: () => clock,
+      setTimeout: setTimer,
+      clearTimeout: vi.fn() as unknown as typeof clearTimeout,
+      awaitLocalWork: async () => undefined,
+    });
+
+    expect(restartBudget).toBe(10);
+  });
+
   it("reuses one managed restart while later drain attempts poll replacement proof", async () => {
     const oldHealth = {
       status: "healthy",
