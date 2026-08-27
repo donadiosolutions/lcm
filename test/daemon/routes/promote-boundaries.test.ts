@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { StorageOperationError } from "../../../src/storage/errors.js";
+import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
 import { makeMockStorageFactory } from "./mock-storage-factory.js";
 import {
   createInvocationCoordinator,
@@ -668,6 +669,26 @@ describe("promote persistence boundaries", () => {
       error: "invocation admission failed",
     });
     await base.shutdown();
+  });
+
+  it("maps publication admission failures to the bounded blocked response", async () => {
+    const admission = vi.fn(async () => {
+      throw new BackendPublicationJournalError("unexpected-state", "publication changed");
+    });
+    await createPromoteHandler(config, makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.factoryClose,
+    }))(
+      {} as never,
+      response,
+      JSON.stringify({ cwd: "/publication-failure" }),
+      { withPublicationAdmission: admission } satisfies RouteExecutionContext,
+    );
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
   });
 
   it("isolates cancellation to the matching invocation while another promotion completes", async () => {

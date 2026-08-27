@@ -299,6 +299,11 @@ export function createPromoteHandler(
         sendJson(res, (err as InvocationCoordinatorError).statusCode, {
           error: "invocation admission failed",
         });
+      } else if (err instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
+        });
       } else {
         const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "promote", storageFactory);
         if (storageFailure) {
