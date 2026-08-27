@@ -37,7 +37,7 @@ describe("cancellation utilities", () => {
     expect(() => throwIfAborted(controller.signal)).toThrowError(expect.objectContaining({ name: "AbortError" }));
     expect(isAbortError(createAbortError())).toBe(true);
     expect(isAbortError(new Error("ordinary"))).toBe(false);
-    expect(isAbortError(Object.assign(new Error("named"), { name: "AbortError" }))).toBe(true);
+    expect(isAbortError(Object.assign(new Error("named"), { name: "AbortError" }))).toBe(false);
     const intentional = createAbortError();
     expect(createAbortError(intentional)).toBe(intentional);
   });

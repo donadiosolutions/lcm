@@ -28,8 +28,7 @@ export function throwIfAborted(signal?: AbortSignal): void {
 /** Identify intentional cancellation without classifying transport failures as aborts. */
 export function isAbortError(error: unknown): error is IntentionalAbortError {
   return error instanceof Error
-    && (error as IntentionalAbortError)[INTENTIONAL_ABORT] === true
-    || error instanceof Error && error.name === "AbortError";
+    && (error as IntentionalAbortError)[INTENTIONAL_ABORT] === true;
 }
 
 export type AbortSignalComposition = Readonly<{

@@ -252,6 +252,17 @@ export async function daemonJsonResponse<T>(
         reject(error);
       }
     };
+    const destroyRequestAfterSettlement = (): void => {
+      if (req === undefined) return;
+      const absorbLateRequestError = (): void => undefined;
+      const removeLateRequestListeners = (): void => {
+        removeListener(req!, "error", absorbLateRequestError);
+        removeListener(req!, "close", removeLateRequestListeners);
+      };
+      req.once("error", absorbLateRequestError);
+      req.once("close", removeLateRequestListeners);
+      req.destroy();
+    };
     const cleanup = (): void => {
       if (timeoutConfigured) {
         // Node clears an active socket timeout when setTimeout receives zero.
@@ -269,22 +280,11 @@ export async function daemonJsonResponse<T>(
     };
     const settleFailure = (error: Error, destroyTransport = false): void => {
       if (settled) return;
-      let absorbLateRequestError: (() => void) | undefined;
-      let removeLateRequestListeners: (() => void) | undefined;
       settled = true;
       if (destroyTransport) {
-        if (req !== undefined) {
-          absorbLateRequestError = (): void => undefined;
-          removeLateRequestListeners = (): void => {
-            removeListener(req!, "error", absorbLateRequestError! as (...args: unknown[]) => void);
-            removeListener(req!, "close", removeLateRequestListeners! as (...args: unknown[]) => void);
-          };
-          req.once("error", absorbLateRequestError);
-          req.once("close", removeLateRequestListeners);
-        }
         // Destroy without an error argument: the explicit rejection below is
         // authoritative and this avoids a second uncaught socket error.
-        req?.destroy();
+        destroyRequestAfterSettlement();
         response?.destroy();
       }
       cleanup();
@@ -319,8 +319,11 @@ export async function daemonJsonResponse<T>(
         incomingResponse.once("error", onResponseError);
         incomingResponse.once("end", onResponseEnd);
       });
+      if (settled) {
+        destroyRequestAfterSettlement();
+        return;
+      }
       req.on("error", onRequestError);
-      if (settled) return;
       if (options.timeoutMs !== undefined) {
         timeoutConfigured = true;
         req.setTimeout(options.timeoutMs, () => {

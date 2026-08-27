@@ -98,6 +98,13 @@ describe("abortable daemon transport", () => {
       signal: requestController.signal,
     });
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(state.request?.destroy).toHaveBeenCalledOnce();
+    expect(state.request?.listenerCount("error")).toBe(0);
+    expect(state.request?.listenerCount("close")).toBe(0);
+    expect(state.response?.listenerCount("data")).toBe(0);
+    expect(state.response?.listenerCount("aborted")).toBe(0);
+    expect(state.response?.listenerCount("error")).toBe(0);
+    expect(state.response?.listenerCount("end")).toBe(0);
     expect(state.request?.end).not.toHaveBeenCalled();
   });
 

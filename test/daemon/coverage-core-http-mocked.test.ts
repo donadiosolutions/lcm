@@ -33,6 +33,7 @@ import {
   daemonJsonRequest,
   isDaemonTransportFailure,
 } from "../../src/daemon/http-url.js";
+import { createAbortError, isAbortError } from "../../src/daemon/cancellation.js";
 
 describe("mocked daemon HTTP response metadata", () => {
   it("classifies only bounded, known TypeError transport messages", () => {
@@ -59,10 +60,15 @@ describe("mocked daemon HTTP response metadata", () => {
     expect(isDaemonTransportFailure(new TypeError(message)), message).toBe(false);
     }
 
-    expect(isDaemonTransportFailure(Object.assign(new Error("cancelled"), {
+    const unmarkedAbort = Object.assign(new Error("cancelled"), {
       name: "AbortError",
       code: "ECONNRESET",
-    }))).toBe(false);
+    });
+    expect(isAbortError(unmarkedAbort)).toBe(false);
+    expect(isDaemonTransportFailure(unmarkedAbort)).toBe(true);
+    const intentionalAbort = createAbortError();
+    expect(isAbortError(intentionalAbort)).toBe(true);
+    expect(isDaemonTransportFailure(intentionalAbort)).toBe(false);
     expect(isDaemonTransportFailure(new Error("Daemon request timed out"))).toBe(true);
 
     const codedCause = new TypeError("programming failure", {
