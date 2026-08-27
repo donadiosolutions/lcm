@@ -388,7 +388,8 @@ admission blocked; complete or recover the publication before retrying`.
   for example `(reason: malformed-journal)`, and a logger failure never
   replaces the original publication error. Missing publication evidence and
   typed private lock contention remain exit-`0` best-effort outcomes after
-  durable enqueue and do not emit a `systemMessage`.
+  durable enqueue, do not emit a `systemMessage`, and do not add a hook-error
+  ledger entry.
 - **Doctor:** `lcm doctor` emits a sanitized `backend-publication` failure with
   guidance appropriate to missing evidence, an unresolved journal, backend
   mismatch, or unsafe state. It continues unrelated diagnostics, but skips
