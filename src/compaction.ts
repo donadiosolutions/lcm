@@ -499,54 +499,54 @@ export class CompactionEngine {
         ? await this.selectOldestLeafChunk(conversationId, signal)
         : await this.selectOldestLeafChunk(conversationId);
       throwIfAborted(signal);
-      if (leafChunk.items.length === 0) {
-        break;
-      }
+      if (leafChunk.items.length > 0) {
+        // For first leaf pass: use caller's seed if provided, otherwise resolve from store
+        if (isFirstLeafPass) {
+          const MAX_PREVIOUS_SUMMARY_LENGTH = 50_000;
+          const seedSummary = input.previousSummaryContent ?? (hasInvocationContext
+            ? await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items, signal)
+            : await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items));
+          throwIfAborted(signal);
+          previousSummaryContent = seedSummary ? seedSummary.slice(0, MAX_PREVIOUS_SUMMARY_LENGTH) : undefined;
+          isFirstLeafPass = false;
+        }
 
-      // For first leaf pass: use caller's seed if provided, otherwise resolve from store
-      if (isFirstLeafPass) {
-        const MAX_PREVIOUS_SUMMARY_LENGTH = 50_000;
-        const seedSummary = input.previousSummaryContent ?? (hasInvocationContext
-          ? await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items, signal)
-          : await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items));
+        const passTokensBefore = await this.storage.context.getContextTokenCount(conversationId);
         throwIfAborted(signal);
-        previousSummaryContent = seedSummary ? seedSummary.slice(0, MAX_PREVIOUS_SUMMARY_LENGTH) : undefined;
-        isFirstLeafPass = false;
-      }
+        const leafResult = hasInvocationContext
+          ? await this.leafPass(
+              conversationId,
+              leafChunk.items,
+              summarize,
+              previousSummaryContent,
+              context,
+            )
+          : await this.leafPass(conversationId, leafChunk.items, summarize, previousSummaryContent);
+        const passTokensAfter = await this.storage.context.getContextTokenCount(conversationId);
+        throwIfAborted(signal);
+        const persistLeafInput = {
+          conversationId,
+          tokensBefore: passTokensBefore,
+          tokensAfterLeaf: passTokensAfter,
+          tokensAfterFinal: passTokensAfter,
+          leafResult: { summaryId: leafResult.summaryId, level: leafResult.level },
+          condenseResult: null,
+          ...(hasInvocationContext ? { context } : {}),
+        } as const;
+        await this.persistCompactionEvents(persistLeafInput);
 
-      const passTokensBefore = await this.storage.context.getContextTokenCount(conversationId);
-      throwIfAborted(signal);
-      const leafResult = hasInvocationContext
-        ? await this.leafPass(
-            conversationId,
-            leafChunk.items,
-            summarize,
-            previousSummaryContent,
-            context,
-          )
-        : await this.leafPass(conversationId, leafChunk.items, summarize, previousSummaryContent);
-      const passTokensAfter = await this.storage.context.getContextTokenCount(conversationId);
-      throwIfAborted(signal);
-      const persistLeafInput = {
-        conversationId,
-        tokensBefore: passTokensBefore,
-        tokensAfterLeaf: passTokensAfter,
-        tokensAfterFinal: passTokensAfter,
-        leafResult: { summaryId: leafResult.summaryId, level: leafResult.level },
-        condenseResult: null,
-        ...(hasInvocationContext ? { context } : {}),
-      } as const;
-      await this.persistCompactionEvents(persistLeafInput);
+        actionTaken = true;
+        createdSummaryId = leafResult.summaryId;
+        level = leafResult.level;
+        previousSummaryContent = leafResult.content;
 
-      actionTaken = true;
-      createdSummaryId = leafResult.summaryId;
-      level = leafResult.level;
-      previousSummaryContent = leafResult.content;
-
-      if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
+        if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
+          break;
+        }
+        previousTokens = passTokensAfter;
+      } else {
         break;
       }
-      previousTokens = passTokensAfter;
     }
 
     // Phase 2: depth-aware condensed passes, always processing shallowest depth first.

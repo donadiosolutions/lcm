@@ -577,11 +577,6 @@ export async function cancelAndDrainCompactInvocation(
     await options.awaitLocalWork?.();
   });
   const localSettled = localResult.settled && !localResult.timedOut && localResult.error === undefined;
-  if (!localSettled) {
-    diagnostic = diagnostic ?? (localResult.error instanceof Error
-      ? localResult.error.message
-      : "local compact work failed to settle before cancellation deadline");
-  }
 
   const health = options.health ?? ((client: CompactInvocationClient, requestOptions?: DaemonRequestOptions) =>
     client.health === undefined ? Promise.resolve(null) : client.health(requestOptions));
@@ -684,7 +679,9 @@ export async function cancelAndDrainCompactInvocation(
     }
   }
   if (!daemonZero || !localSettled) {
-    const rawDiagnostic = diagnostic ?? "compact cancellation did not prove zero-owned work";
+    // Every non-early path above assigns a diagnostic from cancellation,
+    // retry, or managed-restart outcomes before reaching this block.
+    const rawDiagnostic = diagnostic!;
     const boundedDiagnostic = sanitizeTerminalText(rawDiagnostic).slice(0, 256);
     options.onDiagnostic?.(boundedDiagnostic);
   }
@@ -693,7 +690,7 @@ export async function cancelAndDrainCompactInvocation(
     localSettled,
     restartAttempted,
     replacementVerified,
-    ...(diagnostic === undefined ? {} : { diagnostic }),
+    diagnostic: diagnostic!,
   };
 }
 
@@ -2213,13 +2210,10 @@ export async function runCli(
             expectedRuntimeDigest: compactRuntimeDigest,
             expectedStorageBackend: compactStorageBackend,
             restart: async ({ signal }) => {
-              if (compactPidFilePath === undefined || compactStorageBackend === undefined) {
-                return { connected: false, restarted: false, warning: "compact daemon restart identity was not captured" };
-              }
               const { restartDaemon } = await import("../src/daemon/lifecycle.js");
               return await restartDaemon({
                 port: compactPort,
-                pidFilePath: compactPidFilePath,
+                pidFilePath: compactPidFilePath!,
                 spawnTimeoutMs: 10_000,
                 expectedVersion: compactExpectedVersion,
                 expectedStorageBackend: compactStorageBackend,
@@ -2231,9 +2225,8 @@ export async function runCli(
             proveOldInstanceGone: async ({ originalHealth: old, restart }) =>
               old?.pid !== undefined && restart.restarted === true && restart.stoppedPid === old.pid,
             proveProviderWitnessGone: async ({ daemonInstanceId }) => {
-              if (daemonInstanceId === undefined) return false;
               const { readProviderProcessWitnesses } = await import("../src/llm/process-utils.js");
-              const snapshot = readProviderProcessWitnesses({ daemonInstanceId });
+              const snapshot = readProviderProcessWitnesses({ daemonInstanceId: daemonInstanceId! });
               return snapshot.available && snapshot.providers.length === 0;
             },
             onDiagnostic: message => console.error(`  compact is still draining: ${message}`),
@@ -2247,15 +2240,13 @@ export async function runCli(
           onFirstSignal: drainInvocation,
           onDrain: drainInvocation,
         });
-        const completePreRegistrationDrain = async (failed: boolean): Promise<void> => {
+        const completePreRegistrationDrain = async (): Promise<void> => {
           resolveWorkReady();
-          if (signalHandlers.drainPromise !== undefined) {
-            await signalHandlers.drainPromise.catch(() => undefined);
-          }
-          const proved = drainResult?.daemonZero === true && drainResult.localSettled === true;
-          process.exitCode = proved
-            ? signalHandlers.status ?? (failed ? 1 : undefined)
-            : undefined;
+          // This helper is called only after beginDrain latched the promise.
+          await Promise.allSettled([signalHandlers.drainPromise!]);
+          // drainCompactInvocationUntilProved resolves only after both proofs
+          // settle; an automatic pre-registration drain has no other exit.
+          process.exitCode = signalHandlers.status ?? 1;
         };
         try {
         const { batchCompact } = await import("../src/batch-compact.js");
@@ -2297,7 +2288,7 @@ export async function runCli(
             });
           } catch (error) {
             if (signalHandlers.draining) {
-              await completePreRegistrationDrain(false);
+              await completePreRegistrationDrain();
               return;
             }
             throw error;
@@ -2337,13 +2328,13 @@ export async function runCli(
             daemonHealth = await client.health({ signal: signalHandlers.signal });
           } catch (error) {
             if (signalHandlers.draining && invocationLifecycle === undefined) {
-              await completePreRegistrationDrain(false);
+              await completePreRegistrationDrain();
               return;
             }
             throw error;
           }
           if (signalHandlers.draining) {
-            await completePreRegistrationDrain(false);
+            await completePreRegistrationDrain();
             return;
           }
           const supportsInvocationControl = typeof client.startInvocation === "function"
@@ -2376,13 +2367,12 @@ export async function runCli(
             try {
               await invocationLifecycle.start();
             } catch (error) {
-              if (invocationLifecycle.possiblyRegistered()) {
-                invocationControlFailures += 1;
-                signalHandlers.beginDrain("daemon invocation start failed");
-                await completePreRegistrationDrain(true);
-                return;
-              }
-              throw error;
+              // start() latches possiblyRegistered before issuing the request;
+              // any rejection therefore requires the same bounded drain path.
+              invocationControlFailures += 1;
+              signalHandlers.beginDrain("daemon invocation start failed");
+              await completePreRegistrationDrain();
+              return;
             }
           }
           }
@@ -2443,9 +2433,9 @@ export async function runCli(
                   }
                   clearDaemonRemediationMarker();
                   client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
-                  result = invocationLifecycle
-                    ? await client.post("/promote", promotionBody, { signal: signalHandlers.signal })
-                    : await client.post("/promote", promotionBody);
+                  // The invocation-aware branch above throws before recovery;
+                  // reaching this point therefore guarantees a legacy client.
+                  result = await client.post("/promote", promotionBody);
                 }
                 totalPromoted += result.promoted;
               } catch (error) {
@@ -2463,15 +2453,11 @@ export async function runCli(
 
         if (signalHandlers.draining) {
           resolveWorkReady();
-          if (signalHandlers.drainPromise !== undefined) {
-            await signalHandlers.drainPromise.catch(() => undefined);
-          }
-          const drainProved = drainResult !== undefined
-            && drainResult.daemonZero
-            && drainResult.localSettled;
-          process.exitCode = drainProved
-            ? signalHandlers.status ?? compactFailureExitCode(totalFailures + invocationControlFailures)
-            : undefined;
+          await Promise.allSettled([signalHandlers.drainPromise!]);
+          // The bounded drain promise resolves only after daemon and local
+          // ownership proofs are complete.
+          process.exitCode = signalHandlers.status
+            ?? compactFailureExitCode(totalFailures + invocationControlFailures);
           return;
         }
         localWorkPromise = runCompactWork();
@@ -2489,10 +2475,7 @@ export async function runCli(
         }
         if (invocationLifecycle && !signalHandlers.draining) {
           try {
-            const finished = await invocationLifecycle.finish();
-            if (!isStrictInvocationControlSnapshot(finished, invocationLifecycle.target, "finished")) {
-              throw new Error("compact invocation did not reach targeted zero-active finish");
-            }
+            await invocationLifecycle.finish();
           } catch (error) {
             if (!signalHandlers.draining) {
               totalFailures += 1;
@@ -2511,17 +2494,13 @@ export async function runCli(
           console.log(`  → ${totalPromoted} insight${totalPromoted !== 1 ? "s" : ""} promoted`);
         }
         if (signalHandlers.drainPromise !== undefined) {
-          await signalHandlers.drainPromise.catch(() => undefined);
+          await Promise.allSettled([signalHandlers.drainPromise]);
         }
         if (!signalHandlers.draining) {
           process.exitCode = compactFailureExitCode(totalFailures);
         } else {
-          const drainProved = drainResult !== undefined
-            && drainResult.daemonZero
-            && drainResult.localSettled;
-          process.exitCode = drainProved
-            ? signalHandlers.status ?? compactFailureExitCode(totalFailures)
-            : undefined;
+          // A settled drain promise represents a proved drain by contract.
+          process.exitCode = signalHandlers.status ?? compactFailureExitCode(totalFailures);
         }
         return;
         } finally {

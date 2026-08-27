@@ -290,6 +290,44 @@ describe("CompactionEngine.compact — previousSummaryContent seeding", () => {
     expect(permit.release).toHaveBeenCalled();
   });
 
+  it("handles an empty invocation-aware leaf chunk without provider work", async () => {
+    const { conversationStore, summaryStore } = makeMinimalStores();
+    const controller = new AbortController();
+    const engine = new CompactionEngine({
+      conversations: conversationStore,
+      summaries: summaryStore,
+      context: summaryStore,
+      transaction: async (callback: (repositories: unknown) => Promise<unknown>) => callback({
+        conversations: conversationStore,
+        summaries: summaryStore,
+        context: summaryStore,
+      }),
+    } as never, {
+      contextThreshold: 0.5,
+      freshTailCount: 0,
+      leafMinFanout: 1,
+      condensedMinFanout: 10,
+      condensedMinFanoutHard: 5,
+      incrementalMaxDepth: 0,
+      leafTargetTokens: 600,
+      condensedTargetTokens: 900,
+      maxRounds: 1,
+    });
+    const selectOldestLeafChunk = vi.spyOn(engine as never, "selectOldestLeafChunk" as never)
+      .mockResolvedValue({ items: [], rawTokensOutsideTail: 0, threshold: 10 } as never);
+    const summarize = vi.fn<CompactionSummarizeFn>();
+
+    await expect(engine.compactFullSweep({
+      conversationId: 1,
+      tokenBudget: 100_000,
+      summarize,
+      force: true,
+      signal: controller.signal,
+    })).resolves.toMatchObject({ actionTaken: false, condensed: false });
+    expect(selectOldestLeafChunk).toHaveBeenCalledWith(1, controller.signal);
+    expect(summarize).not.toHaveBeenCalled();
+  });
+
   it("runs an invocation-aware condensed pass and persists its event", async () => {
     const { conversationStore, summaryStore } = makeMinimalStores();
     const contextItems = [

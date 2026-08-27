@@ -1227,6 +1227,52 @@ describe("compact route coverage", () => {
     await coordinator.shutdown();
   });
 
+  it("cancels a duplicate invocation before returning the skip response", async () => {
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const invocationId = "13131313-1313-4131-8131-131313131313";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    let releaseFirstCompact!: () => void;
+    const firstCompactGate = new Promise<void>(resolve => { releaseFirstCompact = resolve; });
+    const firstCompactStarted = new Promise<void>(resolve => {
+      state.compactInputObserver = async () => {
+        resolve();
+        await firstCompactGate;
+      };
+    });
+    const cancel = vi.spyOn(coordinator, "cancel").mockRejectedValueOnce(new Error("already cancelled"));
+    try {
+      const handler = createCompactHandlerProduction(config());
+      const first = response();
+      const firstPending = handler(
+        {} as never,
+        first.res,
+        JSON.stringify({ session_id: "duplicate-cancel", cwd: "/tmp" }),
+        testCompactContext,
+      );
+      await firstCompactStarted;
+
+      const duplicate = response();
+      await handler(
+        {} as never,
+        duplicate.res,
+        JSON.stringify({ session_id: "duplicate-cancel", cwd: "/tmp", invocation_id: invocationId }),
+        { ...testCompactContext, invocationCoordinator: coordinator },
+      );
+
+      expect(cancel).toHaveBeenCalledWith({ invocationId, command: "compact", daemonInstanceId });
+      expect(duplicate.status()).toBe(200);
+      expect(duplicate.json()).toMatchObject({ skipped: true, actionTaken: false });
+      expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "active", activeCount: 0 });
+
+      releaseFirstCompact();
+      await firstPending;
+    } finally {
+      releaseFirstCompact();
+      await coordinator.shutdown();
+    }
+  });
+
   it("finishes a pre-latched metadata commit but rejects later writes", async () => {
     const invocationId = "55555555-5555-4555-8555-555555555555";
     const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
