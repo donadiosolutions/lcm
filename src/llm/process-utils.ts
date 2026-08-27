@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, chmodSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { lcmHomeDir } from "../runtime-paths.js";
+import { currentUid, lcmHomeDir } from "../runtime-paths.js";
 import {
   processStartTime,
   withPrivateMutationLock,
@@ -336,10 +336,12 @@ type WitnessOperations = Readonly<{
   chmodSync: typeof chmodSync;
   renameSync: typeof renameSync;
   unlinkSync: typeof unlinkSync;
+  getUid: typeof currentUid;
 }>;
 
 export type ProviderProcessWitnessStore = Readonly<{
   path: string;
+  initialize?: () => void;
   add: (entry: ProviderProcessWitness) => void;
   remove: (entry: ProviderProcessWitness) => void;
 }>;
@@ -362,29 +364,14 @@ const DEFAULT_WITNESS_OPERATIONS: WitnessOperations = {
   chmodSync,
   renameSync,
   unlinkSync,
+  getUid: currentUid,
 };
 
-function readWitnesses(path: string, operations: WitnessOperations): ProviderProcessWitness[] {
-  try {
-    const parsed = JSON.parse(operations.readFileSync(path, "utf8")) as { providers?: unknown };
-    if (!parsed || !Array.isArray(parsed.providers)) return [];
-    return parsed.providers.filter((entry): entry is ProviderProcessWitness => {
-      if (!entry || typeof entry !== "object") return false;
-      const candidate = entry as Partial<ProviderProcessWitness>;
-      return typeof candidate.daemonInstanceId === "string"
-        && typeof candidate.providerId === "string"
-        && positivePid(candidate.pid) !== undefined
-        && (candidate.pgid === null || positivePid(candidate.pgid) !== undefined)
-        && (candidate.processStartTime === null || typeof candidate.processStartTime === "string");
-    });
-  } catch {
-    return [];
-  }
-}
-
-const WITNESS_VERSION = 1;
+const LEGACY_WITNESS_VERSION = 1;
+const WITNESS_VERSION = 2;
 const WITNESS_MAX_BYTES = 64 * 1024;
-const WITNESS_TOP_LEVEL_KEYS = ["daemonInstanceId", "providers", "version"] as const;
+const LEGACY_WITNESS_TOP_LEVEL_KEYS = ["daemonInstanceId", "providers", "version"] as const;
+const WITNESS_TOP_LEVEL_KEYS = ["daemonInstances", "providers", "version"] as const;
 const WITNESS_ENTRY_KEYS = ["daemonInstanceId", "pgid", "pid", "processStartTime", "providerId"] as const;
 
 function hasExactKeys(value: object, keys: readonly string[]): boolean {
@@ -393,25 +380,39 @@ function hasExactKeys(value: object, keys: readonly string[]): boolean {
 }
 
 function parseWitnessDocument(value: unknown): {
-  daemonInstanceId: string;
+  version: 1 | 2;
+  daemonInstances: string[];
   providers: ProviderProcessWitness[];
 } | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  if (!hasExactKeys(value, WITNESS_TOP_LEVEL_KEYS)) return undefined;
-  const document = value as {
-    daemonInstanceId?: unknown;
-    providers?: unknown;
-    version?: unknown;
-  };
-  if (
-    document.version !== WITNESS_VERSION
-    || typeof document.daemonInstanceId !== "string"
-    || document.daemonInstanceId.length === 0
-    || !Array.isArray(document.providers)
-  ) return undefined;
+  const candidate = value as Record<string, unknown>;
+  let version: 1 | 2;
+  let daemonInstances: string[];
+  let rawProviders: unknown;
+  if (candidate.version === LEGACY_WITNESS_VERSION) {
+    version = LEGACY_WITNESS_VERSION;
+    if (!hasExactKeys(value, LEGACY_WITNESS_TOP_LEVEL_KEYS)) return undefined;
+    if (typeof candidate.daemonInstanceId !== "string" || candidate.daemonInstanceId.length === 0) return undefined;
+    daemonInstances = [candidate.daemonInstanceId];
+    rawProviders = candidate.providers;
+  } else {
+    version = WITNESS_VERSION;
+    if (!hasExactKeys(value, WITNESS_TOP_LEVEL_KEYS)) return undefined;
+    if (!Array.isArray(candidate.daemonInstances) || candidate.daemonInstances.length === 0) return undefined;
+    daemonInstances = [];
+    const daemonIdentitySet = new Set<string>();
+    for (const rawIdentity of candidate.daemonInstances) {
+      if (typeof rawIdentity !== "string" || rawIdentity.length === 0 || daemonIdentitySet.has(rawIdentity)) return undefined;
+      daemonIdentitySet.add(rawIdentity);
+      daemonInstances.push(rawIdentity);
+    }
+    rawProviders = candidate.providers;
+  }
+  if (!Array.isArray(rawProviders)) return undefined;
+  const daemonIdentitySet = new Set(daemonInstances);
   const providers: ProviderProcessWitness[] = [];
   const identities = new Set<string>();
-  for (const raw of document.providers) {
+  for (const raw of rawProviders) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw) || !hasExactKeys(raw, WITNESS_ENTRY_KEYS)) {
       return undefined;
     }
@@ -421,6 +422,7 @@ function parseWitnessDocument(value: unknown): {
     if (
       typeof entry.daemonInstanceId !== "string"
       || entry.daemonInstanceId.length === 0
+      || !daemonIdentitySet.has(entry.daemonInstanceId)
       || typeof entry.providerId !== "string"
       || entry.providerId.length === 0
       || pid === undefined
@@ -440,20 +442,64 @@ function parseWitnessDocument(value: unknown): {
     identities.add(identity);
     providers.push(normalized);
   }
-  return { daemonInstanceId: document.daemonInstanceId, providers };
+  return { version, daemonInstances, providers };
+}
+
+type WitnessDocument = Readonly<{
+  version: 1 | 2;
+  daemonInstances: string[];
+  providers: ProviderProcessWitness[];
+}>;
+
+/**
+ * Keep the historical test seam for callers that only need the provider
+ * entries. Mutating callers use readWitnessDocument so malformed evidence is
+ * never silently reduced to an empty list.
+ */
+function readWitnesses(path: string, operations: WitnessOperations): ProviderProcessWitness[] {
+  try {
+    const parsed = JSON.parse(operations.readFileSync(path, "utf8")) as unknown;
+    return parseWitnessDocument(parsed)?.providers ?? [];
+  } catch {
+    return [];
+  }
+}
+
+function readWitnessDocument(
+  path: string,
+  operations: Pick<WitnessOperations, "getUid"> = DEFAULT_WITNESS_OPERATIONS,
+): WitnessDocument | undefined {
+  try {
+    const snapshot = readBoundedRegularFileWithStat(path, {
+      allowedRoot: dirname(path),
+      maxBytes: WITNESS_MAX_BYTES,
+      expectedUid: operations.getUid(),
+      allowedModes: [0o600],
+      requireSingleLink: true,
+    });
+    const document = parseWitnessDocument(JSON.parse(snapshot.content) as unknown);
+    if (document === undefined) throw new Error("provider witness document is malformed");
+    return document;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return undefined;
+    throw error;
+  }
 }
 
 /** Read the secret-free provider witness without mutating its backing file. */
 export function readProviderProcessWitnesses(options: {
   path?: string;
   daemonInstanceId?: string;
+  /** @internal deterministic platform identity seam. */
+  _getUid?: () => number | undefined;
 } = {}): ProviderProcessWitnessSnapshot {
   const path = options.path ?? join(lcmHomeDir(), DEFAULT_WITNESS_FILE);
+  const getUid = options._getUid ?? currentUid;
   try {
     const snapshot = readBoundedRegularFileWithStat(path, {
       allowedRoot: dirname(path),
       maxBytes: WITNESS_MAX_BYTES,
-      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      expectedUid: getUid(),
       allowedModes: [0o600],
       requireSingleLink: true,
     });
@@ -463,7 +509,9 @@ export function readProviderProcessWitnesses(options: {
       available: true,
       providers: options.daemonInstanceId === undefined
         ? document.providers
-        : document.providers.filter(entry => entry.daemonInstanceId === options.daemonInstanceId),
+        : document.daemonInstances.includes(options.daemonInstanceId)
+          ? document.providers.filter(entry => entry.daemonInstanceId === options.daemonInstanceId)
+          : [],
     };
   } catch {
     // Missing, replaced, symlinked, wrong-owner, wrong-mode, and malformed
@@ -472,10 +520,15 @@ export function readProviderProcessWitnesses(options: {
   }
 }
 
-function writeWitnesses(path: string, daemonInstanceId: string, providers: readonly ProviderProcessWitness[], operations: WitnessOperations): void {
+function writeWitnesses(
+  path: string,
+  daemonInstances: readonly string[],
+  providers: readonly ProviderProcessWitness[],
+  operations: WitnessOperations,
+): void {
   const directory = dirname(path);
   const temporaryPath = join(directory, `.${DEFAULT_WITNESS_FILE}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
-  const content = `${JSON.stringify({ version: 1, daemonInstanceId, providers })}\n`;
+  const content = `${JSON.stringify({ version: WITNESS_VERSION, daemonInstances, providers })}\n`;
   let published = false;
   try {
     operations.writeFileSync(temporaryPath, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -543,9 +596,36 @@ export function createProviderProcessWitnessStore(options: {
 }): ProviderProcessWitnessStore {
   const path = options.path ?? join(lcmHomeDir(), DEFAULT_WITNESS_FILE);
   const operations: WitnessOperations = { ...DEFAULT_WITNESS_OPERATIONS, ...options.operations };
+  const initialize = (): void => withWitnessPathLock(path, () =>
+    withWitnessMutationLock(path, () => {
+      const existing = readWitnessDocument(path, operations);
+      if (existing === undefined) {
+        writeWitnesses(path, [options.daemonInstanceId], [], operations);
+        return;
+      }
+      const daemonInstances = existing.daemonInstances.includes(options.daemonInstanceId)
+        ? existing.daemonInstances
+        : [...existing.daemonInstances, options.daemonInstanceId];
+      // A legacy document is rewritten to the v2 multi-generation format even
+      // when this daemon was already the sole recorded generation.
+      const needsMigration = existing.version !== WITNESS_VERSION
+        || daemonInstances.length !== existing.daemonInstances.length;
+      if (needsMigration) writeWitnesses(path, daemonInstances, existing.providers, operations);
+    }),
+  );
+  initialize();
   const update = (entry: ProviderProcessWitness, remove: boolean): void => withWitnessPathLock(path, () =>
     withWitnessMutationLock(path, () => {
-      const entries = readWitnesses(path, operations);
+      const existing = readWitnessDocument(path, operations);
+      if (existing === undefined) {
+        if (remove) {
+          writeWitnesses(path, [options.daemonInstanceId], [], operations);
+          return;
+        }
+        writeWitnesses(path, [options.daemonInstanceId], [entry], operations);
+        return;
+      }
+      const entries = existing.providers;
       const current = entries.filter(candidate => candidate.daemonInstanceId === options.daemonInstanceId);
       const otherDaemonEntries = entries.filter(candidate => candidate.daemonInstanceId !== options.daemonInstanceId);
       const matches = (candidate: ProviderProcessWitness): boolean => candidate.providerId === entry.providerId
@@ -556,19 +636,15 @@ export function createProviderProcessWitnessStore(options: {
         ? current.filter(candidate => !matches(candidate))
         : [...current.filter(candidate => !matches(candidate)), entry];
       const next = [...otherDaemonEntries, ...nextCurrent];
-      if (next.length === 0) {
-        try {
-          operations.unlinkSync(path);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") throw error;
-        }
-        return;
-      }
-      writeWitnesses(path, options.daemonInstanceId, next, operations);
+      const daemonInstances = existing.daemonInstances.includes(options.daemonInstanceId)
+        ? existing.daemonInstances
+        : [...existing.daemonInstances, options.daemonInstanceId];
+      writeWitnesses(path, daemonInstances, next, operations);
     }),
   );
   return {
     path,
+    initialize,
     add: entry => update(entry, false),
     remove: entry => update(entry, true),
   };

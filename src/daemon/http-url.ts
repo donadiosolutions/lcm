@@ -352,7 +352,7 @@ export async function daemonJsonRequest<T>(
       && typeof (data as { error?: unknown }).error === "string"
       ? (data as { error: string }).error
       : `HTTP ${statusCode}`;
-    throw new Error(message);
+    throw Object.assign(new Error(message), { statusCode });
   }
   return data;
 }

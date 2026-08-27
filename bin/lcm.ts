@@ -172,6 +172,8 @@ export type CompactInvocationLifecycleOptions = Readonly<{
   signal?: AbortSignal;
   /** Bounds the ordinary start control transport without using command abort. */
   startTimeoutMs?: number;
+  /** Injectable clock used to bound uncertain start outcomes. */
+  now?: () => number;
   heartbeatMs?: number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
@@ -185,6 +187,10 @@ export type CompactInvocationLifecycle = Readonly<{
   started: () => boolean;
   /** True once the start request was sent, even if its response was lost. */
   possiblyRegistered: () => boolean;
+  /** Registration state, including an uncertain start transport outcome. */
+  startState?: () => "unsent" | "sent" | "confirmed" | "response-lost";
+  /** Absolute deadline after which an unconfirmed start may be reconciled. */
+  uncertaintyDeadline?: () => number | undefined;
   start: () => Promise<InvocationControlResponse>;
   stopHeartbeat: () => void;
   /** Stop and await every heartbeat request already in flight. */
@@ -258,6 +264,7 @@ export function createCompactInvocationLifecycle(
     throw new RangeError("compact invocation start timeout must be positive");
   }
   const signal = options.signal ?? new AbortController().signal;
+  const now = options.now ?? Date.now;
   const setTimer = options.setInterval ?? setInterval;
   const clearTimer = options.clearInterval ?? clearInterval;
   const target: InvocationControlRequest = {
@@ -267,6 +274,9 @@ export function createCompactInvocationLifecycle(
   };
   let started = false;
   let possiblyRegistered = false;
+  let startState: "unsent" | "sent" | "confirmed" | "response-lost" = "unsent";
+  let startSentAt: number | undefined;
+  let uncertaintyDeadline: number | undefined;
   const startController = new AbortController();
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   let heartbeatPromise: Promise<InvocationControlResponse> | undefined;
@@ -316,16 +326,26 @@ export function createCompactInvocationLifecycle(
     // transport rejects or loses its response so the caller must cancel the
     // target before it can leave the command.
     possiblyRegistered = true;
-    const result = await options.client.startInvocation(target, {
-      signal: startController.signal,
-      timeoutMs: startTimeoutMs,
-    });
-    if (!isInvocationTargetResponse(result, target, "active")) {
-      throw new Error("compact invocation start returned an invalid snapshot");
+    startState = "sent";
+    startSentAt = now();
+    uncertaintyDeadline = startSentAt + startTimeoutMs + 30_000;
+    try {
+      const result = await options.client.startInvocation(target, {
+        signal: startController.signal,
+        timeoutMs: startTimeoutMs,
+      });
+      if (!isInvocationTargetResponse(result, target, "active")) {
+        startState = "response-lost";
+        throw new Error("compact invocation start returned an invalid snapshot");
+      }
+      startState = "confirmed";
+      started = true;
+      scheduleHeartbeat();
+      return result;
+    } catch (error) {
+      if (startState !== "confirmed") startState = "response-lost";
+      throw error;
     }
-    started = true;
-    scheduleHeartbeat();
-    return result;
   };
 
   const settleHeartbeat = async (): Promise<void> => {
@@ -355,6 +375,8 @@ export function createCompactInvocationLifecycle(
     signal,
     started: () => started,
     possiblyRegistered: () => possiblyRegistered,
+    startState: () => startState,
+    uncertaintyDeadline: () => startState === "response-lost" ? uncertaintyDeadline : undefined,
     start,
     stopHeartbeat,
     settleHeartbeat,
@@ -473,6 +495,8 @@ export type CompactDrainOptions = Readonly<{
   lifecycle: CompactInvocationLifecycle;
   createFreshClient: () => CompactInvocationClient;
   awaitLocalWork?: () => Promise<void>;
+  /** True once the command has dispatched any local compact work. */
+  localWorkDispatched?: () => boolean;
   originalHealth?: DaemonHealth | null;
   health?: (client: CompactInvocationClient, options?: DaemonRequestOptions) => Promise<DaemonHealth | null>;
   timeoutMs?: number;
@@ -488,6 +512,15 @@ export type CompactDrainOptions = Readonly<{
   session?: CompactDrainSession;
   onDiagnostic?: (message: string) => void;
 }>;
+
+function isUnknownInvocationCancellation(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const candidate = error as { statusCode?: unknown; code?: unknown; message?: unknown };
+  if (candidate.statusCode === 404) return true;
+  if (candidate.code === "unknown-invocation" || candidate.code === "UNKNOWN_INVOCATION") return true;
+  return typeof candidate.message === "string"
+    && /(?:unknown invocation|invocation not found|http\s*404)/iu.test(candidate.message);
+}
 
 export type CompactDrainSession = {
   restartAttempted: boolean;
@@ -515,11 +548,17 @@ export async function cancelAndDrainCompactInvocation(
   const setTimer = options.setTimeout ?? setTimeout;
   const clearTimer = options.clearTimeout ?? clearTimeout;
   const now = options.now ?? Date.now;
+  const startState = options.lifecycle.startState?.();
+  const uncertaintyDeadline = options.lifecycle.uncertaintyDeadline?.();
+  const localWorkDispatched = options.localWorkDispatched?.() === true;
   const deadline = now() + timeoutMs;
   type BoundedResult<T> = Readonly<{ settled: boolean; value?: T; error?: unknown; timedOut: boolean }>;
-  const bounded = async <T>(operation: (signal: AbortSignal) => Promise<T>): Promise<BoundedResult<T>> => {
+  const bounded = async <T>(
+    operation: (signal: AbortSignal) => Promise<T>,
+    operationDeadline = deadline,
+  ): Promise<BoundedResult<T>> => {
     const controller = new AbortController();
-    const remaining = Math.max(0, deadline - now());
+    const remaining = Math.max(0, operationDeadline - now());
     let timer: ReturnType<typeof setTimeout> | undefined;
     let resolveTimeout!: () => void;
     const timeout = new Promise<void>(resolve => {
@@ -580,8 +619,17 @@ export async function cancelAndDrainCompactInvocation(
 
   const health = options.health ?? ((client: CompactInvocationClient, requestOptions?: DaemonRequestOptions) =>
     client.health === undefined ? Promise.resolve(null) : client.health(requestOptions));
-  if ((!daemonZero || !localSettled) && now() <= deadline) {
-    const healthResult = await bounded(signal => health(options.createFreshClient(), { signal }));
+  const uncertainStart = startState === "response-lost"
+    && !localWorkDispatched
+    && uncertaintyDeadline !== undefined
+    && options.originalHealth?.daemonInstanceId !== undefined;
+  const unknownFirstCancel = firstCancel.settled
+    && firstCancel.error !== undefined
+    && isUnknownInvocationCancellation(firstCancel.error);
+  if ((!daemonZero || !localSettled)
+    && (now() <= deadline || (uncertainStart && unknownFirstCancel))) {
+    const healthDeadline = now() <= deadline ? deadline : now() + timeoutMs;
+    const healthResult = await bounded(signal => health(options.createFreshClient(), { signal }), healthDeadline);
     const observed = healthResult.value;
     const sameInstance = observed !== null
       && observed !== undefined
@@ -593,12 +641,12 @@ export async function cancelAndDrainCompactInvocation(
       const retry = await bounded(signal => options.createFreshClient().cancelInvocation(
         options.lifecycle.target,
         { signal },
-      ));
+      ), healthDeadline);
       const retryProviderProof = options.proveProviderWitnessGone === undefined
         ? { settled: true, value: false, timedOut: false }
         : await bounded(async () => await options.proveProviderWitnessGone!({
           daemonInstanceId: options.originalHealth?.daemonInstanceId,
-        }));
+        }), healthDeadline);
       const strictRetry = retry.settled
         && retry.error === undefined
         && retry.value !== undefined
@@ -607,6 +655,14 @@ export async function cancelAndDrainCompactInvocation(
         && retryProviderProof.error === undefined
         && retryProviderProof.value === true;
       daemonZero = strictRetry && retryProviderGone;
+      if (!daemonZero
+        && uncertainStart
+        && now() >= uncertaintyDeadline!
+        && unknownFirstCancel
+        && isUnknownInvocationCancellation(retry.error)
+        && retryProviderGone) {
+        daemonZero = true;
+      }
       if (!daemonZero) diagnostic = strictRetry
         ? "provider process witness is unavailable or still reports owned work after cancellation retry"
         : "daemon cancellation response did not prove targeted zero-owned work after retry";
@@ -2206,6 +2262,7 @@ export async function runCli(
             lifecycle: invocationLifecycle,
             createFreshClient: () => new DaemonClient(`http://127.0.0.1:${compactPort}`, compactTokenPath),
             awaitLocalWork: async () => { await localWorkPromise?.catch(() => undefined); },
+            localWorkDispatched: () => localWorkPromise !== undefined,
             originalHealth: originalDaemonHealth,
             expectedRuntimeDigest: compactRuntimeDigest,
             expectedStorageBackend: compactStorageBackend,

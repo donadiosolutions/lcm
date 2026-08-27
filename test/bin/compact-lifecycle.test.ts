@@ -4,6 +4,7 @@ import { createAbortError } from "../../src/daemon/cancellation.js";
 import {
   cancelAndDrainCompactInvocation,
   createCompactInvocationLifecycle,
+  type CompactInvocationLifecycle,
   drainCompactInvocationUntilProved,
   installCompactSignalHandlers,
   isStrictInvocationControlSnapshot,
@@ -106,6 +107,25 @@ describe("compact invocation lifecycle", () => {
     });
     await expect(invalidArray.start()).rejects.toThrow(/invalid snapshot/);
     await expect(invalid.finish()).resolves.toBeUndefined();
+  });
+
+  it("retains confirmed state when heartbeat scheduling fails after start", async () => {
+    const schedulingError = new Error("heartbeat scheduling failed");
+    const lifecycle = createCompactInvocationLifecycle({
+      client: {
+        startInvocation: vi.fn(async () => response("active")),
+        heartbeatInvocation: vi.fn(async () => response("active")),
+        cancelInvocation: vi.fn(async () => response("cancelled")),
+        finishInvocation: vi.fn(async () => response("finished")),
+      },
+      daemonInstanceId,
+      invocationId,
+      setInterval: vi.fn(() => { throw schedulingError; }),
+      clearInterval: vi.fn(),
+    });
+    await expect(lifecycle.start()).rejects.toBe(schedulingError);
+    expect(lifecycle.startState?.()).toBe("confirmed");
+    expect(lifecycle.started()).toBe(true);
   });
 
   it("returns no heartbeat after abort and reports non-abort heartbeat errors", async () => {
@@ -825,6 +845,291 @@ describe("compact invocation lifecycle", () => {
     expect(possiblyRegistered()).toBe(true);
     await expect(lifecycle.cancel()).resolves.toMatchObject({ state: "cancelled" });
     expect(cancelInvocation).toHaveBeenCalledOnce();
+  });
+
+  it("distinguishes an unsent start, a confirmed start, and a lost response", async () => {
+    let nowValue = 1_000;
+    const now = () => nowValue;
+    const startInvocation = vi.fn()
+      .mockResolvedValueOnce(response("active"))
+      .mockRejectedValueOnce(new Error("start response lost"));
+    const base = {
+      client: {
+        startInvocation,
+        heartbeatInvocation: vi.fn(async () => response("active")),
+        cancelInvocation: vi.fn(async () => response("cancelled")),
+        finishInvocation: vi.fn(async () => response("finished")),
+      },
+      daemonInstanceId,
+      invocationId,
+      startTimeoutMs: 10_000,
+      now,
+      setInterval: vi.fn(() => 23 as unknown as ReturnType<typeof globalThis.setInterval>),
+      clearInterval: vi.fn(),
+    };
+    const confirmed = createCompactInvocationLifecycle(base);
+    expect((confirmed as never as { startState: () => string }).startState()).toBe("unsent");
+    await confirmed.start();
+    expect((confirmed as never as { startState: () => string }).startState()).toBe("confirmed");
+    expect((confirmed as never as { uncertaintyDeadline: () => number | undefined }).uncertaintyDeadline()).toBeUndefined();
+
+    nowValue = 2_000;
+    const lost = createCompactInvocationLifecycle(base);
+    await expect(lost.start()).rejects.toThrow("start response lost");
+    expect((lost as never as { startState: () => string }).startState()).toBe("response-lost");
+    expect((lost as never as { uncertaintyDeadline: () => number | undefined }).uncertaintyDeadline()).toBe(42_000);
+  });
+
+  it("clears an unregistered response-lost start only after its uncertainty deadline", async () => {
+    let nowValue = 0;
+    const now = () => nowValue;
+    const unknown = Object.assign(new Error("unknown invocation"), { statusCode: 404 });
+    const oldHealth = {
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite" as const,
+      daemonInstanceId,
+      pid: 9,
+      uptime: 1,
+    };
+    const startInvocation = vi.fn(async () => { throw new Error("start response lost"); });
+    const cancelInvocation = vi.fn(async () => { throw unknown; });
+    const health = vi.fn(async () => oldHealth);
+    const lifecycle = createCompactInvocationLifecycle({
+      client: {
+        startInvocation,
+        heartbeatInvocation: vi.fn(async () => response("active")),
+        cancelInvocation,
+        finishInvocation: vi.fn(async () => response("finished")),
+      },
+      daemonInstanceId,
+      invocationId,
+      startTimeoutMs: 10,
+      now,
+      setInterval: vi.fn(() => 24 as unknown as ReturnType<typeof globalThis.setInterval>),
+      clearInterval: vi.fn(),
+    });
+    await expect(lifecycle.start()).rejects.toThrow("start response lost");
+
+    const before = await cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation, health }),
+      originalHealth: oldHealth,
+      health,
+      proveProviderWitnessGone: async () => true,
+      awaitLocalWork: async () => undefined,
+      timeoutMs: 5,
+      now,
+    });
+    expect(before.daemonZero).toBe(false);
+
+    nowValue = 40_011;
+    const after = await cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation, health }),
+      originalHealth: oldHealth,
+      health,
+      proveProviderWitnessGone: async () => true,
+      awaitLocalWork: async () => undefined,
+      timeoutMs: 5,
+      now,
+    });
+    expect(after).toMatchObject({ daemonZero: true, localSettled: true });
+    expect(cancelInvocation).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    ["local work was dispatched", true, true],
+    ["provider witness is unavailable", false, false],
+  ])("keeps a response-lost registration unproved when %s", async (_label, localWorkDispatched, witnessGone) => {
+    let nowValue = 40_011;
+    const now = () => nowValue;
+    const oldHealth = {
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite" as const,
+      daemonInstanceId,
+      pid: 9,
+      uptime: 1,
+    };
+    const lifecycle = createCompactInvocationLifecycle({
+      client: {
+        startInvocation: vi.fn(async () => { throw new Error("start response lost"); }),
+        heartbeatInvocation: vi.fn(async () => response("active")),
+        cancelInvocation: vi.fn(async () => { throw Object.assign(new Error("unknown invocation"), { statusCode: 404 }); }),
+        finishInvocation: vi.fn(async () => response("finished")),
+      },
+      daemonInstanceId,
+      invocationId,
+      now: () => 0,
+      startTimeoutMs: 10,
+      setInterval: vi.fn(() => 25 as unknown as ReturnType<typeof globalThis.setInterval>),
+      clearInterval: vi.fn(),
+    });
+    await expect(lifecycle.start()).rejects.toThrow("start response lost");
+    const result = await cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({
+        cancelInvocation: vi.fn(async () => { throw Object.assign(new Error("unknown invocation"), { statusCode: 404 }); }),
+        health: async () => oldHealth,
+      }),
+      originalHealth: oldHealth,
+      health: async () => oldHealth,
+      proveProviderWitnessGone: async () => witnessGone,
+      awaitLocalWork: async () => undefined,
+      localWorkDispatched: () => localWorkDispatched,
+      timeoutMs: 5,
+      now,
+    } as never);
+    expect(result.daemonZero).toBe(false);
+  });
+
+  it("never uses the uncertainty escape for a confirmed invocation", async () => {
+    const unknown = Object.assign(new Error("unknown invocation"), { statusCode: 404 });
+    const oldHealth = {
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite" as const,
+      daemonInstanceId,
+      pid: 9,
+      uptime: 1,
+    };
+    let nowValue = 40_011;
+    const lifecycle = createCompactInvocationLifecycle({
+      client: {
+        startInvocation: vi.fn(async () => response("active")),
+        heartbeatInvocation: vi.fn(async () => response("active")),
+        cancelInvocation: vi.fn(async () => { throw unknown; }),
+        finishInvocation: vi.fn(async () => response("finished")),
+      },
+      daemonInstanceId,
+      invocationId,
+      now: () => 0,
+      startTimeoutMs: 10,
+      setInterval: vi.fn(() => 26 as unknown as ReturnType<typeof globalThis.setInterval>),
+      clearInterval: vi.fn(),
+    });
+    await lifecycle.start();
+    const result = await cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation: vi.fn(async () => { throw unknown; }), health: async () => oldHealth }),
+      originalHealth: oldHealth,
+      health: async () => oldHealth,
+      proveProviderWitnessGone: async () => true,
+      awaitLocalWork: async () => undefined,
+      timeoutMs: 5,
+      now: () => nowValue,
+    } as never);
+    expect(result.daemonZero).toBe(false);
+  });
+
+  it.each([
+    ["lowercase code", { code: "unknown-invocation" }],
+    ["uppercase code", { code: "UNKNOWN_INVOCATION" }],
+    ["not-found message", { message: "invocation not found" }],
+  ])("recognizes unknown-invocation cancellation evidence from %s", async (_label, unknownError) => {
+    const oldHealth = {
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite" as const,
+      daemonInstanceId,
+      pid: 9,
+      uptime: 1,
+    };
+    const startError = new Error("start response lost");
+    let nowValue = 40_011;
+    const now = () => nowValue;
+    const makeUnknown = (): Error => Object.assign(new Error("unknown invocation"), unknownError);
+    const lifecycle = createCompactInvocationLifecycle({
+      client: {
+        startInvocation: vi.fn(async () => { throw startError; }),
+        heartbeatInvocation: vi.fn(async () => response("active")),
+        cancelInvocation: vi.fn(async () => { throw makeUnknown(); }),
+        finishInvocation: vi.fn(async () => response("finished")),
+      },
+      daemonInstanceId,
+      invocationId,
+      startTimeoutMs: 10,
+      now: () => 0,
+      setInterval: vi.fn(() => 27 as unknown as ReturnType<typeof globalThis.setInterval>),
+      clearInterval: vi.fn(),
+    });
+    await expect(lifecycle.start()).rejects.toBe(startError);
+    const result = await cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({
+        cancelInvocation: vi.fn(async () => { throw makeUnknown(); }),
+        health: async () => oldHealth,
+      }),
+      originalHealth: oldHealth,
+      health: async () => oldHealth,
+      proveProviderWitnessGone: async () => true,
+      awaitLocalWork: async () => undefined,
+      timeoutMs: 5,
+      now,
+    });
+    expect(result.daemonZero).toBe(true);
+  });
+
+  it("uses the cancellation deadline and uncertainty deadline as separate clocks", async () => {
+    const oldHealth = {
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite" as const,
+      daemonInstanceId,
+      pid: 9,
+      uptime: 1,
+    };
+    const unknown = Object.assign(new Error("unknown invocation"), { statusCode: 404 });
+    const makeLifecycle = async (): Promise<CompactInvocationLifecycle> => {
+      const lifecycle = createCompactInvocationLifecycle({
+        client: {
+          startInvocation: vi.fn(async () => { throw new Error("start response lost"); }),
+          heartbeatInvocation: vi.fn(async () => response("active")),
+          cancelInvocation: vi.fn(async () => { throw unknown; }),
+          finishInvocation: vi.fn(async () => response("finished")),
+        },
+        daemonInstanceId,
+        invocationId,
+        startTimeoutMs: 10,
+        now: () => 0,
+        setInterval: vi.fn(() => 28 as unknown as ReturnType<typeof globalThis.setInterval>),
+        clearInterval: vi.fn(),
+      });
+      await expect(lifecycle.start()).rejects.toThrow("start response lost");
+      return lifecycle;
+    };
+    const drain = async (lifecycle: CompactInvocationLifecycle, now: () => number, localWorkDispatched?: () => boolean) => cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({
+        cancelInvocation: vi.fn(async () => { throw unknown; }),
+        health: async () => oldHealth,
+      }),
+      originalHealth: oldHealth,
+      health: async () => oldHealth,
+      proveProviderWitnessGone: async () => true,
+      awaitLocalWork: async () => undefined,
+      localWorkDispatched,
+      timeoutMs: 5,
+      now,
+    });
+
+    const settled = await drain(await makeLifecycle(), () => 0);
+    expect(settled.daemonZero).toBe(false);
+
+    const clock = [0, 0, 0, 0, 40_011, 40_011];
+    let clockIndex = 0;
+    const uncertain = await drain(await makeLifecycle(), () => clock[clockIndex++] ?? 40_011);
+    expect(uncertain.daemonZero).toBe(true);
+
+    const lateClock = [0, 0, 0, 0, 40_011];
+    let lateClockIndex = 0;
+    const dispatched = await drain(
+      await makeLifecycle(),
+      () => lateClock[lateClockIndex++] ?? 40_011,
+      () => true,
+    );
+    expect(dispatched.daemonZero).toBe(false);
   });
 
   it("does not mark or send a start request when already aborted", async () => {

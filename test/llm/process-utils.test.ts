@@ -8,6 +8,7 @@ import {
   createOwnedProcessTeardown,
   createProviderProcessWitnessStore,
   readProviderProcessWitnesses,
+  boundedModelForDisplay,
   normalizeProcessBirthTime,
 } from "../../src/llm/process-utils.js";
 import { PrivateMutationLockContentionError, withPrivateMutationLock } from "../../src/private-mutation-lock.js";
@@ -36,6 +37,10 @@ describe("owned process lifecycle utilities", () => {
     expect(normalizeProcessBirthTime("birth")).toBe("birth");
     expect(normalizeProcessBirthTime(null)).toBeNull();
     expect(normalizeProcessBirthTime(undefined)).toBeNull();
+  });
+
+  it("uses a default model label for blank display input", () => {
+    expect(boundedModelForDisplay("   ")).toBe("default");
   });
 
   it("uses the direct child when the pid/group identity is not safe", async () => {
@@ -671,12 +676,96 @@ describe("owned process lifecycle utilities", () => {
     store.add(entry);
     expect(statSync(path).mode & 0o777).toBe(0o600);
     const content = readFileSync(path, "utf8");
-    expect(JSON.parse(content)).toEqual({ version: 1, daemonInstanceId: "daemon-a", providers: [entry] });
+    expect(JSON.parse(content)).toEqual({ version: 2, daemonInstances: ["daemon-a"], providers: [entry] });
     expect(content).not.toMatch(/prompt|output|auth|token|url/i);
     store.add(entry);
     expect(JSON.parse(readFileSync(path, "utf8")).providers).toHaveLength(1);
     store.remove(entry);
-    expect(() => readFileSync(path)).toThrow();
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      version: 2,
+      daemonInstances: ["daemon-a"],
+      providers: [],
+    });
+  });
+
+  it("initializes an authenticated empty generation before provider work", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-init-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    createProviderProcessWitnessStore({ daemonInstanceId: "daemon-a", path });
+
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      version: 2,
+      daemonInstances: ["daemon-a"],
+      providers: [],
+    });
+    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-a" })).toEqual({
+      available: true,
+      providers: [],
+    });
+  });
+
+  it("keeps the legacy reader seam fail-closed while accepting v2 documents", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reader-seam-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const entry = {
+      daemonInstanceId: "daemon-a",
+      providerId: "codex-process",
+      pid: 31,
+      pgid: null,
+      processStartTime: null,
+    } as const;
+    writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: ["daemon-a"], providers: [entry] }), { mode: 0o600 });
+    const operations = {
+      readFileSync,
+      writeFileSync,
+      chmodSync,
+      renameSync,
+      unlinkSync: rmSync as never,
+    };
+    expect(__processUtilsTestUtils.readWitnesses(path, operations as never)).toEqual([entry]);
+    expect(__processUtilsTestUtils.readWitnesses(join(root, "missing.json"), operations as never)).toEqual([]);
+    writeFileSync(path, "not-json", { mode: 0o600 });
+    expect(__processUtilsTestUtils.readWitnesses(path, operations as never)).toEqual([]);
+    writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: ["daemon-a"], providers: "invalid" }), { mode: 0o600 });
+    expect(__processUtilsTestUtils.readWitnesses(path, operations as never)).toEqual([]);
+  });
+
+  it("retains authenticated empty generations for multiple daemons", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-generations-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const first = createProviderProcessWitnessStore({ daemonInstanceId: "daemon-a", path });
+    const second = createProviderProcessWitnessStore({ daemonInstanceId: "daemon-b", path });
+
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      version: 2,
+      daemonInstances: ["daemon-a", "daemon-b"],
+      providers: [],
+    });
+    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-a" })).toEqual({ available: true, providers: [] });
+    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-b" })).toEqual({ available: true, providers: [] });
+    createProviderProcessWitnessStore({ daemonInstanceId: "daemon-a", path });
+    first.remove({ daemonInstanceId: "daemon-a", providerId: "none", pid: 1, pgid: null, processStartTime: null });
+    second.remove({ daemonInstanceId: "daemon-b", providerId: "none", pid: 2, pgid: null, processStartTime: null });
+    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-a" })).toEqual({ available: true, providers: [] });
+    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-b" })).toEqual({ available: true, providers: [] });
+  });
+
+  it("refuses initialization over malformed or symlinked evidence", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-init-unsafe-"));
+    roots.push(root);
+    const malformedPath = join(root, "malformed.json");
+    writeFileSync(malformedPath, JSON.stringify({ version: 1, daemonInstanceId: "daemon-a", providers: "invalid" }), { mode: 0o600 });
+    expect(() => createProviderProcessWitnessStore({ daemonInstanceId: "daemon-b", path: malformedPath })).toThrow();
+    expect(JSON.parse(readFileSync(malformedPath, "utf8"))).toEqual({ version: 1, daemonInstanceId: "daemon-a", providers: "invalid" });
+
+    const targetPath = join(root, "target.json");
+    const symlinkPath = join(root, "symlink.json");
+    writeFileSync(targetPath, JSON.stringify({ version: 2, daemonInstances: ["daemon-a"], providers: [] }), { mode: 0o600 });
+    symlinkSync(targetPath, symlinkPath);
+    expect(() => createProviderProcessWitnessStore({ daemonInstanceId: "daemon-b", path: symlinkPath })).toThrow();
   });
 
   it("reads a provider witness snapshot for old-instance disappearance proof", () => {
@@ -696,12 +785,16 @@ describe("owned process lifecycle utilities", () => {
       available: true,
       providers: [entry],
     });
+    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-a" })).toMatchObject({
+      available: true,
+      providers: [entry],
+    });
     expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-b" })).toMatchObject({
       available: true,
       providers: [],
     });
     store.remove(entry);
-    expect(readProviderProcessWitnesses({ path })).toMatchObject({ available: false, providers: [] });
+    expect(readProviderProcessWitnesses({ path })).toMatchObject({ available: true, providers: [] });
     writeFileSync(path, "not-json", { mode: 0o600 });
     expect(readProviderProcessWitnesses({ path })).toMatchObject({ available: false, providers: [] });
   });
@@ -804,6 +897,24 @@ describe("owned process lifecycle utilities", () => {
     expect(readProviderProcessWitnesses({ path })).toEqual({ available: false, providers: [] });
   });
 
+  it.each([
+    ["non-array daemon instances", { version: 2, daemonInstances: "daemon-a", providers: [] }],
+    ["empty daemon instances", { version: 2, daemonInstances: [], providers: [] }],
+    ["duplicate daemon instances", { version: 2, daemonInstances: ["daemon-a", "daemon-a"], providers: [] }],
+    ["invalid daemon instance", { version: 2, daemonInstances: [""], providers: [] }],
+    ["provider outside daemon instances", {
+      version: 2,
+      daemonInstances: ["daemon-a"],
+      providers: [{ daemonInstanceId: "daemon-b", providerId: "codex-process", pid: 1, pgid: null, processStartTime: null }],
+    }],
+  ])("rejects malformed v2 witness document (%s)", (_label, value) => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-malformed-v2-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+    expect(readProviderProcessWitnesses({ path })).toEqual({ available: false, providers: [] });
+  });
+
   it("rejects duplicate provider identities in a witness snapshot", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-duplicate-"));
     roots.push(root);
@@ -884,9 +995,13 @@ describe("owned process lifecycle utilities", () => {
     try {
       await Promise.all([first.add(entryA), second.add(entryB)]);
       expect(JSON.parse(readFileSync(path, "utf8")).providers).toEqual([entryA, entryB]);
-      expect(new Set(temporaryPaths).size).toBe(2);
+      expect(new Set(temporaryPaths).size).toBe(4);
       await Promise.all([first.remove(entryA), second.remove(entryB)]);
-      expect(() => readFileSync(path)).toThrow();
+      expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+        version: 2,
+        daemonInstances: ["daemon-a", "daemon-b"],
+        providers: [],
+      });
     } finally {
       now.mockRestore();
     }
@@ -913,7 +1028,7 @@ describe("owned process lifecycle utilities", () => {
     let store: ReturnType<typeof createProviderProcessWitnessStore>;
     let queued = false;
     const write = (target: Parameters<typeof writeFileSync>[0], ...args: Parameters<typeof writeFileSync> extends [unknown, ...infer Rest] ? Rest : never): void => {
-      if (!queued) {
+      if (!queued && store !== undefined) {
         queued = true;
         store.add(entryB);
       }
@@ -949,9 +1064,13 @@ describe("owned process lifecycle utilities", () => {
     } as const;
     let store: ReturnType<typeof createProviderProcessWitnessStore>;
     let queued = false;
-    const rename = vi.fn(() => { throw error; });
+    let failPublication = false;
+    const rename = vi.fn((...args: Parameters<typeof import("node:fs").renameSync>) => {
+      if (failPublication) throw error;
+      return renameSync(...args);
+    });
     const write = (target: Parameters<typeof writeFileSync>[0], ...args: Parameters<typeof writeFileSync> extends [unknown, ...infer Rest] ? Rest : never): void => {
-      if (!queued) {
+      if (!queued && store !== undefined) {
         queued = true;
         store.add(entryB);
       }
@@ -965,6 +1084,7 @@ describe("owned process lifecycle utilities", () => {
         renameSync: rename,
       },
     });
+    failPublication = true;
     expect(() => store.add(entryA)).toThrow(error);
     expect(rename).toHaveBeenCalled();
   });
@@ -992,7 +1112,7 @@ describe("owned process lifecycle utilities", () => {
     let queued = false;
     let renames = 0;
     const write = (target: Parameters<typeof writeFileSync>[0], ...args: Parameters<typeof writeFileSync> extends [unknown, ...infer Rest] ? Rest : never): void => {
-      if (!queued) {
+      if (!queued && store !== undefined) {
         queued = true;
         store.add(entryB);
       }
@@ -1000,7 +1120,7 @@ describe("owned process lifecycle utilities", () => {
     };
     const rename = vi.fn((...args: Parameters<typeof import("node:fs").renameSync>) => {
       renames += 1;
-      if (renames === 2) throw error;
+      if (renames === 3) throw error;
       return renameSync(...args);
     });
     store = createProviderProcessWitnessStore({
@@ -1012,6 +1132,64 @@ describe("owned process lifecycle utilities", () => {
       },
     });
     expect(() => store.add(entryA)).toThrow(error);
+  });
+
+  it("recreates a missing witness on remove and add after initialization", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-recreate-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const store = createProviderProcessWitnessStore({ daemonInstanceId: "daemon-a", path });
+    const entry = {
+      daemonInstanceId: "daemon-a",
+      providerId: "codex-process",
+      pid: 32,
+      pgid: null,
+      processStartTime: null,
+    } as const;
+    rmSync(path);
+    store.remove(entry);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      version: 2,
+      daemonInstances: ["daemon-a"],
+      providers: [],
+    });
+    rmSync(path);
+    store.add(entry);
+    expect(JSON.parse(readFileSync(path, "utf8")).providers).toEqual([entry]);
+  });
+
+  it("adds a generation when an existing document omits this daemon", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-generation-append-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const store = createProviderProcessWitnessStore({ daemonInstanceId: "daemon-a", path });
+    const entry = {
+      daemonInstanceId: "daemon-a",
+      providerId: "codex-process",
+      pid: 33,
+      pgid: null,
+      processStartTime: null,
+    } as const;
+    writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: ["daemon-b"], providers: [] }), { mode: 0o600 });
+    store.add(entry);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      version: 2,
+      daemonInstances: ["daemon-b", "daemon-a"],
+      providers: [entry],
+    });
+  });
+
+  it("reads a witness with no uid probe through the compatibility path", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-no-uid-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: ["daemon-a"], providers: [] }), { mode: 0o600 });
+    expect(readProviderProcessWitnesses({ path, _getUid: () => undefined })).toEqual({
+      available: true,
+      providers: [],
+    });
+    const store = createProviderProcessWitnessStore({ daemonInstanceId: "daemon-a", path });
+    store.add({ daemonInstanceId: "daemon-a", providerId: "codex-process", pid: 34, pgid: null, processStartTime: null });
   });
 
   it("preserves the original witness publication failure and tolerates missing cleanup", () => {
@@ -1026,27 +1204,38 @@ describe("owned process lifecycle utilities", () => {
       processStartTime: null,
     } as const;
     const renameError = new Error("rename failed");
+    let failPublication = false;
     const store = createProviderProcessWitnessStore({
       daemonInstanceId: "daemon-a",
       path,
       operations: {
-        renameSync: () => { throw renameError; },
+        renameSync: (...args) => {
+          if (failPublication) throw renameError;
+          return renameSync(...args);
+        },
       },
     });
+    failPublication = true;
     expect(() => store.add(entry)).toThrow(renameError);
 
+    const cleanupPath = join(root, "cleanup.json");
+    let failCleanupPublication = false;
     const cleanupErrorStore = createProviderProcessWitnessStore({
       daemonInstanceId: "daemon-a",
-      path,
+      path: cleanupPath,
       operations: {
-        renameSync: () => { throw renameError; },
+        renameSync: (...args) => {
+          if (failCleanupPublication) throw renameError;
+          return renameSync(...args);
+        },
         unlinkSync: () => { throw new Error("unlink failed"); },
       },
     });
+    failCleanupPublication = true;
     expect(() => cleanupErrorStore.add(entry)).toThrow(renameError);
   });
 
-  it("ignores malformed witness input and tolerates an already-removed file", () => {
+  it("rejects malformed witness input without overwriting it", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-malformed-"));
     roots.push(root);
     const path = join(root, "daemon-runtime.json");
@@ -1060,11 +1249,9 @@ describe("owned process lifecycle utilities", () => {
     const store = createProviderProcessWitnessStore({ daemonInstanceId: "daemon-a", path });
     const malformed = JSON.stringify({ version: 1, daemonInstanceId: "daemon-a", providers: [null, {}, { pid: 0 }] });
     writeFileSync(path, malformed, { mode: 0o600 });
-    store.remove(entry);
-    store.add(entry);
-    store.remove(entry);
-    store.remove(entry);
-    expect(() => readFileSync(path)).toThrow();
+    expect(() => store.remove(entry)).toThrow(/malformed/iu);
+    expect(() => store.add(entry)).toThrow(/malformed/iu);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(JSON.parse(malformed));
   });
 
   it("handles missing or unsupported witness files without inventing entries", () => {
@@ -1081,9 +1268,9 @@ describe("owned process lifecycle utilities", () => {
     } as const;
     store.remove(entry);
     writeFileSync(path, JSON.stringify(null), { mode: 0o600 });
-    store.remove(entry);
+    expect(() => store.remove(entry)).toThrow(/malformed/iu);
     writeFileSync(path, JSON.stringify({ providers: "invalid" }), { mode: 0o600 });
-    store.remove(entry);
+    expect(() => store.remove(entry)).toThrow(/malformed/iu);
   });
 
   it("uses the canonical default witness path when no path override is supplied", () => {
@@ -1103,13 +1290,10 @@ describe("owned process lifecycle utilities", () => {
       } as const;
       store.add(entry);
       expect(store.path).toContain("daemon-runtime.json");
-      const originalGetuid = process.getuid;
-      Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
-      try {
-        expect(readProviderProcessWitnesses()).toMatchObject({ available: true, providers: [entry] });
-      } finally {
-        Object.defineProperty(process, "getuid", { configurable: true, value: originalGetuid });
-      }
+      expect(readProviderProcessWitnesses({ _getUid: () => undefined })).toMatchObject({
+        available: true,
+        providers: [entry],
+      });
       store.remove(entry);
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
@@ -1117,16 +1301,23 @@ describe("owned process lifecycle utilities", () => {
     }
   });
 
-  it("fails closed for a non-missing witness unlink error", () => {
+  it("fails closed for a non-missing witness publication error", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-unlink-"));
     roots.push(root);
     const path = join(root, "daemon-runtime.json");
     const error = Object.assign(new Error("permission denied"), { code: "EACCES" });
+    let failPublication = false;
     const store = createProviderProcessWitnessStore({
       daemonInstanceId: "daemon-a",
       path,
-      operations: { unlinkSync: () => { throw error; } },
+      operations: {
+        renameSync: (...args) => {
+          if (failPublication) throw error;
+          return renameSync(...args);
+        },
+      },
     });
+    failPublication = true;
     expect(() => store.remove({
       daemonInstanceId: "daemon-a",
       providerId: "claude-process",
@@ -1152,6 +1343,10 @@ describe("owned process lifecycle utilities", () => {
     withPrivateMutationLock(`${path}.lock`, "test witness", () => {
       expect(() => store.add(entry)).toThrow(PrivateMutationLockContentionError);
     });
-    expect(() => readFileSync(path)).toThrow();
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      version: 2,
+      daemonInstances: ["daemon-a"],
+      providers: [],
+    });
   });
 });

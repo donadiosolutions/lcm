@@ -88,6 +88,9 @@ export function makeSummarizerCache(config: DaemonConfig, context: SummarizerFac
   const witnessStore = context.witnessStore ?? (context.daemonInstanceId === undefined
     ? undefined
     : createProviderProcessWitnessStore({ daemonInstanceId: context.daemonInstanceId }));
+  // Publish the authenticated empty generation while the route/cache is being
+  // constructed, before a process provider can be requested.
+  witnessStore?.initialize?.();
   const factoryContext: SummarizerFactoryContext = {
     daemonInstanceId: context.daemonInstanceId,
     witnessStore,
