@@ -1249,6 +1249,43 @@ describe("compact route coverage", () => {
     await base.shutdown();
   });
 
+  it("keeps storage open until an admitted commit releases after cancellation", async () => {
+    const invocationId = "57575757-5757-4575-8575-575757575757";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    const requestController = new AbortController();
+    let observedOpenCommit = false;
+    state.compactInputObserver = async (input) => {
+      const permit = (input as { acquireCommit: () => { release: () => void } }).acquireCommit();
+      try {
+        requestController.abort();
+        expect(state.projectClose).not.toHaveBeenCalled();
+        observedOpenCommit = true;
+      } finally {
+        permit.release();
+      }
+    };
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "commit-close-order", cwd: "/tmp", invocation_id: invocationId }),
+      {
+        ...testCompactContext,
+        signal: requestController.signal,
+        invocationCoordinator: coordinator,
+      },
+    );
+
+    expect(observedOpenCommit).toBe(true);
+    expect(output.status()).toBe(499);
+    expect(state.projectClose).toHaveBeenCalledOnce();
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
+    await coordinator.shutdown();
+  });
+
   it("returns a bounded response when commit admission reports cancellation", async () => {
     const invocationId = "66666666-6666-4666-8666-666666666666";
     const daemonInstanceId = "11111111-1111-4111-8111-111111111111";

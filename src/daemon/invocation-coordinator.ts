@@ -7,7 +7,6 @@ import {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const DEFAULT_LEASE_MS = 30_000;
-const DEFAULT_TOMBSTONE_TTL_MS = 60_000;
 const DEFAULT_MAX_TOMBSTONES = 1_024;
 
 export type InvocationCommand = "compact";
@@ -198,7 +197,12 @@ export function createInvocationCoordinator(
   const setTimer = options.setTimeout ?? options._setTimeout ?? setTimeout;
   const clearTimer = options.clearTimeout ?? options._clearTimeout ?? clearTimeout;
   const leaseMs = optionNumber(options.leaseMs, DEFAULT_LEASE_MS, "lease");
-  const tombstoneTtlMs = optionNumber(options.tombstoneTtlMs, DEFAULT_TOMBSTONE_TTL_MS, "tombstone TTL");
+  // Production tombstones are capacity-bounded rather than time-bounded so a
+  // loopback outage cannot destroy terminal drain proof. Tests may inject a
+  // finite TTL to exercise explicit expiry and reaper behavior.
+  const tombstoneTtlMs = options.tombstoneTtlMs === undefined
+    ? Number.POSITIVE_INFINITY
+    : optionNumber(options.tombstoneTtlMs, 1, "tombstone TTL");
   const maxTombstones = optionNumber(options.maxTombstones, DEFAULT_MAX_TOMBSTONES, "tombstone limit");
   if (!Number.isInteger(maxTombstones)) throw new RangeError("tombstone limit must be an integer");
 
@@ -227,6 +231,7 @@ export function createInvocationCoordinator(
     if (reaperTimer !== undefined || tombstones.size === 0) return;
     let earliest = Number.POSITIVE_INFINITY;
     for (const tombstone of tombstones.values()) earliest = Math.min(earliest, tombstone.expiresAt);
+    if (!Number.isFinite(earliest)) return;
     const delay = Math.max(0, earliest - now());
     reaperTimer = setTimer(() => {
       reaperTimer = undefined;

@@ -54,6 +54,7 @@ import {
 } from "../../storage/index.js";
 import {
   closeRouteStorage,
+  createCommitCloseBarrier,
   stagedPostgreSqlFactoryUnavailableResponse,
   storageRouteFailureResponse,
 } from "./storage-lifecycle.js";
@@ -444,9 +445,12 @@ export function createCompactHandler(
       }
     }
 
-    const acquireCommit = invocationTarget !== undefined && coordinator !== undefined
+    const underlyingAcquireCommit = invocationTarget !== undefined && coordinator !== undefined
       ? (): CompactionCommitPermit => coordinator!.acquireCommit(invocationTarget!)
       : localCommitAdmission(signal);
+    const commitCloseBarrier = createCommitCloseBarrier();
+    const acquireCommit = (): CompactionCommitPermit =>
+      commitCloseBarrier.acquire(underlyingAcquireCommit);
     const releaseInvocation = (): void => {
       detachInvocationCancellation?.();
       invocationSignalCleanup?.();
@@ -518,6 +522,7 @@ export function createCompactHandler(
     let openedProjectClose: Promise<void> | undefined;
     let detachProjectAbort: (() => void) | undefined;
     const closeOpenedProject = async (): Promise<void> => {
+      await commitCloseBarrier.waitForZero();
       openedProjectClose ??= closeRouteStorage(openedProject);
       await openedProjectClose;
     };

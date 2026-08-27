@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   closeRouteStorage,
+  createCommitCloseBarrier,
   openExistingProject,
   withProjectStorage,
   stagedPostgreSqlUnavailableResponse,
@@ -113,6 +114,38 @@ function fakeFactory(options: {
 }
 
 describe("route storage cleanup", () => {
+  it("settles commit close barriers across acquisition and release edge cases", async () => {
+    const barrier = createCommitCloseBarrier();
+    await expect(barrier.waitForZero()).resolves.toBeUndefined();
+
+    const firstRelease = vi.fn();
+    const secondRelease = vi.fn();
+    const first = barrier.acquire(() => ({ release: firstRelease }));
+    const second = barrier.acquire(() => ({ release: secondRelease }));
+    let settled = 0;
+    const waits = [barrier.waitForZero(), barrier.waitForZero()]
+      .map(wait => wait.then(() => { settled += 1; }));
+
+    first.release();
+    first.release();
+    expect(firstRelease).toHaveBeenCalledOnce();
+    expect(settled).toBe(0);
+    second.release();
+    await Promise.all(waits);
+    expect(secondRelease).toHaveBeenCalledOnce();
+    expect(settled).toBe(2);
+
+    expect(() => barrier.acquire(() => { throw new Error("acquire failed"); }))
+      .toThrow("acquire failed");
+    await expect(barrier.waitForZero()).resolves.toBeUndefined();
+
+    const throwing = barrier.acquire(() => ({
+      release: () => { throw new Error("release failed"); },
+    }));
+    expect(() => throwing.release()).toThrow("release failed");
+    await expect(barrier.waitForZero()).resolves.toBeUndefined();
+  });
+
   it("ignores absent resources", async () => {
     await expect(closeRouteStorage(undefined, undefined)).resolves.toBeUndefined();
   });

@@ -26,6 +26,7 @@ import {
 import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
 import { StorageOperationError } from "../../storage/errors.js";
 import {
+  createCommitCloseBarrier,
   storageRouteFailureResponse,
   withProjectStorage,
 } from "./storage-lifecycle.js";
@@ -159,9 +160,12 @@ export function createPromoteHandler(
         ? undefined
         : { ...context, signal };
 
-      const acquireCommit = invocationTarget !== undefined && coordinator !== undefined
+      const underlyingAcquireCommit = invocationTarget !== undefined && coordinator !== undefined
         ? (): InvocationAdmission => coordinator!.acquireCommit(invocationTarget!)
         : (): InvocationAdmission => ({ signal: signal ?? new AbortController().signal, release: () => undefined });
+      const commitCloseBarrier = createCommitCloseBarrier();
+      const acquireCommit = (): Readonly<{ release: () => void }> =>
+        commitCloseBarrier.acquire(underlyingAcquireCommit);
       const withCommitAdmission = async <T>(operation: () => Promise<T> | T): Promise<T> => {
         throwIfAborted(signal);
         const permit = await acquireCommit();
@@ -173,7 +177,14 @@ export function createPromoteHandler(
       };
 
       const result = await withProjectStorage(
-        { config, cwd, factory: storageFactory, context: storageContext, mode: "existing" },
+        {
+          config,
+          cwd,
+          factory: storageFactory,
+          context: storageContext,
+          mode: "existing",
+          beforeClose: commitCloseBarrier.waitForZero,
+        },
         async (project) => {
           let processed = 0;
           let promoted = 0;

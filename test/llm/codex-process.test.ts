@@ -1179,6 +1179,26 @@ describe("createCodexProcessSummarizer", () => {
     await expect(summarizer("text", false)).rejects.toThrow("plain failure");
   });
 
+  it("terminates the child and cleans owned resources when teardown setup throws", async () => {
+    const child = makeHangingChild();
+    vi.spyOn(child, "once").mockImplementation(() => {
+      throw new Error("teardown listener setup failed");
+    });
+    const gateway = makeGateway();
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child, { rmSync: rmSyncMock }),
+      _createGateway: vi.fn(async () => gateway),
+    } as never);
+
+    await expect(summarizer("text", false)).rejects.toThrow("teardown listener setup failed");
+
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(gateway.close).toHaveBeenCalledOnce();
+    expect(rmSyncMock).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])("times out and cleans up when killThrows=%s", async (killThrows) => {
     const child = makeHangingChild(killThrows);
     const summarizer = createCodexProcessSummarizer({

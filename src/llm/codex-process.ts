@@ -305,20 +305,29 @@ async function runCodexSummarizer(
       return;
     }
 
-    teardown = createOwnedProcessTeardown({
-      child,
-      platform: deps.platform,
-      detachedProcessGroup: deps.detachedProcessGroup
-        ?? ((deps.platform ?? process.platform) !== "win32" && deps.processGroupId === undefined),
-      processGroupId: deps.processGroupId,
-      daemonProcessGroupId: deps.daemonProcessGroupId,
-      killProcess: deps.killProcess,
-      isProcessGroupAlive: deps.isProcessGroupAlive,
-      processBirthTime: deps.processBirthTime,
-      processGroupIdProbe: deps.processGroupIdProbe,
-      setTimeout: deps.setTimeout,
-      clearTimeout: deps.clearTimeout,
-    });
+    try {
+      teardown = createOwnedProcessTeardown({
+        child,
+        platform: deps.platform,
+        detachedProcessGroup: deps.detachedProcessGroup
+          ?? ((deps.platform ?? process.platform) !== "win32" && deps.processGroupId === undefined),
+        processGroupId: deps.processGroupId,
+        daemonProcessGroupId: deps.daemonProcessGroupId,
+        killProcess: deps.killProcess,
+        isProcessGroupAlive: deps.isProcessGroupAlive,
+        processBirthTime: deps.processBirthTime,
+        processGroupIdProbe: deps.processGroupIdProbe,
+        setTimeout: deps.setTimeout,
+        clearTimeout: deps.clearTimeout,
+      });
+    } catch (error) {
+      // Teardown setup failed after spawn, so no controller can own settlement.
+      // The ChildProcess handle is still an authenticated direct-child target.
+      try { child.kill("SIGTERM"); } catch { /* already exited */ }
+      try { child.kill("SIGKILL"); } catch { /* already exited */ }
+      void finishRun(error);
+      return;
+    }
     if (deps.daemonInstanceId !== undefined && deps.witnessStore !== undefined && teardown.pid !== undefined) {
       witness = {
         daemonInstanceId: deps.daemonInstanceId,

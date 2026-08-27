@@ -409,6 +409,48 @@ describe("promote persistence boundaries", () => {
     await base.shutdown();
   });
 
+  it("keeps project storage open until a cancelled commit releases", async () => {
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const invocationId = "14141414-1414-4414-8414-141414141414";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    const requestController = new AbortController();
+    let observedOpenCommit = false;
+    mocks.conversations.mockResolvedValueOnce([{ conversationId: 1, sessionId: "s" }]);
+    mocks.summaries.mockResolvedValueOnce([
+      { content: "first", depth: 1, tokenCount: 1, sourceMessageTokenCount: 3 },
+    ]);
+    mocks.shouldPromote.mockReturnValue({ promote: true, tags: [], confidence: 0.25 });
+    mocks.dedup.mockImplementation(async () => {
+      requestController.abort();
+      expect(mocks.projectClose).not.toHaveBeenCalled();
+      observedOpenCommit = true;
+    });
+
+    await createPromoteHandler(config, makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.factoryClose,
+    }))(
+      {} as never,
+      response,
+      JSON.stringify({ cwd: "/commit-close-order", invocation_id: invocationId }),
+      {
+        signal: requestController.signal,
+        invocationCoordinator: coordinator,
+      } satisfies RouteExecutionContext,
+    );
+
+    expect(observedOpenCommit).toBe(true);
+    expect(mocks.projectClose).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 499, {
+      status: "cancelled",
+      error: "promote cancelled",
+    });
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
+    await coordinator.shutdown();
+  });
+
   it("detaches request and composed-signal listeners after invocation settlement", async () => {
     const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
     const invocationId = "13131313-1313-4313-8313-131313131313";

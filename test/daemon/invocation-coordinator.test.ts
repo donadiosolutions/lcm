@@ -253,12 +253,23 @@ describe("invocation coordinator", () => {
   });
 
   it("finishes into a bounded tombstone and rejects replay until reaped", async () => {
-    const { coordinator, clock } = createHarness();
+    const { coordinator, clock } = createHarness({ tombstoneTtlMs: 60_000 });
     coordinator.start(target());
     await expect(coordinator.finish(target())).resolves.toMatchObject({ state: "finished", activeCount: 0 });
     expect(() => coordinator.start(target())).toThrow(/tombstone|replay/i);
     clock.advance(60_001);
     expect(() => coordinator.start(target())).not.toThrow();
+  });
+
+  it("retains production tombstones across outages until capacity eviction", async () => {
+    const { coordinator, clock } = createHarness();
+    coordinator.start(target());
+    await expect(coordinator.finish(target())).resolves.toMatchObject({ state: "finished" });
+
+    clock.advance(7 * 24 * 60 * 60 * 1_000);
+
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "finished" });
+    expect(clock.timers.filter(timer => timer.active)).toHaveLength(0);
   });
 
   it("refreshes tombstones on repeated cancel, finish, and snapshot reads", async () => {
@@ -340,6 +351,17 @@ describe("invocation coordinator", () => {
     const stopping = coordinator.shutdown();
     work.release();
     await expect(stopping).resolves.toBeUndefined();
+  });
+
+  it("clears a finite reaper during immediate zero-work shutdown", async () => {
+    const { coordinator, clock } = createHarness({ tombstoneTtlMs: 100_000 });
+    coordinator.start(target());
+    await coordinator.finish(target());
+    expect(clock.timers.some(timer => timer.active)).toBe(true);
+
+    await coordinator.shutdown();
+
+    expect(clock.timers.some(timer => timer.active)).toBe(false);
   });
 
   it("drains without a reaper when terminal tombstones are disabled", async () => {
