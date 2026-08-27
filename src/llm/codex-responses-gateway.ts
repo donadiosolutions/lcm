@@ -388,9 +388,7 @@ async function writeChunk(
   if (response.write(chunk)) return;
 
   await new Promise<void>((resolve, reject) => {
-    let settled = false;
     const finish = (error?: Error): void => {
-      settled = true;
       response.removeListener("drain", onDrain);
       response.removeListener("close", onClose);
       signal.removeEventListener("abort", onAbort);
