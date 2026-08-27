@@ -10,6 +10,11 @@ import { readBoundedRegularFileWithStat } from "../security-files.js";
 
 export const MAX_MODEL_DISPLAY_LENGTH = 80;
 
+/** Normalize host process-birth probes to the witness file's null sentinel. */
+export function normalizeProcessBirthTime(value: string | null | undefined): string | null {
+  return value ?? null;
+}
+
 export function boundedModelForDisplay(model: string): string {
   const sanitized = model
     .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")

@@ -17,6 +17,7 @@ vi.mock("../../src/llm/process-utils.js", () => ({
   }),
   createProcessCompatibilityError: (options: { cliName: string; providerId: string; code: number | null }) =>
     new Error(`${options.cliName} ${options.providerId} ${options.code ?? "unknown"}`),
+  normalizeProcessBirthTime: (value: string | null | undefined) => value ?? null,
 }));
 
 const { createClaudeProcessSummarizer } = await import("../../src/llm/claude-process.js");

@@ -8,6 +8,7 @@ import {
   createOwnedProcessTeardown,
   createProviderProcessWitnessStore,
   readProviderProcessWitnesses,
+  normalizeProcessBirthTime,
 } from "../../src/llm/process-utils.js";
 import { PrivateMutationLockContentionError, withPrivateMutationLock } from "../../src/private-mutation-lock.js";
 
@@ -29,6 +30,12 @@ describe("owned process lifecycle utilities", () => {
   afterEach(() => {
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
     vi.useRealTimers();
+  });
+
+  it("normalizes absent process-birth probes to the witness null sentinel", () => {
+    expect(normalizeProcessBirthTime("birth")).toBe("birth");
+    expect(normalizeProcessBirthTime(null)).toBeNull();
+    expect(normalizeProcessBirthTime(undefined)).toBeNull();
   });
 
   it("uses the direct child when the pid/group identity is not safe", async () => {

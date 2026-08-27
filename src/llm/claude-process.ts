@@ -4,6 +4,7 @@ import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, resolveDaemonConfigEnv, type ClaudeProc
 import {
   createOwnedProcessTeardown,
   createProcessCompatibilityError,
+  normalizeProcessBirthTime,
   type ProviderProcessWitnessStore,
 } from "./process-utils.js";
 import { createAbortError, isAbortError, throwIfAborted } from "../daemon/cancellation.js";
@@ -150,7 +151,7 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
             providerId: "claude-process",
             pid: teardown.pid,
             pgid: teardown.processGroupId ?? null,
-            processStartTime: processBirthTime(teardown.pid) ?? null,
+            processStartTime: normalizeProcessBirthTime(processBirthTime(teardown.pid)),
           }
         : undefined;
       proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });

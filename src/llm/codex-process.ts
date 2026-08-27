@@ -6,6 +6,7 @@ import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, type CodexProcessReasoningEffort } from "../daemon/config.js";
 import {
   createOwnedProcessTeardown,
+  normalizeProcessBirthTime,
   createProcessCompatibilityError,
   type ProviderProcessWitness,
   type ProviderProcessWitnessStore,
@@ -155,7 +156,7 @@ async function runCodexSummarizer(
     processGroupIdProbe?: (pid: number) => number | undefined;
     daemonInstanceId?: string;
     witnessStore?: ProviderProcessWitnessStore;
-    processBirthTime?: (pid: number) => string | null;
+    processBirthTime: (pid: number) => string | null;
     setTimeout?: typeof setTimeout;
     clearTimeout?: typeof clearTimeout;
   },
@@ -319,12 +320,13 @@ async function runCodexSummarizer(
         providerId: "codex-process",
         pid: teardown.pid,
         pgid: teardown.processGroupId ?? null,
-        processStartTime: (deps.processBirthTime ?? processStartTime)(teardown.pid) ?? null,
+        processStartTime: normalizeProcessBirthTime(deps.processBirthTime(teardown.pid)),
       };
     }
 
     const onAbort = (): void => {
-      if (terminalReason === "timeout") return;
+      // finishRun is single-flight and detaches this listener during timeout
+      // teardown, so a later abort cannot enter this handler.
       cancellationRequested = true;
       if (finishPromise !== undefined) {
         abortCompletionWait?.(createAbortError(signal?.reason));
@@ -371,7 +373,7 @@ async function runCodexSummarizer(
     };
     const onChildClose = (code: number | null): void => {
       void finishRun(undefined, async () => {
-        if (signal?.aborted) throw createAbortError(signal.reason);
+        // Abort is handled by onAbort before this single-flight close callback.
         if (code !== 0) {
           throw createProcessCompatibilityError({
             cliName: "Codex",
