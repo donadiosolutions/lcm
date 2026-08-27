@@ -37,6 +37,7 @@ import { ScrubEngine } from "../../scrub.js";
 import {
   makeSummarizerCache,
   resolveEffectiveProvider,
+  type SummarizerFactoryContext,
   type CompactClient,
   type EffectiveProvider,
 } from "../summarizer.js";
@@ -291,8 +292,12 @@ function isInvocationCancellation(error: unknown): boolean {
 }
 
 
-export function createCompactHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
-  const getSummarizer = makeSummarizerCache(config);
+export function createCompactHandler(
+  config: DaemonConfig,
+  storageFactory?: StorageBackendFactory,
+  summarizerContext: SummarizerFactoryContext = {},
+): RouteHandler {
+  const getSummarizer = makeSummarizerCache(config, summarizerContext);
 
   return async (_req, res, body, context) => {
     let parsed: unknown;

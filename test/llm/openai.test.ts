@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import OpenAI from "openai";
 import { describe, it, expect, vi } from "vitest";
 import { createOpenAISummarizer } from "../../src/llm/openai.js";
+import { createAbortError, isAbortError } from "../../src/daemon/cancellation.js";
 
 describe("createOpenAISummarizer", () => {
   it("constructs the default OpenAI client", () => {
@@ -99,6 +100,64 @@ describe("createOpenAISummarizer", () => {
 
     expect(mockClient.chat.completions.create).toHaveBeenCalledOnce();
     expect(mockClient.responses.create).not.toHaveBeenCalled();
+  });
+
+  it("forwards a per-call signal and skips a pre-aborted request", async () => {
+    const preAborted = new AbortController();
+    preAborted.abort();
+    const preCreate = vi.fn();
+    const preSummarizer = createOpenAISummarizer({
+      model: "model",
+      baseUrl: "http://localhost",
+      _clientOverride: { chat: { completions: { create: preCreate } } },
+    });
+
+    await expect(preSummarizer("text", false, { signal: preAborted.signal }))
+      .rejects.toSatisfy(error => isAbortError(error));
+    expect(preCreate).not.toHaveBeenCalled();
+
+    const controller = new AbortController();
+    const create = vi.fn(() => new Promise<never>(() => {}));
+    const summarizer = createOpenAISummarizer({
+      model: "model",
+      baseUrl: "http://localhost",
+      _clientOverride: { chat: { completions: { create } } },
+    });
+    const pending = summarizer("text", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
+    expect(create.mock.calls[0]?.[1]).toEqual({ signal: controller.signal });
+    controller.abort();
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("aborts a retry delay without starting another attempt", async () => {
+    const controller = new AbortController();
+    const create = vi.fn().mockRejectedValue(Object.assign(new Error("busy"), { status: 500 }));
+    const sleep = vi.fn(() => new Promise<void>(() => {}));
+    const summarizer = createOpenAISummarizer({
+      model: "model",
+      baseUrl: "http://localhost",
+      retry: { maxAttempts: 2, initialDelayMs: 1000, maxDelayMs: 1000, multiplier: 1 },
+      _clientOverride: { chat: { completions: { create } } },
+      _sleep: sleep,
+    });
+
+    const pending = summarizer("text", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(sleep).toHaveBeenCalledOnce());
+    controller.abort();
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it("does not retry an already-marked intentional abort from a client", async () => {
+    const create = vi.fn().mockRejectedValue(createAbortError());
+    const summarizer = createOpenAISummarizer({
+      model: "model",
+      baseUrl: "http://localhost",
+      _clientOverride: { chat: { completions: { create } } },
+    });
+    await expect(summarizer("text", false)).rejects.toSatisfy(error => isAbortError(error));
+    expect(create).toHaveBeenCalledOnce();
   });
 
   it("reports clients missing the selected API", async () => {

@@ -10,9 +10,19 @@ import { createClaudeProcessSummarizer } from "../llm/claude-process.js";
 import { createCodexProcessSummarizer } from "../llm/codex-process.js";
 import { createMockSummarizer } from "../llm/mock-summarizer.js";
 import type { LcmSummarizeFn } from "../llm/types.js";
+import {
+  createProviderProcessWitnessStore,
+  type ProviderProcessWitnessStore,
+} from "../llm/process-utils.js";
 
 export type CompactClient = "claude" | "codex";
 export type EffectiveProvider = Exclude<DaemonConfig["llm"]["provider"], "auto">;
+
+/** Factory-scoped identity used by process providers for runtime witnesses. */
+export type SummarizerFactoryContext = Readonly<{
+  daemonInstanceId?: string;
+  witnessStore?: ProviderProcessWitnessStore;
+}>;
 
 export function resolveEffectiveProvider(config: DaemonConfig, client?: CompactClient): EffectiveProvider {
   if (config.llm.provider === "auto") {
@@ -25,6 +35,7 @@ export async function createSummarizer(
   provider: EffectiveProvider,
   config: DaemonConfig,
   overrides: { reasoningEffort?: LlmReasoningEffort; fastMode?: boolean; requestPolicy?: LlmRequestPolicy } = {},
+  context: SummarizerFactoryContext = {},
 ): Promise<LcmSummarizeFn | null> {
   // Mock summarizer for E2E testing — deterministic, no LLM calls
   if (config.summarizer?.mock) return createMockSummarizer();
@@ -35,6 +46,8 @@ export async function createSummarizer(
       reasoningEffort: (overrides.reasoningEffort ?? config.llm.reasoningEffort) as ClaudeProcessReasoningEffort | undefined,
       fastMode: overrides.fastMode ?? config.llm.fastMode ?? false,
       timeoutMs: overrides.requestPolicy?.requestTimeoutMs ?? config.llm.requestTimeoutMs,
+      daemonInstanceId: context.daemonInstanceId,
+      witnessStore: context.witnessStore,
     });
   }
   if (provider === "codex-process") {
@@ -43,6 +56,8 @@ export async function createSummarizer(
       reasoningEffort: (overrides.reasoningEffort ?? config.llm.reasoningEffort) as CodexProcessReasoningEffort | undefined,
       fastMode: overrides.fastMode ?? config.llm.fastMode ?? false,
       timeoutMs: overrides.requestPolicy?.requestTimeoutMs ?? config.llm.requestTimeoutMs,
+      daemonInstanceId: context.daemonInstanceId,
+      witnessStore: context.witnessStore,
     });
   }
   if (provider === "openai") {
@@ -69,7 +84,14 @@ export async function createSummarizer(
  * Creates a cached summarizer factory for a given DaemonConfig.
  * The returned function lazily creates summarizers per provider and memoizes them.
  */
-export function makeSummarizerCache(config: DaemonConfig) {
+export function makeSummarizerCache(config: DaemonConfig, context: SummarizerFactoryContext = {}) {
+  const witnessStore = context.witnessStore ?? (context.daemonInstanceId === undefined
+    ? undefined
+    : createProviderProcessWitnessStore({ daemonInstanceId: context.daemonInstanceId }));
+  const factoryContext: SummarizerFactoryContext = {
+    daemonInstanceId: context.daemonInstanceId,
+    witnessStore,
+  };
   const cache = new Map<string, Promise<LcmSummarizeFn | null>>();
   return (
     provider: EffectiveProvider,
@@ -91,7 +113,12 @@ export function makeSummarizerCache(config: DaemonConfig) {
     ]);
     let cached = cache.get(cacheKey);
     if (!cached) {
-      cached = createSummarizer(provider, config, { reasoningEffort, fastMode, requestPolicy: effectivePolicy });
+      cached = createSummarizer(
+        provider,
+        config,
+        { reasoningEffort, fastMode, requestPolicy: effectivePolicy },
+        factoryContext,
+      );
       cache.set(cacheKey, cached);
     }
     return cached;

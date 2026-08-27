@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { createCodexProcessSummarizer } from "../../src/llm/codex-process.js";
+import { isAbortError } from "../../src/daemon/cancellation.js";
 
 vi.mock("../../src/llm/codex-responses-gateway.js", () => ({
   createCodexResponsesGateway: vi.fn(async () => ({
@@ -81,6 +82,124 @@ describe("createCodexProcessSummarizer", () => {
 
   it("constructs with default process dependencies", () => {
     expect(createCodexProcessSummarizer()).toBeTypeOf("function");
+  });
+
+  it("does not create a gateway or spawn for a pre-aborted call", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const createGateway = vi.fn();
+    const spawn = vi.fn() as unknown as SpawnFn;
+    const summarizer = createCodexProcessSummarizer({
+      spawn,
+      _createGateway: createGateway,
+    } as never);
+
+    await expect(summarizer("text", false, { signal: controller.signal }))
+      .rejects.toSatisfy(error => isAbortError(error));
+    expect(createGateway).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("waits for child and gateway teardown before rejecting a mid-request abort", async () => {
+    const controller = new AbortController();
+    const child = makeHangingChild();
+    (child as FakeChild & { pid: number }).pid = 9312;
+    const gateway = makeGateway({ close: vi.fn().mockResolvedValue(undefined) });
+    const createGateway = vi.fn().mockResolvedValue(gateway);
+    const killProcess = vi.fn();
+    const isProcessGroupAlive = vi.fn(() => false);
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child, { spawn, rmSync: rmSyncMock }),
+      _createGateway: createGateway,
+      killProcess,
+      processGroupId: 9312,
+      daemonProcessGroupId: 9311,
+      isProcessGroupAlive,
+    } as never);
+
+    const pending = summarizer("private transcript", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    controller.abort();
+    child.emit("close", null);
+
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+    expect(killProcess).toHaveBeenCalledWith(-9312, "SIGTERM");
+    expect(gateway.close).toHaveBeenCalledOnce();
+    expect(rmSyncMock).toHaveBeenCalledOnce();
+  });
+
+  it("cancellation wins over deferred gateway completion and cleans every handle", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const child = makeHangingChild();
+    (child as FakeChild & { pid: number }).pid = 9412;
+    const gateway = makeGateway({
+      waitForCompletion: vi.fn(() => new Promise<void>(() => {})),
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+    const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    let groupAlive = true;
+    const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === "SIGKILL") groupAlive = false;
+    });
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child, { spawn, rmSync: rmSyncMock }),
+      timeoutMs: 60_000,
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+      killProcess,
+      processGroupId: 9412,
+      daemonProcessGroupId: 9411,
+      isProcessGroupAlive: () => groupAlive,
+    } as never);
+
+    try {
+      const pending = summarizer("private transcript", false, { signal: controller.signal });
+      const observed = pending.catch(error => error);
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      child.emit("close", 0);
+      await vi.runAllTicks();
+      expect(gateway.waitForCompletion).toHaveBeenCalledOnce();
+      controller.abort();
+      await vi.runAllTicks();
+      await vi.advanceTimersByTimeAsync(1_999);
+      await vi.advanceTimersByTimeAsync(1);
+      child.emit("close", null);
+      expect(isAbortError(await observed)).toBe(true);
+      expect(gateway.close).toHaveBeenCalledOnce();
+      expect(rmSyncMock).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("publishes and removes a secret-free Codex process witness after gateway settlement", async () => {
+    const child = makeChild(0);
+    (child as FakeChild & { pid: number }).pid = 9512;
+    const gateway = makeGateway();
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/daemon-runtime.json" };
+    const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child, { spawn }),
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+      platform: "win32",
+      daemonInstanceId: "22222222-2222-4222-8222-222222222222",
+      witnessStore,
+      processBirthTime: () => "birth-9512",
+    } as never);
+
+    await expect(summarizer("text", false)).resolves.toBe("summary");
+    expect(witnessStore.add).toHaveBeenCalledWith({
+      daemonInstanceId: "22222222-2222-4222-8222-222222222222",
+      providerId: "codex-process",
+      pid: 9512,
+      pgid: null,
+      processStartTime: "birth-9512",
+    });
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
   });
 
   afterEach(() => {

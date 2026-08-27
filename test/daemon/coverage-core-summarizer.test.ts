@@ -126,4 +126,19 @@ describe("daemon summarizer selection", () => {
     const noFastMode = makeSummarizerCache(config);
     await noFastMode("claude-process");
   });
+
+  it("threads one factory-scoped daemon witness through cached process providers", async () => {
+    const config = loadDaemonConfig("/missing", { llm: { model: "m" } });
+    const witnessStore = {
+      path: "/tmp/daemon-runtime.json",
+      add: vi.fn(),
+      remove: vi.fn(),
+    };
+    const daemonInstanceId = "33333333-3333-4333-8333-333333333333";
+    const cache = makeSummarizerCache(config, { daemonInstanceId, witnessStore });
+    await cache("claude-process");
+    expect(mocks.claude).toHaveBeenCalledWith(expect.objectContaining({ daemonInstanceId, witnessStore }));
+    await cache("codex-process");
+    expect(mocks.codex).toHaveBeenCalledWith(expect.objectContaining({ daemonInstanceId, witnessStore }));
+  });
 });

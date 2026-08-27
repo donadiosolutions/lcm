@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { createClaudeProcessSummarizer } from "../../src/llm/claude-process.js";
+import { isAbortError } from "../../src/daemon/cancellation.js";
 
 type SpawnFn = typeof import("node:child_process").spawn;
 
@@ -52,6 +53,103 @@ function makeErrorChild(error: unknown): FakeChild {
 describe("createClaudeProcessSummarizer", () => {
   it("constructs with default process dependencies", () => {
     expect(createClaudeProcessSummarizer()).toBeTypeOf("function");
+  });
+
+  it("does not spawn for a pre-aborted call", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const spawn = vi.fn() as unknown as SpawnFn;
+    const summarizer = createClaudeProcessSummarizer({ spawn });
+
+    await expect(summarizer("text", false, { signal: controller.signal }))
+      .rejects.toSatisfy(error => isAbortError(error));
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("tears down an owned child on mid-request cancellation before rejecting", async () => {
+    const child = makeHangingChild();
+    (child as FakeChild & { pid: number }).pid = 4312;
+    const controller = new AbortController();
+    const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const killProcess = vi.fn();
+    const isProcessGroupAlive = vi.fn(() => false);
+    const summarizer = createClaudeProcessSummarizer({
+      spawn,
+      killProcess,
+      processGroupId: 4312,
+      daemonProcessGroupId: 9999,
+      isProcessGroupAlive,
+    } as never);
+
+    const pending = summarizer("text", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    controller.abort();
+    child.emit("close", null);
+
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+    expect(killProcess).toHaveBeenCalledWith(-4312, "SIGTERM");
+    expect(killProcess).not.toHaveBeenCalledWith(0, expect.anything());
+  });
+
+  it("escalates Claude cancellation from the owned group TERM to KILL and clears timers", async () => {
+    vi.useFakeTimers();
+    const child = makeHangingChild();
+    (child as FakeChild & { pid: number }).pid = 4512;
+    const controller = new AbortController();
+    let groupAlive = true;
+    const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === "SIGKILL") groupAlive = false;
+    });
+    const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const summarizer = createClaudeProcessSummarizer({
+      spawn,
+      timeoutMs: 60_000,
+      killProcess,
+      processGroupId: 4512,
+      daemonProcessGroupId: 4511,
+      isProcessGroupAlive: () => groupAlive,
+    } as never);
+
+    try {
+      const pending = summarizer("text", false, { signal: controller.signal });
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      controller.abort();
+      await vi.runAllTicks();
+      expect(killProcess).toHaveBeenNthCalledWith(1, -4512, "SIGTERM");
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(killProcess).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(killProcess).toHaveBeenNthCalledWith(2, -4512, "SIGKILL");
+      child.emit("close", null);
+      await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("publishes and removes a secret-free Claude process witness after close", async () => {
+    const child = makeChild(0, "witness summary");
+    (child as FakeChild & { pid: number }).pid = 4612;
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/daemon-runtime.json" };
+    const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const summarizer = createClaudeProcessSummarizer({
+      spawn,
+      platform: "win32",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+      witnessStore,
+      processBirthTime: () => "birth-4612",
+    } as never);
+
+    await expect(summarizer("text", false)).resolves.toBe("witness summary");
+    expect(witnessStore.add).toHaveBeenCalledWith({
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+      providerId: "claude-process",
+      pid: 4612,
+      pgid: null,
+      processStartTime: "birth-4612",
+    });
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
   });
   it("projects a staged OAuth token into the Claude child environment without argv exposure", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-claude-credentials-"));

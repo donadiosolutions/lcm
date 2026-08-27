@@ -688,7 +688,9 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   registerBuiltInRoute(
     "POST",
     "/compact",
-    createCompactHandler(config, storageFactory),
+    createCompactHandler(config, storageFactory, {
+      daemonInstanceId: invocationCoordinator.daemonInstanceId,
+    }),
     "mutating",
     "operation-scoped",
   );

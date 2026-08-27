@@ -4,7 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, type CodexProcessReasoningEffort } from "../daemon/config.js";
-import { createProcessCompatibilityError } from "./process-utils.js";
+import {
+  createOwnedProcessTeardown,
+  createProcessCompatibilityError,
+  type ProviderProcessWitness,
+  type ProviderProcessWitnessStore,
+} from "./process-utils.js";
+import {
+  createAbortError,
+  isAbortError,
+  throwIfAborted,
+  waitForAbortable,
+} from "../daemon/cancellation.js";
+import { processStartTime } from "../private-mutation-lock.js";
 import {
   createCodexResponsesGateway,
   type CodexResponsesGateway,
@@ -28,6 +40,17 @@ export type CodexProcessDeps = {
   tmpdir?: typeof tmpdir;
   timeoutMs?: number;
   _createGateway?: (options: CodexResponsesGatewayOptions) => Promise<CodexResponsesGateway>;
+  /** @internal deterministic process lifecycle seams. */
+  platform?: NodeJS.Platform;
+  killProcess?: (pid: number, signal?: NodeJS.Signals | number) => void;
+  processGroupId?: number;
+  daemonProcessGroupId?: number;
+  isProcessGroupAlive?: (pgid: number) => boolean;
+  daemonInstanceId?: string;
+  witnessStore?: ProviderProcessWitnessStore;
+  processBirthTime?: (pid: number) => string | null;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
 };
 
 const CODEX_BOOTSTRAP = "LCM compaction bootstrap.\n";
@@ -123,33 +146,86 @@ async function runCodexSummarizer(
     reasoningEffort?: CodexProcessReasoningEffort;
     fastMode?: boolean;
     createGateway: (options: CodexResponsesGatewayOptions) => Promise<CodexResponsesGateway>;
+    platform?: NodeJS.Platform;
+    killProcess?: (pid: number, signal?: NodeJS.Signals | number) => void;
+    processGroupId?: number;
+    daemonProcessGroupId?: number;
+    isProcessGroupAlive?: (pgid: number) => boolean;
+    daemonInstanceId?: string;
+    witnessStore?: ProviderProcessWitnessStore;
+    processBirthTime?: (pid: number) => string | null;
+    setTimeout?: typeof setTimeout;
+    clearTimeout?: typeof clearTimeout;
   },
+  signal?: AbortSignal,
 ): Promise<string> {
+  throwIfAborted(signal);
   const tempDir = deps.mkdtempSync(join(deps.tmpdir(), "lcm-codex-"));
   const outputPath = join(tempDir, "last-message.txt");
-  let gateway: CodexResponsesGateway;
+  let gateway: CodexResponsesGateway | undefined;
 
   try {
-    gateway = await deps.createGateway({ prompt });
+    const gatewayPromise = Promise.resolve(deps.createGateway({ prompt }));
+    // A gateway that resolves after a raced cancellation remains owned by this
+    // call and must be closed even though the caller already observed abort.
+    void gatewayPromise.then((lateGateway) => {
+      if (signal?.aborted) void lateGateway.close().catch(() => undefined);
+    }, () => undefined);
+    gateway = await waitForAbortable(gatewayPromise, signal);
+    throwIfAborted(signal);
   } catch (error) {
+    if (gateway !== undefined) {
+      try { await gateway.close(); } catch { /* preserve the primary error */ }
+    }
     cleanupTempDir(deps.rmSync, tempDir);
     throw error instanceof Error ? error : new Error(String(error));
   }
+
+  const activeGateway = gateway;
 
   return new Promise((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams;
     let finishPromise: Promise<void> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let abortCompletionWait: ((error: Error) => void) | undefined;
+    let teardown: ReturnType<typeof createOwnedProcessTeardown> | undefined;
+    let detachAbort: (() => void) | undefined;
+    let childListenersAttached = false;
+    let cancellationRequested = false;
+    let terminalReason: "abort" | "timeout" | undefined;
+    let witness: ProviderProcessWitness | undefined;
+    let witnessRemoved = false;
+
+    const cleanupStreams = (): void => {
+      if (child === undefined) return;
+      try { child.stdin.removeAllListeners("error"); } catch { /* already closed */ }
+      try { child.stdin.on("error", () => undefined); } catch { /* already closed */ }
+      try { child.stdin.destroy(); } catch { /* already closed */ }
+      try { child.stdout.removeAllListeners("data"); } catch { /* already closed */ }
+      try { child.stderr.removeAllListeners("data"); } catch { /* already closed */ }
+    };
+
+    const cleanupChildListeners = (): void => {
+      if (!childListenersAttached || child === undefined) return;
+      // Keep a terminal error sink on EventEmitter-compatible test/process
+      // handles: emitting a late child error with zero listeners would itself
+      // throw and mask the already-settled provider result. The sink does not
+      // retain any OS handle; close/error work remains guarded by finishPromise.
+      child.removeListener("close", onChildClose);
+      child.removeListener("error", onChildError);
+      child.on("error", () => undefined);
+      childListenersAttached = false;
+    };
 
     const finishRun = (
       primaryError?: unknown,
       completionWork?: () => Promise<string>,
+      teardownReason?: "abort" | "timeout",
     ): Promise<void> => {
       if (finishPromise !== undefined) return finishPromise;
       finishPromise = (async () => {
         let finalError = primaryError === undefined
-          ? undefined
+          ? cancellationRequested ? createAbortError(signal?.reason) : undefined
           : primaryError instanceof Error ? primaryError : new Error(String(primaryError));
         let summary: string | undefined;
         if (finalError === undefined && completionWork !== undefined) {
@@ -166,14 +242,41 @@ async function runCodexSummarizer(
             abortCompletionWait = undefined;
           }
         }
+        if (cancellationRequested && finalError === undefined) {
+          finalError = createAbortError(signal?.reason);
+        }
         try {
-          await gateway.close();
+          if (teardown !== undefined && child !== undefined) {
+            const effectiveTeardownReason = teardownReason ?? (cancellationRequested ? "abort" : undefined);
+            const settled = effectiveTeardownReason !== undefined
+              ? await teardown.terminate(effectiveTeardownReason)
+              : await teardown.waitForSettlement();
+            if (settled && witness !== undefined && !witnessRemoved) {
+              try {
+                deps.witnessStore!.remove(witness);
+                witnessRemoved = true;
+              } catch (error) {
+                if (finalError === undefined) {
+                  finalError = error instanceof Error ? error : new Error(String(error));
+                }
+              }
+            }
+          }
+          await activeGateway.close();
         } catch (error) {
           if (finalError === undefined) {
             finalError = error instanceof Error ? error : new Error(String(error));
           }
         }
-        if (timer !== undefined) clearTimeout(timer);
+        if (timer !== undefined) {
+          const clearTimer = deps.clearTimeout ?? clearTimeout;
+          clearTimer(timer);
+          timer = undefined;
+        }
+        detachAbort?.();
+        detachAbort = undefined;
+        cleanupChildListeners();
+        cleanupStreams();
         cleanupTempDir(deps.rmSync, tempDir);
         if (finalError !== undefined) reject(finalError);
         else resolve(summary as string);
@@ -182,54 +285,85 @@ async function runCodexSummarizer(
     };
 
     try {
-      child = deps.spawn("codex", buildArgs(outputPath, gateway.baseUrl, deps.model, deps.reasoningEffort, deps.fastMode), {
+      child = deps.spawn("codex", buildArgs(outputPath, activeGateway.baseUrl, deps.model, deps.reasoningEffort, deps.fastMode), {
         cwd: tempDir,
         stdio: ["pipe", "pipe", "pipe"],
+        detached: (deps.platform ?? process.platform) !== "win32",
       });
     } catch (error) {
       void finishRun(normalizeSpawnError(error));
       return;
     }
 
-    timer = setTimeout(() => {
+    teardown = createOwnedProcessTeardown({
+      child,
+      platform: deps.platform,
+      processGroupId: deps.processGroupId,
+      daemonProcessGroupId: deps.daemonProcessGroupId,
+      killProcess: deps.killProcess,
+      isProcessGroupAlive: deps.isProcessGroupAlive,
+      setTimeout: deps.setTimeout,
+      clearTimeout: deps.clearTimeout,
+    });
+    if (deps.daemonInstanceId !== undefined && deps.witnessStore !== undefined && teardown.pid !== undefined) {
+      witness = {
+        daemonInstanceId: deps.daemonInstanceId,
+        providerId: "codex-process",
+        pid: teardown.pid,
+        pgid: teardown.processGroupId ?? null,
+        processStartTime: (deps.processBirthTime ?? processStartTime)(teardown.pid) ?? null,
+      };
+    }
+
+    const onAbort = (): void => {
+      if (terminalReason === "timeout") return;
+      cancellationRequested = true;
+      if (finishPromise !== undefined) {
+        abortCompletionWait?.(createAbortError(signal?.reason));
+        return;
+      }
+      terminalReason = "abort";
+      void finishRun(createAbortError(signal?.reason), undefined, "abort");
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    detachAbort = () => signal?.removeEventListener("abort", onAbort);
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+
+    const setTimer = deps.setTimeout ?? setTimeout;
+    timer = setTimer(() => {
       const timeoutError = new Error(`codex process timed out after ${Math.round(deps.timeoutMs / 1000)}s`);
       if (finishPromise !== undefined) {
+        terminalReason = "timeout";
         abortCompletionWait?.(timeoutError);
         return;
       }
-      try {
-        child.kill();
-      } catch {
-        // ignore kill failures during timeout cleanup
-      }
-      void finishRun(timeoutError);
+      terminalReason = "timeout";
+      void finishRun(timeoutError, undefined, "timeout");
     }, deps.timeoutMs);
 
     try {
       child.stdout.resume();
       child.stderr.resume();
     } catch (error) {
-      void finishRun(error);
+      void finishRun(error, undefined, "timeout");
       return;
     }
 
     const onStdinError = (): void => {
       if (finishPromise !== undefined) return;
-      try {
-        child.kill();
-      } catch {
-        // ignore kill failures after stdin has closed
-      }
-      void finishRun(new Error("codex process stdin failed"));
+      void finishRun(new Error("codex process stdin failed"), undefined, "timeout");
     };
     child.stdin.on("error", onStdinError);
 
-    child.on("error", (error) => {
-      void finishRun(normalizeSpawnError(error));
-    });
-
-    child.on("close", (code: number | null) => {
+    const onChildError = (error: Error): void => {
+      void finishRun(normalizeSpawnError(error), undefined, "timeout");
+    };
+    const onChildClose = (code: number | null): void => {
       void finishRun(undefined, async () => {
+        if (signal?.aborted) throw createAbortError(signal.reason);
         if (code !== 0) {
           throw createProcessCompatibilityError({
             cliName: "Codex",
@@ -240,11 +374,11 @@ async function runCodexSummarizer(
             fastMode: deps.fastMode,
           });
         }
-        if (!gateway.requestAccepted) {
+        if (!activeGateway.requestAccepted) {
           throw new Error("codex responses gateway did not receive an authenticated request");
         }
-        await gateway.waitForCompletion();
-        if (!gateway.requestCompleted) {
+        await activeGateway.waitForCompletion();
+        if (!activeGateway.requestCompleted) {
           throw new Error("codex responses gateway did not complete");
         }
         const summary = deps.readFileSync(outputPath, "utf-8").trim();
@@ -253,13 +387,27 @@ async function runCodexSummarizer(
         }
         return summary;
       });
-    });
+    };
+
+    child.on("error", onChildError);
+    child.on("close", onChildClose);
+    childListenersAttached = true;
+    if (witness !== undefined) {
+      try {
+        deps.witnessStore!.add(witness);
+      } catch (error) {
+        void finishRun(error, undefined, "timeout");
+        return;
+      }
+    }
 
     try {
+      throwIfAborted(signal);
       child.stdin.write(CODEX_BOOTSTRAP);
       child.stdin.end();
     } catch (error) {
-      void finishRun(error);
+      if (isAbortError(error)) onAbort();
+      else void finishRun(error, undefined, "timeout");
     }
   });
 }
@@ -276,10 +424,21 @@ export function createCodexProcessSummarizer(opts: CodexProcessDeps = {}): LcmSu
     tmpdir: opts.tmpdir ?? tmpdir,
     timeoutMs: opts.timeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS,
     createGateway: opts._createGateway ?? createCodexResponsesGateway,
+    platform: opts.platform,
+    killProcess: opts.killProcess,
+    processGroupId: opts.processGroupId,
+    daemonProcessGroupId: opts.daemonProcessGroupId,
+    isProcessGroupAlive: opts.isProcessGroupAlive,
+    daemonInstanceId: opts.daemonInstanceId,
+    witnessStore: opts.witnessStore,
+    processBirthTime: opts.processBirthTime ?? processStartTime,
+    setTimeout: opts.setTimeout,
+    clearTimeout: opts.clearTimeout,
   };
 
   return async function summarize(text, aggressive, ctx = {}): Promise<string> {
+    throwIfAborted(ctx.signal);
     const prompt = buildPrompt(text, aggressive, ctx);
-    return runCodexSummarizer(prompt, deps);
+    return runCodexSummarizer(prompt, deps, ctx.signal);
   };
 }
