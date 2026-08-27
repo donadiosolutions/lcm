@@ -149,10 +149,10 @@ describe("authenticated invocation-control route", () => {
     }
     const cancelled = await cancelResponse;
     expect(cancelled.status).toBe(200);
-    expect(await cancelled.json()).toMatchObject({ state: "cancelling", activeCount: 0 });
+    expect(await cancelled.json()).toMatchObject({ state: "cancelled", activeCount: 0 });
     const finished = await control("finish");
     expect(finished.status).toBe(200);
-    expect(await finished.json()).toMatchObject({ state: "finished", activeCount: 0 });
+    expect(await finished.json()).toMatchObject({ state: "cancelled", activeCount: 0 });
     const replay = await control("start");
     expect(replay.status).toBe(409);
   });

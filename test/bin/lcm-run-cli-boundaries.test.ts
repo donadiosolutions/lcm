@@ -11,7 +11,7 @@ const state = vi.hoisted(() => ({
   health: vi.fn(async () => true),
   startInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0 })),
   heartbeatInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0 })),
-  cancelInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "cancelling", activeCount: 0 })),
+  cancelInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "cancelled", activeCount: 0 })),
   finishInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "finished", activeCount: 0 })),
   readAuthToken: vi.fn(() => state.authToken),
   authToken: "test-token" as string | null,
@@ -853,7 +853,7 @@ describe("runCli scanning and portable knowledge boundaries", () => {
       return { ...target as object, state: "active", activeCount: 0 };
     });
     let release!: () => void;
-    state.cancelInvocation.mockImplementationOnce(() => new Promise(resolve => { release = () => resolve({ state: "cancelling", activeCount: 0 }); }));
+    state.cancelInvocation.mockImplementationOnce(() => new Promise(resolve => { release = () => resolve({ state: "cancelled", activeCount: 0 }); }));
 
     let settled = false;
     const pending = invoke(["compact", "--no-promote"]).then(result => { settled = true; return result; });
@@ -972,19 +972,28 @@ describe("runCli scanning and portable knowledge boundaries", () => {
   });
 
   it("keeps draining without a final exit when targeted zero remains unproved", async () => {
+    vi.useFakeTimers();
     state.health.mockResolvedValueOnce({
       status: "healthy",
       version: "1.4.2",
       storageBackend: "sqlite",
       daemonInstanceId: "11111111-1111-4111-8111-111111111111",
     });
-    state.cancelInvocation.mockResolvedValue({
-      invocationId: "22222222-2222-4222-8222-222222222222",
-      command: "compact",
-      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
-      state: "cancelling",
-      activeCount: 1,
-    });
+    state.cancelInvocation
+      .mockResolvedValueOnce({
+        invocationId: "22222222-2222-4222-8222-222222222222",
+        command: "compact",
+        daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+        state: "cancelling",
+        activeCount: 1,
+      })
+      .mockResolvedValueOnce({
+        invocationId: "22222222-2222-4222-8222-222222222222",
+        command: "compact",
+        daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+        state: "cancelled",
+        activeCount: 0,
+      });
     let release!: () => void;
     state.batchGate = new Promise<void>(resolve => { release = resolve; });
 
@@ -992,13 +1001,18 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
     process.emit("SIGINT");
     release();
+    await vi.waitFor(() => expect(state.cancelInvocation).toHaveBeenCalledOnce());
+    expect(process.exitCode).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1_000);
     await expect(pending).resolves.toBeUndefined();
 
-    expect(state.cancelInvocation).toHaveBeenCalled();
-    expect(process.exitCode).toBeUndefined();
+    expect(state.cancelInvocation).toHaveBeenCalledTimes(2);
+    expect(process.exitCode).toBe(130);
+    vi.useRealTimers();
   });
 
   it("does not claim signal exit when a batch failure leaves cancellation unproved", async () => {
+    vi.useFakeTimers();
     state.health.mockResolvedValueOnce({
       status: "healthy",
       version: "1.4.2",
@@ -1008,23 +1022,35 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     let release!: () => void;
     state.batchGate = new Promise<void>(resolve => { release = resolve; });
     state.batchError = new Error("ordinary batch failure");
-    state.cancelInvocation.mockResolvedValue({
-      invocationId: "22222222-2222-4222-8222-222222222222",
-      command: "compact",
-      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
-      state: "cancelling",
-      activeCount: 1,
-    });
+    state.cancelInvocation
+      .mockResolvedValueOnce({
+        invocationId: "22222222-2222-4222-8222-222222222222",
+        command: "compact",
+        daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+        state: "cancelling",
+        activeCount: 1,
+      })
+      .mockResolvedValueOnce({
+        invocationId: "22222222-2222-4222-8222-222222222222",
+        command: "compact",
+        daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+        state: "cancelled",
+        activeCount: 0,
+      });
 
     const pending = invoke(["compact", "--no-promote"]);
     await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
     process.emit("SIGINT");
     release();
+    await vi.waitFor(() => expect(state.cancelInvocation).toHaveBeenCalledOnce());
+    expect(process.exitCode).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1_000);
     const result = await pending;
 
     expect(result).toBeUndefined();
-    expect(state.cancelInvocation).toHaveBeenCalledOnce();
-    expect(process.exitCode).toBeUndefined();
+    expect(state.cancelInvocation).toHaveBeenCalledTimes(2);
+    expect(process.exitCode).toBe(130);
+    vi.useRealTimers();
   });
 
   it("covers TTY all-provider import directory filtering", async () => {

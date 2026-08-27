@@ -525,7 +525,9 @@ export async function cancelAndDrainCompactInvocation(
     }
   }
   if (!daemonZero || !localSettled) {
-    options.onDiagnostic?.(diagnostic ?? "compact cancellation did not prove zero-owned work");
+    const rawDiagnostic = diagnostic ?? "compact cancellation did not prove zero-owned work";
+    const boundedDiagnostic = sanitizeTerminalText(rawDiagnostic).slice(0, 256);
+    options.onDiagnostic?.(boundedDiagnostic);
   }
   return {
     daemonZero,
@@ -534,6 +536,30 @@ export async function cancelAndDrainCompactInvocation(
     replacementVerified,
     ...(diagnostic === undefined ? {} : { diagnostic }),
   };
+}
+
+export type CompactDrainUntilProvedOptions = CompactDrainOptions & Readonly<{
+  /** Delay between fresh cancellation/proof attempts. */
+  retryDelayMs?: number;
+  /** Injectable retry delay seam used by deterministic lifecycle tests. */
+  waitForRetry?: (delayMs: number) => Promise<void>;
+}>;
+
+/** Keep retrying fresh cancellation and ownership proof until both settle. */
+export async function drainCompactInvocationUntilProved(
+  options: CompactDrainUntilProvedOptions,
+): Promise<CompactDrainResult> {
+  const retryDelayMs = options.retryDelayMs ?? 1_000;
+  if (!Number.isFinite(retryDelayMs) || retryDelayMs <= 0) {
+    throw new RangeError("compact drain retry delay must be positive");
+  }
+  const waitForRetry = options.waitForRetry ?? ((delayMs: number): Promise<void> =>
+    new Promise<void>(resolve => { setTimeout(resolve, delayMs); }));
+  while (true) {
+    const result = await cancelAndDrainCompactInvocation(options);
+    if (result.daemonZero && result.localSettled) return result;
+    await waitForRetry(retryDelayMs);
+  }
 }
 
 /** Parse the canonical unsigned decimal form accepted by --max-concurrency. */
@@ -2015,8 +2041,11 @@ export async function runCli(
         const workReady = new Promise<void>(resolve => { resolveWorkReady = resolve; });
         const drainInvocation = async (): Promise<void> => {
           await workReady;
-          if (invocationLifecycle === undefined) return;
-          const drained = await cancelAndDrainCompactInvocation({
+          if (invocationLifecycle === undefined) {
+            drainResult = { daemonZero: true, localSettled: true };
+            return;
+          }
+          const drained = await drainCompactInvocationUntilProved({
             lifecycle: invocationLifecycle,
             createFreshClient: () => new DaemonClient(`http://127.0.0.1:${compactPort}`, compactTokenPath),
             awaitLocalWork: async () => { await localWorkPromise?.catch(() => undefined); },
@@ -2050,9 +2079,6 @@ export async function runCli(
             onDiagnostic: message => console.error(`  compact is still draining: ${message}`),
           });
           drainResult = drained;
-          if (!drained.daemonZero || !drained.localSettled) {
-            console.error("  compact cancellation remains unproved; continuing to drain owned work");
-          }
         };
         const signalHandlers = installCompactSignalHandlers({
           onRepeatSignal: (status) => {
@@ -2247,9 +2273,12 @@ export async function runCli(
           if (signalHandlers.drainPromise !== undefined) {
             await signalHandlers.drainPromise.catch(() => undefined);
           }
-          const drainProved = drainResult === undefined
-            || (drainResult.daemonZero && drainResult.localSettled);
-          process.exitCode = drainProved ? signalHandlers.status : undefined;
+          const drainProved = drainResult !== undefined
+            && drainResult.daemonZero
+            && drainResult.localSettled;
+          process.exitCode = drainProved
+            ? signalHandlers.status ?? compactFailureExitCode(totalFailures + invocationControlFailures)
+            : undefined;
           return;
         }
         localWorkPromise = runCompactWork();
@@ -2291,11 +2320,16 @@ export async function runCli(
         if (signalHandlers.drainPromise !== undefined) {
           await signalHandlers.drainPromise.catch(() => undefined);
         }
-        const drainProved = drainResult === undefined
-          || (drainResult.daemonZero && drainResult.localSettled);
-        process.exitCode = drainProved
-          ? signalHandlers.status ?? compactFailureExitCode(totalFailures)
-          : undefined;
+        if (!signalHandlers.draining) {
+          process.exitCode = compactFailureExitCode(totalFailures);
+        } else {
+          const drainProved = drainResult !== undefined
+            && drainResult.daemonZero
+            && drainResult.localSettled;
+          process.exitCode = drainProved
+            ? signalHandlers.status ?? compactFailureExitCode(totalFailures)
+            : undefined;
+        }
         return;
         } finally {
           compactRenderer.stop();

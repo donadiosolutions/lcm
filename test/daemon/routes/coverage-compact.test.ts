@@ -783,7 +783,7 @@ describe("compact route coverage", () => {
     expect(output.status()).toBe(499);
     expect(output.json()).toMatchObject({ status: "cancelled" });
     expect(state.openProject).not.toHaveBeenCalled();
-    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     await coordinator.shutdown();
   });
 
@@ -861,7 +861,7 @@ describe("compact route coverage", () => {
     expect(cancel).toHaveBeenCalledOnce();
     expect(state.writeFileSync).not.toHaveBeenCalled();
     expect(justCompactedMap.has("provider-return-cancel")).toBe(false);
-    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     await coordinator.shutdown();
   });
 
@@ -1003,7 +1003,7 @@ describe("compact route coverage", () => {
     expect(output.status()).toBe(499);
     expect(output.json()).toMatchObject({ status: "cancelled" });
     expect(state.openProject).not.toHaveBeenCalled();
-    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     await coordinator.shutdown();
   });
 
@@ -1055,7 +1055,7 @@ describe("compact route coverage", () => {
     releaseFirstCompact();
     await Promise.allSettled([pending, duplicatePending]);
     expect(duplicate.status()).toBe(499);
-    expect(coordinator.snapshot(secondInvocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    expect(coordinator.snapshot(secondInvocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     await coordinator.shutdown();
   });
 
@@ -1134,7 +1134,7 @@ describe("compact route coverage", () => {
       expect(duplicate.json()).toMatchObject({ status: "cancelled" });
       expect(state.projectClose).toHaveBeenCalledOnce();
       expect(removeListener.mock.calls.some(([, listener]) => listener === projectListener)).toBe(true);
-      expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+      expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     } finally {
       releaseFirstCompact();
       await Promise.allSettled([firstPending, duplicatePending].filter(
@@ -1180,7 +1180,7 @@ describe("compact route coverage", () => {
     expect(output.status()).toBe(499);
     expect(state.writeFileSync).toHaveBeenCalledOnce();
     expect(justCompactedMap.has("metadata-latch")).toBe(false);
-    expect(base.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    expect(base.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     await base.shutdown();
   });
 

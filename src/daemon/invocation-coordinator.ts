@@ -272,8 +272,6 @@ export function createInvocationCoordinator(
       return snapshot;
     }
     if (record.drainState === undefined) {
-      const waiters = record.zeroWaiters.splice(0);
-      for (const waiter of waiters) waiter(snapshot);
       resolveGlobalZero();
       return snapshot;
     }
@@ -390,8 +388,8 @@ export function createInvocationCoordinator(
     const target = normalizeTarget(input, daemonInstanceId);
     const found = lookup(target);
     if (!("controller" in found)) return snapshotForTombstone(found);
-    if (found.state === "active") transitionToCancel(found, undefined);
-    if (activeCount(found) === 0) return snapshotForRecord(found);
+    const transitioned = transitionToCancel(found, "cancelled");
+    if (records.get(found.invocationId) !== found) return transitioned;
     return await waitForZero(found);
   };
 
@@ -399,7 +397,12 @@ export function createInvocationCoordinator(
     const target = normalizeTarget(input, daemonInstanceId);
     const found = lookup(target);
     if (!("controller" in found)) return snapshotForTombstone(found);
-    const transitioned = transitionToCancel(found, "finished");
+    clearLeaseTimer(found);
+    if (found.drainState !== "cancelled") {
+      found.state = "cancelling";
+      found.drainState = "finished";
+    }
+    const transitioned = maybeDrainRecord(found);
     if (records.get(found.invocationId) !== found) return transitioned;
     return await waitForZero(found);
   };

@@ -130,7 +130,8 @@ describe("invocation coordinator", () => {
     expect(coordinator.snapshot(secondInvocationId)).toMatchObject({ state: "active", activeCount: 1 });
     secondWork.release();
     firstWork.release();
-    await expect(cancelling).resolves.toMatchObject({ state: "cancelling", activeCount: 0 });
+    await expect(cancelling).resolves.toMatchObject({ state: "cancelled", activeCount: 0 });
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     expect(coordinator.snapshot(secondInvocationId)).toMatchObject({ state: "active", activeCount: 0 });
   });
 
@@ -146,7 +147,8 @@ describe("invocation coordinator", () => {
     await Promise.resolve();
     expect(settled).toBe(false);
     permit.release();
-    await expect(cancelling).resolves.toMatchObject({ activeCount: 0 });
+    await expect(cancelling).resolves.toMatchObject({ state: "cancelled", activeCount: 0 });
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     permit.release();
   });
 
@@ -154,18 +156,40 @@ describe("invocation coordinator", () => {
     const { coordinator } = createHarness();
     coordinator.start(target());
     await expect(coordinator.cancel(target())).resolves.toMatchObject({
-      state: "cancelling",
+      state: "cancelled",
       activeCount: 0,
     });
-    await expect(coordinator.cancel(target())).resolves.toMatchObject({ state: "cancelling" });
-    expect(() => coordinator.heartbeat(target())).toThrow(/cancel/i);
-    await expect(coordinator.finish(target())).resolves.toMatchObject({ state: "finished" });
+    await expect(coordinator.cancel(target())).resolves.toMatchObject({ state: "cancelled" });
+    expect(() => coordinator.heartbeat(target())).toThrow(/terminal|cancel/i);
+    await expect(coordinator.finish(target())).resolves.toMatchObject({ state: "cancelled" });
     expect(() => coordinator.admitWork(target())).toThrow(/terminal|cancel/i);
     expect(() => coordinator.admitCommit(target())).toThrow(/terminal|cancel/i);
     expect(() => coordinator.admitCommit(target())).toThrow(/terminal|cancel/i);
-    await expect(coordinator.cancel(target())).resolves.toMatchObject({ state: "finished" });
-    await expect(coordinator.finish(target())).resolves.toMatchObject({ state: "finished" });
+    await expect(coordinator.cancel(target())).resolves.toMatchObject({ state: "cancelled" });
+    await expect(coordinator.finish(target())).resolves.toMatchObject({ state: "cancelled" });
     expect(() => coordinator.heartbeat(target())).toThrow(/terminal/i);
+  });
+
+  it("terminalizes repeated explicit cancellation after active work drains and bounds tombstones", async () => {
+    const { coordinator } = createHarness({ maxTombstones: 2 });
+    coordinator.start(target());
+    const work = coordinator.admitWork(target());
+    const cancellations = Array.from({ length: 8 }, () => coordinator.cancel(target()));
+    const finishing = coordinator.finish(target());
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 1 });
+    work.release();
+    await expect(Promise.all([...cancellations, finishing])).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ state: "cancelled", activeCount: 0 })]),
+    );
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
+    expect(coordinator.tombstoneCount()).toBe(1);
+
+    for (let index = 0; index < 5; index += 1) {
+      const id = `44444444-4444-4444-8444-${String(index).padStart(12, "0")}`;
+      coordinator.start(target(id));
+      await expect(coordinator.cancel(target(id))).resolves.toMatchObject({ state: "cancelled", activeCount: 0 });
+    }
+    expect(coordinator.tombstoneCount()).toBeLessThanOrEqual(2);
   });
 
   it("waits for active finish permits and releases each permit exactly once", async () => {
@@ -185,6 +209,26 @@ describe("invocation coordinator", () => {
     commit.release();
     await expect(finishing).resolves.toMatchObject({ state: "finished", activeCount: 0 });
     commit.release();
+  });
+
+  it("closes finish admission without aborting active work signals", async () => {
+    const { coordinator } = createHarness();
+    coordinator.start(target());
+    const work = coordinator.admitWork(target());
+    const finishing = coordinator.finish(target());
+    expect(work.signal.aborted).toBe(false);
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 1 });
+    expect(() => coordinator.admitWork(target())).toThrow(/cancel|finish|admission/i);
+    expect(() => coordinator.heartbeat(target())).toThrow(/cancel/i);
+    let settled = false;
+    void finishing.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(work.signal.aborted).toBe(false);
+    work.release();
+    await expect(finishing).resolves.toMatchObject({ state: "finished", activeCount: 0 });
+    expect(work.signal.aborted).toBe(false);
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "finished", activeCount: 0 });
   });
 
   it("finishes into a bounded tombstone and rejects replay until reaped", async () => {

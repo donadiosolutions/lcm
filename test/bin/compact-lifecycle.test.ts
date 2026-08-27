@@ -3,6 +3,7 @@ import type { InvocationControlResponse } from "../../src/daemon/client.js";
 import { createAbortError } from "../../src/daemon/cancellation.js";
 import {
   createCompactInvocationLifecycle,
+  drainCompactInvocationUntilProved,
   installCompactSignalHandlers,
 } from "../../bin/lcm.js";
 
@@ -234,6 +235,44 @@ describe("compact invocation lifecycle", () => {
     expect(result.daemonZero).toBe(false);
     expect(result.replacementVerified).toBe(false);
     expect(diagnostic).toHaveBeenCalled();
+  });
+
+  it("keeps retrying an unproved drain until a later proof settles", async () => {
+    const cancelInvocation = vi.fn()
+      .mockResolvedValueOnce(response("cancelling", 1))
+      .mockResolvedValueOnce(response("cancelled", 0));
+    const waits: number[] = [];
+    const diagnostics = vi.fn();
+    const lifecycle = {
+      started: () => true,
+      stopHeartbeat: vi.fn(),
+      target: { invocationId, command: "compact" as const, daemonInstanceId },
+    } as never;
+
+    const result = await drainCompactInvocationUntilProved({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation }),
+      awaitLocalWork: async () => undefined,
+      retryDelayMs: 25,
+      waitForRetry: async delayMs => { waits.push(delayMs); },
+      onDiagnostic: diagnostics,
+    } as never);
+
+    expect(result).toMatchObject({ daemonZero: true, localSettled: true });
+    expect(cancelInvocation).toHaveBeenCalledTimes(2);
+    expect(waits).toEqual([25]);
+    expect(diagnostics).toHaveBeenCalledOnce();
+  });
+
+  it("validates the drain retry delay before starting cancellation", async () => {
+    const lifecycle = {
+      started: () => false,
+      stopHeartbeat: vi.fn(),
+      target: { invocationId, command: "compact" as const, daemonInstanceId },
+    } as never;
+
+    await expect(drainCompactInvocationUntilProved({ lifecycle, retryDelayMs: 0 } as never))
+      .rejects.toThrow(/retry delay/i);
   });
 
   it("stops the lease heartbeat before starting cancellation drain", async () => {

@@ -368,7 +368,7 @@ describe("promote persistence boundaries", () => {
       status: "cancelled",
       error: "promote cancelled",
     });
-    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     await coordinator.shutdown();
   });
 
@@ -526,7 +526,7 @@ describe("promote persistence boundaries", () => {
       error: "promote cancelled",
     });
     expect(coordinator.snapshot(invocationId)).toMatchObject({
-      state: "cancelling",
+      state: "cancelled",
       activeCount: 0,
       workCount: 0,
       commitCount: 0,
@@ -578,7 +578,7 @@ describe("promote persistence boundaries", () => {
       status: "cancelled",
       error: "promote cancelled",
     });
-    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     await coordinator.shutdown();
   });
 
@@ -620,7 +620,7 @@ describe("promote persistence boundaries", () => {
       status: "cancelled",
       error: "promote cancelled",
     });
-    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     await coordinator.shutdown();
   });
 
@@ -738,7 +738,7 @@ describe("promote persistence boundaries", () => {
     await Promise.all([first, second]);
 
     expect(mocks.dedup).toHaveBeenCalledTimes(2);
-    expect(coordinator.snapshot(firstInvocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    expect(coordinator.snapshot(firstInvocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     expect(coordinator.snapshot(secondInvocationId)).toMatchObject({ state: "active", activeCount: 0 });
     expect(mocks.send).toHaveBeenCalledWith(response, 499, {
       status: "cancelled",
