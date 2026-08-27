@@ -80,6 +80,8 @@ const state = vi.hoisted(() => ({
   batchPatch: { lastResult: { ok: true } } as Record<string, unknown>,
   batchTransportFailure: undefined as unknown,
   batchSignal: undefined as "SIGINT" | "SIGTERM" | undefined,
+  providerWitnessReads: [] as Array<{ available: boolean; providers: unknown[] } | Error>,
+  providerWitnessReconciles: [] as Array<{ available: boolean; providers: unknown[] } | Error>,
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
   importResult: { imported: 1, skipped: 0 },
   importPatch: { lastResult: { ok: true } } as Record<string, unknown>,
@@ -149,8 +151,16 @@ vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon 
 vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn(), readAuthToken: state.readAuthToken }));
 vi.mock("../../src/llm/process-utils.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/llm/process-utils.js")>()),
-  readProviderProcessWitnesses: vi.fn(() => ({ available: true, providers: [] })),
-  reconcileProviderProcessWitnesses: vi.fn(() => ({ available: true, providers: [] })),
+  readProviderProcessWitnesses: vi.fn(() => {
+    const result = state.providerWitnessReads.shift() ?? { available: true, providers: [] };
+    if (result instanceof Error) throw result;
+    return result;
+  }),
+  reconcileProviderProcessWitnesses: vi.fn(() => {
+    const result = state.providerWitnessReconciles.shift() ?? { available: true, providers: [] };
+    if (result instanceof Error) throw result;
+    return result;
+  }),
 }));
 vi.mock("../../src/cli-help.js", () => ({ printHelp: vi.fn() }));
 vi.mock("../../src/identity-service.js", () => ({
@@ -285,6 +295,8 @@ beforeEach(() => {
   state.batchPatch = { lastResult: { ok: true } };
   state.batchTransportFailure = undefined;
   state.batchSignal = undefined;
+  state.providerWitnessReads = [];
+  state.providerWitnessReconciles = [];
   state.importPatch = { lastResult: { ok: true } };
   state.rendererOptions = undefined;
   state.health.mockResolvedValue(true);
@@ -849,6 +861,25 @@ describe("runCli lifecycle and connector boundaries", () => {
     await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
     expect(state.cancelInvocation).toHaveBeenCalledOnce();
     expect(process.exitCode).toBe(130);
+  });
+
+  it.each([
+    ["owned provider evidence", { available: true, providers: [{}] }],
+    ["provider proof failure", new Error("provider witness read failed")],
+  ])("drains normal completion after %s", async (_label, firstRead) => {
+    const owned = { available: true, providers: [{}] };
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.providerWitnessReads = [firstRead, { available: true, providers: [] }];
+    state.providerWitnessReconciles = [owned];
+
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+
+    expect(state.finishInvocation).not.toHaveBeenCalled();
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBeUndefined();
   });
 
   it("awaits foreground daemon stop before exiting on SIGTERM", async () => {

@@ -2332,6 +2332,20 @@ export async function runCli(
         let invocationControlFailures = 0;
         let resolveWorkReady!: () => void;
         const workReady = new Promise<void>(resolve => { resolveWorkReady = resolve; });
+        const proveProviderProcessesGone = async (
+          daemonInstanceId: string,
+          invocationId?: string,
+        ): Promise<boolean> => {
+          try {
+            const { readProviderProcessWitnesses, reconcileProviderProcessWitnesses } = await import("../src/llm/process-utils.js");
+            return proveCompactProviderWitnessGone({ daemonInstanceId, invocationId }, {
+              read: readProviderProcessWitnesses,
+              reconcile: reconcileProviderProcessWitnesses,
+            });
+          } catch {
+            return false;
+          }
+        };
         const drainInvocation = async (): Promise<void> => {
           await workReady;
           if (invocationLifecycle === undefined) {
@@ -2361,13 +2375,9 @@ export async function runCli(
             },
             proveOldInstanceGone: async ({ originalHealth: old, restart }) =>
               old?.pid !== undefined && restart.restarted === true && restart.stoppedPid === old.pid,
-            proveProviderWitnessGone: async ({ daemonInstanceId, invocationId }) => {
-              const { readProviderProcessWitnesses, reconcileProviderProcessWitnesses } = await import("../src/llm/process-utils.js");
-              return proveCompactProviderWitnessGone({ daemonInstanceId: daemonInstanceId!, invocationId }, {
-                read: readProviderProcessWitnesses,
-                reconcile: reconcileProviderProcessWitnesses,
-              });
-            },
+            proveProviderWitnessGone: async ({ daemonInstanceId, invocationId }) =>
+              daemonInstanceId !== undefined
+                && await proveProviderProcessesGone(daemonInstanceId, invocationId),
             onDiagnostic: message => console.error(`  compact is still draining: ${message}`),
           });
           drainResult = drained;
@@ -2622,18 +2632,26 @@ export async function runCli(
           console.error(`  compact failed while draining: ${sanitizeTerminalText(message)}`);
         }
         if (invocationLifecycle && !signalHandlers.draining) {
-          try {
-            await invocationLifecycle.finish();
-          } catch (error) {
-            if (!signalHandlers.draining) {
-              totalFailures += 1;
-              signalHandlers.beginDrain("daemon finish control failed");
-            }
-            if (!isAbortError(error)) {
-              compactState.phaseErrors.push({
-                phase: "Compact",
-                message: error instanceof Error ? error.message : "invocation finish failed",
-              });
+          const providersGone = await proveProviderProcessesGone(
+            invocationLifecycle.target.daemonInstanceId,
+            invocationLifecycle.invocationId,
+          );
+          if (!providersGone) {
+            signalHandlers.beginDrain("provider process witness did not prove targeted zero-owned work");
+          } else {
+            try {
+              await invocationLifecycle.finish();
+            } catch (error) {
+              if (!signalHandlers.draining) {
+                totalFailures += 1;
+                signalHandlers.beginDrain("daemon finish control failed");
+              }
+              if (!isAbortError(error)) {
+                compactState.phaseErrors.push({
+                  phase: "Compact",
+                  message: error instanceof Error ? error.message : "invocation finish failed",
+                });
+              }
             }
           }
         }
