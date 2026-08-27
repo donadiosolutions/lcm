@@ -32,11 +32,33 @@ that you configure explicitly:
 |-----------------------------|----------------------|
 | `disabled` (default) | Nothing |
 | `claude-process` | Messages sent to Anthropic via the `claude` CLI (your Claude subscription) |
-| `codex-process` | Messages sent to OpenAI via the `codex` CLI (your OpenAI subscription) |
+| `codex-process` | Messages sent to OpenAI through the `codex` CLI and its per-call loopback Responses gateway (your OpenAI subscription) |
 | `anthropic` | Messages sent to Anthropic API (your API key) |
 | `openai` | Messages sent to OpenAI API (your API key) |
 
 When using an external summarizer, only the text being summarized is sent — not your full history. The summarizer receives a batch of recent messages to compress into a summary.
+
+For `codex-process`, the Codex CLI receives only a fixed, non-sensitive
+bootstrap string. The gateway holds the complete LCM summarizer prompt and
+transcript in memory for one request, then discards them when the call closes.
+It constructs a fresh minimized Responses payload rather than forwarding the
+CLI's inherited instructions, input, tool inventory, client metadata, or
+prompt-cache key. The payload explicitly uses `tools: []`,
+`tool_choice: "none"`, `parallel_tool_calls: false`, `store: false`, and
+`stream: true` in the standard Responses dialect. Responses Lite instead uses
+an explicit empty `additional_tools` inventory and omits top-level `tools`.
+Both dialects discard inherited prompt/input/tools state; `include` and
+`stream_options` are omitted. Managed
+authentication is forwarded only through an explicit header allowlist, and the
+gateway selects the exact endpoint described in [configuration](configuration.md):
+`sk-`-prefixed bearer credentials use the public OpenAI route, while other
+managed bearers use the ChatGPT route even when account ID is absent. A supplied
+account ID is forwarded but is not the sole route classifier. It never persists
+or logs credentials,
+raw request bodies, prompts, or upstream response bodies. If authentication,
+request shape, routing, streaming, or gateway shutdown is ambiguous, the
+compaction fails closed. The selected provider's retention policy still
+applies to the minimized request sent outside the machine.
 
 The daemon's PostgreSQL project routes store scrubbed messages, summaries,
 promoted memories, and related repository data only after local validation and
