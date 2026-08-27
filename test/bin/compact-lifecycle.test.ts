@@ -6,6 +6,7 @@ import {
   createCompactInvocationLifecycle,
   drainCompactInvocationUntilProved,
   installCompactSignalHandlers,
+  isStrictInvocationControlSnapshot,
 } from "../../bin/lcm.js";
 
 const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
@@ -25,6 +26,132 @@ function response(state: InvocationControlResponse["state"], activeCount = 0): I
 }
 
 describe("compact invocation lifecycle", () => {
+  it("rejects malformed strict snapshots before inspecting fields", () => {
+    const target = { invocationId, command: "compact" as const, daemonInstanceId };
+    expect(isStrictInvocationControlSnapshot(null, target, "cancelled")).toBe(false);
+    expect(isStrictInvocationControlSnapshot([], target, "cancelled")).toBe(false);
+    expect(isStrictInvocationControlSnapshot({ ...response("cancelled"), workCount: 1 }, target, "cancelled")).toBe(false);
+    expect(isStrictInvocationControlSnapshot(response("cancelled"), target, "cancelled")).toBe(true);
+  });
+
+  it("validates invocation identifiers and timing bounds", () => {
+    const base = {
+      client: {
+        startInvocation: vi.fn(async () => response("active")),
+        heartbeatInvocation: vi.fn(async () => response("active")),
+        cancelInvocation: vi.fn(async () => response("cancelled")),
+        finishInvocation: vi.fn(async () => response("finished")),
+      },
+      daemonInstanceId,
+    };
+    expect(() => createCompactInvocationLifecycle({ ...base, invocationId: "bad" })).toThrow(/invocation ID/);
+    expect(() => createCompactInvocationLifecycle({ ...base, daemonInstanceId: "bad" })).toThrow(/daemon instance ID/);
+    expect(() => createCompactInvocationLifecycle({ ...base, heartbeatMs: 0 })).toThrow(/heartbeat interval/);
+    expect(() => createCompactInvocationLifecycle({ ...base, heartbeatMs: 30_000 })).toThrow(/heartbeat interval/);
+    expect(() => createCompactInvocationLifecycle({ ...base, startTimeoutMs: 0 })).toThrow(/start timeout/);
+  });
+
+  it("handles repeated starts, pre-start cancellation, and invalid start snapshots", async () => {
+    const heartbeatInvocation = vi.fn(async () => response("active"));
+    const client = {
+      startInvocation: vi.fn(async () => response("active")),
+      heartbeatInvocation,
+      cancelInvocation: vi.fn(async () => response("cancelled")),
+      finishInvocation: vi.fn(async () => response("finished")),
+    };
+    const lifecycle = createCompactInvocationLifecycle({
+      client,
+      daemonInstanceId,
+      invocationId,
+      setInterval: vi.fn(() => 19 as unknown as ReturnType<typeof globalThis.setInterval>),
+      clearInterval: vi.fn(),
+    });
+    await expect(lifecycle.cancel()).resolves.toBeUndefined();
+    await lifecycle.start();
+    await expect(lifecycle.start()).resolves.toMatchObject({ state: "active" });
+    expect(heartbeatInvocation).toHaveBeenCalledOnce();
+
+    const invalid = createCompactInvocationLifecycle({
+      client: {
+        ...client,
+        startInvocation: vi.fn(async () => ({ ...response("active"), invocationId: "wrong" })),
+      },
+      daemonInstanceId,
+      invocationId,
+      setInterval: vi.fn(() => 20 as unknown as ReturnType<typeof globalThis.setInterval>),
+      clearInterval: vi.fn(),
+    });
+    await expect(invalid.start()).rejects.toThrow(/invalid snapshot/);
+  });
+
+  it("returns no heartbeat after abort and reports non-abort heartbeat errors", async () => {
+    const command = new AbortController();
+    const onHeartbeatError = vi.fn();
+    const lifecycle = createCompactInvocationLifecycle({
+      client: {
+        startInvocation: vi.fn(async () => response("active")),
+        heartbeatInvocation: vi.fn(async () => { throw new Error("heartbeat failed"); }),
+        cancelInvocation: vi.fn(async () => response("cancelled")),
+        finishInvocation: vi.fn(async () => response("finished")),
+      },
+      daemonInstanceId,
+      invocationId,
+      signal: command.signal,
+      onHeartbeatError,
+      setInterval: vi.fn(() => 21 as unknown as ReturnType<typeof globalThis.setInterval>),
+      clearInterval: vi.fn(),
+    });
+    expect(await lifecycle.heartbeat()).toBeUndefined();
+    await lifecycle.start();
+    await expect(lifecycle.heartbeat()).rejects.toThrow("heartbeat failed");
+    expect(onHeartbeatError).toHaveBeenCalledWith(expect.any(Error));
+    command.abort();
+    expect(await lifecycle.heartbeat()).toBeUndefined();
+  });
+
+  it("ignores abort heartbeat failures and safely cleans up twice", async () => {
+    const command = new AbortController();
+    const onHeartbeatError = vi.fn();
+    const abortError = createAbortError("aborted");
+    const lifecycle = createCompactInvocationLifecycle({
+      client: {
+        startInvocation: vi.fn(async () => response("active")),
+        heartbeatInvocation: vi.fn(async () => { throw abortError; }),
+        cancelInvocation: vi.fn(async () => response("cancelled")),
+        finishInvocation: vi.fn(async () => response("finished")),
+      },
+      daemonInstanceId,
+      invocationId,
+      signal: command.signal,
+      onHeartbeatError,
+      setInterval: vi.fn(() => 22 as unknown as ReturnType<typeof globalThis.setInterval>),
+      clearInterval: vi.fn(),
+    });
+    await lifecycle.start();
+    await expect(lifecycle.heartbeat()).rejects.toMatchObject({ name: "AbortError" });
+    expect(onHeartbeatError).not.toHaveBeenCalled();
+    lifecycle.stopHeartbeat();
+    lifecycle.stopHeartbeat();
+    await expect(lifecycle.finish()).resolves.toMatchObject({ state: "finished" });
+  });
+
+  it("latches repeated automatic drains and preserves rejection through drainPromise", async () => {
+    const handlers = new Map<string, () => void>();
+    const processLike = {
+      on: vi.fn((event: string, handler: () => void) => { handlers.set(event, handler); return processLike; }),
+      removeListener: vi.fn((event: string) => { handlers.delete(event); return processLike; }),
+    };
+    const onDrain = vi.fn(() => { throw new Error("drain failed"); });
+    const onRepeatSignal = vi.fn();
+    const lifecycle = installCompactSignalHandlers({ processLike, onDrain, onRepeatSignal });
+    lifecycle.beginDrain("automatic");
+    lifecycle.beginDrain("duplicate");
+    handlers.get("SIGTERM")?.();
+    expect(onRepeatSignal).toHaveBeenCalledWith(143, "SIGTERM");
+    await expect(lifecycle.drainPromise).rejects.toThrow("drain failed");
+    lifecycle.cleanup();
+    lifecycle.cleanup();
+  });
   it("starts before heartbeat and finishes after stopping the heartbeat", async () => {
     const signal = new AbortController().signal;
     const startInvocation = vi.fn(async () => response("active"));
@@ -334,6 +461,58 @@ describe("compact invocation lifecycle", () => {
 
     expect(result.daemonZero).toBe(false);
     expect(proveProviderWitnessGone).toHaveBeenCalledWith({ daemonInstanceId });
+  });
+
+  it("validates cancellation timeout and preserves primitive/error diagnostics", async () => {
+    const lifecycle = {
+      started: () => true,
+      stopHeartbeat: vi.fn(),
+      target: { invocationId, command: "compact" as const, daemonInstanceId },
+    } as never;
+    await expect(cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation: vi.fn(async () => response("cancelled")) }),
+      timeoutMs: 0,
+    } as never)).rejects.toThrow(/cancellation timeout/);
+
+    const onDiagnostic = vi.fn();
+    const result = await cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation: vi.fn(async () => { throw "primitive failure"; }) }),
+      awaitLocalWork: async () => { throw new Error("local failed"); },
+      onDiagnostic,
+    } as never);
+    expect(result).toMatchObject({ daemonZero: false, localSettled: false });
+    expect(onDiagnostic).toHaveBeenCalledWith(expect.stringContaining("daemon cancellation request failed"));
+  });
+
+  it("reports local timeout and local primitive failure while bounding operations", async () => {
+    vi.useFakeTimers();
+    const lifecycle = {
+      started: () => true,
+      stopHeartbeat: vi.fn(),
+      target: { invocationId, command: "compact" as const, daemonInstanceId },
+    } as never;
+    const diagnostic = vi.fn();
+    const pending = cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation: vi.fn(async () => response("cancelling", 1)) }),
+      awaitLocalWork: async () => { throw "local primitive"; },
+      timeoutMs: 5,
+      onDiagnostic: diagnostic,
+    } as never);
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(pending).resolves.toMatchObject({ daemonZero: false, localSettled: false });
+    expect(diagnostic).toHaveBeenCalled();
+
+    const hanging = cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation: vi.fn(async () => new Promise<never>(() => undefined)) }),
+      timeoutMs: 5,
+    } as never);
+    await vi.advanceTimersByTimeAsync(5);
+    await expect(hanging).resolves.toMatchObject({ daemonZero: false, localSettled: true });
+    vi.useRealTimers();
   });
 
   it("treats a missing provider witness reader as unavailable proof", async () => {

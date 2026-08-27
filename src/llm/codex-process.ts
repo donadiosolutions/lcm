@@ -173,7 +173,7 @@ async function runCodexSummarizer(
     throwIfAborted(signal);
   } catch (error) {
     if (gateway !== undefined) {
-      try { await gateway.close(); } catch { /* preserve the primary error */ }
+      await gateway.close().catch(() => undefined);
     } else if (signal?.aborted && gatewayPromise !== undefined) {
       // waitForAbortable rejects immediately, but the gateway promise remains
       // owned by this call. Await it before cleanup so a late gateway cannot
@@ -251,13 +251,9 @@ async function runCodexSummarizer(
             abortCompletionWait = undefined;
           }
         }
-        if (cancellationRequested && finalError === undefined) {
-          finalError = createAbortError(signal?.reason);
-        }
         try {
           if (teardown !== undefined && child !== undefined) {
-            const effectiveTeardownReason = teardownReason ?? (cancellationRequested ? "abort" : "close");
-            const settled = await teardown.terminate(effectiveTeardownReason);
+            const settled = await teardown.terminate(teardownReason!);
             if (!settled && finalError === undefined) {
               finalError = new Error("codex process teardown did not settle");
             }

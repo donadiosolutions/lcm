@@ -328,6 +328,143 @@ describe("owned process lifecycle utilities", () => {
     expect(processChild.kill).toHaveBeenCalledWith("SIGTERM");
   });
 
+  it("fails closed after identity invalidation", async () => {
+    vi.useFakeTimers();
+    try {
+      const processChild = child(7992);
+      let birth: string | null = "birth-7992";
+      let groupAlive = true;
+      const killProcess = vi.fn();
+      const teardown = createOwnedProcessTeardown({
+        child: processChild,
+        platform: "linux",
+        processGroupId: 7992,
+        daemonProcessGroupId: 7991,
+        processBirthTime: () => {
+          const observed = birth;
+          birth = null;
+          return observed;
+        },
+        killProcess,
+        isProcessGroupAlive: () => groupAlive,
+      });
+
+      const pending = teardown.terminate();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(killProcess).not.toHaveBeenCalled();
+      expect(processChild.kill).toHaveBeenCalledWith("SIGTERM");
+      groupAlive = false;
+      processChild.emit("close");
+      await expect(pending).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reuses and clears settlement timers while ignoring stale polls", async () => {
+    const processChild = child(7995);
+    let groupAlive = true;
+    const timers: Array<() => void> = [];
+    const setTimeoutMock = vi.fn((callback: () => void) => {
+      timers.push(callback);
+      return timers.length as unknown as ReturnType<typeof setTimeout>;
+    }) as unknown as typeof setTimeout;
+    const clearTimeoutMock = vi.fn() as unknown as typeof clearTimeout;
+    const teardown = createOwnedProcessTeardown({
+      child: processChild,
+      platform: "linux",
+      processGroupId: 7995,
+      daemonProcessGroupId: 7991,
+      processBirthTime: () => "birth-7995",
+      isProcessGroupAlive: () => groupAlive,
+      setTimeout: setTimeoutMock,
+      clearTimeout: clearTimeoutMock,
+      killProcess: vi.fn(),
+    });
+    const pending = teardown.terminate();
+    const duplicateWait = teardown.waitForSettlement();
+    expect(duplicateWait).toBeInstanceOf(Promise);
+    // Close while the group is still alive, then let the poll observe its
+    // disappearance; this settles after the poll timer has cleared itself.
+    processChild.emit("close");
+    timers[0]?.();
+    groupAlive = false;
+    timers[2]?.();
+    await expect(pending).resolves.toBe(true);
+    timers[0]?.();
+    expect(clearTimeoutMock).toHaveBeenCalled();
+  });
+
+  it("clears an active deadline timer when the child settles", async () => {
+    const processChild = child(7996);
+    const timers: Array<() => void> = [];
+    const setTimeoutMock = vi.fn((callback: () => void) => {
+      timers.push(callback);
+      return timers.length as unknown as ReturnType<typeof setTimeout>;
+    }) as unknown as typeof setTimeout;
+    const clearTimeoutMock = vi.fn() as unknown as typeof clearTimeout;
+    const teardown = createOwnedProcessTeardown({
+      child: processChild,
+      platform: "linux",
+      processGroupId: 7996,
+      daemonProcessGroupId: 7991,
+      processBirthTime: () => "birth-7996",
+      isProcessGroupAlive: () => false,
+      setTimeout: setTimeoutMock,
+      clearTimeout: clearTimeoutMock,
+      killProcess: vi.fn(),
+    });
+    const pending = teardown.terminate();
+    // The first callback is the poll; the second is the deadline.
+    expect(timers.length).toBe(2);
+    processChild.emit("close");
+    await expect(pending).resolves.toBe(true);
+    expect(clearTimeoutMock).toHaveBeenCalledTimes(2);
+    timers[1]?.();
+  });
+
+  it("settles a plain wait without a deadline timer", async () => {
+    const processChild = child(7997);
+    let groupAlive = true;
+    const teardown = createOwnedProcessTeardown({
+      child: processChild,
+      platform: "linux",
+      processGroupId: 7997,
+      daemonProcessGroupId: 7991,
+      processBirthTime: () => "birth-7997",
+      isProcessGroupAlive: () => groupAlive,
+    });
+    const pending = teardown.waitForSettlement();
+    processChild.emit("close");
+    groupAlive = false;
+    await expect(pending).resolves.toBe(true);
+  });
+
+  it("uses direct-child cleanup on non-Linux hosts without group witnesses", async () => {
+    const childWithoutGroup = child(7993);
+    const direct = createOwnedProcessTeardown({
+      child: childWithoutGroup,
+      platform: "darwin",
+      processBirthTime: () => "birth-7993",
+    });
+    expect(direct.groupValidated).toBe(false);
+    const directPending = direct.terminate();
+    childWithoutGroup.emit("close");
+    await expect(directPending).resolves.toBe(true);
+
+    const groupWithoutDaemonWitness = child(7994);
+    const fallback = createOwnedProcessTeardown({
+      child: groupWithoutDaemonWitness,
+      platform: "darwin",
+      processGroupId: 7994,
+      processBirthTime: () => "birth-7994",
+    });
+    expect(fallback.groupValidated).toBe(false);
+    const fallbackPending = fallback.terminate();
+    groupWithoutDaemonWitness.emit("close");
+    await expect(fallbackPending).resolves.toBe(true);
+  });
+
   it("disables group signaling when birth capture fails", async () => {
     const processChild = child(7762);
     const teardown = createOwnedProcessTeardown({
@@ -959,6 +1096,13 @@ describe("owned process lifecycle utilities", () => {
       } as const;
       store.add(entry);
       expect(store.path).toContain("daemon-runtime.json");
+      const originalGetuid = process.getuid;
+      Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+      try {
+        expect(readProviderProcessWitnesses()).toMatchObject({ available: true, providers: [entry] });
+      } finally {
+        Object.defineProperty(process, "getuid", { configurable: true, value: originalGetuid });
+      }
       store.remove(entry);
     } finally {
       if (previousHome === undefined) delete process.env.HOME;

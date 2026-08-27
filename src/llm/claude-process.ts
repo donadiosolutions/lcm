@@ -189,14 +189,12 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
         error?: unknown,
         complete?: () => void,
       ): void => {
-        if (finished) return;
         if (error !== undefined && terminalError === undefined) terminalError = error;
         if (settlement !== undefined) return;
         settlement = (async () => {
           try { proc.stdin.destroy(); } catch { /* already closed */ }
           const settled = await teardown.terminate(reason);
           await removeWitness(settled);
-          if (finished) return;
           if (!settled && terminalError === undefined) {
             terminalError = new Error("claude process teardown did not settle");
           }
@@ -215,7 +213,6 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
           }
         })();
         void settlement.catch((caught: unknown) => {
-          if (finished) return;
           finished = true;
           if (timer !== undefined) {
             (opts.clearTimeout ?? clearTimeout)(timer);

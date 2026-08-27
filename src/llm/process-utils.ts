@@ -102,8 +102,7 @@ function linuxProcessGroupId(pid: number): number | undefined {
   try {
     const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
     const fields = raw.slice(raw.lastIndexOf(")") + 2).split(" ");
-    const pgid = Number(fields[2]);
-    return Number.isSafeInteger(pgid) && pgid > 0 ? pgid : undefined;
+    return positivePid(Number(fields[2]));
   } catch {
     return undefined;
   }

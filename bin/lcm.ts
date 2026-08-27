@@ -401,7 +401,6 @@ export function installCompactSignalHandlers(
   const beginDrain = (reason?: string, signal?: "SIGINT" | "SIGTERM"): void => {
     const nextStatus = signal === undefined ? undefined : signal === "SIGINT" ? 130 : 143;
     if (draining) {
-      if (signal !== undefined && status !== undefined) options.onRepeatSignal?.(status, signal);
       return;
     }
     draining = true;

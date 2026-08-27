@@ -608,6 +608,17 @@ describe("full-sweep orchestration", () => {
     await expect(engine.compactFullSweep({ conversationId: 1, tokenBudget: 10, summarize, force: true })).resolves.toMatchObject({ actionTaken: false });
   });
 
+  it("stops immediately when forced compaction has no leaf chunk", async () => {
+    const { engine, summaries } = fixture();
+    summaries.getContextItems.mockResolvedValue([item(0, "message", 1)]);
+    summaries.getContextTokenCount.mockResolvedValue(10);
+    const privateEngine = engine as unknown as Record<string, (...args: unknown[]) => unknown>;
+    privateEngine.selectOldestLeafChunk = vi.fn(async () => ({ items: [], rawTokensOutsideTail: 0, threshold: 10 }));
+    privateEngine.selectShallowestCondensationCandidate = vi.fn(async () => null);
+    await expect(engine.compactFullSweep({ conversationId: 1, tokenBudget: 10, summarize, force: true }))
+      .resolves.toMatchObject({ actionTaken: false, condensed: false });
+  });
+
   it("runs leaf and condensed phases with seed truncation and hard fanout", async () => {
     const { engine, summaries } = fixture();
     summaries.getContextItems.mockResolvedValue([item(0, "message", 1)]);
