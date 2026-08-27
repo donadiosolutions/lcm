@@ -260,7 +260,7 @@ describe("compact invocation lifecycle", () => {
     expect(clearInterval).toHaveBeenCalledWith(17);
     expect(finishInvocation).toHaveBeenCalledWith(
       { invocationId, command: "compact", daemonInstanceId },
-      { signal },
+      { signal, timeoutMs: 10_000 },
     );
     expect(heartbeatInvocation).not.toHaveBeenCalled();
   });

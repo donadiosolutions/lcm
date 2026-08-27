@@ -273,6 +273,23 @@ describe("invocation coordinator", () => {
     expect(coordinator.tombstoneCount()).toBeLessThanOrEqual(2);
   });
 
+  it("uses refreshed tombstone access as capacity recency", async () => {
+    const { coordinator } = createHarness({ maxTombstones: 2 });
+    const third = "44444444-4444-4444-8444-444444444444";
+    coordinator.start(target());
+    await coordinator.finish(target());
+    coordinator.start(target(secondInvocationId));
+    await coordinator.finish(target(secondInvocationId));
+
+    await coordinator.cancel(target());
+    coordinator.start(target(third));
+    await coordinator.finish(target(third));
+
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "finished" });
+    expect(() => coordinator.snapshot(secondInvocationId)).toThrow(/unknown/i);
+    expect(coordinator.snapshot(third)).toMatchObject({ state: "finished" });
+  });
+
   it("reaps only expired tombstones and ignores stale lease callbacks", async () => {
     const { coordinator, clock } = createHarness({ tombstoneTtlMs: 10 });
     coordinator.start(target());

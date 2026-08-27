@@ -305,8 +305,12 @@ export function createInvocationCoordinator(
     maybeUnref.unref?.();
   };
 
-  const refreshTombstone = (tombstone: Tombstone): Tombstone => {
+  const refreshTombstone = (invocationId: string, tombstone: Tombstone): Tombstone => {
     tombstone.expiresAt = now() + tombstoneTtlMs;
+    // Map insertion order is the capacity LRU. Move active drain proof to the
+    // newest position so unrelated terminal invocations evict idle evidence.
+    tombstones.delete(invocationId);
+    tombstones.set(invocationId, tombstone);
     return tombstone;
   };
 
@@ -314,7 +318,7 @@ export function createInvocationCoordinator(
     const record = records.get(target.invocationId);
     if (record !== undefined) return record;
     const tombstone = tombstones.get(target.invocationId);
-    if (tombstone !== undefined) return refreshTombstone(tombstone);
+    if (tombstone !== undefined) return refreshTombstone(target.invocationId, tombstone);
     throw new InvocationCoordinatorError("unknown-invocation", "unknown invocation", 404);
   };
 
@@ -424,7 +428,7 @@ export function createInvocationCoordinator(
     const record = records.get(invocationId);
     if (record !== undefined) return snapshotForRecord(record);
     const tombstone = tombstones.get(invocationId);
-    if (tombstone !== undefined) return snapshotForTombstone(refreshTombstone(tombstone));
+    if (tombstone !== undefined) return snapshotForTombstone(refreshTombstone(invocationId, tombstone));
     throw new InvocationCoordinatorError("unknown-invocation", "unknown invocation", 404);
   };
 

@@ -370,7 +370,10 @@ export function createCompactInvocationLifecycle(
   const finish = async (): Promise<InvocationControlResponse | undefined> => {
     await settleHeartbeat();
     if (!started) return undefined;
-    const result = await options.client.finishInvocation(target, { signal });
+    const result = await options.client.finishInvocation(target, {
+      signal,
+      timeoutMs: startTimeoutMs,
+    });
     if (!isStrictInvocationControlSnapshot(result, target, "finished")) {
       throw new Error("compact invocation finish returned an invalid terminal snapshot");
     }
