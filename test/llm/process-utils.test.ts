@@ -7,6 +7,7 @@ import {
   __processUtilsTestUtils,
   createOwnedProcessTeardown,
   createProviderProcessWitnessStore,
+  reconcileProviderProcessWitnesses,
   readProviderProcessWitnesses,
   boundedModelForDisplay,
   normalizeProcessBirthTime,
@@ -747,7 +748,7 @@ describe("owned process lifecycle utilities", () => {
     expect(__processUtilsTestUtils.readWitnesses(path, operations as never)).toEqual([]);
   });
 
-  it("retains authenticated empty generations for multiple daemons", () => {
+  it("prunes empty old generations while retaining the current generation", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-generations-"));
     roots.push(root);
     const path = join(root, "daemon-runtime.json");
@@ -756,16 +757,122 @@ describe("owned process lifecycle utilities", () => {
 
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
       version: 2,
-      daemonInstances: ["daemon-a", "daemon-b"],
+      daemonInstances: ["daemon-b"],
       providers: [],
     });
-    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-a" })).toEqual({ available: true, providers: [] });
     expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-b" })).toEqual({ available: true, providers: [] });
     createProviderProcessWitnessStore({ daemonInstanceId: "daemon-a", path });
     first.remove({ daemonInstanceId: "daemon-a", providerId: "none", pid: 1, pgid: null, processStartTime: null });
     second.remove({ daemonInstanceId: "daemon-b", providerId: "none", pid: 2, pgid: null, processStartTime: null });
     expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-a" })).toEqual({ available: true, providers: [] });
     expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-b" })).toEqual({ available: true, providers: [] });
+  });
+
+  it("reconciles absent and reused old-generation PIDs but retains live or ambiguous identities", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reconcile-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const old = "daemon-a";
+    const current = "daemon-b";
+    const absent = { daemonInstanceId: old, providerId: "absent", pid: 41, pgid: null, processStartTime: "birth-41" } as const;
+    const reused = { daemonInstanceId: old, providerId: "reused", pid: 42, pgid: null, processStartTime: "birth-old" } as const;
+    const live = { daemonInstanceId: old, providerId: "live", pid: 43, pgid: null, processStartTime: "birth-43" } as const;
+    const ambiguous = { daemonInstanceId: old, providerId: "ambiguous", pid: 44, pgid: null, processStartTime: null } as const;
+    const replacement = { daemonInstanceId: current, providerId: "replacement", pid: 45, pgid: null, processStartTime: null } as const;
+    writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: [old, current], providers: [absent, reused, live, ambiguous, replacement] }), { mode: 0o600 });
+    const killProcess = vi.fn((pid: number) => {
+      if (pid === absent.pid) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      if (pid === 44) throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+    });
+    const processBirthTime = vi.fn((pid: number) => pid === reused.pid ? "birth-new" : "birth-43");
+    expect(reconcileProviderProcessWitnesses({ daemonInstanceId: old, path, killProcess, processBirthTime })).toEqual({
+      available: true,
+      providers: [live, ambiguous],
+    });
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      version: 2,
+      daemonInstances: [old, current],
+      providers: [live, ambiguous, replacement],
+    });
+    expect(processBirthTime).toHaveBeenCalledWith(reused.pid);
+    expect(processBirthTime).toHaveBeenCalledWith(live.pid);
+    expect(processBirthTime).not.toHaveBeenCalledWith(ambiguous.pid);
+  });
+
+  it("drops an empty old generation after reconciliation and keeps current rows", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reconcile-empty-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const old = { daemonInstanceId: "daemon-a", providerId: "gone", pid: 51, pgid: null, processStartTime: "birth" } as const;
+    const current = { daemonInstanceId: "daemon-b", providerId: "current", pid: 52, pgid: null, processStartTime: null } as const;
+    writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: ["daemon-a", "daemon-b"], providers: [old, current] }), { mode: 0o600 });
+    expect(reconcileProviderProcessWitnesses({ daemonInstanceId: "daemon-a", path, killProcess: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); } })).toEqual({ available: true, providers: [] });
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ version: 2, daemonInstances: ["daemon-b"], providers: [current] });
+  });
+
+  it("retains a sole empty generation so the witness document stays parseable", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reconcile-sole-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const old = { daemonInstanceId: "daemon-a", providerId: "gone", pid: 53, pgid: null, processStartTime: "birth" } as const;
+    writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: ["daemon-a"], providers: [old] }), { mode: 0o600 });
+    expect(reconcileProviderProcessWitnesses({ daemonInstanceId: "daemon-a", path, killProcess: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); } })).toEqual({ available: true, providers: [] });
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ version: 2, daemonInstances: ["daemon-a"], providers: [] });
+  });
+
+  it("fails closed for invalid reconciliation identities and probe seams", () => {
+    expect(reconcileProviderProcessWitnesses({ daemonInstanceId: "" })).toEqual({ available: false, providers: [] });
+    expect(reconcileProviderProcessWitnesses({ daemonInstanceId: undefined as never })).toEqual({ available: false, providers: [] });
+    expect(reconcileProviderProcessWitnesses({ daemonInstanceId: "daemon-a", killProcess: 1 as never })).toEqual({ available: false, providers: [] });
+    expect(reconcileProviderProcessWitnesses({ daemonInstanceId: "daemon-a", processBirthTime: 1 as never })).toEqual({ available: false, providers: [] });
+  });
+
+  it("returns unavailable when the reconciliation witness is missing", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reconcile-missing-"));
+    roots.push(root);
+    expect(reconcileProviderProcessWitnesses({ daemonInstanceId: "daemon-a", path: join(root, "missing.json") })).toEqual({ available: false, providers: [] });
+  });
+
+  it("retains a live null-birth witness and an unavailable birth probe", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reconcile-ambiguous-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const nullBirth = { daemonInstanceId: "daemon-a", providerId: "null-birth", pid: 71, pgid: null, processStartTime: null } as const;
+    const throwingBirth = { daemonInstanceId: "daemon-a", providerId: "throwing-birth", pid: 72, pgid: null, processStartTime: "birth-72" } as const;
+    writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: ["daemon-a"], providers: [nullBirth, throwingBirth] }), { mode: 0o600 });
+    expect(reconcileProviderProcessWitnesses({
+      daemonInstanceId: "daemon-a",
+      path,
+      killProcess: () => undefined,
+      processBirthTime: () => { throw new Error("birth unavailable"); },
+    })).toEqual({ available: true, providers: [nullBirth, throwingBirth] });
+  });
+
+  it("does not rewrite an already-empty target generation", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reconcile-noop-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: ["daemon-b"], providers: [] }), { mode: 0o600 });
+    const rename = vi.fn(renameSync);
+    expect(reconcileProviderProcessWitnesses({ daemonInstanceId: "daemon-a", path, operations: { renameSync: rename } })).toEqual({ available: true, providers: [] });
+    expect(rename).not.toHaveBeenCalled();
+  });
+
+  it("fails closed and preserves the prior witness when reconciliation publication fails", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reconcile-failure-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const old = { daemonInstanceId: "daemon-a", providerId: "gone", pid: 61, pgid: null, processStartTime: "birth" } as const;
+    writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: ["daemon-a"], providers: [old] }), { mode: 0o600 });
+    const before = readFileSync(path, "utf8");
+    const error = new Error("rename failed");
+    expect(reconcileProviderProcessWitnesses({
+      daemonInstanceId: "daemon-a",
+      path,
+      killProcess: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+      operations: { renameSync: () => { throw error; } },
+    })).toEqual({ available: false, providers: [] });
+    expect(readFileSync(path, "utf8")).toBe(before);
   });
 
   it("refuses initialization over malformed or symlinked evidence", () => {
@@ -1027,7 +1134,7 @@ describe("owned process lifecycle utilities", () => {
       await Promise.all([first.remove(entryA), second.remove(entryB)]);
       expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
         version: 2,
-        daemonInstances: ["daemon-a", "daemon-b"],
+        daemonInstances: ["daemon-b"],
         providers: [],
       });
     } finally {
@@ -1202,7 +1309,7 @@ describe("owned process lifecycle utilities", () => {
     store.add(entry);
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
       version: 2,
-      daemonInstances: ["daemon-b", "daemon-a"],
+      daemonInstances: ["daemon-a"],
       providers: [entry],
     });
   });
@@ -1319,6 +1426,18 @@ describe("owned process lifecycle utilities", () => {
       store.add(entry);
       expect(store.path).toContain("daemon-runtime.json");
       expect(readProviderProcessWitnesses({ _getUid: () => undefined })).toMatchObject({
+        available: true,
+        providers: [entry],
+      });
+      const reusedEntry = {
+        daemonInstanceId: "daemon-default",
+        providerId: "default-reconcile",
+        pid: process.pid,
+        pgid: null,
+        processStartTime: "old-process-birth",
+      } as const;
+      store.add(reusedEntry);
+      expect(reconcileProviderProcessWitnesses({ daemonInstanceId: "daemon-default" })).toEqual({
         available: true,
         providers: [entry],
       });

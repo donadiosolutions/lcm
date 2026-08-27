@@ -150,6 +150,7 @@ vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn(), readAuthT
 vi.mock("../../src/llm/process-utils.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/llm/process-utils.js")>()),
   readProviderProcessWitnesses: vi.fn(() => ({ available: true, providers: [] })),
+  reconcileProviderProcessWitnesses: vi.fn(() => ({ available: true, providers: [] })),
 }));
 vi.mock("../../src/cli-help.js", () => ({ printHelp: vi.fn() }));
 vi.mock("../../src/identity-service.js", () => ({

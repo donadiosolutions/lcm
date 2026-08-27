@@ -2284,8 +2284,10 @@ export async function runCli(
             proveOldInstanceGone: async ({ originalHealth: old, restart }) =>
               old?.pid !== undefined && restart.restarted === true && restart.stoppedPid === old.pid,
             proveProviderWitnessGone: async ({ daemonInstanceId, invocationId }) => {
-              const { readProviderProcessWitnesses } = await import("../src/llm/process-utils.js");
-              const snapshot = readProviderProcessWitnesses({ daemonInstanceId: daemonInstanceId!, ...(invocationId === undefined ? {} : { invocationId }) });
+              const { readProviderProcessWitnesses, reconcileProviderProcessWitnesses } = await import("../src/llm/process-utils.js");
+              const snapshot = invocationId === undefined
+                ? reconcileProviderProcessWitnesses({ daemonInstanceId: daemonInstanceId! })
+                : readProviderProcessWitnesses({ daemonInstanceId: daemonInstanceId!, invocationId });
               return snapshot.available && snapshot.providers.length === 0;
             },
             onDiagnostic: message => console.error(`  compact is still draining: ${message}`),

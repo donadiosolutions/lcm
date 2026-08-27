@@ -353,6 +353,18 @@ export type ProviderProcessWitnessSnapshot = Readonly<{
   providers: readonly ProviderProcessWitness[];
 }>;
 
+export type ProviderProcessWitnessReconcileOptions = Readonly<{
+  /** Generation whose provider identities may be reconciled and reclaimed. */
+  daemonInstanceId: string;
+  path?: string;
+  /** Injectable PID liveness probe used by deterministic tests. */
+  killProcess?: ProcessKill;
+  /** Injectable process-birth identity probe used by deterministic tests. */
+  processBirthTime?: ProcessBirthProbe;
+  /** @internal deterministic filesystem/ownership seams. */
+  operations?: Partial<WitnessOperations>;
+}>;
+
 const DEFAULT_WITNESS_FILE = "daemon-runtime.json";
 type WitnessUpdate = () => void;
 type WitnessPathLock = {
@@ -559,6 +571,18 @@ function writeWitnesses(
   }
 }
 
+function compactDaemonInstances(
+  daemonInstances: readonly string[],
+  currentDaemonInstanceId: string,
+  providers: readonly ProviderProcessWitness[],
+): string[] {
+  const retained = new Set<string>([currentDaemonInstanceId]);
+  for (const entry of providers) retained.add(entry.daemonInstanceId);
+  return daemonInstances.filter(id => retained.has(id)).concat(
+    [...retained].filter(id => !daemonInstances.includes(id)),
+  );
+}
+
 function withWitnessMutationLock<T>(path: string, operation: () => T): T {
   // The repository lock validates owner PID/start identity, rejects unsafe
   // lock files, and reclaims only stale owners. A live lock is contention,
@@ -616,13 +640,16 @@ export function createProviderProcessWitnessStore(options: {
         writeWitnesses(path, [options.daemonInstanceId], [], operations);
         return;
       }
-      const daemonInstances = existing.daemonInstances.includes(options.daemonInstanceId)
-        ? existing.daemonInstances
-        : [...existing.daemonInstances, options.daemonInstanceId];
+      const daemonInstances = compactDaemonInstances(
+        existing.daemonInstances,
+        options.daemonInstanceId,
+        existing.providers,
+      );
       // A legacy document is rewritten to the v2 multi-generation format even
       // when this daemon was already the sole recorded generation.
       const needsMigration = existing.version !== WITNESS_VERSION
-        || daemonInstances.length !== existing.daemonInstances.length;
+        || daemonInstances.length !== existing.daemonInstances.length
+        || daemonInstances.some((id, index) => id !== existing.daemonInstances[index]);
       if (needsMigration) writeWitnesses(path, daemonInstances, existing.providers, operations);
     }),
   );
@@ -650,9 +677,11 @@ export function createProviderProcessWitnessStore(options: {
         ? current.filter(candidate => !matches(candidate))
         : [...current.filter(candidate => !matches(candidate)), entry];
       const next = [...otherDaemonEntries, ...nextCurrent];
-      const daemonInstances = existing.daemonInstances.includes(options.daemonInstanceId)
-        ? existing.daemonInstances
-        : [...existing.daemonInstances, options.daemonInstanceId];
+      const daemonInstances = compactDaemonInstances(
+        existing.daemonInstances,
+        options.daemonInstanceId,
+        next,
+      );
       writeWitnesses(path, daemonInstances, next, operations);
     }),
   );
@@ -664,6 +693,73 @@ export function createProviderProcessWitnessStore(options: {
   };
 }
 
+/**
+ * Reconcile provider identities for a daemon generation that has been
+ * replaced.  This is intentionally the only mutating read path: ordinary
+ * invocation-scoped reads remain observational and never prune evidence.
+ * A provider is reclaimed only when its PID is proven absent (ESRCH), or its
+ * live PID has a different non-null birth identity.  Any other result is
+ * ambiguous and is retained so replacement proof fails closed.
+ */
+export function reconcileProviderProcessWitnesses(
+  options: ProviderProcessWitnessReconcileOptions,
+): ProviderProcessWitnessSnapshot {
+  if (typeof options.daemonInstanceId !== "string" || options.daemonInstanceId.length === 0) {
+    return { available: false, providers: [] };
+  }
+  const path = options.path ?? join(lcmHomeDir(), DEFAULT_WITNESS_FILE);
+  const operations: WitnessOperations = { ...DEFAULT_WITNESS_OPERATIONS, ...options.operations };
+  const killProcess = options.killProcess ?? process.kill.bind(process);
+  const processBirth = options.processBirthTime ?? processStartTime;
+  if (typeof killProcess !== "function" || typeof processBirth !== "function") {
+    return { available: false, providers: [] };
+  }
+  let result: ProviderProcessWitnessSnapshot = { available: false, providers: [] };
+  try {
+    withWitnessPathLock(path, () => withWitnessMutationLock(path, () => {
+      const existing = readWitnessDocument(path, operations);
+      if (existing === undefined) return;
+      const targetEntries = existing.providers.filter(entry => entry.daemonInstanceId === options.daemonInstanceId);
+      const dead = new Set<ProviderProcessWitness>();
+      for (const entry of targetEntries) {
+        try {
+          killProcess(entry.pid, 0);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException | undefined)?.code === "ESRCH") dead.add(entry);
+          continue;
+        }
+        if (entry.processStartTime === null) continue;
+        let observedBirth: string | null;
+        try {
+          observedBirth = normalizeProcessBirthTime(processBirth(entry.pid));
+        } catch {
+          continue;
+        }
+        if (observedBirth !== null && observedBirth !== entry.processStartTime) dead.add(entry);
+      }
+      const providers = dead.size === 0
+        ? existing.providers
+        : existing.providers.filter(entry => !dead.has(entry));
+      // This function is used for an old-generation replacement proof. Keep
+      // every non-target generation and any target generation that still owns
+      // rows; remove an empty target generation after successful publication.
+      const targetRetained = providers.some(entry => entry.daemonInstanceId === options.daemonInstanceId);
+      const daemonInstances = existing.daemonInstances.filter(id => id !== options.daemonInstanceId || targetRetained);
+      if (daemonInstances.length === 0) daemonInstances.push(options.daemonInstanceId);
+      const changed = providers.length !== existing.providers.length
+        || daemonInstances.length !== existing.daemonInstances.length;
+      if (changed) writeWitnesses(path, daemonInstances, providers, operations);
+      result = {
+        available: true,
+        providers: providers.filter(entry => entry.daemonInstanceId === options.daemonInstanceId),
+      };
+    }));
+  } catch {
+    return { available: false, providers: [] };
+  }
+  return result;
+}
+
 /** Internal pure/lifecycle seams used by provider tests. */
 export const __processUtilsTestUtils = {
   positivePid,
@@ -672,4 +768,5 @@ export const __processUtilsTestUtils = {
   defaultProcessGroupAlive,
   readWitnesses,
   writeWitnesses,
+  compactDaemonInstances,
 };
