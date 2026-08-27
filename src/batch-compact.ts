@@ -9,6 +9,7 @@ import {
   type ProgressState,
 } from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
+import { isDaemonTransportFailure } from "./daemon/http-url.js";
 import { configPath, projectsDir as lcmProjectsDir } from "./runtime-paths.js";
 import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
 import { loadDaemonConfig, type LlmApiMode, type LlmInvocationRequestPolicy, type LlmReasoningEffort, type LlmRetryPolicy } from "./daemon/config.js";
@@ -345,8 +346,12 @@ export async function batchCompact(opts: {
   requestPolicy?: LlmInvocationRequestPolicy;
   /** Effective compact worker count; replay callers should resolve this to one. */
   maxConcurrency?: number;
+  /** Invocation identity forwarded to every admitted daemon compact request. */
+  invocationId?: string;
   /** Stops future claims while admitted requests are allowed to settle. */
   signal?: AbortSignal;
+  /** Reports a daemon transport failure so a command can enter cancellation drain. */
+  onTransportFailure?: (error: unknown) => void;
   /** Called with state patches as each session is processed — used by the ninja renderer */
   onProgress?: (patch: Partial<ProgressState>) => void;
 }): Promise<BatchCompactResult> {
@@ -441,11 +446,12 @@ export async function batchCompact(opts: {
       },
     worker: async (conv) => {
       if (opts.dryRun) return {};
-      return client.post<CompactResponse>("/compact", {
+      const body = {
         session_id: conv.sessionId,
         cwd: conv.cwd,
         skip_ingest: true,
         client: "claude",
+        ...(opts.invocationId === undefined ? {} : { invocation_id: opts.invocationId }),
         reasoning_effort: opts.reasoningEffort,
         fast_mode: opts.fastMode,
         request_timeout_ms: opts.requestPolicy?.requestTimeoutMs,
@@ -455,7 +461,10 @@ export async function batchCompact(opts: {
           max_delay_ms: opts.requestPolicy.retry.maxDelayMs,
           multiplier: opts.requestPolicy.retry.multiplier,
         } } : {}),
-      });
+      };
+      return opts.signal === undefined
+        ? client.post<CompactResponse>("/compact", body)
+        : client.post<CompactResponse>("/compact", body, { signal: opts.signal });
     },
     onResult: (result) => {
       const conv = result.item;
@@ -466,6 +475,7 @@ export async function batchCompact(opts: {
 
       if ("error" in result) {
         const errMsg = result.error instanceof Error ? result.error.message : "unknown error";
+        if (isDaemonTransportFailure(result.error)) opts.onTransportFailure?.(result.error);
         console.log(`${label} FAILED (${errMsg})`);
         progressErrors.push({ sessionId: conv.sessionId, message: errMsg });
         onProgress?.({

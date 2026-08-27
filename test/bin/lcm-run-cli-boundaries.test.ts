@@ -5,10 +5,14 @@ const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
   ensureDaemon: vi.fn(async () => ({ connected: true, spawned: false, restartedForParent: false, pid: 42 })),
   restartDaemon: vi.fn(async () => ({ connected: true, restarted: true, spawned: false, pid: 42 })),
-  createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })),
+  createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }), stop: vi.fn() })),
   post: vi.fn(async () => ({ processed: 1, promoted: 1 })),
   get: vi.fn(async () => ({ totalConnections: 1, activeConnections: 0, idleConnections: 1, connections: [] })),
   health: vi.fn(async () => true),
+  startInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0 })),
+  heartbeatInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0 })),
+  cancelInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "cancelling", activeCount: 0 })),
+  finishInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "finished", activeCount: 0 })),
   readAuthToken: vi.fn(() => state.authToken),
   authToken: "test-token" as string | null,
   migrateLegacyHome: vi.fn(),
@@ -71,6 +75,8 @@ const state = vi.hoisted(() => ({
   storedCodexTransport: undefined as "cli" | "mcp" | undefined,
   batchResult: { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] },
   batchError: undefined as unknown,
+  batchGate: undefined as Promise<void> | undefined,
+  batchOptions: undefined as unknown,
   batchPatch: { lastResult: { ok: true } } as Record<string, unknown>,
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
   importResult: { imported: 1, skipped: 0 },
@@ -127,7 +133,15 @@ vi.mock("../../src/daemon/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()), loadDaemonConfig: state.loadConfig,
 }));
 vi.mock("../../src/daemon/lifecycle.js", () => ({ ensureDaemon: state.ensureDaemon, restartDaemon: state.restartDaemon }));
-vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class { post = state.post; get = state.get; health = state.health; } }));
+vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class {
+  post = state.post;
+  get = state.get;
+  health = state.health;
+  startInvocation = state.startInvocation;
+  heartbeatInvocation = state.heartbeatInvocation;
+  cancelInvocation = state.cancelInvocation;
+  finishInvocation = state.finishInvocation;
+} }));
 vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
 vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn(), readAuthToken: state.readAuthToken }));
 vi.mock("../../src/cli-help.js", () => ({ printHelp: vi.fn() }));
@@ -151,8 +165,11 @@ vi.mock("../../src/config-manager.js", () => ({
   readConnectorTransportSnapshot: vi.fn(() => state.storedCodexTransport),
 }));
 vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
+  state.batchOptions = opts;
+  opts.onProgress?.(state.batchPatch);
+  if (state.batchGate !== undefined) await state.batchGate;
   if (state.batchError !== undefined) throw state.batchError;
-  opts.onProgress?.(state.batchPatch); return state.batchResult;
+  return state.batchResult;
 }) }));
 vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((value: Record<string, unknown>) => {
   const progressState = {
@@ -252,9 +269,15 @@ beforeEach(() => {
   state.storedCodexTransport = undefined;
   state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] };
   state.batchError = undefined;
+  state.batchGate = undefined;
+  state.batchOptions = undefined;
   state.batchPatch = { lastResult: { ok: true } };
   state.importPatch = { lastResult: { ok: true } };
   state.health.mockResolvedValue(true);
+  state.startInvocation.mockClear();
+  state.heartbeatInvocation.mockClear();
+  state.cancelInvocation.mockClear();
+  state.finishInvocation.mockClear();
   state.authToken = "test-token";
   state.migrateLegacyHome.mockReset();
   state.portableResult = { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false };
@@ -609,6 +632,22 @@ describe("runCli lifecycle and connector boundaries", () => {
     mismatchCleanup();
   });
 
+  it("awaits foreground daemon stop before exiting on SIGTERM", async () => {
+    let release!: () => void;
+    const stop = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    state.createDaemon.mockResolvedValueOnce({ address: () => ({ port: 3737 }), stop });
+    const on = vi.spyOn(process, "on");
+    await expect(invoke(["daemon", "start", "--foreground"])).resolves.toBeUndefined();
+    const exit = state.exit;
+    const handler = on.mock.calls.filter(([event]) => event === "SIGTERM").at(-1)?.[1] as (() => void);
+
+    handler();
+    expect(stop).toHaveBeenCalledOnce();
+    expect(exit).not.toHaveBeenCalledWith(0);
+    release();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+  });
+
   it("covers defaulted raw action options and empty service results", async () => {
     const actions = await captureRunCliActions();
     state.loadConfig.mockReturnValue({
@@ -748,6 +787,189 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     expect(state.progressState?.phaseErrors).toEqual([
       { phase: "Promote", target: "/good", message: "best effort" },
     ]);
+  });
+
+  it("registers one invocation and reuses it for automatic promotion", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] };
+    await expect(invoke(["compact"])).resolves.toBeUndefined();
+
+    expect(state.startInvocation).toHaveBeenCalledOnce();
+    const target = state.startInvocation.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(target).toMatchObject({ command: "compact", daemonInstanceId: "11111111-1111-4111-8111-111111111111" });
+    expect(target.invocationId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(state.finishInvocation).toHaveBeenCalledWith(target, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(state.post).toHaveBeenCalledWith("/promote", {
+      cwd: "/good",
+      dry_run: false,
+      invocation_id: target.invocationId,
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("cancels the invocation after SIGINT and preserves the 130 status", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    let release!: () => void;
+    state.batchGate = new Promise<void>(resolve => { release = resolve; });
+
+    const pending = invoke(["compact", "--no-promote"]);
+    await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
+    process.emit("SIGINT");
+    release();
+    await expect(pending).resolves.toBeUndefined();
+
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(state.finishInvocation).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(130);
+  });
+
+  it("turns a heartbeat control failure into cancellation and an invocation failure", async () => {
+    vi.useFakeTimers();
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.heartbeatInvocation.mockRejectedValueOnce(new Error("heartbeat unavailable"));
+    let release!: () => void;
+    state.batchGate = new Promise<void>(resolve => { release = resolve; });
+
+    const pending = invoke(["compact", "--no-promote"]);
+    await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(10_000);
+    release();
+    await expect(pending).resolves.toBeUndefined();
+
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it("preserves SIGTERM precedence and only reports repeated signals while draining", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    let release!: () => void;
+    state.batchGate = new Promise<void>(resolve => { release = resolve; });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const pending = invoke(["compact", "--no-promote"]);
+    await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
+    process.emit("SIGTERM");
+    process.emit("SIGINT");
+    release();
+    await expect(pending).resolves.toBeUndefined();
+
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(143);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("already draining"));
+  });
+
+  it("cleans up a pre-registration signal without creating an invocation or dispatching work", async () => {
+    state.ensureDaemon.mockImplementationOnce(async () => {
+      process.emit("SIGINT");
+      return { connected: true, spawned: false, restartedForParent: false, pid: 42 };
+    });
+
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.startInvocation).not.toHaveBeenCalled();
+    expect(state.cancelInvocation).not.toHaveBeenCalled();
+    expect(state.batchOptions).toBeUndefined();
+    expect(process.exitCode).toBe(130);
+  });
+
+  it("preserves a preflight signal when daemon startup fails concurrently", async () => {
+    state.ensureDaemon.mockImplementationOnce(async () => {
+      process.emit("SIGINT");
+      throw new Error("daemon startup failed");
+    });
+
+    const result = await invoke(["compact", "--no-promote"]);
+    expect(result).toBeUndefined();
+    expect(state.startInvocation).not.toHaveBeenCalled();
+    expect(state.batchOptions).toBeUndefined();
+    expect(process.exitCode).toBe(130);
+  });
+
+  it("removes command signal handlers after normal compact teardown", async () => {
+    const on = vi.spyOn(process, "on");
+    const remove = vi.spyOn(process, "removeListener");
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+
+    const installed = on.mock.calls.filter(([event]) => event === "SIGINT" || event === "SIGTERM");
+    expect(installed).toHaveLength(2);
+    for (const [event, handler] of installed) {
+      expect(remove).toHaveBeenCalledWith(event, handler);
+    }
+  });
+
+  it("keeps draining without a final exit when targeted zero remains unproved", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.cancelInvocation.mockResolvedValue({
+      invocationId: "22222222-2222-4222-8222-222222222222",
+      command: "compact",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+      state: "cancelling",
+      activeCount: 1,
+    });
+    let release!: () => void;
+    state.batchGate = new Promise<void>(resolve => { release = resolve; });
+
+    const pending = invoke(["compact", "--no-promote"]);
+    await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
+    process.emit("SIGINT");
+    release();
+    await expect(pending).resolves.toBeUndefined();
+
+    expect(state.cancelInvocation).toHaveBeenCalled();
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("does not claim signal exit when a batch failure leaves cancellation unproved", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    let release!: () => void;
+    state.batchGate = new Promise<void>(resolve => { release = resolve; });
+    state.batchError = new Error("ordinary batch failure");
+    state.cancelInvocation.mockResolvedValue({
+      invocationId: "22222222-2222-4222-8222-222222222222",
+      command: "compact",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+      state: "cancelling",
+      activeCount: 1,
+    });
+
+    const pending = invoke(["compact", "--no-promote"]);
+    await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
+    process.emit("SIGINT");
+    release();
+    const result = await pending;
+
+    expect(result).toBeUndefined();
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBeUndefined();
   });
 
   it("covers TTY all-provider import directory filtering", async () => {

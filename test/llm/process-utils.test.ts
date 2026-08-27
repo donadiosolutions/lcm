@@ -7,6 +7,7 @@ import {
   __processUtilsTestUtils,
   createOwnedProcessTeardown,
   createProviderProcessWitnessStore,
+  readProviderProcessWitnesses,
 } from "../../src/llm/process-utils.js";
 
 type Child = EventEmitter & {
@@ -444,6 +445,33 @@ describe("owned process lifecycle utilities", () => {
     expect(JSON.parse(readFileSync(path, "utf8")).providers).toHaveLength(1);
     store.remove(entry);
     expect(() => readFileSync(path)).toThrow();
+  });
+
+  it("reads a provider witness snapshot for old-instance disappearance proof", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-read-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const store = createProviderProcessWitnessStore({ daemonInstanceId: "daemon-a", path });
+    const entry = {
+      daemonInstanceId: "daemon-a",
+      providerId: "claude-process",
+      pid: 1234,
+      pgid: 1234,
+      processStartTime: "9876",
+    } as const;
+    store.add(entry);
+    expect(readProviderProcessWitnesses({ path })).toMatchObject({
+      available: true,
+      providers: [entry],
+    });
+    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-b" })).toMatchObject({
+      available: true,
+      providers: [],
+    });
+    store.remove(entry);
+    expect(readProviderProcessWitnesses({ path })).toMatchObject({ available: true, providers: [] });
+    writeFileSync(path, "not-json", { mode: 0o600 });
+    expect(readProviderProcessWitnesses({ path })).toMatchObject({ available: false, providers: [] });
   });
 
   it("retains another daemon witness while removing only the matching entry", () => {

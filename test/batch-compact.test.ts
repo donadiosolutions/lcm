@@ -429,6 +429,75 @@ describe("batch compaction discovery", () => {
     }));
   });
 
+  it("threads invocation identity and abort signal through compact requests", async () => {
+    const cwd = makeDir("compact-invocation-forwarding");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    const signal = new AbortController().signal;
+    const post = vi.spyOn(DaemonClient.prototype, "post")
+      .mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      invocationId: "22222222-2222-4222-8222-222222222222",
+      signal,
+    });
+
+    expect(post).toHaveBeenCalledWith("/compact", expect.objectContaining({
+      invocation_id: "22222222-2222-4222-8222-222222222222",
+    }), { signal });
+  });
+
+  it("does not create compact requests during dry-run even when an invocation is supplied", async () => {
+    const cwd = makeDir("compact-invocation-dry-run");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    const post = vi.spyOn(DaemonClient.prototype, "post");
+
+    await batchCompact({
+      minTokens: 100,
+      dryRun: true,
+      port: 3737,
+      cwd,
+      invocationId: "22222222-2222-4222-8222-222222222222",
+    });
+
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("reports daemon transport loss to the command drain callback", async () => {
+    const cwd = makeDir("compact-transport-loss");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    const transportError = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+    vi.spyOn(DaemonClient.prototype, "post").mockRejectedValue(transportError);
+    const onTransportFailure = vi.fn();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      invocationId: "22222222-2222-4222-8222-222222222222",
+      onTransportFailure,
+    });
+
+    expect(onTransportFailure).toHaveBeenCalledWith(transportError);
+  });
+
   it("reports daemon no-ops as unchanged and excludes them from promotion projects", async () => {
     const cwd = makeDir("compact-noop-accounting");
     const paths = projectPaths(cwd);

@@ -335,6 +335,11 @@ export type ProviderProcessWitnessStore = Readonly<{
   remove: (entry: ProviderProcessWitness) => void;
 }>;
 
+export type ProviderProcessWitnessSnapshot = Readonly<{
+  available: boolean;
+  providers: readonly ProviderProcessWitness[];
+}>;
+
 const DEFAULT_WITNESS_FILE = "daemon-runtime.json";
 type WitnessUpdate = () => void;
 type WitnessPathLock = {
@@ -366,6 +371,35 @@ function readWitnesses(path: string, operations: WitnessOperations): ProviderPro
   } catch {
     return [];
   }
+}
+
+/** Read the secret-free provider witness without mutating its backing file. */
+export function readProviderProcessWitnesses(options: {
+  path?: string;
+  daemonInstanceId?: string;
+} = {}): ProviderProcessWitnessSnapshot {
+  const path = options.path ?? join(lcmHomeDir(), DEFAULT_WITNESS_FILE);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT"
+      ? { available: true, providers: [] }
+      : { available: false, providers: [] };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { available: false, providers: [] };
+  }
+  const rawProviders = (parsed as { providers?: unknown }).providers;
+  if (!Array.isArray(rawProviders)) return { available: false, providers: [] };
+  const providers = readWitnesses(path, DEFAULT_WITNESS_OPERATIONS);
+  if (providers.length !== rawProviders.length) return { available: false, providers: [] };
+  return {
+    available: true,
+    providers: options.daemonInstanceId === undefined
+      ? providers
+      : providers.filter(entry => entry.daemonInstanceId === options.daemonInstanceId),
+  };
 }
 
 function writeWitnesses(path: string, daemonInstanceId: string, providers: readonly ProviderProcessWitness[], operations: WitnessOperations): void {
