@@ -78,24 +78,40 @@ export async function runBatchWorkerPool<TItem, TResult>(
   const completions: BatchWorkerCompletion<TItem, TResult>[] = [];
   const active = new Set<Promise<void>>();
   let nextIndex = 0;
+  let callbackError: unknown;
+  let callbackErrorSet = false;
 
   const claim = (): void => {
     while (
       active.size < options.maxConcurrency
       && nextIndex < options.items.length
       && options.signal?.aborted !== true
+      && !callbackErrorSet
     ) {
       const index = nextIndex;
       nextIndex += 1;
       const item = options.items[index]!;
-      options.onClaim?.(item, index);
+      try {
+        options.onClaim?.(item, index);
+      } catch (error) {
+        callbackError = error;
+        callbackErrorSet = true;
+        return;
+      }
       const task = Promise.resolve()
         .then(() => options.worker(item, index))
         .then(value => ({ index, item, value } as BatchWorkerCompletion<TItem, TResult>))
         .catch(error => ({ index, item, error } as BatchWorkerCompletion<TItem, TResult>))
         .then((result) => {
           completions.push(result);
-          options.onResult?.(result);
+          try {
+            options.onResult?.(result);
+          } catch (error) {
+            if (!callbackErrorSet) {
+              callbackError = error;
+              callbackErrorSet = true;
+            }
+          }
         })
         .finally(() => {
           active.delete(task);
@@ -109,6 +125,7 @@ export async function runBatchWorkerPool<TItem, TResult>(
     await Promise.race(active);
     claim();
   }
+  if (callbackErrorSet) throw callbackError;
   return completions;
 }
 
@@ -449,7 +466,7 @@ export async function batchCompact(opts: {
 
       if ("error" in result) {
         const errMsg = result.error instanceof Error ? result.error.message : "unknown error";
-        console.log(` FAILED (${errMsg})`);
+        console.log(`${label} FAILED (${errMsg})`);
         progressErrors.push({ sessionId: conv.sessionId, message: errMsg });
         onProgress?.({
           ...activePatch,
@@ -461,6 +478,18 @@ export async function batchCompact(opts: {
       }
 
       const data = result.value;
+      if (data === null || data === undefined) {
+        const errMsg = "malformed compact response";
+        console.log(`${label} FAILED (${errMsg})`);
+        progressErrors.push({ sessionId: conv.sessionId, message: errMsg });
+        onProgress?.({
+          ...activePatch,
+          completed: completedCount,
+          errors: progressErrors,
+          lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, elapsed: Date.now() - sessionStart },
+        });
+        return;
+      }
       if (opts.dryRun) {
         console.log(`  [dry-run] would compact: ${label}`);
         completedCount++;
@@ -468,7 +497,7 @@ export async function batchCompact(opts: {
       } else if (data?.skipped) {
         skipped++;
         completedCount++;
-        console.log(" skipped (already in progress)");
+        console.log(`${label} skipped (already in progress)`);
         onProgress?.({
           ...activePatch,
           completed: completedCount,
@@ -480,7 +509,7 @@ export async function batchCompact(opts: {
         const tokensBefore = data.tokensBefore ?? conv.tokens;
         const tokensAfter = data.tokensAfter ?? tokensBefore;
         const summary = data.summary?.trim() || "No compaction needed.";
-        console.log(` unchanged (${summary})`);
+        console.log(`${label} unchanged (${summary})`);
         onProgress?.({
           ...activePatch,
           completed: completedCount,
@@ -491,9 +520,9 @@ export async function batchCompact(opts: {
         const tokensAfter = data?.tokensAfter ?? tokensBefore;
         if (opts.verbose && tokensBefore > 0) {
           const pct = Math.round((1 - tokensAfter / tokensBefore) * 100);
-          console.log(` done  (${(tokensBefore / 1000).toFixed(1)}k → ${(tokensAfter / 1000).toFixed(1)}k tokens, ${pct}% reduction)`);
+          console.log(`${label} done  (${(tokensBefore / 1000).toFixed(1)}k → ${(tokensAfter / 1000).toFixed(1)}k tokens, ${pct}% reduction)`);
         } else {
-          console.log(" done");
+          console.log(`${label} done`);
         }
         compacted++;
         completedCount++;
