@@ -379,7 +379,12 @@ export function createInvocationCoordinator(
     if (found.state !== "active") {
       throw new InvocationCoordinatorError("cancelled", "invocation is cancelling", 409);
     }
-    found.leaseExpiresAt = now() + leaseMs;
+    const current = now();
+    if (current >= found.leaseExpiresAt) {
+      transitionToCancel(found, "cancelled");
+      throw new InvocationCoordinatorError("cancelled", "invocation lease has expired", 409);
+    }
+    found.leaseExpiresAt = current + leaseMs;
     scheduleLease(found);
     return snapshotForRecord(found);
   };

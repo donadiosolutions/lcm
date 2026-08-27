@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, chmodSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { lcmHomeDir } from "../runtime-paths.js";
-import { processStartTime } from "../private-mutation-lock.js";
+import {
+  processStartTime,
+  withPrivateMutationLock,
+} from "../private-mutation-lock.js";
+import { readBoundedRegularFileWithStat } from "../security-files.js";
 
 export const MAX_MODEL_DISPLAY_LENGTH = 80;
 
@@ -206,16 +210,11 @@ export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions)
       groupInvalidated = true;
       return false;
     }
-    if (observedBirth !== null && observedBirth !== capturedBirth) {
+    if (observedBirth === null || observedBirth !== capturedBirth) {
       groupInvalidated = true;
       return false;
     }
-    if (childClosed) return true;
-    if (observedBirth !== capturedBirth) {
-      groupInvalidated = true;
-      return false;
-    }
-    if (!childClosed && currentGroupProbe !== undefined) {
+    if (currentGroupProbe !== undefined) {
       let observedGroup: number | undefined;
       try {
         observedGroup = currentGroupProbe(processId);
@@ -227,6 +226,12 @@ export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions)
         groupInvalidated = true;
         return false;
       }
+    } else if (childClosed) {
+      // Once the child handle has closed, the captured PGID alone is no
+      // longer enough to authenticate a negative-group signal. Without a
+      // current PGID probe, fail closed rather than risking PID/PGID reuse.
+      groupInvalidated = true;
+      return false;
     }
     return true;
   }
@@ -373,51 +378,122 @@ function readWitnesses(path: string, operations: WitnessOperations): ProviderPro
   }
 }
 
+const WITNESS_VERSION = 1;
+const WITNESS_MAX_BYTES = 64 * 1024;
+const WITNESS_TOP_LEVEL_KEYS = ["daemonInstanceId", "providers", "version"] as const;
+const WITNESS_ENTRY_KEYS = ["daemonInstanceId", "pgid", "pid", "processStartTime", "providerId"] as const;
+
+function hasExactKeys(value: object, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
+}
+
+function parseWitnessDocument(value: unknown): {
+  daemonInstanceId: string;
+  providers: ProviderProcessWitness[];
+} | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (!hasExactKeys(value, WITNESS_TOP_LEVEL_KEYS)) return undefined;
+  const document = value as {
+    daemonInstanceId?: unknown;
+    providers?: unknown;
+    version?: unknown;
+  };
+  if (
+    document.version !== WITNESS_VERSION
+    || typeof document.daemonInstanceId !== "string"
+    || document.daemonInstanceId.length === 0
+    || !Array.isArray(document.providers)
+  ) return undefined;
+  const providers: ProviderProcessWitness[] = [];
+  const identities = new Set<string>();
+  for (const raw of document.providers) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || !hasExactKeys(raw, WITNESS_ENTRY_KEYS)) {
+      return undefined;
+    }
+    const entry = raw as Partial<ProviderProcessWitness>;
+    const pid = positivePid(entry.pid);
+    const pgid = entry.pgid === null ? null : positivePid(entry.pgid);
+    if (
+      typeof entry.daemonInstanceId !== "string"
+      || entry.daemonInstanceId.length === 0
+      || typeof entry.providerId !== "string"
+      || entry.providerId.length === 0
+      || pid === undefined
+      || pgid === undefined
+      || (entry.processStartTime !== null && typeof entry.processStartTime !== "string")
+      || (typeof entry.processStartTime === "string" && entry.processStartTime.length === 0)
+    ) return undefined;
+    const normalized: ProviderProcessWitness = {
+      daemonInstanceId: entry.daemonInstanceId,
+      providerId: entry.providerId,
+      pid,
+      pgid,
+      processStartTime: entry.processStartTime,
+    };
+    const identity = JSON.stringify(normalized);
+    if (identities.has(identity)) return undefined;
+    identities.add(identity);
+    providers.push(normalized);
+  }
+  return { daemonInstanceId: document.daemonInstanceId, providers };
+}
+
 /** Read the secret-free provider witness without mutating its backing file. */
 export function readProviderProcessWitnesses(options: {
   path?: string;
   daemonInstanceId?: string;
 } = {}): ProviderProcessWitnessSnapshot {
   const path = options.path ?? join(lcmHomeDir(), DEFAULT_WITNESS_FILE);
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT"
-      ? { available: true, providers: [] }
-      : { available: false, providers: [] };
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const snapshot = readBoundedRegularFileWithStat(path, {
+      allowedRoot: dirname(path),
+      maxBytes: WITNESS_MAX_BYTES,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+    });
+    const document = parseWitnessDocument(JSON.parse(snapshot.content) as unknown);
+    if (document === undefined) return { available: false, providers: [] };
+    return {
+      available: true,
+      providers: options.daemonInstanceId === undefined
+        ? document.providers
+        : document.providers.filter(entry => entry.daemonInstanceId === options.daemonInstanceId),
+    };
+  } catch {
+    // Missing, replaced, symlinked, wrong-owner, wrong-mode, and malformed
+    // evidence are all unavailable for a drain proof.
     return { available: false, providers: [] };
   }
-  const rawProviders = (parsed as { providers?: unknown }).providers;
-  if (!Array.isArray(rawProviders)) return { available: false, providers: [] };
-  const providers = readWitnesses(path, DEFAULT_WITNESS_OPERATIONS);
-  if (providers.length !== rawProviders.length) return { available: false, providers: [] };
-  return {
-    available: true,
-    providers: options.daemonInstanceId === undefined
-      ? providers
-      : providers.filter(entry => entry.daemonInstanceId === options.daemonInstanceId),
-  };
 }
 
 function writeWitnesses(path: string, daemonInstanceId: string, providers: readonly ProviderProcessWitness[], operations: WitnessOperations): void {
   const directory = dirname(path);
   const temporaryPath = join(directory, `.${DEFAULT_WITNESS_FILE}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
   const content = `${JSON.stringify({ version: 1, daemonInstanceId, providers })}\n`;
-  operations.writeFileSync(temporaryPath, content, { encoding: "utf8", mode: 0o600 });
-  operations.chmodSync(temporaryPath, 0o600);
+  let published = false;
   try {
+    operations.writeFileSync(temporaryPath, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    operations.chmodSync(temporaryPath, 0o600);
     operations.renameSync(temporaryPath, path);
-  } catch (error) {
-    try {
-      operations.unlinkSync(temporaryPath);
-    } catch {
-      // Preserve the original publication failure.
+    published = true;
+  } finally {
+    if (!published) {
+      try {
+        operations.unlinkSync(temporaryPath);
+      } catch {
+        // Preserve the original publication failure.
+      }
     }
-    throw error;
   }
+}
+
+function withWitnessMutationLock<T>(path: string, operation: () => T): T {
+  // The repository lock validates owner PID/start identity, rejects unsafe
+  // lock files, and reclaims only stale owners. A live lock is contention,
+  // never permission to perform an unlocked read-modify-write.
+  return withPrivateMutationLock(`${path}.lock`, "provider witness", operation);
 }
 
 function withWitnessPathLock(path: string, operation: WitnessUpdate): void {
@@ -463,28 +539,30 @@ export function createProviderProcessWitnessStore(options: {
 }): ProviderProcessWitnessStore {
   const path = options.path ?? join(lcmHomeDir(), DEFAULT_WITNESS_FILE);
   const operations: WitnessOperations = { ...DEFAULT_WITNESS_OPERATIONS, ...options.operations };
-  const update = (entry: ProviderProcessWitness, remove: boolean): void => withWitnessPathLock(path, () => {
-    const entries = readWitnesses(path, operations);
-    const current = entries.filter(candidate => candidate.daemonInstanceId === options.daemonInstanceId);
-    const otherDaemonEntries = entries.filter(candidate => candidate.daemonInstanceId !== options.daemonInstanceId);
-    const matches = (candidate: ProviderProcessWitness): boolean => candidate.providerId === entry.providerId
-      && candidate.pid === entry.pid
-      && candidate.pgid === entry.pgid
-      && candidate.processStartTime === entry.processStartTime;
-    const nextCurrent = remove
-      ? current.filter(candidate => !matches(candidate))
-      : [...current.filter(candidate => !matches(candidate)), entry];
-    const next = [...otherDaemonEntries, ...nextCurrent];
-    if (next.length === 0) {
-      try {
-        operations.unlinkSync(path);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") throw error;
+  const update = (entry: ProviderProcessWitness, remove: boolean): void => withWitnessPathLock(path, () =>
+    withWitnessMutationLock(path, () => {
+      const entries = readWitnesses(path, operations);
+      const current = entries.filter(candidate => candidate.daemonInstanceId === options.daemonInstanceId);
+      const otherDaemonEntries = entries.filter(candidate => candidate.daemonInstanceId !== options.daemonInstanceId);
+      const matches = (candidate: ProviderProcessWitness): boolean => candidate.providerId === entry.providerId
+        && candidate.pid === entry.pid
+        && candidate.pgid === entry.pgid
+        && candidate.processStartTime === entry.processStartTime;
+      const nextCurrent = remove
+        ? current.filter(candidate => !matches(candidate))
+        : [...current.filter(candidate => !matches(candidate)), entry];
+      const next = [...otherDaemonEntries, ...nextCurrent];
+      if (next.length === 0) {
+        try {
+          operations.unlinkSync(path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") throw error;
+        }
+        return;
       }
-      return;
-    }
-    writeWitnesses(path, options.daemonInstanceId, next, operations);
-  });
+      writeWitnesses(path, options.daemonInstanceId, next, operations);
+    }),
+  );
   return {
     path,
     add: entry => update(entry, false),

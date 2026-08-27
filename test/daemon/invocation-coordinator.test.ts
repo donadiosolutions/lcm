@@ -323,6 +323,18 @@ describe("invocation coordinator", () => {
     expect(() => coordinator.heartbeat(target(secondInvocationId))).toThrow();
     expect(() => coordinator.heartbeat({ ...target(), command: "promote" })).toThrow();
   });
+
+  it("cancels an expired lease before a delayed timer can be renewed", () => {
+    const { coordinator } = createHarness({ leaseMs: 0 });
+    coordinator.start(target());
+
+    expect(() => coordinator.heartbeat(target())).toThrow(/expired|cancel/i);
+    expect(coordinator.snapshot(invocationId)).toMatchObject({
+      state: "cancelled",
+      activeCount: 0,
+      leaseExpiresAt: null,
+    });
+  });
 });
 
 void (undefined as unknown as InvocationCoordinator);

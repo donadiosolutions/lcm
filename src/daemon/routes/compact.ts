@@ -307,6 +307,7 @@ export function createCompactHandler(
     let invocationTarget: InvocationTarget | undefined;
     let invocationSignalCleanup: (() => void) | undefined;
     let detachInvocationCancellation: (() => void) | undefined;
+    let invocationCancellation: Promise<unknown> | undefined;
     let signal = context?.signal;
     try {
       parsed = JSON.parse(body || "{}");
@@ -435,7 +436,7 @@ export function createCompactHandler(
       // aborts this route when a control request or lease expiry cancels it.
       if (context?.signal !== undefined) {
         const onRequestCancellation = (): void => {
-          void coordinator!.cancel(invocationTarget!).catch(() => undefined);
+          invocationCancellation ??= coordinator!.cancel(invocationTarget!).catch(() => undefined);
         };
         context.signal.addEventListener("abort", onRequestCancellation, { once: true });
         detachInvocationCancellation = () => context.signal?.removeEventListener("abort", onRequestCancellation);
@@ -603,6 +604,10 @@ export function createCompactHandler(
         await closeOpenedProject();
         await closeRouteStorage(undefined, ownedFactory);
         releaseInvocation();
+        if (invocationTarget !== undefined && coordinator !== undefined && invocationCancellation === undefined) {
+          invocationCancellation = coordinator.cancel(invocationTarget).catch(() => undefined);
+        }
+        if (invocationCancellation !== undefined) await invocationCancellation;
       }
       return;
     }
@@ -850,6 +855,7 @@ export function createCompactHandler(
       await closeRouteStorage(undefined, ownedFactory);
       compactingNow.delete(session_id);
       releaseInvocation();
+      if (invocationCancellation !== undefined) await invocationCancellation;
     }
   };
 }

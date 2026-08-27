@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,7 @@ import {
   createProviderProcessWitnessStore,
   readProviderProcessWitnesses,
 } from "../../src/llm/process-utils.js";
+import { PrivateMutationLockContentionError, withPrivateMutationLock } from "../../src/private-mutation-lock.js";
 
 type Child = EventEmitter & {
   pid?: number;
@@ -142,7 +143,7 @@ describe("owned process lifecycle utilities", () => {
     }
   });
 
-  it("uses the captured identity to clean a live group after child reaping", async () => {
+  it("does not clean a live group after child reaping without current identity", async () => {
     vi.useFakeTimers();
     try {
       const processChild = child(7462);
@@ -163,9 +164,96 @@ describe("owned process lifecycle utilities", () => {
       processChild.emit("close");
       birth = null;
       const pending = teardown.terminate("close");
-      expect(killProcess).toHaveBeenCalledWith(-7462, "SIGTERM");
-      await vi.advanceTimersByTimeAsync(2_000);
-      expect(killProcess).toHaveBeenCalledWith(-7462, "SIGKILL");
+      expect(killProcess).not.toHaveBeenCalledWith(-7462, expect.anything());
+      groupAlive = false;
+      await vi.advanceTimersByTimeAsync(20);
+      await expect(pending).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never signals a live group after child close when birth identity is unavailable", async () => {
+    vi.useFakeTimers();
+    try {
+      const processChild = child(7472);
+      let birth: string | null = "birth-7472";
+      let groupAlive = true;
+      const killProcess = vi.fn();
+      const teardown = createOwnedProcessTeardown({
+        child: processChild,
+        platform: "linux",
+        processGroupId: 7472,
+        daemonProcessGroupId: 7471,
+        processBirthTime: () => birth,
+        processGroupIdProbe: () => 7472,
+        killProcess,
+        isProcessGroupAlive: () => groupAlive,
+      });
+
+      processChild.emit("close");
+      birth = null;
+      const pending = teardown.terminate("close");
+      expect(killProcess).not.toHaveBeenCalledWith(-7472, expect.anything());
+      groupAlive = false;
+      await vi.advanceTimersByTimeAsync(20);
+      await expect(pending).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never signals a live group after child close when its PGID changes", async () => {
+    vi.useFakeTimers();
+    try {
+      const processChild = child(7482);
+      let observedGroup = 7482;
+      let groupAlive = true;
+      const killProcess = vi.fn();
+      const teardown = createOwnedProcessTeardown({
+        child: processChild,
+        platform: "linux",
+        processGroupId: 7482,
+        daemonProcessGroupId: 7481,
+        processBirthTime: () => "birth-7482",
+        processGroupIdProbe: () => observedGroup,
+        killProcess,
+        isProcessGroupAlive: () => groupAlive,
+      });
+
+      processChild.emit("close");
+      observedGroup = 9999;
+      const pending = teardown.terminate("close");
+      expect(killProcess).not.toHaveBeenCalledWith(-7482, expect.anything());
+      groupAlive = false;
+      await vi.advanceTimersByTimeAsync(20);
+      await expect(pending).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never signals a live group after child close without a current PGID probe", async () => {
+    vi.useFakeTimers();
+    try {
+      const processChild = child(7492);
+      let groupAlive = true;
+      const killProcess = vi.fn();
+      const teardown = createOwnedProcessTeardown({
+        child: processChild,
+        platform: "linux",
+        processGroupId: 7492,
+        daemonProcessGroupId: 7491,
+        processBirthTime: () => "birth-7492",
+        killProcess,
+        isProcessGroupAlive: () => groupAlive,
+      });
+
+      processChild.emit("close");
+      const pending = teardown.terminate("close");
+      expect(killProcess).not.toHaveBeenCalledWith(-7492, expect.anything());
+      groupAlive = false;
+      await vi.advanceTimersByTimeAsync(20);
       await expect(pending).resolves.toBe(true);
     } finally {
       vi.useRealTimers();
@@ -469,9 +557,122 @@ describe("owned process lifecycle utilities", () => {
       providers: [],
     });
     store.remove(entry);
-    expect(readProviderProcessWitnesses({ path })).toMatchObject({ available: true, providers: [] });
+    expect(readProviderProcessWitnesses({ path })).toMatchObject({ available: false, providers: [] });
     writeFileSync(path, "not-json", { mode: 0o600 });
     expect(readProviderProcessWitnesses({ path })).toMatchObject({ available: false, providers: [] });
+  });
+
+  it("treats a missing provider witness as unavailable proof", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-missing-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+
+    expect(readProviderProcessWitnesses({ path })).toEqual({
+      available: false,
+      providers: [],
+    });
+  });
+
+  it.each([
+    ["symlink", (root: string, path: string) => {
+      const target = join(root, "target.json");
+      writeFileSync(target, JSON.stringify({ version: 1, daemonInstanceId: "daemon-a", providers: [] }), { mode: 0o600 });
+      const linkTarget = join(root, "link-target.json");
+      renameSync(target, linkTarget);
+      symlinkSync(linkTarget, path);
+    }],
+    ["world-readable mode", (_root: string, path: string) => {
+      writeFileSync(path, JSON.stringify({ version: 1, daemonInstanceId: "daemon-a", providers: [] }), { mode: 0o644 });
+      chmodSync(path, 0o644);
+    }],
+    ["unsupported version", (_root: string, path: string) => {
+      writeFileSync(path, JSON.stringify({ version: 2, daemonInstanceId: "daemon-a", providers: [] }), { mode: 0o600 });
+    }],
+  ])("fails closed for an unsafe witness (%s)", (_label, setup) => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-unsafe-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    setup(root, path);
+    expect(readProviderProcessWitnesses({ path })).toEqual({
+      available: false,
+      providers: [],
+    });
+  });
+
+  it.each([
+    ["top-level null", null],
+    ["top-level array", []],
+    ["missing top-level key", { version: 1, daemonInstanceId: "daemon-a" }],
+    ["non-array providers", { version: 1, daemonInstanceId: "daemon-a", providers: "invalid" }],
+    ["empty top-level identity", { version: 1, daemonInstanceId: "", providers: [] }],
+    ["null provider entry", { version: 1, daemonInstanceId: "daemon-a", providers: [null] }],
+    ["array provider entry", { version: 1, daemonInstanceId: "daemon-a", providers: [[]] }],
+    ["extra provider field", {
+      version: 1,
+      daemonInstanceId: "daemon-a",
+      providers: [{ daemonInstanceId: "daemon-a", providerId: "claude-process", pid: 1, pgid: null, processStartTime: null, extra: true }],
+    }],
+    ["empty provider identity", {
+      version: 1,
+      daemonInstanceId: "daemon-a",
+      providers: [{ daemonInstanceId: "", providerId: "claude-process", pid: 1, pgid: null, processStartTime: null }],
+    }],
+    ["non-string provider identity", {
+      version: 1,
+      daemonInstanceId: "daemon-a",
+      providers: [{ daemonInstanceId: 1, providerId: "claude-process", pid: 1, pgid: null, processStartTime: null }],
+    }],
+    ["empty provider id", {
+      version: 1,
+      daemonInstanceId: "daemon-a",
+      providers: [{ daemonInstanceId: "daemon-a", providerId: "", pid: 1, pgid: null, processStartTime: null }],
+    }],
+    ["non-string provider id", {
+      version: 1,
+      daemonInstanceId: "daemon-a",
+      providers: [{ daemonInstanceId: "daemon-a", providerId: 1, pid: 1, pgid: null, processStartTime: null }],
+    }],
+    ["invalid pid", {
+      version: 1,
+      daemonInstanceId: "daemon-a",
+      providers: [{ daemonInstanceId: "daemon-a", providerId: "claude-process", pid: 0, pgid: null, processStartTime: null }],
+    }],
+    ["invalid pgid", {
+      version: 1,
+      daemonInstanceId: "daemon-a",
+      providers: [{ daemonInstanceId: "daemon-a", providerId: "claude-process", pid: 1, pgid: 0, processStartTime: null }],
+    }],
+    ["non-string process birth", {
+      version: 1,
+      daemonInstanceId: "daemon-a",
+      providers: [{ daemonInstanceId: "daemon-a", providerId: "claude-process", pid: 1, pgid: null, processStartTime: 1 }],
+    }],
+    ["empty process birth", {
+      version: 1,
+      daemonInstanceId: "daemon-a",
+      providers: [{ daemonInstanceId: "daemon-a", providerId: "claude-process", pid: 1, pgid: null, processStartTime: "" }],
+    }],
+  ])("rejects malformed witness document (%s)", (_label, value) => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-malformed-document-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+    expect(readProviderProcessWitnesses({ path })).toEqual({ available: false, providers: [] });
+  });
+
+  it("rejects duplicate provider identities in a witness snapshot", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-duplicate-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const entry = {
+      daemonInstanceId: "daemon-a",
+      providerId: "claude-process",
+      pid: 19,
+      pgid: null,
+      processStartTime: null,
+    };
+    writeFileSync(path, JSON.stringify({ version: 1, daemonInstanceId: "daemon-a", providers: [entry, entry] }), { mode: 0o600 });
+    expect(readProviderProcessWitnesses({ path })).toEqual({ available: false, providers: [] });
   });
 
   it("retains another daemon witness while removing only the matching entry", () => {
@@ -782,5 +983,24 @@ describe("owned process lifecycle utilities", () => {
       pgid: null,
       processStartTime: null,
     })).toThrow(error);
+  });
+
+  it("fails closed when another live writer owns the witness mutation lock", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-lock-contention-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const store = createProviderProcessWitnessStore({ daemonInstanceId: "daemon-a", path });
+    const entry = {
+      daemonInstanceId: "daemon-a",
+      providerId: "claude-process",
+      pid: 20,
+      pgid: null,
+      processStartTime: null,
+    } as const;
+
+    withPrivateMutationLock(`${path}.lock`, "test witness", () => {
+      expect(() => store.add(entry)).toThrow(PrivateMutationLockContentionError);
+    });
+    expect(() => readFileSync(path)).toThrow();
   });
 });

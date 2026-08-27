@@ -37,6 +37,7 @@ export function enqueue<T>(projectId: string, fn: () => Promise<T>, signal?: Abo
   const run = async (): Promise<void> => {
     try {
       if (canceled || signal?.aborted) {
+        signal?.removeEventListener("abort", onAbort);
         rejectResult(createAbortError(signal?.reason));
         return;
       }

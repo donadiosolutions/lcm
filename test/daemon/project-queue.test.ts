@@ -212,4 +212,23 @@ describe("enqueue", () => {
     expect(entered).toBe(false);
     await expect(enqueue("proj-claim-abort", async () => "next")).resolves.toBe("next");
   });
+
+  it("removes the abort listener when cancellation wins before callback entry", async () => {
+    let listener!: () => void;
+    let removed = 0;
+    const signal = {
+      aborted: false,
+      reason: undefined,
+      addEventListener: (_type: string, callback: () => void) => { listener = callback; },
+      removeEventListener: (_type: string, callback: () => void) => {
+        if (callback === listener) removed += 1;
+      },
+    } as unknown as AbortSignal;
+    const operation = enqueue("proj-claim-listener-cleanup", async () => "unexpected", signal);
+    signal.aborted = true;
+    listener();
+
+    await expect(operation).rejects.toSatisfy(error => isAbortError(error));
+    expect(removed).toBeGreaterThan(0);
+  });
 });
