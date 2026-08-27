@@ -87,6 +87,8 @@ const expectedComponents = [
       "^src/daemon/config\\.ts$",
       "^src/daemon/content-fence\\.ts$",
       "^src/daemon/http-url\\.ts$",
+      "^src/daemon/invocation-coordinator\\.ts$",
+      "^src/daemon/cancellation\\.ts$",
       "^src/daemon/orientation\\.ts$",
       "^src/daemon/project-queue\\.ts$",
       "^src/daemon/project\\.ts$",
@@ -447,7 +449,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(202);
+    expect(productionFiles).toHaveLength(205);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -477,7 +479,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(202);
+    expect(ownershipCounts.size).toBe(205);
   });
 
   test("keeps response-fence and #726/#737 diagnostic files in their intended components", () => {

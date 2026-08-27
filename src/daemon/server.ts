@@ -43,6 +43,11 @@ import {
 import { createStatsHandler } from "./routes/stats.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
+import { createInvocationControlHandler } from "./routes/invocation-control.js";
+import {
+  createInvocationCoordinator,
+  type InvocationCoordinator,
+} from "./invocation-coordinator.js";
 import { PKG_VERSION, RUNTIME_DIGEST } from "./version.js";
 import { normalizeDaemonPort, normalizeIdleTimeoutMs } from "./http-url.js";
 import {
@@ -95,6 +100,10 @@ type RegisteredRoute = Readonly<{
 }>;
 export type DaemonInstance = {
   address: () => AddressInfo;
+  /** Stable UUID for this daemon process generation. */
+  daemonInstanceId: string;
+  /** Coordinator exposed for invocation-aware callers and lifecycle tests. */
+  invocationCoordinator: InvocationCoordinator;
   stop: () => Promise<void>;
   /**
    * Runtime overrides inherit a built-in route's admission classification.
@@ -128,6 +137,8 @@ export type DaemonOptions = {
   _createStorageBackendFactory?: typeof createStorageBackendFactory;
   /** @internal Deterministic config-snapshot seam for daemon read-admission tests. */
   _readDaemonConfigSnapshot?: typeof readDaemonConfigSnapshot;
+  /** @internal Deterministic daemon UUID seam for invocation-control tests. */
+  _daemonInstanceId?: string;
   /** Canonical daemon config path used for request-time publication admission. */
   publicationConfigPath?: string;
   /** @internal Test-only publication admission seam. */
@@ -575,6 +586,9 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       { lockToken: retainedToken },
     );
   };
+  const invocationCoordinator = createInvocationCoordinator({
+    daemonInstanceId: options?._daemonInstanceId,
+  });
   const createFactory = options?._createStorageBackendFactory ?? createStorageBackendFactory;
   let storageFactory: StorageBackendFactory;
   try {
@@ -587,6 +601,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     );
   } catch (error) {
     shutdownController.abort();
+    await settleCleanup(() => invocationCoordinator.shutdown());
     throw error;
   }
   const sqliteStorage = config.storage.backend === "sqlite";
@@ -654,6 +669,9 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       pid: process.pid,
       entrypoint: daemonEntrypoint,
       ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
+      ...(serverToken && req.headers.authorization !== undefined
+        ? { daemonInstanceId: invocationCoordinator.daemonInstanceId }
+        : {}),
       ...(serverToken && req.headers.authorization !== undefined && runtimeDigest
         ? { runtimeDigest }
         : {}),
@@ -761,6 +779,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     createReviewStaleHandler(config, storageFactory),
     "mutating",
     "operation-scoped",
+  );
+  registerBuiltInRoute(
+    "POST",
+    "/invocation-control",
+    createInvocationControlHandler(invocationCoordinator),
+    "read",
   );
   // Status handler is registered after listen() when we know the actual port
   const projectMapWatcher = watchProjectMap();
@@ -875,6 +899,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       // into authenticated diagnostics and therefore must fail closed.
       const rawAuth = req.headers["authorization"];
       const publicHealth = serverToken !== null && key === "GET /health" && rawAuth === undefined;
+      if (key === "POST /invocation-control" && serverToken === null) {
+        sendJsonIfWritable(res, 401, { error: "unauthorized" });
+        return;
+      }
       if (serverToken) {
         const authHeader = (Array.isArray(rawAuth) ? rawAuth[0] : rawAuth) ?? "";
         if (!publicHealth && authHeader.trim() !== `Bearer ${serverToken}`) {
@@ -978,6 +1006,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const cleanupStartupFailure = async (): Promise<void> => {
     startupCleanupStarted = true;
     shutdownController.abort();
+    await settleCleanup(() => invocationCoordinator.shutdown());
     await settleCleanup(() => clearInterval(ingestInterval));
     await settleCleanup(() => activeIngestScan);
     await settleCleanup(() => projectMapWatcher.close());
@@ -1020,8 +1049,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
 
       resolve({
         address: () => addr,
+        daemonInstanceId: invocationCoordinator.daemonInstanceId,
+        invocationCoordinator,
         stop: async () => {
           shutdownController.abort();
+          await settleCleanup(() => invocationCoordinator.shutdown());
           const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
           await settleCleanup(() => clearInterval(ingestInterval));
           await settleCleanup(() => activeIngestScan);
@@ -1055,6 +1087,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   } catch (error) {
     if (startupCleanupStarted) throw error;
     shutdownController.abort();
+    await settleCleanup(() => invocationCoordinator.shutdown());
     if (constructedIngestInterval) {
       const ingestInterval = constructedIngestInterval;
       await settleCleanup(() => clearInterval(ingestInterval));

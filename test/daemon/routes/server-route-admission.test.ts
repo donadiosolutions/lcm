@@ -53,6 +53,7 @@ const EXPECTED_BUILT_IN_ROUTE_ADMISSIONS: readonly [string, RouteAdmission, "ret
   ["GET /stats", "read", "retained"],
   ["GET /stats/pool", "read", "retained"],
   ["POST /review-stale", "mutating", "operation-scoped"],
+  ["POST /invocation-control", "read", "retained"],
   ["POST /status", "read", "retained"],
 ];
 

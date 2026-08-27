@@ -56,8 +56,14 @@ describe("mocked daemon HTTP response metadata", () => {
       "fetch failed: secret=/private/credential",
       "fetch failed".repeat(100),
     ]) {
-      expect(isDaemonTransportFailure(new TypeError(message)), message).toBe(false);
+    expect(isDaemonTransportFailure(new TypeError(message)), message).toBe(false);
     }
+
+    expect(isDaemonTransportFailure(Object.assign(new Error("cancelled"), {
+      name: "AbortError",
+      code: "ECONNRESET",
+    }))).toBe(false);
+    expect(isDaemonTransportFailure(new Error("Daemon request timed out"))).toBe(true);
 
     const codedCause = new TypeError("programming failure", {
       cause: Object.assign(new Error("broken pipe"), { code: "EPIPE" }),
