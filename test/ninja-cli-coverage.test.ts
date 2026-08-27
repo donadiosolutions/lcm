@@ -52,6 +52,27 @@ describe("renderFrame coverage boundaries", () => {
     );
   });
 
+  it("sanitizes completed-session and provider text in every frame mode", () => {
+    const state = completedState({
+      current: undefined,
+      lastResult: {
+        sessionId: "ses\u001b[31m\nsion",
+        messages: 1,
+        tokensBefore: 10,
+        tokensAfter: 5,
+        provider: "pro\u001b]8;;https://invalid\u0007vider",
+        elapsed: 1,
+      },
+    });
+    for (const renderOpts of [opts({ isTTY: false }), opts({ verbose: true }), opts()]) {
+      const output = renderFrame(state, renderOpts, 0);
+      expect(output).toContain("ses sion");
+      expect(output).toContain("provider");
+      expect(output).not.toContain("\u001b");
+      expect(output).not.toContain("https://invalid");
+    }
+  });
+
   it.each([
     [10, "\u001b[32m10.0×\u001b[0m", "green"],
     [5, "\u001b[33m5.0×\u001b[0m", "yellow"],
@@ -153,10 +174,10 @@ describe("printSummary", () => {
       phases: [{ name: "Import", status: "done" }, { name: "Compact", status: "done" }],
       total: 3,
       completed: 2,
-      errors: [{ sessionId: "broken", message: "network failed" }],
+      errors: [{ sessionId: "bro\u001b[31m\nken", message: "network\u001b]8;;https://invalid\u0007 failed" }],
       phaseErrors: [
         { phase: "Promote", message: "daemon unavailable" },
-        { phase: "Promote", target: "/project", message: "request failed" },
+        { phase: "Pro\u001b[31m\nmote", target: "/pro\u001b[31m\nject", message: "request\nfailed" },
       ],
       messagesIn: 1_234,
       tokensIn: 1_000_000,
@@ -175,9 +196,11 @@ describe("printSummary", () => {
     expect(output).toContain("Total time    2.5s");
     expect(output).toContain("Failed        1");
     expect(output).toContain("Phase failed  2");
-    expect(output).toContain("broken: network failed");
+    expect(output).toContain("bro ken: network failed");
     expect(output).toContain("Promote: daemon unavailable");
-    expect(output).toContain("Promote (/project): request failed");
+    expect(output).toContain("Pro mote (/pro ject): request failed");
+    expect(output).not.toContain("\u001b");
+    expect(output).not.toContain("https://invalid");
   });
 
   it("prints an empty narrow summary with a 100 percent default", () => {

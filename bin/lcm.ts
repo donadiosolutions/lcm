@@ -2488,7 +2488,8 @@ export async function runCli(
               signal: signalHandlers.signal,
               onHeartbeatError: (error) => {
                 invocationControlFailures += 1;
-                console.error(`  compact heartbeat failed: ${error instanceof Error ? error.message : "request failed"}`);
+                const message = error instanceof Error ? error.message : "request failed";
+                console.error(`  compact heartbeat failed: ${sanitizeTerminalText(message)}`);
                 signalHandlers.beginDrain("daemon heartbeat failed");
               },
             });
@@ -2513,7 +2514,8 @@ export async function runCli(
             ...(invocationLifecycle ? { invocationId: invocationLifecycle.invocationId } : {}),
             signal: signalHandlers.signal,
             onTransportFailure: (error: unknown): void => {
-              console.error(`  compact transport disconnected: ${error instanceof Error ? error.message : "request failed"}`);
+              const message = error instanceof Error ? error.message : "request failed";
+              console.error(`  compact transport disconnected: ${sanitizeTerminalText(message)}`);
               signalHandlers.beginDrain("daemon transport disconnected");
             },
             onProgress: (patch: Partial<ProgressState>): void => {
@@ -2530,8 +2532,8 @@ export async function runCli(
             compactState.phases[1]!.status = "active";
             for (const promoteCwd of compactedProjects) {
               if (signalHandlers.draining) break;
-              compactState.currentProject = promoteCwd;
-              if (!isTTY || verbose) console.log(`  promoting: ${promoteCwd}...`);
+              compactState.currentProject = sanitizeTerminalText(promoteCwd);
+              if (!isTTY || verbose) console.log(`  promoting: ${sanitizeTerminalText(promoteCwd)}...`);
               try {
                 const promotionBody = {
                   cwd: promoteCwd,
@@ -2569,7 +2571,11 @@ export async function runCli(
               } catch (error) {
                 promotionFailures++;
                 const message = error instanceof Error ? error.message : "request failed";
-                compactState.phaseErrors.push({ phase: "Promote", target: promoteCwd, message });
+                compactState.phaseErrors.push({
+                  phase: "Promote",
+                  target: sanitizeTerminalText(promoteCwd),
+                  message: sanitizeTerminalText(message),
+                });
                 console.error(
                   `  promotion failed for ${sanitizeTerminalText(promoteCwd)}: ${sanitizeTerminalText(message)}`,
                 );
@@ -2601,7 +2607,8 @@ export async function runCli(
             phase: "Compact",
             message: error instanceof Error ? error.message : "compact work failed",
           });
-          console.error(`  compact failed while draining: ${error instanceof Error ? error.message : "request failed"}`);
+          const message = error instanceof Error ? error.message : "request failed";
+          console.error(`  compact failed while draining: ${sanitizeTerminalText(message)}`);
         }
         if (invocationLifecycle && !signalHandlers.draining) {
           try {
@@ -3776,7 +3783,9 @@ export async function runCli(
           if (verbose) {
             process.stdout.write("\r");
             const convLabel = result.conversations !== undefined ? `, ${result.conversations} conversation${result.conversations !== 1 ? "s" : ""}` : "";
-            console.log(`  ${cwd}: ${result.processed} scanned${convLabel}, ${result.promoted} promoted`);
+            console.log(
+              `  ${sanitizeTerminalText(cwd)}: ${result.processed} scanned${convLabel}, ${result.promoted} promoted`,
+            );
           }
         } catch (err) {
           if (verbose) {
