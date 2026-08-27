@@ -2121,23 +2121,32 @@ export async function runCli(
           { name: "Compact", status: "active" },
           ...(!noPromote ? [{ name: "Promote", status: "pending" } as const] : []),
         ], dryRun });
-        const compactRenderer = new NinjaRenderer({ state: compactState, renderOpts });
+        const compactRenderer = new NinjaRenderer({ state: compactState, renderOpts, handleSignals: false });
         signalHandlers.bindRenderer(compactState);
         compactRenderer.start();
         try {
           if (!dryRun && !signalHandlers.draining) {
           const daemonHealth = await client.health({ signal: signalHandlers.signal });
-          if (daemonHealth !== null
-            && typeof daemonHealth === "object"
-            && typeof daemonHealth.daemonInstanceId === "string"
-            && typeof client.startInvocation === "function"
+          const supportsInvocationControl = typeof client.startInvocation === "function"
             && typeof client.heartbeatInvocation === "function"
             && typeof client.cancelInvocation === "function"
-            && typeof client.finishInvocation === "function") {
+            && typeof client.finishInvocation === "function";
+          const hasInvocationIdentity = daemonHealth !== null
+            && typeof daemonHealth === "object"
+            && typeof daemonHealth.daemonInstanceId === "string";
+          if (!supportsInvocationControl || !hasInvocationIdentity) {
+            // Structural fakes and direct legacy callers may omit invocation
+            // control entirely; a real DaemonClient must fail closed when its
+            // authenticated health response cannot bind this command.
+            const legacyClient = (daemonHealth as unknown) === true;
+            if (!legacyClient) {
+              throw new Error("manual compact requires authenticated daemon invocation identity and control support");
+            }
+          } else {
             originalDaemonHealth = daemonHealth;
             invocationLifecycle = createCompactInvocationLifecycle({
               client,
-              daemonInstanceId: daemonHealth.daemonInstanceId,
+              daemonInstanceId: (daemonHealth as { daemonInstanceId: string }).daemonInstanceId,
               signal: signalHandlers.signal,
               onHeartbeatError: (error) => {
                 invocationControlFailures += 1;
@@ -2225,7 +2234,12 @@ export async function runCli(
 
         if (signalHandlers.draining) {
           resolveWorkReady();
-          process.exitCode = signalHandlers.status;
+          if (signalHandlers.drainPromise !== undefined) {
+            await signalHandlers.drainPromise.catch(() => undefined);
+          }
+          const drainProved = drainResult === undefined
+            || (drainResult.daemonZero && drainResult.localSettled);
+          process.exitCode = drainProved ? signalHandlers.status : undefined;
           return;
         }
         localWorkPromise = runCompactWork();

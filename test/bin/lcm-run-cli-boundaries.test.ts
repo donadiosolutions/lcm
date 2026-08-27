@@ -82,6 +82,7 @@ const state = vi.hoisted(() => ({
   importResult: { imported: 1, skipped: 0 },
   importPatch: { lastResult: { ok: true } } as Record<string, unknown>,
   renderer: { start: vi.fn(), stop: vi.fn(), sessionDone: vi.fn(), printSummary: vi.fn() },
+  rendererOptions: undefined as unknown,
   progressState: undefined as undefined | Record<string, unknown>,
   writeFile: vi.fn(), unlink: vi.fn(), mkdir: vi.fn(),
   dispatchHook: vi.fn(async () => ({ stdout: "", exitCode: 0 })),
@@ -179,6 +180,7 @@ vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((va
   return progressState;
 }) }));
 vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
+  constructor(options: unknown) { state.rendererOptions = options; }
   start = state.renderer.start; stop = state.renderer.stop;
   sessionDone = state.renderer.sessionDone; printSummary = state.renderer.printSummary;
 } }));
@@ -273,6 +275,7 @@ beforeEach(() => {
   state.batchOptions = undefined;
   state.batchPatch = { lastResult: { ok: true } };
   state.importPatch = { lastResult: { ok: true } };
+  state.rendererOptions = undefined;
   state.health.mockResolvedValue(true);
   state.startInvocation.mockClear();
   state.heartbeatInvocation.mockClear();
@@ -809,6 +812,55 @@ describe("runCli scanning and portable knowledge boundaries", () => {
       dry_run: false,
       invocation_id: target.invocationId,
     }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("disables renderer-owned process signals for compact lifecycle control", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.rendererOptions).toMatchObject({ handleSignals: false });
+  });
+
+  it("fails closed when a live manual daemon cannot provide invocation identity", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+    });
+
+    const result = await invoke(["compact", "--no-promote"]);
+    expect(result).toBeInstanceOf(Error);
+    expect((result as Error).message).toMatch(/invocation control|identity/i);
+    expect(state.batchOptions).toBeUndefined();
+    expect(state.startInvocation).not.toHaveBeenCalled();
+  });
+
+  it("drains a signal that arrives during invocation start before returning", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.startInvocation.mockImplementationOnce(async (target: unknown) => {
+      process.emit("SIGINT");
+      return { ...target as object, state: "active", activeCount: 0 };
+    });
+    let release!: () => void;
+    state.cancelInvocation.mockImplementationOnce(() => new Promise(resolve => { release = () => resolve({ state: "cancelling", activeCount: 0 }); }));
+
+    let settled = false;
+    const pending = invoke(["compact", "--no-promote"]).then(result => { settled = true; return result; });
+    await vi.waitFor(() => expect(state.cancelInvocation).toHaveBeenCalledOnce());
+    expect(settled).toBe(false);
+    release();
+    await expect(pending).resolves.toBeUndefined();
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(130);
   });
 
   it("cancels the invocation after SIGINT and preserves the 130 status", async () => {
