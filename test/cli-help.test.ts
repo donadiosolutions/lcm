@@ -74,6 +74,8 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("lcm compact --all --max-concurrency 4");
     expect(text).toContain("llm.maxConcurrency defaults to 1");
     expect(text).toContain("--replay clamps stored concurrency to 1");
+    expect(text).toContain("SIGINT exits 130 and SIGTERM exits 143 only after local and daemon-owned work drains");
+    expect(text).toContain("promotion remains sequential and deterministic");
     expect(text).toContain("--dry-run validates configuration and discovery without starting the daemon");
     expect(text).toContain("Retry flags remain OpenAI-compatible-only");
     expect(text).toContain("Examples:");
