@@ -8,6 +8,7 @@ import {
   drainCompactInvocationUntilProved,
   installCompactSignalHandlers,
   isStrictInvocationControlSnapshot,
+  proveCompactProviderWitnessGone,
 } from "../../bin/lcm.js";
 
 const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
@@ -27,6 +28,28 @@ function response(state: InvocationControlResponse["state"], activeCount = 0): I
 }
 
 describe("compact invocation lifecycle", () => {
+  it("selects read-only or reconciled provider witness proof by observed state", () => {
+    const read = vi.fn();
+    const reconcile = vi.fn();
+
+    read.mockReturnValueOnce({ available: false, providers: [] });
+    expect(proveCompactProviderWitnessGone({ daemonInstanceId }, { read, reconcile })).toBe(false);
+    expect(reconcile).not.toHaveBeenCalled();
+
+    read.mockReturnValueOnce({ available: true, providers: [] });
+    expect(proveCompactProviderWitnessGone({ daemonInstanceId }, { read, reconcile })).toBe(true);
+
+    read.mockReturnValueOnce({ available: true, providers: [{}] });
+    reconcile.mockReturnValueOnce({ available: true, providers: [] });
+    expect(proveCompactProviderWitnessGone({ daemonInstanceId, invocationId }, { read, reconcile })).toBe(true);
+    expect(reconcile).toHaveBeenLastCalledWith({ daemonInstanceId, invocationId });
+
+    read.mockReturnValueOnce({ available: true, providers: [{}] });
+    reconcile.mockReturnValueOnce({ available: true, providers: [{}] });
+    expect(proveCompactProviderWitnessGone({ daemonInstanceId }, { read, reconcile })).toBe(false);
+    expect(reconcile).toHaveBeenLastCalledWith({ daemonInstanceId });
+  });
+
   it("returns a proved drain when no invocation was registered", async () => {
     const lifecycle = {
       started: () => false,
@@ -585,6 +608,158 @@ describe("compact invocation lifecycle", () => {
     expect(proveProviderWitnessGone).toHaveBeenCalledWith({ daemonInstanceId });
   });
 
+  it("retains a timed-out restart promise and proves its later replacement", async () => {
+    const oldHealth = {
+      status: "healthy" as const,
+      version: "1.4.2",
+      storageBackend: "sqlite" as const,
+      daemonInstanceId,
+      pid: 9,
+      uptime: 1,
+    };
+    const replacementHealth = {
+      ...oldHealth,
+      daemonInstanceId: "33333333-3333-4333-8333-333333333333",
+      pid: 10,
+    };
+    let resolveRestart!: (value: CompactManagedRestartResult) => void;
+    const restartPromise = new Promise<CompactManagedRestartResult>(resolve => {
+      resolveRestart = resolve;
+    });
+    const restart = vi.fn(async () => await restartPromise);
+    const cancelInvocation = vi.fn(async () => response("cancelling", 1));
+    const health = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue(replacementHealth);
+    const lifecycle = {
+      started: () => true,
+      stopHeartbeat: vi.fn(),
+      target: { invocationId, command: "compact" as const, daemonInstanceId },
+    } as never;
+    const session = { restartAttempted: false };
+
+    const first = await cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation, health }),
+      originalHealth: oldHealth,
+      health,
+      restart,
+      proveOldInstanceGone: async () => true,
+      proveProviderWitnessGone: async () => true,
+      awaitLocalWork: async () => undefined,
+      session,
+      timeoutMs: 5,
+    });
+    expect(first).toMatchObject({ daemonZero: false, restartAttempted: true });
+    expect(session.restartPromise).toBeInstanceOf(Promise);
+
+    resolveRestart({ connected: true, restarted: true, stoppedPid: 9, pid: 10 });
+    await expect(cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation, health }),
+      originalHealth: oldHealth,
+      health,
+      restart,
+      proveOldInstanceGone: async () => true,
+      proveProviderWitnessGone: async () => true,
+      awaitLocalWork: async () => undefined,
+      session,
+      timeoutMs: 100,
+    })).resolves.toMatchObject({
+      daemonZero: true,
+      restartAttempted: true,
+      replacementVerified: true,
+    });
+    expect(restart).toHaveBeenCalledOnce();
+  });
+
+  it("keeps pending restart sessions fail closed and releases terminal failures", async () => {
+    const oldHealth = {
+      status: "healthy" as const,
+      version: "1.4.2",
+      storageBackend: "sqlite" as const,
+      daemonInstanceId,
+      pid: 9,
+      uptime: 1,
+    };
+    const lifecycle = {
+      started: () => true,
+      stopHeartbeat: vi.fn(),
+      target: { invocationId, command: "compact" as const, daemonInstanceId },
+    } as never;
+    const cancelInvocation = vi.fn(async () => response("cancelling", 1));
+    const base = {
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation, health: async () => null }),
+      originalHealth: oldHealth,
+      health: async () => null,
+      proveOldInstanceGone: async () => false,
+      proveProviderWitnessGone: async () => false,
+      awaitLocalWork: async () => undefined,
+      timeoutMs: 5,
+    } as const;
+
+    const never = new Promise<CompactManagedRestartResult>(() => undefined);
+    const pendingSession = { restartAttempted: true, restartPromise: never };
+    await expect(cancelAndDrainCompactInvocation({ ...base, session: pendingSession }))
+      .resolves.toMatchObject({ daemonZero: false, restartAttempted: true });
+    expect(pendingSession.restartPromise).toBe(never);
+
+    const failedSession = {
+      restartAttempted: true,
+      restartPromise: Promise.reject(new Error("restart failed later")),
+    };
+    await expect(cancelAndDrainCompactInvocation({ ...base, session: failedSession }))
+      .resolves.toMatchObject({ daemonZero: false, diagnostic: "restart failed later" });
+    expect(failedSession).toMatchObject({ restartAttempted: false, restartPromise: undefined });
+
+    const primitiveSession = {
+      restartAttempted: true,
+      restartPromise: Promise.reject("primitive restart failure"),
+    };
+    await expect(cancelAndDrainCompactInvocation({ ...base, session: primitiveSession }))
+      .resolves.toMatchObject({ daemonZero: false, diagnostic: "managed daemon restart was not verified" });
+
+    const unprovedSession = {
+      restartAttempted: true,
+      restartPromise: Promise.resolve({ connected: true, restarted: true, stoppedPid: 9, pid: 10 }),
+    };
+    await expect(cancelAndDrainCompactInvocation({ ...base, session: unprovedSession }))
+      .resolves.toMatchObject({ daemonZero: false, replacementVerified: false });
+    expect(unprovedSession).toHaveProperty("restart");
+
+    const existingSession = {
+      restartAttempted: true,
+      restart: { connected: true, restarted: true, stoppedPid: 9, pid: 10 },
+    };
+    await expect(cancelAndDrainCompactInvocation({ ...base, session: existingSession }))
+      .resolves.toMatchObject({ daemonZero: false, replacementVerified: false });
+  });
+
+  it("allows a fresh restart after the prior attempt rejects terminally", async () => {
+    const session = { restartAttempted: false };
+    const lifecycle = {
+      started: () => true,
+      stopHeartbeat: vi.fn(),
+      target: { invocationId, command: "compact" as const, daemonInstanceId },
+    } as never;
+    await expect(cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({
+        cancelInvocation: vi.fn(async () => response("cancelling", 1)),
+        health: async () => null,
+      }),
+      health: async () => null,
+      restart: async () => { throw new Error("restart rejected"); },
+      proveProviderWitnessGone: async () => false,
+      awaitLocalWork: async () => undefined,
+      session,
+      timeoutMs: 100,
+    })).resolves.toMatchObject({ daemonZero: false, diagnostic: "restart rejected" });
+    expect(session).toMatchObject({ restartAttempted: false, restartPromise: undefined });
+  });
+
   it("bounds a retry when provider proof is unavailable and the snapshot stays non-terminal", async () => {
     const oldHealth = {
       status: "healthy",
@@ -717,7 +892,8 @@ describe("compact invocation lifecycle", () => {
     expect(result).toMatchObject({ daemonZero: true, replacementVerified: true });
     expect(restart).toHaveBeenCalledOnce();
     expect(proveOldInstanceGone).toHaveBeenCalledOnce();
-    expect(proveProviderWitnessGone).toHaveBeenCalledWith({ daemonInstanceId: undefined });
+    expect(proveProviderWitnessGone).toHaveBeenCalledWith({ daemonInstanceId, invocationId });
+    expect(proveProviderWitnessGone).toHaveBeenCalledWith({ daemonInstanceId });
   });
 
   it("does not repeat a managed restart when a prior session has no result", async () => {

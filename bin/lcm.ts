@@ -532,10 +532,34 @@ function isUnknownInvocationCancellation(error: unknown): boolean {
 
 export type CompactDrainSession = {
   restartAttempted: boolean;
+  restartPromise?: Promise<CompactManagedRestartResult>;
   restart?: CompactManagedRestartResult;
   oldInstanceGone?: boolean;
   providerWitnessGone?: boolean;
 };
+
+type CompactProviderWitnessSnapshot = Readonly<{
+  available: boolean;
+  providers: readonly unknown[];
+}>;
+
+export function proveCompactProviderWitnessGone(
+  input: Readonly<{ daemonInstanceId: string; invocationId?: string }>,
+  readers: Readonly<{
+    read: (input: Readonly<{ daemonInstanceId: string; invocationId?: string }>) => CompactProviderWitnessSnapshot;
+    reconcile: (input: Readonly<{ daemonInstanceId: string; invocationId?: string }>) => CompactProviderWitnessSnapshot;
+  }>,
+): boolean {
+  const target = {
+    daemonInstanceId: input.daemonInstanceId,
+    ...(input.invocationId === undefined ? {} : { invocationId: input.invocationId }),
+  };
+  const observed = readers.read(target);
+  const snapshot = observed.available && observed.providers.length > 0
+    ? readers.reconcile(target)
+    : observed;
+  return snapshot.available && snapshot.providers.length === 0;
+}
 
 /** Cancel one invocation with a fresh client and await local owned work. */
 export async function cancelAndDrainCompactInvocation(
@@ -560,7 +584,13 @@ export async function cancelAndDrainCompactInvocation(
   const uncertaintyDeadline = options.lifecycle.uncertaintyDeadline?.();
   const localWorkDispatched = options.localWorkDispatched?.() === true;
   const deadline = now() + timeoutMs;
-  type BoundedResult<T> = Readonly<{ settled: boolean; value?: T; error?: unknown; timedOut: boolean }>;
+  type BoundedResult<T> = Readonly<{
+    settled: boolean;
+    value?: T;
+    error?: unknown;
+    timedOut: boolean;
+    pending?: Promise<T>;
+  }>;
   const bounded = async <T>(
     operation: (signal: AbortSignal) => Promise<T>,
     operationDeadline = deadline,
@@ -582,9 +612,9 @@ export async function cancelAndDrainCompactInvocation(
     resolveTimeout();
     if (outcome.timedOut) {
       controller.abort(createAbortError("compact cancellation deadline exceeded"));
-      return { settled: false, timedOut: true };
+      return { settled: false, timedOut: true, pending };
     }
-    return outcome;
+    return { ...outcome, pending };
   };
   let daemonZero = false;
   let restartAttempted = false;
@@ -600,7 +630,8 @@ export async function cancelAndDrainCompactInvocation(
   const providerProof = options.proveProviderWitnessGone === undefined
     ? { settled: true, value: false, timedOut: false }
     : await bounded(async () => await options.proveProviderWitnessGone!({
-      daemonInstanceId: options.originalHealth?.daemonInstanceId,
+      daemonInstanceId: options.originalHealth?.daemonInstanceId
+        ?? options.lifecycle.target.daemonInstanceId,
       invocationId: options.lifecycle.target.invocationId,
     }));
   const strictCancel = firstCancel.settled
@@ -654,7 +685,7 @@ export async function cancelAndDrainCompactInvocation(
       const retryProviderProof = options.proveProviderWitnessGone === undefined
         ? { settled: true, value: false, timedOut: false }
         : await bounded(async () => await options.proveProviderWitnessGone!({
-          daemonInstanceId: options.originalHealth?.daemonInstanceId,
+          daemonInstanceId: options.originalHealth!.daemonInstanceId!,
           invocationId: options.lifecycle.target.invocationId,
         }), healthDeadline);
       const strictRetry = retry.settled
@@ -692,7 +723,8 @@ export async function cancelAndDrainCompactInvocation(
     const providersGoneResult: BooleanBoundedResult = options.proveProviderWitnessGone === undefined
       ? { settled: true, value: false, timedOut: false }
       : await bounded(async () => await options.proveProviderWitnessGone!({
-        daemonInstanceId: options.originalHealth?.daemonInstanceId,
+        daemonInstanceId: options.originalHealth?.daemonInstanceId
+          ?? options.lifecycle.target.daemonInstanceId,
       }));
     const oldGone = oldGoneResult.settled && oldGoneResult.error === undefined && oldGoneResult.value === true;
     const providersGone = providersGoneResult.settled
@@ -719,7 +751,26 @@ export async function cancelAndDrainCompactInvocation(
 
   if ((!daemonZero || !localSettled) && session?.restartAttempted === true) {
     restartAttempted = true;
-    if (session.restart !== undefined && await proveReplacement(session.restart)) daemonZero = true;
+    if (session.restart !== undefined) {
+      if (await proveReplacement(session.restart)) daemonZero = true;
+    } else if (session.restartPromise !== undefined) {
+      const pendingRestart = await bounded(async () => await session.restartPromise!);
+      if (pendingRestart.settled
+        && pendingRestart.error === undefined
+        && pendingRestart.value !== undefined) {
+        session.restart = pendingRestart.value;
+        session.restartPromise = undefined;
+        if (await proveReplacement(pendingRestart.value)) daemonZero = true;
+      } else if (pendingRestart.settled) {
+        // A terminally failed attempt no longer owns restart admission. Permit
+        // a later drain iteration to start one fresh managed restart.
+        session.restartAttempted = false;
+        session.restartPromise = undefined;
+        diagnostic = pendingRestart.error instanceof Error
+          ? pendingRestart.error.message
+          : "managed daemon restart was not verified";
+      }
+    }
   } else if ((!daemonZero || !localSettled)
     && options.restart !== undefined
     && !originalReachable
@@ -731,11 +782,19 @@ export async function cancelAndDrainCompactInvocation(
         originalHealth: options.originalHealth ?? undefined,
         signal,
       }));
+      if (session !== undefined) session.restartPromise = restartResult.pending;
       if (!restartResult.settled || restartResult.error !== undefined || restartResult.value === undefined) {
+        if (session !== undefined && restartResult.settled) {
+          session.restartAttempted = false;
+          session.restartPromise = undefined;
+        }
         throw restartResult.error ?? new Error("managed daemon restart did not settle before cancellation deadline");
       }
       const restart = restartResult.value;
-      if (session !== undefined) session.restart = restart;
+      if (session !== undefined) {
+        session.restart = restart;
+        session.restartPromise = undefined;
+      }
       if (await proveReplacement(restart)) daemonZero = true;
       if (!replacementVerified) {
         diagnostic = restart.warning ?? "managed daemon restart did not prove replacement identity";
@@ -2293,10 +2352,10 @@ export async function runCli(
               old?.pid !== undefined && restart.restarted === true && restart.stoppedPid === old.pid,
             proveProviderWitnessGone: async ({ daemonInstanceId, invocationId }) => {
               const { readProviderProcessWitnesses, reconcileProviderProcessWitnesses } = await import("../src/llm/process-utils.js");
-              const snapshot = invocationId === undefined
-                ? reconcileProviderProcessWitnesses({ daemonInstanceId: daemonInstanceId! })
-                : readProviderProcessWitnesses({ daemonInstanceId: daemonInstanceId!, invocationId });
-              return snapshot.available && snapshot.providers.length === 0;
+              return proveCompactProviderWitnessGone({ daemonInstanceId: daemonInstanceId!, invocationId }, {
+                read: readProviderProcessWitnesses,
+                reconcile: reconcileProviderProcessWitnesses,
+              });
             },
             onDiagnostic: message => console.error(`  compact is still draining: ${message}`),
           });

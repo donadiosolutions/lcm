@@ -919,6 +919,54 @@ describe("owned process lifecycle utilities", () => {
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ version: 2, daemonInstances: ["daemon-b"], providers: [current] });
   });
 
+  it("reconciles only one invocation in the current daemon generation", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reconcile-invocation-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const invocationA = "11111111-1111-4111-8111-111111111111";
+    const invocationB = "22222222-2222-4222-8222-222222222222";
+    const stale = {
+      daemonInstanceId: "daemon-a",
+      invocationId: invocationA,
+      providerId: "claude-process",
+      pid: 81,
+      pgid: null,
+      processStartTime: "birth-81",
+    } as const;
+    const unrelated = {
+      daemonInstanceId: "daemon-a",
+      invocationId: invocationB,
+      providerId: "codex-process",
+      pid: 82,
+      pgid: null,
+      processStartTime: null,
+    } as const;
+    writeFileSync(path, JSON.stringify({
+      version: 2,
+      daemonInstances: ["daemon-a"],
+      providers: [stale, unrelated],
+    }), { mode: 0o600 });
+
+    expect(reconcileProviderProcessWitnesses({
+      daemonInstanceId: "daemon-a",
+      invocationId: invocationA,
+      path,
+      killProcess: pid => {
+        if (pid === stale.pid) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      },
+    })).toEqual({ available: true, providers: [] });
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      version: 2,
+      daemonInstances: ["daemon-a"],
+      providers: [unrelated],
+    });
+    expect(reconcileProviderProcessWitnesses({
+      daemonInstanceId: "daemon-a",
+      invocationId: "invalid",
+      path,
+    })).toEqual({ available: false, providers: [] });
+  });
+
   it("retains a sole empty generation so the witness document stays parseable", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reconcile-sole-"));
     roots.push(root);

@@ -385,6 +385,8 @@ export type ProviderProcessWitnessSnapshot = Readonly<{
 export type ProviderProcessWitnessReconcileOptions = Readonly<{
   /** Generation whose provider identities may be reconciled and reclaimed. */
   daemonInstanceId: string;
+  /** Optional invocation scope for current-generation stale-row cleanup. */
+  invocationId?: string;
   path?: string;
   /** Injectable PID liveness probe used by deterministic tests. */
   killProcess?: ProcessKill;
@@ -736,6 +738,9 @@ export function reconcileProviderProcessWitnesses(
   if (typeof options.daemonInstanceId !== "string" || options.daemonInstanceId.length === 0) {
     return { available: false, providers: [] };
   }
+  if (options.invocationId !== undefined && !isCanonicalInvocationId(options.invocationId)) {
+    return { available: false, providers: [] };
+  }
   const path = options.path ?? join(lcmHomeDir(), DEFAULT_WITNESS_FILE);
   const operations: WitnessOperations = { ...DEFAULT_WITNESS_OPERATIONS, ...options.operations };
   const killProcess = options.killProcess ?? process.kill.bind(process);
@@ -748,7 +753,9 @@ export function reconcileProviderProcessWitnesses(
     withWitnessPathLock(path, () => withWitnessMutationLock(path, () => {
       const existing = readWitnessDocument(path, operations);
       if (existing === undefined) return;
-      const targetEntries = existing.providers.filter(entry => entry.daemonInstanceId === options.daemonInstanceId);
+      const targetEntries = existing.providers.filter(entry =>
+        entry.daemonInstanceId === options.daemonInstanceId
+        && (options.invocationId === undefined || entry.invocationId === options.invocationId));
       const dead = new Set<ProviderProcessWitness>();
       for (const entry of targetEntries) {
         try {
@@ -773,14 +780,18 @@ export function reconcileProviderProcessWitnesses(
       // every non-target generation and any target generation that still owns
       // rows; remove an empty target generation after successful publication.
       const targetRetained = providers.some(entry => entry.daemonInstanceId === options.daemonInstanceId);
-      const daemonInstances = existing.daemonInstances.filter(id => id !== options.daemonInstanceId || targetRetained);
+      const daemonInstances = options.invocationId === undefined
+        ? existing.daemonInstances.filter(id => id !== options.daemonInstanceId || targetRetained)
+        : [...existing.daemonInstances];
       if (daemonInstances.length === 0) daemonInstances.push(options.daemonInstanceId);
       const changed = providers.length !== existing.providers.length
         || daemonInstances.length !== existing.daemonInstances.length;
       if (changed) writeWitnesses(path, daemonInstances, providers, operations);
       result = {
         available: true,
-        providers: providers.filter(entry => entry.daemonInstanceId === options.daemonInstanceId),
+        providers: providers.filter(entry =>
+          entry.daemonInstanceId === options.daemonInstanceId
+          && (options.invocationId === undefined || entry.invocationId === options.invocationId)),
       };
     }));
   } catch {
