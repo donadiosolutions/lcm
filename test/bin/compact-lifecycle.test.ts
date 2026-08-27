@@ -516,6 +516,27 @@ describe("compact invocation lifecycle", () => {
     });
 
     expect(result.daemonZero).toBe(false);
+    expect(proveProviderWitnessGone).toHaveBeenCalledWith({ daemonInstanceId, invocationId });
+  });
+
+  it("keeps restart witness proof daemon-wide", async () => {
+    const oldHealth = { status: "healthy" as const, version: "1.4.2", storageBackend: "sqlite" as const, daemonInstanceId, pid: 9, uptime: 1 };
+    const replacementHealth = { ...oldHealth, daemonInstanceId: "33333333-3333-4333-8333-333333333333" };
+    const proveProviderWitnessGone = vi.fn(async () => true);
+    const health = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(replacementHealth);
+    const lifecycle = { started: () => true, stopHeartbeat: vi.fn(), target: { invocationId, command: "compact" as const, daemonInstanceId } } as never;
+    await cancelAndDrainCompactInvocation({
+      lifecycle,
+      createFreshClient: () => ({ cancelInvocation: vi.fn(async () => response("cancelling", 1)), health }),
+      originalHealth: oldHealth,
+      health,
+      restart: async () => ({ connected: true, restarted: true, stoppedPid: 9, pid: 10 }),
+      proveOldInstanceGone: async () => true,
+      proveProviderWitnessGone,
+      awaitLocalWork: async () => undefined,
+      expectedRuntimeDigest: undefined,
+      timeoutMs: 100,
+    } as never);
     expect(proveProviderWitnessGone).toHaveBeenCalledWith({ daemonInstanceId });
   });
 
@@ -975,7 +996,7 @@ describe("compact invocation lifecycle", () => {
       }),
       originalHealth: oldHealth,
       health: async () => oldHealth,
-      proveProviderWitnessGone: async () => witnessGone,
+      proveProviderWitnessGone: vi.fn(async () => witnessGone),
       awaitLocalWork: async () => undefined,
       localWorkDispatched: () => localWorkDispatched,
       timeoutMs: 5,

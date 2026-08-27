@@ -161,6 +161,7 @@ async function runCodexSummarizer(
     clearTimeout?: typeof clearTimeout;
   },
   signal?: AbortSignal,
+  invocationId?: string,
 ): Promise<string> {
   throwIfAborted(signal);
   const tempDir = deps.mkdtempSync(join(deps.tmpdir(), "lcm-codex-"));
@@ -317,6 +318,7 @@ async function runCodexSummarizer(
     if (deps.daemonInstanceId !== undefined && deps.witnessStore !== undefined && teardown.pid !== undefined) {
       witness = {
         daemonInstanceId: deps.daemonInstanceId,
+        ...(invocationId === undefined ? {} : { invocationId }),
         providerId: "codex-process",
         pid: teardown.pid,
         pgid: teardown.processGroupId ?? null,
@@ -450,6 +452,6 @@ export function createCodexProcessSummarizer(opts: CodexProcessDeps = {}): LcmSu
   return async function summarize(text, aggressive, ctx = {}): Promise<string> {
     throwIfAborted(ctx.signal);
     const prompt = buildPrompt(text, aggressive, ctx);
-    return runCodexSummarizer(prompt, deps, ctx.signal);
+    return runCodexSummarizer(prompt, deps, ctx.signal, ctx.invocationId);
   };
 }

@@ -705,6 +705,21 @@ describe("owned process lifecycle utilities", () => {
     });
   });
 
+  it("filters invocation witnesses while daemon-wide reads retain every generation", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-invocations-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const invocationA = "11111111-1111-4111-8111-111111111111";
+    const invocationB = "22222222-2222-4222-8222-222222222222";
+    const entryA = { daemonInstanceId: "daemon-a", invocationId: invocationA, providerId: "claude-process", pid: 1, pgid: null, processStartTime: null };
+    const entryB = { daemonInstanceId: "daemon-a", invocationId: invocationB, providerId: "codex-process", pid: 2, pgid: null, processStartTime: null };
+    const legacy = { daemonInstanceId: "daemon-a", providerId: "legacy", pid: 3, pgid: null, processStartTime: null };
+    writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: ["daemon-a"], providers: [entryA, entryB, legacy] }), { mode: 0o600 });
+    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-a", invocationId: invocationA })).toEqual({ available: true, providers: [entryA] });
+    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-a", invocationId: "bad" })).toEqual({ available: false, providers: [] });
+    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-a" })).toEqual({ available: true, providers: [entryA, entryB, legacy] });
+  });
+
   it("keeps the legacy reader seam fail-closed while accepting v2 documents", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reader-seam-"));
     roots.push(root);
@@ -955,6 +970,19 @@ describe("owned process lifecycle utilities", () => {
     first.remove(entryA);
     expect(JSON.parse(readFileSync(path, "utf8")).providers).toEqual([entryB]);
     chmodSync(path, 0o600);
+  });
+
+  it("keeps same process identities distinct across invocation removal", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-invocation-remove-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const first = createProviderProcessWitnessStore({ daemonInstanceId: "daemon-a", path });
+    const entryA = { daemonInstanceId: "daemon-a", invocationId: "11111111-1111-4111-8111-111111111111", providerId: "claude-process", pid: 4, pgid: null, processStartTime: null } as const;
+    const entryB = { ...entryA, invocationId: "22222222-2222-4222-8222-222222222222" } as const;
+    first.add(entryA);
+    first.add(entryB);
+    first.remove(entryA);
+    expect(readProviderProcessWitnesses({ path, daemonInstanceId: "daemon-a" }).providers).toEqual([entryB]);
   });
 
   it("serializes daemon updates and uses unique temporary witness paths", async () => {

@@ -7,6 +7,7 @@ import {
   withPrivateMutationLock,
 } from "../private-mutation-lock.js";
 import { readBoundedRegularFileWithStat } from "../security-files.js";
+import { isCanonicalInvocationId } from "../daemon/invocation-coordinator.js";
 
 export const MAX_MODEL_DISPLAY_LENGTH = 80;
 
@@ -324,6 +325,7 @@ export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions)
 
 export type ProviderProcessWitness = Readonly<{
   daemonInstanceId: string;
+  invocationId?: string;
   providerId: string;
   pid: number;
   pgid: number | null;
@@ -372,7 +374,8 @@ const WITNESS_VERSION = 2;
 const WITNESS_MAX_BYTES = 64 * 1024;
 const LEGACY_WITNESS_TOP_LEVEL_KEYS = ["daemonInstanceId", "providers", "version"] as const;
 const WITNESS_TOP_LEVEL_KEYS = ["daemonInstances", "providers", "version"] as const;
-const WITNESS_ENTRY_KEYS = ["daemonInstanceId", "pgid", "pid", "processStartTime", "providerId"] as const;
+const LEGACY_WITNESS_ENTRY_KEYS = ["daemonInstanceId", "pgid", "pid", "processStartTime", "providerId"] as const;
+const WITNESS_ENTRY_KEYS = ["daemonInstanceId", "invocationId", "pgid", "pid", "processStartTime", "providerId"] as const;
 
 function hasExactKeys(value: object, keys: readonly string[]): boolean {
   const actual = Object.keys(value).sort();
@@ -413,7 +416,8 @@ function parseWitnessDocument(value: unknown): {
   const providers: ProviderProcessWitness[] = [];
   const identities = new Set<string>();
   for (const raw of rawProviders) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw) || !hasExactKeys(raw, WITNESS_ENTRY_KEYS)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)
+      || (!hasExactKeys(raw, LEGACY_WITNESS_ENTRY_KEYS) && !hasExactKeys(raw, WITNESS_ENTRY_KEYS))) {
       return undefined;
     }
     const entry = raw as Partial<ProviderProcessWitness>;
@@ -429,9 +433,11 @@ function parseWitnessDocument(value: unknown): {
       || pgid === undefined
       || (entry.processStartTime !== null && typeof entry.processStartTime !== "string")
       || (typeof entry.processStartTime === "string" && entry.processStartTime.length === 0)
+      || (entry.invocationId !== undefined && !isCanonicalInvocationId(entry.invocationId))
     ) return undefined;
     const normalized: ProviderProcessWitness = {
       daemonInstanceId: entry.daemonInstanceId,
+      ...(typeof entry.invocationId === "string" ? { invocationId: entry.invocationId } : {}),
       providerId: entry.providerId,
       pid,
       pgid,
@@ -490,9 +496,13 @@ function readWitnessDocument(
 export function readProviderProcessWitnesses(options: {
   path?: string;
   daemonInstanceId?: string;
+  invocationId?: string;
   /** @internal deterministic platform identity seam. */
   _getUid?: () => number | undefined;
 } = {}): ProviderProcessWitnessSnapshot {
+  if (options.invocationId !== undefined && !isCanonicalInvocationId(options.invocationId)) {
+    return { available: false, providers: [] };
+  }
   const path = options.path ?? join(lcmHomeDir(), DEFAULT_WITNESS_FILE);
   const getUid = options._getUid ?? currentUid;
   try {
@@ -505,13 +515,16 @@ export function readProviderProcessWitnesses(options: {
     });
     const document = parseWitnessDocument(JSON.parse(snapshot.content) as unknown);
     if (document === undefined) return { available: false, providers: [] };
+    const daemonProviders = options.daemonInstanceId === undefined
+      ? document.providers
+      : document.daemonInstances.includes(options.daemonInstanceId)
+        ? document.providers.filter(entry => entry.daemonInstanceId === options.daemonInstanceId)
+        : [];
     return {
       available: true,
-      providers: options.daemonInstanceId === undefined
-        ? document.providers
-        : document.daemonInstances.includes(options.daemonInstanceId)
-          ? document.providers.filter(entry => entry.daemonInstanceId === options.daemonInstanceId)
-          : [],
+      providers: options.invocationId === undefined
+        ? daemonProviders
+        : daemonProviders.filter(entry => entry.invocationId === options.invocationId),
     };
   } catch {
     // Missing, replaced, symlinked, wrong-owner, wrong-mode, and malformed
@@ -629,6 +642,7 @@ export function createProviderProcessWitnessStore(options: {
       const current = entries.filter(candidate => candidate.daemonInstanceId === options.daemonInstanceId);
       const otherDaemonEntries = entries.filter(candidate => candidate.daemonInstanceId !== options.daemonInstanceId);
       const matches = (candidate: ProviderProcessWitness): boolean => candidate.providerId === entry.providerId
+        && candidate.invocationId === entry.invocationId
         && candidate.pid === entry.pid
         && candidate.pgid === entry.pgid
         && candidate.processStartTime === entry.processStartTime;

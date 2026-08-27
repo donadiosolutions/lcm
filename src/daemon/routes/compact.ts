@@ -604,9 +604,6 @@ export function createCompactHandler(
         await closeOpenedProject();
         await closeRouteStorage(undefined, ownedFactory);
         releaseInvocation();
-        if (invocationTarget !== undefined && coordinator !== undefined && invocationCancellation === undefined) {
-          invocationCancellation = coordinator.cancel(invocationTarget).catch(() => undefined);
-        }
         if (invocationCancellation !== undefined) await invocationCancellation;
       }
       return;
@@ -744,6 +741,7 @@ export function createCompactHandler(
             force: true,
             previousSummaryContent: validatedPreviousSummary,
             signal,
+            ...(invocationId === undefined ? {} : { invocationId }),
             acquireCommit,
           });
           throwIfAborted(signal);

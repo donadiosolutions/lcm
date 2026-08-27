@@ -293,9 +293,10 @@ describe("createCodexProcessSummarizer", () => {
       processBirthTime: () => "birth-9512",
     } as never);
 
-    await expect(summarizer("text", false)).resolves.toBe("summary");
+    await expect(summarizer("text", false, { invocationId: "11111111-1111-4111-8111-111111111111" })).resolves.toBe("summary");
     expect(witnessStore.add).toHaveBeenCalledWith({
       daemonInstanceId: "22222222-2222-4222-8222-222222222222",
+      invocationId: "11111111-1111-4111-8111-111111111111",
       providerId: "codex-process",
       pid: 9512,
       pgid: null,

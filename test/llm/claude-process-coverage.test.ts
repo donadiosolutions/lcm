@@ -70,12 +70,12 @@ describe("Claude process defensive coverage", () => {
       setTimeout: (() => undefined) as never,
       clearTimeout: vi.fn(),
     } as never);
-    const pending = summarizer("prompt");
+    const pending = summarizer("prompt", false, { invocationId: "11111111-1111-4111-8111-111111111111" });
     processChild.stdout.end("summary");
     processChild.emit("close", 0);
     await expect(pending).resolves.toBe("summary");
     processChild.emit("close", 0);
-    expect(witnessStore.add).toHaveBeenCalledWith(expect.objectContaining({ processStartTime: null }));
+    expect(witnessStore.add).toHaveBeenCalledWith(expect.objectContaining({ processStartTime: null, invocationId: "11111111-1111-4111-8111-111111111111" }));
   });
 
   it("normalizes a non-Error witness failure", async () => {

@@ -507,7 +507,7 @@ export type CompactDrainOptions = Readonly<{
   expectedStorageBackend?: DaemonHealth["storageBackend"];
   restart?: (input: Readonly<{ originalHealth?: DaemonHealth; signal: AbortSignal }>) => Promise<CompactManagedRestartResult>;
   proveOldInstanceGone?: (input: Readonly<{ originalHealth?: DaemonHealth; restart: CompactManagedRestartResult }>) => Promise<boolean> | boolean;
-  proveProviderWitnessGone?: (input: Readonly<{ daemonInstanceId?: string }>) => Promise<boolean> | boolean;
+  proveProviderWitnessGone?: (input: Readonly<{ daemonInstanceId?: string; invocationId?: string }>) => Promise<boolean> | boolean;
   /** Mutable state shared by one automatic drain retry session. */
   session?: CompactDrainSession;
   onDiagnostic?: (message: string) => void;
@@ -593,6 +593,7 @@ export async function cancelAndDrainCompactInvocation(
     ? { settled: true, value: false, timedOut: false }
     : await bounded(async () => await options.proveProviderWitnessGone!({
       daemonInstanceId: options.originalHealth?.daemonInstanceId,
+      invocationId: options.lifecycle.target.invocationId,
     }));
   const strictCancel = firstCancel.settled
     && firstCancel.error === undefined
@@ -646,6 +647,7 @@ export async function cancelAndDrainCompactInvocation(
         ? { settled: true, value: false, timedOut: false }
         : await bounded(async () => await options.proveProviderWitnessGone!({
           daemonInstanceId: options.originalHealth?.daemonInstanceId,
+          invocationId: options.lifecycle.target.invocationId,
         }), healthDeadline);
       const strictRetry = retry.settled
         && retry.error === undefined
@@ -2281,9 +2283,9 @@ export async function runCli(
             },
             proveOldInstanceGone: async ({ originalHealth: old, restart }) =>
               old?.pid !== undefined && restart.restarted === true && restart.stoppedPid === old.pid,
-            proveProviderWitnessGone: async ({ daemonInstanceId }) => {
+            proveProviderWitnessGone: async ({ daemonInstanceId, invocationId }) => {
               const { readProviderProcessWitnesses } = await import("../src/llm/process-utils.js");
-              const snapshot = readProviderProcessWitnesses({ daemonInstanceId: daemonInstanceId! });
+              const snapshot = readProviderProcessWitnesses({ daemonInstanceId: daemonInstanceId!, ...(invocationId === undefined ? {} : { invocationId }) });
               return snapshot.available && snapshot.providers.length === 0;
             },
             onDiagnostic: message => console.error(`  compact is still draining: ${message}`),

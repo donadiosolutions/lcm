@@ -66,6 +66,7 @@ type CompactionSummarizeOptions = {
   isCondensed?: boolean;
   depth?: number;
   signal?: AbortSignal;
+  invocationId?: string;
 };
 export type CompactionSummarizeFn = (
   text: string,
@@ -87,6 +88,7 @@ export type CompactionCommitAdmission = () =>
 export type CompactionInvocationContext = Readonly<{
   signal?: AbortSignal;
   acquireCommit?: CompactionCommitAdmission;
+  invocationId?: string;
 }>;
 
 type CompactionInputContext = CompactionInvocationContext & {
@@ -208,6 +210,7 @@ export class CompactionEngine {
     return {
       signal: input.signal ?? input.context?.signal,
       acquireCommit: input.acquireCommit ?? input.context?.acquireCommit,
+      invocationId: input.invocationId ?? input.context?.invocationId,
     };
   }
 
@@ -1152,6 +1155,7 @@ export class CompactionEngine {
     throwIfAborted(signal);
     let summaryText = await params.summarize(sourceText, false, {
       ...params.options,
+      ...(params.context?.invocationId === undefined ? {} : { invocationId: params.context.invocationId }),
       ...(signal === undefined ? {} : { signal }),
     });
     throwIfAborted(signal);
@@ -1161,6 +1165,7 @@ export class CompactionEngine {
       throwIfAborted(signal);
       summaryText = await params.summarize(sourceText, true, {
         ...params.options,
+        ...(params.context?.invocationId === undefined ? {} : { invocationId: params.context.invocationId }),
         ...(signal === undefined ? {} : { signal }),
       });
       throwIfAborted(signal);

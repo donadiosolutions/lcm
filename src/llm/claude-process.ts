@@ -148,6 +148,7 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
       const witness = opts.daemonInstanceId !== undefined && opts.witnessStore !== undefined && teardown.pid !== undefined
         ? {
             daemonInstanceId: opts.daemonInstanceId,
+            ...(ctx.invocationId === undefined ? {} : { invocationId: ctx.invocationId }),
             providerId: "claude-process",
             pid: teardown.pid,
             pgid: teardown.processGroupId ?? null,

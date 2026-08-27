@@ -212,9 +212,11 @@ describe("CompactionEngine.compact — previousSummaryContent seeding", () => {
     const permit = { release: vi.fn() };
     const acquireCommit = vi.fn(() => permit);
     let observedSignal: AbortSignal | undefined;
+    const observedInvocationIds: string[] = [];
     const summarize: CompactionSummarizeFn = vi.fn(async (_text, _aggressive, options) => {
       observedSignal = options?.signal;
-      return "short";
+      observedInvocationIds.push(options?.invocationId ?? "missing");
+      return observedInvocationIds.length === 1 ? "long summary" : "short";
     });
     const storage = {
       conversations: conversationStore,
@@ -244,9 +246,11 @@ describe("CompactionEngine.compact — previousSummaryContent seeding", () => {
       summarize,
       force: true,
       signal: controller.signal,
+      invocationId: "11111111-1111-4111-8111-111111111111",
       acquireCommit,
     })).resolves.toMatchObject({ actionTaken: true });
     expect(observedSignal).toBe(controller.signal);
+    expect(observedInvocationIds).toEqual(["11111111-1111-4111-8111-111111111111"]);
     expect(acquireCommit).toHaveBeenCalled();
     expect(permit.release).toHaveBeenCalled();
   });
@@ -454,8 +458,10 @@ describe("CompactionEngine.compact — previousSummaryContent seeding", () => {
       transaction,
     } as never;
     const controller = new AbortController();
+    const invocationId = "11111111-1111-4111-8111-111111111111";
     const summarize: CompactionSummarizeFn = vi.fn(async (text, aggressive, options) => {
       expect(options?.signal).toBe(controller.signal);
+      expect(options?.invocationId).toBe(invocationId);
       return aggressive ? "short" : text;
     });
     const engine = new CompactionEngine(storage, {
@@ -476,6 +482,7 @@ describe("CompactionEngine.compact — previousSummaryContent seeding", () => {
       summarize,
       force: true,
       signal: controller.signal,
+      invocationId,
     })).resolves.toMatchObject({ actionTaken: true, level: "aggressive" });
     expect(summarize).toHaveBeenCalledTimes(2);
   });
