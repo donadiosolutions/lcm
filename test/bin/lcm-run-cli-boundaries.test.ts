@@ -9,10 +9,10 @@ const state = vi.hoisted(() => ({
   post: vi.fn(async () => ({ processed: 1, promoted: 1 })),
   get: vi.fn(async () => ({ totalConnections: 1, activeConnections: 0, idleConnections: 1, connections: [] })),
   health: vi.fn(async () => true),
-  startInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0 })),
-  heartbeatInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0 })),
-  cancelInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "cancelled", activeCount: 0 })),
-  finishInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "finished", activeCount: 0 })),
+  startInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
+  heartbeatInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
+  cancelInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "cancelled", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
+  finishInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "finished", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
   readAuthToken: vi.fn(() => state.authToken),
   authToken: "test-token" as string | null,
   migrateLegacyHome: vi.fn(),
@@ -145,6 +145,10 @@ vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class {
 } }));
 vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
 vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn(), readAuthToken: state.readAuthToken }));
+vi.mock("../../src/llm/process-utils.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/llm/process-utils.js")>()),
+  readProviderProcessWitnesses: vi.fn(() => ({ available: true, providers: [] })),
+}));
 vi.mock("../../src/cli-help.js", () => ({ printHelp: vi.fn() }));
 vi.mock("../../src/identity-service.js", () => ({
   listProjects: state.projectList,
@@ -839,6 +843,18 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     expect(state.startInvocation).not.toHaveBeenCalled();
   });
 
+  it("returns the latched signal status when authenticated health aborts before registration", async () => {
+    state.health.mockImplementationOnce(async () => {
+      process.emit("SIGINT");
+      throw new Error("health request aborted");
+    });
+
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.startInvocation).not.toHaveBeenCalled();
+    expect(state.batchOptions).toBeUndefined();
+    expect(process.exitCode).toBe(130);
+  });
+
   it("drains a signal that arrives during invocation start before returning", async () => {
     state.health.mockResolvedValueOnce({
       status: "healthy",
@@ -850,10 +866,12 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     state.startInvocation.mockImplementationOnce(async (target: unknown, options: { signal?: AbortSignal }) => {
       startSignal = options.signal!;
       process.emit("SIGINT");
-      return { ...target as object, state: "active", activeCount: 0 };
+      return { ...target as object, state: "active", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null };
     });
     let release!: () => void;
-    state.cancelInvocation.mockImplementationOnce(() => new Promise(resolve => { release = () => resolve({ state: "cancelled", activeCount: 0 }); }));
+    state.cancelInvocation.mockImplementationOnce((target: unknown) => new Promise(resolve => {
+      release = () => resolve({ ...target as object, state: "cancelled", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null });
+    }));
 
     let settled = false;
     const pending = invoke(["compact", "--no-promote"]).then(result => { settled = true; return result; });
@@ -980,20 +998,22 @@ describe("runCli scanning and portable knowledge boundaries", () => {
       daemonInstanceId: "11111111-1111-4111-8111-111111111111",
     });
     state.cancelInvocation
-      .mockResolvedValueOnce({
-        invocationId: "22222222-2222-4222-8222-222222222222",
-        command: "compact",
-        daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+      .mockImplementationOnce(async (target: unknown) => ({
+        ...target as object,
         state: "cancelling",
         activeCount: 1,
-      })
-      .mockResolvedValueOnce({
-        invocationId: "22222222-2222-4222-8222-222222222222",
-        command: "compact",
-        daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+        workCount: 1,
+        commitCount: 0,
+        leaseExpiresAt: null,
+      }))
+      .mockImplementationOnce(async (target: unknown) => ({
+        ...target as object,
         state: "cancelled",
         activeCount: 0,
-      });
+        workCount: 0,
+        commitCount: 0,
+        leaseExpiresAt: null,
+      }));
     let release!: () => void;
     state.batchGate = new Promise<void>(resolve => { release = resolve; });
 
@@ -1023,20 +1043,22 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     state.batchGate = new Promise<void>(resolve => { release = resolve; });
     state.batchError = new Error("ordinary batch failure");
     state.cancelInvocation
-      .mockResolvedValueOnce({
-        invocationId: "22222222-2222-4222-8222-222222222222",
-        command: "compact",
-        daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+      .mockImplementationOnce(async (target: unknown) => ({
+        ...target as object,
         state: "cancelling",
         activeCount: 1,
-      })
-      .mockResolvedValueOnce({
-        invocationId: "22222222-2222-4222-8222-222222222222",
-        command: "compact",
-        daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+        workCount: 1,
+        commitCount: 0,
+        leaseExpiresAt: null,
+      }))
+      .mockImplementationOnce(async (target: unknown) => ({
+        ...target as object,
         state: "cancelled",
         activeCount: 0,
-      });
+        workCount: 0,
+        commitCount: 0,
+        leaseExpiresAt: null,
+      }));
 
     const pending = invoke(["compact", "--no-promote"]);
     await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());

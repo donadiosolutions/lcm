@@ -380,7 +380,7 @@ describe("batch compaction discovery", () => {
     const firstLabel = `${paths.canonical} conv #1 (9 msgs, 0.3k tokens)`;
     const secondLabel = `${paths.canonical} conv #2 (9 msgs, 0.3k tokens)`;
     const post = vi.spyOn(DaemonClient.prototype, "post")
-      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ tokensBefore: 250, tokensAfter: 250 })
       .mockResolvedValueOnce({ tokensBefore: 300, tokensAfter: 30 });
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -559,6 +559,7 @@ describe("batch compaction discovery", () => {
   it.each([
     ["null", null],
     ["undefined", undefined],
+    ["empty object", {}],
   ] as const)("accounts a non-dry-run %s response as a failure", async (_name, response) => {
     const cwd = makeDir("compact-malformed-response");
     const paths = projectPaths(cwd);
@@ -589,6 +590,20 @@ describe("batch compaction discovery", () => {
       expect.objectContaining({ tokensOut: expect.anything() }),
     ]));
     expect(log).toHaveBeenCalledWith("\nBatch compact complete.");
+  });
+
+  it("accepts a token-after-only compact response with discovered input fallback", async () => {
+    const cwd = makeDir("compact-token-after-fallback");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensAfter: 50 });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await expect(batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd }))
+      .resolves.toMatchObject({ compacted: 1, failures: 0 });
   });
 
   it("sends a process-provider timeout without an implicit retry override", async () => {

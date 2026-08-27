@@ -422,6 +422,17 @@ export async function batchCompact(opts: {
     retry?: LlmRetryPolicy | null;
   };
 
+  const isCompactResponse = (value: unknown): value is CompactResponse => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const response = value as Partial<CompactResponse>;
+    return response.skipped === true
+      || typeof response.actionTaken === "boolean"
+      // Successful daemon responses from older versions omit actionTaken but
+      // carry the measured token counters; retain that wire compatibility.
+      || typeof response.tokensBefore === "number"
+      || typeof response.tokensAfter === "number";
+  };
+
   const progressActivePatch = (): Partial<ProgressState> => opts.dryRun
     ? {}
     : {
@@ -488,7 +499,7 @@ export async function batchCompact(opts: {
       }
 
       const data = result.value;
-      if (data === null || data === undefined) {
+      if (!opts.dryRun && !isCompactResponse(data)) {
         const errMsg = "malformed compact response";
         console.log(`${label} FAILED (${errMsg})`);
         progressErrors.push({ sessionId: conv.sessionId, message: errMsg });
@@ -526,8 +537,8 @@ export async function batchCompact(opts: {
           lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore, tokensAfter, provider: formatLlmDiagnostic(data), elapsed: Date.now() - sessionStart },
         });
       } else {
-        const tokensBefore = data?.tokensBefore ?? conv.tokens;
-        const tokensAfter = data?.tokensAfter ?? tokensBefore;
+        const tokensBefore = data.tokensBefore ?? conv.tokens;
+        const tokensAfter = data.tokensAfter ?? tokensBefore;
         if (opts.verbose && tokensBefore > 0) {
           const pct = Math.round((1 - tokensAfter / tokensBefore) * 100);
           console.log(`${label} done  (${(tokensBefore / 1000).toFixed(1)}k → ${(tokensAfter / 1000).toFixed(1)}k tokens, ${pct}% reduction)`);
