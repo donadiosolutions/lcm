@@ -240,6 +240,25 @@ describe("invocation coordinator", () => {
     expect(() => coordinator.start(target())).not.toThrow();
   });
 
+  it("refreshes tombstones on repeated cancel, finish, and snapshot reads", async () => {
+    const { coordinator, clock } = createHarness({ tombstoneTtlMs: 10 });
+    coordinator.start(target());
+    await expect(coordinator.finish(target())).resolves.toMatchObject({ state: "finished" });
+
+    clock.advance(9);
+    await expect(coordinator.cancel(target())).resolves.toMatchObject({ state: "finished" });
+    clock.advance(2);
+    await expect(coordinator.finish(target())).resolves.toMatchObject({ state: "finished" });
+    clock.advance(8);
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "finished" });
+
+    clock.advance(9);
+    expect(coordinator.tombstoneCount()).toBe(1);
+    clock.advance(2);
+    clock.advance(0);
+    expect(() => coordinator.snapshot(invocationId)).toThrow(/unknown/i);
+  });
+
   it("expires leases through cancellation and bounds terminal tombstones", async () => {
     const { coordinator, clock } = createHarness({ maxTombstones: 2 });
     coordinator.start(target());

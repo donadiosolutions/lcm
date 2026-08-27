@@ -478,24 +478,30 @@ describe("owned process lifecycle utilities", () => {
     await expect(fallbackPending).resolves.toBe(true);
   });
 
-  it("uses the detached child PID as a Darwin process group and cleans descendants after leader close", async () => {
-    const processChild = child(8001);
-    let groupAlive = true;
-    const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
-      if (signal === "SIGTERM") groupAlive = false;
-    });
-    const teardown = createOwnedProcessTeardown({
-      child: processChild,
-      platform: "darwin",
-      detachedProcessGroup: true,
-      processBirthTime: () => "birth-8001",
-      isProcessGroupAlive: () => groupAlive,
-      killProcess,
-    });
-    processChild.emit("close");
-    await expect(teardown.terminate("close")).resolves.toBe(true);
-    expect(teardown.processGroupId).toBe(8001);
-    expect(killProcess).toHaveBeenCalledWith(-8001, "SIGTERM");
+  it("fails closed when a detached leader exits before group ownership can be revalidated", async () => {
+    vi.useFakeTimers();
+    try {
+      const processChild = child(8001);
+      let leaderAlive = true;
+      const killProcess = vi.fn();
+      const teardown = createOwnedProcessTeardown({
+        child: processChild,
+        platform: "darwin",
+        detachedProcessGroup: true,
+        processBirthTime: () => leaderAlive ? "birth-8001" : null,
+        isProcessGroupAlive: () => true,
+        killProcess,
+      });
+      leaderAlive = false;
+      processChild.emit("close");
+      const pending = teardown.terminate("close");
+      await vi.advanceTimersByTimeAsync(4_000);
+      await expect(pending).resolves.toBe(false);
+      expect(teardown.processGroupId).toBe(8001);
+      expect(killProcess).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("escalates a detached Darwin group from TERM to KILL before settling", async () => {
@@ -917,6 +923,44 @@ describe("owned process lifecycle utilities", () => {
     writeFileSync(path, JSON.stringify({ version: 2, daemonInstances: ["daemon-a", "daemon-b"], providers: [old, current] }), { mode: 0o600 });
     expect(reconcileProviderProcessWitnesses({ daemonInstanceId: "daemon-a", path, killProcess: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); } })).toEqual({ available: true, providers: [] });
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ version: 2, daemonInstances: ["daemon-b"], providers: [current] });
+  });
+
+  it("retains stale leaders while their recorded process group is live or ambiguous", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-provider-witness-reconcile-group-"));
+    roots.push(root);
+    const path = join(root, "daemon-runtime.json");
+    const entry = {
+      daemonInstanceId: "daemon-a",
+      providerId: "claude-process",
+      pid: 91,
+      pgid: 91,
+      processStartTime: "birth-91",
+    } as const;
+    writeFileSync(path, JSON.stringify({
+      version: 2,
+      daemonInstances: ["daemon-a"],
+      providers: [entry],
+    }), { mode: 0o600 });
+    const absent = () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); };
+
+    expect(reconcileProviderProcessWitnesses({
+      daemonInstanceId: "daemon-a",
+      path,
+      killProcess: absent,
+      isProcessGroupAlive: () => true,
+    })).toEqual({ available: true, providers: [entry] });
+    expect(reconcileProviderProcessWitnesses({
+      daemonInstanceId: "daemon-a",
+      path,
+      killProcess: absent,
+      isProcessGroupAlive: () => { throw new Error("group probe unavailable"); },
+    })).toEqual({ available: true, providers: [entry] });
+    expect(reconcileProviderProcessWitnesses({
+      daemonInstanceId: "daemon-a",
+      path,
+      killProcess: absent,
+      isProcessGroupAlive: () => false,
+    })).toEqual({ available: true, providers: [] });
   });
 
   it("reconciles only one invocation in the current daemon generation", () => {

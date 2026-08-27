@@ -224,11 +224,6 @@ export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions)
 
   function groupIdentityStillOwned(): boolean {
     if (groupId === undefined || groupInvalidated || groupDisappearedLatched) return false;
-    // A detached leader may have exited while descendants keep the PGID
-    // alive.  Its PID birth/PGID probes necessarily fail after close; the
-    // explicit detached-spawn proof plus the immediately preceding group-live
-    // probe is the ownership evidence for this post-leader phase.
-    if (options.detachedProcessGroup && childClosed) return true;
     const processId = pid as number;
     const capturedBirth = expectedBirth as string;
     let observedBirth: string | null;
@@ -392,6 +387,8 @@ export type ProviderProcessWitnessReconcileOptions = Readonly<{
   killProcess?: ProcessKill;
   /** Injectable process-birth identity probe used by deterministic tests. */
   processBirthTime?: ProcessBirthProbe;
+  /** Injectable provider-group liveness probe used by deterministic tests. */
+  isProcessGroupAlive?: ProcessGroupProbe;
   /** @internal deterministic filesystem/ownership seams. */
   operations?: Partial<WitnessOperations>;
 }>;
@@ -745,7 +742,10 @@ export function reconcileProviderProcessWitnesses(
   const operations: WitnessOperations = { ...DEFAULT_WITNESS_OPERATIONS, ...options.operations };
   const killProcess = options.killProcess ?? process.kill.bind(process);
   const processBirth = options.processBirthTime ?? processStartTime;
-  if (typeof killProcess !== "function" || typeof processBirth !== "function") {
+  const isGroupAlive = options.isProcessGroupAlive ?? defaultProcessGroupAlive;
+  if (typeof killProcess !== "function"
+    || typeof processBirth !== "function"
+    || typeof isGroupAlive !== "function") {
     return { available: false, providers: [] };
   }
   let result: ProviderProcessWitnessSnapshot = { available: false, providers: [] };
@@ -758,20 +758,32 @@ export function reconcileProviderProcessWitnesses(
         && (options.invocationId === undefined || entry.invocationId === options.invocationId));
       const dead = new Set<ProviderProcessWitness>();
       for (const entry of targetEntries) {
+        let stale = false;
         try {
           killProcess(entry.pid, 0);
         } catch (error) {
-          if ((error as NodeJS.ErrnoException | undefined)?.code === "ESRCH") dead.add(entry);
-          continue;
+          if ((error as NodeJS.ErrnoException | undefined)?.code !== "ESRCH") continue;
+          stale = true;
         }
-        if (entry.processStartTime === null) continue;
-        let observedBirth: string | null;
-        try {
-          observedBirth = normalizeProcessBirthTime(processBirth(entry.pid));
-        } catch {
-          continue;
+        if (!stale) {
+          if (entry.processStartTime === null) continue;
+          let observedBirth: string | null;
+          try {
+            observedBirth = normalizeProcessBirthTime(processBirth(entry.pid));
+          } catch {
+            continue;
+          }
+          stale = observedBirth !== null && observedBirth !== entry.processStartTime;
         }
-        if (observedBirth !== null && observedBirth !== entry.processStartTime) dead.add(entry);
+        if (!stale) continue;
+        if (entry.pgid !== null) {
+          try {
+            if (isGroupAlive(entry.pgid)) continue;
+          } catch {
+            continue;
+          }
+        }
+        dead.add(entry);
       }
       const providers = dead.size === 0
         ? existing.providers
