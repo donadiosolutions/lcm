@@ -565,8 +565,11 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
           try {
             await openProjectWithAdmission();
             await closeOpenedProject();
+            throwIfAborted(signal);
           } catch (err) {
-            if (err instanceof BackendPublicationJournalError) {
+            if (isAbortError(err)) {
+              sendCancellationIfWritable(res);
+            } else if (err instanceof BackendPublicationJournalError) {
               sendJson(res, 503, {
                 status: "blocked",
                 error: "backend publication admission blocked",
@@ -591,6 +594,8 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
         }
         sendJson(res, 200, { skipped: true, actionTaken: false, summary: "Compaction already in progress for this session." });
       } finally {
+        detachProjectAbort?.();
+        await closeOpenedProject();
         await closeRouteStorage(undefined, ownedFactory);
         releaseInvocation();
       }
@@ -618,8 +623,8 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
       if (invocationTarget !== undefined) throwIfAborted(signal);
       if (!summarize) {
         if (config.storage.backend === "postgresql") {
-          const stagedProject = await openProjectWithAdmission();
-          await closeRouteStorage(stagedProject, undefined);
+          await openProjectWithAdmission();
+          await closeOpenedProject();
         }
         sendJson(res, 200, {
           actionTaken: false,
@@ -836,6 +841,7 @@ export function createCompactHandler(config: DaemonConfig, storageFactory?: Stor
       sendJson(res, 500, { error: err instanceof Error ? err.message : "compact failed" });
     } finally {
       detachProjectAbort?.();
+      await closeOpenedProject();
       await closeRouteStorage(undefined, ownedFactory);
       compactingNow.delete(session_id);
       releaseInvocation();

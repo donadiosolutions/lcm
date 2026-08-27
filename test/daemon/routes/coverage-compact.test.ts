@@ -42,6 +42,8 @@ const state = vi.hoisted(() => ({
   ensureProject: vi.fn(),
   queuedKeys: [] as string[],
   queuedSignals: [] as Array<AbortSignal | undefined>,
+  queueSerialize: false,
+  queueChains: new Map<string, Promise<void>>(),
   beforeQueuedWork: undefined as (() => void) | undefined,
   transactionActive: false,
   scrubber: vi.fn(async () => ({ scrubWithCounts: (content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }) })),
@@ -102,8 +104,41 @@ vi.mock("../../../src/daemon/project-queue.js", () => ({
   enqueue: (id: string, work: () => unknown, signal?: AbortSignal) => {
     state.queuedKeys.push(id);
     state.queuedSignals.push(signal);
-    state.beforeQueuedWork?.();
-    return work();
+    const run = async (): Promise<unknown> => {
+      state.beforeQueuedWork?.();
+      if (signal?.aborted) throw createAbortError(signal.reason);
+      return work();
+    };
+    if (!state.queueSerialize) return run();
+    const previous = state.queueChains.get(id) ?? Promise.resolve();
+    const current = previous.then(run, run);
+    state.queueChains.set(id, current.then(() => undefined, () => undefined));
+    if (signal === undefined) return current;
+    return new Promise<unknown>((resolve, reject) => {
+      let settled = false;
+      const onAbort = (): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(createAbortError(signal.reason));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      current.then(
+        value => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        error => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
   },
 }));
 vi.mock("../../../src/db/connection.js", () => ({
@@ -358,6 +393,8 @@ describe("compact route coverage", () => {
     state.ensureProject.mockReturnValue("/tmp/project");
     state.queuedKeys = [];
     state.queuedSignals = [];
+    state.queueSerialize = false;
+    state.queueChains.clear();
     state.beforeQueuedWork = undefined;
     state.transactionActive = false;
     state.scrubber.mockClear();
@@ -968,6 +1005,145 @@ describe("compact route coverage", () => {
     expect(state.openProject).not.toHaveBeenCalled();
     expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
     await coordinator.shutdown();
+  });
+
+  it("waits for an opened project to close before releasing queued cancellation", async () => {
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    const requestController = new AbortController();
+    const closeStarted = vi.fn();
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>(resolve => { releaseClose = resolve; });
+    state.projectClose.mockImplementation(async () => {
+      closeStarted();
+      await closeGate;
+    });
+    state.queueSerialize = true;
+    let releaseFirstCompact!: () => void;
+    const firstCompactGate = new Promise<void>(resolve => { releaseFirstCompact = resolve; });
+    let compactCalls = 0;
+    state.compactInputObserver = async () => {
+      compactCalls += 1;
+      if (compactCalls === 1) await firstCompactGate;
+    };
+    const first = response();
+    const pending = createCompactHandlerProduction(config())(
+      {} as never,
+      first.res,
+      JSON.stringify({ session_id: "queue-close-first", cwd: "/tmp" }),
+      testCompactContext,
+    );
+    await vi.waitFor(() => expect(compactCalls).toBe(1));
+    const secondInvocationId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    coordinator.start({ invocationId: secondInvocationId, command: "compact", daemonInstanceId });
+    const duplicate = response();
+    const duplicatePending = createCompactHandlerProduction(config())(
+      {} as never,
+      duplicate.res,
+      JSON.stringify({ session_id: "queue-close-second", cwd: "/tmp", invocation_id: secondInvocationId }),
+      { ...testCompactContext, signal: requestController.signal, invocationCoordinator: coordinator },
+    );
+    await vi.waitFor(() => expect(state.openProject).toHaveBeenCalledTimes(2));
+    requestController.abort();
+    await vi.waitFor(() => expect(closeStarted).toHaveBeenCalled());
+    expect(coordinator.snapshot(secondInvocationId).activeCount).toBeGreaterThan(0);
+    let duplicateSettled = false;
+    void duplicatePending.then(() => { duplicateSettled = true; });
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    expect(duplicateSettled).toBe(false);
+    releaseClose();
+    releaseFirstCompact();
+    await Promise.allSettled([pending, duplicatePending]);
+    expect(duplicate.status()).toBe(499);
+    expect(coordinator.snapshot(secondInvocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    await coordinator.shutdown();
+  });
+
+  it("classifies cancellation and detaches duplicate PostgreSQL listeners", async () => {
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const invocationId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        poolMax: 1,
+        connectionTimeoutMs: 100,
+        idleTimeoutMs: 100,
+        statementTimeoutMs: 100,
+      },
+    };
+    state.paths.mockImplementation((cwd: string) => ({
+      id: "pid",
+      dir: "/tmp/project",
+      dbPath: "/tmp/project/lcm.db",
+      metaPath: "/tmp/project/meta.json",
+      canonical: cwd,
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+    }));
+    let releaseFirstCompact!: () => void;
+    const firstCompactGate = new Promise<void>(resolve => { releaseFirstCompact = resolve; });
+    const firstCompactStarted = new Promise<void>(resolve => {
+      state.compactInputObserver = async () => {
+        resolve();
+        await firstCompactGate;
+      };
+    });
+    const requestController = new AbortController();
+    state.openProject.mockImplementation(() => {
+      if (state.openProject.mock.calls.length === 2) requestController.abort();
+    });
+    const addListener = vi.spyOn(AbortSignal.prototype, "addEventListener");
+    const removeListener = vi.spyOn(AbortSignal.prototype, "removeEventListener");
+    let firstPending: Promise<unknown> | undefined;
+    let duplicatePending: Promise<unknown> | undefined;
+
+    try {
+      const handler = createCompactHandlerProduction(value);
+      const first = response();
+      firstPending = handler(
+        {} as never,
+        first.res,
+        JSON.stringify({ session_id: "postgres-duplicate-cancel", cwd: "/tmp" }),
+        testCompactContext,
+      );
+      await firstCompactStarted;
+
+      const duplicate = response();
+      duplicatePending = handler(
+        {} as never,
+        duplicate.res,
+        JSON.stringify({
+          session_id: "postgres-duplicate-cancel",
+          cwd: "/tmp",
+          invocation_id: invocationId,
+        }),
+        {
+          ...testCompactContext,
+          signal: requestController.signal,
+          invocationCoordinator: coordinator,
+        },
+      );
+      await duplicatePending;
+
+      const projectListener = addListener.mock.calls.at(-1)?.[1];
+      expect(projectListener).toBeDefined();
+      expect(duplicate.status()).toBe(499);
+      expect(duplicate.json()).toMatchObject({ status: "cancelled" });
+      expect(state.projectClose).toHaveBeenCalledOnce();
+      expect(removeListener.mock.calls.some(([, listener]) => listener === projectListener)).toBe(true);
+      expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 0 });
+    } finally {
+      releaseFirstCompact();
+      await Promise.allSettled([firstPending, duplicatePending].filter(
+        (pending): pending is Promise<unknown> => pending !== undefined,
+      ));
+      await coordinator.shutdown();
+      addListener.mockRestore();
+      removeListener.mockRestore();
+    }
   });
 
   it("finishes a pre-latched metadata commit but rejects later writes", async () => {
