@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { InvocationControlResponse } from "../../src/daemon/client.js";
+import { createAbortError } from "../../src/daemon/cancellation.js";
 import {
   createCompactInvocationLifecycle,
   installCompactSignalHandlers,
@@ -43,7 +44,7 @@ describe("compact invocation lifecycle", () => {
     await lifecycle.start();
     expect(startInvocation).toHaveBeenCalledWith(
       { invocationId, command: "compact", daemonInstanceId },
-      { signal },
+      { signal: expect.any(AbortSignal), timeoutMs: 10_000 },
     );
     expect(setInterval).toHaveBeenCalledOnce();
 
@@ -54,6 +55,38 @@ describe("compact invocation lifecycle", () => {
       { signal },
     );
     expect(heartbeatInvocation).not.toHaveBeenCalled();
+  });
+
+  it("keeps an accepted start request alive when the command signal aborts", async () => {
+    const command = new AbortController();
+    let resolveStart!: (value: InvocationControlResponse) => void;
+    let rejectStart!: (error: unknown) => void;
+    const startInvocation = vi.fn((_target: unknown, options: { signal?: AbortSignal }) => new Promise<InvocationControlResponse>((resolve, reject) => {
+      resolveStart = resolve;
+      rejectStart = reject;
+      options.signal?.addEventListener("abort", () => reject(createAbortError()), { once: true });
+    }));
+    const lifecycle = createCompactInvocationLifecycle({
+      client: {
+        startInvocation,
+        heartbeatInvocation: vi.fn(async () => response("active")),
+        cancelInvocation: vi.fn(async () => response("cancelling")),
+        finishInvocation: vi.fn(async () => response("finished")),
+      },
+      daemonInstanceId,
+      invocationId,
+      signal: command.signal,
+      startTimeoutMs: 1000,
+    } as never);
+
+    const pending = lifecycle.start();
+    const startSignal = startInvocation.mock.calls[0]?.[1]?.signal as AbortSignal;
+    command.abort();
+    expect(startSignal.aborted).toBe(false);
+    resolveStart(response("active"));
+    await expect(pending).resolves.toMatchObject({ state: "active" });
+    expect(lifecycle.started()).toBe(true);
+    expect(rejectStart).toBeDefined();
   });
 
   it("latches the first signal status, aborts dispatch, and reports repeats without exiting", async () => {

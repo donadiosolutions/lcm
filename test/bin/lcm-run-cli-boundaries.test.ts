@@ -846,7 +846,9 @@ describe("runCli scanning and portable knowledge boundaries", () => {
       storageBackend: "sqlite",
       daemonInstanceId: "11111111-1111-4111-8111-111111111111",
     });
-    state.startInvocation.mockImplementationOnce(async (target: unknown) => {
+    let startSignal!: AbortSignal;
+    state.startInvocation.mockImplementationOnce(async (target: unknown, options: { signal?: AbortSignal }) => {
+      startSignal = options.signal!;
       process.emit("SIGINT");
       return { ...target as object, state: "active", activeCount: 0 };
     });
@@ -859,6 +861,7 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     expect(settled).toBe(false);
     release();
     await expect(pending).resolves.toBeUndefined();
+    expect(startSignal.aborted).toBe(false);
     expect(state.cancelInvocation).toHaveBeenCalledOnce();
     expect(process.exitCode).toBe(130);
   });

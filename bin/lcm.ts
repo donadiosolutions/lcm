@@ -170,6 +170,8 @@ export type CompactInvocationLifecycleOptions = Readonly<{
   daemonInstanceId: string;
   invocationId?: string;
   signal?: AbortSignal;
+  /** Bounds the ordinary start control transport without using command abort. */
+  startTimeoutMs?: number;
   heartbeatMs?: number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
@@ -206,6 +208,10 @@ export function createCompactInvocationLifecycle(
   if (!Number.isFinite(heartbeatMs) || heartbeatMs <= 0 || heartbeatMs >= 30_000) {
     throw new RangeError("compact heartbeat interval must be between 0 and 30000 ms");
   }
+  const startTimeoutMs = options.startTimeoutMs ?? 10_000;
+  if (!Number.isFinite(startTimeoutMs) || startTimeoutMs <= 0) {
+    throw new RangeError("compact invocation start timeout must be positive");
+  }
   const signal = options.signal ?? new AbortController().signal;
   const setTimer = options.setInterval ?? setInterval;
   const clearTimer = options.clearInterval ?? clearInterval;
@@ -215,6 +221,7 @@ export function createCompactInvocationLifecycle(
     daemonInstanceId: options.daemonInstanceId,
   };
   let started = false;
+  const startController = new AbortController();
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   let heartbeatPromise: Promise<InvocationControlResponse> | undefined;
 
@@ -247,7 +254,10 @@ export function createCompactInvocationLifecycle(
   const start = async (): Promise<InvocationControlResponse> => {
     if (started) return await options.client.heartbeatInvocation(target, { signal });
     throwIfAborted(signal);
-    const result = await options.client.startInvocation(target, { signal });
+    const result = await options.client.startInvocation(target, {
+      signal: startController.signal,
+      timeoutMs: startTimeoutMs,
+    });
     started = true;
     scheduleHeartbeat();
     return result;
