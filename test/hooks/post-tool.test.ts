@@ -146,7 +146,7 @@ describe("handlePostToolUse", () => {
     }
   });
 
-  it("safe-logs typed lock contention after enqueue and preserves the successful hook outcome", async () => {
+  it("does not log typed lock contention after durable enqueue", async () => {
     const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-contention-cwd-"));
     extraDirs.push(inputCwd);
     const event = { type: "decision", category: "decision", data: "Use SQLite?", priority: 1 } as const;
@@ -167,8 +167,7 @@ describe("handlePostToolUse", () => {
         tool_response: "yes",
       }))).resolves.toEqual({ exitCode: 0, stdout: "" });
       expect(append.mock.invocationCallOrder[0]).toBeLessThan(ensure.mock.invocationCallOrder[0]!);
-      expect(log).toHaveBeenCalledOnce();
-      expect(log).toHaveBeenCalledWith("PostToolUse", contention, { cwd: inputCwd });
+      expect(log).not.toHaveBeenCalled();
     } finally {
       scrub.mockRestore();
       append.mockRestore();
@@ -177,7 +176,7 @@ describe("handlePostToolUse", () => {
     }
   });
 
-  it("preserves global redaction patterns when config admission contends before enqueue", async () => {
+  it("preserves global redaction patterns without logging durable contention", async () => {
     const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-pre-enqueue-contention-cwd-"));
     extraDirs.push(inputCwd);
     writeFileSync(join(homeDir, ".lcm", "config.json"), JSON.stringify({
@@ -207,7 +206,7 @@ describe("handlePostToolUse", () => {
         }),
       ]);
       expect(load).toHaveBeenCalled();
-      expect(log).toHaveBeenCalledWith("PostToolUse", contention, { cwd: inputCwd });
+      expect(log).not.toHaveBeenCalled();
     } finally {
       load.mockRestore();
       ensure.mockRestore();

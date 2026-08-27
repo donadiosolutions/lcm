@@ -42,7 +42,7 @@ component_management:
     - component_id: "unit-hooks"
       name: "Unit - Hooks"
       paths:
-        # Includes native adapters and the #726 publication-diagnostic flow.
+        # Includes native adapters and the #726/#737 publication-diagnostic flow.
         - "src/hooks/"
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"

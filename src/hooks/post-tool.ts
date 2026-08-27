@@ -3,6 +3,7 @@ import { extractPostToolEvents } from "./extractors.js";
 import { normalizePostToolInput } from "./post-tool-normalization.js";
 import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
+import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import { appendLocalHookEvents } from "./local-enqueue.js";
 import {
   BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC,
@@ -103,6 +104,9 @@ export async function handlePostToolUse(
         };
       }
       throw error;
+    }
+    if (enqueued && error instanceof PrivateMutationLockContentionError) {
+      return { exitCode: 0, stdout: "" };
     }
     await safeLogError("PostToolUse", error, { cwd });
   }

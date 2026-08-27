@@ -163,7 +163,8 @@ these fixed capture rules.
 If selected-state publication admission is blocked after a PostToolUse event
 has been durably appended, the event remains preserved locally. Missing
 publication evidence and typed private lock contention are successful
-best-effort hook outcomes. Other malformed, tampered, unsafe, mismatched, or
+best-effort hook outcomes and do not add a hook-error ledger entry. Other
+malformed, tampered, unsafe, mismatched, or
 unresolved evidence fails closed for selected-state work and surfaces this exact
 fixed diagnostic. After the event is durable, the PostToolUse hook returns code
 `0` with a JSON `systemMessage` containing that same line, so Codex can render
