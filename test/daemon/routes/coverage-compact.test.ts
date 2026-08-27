@@ -975,6 +975,25 @@ describe("compact route coverage", () => {
     await coordinator.shutdown();
   });
 
+  it("swallows a normal-finally cancellation rejection after successful compaction", async () => {
+    const invocationId = "66666666-6666-4666-8666-666666666666";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    vi.spyOn(coordinator, "cancel").mockRejectedValueOnce(new Error("late cancellation"));
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "normal-finally-cancel", cwd: "/tmp", invocation_id: invocationId }),
+      { ...testCompactContext, invocationCoordinator: coordinator },
+    );
+
+    expect(output.status()).toBe(200);
+    await coordinator.shutdown();
+  });
+
   it("cancels the matching invocation on request disconnect before project open", async () => {
     const invocationId = "44444444-4444-4444-8444-444444444444";
     const daemonInstanceId = "11111111-1111-4111-8111-111111111111";

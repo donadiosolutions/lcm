@@ -74,7 +74,7 @@ describe("compact invocation lifecycle", () => {
     const invalid = createCompactInvocationLifecycle({
       client: {
         ...client,
-        startInvocation: vi.fn(async () => ({ ...response("active"), invocationId: "wrong" })),
+        startInvocation: vi.fn(async () => null as never),
       },
       daemonInstanceId,
       invocationId,
@@ -82,6 +82,19 @@ describe("compact invocation lifecycle", () => {
       clearInterval: vi.fn(),
     });
     await expect(invalid.start()).rejects.toThrow(/invalid snapshot/);
+
+    const invalidArray = createCompactInvocationLifecycle({
+      client: {
+        ...client,
+        startInvocation: vi.fn(async () => [] as never),
+      },
+      daemonInstanceId,
+      invocationId,
+      setInterval: vi.fn(() => 20 as unknown as ReturnType<typeof globalThis.setInterval>),
+      clearInterval: vi.fn(),
+    });
+    await expect(invalidArray.start()).rejects.toThrow(/invalid snapshot/);
+    await expect(invalid.finish()).resolves.toBeUndefined();
   });
 
   it("returns no heartbeat after abort and reports non-abort heartbeat errors", async () => {
