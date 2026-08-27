@@ -312,6 +312,94 @@ describe("createCodexProcessSummarizer", () => {
     expect(gateway.close).toHaveBeenCalledOnce();
   });
 
+  it("normalizes a non-Error stdout setup failure", async () => {
+    const child = makeChild(0);
+    child.stdout.resume = () => { throw "stdout raw failure"; };
+    const gateway = makeGateway();
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+    } as never);
+    await expect(summarizer("transcript", false)).rejects.toThrow("stdout raw failure");
+    expect(gateway.close).toHaveBeenCalledOnce();
+  });
+
+  it("routes an asynchronous stdin EPIPE through single-flight cleanup", async () => {
+    const child = makeHangingChild();
+    const gateway = makeGateway();
+    const close = gateway.close;
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      rmSync: rmSyncMock,
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+    } as never);
+
+    const promise = summarizer("private transcript", false);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    child.stdin.emit("error", Object.assign(new Error("write EPIPE secret-body"), { code: "EPIPE" }));
+
+    await expect(promise).rejects.toThrow(/stdin/i);
+    expect(close).toHaveBeenCalledOnce();
+    expect(rmSyncMock).toHaveBeenCalledOnce();
+
+    // Late terminal events, including a second stdin error, are harmless and
+    // do not trigger a second close or cleanup operation.
+    child.stdin.emit("error", new Error("late stdin error"));
+    child.emit("error", new Error("late child error"));
+    child.emit("close", 0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(close).toHaveBeenCalledOnce();
+    expect(rmSyncMock).toHaveBeenCalledOnce();
+  });
+
+  it("latches child-close settlement before deferred gateway completion", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeHangingChild();
+      let resolveGateway: (() => void) | undefined;
+      const gatewayCompletion = new Promise<void>((resolve) => { resolveGateway = resolve; });
+      const gateway = makeGateway({
+        waitForCompletion: vi.fn(() => gatewayCompletion),
+      });
+      const close = gateway.close;
+      const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+      const spawn = vi.fn().mockReturnValue(child);
+      const summarizer = createCodexProcessSummarizer({
+        ...baseDeps(child),
+        spawn: spawn as unknown as SpawnFn,
+        rmSync: rmSyncMock,
+        timeoutMs: 20,
+        _createGateway: vi.fn().mockResolvedValue(gateway),
+      } as never);
+
+      const promise = summarizer("private transcript", false);
+      while (spawn.mock.calls.length === 0) await Promise.resolve();
+      child.emit("close", 0);
+      await vi.runAllTicks();
+      expect(gateway.waitForCompletion).toHaveBeenCalledOnce();
+
+      // The timeout expires while the accepted child-close path is waiting for
+      // the gateway's complete upstream stream. It must not kill the child or
+      // replace the original terminal outcome with a timeout.
+      await vi.advanceTimersByTimeAsync(30);
+      expect(child.kill).not.toHaveBeenCalled();
+      resolveGateway?.();
+      await expect(promise).resolves.toBe("summary");
+      expect(close).toHaveBeenCalledOnce();
+      expect(rmSyncMock).toHaveBeenCalledOnce();
+
+      child.emit("close", 0);
+      child.emit("error", new Error("late child error"));
+      child.stdin.emit("error", new Error("late stdin error"));
+      await vi.runAllTicks();
+      expect(close).toHaveBeenCalledOnce();
+      expect(rmSyncMock).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("passes --model when configured", async () => {
     const child = makeChild(0);
     const spawn = vi.fn().mockReturnValue(child);

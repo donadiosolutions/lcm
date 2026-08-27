@@ -402,6 +402,16 @@ async function relaySse(
   }
 }
 
+async function cancelUpstreamBody(body: ReadableStream<Uint8Array> | null | undefined): Promise<void> {
+  if (body === null || body === undefined) return;
+  try {
+    await body.cancel();
+  } catch {
+    // The abort signal is the primary cancellation mechanism. A body that is
+    // already errored or locked is safely discarded when its request closes.
+  }
+}
+
 function listen(server: Server): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -523,6 +533,7 @@ export async function createCodexResponsesGateway(
     request.on("aborted", onRequestClose);
     request.on("close", onRequestClose);
 
+    let upstreamBody: ReadableStream<Uint8Array> | null | undefined;
     try {
       rejectDuplicateRequestHeaders(request);
       validateRequestEncoding(request.headers);
@@ -546,6 +557,7 @@ export async function createCodexResponsesGateway(
       } catch {
         throw new GatewayInputError(502);
       }
+      upstreamBody = upstream.body;
       if (!upstream.ok) {
         throw new GatewayInputError(502);
       }
@@ -563,10 +575,13 @@ export async function createCodexResponsesGateway(
       const cacheControl = safeResponseHeader(upstream.headers.get("cache-control"));
       if (cacheControl !== undefined) response.setHeader("Cache-Control", cacheControl);
       await relaySse(upstream.body, response, controller.signal);
+      upstreamBody = null;
       if (!response.writableEnded) response.end();
       requestCompleted = true;
       finishCompletion();
     } catch (error) {
+      controller.abort();
+      await cancelUpstreamBody(upstreamBody);
       failCompletion();
       sendError(response, error instanceof GatewayInputError ? error.statusCode : 502);
     } finally {

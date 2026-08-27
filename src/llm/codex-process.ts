@@ -138,25 +138,39 @@ async function runCodexSummarizer(
 
   return new Promise((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams;
-    let finished = false;
+    let finishPromise: Promise<void> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
-    const finishRun = async (primaryError?: unknown, summary?: string): Promise<void> => {
-      finished = true;
-      if (timer !== undefined) clearTimeout(timer);
-      let finalError = primaryError === undefined
-        ? undefined
-        : primaryError instanceof Error ? primaryError : new Error(String(primaryError));
-      try {
-        await gateway.close();
-      } catch (error) {
-        if (finalError === undefined) {
-          finalError = error instanceof Error ? error : new Error(String(error));
+    const finishRun = (
+      primaryError?: unknown,
+      completionWork?: () => Promise<string>,
+    ): Promise<void> => {
+      if (finishPromise !== undefined) return finishPromise;
+      finishPromise = (async () => {
+        if (timer !== undefined) clearTimeout(timer);
+        let finalError = primaryError === undefined
+          ? undefined
+          : primaryError instanceof Error ? primaryError : new Error(String(primaryError));
+        let summary: string | undefined;
+        if (finalError === undefined && completionWork !== undefined) {
+          try {
+            summary = await completionWork();
+          } catch (error) {
+            finalError = error instanceof Error ? error : new Error(String(error));
+          }
         }
-      }
-      cleanupTempDir(deps.rmSync, tempDir);
-      if (finalError !== undefined) reject(finalError);
-      else resolve(summary as string);
+        try {
+          await gateway.close();
+        } catch (error) {
+          if (finalError === undefined) {
+            finalError = error instanceof Error ? error : new Error(String(error));
+          }
+        }
+        cleanupTempDir(deps.rmSync, tempDir);
+        if (finalError !== undefined) reject(finalError);
+        else resolve(summary as string);
+      })();
+      return finishPromise;
     };
 
     try {
@@ -170,7 +184,7 @@ async function runCodexSummarizer(
     }
 
     timer = setTimeout(() => {
-      if (finished) return;
+      if (finishPromise !== undefined) return;
       try {
         child.kill();
       } catch {
@@ -187,41 +201,46 @@ async function runCodexSummarizer(
       return;
     }
 
+    const onStdinError = (): void => {
+      if (finishPromise !== undefined) return;
+      try {
+        child.kill();
+      } catch {
+        // ignore kill failures after stdin has closed
+      }
+      void finishRun(new Error("codex process stdin failed"));
+    };
+    child.stdin.on("error", onStdinError);
+
     child.on("error", (error) => {
-      if (finished) return;
       void finishRun(normalizeSpawnError(error));
     });
 
     child.on("close", (code: number | null) => {
-      if (finished) return;
-      void (async () => {
-        try {
-          if (code !== 0) {
-            throw createProcessCompatibilityError({
-              cliName: "Codex",
-              providerId: "codex-process",
-              code,
-              model: deps.model,
-              reasoningEffort: deps.reasoningEffort,
-              fastMode: deps.fastMode,
-            });
-          }
-          if (!gateway.requestAccepted) {
-            throw new Error("codex responses gateway did not receive an authenticated request");
-          }
-          await gateway.waitForCompletion();
-          if (!gateway.requestCompleted) {
-            throw new Error("codex responses gateway did not complete");
-          }
-          const summary = deps.readFileSync(outputPath, "utf-8").trim();
-          if (!summary) {
-            throw new Error("codex output was empty");
-          }
-          await finishRun(undefined, summary);
-        } catch (error) {
-          await finishRun(error);
+      void finishRun(undefined, async () => {
+        if (code !== 0) {
+          throw createProcessCompatibilityError({
+            cliName: "Codex",
+            providerId: "codex-process",
+            code,
+            model: deps.model,
+            reasoningEffort: deps.reasoningEffort,
+            fastMode: deps.fastMode,
+          });
         }
-      })();
+        if (!gateway.requestAccepted) {
+          throw new Error("codex responses gateway did not receive an authenticated request");
+        }
+        await gateway.waitForCompletion();
+        if (!gateway.requestCompleted) {
+          throw new Error("codex responses gateway did not complete");
+        }
+        const summary = deps.readFileSync(outputPath, "utf-8").trim();
+        if (!summary) {
+          throw new Error("codex output was empty");
+        }
+        return summary;
+      });
     });
 
     try {

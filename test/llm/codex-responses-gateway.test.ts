@@ -727,6 +727,66 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(await response.text()).toBe("codex responses gateway request failed\n");
   });
 
+  it.each([401, 503])("aborts and cancels an endless non-2xx upstream body (%s)", async (status) => {
+    let cancelled = false;
+    let upstreamSignal: AbortSignal | undefined;
+    const endless = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("UPSTREAM-SECRET"));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      upstreamSignal = init?.signal;
+      return new Response(endless, {
+        status,
+        headers: { "content-type": "text/event-stream" },
+      });
+    };
+    const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
+    gateways.push(gateway);
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(502);
+    const text = await response.text();
+    expect(text).toBe("codex responses gateway request failed\n");
+    expect(text).not.toContain("UPSTREAM-SECRET");
+    expect(cancelled).toBe(true);
+    expect(upstreamSignal?.aborted).toBe(true);
+    await gateway.close();
+  });
+
+  it("aborts and cancels an endless upstream body before rejecting invalid SSE", async () => {
+    let cancelled = false;
+    let upstreamSignal: AbortSignal | undefined;
+    const endless = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("UPSTREAM-SECRET"));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      upstreamSignal = init?.signal;
+      return new Response(endless, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
+    gateways.push(gateway);
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(502);
+    const text = await response.text();
+    expect(text).toBe("codex responses gateway request failed\n");
+    expect(text).not.toContain("UPSTREAM-SECRET");
+    expect(cancelled).toBe(true);
+    expect(upstreamSignal?.aborted).toBe(true);
+    await gateway.close();
+  });
+
   it.each([
     ["fetch failure", async () => { throw new Error("UPSTREAM-SECRET"); }],
     ["redirect", async () => new Response("UPSTREAM-SECRET", { status: 302, headers: { location: "https://evil.invalid" } })],
