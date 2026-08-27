@@ -904,6 +904,26 @@ forward-compatible fields in the user's Codex configuration from becoming fatal
 to compaction while still applying the requested controls to the spawned
 summarizer.
 
+Codex-process compaction uses a private, one-use loopback Responses gateway for
+each summarize call. The gateway binds only to `127.0.0.1` on an ephemeral port
+and exposes a high-entropy capability path that accepts one exact
+`POST /<capability>/responses` request. Codex runs from an empty per-call temporary
+directory with user configuration, rules, and hooks disabled, and receives only
+the fixed `LCM compaction bootstrap.` stdin string. The gateway keeps the real
+LCM summarizer prompt and transcript in memory, replaces all inherited
+`instructions` and `input` content, and sends a minimized Responses request
+with `tools: []`, `tool_choice: "none"`, `parallel_tool_calls: false`,
+`store: false`, and `stream: true`.
+
+Only the validated model, reasoning controls, and supported service tier are
+retained from Codex's request. `instructions`, `previous_response_id`,
+`client_metadata`, `prompt_cache_key`, `include`, and `stream_options` are not
+forwarded. The gateway requires one managed `Authorization: Bearer ...`
+header. With a valid `ChatGPT-Account-Id`, it uses only
+`https://chatgpt.com/backend-api/codex/responses`; without one, it uses only
+`https://api.openai.com/v1/responses`. Redirects and ambiguous request or
+shutdown outcomes fail closed.
+
 ```json
 {
   "llm": {
