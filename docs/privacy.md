@@ -50,8 +50,11 @@ an explicit empty `additional_tools` inventory and omits top-level `tools`.
 Both dialects discard inherited prompt/input/tools state; `include` and
 `stream_options` are omitted. Managed
 authentication is forwarded only through an explicit header allowlist, and the
-gateway selects the exact ChatGPT or OpenAI endpoint described in
-[configuration](configuration.md). It never persists or logs credentials,
+gateway selects the exact endpoint described in [configuration](configuration.md):
+`sk-`-prefixed bearer credentials use the public OpenAI route, while other
+managed bearers use the ChatGPT route even when account ID is absent. A supplied
+account ID is forwarded but is not the sole route classifier. It never persists
+or logs credentials,
 raw request bodies, prompts, or upstream response bodies. If authentication,
 request shape, routing, streaming, or gateway shutdown is ambiguous, the
 compaction fails closed. The selected provider's retention policy still

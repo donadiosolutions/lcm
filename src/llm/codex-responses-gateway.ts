@@ -90,6 +90,12 @@ export type CodexResponsesGateway = {
 
 type PlainRecord = Record<string, unknown>;
 
+type ManagedAuthorization = {
+  header: string;
+  token: string;
+  route: "api" | "chatgpt";
+};
+
 class GatewayInputError extends Error {
   readonly statusCode: number;
 
@@ -139,7 +145,7 @@ function boundedHeader(value: string | undefined, maxBytes: number): string | un
   return value;
 }
 
-function requireAuthorization(headers: IncomingHttpHeaders): string {
+function requireAuthorization(headers: IncomingHttpHeaders): ManagedAuthorization {
   const value = boundedHeader(
     typeof headers.authorization === "string" ? headers.authorization : undefined,
     MAX_AUTH_BYTES,
@@ -147,7 +153,12 @@ function requireAuthorization(headers: IncomingHttpHeaders): string {
   if (value === undefined || !/^Bearer [^\s,]+$/u.test(value)) {
     throw new GatewayInputError(400);
   }
-  return value;
+  const token = value.slice("Bearer ".length);
+  return {
+    header: value,
+    token,
+    route: token.startsWith("sk-") ? "api" : "chatgpt",
+  };
 }
 
 function optionalAccountId(headers: IncomingHttpHeaders): string | undefined {
@@ -317,11 +328,11 @@ function canonicalMetadataHeader(name: typeof CODEX_METADATA_HEADERS[number]): s
 
 function buildUpstreamHeaders(
   headers: IncomingHttpHeaders,
-  authorization: string,
+  authorization: ManagedAuthorization,
   accountId: string | undefined,
 ): Record<string, string> {
   const outbound: Record<string, string> = {
-    Authorization: authorization,
+    Authorization: authorization.header,
     Accept: "text/event-stream",
     "Content-Type": "application/json",
     "Accept-Encoding": "identity",
@@ -339,11 +350,11 @@ function buildUpstreamHeaders(
 }
 
 function upstreamUrlFor(
-  accountId: string | undefined,
+  authorization: ManagedAuthorization,
   options: CodexResponsesGatewayOptions,
 ): string {
   if (options._upstreamUrl !== undefined) return options._upstreamUrl;
-  if (accountId !== undefined) return options._upstreamUrls?.chatgpt ?? CHATGPT_RESPONSES_URL;
+  if (authorization.route === "chatgpt") return options._upstreamUrls?.chatgpt ?? CHATGPT_RESPONSES_URL;
   return options._upstreamUrls?.api ?? OPENAI_RESPONSES_URL;
 }
 
@@ -546,6 +557,7 @@ export async function createCodexResponsesGateway(
     request.on("aborted", onRequestClose);
     request.on("close", onRequestClose);
 
+    let bodyReadAttempted = false;
     let upstreamBody: ReadableStream<Uint8Array> | null | undefined;
     try {
       rejectDuplicateRequestHeaders(request);
@@ -554,6 +566,7 @@ export async function createCodexResponsesGateway(
       const authorization = requireAuthorization(request.headers);
       const accountId = optionalAccountId(request.headers);
       const responsesLite = responsesLiteEnabled(request.headers);
+      bodyReadAttempted = true;
       const body = parseRequestBody(await readRequestBody(request, declaredLength));
       const payload = buildPayload(options.prompt, body, responsesLite);
       const headers = buildUpstreamHeaders(request.headers, authorization, accountId);
@@ -561,7 +574,7 @@ export async function createCodexResponsesGateway(
 
       let upstream: Response;
       try {
-        upstream = await fetchImpl(upstreamUrlFor(accountId, options), {
+        upstream = await fetchImpl(upstreamUrlFor(authorization, options), {
           method: "POST",
           headers,
           body: JSON.stringify(payload),
@@ -594,6 +607,13 @@ export async function createCodexResponsesGateway(
       requestCompleted = true;
       finishCompletion();
     } catch (error) {
+      if (!bodyReadAttempted) {
+        try {
+          request.resume();
+        } catch {
+          // Keep the generic validation error even if draining the socket fails.
+        }
+      }
       controller.abort();
       await cancelUpstreamBody(upstreamBody);
       failCompletion();

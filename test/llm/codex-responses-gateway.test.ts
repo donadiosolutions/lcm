@@ -201,7 +201,9 @@ describe("Codex Responses zero-tools gateway", () => {
       "chatgpt-account-id": "acct-1",
       "x-client-request-id": "request-1",
     };
-    const outbound = utils.buildUpstreamHeaders(headers, "Bearer token", "acct-1");
+    const chatAuthorization = { header: "Bearer token", token: "token", route: "chatgpt" as const };
+    const apiAuthorization = { header: "Bearer sk-test", token: "sk-test", route: "api" as const };
+    const outbound = utils.buildUpstreamHeaders(headers, chatAuthorization, "acct-1");
     expect(outbound).toMatchObject({
       Authorization: "Bearer token",
       "ChatGPT-Account-Id": "acct-1",
@@ -210,11 +212,11 @@ describe("Codex Responses zero-tools gateway", () => {
       "Content-Type": "application/json",
       "Accept-Encoding": "identity",
     });
-    expect(utils.upstreamUrlFor("acct-1", { prompt: "x", _upstreamUrl: "http://test/one" })).toBe("http://test/one");
-    expect(utils.upstreamUrlFor("acct-1", { prompt: "x", _upstreamUrls: { chatgpt: "http://test/chat" } })).toBe("http://test/chat");
-    expect(utils.upstreamUrlFor(undefined, { prompt: "x", _upstreamUrls: { api: "http://test/api" } })).toBe("http://test/api");
-    expect(utils.upstreamUrlFor("acct-1", { prompt: "x" })).toBe("https://chatgpt.com/backend-api/codex/responses");
-    expect(utils.upstreamUrlFor(undefined, { prompt: "x" })).toBe("https://api.openai.com/v1/responses");
+    expect(utils.upstreamUrlFor(chatAuthorization, { prompt: "x", _upstreamUrl: "http://test/one" })).toBe("http://test/one");
+    expect(utils.upstreamUrlFor(chatAuthorization, { prompt: "x", _upstreamUrls: { chatgpt: "http://test/chat" } })).toBe("http://test/chat");
+    expect(utils.upstreamUrlFor(apiAuthorization, { prompt: "x", _upstreamUrls: { api: "http://test/api" } })).toBe("http://test/api");
+    expect(utils.upstreamUrlFor(chatAuthorization, { prompt: "x" })).toBe("https://chatgpt.com/backend-api/codex/responses");
+    expect(utils.upstreamUrlFor(apiAuthorization, { prompt: "x" })).toBe("https://api.openai.com/v1/responses");
     expect(utils.safeResponseHeader(null)).toBeUndefined();
     expect(utils.safeResponseHeader("")).toBeUndefined();
     expect(utils.safeResponseHeader("x".repeat(513))).toBeUndefined();
@@ -250,7 +252,7 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(utils.validateContentLength({ "content-length": "2" })).toBe(2);
     expect(() => utils.validateRequestEncoding({ "content-encoding": "gzip" })).toThrow();
     expect(() => utils.validateRequestEncoding({ "content-encoding": "identity" })).not.toThrow();
-    expect(() => utils.buildUpstreamHeaders({ "x-client-request-id": "x".repeat(16 * 1024 + 1) }, "Bearer token", undefined)).toThrow();
+    expect(() => utils.buildUpstreamHeaders({ "x-client-request-id": "x".repeat(16 * 1024 + 1) }, chatAuthorization, undefined)).toThrow();
     expect(utils.responsesLiteEnabled({})).toBe(false);
     expect(utils.responsesLiteEnabled({ "x-openai-internal-codex-responses-lite": "true" })).toBe(true);
     expect(() => utils.responsesLiteEnabled({ "x-openai-internal-codex-responses-lite": "false" })).toThrow();
@@ -756,7 +758,7 @@ describe("Codex Responses zero-tools gateway", () => {
     const apiGateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
     gateways.push(chatGateway, apiGateway);
     await expect(fetchGateway(chatGateway, { headers: { "ChatGPT-Account-Id": "acct-1" } })).resolves.toMatchObject({ status: 200 });
-    await expect(fetchGateway(apiGateway)).resolves.toMatchObject({ status: 200 });
+    await expect(fetchGateway(apiGateway, { headers: { Authorization: "Bearer sk-test-token" } })).resolves.toMatchObject({ status: 200 });
     expect(seen).toEqual(["/v1/responses", "/v1/responses"]);
   });
 
@@ -773,7 +775,7 @@ describe("Codex Responses zero-tools gateway", () => {
     const apiGateway = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
     gateways.push(chatGateway, apiGateway);
     await expect(fetchGateway(chatGateway, { headers: { "ChatGPT-Account-Id": "acct-1" } })).resolves.toMatchObject({ status: 200 });
-    await expect(fetchGateway(apiGateway)).resolves.toMatchObject({ status: 200 });
+    await expect(fetchGateway(apiGateway, { headers: { Authorization: "Bearer sk-test-token" } })).resolves.toMatchObject({ status: 200 });
     expect(destinations).toEqual([
       "https://chatgpt.com/backend-api/codex/responses",
       "https://api.openai.com/v1/responses",
@@ -786,6 +788,66 @@ describe("Codex Responses zero-tools gateway", () => {
     const noContentTypeResponse = await fetchGateway(noContentType);
     expect(noContentTypeResponse.status).toBe(200);
     expect(noContentTypeResponse.headers.get("content-type")).toMatch(/^text\/event-stream/);
+  });
+
+  it("classifies bearer credentials by API-key syntax before selecting the fixed route", async () => {
+    const destinations: string[] = [];
+    const fetchImpl: typeof fetch = async (input) => {
+      destinations.push(String(input));
+      return new Response("data: ok\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    };
+    const accountlessOAuth = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
+    const projectKey = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
+    const accountWithOpaque = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
+    gateways.push(accountlessOAuth, projectKey, accountWithOpaque);
+
+    await expect(fetchGateway(accountlessOAuth, {
+      headers: { Authorization: "Bearer eyJhbGciOiJSUzI1NiJ9.opaque-chatgpt-token" },
+    })).resolves.toMatchObject({ status: 200 });
+    await expect(fetchGateway(projectKey, {
+      headers: { Authorization: "Bearer sk-proj-test-key" },
+    })).resolves.toMatchObject({ status: 200 });
+    await expect(fetchGateway(accountWithOpaque, {
+      headers: {
+        Authorization: "Bearer opaque-chatgpt-token",
+        "ChatGPT-Account-Id": "acct-with-opaque-token",
+      },
+    })).resolves.toMatchObject({ status: 200 });
+    expect(destinations).toEqual([
+      "https://chatgpt.com/backend-api/codex/responses",
+      "https://api.openai.com/v1/responses",
+      "https://chatgpt.com/backend-api/codex/responses",
+    ]);
+  });
+
+  it("drains a request once when exact-path prevalidation fails before body consumption", async () => {
+    let handler: ((request: IncomingMessage, response: ServerResponse) => void) | undefined;
+    const upstreamFetch = vi.fn<typeof fetch>();
+    const fakeServer = makeFakeServer();
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: upstreamFetch,
+      _createServer: ((requestHandler) => {
+        handler = requestHandler;
+        return fakeServer;
+      }) as unknown as typeof createServer,
+    });
+    const request = new EventEmitter() as IncomingMessage;
+    Object.assign(request, {
+      resume: vi.fn(),
+      url: `${gateway.capabilityPath}/responses`,
+      method: "POST",
+      headers: { authorization: "Bearer one" },
+      rawHeaders: ["Authorization", "Bearer one", "Authorization", "Bearer two"],
+      [Symbol.asyncIterator]: async function* () { throw new Error("body must not be read"); },
+    });
+    const response = makeFakeResponse(true);
+    handler?.(request, response as unknown as ServerResponse);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(response.statusCode).toBe(400);
+    expect(request.resume).toHaveBeenCalledOnce();
+    expect(upstreamFetch).not.toHaveBeenCalled();
+    await gateway.close();
   });
 
   it.each([401, 503])("does not expose upstream error bodies and rejects a replay after upstream %s", async (status) => {
@@ -919,10 +981,9 @@ describe("Codex Responses zero-tools gateway", () => {
     const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
     gateways.push(gateway);
     const responsePromise = fetchGateway(gateway);
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    const response = await responsePromise;
     await gateway.close();
     await expect(gateway.waitForCompletion()).rejects.toThrow("codex responses gateway did not complete");
-    const response = await responsePromise;
     await expect(response.arrayBuffer()).rejects.toThrow();
   });
 

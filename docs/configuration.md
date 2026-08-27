@@ -921,10 +921,12 @@ Only the validated model, reasoning controls, and supported service tier are
 retained from Codex's request. `instructions`, `previous_response_id`,
 `client_metadata`, `prompt_cache_key`, `include`, and `stream_options` are not
 forwarded. The gateway requires one managed `Authorization: Bearer ...`
-header. With a valid `ChatGPT-Account-Id`, it uses only
-`https://chatgpt.com/backend-api/codex/responses`; without one, it uses only
-`https://api.openai.com/v1/responses`. Redirects and ambiguous request or
-shutdown outcomes fail closed.
+header. A bearer token beginning with `sk-` selects only
+`https://api.openai.com/v1/responses`; any other valid managed bearer selects
+only `https://chatgpt.com/backend-api/codex/responses`, whether or not a
+`ChatGPT-Account-Id` is present. A valid account ID is forwarded when supplied,
+but its absence does not select the public API route. Redirects and ambiguous
+request or shutdown outcomes fail closed.
 
 ```json
 {
