@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   createAbortError,
   throwIfAborted,
+  waitForAbortable,
 } from "./cancellation.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -66,8 +67,8 @@ export type InvocationCoordinator = Readonly<{
   admitWork: (input: InvocationInput) => InvocationAdmission;
   acquireCommit: (input: InvocationInput) => InvocationAdmission;
   admitCommit: (input: InvocationInput) => InvocationAdmission;
-  cancel: (input: InvocationInput) => Promise<InvocationSnapshot>;
-  finish: (input: InvocationInput) => Promise<InvocationSnapshot>;
+  cancel: (input: InvocationInput, signal?: AbortSignal) => Promise<InvocationSnapshot>;
+  finish: (input: InvocationInput, signal?: AbortSignal) => Promise<InvocationSnapshot>;
   snapshot: (invocationId: string) => InvocationSnapshot;
   tombstoneCount: () => number;
   shutdown: () => Promise<void>;
@@ -322,8 +323,18 @@ export function createInvocationCoordinator(
     throw new InvocationCoordinatorError("unknown-invocation", "unknown invocation", 404);
   };
 
-  const waitForZero = (record: InvocationRecord): Promise<InvocationSnapshot> => {
-    return new Promise(resolve => record.zeroWaiters.push(resolve));
+  const waitForZero = async (record: InvocationRecord, signal?: AbortSignal): Promise<InvocationSnapshot> => {
+    let waiter!: (snapshot: InvocationSnapshot) => void;
+    const pending = new Promise<InvocationSnapshot>(resolve => {
+      waiter = resolve;
+      record.zeroWaiters.push(waiter);
+    });
+    try {
+      return await waitForAbortable(pending, signal);
+    } finally {
+      const index = record.zeroWaiters.indexOf(waiter);
+      if (index >= 0) record.zeroWaiters.splice(index, 1);
+    }
   };
 
   const releaseCount = (record: InvocationRecord, kind: "work" | "commit"): void => {
@@ -398,16 +409,16 @@ export function createInvocationCoordinator(
     return snapshotForRecord(found);
   };
 
-  const cancel = async (input: InvocationInput): Promise<InvocationSnapshot> => {
+  const cancel = async (input: InvocationInput, signal?: AbortSignal): Promise<InvocationSnapshot> => {
     const target = normalizeTarget(input, daemonInstanceId);
     const found = lookup(target);
     if (!("controller" in found)) return snapshotForTombstone(found);
     const transitioned = transitionToCancel(found, "cancelled");
     if (records.get(found.invocationId) !== found) return transitioned;
-    return await waitForZero(found);
+    return await waitForZero(found, signal);
   };
 
-  const finish = async (input: InvocationInput): Promise<InvocationSnapshot> => {
+  const finish = async (input: InvocationInput, signal?: AbortSignal): Promise<InvocationSnapshot> => {
     const target = normalizeTarget(input, daemonInstanceId);
     const found = lookup(target);
     if (!("controller" in found)) return snapshotForTombstone(found);
@@ -418,7 +429,7 @@ export function createInvocationCoordinator(
     }
     const transitioned = maybeDrainRecord(found);
     if (records.get(found.invocationId) !== found) return transitioned;
-    return await waitForZero(found);
+    return await waitForZero(found, signal);
   };
 
   const snapshot = (invocationId: string): InvocationSnapshot => {

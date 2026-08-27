@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { isAbortError } from "../cancellation.js";
 import type { InvocationCoordinator, InvocationInput } from "../invocation-coordinator.js";
 import { InvocationCoordinatorError } from "../invocation-coordinator.js";
 import { sendJson } from "../server.js";
@@ -66,7 +67,7 @@ function asTarget(input: Record<string, unknown>): InvocationInput {
 
 /** Handle the fixed, authenticated invocation-control protocol. */
 export function createInvocationControlHandler(coordinator: InvocationCoordinator): RouteHandler {
-  return async (_req, res, body) => {
+  return async (_req, res, body, context) => {
     try {
       const input = parseInvocationControlBody(body);
       const target = asTarget(input);
@@ -76,10 +77,11 @@ export function createInvocationControlHandler(coordinator: InvocationCoordinato
         : action === "heartbeat"
           ? coordinator.heartbeat(target)
           : action === "cancel"
-            ? await coordinator.cancel(target)
-            : await coordinator.finish(target);
+            ? await coordinator.cancel(target, context?.signal)
+            : await coordinator.finish(target, context?.signal);
       sendJson(res, 200, result);
     } catch (error) {
+      if (isAbortError(error)) return;
       if (error instanceof InvocationCoordinatorError) {
         sendJson(res, error.statusCode, { error: "invalid invocation control request" });
         return;

@@ -135,6 +135,27 @@ describe("invocation coordinator", () => {
     expect(coordinator.snapshot(secondInvocationId)).toMatchObject({ state: "active", activeCount: 0 });
   });
 
+  it("detaches a disconnected cancellation waiter without undoing cancellation", async () => {
+    const { coordinator } = createHarness();
+    coordinator.start(target());
+    const work = coordinator.admitWork(target());
+    const request = new AbortController();
+    let outcome = "pending";
+    void coordinator.cancel(target(), request.signal).then(
+      () => { outcome = "resolved"; },
+      (error: unknown) => { outcome = (error as Error).name; },
+    );
+
+    request.abort();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(outcome).toBe("AbortError");
+    expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelling", activeCount: 1 });
+
+    const replacement = coordinator.cancel(target());
+    work.release();
+    await expect(replacement).resolves.toMatchObject({ state: "cancelled", activeCount: 0 });
+  });
+
   it("allows a pre-cancel commit permit to finish and blocks later permits", async () => {
     const { coordinator } = createHarness();
     coordinator.start(target());

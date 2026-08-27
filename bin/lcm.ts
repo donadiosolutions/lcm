@@ -745,7 +745,7 @@ export async function cancelAndDrainCompactInvocation(
       session.oldInstanceGone = oldGone;
       session.providerWitnessGone = providersGone;
     }
-    if (!restart.connected || !oldGone || !providersGone) return false;
+    if (!oldGone || !providersGone) return false;
     const replacementResult = await boundedRestart(signal => health(options.createFreshClient(), { signal }));
     const replacement = replacementResult.value;
     replacementVerified = replacementResult.settled

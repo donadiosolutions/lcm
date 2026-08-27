@@ -413,7 +413,7 @@ describe("compact invocation lifecycle", () => {
     expect(cancelInvocation).toHaveBeenCalledTimes(2);
   });
 
-  it("requires old-instance and provider disappearance proof before accepting restart", async () => {
+  it("rechecks replacement health after restart stops the old daemon without connecting", async () => {
     const oldHealth = {
       status: "healthy",
       version: "1.4.2",
@@ -428,7 +428,7 @@ describe("compact invocation lifecycle", () => {
     const health = vi.fn()
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(replacementHealth);
-    const restart = vi.fn(async () => ({ connected: true, restarted: true, stoppedPid: 9, pid: 10 }));
+    const restart = vi.fn(async () => ({ connected: false, restarted: true, stoppedPid: 9, pid: 10 }));
     const lifecycle = {
       started: () => true,
       stopHeartbeat: vi.fn(),

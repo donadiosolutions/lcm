@@ -1,4 +1,5 @@
 import { ensureAuthToken, readAuthToken } from "../../src/daemon/auth.js";
+import { createAbortError } from "../../src/daemon/cancellation.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { createDaemon, type DaemonInstance } from "../../src/daemon/server.js";
 import {
@@ -111,6 +112,47 @@ describe("authenticated invocation-control route", () => {
     const response = await control("start", target, undefined);
     expect(response.status).toBe(401);
     expect(await response.json()).toEqual({ error: "unauthorized" });
+  });
+
+  it("passes the request signal to cancellation and finish waiters", async () => {
+    const signal = new AbortController().signal;
+    const result = {
+      invocationId,
+      command: "compact" as const,
+      daemonInstanceId,
+      state: "cancelled" as const,
+      activeCount: 0,
+      workCount: 0,
+      commitCount: 0,
+      leaseExpiresAt: null,
+    };
+    const cancel = vi.fn(async () => result);
+    const finish = vi.fn(async () => result);
+    const handler = createInvocationControlHandler({ cancel, finish } as never);
+    const response = { writeHead: vi.fn(), end: vi.fn() };
+
+    await handler({} as never, response as never, JSON.stringify({ action: "cancel", ...target }), { signal });
+    await handler({} as never, response as never, JSON.stringify({ action: "finish", ...target }), { signal });
+
+    expect(cancel).toHaveBeenCalledWith({ invocationId, command: "compact", daemonInstanceId }, signal);
+    expect(finish).toHaveBeenCalledWith({ invocationId, command: "compact", daemonInstanceId }, signal);
+  });
+
+  it("does not reply after request cancellation detaches a waiter", async () => {
+    const handler = createInvocationControlHandler({
+      cancel: async () => { throw createAbortError(); },
+    } as never);
+    const response = { writeHead: vi.fn(), end: vi.fn() };
+
+    await handler(
+      {} as never,
+      response as never,
+      JSON.stringify({ action: "cancel", ...target }),
+      { signal: new AbortController().signal },
+    );
+
+    expect(response.writeHead).not.toHaveBeenCalled();
+    expect(response.end).not.toHaveBeenCalled();
   });
 
   it("starts, heartbeats, cancels only after targeted work reaches zero, then finishes", async () => {
