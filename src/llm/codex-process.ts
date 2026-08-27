@@ -46,6 +46,7 @@ export type CodexProcessDeps = {
   processGroupId?: number;
   daemonProcessGroupId?: number;
   isProcessGroupAlive?: (pgid: number) => boolean;
+  processGroupIdProbe?: (pid: number) => number | undefined;
   daemonInstanceId?: string;
   witnessStore?: ProviderProcessWitnessStore;
   processBirthTime?: (pid: number) => string | null;
@@ -151,6 +152,7 @@ async function runCodexSummarizer(
     processGroupId?: number;
     daemonProcessGroupId?: number;
     isProcessGroupAlive?: (pgid: number) => boolean;
+    processGroupIdProbe?: (pid: number) => number | undefined;
     daemonInstanceId?: string;
     witnessStore?: ProviderProcessWitnessStore;
     processBirthTime?: (pid: number) => string | null;
@@ -163,21 +165,28 @@ async function runCodexSummarizer(
   const tempDir = deps.mkdtempSync(join(deps.tmpdir(), "lcm-codex-"));
   const outputPath = join(tempDir, "last-message.txt");
   let gateway: CodexResponsesGateway | undefined;
+  let gatewayPromise: Promise<CodexResponsesGateway> | undefined;
 
   try {
-    const gatewayPromise = Promise.resolve(deps.createGateway({ prompt }));
-    // A gateway that resolves after a raced cancellation remains owned by this
-    // call and must be closed even though the caller already observed abort.
-    void gatewayPromise.then((lateGateway) => {
-      if (signal?.aborted) void lateGateway.close().catch(() => undefined);
-    }, () => undefined);
+    gatewayPromise = Promise.resolve(deps.createGateway({ prompt }));
     gateway = await waitForAbortable(gatewayPromise, signal);
     throwIfAborted(signal);
   } catch (error) {
     if (gateway !== undefined) {
       try { await gateway.close(); } catch { /* preserve the primary error */ }
+    } else if (signal?.aborted && gatewayPromise !== undefined) {
+      // waitForAbortable rejects immediately, but the gateway promise remains
+      // owned by this call. Await it before cleanup so a late gateway cannot
+      // outlive the temp directory or leak its listener/socket handles.
+      try {
+        const lateGateway = await gatewayPromise;
+        try { await lateGateway.close(); } catch { /* preserve cancellation */ }
+      } catch {
+        // A failed late gateway has no owned close handle.
+      }
     }
     cleanupTempDir(deps.rmSync, tempDir);
+    if (signal?.aborted) throw createAbortError(signal.reason);
     throw error instanceof Error ? error : new Error(String(error));
   }
 
@@ -220,7 +229,7 @@ async function runCodexSummarizer(
     const finishRun = (
       primaryError?: unknown,
       completionWork?: () => Promise<string>,
-      teardownReason?: "abort" | "timeout",
+      teardownReason?: "abort" | "timeout" | "close",
     ): Promise<void> => {
       if (finishPromise !== undefined) return finishPromise;
       finishPromise = (async () => {
@@ -247,10 +256,11 @@ async function runCodexSummarizer(
         }
         try {
           if (teardown !== undefined && child !== undefined) {
-            const effectiveTeardownReason = teardownReason ?? (cancellationRequested ? "abort" : undefined);
-            const settled = effectiveTeardownReason !== undefined
-              ? await teardown.terminate(effectiveTeardownReason)
-              : await teardown.waitForSettlement();
+            const effectiveTeardownReason = teardownReason ?? (cancellationRequested ? "abort" : "close");
+            const settled = await teardown.terminate(effectiveTeardownReason);
+            if (!settled && finalError === undefined) {
+              finalError = new Error("codex process teardown did not settle");
+            }
             if (settled && witness !== undefined && !witnessRemoved) {
               try {
                 deps.witnessStore!.remove(witness);
@@ -302,6 +312,8 @@ async function runCodexSummarizer(
       daemonProcessGroupId: deps.daemonProcessGroupId,
       killProcess: deps.killProcess,
       isProcessGroupAlive: deps.isProcessGroupAlive,
+      processBirthTime: deps.processBirthTime,
+      processGroupIdProbe: deps.processGroupIdProbe,
       setTimeout: deps.setTimeout,
       clearTimeout: deps.clearTimeout,
     });
@@ -386,7 +398,7 @@ async function runCodexSummarizer(
           throw new Error("codex output was empty");
         }
         return summary;
-      });
+      }, "close");
     };
 
     child.on("error", onChildError);
@@ -429,6 +441,7 @@ export function createCodexProcessSummarizer(opts: CodexProcessDeps = {}): LcmSu
     processGroupId: opts.processGroupId,
     daemonProcessGroupId: opts.daemonProcessGroupId,
     isProcessGroupAlive: opts.isProcessGroupAlive,
+    processGroupIdProbe: opts.processGroupIdProbe,
     daemonInstanceId: opts.daemonInstanceId,
     witnessStore: opts.witnessStore,
     processBirthTime: opts.processBirthTime ?? processStartTime,

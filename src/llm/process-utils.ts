@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, chmodSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { lcmHomeDir } from "../runtime-paths.js";
+import { processStartTime } from "../private-mutation-lock.js";
 
 export const MAX_MODEL_DISPLAY_LENGTH = 80;
 
@@ -40,6 +42,8 @@ type ProcessChild = {
 
 type ProcessGroupProbe = (pgid: number) => boolean;
 type ProcessKill = (pid: number, signal?: NodeJS.Signals | number) => void;
+type ProcessBirthProbe = (pid: number) => string | null;
+type ProcessGroupIdProbe = (pid: number) => number | undefined;
 
 export type OwnedProcessTeardownOptions = Readonly<{
   child: ProcessChild;
@@ -53,6 +57,10 @@ export type OwnedProcessTeardownOptions = Readonly<{
   killProcess?: ProcessKill;
   /** Injectable group-liveness probe. */
   isProcessGroupAlive?: ProcessGroupProbe;
+  /** Injectable process-birth identity probe. */
+  processBirthTime?: ProcessBirthProbe;
+  /** Injectable current process-group identity probe. */
+  processGroupIdProbe?: ProcessGroupIdProbe;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
 }>;
@@ -64,7 +72,7 @@ export type OwnedProcessTeardown = Readonly<{
   /** Wait for the child close and (when validated) group disappearance. */
   waitForSettlement: () => Promise<boolean>;
   /** Idempotently tear down one process. Cancellation waits for full settlement. */
-  terminate: (reason?: "abort" | "timeout") => Promise<boolean>;
+  terminate: (reason?: "abort" | "timeout" | "close") => Promise<boolean>;
 }>;
 
 const POSIX_PROCESS_GROUP_PLATFORMS = new Set<NodeJS.Platform>([
@@ -80,6 +88,7 @@ const POSIX_PROCESS_GROUP_PLATFORMS = new Set<NodeJS.Platform>([
 ]);
 const PROCESS_GROUP_POLL_MS = 20;
 const PROCESS_GROUP_TERM_GRACE_MS = 2_000;
+const PROCESS_GROUP_KILL_GRACE_MS = 2_000;
 
 function positivePid(value: number | null | undefined): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
@@ -138,21 +147,94 @@ function safeChildSignal(child: ProcessChild, signal: NodeJS.Signals): void {
  */
 export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions): OwnedProcessTeardown {
   const pid = positivePid(options.child.pid);
-  const groupId = resolveOwnedProcessGroup(options, pid);
+  const platform = options.platform ?? process.platform;
+  const birthProbe = options.processBirthTime ?? processStartTime;
+  let expectedBirth: string | undefined;
+  if (pid !== undefined) {
+    try {
+      expectedBirth = birthProbe(pid) ?? undefined;
+    } catch {
+      expectedBirth = undefined;
+    }
+  }
+  const candidateGroupId = resolveOwnedProcessGroup(options, pid);
+  const groupId = candidateGroupId !== undefined && expectedBirth !== undefined ? candidateGroupId : undefined;
   const killProcess = options.killProcess ?? ((target: number, signal?: NodeJS.Signals | number) => process.kill(target, signal));
   const isGroupAlive = options.isProcessGroupAlive ?? defaultProcessGroupAlive;
   const setTimer = options.setTimeout ?? setTimeout;
   const clearTimer = options.clearTimeout ?? clearTimeout;
+  const currentGroupProbe = options.processGroupIdProbe
+    ?? (platform === "linux" && options.processGroupId === undefined ? linuxProcessGroupId : undefined);
   let childClosed = false;
   let termination: Promise<boolean> | undefined;
-  let closeListener: ((...args: unknown[]) => void) | undefined;
+  let groupInvalidated = false;
+  let groupDisappearedLatched = groupId === undefined;
+  let settlementPromise: Promise<boolean> | undefined;
+  let resolveSettlement: ((result: boolean) => void) | undefined;
+  let settlementPollTimer: ReturnType<typeof setTimeout> | undefined;
+  let settlementDeadlineTimer: ReturnType<typeof setTimeout> | undefined;
   // Observe close from creation so an abort cannot miss a child that exited
   // between the provider's terminal event and teardown initialization.
-  options.child.once("close", () => { childClosed = true; });
+  const observeChildClose = (): void => {
+    childClosed = true;
+    groupDisappeared();
+    if (settlementPromise !== undefined) checkSettlement();
+  };
+  options.child.once("close", observeChildClose);
+
+  function groupDisappeared(): boolean {
+    if (groupDisappearedLatched) return true;
+    try {
+      if (!isGroupAlive(groupId!)) {
+        groupDisappearedLatched = true;
+        return true;
+      }
+    } catch {
+      // An unverifiable group remains evidence-bearing; do not claim it gone.
+    }
+    return false;
+  }
+
+  function groupIdentityStillOwned(): boolean {
+    if (groupId === undefined || groupInvalidated || groupDisappearedLatched) return false;
+    const processId = pid as number;
+    const capturedBirth = expectedBirth as string;
+    let observedBirth: string | null;
+    try {
+      observedBirth = birthProbe(processId);
+    } catch {
+      groupInvalidated = true;
+      return false;
+    }
+    if (observedBirth !== null && observedBirth !== capturedBirth) {
+      groupInvalidated = true;
+      return false;
+    }
+    if (childClosed) return true;
+    if (observedBirth !== capturedBirth) {
+      groupInvalidated = true;
+      return false;
+    }
+    if (!childClosed && currentGroupProbe !== undefined) {
+      let observedGroup: number | undefined;
+      try {
+        observedGroup = currentGroupProbe(processId);
+      } catch {
+        groupInvalidated = true;
+        return false;
+      }
+      if (observedGroup !== groupId) {
+        groupInvalidated = true;
+        return false;
+      }
+    }
+    return true;
+  }
 
   const signalTarget = (signal: NodeJS.Signals): void => {
-    if (groupId === undefined) {
-      safeChildSignal(options.child, signal);
+    const disappearanceObserved = signal === "SIGKILL" || childClosed ? groupDisappeared() : false;
+    if (groupId === undefined || disappearanceObserved || !groupIdentityStillOwned()) {
+      if (!childClosed) safeChildSignal(options.child, signal);
       return;
     }
     try {
@@ -165,53 +247,51 @@ export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions)
     }
   };
 
-  const groupDisappeared = (): boolean => {
-    if (groupId === undefined) return true;
-    try {
-      return !isGroupAlive(groupId);
-    } catch {
-      // An unverifiable group remains evidence-bearing; do not claim it gone.
-      return false;
+  function finishSettlement(result: boolean): void {
+    const resolve = resolveSettlement;
+    if (resolve === undefined) return;
+    resolveSettlement = undefined;
+    if (settlementPollTimer !== undefined) {
+      clearTimer(settlementPollTimer);
+      settlementPollTimer = undefined;
     }
-  };
-
-  const waitForSettlement = (deadlineMs?: number): Promise<boolean> => new Promise(resolve => {
-    let pollTimer: ReturnType<typeof setTimeout> | undefined;
-    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-    let settled = false;
-    const finish = (result: boolean): void => {
-      if (settled) return;
-      settled = true;
-      if (pollTimer !== undefined) clearTimer(pollTimer);
-      if (deadlineTimer !== undefined) clearTimer(deadlineTimer);
-      options.child.removeListener("close", closeListener!);
-      closeListener = undefined;
-      resolve(result);
-    };
-    closeListener = (): void => {
-      childClosed = true;
-      if (groupDisappeared()) finish(true);
-    };
-    options.child.once("close", closeListener);
-    if (deadlineMs !== undefined) {
-      deadlineTimer = setTimer(() => finish(false), deadlineMs);
+    if (settlementDeadlineTimer !== undefined) {
+      clearTimer(settlementDeadlineTimer);
+      settlementDeadlineTimer = undefined;
     }
-    const poll = (): void => {
-      if (childClosed && groupDisappeared()) {
-        finish(true);
-        return;
-      }
-      pollTimer = setTimer(poll, PROCESS_GROUP_POLL_MS);
-    };
-    poll();
-  });
+    settlementPromise = undefined;
+    resolve(result);
+  }
 
-  const waitForSettlementWithoutDeadline = (): Promise<boolean> => waitForSettlement();
+  function checkSettlement(): void {
+    const groupGone = groupDisappeared();
+    if (childClosed && groupGone) finishSettlement(true);
+  }
 
-  const terminate = (reason: "abort" | "timeout" = "abort"): Promise<boolean> => {
+  function waitForSettlement(deadlineMs?: number): Promise<boolean> {
+    if (childClosed && groupDisappeared()) return Promise.resolve(true);
+    if (settlementPromise === undefined) {
+      settlementPromise = new Promise<boolean>(resolve => { resolveSettlement = resolve; });
+      const poll = (): void => {
+        if (settlementPromise === undefined) return;
+        settlementPollTimer = undefined;
+        checkSettlement();
+        if (settlementPromise !== undefined) {
+          settlementPollTimer = setTimer(poll, PROCESS_GROUP_POLL_MS);
+        }
+      };
+      settlementPollTimer = setTimer(poll, PROCESS_GROUP_POLL_MS);
+    }
+    if (deadlineMs !== undefined && settlementDeadlineTimer === undefined) {
+      settlementDeadlineTimer = setTimer(() => finishSettlement(false), deadlineMs);
+    }
+    return settlementPromise;
+  }
+
+  const terminate = (reason: "abort" | "timeout" | "close" = "abort"): Promise<boolean> => {
     if (termination !== undefined) return termination;
     termination = (async () => {
-      signalTarget("SIGTERM");
+      if (!childClosed || groupId !== undefined) signalTarget("SIGTERM");
       // Older process fakes may not expose a pid or close event. Preserve the
       // historical immediate timeout/error result for that unidentifiable
       // compatibility path; real children with validated PIDs take the full
@@ -219,7 +299,7 @@ export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions)
       if (reason === "timeout" && pid === undefined) return false;
       if (await waitForSettlement(PROCESS_GROUP_TERM_GRACE_MS)) return true;
       signalTarget("SIGKILL");
-      return waitForSettlement();
+      return waitForSettlement(PROCESS_GROUP_KILL_GRACE_MS);
     })();
     return termination;
   };
@@ -228,7 +308,7 @@ export function createOwnedProcessTeardown(options: OwnedProcessTeardownOptions)
     pid,
     processGroupId: groupId,
     groupValidated: groupId !== undefined,
-    waitForSettlement: waitForSettlementWithoutDeadline,
+    waitForSettlement: () => waitForSettlement(),
     terminate,
   };
 }
@@ -256,6 +336,12 @@ export type ProviderProcessWitnessStore = Readonly<{
 }>;
 
 const DEFAULT_WITNESS_FILE = "daemon-runtime.json";
+type WitnessUpdate = () => void;
+type WitnessPathLock = {
+  active: boolean;
+  pending: WitnessUpdate[];
+};
+const witnessPathLocks = new Map<string, WitnessPathLock>();
 const DEFAULT_WITNESS_OPERATIONS: WitnessOperations = {
   readFileSync,
   writeFileSync,
@@ -284,7 +370,7 @@ function readWitnesses(path: string, operations: WitnessOperations): ProviderPro
 
 function writeWitnesses(path: string, daemonInstanceId: string, providers: readonly ProviderProcessWitness[], operations: WitnessOperations): void {
   const directory = dirname(path);
-  const temporaryPath = join(directory, `.${DEFAULT_WITNESS_FILE}.${process.pid}.${Date.now()}.tmp`);
+  const temporaryPath = join(directory, `.${DEFAULT_WITNESS_FILE}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
   const content = `${JSON.stringify({ version: 1, daemonInstanceId, providers })}\n`;
   operations.writeFileSync(temporaryPath, content, { encoding: "utf8", mode: 0o600 });
   operations.chmodSync(temporaryPath, 0o600);
@@ -300,6 +386,41 @@ function writeWitnesses(path: string, daemonInstanceId: string, providers: reado
   }
 }
 
+function withWitnessPathLock(path: string, operation: WitnessUpdate): void {
+  let lock = witnessPathLocks.get(path);
+  if (lock === undefined) {
+    lock = { active: false, pending: [] };
+    witnessPathLocks.set(path, lock);
+  }
+  if (lock.active) {
+    lock.pending.push(operation);
+    return;
+  }
+  lock.active = true;
+  let observedError: unknown;
+  let hasError = false;
+  try {
+    operation();
+  } catch (error) {
+    observedError = error;
+    hasError = true;
+  }
+  while (lock.pending.length > 0) {
+    const queued = lock.pending.shift()!;
+    try {
+      queued();
+    } catch (error) {
+      if (!hasError) {
+        observedError = error;
+        hasError = true;
+      }
+    }
+  }
+  lock.active = false;
+  witnessPathLocks.delete(path);
+  if (hasError) throw observedError;
+}
+
 /** Maintain a secret-free owner-only witness for provider child identities. */
 export function createProviderProcessWitnessStore(options: {
   daemonInstanceId: string;
@@ -308,11 +429,10 @@ export function createProviderProcessWitnessStore(options: {
 }): ProviderProcessWitnessStore {
   const path = options.path ?? join(lcmHomeDir(), DEFAULT_WITNESS_FILE);
   const operations: WitnessOperations = { ...DEFAULT_WITNESS_OPERATIONS, ...options.operations };
-  const update = (entry: ProviderProcessWitness, remove: boolean): void => {
-    const current = readWitnesses(path, operations)
-      .filter(candidate => candidate.daemonInstanceId === options.daemonInstanceId);
-    const otherDaemonEntries = readWitnesses(path, operations)
-      .filter(candidate => candidate.daemonInstanceId !== options.daemonInstanceId);
+  const update = (entry: ProviderProcessWitness, remove: boolean): void => withWitnessPathLock(path, () => {
+    const entries = readWitnesses(path, operations);
+    const current = entries.filter(candidate => candidate.daemonInstanceId === options.daemonInstanceId);
+    const otherDaemonEntries = entries.filter(candidate => candidate.daemonInstanceId !== options.daemonInstanceId);
     const matches = (candidate: ProviderProcessWitness): boolean => candidate.providerId === entry.providerId
       && candidate.pid === entry.pid
       && candidate.pgid === entry.pgid
@@ -330,7 +450,7 @@ export function createProviderProcessWitnessStore(options: {
       return;
     }
     writeWitnesses(path, options.daemonInstanceId, next, operations);
-  };
+  });
   return {
     path,
     add: entry => update(entry, false),

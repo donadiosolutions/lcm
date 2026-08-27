@@ -33,6 +33,7 @@ type ClaudeProcessDeps = {
   processGroupId?: number;
   daemonProcessGroupId?: number;
   isProcessGroupAlive?: (pgid: number) => boolean;
+  processGroupIdProbe?: (pid: number) => number | undefined;
   processBirthTime?: (pid: number) => string | null;
   daemonInstanceId?: string;
   witnessStore?: ProviderProcessWitnessStore;
@@ -134,6 +135,8 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
           daemonProcessGroupId: opts.daemonProcessGroupId,
           killProcess: opts.killProcess,
           isProcessGroupAlive: opts.isProcessGroupAlive,
+          processBirthTime: opts.processBirthTime,
+          processGroupIdProbe: opts.processGroupIdProbe,
           setTimeout: opts.setTimeout,
           clearTimeout: opts.clearTimeout,
         });
@@ -155,6 +158,9 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
 
       const cleanupStreams = (): void => {
         try { proc.stdin.removeAllListeners("error"); } catch { /* already closed */ }
+        // Retain an inert sink after settlement so a late EPIPE cannot become
+        // an EventEmitter uncaught exception.
+        try { proc.stdin.on("error", () => undefined); } catch { /* already closed */ }
         try { proc.stdin.destroy(); } catch { /* already closed */ }
         try { proc.stdout.removeAllListeners("data"); } catch { /* already closed */ }
         try { proc.stderr.removeAllListeners("data"); } catch { /* already closed */ }
@@ -163,29 +169,37 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
       let timer: ReturnType<typeof setTimeout> | undefined;
       let witnessRemoved = false;
       let cancellationRequested = false;
-      let childListenersAttached = false;
+      let terminalError: unknown;
       const detachAbort = (): void => ctx.signal?.removeEventListener("abort", onAbort);
       const cleanupChildListeners = (): void => {
-        if (!childListenersAttached) return;
         proc.removeListener("close", onClose);
         proc.removeListener("error", onError);
+        proc.stdin.removeListener("error", onStdinError);
         // Keep an inert error sink so a late child error cannot escape as an
         // EventEmitter uncaught exception after the result has settled.
         proc.on("error", () => undefined);
-        childListenersAttached = false;
       };
       const removeWitness = async (settled: boolean): Promise<void> => {
         if (!settled || witness === undefined || witnessRemoved) return;
         opts.witnessStore!.remove(witness);
         witnessRemoved = true;
       };
-      const settleFailure = (error: unknown, reason: "abort" | "timeout"): void => {
-        if (settlement !== undefined || finished) return;
+      const settle = (
+        reason: "abort" | "timeout" | "close",
+        error?: unknown,
+        complete?: () => void,
+      ): void => {
+        if (finished) return;
+        if (error !== undefined && terminalError === undefined) terminalError = error;
+        if (settlement !== undefined) return;
         settlement = (async () => {
           try { proc.stdin.destroy(); } catch { /* already closed */ }
           const settled = await teardown.terminate(reason);
           await removeWitness(settled);
           if (finished) return;
+          if (!settled && terminalError === undefined) {
+            terminalError = new Error("claude process teardown did not settle");
+          }
           finished = true;
           if (timer !== undefined) {
             (opts.clearTimeout ?? clearTimeout)(timer);
@@ -194,7 +208,11 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
           detachAbort();
           cleanupChildListeners();
           cleanupStreams();
-          reject(error instanceof Error ? error : new Error(String(error)));
+          if (terminalError !== undefined) {
+            reject(terminalError instanceof Error ? terminalError : new Error(String(terminalError)));
+          } else {
+            complete?.();
+          }
         })();
         void settlement.catch((caught: unknown) => {
           if (finished) return;
@@ -209,27 +227,19 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
           reject(caught instanceof Error ? caught : new Error(String(caught)));
         });
       };
+      const settleFailure = (error: unknown, reason: "abort" | "timeout"): void => {
+        settle(reason, error);
+      };
       const settleAbort = (): void => {
         cancellationRequested = true;
-        settleFailure(createAbortError(ctx.signal?.reason), "abort");
+        if (settlement !== undefined) return;
+        settle("abort", createAbortError(ctx.signal?.reason));
       };
       const onAbort = (): void => settleAbort();
       ctx.signal?.addEventListener("abort", onAbort, { once: true });
 
       const onClose = (code: number | null): void => {
-        if (finished || settlement !== undefined) return;
-        settlement = (async () => {
-          const settled = await teardown.waitForSettlement();
-          await removeWitness(settled);
-          if (finished) return;
-          finished = true;
-          if (timer !== undefined) {
-            (opts.clearTimeout ?? clearTimeout)(timer);
-            timer = undefined;
-          }
-          detachAbort();
-          cleanupChildListeners();
-          cleanupStreams();
+        settle("close", undefined, () => {
           if (cancellationRequested || ctx.signal?.aborted) {
             reject(createAbortError(ctx.signal?.reason));
             return;
@@ -248,30 +258,20 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
               fastMode,
             }));
           }
-        })();
-        void settlement.catch((error: unknown) => {
-          if (finished) return;
-          finished = true;
-          if (timer !== undefined) {
-            (opts.clearTimeout ?? clearTimeout)(timer);
-            timer = undefined;
-          }
-          detachAbort();
-          cleanupChildListeners();
-          cleanupStreams();
-          reject(error instanceof Error ? error : new Error(String(error)));
         });
       };
       const onError = (err: Error): void => {
-        if (finished || settlement !== undefined) return;
         settleFailure(normalizeSpawnError(err), "timeout");
+      };
+      const onStdinError = (): void => {
+        settleFailure(new Error("claude process stdin failed"), "timeout");
       };
       proc.on("close", onClose);
       proc.on("error", onError);
-      childListenersAttached = true;
+      proc.stdin.on("error", onStdinError);
       const setTimer = opts.setTimeout ?? setTimeout;
       timer = setTimer(() => {
-        if (finished || settlement !== undefined) return;
+        if (finished) return;
         settleFailure(new Error(`claude process timed out after ${Math.round(timeoutMs / 1000)}s`), "timeout");
       }, timeoutMs);
       if (witness !== undefined) {

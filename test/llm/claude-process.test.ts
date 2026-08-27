@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { createClaudeProcessSummarizer } from "../../src/llm/claude-process.js";
-import { isAbortError } from "../../src/daemon/cancellation.js";
+import { createAbortError, isAbortError } from "../../src/daemon/cancellation.js";
 
 type SpawnFn = typeof import("node:child_process").spawn;
 
@@ -78,6 +78,7 @@ describe("createClaudeProcessSummarizer", () => {
       killProcess,
       processGroupId: 4312,
       daemonProcessGroupId: 9999,
+      processBirthTime: () => "birth-4312",
       isProcessGroupAlive,
     } as never);
 
@@ -107,6 +108,7 @@ describe("createClaudeProcessSummarizer", () => {
       killProcess,
       processGroupId: 4512,
       daemonProcessGroupId: 4511,
+      processBirthTime: () => "birth-4512",
       isProcessGroupAlive: () => groupAlive,
     } as never);
 
@@ -126,6 +128,240 @@ describe("createClaudeProcessSummarizer", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("settles a close through the owned group before resolving", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeHangingChild();
+      (child as FakeChild & { pid: number }).pid = 4613;
+      let groupAlive = true;
+      const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+        if (signal === "SIGKILL") groupAlive = false;
+      });
+      const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+      const summarizer = createClaudeProcessSummarizer({
+        spawn,
+        timeoutMs: 60_000,
+        killProcess,
+        processGroupId: 4613,
+        daemonProcessGroupId: 4612,
+        processBirthTime: () => "birth-4613",
+        isProcessGroupAlive: () => groupAlive,
+      } as never);
+
+      const pending = summarizer("text", false);
+      const observed = pending.then(value => ({ value }), error => ({ error }));
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      child.stdout.write("summary text");
+      child.emit("close", 0);
+      await vi.runAllTicks();
+      expect(killProcess).toHaveBeenNthCalledWith(1, -4613, "SIGTERM");
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(killProcess).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(killProcess).toHaveBeenNthCalledWith(2, -4613, "SIGKILL");
+      await expect(observed).resolves.toEqual({ value: "summary text" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps close and abort on one teardown flight", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeHangingChild();
+      (child as FakeChild & { pid: number }).pid = 4614;
+      let groupAlive = true;
+      const controller = new AbortController();
+      const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+        if (signal === "SIGKILL") groupAlive = false;
+      });
+      const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+      const summarizer = createClaudeProcessSummarizer({
+        spawn,
+        timeoutMs: 60_000,
+        killProcess,
+        processGroupId: 4614,
+        daemonProcessGroupId: 4613,
+        processBirthTime: () => "birth-4614",
+        isProcessGroupAlive: () => groupAlive,
+      } as never);
+
+      const pending = summarizer("text", false, { signal: controller.signal });
+      const observed = pending.then(value => ({ value }), error => ({ error }));
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      child.emit("close", 0);
+      controller.abort();
+      await vi.runAllTicks();
+      expect(killProcess).toHaveBeenCalledTimes(1);
+      expect(killProcess).toHaveBeenCalledWith(-4614, "SIGTERM");
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(isAbortError((await observed).error)).toBe(true);
+      expect(killProcess).toHaveBeenCalledWith(-4614, "SIGKILL");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("routes asynchronous Claude stdin errors through teardown", async () => {
+    const child = makeHangingChild();
+    (child as FakeChild & { pid: number }).pid = 4615;
+    const killProcess = vi.fn();
+    const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const summarizer = createClaudeProcessSummarizer({
+      spawn,
+      killProcess,
+      processGroupId: 4615,
+      daemonProcessGroupId: 4613,
+      processBirthTime: () => "birth-4615",
+      isProcessGroupAlive: () => false,
+    } as never);
+
+    const pending = summarizer("private transcript", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.stdin.emit("error", Object.assign(new Error("write EPIPE secret-body"), { code: "EPIPE" }));
+    await expect(pending).rejects.toThrow(/stdin/i);
+    expect(killProcess).toHaveBeenCalledWith(-4615, "SIGTERM");
+
+    child.stdin.emit("error", new Error("late stdin error"));
+    child.emit("error", new Error("late child error"));
+    child.emit("close", 0);
+  });
+
+  it("normalizes teardown construction failures", async () => {
+    const child = makeHangingChild();
+    child.once = vi.fn(() => { throw new Error("teardown setup failed"); }) as never;
+    const summarizer = createClaudeProcessSummarizer({
+      spawn: vi.fn().mockReturnValue(child) as unknown as SpawnFn,
+    });
+    await expect(summarizer("text", false)).rejects.toThrow("teardown setup failed");
+  });
+
+  it("rejects after retaining a witness when witness removal fails", async () => {
+    const child = makeChild(0, "summary text");
+    (child as FakeChild & { pid: number }).pid = 4616;
+    const removalError = new Error("witness remove failed");
+    const witnessStore = {
+      add: vi.fn(),
+      remove: vi.fn(() => { throw removalError; }),
+      path: "/tmp/daemon-runtime.json",
+    };
+    const summarizer = createClaudeProcessSummarizer({
+      spawn: vi.fn().mockReturnValue(child) as unknown as SpawnFn,
+      platform: "win32",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+      witnessStore,
+      processBirthTime: () => "birth-4616",
+    } as never);
+    await expect(summarizer("text", false)).rejects.toThrow("witness remove failed");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed after the bounded Claude KILL settlement deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeHangingChild();
+      (child as FakeChild & { pid: number }).pid = 4617;
+      const killProcess = vi.fn();
+      const controller = new AbortController();
+      const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+      const summarizer = createClaudeProcessSummarizer({
+        spawn,
+        timeoutMs: 60_000,
+        killProcess,
+        processGroupId: 4617,
+        daemonProcessGroupId: 4611,
+        processBirthTime: () => "birth-4617",
+        isProcessGroupAlive: () => true,
+      } as never);
+      const pending = summarizer("text", false, { signal: controller.signal });
+      const observed = pending.then(value => ({ value }), error => ({ error }));
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(4_000);
+      const result = await observed;
+      expect(result.error).toMatchObject({ message: "The operation was aborted" });
+      expect(killProcess).toHaveBeenNthCalledWith(1, -4617, "SIGTERM");
+      expect(killProcess).toHaveBeenNthCalledWith(2, -4617, "SIGKILL");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects a normal close when the owned group never disappears", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeHangingChild();
+      (child as FakeChild & { pid: number }).pid = 4618;
+      const killProcess = vi.fn();
+      const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+      const summarizer = createClaudeProcessSummarizer({
+        spawn,
+        killProcess,
+        processGroupId: 4618,
+        daemonProcessGroupId: 4611,
+        processBirthTime: () => "birth-4618",
+        isProcessGroupAlive: () => true,
+      } as never);
+      const pending = summarizer("text", false);
+      const observed = pending.then(value => ({ value }), error => ({ error }));
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      child.stdout.write("summary text");
+      child.emit("close", 0);
+      await vi.runAllTicks();
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect((await observed).error).toMatchObject({ message: "claude process teardown did not settle" });
+      expect(killProcess).toHaveBeenNthCalledWith(1, -4618, "SIGTERM");
+      expect(killProcess).toHaveBeenNthCalledWith(2, -4618, "SIGKILL");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects after witness publication fails and still tears down the child", async () => {
+    const child = makeChild(0, "summary text");
+    (child as FakeChild & { pid: number }).pid = 4619;
+    const witnessError = new Error("witness add failed");
+    const witnessStore = {
+      add: vi.fn(() => { throw witnessError; }),
+      remove: vi.fn(),
+      path: "/tmp/daemon-runtime.json",
+    };
+    const summarizer = createClaudeProcessSummarizer({
+      spawn: vi.fn().mockReturnValue(child) as unknown as SpawnFn,
+      platform: "win32",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+      witnessStore,
+      processBirthTime: () => "birth-4619",
+    } as never);
+    await expect(summarizer("text", false)).rejects.toThrow("witness add failed");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+  });
+
+  it("routes an ordinary synchronous Claude stdin failure through teardown", async () => {
+    const child = makeHangingChild();
+    child.stdin.write = () => { throw new Error("synchronous stdin failed"); };
+    const summarizer = createClaudeProcessSummarizer({
+      spawn: vi.fn().mockReturnValue(child) as unknown as SpawnFn,
+    });
+    const pending = summarizer("text", false);
+    child.emit("close", null);
+    await expect(pending).rejects.toThrow("synchronous stdin failed");
+  });
+
+  it("handles an intentional synchronous Claude stdin abort", async () => {
+    const child = makeHangingChild();
+    child.stdin.write = () => { throw createAbortError(); };
+    const summarizer = createClaudeProcessSummarizer({
+      spawn: vi.fn().mockReturnValue(child) as unknown as SpawnFn,
+    });
+    const pending = summarizer("text", false);
+    child.emit("close", null);
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
   });
 
   it("publishes and removes a secret-free Claude process witness after close", async () => {
