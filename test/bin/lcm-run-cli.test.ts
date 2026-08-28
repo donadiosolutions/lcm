@@ -1128,6 +1128,27 @@ describe("runCli failure and alternate presentation branches", () => {
     });
   });
 
+  it("dispatches post-tool without root bootstrap migration", async () => {
+    fakeStdin.isTTY = false;
+    fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
+      if (event === "data") queueMicrotask(() => callback(Buffer.from(JSON.stringify({
+        session_id: "codex-session",
+        tool_name: "functions.exec",
+      }))));
+      if (event === "end") queueMicrotask(() => callback());
+      return fakeStdin;
+    });
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const migrate = vi.fn(() => { throw contention; });
+
+    expect((await invoke(["post-tool", "--client", "codex"], {
+      migrate,
+      sleep: async (_delayMs: number) => undefined,
+    }))?.message).toBe("exit:0");
+    expect(migrate).not.toHaveBeenCalled();
+    expect(state.dispatchHook).toHaveBeenCalledWith("post-tool", expect.any(String));
+  });
+
   it("reports exact Codex structure and functional capture health", async () => {
     state.installed = [{ agentId: "codex", type: "hook", path: "/partial/hooks.json" }];
     state.inspectCodexPostToolHook.mockReturnValue({
