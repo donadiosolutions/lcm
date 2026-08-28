@@ -21,8 +21,24 @@ const proc = (root: string, pid: number, status: string, command?: string) => {
   writeFileSync(join(dir, "status"), status);
   if (command !== undefined) writeFileSync(join(dir, "cmdline"), command.replaceAll(" ", "\0"));
 };
-const fetchHealthy = (pid?: number) => vi.fn(async (url: string) => url.endsWith("/health")
-  ? { ok: true, json: async () => ({ status: "ok", version: "1", pid }) }
+const fetchHealthy = (
+  pid?: number,
+  identity: Readonly<{ entrypoint?: string; runtimeDigest?: string }> = {},
+) => vi.fn(async (url: string) => url.endsWith("/health")
+  ? {
+      ok: true,
+      json: async () => ({
+        status: "ok",
+        version: "1",
+        pid,
+        ...(identity.entrypoint === undefined
+          ? {}
+          : { entrypoint: identity.entrypoint }),
+        ...(identity.runtimeDigest === undefined
+          ? {}
+          : { runtimeDigest: identity.runtimeDigest }),
+      }),
+    }
   : { ok: true, json: async () => ({}) });
 
 function unavailableSupervisor(): EnsureDaemonOptions["_supervisorOverride"] {
@@ -446,19 +462,26 @@ describe("lifecycle procfs and parent warnings", () => {
     const dir = temp(); const procRoot = join(dir, "proc"); mkdirSync(procRoot);
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "31"); ensureAuthToken(join(dir, "daemon.token"));
     proc(procRoot, 31, "Uid:\t1000\nPPid:\t1\n");
+    const runtimeIdentity = {
+      entrypoint: "/fixture/lcm-daemon",
+      runtimeDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    } as const;
     // observeHttpHealth owns a real wall-clock deadline not controlled by
     // _monotonicNowOverride, so pin performance.now for this 1 ms fixture.
     vi.spyOn(performance, "now").mockReturnValue(0);
     const result = await ensureDaemon({
       port: 1, pidFilePath: pidPath, spawnTimeoutMs: 1, enforceUserManagerParent: true,
-      expectedVersion: "1",
-      _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(31) as never,
+      expectedVersion: "1", expectedEntrypoint: runtimeIdentity.entrypoint,
+      expectedRuntimeDigest: runtimeIdentity.runtimeDigest,
+      _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(31, runtimeIdentity) as never,
       _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [1], _skipSpawn: true,
       _monotonicNowOverride: (): number => 0,
       _supervisorOverride: unavailableSupervisor(),
     });
-    expect(result.connected).toBe(true);
-    expect(result.warning).toContain("not an LCM daemon");
+    expect(result).toMatchObject({
+      connected: true,
+      warning: "daemon PID 31 is not an LCM daemon; daemon parent invariant is not verified",
+    });
   });
 });
 
