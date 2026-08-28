@@ -54,6 +54,7 @@ const state = vi.hoisted(() => ({
   openProjectError: undefined as unknown,
   compactInputObserver: undefined as ((input: unknown) => void | Promise<void>) | undefined,
   compactInput: undefined as unknown,
+  createMessagesBulk: vi.fn(async () => []),
   writeFileSync: vi.fn(),
   compactionStorageProbe: undefined as ((storage: {
     health: () => Promise<unknown>;
@@ -190,7 +191,7 @@ vi.mock("../../../src/storage/index.js", () => ({
       const conversations = {
         getOrCreateConversation: async () => ({ conversationId: "conversation" }),
         getMessageCount: async () => 0,
-        createMessagesBulk: async () => [],
+        createMessagesBulk: state.createMessagesBulk,
       };
       const summaries = {
         getSummariesByConversation: async () => state.summaries,
@@ -405,6 +406,7 @@ describe("compact route coverage", () => {
     state.openProjectError = undefined;
     state.compactInputObserver = undefined;
     state.compactInput = undefined;
+    state.createMessagesBulk.mockClear();
     state.writeFileSync.mockReset();
     state.writeFileSync.mockImplementation(() => undefined);
     justCompactedMap.clear();
@@ -1245,6 +1247,50 @@ describe("compact route coverage", () => {
     expect(output.status()).toBe(499);
     expect(state.writeFileSync).toHaveBeenCalledOnce();
     expect(justCompactedMap.has("metadata-latch")).toBe(false);
+    expect(base.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
+    await base.shutdown();
+  });
+
+  it("finishes an admitted ingest transaction after cancellation", async () => {
+    const invocationId = "56565656-5656-4565-8565-565656565656";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const base = createInvocationCoordinator({ daemonInstanceId });
+    base.start({ invocationId, command: "compact", daemonInstanceId });
+    const requestController = new AbortController();
+    let abortOnCommit = true;
+    const coordinator = {
+      ...base,
+      acquireCommit: (target: Parameters<typeof base.acquireCommit>[0]) => {
+        const permit = base.acquireCommit(target);
+        if (abortOnCommit) {
+          abortOnCommit = false;
+          requestController.abort();
+        }
+        return permit;
+      },
+    } as unknown as InvocationCoordinator;
+    state.messages = [{ role: "user", content: "ingest me", tokenCount: 2 }];
+    state.existingMeta = true;
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({
+        session_id: "ingest-latch",
+        cwd: "/tmp",
+        transcript_path: "/tmp/transcript.jsonl",
+        invocation_id: invocationId,
+      }),
+      {
+        ...testCompactContext,
+        signal: requestController.signal,
+        invocationCoordinator: coordinator,
+      },
+    );
+
+    expect(output.status()).toBe(499);
+    expect(state.createMessagesBulk).toHaveBeenCalledOnce();
     expect(base.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     await base.shutdown();
   });

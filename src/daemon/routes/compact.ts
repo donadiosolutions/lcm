@@ -676,11 +676,9 @@ export function createCompactHandler(
           if (!skip_ingest && safeTranscriptPath && existsSync(safeTranscriptPath)) {
             const parsed = parseTranscriptForClient(safeTranscriptPath, normalizeTranscriptClient(client));
             await withCommitAdmission(() => admittedProject.transaction(async (repositories) => {
-              throwIfAborted(signal);
               const storedCount = await repositories.conversations.getMessageCount(
                 conversation.conversationId,
               );
-              throwIfAborted(signal);
               const newMessages = parsed.slice(storedCount);
               if (newMessages.length > 0) {
                 const ingestCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
