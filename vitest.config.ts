@@ -1,6 +1,7 @@
-import { defineConfig } from "vitest/config";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
+import { defineConfig, type UserConfig } from "vitest/config";
 
 const sqliteRouteTests = ["test/daemon/routes/**/*.test.ts"];
 const worktreeReconciliationTests = ["test/worktree-reconciliation.test.ts"];
@@ -10,88 +11,170 @@ const e2eTests = ["test/e2e/**/*.test.ts"];
 const runtimeHomeSetup = ["test/setup/isolate-runtime-home.ts"];
 const runtimeHomeGlobalSetup = ["test/setup/runtime-home-global.ts"];
 
-export default defineConfig({
-  cacheDir: join(tmpdir(), "vitest-lcm-cache"),
-  test: {
-    globalSetup: runtimeHomeGlobalSetup,
-    setupFiles: runtimeHomeSetup,
-    include: ["**/*.test.ts"],
-    exclude: ["node_modules/**", ".claude/**"],
-    coverage: {
-      include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
-      thresholds: {
-        statements: 100,
-        lines: 100,
-        branches: 100,
-        functions: 100,
-        perFile: true,
+export interface VitestRunRootDependencies {
+  readonly environment?: NodeJS.ProcessEnv;
+  readonly mkdtempSync?: typeof mkdtempSync;
+  readonly mkdirSync?: typeof mkdirSync;
+  readonly chmodSync?: typeof chmodSync;
+  readonly lstatSync?: typeof lstatSync;
+  readonly temporaryRoot?: () => string;
+}
+
+export interface VitestConfigurationResolverDependencies {
+  readonly createRunRoot?: () => string;
+}
+
+function assertFreshExplicitRoot(
+  root: string,
+  createDirectory: typeof mkdirSync,
+  inspectPath: typeof lstatSync,
+): void {
+  const parent = dirname(root);
+  if (!basename(root)) {
+    throw new Error("LCM_TEST_ARTIFACT_ROOT must name a fresh leaf");
+  }
+  const parentStats = inspectPath(parent);
+  if (!parentStats.isDirectory()) {
+    throw new Error("LCM_TEST_ARTIFACT_ROOT parent must be a directory");
+  }
+  try {
+    inspectPath(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+    createDirectory(root, { mode: 0o700, recursive: false });
+    return;
+  }
+  throw new Error("LCM_TEST_ARTIFACT_ROOT must not preexist");
+}
+
+export function createVitestRunRoot(
+  dependencies: VitestRunRootDependencies = {},
+): string {
+  const environment = dependencies.environment ?? process.env;
+  const createTemporaryDirectory = dependencies.mkdtempSync ?? mkdtempSync;
+  const createDirectory = dependencies.mkdirSync ?? mkdirSync;
+  const secureDirectory = dependencies.chmodSync ?? chmodSync;
+  const inspectPath = dependencies.lstatSync ?? lstatSync;
+  const override = environment.LCM_TEST_ARTIFACT_ROOT;
+
+  if (override === undefined || override === "") {
+    const temporaryRoot = dependencies.temporaryRoot ?? tmpdir;
+    const root = createTemporaryDirectory(join(temporaryRoot(), "lcm-vitest-run-"));
+    secureDirectory(root, 0o700);
+    return root;
+  }
+  if (override.trim() !== override || override.trim() === "" || !isAbsolute(override)) {
+    throw new Error("LCM_TEST_ARTIFACT_ROOT must be an absolute, unpadded path");
+  }
+
+  assertFreshExplicitRoot(override, createDirectory, inspectPath);
+  secureDirectory(override, 0o700);
+  return override;
+}
+
+export function createVitestConfiguration(root: string): UserConfig {
+  return {
+    cacheDir: join(root, "cache"),
+    test: {
+      globalSetup: runtimeHomeGlobalSetup,
+      setupFiles: runtimeHomeSetup,
+      include: ["**/*.test.ts"],
+      exclude: ["node_modules/**", ".claude/**"],
+      coverage: {
+        include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
+        reportsDirectory: join(root, "coverage"),
+        thresholds: {
+          statements: 100,
+          lines: 100,
+          branches: 100,
+          functions: 100,
+          perFile: true,
+        },
       },
+      outputFile: {
+        junit: join(root, "test-report.junit.xml"),
+      },
+      projects: [
+        {
+          test: {
+            name: "unit-parallel",
+            globalSetup: runtimeHomeGlobalSetup,
+            setupFiles: runtimeHomeSetup,
+            include: ["test/**/*.test.ts"],
+            exclude: [
+              ...serialSqliteTests,
+              ...packageConfigTests,
+              ...e2eTests,
+              "node_modules/**",
+              ".claude/**",
+            ],
+            sequence: {
+              groupOrder: 0,
+            },
+          },
+        },
+        {
+          test: {
+            name: "unit-package",
+            globalSetup: runtimeHomeGlobalSetup,
+            setupFiles: runtimeHomeSetup,
+            include: packageConfigTests,
+            exclude: ["node_modules/**", ".claude/**"],
+            sequence: {
+              groupOrder: 1,
+            },
+            // Package inventory tests run npm build and mutate dist. Keep them
+            // out of the parallel unit pool so they cannot race other tests.
+            fileParallelism: false,
+          },
+        },
+        {
+          test: {
+            name: "unit-sqlite-routes",
+            globalSetup: runtimeHomeGlobalSetup,
+            setupFiles: runtimeHomeSetup,
+            include: serialSqliteTests,
+            exclude: ["node_modules/**", ".claude/**"],
+            sequence: {
+              groupOrder: 2,
+            },
+            // Route handler and worktree reconciliation tests repeatedly open and migrate
+            // project SQLite DBs. Keep this group serial and ordered after the parallel
+            // unit pool so their real timeout assertions are not distorted by I/O contention.
+            fileParallelism: false,
+          },
+        },
+        {
+          test: {
+            name: "e2e",
+            globalSetup: runtimeHomeGlobalSetup,
+            setupFiles: runtimeHomeSetup,
+            include: e2eTests,
+            exclude: ["node_modules/**", ".claude/**"],
+            sequence: {
+              groupOrder: 3,
+            },
+            // E2E tests spin up real daemons backed by SQLite — must run
+            // sequentially to avoid concurrent write conflicts.
+            fileParallelism: false,
+          },
+        },
+      ],
     },
-    projects: [
-      {
-        test: {
-          name: "unit-parallel",
-          globalSetup: runtimeHomeGlobalSetup,
-          setupFiles: runtimeHomeSetup,
-          include: ["test/**/*.test.ts"],
-          exclude: [
-            ...serialSqliteTests,
-            ...packageConfigTests,
-            ...e2eTests,
-            "node_modules/**",
-            ".claude/**",
-          ],
-          sequence: {
-            groupOrder: 0,
-          },
-        },
-      },
-      {
-        test: {
-          name: "unit-package",
-          globalSetup: runtimeHomeGlobalSetup,
-          setupFiles: runtimeHomeSetup,
-          include: packageConfigTests,
-          exclude: ["node_modules/**", ".claude/**"],
-          // Package inventory tests run npm build and mutate dist. Keep them
-          // out of the parallel unit pool so they cannot race other tests.
-          sequence: {
-            groupOrder: 1,
-          },
-          fileParallelism: false,
-        },
-      },
-      {
-        test: {
-          name: "unit-sqlite-routes",
-          globalSetup: runtimeHomeGlobalSetup,
-          setupFiles: runtimeHomeSetup,
-          include: serialSqliteTests,
-          exclude: ["node_modules/**", ".claude/**"],
-          // Route handler and worktree reconciliation tests repeatedly open and migrate
-          // project SQLite DBs. Keep this group serial and ordered after the parallel
-          // unit pool so their real timeout assertions are not distorted by I/O contention.
-          sequence: {
-            groupOrder: 2,
-          },
-          fileParallelism: false,
-        },
-      },
-      {
-        test: {
-          name: "e2e",
-          globalSetup: runtimeHomeGlobalSetup,
-          setupFiles: runtimeHomeSetup,
-          include: e2eTests,
-          exclude: ["node_modules/**", ".claude/**"],
-          // E2E tests spin up real daemons backed by SQLite — must run
-          // sequentially to avoid concurrent write conflicts.
-          sequence: {
-            groupOrder: 3,
-          },
-          fileParallelism: false,
-        },
-      },
-    ],
-  },
-});
+  };
+}
+
+export function createVitestConfigurationResolver(
+  dependencies: VitestConfigurationResolverDependencies = {},
+): () => UserConfig {
+  const createRunRoot = dependencies.createRunRoot ?? (() => createVitestRunRoot());
+  let configuration: UserConfig | undefined;
+  return () => {
+    configuration ??= createVitestConfiguration(createRunRoot());
+    return configuration;
+  };
+}
+
+export default defineConfig(createVitestConfigurationResolver());
