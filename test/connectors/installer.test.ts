@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { installConnector, removeConnector, listConnectors, listConnectorInventory } from '../../src/connectors/installer.js';
@@ -759,6 +760,16 @@ describe('installConnector — MCP JSON', () => {
 });
 
 describe('installConnector — skill', () => {
+  const historicalInitialBlankLineFixture = new URL('./fixtures/historical-skill-initial-blank-line.md', import.meta.url);
+
+  it('pins the historical initial-blank-line fixture provenance', () => {
+    const fixture = readFileSync(historicalInitialBlankLineFixture);
+    expect(fixture.byteLength).toBe(1885);
+    expect(createHash('sha256').update(fixture).digest('hex'))
+      .toBe('6c1757c7434102bb62e6faac25796f7bd1d7c26ff2479c53a9f7497b36076c57');
+    expect(fixture.subarray(-2)).toEqual(Buffer.from([0x0a, 0x0a]));
+  });
+
   it('uses an agent default type when no type is supplied', () => {
     expect(installConnector('claude-code', undefined, tmpDir).path).toContain('SKILL.md');
   });
@@ -796,6 +807,67 @@ describe('installConnector — skill', () => {
 
     expect(() => installConnector('claude-code', 'skill', tmpDir)).not.toThrow();
     expect(readFileSync(skillPath, 'utf-8')).toContain(LCM_MANAGED_SKILL_MARKER);
+  });
+
+  it('migrates the historical generated skill with an initial blank line exactly', () => {
+    const skillPath = join(tmpDir, '.claude', 'skills', 'lcm-memory', 'SKILL.md');
+    mkdirSync(dirname(skillPath), { recursive: true });
+    const historical = readFileSync(historicalInitialBlankLineFixture);
+    writeFileSync(skillPath, historical);
+
+    expect(() => installConnector('claude-code', 'skill', tmpDir)).not.toThrow();
+    const expected = Buffer.from(renderGuidance('skill', 'cli'), 'utf-8');
+    expect(readFileSync(skillPath)).toEqual(expected);
+  });
+
+  it('rejects the historical skill with the initial template terminal LF removed before mutation', () => {
+    const skillPath = join(tmpDir, '.claude', 'skills', 'lcm-memory', 'SKILL.md');
+    mkdirSync(dirname(skillPath), { recursive: true });
+    const fixture = readFileSync(historicalInitialBlankLineFixture);
+    const neighbor = fixture.subarray(0, -2);
+    expect(neighbor.byteLength).toBe(1883);
+    expect(createHash('sha256').update(neighbor).digest('hex'))
+      .toBe('5d15caf23fccfb484bde8453c90ccba4716ea64ea241ef7b5e9452a8950ec041');
+    writeFileSync(skillPath, neighbor);
+
+    expect(() => installConnector('claude-code', 'skill', tmpDir)).toThrow(/skill.*collision|refus.*skill/i);
+    expect(readFileSync(skillPath)).toEqual(neighbor);
+    expect(readFileSync(skillPath, 'utf-8')).not.toContain(LCM_MANAGED_SKILL_MARKER);
+    expect(listConnectors(tmpDir).some((entry) => entry.path === skillPath)).toBe(false);
+  });
+
+  it('rejects the historical skill with two appended LF bytes before mutation', () => {
+    const skillPath = join(tmpDir, '.claude', 'skills', 'lcm-memory', 'SKILL.md');
+    mkdirSync(dirname(skillPath), { recursive: true });
+    const fixture = readFileSync(historicalInitialBlankLineFixture);
+    const neighbor = Buffer.concat([fixture, Buffer.from([0x0a])]);
+    expect(neighbor.byteLength).toBe(1886);
+    writeFileSync(skillPath, neighbor);
+
+    expect(() => installConnector('claude-code', 'skill', tmpDir)).toThrow(/skill.*collision|refus.*skill/i);
+    expect(readFileSync(skillPath)).toEqual(neighbor);
+    expect(readFileSync(skillPath, 'utf-8')).not.toContain(LCM_MANAGED_SKILL_MARKER);
+    expect(listConnectors(tmpDir).some((entry) => entry.path === skillPath)).toBe(false);
+  });
+
+  it('rejects a one-byte body mutation of the historical target before mutation', () => {
+    const skillPath = join(tmpDir, '.claude', 'skills', 'lcm-memory', 'SKILL.md');
+    mkdirSync(dirname(skillPath), { recursive: true });
+    const fixture = readFileSync(historicalInitialBlankLineFixture);
+    const neighbor = Buffer.from(fixture);
+    const bodyMarker = Buffer.from('# Lossless', 'utf-8');
+    const bodyMarkerIndex = neighbor.indexOf(bodyMarker);
+    expect(bodyMarkerIndex).toBeGreaterThanOrEqual(0);
+    const bodyOffset = bodyMarkerIndex + 2;
+    neighbor[bodyOffset] = 'X'.charCodeAt(0);
+    expect(createHash('sha256').update(neighbor).digest('hex'))
+      .not.toBe('6c1757c7434102bb62e6faac25796f7bd1d7c26ff2479c53a9f7497b36076c57');
+    writeFileSync(skillPath, neighbor);
+
+    expect(() => installConnector('claude-code', 'skill', tmpDir)).toThrow(/skill.*collision|refus.*skill/i);
+    expect(readFileSync(skillPath)).toEqual(neighbor);
+    expect(readFileSync(skillPath, 'utf-8')).not.toContain(LCM_MANAGED_SKILL_MARKER);
+    expect(listConnectors(tmpDir).some((entry) => entry.path === skillPath)).toBe(false);
   });
 
   it('rejects an arbitrary skill collision before mutation', () => {

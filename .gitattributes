@@ -2,3 +2,4 @@ src/storage/postgresql/migrations/*.sql text eol=lf
 test/postgresql/init.sh text eol=lf
 test/postgresql/template-init.sh text eol=lf
 test/postgresql/cached-run-init.sh text eol=lf
+test/connectors/fixtures/historical-skill-initial-blank-line.md binary

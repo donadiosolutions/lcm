@@ -19,6 +19,12 @@ lcm doctor
 commands and skills, and verifies the daemon. The operation is idempotent, so
 rerun it after updating the npm package.
 
+During `lcm install`, `~/.claude/skills/lcm-memory/SKILL.md` is migrated only
+when it contains current generated content, the canonical managed marker, or
+exact released content in the fixed historical digest allowlist. Any other
+content difference—including other whitespace or newline variants or user
+modifications—is preserved and the installation is refused.
+
 LCM no longer supports direct Claude Marketplace installation. During
 installation, LCM writes and reads back its native hook and MCP settings before
 removing any recognized current or legacy LCM Marketplace installation. It
