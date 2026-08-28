@@ -158,7 +158,9 @@ Invoked after every tool call. lcm extracts structured events (decisions, errors
 
 **Response:** Normal capture exits with code `0`. This hook runs on every tool
 call and must be fast; it does no network I/O and only writes to a local
-sidecar SQLite database. The local event is appended before any selected-state
+sidecar SQLite database. The CLI dispatches PostToolUse without running the
+legacy-root bootstrap migration; installation and session startup own that
+boundary. The local event is appended before any selected-state
 publication admission is attempted. After that durable boundary:
 
 - missing publication evidence is treated as a successful best-effort outcome

@@ -1187,6 +1187,7 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   const action = actionCommand.name();
   const topLevel = actionCommand.parent?.name() === "lcm";
   if (topLevel && (action === "search" || action === "grep" || action === "describe" || action === "expand")) return false;
+  if (topLevel && action === "post-tool") return false;
   if (topLevel && action === "status") return false;
   if (topLevel && action === "stats") return actionCommand.opts<Record<string, unknown>>().pool !== true;
   if (topLevel && (action === "diagnose" || action === "help")) return false;

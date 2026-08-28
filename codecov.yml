@@ -6,7 +6,7 @@ component_management:
     - component_id: "unit-cli"
       name: "Unit - CLI"
       paths:
-        # Keep the #691 command-routing and #726 diagnostic entrypoint exclusively in Unit - CLI.
+        # Keep the #691 routing and #726/#742 hook entrypoints exclusively in Unit - CLI.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"

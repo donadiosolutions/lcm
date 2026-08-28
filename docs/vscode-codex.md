@@ -160,6 +160,11 @@ trimmed command beginning with `lcm store` is suppressed to avoid a feedback
 loop from LCM's own storage calls. There is no new configuration option for
 these fixed capture rules.
 
+Because this hook runs after every tool call, its CLI entrypoint does not run
+legacy-root bootstrap migration before reading and dispatching the payload.
+LCM installation and session startup establish or migrate the private root;
+PostToolUse remains an observer and cannot contend on that startup boundary.
+
 If selected-state publication admission is blocked after a PostToolUse event
 has been durably appended, the event remains preserved locally. Missing
 publication evidence and typed private lock contention are successful
