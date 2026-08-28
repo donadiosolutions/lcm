@@ -708,6 +708,47 @@ describe("Claude skill and legacy guidance seams", () => {
     expect(files.get(skillPath)).toContain("<!-- lcm-managed-skill:v1 -->");
   });
 
+  const historicalInitialBlankLine = fsReadFileSync(
+    new URL("../connectors/fixtures/historical-skill-initial-blank-line.md", import.meta.url),
+    "utf-8",
+  );
+
+  it("replaces the historical initial-blank-line skill with exact canonical content", () => {
+    const files = new Map([[skillPath, historicalInitialBlankLine]]);
+    const canonical = "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\ncanonical\n";
+    const writes = vi.fn((path: string, content: string) => { files.set(path, content); });
+    const deps = {
+      existsSync: (path: string) => files.has(path),
+      readFileSync: (path: string) => files.get(path) ?? "",
+      writeFileSync: writes,
+      mkdirSync: vi.fn(),
+      renderClaudeSkill: () => canonical,
+    };
+
+    expect(() => installClaudeSkill(deps, "mcp", home)).not.toThrow();
+    expect(files.get(skillPath)).toBe(canonical);
+  });
+
+  it.each([
+    ["with the initial template terminal LF removed", historicalInitialBlankLine.slice(0, -2)],
+    ["with two appended LF bytes", `${historicalInitialBlankLine}\n`],
+    ["with one changed ASCII body byte", historicalInitialBlankLine.replace("# Lossless", "# Xossless")],
+  ])("rejects the historical skill %s without writing", (_description, existing) => {
+    const files = new Map([[skillPath, existing]]);
+    const writes = vi.fn((path: string, content: string) => { files.set(path, content); });
+    const deps = {
+      existsSync: (path: string) => files.has(path),
+      readFileSync: (path: string) => files.get(path) ?? "",
+      writeFileSync: writes,
+      mkdirSync: vi.fn(),
+      renderClaudeSkill: () => canonicalSkill,
+    };
+
+    expect(() => installClaudeSkill(deps, "mcp", home)).toThrow("unowned LCM skill");
+    expect(writes).not.toHaveBeenCalled();
+    expect(files.get(skillPath)).toBe(existing);
+  });
+
   const canonicalSkill = "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\ncanonical\n";
   const skillDepsForExisting = (existing: string, generated = canonicalSkill) => {
     const files = new Map([[skillPath, existing]]);
@@ -779,6 +820,26 @@ describe("Claude skill and legacy guidance seams", () => {
     expect(installClaudeSkill(deps, "cli", home)).toBe(skillPath);
     expect(preview).toHaveBeenCalledWith(skillPath, "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\nnew\n");
     expect(deps.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("previews the exact historical initial-blank-line migration without writing", () => {
+    const files = new Map([[skillPath, historicalInitialBlankLine]]);
+    const preview = vi.fn();
+    const canonical = "---\nname: lcm-memory\n---\n<!-- lcm-managed-skill:v1 -->\ncanonical\n";
+    const deps = {
+      existsSync: (path: string) => files.has(path),
+      readFileSync: (path: string) => files.get(path) ?? "",
+      writeFileSync: vi.fn(),
+      mkdirSync: vi.fn(),
+      previewWriteFile: preview,
+      dryRun: true,
+      renderClaudeSkill: () => canonical,
+    };
+
+    expect(installClaudeSkill(deps, "cli", home)).toBe(skillPath);
+    expect(preview).toHaveBeenCalledWith(skillPath, canonical);
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+    expect(files.get(skillPath)).toBe(historicalInitialBlankLine);
   });
 
   it("removes recognized legacy assets and preserves modified or unreadable collisions", () => {
