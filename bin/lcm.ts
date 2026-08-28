@@ -1,19 +1,28 @@
 #!/usr/bin/env node
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { argv, exit, stdin, stdout } from "node:process";
+import { argv, exit, kill as processKill, stdin, stdout } from "node:process";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command, Option } from "commander";
 import { packageRootFor } from "../src/runtime-root.js";
-import { DaemonClient, type DaemonHealth } from "../src/daemon/client.js";
+import {
+  DaemonClient,
+  type DaemonHealth,
+  type DaemonRequestOptions,
+  type InvocationControlRequest,
+  type InvocationControlResponse,
+} from "../src/daemon/client.js";
 import {
   ConfigValidationError,
+  DEFAULT_LLM_MAX_CONCURRENCY,
   daemonConfigSnapshotWitnessEqual,
   LLM_REASONING_EFFORTS,
   readDaemonConfigSnapshot,
   reasoningEffortsForProvider,
   resolveLlmRequestPolicy,
+  MAX_LLM_MAX_CONCURRENCY,
   supportsFastMode,
   supportsRequestTimeout,
   type DaemonConfig,
@@ -67,6 +76,7 @@ import type {
   PostgreSqlPassiveEventRepository,
 } from "../src/storage/postgresql/passive-event-repository.js";
 import { CONNECTOR_TRANSPORTS } from "../src/connectors/types.js";
+import { createAbortError, isAbortError, throwIfAborted } from "../src/daemon/cancellation.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -132,7 +142,778 @@ type CompactOptions = CompactRequestPolicyOptions & {
   hook?: boolean;
   client?: unknown;
   help?: boolean;
+  maxConcurrency?: string;
 };
+
+export type CompactInvocationClient = Readonly<{
+  health?: (options?: DaemonRequestOptions) => Promise<DaemonHealth | null>;
+  startInvocation: (
+    input: InvocationControlRequest,
+    options?: DaemonRequestOptions,
+  ) => Promise<InvocationControlResponse>;
+  heartbeatInvocation: (
+    input: InvocationControlRequest,
+    options?: DaemonRequestOptions,
+  ) => Promise<InvocationControlResponse>;
+  cancelInvocation: (
+    input: InvocationControlRequest,
+    options?: DaemonRequestOptions,
+  ) => Promise<InvocationControlResponse>;
+  finishInvocation: (
+    input: InvocationControlRequest,
+    options?: DaemonRequestOptions,
+  ) => Promise<InvocationControlResponse>;
+}>;
+
+export type CompactInvocationLifecycleOptions = Readonly<{
+  client: CompactInvocationClient;
+  daemonInstanceId: string;
+  invocationId?: string;
+  signal?: AbortSignal;
+  /** Bounds the ordinary start control transport without using command abort. */
+  startTimeoutMs?: number;
+  /** Injectable clock used to bound uncertain start outcomes. */
+  now?: () => number;
+  heartbeatMs?: number;
+  setInterval?: typeof setInterval;
+  clearInterval?: typeof clearInterval;
+  onHeartbeatError?: (error: unknown) => void;
+}>;
+
+export type CompactInvocationLifecycle = Readonly<{
+  invocationId: string;
+  target: InvocationControlRequest;
+  signal: AbortSignal;
+  started: () => boolean;
+  /** True once the start request was sent, even if its response was lost. */
+  possiblyRegistered: () => boolean;
+  /** Registration state, including an uncertain start transport outcome. */
+  startState?: () => "unsent" | "sent" | "confirmed" | "response-lost";
+  /** Absolute deadline after which an unconfirmed start may be reconciled. */
+  uncertaintyDeadline?: () => number | undefined;
+  start: () => Promise<InvocationControlResponse>;
+  stopHeartbeat: () => void;
+  /** Stop and await every heartbeat request already in flight. */
+  settleHeartbeat: () => Promise<void>;
+  heartbeat: () => Promise<InvocationControlResponse | undefined>;
+  cancel: () => Promise<InvocationControlResponse | undefined>;
+  finish: () => Promise<InvocationControlResponse | undefined>;
+}>;
+
+/**
+ * Verify a daemon invocation snapshot is bound to the requested target and
+ * carries all three independent zero-work counters.  `activeCount` alone is
+ * not a sufficient ownership proof: older or malformed responses may omit a
+ * work/commit counter while still claiming zero active work.
+ */
+export function isStrictInvocationControlSnapshot(
+  value: unknown,
+  target: InvocationControlRequest,
+  state: "cancelled" | "finished",
+): value is InvocationControlResponse {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const snapshot = value as Partial<InvocationControlResponse>;
+  return snapshot.invocationId === target.invocationId
+    && snapshot.command === target.command
+    && snapshot.daemonInstanceId === target.daemonInstanceId
+    && snapshot.state === state
+    && snapshot.activeCount === 0
+    && snapshot.workCount === 0
+    && snapshot.commitCount === 0;
+}
+
+function isStrictTerminalInvocationControlSnapshot(
+  value: unknown,
+  target: InvocationControlRequest,
+): value is InvocationControlResponse {
+  return isStrictInvocationControlSnapshot(value, target, "cancelled")
+    || isStrictInvocationControlSnapshot(value, target, "finished");
+}
+
+function isInvocationTargetResponse(
+  value: unknown,
+  target: InvocationControlRequest,
+  state: "active" | "cancelling" | "cancelled" | "finished",
+): value is InvocationControlResponse {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const snapshot = value as Partial<InvocationControlResponse>;
+  return snapshot.invocationId === target.invocationId
+    && snapshot.command === target.command
+    && snapshot.daemonInstanceId === target.daemonInstanceId
+    && snapshot.state === state
+    && typeof snapshot.activeCount === "number"
+    && Number.isSafeInteger(snapshot.activeCount)
+    && typeof snapshot.workCount === "number"
+    && Number.isSafeInteger(snapshot.workCount)
+    && typeof snapshot.commitCount === "number"
+    && Number.isSafeInteger(snapshot.commitCount);
+}
+
+/**
+ * Own one daemon invocation's start, lease heartbeats, and terminal control.
+ * The caller remains responsible for command-signal and drain orchestration.
+ */
+export function createCompactInvocationLifecycle(
+  options: CompactInvocationLifecycleOptions,
+): CompactInvocationLifecycle {
+  const invocationId = options.invocationId ?? randomUUID();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(invocationId)) {
+    throw new Error("compact invocation ID must be a canonical UUID");
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(options.daemonInstanceId)) {
+    throw new Error("daemon instance ID must be a canonical UUID");
+  }
+  const heartbeatMs = options.heartbeatMs ?? 10_000;
+  if (!Number.isFinite(heartbeatMs) || heartbeatMs <= 0 || heartbeatMs >= 30_000) {
+    throw new RangeError("compact heartbeat interval must be between 0 and 30000 ms");
+  }
+  const startTimeoutMs = options.startTimeoutMs ?? 10_000;
+  if (!Number.isFinite(startTimeoutMs) || startTimeoutMs <= 0) {
+    throw new RangeError("compact invocation start timeout must be positive");
+  }
+  const signal = options.signal ?? new AbortController().signal;
+  const now = options.now ?? Date.now;
+  const setTimer = options.setInterval ?? setInterval;
+  const clearTimer = options.clearInterval ?? clearInterval;
+  const target: InvocationControlRequest = {
+    invocationId,
+    command: "compact",
+    daemonInstanceId: options.daemonInstanceId,
+  };
+  let started = false;
+  let possiblyRegistered = false;
+  let startState: "unsent" | "sent" | "confirmed" | "response-lost" = "unsent";
+  let startSentAt: number | undefined;
+  let uncertaintyDeadline: number | undefined;
+  const startController = new AbortController();
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let heartbeatPromise: Promise<InvocationControlResponse> | undefined;
+
+  const stopHeartbeat = (): void => {
+    if (heartbeatTimer === undefined) return;
+    clearTimer(heartbeatTimer);
+    heartbeatTimer = undefined;
+  };
+
+  const heartbeat = async (): Promise<InvocationControlResponse | undefined> => {
+    if (!started || signal.aborted) return undefined;
+    if (heartbeatPromise !== undefined) return await heartbeatPromise;
+    // Heartbeats must carry their own transport deadline.  Cleanup awaits the
+    // in-flight request, so relying only on the command signal could leave
+    // finish/cancel blocked forever when the daemon stops responding.
+    const pending = options.client.heartbeatInvocation(target, {
+      signal,
+      timeoutMs: startTimeoutMs,
+    });
+    heartbeatPromise = pending;
+    try {
+      return await pending;
+    } catch (error) {
+      if (!isAbortError(error)) options.onHeartbeatError?.(error);
+      throw error;
+    } finally {
+      if (heartbeatPromise === pending) heartbeatPromise = undefined;
+    }
+  };
+
+  const scheduleHeartbeat = (): void => {
+    heartbeatTimer = setTimer(() => {
+      void heartbeat().catch(() => undefined);
+    }, heartbeatMs);
+  };
+
+  const start = async (): Promise<InvocationControlResponse> => {
+    if (started) {
+      return await options.client.heartbeatInvocation(target, {
+        signal,
+        timeoutMs: startTimeoutMs,
+      });
+    }
+    throwIfAborted(signal);
+    // The request is now an owned side effect.  Keep this marker latched if
+    // transport rejects or loses its response so the caller must cancel the
+    // target before it can leave the command.
+    possiblyRegistered = true;
+    startState = "sent";
+    startSentAt = now();
+    uncertaintyDeadline = startSentAt + startTimeoutMs + 30_000;
+    try {
+      const result = await options.client.startInvocation(target, {
+        signal: startController.signal,
+        timeoutMs: startTimeoutMs,
+      });
+      if (!isInvocationTargetResponse(result, target, "active")) {
+        startState = "response-lost";
+        throw new Error("compact invocation start returned an invalid snapshot");
+      }
+      startState = "confirmed";
+      started = true;
+      scheduleHeartbeat();
+      return result;
+    } catch (error) {
+      if (startState !== "confirmed") startState = "response-lost";
+      throw error;
+    }
+  };
+
+  const settleHeartbeat = async (): Promise<void> => {
+    stopHeartbeat();
+    if (heartbeatPromise !== undefined) await Promise.allSettled([heartbeatPromise]);
+  };
+
+  const cancel = async (): Promise<InvocationControlResponse | undefined> => {
+    await settleHeartbeat();
+    if (!started && !possiblyRegistered) return undefined;
+    return await options.client.cancelInvocation(target, { signal });
+  };
+
+  const finish = async (): Promise<InvocationControlResponse | undefined> => {
+    await settleHeartbeat();
+    if (!started) return undefined;
+    const result = await options.client.finishInvocation(target, {
+      signal,
+      timeoutMs: startTimeoutMs,
+    });
+    if (!isStrictInvocationControlSnapshot(result, target, "finished")) {
+      throw new Error("compact invocation finish returned an invalid terminal snapshot");
+    }
+    return result;
+  };
+
+  return {
+    invocationId,
+    target,
+    signal,
+    started: () => started,
+    possiblyRegistered: () => possiblyRegistered,
+    startState: () => startState,
+    uncertaintyDeadline: () => startState === "response-lost" ? uncertaintyDeadline : undefined,
+    start,
+    stopHeartbeat,
+    settleHeartbeat,
+    heartbeat,
+    cancel,
+    finish,
+  };
+}
+
+type CompactSignalProcessLike = Readonly<{
+  on: (event: "SIGINT" | "SIGTERM", handler: () => void) => unknown;
+  removeListener: (event: "SIGINT" | "SIGTERM", handler: () => void) => unknown;
+}>;
+
+export type CompactSignalHandlers = Readonly<{
+  readonly signal: AbortSignal;
+  readonly status: 130 | 143 | undefined;
+  readonly draining: boolean;
+  readonly drainPromise: Promise<void> | undefined;
+  bindRenderer: (state: Pick<ProgressState, "aborted">) => void;
+  beginDrain: (reason?: string) => void;
+  cleanup: () => void;
+}>;
+
+export type CompactSignalHandlerOptions = Readonly<{
+  processLike?: CompactSignalProcessLike;
+  onFirstSignal?: (status: 130 | 143, signal: "SIGINT" | "SIGTERM") => Promise<void> | void;
+  onDrain?: (reason?: string) => Promise<void> | void;
+  onRepeatSignal?: (status: 130 | 143, signal: "SIGINT" | "SIGTERM") => void;
+}>;
+
+/** Install non-exiting compact signal handlers and expose their drain state. */
+export function installCompactSignalHandlers(
+  options: CompactSignalHandlerOptions = {},
+): CompactSignalHandlers {
+  const processLike = options.processLike ?? process;
+  const controller = new AbortController();
+  let status: 130 | 143 | undefined;
+  let draining = false;
+  let drainPromise: Promise<void> | undefined;
+  let rendererState: Pick<ProgressState, "aborted"> | undefined;
+  let cleaned = false;
+
+  const beginDrain = (reason?: string, signal?: "SIGINT" | "SIGTERM"): void => {
+    const nextStatus = signal === undefined ? undefined : signal === "SIGINT" ? 130 : 143;
+    if (draining) {
+      return;
+    }
+    draining = true;
+    if (nextStatus !== undefined) status = nextStatus;
+    if (rendererState !== undefined) rendererState.aborted = true;
+    controller.abort(createAbortError(reason ?? signal ?? "compact drain requested"));
+    try {
+      drainPromise = signal === undefined
+        ? Promise.resolve(options.onDrain?.(reason))
+        : Promise.resolve(options.onFirstSignal?.(signal === "SIGINT" ? 130 : 143, signal));
+    } catch (error) {
+      drainPromise = Promise.reject(error);
+    }
+    void drainPromise.catch(() => undefined);
+  };
+  const receive = (signal: "SIGINT" | "SIGTERM"): void => {
+    if (draining) {
+      // Automatic drains begin without an exit status.  A late user signal
+      // must still latch its status, while subsequent signals retain the
+      // first latched status and can never bypass the drain.
+      if (status === undefined) status = signal === "SIGINT" ? 130 : 143;
+      options.onRepeatSignal?.(status, signal);
+      return;
+    }
+    beginDrain(undefined, signal);
+  };
+  const sigintHandler = (): void => receive("SIGINT");
+  const sigtermHandler = (): void => receive("SIGTERM");
+  processLike.on("SIGINT", sigintHandler);
+  processLike.on("SIGTERM", sigtermHandler);
+
+  const cleanup = (): void => {
+    if (cleaned) return;
+    cleaned = true;
+    processLike.removeListener("SIGINT", sigintHandler);
+    processLike.removeListener("SIGTERM", sigtermHandler);
+  };
+  return {
+    signal: controller.signal,
+    get status() { return status; },
+    get draining() { return draining; },
+    get drainPromise() { return drainPromise; },
+    bindRenderer: (state): void => {
+      rendererState = state;
+      if (status !== undefined) state.aborted = true;
+    },
+    beginDrain: (reason?: string): void => beginDrain(reason),
+    cleanup,
+  };
+}
+
+export type CompactDrainResult = Readonly<{
+  daemonZero: boolean;
+  localSettled: boolean;
+  restartAttempted?: boolean;
+  replacementVerified?: boolean;
+  diagnostic?: string;
+}>;
+
+export type CompactManagedRestartResult = Readonly<{
+  connected: boolean;
+  restarted?: boolean;
+  stoppedPid?: number;
+  pid?: number;
+  refusalReason?: unknown;
+  warning?: string;
+}>;
+
+/** Prove the original daemon PID gone without requiring this restart to stop it. */
+export function proveOriginalDaemonGone(
+  originalPid: number | undefined,
+  restart: CompactManagedRestartResult,
+  killProcess: (pid: number, signal: 0) => void = processKill,
+): boolean {
+  if (originalPid === undefined) return false;
+  if (restart.restarted === true && restart.stoppedPid === originalPid) return true;
+  try {
+    killProcess(originalPid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | undefined)?.code === "ESRCH";
+  }
+}
+
+export type CompactDrainOptions = Readonly<{
+  lifecycle: CompactInvocationLifecycle;
+  createFreshClient: () => CompactInvocationClient;
+  awaitLocalWork?: () => Promise<void>;
+  /** True once the command has dispatched any local compact work. */
+  localWorkDispatched?: () => boolean;
+  originalHealth?: DaemonHealth | null;
+  health?: (client: CompactInvocationClient, options?: DaemonRequestOptions) => Promise<DaemonHealth | null>;
+  timeoutMs?: number;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
+  now?: () => number;
+  expectedRuntimeDigest?: string;
+  expectedStorageBackend?: DaemonHealth["storageBackend"];
+  restart?: (input: Readonly<{ originalHealth?: DaemonHealth; signal: AbortSignal }>) => Promise<CompactManagedRestartResult>;
+  proveOldInstanceGone?: (input: Readonly<{ originalHealth?: DaemonHealth; restart: CompactManagedRestartResult }>) => Promise<boolean> | boolean;
+  proveProviderWitnessGone?: (input: Readonly<{ daemonInstanceId?: string; invocationId?: string }>) => Promise<boolean> | boolean;
+  /** Mutable state shared by one automatic drain retry session. */
+  session?: CompactDrainSession;
+  onDiagnostic?: (message: string) => void;
+}>;
+
+function isUnknownInvocationCancellation(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const candidate = error as { statusCode?: unknown; code?: unknown; message?: unknown };
+  if (candidate.statusCode === 404) return true;
+  if (candidate.code === "unknown-invocation" || candidate.code === "UNKNOWN_INVOCATION") return true;
+  return typeof candidate.message === "string"
+    && /(?:unknown invocation|invocation not found|http\s*404)/iu.test(candidate.message);
+}
+
+export type CompactDrainSession = {
+  restartAttempted: boolean;
+  restartPromise?: Promise<CompactManagedRestartResult>;
+  restart?: CompactManagedRestartResult;
+  oldInstanceGone?: boolean;
+  providerWitnessGone?: boolean;
+};
+
+type CompactProviderWitnessSnapshot = Readonly<{
+  available: boolean;
+  providers: readonly unknown[];
+}>;
+
+export function proveCompactProviderWitnessGone(
+  input: Readonly<{ daemonInstanceId: string; invocationId?: string }>,
+  readers: Readonly<{
+    read: (input: Readonly<{ daemonInstanceId: string; invocationId?: string }>) => CompactProviderWitnessSnapshot;
+    reconcile: (input: Readonly<{ daemonInstanceId: string; invocationId?: string }>) => CompactProviderWitnessSnapshot;
+  }>,
+): boolean {
+  const target = {
+    daemonInstanceId: input.daemonInstanceId,
+    ...(input.invocationId === undefined ? {} : { invocationId: input.invocationId }),
+  };
+  const observed = readers.read(target);
+  const snapshot = observed.available && observed.providers.length > 0
+    ? readers.reconcile(target)
+    : observed;
+  return snapshot.available && snapshot.providers.length === 0;
+}
+
+/** Cancel one invocation with a fresh client and await local owned work. */
+export async function cancelAndDrainCompactInvocation(
+  options: CompactDrainOptions,
+): Promise<CompactDrainResult> {
+  const possiblyRegistered = options.lifecycle.started()
+    || options.lifecycle.possiblyRegistered?.() === true;
+  if (!possiblyRegistered) return { daemonZero: true, localSettled: true };
+  if (options.lifecycle.settleHeartbeat !== undefined) {
+    await options.lifecycle.settleHeartbeat();
+  } else {
+    options.lifecycle.stopHeartbeat();
+  }
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError("compact cancellation timeout must be positive");
+  }
+  const setTimer = options.setTimeout ?? setTimeout;
+  const clearTimer = options.clearTimeout ?? clearTimeout;
+  const now = options.now ?? Date.now;
+  const startState = options.lifecycle.startState?.();
+  const uncertaintyDeadline = options.lifecycle.uncertaintyDeadline?.();
+  const localWorkDispatched = options.localWorkDispatched?.() === true;
+  const deadline = now() + timeoutMs;
+  type BoundedResult<T> = Readonly<{
+    settled: boolean;
+    value?: T;
+    error?: unknown;
+    timedOut: boolean;
+    pending?: Promise<T>;
+  }>;
+  const bounded = async <T>(
+    operation: (signal: AbortSignal) => Promise<T>,
+    operationDeadline = deadline,
+  ): Promise<BoundedResult<T>> => {
+    const controller = new AbortController();
+    const remaining = Math.max(0, operationDeadline - now());
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let resolveTimeout!: () => void;
+    const timeout = new Promise<void>(resolve => {
+      resolveTimeout = resolve;
+      timer = setTimer(resolve, remaining);
+    });
+    const pending = Promise.resolve().then(() => operation(controller.signal));
+    const outcome = await Promise.race([
+      pending.then(value => ({ settled: true, value, timedOut: false } as const), error => ({ settled: true, error, timedOut: false } as const)),
+      timeout.then(() => ({ settled: false, timedOut: true } as const)),
+    ]);
+    if (timer !== undefined) clearTimer(timer);
+    resolveTimeout();
+    if (outcome.timedOut) {
+      controller.abort(createAbortError("compact cancellation deadline exceeded"));
+      return { settled: false, timedOut: true, pending };
+    }
+    return { ...outcome, pending };
+  };
+  let daemonZero = false;
+  let restartAttempted = false;
+  let replacementVerified = false;
+  let diagnostic: string | undefined;
+  let originalReachable = false;
+  const session = options.session;
+  const firstClient = options.createFreshClient();
+  const firstCancel = await bounded(signal => firstClient.cancelInvocation(
+    options.lifecycle.target,
+    { signal },
+  ));
+  const providerProof = options.proveProviderWitnessGone === undefined
+    ? { settled: true, value: false, timedOut: false }
+    : await bounded(async () => await options.proveProviderWitnessGone!({
+      daemonInstanceId: options.originalHealth?.daemonInstanceId
+        ?? options.lifecycle.target.daemonInstanceId,
+      invocationId: options.lifecycle.target.invocationId,
+    }));
+  const strictCancel = firstCancel.settled
+    && firstCancel.error === undefined
+    && firstCancel.value !== undefined
+    && isStrictTerminalInvocationControlSnapshot(firstCancel.value, options.lifecycle.target);
+  const providerGone = providerProof.settled
+    && providerProof.error === undefined
+    && providerProof.value === true;
+  daemonZero = strictCancel && providerGone;
+  if (!daemonZero && firstCancel.settled && firstCancel.error === undefined && firstCancel.value !== undefined) {
+    diagnostic = strictCancel
+      ? "provider process witness is unavailable or still reports owned work"
+      : "daemon cancellation response did not prove targeted zero-owned work";
+  } else if (firstCancel.settled && firstCancel.error !== undefined) {
+    diagnostic = firstCancel.error instanceof Error ? firstCancel.error.message : "daemon cancellation request failed";
+  } else {
+    diagnostic = "daemon cancellation deadline exceeded";
+  }
+
+  const localResult = await bounded(async () => {
+    await options.awaitLocalWork?.();
+  });
+  const localSettled = localResult.settled && !localResult.timedOut && localResult.error === undefined;
+
+  const health = options.health ?? ((client: CompactInvocationClient, requestOptions?: DaemonRequestOptions) =>
+    client.health === undefined ? Promise.resolve(null) : client.health(requestOptions));
+  const uncertainStart = startState === "response-lost"
+    && !localWorkDispatched
+    && uncertaintyDeadline !== undefined
+    && options.originalHealth?.daemonInstanceId !== undefined;
+  const unknownFirstCancel = firstCancel.settled
+    && firstCancel.error !== undefined
+    && isUnknownInvocationCancellation(firstCancel.error);
+  if ((!daemonZero || !localSettled)
+    && (now() <= deadline || (uncertainStart && unknownFirstCancel))) {
+    const healthDeadline = now() <= deadline ? deadline : now() + timeoutMs;
+    const healthResult = await bounded(signal => health(options.createFreshClient(), { signal }), healthDeadline);
+    const observed = healthResult.value;
+    const sameInstance = observed !== null
+      && observed !== undefined
+      && options.originalHealth?.daemonInstanceId !== undefined
+      && observed.daemonInstanceId === options.originalHealth.daemonInstanceId
+      && (observed.status === "ok" || observed.status === "healthy");
+    if (sameInstance) {
+      originalReachable = true;
+      const retry = await bounded(signal => options.createFreshClient().cancelInvocation(
+        options.lifecycle.target,
+        { signal },
+      ), healthDeadline);
+      const retryProviderProof = options.proveProviderWitnessGone === undefined
+        ? { settled: true, value: false, timedOut: false }
+        : await bounded(async () => await options.proveProviderWitnessGone!({
+          daemonInstanceId: options.originalHealth!.daemonInstanceId!,
+          invocationId: options.lifecycle.target.invocationId,
+        }), healthDeadline);
+      const strictRetry = retry.settled
+        && retry.error === undefined
+        && retry.value !== undefined
+        && isStrictTerminalInvocationControlSnapshot(retry.value, options.lifecycle.target);
+      const retryProviderGone = retryProviderProof.settled
+        && retryProviderProof.error === undefined
+        && retryProviderProof.value === true;
+      daemonZero = strictRetry && retryProviderGone;
+      if (!daemonZero
+        && uncertainStart
+        && now() >= uncertaintyDeadline!
+        && unknownFirstCancel
+        && isUnknownInvocationCancellation(retry.error)
+        && retryProviderGone) {
+        daemonZero = true;
+      }
+      if (!daemonZero) diagnostic = strictRetry
+        ? "provider process witness is unavailable or still reports owned work after cancellation retry"
+        : "daemon cancellation response did not prove targeted zero-owned work after retry";
+    } else if (observed !== null && observed !== undefined) {
+      diagnostic = "daemon instance changed while cancellation was in progress";
+    }
+  }
+
+  let restartDeadline: number | undefined;
+  const boundedRestart = async <T>(
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<BoundedResult<T>> => {
+    restartDeadline ??= now() + timeoutMs;
+    return await bounded(operation, restartDeadline);
+  };
+
+  const proveReplacement = async (restart: CompactManagedRestartResult): Promise<boolean> => {
+    type BooleanBoundedResult = BoundedResult<boolean>;
+    const oldGoneResult: BooleanBoundedResult = options.proveOldInstanceGone === undefined
+      ? { settled: true, value: restart.restarted === true && restart.stoppedPid !== undefined, timedOut: false }
+      : await boundedRestart(async () => await options.proveOldInstanceGone!({
+        originalHealth: options.originalHealth ?? undefined,
+        restart,
+      }));
+    const providersGoneResult: BooleanBoundedResult = options.proveProviderWitnessGone === undefined
+      ? { settled: true, value: false, timedOut: false }
+      : await boundedRestart(async () => await options.proveProviderWitnessGone!({
+        daemonInstanceId: options.originalHealth?.daemonInstanceId
+          ?? options.lifecycle.target.daemonInstanceId,
+      }));
+    const oldGone = oldGoneResult.settled && oldGoneResult.error === undefined && oldGoneResult.value === true;
+    const providersGone = providersGoneResult.settled
+      && providersGoneResult.error === undefined
+      && providersGoneResult.value === true;
+    if (session !== undefined) {
+      session.oldInstanceGone = oldGone;
+      session.providerWitnessGone = providersGone;
+    }
+    if (!oldGone || !providersGone) return false;
+    const replacementResult = await boundedRestart(signal => health(options.createFreshClient(), { signal }));
+    const replacement = replacementResult.value;
+    replacementVerified = replacementResult.settled
+      && replacementResult.error === undefined
+      && replacement !== null
+      && replacement !== undefined
+      && replacement.daemonInstanceId !== undefined
+      && replacement.daemonInstanceId !== options.originalHealth?.daemonInstanceId
+      && (options.expectedRuntimeDigest === undefined || replacement.runtimeDigest === options.expectedRuntimeDigest)
+      && (options.expectedStorageBackend === undefined || replacement.storageBackend === options.expectedStorageBackend)
+      && (replacement.status === "ok" || replacement.status === "healthy");
+    return replacementVerified;
+  };
+
+  if ((!daemonZero || !localSettled) && session?.restartAttempted === true) {
+    restartAttempted = true;
+    if (session.restart !== undefined) {
+      if (await proveReplacement(session.restart)) daemonZero = true;
+    } else if (session.restartPromise !== undefined) {
+      const pendingRestart = await boundedRestart(async () => await session.restartPromise!);
+      if (pendingRestart.settled
+        && pendingRestart.error === undefined
+        && pendingRestart.value !== undefined) {
+        session.restart = pendingRestart.value;
+        session.restartPromise = undefined;
+        if (await proveReplacement(pendingRestart.value)) daemonZero = true;
+      } else if (pendingRestart.settled) {
+        // A terminally failed attempt no longer owns restart admission. Permit
+        // a later drain iteration to start one fresh managed restart.
+        session.restartAttempted = false;
+        session.restartPromise = undefined;
+        diagnostic = pendingRestart.error instanceof Error
+          ? pendingRestart.error.message
+          : "managed daemon restart was not verified";
+      }
+    }
+  } else if ((!daemonZero || !localSettled)
+    && options.restart !== undefined
+    && !originalReachable
+    && (session === undefined || !session.restartAttempted)) {
+    restartAttempted = true;
+    if (session !== undefined) session.restartAttempted = true;
+    try {
+      const restartResult = await boundedRestart(signal => options.restart!({
+        originalHealth: options.originalHealth ?? undefined,
+        signal,
+      }));
+      if (session !== undefined) session.restartPromise = restartResult.pending;
+      if (!restartResult.settled || restartResult.error !== undefined || restartResult.value === undefined) {
+        if (session !== undefined && restartResult.settled) {
+          session.restartAttempted = false;
+          session.restartPromise = undefined;
+        }
+        throw restartResult.error ?? new Error("managed daemon restart did not settle before cancellation deadline");
+      }
+      const restart = restartResult.value;
+      if (session !== undefined) {
+        session.restart = restart;
+        session.restartPromise = undefined;
+      }
+      if (await proveReplacement(restart)) daemonZero = true;
+      if (!replacementVerified) {
+        diagnostic = restart.warning ?? "managed daemon restart did not prove replacement identity";
+      }
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : "managed daemon restart was not verified";
+    }
+  }
+  if (!daemonZero || !localSettled) {
+    // Every non-early path above assigns a diagnostic from cancellation,
+    // retry, or managed-restart outcomes before reaching this block.
+    const rawDiagnostic = diagnostic!;
+    const boundedDiagnostic = sanitizeTerminalText(rawDiagnostic).slice(0, 256);
+    options.onDiagnostic?.(boundedDiagnostic);
+  }
+  return {
+    daemonZero,
+    localSettled,
+    restartAttempted,
+    replacementVerified,
+    diagnostic: diagnostic!,
+  };
+}
+
+export type CompactDrainUntilProvedOptions = CompactDrainOptions & Readonly<{
+  /** Delay between fresh cancellation/proof attempts. */
+  retryDelayMs?: number;
+  /** Injectable retry delay seam used by deterministic lifecycle tests. */
+  waitForRetry?: (delayMs: number) => Promise<void>;
+}>;
+
+/** Keep retrying fresh cancellation and ownership proof until both settle. */
+export async function drainCompactInvocationUntilProved(
+  options: CompactDrainUntilProvedOptions,
+): Promise<CompactDrainResult> {
+  const retryDelayMs = options.retryDelayMs ?? 1_000;
+  if (!Number.isFinite(retryDelayMs) || retryDelayMs <= 0) {
+    throw new RangeError("compact drain retry delay must be positive");
+  }
+  const waitForRetry = options.waitForRetry ?? ((delayMs: number): Promise<void> =>
+    new Promise<void>(resolve => { setTimeout(resolve, delayMs); }));
+  const session: CompactDrainSession = options.session ?? { restartAttempted: false };
+  while (true) {
+    const result = await cancelAndDrainCompactInvocation({ ...options, session });
+    if (result.daemonZero && result.localSettled) return result;
+    await waitForRetry(retryDelayMs);
+  }
+}
+
+/** Parse the canonical unsigned decimal form accepted by --max-concurrency. */
+export function parseCompactConcurrency(value: unknown): number {
+  if (typeof value !== "string" || !/^(?:0|[1-9]\d*)$/u.test(value)) {
+    throw new ConfigValidationError(
+      "compact.maxConcurrency",
+      "--max-concurrency requires canonical unsigned decimal text",
+    );
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < DEFAULT_LLM_MAX_CONCURRENCY || parsed > MAX_LLM_MAX_CONCURRENCY) {
+    throw new ConfigValidationError(
+      "compact.maxConcurrency",
+      `--max-concurrency must be an integer between ${DEFAULT_LLM_MAX_CONCURRENCY} and ${MAX_LLM_MAX_CONCURRENCY}`,
+    );
+  }
+  return parsed;
+}
+
+/** Resolve one compact invocation's effective worker concurrency. */
+export function resolveCompactConcurrency(
+  config: Pick<DaemonConfig, "llm">,
+  options: { maxConcurrency?: string; replay?: boolean } = {},
+): number {
+  const explicit = options.maxConcurrency === undefined
+    ? undefined
+    : parseCompactConcurrency(options.maxConcurrency);
+  if (options.replay === true && explicit !== undefined && explicit > 1) {
+    throw new ConfigValidationError(
+      "compact.maxConcurrency",
+      "--max-concurrency values above 1 are not supported with --replay",
+    );
+  }
+  if (explicit !== undefined) return explicit;
+  if (options.replay === true) return 1;
+  const stored = config.llm.maxConcurrency ?? DEFAULT_LLM_MAX_CONCURRENCY;
+  if (!Number.isSafeInteger(stored) || stored < DEFAULT_LLM_MAX_CONCURRENCY || stored > MAX_LLM_MAX_CONCURRENCY) {
+    throw new ConfigValidationError(
+      "llm.maxConcurrency",
+      `must be an integer between ${DEFAULT_LLM_MAX_CONCURRENCY} and ${MAX_LLM_MAX_CONCURRENCY}`,
+    );
+  }
+  return stored;
+}
 
 function numericOption(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
@@ -1402,8 +2183,31 @@ export async function runCli(
       writeFileSync(pidFilePath, String(process.pid));
       process.on("exit", cleanupPidFile);
       console.log(`lcm daemon started on port ${daemon.address().port}`);
-      process.on("SIGTERM", () => exit(0));
-      process.on("SIGINT", () => exit(0));
+      let stopping: Promise<void> | undefined;
+      const stopForegroundDaemon = (): void => {
+        if (stopping === undefined) {
+          const stop = (daemon as { stop?: () => Promise<void> | void }).stop;
+          if (stop === undefined) {
+            exit(0);
+            return;
+          }
+          let result: Promise<void> | void;
+          try {
+            result = stop.call(daemon);
+          } catch {
+            void Promise.resolve().then(() => exit(1)).catch(() => undefined);
+            return;
+          }
+          if (result === undefined) {
+            exit(0);
+            return;
+          }
+          stopping = Promise.resolve(result);
+        }
+        void stopping.then(() => exit(0), () => exit(1)).catch(() => undefined);
+      };
+      process.on("SIGTERM", stopForegroundDaemon);
+      process.on("SIGINT", stopForegroundDaemon);
     });
   daemonCmd.command("restart")
     .description("Restart the managed context daemon and reload configuration")
@@ -1511,6 +2315,7 @@ export async function runCli(
     .option("--retry-initial-delay-ms <ms>", "Override OpenAI-compatible initial retry delay")
     .option("--retry-max-delay-ms <ms>", "Override OpenAI-compatible maximum retry delay")
     .option("--retry-multiplier <n>", "Override OpenAI-compatible retry multiplier")
+    .option("--max-concurrency <n>", "Limit concurrent compaction requests (1-32)")
     .option("-v, --verbose", "Show per-session token details")
     .addOption(new Option("--hook", "Hook dispatch mode (internal)").hideHelp())
     .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
@@ -1530,6 +2335,85 @@ export async function runCli(
       // Hook dispatch only when --hook is explicit; all other invocations go to batch.
       const hook: boolean = opts.hook ?? false;
       if (!hook) {
+        let invocationLifecycle: CompactInvocationLifecycle | undefined;
+        let localWorkPromise: Promise<void> | undefined;
+        let compactPort = 3737;
+        let compactTokenPath: string | undefined;
+        let compactPidFilePath: string | undefined;
+        let compactStorageBackend: DaemonHealth["storageBackend"] | undefined;
+        let compactRuntimeDigest: string | undefined;
+        let compactExpectedVersion: string | undefined;
+        let originalDaemonHealth: DaemonHealth | undefined;
+        let drainResult: CompactDrainResult | undefined;
+        let invocationControlFailures = 0;
+        let resolveWorkReady!: () => void;
+        const workReady = new Promise<void>(resolve => { resolveWorkReady = resolve; });
+        const proveProviderProcessesGone = async (
+          daemonInstanceId: string,
+          invocationId?: string,
+        ): Promise<boolean> => {
+          try {
+            const { readProviderProcessWitnesses, reconcileProviderProcessWitnesses } = await import("../src/llm/process-utils.js");
+            return proveCompactProviderWitnessGone({ daemonInstanceId, invocationId }, {
+              read: readProviderProcessWitnesses,
+              reconcile: reconcileProviderProcessWitnesses,
+            });
+          } catch {
+            return false;
+          }
+        };
+        const drainInvocation = async (): Promise<void> => {
+          await workReady;
+          if (invocationLifecycle === undefined) {
+            drainResult = { daemonZero: true, localSettled: true };
+            return;
+          }
+          const drained = await drainCompactInvocationUntilProved({
+            lifecycle: invocationLifecycle,
+            createFreshClient: () => new DaemonClient(`http://127.0.0.1:${compactPort}`, compactTokenPath),
+            awaitLocalWork: async () => { await localWorkPromise?.catch(() => undefined); },
+            localWorkDispatched: () => localWorkPromise !== undefined,
+            originalHealth: originalDaemonHealth,
+            expectedRuntimeDigest: compactRuntimeDigest,
+            expectedStorageBackend: compactStorageBackend,
+            restart: async ({ signal }) => {
+              const { restartDaemon } = await import("../src/daemon/lifecycle.js");
+              return await restartDaemon({
+                port: compactPort,
+                pidFilePath: compactPidFilePath!,
+                spawnTimeoutMs: 10_000,
+                expectedVersion: compactExpectedVersion,
+                expectedStorageBackend: compactStorageBackend,
+                expectedRuntimeDigest: compactRuntimeDigest,
+                enforceUserManagerParent: true,
+                _abortSignal: signal,
+              });
+            },
+            proveOldInstanceGone: async ({ originalHealth: old, restart }) =>
+              proveOriginalDaemonGone(old?.pid, restart),
+            proveProviderWitnessGone: async ({ daemonInstanceId, invocationId }) =>
+              daemonInstanceId !== undefined
+                && await proveProviderProcessesGone(daemonInstanceId, invocationId),
+            onDiagnostic: message => console.error(`  compact is still draining: ${message}`),
+          });
+          drainResult = drained;
+        };
+        const signalHandlers = installCompactSignalHandlers({
+          onRepeatSignal: (status) => {
+            console.error(`  compact is already draining (exit ${status}); waiting for local work to settle`);
+          },
+          onFirstSignal: drainInvocation,
+          onDrain: drainInvocation,
+        });
+        const completePreRegistrationDrain = async (): Promise<void> => {
+          resolveWorkReady();
+          // This helper is called only after beginDrain latched the promise.
+          await Promise.allSettled([signalHandlers.drainPromise!]);
+          // drainCompactInvocationUntilProved resolves only after both proofs
+          // settle; an automatic pre-registration drain has no other exit.
+          process.exitCode = signalHandlers.status ?? 1;
+        };
+        try {
         const { batchCompact } = await import("../src/batch-compact.js");
         const { loadDaemonConfig } = await import("../src/daemon/config.js");
         const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
@@ -1537,6 +2421,9 @@ export async function runCli(
         const configFile = defaultConfigPath();
         const config = loadDaemonConfig(configFile);
         selectStorageBackendForConfig(configFile, config.storage);
+        compactStorageBackend = config.storage.backend;
+        compactRuntimeDigest = RUNTIME_DIGEST;
+        compactExpectedVersion = typeof pkg.version === "string" ? pkg.version : undefined;
         const requestPolicy = resolveCompactRequestPolicyOverride(config, opts);
         const effectiveProvider = resolveManualCompactProvider(config.llm.provider);
         const supportedEfforts = reasoningEffortsForProvider(effectiveProvider, config.llm.apiMode);
@@ -1548,24 +2435,44 @@ export async function runCli(
           console.error(`  --${fastMode ? "fast-mode" : "no-fast-mode"} requires llm.provider="auto", "claude-process", or "codex-process"`);
           exit(1);
         }
+        const maxConcurrency = resolveCompactConcurrency(config, { maxConcurrency: opts.maxConcurrency, replay });
         const port = config.daemon?.port ?? 3737;
+        compactPort = port;
         const pidFilePath = daemonPidPath();
-        const daemonResult = await ensureDaemon({
-          port,
-          pidFilePath,
-          spawnTimeoutMs: 10000,
-          expectedStorageBackend: config.storage.backend,
-          enforceUserManagerParent: true,
-        });
-        if (!daemonResult.connected) {
-          console.error(`Could not connect to daemon: ${daemonUnavailableMessage(daemonResult, "not-running")}`);
-          exit(1);
+        compactPidFilePath = pidFilePath;
+        if (!dryRun && !signalHandlers.draining) {
+          let daemonResult: Awaited<ReturnType<typeof ensureDaemon>>;
+          try {
+            daemonResult = await ensureDaemon({
+              port,
+              pidFilePath,
+              spawnTimeoutMs: 10000,
+              expectedStorageBackend: config.storage.backend,
+              enforceUserManagerParent: true,
+              _abortSignal: signalHandlers.signal,
+            });
+          } catch (error) {
+            if (signalHandlers.draining) {
+              await completePreRegistrationDrain();
+              return;
+            }
+            throw error;
+          }
+          if (!daemonResult.connected) {
+            if (signalHandlers.draining) {
+              process.exitCode = signalHandlers.status;
+              return;
+            }
+            console.error(`Could not connect to daemon: ${daemonUnavailableMessage(daemonResult, "not-running")}`);
+            exit(1);
+          }
+          clearDaemonRemediationMarker();
         }
-        clearDaemonRemediationMarker();
         const noPromote: boolean = !opts.promote;
         const minTokens = config.compaction.autoCompactMinTokens;
         const cwd = all ? undefined : process.cwd();
         const tokenPath = daemonTokenPath();
+        compactTokenPath = tokenPath;
         let client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
 
         const { NinjaRenderer } = await import("../src/cli/pipeline-runner.js");
@@ -1576,14 +2483,78 @@ export async function runCli(
           { name: "Compact", status: "active" },
           ...(!noPromote ? [{ name: "Promote", status: "pending" } as const] : []),
         ], dryRun });
-        const compactRenderer = new NinjaRenderer({ state: compactState, renderOpts });
+        const compactRenderer = new NinjaRenderer({ state: compactState, renderOpts, handleSignals: false });
+        signalHandlers.bindRenderer(compactState);
         compactRenderer.start();
+        try {
+          if (!dryRun && !signalHandlers.draining) {
+          let daemonHealth: DaemonHealth | null;
+          try {
+            daemonHealth = await client.health({ signal: signalHandlers.signal });
+          } catch (error) {
+            if (signalHandlers.draining && invocationLifecycle === undefined) {
+              await completePreRegistrationDrain();
+              return;
+            }
+            throw error;
+          }
+          if (signalHandlers.draining) {
+            await completePreRegistrationDrain();
+            return;
+          }
+          const supportsInvocationControl = typeof client.startInvocation === "function"
+            && typeof client.heartbeatInvocation === "function"
+            && typeof client.cancelInvocation === "function"
+            && typeof client.finishInvocation === "function";
+          const hasInvocationIdentity = daemonHealth !== null
+            && typeof daemonHealth === "object"
+            && typeof daemonHealth.daemonInstanceId === "string";
+          if (!supportsInvocationControl || !hasInvocationIdentity) {
+            // Structural fakes and direct legacy callers may omit invocation
+            // control entirely; a real DaemonClient must fail closed when its
+            // authenticated health response cannot bind this command.
+            const legacyClient = (daemonHealth as unknown) === true;
+            if (!legacyClient) {
+              throw new Error("manual compact requires authenticated daemon invocation identity and control support");
+            }
+          } else {
+            originalDaemonHealth = daemonHealth as DaemonHealth;
+            invocationLifecycle = createCompactInvocationLifecycle({
+              client,
+              daemonInstanceId: (daemonHealth as { daemonInstanceId: string }).daemonInstanceId,
+              signal: signalHandlers.signal,
+              onHeartbeatError: (error) => {
+                invocationControlFailures += 1;
+                const message = error instanceof Error ? error.message : "request failed";
+                console.error(`  compact heartbeat failed: ${sanitizeTerminalText(message)}`);
+                signalHandlers.beginDrain("daemon heartbeat failed");
+              },
+            });
+            try {
+              await invocationLifecycle.start();
+            } catch (error) {
+              // start() latches possiblyRegistered before issuing the request;
+              // any rejection therefore requires the same bounded drain path.
+              invocationControlFailures += 1;
+              signalHandlers.beginDrain("daemon invocation start failed");
+              await completePreRegistrationDrain();
+              return;
+            }
+          }
+          }
 
         let totalFailures = 0;
         let totalPromoted = 0;
-        try {
+        const runCompactWork = async (): Promise<void> => {
           const { compacted, failures, compactedProjects } = await batchCompact({
-            minTokens, dryRun, port, cwd, replay, verbose, tokenPath, reasoningEffort, fastMode, requestPolicy,
+            minTokens, dryRun, port, cwd, replay, verbose, tokenPath, reasoningEffort, fastMode, requestPolicy, maxConcurrency,
+            ...(invocationLifecycle ? { invocationId: invocationLifecycle.invocationId } : {}),
+            signal: signalHandlers.signal,
+            onTransportFailure: (error: unknown): void => {
+              const message = error instanceof Error ? error.message : "request failed";
+              console.error(`  compact transport disconnected: ${sanitizeTerminalText(message)}`);
+              signalHandlers.beginDrain("daemon transport disconnected");
+            },
             onProgress: (patch: Partial<ProgressState>): void => {
               Object.assign(compactState, patch);
               if (patch.lastResult) compactRenderer.sessionDone();
@@ -1594,18 +2565,29 @@ export async function runCli(
 
           // Auto-promote after a successful compact: new summaries are prime promotion candidates.
           let promotionFailures = 0;
-          if (compacted > 0 && !noPromote) {
+          if (!dryRun && compacted > 0 && !noPromote && !signalHandlers.draining) {
             compactState.phases[1]!.status = "active";
             for (const promoteCwd of compactedProjects) {
-              compactState.currentProject = promoteCwd;
-              if (!isTTY || verbose) console.log(`  promoting: ${promoteCwd}...`);
+              if (signalHandlers.draining) break;
+              compactState.currentProject = sanitizeTerminalText(promoteCwd);
+              if (!isTTY || verbose) console.log(`  promoting: ${sanitizeTerminalText(promoteCwd)}...`);
               try {
-                const promotionBody = { cwd: promoteCwd, dry_run: dryRun };
+                const promotionBody = {
+                  cwd: promoteCwd,
+                  dry_run: dryRun,
+                  ...(invocationLifecycle ? { invocation_id: invocationLifecycle.invocationId } : {}),
+                };
                 let result: { processed: number; promoted: number };
                 try {
-                  result = await client.post("/promote", promotionBody);
+                  result = invocationLifecycle
+                    ? await client.post("/promote", promotionBody, { signal: signalHandlers.signal })
+                    : await client.post("/promote", promotionBody);
                 } catch (error) {
-                  if (!isDaemonTransportFailure(error)) throw error;
+                  if (signalHandlers.draining || !isDaemonTransportFailure(error)) throw error;
+                  if (invocationLifecycle !== undefined) {
+                    signalHandlers.beginDrain("daemon transport disconnected");
+                    throw error;
+                  }
                   const recovery = await ensureDaemon({
                     port,
                     pidFilePath,
@@ -1618,29 +2600,99 @@ export async function runCli(
                   }
                   clearDaemonRemediationMarker();
                   client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
+                  // The invocation-aware branch above throws before recovery;
+                  // reaching this point therefore guarantees a legacy client.
                   result = await client.post("/promote", promotionBody);
                 }
                 totalPromoted += result.promoted;
               } catch (error) {
                 promotionFailures++;
                 const message = error instanceof Error ? error.message : "request failed";
-                compactState.phaseErrors.push({ phase: "Promote", target: promoteCwd, message });
-                console.error(`  promotion failed for ${promoteCwd}: ${message}`);
+                compactState.phaseErrors.push({
+                  phase: "Promote",
+                  target: sanitizeTerminalText(promoteCwd),
+                  message: sanitizeTerminalText(message),
+                });
+                console.error(
+                  `  promotion failed for ${sanitizeTerminalText(promoteCwd)}: ${sanitizeTerminalText(message)}`,
+                );
               }
             }
             compactState.currentProject = undefined;
           }
           if (!noPromote) compactState.phases[1]!.status = "done";
-          totalFailures = failures + promotionFailures;
-        } finally {
-          compactRenderer.stop();
+          totalFailures = failures + promotionFailures + invocationControlFailures;
+        };
+
+        if (signalHandlers.draining) {
+          resolveWorkReady();
+          await Promise.allSettled([signalHandlers.drainPromise!]);
+          // The bounded drain promise resolves only after daemon and local
+          // ownership proofs are complete.
+          process.exitCode = signalHandlers.status
+            ?? compactFailureExitCode(totalFailures + invocationControlFailures);
+          return;
+        }
+        localWorkPromise = runCompactWork();
+        resolveWorkReady();
+        try {
+          await localWorkPromise;
+        } catch (error) {
+          if (!signalHandlers.draining) throw error;
+          totalFailures += 1;
+          compactState.phaseErrors.push({
+            phase: "Compact",
+            message: error instanceof Error ? error.message : "compact work failed",
+          });
+          const message = error instanceof Error ? error.message : "request failed";
+          console.error(`  compact failed while draining: ${sanitizeTerminalText(message)}`);
+        }
+        if (invocationLifecycle && !signalHandlers.draining) {
+          const providersGone = await proveProviderProcessesGone(
+            invocationLifecycle.target.daemonInstanceId,
+            invocationLifecycle.invocationId,
+          );
+          if (!providersGone) {
+            signalHandlers.beginDrain("provider process witness did not prove targeted zero-owned work");
+          } else {
+            try {
+              await invocationLifecycle.finish();
+            } catch (error) {
+              if (!signalHandlers.draining) {
+                totalFailures += 1;
+                signalHandlers.beginDrain("daemon finish control failed");
+              }
+              if (!isAbortError(error)) {
+                compactState.phaseErrors.push({
+                  phase: "Compact",
+                  message: error instanceof Error ? error.message : "invocation finish failed",
+                });
+              }
+            }
+          }
         }
         if (isTTY) compactRenderer.printSummary();
         if (totalPromoted > 0) {
           console.log(`  → ${totalPromoted} insight${totalPromoted !== 1 ? "s" : ""} promoted`);
         }
-        process.exitCode = compactFailureExitCode(totalFailures);
+        if (signalHandlers.drainPromise !== undefined) {
+          await Promise.allSettled([signalHandlers.drainPromise]);
+        }
+        if (!signalHandlers.draining) {
+          process.exitCode = compactFailureExitCode(totalFailures);
+        } else {
+          // A settled drain promise represents a proved drain by contract.
+          process.exitCode = signalHandlers.status ?? compactFailureExitCode(totalFailures);
+        }
         return;
+        } finally {
+          await invocationLifecycle?.settleHeartbeat?.();
+          compactRenderer.stop();
+        }
+        } finally {
+          resolveWorkReady();
+          signalHandlers.cleanup();
+        }
       }
       // Piped stdin — hook dispatch (PreCompact hook invocation)
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
@@ -2776,10 +3828,15 @@ export async function runCli(
           if (verbose) {
             process.stdout.write("\r");
             const convLabel = result.conversations !== undefined ? `, ${result.conversations} conversation${result.conversations !== 1 ? "s" : ""}` : "";
-            console.log(`  ${cwd}: ${result.processed} scanned${convLabel}, ${result.promoted} promoted`);
+            console.log(
+              `  ${sanitizeTerminalText(cwd)}: ${result.processed} scanned${convLabel}, ${result.promoted} promoted`,
+            );
           }
         } catch (err) {
-          if (verbose) console.error(`  promote failed for ${cwd}: ${err instanceof Error ? err.message : "request failed"}`);
+          if (verbose) {
+            const message = err instanceof Error ? err.message : "request failed";
+            console.error(`  promote failed for ${sanitizeTerminalText(cwd)}: ${sanitizeTerminalText(message)}`);
+          }
           continue;
         }
       }

@@ -12,6 +12,10 @@ export interface PipelineRunnerOpts {
   renderOpts: RenderOpts;
   /** Called once the runner has started (before session iteration begins) */
   onReady?: () => void;
+  /** Whether the renderer owns process signal handlers. */
+  handleSignals?: boolean;
+  /** Called for SIGINT/SIGTERM when an external lifecycle owns drain. */
+  onSignal?: (signal: 'SIGINT' | 'SIGTERM') => void;
 }
 
 /**
@@ -31,13 +35,18 @@ export class NinjaRenderer {
   private intervalId?: ReturnType<typeof setInterval>;
   private firstFrame = true;
   private sigintHandler?: () => void;
+  private sigtermHandler?: () => void;
   private sigwinchHandler?: () => void;
   private onReady?: () => void;
+  private readonly handleSignals: boolean;
+  private readonly onSignal?: (signal: 'SIGINT' | 'SIGTERM') => void;
 
   constructor(opts: PipelineRunnerOpts) {
     this.state = opts.state;
     this.opts = opts.renderOpts;
     this.onReady = opts.onReady;
+    this.handleSignals = opts.handleSignals ?? true;
+    this.onSignal = opts.onSignal;
   }
 
   /** Start the render loop and register signal handlers. */
@@ -50,14 +59,22 @@ export class NinjaRenderer {
     };
     process.on('SIGWINCH', this.sigwinchHandler);
 
-    // Register SIGINT for clean partial summary
-    this.sigintHandler = () => {
-      this.state.aborted = true;
-      this.stop();
-      this.printSummary();
-      process.exit(130);
-    };
-    process.on('SIGINT', this.sigintHandler);
+    if (this.handleSignals) {
+      const handleSignal = (signal: 'SIGINT' | 'SIGTERM'): void => {
+        this.state.aborted = true;
+        if (this.onSignal !== undefined) {
+          this.onSignal(signal);
+          return;
+        }
+        this.stop();
+        this.printSummary();
+        process.exit(signal === 'SIGINT' ? 130 : 143);
+      };
+      this.sigintHandler = () => handleSignal('SIGINT');
+      this.sigtermHandler = () => handleSignal('SIGTERM');
+      process.on('SIGINT', this.sigintHandler);
+      process.on('SIGTERM', this.sigtermHandler);
+    }
 
     if (isTTY && !verbose) {
       // Emit blank lines to reserve space for the 3-line frame
@@ -84,6 +101,10 @@ export class NinjaRenderer {
     if (this.sigintHandler) {
       process.removeListener('SIGINT', this.sigintHandler);
       this.sigintHandler = undefined;
+    }
+    if (this.sigtermHandler) {
+      process.removeListener('SIGTERM', this.sigtermHandler);
+      this.sigtermHandler = undefined;
     }
     if (this.sigwinchHandler) {
       process.removeListener('SIGWINCH', this.sigwinchHandler);

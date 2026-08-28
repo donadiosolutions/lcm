@@ -20,6 +20,7 @@ import {
   CODEX_PROCESS_REASONING_EFFORTS,
   ConfigValidationError,
   DEFAULT_DAEMON_PORT,
+  DEFAULT_LLM_MAX_CONCURRENCY,
   DEFAULT_LLM_REQUEST_TIMEOUT_MS,
   DEFAULT_LLM_RETRY_POLICY,
   LLM_API_MODES,
@@ -205,6 +206,34 @@ describe("readDaemonConfigSnapshot", () => {
 });
 
 describe("known configuration schema validation", () => {
+  it("defaults maxConcurrency to one and excludes it from the hook request policy projection", () => {
+    expect(parseDaemonConfig("{}").llm.maxConcurrency).toBe(DEFAULT_LLM_MAX_CONCURRENCY);
+    expect(parseLlmRequestPolicyConfig("{}").llm).not.toHaveProperty("maxConcurrency");
+  });
+
+  it.each([0, 33, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "2", null])(
+    "rejects llm.maxConcurrency value %j unless it is an integer from 1 through 32",
+    (maxConcurrency) => {
+      expect(() => parseStoredConfig(JSON.stringify({ llm: { maxConcurrency } }))).toThrow("llm.maxConcurrency");
+      expect(() => parseDaemonConfig("{}", { llm: { maxConcurrency } })).toThrow("llm.maxConcurrency");
+    },
+  );
+
+  it("accepts both maxConcurrency boundaries and preserves the value across provider transitions", () => {
+    expect(parseDaemonConfig(JSON.stringify({ llm: { maxConcurrency: 1 } })).llm.maxConcurrency).toBe(1);
+    const content = JSON.stringify({
+      llm: {
+        provider: "openai",
+        model: "gpt-test",
+        baseUrl: "http://localhost:11435/v1",
+        apiMode: "responses",
+        maxConcurrency: 32,
+      },
+    });
+    expect(parseDaemonConfig(content).llm.maxConcurrency).toBe(32);
+    expect(parseDaemonConfig(content, {}, { LCM_SUMMARY_PROVIDER: "disabled" }).llm.maxConcurrency).toBe(32);
+  });
+
   it.each([
     [{ version: 0 }, "version"],
     [{ daemon: "not-an-object" }, "daemon"],

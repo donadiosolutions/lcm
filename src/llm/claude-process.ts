@@ -1,7 +1,14 @@
 import { spawn as defaultSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, resolveDaemonConfigEnv, type ClaudeProcessReasoningEffort } from "../daemon/config.js";
-import { createProcessCompatibilityError } from "./process-utils.js";
+import {
+  createOwnedProcessTeardown,
+  createProcessCompatibilityError,
+  normalizeProcessBirthTime,
+  type ProviderProcessWitnessStore,
+} from "./process-utils.js";
+import { createAbortError, isAbortError, throwIfAborted } from "../daemon/cancellation.js";
+import { processStartTime } from "../private-mutation-lock.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
   buildLeafSummaryPrompt,
@@ -21,6 +28,19 @@ type ClaudeProcessDeps = {
   spawn?: typeof defaultSpawn;
   environment?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  /** @internal deterministic process lifecycle seams. */
+  platform?: NodeJS.Platform;
+  detachedProcessGroup?: boolean;
+  killProcess?: (pid: number, signal?: NodeJS.Signals | number) => void;
+  processGroupId?: number;
+  daemonProcessGroupId?: number;
+  isProcessGroupAlive?: (pgid: number) => boolean;
+  processGroupIdProbe?: (pid: number) => number | undefined;
+  processBirthTime?: (pid: number) => string | null;
+  daemonInstanceId?: string;
+  witnessStore?: ProviderProcessWitnessStore;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
 };
 
 function friendlyMissingClaudeError(): Error {
@@ -57,8 +77,11 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
   const spawn = opts.spawn ?? defaultSpawn;
   const environment = opts.environment ?? process.env;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS;
+  const platform = opts.platform ?? process.platform;
+  const processBirthTime = opts.processBirthTime ?? processStartTime;
 
   return async function summarize(text: string, aggressive?: boolean, ctx: SummarizeContext = {}): Promise<string> {
+    throwIfAborted(ctx.signal);
     const estimatedInputTokens = Math.ceil(text.length / 4);
     const targetTokens = ctx.targetTokens ?? resolveTargetTokens({
       inputTokens: estimatedInputTokens,
@@ -95,6 +118,7 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
         proc = spawn("claude", args, {
           stdio: ["pipe", "pipe", "pipe"],
           env: resolveClaudeProcessEnvironment(environment),
+          detached: platform !== "win32",
         });
       } catch (error) {
         reject(normalizeSpawnError(error));
@@ -103,53 +127,172 @@ export function createClaudeProcessSummarizer(opts: ClaudeProcessDeps = {}): Lcm
 
       let stdout = "";
       let finished = false;
-
+      let settlement: Promise<void> | undefined;
+      let teardown: ReturnType<typeof createOwnedProcessTeardown>;
+      try {
+        teardown = createOwnedProcessTeardown({
+          child: proc,
+          platform,
+          detachedProcessGroup: opts.detachedProcessGroup
+            ?? (platform !== "win32" && opts.processGroupId === undefined),
+          processGroupId: opts.processGroupId,
+          daemonProcessGroupId: opts.daemonProcessGroupId,
+          killProcess: opts.killProcess,
+          isProcessGroupAlive: opts.isProcessGroupAlive,
+          processBirthTime: opts.processBirthTime,
+          processGroupIdProbe: opts.processGroupIdProbe,
+          setTimeout: opts.setTimeout,
+          clearTimeout: opts.clearTimeout,
+        });
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      const witness = opts.daemonInstanceId !== undefined && opts.witnessStore !== undefined && teardown.pid !== undefined
+        ? {
+            daemonInstanceId: opts.daemonInstanceId,
+            ...(ctx.invocationId === undefined ? {} : { invocationId: ctx.invocationId }),
+            providerId: "claude-process",
+            pid: teardown.pid,
+            pgid: teardown.processGroupId ?? null,
+            processStartTime: normalizeProcessBirthTime(processBirthTime(teardown.pid)),
+          }
+        : undefined;
       proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
       proc.stderr.resume();
 
-      const timer = setTimeout(() => {
-        if (finished) return;
-        finished = true;
-        try {
-          proc.kill();
-        } catch {
-          // ignore kill failures during timeout cleanup
-        }
-        reject(new Error(`claude process timed out after ${Math.round(timeoutMs / 1000)}s`));
-      }, timeoutMs);
+      const cleanupStreams = (): void => {
+        try { proc.stdin.removeAllListeners("error"); } catch { /* already closed */ }
+        // Retain an inert sink after settlement so a late EPIPE cannot become
+        // an EventEmitter uncaught exception.
+        try { proc.stdin.on("error", () => undefined); } catch { /* already closed */ }
+        try { proc.stdin.destroy(); } catch { /* already closed */ }
+        try { proc.stdout.removeAllListeners("data"); } catch { /* already closed */ }
+        try { proc.stderr.removeAllListeners("data"); } catch { /* already closed */ }
+      };
 
-      proc.on("close", (code: number | null) => {
-        if (finished) return;
-        finished = true;
-        clearTimeout(timer);
-        const out = stdout.trim();
-        if (code === 0) {
-          if (out) {
-            resolve(out);
-          } else {
-            reject(new Error("claude output was empty"));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let witnessRemoved = false;
+      let cancellationRequested = false;
+      let terminalError: unknown;
+      const detachAbort = (): void => ctx.signal?.removeEventListener("abort", onAbort);
+      const cleanupChildListeners = (): void => {
+        proc.removeListener("close", onClose);
+        proc.removeListener("error", onError);
+        proc.stdin.removeListener("error", onStdinError);
+        // Keep an inert error sink so a late child error cannot escape as an
+        // EventEmitter uncaught exception after the result has settled.
+        proc.on("error", () => undefined);
+      };
+      const removeWitness = async (settled: boolean): Promise<void> => {
+        if (!settled || witness === undefined || witnessRemoved) return;
+        opts.witnessStore!.remove(witness);
+        witnessRemoved = true;
+      };
+      const settle = (
+        reason: "abort" | "timeout" | "close",
+        error?: unknown,
+        complete?: () => void,
+      ): void => {
+        if (error !== undefined && terminalError === undefined) terminalError = error;
+        if (settlement !== undefined) return;
+        settlement = (async () => {
+          try { proc.stdin.destroy(); } catch { /* already closed */ }
+          const settled = await teardown.terminate(reason);
+          await removeWitness(settled);
+          if (!settled && terminalError === undefined) {
+            terminalError = new Error("claude process teardown did not settle");
           }
-        } else {
-          reject(createProcessCompatibilityError({
-            cliName: "Claude",
-            providerId: "claude-process",
-            code,
-            model,
-            reasoningEffort,
-            fastMode,
-          }));
-        }
-      });
+          finished = true;
+          if (timer !== undefined) {
+            (opts.clearTimeout ?? clearTimeout)(timer);
+            timer = undefined;
+          }
+          detachAbort();
+          cleanupChildListeners();
+          cleanupStreams();
+          if (terminalError !== undefined) {
+            reject(terminalError instanceof Error ? terminalError : new Error(String(terminalError)));
+          } else {
+            complete?.();
+          }
+        })();
+        void settlement.catch((caught: unknown) => {
+          finished = true;
+          if (timer !== undefined) {
+            (opts.clearTimeout ?? clearTimeout)(timer);
+            timer = undefined;
+          }
+          detachAbort();
+          cleanupChildListeners();
+          cleanupStreams();
+          reject(caught instanceof Error ? caught : new Error(String(caught)));
+        });
+      };
+      const settleFailure = (error: unknown, reason: "abort" | "timeout"): void => {
+        settle(reason, error);
+      };
+      const settleAbort = (): void => {
+        cancellationRequested = true;
+        if (settlement !== undefined) return;
+        settle("abort", createAbortError(ctx.signal?.reason));
+      };
+      const onAbort = (): void => settleAbort();
+      ctx.signal?.addEventListener("abort", onAbort, { once: true });
 
-      proc.on("error", (err) => {
+      const onClose = (code: number | null): void => {
+        settle("close", undefined, () => {
+          if (cancellationRequested || ctx.signal?.aborted) {
+            reject(createAbortError(ctx.signal?.reason));
+            return;
+          }
+          const out = stdout.trim();
+          if (code === 0) {
+            if (out) resolve(out);
+            else reject(new Error("claude output was empty"));
+          } else {
+            reject(createProcessCompatibilityError({
+              cliName: "Claude",
+              providerId: "claude-process",
+              code,
+              model,
+              reasoningEffort,
+              fastMode,
+            }));
+          }
+        });
+      };
+      const onError = (err: Error): void => {
+        settleFailure(normalizeSpawnError(err), "timeout");
+      };
+      const onStdinError = (): void => {
+        settleFailure(new Error("claude process stdin failed"), "timeout");
+      };
+      proc.on("close", onClose);
+      proc.on("error", onError);
+      proc.stdin.on("error", onStdinError);
+      const setTimer = opts.setTimeout ?? setTimeout;
+      timer = setTimer(() => {
         if (finished) return;
-        finished = true;
-        clearTimeout(timer);
-        reject(normalizeSpawnError(err));
-      });
+        settleFailure(new Error(`claude process timed out after ${Math.round(timeoutMs / 1000)}s`), "timeout");
+      }, timeoutMs);
+      if (witness !== undefined) {
+        try {
+          opts.witnessStore!.add(witness);
+        } catch (error) {
+          settleFailure(error, "timeout");
+          return;
+        }
+      }
 
-      proc.stdin.write(prompt);
-      proc.stdin.end();
+      try {
+        throwIfAborted(ctx.signal);
+        proc.stdin.write(prompt);
+        proc.stdin.end();
+      } catch (error) {
+        if (isAbortError(error)) settleAbort();
+        else settleFailure(error, "timeout");
+      }
     });
   };
 }

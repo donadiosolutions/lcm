@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { enqueue } from "../../src/daemon/project-queue.js";
+import { isAbortError } from "../../src/daemon/cancellation.js";
 
 type Deferred = {
   promise: Promise<void>;
@@ -129,5 +130,105 @@ describe("enqueue", () => {
     await expect(
       enqueue("proj-reject", () => Promise.reject(err))
     ).rejects.toThrow("test-error");
+  });
+
+  it("rejects pre-aborted work without entering its callback", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let entered = false;
+
+    const operation = enqueue("proj-pre-aborted", async () => {
+      entered = true;
+      return "unexpected";
+    }, controller.signal);
+
+    await expect(operation).rejects.toSatisfy(error => isAbortError(error));
+    expect(entered).toBe(false);
+  });
+
+  it("rejects canceled work while waiting without entering its callback", async () => {
+    const firstEntry = deferred();
+    const releaseFirst = deferred();
+    const controller = new AbortController();
+    let entered = false;
+
+    const first = enqueue("proj-wait-cancel", async () => {
+      firstEntry.resolve();
+      await releaseFirst.promise;
+    });
+    const second = enqueue("proj-wait-cancel", async () => {
+      entered = true;
+      return "unexpected";
+    }, controller.signal);
+
+    await firstEntry.promise;
+    controller.abort();
+    await expect(second).rejects.toSatisfy(error => isAbortError(error));
+    expect(entered).toBe(false);
+
+    releaseFirst.resolve();
+    await expect(first).resolves.toBeUndefined();
+  });
+
+  it("keeps callback-owned settlement after abort and isolates callback rejection", async () => {
+    const entry = deferred();
+    const release = deferred();
+    const controller = new AbortController();
+    const operation = enqueue("proj-abort-after-start", async () => {
+      entry.resolve();
+      await release.promise;
+      return "finished";
+    }, controller.signal);
+
+    await entry.promise;
+    controller.abort();
+    release.resolve();
+    await expect(operation).resolves.toBe("finished");
+
+    const failed = enqueue("proj-callback-reject", async () => {
+      throw new Error("callback failed");
+    });
+    const following = enqueue("proj-callback-reject", async () => "following");
+    await expect(failed).rejects.toThrow("callback failed");
+    await expect(following).resolves.toBe("following");
+  });
+
+  it("settles a pre-aborted queue operation at claim time and keeps chain cleanup", async () => {
+    let listener!: () => void;
+    const signal = {
+      aborted: false,
+      reason: undefined,
+      addEventListener: (_type: string, callback: () => void) => { listener = callback; },
+      removeEventListener: () => undefined,
+    } as unknown as AbortSignal;
+    let entered = false;
+    const operation = enqueue("proj-claim-abort", async () => {
+      entered = true;
+      return "unexpected";
+    }, signal);
+    signal.aborted = true;
+    listener();
+    await expect(operation).rejects.toSatisfy(error => isAbortError(error));
+    expect(entered).toBe(false);
+    await expect(enqueue("proj-claim-abort", async () => "next")).resolves.toBe("next");
+  });
+
+  it("removes the abort listener when cancellation wins before callback entry", async () => {
+    let listener!: () => void;
+    let removed = 0;
+    const signal = {
+      aborted: false,
+      reason: undefined,
+      addEventListener: (_type: string, callback: () => void) => { listener = callback; },
+      removeEventListener: (_type: string, callback: () => void) => {
+        if (callback === listener) removed += 1;
+      },
+    } as unknown as AbortSignal;
+    const operation = enqueue("proj-claim-listener-cleanup", async () => "unexpected", signal);
+    signal.aborted = true;
+    listener();
+
+    await expect(operation).rejects.toSatisfy(error => isAbortError(error));
+    expect(removed).toBeGreaterThan(0);
   });
 });

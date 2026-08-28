@@ -4,6 +4,7 @@
  */
 
 import type { ProgressState } from './progress-state.js';
+import { sanitizeTerminalText } from '../terminal-sanitize.js';
 import type { RenderOpts } from './render-frame.js';
 
 function fmtTokens(n: number): string {
@@ -94,13 +95,15 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
   if (state.errors.length > 0) {
     process.stdout.write('\n  Failed:\n');
     for (const { sessionId, message } of state.errors) {
-      process.stdout.write(`    ${sessionId}: ${message}\n`);
+      process.stdout.write(`    ${sanitizeTerminalText(sessionId)}: ${sanitizeTerminalText(message)}\n`);
     }
   }
   if (state.phaseErrors.length > 0) {
     process.stdout.write('\n  Phase failures:\n');
     for (const { phase, target, message } of state.phaseErrors) {
-      process.stdout.write(`    ${phase}${target ? ` (${target})` : ''}: ${message}\n`);
+      const safePhase = sanitizeTerminalText(phase);
+      const safeTarget = target ? ` (${sanitizeTerminalText(target)})` : '';
+      process.stdout.write(`    ${safePhase}${safeTarget}: ${sanitizeTerminalText(message)}\n`);
     }
   }
 

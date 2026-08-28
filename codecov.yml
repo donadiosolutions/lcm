@@ -53,6 +53,8 @@ component_management:
         - "^src/daemon/config\\.ts$"
         - "^src/daemon/content-fence\\.ts$"
         - "^src/daemon/http-url\\.ts$"
+        - "^src/daemon/invocation-coordinator\\.ts$"
+        - "^src/daemon/cancellation\\.ts$"
         - "^src/daemon/orientation\\.ts$"
         - "^src/daemon/project-queue\\.ts$"
         - "^src/daemon/project\\.ts$"

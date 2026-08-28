@@ -3,12 +3,19 @@ import { Command } from "commander";
 
 const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
+  killProcess: vi.fn((_pid: number, _signal: 0): never => {
+    throw Object.assign(new Error("process absent"), { code: "ESRCH" });
+  }),
   ensureDaemon: vi.fn(async () => ({ connected: true, spawned: false, restartedForParent: false, pid: 42 })),
   restartDaemon: vi.fn(async () => ({ connected: true, restarted: true, spawned: false, pid: 42 })),
-  createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })),
+  createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }), stop: vi.fn() })),
   post: vi.fn(async () => ({ processed: 1, promoted: 1 })),
   get: vi.fn(async () => ({ totalConnections: 1, activeConnections: 0, idleConnections: 1, connections: [] })),
   health: vi.fn(async () => true),
+  startInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
+  heartbeatInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
+  cancelInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "cancelled", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
+  finishInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "finished", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
   readAuthToken: vi.fn(() => state.authToken),
   authToken: "test-token" as string | null,
   migrateLegacyHome: vi.fn(),
@@ -71,11 +78,18 @@ const state = vi.hoisted(() => ({
   storedCodexTransport: undefined as "cli" | "mcp" | undefined,
   batchResult: { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] },
   batchError: undefined as unknown,
+  batchGate: undefined as Promise<void> | undefined,
+  batchOptions: undefined as unknown,
   batchPatch: { lastResult: { ok: true } } as Record<string, unknown>,
+  batchTransportFailure: undefined as unknown,
+  batchSignal: undefined as "SIGINT" | "SIGTERM" | undefined,
+  providerWitnessReads: [] as Array<{ available: boolean; providers: unknown[] } | Error>,
+  providerWitnessReconciles: [] as Array<{ available: boolean; providers: unknown[] } | Error>,
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
   importResult: { imported: 1, skipped: 0 },
   importPatch: { lastResult: { ok: true } } as Record<string, unknown>,
   renderer: { start: vi.fn(), stop: vi.fn(), sessionDone: vi.fn(), printSummary: vi.fn() },
+  rendererOptions: undefined as unknown,
   progressState: undefined as undefined | Record<string, unknown>,
   writeFile: vi.fn(), unlink: vi.fn(), mkdir: vi.fn(),
   dispatchHook: vi.fn(async () => ({ stdout: "", exitCode: 0 })),
@@ -93,6 +107,7 @@ const fakeStdin = vi.hoisted(() => ({ isTTY: true, destroy: vi.fn(), on: vi.fn()
 vi.mock("node:process", async importOriginal => ({
   ...(await importOriginal<typeof import("node:process")>()),
   exit: state.exit,
+  kill: state.killProcess,
   stdin: fakeStdin,
 }));
 vi.mock("node:fs", async importOriginal => ({
@@ -127,9 +142,30 @@ vi.mock("../../src/daemon/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()), loadDaemonConfig: state.loadConfig,
 }));
 vi.mock("../../src/daemon/lifecycle.js", () => ({ ensureDaemon: state.ensureDaemon, restartDaemon: state.restartDaemon }));
-vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class { post = state.post; get = state.get; health = state.health; } }));
+vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class {
+  post = state.post;
+  get = state.get;
+  health = state.health;
+  startInvocation = state.startInvocation;
+  heartbeatInvocation = state.heartbeatInvocation;
+  cancelInvocation = state.cancelInvocation;
+  finishInvocation = state.finishInvocation;
+} }));
 vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
 vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn(), readAuthToken: state.readAuthToken }));
+vi.mock("../../src/llm/process-utils.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/llm/process-utils.js")>()),
+  readProviderProcessWitnesses: vi.fn(() => {
+    const result = state.providerWitnessReads.shift() ?? { available: true, providers: [] };
+    if (result instanceof Error) throw result;
+    return result;
+  }),
+  reconcileProviderProcessWitnesses: vi.fn(() => {
+    const result = state.providerWitnessReconciles.shift() ?? { available: true, providers: [] };
+    if (result instanceof Error) throw result;
+    return result;
+  }),
+}));
 vi.mock("../../src/cli-help.js", () => ({ printHelp: vi.fn() }));
 vi.mock("../../src/identity-service.js", () => ({
   listProjects: state.projectList,
@@ -150,9 +186,14 @@ vi.mock("../../src/config-manager.js", () => ({
   readConnectorTransport: vi.fn(() => state.storedCodexTransport),
   readConnectorTransportSnapshot: vi.fn(() => state.storedCodexTransport),
 }));
-vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
+vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void; onTransportFailure?: (error: unknown) => void }): Promise<typeof state.batchResult> => {
+  state.batchOptions = opts;
+  opts.onProgress?.(state.batchPatch);
+  if (state.batchSignal !== undefined) process.emit(state.batchSignal);
+  if (state.batchTransportFailure !== undefined) opts.onTransportFailure?.(state.batchTransportFailure);
+  if (state.batchGate !== undefined) await state.batchGate;
   if (state.batchError !== undefined) throw state.batchError;
-  opts.onProgress?.(state.batchPatch); return state.batchResult;
+  return state.batchResult;
 }) }));
 vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((value: Record<string, unknown>) => {
   const progressState = {
@@ -162,6 +203,7 @@ vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((va
   return progressState;
 }) }));
 vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
+  constructor(options: unknown) { state.rendererOptions = options; }
   start = state.renderer.start; stop = state.renderer.stop;
   sessionDone = state.renderer.sessionDone; printSummary = state.renderer.printSummary;
 } }));
@@ -238,6 +280,9 @@ async function invoke(args: string[]): Promise<Error | undefined> {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  state.killProcess.mockImplementation((_pid: number, _signal: 0): never => {
+    throw Object.assign(new Error("process absent"), { code: "ESRCH" });
+  });
   fakeStdin.isTTY = true;
   state.ensureDaemon.mockResolvedValue({ connected: true, spawned: false, restartedForParent: false, pid: 42 });
   state.restartDaemon.mockResolvedValue({ connected: true, restarted: true, spawned: false, pid: 42 });
@@ -252,9 +297,20 @@ beforeEach(() => {
   state.storedCodexTransport = undefined;
   state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] };
   state.batchError = undefined;
+  state.batchGate = undefined;
+  state.batchOptions = undefined;
   state.batchPatch = { lastResult: { ok: true } };
+  state.batchTransportFailure = undefined;
+  state.batchSignal = undefined;
+  state.providerWitnessReads = [];
+  state.providerWitnessReconciles = [];
   state.importPatch = { lastResult: { ok: true } };
+  state.rendererOptions = undefined;
   state.health.mockResolvedValue(true);
+  state.startInvocation.mockClear();
+  state.heartbeatInvocation.mockClear();
+  state.cancelInvocation.mockClear();
+  state.finishInvocation.mockClear();
   state.authToken = "test-token";
   state.migrateLegacyHome.mockReset();
   state.portableResult = { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false };
@@ -609,6 +665,276 @@ describe("runCli lifecycle and connector boundaries", () => {
     mismatchCleanup();
   });
 
+  it("reports compact startup and health failures", async () => {
+    state.ensureDaemon.mockRejectedValueOnce(new Error("daemon startup failed"));
+    expect((await invoke(["compact", "--no-promote"]))?.message).toBe("daemon startup failed");
+
+    state.ensureDaemon.mockResolvedValueOnce({ connected: true, spawned: false, restartedForParent: false, pid: 42 });
+    state.health.mockRejectedValueOnce(new Error("health failed"));
+    expect((await invoke(["compact", "--no-promote"]))?.message).toBe("health failed");
+
+    state.ensureDaemon.mockResolvedValueOnce({ connected: false, spawned: false, restartedForParent: false, pid: undefined });
+    expect((await invoke(["compact", "--no-promote"]))?.message).toBe("exit:1");
+  });
+
+  it("settles compact pre-registration and health drains without dispatching work", async () => {
+    state.ensureDaemon.mockImplementationOnce(async () => {
+      process.emit("SIGINT");
+      return { connected: false, spawned: false, restartedForParent: false, pid: undefined };
+    });
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(process.exitCode).toBe(130);
+
+    state.ensureDaemon.mockResolvedValueOnce({ connected: true, spawned: false, restartedForParent: false, pid: 42 });
+    state.health.mockImplementationOnce(async () => {
+      process.emit("SIGTERM");
+      return true;
+    });
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(process.exitCode).toBe(143);
+    expect(state.batchOptions).toBeUndefined();
+  });
+
+  it("starts a bounded drain when compact transport reports a primitive failure", async () => {
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.batchTransportFailure = "transport disconnected";
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(diagnostic).toHaveBeenCalledWith("  compact transport disconnected: request failed");
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+  });
+
+  it("reports an Error compact transport failure before draining", async () => {
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.batchTransportFailure = new Error("transport disconnected");
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(diagnostic).toHaveBeenCalledWith("  compact transport disconnected: transport disconnected");
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+  });
+
+  it("uses the compact failure fallback when an automatic heartbeat drain starts early", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.heartbeatInvocation.mockRejectedValueOnce("heartbeat disconnected");
+    const setInterval = vi.spyOn(globalThis, "setInterval").mockImplementation(((handler: TimerHandler) => {
+      if (typeof handler === "function") handler();
+      return {} as ReturnType<typeof globalThis.setInterval>;
+    }) as typeof globalThis.setInterval);
+
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.batchOptions).toBeUndefined();
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(1);
+    setInterval.mockRestore();
+  });
+
+  it("drains when invocation registration loses its start response", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.startInvocation.mockRejectedValueOnce(new Error("start response lost"));
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.startInvocation).toHaveBeenCalledOnce();
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("reports a primitive heartbeat control failure before draining", async () => {
+    vi.useFakeTimers();
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.heartbeatInvocation.mockRejectedValueOnce("heartbeat disconnected");
+    let release!: () => void;
+    state.batchGate = new Promise<void>(resolve => { release = resolve; });
+    const pending = invoke(["compact", "--no-promote"]);
+    await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(10_000);
+    release();
+    await expect(pending).resolves.toBeUndefined();
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it("breaks promotion after a signal begins draining", async () => {
+    state.health.mockResolvedValueOnce({ status: "healthy", version: "1.4.2", storageBackend: "sqlite", daemonInstanceId: "11111111-1111-4111-8111-111111111111" });
+    state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/one", "/two"] };
+    state.post.mockImplementationOnce(async (path: string) => { if (path === "/promote") process.emit("SIGINT"); return { processed: 1, promoted: 1 }; });
+    await expect(invoke(["compact"])).resolves.toBeUndefined();
+    expect(state.post).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts a drain when invocation-aware promotion loses transport", async () => {
+    state.health.mockResolvedValueOnce({ status: "healthy", version: "1.4.2", storageBackend: "sqlite", daemonInstanceId: "11111111-1111-4111-8111-111111111111" });
+    const transport = Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+    state.post.mockImplementationOnce(async (path: string) => {
+      if (path === "/promote") throw transport;
+      return { processed: 1, promoted: 1 };
+    });
+    await expect(invoke(["compact"])).resolves.toBeUndefined();
+    expect(process.exitCode).toBe(1);
+    expect(state.post).toHaveBeenCalledWith("/promote", expect.any(Object), expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("recovers a legacy promotion after a primitive transport failure", async () => {
+    const transport = Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+    state.post.mockImplementationOnce(async (path: string) => {
+      if (path === "/promote") throw transport;
+      return { processed: 1, promoted: 1 };
+    });
+    state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/legacy"] };
+    await expect(invoke(["compact"])).resolves.toBeUndefined();
+    expect(state.ensureDaemon).toHaveBeenCalledTimes(2);
+    expect(state.post).toHaveBeenCalledTimes(2);
+  });
+
+  it("drains after malformed or rejected invocation finish control", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.finishInvocation.mockResolvedValueOnce({ state: "finished" });
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.finishInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(1);
+
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.finishInvocation.mockRejectedValueOnce(new Error("finish failed"));
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("records a primitive compact failure while a drain is active", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.batchError = "compact primitive failure";
+    state.batchSignal = "SIGINT";
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(130);
+  });
+
+  it("records a primitive invocation finish failure and drains", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.finishInvocation.mockRejectedValueOnce("finish primitive failure");
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(state.progressState?.phaseErrors).toEqual([
+      { phase: "Compact", message: "invocation finish failed" },
+    ]);
+  });
+
+  it("suppresses an abort finish failure diagnostic", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    const { createAbortError } = await import("../../src/daemon/cancellation.js");
+    state.finishInvocation.mockRejectedValueOnce(createAbortError("finish aborted"));
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(state.progressState?.phaseErrors).toEqual([]);
+  });
+
+  it("keeps finish cleanup on the already-draining path", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.finishInvocation.mockImplementationOnce(async () => {
+      process.emit("SIGINT");
+      throw new Error("finish after signal");
+    });
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(130);
+  });
+
+  it.each([
+    ["owned provider evidence", { available: true, providers: [{}] }],
+    ["provider proof failure", new Error("provider witness read failed")],
+  ])("drains normal completion after %s", async (_label, firstRead) => {
+    const owned = { available: true, providers: [{}] };
+    state.health.mockResolvedValueOnce({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.providerWitnessReads = [firstRead, { available: true, providers: [] }];
+    state.providerWitnessReconciles = [owned];
+
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+
+    expect(state.finishInvocation).not.toHaveBeenCalled();
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("awaits foreground daemon stop before exiting on SIGTERM", async () => {
+    let release!: () => void;
+    const stop = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    state.createDaemon.mockResolvedValueOnce({ address: () => ({ port: 3737 }), stop });
+    const on = vi.spyOn(process, "on");
+    await expect(invoke(["daemon", "start", "--foreground"])).resolves.toBeUndefined();
+    const exit = state.exit;
+    const handler = on.mock.calls.filter(([event]) => event === "SIGTERM").at(-1)?.[1] as (() => void);
+
+    handler();
+    expect(stop).toHaveBeenCalledOnce();
+    expect(exit).not.toHaveBeenCalledWith(0);
+    release();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+  });
+
+  it("reports synchronous and asynchronous foreground stop failures", async () => {
+    const on = vi.spyOn(process, "on");
+    const synchronousHandlers = new Map<string, (...args: unknown[]) => unknown>();
+    on.mockImplementation(((event: string, listener: (...args: unknown[]) => unknown) => {
+      synchronousHandlers.set(event, listener);
+      return process;
+    }) as typeof process.on);
+    state.createDaemon.mockResolvedValueOnce({
+      address: () => ({ port: 3737 }),
+      stop: vi.fn(() => { throw new Error("sync stop failed"); }),
+    });
+    await expect(invoke(["daemon", "start", "--foreground"])).resolves.toBeUndefined();
+    synchronousHandlers.get("SIGTERM")?.();
+    await vi.waitFor(() => expect(state.exit).toHaveBeenCalledWith(1));
+
+    state.exit.mockClear();
+    const asynchronousHandlers = new Map<string, (...args: unknown[]) => unknown>();
+    on.mockImplementation(((event: string, listener: (...args: unknown[]) => unknown) => {
+      asynchronousHandlers.set(event, listener);
+      return process;
+    }) as typeof process.on);
+    state.createDaemon.mockResolvedValueOnce({
+      address: () => ({ port: 3737 }),
+      stop: vi.fn(() => Promise.reject(new Error("async stop failed"))),
+    });
+    await expect(invoke(["daemon", "start", "--foreground"])).resolves.toBeUndefined();
+    asynchronousHandlers.get("SIGINT")?.();
+    await vi.waitFor(() => expect(state.exit).toHaveBeenCalledWith(1));
+  });
+
   it("covers defaulted raw action options and empty service results", async () => {
     const actions = await captureRunCliActions();
     state.loadConfig.mockReturnValue({
@@ -748,6 +1074,342 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     expect(state.progressState?.phaseErrors).toEqual([
       { phase: "Promote", target: "/good", message: "best effort" },
     ]);
+  });
+
+  it("registers one invocation and reuses it for automatic promotion", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/good"] };
+    await expect(invoke(["compact"])).resolves.toBeUndefined();
+
+    expect(state.startInvocation).toHaveBeenCalledOnce();
+    const target = state.startInvocation.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(target).toMatchObject({ command: "compact", daemonInstanceId: "11111111-1111-4111-8111-111111111111" });
+    expect(target.invocationId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(state.finishInvocation).toHaveBeenCalledWith(target, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(state.post).toHaveBeenCalledWith("/promote", {
+      cwd: "/good",
+      dry_run: false,
+      invocation_id: target.invocationId,
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("disables renderer-owned process signals for compact lifecycle control", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.rendererOptions).toMatchObject({ handleSignals: false });
+  });
+
+  it("fails closed when a live manual daemon cannot provide invocation identity", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+    });
+
+    const result = await invoke(["compact", "--no-promote"]);
+    expect(result).toBeInstanceOf(Error);
+    expect((result as Error).message).toMatch(/invocation control|identity/i);
+    expect(state.batchOptions).toBeUndefined();
+    expect(state.startInvocation).not.toHaveBeenCalled();
+  });
+
+  it("returns the latched signal status when authenticated health aborts before registration", async () => {
+    state.health.mockImplementationOnce(async () => {
+      process.emit("SIGINT");
+      throw new Error("health request aborted");
+    });
+
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.startInvocation).not.toHaveBeenCalled();
+    expect(state.batchOptions).toBeUndefined();
+    expect(process.exitCode).toBe(130);
+  });
+
+  it("drains a signal that arrives during invocation start before returning", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    let startSignal!: AbortSignal;
+    state.startInvocation.mockImplementationOnce(async (target: unknown, options: { signal?: AbortSignal }) => {
+      startSignal = options.signal!;
+      process.emit("SIGINT");
+      return { ...target as object, state: "active", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null };
+    });
+    let release!: () => void;
+    state.cancelInvocation.mockImplementationOnce((target: unknown) => new Promise(resolve => {
+      release = () => resolve({ ...target as object, state: "cancelled", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null });
+    }));
+
+    let settled = false;
+    const pending = invoke(["compact", "--no-promote"]).then(result => { settled = true; return result; });
+    await vi.waitFor(() => expect(state.cancelInvocation).toHaveBeenCalledOnce());
+    expect(settled).toBe(false);
+    release();
+    await expect(pending).resolves.toBeUndefined();
+    expect(startSignal.aborted).toBe(false);
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(130);
+  });
+
+  it("cancels the invocation after SIGINT and preserves the 130 status", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    let release!: () => void;
+    state.batchGate = new Promise<void>(resolve => { release = resolve; });
+
+    const pending = invoke(["compact", "--no-promote"]);
+    await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
+    process.emit("SIGINT");
+    release();
+    await expect(pending).resolves.toBeUndefined();
+
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(state.finishInvocation).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(130);
+  });
+
+  it("turns a heartbeat control failure into cancellation and an invocation failure", async () => {
+    vi.useFakeTimers();
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.heartbeatInvocation.mockRejectedValueOnce(new Error("heartbeat unavailable"));
+    let release!: () => void;
+    state.batchGate = new Promise<void>(resolve => { release = resolve; });
+
+    const pending = invoke(["compact", "--no-promote"]);
+    await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(10_000);
+    release();
+    await expect(pending).resolves.toBeUndefined();
+
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it("preserves SIGTERM precedence and only reports repeated signals while draining", async () => {
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    let release!: () => void;
+    state.batchGate = new Promise<void>(resolve => { release = resolve; });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const pending = invoke(["compact", "--no-promote"]);
+    await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
+    process.emit("SIGTERM");
+    process.emit("SIGINT");
+    release();
+    await expect(pending).resolves.toBeUndefined();
+
+    expect(state.cancelInvocation).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(143);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("already draining"));
+  });
+
+  it("cleans up a pre-registration signal without creating an invocation or dispatching work", async () => {
+    state.ensureDaemon.mockImplementationOnce(async () => {
+      process.emit("SIGINT");
+      return { connected: true, spawned: false, restartedForParent: false, pid: 42 };
+    });
+
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.startInvocation).not.toHaveBeenCalled();
+    expect(state.cancelInvocation).not.toHaveBeenCalled();
+    expect(state.batchOptions).toBeUndefined();
+    expect(process.exitCode).toBe(130);
+  });
+
+  it("preserves a preflight signal when daemon startup fails concurrently", async () => {
+    state.ensureDaemon.mockImplementationOnce(async () => {
+      process.emit("SIGINT");
+      throw new Error("daemon startup failed");
+    });
+
+    const result = await invoke(["compact", "--no-promote"]);
+    expect(result).toBeUndefined();
+    expect(state.startInvocation).not.toHaveBeenCalled();
+    expect(state.batchOptions).toBeUndefined();
+    expect(process.exitCode).toBe(130);
+  });
+
+  it("removes command signal handlers after normal compact teardown", async () => {
+    const on = vi.spyOn(process, "on");
+    const remove = vi.spyOn(process, "removeListener");
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+
+    const installed = on.mock.calls.filter(([event]) => event === "SIGINT" || event === "SIGTERM");
+    expect(installed).toHaveLength(2);
+    for (const [event, handler] of installed) {
+      expect(remove).toHaveBeenCalledWith(event, handler);
+    }
+  });
+
+  it("keeps draining without a final exit when targeted zero remains unproved", async () => {
+    vi.useFakeTimers();
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    state.cancelInvocation
+      .mockImplementationOnce(async (target: unknown) => ({
+        ...target as object,
+        state: "cancelling",
+        activeCount: 1,
+        workCount: 1,
+        commitCount: 0,
+        leaseExpiresAt: null,
+      }))
+      .mockImplementationOnce(async (target: unknown) => ({
+        ...target as object,
+        state: "cancelled",
+        activeCount: 0,
+        workCount: 0,
+        commitCount: 0,
+        leaseExpiresAt: null,
+      }));
+    let release!: () => void;
+    state.batchGate = new Promise<void>(resolve => { release = resolve; });
+
+    const pending = invoke(["compact", "--no-promote"]);
+    await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
+    process.emit("SIGINT");
+    release();
+    await vi.waitFor(() => expect(state.cancelInvocation).toHaveBeenCalledOnce());
+    expect(process.exitCode).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(pending).resolves.toBeUndefined();
+
+    expect(state.cancelInvocation).toHaveBeenCalledTimes(2);
+    expect(process.exitCode).toBe(130);
+    vi.useRealTimers();
+  });
+
+  it("does not claim signal exit when a batch failure leaves cancellation unproved", async () => {
+    vi.useFakeTimers();
+    state.health.mockResolvedValueOnce({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+    });
+    let release!: () => void;
+    state.batchGate = new Promise<void>(resolve => { release = resolve; });
+    state.batchError = new Error("ordinary batch failure");
+    state.cancelInvocation
+      .mockImplementationOnce(async (target: unknown) => ({
+        ...target as object,
+        state: "cancelling",
+        activeCount: 1,
+        workCount: 1,
+        commitCount: 0,
+        leaseExpiresAt: null,
+      }))
+      .mockImplementationOnce(async (target: unknown) => ({
+        ...target as object,
+        state: "cancelled",
+        activeCount: 0,
+        workCount: 0,
+        commitCount: 0,
+        leaseExpiresAt: null,
+      }));
+
+    const pending = invoke(["compact", "--no-promote"]);
+    await vi.waitFor(() => expect(state.startInvocation).toHaveBeenCalledOnce());
+    process.emit("SIGINT");
+    release();
+    await vi.waitFor(() => expect(state.cancelInvocation).toHaveBeenCalledOnce());
+    expect(process.exitCode).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result = await pending;
+
+    expect(result).toBeUndefined();
+    expect(state.cancelInvocation).toHaveBeenCalledTimes(2);
+    expect(process.exitCode).toBe(130);
+    vi.useRealTimers();
+  });
+
+  it.each([
+    { pid: 9, restarted: false, stoppedPid: undefined },
+    { pid: 9, restarted: true, stoppedPid: undefined },
+    { pid: 9, restarted: true, stoppedPid: 8 },
+    { pid: 9, restarted: true, stoppedPid: 9 },
+  ] as const)("checks managed restart old-instance identity for %#", async (scenario) => {
+    vi.useFakeTimers();
+    try {
+      state.health.mockReset();
+      state.cancelInvocation.mockReset();
+      state.health
+        .mockResolvedValueOnce({
+          status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+          daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+          ...(scenario.pid === undefined ? {} : { pid: scenario.pid }),
+        })
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({
+          status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+          daemonInstanceId: "33333333-3333-4333-8333-333333333333",
+          runtimeDigest: "runtime",
+        });
+      state.restartDaemon.mockResolvedValueOnce({
+        connected: true,
+        restarted: scenario.restarted,
+        stoppedPid: scenario.stoppedPid,
+        pid: 10,
+      });
+      state.cancelInvocation
+        .mockImplementationOnce(async (target: unknown) => ({
+          ...target as object,
+          state: "cancelling",
+          activeCount: 1,
+          workCount: 1,
+          commitCount: 0,
+          leaseExpiresAt: null,
+        }))
+        .mockImplementationOnce(async (target: unknown) => ({
+          ...target as object,
+          state: "cancelled",
+          activeCount: 0,
+          workCount: 0,
+          commitCount: 0,
+          leaseExpiresAt: null,
+        }));
+      state.batchSignal = "SIGINT";
+
+      const pending = invoke(["compact", "--no-promote"]);
+      await vi.waitFor(() => expect(state.cancelInvocation).toHaveBeenCalledOnce());
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(pending).resolves.toBeUndefined();
+      expect(state.restartDaemon).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("covers TTY all-provider import directory filtering", async () => {

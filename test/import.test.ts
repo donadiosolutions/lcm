@@ -445,10 +445,11 @@ describe("importSessions", () => {
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(projectDir, "session.jsonl"), "");
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
-    await importSessions(makeMockClient(async () => { throw new Error("specific failure"); }), {
+    await importSessions(makeMockClient(async () => { throw new Error("specific\u001b[31m\nfailure"); }), {
       cwd, _claudeProjectsDir: claudeProjectsDir, verbose: true,
     });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("specific failure"));
+    expect(log.mock.calls.flat().join("\n")).not.toContain("\u001b");
   });
 
   it("imports when the ingest database is missing or malformed", async () => {

@@ -46,7 +46,54 @@ export type ProjectStorageRequest = Readonly<{
   readonly factory?: StorageBackendFactory;
   readonly context?: RouteExecutionContext;
   readonly mode: "create" | "existing";
+  /** Optional non-revocable work that must settle before storage closes. */
+  readonly beforeClose?: () => Promise<void>;
 }>;
+
+type ReleasePermit = Readonly<{ release: () => void }>;
+
+/** Keep request-scoped resources open until every acquired commit releases. */
+export function createCommitCloseBarrier(): Readonly<{
+  acquire: (operation: () => ReleasePermit) => ReleasePermit;
+  waitForZero: () => Promise<void>;
+}> {
+  let active = 0;
+  const waiters: Array<() => void> = [];
+  const releaseSlot = (): void => {
+    active -= 1;
+    if (active !== 0) return;
+    for (const resolve of waiters.splice(0)) resolve();
+  };
+  return {
+    acquire: (operation): ReleasePermit => {
+      // Reserve before acquisition: the operation may synchronously latch
+      // cancellation before it returns the non-revocable permit.
+      active += 1;
+      let permit: ReleasePermit;
+      try {
+        permit = operation();
+      } catch (error) {
+        releaseSlot();
+        throw error;
+      }
+      let released = false;
+      return {
+        release: (): void => {
+          if (released) return;
+          released = true;
+          try {
+            permit.release();
+          } finally {
+            releaseSlot();
+          }
+        },
+      };
+    },
+    waitForZero: (): Promise<void> => active === 0
+      ? Promise.resolve()
+      : new Promise(resolve => waiters.push(resolve)),
+  };
+}
 
 export type ProjectStorageOperation<T> = (
   storage: ProjectStorage,
@@ -112,7 +159,10 @@ export async function withProjectStorage<T>(
     let project: ProjectStorage | undefined;
     let projectClose: Promise<void> | undefined;
     const closeProject = (): Promise<void> => {
-      projectClose ??= closeRouteStorage(project);
+      projectClose ??= (async () => {
+        await request.beforeClose?.();
+        await closeRouteStorage(project);
+      })();
       return projectClose;
     };
     const onAbort = (): void => {

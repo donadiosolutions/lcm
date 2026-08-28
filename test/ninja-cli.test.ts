@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { renderFrame, FRAME_LINES } from "../src/cli/render-frame.js";
-import { makeProgressState } from "../src/cli/progress-state.js";
+import { makeProgressState, progressCurrentSession, updateProgressActiveSessions } from "../src/cli/progress-state.js";
 import type { RenderOpts } from "../src/cli/render-frame.js";
 
 const nonTTY: RenderOpts = { isTTY: false, width: 80, color: false, verbose: false };
@@ -190,9 +190,10 @@ describe("renderFrame — TTY non-verbose mode", () => {
 
   it("shows the current project during a multi-project phase", (): void => {
     const state = makeProgressState({ phases: [{ name: "Promote", status: "active" }] });
-    state.currentProject = "/workspace/project";
+    state.currentProject = "/workspace\u001b[31m\n/project";
     const output = renderFrame(state, ttyOpts, 0);
-    expect(output).toContain("/workspace/project  processing...");
+    expect(output).toContain("/workspace /project  processing...");
+    expect(output).not.toContain("\u001b");
   });
 
   it("includes cursor-up codes when prevLines > 0", () => {
@@ -214,12 +215,34 @@ describe("makeProgressState", () => {
     expect(state.dryRun).toBe(true);
     expect(state.aborted).toBe(false);
     expect(state.phases).toEqual([]);
+    expect(state.activeSessions).toEqual([]);
   });
 
   it("accepts phases array", () => {
     const phases = [{ name: "Import", status: "active" as const }];
     const state = makeProgressState({ phases });
     expect(state.phases).toEqual(phases);
+  });
+});
+
+describe("progress active sessions", () => {
+  it("tracks every active session and exposes the oldest as current", () => {
+    const state = makeProgressState({ total: 3 });
+    const first = { sessionId: "first", messages: 1, tokens: 2, startedAt: 100 };
+    const second = { sessionId: "second", messages: 3, tokens: 4, startedAt: 200 };
+    updateProgressActiveSessions(state, [second, first]);
+    expect(state.activeSessions).toEqual([second, first]);
+    expect(state.current).toEqual(first);
+    expect(progressCurrentSession(state.activeSessions)).toEqual(first);
+    updateProgressActiveSessions(state, [second]);
+    expect(state.current).toEqual(second);
+    expect(progressCurrentSession(state.activeSessions)).toEqual(second);
+    updateProgressActiveSessions(state, []);
+    expect(state.current).toBeUndefined();
+    expect(progressCurrentSession(state.activeSessions)).toBeUndefined();
+    const tieFirst = { ...first, sessionId: "tie-first", startedAt: 300 };
+    const tieSecond = { ...second, sessionId: "tie-second", startedAt: 300 };
+    expect(progressCurrentSession([tieFirst, tieSecond])).toBe(tieFirst);
   });
 });
 

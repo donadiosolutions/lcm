@@ -3,7 +3,9 @@ import { Command, Option } from "commander";
 import { LLM_REASONING_EFFORTS, parseDaemonConfig, reasoningEffortsForProvider } from "../../src/daemon/config.js";
 import {
   compactFailureExitCode,
+  parseCompactConcurrency,
   resolveCompactRequestPolicyOverride,
+  resolveCompactConcurrency,
   resolveManualCompactProvider,
   withHookOverrides,
 } from "../../bin/lcm.js";
@@ -23,11 +25,49 @@ function makeCompactCmd() {
   cmd.option("--retry-initial-delay-ms <ms>");
   cmd.option("--retry-max-delay-ms <ms>");
   cmd.option("--retry-multiplier <n>");
+  cmd.option("--max-concurrency <n>");
   cmd.addOption(new Option("--hook", "Hook dispatch mode (internal)").hideHelp());
   return cmd;
 }
 
 describe("compact command --hook routing", () => {
+  it("resolves CLI max concurrency over the config and clamps replay to one", () => {
+    const config = parseDaemonConfig(JSON.stringify({ llm: { maxConcurrency: 8 } }));
+    expect(resolveCompactConcurrency(config, {})).toBe(8);
+    expect(resolveCompactConcurrency(config, { maxConcurrency: "4" })).toBe(4);
+    expect(resolveCompactConcurrency(config, { replay: true })).toBe(1);
+    expect(resolveCompactConcurrency(config, { replay: true, maxConcurrency: "1" })).toBe(1);
+    expect(() => resolveCompactConcurrency(config, { replay: true, maxConcurrency: "2" })).toThrow("replay");
+  });
+
+  it.each(["", " 1", "1 ", "+1", "-1", "01", "1.0", "1e1", "0", "33"])(
+    "rejects non-canonical max concurrency text %j",
+    value => expect(() => parseCompactConcurrency(value)).toThrow("max-concurrency"),
+  );
+
+  it("rejects a missing max concurrency value", () => {
+    expect(() => parseCompactConcurrency(undefined)).toThrow("max-concurrency");
+    expect(() => parseCompactConcurrency("9007199254740992")).toThrow("max-concurrency");
+  });
+
+  it("accepts canonical decimal max concurrency text", () => {
+    expect(parseCompactConcurrency("1")).toBe(1);
+    expect(parseCompactConcurrency("32")).toBe(32);
+  });
+
+  it("defaults an absent stored concurrency to one and rejects an invalid one", () => {
+    type ResolverConfig = Parameters<typeof resolveCompactConcurrency>[0];
+    expect(resolveCompactConcurrency({ llm: { maxConcurrency: undefined } } as ResolverConfig, {})).toBe(1);
+    expect(() => resolveCompactConcurrency({ llm: { maxConcurrency: 0 } } as ResolverConfig, {}))
+      .toThrow("llm.maxConcurrency");
+  });
+
+  it("parses the max-concurrency option as canonical text for pure resolution", async () => {
+    const cmd = makeCompactCmd();
+    await cmd.parseAsync(["--max-concurrency", "4"], { from: "user" });
+    expect(resolveCompactConcurrency(parseDaemonConfig("{}"), cmd.opts())).toBe(4);
+  });
+
   it("zero flags: opts.hook is falsy → batch mode", async () => {
     const cmd = makeCompactCmd();
     await cmd.parseAsync([], { from: "user" });

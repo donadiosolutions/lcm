@@ -1,4 +1,5 @@
 import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
+import { throwIfAborted } from "../daemon/cancellation.js";
 
 /**
  * Deterministic mock summarizer for E2E testing.
@@ -8,7 +9,8 @@ import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
  * Must match LcmSummarizeFn signature: (text, aggressive?, ctx?) => Promise<string>
  */
 export function createMockSummarizer(): LcmSummarizeFn {
-  return async (text: string, _aggressive?: boolean, _ctx?: SummarizeContext): Promise<string> => {
+  return async (text: string, _aggressive?: boolean, ctx?: SummarizeContext): Promise<string> => {
+    throwIfAborted(ctx?.signal);
     // Extract first sentence or first 200 chars as "summary"
     const firstSentence = text.split(/[.!?\n]/)[0]?.trim() || text.slice(0, 200);
     // Deterministic hash for consistent output

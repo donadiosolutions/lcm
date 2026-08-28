@@ -296,6 +296,9 @@ lcm project show [path|local-hash|project-uuid] # inspect one uniquely mapped pr
 # Compaction & promotion
 lcm compact                # compact the current project
 lcm compact --all          # compact all tracked projects
+lcm compact --all --max-concurrency 4  # up to four /compact requests at once
+lcm compact --all --replay # sequential threaded-context replay
+lcm compact --dry-run      # validate and preview without daemon/provider work
 lcm compact --reasoning-effort high  # one-run OpenAI Responses reasoning override
 lcm compact --timeout-ms 120000 --retry-max-attempts 4  # one-run request-policy overrides
 lcm promote                # promote durable insights to long-term memory
@@ -384,6 +387,14 @@ All environment variables are optional. The default summarizer mode is `auto`.
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File size (tokens) above which content is extracted to disk |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Set to `true` to disable automatic compaction after each turn |
 | `LCM_ENABLED` | `true` | Set to `false` to disable LCM while keeping its native integration installed |
+
+The JSON setting `llm.maxConcurrency` defaults to `1` and accepts integers from
+`1` through `32`. It limits only in-flight manual `/compact` requests; promotion
+remains sequential. A one-run `lcm compact --max-concurrency <n>` override wins
+over JSON and is not persisted. `--replay` clamps the stored value to `1` and
+rejects an explicit value above `1`. See
+[`docs/configuration.md`](docs/configuration.md#llm-configuration) for the
+drain, interruption, and fail-closed guarantees.
 
 `auto` resolves per caller:
 

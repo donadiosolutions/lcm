@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { createCodexProcessSummarizer } from "../../src/llm/codex-process.js";
+import { createAbortError, isAbortError } from "../../src/daemon/cancellation.js";
 
 vi.mock("../../src/llm/codex-responses-gateway.js", () => ({
   createCodexResponsesGateway: vi.fn(async () => ({
@@ -81,6 +82,336 @@ describe("createCodexProcessSummarizer", () => {
 
   it("constructs with default process dependencies", () => {
     expect(createCodexProcessSummarizer()).toBeTypeOf("function");
+  });
+
+  it("does not create a gateway or spawn for a pre-aborted call", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const createGateway = vi.fn();
+    const spawn = vi.fn() as unknown as SpawnFn;
+    const summarizer = createCodexProcessSummarizer({
+      spawn,
+      _createGateway: createGateway,
+    } as never);
+
+    await expect(summarizer("text", false, { signal: controller.signal }))
+      .rejects.toSatisfy(error => isAbortError(error));
+    expect(createGateway).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("awaits a late gateway close before abort rejection and temp cleanup", async () => {
+    const controller = new AbortController();
+    const child = makeHangingChild();
+    let resolveGateway: ((gateway: ReturnType<typeof makeGateway>) => void) | undefined;
+    const gatewayPromise = new Promise<ReturnType<typeof makeGateway>>(resolve => { resolveGateway = resolve; });
+    let releaseClose: (() => void) | undefined;
+    const closePromise = new Promise<void>(resolve => { releaseClose = resolve; });
+    const gateway = makeGateway({ close: vi.fn(() => closePromise) });
+    const createGateway = vi.fn(() => gatewayPromise);
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const mkdtempSyncMock = vi.fn(() => "/tmp/lcm-codex-deferred-gateway");
+    const summarizer = createCodexProcessSummarizer({
+      spawn: vi.fn().mockReturnValue(child) as unknown as SpawnFn,
+      mkdtempSync: mkdtempSyncMock as unknown as MkdtempSyncFn,
+      readFileSync: vi.fn(() => "summary") as unknown as ReadFileSyncFn,
+      rmSync: rmSyncMock,
+      _createGateway: createGateway,
+    } as never);
+
+    const pending = summarizer("private transcript", false, { signal: controller.signal });
+    const observed = pending.then(value => ({ value }), error => ({ error }));
+    await vi.waitFor(() => expect(createGateway).toHaveBeenCalledOnce());
+    controller.abort();
+    let settled = false;
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(rmSyncMock).not.toHaveBeenCalled();
+
+    resolveGateway?.(gateway);
+    await vi.waitFor(() => expect(gateway.close).toHaveBeenCalledOnce());
+    expect(rmSyncMock).not.toHaveBeenCalled();
+    releaseClose?.();
+    expect(isAbortError((await observed).error)).toBe(true);
+    expect(rmSyncMock).toHaveBeenCalledOnce();
+  });
+
+  it("normalizes a non-Error late gateway close while preserving abort", async () => {
+    const controller = new AbortController();
+    const gateway = makeGateway({ close: vi.fn().mockRejectedValue("late gateway close failed") });
+    let resolveGateway: ((gateway: ReturnType<typeof makeGateway>) => void) | undefined;
+    const gatewayPromise = new Promise<ReturnType<typeof makeGateway>>(resolve => { resolveGateway = resolve; });
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), { rmSync: rmSyncMock }),
+      _createGateway: vi.fn(() => gatewayPromise),
+    } as never);
+    const pending = summarizer("text", false, { signal: controller.signal });
+    const observed = pending.then(value => ({ value }), error => ({ error }));
+    await vi.waitFor(() => expect(rmSyncMock).not.toHaveBeenCalled());
+    controller.abort();
+    resolveGateway?.(gateway);
+    const result = await observed;
+    expect(isAbortError(result.error)).toBe(true);
+    expect(rmSyncMock).toHaveBeenCalledOnce();
+  });
+
+  it("closes an already-created gateway when abort races gateway startup", async () => {
+    const controller = new AbortController();
+    const gateway = makeGateway({ close: vi.fn().mockRejectedValue(new Error("close failed")) });
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild()),
+      _createGateway: vi.fn(() => {
+        controller.abort();
+        return gateway;
+      }),
+    } as never);
+    await expect(summarizer("text", false, { signal: controller.signal })).rejects.toSatisfy(error => isAbortError(error));
+    expect(gateway.close).toHaveBeenCalledOnce();
+  });
+
+  it("preserves cancellation when gateway close fails after startup", async () => {
+    const controller = new AbortController();
+    const gateway = makeGateway({ close: vi.fn().mockRejectedValue(new Error("close failed")) });
+    let release!: (value: ReturnType<typeof makeGateway>) => void;
+    const gatewayPromise = new Promise<ReturnType<typeof makeGateway>>(resolve => { release = resolve; });
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild()),
+      _createGateway: vi.fn(() => gatewayPromise),
+    } as never);
+    const pending = summarizer("text", false, { signal: controller.signal });
+    release(gateway);
+    await Promise.resolve();
+    controller.abort();
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+    expect(gateway.close).toHaveBeenCalledOnce();
+  });
+
+  it("preserves a non-abort gateway creation failure", async () => {
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), { rmSync: rmSyncMock }),
+      _createGateway: vi.fn(async () => { throw "gateway creation failed"; }),
+    } as never);
+    await expect(summarizer("text", false)).rejects.toThrow("gateway creation failed");
+    expect(rmSyncMock).toHaveBeenCalledOnce();
+  });
+
+  it("waits for child and gateway teardown before rejecting a mid-request abort", async () => {
+    const controller = new AbortController();
+    const child = makeHangingChild();
+    (child as FakeChild & { pid: number }).pid = 9312;
+    const gateway = makeGateway({ close: vi.fn().mockResolvedValue(undefined) });
+    const createGateway = vi.fn().mockResolvedValue(gateway);
+    let groupAlive = true;
+    const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === "SIGTERM") groupAlive = false;
+    });
+    const isProcessGroupAlive = vi.fn(() => groupAlive);
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child, { spawn, rmSync: rmSyncMock }),
+      _createGateway: createGateway,
+      detachedProcessGroup: false,
+      killProcess,
+      processGroupId: 9312,
+      processGroupIdProbe: () => 9312,
+      daemonProcessGroupId: 9311,
+      processBirthTime: () => "birth-9312",
+      isProcessGroupAlive,
+    } as never);
+
+    const pending = summarizer("private transcript", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    controller.abort();
+    child.emit("close", null);
+
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+    expect(killProcess).toHaveBeenCalledWith(-9312, "SIGTERM");
+    expect(gateway.close).toHaveBeenCalledOnce();
+    expect(rmSyncMock).toHaveBeenCalledOnce();
+  });
+
+  it("cancellation wins over deferred gateway completion and cleans every handle", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const child = makeHangingChild();
+    (child as FakeChild & { pid: number }).pid = 9412;
+    const gateway = makeGateway({
+      waitForCompletion: vi.fn(() => new Promise<void>(() => {})),
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+    const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    let groupAlive = true;
+    const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === "SIGKILL") groupAlive = false;
+    });
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child, { spawn, rmSync: rmSyncMock }),
+      timeoutMs: 60_000,
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+      killProcess,
+      processGroupId: 9412,
+      processGroupIdProbe: () => 9412,
+      daemonProcessGroupId: 9411,
+      processBirthTime: () => "birth-9412",
+      isProcessGroupAlive: () => groupAlive,
+    } as never);
+
+    try {
+      const pending = summarizer("private transcript", false, { signal: controller.signal });
+      const observed = pending.catch(error => error);
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      child.emit("close", 0);
+      await vi.runAllTicks();
+      expect(gateway.waitForCompletion).toHaveBeenCalledOnce();
+      controller.abort();
+      await vi.runAllTicks();
+      await vi.advanceTimersByTimeAsync(1_999);
+      await vi.advanceTimersByTimeAsync(1);
+      child.emit("close", null);
+      expect(isAbortError(await observed)).toBe(true);
+      expect(gateway.close).toHaveBeenCalledOnce();
+      expect(rmSyncMock).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("publishes and removes a secret-free Codex process witness after gateway settlement", async () => {
+    const child = makeChild(0);
+    (child as FakeChild & { pid: number }).pid = 9512;
+    const gateway = makeGateway();
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/daemon-runtime.json" };
+    const spawn = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child, { spawn }),
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+      platform: "win32",
+      daemonInstanceId: "22222222-2222-4222-8222-222222222222",
+      witnessStore,
+      processBirthTime: () => "birth-9512",
+    } as never);
+
+    await expect(summarizer("text", false, { invocationId: "11111111-1111-4111-8111-111111111111" })).resolves.toBe("summary");
+    expect(witnessStore.add).toHaveBeenCalledWith({
+      daemonInstanceId: "22222222-2222-4222-8222-222222222222",
+      invocationId: "11111111-1111-4111-8111-111111111111",
+      providerId: "codex-process",
+      pid: 9512,
+      pgid: null,
+      processStartTime: "birth-9512",
+    });
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("records a null process birth witness when the identity probe is unavailable", async () => {
+    const child = makeChild();
+    (child as FakeChild & { pid: number }).pid = 9514;
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/daemon-runtime.json" };
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      daemonInstanceId: "daemon-a",
+      witnessStore,
+      processBirthTime: () => undefined,
+    } as never);
+    await expect(summarizer("text")).resolves.toBe("summary");
+    expect(witnessStore.add).toHaveBeenCalledWith(expect.objectContaining({ processStartTime: null }));
+  });
+
+  it("preserves a witness removal failure after successful completion", async () => {
+    const child = makeChild();
+    (child as FakeChild & { pid: number }).pid = 9515;
+    const witnessStore = {
+      add: vi.fn(),
+      remove: vi.fn(() => { throw "witness remove failed"; }),
+      path: "/tmp/daemon-runtime.json",
+    };
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child), daemonInstanceId: "daemon-a", witnessStore, processBirthTime: () => "birth-9515",
+    } as never);
+    await expect(summarizer("text")).rejects.toThrow("witness remove failed");
+  });
+
+  it("normalizes an Error witness removal failure", async () => {
+    const child = makeChild();
+    (child as FakeChild & { pid: number }).pid = 9516;
+    const witnessStore = {
+      add: vi.fn(),
+      remove: vi.fn(() => { throw new Error("witness remove error"); }),
+      path: "/tmp/daemon-runtime.json",
+    };
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child), daemonInstanceId: "daemon-a", witnessStore, processBirthTime: () => "birth-9516",
+    } as never);
+    await expect(summarizer("text")).rejects.toThrow("witness remove error");
+  });
+
+  it("preserves a primary child failure when witness removal also fails", async () => {
+    const child = makeChild(1);
+    (child as FakeChild & { pid: number }).pid = 9518;
+    const witnessStore = {
+      add: vi.fn(),
+      remove: vi.fn(() => { throw new Error("witness remove after child failure"); }),
+      path: "/tmp/daemon-runtime.json",
+    };
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      daemonInstanceId: "daemon-a",
+      witnessStore,
+      processBirthTime: () => "birth-9518",
+    } as never);
+    await expect(summarizer("text")).rejects.toThrow(/rejected the compaction request/i);
+  });
+
+  it("uses the default process-start probe when publishing a witness", async () => {
+    const child = makeChild(0);
+    (child as FakeChild & { pid: number }).pid = 9519;
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/daemon-runtime.json" };
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child), daemonInstanceId: "daemon-a", witnessStore,
+    } as never);
+    await expect(summarizer("text")).resolves.toBe("summary");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+  });
+
+  it("records null when the default process-start probe cannot identify the child", async () => {
+    const child = makeChild(0);
+    (child as FakeChild & { pid: number }).pid = 9521;
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/daemon-runtime.json" };
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child), daemonInstanceId: "daemon-a", witnessStore,
+      processBirthTime: () => undefined,
+    } as never);
+    await summarizer("text");
+    expect(witnessStore.add).toHaveBeenCalledWith(expect.objectContaining({ processStartTime: null }));
+  });
+
+  it("falls back to the default birth probe when the seam is explicitly absent", async () => {
+    const child = makeChild(0);
+    (child as FakeChild & { pid: number }).pid = 9522;
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/daemon-runtime.json" };
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child), daemonInstanceId: "daemon-a", witnessStore,
+      processBirthTime: null,
+    } as never);
+    await expect(summarizer("text")).resolves.toBe("summary");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+  });
+
+  it("uses the default process birth probe for witness entries", async () => {
+    const child = makeChild();
+    (child as FakeChild & { pid: number }).pid = 9517;
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/daemon-runtime.json" };
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child), daemonInstanceId: "daemon-a", witnessStore,
+    } as never);
+    await expect(summarizer("text")).resolves.toBe("summary");
+    expect(witnessStore.add).toHaveBeenCalledWith(expect.objectContaining({ processStartTime: null }));
   });
 
   afterEach(() => {
@@ -240,6 +571,16 @@ describe("createCodexProcessSummarizer", () => {
     expect(gateway.close).toHaveBeenCalledOnce();
   });
 
+  it("normalizes a non-Error gateway close failure after a child error", async () => {
+    const child = makeChild(2);
+    const gateway = makeGateway({ close: vi.fn().mockRejectedValue("gateway close failed") });
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+    } as never);
+    await expect(summarizer("transcript", false)).rejects.toThrow(/Codex CLI rejected/);
+  });
+
   it("awaits gateway close on synchronous spawn failure", async () => {
     const gateway = makeGateway();
     const summarizer = createCodexProcessSummarizer({
@@ -300,6 +641,102 @@ describe("createCodexProcessSummarizer", () => {
     expect(gateway.close).toHaveBeenCalledOnce();
   });
 
+  it("closes the gateway when witness publication fails", async () => {
+    const child = makeHangingChild();
+    (child as FakeChild & { pid: number }).pid = 9513;
+    const gateway = makeGateway();
+    const witnessError = new Error("witness publication failed");
+    const witnessStore = {
+      path: "/tmp/daemon-runtime.json",
+      add: vi.fn(() => { throw witnessError; }),
+      remove: vi.fn(),
+    };
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      platform: "win32",
+      daemonInstanceId: "22222222-2222-4222-8222-222222222222",
+      witnessStore,
+      processBirthTime: () => "birth-9513",
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+    } as never);
+    await expect(summarizer("text", false)).rejects.toThrow("witness publication failed");
+    expect(gateway.close).toHaveBeenCalledOnce();
+  });
+
+  it("handles an intentional synchronous Codex stdin abort", async () => {
+    const controller = new AbortController();
+    const child = makeHangingChild();
+    child.stdin.write = () => {
+      controller.abort();
+      return true;
+    };
+    const gateway = makeGateway();
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+    } as never);
+    const pending = summarizer("text", false, { signal: controller.signal });
+    child.emit("close", null);
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("handles a signal that aborts immediately after child spawn", async () => {
+    const controller = new AbortController();
+    const processChild = makeHangingChild();
+    processChild.kill.mockImplementation(() => { processChild.emit("close", null); });
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(processChild),
+      spawn: vi.fn(() => { controller.abort(); return processChild; }) as unknown as SpawnFn,
+    } as never);
+    await expect(summarizer("text", false, { signal: controller.signal })).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("ignores a late abort after timeout has started teardown", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const processChild = makeHangingChild();
+      processChild.kill.mockImplementation(() => { processChild.emit("close", null); });
+      const summarizer = createCodexProcessSummarizer({
+        ...baseDeps(processChild), timeoutMs: 1,
+      } as never);
+      const pending = summarizer("text", false, { signal: controller.signal });
+      const observed = pending.then(() => undefined, error => error);
+      await vi.waitFor(() => expect(processChild.stdin.listenerCount("error")).toBeGreaterThan(0));
+      await vi.advanceTimersByTimeAsync(1);
+      controller.abort();
+      await expect(observed).resolves.toMatchObject({ message: expect.stringMatching(/timed out/) });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("routes an abort-shaped synchronous stdin failure through cancellation", async () => {
+    const processChild = makeHangingChild();
+    processChild.stdin.write = vi.fn(() => { throw createAbortError(); }) as typeof processChild.stdin.write;
+    processChild.kill.mockImplementation(() => { processChild.emit("close", null); });
+    const summarizer = createCodexProcessSummarizer({ ...baseDeps(processChild) } as never);
+    await expect(summarizer("text")).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("aborts deferred gateway completion when the signal fires", async () => {
+    const controller = new AbortController();
+    let release!: () => void;
+    const gateway = makeGateway({
+      waitForCompletion: vi.fn(() => new Promise<void>(resolve => { release = resolve; })),
+    });
+    const processChild = makeChild();
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(processChild), _createGateway: vi.fn(async () => gateway),
+    } as never);
+    const pending = summarizer("text", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(processChild.listenerCount("close")).toBeGreaterThan(0));
+    processChild.emit("close", 0);
+    controller.abort();
+    release?.();
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+  });
+
   it("closes the gateway when stdout setup fails", async () => {
     const child = makeChild(0);
     child.stdout.resume = () => { throw new Error("stdout setup failed"); };
@@ -351,6 +788,72 @@ describe("createCodexProcessSummarizer", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(close).toHaveBeenCalledOnce();
     expect(rmSyncMock).toHaveBeenCalledOnce();
+  });
+
+  it("ignores duplicate stdin errors after teardown has started", async () => {
+    const child = makeHangingChild();
+    const gateway = makeGateway();
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child), _createGateway: vi.fn().mockResolvedValue(gateway),
+    } as never);
+    const pending = summarizer("text");
+    await vi.waitFor(() => expect(child.stdin.listenerCount("error")).toBeGreaterThan(0));
+    child.stdin.emit("error", new Error("first stdin failure"));
+    child.stdin.emit("error", new Error("duplicate stdin failure"));
+    child.emit("close", 1);
+    await expect(pending).rejects.toThrow(/stdin/i);
+  });
+
+  it("rejects a child close callback when the command aborts after close", async () => {
+    const controller = new AbortController();
+    const child = makeChild(0);
+    let release!: () => void;
+    const gateway = makeGateway({ waitForCompletion: vi.fn(() => new Promise<void>(resolve => { release = resolve; })) });
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child), _createGateway: vi.fn().mockResolvedValue(gateway),
+    } as never);
+    const pending = summarizer("text", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(child.listenerCount("close")).toBeGreaterThan(0));
+    child.emit("close", 0);
+    controller.abort();
+    release();
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("ignores an abort arriving after timeout teardown has started", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const child = makeHangingChild();
+      const gateway = makeGateway();
+      const summarizer = createCodexProcessSummarizer({
+        ...baseDeps(child), _createGateway: vi.fn().mockResolvedValue(gateway), timeoutMs: 1,
+      } as never);
+      const pending = summarizer("text", false, { signal: controller.signal });
+      const observed = pending.then(() => undefined, error => error);
+      await vi.waitFor(() => expect(child.stdin.listenerCount("error")).toBeGreaterThan(0));
+      await vi.advanceTimersByTimeAsync(1);
+      controller.abort();
+      child.emit("close", null);
+      await expect(observed).resolves.toMatchObject({ message: expect.stringMatching(/timed out|abort/i) });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("classifies a child close observed after an already-aborted signal", async () => {
+    const controller = new AbortController();
+    const child = makeHangingChild();
+    const gateway = makeGateway();
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child), _createGateway: vi.fn().mockResolvedValue(gateway),
+    } as never);
+    const pending = summarizer("text", false, { signal: controller.signal });
+    const observed = pending.then(() => undefined, error => error);
+    await vi.waitFor(() => expect(child.listenerCount("close")).toBeGreaterThan(0));
+    controller.abort();
+    child.emit("close", 0);
+    await expect(observed).resolves.toSatisfy(error => isAbortError(error));
   });
 
   it("latches child-close settlement before deferred gateway completion", async () => {
@@ -437,6 +940,31 @@ describe("createCodexProcessSummarizer", () => {
       expect(child.kill).not.toHaveBeenCalled();
       expect(close).toHaveBeenCalledOnce();
       expect(rmSyncMock).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails closed when the owned process group never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const processChild = makeHangingChild();
+      (processChild as FakeChild & { pid: number }).pid = 9520;
+      const gateway = makeGateway();
+      const summarizer = createCodexProcessSummarizer({
+        ...baseDeps(processChild),
+        _createGateway: vi.fn(async () => gateway),
+        processGroupId: 9520,
+        daemonProcessGroupId: 9519,
+        processBirthTime: () => "birth-9520",
+        isProcessGroupAlive: () => true,
+      } as never);
+      const pending = summarizer("text");
+      const observed = pending.then(() => undefined, error => error);
+      await vi.waitFor(() => expect(processChild.listenerCount("close")).toBeGreaterThan(0));
+      processChild.emit("close", 0);
+      await vi.advanceTimersByTimeAsync(4_000);
+      await expect(observed).resolves.toMatchObject({ message: "codex process teardown did not settle" });
     } finally {
       vi.useRealTimers();
     }
@@ -649,6 +1177,26 @@ describe("createCodexProcessSummarizer", () => {
       rmSync: vi.fn(() => { throw new Error("cleanup failed"); }) as unknown as RmSyncFn,
     });
     await expect(summarizer("text", false)).rejects.toThrow("plain failure");
+  });
+
+  it("terminates the child and cleans owned resources when teardown setup throws", async () => {
+    const child = makeHangingChild();
+    vi.spyOn(child, "once").mockImplementation(() => {
+      throw new Error("teardown listener setup failed");
+    });
+    const gateway = makeGateway();
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child, { rmSync: rmSyncMock }),
+      _createGateway: vi.fn(async () => gateway),
+    } as never);
+
+    await expect(summarizer("text", false)).rejects.toThrow("teardown listener setup failed");
+
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(gateway.close).toHaveBeenCalledOnce();
+    expect(rmSyncMock).toHaveBeenCalledOnce();
   });
 
   it.each([false, true])("times out and cleans up when killThrows=%s", async (killThrows) => {

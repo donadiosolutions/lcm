@@ -88,6 +88,8 @@ export interface LlmRequestPolicyOverride {
 }
 
 export const DEFAULT_LLM_REQUEST_TIMEOUT_MS = 600_000;
+export const DEFAULT_LLM_MAX_CONCURRENCY = 1;
+export const MAX_LLM_MAX_CONCURRENCY = 32;
 export const DEFAULT_LLM_RETRY_POLICY: Readonly<LlmRetryPolicy> = Object.freeze({
   maxAttempts: 3,
   initialDelayMs: 1_000,
@@ -187,6 +189,7 @@ export type DaemonConfig = {
     apiMode?: LlmApiMode;
     reasoningEffort?: LlmReasoningEffort;
     fastMode: boolean;
+    maxConcurrency: number;
     requestTimeoutMs: number;
     retry: LlmRetryPolicy;
   };
@@ -278,6 +281,7 @@ const DEFAULTS: DaemonConfigDefaults = {
     apiKey: "",
     baseUrl: "",
     fastMode: false,
+    maxConcurrency: DEFAULT_LLM_MAX_CONCURRENCY,
     requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS,
     retry: { ...DEFAULT_LLM_RETRY_POLICY },
   },
@@ -686,7 +690,7 @@ const LLM_PROVIDER_ALIASES: Readonly<Record<string, LlmProvider>> = {
 };
 const LLM_KEYS = new Set([
   "provider", "model", "apiKey", "baseUrl", "baseURL", "apiMode", "reasoningEffort", "fastMode",
-  "requestTimeoutMs", "retry",
+  "maxConcurrency", "requestTimeoutMs", "retry",
 ]);
 const CONFIG_EXAMPLE = JSON.stringify({
   storage: {
@@ -1133,6 +1137,7 @@ function validateLlmObject(
     validateStringField(llm, key);
   }
   validateOptionalBoolean(llm, "fastMode", "llm");
+  validateOptionalInteger(llm, "maxConcurrency", "llm", DEFAULT_LLM_MAX_CONCURRENCY, MAX_LLM_MAX_CONCURRENCY);
   normalizeBaseUrl(llm);
   resolveLlmRequestPolicy(
     { requestTimeoutMs: DEFAULT_LLM_REQUEST_TIMEOUT_MS, retry: { ...DEFAULT_LLM_RETRY_POLICY } },

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { createMockSummarizer } from "../../src/llm/mock-summarizer.js";
+import { isAbortError } from "../../src/daemon/cancellation.js";
 
 describe("createMockSummarizer", () => {
   it("returns structurally valid summary text (non-empty string)", async () => {
@@ -59,5 +60,12 @@ describe("createMockSummarizer", () => {
     const result = await summarizer(multilineText);
     expect(result).toBeTruthy();
     expect(result).toContain("Line 1");
+  });
+
+  it("rejects a pre-aborted invocation with the intentional AbortError", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(createMockSummarizer()("text", false, { signal: controller.signal }))
+      .rejects.toSatisfy(error => isAbortError(error));
   });
 });

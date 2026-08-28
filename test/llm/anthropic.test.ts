@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { createAnthropicSummarizer } from "../../src/llm/anthropic.js";
+import { createAbortError, isAbortError } from "../../src/daemon/cancellation.js";
 
 describe("createAnthropicSummarizer", () => {
   it("constructs the default SDK client lazily", () => {
@@ -20,6 +21,64 @@ describe("createAnthropicSummarizer", () => {
     expect(args.model).toBe("claude-haiku-4-5-20251001");
     expect(args.max_tokens).toBe(1024);
     expect(args.system).toBeDefined();
+  });
+
+  it("forwards a per-call signal and skips a pre-aborted request", async () => {
+    const preAborted = new AbortController();
+    preAborted.abort();
+    const preCreate = vi.fn();
+    const preSummarizer = createAnthropicSummarizer({
+      model: "model",
+      apiKey: "key",
+      _clientOverride: { messages: { create: preCreate } },
+    });
+
+    await expect(preSummarizer("text", false, { signal: preAborted.signal }))
+      .rejects.toSatisfy(error => isAbortError(error));
+    expect(preCreate).not.toHaveBeenCalled();
+
+    const controller = new AbortController();
+    const create = vi.fn(() => new Promise<never>(() => {}));
+    const summarizer = createAnthropicSummarizer({
+      model: "model",
+      apiKey: "key",
+      _clientOverride: { messages: { create } },
+    });
+    const pending = summarizer("text", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
+    expect(create.mock.calls[0]?.[1]).toEqual({ signal: controller.signal });
+    controller.abort();
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("aborts a retry delay without starting another attempt", async () => {
+    const controller = new AbortController();
+    const create = vi.fn().mockRejectedValue(new Error("temporary"));
+    const sleep = vi.fn(() => new Promise<void>(() => {}));
+    const summarizer = createAnthropicSummarizer({
+      model: "model",
+      apiKey: "key",
+      _retryDelayMs: 1000,
+      _clientOverride: { messages: { create } },
+      _sleep: sleep,
+    });
+
+    const pending = summarizer("text", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(sleep).toHaveBeenCalledOnce());
+    controller.abort();
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it("does not retry an already-marked intentional abort from a client", async () => {
+    const create = vi.fn().mockRejectedValue(createAbortError());
+    const summarizer = createAnthropicSummarizer({
+      model: "model",
+      apiKey: "key",
+      _clientOverride: { messages: { create } },
+    });
+    await expect(summarizer("text", false)).rejects.toSatisfy(error => isAbortError(error));
+    expect(create).toHaveBeenCalledOnce();
   });
 
   it("retries once on empty content, then returns", async () => {

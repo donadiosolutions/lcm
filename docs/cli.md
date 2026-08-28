@@ -194,3 +194,53 @@ lcm doctor
 Do not edit hook files or use process-kill commands as a recovery procedure.
 See [Managed daemon recovery](daemon-restart-recovery.md) for the platform
 boundaries and the user-facing failure cases.
+
+## Compact concurrency and cancellation
+
+`lcm compact` accepts a bounded worker-pool setting for manual batch work:
+
+```bash
+lcm compact --all --max-concurrency 4
+lcm compact --all --replay                 # always sequential
+lcm compact --all --dry-run                # validate and preview only
+```
+
+The persistent setting is `llm.maxConcurrency` in `~/.lcm/config.json` (default
+`1`, valid range `1..32`):
+
+```bash
+lcm config set llm.maxConcurrency 4 --json
+lcm config get llm.maxConcurrency --effective
+```
+
+`--max-concurrency` overrides the stored value for one invocation and does not
+write the configuration file. It must be canonical unsigned decimal text and
+is rejected outside `1..32`. `--replay` always uses one worker so each summary
+sees the previous summary's context; a stored value is clamped to `1`, while an
+explicit value above `1` is rejected. The limit counts only in-flight `/compact`
+requests. Discovery and rendering are outside the limit, and promotion remains
+sequential. Compacted projects are promoted in deterministic discovery order.
+
+`--dry-run` validates configuration and discovery, but does not start the
+daemon, register an invocation lease, dispatch compact/provider work, write
+summaries, or promote anything.
+
+Every non-hook manual compact is bound to an authenticated daemon invocation.
+The lease is refreshed while work runs. A heartbeat failure, transport
+disconnect, lease expiry, or signal begins a drain: no new work is admitted,
+queued and active local work settles, and invocation-owned promotion is
+cancelled. An atomic pass admitted before cancellation may finish, but later
+passes cannot acquire a durable-write permit.
+
+Ctrl+C (`SIGINT`) returns `130`; `SIGTERM` returns `143`. Both statuses are
+returned only after the drain proves zero daemon-owned and local work. Repeated
+signals keep waiting and print a diagnostic instead of interrupting settlement.
+Provider work already accepted by a remote service may continue remotely; the
+local guarantee covers LCM-owned queued/active requests, SDK retries, provider
+processes/groups, locks, and invocation-scoped promotion only.
+
+If cancellation cannot prove that the managed daemon and its owned provider
+work disappeared, LCM does not signal an unknown process or claim success. It
+stays in draining state, reports the missing proof, and fails closed. This also
+applies when a managed restart cannot prove old-instance disappearance and
+replacement identity.

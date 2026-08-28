@@ -995,6 +995,56 @@ describe("runCli orchestration actions", () => {
     expect(await invoke(args)).toBeUndefined();
   });
 
+  it("validates compact dry-run without daemon registration or dispatch", async () => {
+    expect(await invoke(["compact", "--dry-run", "--max-concurrency", "4"])).toBeUndefined();
+
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+    expect(vi.mocked(batchCompact)).toHaveBeenCalledWith(
+      expect.objectContaining({ dryRun: true, maxConcurrency: 4 }),
+    );
+  });
+
+  it("forwards the CLI concurrency override over the stored setting", async () => {
+    state.loadConfig.mockImplementationOnce(() => ({
+      daemon: { port: 3737 },
+      storage: { backend: "sqlite" },
+      llm: {
+        provider: "openai",
+        apiMode: "responses",
+        maxConcurrency: 7,
+        requestTimeoutMs: 1000,
+        retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 },
+      },
+      compaction: { autoCompactMinTokens: 100 },
+    }));
+
+    expect(await invoke(["compact", "--no-promote", "--max-concurrency", "4"])).toBeUndefined();
+    expect(vi.mocked(batchCompact)).toHaveBeenCalledWith(
+      expect.objectContaining({ dryRun: false, maxConcurrency: 4 }),
+    );
+  });
+
+  it("rejects invalid compact concurrency before daemon registration or dispatch", async () => {
+    expect((await invoke(["compact", "--max-concurrency", "0"]))).toMatchObject({
+      message: expect.stringContaining("max-concurrency"),
+    });
+
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+    expect(batchCompact).not.toHaveBeenCalled();
+  });
+
+  it("rejects replay concurrency above one before daemon registration or dispatch", async () => {
+    expect((await invoke(["compact", "--replay", "--max-concurrency", "2"]))).toMatchObject({
+      message: expect.stringContaining("replay"),
+    });
+
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+    expect(batchCompact).not.toHaveBeenCalled();
+  });
+
   it("runs supported manual provider overrides", async () => {
     state.provider = "auto";
     expect(await invoke(["compact", "--all", "--reasoning-effort", "low", "--fast-mode"])).toBeUndefined();
@@ -2012,9 +2062,12 @@ describe("runCli failure and alternate presentation branches", () => {
   });
 
   it("fails compact when automatic promotion fails while keeping explicit promote best-effort", async () => {
-    state.post.mockRejectedValueOnce(new Error("promote failed"));
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    state.post.mockRejectedValueOnce(new Error("promote\u001b[31m\nfailed"));
     expect(await invoke(["compact"])).toBeUndefined();
     expect(process.exitCode).toBe(1);
+    expect(error.mock.calls.flat().join("\n")).toContain("promote failed");
+    expect(error.mock.calls.flat().join("\n")).not.toContain("\u001b");
     expect(state.ensureDaemon).toHaveBeenCalledTimes(1);
     process.exitCode = undefined;
     state.post.mockRejectedValueOnce("promote failed");

@@ -18,6 +18,7 @@ import {
 } from "./project-map.js";
 import { resolveCodexSessions } from "./codex-project-resolution.js";
 import { findAllCodexTranscripts } from "./codex-transcript.js";
+import { sanitizeTerminalText } from "./terminal-sanitize.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
 
@@ -261,7 +262,10 @@ async function ingestSessionList(
           previousSummaries.delete(replayKey);
           // Always warn on chain breakage so users know the DAG is incomplete,
           // regardless of whether --verbose was passed.
-          console.error(`  \u26a0\ufe0f [replay] compact failed for session ${sessionId}: ${err instanceof Error ? err.message : 'unknown error'}`);
+          const message = err instanceof Error ? err.message : "unknown error";
+          console.error(
+            `  \u26a0\ufe0f [replay] compact failed for session ${sanitizeTerminalText(sessionId)}: ${sanitizeTerminalText(message)}`,
+          );
           // Fall back to ingest's totalTokens so they aren't silently lost.
           result.totalTokens += res.totalTokens;
         }
@@ -270,7 +274,10 @@ async function ingestSessionList(
     } catch (err) {
       result.failed++;
       if (options.replay) previousSummaries.delete(replayKey); // chain broken for this project/client
-      if (options.verbose) console.log(`  \u274c ${sessionId}: ${err instanceof Error ? err.message : "failed"}`);
+      if (options.verbose) {
+        const message = err instanceof Error ? err.message : "failed";
+        console.log(`  \u274c ${sanitizeTerminalText(sessionId)}: ${sanitizeTerminalText(message)}`);
+      }
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
     }
   }

@@ -846,6 +846,7 @@ example shows the OpenAI-specific fields and enables reasoning:
     "baseUrl": "https://api.openai.com/v1",
     "apiMode": "responses",
     "reasoningEffort": "medium",
+    "maxConcurrency": 1,
     "requestTimeoutMs": 600000,
     "retry": {
       "maxAttempts": 3,
@@ -903,6 +904,51 @@ without enabling Codex strict configuration validation. This keeps unrelated,
 forward-compatible fields in the user's Codex configuration from becoming fatal
 to compaction while still applying the requested controls to the spawned
 summarizer.
+
+`llm.maxConcurrency` controls the number of manual compact requests that may be
+in flight at once. It defaults to `1` and accepts only integer values from `1`
+through `32`. The limit applies to active `/compact` requests, not to discovery,
+progress rendering, or promotion. Newly compacted projects are promoted one at a
+time in deterministic discovery order (the first compacted conversation for each
+project), so increasing the limit does not make promotion concurrent.
+
+The setting is read from the effective daemon configuration. A command-line
+`--max-concurrency <n>` value has precedence for that invocation and never
+rewrites `~/.lcm/config.json`; use `lcm config set llm.maxConcurrency <n> --json`
+for a persistent default. The CLI accepts canonical unsigned decimal text only
+(for example `4`, not `04`, `+4`, or `4.0`). Values outside `1..32` fail before
+daemon registration or provider work. When `--replay` is selected, compaction
+is always sequential: a stored value is silently clamped to `1`, while an
+explicit `--max-concurrency` value above `1` is rejected because it would break
+threaded replay ordering.
+
+Use `--dry-run` to validate the complete configuration and discover eligible
+conversations without starting the daemon, registering an invocation, sending
+`/compact` requests, writing summaries, or promoting anything. Dry-run output is
+therefore a preview, not a reservation of work.
+
+Manual compact owns an invocation lease while it runs. A lost heartbeat,
+daemon disconnect, expired lease, or client interruption moves that invocation
+to cancellation and stops admitting new work. Work already admitted before
+cancellation may finish its current atomic pass; no later pass may acquire a
+durable-write permit. Queued work, active requests, provider retries, owned
+provider processes/groups, and invocation-scoped promotion are drained before
+the command exits. Promotion is skipped once draining begins.
+
+For a catchable `SIGINT` (Ctrl+C), the command exits with status `130` after the
+drain; `SIGTERM` exits with status `143`. A repeated signal does not bypass the
+drain and reports that the command is still waiting for local work to settle.
+These statuses are emitted only after the local and daemon-owned work reaches a
+verified terminal state. A remote provider may still retain work it accepted
+before cancellation; LCM cannot revoke that provider-side work. The local
+guarantee is limited to zero LCM-owned queued/active work, SDK retry, provider
+process/group, lock, and invocation-scoped promotion.
+
+If a managed restart is needed during cancellation, LCM must prove that the old
+daemon instance and its owned provider work disappeared before accepting a
+replacement. If that proof is unavailable, the command remains in draining
+state, reports the unproved condition, and fails closed rather than signaling an
+unknown process or claiming that cancellation completed.
 
 Codex-process compaction uses a private, one-use loopback Responses gateway for
 each summarize call. The gateway binds only to `127.0.0.1` on an ephemeral port

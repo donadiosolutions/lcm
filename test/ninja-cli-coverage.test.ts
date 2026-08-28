@@ -52,6 +52,27 @@ describe("renderFrame coverage boundaries", () => {
     );
   });
 
+  it("sanitizes completed-session and provider text in every frame mode", () => {
+    const state = completedState({
+      current: undefined,
+      lastResult: {
+        sessionId: "ses\u001b[31m\nsion",
+        messages: 1,
+        tokensBefore: 10,
+        tokensAfter: 5,
+        provider: "pro\u001b]8;;https://invalid\u0007vider",
+        elapsed: 1,
+      },
+    });
+    for (const renderOpts of [opts({ isTTY: false }), opts({ verbose: true }), opts()]) {
+      const output = renderFrame(state, renderOpts, 0);
+      expect(output).toContain("ses sion");
+      expect(output).toContain("provider");
+      expect(output).not.toContain("\u001b");
+      expect(output).not.toContain("https://invalid");
+    }
+  });
+
   it.each([
     [10, "\u001b[32m10.0×\u001b[0m", "green"],
     [5, "\u001b[33m5.0×\u001b[0m", "yellow"],
@@ -153,10 +174,10 @@ describe("printSummary", () => {
       phases: [{ name: "Import", status: "done" }, { name: "Compact", status: "done" }],
       total: 3,
       completed: 2,
-      errors: [{ sessionId: "broken", message: "network failed" }],
+      errors: [{ sessionId: "bro\u001b[31m\nken", message: "network\u001b]8;;https://invalid\u0007 failed" }],
       phaseErrors: [
         { phase: "Promote", message: "daemon unavailable" },
-        { phase: "Promote", target: "/project", message: "request failed" },
+        { phase: "Pro\u001b[31m\nmote", target: "/pro\u001b[31m\nject", message: "request\nfailed" },
       ],
       messagesIn: 1_234,
       tokensIn: 1_000_000,
@@ -175,9 +196,11 @@ describe("printSummary", () => {
     expect(output).toContain("Total time    2.5s");
     expect(output).toContain("Failed        1");
     expect(output).toContain("Phase failed  2");
-    expect(output).toContain("broken: network failed");
+    expect(output).toContain("bro ken: network failed");
     expect(output).toContain("Promote: daemon unavailable");
-    expect(output).toContain("Promote (/project): request failed");
+    expect(output).toContain("Pro mote (/pro ject): request failed");
+    expect(output).not.toContain("\u001b");
+    expect(output).not.toContain("https://invalid");
   });
 
   it("prints an empty narrow summary with a 100 percent default", () => {
@@ -333,5 +356,77 @@ describe("NinjaRenderer lifecycle", () => {
     expect(state.aborted).toBe(true);
     expect(exit).toHaveBeenCalledWith(130);
     expect(writes.join("")).toContain("Sessions");
+  });
+
+  it("uses the default signal handler when no external callback is supplied", () => {
+    const handlers = new Map<string, () => void>();
+    vi.spyOn(process, "on").mockImplementation(((event: string, handler: () => void) => {
+      handlers.set(event, handler);
+      return process;
+    }) as typeof process.on);
+    const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`exit:${code}`);
+    }) as typeof process.exit);
+    const renderer = new NinjaRenderer({ state: makeProgressState({ total: 1 }), renderOpts: opts({ isTTY: false }) });
+    renderer.start();
+    expect(() => handlers.get("SIGTERM")?.()).toThrow("exit:143");
+    expect(exit).toHaveBeenCalledWith(143);
+    renderer.stop();
+  });
+
+  it("delegates command signals without exiting when an external lifecycle owns drain", () => {
+    const handlers = new Map<string, () => void>();
+    vi.spyOn(process, "on").mockImplementation(((event: string, handler: () => void) => {
+      handlers.set(event, handler);
+      return process;
+    }) as typeof process.on);
+    const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`exit:${code}`);
+    }) as typeof process.exit);
+    const onSignal = vi.fn();
+    const state = makeProgressState({ total: 1 });
+    const renderer = new NinjaRenderer({
+      state,
+      renderOpts: opts({ isTTY: false }),
+      handleSignals: false,
+      onSignal,
+    });
+
+    renderer.start();
+    expect(handlers.has("SIGINT")).toBe(false);
+    expect(handlers.has("SIGTERM")).toBe(false);
+    expect(() => handlers.get("SIGINT")?.()).not.toThrow();
+    expect(onSignal).not.toHaveBeenCalled();
+    expect(exit).not.toHaveBeenCalled();
+    renderer.stop();
+  });
+
+  it("delegates SIGINT and SIGTERM to a command lifecycle without immediate exit", () => {
+    const handlers = new Map<string, () => void>();
+    vi.spyOn(process, "on").mockImplementation(((event: string, handler: () => void) => {
+      handlers.set(event, handler);
+      return process;
+    }) as typeof process.on);
+    const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`exit:${code}`);
+    }) as typeof process.exit);
+    const onSignal = vi.fn();
+    const state = makeProgressState({ total: 1 });
+    const renderer = new NinjaRenderer({
+      state,
+      renderOpts: opts({ isTTY: false }),
+      onSignal,
+    });
+
+    renderer.start();
+    expect(handlers.has("SIGINT")).toBe(true);
+    expect(handlers.has("SIGTERM")).toBe(true);
+    expect(() => handlers.get("SIGINT")?.()).not.toThrow();
+    expect(() => handlers.get("SIGTERM")?.()).not.toThrow();
+    expect(onSignal).toHaveBeenNthCalledWith(1, "SIGINT");
+    expect(onSignal).toHaveBeenNthCalledWith(2, "SIGTERM");
+    expect(state.aborted).toBe(true);
+    expect(exit).not.toHaveBeenCalled();
+    renderer.stop();
   });
 });

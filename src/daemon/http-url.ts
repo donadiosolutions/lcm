@@ -1,5 +1,10 @@
-import { request } from "node:http";
+import { request, type IncomingMessage } from "node:http";
 import { Buffer } from "node:buffer";
+import {
+  createAbortError,
+  isAbortError,
+  throwIfAborted,
+} from "./cancellation.js";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
@@ -10,6 +15,7 @@ const DAEMON_PATHS = new Set([
   "/grep",
   "/health",
   "/ingest",
+  "/invocation-control",
   "/promote",
   "/promote-events",
   "/promote-events/all",
@@ -71,6 +77,7 @@ export type DaemonJsonRequestOptions = {
   headers?: Record<string, string>;
   body?: unknown;
   timeoutMs?: number;
+  signal?: AbortSignal;
 };
 
 export type DaemonJsonResponse<T> = {
@@ -151,6 +158,7 @@ export function isDaemonTransportFailure(error: unknown): boolean {
     if (typeof current !== "object" || current === null || seen.has(current)) continue;
     seen.add(current);
     inspectedNodes += 1;
+    if (isAbortError(current)) continue;
     const candidate = current as {
       code?: unknown;
       message?: unknown;
@@ -196,6 +204,7 @@ export async function daemonJsonResponse<T>(
 ): Promise<DaemonJsonResponse<T>> {
   const port = normalizeDaemonPort(portValue);
   const routePath = normalizeDaemonPath(path);
+  throwIfAborted(options.signal);
   const json = options.body === undefined ? undefined : JSON.stringify(options.body);
   const headers = { ...(options.headers ?? {}) };
   if (json !== undefined) {
@@ -203,54 +212,132 @@ export async function daemonJsonResponse<T>(
   }
 
   return await new Promise<DaemonJsonResponse<T>>((resolve, reject) => {
-    const req = request({
-      hostname: "127.0.0.1",
-      port,
-      path: routePath,
-      method: options.method,
-      headers,
-    }, (res) => {
-      const chunks: Buffer[] = [];
-      let responseSettled = false;
-      const finishResponse = (transportError?: Error): void => {
-        if (responseSettled) return;
-        responseSettled = true;
-        if (transportError !== undefined) {
-          reject(transportError);
-          return;
-        }
-        try {
-          const statusCode = res.statusCode ?? 500;
-          const raw = Buffer.concat(chunks).toString("utf-8");
-          const data = raw ? JSON.parse(raw) as T : undefined as T;
-          resolve({ statusCode, data });
-        } catch (err) {
-          reject(err);
-        }
+    let req: ReturnType<typeof request> | undefined;
+    let response: IncomingMessage | undefined;
+    let responseData: Buffer[] = [];
+    let settled = false;
+    let timeoutConfigured = false;
+    const signal = options.signal;
+
+    const removeListener = (
+      emitter: object,
+      event: string,
+      listener: (...args: unknown[]) => void,
+    ): void => {
+      const value = emitter as {
+        off?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+        removeListener?: (event: string, listener: (...args: unknown[]) => void) => unknown;
       };
-      res.on("data", (chunk: Buffer | string) => {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      });
-      res.once("aborted", () => {
-        finishResponse(interruptedDaemonResponse(
-          Object.assign(new Error("Daemon response aborted"), { code: "ECONNRESET" }),
-        ));
-      });
-      res.once("error", (error: Error) => {
-        finishResponse(interruptedDaemonResponse(error));
-      });
-      res.once("end", () => finishResponse());
-    });
-    req.on("error", reject);
-    if (options.timeoutMs !== undefined) {
-      req.setTimeout(options.timeoutMs, () => {
-        req.destroy(new Error("Daemon request timed out"));
-      });
+      if (typeof value.off === "function") value.off(event, listener);
+      else value.removeListener?.(event, listener);
+    };
+    const onRequestError = (error: Error): void => settleFailure(error);
+    const onResponseData = (chunk: Buffer | string): void => {
+      responseData.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    };
+    const onResponseAborted = (): void => settleFailure(interruptedDaemonResponse(
+      Object.assign(new Error("Daemon response aborted"), { code: "ECONNRESET" }),
+    ));
+    const onResponseError = (error: Error): void => settleFailure(interruptedDaemonResponse(error));
+    const onResponseEnd = (): void => {
+      if (settled || response === undefined) return;
+      settled = true;
+      cleanup();
+      try {
+        const statusCode = response.statusCode ?? 500;
+        const raw = Buffer.concat(responseData).toString("utf-8");
+        const data = raw ? JSON.parse(raw) as T : undefined as T;
+        resolve({ statusCode, data });
+      } catch (error) {
+        reject(error);
+      }
+    };
+    const destroyRequestAfterSettlement = (): void => {
+      if (req === undefined) return;
+      const absorbLateRequestError = (): void => undefined;
+      const removeLateRequestListeners = (): void => {
+        removeListener(req!, "error", absorbLateRequestError);
+        removeListener(req!, "close", removeLateRequestListeners);
+      };
+      req.once("error", absorbLateRequestError);
+      req.once("close", removeLateRequestListeners);
+      req.destroy();
+    };
+    const cleanup = (): void => {
+      if (timeoutConfigured) {
+        // Node clears an active socket timeout when setTimeout receives zero.
+        req?.setTimeout(0, () => undefined);
+        timeoutConfigured = false;
+      }
+      if (req !== undefined) removeListener(req, "error", onRequestError as (...args: unknown[]) => void);
+      if (response !== undefined) {
+        removeListener(response, "data", onResponseData as (...args: unknown[]) => void);
+        removeListener(response, "aborted", onResponseAborted as (...args: unknown[]) => void);
+        removeListener(response, "error", onResponseError as (...args: unknown[]) => void);
+        removeListener(response, "end", onResponseEnd as (...args: unknown[]) => void);
+      }
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const settleFailure = (error: Error, destroyTransport = false): void => {
+      if (settled) return;
+      settled = true;
+      if (destroyTransport) {
+        // Destroy without an error argument: the explicit rejection below is
+        // authoritative and this avoids a second uncaught socket error.
+        destroyRequestAfterSettlement();
+        response?.destroy();
+      }
+      cleanup();
+      if (response !== undefined) {
+        // A settled IncomingMessage may still deliver one queued error event.
+        // Absorb only that late event, then release the guard on the next turn
+        // so normal response listeners are not retained.
+        const absorbLateError = (): void => undefined;
+        response.once("error", absorbLateError);
+        queueMicrotask(() => removeListener(response!, "error", absorbLateError));
+      }
+      reject(error);
+    };
+    const onAbort = (): void => settleFailure(createAbortError(signal?.reason), true);
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+      return;
     }
-    if (json !== undefined) {
-      req.write(json);
+    try {
+      req = request({
+        hostname: "127.0.0.1",
+        port,
+        path: routePath,
+        method: options.method,
+        headers,
+      }, (incomingResponse: IncomingMessage) => {
+        response = incomingResponse;
+        incomingResponse.on("data", onResponseData);
+        incomingResponse.once("aborted", onResponseAborted);
+        incomingResponse.once("error", onResponseError);
+        incomingResponse.once("end", onResponseEnd);
+      });
+      if (settled) {
+        destroyRequestAfterSettlement();
+        return;
+      }
+      req.on("error", onRequestError);
+      if (options.timeoutMs !== undefined) {
+        timeoutConfigured = true;
+        req.setTimeout(options.timeoutMs, () => {
+          settleFailure(
+            Object.assign(new Error("Daemon request timed out"), { code: "ETIMEDOUT" }),
+            true,
+          );
+        });
+      }
+      if (json !== undefined) req.write(json);
+      req.end();
+    } catch (error) {
+      settleFailure(error instanceof Error ? error : new Error("Daemon request failed"));
     }
-    req.end();
   });
 }
 
@@ -265,7 +352,7 @@ export async function daemonJsonRequest<T>(
       && typeof (data as { error?: unknown }).error === "string"
       ? (data as { error: string }).error
       : `HTTP ${statusCode}`;
-    throw new Error(message);
+    throw Object.assign(new Error(message), { statusCode });
   }
   return data;
 }

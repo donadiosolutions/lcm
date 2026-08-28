@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { batchCompact, findUncompacted, formatLlmDiagnostic } from "../src/batch-compact.js";
+import { batchCompact, findUncompacted, formatLlmDiagnostic, runBatchWorkerPool } from "../src/batch-compact.js";
 import { DaemonClient } from "../src/daemon/client.js";
 import { closeLcmConnection, getLcmConnection, getPoolStats } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
@@ -48,11 +48,11 @@ function seedConversation(dbPath: string, messageCount = 9): void {
   }
 }
 
-function seedConversations(dbPath: string): void {
+function seedConversations(dbPath: string, ids: readonly number[] = [1, 2]): void {
   const db = getLcmConnection(dbPath);
   try {
     runLcmMigrations(db);
-    for (const id of [1, 2]) {
+    for (const id of ids) {
       db.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)").run(id, `session-${id}`);
       insertMessages(db, id);
     }
@@ -377,8 +377,10 @@ describe("batch compaction discovery", () => {
     ensureProjectDir(cwd);
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }, null, 2) + "\n");
     seedConversations(paths.dbPath);
+    const firstLabel = `${paths.canonical} conv #1 (9 msgs, 0.3k tokens)`;
+    const secondLabel = `${paths.canonical} conv #2 (9 msgs, 0.3k tokens)`;
     const post = vi.spyOn(DaemonClient.prototype, "post")
-      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ tokensBefore: 250, tokensAfter: 250 })
       .mockResolvedValueOnce({ tokensBefore: 300, tokensAfter: 30 });
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -413,8 +415,8 @@ describe("batch compaction discovery", () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining(
       "2 sessions compacted, 0.6k → 0.3k tokens (49% reduction, 0.3k freed)",
     ));
-    expect(log).toHaveBeenCalledWith(" done  (0.3k → 0.3k tokens, 0% reduction)");
-    expect(log).toHaveBeenCalledWith(" done  (0.3k → 0.0k tokens, 90% reduction)");
+    expect(log).toHaveBeenCalledWith(`${firstLabel} done  (0.3k → 0.3k tokens, 0% reduction)`);
+    expect(log).toHaveBeenCalledWith(`${secondLabel} done  (0.3k → 0.0k tokens, 90% reduction)`);
     expect(post).toHaveBeenNthCalledWith(1, "/compact", expect.objectContaining({
       fast_mode: false,
       request_timeout_ms: 120_000,
@@ -425,6 +427,75 @@ describe("batch compaction discovery", () => {
         multiplier: 2,
       },
     }));
+  });
+
+  it("threads invocation identity and abort signal through compact requests", async () => {
+    const cwd = makeDir("compact-invocation-forwarding");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    const signal = new AbortController().signal;
+    const post = vi.spyOn(DaemonClient.prototype, "post")
+      .mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      invocationId: "22222222-2222-4222-8222-222222222222",
+      signal,
+    });
+
+    expect(post).toHaveBeenCalledWith("/compact", expect.objectContaining({
+      invocation_id: "22222222-2222-4222-8222-222222222222",
+    }), { signal });
+  });
+
+  it("does not create compact requests during dry-run even when an invocation is supplied", async () => {
+    const cwd = makeDir("compact-invocation-dry-run");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    const post = vi.spyOn(DaemonClient.prototype, "post");
+
+    await batchCompact({
+      minTokens: 100,
+      dryRun: true,
+      port: 3737,
+      cwd,
+      invocationId: "22222222-2222-4222-8222-222222222222",
+    });
+
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("reports daemon transport loss to the command drain callback", async () => {
+    const cwd = makeDir("compact-transport-loss");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    const transportError = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+    vi.spyOn(DaemonClient.prototype, "post").mockRejectedValue(transportError);
+    const onTransportFailure = vi.fn();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      invocationId: "22222222-2222-4222-8222-222222222222",
+      onTransportFailure,
+    });
+
+    expect(onTransportFailure).toHaveBeenCalledWith(transportError);
   });
 
   it("reports daemon no-ops as unchanged and excludes them from promotion projects", async () => {
@@ -454,7 +525,7 @@ describe("batch compaction discovery", () => {
     });
 
     expect(result).toEqual({ compacted: 1, unchanged: 1, skipped: 0, failures: 0, compactedProjects: [paths.canonical] });
-    expect(log).toHaveBeenCalledWith(" unchanged (Summarization disabled — no summarizer configured.)");
+    expect(log).toHaveBeenCalledWith(`${paths.canonical} conv #1 (9 msgs, 0.3k tokens) unchanged (Summarization disabled — no summarizer configured.)`);
     expect(progress.find(patch => patch.lastResult?.sessionId === "session-1")?.lastResult).toMatchObject({
       tokensBefore: 125,
       tokensAfter: 120,
@@ -481,8 +552,58 @@ describe("batch compaction discovery", () => {
     });
 
     expect(result).toEqual({ compacted: 0, unchanged: 1, skipped: 0, failures: 0, compactedProjects: [] });
-    expect(log).toHaveBeenCalledWith(" unchanged (No compaction needed.)");
+    expect(log).toHaveBeenCalledWith(`${paths.canonical} conv #1 (9 msgs, 0.3k tokens) unchanged (No compaction needed.)`);
     expect(progress.at(-1)?.lastResult).toMatchObject({ tokensBefore: 250, tokensAfter: 250 });
+  });
+
+  it.each([
+    ["null", null],
+    ["undefined", undefined],
+    ["empty object", {}],
+  ] as const)("accounts a non-dry-run %s response as a failure", async (_name, response) => {
+    const cwd = makeDir("compact-malformed-response");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue(response as never);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    });
+
+    expect(result).toEqual({ compacted: 0, unchanged: 0, skipped: 0, failures: 1, compactedProjects: [] });
+    expect(post).toHaveBeenCalledOnce();
+    expect(progress.find(patch => patch.errors)).toMatchObject({
+      errors: [{ sessionId: "session-1", message: "malformed compact response" }],
+    });
+    expect(progress).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ messagesIn: expect.anything() }),
+      expect.objectContaining({ tokensIn: expect.anything() }),
+      expect.objectContaining({ tokensOut: expect.anything() }),
+    ]));
+    expect(log).toHaveBeenCalledWith("\nBatch compact complete.");
+  });
+
+  it("accepts a token-after-only compact response with discovered input fallback", async () => {
+    const cwd = makeDir("compact-token-after-fallback");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensAfter: 50 });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await expect(batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd }))
+      .resolves.toMatchObject({ compacted: 1, failures: 0 });
   });
 
   it("sends a process-provider timeout without an implicit retry override", async () => {
@@ -686,8 +807,8 @@ describe("batch compaction discovery", () => {
       onProgress: patch => progress.push(patch),
     })).toEqual({ compacted: 0, unchanged: 0, skipped: 1, failures: 1, compactedProjects: [] });
     expect(post).toHaveBeenCalledTimes(2);
-    expect(log).toHaveBeenCalledWith(" skipped (already in progress)");
-    expect(log).toHaveBeenCalledWith(" FAILED (unknown error)");
+    expect(log).toHaveBeenCalledWith(`${paths.canonical} conv #1 (9 msgs, 0.3k tokens) skipped (already in progress)`);
+    expect(log).toHaveBeenCalledWith(`${paths.canonical} conv #2 (9 msgs, 0.3k tokens) FAILED (unknown error)`);
     expect(log).toHaveBeenCalledWith("\nBatch compact complete.");
   });
 
@@ -709,8 +830,397 @@ describe("batch compaction discovery", () => {
       compactedProjects: [paths.canonical],
     });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("Found 1 uncompacted conversation ("));
-    expect(log).toHaveBeenCalledWith(" done");
+    expect(log).toHaveBeenCalledWith(`${paths.canonical} conv #1 (9 msgs, 0.3k tokens) done`);
     expect(log).toHaveBeenCalledWith(expect.stringContaining("1 session compacted"));
+  });
+
+  it("emits one complete labeled line for each staggered concurrent outcome", async () => {
+    const cwd = makeDir("compact-labeled-output");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversations(paths.dbPath, [1, 2, 3, 4, 5]);
+    const conversations = findUncompacted(100, true, cwd);
+    const labels = new Map(conversations.map(conv => [
+      conv.sessionId,
+      `${conv.cwd} conv #${conv.conversationId} (${conv.messages} msgs, ${(conv.tokens / 1000).toFixed(1)}k tokens)`,
+    ]));
+    const gates = new Map(conversations.map(conv => {
+      let release!: () => void;
+      const promise = new Promise<void>(resolve => { release = resolve; });
+      return [conv.sessionId, { promise, release }] as const;
+    }));
+    const outcomes = new Map<string, object | Error>([
+      ["session-1", { tokensBefore: 250, tokensAfter: 50 }],
+      ["session-2", { tokensBefore: 250, tokensAfter: 50 }],
+      ["session-3", { actionTaken: false, summary: "No action", tokensBefore: 250, tokensAfter: 250 }],
+      ["session-4", { skipped: true }],
+      ["session-5", new Error("provider unavailable")],
+    ]);
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockImplementation(async (_path, body) => {
+      const sessionId = String(body.session_id);
+      await gates.get(sessionId)!.promise;
+      const outcome = outcomes.get(sessionId)!;
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
+    });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line?: unknown) => { lines.push(String(line)); });
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    const pending = batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      maxConcurrency: 5,
+    });
+    await vi.waitFor(() => expect(post).toHaveBeenCalledTimes(5));
+    for (const sessionId of ["session-5", "session-3", "session-2", "session-4", "session-1"]) {
+      gates.get(sessionId)!.release();
+    }
+
+    await expect(pending).resolves.toEqual({
+      compacted: 2,
+      unchanged: 1,
+      skipped: 1,
+      failures: 1,
+      compactedProjects: [paths.canonical],
+    });
+
+    const completionLines = lines.filter(line => [...labels.values()].some(label => line.includes(label)));
+    expect(completionLines).toHaveLength(5);
+    expect(completionLines.every(line => !line.includes("\n") && !line.includes("\r"))).toBe(true);
+    expect(completionLines.every(line => [...labels.values()].some(label => line.startsWith(`${label} `)))).toBe(true);
+    expect(completionLines).toEqual(expect.arrayContaining([
+      `${labels.get("session-1")} done`,
+      `${labels.get("session-2")} done`,
+      `${labels.get("session-3")} unchanged (No action)`,
+      `${labels.get("session-4")} skipped (already in progress)`,
+      `${labels.get("session-5")} FAILED (provider unavailable)`,
+    ]));
+    expect(lines).not.toEqual(expect.arrayContaining([
+      " done",
+      " skipped (already in progress)",
+      " unchanged (No action)",
+      " FAILED (provider unavailable)",
+    ]));
+  });
+
+  it("includes the conversation label in verbose completion lines", async () => {
+    const cwd = makeDir("compact-verbose-labeled-output");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    const label = `${paths.canonical} conv #1 (9 msgs, 0.3k tokens)`;
+    vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line?: unknown) => { lines.push(String(line)); });
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd, verbose: true });
+
+    expect(lines).toContain(`${label} done  (0.3k → 0.1k tokens, 80% reduction)`);
+  });
+
+  it("limits concurrent compaction requests, keeps the oldest active session current, and orders projects by discovery", async () => {
+    const firstCwd = makeDir("compact-pool-a");
+    const firstPaths = projectPaths(firstCwd);
+    ensureProjectDir(firstCwd);
+    writeFileSync(firstPaths.metaPath, JSON.stringify({ cwd: firstPaths.canonical }));
+    seedConversation(firstPaths.dbPath);
+
+    const secondCwd = makeDir("compact-pool-b");
+    const secondPaths = projectPaths(secondCwd);
+    ensureProjectDir(secondCwd);
+    writeFileSync(secondPaths.metaPath, JSON.stringify({ cwd: secondPaths.canonical }));
+    seedConversation(secondPaths.dbPath);
+
+    const expectedProjectOrder = [...new Set(findUncompacted(100, true).map(conv => conv.cwd))];
+    expect(expectedProjectOrder).toEqual(expect.arrayContaining([
+      firstPaths.canonical,
+      secondPaths.canonical,
+    ]));
+
+    const releases = [0, 1].map(() => {
+      let release!: () => void;
+      const pending = new Promise<void>(resolve => { release = resolve; });
+      return { pending, release };
+    });
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockImplementation(async (_path, body) => {
+      const index = body.cwd === firstPaths.canonical ? 0 : 1;
+      await releases[index]!.pending;
+      return { tokensBefore: 250, tokensAfter: 50 };
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    const pending = batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      maxConcurrency: 2,
+      onProgress: patch => progress.push(patch),
+    });
+    await vi.waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+    const active = progress.filter(patch => patch.activeSessions !== undefined);
+    expect(active.at(-1)?.activeSessions).toHaveLength(2);
+    expect(active.at(-1)?.current).toMatchObject({ sessionId: "session-1" });
+
+    releases[1]!.release();
+    await vi.waitFor(() => expect(progress.at(-1)?.activeSessions).toHaveLength(1));
+    expect(progress.at(-1)?.current).toMatchObject({ sessionId: "session-1" });
+    releases[0]!.release();
+
+    await expect(pending).resolves.toMatchObject({
+      compacted: 2,
+      compactedProjects: expectedProjectOrder,
+    });
+    expect(progress.at(-1)?.activeSessions).toEqual([]);
+    expect(progress.at(-1)?.current).toBeUndefined();
+    expect(log.mock.calls.filter(([line]) => String(line).includes("done")).length).toBe(2);
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining("compacting:"));
+  });
+
+  it("clamps replay compaction to one in-flight request", async () => {
+    const cwd = makeDir("compact-replay-serial");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversations(paths.dbPath);
+
+    const releases = [0, 1].map(() => {
+      let release!: () => void;
+      const pending = new Promise<void>(resolve => { release = resolve; });
+      return { pending, release };
+    });
+    let call = 0;
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockImplementation(async () => {
+      const index = call++;
+      await releases[index]!.pending;
+      return { tokensBefore: 250, tokensAfter: 50 };
+    });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    const pending = batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      replay: true,
+      maxConcurrency: 32,
+    });
+    await vi.waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    releases[0]!.release();
+    await vi.waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+    releases[1]!.release();
+
+    await expect(pending).resolves.toMatchObject({ compacted: 2 });
+  });
+});
+
+describe("batch worker pool", () => {
+  it.each([1, 32])("accepts the %d worker concurrency boundary", async maxConcurrency => {
+    let peak = 0;
+    let active = 0;
+    const results = await runBatchWorkerPool({
+      items: [10, 20],
+      maxConcurrency,
+      worker: async item => {
+        active++;
+        peak = Math.max(peak, active);
+        await Promise.resolve();
+        active--;
+        return item * 2;
+      },
+    });
+
+    expect(peak).toBeLessThanOrEqual(maxConcurrency);
+    expect(results.map(result => result.index)).toEqual(expect.arrayContaining([0, 1]));
+  });
+
+  it("rejects a non-positive worker concurrency", async () => {
+    await expect(runBatchWorkerPool({
+      items: [1],
+      maxConcurrency: 0,
+      worker: item => item,
+    })).rejects.toThrow("maxConcurrency");
+  });
+
+  it("does not claim work when cancellation is already requested", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const claimed: number[] = [];
+
+    await expect(runBatchWorkerPool({
+      items: [1, 2],
+      maxConcurrency: 2,
+      signal: controller.signal,
+      onClaim: (_item, index) => claimed.push(index),
+      worker: item => item,
+    })).resolves.toEqual([]);
+    expect(claimed).toEqual([]);
+  });
+
+  it("caps in-flight workers, reduces settled results synchronously, and preserves indexes", async () => {
+    const active = new Set<number>();
+    let peak = 0;
+    const started: number[] = [];
+    const reduced: Array<{ index: number; value?: number; error?: unknown }> = [];
+    const gates = [0, 1, 2, 3].map(() => {
+      let release!: () => void;
+      const promise = new Promise<void>(resolve => { release = resolve; });
+      return { promise, release };
+    });
+
+    const pending = runBatchWorkerPool({
+      items: [10, 20, 30, 40],
+      maxConcurrency: 2,
+      worker: async (item, index) => {
+        started.push(index);
+        active.add(index);
+        peak = Math.max(peak, active.size);
+        await gates[index]!.promise;
+        active.delete(index);
+        return item * 2;
+      },
+      onResult: result => reduced.push(result),
+    });
+
+    await vi.waitFor(() => expect(started).toEqual([0, 1]));
+    gates[1]!.release();
+    await vi.waitFor(() => expect(started).toEqual([0, 1, 2]));
+    gates[2]!.release();
+    gates[0]!.release();
+    await vi.waitFor(() => expect(started).toEqual([0, 1, 2, 3]));
+    gates[3]!.release();
+
+    const results = await pending;
+    expect(peak).toBe(2);
+    expect(results.map(result => result.index)).toEqual([1, 2, 0, 3]);
+    expect(reduced).toEqual(results);
+  });
+
+  it("drains admitted workers before propagating an onResult callback failure", async () => {
+    const callbackError = new Error("onResult failed");
+    const started: number[] = [];
+    const settled: number[] = [];
+    const callbacks: number[] = [];
+    const gates = [0, 1].map(() => {
+      let release!: () => void;
+      const promise = new Promise<void>(resolve => { release = resolve; });
+      return { promise, release };
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      const pending = runBatchWorkerPool({
+        items: [1, 2],
+        maxConcurrency: 2,
+        worker: async (_item, index) => {
+          started.push(index);
+          await gates[index]!.promise;
+          settled.push(index);
+          return index;
+        },
+        onResult: result => {
+          callbacks.push(result.index);
+          throw callbackError;
+        },
+      });
+
+      await vi.waitFor(() => expect(started).toEqual([0, 1]));
+      let rejected = false;
+      void pending.catch(() => { rejected = true; });
+      gates[0]!.release();
+      await vi.waitFor(() => expect(callbacks).toEqual([0]));
+      await Promise.resolve();
+      expect(rejected).toBe(false);
+      expect(settled).toEqual([0]);
+
+      gates[1]!.release();
+      await expect(pending).rejects.toBe(callbackError);
+      expect(settled).toEqual([0, 1]);
+      expect(callbacks).toEqual([0, 1]);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("stops claiming and drains admitted workers before propagating an onClaim failure", async () => {
+    const callbackError = new Error("onClaim failed");
+    const claimed: number[] = [];
+    const started: number[] = [];
+    const settled: number[] = [];
+    const callbacks: number[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+
+    const pending = runBatchWorkerPool({
+      items: [1, 2, 3],
+      maxConcurrency: 2,
+      onClaim: (_item, index) => {
+        claimed.push(index);
+        if (index === 1) throw callbackError;
+      },
+      worker: async (_item, index) => {
+        started.push(index);
+        await gate;
+        settled.push(index);
+        return index;
+      },
+      onResult: result => callbacks.push(result.index),
+    });
+
+    let rejected = false;
+    void pending.catch(() => { rejected = true; });
+    expect(claimed).toEqual([0, 1]);
+    await vi.waitFor(() => expect(started).toEqual([0]));
+    await Promise.resolve();
+    expect(rejected).toBe(false);
+    expect(callbacks).toEqual([]);
+    release();
+
+    await expect(pending).rejects.toBe(callbackError);
+    expect(claimed).toEqual([0, 1]);
+    expect(started).toEqual([0]);
+    expect(settled).toEqual([0]);
+    expect(callbacks).toEqual([0]);
+  });
+
+  it("stops claiming immediately after cancellation while awaiting admitted workers", async () => {
+    const controller = new AbortController();
+    const started: number[] = [];
+    const gates = [0, 1].map(() => {
+      let release!: () => void;
+      const promise = new Promise<void>(resolve => { release = resolve; });
+      return { promise, release };
+    });
+
+    const pending = runBatchWorkerPool({
+      items: [1, 2, 3],
+      maxConcurrency: 2,
+      signal: controller.signal,
+      worker: async (_item, index) => {
+        started.push(index);
+        await gates[index]!.promise;
+        return index;
+      },
+    });
+
+    await vi.waitFor(() => expect(started).toEqual([0, 1]));
+    controller.abort();
+    gates[0]!.release();
+    gates[1]!.release();
+    await expect(pending).resolves.toHaveLength(2);
+    expect(started).toEqual([0, 1]);
   });
 });
 

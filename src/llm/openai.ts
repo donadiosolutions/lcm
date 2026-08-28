@@ -13,6 +13,13 @@ import {
   buildCondensedSummaryPrompt,
   resolveTargetTokens,
 } from "../summarize.js";
+import {
+  abortableDelay,
+  createAbortError,
+  isAbortError,
+  throwIfAborted,
+  waitForAbortable,
+} from "../daemon/cancellation.js";
 
 type ChatCompletionRequest = Pick<
   OpenAI.ChatCompletionCreateParamsNonStreaming,
@@ -46,12 +53,17 @@ type ResponsesResult = Partial<Pick<OpenAI.Responses.Response, "status" | "outpu
 type OpenAISummarizerClient = {
   chat?: {
     completions: {
-      create(request: ChatCompletionRequest): PromiseLike<ChatCompletionResult>;
+      create(request: ChatCompletionRequest, options?: RequestOptions): PromiseLike<ChatCompletionResult>;
     };
   };
   responses?: {
-    create(request: ResponsesRequest): PromiseLike<ResponsesResult>;
+    create(request: ResponsesRequest, options?: RequestOptions): PromiseLike<ResponsesResult>;
   };
+};
+
+/** The SDK request-options shape shared by OpenAI's APIs and test fakes. */
+type RequestOptions = {
+  signal?: AbortSignal;
 };
 
 type OpenAISummarizerOptions = {
@@ -63,7 +75,7 @@ type OpenAISummarizerOptions = {
   requestTimeoutMs?: number;
   retry?: LlmRetryPolicy;
   _clientOverride?: OpenAISummarizerClient;
-  _sleep?: (ms: number) => Promise<void>;
+  _sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   _retryDelayMs?: number;
 };
 
@@ -165,39 +177,40 @@ function requestFailureError(
 
 const MAX_SLEEP_MS = 600_000; // matches the upper bound enforced by validateBoundedInteger for maxDelayMs
 
-/** Schedule one retry-delay slice using a fixed literal timer duration, not one derived from user input. */
-function scheduleRetrySleepSlice(callback: () => void, remainingMs: number): void {
-  if (remainingMs >= 60_000) {
-    setTimeout(callback, 60_000);
-  } else if (remainingMs >= 10_000) {
-    setTimeout(callback, 10_000);
-  } else if (remainingMs >= 1_000) {
-    setTimeout(callback, 1_000);
-  } else if (remainingMs >= 100) {
-    setTimeout(callback, 100);
-  } else if (remainingMs >= 10) {
-    setTimeout(callback, 10);
-  } else {
-    setTimeout(callback, 1);
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  const boundedMs = Number.isFinite(ms) ? Math.max(0, Math.min(ms, MAX_SLEEP_MS)) : 0;
+  if (boundedMs === 0) {
+    await abortableDelay(0, signal);
+    return;
+  }
+
+  const deadline = performance.now() + boundedMs;
+  while (true) {
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) return;
+    await abortableDelay(
+      remainingMs >= 60_000
+        ? 60_000
+        : remainingMs >= 10_000
+          ? 10_000
+          : remainingMs >= 1_000
+            ? 1_000
+            : remainingMs >= 100
+              ? 100
+              : remainingMs >= 10
+                ? 10
+                : 1,
+      signal,
+    );
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  const boundedMs = Number.isFinite(ms) ? Math.max(0, Math.min(ms, MAX_SLEEP_MS)) : 0;
-  if (boundedMs === 0) return new Promise((resolve) => setTimeout(resolve, 0));
-
-  const deadline = performance.now() + boundedMs;
-  return new Promise((resolve) => {
-    const waitForDeadline = (): void => {
-      const remainingMs = deadline - performance.now();
-      if (remainingMs <= 0) {
-        resolve();
-        return;
-      }
-      scheduleRetrySleepSlice(waitForDeadline, remainingMs);
-    };
-    waitForDeadline();
-  });
+function invokeRequest<TRequest, TResult>(
+  create: (request: TRequest, options?: RequestOptions) => PromiseLike<TResult>,
+  request: TRequest,
+  signal?: AbortSignal,
+): PromiseLike<TResult> {
+  return signal === undefined ? create(request) : create(request, { signal });
 }
 
 export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummarizeFn {
@@ -219,6 +232,8 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
   const wait = opts._sleep ?? sleep;
 
   return async function summarize(text, aggressive, ctx: SummarizeContext = {}): Promise<string> {
+    const signal = ctx.signal;
+    throwIfAborted(signal);
     const estimatedInputTokens = Math.ceil(text.length / 4);
     const targetTokens =
       ctx.targetTokens ??
@@ -236,6 +251,7 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
     let lastError: unknown;
     for (let attempt = 0; attempt < retry.maxAttempts; attempt++) {
       try {
+        throwIfAborted(signal);
         if (opts.apiMode === "responses") {
           if (!client.responses) {
             throw new Error("OpenAI client does not provide the Responses API");
@@ -250,37 +266,51 @@ export function createOpenAISummarizer(opts: OpenAISummarizerOptions): LcmSummar
             request.reasoning = { effort: opts.reasoningEffort };
           }
 
-          const response = await client.responses.create(request);
+          const response = await waitForAbortable(
+            Promise.resolve(invokeRequest(client.responses.create.bind(client.responses), request, signal)),
+            signal,
+          );
+          throwIfAborted(signal);
           if (response.status !== "completed") {
             throw Object.assign(new Error("OpenAI Responses request did not complete"), {
               code: "LCM_INCOMPLETE_RESPONSE",
             });
           }
-          return response.output_text || text.slice(0, 500);
+          const output = response.output_text || text.slice(0, 500);
+          throwIfAborted(signal);
+          return output;
         }
 
         if (!client.chat) {
           throw new Error("OpenAI client does not provide the Chat Completions API");
         }
-        const response = await client.chat.completions.create({
-          model: opts.model,
-          ...selectChatCompletionTokenLimit(opts.model, 1024),
-          // Merge system content into user message for compatibility with local
-          // servers (e.g. MLX/llama.cpp) that don't support role:"system".
-          messages: [
-            { role: "user", content: `${LCM_SUMMARIZER_SYSTEM_PROMPT}\n\n${prompt}` },
-          ],
-        });
+        const response = await waitForAbortable(
+          Promise.resolve(invokeRequest(client.chat.completions.create.bind(client.chat.completions), {
+            model: opts.model,
+            ...selectChatCompletionTokenLimit(opts.model, 1024),
+            // Merge system content into user message for compatibility with local
+            // servers (e.g. MLX/llama.cpp) that don't support role:"system".
+            messages: [
+              { role: "user", content: `${LCM_SUMMARIZER_SYSTEM_PROMPT}\n\n${prompt}` },
+            ],
+          }, signal)),
+          signal,
+        );
 
         const textContent = response.choices[0]?.message?.content ?? "";
+        throwIfAborted(signal);
         return textContent || text.slice(0, 500);
       } catch (err: unknown) {
+        if (signal?.aborted) throw createAbortError(signal.reason);
+        if (isAbortError(err)) throw err;
         lastError = err;
         const attempts = attempt + 1;
         if (!isRetryableError(err)) throw terminalRequestError(err, opts, attempts, effectiveRequestPolicy);
         if (attempts < retry.maxAttempts) {
+          throwIfAborted(signal);
           const delay = Math.min(retry.maxDelayMs, retry.initialDelayMs * Math.pow(retry.multiplier, attempt));
-          await wait(delay);
+          await waitForAbortable(wait(delay, signal), signal);
+          throwIfAborted(signal);
         }
       }
     }
