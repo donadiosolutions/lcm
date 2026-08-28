@@ -48,7 +48,7 @@
     "lint": "eslint .",
     "release:verify": "npm test && npm run verify:consumer-topology && npm pack --dry-run",
     "test": "vitest run --dir test",
-    "test:ci": "vitest run --dir test --coverage --coverage.reporter=lcov --coverage.reporter=text --reporter=default --reporter=junit --outputFile=test-report.junit.xml",
+    "test:ci": "vitest run --dir test --coverage --coverage.reporter=lcov --coverage.reporter=text --reporter=default --reporter=junit",
     "test:postgresql": "npm run build && node scripts/postgresql-harness.mjs",
     "typecheck": "tsc --noEmit && tsc --project tsconfig.postgresql-conformance.json",
     "verify:consumer-topology": "node scripts/verify-consumer-topology.mjs",

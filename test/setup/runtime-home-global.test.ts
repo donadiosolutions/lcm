@@ -43,6 +43,70 @@ describe("Vitest runtime-home global lifecycle", () => {
     expect(removeDirectory).toHaveBeenCalledWith("/tmp/lcm-vitest-run-unique");
   });
 
+  it("gives concurrent runs distinct secure roots and tears down only their own root", () => {
+    const provide = vi.fn();
+    const roots = [
+      "/private/harness/lcm-vitest-run-first",
+      "/private/harness/lcm-vitest-run-second",
+    ];
+    const createDirectory = vi.fn(() => roots.shift()!);
+    const secureDirectory = vi.fn();
+    const removeDirectory = vi.fn();
+    const dependencies = {
+      createDirectory,
+      secureDirectory,
+      removeDirectory,
+      environment: { LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: "/private/harness" },
+    };
+
+    const firstTeardown = createRuntimeHomeRun({ provide }, dependencies);
+    const secondTeardown = createRuntimeHomeRun({ provide }, dependencies);
+
+    expect(createDirectory).toHaveBeenNthCalledWith(
+      1,
+      "/private/harness/lcm-vitest-run-",
+    );
+    expect(createDirectory).toHaveBeenNthCalledWith(
+      2,
+      "/private/harness/lcm-vitest-run-",
+    );
+    expect(secureDirectory).toHaveBeenNthCalledWith(
+      1,
+      "/private/harness/lcm-vitest-run-first",
+      0o700,
+    );
+    expect(secureDirectory).toHaveBeenNthCalledWith(
+      2,
+      "/private/harness/lcm-vitest-run-second",
+      0o700,
+    );
+    expect(provide).toHaveBeenNthCalledWith(
+      1,
+      RUNTIME_HOME_ROOT_CONTEXT,
+      "/private/harness/lcm-vitest-run-first",
+    );
+    expect(provide).toHaveBeenNthCalledWith(
+      2,
+      RUNTIME_HOME_ROOT_CONTEXT,
+      "/private/harness/lcm-vitest-run-second",
+    );
+
+    firstTeardown();
+    expect(removeDirectory).toHaveBeenCalledTimes(1);
+    expect(removeDirectory).toHaveBeenCalledWith(
+      "/private/harness/lcm-vitest-run-first",
+    );
+    expect(removeDirectory).not.toHaveBeenCalledWith(
+      "/private/harness/lcm-vitest-run-second",
+    );
+
+    secondTeardown();
+    expect(removeDirectory).toHaveBeenCalledTimes(2);
+    expect(removeDirectory).toHaveBeenLastCalledWith(
+      "/private/harness/lcm-vitest-run-second",
+    );
+  });
+
   it("nests a PostgreSQL run root beneath its harness-owned private directory", () => {
     const provide = vi.fn();
     const createDirectory = vi.fn(() => "/private/harness/lcm-vitest-run-unique");

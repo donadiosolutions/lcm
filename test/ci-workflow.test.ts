@@ -42,6 +42,7 @@ interface CiWorkflow {
       name: string;
       needs: string;
       "runs-on": string;
+      env?: Record<string, string>;
       steps: WorkflowStep[];
     };
     postgresql: {
@@ -303,6 +304,11 @@ describe("CI workflow", () => {
     const steps = workflow.jobs.core.steps;
     const testCiSteps = steps.filter((step) => step.run === "npm run test:ci");
     expect(testCiSteps).toHaveLength(1);
+    expect(testCiSteps[0]?.env).toEqual({
+      LCM_TEST_ARTIFACT_ROOT:
+        "${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}",
+    });
+    expect(workflow.jobs.core.env ?? {}).not.toHaveProperty("LCM_TEST_ARTIFACT_ROOT");
 
     const uploadSteps = steps.filter((step) => step.name === "Upload Vitest reports");
     expect(uploadSteps).toHaveLength(1);
@@ -315,10 +321,30 @@ describe("CI workflow", () => {
       uses: "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
       with: {
         name: "vitest-reports",
-        path: "coverage/\ntest-report.junit.xml\n",
+        path:
+          "${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/coverage/\n${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/test-report.junit.xml\n",
         "if-no-files-found": "warn",
       },
     });
+    expect(uploadStep?.with?.path).not.toContain("/cache/");
+  });
+
+  it("fails directly on legacy checkout artifacts while preserving the porcelain gate", () => {
+    const workspaceCheck = workflow.jobs.core.steps.find(
+      (step) => step.name === "Check for workspace artifacts",
+    );
+    const run = workspaceCheck?.run ?? "";
+
+    expect(run).toContain("git diff --exit-code");
+    expect(run).toMatch(
+      /if \[ -e coverage \] \|\| \[ -e test-report\.junit\.xml \]; then/u,
+    );
+    expect(run).toContain('echo "Tests or build left legacy checkout artifacts:"');
+    expect(run).toContain(
+      'UNTRACKED=$(git status --porcelain | grep "^??" | grep -vE "^\\?\\? (node_modules|dist|coverage)/|^\\?\\? test-report\\.junit\\.xml$" || true)',
+    );
+    expect(run).toContain("git status --porcelain");
+    expect(run).toContain("test-report.junit.xml");
   });
 
   it("runs the pinned Linux user-systemd integration with exact scoped cleanup", () => {

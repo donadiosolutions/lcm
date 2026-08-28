@@ -55,6 +55,8 @@ jobs:
 
       - name: Run tests
         run: npm run test:ci
+        env:
+          LCM_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Test GitHub policy modules
         run: node --test .github/scripts/*.test.mjs
@@ -65,8 +67,8 @@ jobs:
         with:
           name: vitest-reports
           path: |
-            coverage/
-            test-report.junit.xml
+            ${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/coverage/
+            ${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/test-report.junit.xml
           if-no-files-found: warn
 
       - name: Build
@@ -74,6 +76,12 @@ jobs:
 
       - name: Check for workspace artifacts
         run: |
+          if [ -e coverage ] || [ -e test-report.junit.xml ]; then
+            echo "Tests or build left legacy checkout artifacts:"
+            [ ! -e coverage ] || echo "coverage"
+            [ ! -e test-report.junit.xml ] || echo "test-report.junit.xml"
+            exit 1
+          fi
           git diff --exit-code
           UNTRACKED=$(git status --porcelain | grep "^??" | grep -vE "^\?\? (node_modules|dist|coverage)/|^\?\? test-report\.junit\.xml$" || true)
           if [ -n "$UNTRACKED" ]; then
