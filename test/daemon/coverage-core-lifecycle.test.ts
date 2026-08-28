@@ -446,6 +446,9 @@ describe("lifecycle procfs and parent warnings", () => {
     const dir = temp(); const procRoot = join(dir, "proc"); mkdirSync(procRoot);
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "31"); ensureAuthToken(join(dir, "daemon.token"));
     proc(procRoot, 31, "Uid:\t1000\nPPid:\t1\n");
+    // observeHttpHealth owns a real wall-clock deadline not controlled by
+    // _monotonicNowOverride, so pin performance.now for this 1 ms fixture.
+    vi.spyOn(performance, "now").mockReturnValue(0);
     const result = await ensureDaemon({
       port: 1, pidFilePath: pidPath, spawnTimeoutMs: 1, enforceUserManagerParent: true,
       expectedVersion: "1",
@@ -454,6 +457,7 @@ describe("lifecycle procfs and parent warnings", () => {
       _monotonicNowOverride: (): number => 0,
       _supervisorOverride: unavailableSupervisor(),
     });
+    expect(result.connected).toBe(true);
     expect(result.warning).toContain("not an LCM daemon");
   });
 });
