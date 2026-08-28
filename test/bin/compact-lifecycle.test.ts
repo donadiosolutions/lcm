@@ -9,6 +9,7 @@ import {
   installCompactSignalHandlers,
   isStrictInvocationControlSnapshot,
   proveCompactProviderWitnessGone,
+  proveOriginalDaemonGone,
 } from "../../bin/lcm.js";
 
 const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
@@ -28,6 +29,19 @@ function response(state: InvocationControlResponse["state"], activeCount = 0): I
 }
 
 describe("compact invocation lifecycle", () => {
+  it("proves an original daemon gone after either stop ownership or prior exit", () => {
+    const connectedReplacement = { connected: true, restarted: false, pid: 10 };
+    expect(proveOriginalDaemonGone(undefined, connectedReplacement)).toBe(false);
+    expect(proveOriginalDaemonGone(9, { ...connectedReplacement, restarted: true, stoppedPid: 9 })).toBe(true);
+    expect(proveOriginalDaemonGone(9, connectedReplacement, () => undefined)).toBe(false);
+    expect(proveOriginalDaemonGone(9, connectedReplacement, () => {
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    })).toBe(true);
+    expect(proveOriginalDaemonGone(9, connectedReplacement, () => {
+      throw Object.assign(new Error("unprobeable"), { code: "EPERM" });
+    })).toBe(false);
+  });
+
   it("selects read-only or reconciled provider witness proof by observed state", () => {
     const read = vi.fn();
     const reconcile = vi.fn();

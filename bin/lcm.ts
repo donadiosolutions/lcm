@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { argv, exit, stdin, stdout } from "node:process";
+import { argv, exit, kill as processKill, stdin, stdout } from "node:process";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -501,6 +501,22 @@ export type CompactManagedRestartResult = Readonly<{
   refusalReason?: unknown;
   warning?: string;
 }>;
+
+/** Prove the original daemon PID gone without requiring this restart to stop it. */
+export function proveOriginalDaemonGone(
+  originalPid: number | undefined,
+  restart: CompactManagedRestartResult,
+  killProcess: (pid: number, signal: 0) => void = processKill,
+): boolean {
+  if (originalPid === undefined) return false;
+  if (restart.restarted === true && restart.stoppedPid === originalPid) return true;
+  try {
+    killProcess(originalPid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | undefined)?.code === "ESRCH";
+  }
+}
 
 export type CompactDrainOptions = Readonly<{
   lifecycle: CompactInvocationLifecycle;
@@ -2374,7 +2390,7 @@ export async function runCli(
               });
             },
             proveOldInstanceGone: async ({ originalHealth: old, restart }) =>
-              old?.pid !== undefined && restart.restarted === true && restart.stoppedPid === old.pid,
+              proveOriginalDaemonGone(old?.pid, restart),
             proveProviderWitnessGone: async ({ daemonInstanceId, invocationId }) =>
               daemonInstanceId !== undefined
                 && await proveProviderProcessesGone(daemonInstanceId, invocationId),

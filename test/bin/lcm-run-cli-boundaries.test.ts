@@ -3,6 +3,9 @@ import { Command } from "commander";
 
 const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
+  killProcess: vi.fn((_pid: number, _signal: 0): never => {
+    throw Object.assign(new Error("process absent"), { code: "ESRCH" });
+  }),
   ensureDaemon: vi.fn(async () => ({ connected: true, spawned: false, restartedForParent: false, pid: 42 })),
   restartDaemon: vi.fn(async () => ({ connected: true, restarted: true, spawned: false, pid: 42 })),
   createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }), stop: vi.fn() })),
@@ -104,6 +107,7 @@ const fakeStdin = vi.hoisted(() => ({ isTTY: true, destroy: vi.fn(), on: vi.fn()
 vi.mock("node:process", async importOriginal => ({
   ...(await importOriginal<typeof import("node:process")>()),
   exit: state.exit,
+  kill: state.killProcess,
   stdin: fakeStdin,
 }));
 vi.mock("node:fs", async importOriginal => ({
@@ -276,6 +280,9 @@ async function invoke(args: string[]): Promise<Error | undefined> {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  state.killProcess.mockImplementation((_pid: number, _signal: 0): never => {
+    throw Object.assign(new Error("process absent"), { code: "ESRCH" });
+  });
   fakeStdin.isTTY = true;
   state.ensureDaemon.mockResolvedValue({ connected: true, spawned: false, restartedForParent: false, pid: 42 });
   state.restartDaemon.mockResolvedValue({ connected: true, restarted: true, spawned: false, pid: 42 });
@@ -1348,18 +1355,16 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     vi.useRealTimers();
   });
 
-  it("checks every managed restart old-instance identity predicate arm", async () => {
+  it.each([
+    { pid: 9, restarted: false, stoppedPid: undefined },
+    { pid: 9, restarted: true, stoppedPid: undefined },
+    { pid: 9, restarted: true, stoppedPid: 8 },
+    { pid: 9, restarted: true, stoppedPid: 9 },
+  ] as const)("checks managed restart old-instance identity for %#", async (scenario) => {
     vi.useFakeTimers();
-    const cases = [
-      { pid: undefined, restarted: true, stoppedPid: 9 },
-      { pid: 9, restarted: false, stoppedPid: undefined },
-      { pid: 9, restarted: true, stoppedPid: undefined },
-      { pid: 9, restarted: true, stoppedPid: 8 },
-      { pid: 9, restarted: true, stoppedPid: 9 },
-    ] as const;
-
-    for (const scenario of cases) {
+    try {
       state.health.mockReset();
+      state.cancelInvocation.mockReset();
       state.health
         .mockResolvedValueOnce({
           status: "healthy", version: "1.4.2", storageBackend: "sqlite",
@@ -1402,13 +1407,9 @@ describe("runCli scanning and portable knowledge boundaries", () => {
       await vi.advanceTimersByTimeAsync(1_000);
       await expect(pending).resolves.toBeUndefined();
       expect(state.restartDaemon).toHaveBeenCalledOnce();
-      state.restartDaemon.mockClear();
-      state.cancelInvocation.mockClear();
-      state.health.mockReset();
-      state.batchSignal = undefined;
-      process.exitCode = undefined;
+    } finally {
+      vi.useRealTimers();
     }
-    vi.useRealTimers();
   });
 
   it("covers TTY all-provider import directory filtering", async () => {
