@@ -1,16 +1,55 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   PostgreSqlRuntime,
   POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
 } from "../../src/storage/postgresql/runtime.js";
+import { verifyPostgreSqlRuntimeSchema } from "../../src/storage/postgresql/runtime-readiness.js";
 import {
   assertHarnessReady,
   harnessEnvironment,
+  type PostgreSqlTestDatabase,
   settings,
   withPostgreSqlTestDatabase,
 } from "./harness.js";
 
 beforeAll(assertHarnessReady);
+
+const REQUIRED_RUNTIME_GRANT_SCRIPTS = [
+  "postgresql-runtime-readiness-grants.sql",
+  "postgresql-runtime-identity-grants.sql",
+  "postgresql-runtime-conversation-grants.sql",
+  "postgresql-runtime-summary-context-grants.sql",
+  "postgresql-runtime-memory-grants.sql",
+  "postgresql-runtime-search-grants.sql",
+  "postgresql-runtime-coordination-grants.sql",
+] as const;
+
+async function applyRuntimeGrantScripts(
+  database: PostgreSqlTestDatabase,
+): Promise<void> {
+  const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+  try {
+    for (const script of REQUIRED_RUNTIME_GRANT_SCRIPTS) {
+      const template = readFileSync(
+        join(process.cwd(), "src", "storage", "postgresql", "reference", script),
+        "utf8",
+      );
+      const sql = template
+        .split("\n")
+        .filter((line) => !line.startsWith("\\"))
+        .join("\n")
+        .replaceAll(':"lcm_runtime_role"', '"lcm_test_runtime"');
+      await administrator.query({ text: sql }, {
+        domain: "factory",
+        operation: `applyRuntimeGrantScript:${script}`,
+      });
+    }
+  } finally {
+    await administrator.close();
+  }
+}
 
 describe("PostgreSQL 18 runtime", () => {
   it("uses verified TLS, exact major version, UTC, and the least-privilege role", async () => {
@@ -99,6 +138,62 @@ describe("PostgreSQL 18 runtime", () => {
         } finally {
           await admin.close();
         }
+      }
+    });
+  });
+
+  it("pins runtime deparser settings without leaking hostile pooled GUCs", async () => {
+    await withPostgreSqlTestDatabase("runtime-hostile-deparsers", async (database) => {
+      await applyRuntimeGrantScripts(database);
+      const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+      try {
+        await administrator.query({
+          text: "CREATE SCHEMA hostile_deparser",
+        }, { domain: "factory", operation: "createHostileDeparserSchema" });
+        await administrator.query({
+          text: "GRANT USAGE ON SCHEMA hostile_deparser TO lcm_test_runtime",
+        }, { domain: "factory", operation: "grantHostileDeparserSchema" });
+      } finally {
+        await administrator.close();
+      }
+
+      const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }), {
+        ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+        buildConfig: (connectionSettings) => ({
+          ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(connectionSettings),
+          options: "-c timezone=UTC -c search_path=hostile_deparser,pg_catalog,public -c quote_all_identifiers=on",
+        }),
+      });
+      try {
+        await expect(runtime.query<{ search_path: string }>({
+          text: "SHOW search_path",
+        }, { domain: "factory", operation: "readHostileDeparserSearchPathBeforeReadiness" })).resolves.toMatchObject({
+          rows: [{ search_path: "hostile_deparser,pg_catalog,public" }],
+        });
+        await expect(runtime.query<{ quote_all_identifiers: string }>({
+          text: "SHOW quote_all_identifiers",
+        }, { domain: "factory", operation: "readHostileDeparserQuotingBeforeReadiness" })).resolves.toMatchObject({
+          rows: [{ quote_all_identifiers: "on" }],
+        });
+
+        await expect(verifyPostgreSqlRuntimeSchema(runtime, {
+          expectedOwner: "lcm_test_migrator",
+        })).resolves.toMatchObject({
+          runtimeRole: "lcm_test_runtime",
+        });
+
+        await expect(runtime.query<{ search_path: string }>({
+          text: "SHOW search_path",
+        }, { domain: "factory", operation: "readHostileDeparserSearchPathAfterReadiness" })).resolves.toMatchObject({
+          rows: [{ search_path: "hostile_deparser,pg_catalog,public" }],
+        });
+        await expect(runtime.query<{ quote_all_identifiers: string }>({
+          text: "SHOW quote_all_identifiers",
+        }, { domain: "factory", operation: "readHostileDeparserQuotingAfterReadiness" })).resolves.toMatchObject({
+          rows: [{ quote_all_identifiers: "on" }],
+        });
+      } finally {
+        await runtime.close();
       }
     });
   });

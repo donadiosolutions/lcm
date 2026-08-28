@@ -832,6 +832,54 @@ async function expectReadinessFailure(
 }
 
 describe("PostgreSQL runtime schema and grant readiness", () => {
+  const deparserOperations = [
+    "inspectRequiredExtensionFunctions",
+    "inspectRequiredExtensionOperator",
+    "inspectRequiredGinTrgmOperatorClass",
+    "inspectRequiredGinTrgmOperators",
+    "inspectRequiredGinTrgmSupportFunctions",
+    "inspectSchemaOwnership",
+    "inspectFunctionAcl",
+    "inspectSchemaDefinitions",
+  ] as const;
+
+  it("pins and semantically consumes deparser settings in every sensitive query", async () => {
+    const fake = readyExecutor();
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).resolves.toBeDefined();
+
+    const sensitiveCalls = /pg_catalog\.(?:pg_get_[a-z_]+|format_type|quote_ident)\s*\(/gu;
+    const settingCte = /runtime_deparser_settings\s+AS\s+MATERIALIZED\s*\(\s*SELECT\s+pg_catalog\.set_config\(\s*'search_path'\s*,\s*'pg_catalog, public'\s*,\s*true\s*\)\s+AS\s+search_path\s*,\s*pg_catalog\.set_config\(\s*'quote_all_identifiers'\s*,\s*'off'\s*,\s*true\s*\)\s+AS\s+quote_all_identifiers\s*\)/u;
+    for (const operation of deparserOperations) {
+      const calls = fake.queries.filter(({ options }) => options.operation === operation);
+      expect(calls, operation).toHaveLength(1);
+      const text = String((calls[0]?.config as { readonly text?: unknown } | undefined)?.text ?? "");
+      expect(text, operation).toMatch(settingCte);
+      expect(text, operation).toContain("CROSS JOIN runtime_deparser_settings AS settings");
+
+      const matches = [...text.matchAll(sensitiveCalls)];
+      expect(matches.length, operation).toBeGreaterThan(0);
+      for (const match of matches) {
+        const callOffset = match.index ?? -1;
+        expect(callOffset, operation).toBeGreaterThanOrEqual(0);
+        const preceding = text.slice(0, callOffset);
+        const caseOffset = preceding.lastIndexOf("CASE");
+        const followingEnd = text.indexOf("END", callOffset);
+        expect(caseOffset, `${operation} guard start`).toBeGreaterThanOrEqual(0);
+        expect(followingEnd, `${operation} guard end`).toBeGreaterThan(callOffset);
+        const guard = text.slice(caseOffset, followingEnd + 3);
+        expect(guard, `${operation} search_path guard`).toMatch(
+          /settings\.search_path\s+OPERATOR\(pg_catalog\.=\)\s*'pg_catalog, public'/u,
+        );
+        expect(guard, `${operation} quote_all_identifiers guard`).toMatch(
+          /settings\.quote_all_identifiers\s+OPERATOR\(pg_catalog\.=\)\s*'off'/u,
+        );
+        expect(guard, `${operation} non-elidable fallback`).toMatch(/ELSE\s+NULL/u);
+      }
+    }
+  });
+
   it("exposes an immutable versioned privilege manifest and verifier seam", () => {
     expect(POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.version).toBeGreaterThan(0);
     expect(Object.isFrozen(POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST)).toBe(true);
@@ -1579,7 +1627,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     expect(constraintInventory).toContain("ANY ($3::pg_catalog.text[])");
     expect(constraintInventory).toContain("OR (");
     expect(constraintInventory).not.toContain("ANY ($2::pg_catalog.text[])");
-    const indexInventory = section("WITH actual_indexes AS", "actual_triggers AS");
+    const indexInventory = section("actual_indexes AS", "actual_triggers AS");
     expect(indexInventory).toContain("index_metadata.indisvalid AS is_valid");
     expect(indexInventory).toContain("index_metadata.indisready");
     expect(indexInventory).toContain("index_metadata.indislive");

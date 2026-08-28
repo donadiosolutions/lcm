@@ -28,12 +28,33 @@ export class PostgreSqlSearchConfigurationPreflightError extends StorageOperatio
   }
 }
 
+function runtimeDeparserSettingsSql(): string {
+  return `runtime_deparser_settings AS MATERIALIZED (
+             SELECT pg_catalog.set_config(
+                      'search_path', 'pg_catalog, public', true
+                    ) AS search_path,
+                    pg_catalog.set_config(
+                      'quote_all_identifiers', 'off', true
+                    ) AS quote_all_identifiers
+           )`;
+}
+
+function guardedRuntimeDeparserSql(expression: string): string {
+  return `CASE
+            WHEN settings.search_path OPERATOR(pg_catalog.=) 'pg_catalog, public'
+             AND settings.quote_all_identifiers OPERATOR(pg_catalog.=) 'off'
+              THEN ${expression}
+            ELSE NULL
+          END`;
+}
+
 export async function inspectPostgreSqlSearchConfiguration(
   executor: PostgreSqlQueryExecutor,
   options: { readonly operation?: string; readonly signal?: AbortSignal } = {},
 ): Promise<PostgreSqlSearchConfigurationStatus> {
   const result = await executor.query<SearchConfigurationRow>({
-    text: `WITH target AS (
+      text: `WITH ${runtimeDeparserSettingsSql()},
+           target AS (
              SELECT configuration.oid,
                     configuration.cfgparser,
                     configuration.cfgowner,
@@ -69,7 +90,7 @@ export async function inspectPostgreSqlSearchConfiguration(
                     pg_catalog.count(DISTINCT oid) AS configuration_count,
                     pg_catalog.min(cfgparser) AS parser_oid,
                     pg_catalog.string_agg(
-                      pg_catalog.format(
+                      ${guardedRuntimeDeparserSql(`pg_catalog.format(
                         '%s:%s:%I.%I:%s:%s',
                         maptokentype,
                         mapseqno,
@@ -77,16 +98,19 @@ export async function inspectPostgreSqlSearchConfiguration(
                         dictname,
                         dicttemplate,
                         dictionary_options
-                      ),
+                      )`)},
                       E'\\n' ORDER BY maptokentype, mapseqno
                     ) FILTER (WHERE maptokentype IS NOT NULL) AS mappings,
                     pg_catalog.bool_and(config_owned AND dictionary_owned)
                       AS configuration_owned
              FROM mapping_contract
+             CROSS JOIN runtime_deparser_settings AS settings
            ),
            function_contract AS (
              SELECT pg_catalog.count(*) AS function_count,
-                    pg_catalog.min(pg_catalog.pg_get_functiondef(procedure.oid))
+                    pg_catalog.min(${guardedRuntimeDeparserSql(
+                      "pg_catalog.pg_get_functiondef(procedure.oid)",
+                    )})
                       AS function_definition,
                     pg_catalog.bool_and(
                       procedure.proowner OPERATOR(pg_catalog.=) namespace.nspowner
@@ -133,6 +157,7 @@ export async function inspectPostgreSqlSearchConfiguration(
              FROM pg_catalog.pg_proc AS procedure
              JOIN pg_catalog.pg_namespace AS namespace
                ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
+             CROSS JOIN runtime_deparser_settings AS settings
              WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                AND procedure.proname OPERATOR(pg_catalog.=) 'normalize_search_text'
                AND procedure.proargtypes OPERATOR(pg_catalog.=)

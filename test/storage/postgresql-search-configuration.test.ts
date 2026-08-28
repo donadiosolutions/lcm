@@ -48,6 +48,24 @@ describe("PostgreSQL text-search configuration readiness", () => {
       signal: undefined,
     });
     const inspectionSql = seam.query.mock.calls[0]?.[0].text ?? "";
+    expect(inspectionSql).toMatch(
+      /runtime_deparser_settings\s+AS\s+MATERIALIZED\s*\(\s*SELECT\s+pg_catalog\.set_config\(\s*'search_path'\s*,\s*'pg_catalog, public'\s*,\s*true\s*\)\s+AS\s+search_path\s*,\s*pg_catalog\.set_config\(\s*'quote_all_identifiers'\s*,\s*'off'\s*,\s*true\s*\)\s+AS\s+quote_all_identifiers\s*\)/u,
+    );
+    expect(inspectionSql).toContain("CROSS JOIN runtime_deparser_settings AS settings");
+    const functionDefinitionOffset = inspectionSql.indexOf("pg_catalog.pg_get_functiondef");
+    expect(functionDefinitionOffset).toBeGreaterThanOrEqual(0);
+    const functionGuardStart = inspectionSql.lastIndexOf("CASE", functionDefinitionOffset);
+    const functionGuardEnd = inspectionSql.indexOf("END", functionDefinitionOffset);
+    expect(functionGuardStart).toBeGreaterThanOrEqual(0);
+    expect(functionGuardEnd).toBeGreaterThan(functionDefinitionOffset);
+    const functionGuard = inspectionSql.slice(functionGuardStart, functionGuardEnd + 3);
+    expect(functionGuard).toMatch(
+      /settings\.search_path\s+OPERATOR\(pg_catalog\.=\)\s*'pg_catalog, public'/u,
+    );
+    expect(functionGuard).toMatch(
+      /settings\.quote_all_identifiers\s+OPERATOR\(pg_catalog\.=\)\s*'off'/u,
+    );
+    expect(functionGuard).toMatch(/ELSE\s+NULL/u);
     for (const catalogField of [
       "cfgparser",
       "pg_catalog.pg_ts_config",
