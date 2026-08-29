@@ -17,7 +17,7 @@ import {
 } from "../staged-postgresql.js";
 import { sanitizeError } from "../safe-error.js";
 import type { BackendPublicationLockToken } from "../../storage/backend-publication.js";
-import { createAbortError, throwIfAborted } from "../cancellation.js";
+import { createAbortError } from "../cancellation.js";
 
 interface AsyncClosable {
   close(): Promise<void> | void;
@@ -52,6 +52,15 @@ export type ProjectStorageRequest = Readonly<{
 }>;
 
 type ReleasePermit = Readonly<{ release: () => void }>;
+
+/** Keep the route's public cancellation response stable across AbortSignal reasons. */
+function createRouteAbortError(): ReturnType<typeof createAbortError> {
+  return createAbortError(new Error("request cancelled"));
+}
+
+function throwIfRouteAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw createRouteAbortError();
+}
 
 /** Keep request-scoped resources open until every acquired commit releases. */
 export function createCommitCloseBarrier(): Readonly<{
@@ -139,13 +148,13 @@ export async function withProjectStorage<T>(
   operation: ProjectStorageOperation<T>,
 ): Promise<T | null> {
   const signal = request.context?.signal ?? new AbortController().signal;
-  throwIfAborted(signal);
+  throwIfRouteAborted(signal);
   let activeFactory = request.factory;
   let ownedFactory: StorageBackendFactory | undefined;
 
   const state = { openPending: false };
   const run = async (publicationLockToken?: BackendPublicationLockToken): Promise<T | null> => {
-    throwIfAborted(signal);
+    throwIfRouteAborted(signal);
     if (activeFactory === undefined) {
       activeFactory = await createStorageBackendFactory(
         request.config.storage,
@@ -183,13 +192,13 @@ export async function withProjectStorage<T>(
       } finally {
         state.openPending = false;
       }
-      throwIfAborted(signal);
+      throwIfRouteAborted(signal);
       if (project === undefined) return null;
 
       signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted) {
         onAbort();
-        throw createAbortError(signal.reason);
+        throw createRouteAbortError();
       }
       const result = await operation(project, signal);
       return result;
@@ -228,7 +237,7 @@ export async function withProjectStorage<T>(
     };
     const onAbort = (): void => {
       if (!state.openPending) return;
-      settle(() => reject(createAbortError(signal.reason)));
+      settle(() => reject(createRouteAbortError()));
     };
     signal.addEventListener("abort", onAbort, { once: true });
     settledExecution.then(

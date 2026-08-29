@@ -124,7 +124,7 @@ describe("daemon storage identity routing", () => {
       canonical: cwd,
       remoteProjectId: PROJECT_ID,
       machineId: MACHINE_ID,
-    }, undefined);
+    }, undefined, expect.any(AbortSignal));
     expect(response.writeHead).toHaveBeenCalledWith(200, {
       "Content-Type": "application/json",
     });
