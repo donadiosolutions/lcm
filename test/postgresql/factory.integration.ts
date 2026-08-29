@@ -346,10 +346,15 @@ interface ExtensionOperatorState {
 const REQUIRED_SIMILARITY_OPERATOR = "public.%(pg_catalog.text, pg_catalog.text)";
 const FOREIGN_SIMILARITY_OPERATOR_FUNCTION =
   "public.lcm_test_foreign_similarity_operator(pg_catalog.text, pg_catalog.text)";
+const REQUIRED_WORD_SIMILARITY_COMMUTATOR_OPERATOR =
+  "public.<%(pg_catalog.text, pg_catalog.text)";
+const FOREIGN_WORD_SIMILARITY_OPERATOR_FUNCTION =
+  "public.lcm_test_foreign_word_similarity_operator(pg_catalog.text, pg_catalog.text)";
 
 async function inspectExtensionOperatorState(
   administrator: PostgreSqlRuntime,
   operation: string,
+  operatorName = "%",
 ): Promise<ExtensionOperatorState | null> {
   const result = await administrator.query({
     text: `SELECT catalog_operator.oid::pg_catalog.text AS oid,
@@ -449,9 +454,10 @@ async function inspectExtensionOperatorState(
            LEFT JOIN pg_catalog.pg_roles AS extension_owner
              ON extension_owner.oid OPERATOR(pg_catalog.=) extension.extowner
            WHERE namespace.nspname OPERATOR(pg_catalog.=) 'public'
-             AND catalog_operator.oprname OPERATOR(pg_catalog.=) '%'
+             AND catalog_operator.oprname OPERATOR(pg_catalog.=) $1
              AND catalog_operator.oprleft OPERATOR(pg_catalog.=) 'pg_catalog.text'::pg_catalog.regtype
              AND catalog_operator.oprright OPERATOR(pg_catalog.=) 'pg_catalog.text'::pg_catalog.regtype`,
+    values: [operatorName],
   }, { domain: "factory", operation });
   if (result.rows.length === 0) return null;
   const row = result.rows[0];
@@ -1819,6 +1825,208 @@ describe("PostgreSQL 18 project storage factory", () => {
 
       expect(restoredOperator?.definition).toEqual(authoritativeOperator.definition);
       expect(restoredFunction).toEqual(authoritativeFunction);
+    });
+  });
+
+  it("rejects a replaced indirect pg_trgm operator with canonical direct graph", async () => {
+    await withPostgreSqlTestDatabase("factory-indirect-pg-trgm-operator", async (database) => {
+      await applyAllRuntimeGrants(database);
+      const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-factory-indirect-operator-"));
+      const administrator = new PostgreSqlRuntime(settings(database.adminUrl, { poolMax: 1 }));
+      const authoritativeIndexes = await inspectGinTrgmIndexes(
+        administrator,
+        "captureAuthoritativeIndirectOperatorIndexes",
+      );
+      const authoritativeIndirect = await inspectExtensionOperatorState(
+        administrator,
+        "captureAuthoritativeIndirectOperator",
+        "<%",
+      );
+      const authoritativeDirect = await inspectExtensionOperatorState(
+        administrator,
+        "captureAuthoritativeReferringOperator",
+        "%>",
+      );
+      let baselineFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let tamperedFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let restoredFactory: Awaited<ReturnType<
+        typeof createPostgreSqlStorageBackendFactoryForTesting
+      >> | undefined;
+      let factoryError: unknown;
+      let mutationStarted = false;
+      let restoredIndirect: ExtensionOperatorState | null | undefined;
+      try {
+        expect(authoritativeIndirect?.definition).toMatchObject({
+          schemaName: "public",
+          operatorName: "<%",
+          operatorKind: "b",
+          leftType: "text",
+          rightType: "text",
+          resultType: "boolean",
+          extensionName: "pg_trgm",
+          implementationIdentity: "public.word_similarity_op(text, text)",
+          dependencyCount: 3,
+          extensionDependencyCount: 1,
+          implementationDependencyCount: 1,
+          namespaceDependencyCount: 1,
+        });
+        if (authoritativeIndirect === null || authoritativeDirect === null) {
+          throw new Error("missing authoritative indirect/direct operator fixture state");
+        }
+
+        baselineFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        );
+        await baselineFactory.close();
+        baselineFactory = undefined;
+
+        mutationStarted = true;
+        await administrator.query({
+          text: `ALTER EXTENSION pg_trgm DROP OPERATOR ${REQUIRED_WORD_SIMILARITY_COMMUTATOR_OPERATOR}`,
+        }, { domain: "factory", operation: "detachIndirectOperatorForReplacement" });
+        await administrator.query({
+          text: `DROP OPERATOR ${REQUIRED_WORD_SIMILARITY_COMMUTATOR_OPERATOR}`,
+        }, { domain: "factory", operation: "dropAuthoritativeIndirectOperator" });
+        await administrator.query({
+          text: `CREATE FUNCTION ${FOREIGN_WORD_SIMILARITY_OPERATOR_FUNCTION}
+                 RETURNS pg_catalog.bool
+                 LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+                 AS $$ SELECT true $$`,
+        }, { domain: "factory", operation: "createForeignIndirectOperatorFunction" });
+        await administrator.query({
+          text: `CREATE OPERATOR public.<% (
+                   LEFTARG = pg_catalog.text,
+                   RIGHTARG = pg_catalog.text,
+                   FUNCTION = public.lcm_test_foreign_word_similarity_operator,
+                   COMMUTATOR = OPERATOR(public.%>),
+                   RESTRICT = pg_catalog.matchingsel,
+                   JOIN = pg_catalog.matchingjoinsel
+                 )`,
+        }, { domain: "factory", operation: "createReplacedIndirectOperator" });
+        await administrator.query({
+          text: `ALTER EXTENSION pg_trgm ADD OPERATOR ${REQUIRED_WORD_SIMILARITY_COMMUTATOR_OPERATOR}`,
+        }, { domain: "factory", operation: "reattachReplacedIndirectOperator" });
+
+        const tamperedIndirect = await inspectExtensionOperatorState(
+          administrator,
+          "inspectReplacedIndirectOperator",
+          "<%",
+        );
+        const unchangedDirect = await inspectExtensionOperatorState(
+          administrator,
+          "inspectUnchangedReferringOperator",
+          "%>",
+        );
+        const tamperedIndexes = await inspectGinTrgmIndexes(
+          administrator,
+          "inspectIndirectOperatorIndexes",
+        );
+        expect(tamperedIndirect?.definition.implementationIdentity).toBe(
+          "public.lcm_test_foreign_word_similarity_operator(text, text)",
+        );
+        expect(unchangedDirect?.definition).toEqual(authoritativeDirect.definition);
+        expect(tamperedIndexes).toEqual(authoritativeIndexes);
+        expect(ginTrgmIndexFingerprint(tamperedIndexes)).toBe(
+          ginTrgmIndexFingerprint(authoritativeIndexes),
+        );
+
+        tamperedFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        ).catch((error: unknown) => {
+          factoryError = error;
+          return undefined;
+        });
+        await tamperedFactory?.close();
+        tamperedFactory = undefined;
+        await administrator.query({
+          text: `ALTER EXTENSION pg_trgm DROP OPERATOR ${REQUIRED_WORD_SIMILARITY_COMMUTATOR_OPERATOR}`,
+        }, { domain: "factory", operation: "detachReplacedIndirectOperatorForRestore" });
+        await administrator.query({
+          text: `DROP OPERATOR IF EXISTS ${REQUIRED_WORD_SIMILARITY_COMMUTATOR_OPERATOR}`,
+        }, { domain: "factory", operation: "dropReplacedIndirectOperator" });
+        await administrator.query({
+          text: `DROP FUNCTION IF EXISTS ${FOREIGN_WORD_SIMILARITY_OPERATOR_FUNCTION}`,
+        }, { domain: "factory", operation: "dropForeignIndirectOperatorFunction" });
+        await administrator.query({
+          text: `CREATE OPERATOR public.<% (
+                   LEFTARG = pg_catalog.text,
+                   RIGHTARG = pg_catalog.text,
+                   FUNCTION = public.word_similarity_op,
+                   COMMUTATOR = OPERATOR(public.%>),
+                   RESTRICT = pg_catalog.matchingsel,
+                   JOIN = pg_catalog.matchingjoinsel
+                 )`,
+        }, { domain: "factory", operation: "restoreAuthoritativeIndirectOperator" });
+        await administrator.query({
+          text: `ALTER EXTENSION pg_trgm ADD OPERATOR ${REQUIRED_WORD_SIMILARITY_COMMUTATOR_OPERATOR}`,
+        }, { domain: "factory", operation: "restoreIndirectOperatorMembership" });
+        restoredIndirect = await inspectExtensionOperatorState(
+          administrator,
+          "inspectRestoredIndirectOperator",
+          "<%",
+        );
+        const restoredIndexes = await inspectGinTrgmIndexes(
+          administrator,
+          "inspectRestoredIndirectOperatorIndexes",
+        );
+        expect(restoredIndirect?.definition).toEqual(authoritativeIndirect.definition);
+        expect(restoredIndexes).toEqual(authoritativeIndexes);
+        restoredFactory = await createPostgreSqlStorageBackendFactoryForTesting(
+          factoryConfig(database),
+          homeDir,
+        );
+        await restoredFactory.close();
+        restoredFactory = undefined;
+        expect(factoryError).toMatchObject({
+          code: "STORAGE_INITIALIZATION_FAILED",
+          backend: "postgresql",
+          operation: "createFactory",
+        });
+        expect(JSON.stringify(factoryError ?? null)).not.toContain(
+          "lcm_test_foreign_word_similarity_operator",
+        );
+      } finally {
+        try {
+          await baselineFactory?.close().catch(() => undefined);
+          await tamperedFactory?.close().catch(() => undefined);
+          await restoredFactory?.close().catch(() => undefined);
+          if (mutationStarted && restoredIndirect === undefined && authoritativeIndirect !== null) {
+            await administrator.query({
+              text: `ALTER EXTENSION pg_trgm DROP OPERATOR ${REQUIRED_WORD_SIMILARITY_COMMUTATOR_OPERATOR}`,
+            }, { domain: "factory", operation: "detachFinallyReplacedIndirectOperator" });
+            await administrator.query({
+              text: `DROP OPERATOR IF EXISTS ${REQUIRED_WORD_SIMILARITY_COMMUTATOR_OPERATOR}`,
+            }, { domain: "factory", operation: "dropFinallyReplacedIndirectOperator" });
+            await administrator.query({
+              text: `DROP FUNCTION IF EXISTS ${FOREIGN_WORD_SIMILARITY_OPERATOR_FUNCTION}`,
+            }, { domain: "factory", operation: "dropFinallyForeignIndirectOperatorFunction" });
+            await administrator.query({
+              text: `CREATE OPERATOR public.<% (
+                       LEFTARG = pg_catalog.text,
+                       RIGHTARG = pg_catalog.text,
+                       FUNCTION = public.word_similarity_op,
+                       COMMUTATOR = OPERATOR(public.%>),
+                       RESTRICT = pg_catalog.matchingsel,
+                       JOIN = pg_catalog.matchingjoinsel
+                     )`,
+            }, { domain: "factory", operation: "restoreFinallyIndirectOperator" });
+            await administrator.query({
+              text: `ALTER EXTENSION pg_trgm ADD OPERATOR ${REQUIRED_WORD_SIMILARITY_COMMUTATOR_OPERATOR}`,
+            }, { domain: "factory", operation: "restoreFinallyIndirectOperatorMembership" });
+          }
+        } finally {
+          await administrator.close();
+          rmSync(homeDir, { recursive: true, force: true });
+        }
+      }
+
+      expect(restoredIndirect?.definition).toEqual(authoritativeIndirect.definition);
     });
   });
 

@@ -186,6 +186,15 @@ internal dependency, and owning table/column. Migration transactions pin
 every setting-sensitive runtime readiness statement also pin
 `search_path = pg_catalog, public` transaction-locally before catalog
 deparsing or type formatting; these settings do not leak into pooled sessions.
+The pg_trgm readiness preflight closes the complete operator trust graph: it
+authenticates each direct `gin_trgm_ops` mapping and then follows every
+non-direct commutator and negator edge to its exact operator implementation,
+estimator procedures, reciprocal pointer, extension membership, extension
+owner, and dependency provenance. Built-in comparison operators are checked
+with their null extension evidence and zero extension dependencies. Any
+missing, duplicate, redirected, foreign-owned, or dependency-drifted indirect
+edge fails closed as a sanitized extension-preflight error, without exposing
+catalog identities or connection details to callers.
 Any additional valid,
 ready, and live index, non-internal trigger, supported constraint, generated
 column, or ordinary column attached to a managed table, any foreign key

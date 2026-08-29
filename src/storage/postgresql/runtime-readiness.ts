@@ -84,6 +84,21 @@ interface RequiredGinTrgmOperatorMapping {
   readonly canHash: boolean;
 }
 
+interface RequiredGinTrgmIndirectOperator {
+  readonly strategyNumber: number;
+  readonly referringOperatorIdentity: string;
+  readonly referenceKind: "commutator" | "negator";
+  readonly referencedOperatorIdentity: string;
+  readonly implementationIdentity: string;
+  readonly commutatorIdentity: string | null;
+  readonly negatorIdentity: string | null;
+  readonly restrictionIdentity: string;
+  readonly joinIdentity: string;
+  readonly extension: "pg_trgm" | null;
+  readonly canMerge: boolean;
+  readonly canHash: boolean;
+}
+
 interface RequiredGinTrgmSupportFunction {
   readonly supportNumber: number;
   readonly functionIdentity: string;
@@ -530,6 +545,36 @@ const REQUIRED_GIN_TRGM_FUNCTION_IMPLEMENTATIONS = [
     returnType: "double precision",
     volatility: "s",
   })),
+  ...[
+    ["pg_catalog.textnlike(text, text)", "textnlike", false],
+    ["pg_catalog.texticnlike(text, text)", "texticnlike", false],
+    ["pg_catalog.textregexne(text, text)", "textregexne", false],
+    ["pg_catalog.texticregexne(text, text)", "texticregexne", false],
+    ["pg_catalog.textne(text, text)", "textne", true],
+  ].map(([functionIdentity, symbol, leakproof]) => internalFunctionImplementation({
+    functionIdentity: functionIdentity as string,
+    symbol: symbol as string,
+    returnType: "boolean",
+    volatility: "i",
+    leakproof: leakproof as boolean,
+  })),
+  ...[
+    ["nlikesel", "integer"],
+    ["nlikejoinsel", "smallint, internal"],
+    ["icnlikesel", "integer"],
+    ["icnlikejoinsel", "smallint, internal"],
+    ["regexnesel", "integer"],
+    ["regexnejoinsel", "smallint, internal"],
+    ["icregexnesel", "integer"],
+    ["icregexnejoinsel", "smallint, internal"],
+    ["neqsel", "integer"],
+    ["neqjoinsel", "smallint, internal"],
+  ].map(([symbol, finalArguments]) => internalFunctionImplementation({
+    functionIdentity: `pg_catalog.${symbol}(internal, oid, internal, ${finalArguments})`,
+    symbol: symbol!,
+    returnType: "double precision",
+    volatility: "s",
+  })),
 ] as const satisfies readonly RequiredFunctionImplementation[];
 
 const REQUIRED_TRUSTED_FUNCTION_IMPLEMENTATIONS = [
@@ -673,6 +718,31 @@ const REQUIRED_GIN_TRGM_SUPPORT_FUNCTIONS = [
     dependencyKind: "family",
   },
 ] as const satisfies readonly RequiredGinTrgmSupportFunction[];
+
+const REQUIRED_GIN_TRGM_INDIRECT_OPERATORS = [
+  { strategyNumber: 7, referringOperatorIdentity: "public.%>(text, text)", referenceKind: "commutator", referencedOperatorIdentity: "public.<%(text, text)", implementationIdentity: "public.word_similarity_op(text, text)", commutatorIdentity: "public.%>(text, text)", negatorIdentity: null, restrictionIdentity: "pg_catalog.matchingsel(internal, oid, internal, integer)", joinIdentity: "pg_catalog.matchingjoinsel(internal, oid, internal, smallint, internal)", extension: "pg_trgm", canMerge: false, canHash: false },
+  { strategyNumber: 9, referringOperatorIdentity: "public.%>>(text, text)", referenceKind: "commutator", referencedOperatorIdentity: "public.<<%(text, text)", implementationIdentity: "public.strict_word_similarity_op(text, text)", commutatorIdentity: "public.%>>(text, text)", negatorIdentity: null, restrictionIdentity: "pg_catalog.matchingsel(internal, oid, internal, integer)", joinIdentity: "pg_catalog.matchingjoinsel(internal, oid, internal, smallint, internal)", extension: "pg_trgm", canMerge: false, canHash: false },
+  ...[
+    [3, "pg_catalog.~~(text, text)", "pg_catalog.!~~(text, text)", "pg_catalog.textnlike(text, text)", "pg_catalog.nlikesel(internal, oid, internal, integer)", "pg_catalog.nlikejoinsel(internal, oid, internal, smallint, internal)"],
+    [4, "pg_catalog.~~*(text, text)", "pg_catalog.!~~*(text, text)", "pg_catalog.texticnlike(text, text)", "pg_catalog.icnlikesel(internal, oid, internal, integer)", "pg_catalog.icnlikejoinsel(internal, oid, internal, smallint, internal)"],
+    [5, "pg_catalog.~(text, text)", "pg_catalog.!~(text, text)", "pg_catalog.textregexne(text, text)", "pg_catalog.regexnesel(internal, oid, internal, integer)", "pg_catalog.regexnejoinsel(internal, oid, internal, smallint, internal)"],
+    [6, "pg_catalog.~*(text, text)", "pg_catalog.!~*(text, text)", "pg_catalog.texticregexne(text, text)", "pg_catalog.icregexnesel(internal, oid, internal, integer)", "pg_catalog.icregexnejoinsel(internal, oid, internal, smallint, internal)"],
+    [11, "pg_catalog.=(text, text)", "pg_catalog.<>(text, text)", "pg_catalog.textne(text, text)", "pg_catalog.neqsel(internal, oid, internal, integer)", "pg_catalog.neqjoinsel(internal, oid, internal, smallint, internal)"],
+  ].map(([strategyNumber, referringOperatorIdentity, referencedOperatorIdentity, implementationIdentity, restrictionIdentity, joinIdentity]) => ({
+    strategyNumber: strategyNumber as number,
+    referringOperatorIdentity: referringOperatorIdentity as string,
+    referenceKind: "negator" as const,
+    referencedOperatorIdentity: referencedOperatorIdentity as string,
+    implementationIdentity: implementationIdentity as string,
+    commutatorIdentity: strategyNumber === 11 ? referencedOperatorIdentity as string : null,
+    negatorIdentity: referringOperatorIdentity as string,
+    restrictionIdentity: restrictionIdentity as string,
+    joinIdentity: joinIdentity as string,
+    extension: null,
+    canMerge: false,
+    canHash: false,
+  })),
+] as const satisfies readonly RequiredGinTrgmIndirectOperator[];
 
 const OPTIONAL_RELATION_PRIVILEGES: readonly RelationPrivilegeSpec[] = [
   ["native_transcripts", ["SELECT"]],
@@ -913,6 +983,32 @@ interface RequiredGinTrgmOperatorRow extends QueryResultRow {
   readonly operator_extension_dependency_count: unknown;
   readonly operator_implementation_dependency_count: unknown;
   readonly operator_namespace_dependency_count: unknown;
+}
+
+interface RequiredGinTrgmIndirectOperatorRow extends QueryResultRow {
+  readonly strategy_number: unknown;
+  readonly referring_operator_identity: unknown;
+  readonly reference_kind: unknown;
+  readonly referenced_operator_oid: unknown;
+  readonly referenced_operator_identity: unknown;
+  readonly operator_kind: unknown;
+  readonly left_type: unknown;
+  readonly right_type: unknown;
+  readonly result_type: unknown;
+  readonly implementation_identity: unknown;
+  readonly commutator_identity: unknown;
+  readonly negator_identity: unknown;
+  readonly restriction_identity: unknown;
+  readonly join_identity: unknown;
+  readonly can_merge: unknown;
+  readonly can_hash: unknown;
+  readonly reciprocal_matches: unknown;
+  readonly extension_name: unknown;
+  readonly owner_matches_extension: unknown;
+  readonly dependency_count: unknown;
+  readonly extension_dependency_count: unknown;
+  readonly implementation_dependency_count: unknown;
+  readonly namespace_dependency_count: unknown;
 }
 
 interface RequiredGinTrgmSupportRow extends QueryResultRow {
@@ -1952,6 +2048,89 @@ async function inspectRequiredGinTrgmOperators(
   if (observed.size !== expectedByStrategy.size) {
     throw readinessError("extension-preflight", "inspectRequiredGinTrgmOperators");
   }
+}
+
+async function inspectRequiredGinTrgmIndirectOperators(
+  executor: PostgreSqlQueryExecutor,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const result = await executor.query<RequiredGinTrgmIndirectOperatorRow>({
+    text: `WITH ${runtimeDeparserSettingsSql()},
+           scoped AS (
+             SELECT mapping.amopstrategy AS strategy_number,
+                    catalog_operator.oid AS referring_oid,
+                    ${catalogOperatorIdentitySql("catalog_operator", "operator_namespace")} AS referring_identity,
+                    catalog_operator.oprcom AS commutator_oid,
+                    catalog_operator.oprnegate AS negator_oid
+             FROM pg_catalog.pg_amop AS mapping
+             JOIN pg_catalog.pg_opfamily AS family ON family.oid OPERATOR(pg_catalog.=) mapping.amopfamily
+             JOIN pg_catalog.pg_namespace AS family_namespace ON family_namespace.oid OPERATOR(pg_catalog.=) family.opfnamespace
+             JOIN pg_catalog.pg_am AS access_method ON access_method.oid OPERATOR(pg_catalog.=) family.opfmethod
+             JOIN pg_catalog.pg_operator AS catalog_operator ON catalog_operator.oid OPERATOR(pg_catalog.=) mapping.amopopr
+             JOIN pg_catalog.pg_namespace AS operator_namespace ON operator_namespace.oid OPERATOR(pg_catalog.=) catalog_operator.oprnamespace
+             CROSS JOIN runtime_deparser_settings AS settings
+             WHERE family_namespace.nspname OPERATOR(pg_catalog.=) 'public'
+               AND family.opfname OPERATOR(pg_catalog.=) 'gin_trgm_ops'
+               AND access_method.amname OPERATOR(pg_catalog.=) 'gin'
+           ), edges AS (
+             SELECT strategy_number, referring_oid, referring_identity, 'commutator'::pg_catalog.text AS reference_kind, commutator_oid AS referenced_oid FROM scoped WHERE commutator_oid OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
+             UNION ALL
+             SELECT strategy_number, referring_oid, referring_identity, 'negator'::pg_catalog.text, negator_oid FROM scoped WHERE negator_oid OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
+           )
+           SELECT edges.strategy_number, edges.referring_identity AS referring_operator_identity,
+                  edges.reference_kind, edges.referenced_oid AS referenced_operator_oid,
+                  ${catalogOperatorIdentitySql("referenced", "referenced_namespace")} AS referenced_operator_identity,
+                  referenced.oprkind::pg_catalog.text AS operator_kind,
+                  ${guardedRuntimeDeparserSql("pg_catalog.format_type(referenced.oprleft, NULL::pg_catalog.int4)")} AS left_type,
+                  ${guardedRuntimeDeparserSql("pg_catalog.format_type(referenced.oprright, NULL::pg_catalog.int4)")} AS right_type,
+                  ${guardedRuntimeDeparserSql("pg_catalog.format_type(referenced.oprresult, NULL::pg_catalog.int4)")} AS result_type,
+                  ${catalogFunctionIdentitySql("implementation", "implementation_namespace")} AS implementation_identity,
+                  CASE WHEN referenced.oprcom OPERATOR(pg_catalog.=) 0::pg_catalog.oid THEN NULL ELSE ${catalogOperatorIdentitySql("commutator", "commutator_namespace")} END AS commutator_identity,
+                  CASE WHEN referenced.oprnegate OPERATOR(pg_catalog.=) 0::pg_catalog.oid THEN NULL ELSE ${catalogOperatorIdentitySql("negator", "negator_namespace")} END AS negator_identity,
+                  ${catalogFunctionIdentitySql("restriction", "restriction_namespace")} AS restriction_identity,
+                  ${catalogFunctionIdentitySql("join_estimator", "join_namespace")} AS join_identity,
+                  referenced.oprcanmerge AS can_merge, referenced.oprcanhash AS can_hash,
+                  CASE WHEN edges.reference_kind OPERATOR(pg_catalog.=) 'commutator' THEN referenced.oprcom OPERATOR(pg_catalog.=) edges.referring_oid ELSE referenced.oprnegate OPERATOR(pg_catalog.=) edges.referring_oid END AS reciprocal_matches,
+                  extension.extname::pg_catalog.text AS extension_name,
+                  CASE WHEN extension.oid IS NULL THEN NULL ELSE referenced.oprowner OPERATOR(pg_catalog.=) extension.extowner END AS owner_matches_extension,
+                  (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_depend AS d WHERE d.classid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_operator') AND d.objid OPERATOR(pg_catalog.=) referenced.oid) AS dependency_count,
+                  (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_depend AS d WHERE d.classid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_operator') AND d.objid OPERATOR(pg_catalog.=) referenced.oid AND d.refclassid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_extension') AND d.refobjid OPERATOR(pg_catalog.=) extension.oid AND d.deptype OPERATOR(pg_catalog.=) 'e') AS extension_dependency_count,
+                  (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_depend AS d WHERE d.classid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_operator') AND d.objid OPERATOR(pg_catalog.=) referenced.oid AND d.refclassid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_proc') AND d.refobjid OPERATOR(pg_catalog.=) implementation.oid AND d.deptype OPERATOR(pg_catalog.=) 'n') AS implementation_dependency_count,
+                  (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_depend AS d WHERE d.classid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_operator') AND d.objid OPERATOR(pg_catalog.=) referenced.oid AND d.refclassid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_namespace') AND d.refobjid OPERATOR(pg_catalog.=) referenced_namespace.oid AND d.deptype OPERATOR(pg_catalog.=) 'n') AS namespace_dependency_count
+           FROM edges
+           JOIN pg_catalog.pg_operator AS referenced ON referenced.oid OPERATOR(pg_catalog.=) edges.referenced_oid
+           JOIN pg_catalog.pg_namespace AS referenced_namespace ON referenced_namespace.oid OPERATOR(pg_catalog.=) referenced.oprnamespace
+           JOIN pg_catalog.pg_proc AS implementation ON implementation.oid OPERATOR(pg_catalog.=) referenced.oprcode
+           JOIN pg_catalog.pg_namespace AS implementation_namespace ON implementation_namespace.oid OPERATOR(pg_catalog.=) implementation.pronamespace
+           LEFT JOIN pg_catalog.pg_operator AS commutator ON commutator.oid OPERATOR(pg_catalog.=) referenced.oprcom
+           LEFT JOIN pg_catalog.pg_namespace AS commutator_namespace ON commutator_namespace.oid OPERATOR(pg_catalog.=) commutator.oprnamespace
+           LEFT JOIN pg_catalog.pg_operator AS negator ON negator.oid OPERATOR(pg_catalog.=) referenced.oprnegate
+           LEFT JOIN pg_catalog.pg_namespace AS negator_namespace ON negator_namespace.oid OPERATOR(pg_catalog.=) negator.oprnamespace
+           JOIN pg_catalog.pg_proc AS restriction ON restriction.oid OPERATOR(pg_catalog.=) referenced.oprrest
+           JOIN pg_catalog.pg_namespace AS restriction_namespace ON restriction_namespace.oid OPERATOR(pg_catalog.=) restriction.pronamespace
+           JOIN pg_catalog.pg_proc AS join_estimator ON join_estimator.oid OPERATOR(pg_catalog.=) referenced.oprjoin
+           JOIN pg_catalog.pg_namespace AS join_namespace ON join_namespace.oid OPERATOR(pg_catalog.=) join_estimator.pronamespace
+           LEFT JOIN pg_catalog.pg_depend AS extension_dependency ON extension_dependency.classid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_operator') AND extension_dependency.objid OPERATOR(pg_catalog.=) referenced.oid AND extension_dependency.refclassid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_extension') AND extension_dependency.deptype OPERATOR(pg_catalog.=) 'e'
+           LEFT JOIN pg_catalog.pg_extension AS extension ON extension.oid OPERATOR(pg_catalog.=) extension_dependency.refobjid
+           CROSS JOIN runtime_deparser_settings AS settings
+           WHERE NOT EXISTS (SELECT 1 FROM scoped AS direct WHERE direct.referring_oid OPERATOR(pg_catalog.=) edges.referenced_oid)
+           ORDER BY edges.strategy_number, edges.reference_kind`,
+  }, readinessOptions("inspectRequiredGinTrgmIndirectOperators", signal));
+  const expected = new Map(REQUIRED_GIN_TRGM_INDIRECT_OPERATORS.map((mapping) => [
+    `${mapping.strategyNumber}:${mapping.referenceKind}`, mapping,
+  ]));
+  const observed = new Set<string>();
+  for (const row of result.rows) {
+    if (typeof row.strategy_number !== "number" || !Number.isSafeInteger(row.strategy_number) || typeof row.reference_kind !== "string") throw readinessError("extension-preflight", "inspectRequiredGinTrgmIndirectOperators");
+    const key = `${row.strategy_number}:${row.reference_kind}`;
+    const mapping = expected.get(key);
+    const extension = mapping?.extension !== null;
+    if (mapping === undefined || observed.has(key) || row.referring_operator_identity !== mapping.referringOperatorIdentity || typeof row.referenced_operator_oid !== "number" || !Number.isSafeInteger(row.referenced_operator_oid) || row.referenced_operator_oid <= 0 || row.referenced_operator_identity !== mapping.referencedOperatorIdentity || row.operator_kind !== "b" || row.left_type !== "text" || row.right_type !== "text" || row.result_type !== "boolean" || row.implementation_identity !== mapping.implementationIdentity || row.commutator_identity !== mapping.commutatorIdentity || row.negator_identity !== mapping.negatorIdentity || row.restriction_identity !== mapping.restrictionIdentity || row.join_identity !== mapping.joinIdentity || row.can_merge !== mapping.canMerge || row.can_hash !== mapping.canHash || row.reciprocal_matches !== true || row.extension_name !== mapping.extension || row.owner_matches_extension !== (extension ? true : null) || row.dependency_count !== (extension ? 3 : 0) || row.extension_dependency_count !== (extension ? 1 : 0) || row.implementation_dependency_count !== (extension ? 1 : 0) || row.namespace_dependency_count !== (extension ? 1 : 0)) {
+      throw readinessError("extension-preflight", "inspectRequiredGinTrgmIndirectOperators");
+    }
+    observed.add(key);
+  }
+  if (observed.size !== expected.size) throw readinessError("extension-preflight", "inspectRequiredGinTrgmIndirectOperators");
 }
 
 async function inspectRequiredGinTrgmSupportFunctions(
@@ -3645,6 +3824,7 @@ export async function verifyPostgreSqlRuntimeSchema(
     await inspectRequiredExtensionOperator(executor, signal);
     await inspectRequiredGinTrgmOperatorClass(executor, signal);
     await inspectRequiredGinTrgmOperators(executor, signal);
+    await inspectRequiredGinTrgmIndirectOperators(executor, signal);
     await inspectRequiredGinTrgmSupportFunctions(executor, signal);
     await assertPostgreSqlSearchConfigurationReady(executor, {
       operation: "runtimeReadinessSearchConfiguration",

@@ -259,6 +259,36 @@ const REQUIRED_EXTENSION_FUNCTION_ROWS = [
     returnType: "double precision",
     volatility: "s",
   })),
+  ...[
+    ["pg_catalog.textnlike(text, text)", "textnlike", false],
+    ["pg_catalog.texticnlike(text, text)", "texticnlike", false],
+    ["pg_catalog.textregexne(text, text)", "textregexne", false],
+    ["pg_catalog.texticregexne(text, text)", "texticregexne", false],
+    ["pg_catalog.textne(text, text)", "textne", true],
+  ].map(([functionIdentity, symbol, leakproof]) => trustedFunctionRow({
+    functionIdentity: functionIdentity!,
+    symbol: symbol!,
+    returnType: "boolean",
+    volatility: "i",
+    leakproof: leakproof as boolean,
+  })),
+  ...[
+    ["nlikesel", "integer"],
+    ["nlikejoinsel", "smallint, internal"],
+    ["icnlikesel", "integer"],
+    ["icnlikejoinsel", "smallint, internal"],
+    ["regexnesel", "integer"],
+    ["regexnejoinsel", "smallint, internal"],
+    ["icregexnesel", "integer"],
+    ["icregexnejoinsel", "smallint, internal"],
+    ["neqsel", "integer"],
+    ["neqjoinsel", "smallint, internal"],
+  ].map(([symbol, finalArguments]) => trustedFunctionRow({
+    functionIdentity: `pg_catalog.${symbol}(internal, oid, internal, ${finalArguments})`,
+    symbol: symbol!,
+    returnType: "double precision",
+    volatility: "s",
+  })),
 ] as const;
 
 const REQUIRED_EXTENSION_OPERATOR_ROWS = [{
@@ -425,6 +455,97 @@ const REQUIRED_GIN_TRGM_OPERATOR_ROWS = [
     canMerge: true,
     canHash: true,
   }),
+] as const;
+
+function ginTrgmIndirectOperatorRow(input: {
+  readonly strategyNumber: number;
+  readonly referringOperatorIdentity: string;
+  readonly referenceKind: "commutator" | "negator";
+  readonly referencedOperatorOid: number;
+  readonly referencedOperatorIdentity: string;
+  readonly implementationIdentity: string;
+  readonly commutatorIdentity: string | null;
+  readonly negatorIdentity: string | null;
+  readonly restrictionIdentity: string;
+  readonly joinIdentity: string;
+  readonly extension?: "pg_trgm";
+  readonly canMerge?: boolean;
+  readonly canHash?: boolean;
+  readonly reciprocalMatches?: boolean;
+}) {
+  const extension = input.extension ?? null;
+  return {
+    strategy_number: input.strategyNumber,
+    referring_operator_identity: input.referringOperatorIdentity,
+    reference_kind: input.referenceKind,
+    referenced_operator_oid: input.referencedOperatorOid,
+    referenced_operator_identity: input.referencedOperatorIdentity,
+    operator_kind: "b",
+    left_type: "text",
+    right_type: "text",
+    result_type: "boolean",
+    implementation_identity: input.implementationIdentity,
+    commutator_identity: input.commutatorIdentity,
+    negator_identity: input.negatorIdentity,
+    restriction_identity: input.restrictionIdentity,
+    join_identity: input.joinIdentity,
+    can_merge: input.canMerge ?? false,
+    can_hash: input.canHash ?? false,
+    reciprocal_matches: input.reciprocalMatches ?? true,
+    extension_name: extension,
+    owner_matches_extension: extension === null ? null : true,
+    dependency_count: extension === null ? 0 : 3,
+    extension_dependency_count: extension === null ? 0 : 1,
+    implementation_dependency_count: extension === null ? 0 : 1,
+    namespace_dependency_count: extension === null ? 0 : 1,
+  };
+}
+
+const REQUIRED_GIN_TRGM_INDIRECT_OPERATOR_ROWS = [
+  ginTrgmIndirectOperatorRow({
+    strategyNumber: 7,
+    referringOperatorIdentity: "public.%>(text, text)",
+    referenceKind: "commutator",
+    referencedOperatorOid: 7001,
+    referencedOperatorIdentity: "public.<%(text, text)",
+    implementationIdentity: "public.word_similarity_op(text, text)",
+    commutatorIdentity: "public.%>(text, text)",
+    negatorIdentity: null,
+    restrictionIdentity: "pg_catalog.matchingsel(internal, oid, internal, integer)",
+    joinIdentity: "pg_catalog.matchingjoinsel(internal, oid, internal, smallint, internal)",
+    extension: "pg_trgm",
+  }),
+  ginTrgmIndirectOperatorRow({
+    strategyNumber: 9,
+    referringOperatorIdentity: "public.%>>(text, text)",
+    referenceKind: "commutator",
+    referencedOperatorOid: 7002,
+    referencedOperatorIdentity: "public.<<%(text, text)",
+    implementationIdentity: "public.strict_word_similarity_op(text, text)",
+    commutatorIdentity: "public.%>>(text, text)",
+    negatorIdentity: null,
+    restrictionIdentity: "pg_catalog.matchingsel(internal, oid, internal, integer)",
+    joinIdentity: "pg_catalog.matchingjoinsel(internal, oid, internal, smallint, internal)",
+    extension: "pg_trgm",
+  }),
+  ...[
+    [3, "pg_catalog.~~(text, text)", 7103, "pg_catalog.!~~(text, text)", "pg_catalog.textnlike(text, text)", "pg_catalog.~~(text, text)", "pg_catalog.nlikesel(internal, oid, internal, integer)", "pg_catalog.nlikejoinsel(internal, oid, internal, smallint, internal)"],
+    [4, "pg_catalog.~~*(text, text)", 7104, "pg_catalog.!~~*(text, text)", "pg_catalog.texticnlike(text, text)", "pg_catalog.~~*(text, text)", "pg_catalog.icnlikesel(internal, oid, internal, integer)", "pg_catalog.icnlikejoinsel(internal, oid, internal, smallint, internal)"],
+    [5, "pg_catalog.~(text, text)", 7105, "pg_catalog.!~(text, text)", "pg_catalog.textregexne(text, text)", "pg_catalog.~(text, text)", "pg_catalog.regexnesel(internal, oid, internal, integer)", "pg_catalog.regexnejoinsel(internal, oid, internal, smallint, internal)"],
+    [6, "pg_catalog.~*(text, text)", 7106, "pg_catalog.!~*(text, text)", "pg_catalog.texticregexne(text, text)", "pg_catalog.~*(text, text)", "pg_catalog.icregexnesel(internal, oid, internal, integer)", "pg_catalog.icregexnejoinsel(internal, oid, internal, smallint, internal)"],
+    [11, "pg_catalog.=(text, text)", 7111, "pg_catalog.<>(text, text)", "pg_catalog.textne(text, text)", "pg_catalog.=(text, text)", "pg_catalog.neqsel(internal, oid, internal, integer)", "pg_catalog.neqjoinsel(internal, oid, internal, smallint, internal)"],
+  ].map(([strategyNumber, referringOperatorIdentity, referencedOperatorOid, referencedOperatorIdentity, implementationIdentity, negatorIdentity, restrictionIdentity, joinIdentity]) => ginTrgmIndirectOperatorRow({
+    strategyNumber: strategyNumber as number,
+    referringOperatorIdentity: referringOperatorIdentity as string,
+    referenceKind: "negator",
+    referencedOperatorOid: referencedOperatorOid as number,
+    referencedOperatorIdentity: referencedOperatorIdentity as string,
+    implementationIdentity: implementationIdentity as string,
+    commutatorIdentity: strategyNumber === 11 ? referencedOperatorIdentity as string : null,
+    negatorIdentity: negatorIdentity as string,
+    restrictionIdentity: restrictionIdentity as string,
+    joinIdentity: joinIdentity as string,
+  })),
 ] as const;
 
 const REQUIRED_GIN_TRGM_SUPPORT_ROWS = [
@@ -613,6 +734,11 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
     }
     if (operation === "inspectRequiredGinTrgmOperators") {
       return applyOverride(result(REQUIRED_GIN_TRGM_OPERATOR_ROWS.map((row) => ({ ...row }))));
+    }
+    if (operation === "inspectRequiredGinTrgmIndirectOperators") {
+      return applyOverride(result(
+        REQUIRED_GIN_TRGM_INDIRECT_OPERATOR_ROWS.map((row) => ({ ...row })),
+      ));
     }
     if (operation === "inspectRequiredGinTrgmSupportFunctions") {
       return applyOverride(result(REQUIRED_GIN_TRGM_SUPPORT_ROWS.map((row) => ({ ...row }))));
@@ -837,6 +963,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     "inspectRequiredExtensionOperator",
     "inspectRequiredGinTrgmOperatorClass",
     "inspectRequiredGinTrgmOperators",
+    "inspectRequiredGinTrgmIndirectOperators",
     "inspectRequiredGinTrgmSupportFunctions",
     "inspectSchemaOwnership",
     "inspectFunctionAcl",
@@ -1263,6 +1390,107 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     expect(fake.queries.at(-1)?.options.operation).toBe("inspectRequiredGinTrgmOperators");
   });
 
+  it("authenticates every indirect gin_trgm operator edge before support functions", async () => {
+    const fake = readyExecutor();
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).resolves.toBeDefined();
+    expect(fake.queries.map(({ options }) => options.operation)).toContain(
+      "inspectRequiredGinTrgmIndirectOperators",
+    );
+    expect(fake.queries.map(({ options }) => options.operation)).toEqual(expect.arrayContaining([
+      "inspectRequiredGinTrgmOperators",
+      "inspectRequiredGinTrgmIndirectOperators",
+      "inspectRequiredGinTrgmSupportFunctions",
+    ]));
+  });
+
+  it.each(REQUIRED_GIN_TRGM_INDIRECT_OPERATOR_ROWS.map(({ strategy_number, reference_kind }) => [
+    strategy_number,
+    reference_kind,
+  ] as const))(
+    "rejects a redirected indirect operator implementation for edge %s/%s",
+    async (strategyNumber, referenceKind) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRequiredGinTrgmIndirectOperators: mutateRows((rows) => {
+            const row = rows.find((candidate) => (
+              candidate.strategy_number === strategyNumber
+              && candidate.reference_kind === referenceKind
+            ));
+            if (row !== undefined) row.implementation_identity = "public.foreign(text, text)";
+          }),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "extension-preflight");
+      expect(failure.operation).toBe("inspectRequiredGinTrgmIndirectOperators");
+    },
+  );
+
+  it.each([
+    ["strategy number", "strategy_number", "7"],
+    ["referring identity", "referring_operator_identity", "public.#(text, text)"],
+    ["reference kind", "reference_kind", "other"],
+    ["referenced oid", "referenced_operator_oid", "7001"],
+    ["referenced identity", "referenced_operator_identity", "public.#(text, text)"],
+    ["operator kind", "operator_kind", "l"],
+    ["left type", "left_type", "bytea"],
+    ["right type", "right_type", "bytea"],
+    ["result type", "result_type", "integer"],
+    ["implementation", "implementation_identity", "public.#(text, text)"],
+    ["commutator", "commutator_identity", "public.#(text, text)"],
+    ["negator", "negator_identity", "public.#(text, text)"],
+    ["restriction", "restriction_identity", "pg_catalog.eqsel(internal)"],
+    ["join", "join_identity", "pg_catalog.eqjoinsel(internal)"],
+    ["merge capability", "can_merge", true],
+    ["hash capability", "can_hash", true],
+    ["reciprocal", "reciprocal_matches", false],
+    ["extension", "extension_name", "foreign"],
+    ["owner", "owner_matches_extension", false],
+    ["dependency count", "dependency_count", "3"],
+    ["extension dependency", "extension_dependency_count", 0],
+    ["implementation dependency", "implementation_dependency_count", 0],
+    ["namespace dependency", "namespace_dependency_count", 0],
+  ] as const)(
+    "rejects malformed or spoofed indirect operator metadata: %s",
+    async (_label, field, value) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectRequiredGinTrgmIndirectOperators: mutateRows((rows) => {
+            rows[0]![field] = value;
+          }),
+        },
+      });
+
+      const failure = await expectReadinessFailure(fake, "extension-preflight");
+      expect(failure.operation).toBe("inspectRequiredGinTrgmIndirectOperators");
+    },
+  );
+
+  it.each([
+    ["missing", (rows: QueryResultRow[]) => { rows.splice(0, 1); }],
+    ["duplicate", (rows: QueryResultRow[]) => { rows.push({ ...rows[0]! }); }],
+    ["extra", (rows: QueryResultRow[]) => {
+      rows.push({
+        ...rows[0]!,
+        strategy_number: 13,
+        reference_kind: "commutator",
+        referring_operator_identity: "public.foreign(text, text)",
+      });
+    }],
+  ] as const)("rejects a %s indirect gin_trgm operator edge fail-fast", async (_label, mutate) => {
+    const fake = readyExecutor({
+      operationOverrides: {
+        inspectRequiredGinTrgmIndirectOperators: mutateRows(mutate),
+      },
+    });
+
+    const failure = await expectReadinessFailure(fake, "extension-preflight");
+    expect(failure.operation).toBe("inspectRequiredGinTrgmIndirectOperators");
+    expect(fake.queries.at(-1)?.options.operation).toBe("inspectRequiredGinTrgmIndirectOperators");
+  });
+
   it.each(REQUIRED_GIN_TRGM_SUPPORT_ROWS.map(({ support_number }) => [support_number]))(
     "rejects a redirected gin_trgm_ops support function %s",
     async (supportNumber) => {
@@ -1321,7 +1549,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
 
     const failure = await expectReadinessFailure(fake, "extension-preflight");
     expect(failure.operation).toBe("inspectRequiredGinTrgmSupportFunctions");
-    expect(fake.queries.map(({ options }) => options.operation).slice(0, 9)).toEqual([
+    expect(fake.queries.map(({ options }) => options.operation).slice(0, 10)).toEqual([
       "inspectServerReadiness",
       "inspectRuntimeRolePolicy",
       "runtimeReadinessExtensions",
@@ -1330,6 +1558,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       "inspectRequiredExtensionOperator",
       "inspectRequiredGinTrgmOperatorClass",
       "inspectRequiredGinTrgmOperators",
+      "inspectRequiredGinTrgmIndirectOperators",
       "inspectRequiredGinTrgmSupportFunctions",
     ]);
   });
