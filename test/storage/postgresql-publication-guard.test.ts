@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type {
   PostgreSqlQueryExecutor,
   PostgreSqlQueryOptions,
+  PostgreSqlTransactionOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "../../src/storage/postgresql/contracts.js";
 import { PostgreSqlCommitOutcomeUnknownError } from "../../src/storage/postgresql/errors.js";
@@ -89,24 +90,39 @@ function executor(input: {
 }): PostgreSqlBackendPublicationControlExecutor & {
   readonly projectPublicationTransaction: ReturnType<typeof vi.fn>;
   readonly projectPublicationReadback: ReturnType<typeof vi.fn>;
+  readonly transactionOptions: PostgreSqlTransactionOptions[];
+  readonly readbackOptions: PostgreSqlQueryOptions[];
 } {
+  const transactionOptions: PostgreSqlTransactionOptions[] = [];
+  const readbackOptions: PostgreSqlQueryOptions[] = [];
   const projectPublicationTransaction = vi.fn(async <T>(
     _projectId: string,
     callback: (scope: PostgreSqlTransactionScopeExecutor) => Promise<T>,
+    options: PostgreSqlTransactionOptions,
   ) => {
+    transactionOptions.push(options);
     if (input.transactionStartError !== undefined) throw input.transactionStartError;
     const candidate = await callback(transaction(input.transactionQuery));
     if (input.transactionError !== undefined) throw input.transactionError;
     return candidate;
   });
-  const projectPublicationReadback = vi.fn(async () =>
-    result(input.readbackRows ?? []));
+  const projectPublicationReadback = vi.fn(async (
+    _config: QueryConfig<unknown[]>,
+    options: PostgreSqlQueryOptions,
+  ) => {
+    readbackOptions.push(options);
+    return result(input.readbackRows ?? []);
+  });
   return {
     projectPublicationTransaction,
     projectPublicationReadback,
+    transactionOptions,
+    readbackOptions,
   } as unknown as PostgreSqlBackendPublicationControlExecutor & {
     readonly projectPublicationTransaction: ReturnType<typeof vi.fn>;
     readonly projectPublicationReadback: ReturnType<typeof vi.fn>;
+    readonly transactionOptions: PostgreSqlTransactionOptions[];
+    readonly readbackOptions: PostgreSqlQueryOptions[];
   };
 }
 
@@ -443,6 +459,41 @@ describe("PostgreSQL publication admission", () => {
       transactionQuery: () => result([]),
       readbackRows: [],
     })).release(validMutation)).rejects.toMatchObject({ reason: "fence-mismatch" });
+  });
+
+  it("forwards normalized machine identity through acquire, renew, and release", async () => {
+    const queryOptions: PostgreSqlQueryOptions[] = [];
+    const e = executor({
+      transactionQuery: (_config, options) => {
+        queryOptions.push(options);
+        return result([leaseRow()]);
+      },
+    });
+    const guard = new PostgreSqlBackendPublicationGuard(e);
+    await guard.acquire(validAcquire);
+    await guard.renew({ ...validMutation, ttlMs: 60_000 });
+    await guard.release(validMutation);
+    expect(e.transactionOptions).toHaveLength(3);
+    for (const options of e.transactionOptions) {
+      expect(options).toMatchObject({
+        projectId: PROJECT,
+        projectIds: [PROJECT],
+        machineId: MACHINE,
+      });
+    }
+    expect(queryOptions.length).toBeGreaterThanOrEqual(6);
+    for (const options of queryOptions) {
+      expect(options).toMatchObject({ machineId: MACHINE });
+    }
+
+    const read = executor({ readbackRows: [], transactionQuery: () => result([]) });
+    await new PostgreSqlBackendPublicationGuard(read).read({
+      projectId: PROJECT,
+      targetBackend: "postgresql",
+      evidenceSha256: EVIDENCE,
+    });
+    expect(read.readbackOptions).toHaveLength(1);
+    expect(read.readbackOptions[0]).not.toHaveProperty("machineId");
   });
 
   it("reconciles uncertain commits only with exact active or released readback", async () => {

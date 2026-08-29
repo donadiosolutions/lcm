@@ -14,6 +14,7 @@ import { buildPostgreSqlClientConfig } from "./client-config.js";
 import {
   isPostgreSqlConnectionError,
   normalizePostgreSqlError,
+  PostgreSqlStorageOperationError,
   PostgreSqlCommitOutcomeUnknownError,
 } from "./errors.js";
 import {
@@ -200,12 +201,15 @@ function snapshotTransactionOptions(
 }
 
 function aborted(context: PostgreSqlOperationContext): StorageOperationError {
-  return new StorageOperationError(
+  const projectId = contextProjectId(context);
+  return new PostgreSqlStorageOperationError(
     "STORAGE_OPERATION_FAILED",
-    "postgresql",
-    contextProjectId(context),
-    context.domain,
-    context.operation,
+    {
+      ...context,
+      ...(projectId === undefined ? {} : { projectId }),
+    },
+    null,
+    false,
   );
 }
 
@@ -358,6 +362,9 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     const admissionHook = publicationControl
       ? this.dependencies.acquirePublicationLock
       : this.dependencies.acquireMutationGuard;
+    const machineContext = options.machineId === undefined
+      ? {}
+      : { machineId: options.machineId };
     if (requiresAdmission && admissionHook === undefined) {
       throw transactionScopeError(options, declaredProjectIds[0]);
     }
@@ -436,6 +443,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
             operation: options.operation,
             projectId: declaredProjectIds[0],
             projectIds: [declaredProjectIds[0]!],
+            ...machineContext,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
           },
         );
@@ -449,6 +457,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
               operation: options.operation,
               projectId,
               projectIds: [projectId],
+              ...machineContext,
               ...(options.signal === undefined ? {} : { signal: options.signal }),
             },
           );

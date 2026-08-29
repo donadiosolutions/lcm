@@ -24,6 +24,7 @@ import {
   REQUIRED_POSTGRESQL_SERVER_ENCODING,
   REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
 } from "../../src/storage/postgresql/migrations.js";
+import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 import { POSTGRESQL_SEARCH_CONFIGURATION_SHA256 } from "../../src/storage/postgresql/search-configuration.js";
 
 function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
@@ -177,6 +178,140 @@ function fixtures(
 }
 
 describe("PostgreSQL runtime", () => {
+  function expectCancellation(
+    error: unknown,
+    expected: {
+      readonly projectId?: string;
+      readonly domain: string;
+      readonly operation: string;
+      readonly machineId?: string;
+    },
+  ): void {
+    expect(error).toBeInstanceOf(StorageOperationError);
+    expect(error).toBeInstanceOf(PostgreSqlStorageOperationError);
+    expect(error).toMatchObject({
+      name: "StorageOperationError",
+      code: "STORAGE_OPERATION_FAILED",
+      backend: "postgresql",
+      projectId: expected.projectId,
+      domain: expected.domain,
+      operation: expected.operation,
+      machineId: expected.machineId,
+      retryable: false,
+      sqlState: null,
+    });
+    const serialized = (error as PostgreSqlStorageOperationError).toJSON();
+    expect(serialized).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      backend: "postgresql",
+      projectId: expected.projectId,
+      domain: expected.domain,
+      operation: expected.operation,
+      retryable: false,
+      sqlState: null,
+    });
+    if (expected.machineId === undefined) {
+      expect(serialized).not.toHaveProperty("machineId");
+    } else {
+      expect(serialized).toHaveProperty("machineId", expected.machineId);
+    }
+    const json = JSON.stringify(error);
+    expect(json).not.toContain("SELECT");
+    expect(json).not.toContain("secret");
+    expect(json).not.toContain("driver");
+    expect(json).not.toContain("cancelled");
+  }
+
+  it("preserves scoped machine identity on sanitized cancellation errors", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const f = fixtures();
+    const error = await f.runtime.query({ text: "SELECT private_secret" }, {
+      projectId: "project-a",
+      domain: "sessions",
+      operation: "preAcquireAbort",
+      machineId: "machine-a",
+      signal: controller.signal,
+    }).catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      projectId: "project-a",
+      domain: "sessions",
+      operation: "preAcquireAbort",
+      machineId: "machine-a",
+    });
+
+    const machineLess = new AbortController();
+    machineLess.abort();
+    const withoutMachine = await f.runtime.query({ text: "SELECT private_secret" }, {
+      domain: "factory",
+      operation: "machineLessAbort",
+      signal: machineLess.signal,
+    }).catch((caught: unknown) => caught);
+    expectCancellation(withoutMachine, {
+      domain: "factory",
+      operation: "machineLessAbort",
+    });
+  });
+
+  it("retains the first project and machine through mutation admission cancellation", async () => {
+    const controller = new AbortController();
+    const acquireMutationGuard = vi.fn(async () => {
+      controller.abort();
+    });
+    const f = fixtures(undefined, { acquireMutationGuard });
+    const error = await f.runtime.transaction(async () => undefined, {
+      projectIds: ["first-project", "second-project"],
+      domain: "transaction",
+      operation: "mutationAdmissionAbort",
+      machineId: "machine-root",
+      signal: controller.signal,
+    }).catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      projectId: "first-project",
+      domain: "transaction",
+      operation: "mutationAdmissionAbort",
+      machineId: "machine-root",
+    });
+    expect(acquireMutationGuard).toHaveBeenCalledWith(
+      expect.anything(),
+      "first-project",
+      expect.objectContaining({ machineId: "machine-root" }),
+    );
+  });
+
+  it("retains machine identity when publication admission cancels through the facade", async () => {
+    const controller = new AbortController();
+    const acquirePublicationLock = vi.fn(async (
+      executor: PostgreSqlQueryExecutor,
+      _projectId: string,
+      options: PostgreSqlQueryOptions,
+    ) => {
+      controller.abort();
+      await executor.query({ text: "PUBLICATION ADMISSION" }, options);
+    });
+    const f = fixtures(undefined, { acquirePublicationLock });
+    const error = await f.runtime.backendPublicationGuard().acquire({
+      projectId: "018f0000-0000-7000-8000-000000000001",
+      machineId: "018f0000-0000-7000-8000-000000000002",
+      publicationId: "publication",
+      targetBackend: "postgresql",
+      evidenceSha256: "a".repeat(64),
+      ttlMs: 1_000,
+      signal: controller.signal,
+    }).catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      projectId: "018f0000-0000-7000-8000-000000000001",
+      domain: "coordination",
+      operation: "acquireBackendPublication",
+      machineId: "018f0000-0000-7000-8000-000000000002",
+    });
+    expect(acquirePublicationLock).toHaveBeenCalledWith(
+      expect.anything(),
+      "018f0000-0000-7000-8000-000000000001",
+      expect.objectContaining({ machineId: "018f0000-0000-7000-8000-000000000002" }),
+    );
+  });
+
   it("provides the real pg pool and one-shot client constructors", async () => {
     const pool = POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.createPool({ max: 1 });
     const client = POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.createClient({});
@@ -762,15 +897,21 @@ describe("PostgreSQL runtime", () => {
     const f = fixtures();
     const callback = vi.fn(async () => undefined);
 
-    await expect(f.runtime.transaction(async (transaction) => {
+    const error = await f.runtime.transaction(async (transaction) => {
       const scoped = transaction as PostgreSqlTransactionScopeExecutor;
       return scoped.savepoint(callback, {
         domain: "conversations",
         operation: "abortedSavepoint",
+        machineId: "machine-savepoint",
         signal: controller.signal,
       });
-    }, { domain: "transaction", operation: "abortOuter" }))
-      .rejects.toMatchObject({ operation: "abortedSavepoint" });
+    }, { domain: "transaction", operation: "abortOuter" }).catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      projectId: undefined,
+      domain: "conversations",
+      operation: "abortedSavepoint",
+      machineId: "machine-savepoint",
+    });
 
     expect(callback).not.toHaveBeenCalled();
     expect(f.query).not.toHaveBeenCalledWith(
@@ -788,7 +929,7 @@ describe("PostgreSQL runtime", () => {
       const mappingError = new Error("mapping failed");
       const f = fixtures();
 
-      await expect(f.runtime.transaction(async (transaction) => {
+      const error = await f.runtime.transaction(async (transaction) => {
         const scoped = transaction as PostgreSqlTransactionScopeExecutor;
         return scoped.savepoint(async () => {
           controller.abort();
@@ -797,12 +938,16 @@ describe("PostgreSQL runtime", () => {
         }, {
           domain: "conversations",
           operation: `abortAfterCallback${outcome}`,
+          machineId: "machine-savepoint-race",
           signal: controller.signal,
         });
-      }, { domain: "transaction", operation: "abortAfterSavepointCallback" }))
-        .rejects.toMatchObject({
-          operation: `abortAfterCallback${outcome}`,
-        });
+      }, { domain: "transaction", operation: "abortAfterSavepointCallback" })
+        .catch((caught: unknown) => caught);
+      expectCancellation(error, {
+        domain: "conversations",
+        operation: `abortAfterCallback${outcome}`,
+        machineId: "machine-savepoint-race",
+      });
 
       expect(f.query.mock.calls.map(([input]) => input)).toEqual([
         "BEGIN",
@@ -1191,6 +1336,7 @@ describe("PostgreSQL runtime", () => {
       projectId: "project",
       domain: "transaction",
       operation: "abortAfterBegin",
+      machineId: "machine-abort",
       signal: controller.signal,
     });
 
@@ -1198,10 +1344,12 @@ describe("PostgreSQL runtime", () => {
     controller.abort();
     finishBegin(result([]));
 
-    await expect(pending).rejects.toMatchObject({
-      code: "STORAGE_OPERATION_FAILED",
+    const error = await pending.catch((caught: unknown) => caught);
+    expectCancellation(error, {
       projectId: "project",
+      domain: "transaction",
       operation: "abortAfterBegin",
+      machineId: "machine-abort",
     });
     expect(callback).not.toHaveBeenCalled();
     expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
@@ -1380,7 +1528,7 @@ describe("PostgreSQL runtime", () => {
   it("rejects and does not commit when the transaction signal aborts after the callback", async () => {
     const controller = new AbortController();
     const f = fixtures((input) => typeof input === "string" ? result([]) : result([{ value: 1 }]));
-    await expect(f.runtime.transaction(async () => {
+    const error = await f.runtime.transaction(async () => {
       await Promise.resolve();
       controller.abort();
       return "must not resolve";
@@ -1388,11 +1536,14 @@ describe("PostgreSQL runtime", () => {
       projectId: "project",
       domain: "transaction",
       operation: "abortBeforeCommit",
+      machineId: "machine-before-commit",
       signal: controller.signal,
-    })).rejects.toMatchObject({
-      code: "STORAGE_OPERATION_FAILED",
+    }).catch((caught: unknown) => caught);
+    expectCancellation(error, {
       projectId: "project",
+      domain: "transaction",
       operation: "abortBeforeCommit",
+      machineId: "machine-before-commit",
     });
     expect(f.query).not.toHaveBeenCalledWith("COMMIT");
     expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
@@ -1483,9 +1634,15 @@ describe("PostgreSQL runtime", () => {
       return f.poolClient;
     });
 
-    await expect(f.runtime.transaction(callback, {
-      domain: "transaction", operation: "abortDuringAcquire", signal: controller.signal,
-    })).rejects.toMatchObject({ operation: "abortDuringAcquire" });
+    const error = await f.runtime.transaction(callback, {
+      domain: "transaction", operation: "abortDuringAcquire", machineId: "machine-acquire",
+      signal: controller.signal,
+    }).catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      domain: "transaction",
+      operation: "abortDuringAcquire",
+      machineId: "machine-acquire",
+    });
     expect(callback).not.toHaveBeenCalled();
     expect(f.query).not.toHaveBeenCalled();
     expect(f.release).toHaveBeenCalledWith(true);
@@ -1619,6 +1776,7 @@ describe("PostgreSQL runtime", () => {
       const query = transaction.query({ text: "SELECT pg_sleep(10)" }, {
         domain: "transaction",
         operation: "queryLocalAbort",
+        machineId: "machine-query",
         signal: controller.signal,
       });
       await vi.waitFor(() => expect(target).toBeDefined());
@@ -1627,7 +1785,12 @@ describe("PostgreSQL runtime", () => {
       target?.callback(Object.assign(new Error("cancelled"), { code: "57014" }));
       return query;
     });
-    await expect(pending).rejects.toMatchObject({ operation: "queryLocalAbort" });
+    const error = await pending.catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      domain: "transaction",
+      operation: "queryLocalAbort",
+      machineId: "machine-query",
+    });
     expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
     expect(f.release).toHaveBeenCalledWith(true);
   });
@@ -1652,6 +1815,7 @@ describe("PostgreSQL runtime", () => {
         const query = transaction.query({ text: "SELECT pg_sleep(10)" }, {
           domain: "transaction",
           operation: `${abortedSignal}SignalAbort`,
+          machineId: "machine-combined",
           signal: queryController.signal,
         });
         await vi.waitFor(() => expect(target).toBeDefined());
@@ -1666,7 +1830,12 @@ describe("PostgreSQL runtime", () => {
         signal: transactionController.signal,
       });
 
-      await expect(pending).rejects.toMatchObject({ operation: `${abortedSignal}SignalAbort` });
+      const error = await pending.catch((caught: unknown) => caught);
+      expectCancellation(error, {
+        domain: "transaction",
+        operation: `${abortedSignal}SignalAbort`,
+        machineId: "machine-combined",
+      });
       expect(f.cancelQuery).toHaveBeenCalledWith({
         text: "SELECT pg_cancel_backend($1) AS cancelled",
         values: [89],
@@ -2179,11 +2348,17 @@ describe("PostgreSQL runtime", () => {
     const f = fixtures();
     f.connect.mockRejectedValueOnce(Object.assign(new Error("connection secret"), { code: "08006" }));
 
-    await expect(f.runtime.query({ text: "SELECT 1" }, {
+    const error = await f.runtime.query({ text: "SELECT 1" }, {
       domain: "factory",
       operation: "abortAsAcquireFails",
+      machineId: "machine-acquire-race",
       signal,
-    })).rejects.toMatchObject({ operation: "abortAsAcquireFails", retryable: false });
+    }).catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      domain: "factory",
+      operation: "abortAsAcquireFails",
+      machineId: "machine-acquire-race",
+    });
     expect(f.release).not.toHaveBeenCalled();
   });
 
@@ -2221,11 +2396,15 @@ describe("PostgreSQL runtime", () => {
       resolveConnect = resolve;
     }));
     const query = f.runtime.query({ text: "SELECT 1" }, {
-      domain: "factory", operation: "abortAfterAcquire", signal: controller.signal,
+      domain: "factory", operation: "abortAfterAcquire", machineId: "machine-late-client", signal: controller.signal,
     });
-    const expectation = expect(query).rejects.toMatchObject({ operation: "abortAfterAcquire", retryable: false });
     controller.abort();
-    await expectation;
+    const error = await query.catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      domain: "factory",
+      operation: "abortAfterAcquire",
+      machineId: "machine-late-client",
+    });
     expect(f.release).not.toHaveBeenCalled();
 
     resolveConnect(f.poolClient);
@@ -2282,9 +2461,14 @@ describe("PostgreSQL runtime", () => {
       }
       throw new Error("target query must not start");
     });
-    await expect(f.runtime.query({ text: "DELETE FROM sessions" }, {
-      domain: "sessions", operation: "abortDuringPidLookup", signal: controller.signal,
-    })).rejects.toMatchObject({ operation: "abortDuringPidLookup" });
+    const error = await f.runtime.query({ text: "DELETE FROM sessions" }, {
+      domain: "sessions", operation: "abortDuringPidLookup", machineId: "machine-pid", signal: controller.signal,
+    }).catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      domain: "sessions",
+      operation: "abortDuringPidLookup",
+      machineId: "machine-pid",
+    });
     expect(f.query).toHaveBeenCalledTimes(1);
     expect(f.dependencies.createClient).not.toHaveBeenCalled();
     expect(f.release).toHaveBeenCalledWith(true);
@@ -2308,9 +2492,14 @@ describe("PostgreSQL runtime", () => {
       throw new Error("target query must not start");
     });
 
-    await expect(f.runtime.query({ text: "SELECT pg_sleep(10)" }, {
-      domain: "factory", operation: "abortBeforeListener", signal,
-    })).rejects.toMatchObject({ operation: "abortBeforeListener" });
+    const error = await f.runtime.query({ text: "SELECT pg_sleep(10)" }, {
+      domain: "factory", operation: "abortBeforeListener", machineId: "machine-listener", signal,
+    }).catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      domain: "factory",
+      operation: "abortBeforeListener",
+      machineId: "machine-listener",
+    });
     expect(f.cancelQuery).toHaveBeenCalledWith({ text: "SELECT pg_cancel_backend($1) AS cancelled", values: [79] });
     expect(f.query).toHaveBeenCalledTimes(1);
     expect(signal.removeEventListener).toHaveBeenCalled();
@@ -2381,13 +2570,18 @@ describe("PostgreSQL runtime", () => {
     });
     f.cancelQuery.mockImplementationOnce(() => new Promise((resolve) => { finishCancellation = resolve; }));
     const pending = f.runtime.query({ text: "SELECT 1" }, {
-      domain: "factory", operation: "callbackAbortRace", signal: controller.signal,
+      domain: "factory", operation: "callbackAbortRace", machineId: "machine-callback-race", signal: controller.signal,
     });
     await vi.waitFor(() => expect(f.cancelQuery).toHaveBeenCalled());
     expect(f.release).not.toHaveBeenCalled();
 
     finishCancellation(result([{ cancelled: true }]));
-    await expect(pending).rejects.toMatchObject({ operation: "callbackAbortRace" });
+    const error = await pending.catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      domain: "factory",
+      operation: "callbackAbortRace",
+      machineId: "machine-callback-race",
+    });
     expect(f.release).toHaveBeenCalledWith(true);
   });
 
@@ -2407,9 +2601,14 @@ describe("PostgreSQL runtime", () => {
       return target;
     });
     vi.mocked(f.cancelClient.connect).mockRejectedValueOnce(new Error("connect failed"));
-    await expect(f.runtime.query({ text: "SELECT 1" }, {
-      domain: "factory", operation: "missedAbortEvent", signal,
-    })).rejects.toMatchObject({ operation: "missedAbortEvent" });
+    const error = await f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "missedAbortEvent", machineId: "machine-missed-event", signal,
+    }).catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      domain: "factory",
+      operation: "missedAbortEvent",
+      machineId: "machine-missed-event",
+    });
     expect(f.dependencies.createClient).toHaveBeenCalled();
     expect(f.release).toHaveBeenCalledWith(true);
   });
@@ -2471,11 +2670,16 @@ describe("PostgreSQL runtime", () => {
     f.cancelEnd.mockRejectedValueOnce(new Error("end failed"));
     const controller = new AbortController();
     const pending = f.runtime.query({ text: "SELECT pg_sleep(10)" }, {
-      domain: "factory", operation: "cancelFailure", signal: controller.signal,
+      domain: "factory", operation: "cancelFailure", machineId: "machine-cancel-failure", signal: controller.signal,
     });
     await vi.waitFor(() => expect(target).toBeDefined());
     controller.abort();
-    await expect(pending).rejects.toMatchObject({ operation: "cancelFailure" });
+    const error = await pending.catch((caught: unknown) => caught);
+    expectCancellation(error, {
+      domain: "factory",
+      operation: "cancelFailure",
+      machineId: "machine-cancel-failure",
+    });
     expect(f.release).toHaveBeenCalledWith(true);
   });
 });
