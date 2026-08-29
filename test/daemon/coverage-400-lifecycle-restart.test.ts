@@ -570,6 +570,9 @@ describe("ensureDaemon restart and terminal coverage", () => {
     let alive = true;
     const kill = vi.fn(() => { alive = false; });
     const fetch = diagnosticsFetch(health(20), health(20));
+    // observeHttpHealth owns a real wall-clock deadline independent of
+    // _monotonicNowOverride, so this fixture pins performance.now.
+    vi.spyOn(performance, "now").mockReturnValue(0);
     const result = await ensure({
       ...baseOptions(dir),
       enforceUserManagerParent: true,
@@ -581,6 +584,7 @@ describe("ensureDaemon restart and terminal coverage", () => {
       _fetchOverride: fetch,
       _supervisorOverride: unavailableSupervisor(),
     });
+    expect(kill).toHaveBeenCalledOnce();
     expect(kill).toHaveBeenCalledWith(20, "SIGTERM");
     expect(result.connected).toBe(false);
   });
