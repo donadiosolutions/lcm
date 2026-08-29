@@ -278,6 +278,9 @@ raw driver errors, SQL text, or bound values. Operation failures follow the same
 rule: useful diagnostics may name the backend, project identity, and repository
 domain, but secret-bearing and dialect-specific details remain inside the
 adapter and logs' existing safety boundaries.
+Once factory shutdown begins, an in-flight factory health probe reports the
+closed state and exposes no runtime detail, even if the underlying probe later
+settles with a healthy, unavailable, or failed result.
 
 ### Transactions
 
