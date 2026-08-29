@@ -539,6 +539,77 @@ describe("PostgreSQL storage backend factory", () => {
     });
   });
 
+  it("reports closed when health settles after factory shutdown begins", async () => {
+    const outcomes: Array<{
+      name: string;
+      settle: (resolve: (value: PostgreSqlRuntimeHealth) => void,
+        reject: (reason: unknown) => void) => void;
+    }> = [
+      {
+        name: "healthy",
+        settle: (resolve) => resolve(healthy),
+      },
+      {
+        name: "unavailable",
+        settle: (resolve) => resolve({ status: "unavailable", backend: "postgresql" }),
+      },
+      {
+        name: "rejected",
+        settle: (_resolve, reject) => reject(new Error("private health detail")),
+      },
+    ];
+
+    for (const outcome of outcomes) {
+      const { runtime, dependencies, events } = harness();
+      const factory = await createPostgreSqlStorageBackendFactoryForTesting(
+        config,
+        "/home/operator",
+        dependencies,
+      );
+      events.length = 0;
+      let settleHealth!: (value: PostgreSqlRuntimeHealth) => void;
+      let rejectHealth!: (reason: unknown) => void;
+      const healthProbe = new Promise<PostgreSqlRuntimeHealth>((resolve, reject) => {
+        settleHealth = resolve;
+        rejectHealth = reject;
+      });
+      let probeStarted!: () => void;
+      const probeEntered = new Promise<void>((resolve) => {
+        probeStarted = resolve;
+      });
+      let runtimeHealthCalls = 0;
+      runtime.health = () => {
+        runtimeHealthCalls += 1;
+        events.push("health-start");
+        probeStarted();
+        return healthProbe;
+      };
+      runtime.close = async () => {
+        runtime.closeAttempts += 1;
+        events.push("runtime-close");
+      };
+
+      const health = factory.health();
+      await probeEntered;
+      await factory.close();
+      events.push("close-complete");
+      outcome.settle(settleHealth, rejectHealth);
+      const result = await health;
+      events.push("health-complete");
+
+      expect(result).toEqual({ status: "closed", backend: "postgresql" });
+      expect(runtimeHealthCalls).toBe(1);
+      expect(runtime.closeAttempts).toBe(1);
+      expect(events).toEqual([
+        "health-start",
+        "runtime-close",
+        "close-complete",
+        "health-complete",
+      ]);
+      expect(outcome.name).toMatch(/healthy|unavailable|rejected/u);
+    }
+  });
+
   it("waits only for the pending-operation snapshot present when health starts", async () => {
     const { runtime, dependencies } = harness();
     let releaseFirstOpen!: () => void;
