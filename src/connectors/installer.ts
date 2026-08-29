@@ -1,25 +1,35 @@
 import {
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   ftruncateSync,
   lstatSync,
   mkdirSync,
   openSync,
+  realpathSync,
   readSync,
+  readlinkSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { join, dirname } from "node:path";
+import { join, dirname, relative, basename } from "node:path";
 import { homedir } from "node:os";
 import type { Agent, ConnectorSurface, ConnectorTransport } from "./types.js";
 import { CONNECTOR_SURFACES } from "./types.js";
 import { LCM_HISTORICAL_SKILL_SHA256, LCM_MANAGED_SKILL_MARKER, LCM_MARKERS } from "./constants.js";
 import { generateContent } from "./template-service.js";
 import { findAgent, AGENTS, resolveAgentTransport } from "./registry.js";
-import { CODEX_CONFIG_PATH, LEGACY_CODEX_HOOKS_PATHS, hasCodexHooks, installCodexHooks, removeCodexHooks } from "./codex-hooks.js";
+import {
+  CODEX_CONFIG_PATH,
+  LEGACY_CODEX_HOOKS_PATHS,
+  hasCodexHooksContent,
+  mergeCodexHooksContent,
+  removeCodexHooksContent,
+  setCodexHooksFeature,
+} from "./codex-hooks.js";
 import {
   canonicalHookCommand,
   hasCanonicalClaudeMcpEntry,
@@ -464,11 +474,208 @@ function skillCollision(filePath: string): Error {
 
 const NO_FOLLOW_FLAGS = constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
+type MutationTargetSpec = Readonly<{ displayPath: string; rootPath: string }>;
+
+type RootHandle = Readonly<{ rootPath: string; canonicalPath: string; fd: number }>;
+
+/**
+ * Linux-only authority for connector mutations. Descendants are addressed
+ * through retained directory descriptors in /proc; ordinary display paths
+ * remain separate so diagnostics never expose the operation pathname.
+ */
+class ConnectorMutationAuthority {
+  private readonly roots = new Map<string, RootHandle>();
+  private readonly operations = new Map<string, string>();
+  private readonly descriptors: number[] = [];
+
+  constructor(targets: readonly MutationTargetSpec[]) {
+    this.requireSupport();
+    const unique = [...new Map(targets.map((target) => [target.displayPath, target])).values()];
+    for (const target of unique) this.preflightTarget(target);
+    for (const target of unique) this.prepareTarget(target);
+  }
+
+  private requireSupport(): void {
+    for (const flag of [constants.O_DIRECTORY, constants.O_NOFOLLOW, constants.O_NONBLOCK]) {
+      if (typeof flag !== "number" || !Number.isSafeInteger(flag)) {
+        throw new Error("Connector filesystem mutation requires strict Linux open flags");
+      }
+    }
+    try {
+      const descriptorPath = "/proc/self/fd/0";
+      const target = readlinkSync(descriptorPath);
+      if (typeof target !== "string" || target.length === 0) throw new Error("empty proc descriptor target");
+    } catch (error) {
+      throw new Error("Connector filesystem mutation requires /proc/self/fd descriptor lookup", { cause: error });
+    }
+  }
+
+  private root(rootPath: string): RootHandle {
+    const existing = this.roots.get(rootPath);
+    if (existing) return existing;
+    const canonicalPath = realpathSync(rootPath);
+    const fd = openSync(canonicalPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const descriptorStatsValue = fstatSync(fd);
+      if (!descriptorStatsValue.isDirectory()) throw new Error(`Connector root is not a directory: ${rootPath}`);
+      const pathStats = lstatSync(canonicalPath);
+      if (!pathStats.isDirectory() || pathStats.dev !== descriptorStatsValue.dev || pathStats.ino !== descriptorStatsValue.ino) {
+        throw new Error(`Connector root identity changed: ${rootPath}`);
+      }
+      if (realpathSync(rootPath) !== canonicalPath) throw new Error(`Connector root resolution changed: ${rootPath}`);
+      const handle = { rootPath, canonicalPath, fd };
+      this.roots.set(rootPath, handle);
+      this.descriptors.push(fd);
+      return handle;
+    } catch (error) {
+      closeSync(fd);
+      throw error;
+    }
+  }
+
+  private components(target: MutationTargetSpec): { root: RootHandle; parts: string[] } {
+    const root = this.root(target.rootPath);
+    const raw = relative(target.rootPath, target.displayPath);
+    const parts = raw.split(/[\\/]/u);
+    return { root, parts };
+  }
+
+  private childPath(fd: number, component: string): string {
+    const path = `/proc/self/fd/${fd}/${component}`;
+    try {
+      const target = readlinkSync(`/proc/self/fd/${fd}`);
+      if (typeof target !== "string" || target.length === 0) throw new Error("empty proc descriptor target");
+    } catch (error) {
+      throw new Error("Connector proc descendant lookup is unavailable", { cause: error });
+    }
+    return path;
+  }
+
+  private openDirectory(path: string, displayPath: string): number {
+    let fd: number;
+    try {
+      fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ELOOP" || code === "ENOTDIR" || code === "EISDIR") {
+        throw new Error(`Refusing unsafe connector parent ${displayPath}`, { cause: error });
+      }
+      throw error;
+    }
+    try {
+      const descriptorStatsValue = fstatSync(fd);
+      if (!descriptorStatsValue.isDirectory()) throw new Error(`Connector parent is not a directory: ${displayPath}`);
+      const pathStats = lstatSync(path);
+      if (!pathStats.isDirectory() || pathStats.dev !== descriptorStatsValue.dev || pathStats.ino !== descriptorStatsValue.ino) {
+        throw new Error(`Connector parent identity changed: ${displayPath}`);
+      }
+      return fd;
+    } catch (error) {
+      closeSync(fd);
+      throw error;
+    }
+  }
+
+  private preflightTarget(target: MutationTargetSpec): void {
+    const { root, parts } = this.components(target);
+    let fd = root.fd;
+    const temporary: number[] = [];
+    try {
+      for (let index = 0; index < parts.length - 1; index += 1) {
+        const component = parts[index];
+        const path = this.childPath(fd, component);
+        try {
+          const next = this.openDirectory(path, target.displayPath);
+          temporary.push(next);
+          fd = next;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+          throw error;
+        }
+      }
+      // Leaf ownership and no-follow checks remain in each content operation;
+      // parent authority is established here before any surface can mutate.
+    } finally {
+      for (let index = temporary.length - 1; index >= 0; index -= 1) closeSync(temporary[index]);
+    }
+  }
+
+  private prepareTarget(target: MutationTargetSpec): void {
+    const { root, parts } = this.components(target);
+    let fd = root.fd;
+    for (let index = 0; index < parts.length - 1; index += 1) {
+      const component = parts[index];
+      const path = this.childPath(fd, component);
+      try {
+        const next = this.openDirectory(path, target.displayPath);
+        this.descriptors.push(next);
+        fd = next;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        try {
+          mkdirSync(path, { mode: 0o755 });
+        } catch (mkdirError) {
+          if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+        }
+        const next = this.openDirectory(path, target.displayPath);
+        this.descriptors.push(next);
+        fd = next;
+      }
+    }
+    const leaf = parts.at(-1)!;
+    this.operations.set(target.displayPath, this.childPath(fd, leaf));
+  }
+
+  operationPath(displayPath: string): string {
+    return this.operations.get(displayPath) ?? displayPath;
+  }
+
+  displayError(error: unknown): Error {
+    const message = error instanceof Error ? error.message : String(error);
+    let sanitized = message;
+    for (const [displayPath, operationPath] of this.operations) sanitized = sanitized.replaceAll(operationPath, displayPath);
+    return error instanceof Error ? new Error(sanitized, { cause: error }) : new Error(sanitized);
+  }
+
+  close(): void {
+    for (let index = this.descriptors.length - 1; index >= 0; index -= 1) {
+      try { closeSync(this.descriptors[index]); } catch { /* preserve primary failure */ }
+    }
+  }
+}
+
+let activeMutationAuthority: ConnectorMutationAuthority | undefined;
+
+function ioPath(displayPath: string): string {
+  return activeMutationAuthority?.operationPath(displayPath) ?? displayPath;
+}
+
+function ensureMutationParent(displayPath: string): void {
+  if (activeMutationAuthority && activeMutationAuthority.operationPath(displayPath) !== displayPath) return;
+  mkdirSync(dirname(displayPath), { recursive: true });
+}
+
+function withMutationAuthority<T>(targets: readonly MutationTargetSpec[], callback: () => T): T {
+  if (targets.length === 0) return callback();
+  const authority = new ConnectorMutationAuthority(targets);
+  const prior = activeMutationAuthority;
+  activeMutationAuthority = authority;
+  try {
+    return callback();
+  } catch (error) {
+    throw authority.displayError(error);
+  } finally {
+    activeMutationAuthority = prior;
+    authority.close();
+  }
+}
+
 function openNoFollow(filePath: string, flags: number, mode?: number): number {
   const safeFlags = flags | NO_FOLLOW_FLAGS;
+  const operationPath = ioPath(filePath);
   return mode === undefined
-    ? openSync(filePath, safeFlags)
-    : openSync(filePath, safeFlags, mode);
+    ? openSync(operationPath, safeFlags)
+    : openSync(operationPath, safeFlags, mode);
 }
 
 function descriptorStats(descriptor: number, filePath: string): ReturnType<typeof fstatSync> {
@@ -565,7 +772,7 @@ function updateRegularFileNoFollow(
 
 function pathStillIdentifiesDescriptor(filePath: string, stats: ReturnType<typeof fstatSync>): boolean {
   try {
-    const current = lstatSync(filePath);
+    const current = lstatSync(ioPath(filePath));
     return current.isFile() && current.dev === stats.dev && current.ino === stats.ino;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
@@ -584,7 +791,7 @@ function unlinkRegularFileNoFollow(filePath: string): boolean {
   try {
     const stats = descriptorStats(descriptor, filePath);
     if (!pathStillIdentifiesDescriptor(filePath, stats)) return false;
-    unlinkSync(filePath);
+    unlinkSync(ioPath(filePath));
     return true;
   } finally {
     closeSync(descriptor);
@@ -608,7 +815,7 @@ function preflightSkill(filePath: string, generated: string): void {
 function installSkill(content: string, filePath: string): void {
   preflightSkill(filePath, content);
   const expected = Buffer.from(managedSkillContent(content), 'utf-8');
-  mkdirSync(dirname(filePath), { recursive: true });
+  ensureMutationParent(filePath);
   let descriptor: number | undefined;
   let created = false;
   try {
@@ -677,7 +884,7 @@ function removeSkill(filePath: string, generated: string | readonly string[], st
       if (strict) throw new Error(`Refusing to remove a changed LCM skill at ${filePath}`);
       return false;
     }
-    unlinkSync(filePath);
+    unlinkSync(ioPath(filePath));
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
@@ -694,7 +901,7 @@ function installMarkdown(
   writeMode: 'append' | 'overwrite',
   blankLineBeforeManagedBlock = false,
 ): void {
-  mkdirSync(dirname(filePath), { recursive: true });
+  ensureMutationParent(filePath);
   if (writeMode === 'append') {
     updateRegularFileNoFollow(filePath, (existing) => (
       // Remove old markers if present before re-appending.
@@ -707,7 +914,7 @@ function installMarkdown(
 
 // Strategy 2: Structured targets (MCP JSON)
 function installMcpJson(filePath: string, strict = false): void {
-  mkdirSync(dirname(filePath), { recursive: true });
+  ensureMutationParent(filePath);
   let changed = false;
   const verifiedBytes = updateRegularFileNoFollow(filePath, (existingBytes, created) => {
     let existing: Record<string, unknown> = {};
@@ -951,9 +1158,10 @@ export type CodexCliRunner = (request: CodexCliRunRequest) => CodexCliRunResult;
 /** Injectable native Codex MCP seam used by convergence and deterministic tests. */
 export interface CodexMcpRunner {
   get(): readonly CodexMcpEntry[];
-  add(): void;
-  remove(): void;
+  readonly add?: () => void;
+  readonly remove?: () => void;
   restore?(entries: readonly CodexMcpEntry[]): void;
+  readonly pathnameBased?: boolean;
 }
 
 export interface ConnectorInstallerOptions {
@@ -1008,9 +1216,20 @@ function installComponent(
       if (!hookConfigPath) throw new Error(`No config path defined for ${agent.name} with type hook`);
       const hooksPath = resolveConfigPath(hookConfigPath, cwd);
       const configPath = resolveConfigPath(CODEX_CONFIG_PATH, cwd);
-      installCodexHooks(hooksPath, configPath, transport);
+      const existingConfig = readOptionalRegularFileNoFollow(configPath)?.toString("utf-8") ?? "";
+      const updatedConfig = setCodexHooksFeature(existingConfig);
+      if (updatedConfig !== existingConfig) writeRegularFileNoFollow(configPath, Buffer.from(updatedConfig, "utf-8"));
+      const existingHooks = readOptionalRegularFileNoFollow(hooksPath)?.toString("utf-8") ?? "";
+      writeRegularFileNoFollow(hooksPath, Buffer.from(mergeCodexHooksContent(existingHooks, transport), "utf-8"));
       for (const legacyPath of LEGACY_CODEX_HOOKS_PATHS.map((path) => resolveConfigPath(path, cwd))) {
-        if (legacyPath !== hooksPath) removeCodexHooks(legacyPath);
+        if (legacyPath !== hooksPath) {
+          const legacyContent = readOptionalRegularFileNoFollow(legacyPath)?.toString("utf-8");
+          if (legacyContent !== undefined) {
+            const result = removeCodexHooksContent(legacyContent);
+            if (result.state === "remove") unlinkRegularFileNoFollow(legacyPath);
+            else if (result.state === "rewrite") writeRegularFileNoFollow(legacyPath, Buffer.from(result.content, "utf-8"));
+          }
+        }
       }
       return { success: true, path: hooksPath, requiresRestart: surfaceRequiresRestart(surface) };
     }
@@ -1071,7 +1290,15 @@ function removeComponent(agent: Agent, surface: ConnectorSurface, cwd: string, s
   const configPath = agent.configPaths[surface];
   if (!configPath) return false;
   const resolvedPath = resolveConfigPath(configPath, cwd);
-  if (surface === "hook" && agent.id === "codex") return removeCodexHooks(resolvedPath);
+  if (surface === "hook" && agent.id === "codex") {
+    const content = readOptionalRegularFileNoFollow(resolvedPath)?.toString("utf-8");
+    if (content === undefined) return false;
+    const result = removeCodexHooksContent(content);
+    if (result.state === "unchanged") return false;
+    if (result.state === "remove") return unlinkRegularFileNoFollow(resolvedPath);
+    writeRegularFileNoFollow(resolvedPath, Buffer.from(result.content, "utf-8"));
+    return true;
+  }
   if (surface === "hook" && agent.id === "claude-code") return removeClaudeHooks(resolvedPath);
   if (surface === "mcp") return removeMcpJson(resolvedPath);
   if (surface === "skill") {
@@ -1096,7 +1323,7 @@ function removeComponent(agent: Agent, surface: ConnectorSurface, cwd: string, s
     const eol = establishedMarkdownEol(cleaned);
     if (cleaned === "") {
       if (!pathStillIdentifiesDescriptor(resolvedPath, stats)) return false;
-      unlinkSync(resolvedPath);
+      unlinkSync(ioPath(resolvedPath));
     } else {
       writeDescriptor(descriptor, Buffer.from(normalizeMarkdownEof(cleaned, eol), "utf-8"));
     }
@@ -1285,8 +1512,7 @@ function defaultCodexMcpRunner(cwd: string, cliRunner: CodexCliRunner = defaultC
   };
   return {
     get,
-    add: () => { runNativeCodexMcp(cwd, ["mcp", "add", "lcm", "--", "lcm", "mcp"], cliRunner); },
-    remove: () => { runNativeCodexMcp(cwd, ["mcp", "remove", "lcm"], cliRunner); },
+    pathnameBased: true,
   };
 }
 
@@ -1327,14 +1553,39 @@ function findCodexLcmEntry(entries: readonly CodexMcpEntry[]): CodexMcpEntry | u
   return entries.find((entry) => entry.name === "lcm");
 }
 
-function installCodexMcp(runner: CodexMcpRunner): boolean {
-  const current = runner.get();
+function installCodexMcp(runner: CodexMcpRunner, preflighted: readonly CodexMcpEntry[]): boolean {
+  const current = preflighted;
   const existing = findCodexLcmEntry(current);
-  if (existing && !isCanonicalCodexMcpEntry(existing)) throw new Error("Refusing to overwrite an unverified Codex MCP entry named lcm");
-  if (!existing) runner.add();
+  if (!existing) {
+    if (!runner.add) throw new Error("Codex MCP mutation runner does not provide add");
+    runner.add();
+  }
   const verified = findCodexLcmEntry(runner.get());
   if (!verified || !isCanonicalCodexMcpEntry(verified)) throw new Error("Codex MCP lcm entry failed JSON readback verification");
   return !existing;
+}
+
+function preflightCodexMcpInstall(runner: CodexMcpRunner): readonly CodexMcpEntry[] {
+  const current = runner.get();
+  const existing = findCodexLcmEntry(current);
+  if (existing && !isCanonicalCodexMcpEntry(existing)) {
+    throw new Error("Refusing to overwrite an unverified Codex MCP entry named lcm");
+  }
+  if (!existing && runner.pathnameBased) {
+    throw new Error("Automatic Codex MCP add is unavailable for pathname-based native state; add the lcm MCP server manually");
+  }
+  return current;
+}
+
+function preflightCodexMcpRemove(runner: CodexMcpRunner): void {
+  const existing = findCodexLcmEntry(runner.get());
+  if (!existing) return;
+  if (!isCanonicalCodexMcpEntry(existing)) {
+    throw new Error("Refusing to remove an unverified Codex MCP entry named lcm");
+  }
+  if (runner.pathnameBased) {
+    throw new Error("Automatic Codex MCP removal is unavailable for pathname-based native state; remove the lcm MCP server manually");
+  }
 }
 
 function removeCodexMcp(runner: CodexMcpRunner): boolean {
@@ -1342,6 +1593,8 @@ function removeCodexMcp(runner: CodexMcpRunner): boolean {
   const existing = findCodexLcmEntry(current);
   if (!existing) return false;
   if (!isCanonicalCodexMcpEntry(existing)) throw new Error("Refusing to remove an unverified Codex MCP entry named lcm");
+  if (runner.pathnameBased) throw new Error("Automatic Codex MCP removal is unavailable for pathname-based native state; remove the lcm MCP server manually");
+  if (!runner.remove) throw new Error("Codex MCP mutation runner does not provide remove");
   runner.remove();
   if (findCodexLcmEntry(runner.get())) throw new Error("Codex MCP lcm entry remained after removal");
   return true;
@@ -1362,9 +1615,13 @@ function compensateCodexMcp(runner: CodexMcpRunner, prior: readonly CodexMcpEntr
       if (!isCanonicalCodexMcpEntry(currentEntry)) {
         throw new Error("current Codex MCP entry is not safely removable");
       }
+      if (!runner.remove) throw new Error("Codex MCP mutation runner does not provide remove");
       runner.remove();
     }
-    if (findCodexLcmEntry(prior)) runner.add();
+    if (findCodexLcmEntry(prior)) {
+      if (!runner.add) throw new Error("Codex MCP mutation runner does not provide add");
+      runner.add();
+    }
   }
 
   const restored = runner.get();
@@ -1422,7 +1679,7 @@ function restoreOwnedFiles(snapshots: readonly OwnedFileSnapshot[]): void {
       try { unlinkRegularFileNoFollow(snapshot.path); } catch { /* preserve a non-file user surface */ }
       continue;
     }
-    mkdirSync(dirname(snapshot.path), { recursive: true });
+    ensureMutationParent(snapshot.path);
     // A file snapshot always records its mode; absent snapshots have no content
     // and return through the branch above.
     writeRegularFileNoFollow(snapshot.path, snapshot.content, snapshot.mode!);
@@ -1459,6 +1716,33 @@ function allOwnedPaths(agent: Agent, cwd: string): string[] {
   return paths;
 }
 
+function mutationTargetSpecs(agent: Agent, cwd: string, surfaces: readonly ConnectorSurface[]): MutationTargetSpec[] {
+  const specs: MutationTargetSpec[] = [];
+  for (const surface of surfaces) {
+    const configPath = agent.configPaths[surface];
+    if (!configPath) continue;
+    const rawParts = configPath.split("/");
+    const declarativeParts = rawParts.at(-1) === "" ? rawParts.slice(0, -1) : rawParts;
+    if (configPath.startsWith("/") || declarativeParts.some((part) => part === "" || part === "." || part === "..")) {
+      throw new Error(`Refusing unsafe connector registry path ${configPath}`);
+    }
+    const path = surfacePath(agent, surface, cwd);
+    specs.push({ displayPath: path!, rootPath: configPath.startsWith("~/") ? homedir() : cwd });
+    if (surface === "hook" && agent.id === "codex") {
+      const config = resolveConfigPath(CODEX_CONFIG_PATH, cwd);
+      specs.push({ displayPath: config, rootPath: homedir() });
+      for (const legacy of LEGACY_CODEX_HOOKS_PATHS) {
+        specs.push({ displayPath: resolveConfigPath(legacy, cwd), rootPath: cwd });
+      }
+    }
+  }
+  return specs;
+}
+
+function mutationTargetsForPaths(agent: Agent, cwd: string, surfaces: readonly ConnectorSurface[]): readonly MutationTargetSpec[] {
+  return mutationTargetSpecs(agent, cwd, surfaces);
+}
+
 function verifySurface(
   agent: Agent,
   surface: ConnectorSurface,
@@ -1483,7 +1767,8 @@ function verifySurface(
     return;
   }
   if (surface === "hook") {
-    if (!hasCodexHooks(path)) throw new Error(`Installed hook is missing at ${path}`);
+    const installed = readOptionalRegularFileNoFollow(path);
+    if (installed === undefined || !hasCodexHooksContent(installed.toString("utf-8"))) throw new Error(`Installed hook is missing at ${path}`);
     return;
   }
   if (surface === "rules") {
@@ -1548,6 +1833,8 @@ function installTransportBundle(
   let codexMcpMutated = false;
   try {
     phase(options, "snapshot");
+    let codexMcpPreflight: readonly CodexMcpEntry[] | undefined;
+    if (runner && targetSurfaces.includes("mcp") && agent.id === "codex") codexMcpPreflight = preflightCodexMcpInstall(runner);
     phase(options, "stage");
     for (const surface of targetSurfaces) {
       if (surface === "skill") {
@@ -1559,7 +1846,7 @@ function installTransportBundle(
     for (const surface of targetSurfaces) {
       if (surface === "mcp" && agent.id === "codex") {
         codexMcpMutationAttempted = true;
-        codexMcpMutated = installCodexMcp(runner!);
+        codexMcpMutated = installCodexMcp(runner!, codexMcpPreflight!);
         staged.push({ success: true, path: "", requiresRestart: true });
       } else {
         staged.push(installComponent(agent, surface, cwd, true, transport));
@@ -1628,6 +1915,16 @@ function installTransportBundle(
   }
 }
 
+function withInstallAuthority<T>(agent: Agent, surfaces: readonly ConnectorSurface[], cwd: string, callback: () => T): T {
+  // Preserve the legacy ability to bootstrap a not-yet-created project cwd;
+  // there is no selected root descriptor to anchor until that root exists.
+  if (process.platform !== "linux") throw new Error("Connector filesystem mutation requires Linux proc-descriptor anchoring");
+  if (!existsSync(cwd)) return callback();
+  if (!existsSync(homedir())) mkdirSync(homedir(), { recursive: true });
+  const specs = mutationTargetsForPaths(agent, cwd, surfaces);
+  return withMutationAuthority(specs, callback);
+}
+
 function parseInstallerArguments(
   cwdOrOptions: string | ConnectorInstallerOptions | undefined,
   options: ConnectorInstallerOptions | undefined,
@@ -1650,8 +1947,17 @@ export function installConnector(
   const parsed = parseInstallerArguments(cwdOrOptions, options);
   const isNewTransportCall = transportOrSurface === "cli" || parsed.optionsSupplied;
   if (!isNewTransportCall) {
-    if (transportOrSurface === undefined) return installLegacyDefault(agent, parsed.cwd);
-    return installComponent(agent, transportOrSurface, parsed.cwd);
+    if (transportOrSurface === undefined) {
+      const surfaces = legacyDefaultSurfaces(agent);
+      return withInstallAuthority(agent, surfaces, parsed.cwd, () => installLegacyDefault(agent, parsed.cwd));
+    }
+    const surface = transportOrSurface;
+    const configPath = agent.configPaths[surface];
+    if ((surface === "mcp" && (!configPath || configPath.endsWith(".toml")))
+      || (surface === "hook" && agent.id === "claude-code")) {
+      return installComponent(agent, surface, parsed.cwd);
+    }
+    return withInstallAuthority(agent, [surface], parsed.cwd, () => installComponent(agent, surface, parsed.cwd));
   }
   if (transportOrSurface !== undefined && transportOrSurface !== "cli" && transportOrSurface !== "mcp") {
     throw new Error(`Unsupported connector transport ${JSON.stringify(transportOrSurface)}; choose cli or mcp`);
@@ -1661,7 +1967,9 @@ export function installConnector(
     transportOrSurface === undefined ? undefined : transportOrSurface as ConnectorTransport,
     { configPath: parsed.options.configPath },
   );
-  return installTransportBundle(agent, resolved.transport, parsed.cwd, parsed.options, resolved.source);
+  return withInstallAuthority(agent, CONNECTOR_SURFACES, parsed.cwd, () => (
+    installTransportBundle(agent, resolved.transport, parsed.cwd, parsed.options, resolved.source)
+  ));
 }
 
 function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInstallerOptions): RemoveResult {
@@ -1674,6 +1982,12 @@ function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInst
       ? defaultCodexMcpRunner(cwd, options.codexCliRunner)
       : options.codexMcpRunner ?? defaultCodexMcpRunner(cwd))
     : undefined;
+  if (codexMcp) {
+    try { preflightCodexMcpRemove(codexMcp); } catch (error) {
+      failures.push(`mcp: ${error instanceof Error ? error.message : String(error)}`);
+      return { success: false, removed: false, paths, failures };
+    }
+  }
   if (agent.id === "claude-code") {
     const settingsPath = surfacePath(agent, "hook", cwd);
     if (settingsPath) {
@@ -1706,11 +2020,18 @@ export function removeConnector(
   const agent = findAgent(agentIdOrName);
   if (!agent) throw new Error(`Unknown agent: ${agentIdOrName}`);
   if (isConnectorSurface(cwdOrSurface)) {
-    return removeComponent(agent, cwdOrSurface, typeof cwdOrOptions === "string" ? cwdOrOptions : process.cwd());
+    const cwd = typeof cwdOrOptions === "string" ? cwdOrOptions : process.cwd();
+    const configPath = agent.configPaths[cwdOrSurface];
+    if (cwdOrSurface === "mcp" && (!configPath || configPath.endsWith(".toml"))) {
+      return removeComponent(agent, cwdOrSurface, cwd);
+    }
+    return withInstallAuthority(agent, [cwdOrSurface], cwd, () => removeComponent(agent, cwdOrSurface, cwd));
   }
-  if (cwdOrSurface === undefined && typeof cwdOrOptions === "string") return removeLegacyDefault(agent, cwdOrOptions);
+  if (cwdOrSurface === undefined && typeof cwdOrOptions === "string") {
+    return withInstallAuthority(agent, legacyDefaultSurfaces(agent), cwdOrOptions, () => removeLegacyDefault(agent, cwdOrOptions));
+  }
   const parsed = parseInstallerArguments(cwdOrSurface, typeof cwdOrOptions === "object" ? cwdOrOptions : undefined);
-  return removeTransportBundle(agent, parsed.cwd, parsed.options);
+  return withInstallAuthority(agent, CONNECTOR_SURFACES, parsed.cwd, () => removeTransportBundle(agent, parsed.cwd, parsed.options));
 }
 
 export function listConnectors(cwd: string = process.cwd()): InstalledConnector[] {
@@ -1740,7 +2061,8 @@ export function listConnectors(cwd: string = process.cwd()): InstalledConnector[
           // ignore malformed JSON
         }
       } else if (type === 'hook' && agent.id === 'codex') {
-        if (hasCodexHooks(resolvedPath)) {
+        const content = readOptionalRegularFileNoFollow(resolvedPath);
+        if (content !== undefined && hasCodexHooksContent(content.toString("utf-8"))) {
           installed.push({ agentId: agent.id, agentName: agent.name, type, path: resolvedPath });
         }
       } else if (type === 'hook' && agent.id === 'claude-code') {

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -710,7 +710,47 @@ describe('installConnector — rules (markdown append)', () => {
   });
 });
 
+describe('connector parent traversal', () => {
+  it('refuses an intermediate symlink outside the selected project before writing', () => {
+    const external = mkdtempSync(join(tmpdir(), 'lcm-connector-external-'));
+    const externalRules = join(external, 'lcm.md');
+    writeFileSync(externalRules, 'external sentinel\n');
+    symlinkSync(external, join(tmpDir, '.clinerules'));
+
+    expect(() => installConnector('cline', 'rules', tmpDir)).toThrow(/symlink|parent|safe|root|ENOTDIR/iu);
+    expect(readFileSync(externalRules, 'utf8')).toBe('external sentinel\n');
+  });
+
+  it('rejects an intermediate symlink alias even when its destination stays in the project', () => {
+    const target = join(tmpDir, '.clinerules-real');
+    mkdirSync(target);
+    symlinkSync(target, join(tmpDir, '.clinerules'));
+
+    expect(() => installConnector('cline', 'rules', tmpDir)).toThrow(/symlink|parent|safe|root|ENOTDIR/iu);
+    expect(existsSync(join(target, 'lcm.md'))).toBe(false);
+  });
+
+  it('refuses removal through an intermediate symlink without touching the destination', () => {
+    const external = mkdtempSync(join(tmpdir(), 'lcm-connector-remove-external-'));
+    const externalRules = join(external, 'lcm.md');
+    writeFileSync(externalRules, 'external sentinel\n');
+    symlinkSync(external, join(tmpDir, '.clinerules'));
+
+    expect(() => removeConnector('cline', 'rules', tmpDir)).toThrow(/parent|safe|root|ENOTDIR/iu);
+    expect(readFileSync(externalRules, 'utf8')).toBe('external sentinel\n');
+  });
+});
+
 describe('installConnector — MCP JSON', () => {
+  it('refuses to overwrite a non-owned MCP entry without changing bytes', () => {
+    const mcpPath = join(tmpDir, '.mcp.json');
+    const before = JSON.stringify({ mcpServers: { lcm: { type: 'sse', url: 'https://example.invalid' } }, user: true }) + '\n';
+    writeFileSync(mcpPath, before);
+
+    expect(() => installConnector('claude-code', 'mcp', tmpDir)).toThrow(/non-LCM MCP entry named lcm/iu);
+    expect(readFileSync(mcpPath, 'utf8')).toBe(before);
+  });
+
   it('writes JSON with mcpServers.lcm', () => {
     const result = installConnector('claude-code', 'mcp', tmpDir);
     expect(result.success).toBe(true);
@@ -1310,6 +1350,95 @@ describe('installConnector — Codex native hooks', () => {
     expect(removeConnector('codex', 'hook', tmpDir)).toBe(true);
     expect(listConnectors(tmpDir).some(c => c.agentId === 'codex' && c.type === 'hook')).toBe(false);
     expect(existsSync(result.path)).toBe(false);
+  });
+
+  it('preserves an unrelated legacy Codex hooks file while installing the global hook', () => {
+    const originalHome = process.env.HOME;
+    const home = join(tmpDir, 'distinct-home');
+    const projectDir = join(tmpDir, 'project');
+    const legacyPath = join(projectDir, '.codex', 'hooks.json');
+    mkdirSync(home, { recursive: true });
+    mkdirSync(dirname(legacyPath), { recursive: true });
+    process.env.HOME = home;
+    const before = JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo user' }] }] } }, null, 2) + '\n';
+    writeFileSync(legacyPath, before);
+    try {
+      expect(installConnector('codex', 'hook', projectDir).success).toBe(true);
+      expect(readFileSync(legacyPath, 'utf8')).toBe(before);
+      expect(existsSync(join(home, '.codex', 'hooks.json'))).toBe(true);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it('removes a legacy Codex hooks file containing only LCM hooks during CLI install', () => {
+    const originalHome = process.env.HOME;
+    const home = join(tmpDir, 'home');
+    mkdirSync(home, { recursive: true });
+    process.env.HOME = home;
+    const legacyPath = join(tmpDir, '.codex', 'hooks.json');
+    mkdirSync(dirname(legacyPath), { recursive: true });
+    writeFileSync(legacyPath, JSON.stringify({ hooks: {
+      SessionStart: [{ hooks: [{ type: 'command', command: 'lcm restore --client codex' }] }],
+    } }));
+    try {
+      expect(installConnector('codex', 'cli', tmpDir, { persistTransport: false }).success).toBe(true);
+      expect(existsSync(legacyPath)).toBe(false);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it('rewrites a legacy Codex hooks file while preserving unrelated user hooks', () => {
+    const originalHome = process.env.HOME;
+    const home = join(tmpDir, 'home');
+    mkdirSync(home, { recursive: true });
+    process.env.HOME = home;
+    const legacyPath = join(tmpDir, '.codex', 'hooks.json');
+    mkdirSync(dirname(legacyPath), { recursive: true });
+    writeFileSync(legacyPath, JSON.stringify({ userMetadata: 'keep', hooks: {
+      SessionStart: [{ hooks: [
+        { type: 'command', command: 'lcm restore --client codex' },
+        { type: 'command', command: 'echo keep' },
+      ] }],
+    } }));
+    try {
+      expect(installConnector('codex', 'cli', tmpDir, { persistTransport: false }).success).toBe(true);
+      const rewritten = JSON.parse(readFileSync(legacyPath, 'utf8'));
+      expect(rewritten.userMetadata).toBe('keep');
+      expect(rewritten.hooks.SessionStart[0].hooks).toEqual([{ type: 'command', command: 'echo keep' }]);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it('leaves a Codex hooks file byte-identical when no LCM hook is present', () => {
+    const hooksPath = join(tmpDir, '.codex', 'hooks.json');
+    mkdirSync(dirname(hooksPath), { recursive: true });
+    const before = JSON.stringify({ userMetadata: 'keep', hooks: {
+      SessionStart: [{ hooks: [{ type: 'command', command: 'echo keep' }] }],
+    } }, null, 2) + '\n';
+    writeFileSync(hooksPath, before);
+
+    expect(removeConnector('codex', 'hook', tmpDir)).toBe(false);
+    expect(readFileSync(hooksPath, 'utf8')).toBe(before);
+  });
+
+  it('rewrites Codex hooks through the anchored parent while preserving user hooks', () => {
+    const result = installConnector('codex', 'hook', tmpDir);
+    const hooks = JSON.parse(readFileSync(result.path, 'utf8')) as { hooks: Record<string, unknown[]>; userMetadata?: string };
+    hooks.userMetadata = 'preserve me';
+    hooks.hooks.SessionStart.push({ hooks: [{ type: 'command', command: 'echo user hook' }] });
+    writeFileSync(result.path, JSON.stringify(hooks, null, 2) + '\n');
+
+    expect(removeConnector('codex', 'hook', tmpDir)).toBe(true);
+    expect(existsSync(result.path)).toBe(true);
+    const rewritten = JSON.parse(readFileSync(result.path, 'utf8'));
+    expect(rewritten.userMetadata).toBe('preserve me');
+    expect(rewritten.hooks.SessionStart).toEqual([{ hooks: [{ type: 'command', command: 'echo user hook' }] }]);
   });
 
   it('removes old LCM hooks from legacy cwd hooks.json when installing the user hook file', () => {

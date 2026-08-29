@@ -122,14 +122,6 @@ function normalizeHooksConfig(value: unknown): CodexHooksConfig {
   return config as CodexHooksConfig;
 }
 
-function readHooksConfig(path: string): CodexHooksConfig {
-  try {
-    return normalizeHooksConfig(JSON.parse(readFileSync(path, "utf-8")));
-  } catch {
-    return { hooks: {} };
-  }
-}
-
 function isLcmHookCommand(command: unknown): boolean {
   if (typeof command !== "string") return false;
   if (/\blcm\s+user-prompt\s+--client\s+codex(?:\s+--transport\s+(?:cli|mcp))?$/.test(command)) {
@@ -174,6 +166,41 @@ function hasAnyHookGroups(config: CodexHooksConfig): boolean {
 
 function hasNonHookKeys(config: CodexHooksConfig): boolean {
   return Object.keys(config).some((key) => key !== "hooks");
+}
+
+/** Pure content operation used by the anchored installer mutation seam. */
+export function mergeCodexHooksContent(content: string, transport: ConnectorTransport = "cli"): string {
+  const config = stripLcmHooks(readHooksConfigFromContent(content)).config;
+  const lcmHooks = codexLcmHooks(transport);
+  for (const [event, groups] of Object.entries(lcmHooks)) {
+    config.hooks[event] = [...(config.hooks[event] ?? []), ...groups];
+  }
+  return JSON.stringify(config, null, 2) + "\n";
+}
+
+/** Pure content operation for removing LCM hooks. */
+export function removeCodexHooksContent(content: string): { state: "unchanged" | "rewrite" | "remove"; content: string } {
+  const { config, removed } = stripLcmHooks(readHooksConfigFromContent(content));
+  if (!removed) return { state: "unchanged", content };
+  if (!hasAnyHookGroups(config) && !hasNonHookKeys(config)) return { state: "remove", content: "" };
+  return { state: "rewrite", content: JSON.stringify(config, null, 2) + "\n" };
+}
+
+export function hasCodexHooksContent(content: string): boolean {
+  const config = readHooksConfigFromContent(content);
+  return Object.values(config.hooks).some((groups) =>
+    Array.isArray(groups) && groups.some((group) =>
+      Array.isArray(group.hooks) && group.hooks.some((hook) => isLcmHookCommand(hook.command)),
+    ),
+  );
+}
+
+function readHooksConfigFromContent(content: string): CodexHooksConfig {
+  try {
+    return normalizeHooksConfig(JSON.parse(content));
+  } catch {
+    return { hooks: {} };
+  }
 }
 
 export function enableCodexHooksFeature(configPath: string): void {
@@ -246,38 +273,27 @@ export function installCodexHooks(
 ): void {
   mkdirSync(dirname(hooksPath), { recursive: true });
   enableCodexHooksFeature(configPath);
-
-  const { config } = stripLcmHooks(readHooksConfig(hooksPath));
-  const lcmHooks = codexLcmHooks(transport);
-  for (const [event, groups] of Object.entries(lcmHooks)) {
-    config.hooks[event] = [...(config.hooks[event] ?? []), ...groups];
-  }
-
-  writeFileSync(hooksPath, JSON.stringify(config, null, 2) + "\n");
+  let existing = "";
+  try { existing = readFileSync(hooksPath, "utf-8"); } catch { /* malformed/absent is treated as empty */ }
+  writeFileSync(hooksPath, mergeCodexHooksContent(existing, transport));
 }
 
 export function removeCodexHooks(hooksPath: string): boolean {
-  const { config, removed } = stripLcmHooks(readHooksConfig(hooksPath));
-  if (!removed) return false;
-
-  if (!hasAnyHookGroups(config) && !hasNonHookKeys(config)) {
-    unlinkSync(hooksPath);
-    return true;
-  }
-
-  writeFileSync(hooksPath, JSON.stringify(config, null, 2) + "\n");
+  let existing = "";
+  try { existing = readFileSync(hooksPath, "utf-8"); } catch { return false; }
+  const result = removeCodexHooksContent(existing);
+  if (result.state === "unchanged") return false;
+  if (result.state === "remove") unlinkSync(hooksPath);
+  else writeFileSync(hooksPath, result.content);
   return true;
 }
 
 export function hasCodexHooks(hooksPath: string): boolean {
-  const config = readHooksConfig(hooksPath);
-  return Object.values(config.hooks).some((groups) =>
-    Array.isArray(groups) &&
-    groups.some((group) =>
-      Array.isArray(group.hooks) &&
-      group.hooks.some((hook) => isLcmHookCommand(hook.command)),
-    ),
-  );
+  return hasCodexHooksContent(readFileContent(hooksPath));
+}
+
+function readFileContent(path: string): string {
+  try { return readFileSync(path, "utf-8"); } catch { return ""; }
 }
 
 /** Resolve the Codex hooks path using the same `~/` convention as installation. */

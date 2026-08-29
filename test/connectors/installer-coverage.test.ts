@@ -76,6 +76,37 @@ afterEach(() => {
 });
 
 describe("installer defensive branches", () => {
+  it("uses an injected native restore seam during MCP compensation", () => {
+    withTempHome((cwd) => {
+      let entries: readonly Record<string, unknown>[] = [];
+      let restores = 0;
+      const runner = {
+        get: () => entries,
+        add: () => { entries = [codexEntry()]; },
+        remove: () => { entries = []; },
+        restore: (prior: readonly Record<string, unknown>[]) => { restores += 1; entries = prior; },
+      };
+      expect(() => installConnector("codex", "mcp", cwd, {
+        codexMcpRunner: runner,
+        persistTransport: false,
+        failAt: "complete",
+      })).toThrow(/Injected connector installer failure at complete/iu);
+      expect(restores).toBe(1);
+      expect(entries).toEqual([]);
+    });
+  });
+
+  it("rejects an unsafe raw registry path before creating connector parents", () => {
+    const agent = AGENTS.find((candidate) => candidate.id === "cline")!;
+    const original = agent.configPaths.rules;
+    agent.configPaths.rules = "../escape";
+    try {
+      expect(() => installConnector("cline", "rules", directory)).toThrow(/unsafe connector registry path/iu);
+      expect(existsSync(join(directory, "..", "escape"))).toBe(false);
+    } finally {
+      agent.configPaths.rules = original;
+    }
+  });
   it("handles malformed and unterminated skill frontmatter", async () => {
     await withGeneratedContent("---\nname: lcm\n", (install) => {
       expect(() => install("claude-code", "skill", directory)).not.toThrow();
@@ -301,13 +332,18 @@ describe("installer defensive branches", () => {
       return {
         ...actual,
         openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
-          if (String(path) === skillPath && openMode !== "normal") {
+          const currentPath = String(path);
+          const procMatch = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(currentPath);
+          const displayPath = procMatch
+            ? (() => { try { return join(actual.readlinkSync(`/proc/self/fd/${procMatch[1]}`), procMatch[2]); } catch { return currentPath; } })()
+            : currentPath;
+          if (displayPath === skillPath && openMode !== "normal") {
             throw Object.assign(new Error(openMode), { code: openMode === "enoent" ? "ENOENT" : "EACCES" });
           }
           const descriptor = mode === undefined
             ? actual.openSync(path, flags)
             : actual.openSync(path, flags, mode);
-          descriptors.set(descriptor, String(path));
+          descriptors.set(descriptor, displayPath);
           return descriptor;
         }) as typeof actual.openSync,
         readSync: ((descriptor: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
@@ -670,10 +706,15 @@ describe("installer defensive branches", () => {
       return {
         ...actual,
         openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const currentPath = String(path);
+          const procMatch = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(currentPath);
+          const displayPath = procMatch
+            ? (() => { try { return join(actual.readlinkSync(`/proc/self/fd/${procMatch[1]}`), procMatch[2]); } catch { return currentPath; } })()
+            : currentPath;
           const descriptor = mode === undefined
             ? actual.openSync(path, flags)
             : actual.openSync(path, flags, mode);
-          descriptors.set(descriptor, String(path));
+          descriptors.set(descriptor, displayPath);
           return descriptor;
         }) as typeof actual.openSync,
         closeSync: ((descriptor: number) => {
@@ -842,32 +883,37 @@ describe("installer defensive branches", () => {
         ...actual,
         openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
           const currentPath = String(path);
+          const procMatch = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(currentPath);
+          const procDisplayPath = procMatch
+            ? (() => { try { return join(actual.readlinkSync(`/proc/self/fd/${procMatch[1]}`), procMatch[2]); } catch { return currentPath; } })()
+            : currentPath;
+          const displayPath = fault.path && (currentPath === fault.path || procDisplayPath === fault.path) ? fault.path : currentPath;
           const numericFlags = Number(flags);
-          if (currentPath === fault.path && fault.oneShotOpenError) {
+          if (displayPath === fault.path && fault.oneShotOpenError) {
             const code = fault.oneShotOpenError;
             fault.oneShotOpenError = undefined;
             throw error(code);
           }
-          if (currentPath === fault.path && fault.oneShotOpenWithoutCode) {
+          if (displayPath === fault.path && fault.oneShotOpenWithoutCode) {
             fault.oneShotOpenWithoutCode = false;
             throw new Error("unclassified open failure");
           }
-          if (currentPath === fault.path && fault.createError && (numericFlags & fs.constants.O_EXCL) !== 0) {
+          if (displayPath === fault.path && fault.createError && (numericFlags & fs.constants.O_EXCL) !== 0) {
             throw error(fault.createError);
           }
-          if (currentPath === fault.path && fault.symlinkOnCreateTarget
+          if (displayPath === fault.path && fault.symlinkOnCreateTarget
             && (numericFlags & fs.constants.O_EXCL) !== 0) {
             const target = fault.symlinkOnCreateTarget;
             fault.symlinkOnCreateTarget = undefined;
-            actual.symlinkSync(target, currentPath);
+            actual.symlinkSync(target, fault.path!);
           }
-          if (currentPath === fault.path && fault.replaceOnCreateContent !== undefined
+          if (displayPath === fault.path && fault.replaceOnCreateContent !== undefined
             && (numericFlags & fs.constants.O_EXCL) !== 0) {
             const content = fault.replaceOnCreateContent;
             fault.replaceOnCreateContent = undefined;
-            actual.writeFileSync(currentPath, content);
+            actual.writeFileSync(fault.path!, content);
           }
-          if (currentPath === fault.path && fault.openReadErrorAt !== undefined
+          if (displayPath === fault.path && fault.openReadErrorAt !== undefined
             && (numericFlags & fs.constants.O_ACCMODE) === fs.constants.O_RDONLY) {
             fault.openReadCount = (fault.openReadCount ?? 0) + 1;
             if (fault.openReadCount === fault.openReadErrorAt) throw error("EACCES");
@@ -875,7 +921,7 @@ describe("installer defensive branches", () => {
           const descriptor = mode === undefined
             ? actual.openSync(path, flags)
             : actual.openSync(path, flags, mode);
-          descriptors.set(descriptor, currentPath);
+          descriptors.set(descriptor, displayPath);
           return descriptor;
         }) as typeof actual.openSync,
         closeSync: ((descriptor: number) => {
@@ -904,14 +950,26 @@ describe("installer defensive branches", () => {
           return actual.writeSync(descriptor, data, offset, length, position);
         }) as typeof actual.writeSync,
         lstatSync: ((path: fs.PathLike, options?: fs.StatOptions) => {
-          if (String(path) === fault.path && fault.lstatError) throw error(fault.lstatError);
-          if (String(path) === fault.path && fault.lstatReplacement) {
+          const currentPath = String(path);
+          const procMatch = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(currentPath);
+          const procDisplayPath = procMatch
+            ? (() => { try { return join(actual.readlinkSync(`/proc/self/fd/${procMatch[1]}`), procMatch[2]); } catch { return currentPath; } })()
+            : currentPath;
+          const displayPath = fault.path && (currentPath === fault.path || procDisplayPath === fault.path) ? fault.path : currentPath;
+          if (displayPath === fault.path && fault.lstatError) throw error(fault.lstatError);
+          if (displayPath === fault.path && fault.lstatReplacement) {
             return actual.lstatSync(fault.lstatReplacement, options as never);
           }
           return actual.lstatSync(path, options as never);
         }) as typeof actual.lstatSync,
         unlinkSync: ((path: fs.PathLike) => {
-          if (String(path) === fault.path && fault.unlinkError) throw error(fault.unlinkError);
+          const currentPath = String(path);
+          const procMatch = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(currentPath);
+          const procDisplayPath = procMatch
+            ? (() => { try { return join(actual.readlinkSync(`/proc/self/fd/${procMatch[1]}`), procMatch[2]); } catch { return currentPath; } })()
+            : currentPath;
+          const displayPath = fault.path && (currentPath === fault.path || procDisplayPath === fault.path) ? fault.path : currentPath;
+          if (displayPath === fault.path && fault.unlinkError) throw error(fault.unlinkError);
           return actual.unlinkSync(path);
         }) as typeof actual.unlinkSync,
       };
@@ -1130,6 +1188,413 @@ describe("installer defensive branches", () => {
 });
 
 describe("installer descriptor edge branches", () => {
+  it("refuses when fd0 proc lookup returns an empty target", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, readlinkSync: (path: fs.PathLike) => String(path) === "/proc/self/fd/0" ? "" : actual.readlinkSync(path) };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/proc\/self\/fd descriptor lookup/iu);
+    } finally { vi.doUnmock("node:fs"); vi.resetModules(); }
+  });
+
+  it("refuses when the retained root descriptor is not a directory", async () => {
+    let altered = false;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        fstatSync: ((fd: number, options?: fs.StatOptions) => {
+          const value = actual.fstatSync(fd, options as never);
+          if (!altered && value.isDirectory()) {
+            altered = true;
+            return new Proxy(value, { get(target, property) { if (property === "isDirectory") return () => false; return Reflect.get(target, property, target); } });
+          }
+          return value;
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/root is not a directory/iu);
+      expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
+    } finally { vi.doUnmock("node:fs"); vi.resetModules(); }
+  });
+
+  it("refuses when root resolution changes after canonical open", async () => {
+    let calls = 0;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, realpathSync: ((path: fs.PathLike) => ++calls === 2 ? "/tmp" : actual.realpathSync(path)) as typeof actual.realpathSync };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/root resolution changed/iu);
+    } finally { vi.doUnmock("node:fs"); vi.resetModules(); }
+  });
+
+  it("refuses an empty proc descendant target without exposing proc paths", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, readlinkSync: (path: fs.PathLike) => String(path) === "/proc/self/fd/0" ? actual.readlinkSync(path) : "" };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/proc descendant lookup is unavailable/iu);
+    } finally { vi.doUnmock("node:fs"); vi.resetModules(); }
+  });
+
+  it("sanitizes a primitive anchored filesystem failure at the public seam", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+        if (String(path).startsWith("/proc/self/fd/") && String(path).endsWith("/lcm.md")) throw "primitive anchored failure";
+        return mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+      }) as typeof actual.openSync };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try { module.installConnector("cline", "rules", directory); } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toContain("primitive anchored failure");
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+    } finally { vi.doUnmock("node:fs"); vi.resetModules(); }
+  });
+  it("fails closed when a parent descriptor is not a directory", async () => {
+    let directoryStats = 0;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        fstatSync: ((descriptor: number, options?: fs.StatOptions) => {
+          const value = actual.fstatSync(descriptor, options as never);
+          if (value.isDirectory() && directoryStats++ > 0) {
+            return new Proxy(value, {
+              get(target, property) {
+                if (property === "isDirectory") return () => false;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          return value;
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/parent is not a directory/iu);
+      expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("sanitizes an anchored filesystem error to its ordinary display path", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const value = String(path);
+          if (value.startsWith("/proc/self/fd/") && value.endsWith("/SKILL.md")) {
+            throw new Error(`anchored failure at ${value}`);
+          }
+          return mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+        }) as typeof actual.openSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try { module.installConnector("claude-code", "skill", directory); } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toContain(join(directory, ".claude", "skills", "lcm-memory", "SKILL.md"));
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+  it("propagates a non-ENOENT parent open failure during preparation", async () => {
+    let opens = 0;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          if (String(path).startsWith("/proc/self/fd/") && (Number(flags) & actual.constants.O_DIRECTORY) !== 0) {
+            opens += 1;
+            if (opens === 1) throw Object.assign(new Error("parent missing"), { code: "ENOENT" });
+            if (opens === 2) throw Object.assign(new Error("parent denied"), { code: "EACCES" });
+          }
+          return mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+        }) as typeof actual.openSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/parent denied|EACCES/iu);
+      expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+  it("anchors a connector leaf directly beneath the selected root", () => {
+    const agent = AGENTS.find((candidate) => candidate.id === "cline")!;
+    const original = agent.configPaths.rules;
+    agent.configPaths.rules = "lcm.md";
+    try {
+      const module = installConnector("cline", "rules", directory);
+      expect(module.success).toBe(true);
+      expect(module.path).toBe(join(directory, "lcm.md"));
+      expect(existsSync(module.path)).toBe(true);
+    } finally {
+      agent.configPaths.rules = original;
+      rmSync(join(directory, "lcm.md"), { force: true });
+    }
+  });
+  it("reports missing native remove during compensation after an injected failure", () => {
+    withTempHome((cwd) => {
+      let entries: readonly Record<string, unknown>[] = [];
+      const runner = {
+        get: () => entries,
+        add: () => { entries = [codexEntry()]; },
+      };
+      expect(() => installConnector("codex", "mcp", cwd, {
+        codexMcpRunner: runner,
+        persistTransport: false,
+        failAt: "complete",
+      })).toThrow(/rollback incomplete.*remove/iu);
+    });
+  });
+
+  it("reports missing native add during compensation after removal and failure", () => {
+    withTempHome((cwd) => {
+      let entries: readonly Record<string, unknown>[] = [codexEntry()];
+      const runner = {
+        get: () => entries,
+        remove: () => { entries = []; },
+      };
+      expect(() => installConnector("codex", "cli", cwd, {
+        codexMcpRunner: runner,
+        persistTransport: false,
+        failAt: "complete",
+      })).toThrow(/rollback incomplete.*add/iu);
+    });
+  });
+  it("rejects a root identity mismatch and closes the retained root descriptor", async () => {
+    let altered = false;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        lstatSync: ((path: fs.PathLike, options?: fs.StatOptions) => {
+          const value = actual.lstatSync(path, options as never);
+          if (!altered && String(path) === directory) {
+            altered = true;
+            return new Proxy(value, {
+              get(target, property) {
+                if (property === "ino") return Number(target.ino) + 1;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          return value;
+        }) as typeof actual.lstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/root identity changed/iu);
+      expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("refuses an unavailable proc descendant lookup without exposing proc paths", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        readlinkSync: ((path: fs.PathLike, options?: fs.BufferEncoding | { encoding?: fs.BufferEncoding }) => {
+          if (String(path).startsWith("/proc/self/fd/") && String(path) !== "/proc/self/fd/0") {
+            throw Object.assign(new Error("descendant unavailable"), { code: "EINVAL" });
+          }
+          return actual.readlinkSync(path, options as never);
+        }) as typeof actual.readlinkSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try { module.installConnector("cline", "rules", directory); } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toMatch(/proc descendant lookup is unavailable/iu);
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+      expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+  it("refuses filesystem mutation on non-Linux before touching connector state", async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/Linux proc-descriptor/iu);
+      expect(existsSync(join(directory, ".clinerules"))).toBe(false);
+    } finally {
+      if (descriptor) Object.defineProperty(process, "platform", descriptor);
+    }
+  });
+
+  it("bootstraps an absent home before anchored global connector mutation", () => {
+    const originalHome = process.env.HOME;
+    const syntheticHome = join(directory, "absent-home");
+    process.env.HOME = syntheticHome;
+    try {
+      const result = installConnector("codex", "hook", directory);
+      expect(result.success).toBe(true);
+      expect(result.path).toBe(join(syntheticHome, ".codex", "hooks.json"));
+      expect(existsSync(result.path)).toBe(true);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it("refuses when strict directory flags are unavailable", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, constants: { ...actual.constants, O_DIRECTORY: undefined } };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/strict Linux open flags/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("refuses when proc descriptor lookup is unavailable", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, readlinkSync: () => { throw Object.assign(new Error("proc missing"), { code: "ENOENT" }); } };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/proc.*descriptor lookup/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+  it("rejects a parent identity mismatch with the display path and closes its descriptor", async () => {
+    let mismatch = true;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        lstatSync: ((path: fs.PathLike, options?: fs.StatOptions) => {
+          const value = actual.lstatSync(path, options as never);
+          if (mismatch && String(path).startsWith("/proc/self/fd/")) {
+            mismatch = false;
+            return new Proxy(value, {
+              get(target, property) {
+                if (property === "ino") return Number(target.ino) + 1;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          return value;
+        }) as typeof actual.lstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try { module.installConnector("cline", "rules", directory); } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toContain(directory);
+      expect((caught as Error).message).toMatch(/parent identity changed/iu);
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+      expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("reopens a concurrently-created parent after mkdir reports EEXIST", async () => {
+    let injected = false;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        mkdirSync: ((path: fs.PathLike, options?: fs.MakeDirectoryOptions & { recursive?: false }) => {
+          if (!injected && String(path).startsWith("/proc/self/fd/")) {
+            injected = true;
+            actual.mkdirSync(path, options as never);
+            throw Object.assign(new Error("already exists"), { code: "EEXIST" });
+          }
+          return actual.mkdirSync(path, options as never);
+        }) as typeof actual.mkdirSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(module.installConnector("cline", "rules", directory).success).toBe(true);
+      expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(true);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("propagates an unexpected mkdir failure before creating the connector leaf", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        mkdirSync: ((path: fs.PathLike, options?: fs.MakeDirectoryOptions & { recursive?: false }) => {
+          if (String(path).startsWith("/proc/self/fd/")) throw Object.assign(new Error("mkdir denied"), { code: "EACCES" });
+          return actual.mkdirSync(path, options as never);
+        }) as typeof actual.mkdirSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/mkdir denied|EACCES/iu);
+      expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("rejects an unsafe descriptor size and short descriptor reads", async () => {
     let invalidSize = true;
     let returnZero = false;
@@ -1186,7 +1651,11 @@ describe("installer descriptor edge branches", () => {
       return {
         ...actual,
         openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
-          const pathname = String(path);
+          const currentPath = String(path);
+          const procMatch = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(currentPath);
+          const pathname = procMatch
+            ? (() => { try { return join(actual.readlinkSync(`/proc/self/fd/${procMatch[1]}`), procMatch[2]); } catch { return currentPath; } })()
+            : currentPath;
           if (pathname === skillPath) {
             skillOpenCount += 1;
             if (skillOpenCount === 1) throw Object.assign(new Error("missing"), { code: "ENOENT" });
@@ -1241,7 +1710,12 @@ describe("installer descriptor edge branches", () => {
       return {
         ...actual,
         openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
-          if (String(path) === skillPath) {
+          const currentPath = String(path);
+          const procMatch = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(currentPath);
+          const pathname = procMatch
+            ? (() => { try { return join(actual.readlinkSync(`/proc/self/fd/${procMatch[1]}`), procMatch[2]); } catch { return currentPath; } })()
+            : currentPath;
+          if (pathname === skillPath) {
             openCount += 1;
             if (openCount === 1 || openCount === 3) throw Object.assign(new Error("symlink"), { code: "ELOOP" });
             if (openCount === 2) throw Object.assign(new Error("missing"), { code: "ENOENT" });

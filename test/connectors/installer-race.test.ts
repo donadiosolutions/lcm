@@ -32,15 +32,22 @@ vi.mock("node:fs", async (importOriginal) => {
     },
     openSync: (...args: Parameters<typeof actual.openSync>) => {
       const descriptor = actual.openSync(...args);
-      if (args[0] === mocks.swapOpenPath) {
+      const operationPath = String(args[0]);
+      const matchesSwapPath = operationPath === mocks.swapOpenPath
+        || (() => {
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(operationPath);
+          if (!match) return false;
+          try { return join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]) === mocks.swapOpenPath; } catch { return false; }
+        })();
+      if (matchesSwapPath) {
         mocks.swapOpenCount += 1;
         if (mocks.swapOpenCount === 1 && mocks.swapOpenReplacement) {
-          const path = String(args[0]);
+          const path = mocks.swapOpenPath;
           renameSync(path, `${path}.original-before-remove-race`);
           renameSync(mocks.swapOpenReplacement, path);
           mocks.swapOpenOccurred = true;
         } else if (mocks.swapOpenCount === 2 && mocks.swapOpenTarget) {
-          const path = String(args[0]);
+          const path = mocks.swapOpenPath;
           renameSync(path, `${path}.original-before-write-race`);
           actual.symlinkSync(mocks.swapOpenTarget, path);
           mocks.swapOpenOccurred = true;
