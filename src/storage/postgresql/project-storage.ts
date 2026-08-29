@@ -400,15 +400,16 @@ export class PostgreSqlProjectStorage implements ProjectStorage {
     if (this.closed) {
       return { status: "closed", backend: "postgresql", projectId: this.projectId };
     }
+    let candidate: StorageHealth;
     try {
       await this.rootExecutor.query({ text: "SELECT 1" }, {
         domain: "factory",
         operation: "health",
         projectId: this.projectId,
       });
-      return { status: "healthy", backend: "postgresql", projectId: this.projectId };
+      candidate = { status: "healthy", backend: "postgresql", projectId: this.projectId };
     } catch (error) {
-      return {
+      candidate = {
         status: "unavailable",
         backend: "postgresql",
         projectId: this.projectId,
@@ -420,6 +421,10 @@ export class PostgreSqlProjectStorage implements ProjectStorage {
         }),
       };
     }
+    if (this.closed) {
+      return { status: "closed", backend: "postgresql", projectId: this.projectId };
+    }
+    return candidate;
   }
 
   close(): Promise<void> {

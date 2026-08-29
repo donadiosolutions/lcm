@@ -53,6 +53,7 @@ class FakeTransactionScope implements PostgreSqlTransactionScopeExecutor {
 class FakeRuntime implements PostgreSqlProjectStorageRuntime {
   readonly transactions: PostgreSqlTransactionOptions[] = [];
   readonly transactionScopes: FakeTransactionScope[] = [];
+  readonly queryConfigs: QueryConfig[] = [];
   readonly queryOptions: PostgreSqlQueryOptions[] = [];
 
   constructor(
@@ -66,6 +67,7 @@ class FakeRuntime implements PostgreSqlProjectStorageRuntime {
     config: QueryConfig<I>,
     options: PostgreSqlQueryOptions,
   ): Promise<QueryResult<R>> {
+    this.queryConfigs.push(config);
     this.queryOptions.push(options);
     return this.queryImplementation<R>(config, options);
   }
@@ -283,6 +285,151 @@ describe("PostgreSqlProjectStorage", () => {
       },
     });
     expect(JSON.stringify(health)).not.toContain("secret");
+  });
+
+  it("dominates a successful health probe when close begins", async () => {
+    let releaseQuery!: () => void;
+    let probeEntered!: () => void;
+    const queryReleased = new Promise<void>((resolve) => { releaseQuery = resolve; });
+    const entered = new Promise<void>((resolve) => { probeEntered = resolve; });
+    let onCloseCalls = 0;
+    const runtime = new FakeRuntime(async () => {
+      probeEntered();
+      await queryReleased;
+      return result([]);
+    });
+    const storage = new PostgreSqlProjectStorage(
+      runtime,
+      PROJECT_ID,
+      MACHINE_ID,
+      () => { onCloseCalls += 1; },
+    );
+
+    const health = storage.health();
+    await entered;
+    const firstClose = storage.close();
+    expect(storage.close()).toBe(firstClose);
+    expect(runtime.queryConfigs).toEqual([{ text: "SELECT 1" }]);
+    expect(runtime.queryOptions).toHaveLength(1);
+    expect(runtime.queryOptions[0]).toMatchObject({
+      domain: "factory",
+      operation: "health",
+      projectId: PROJECT_ID,
+      signal: expect.any(AbortSignal),
+    });
+    expect(runtime.queryOptions[0]?.signal?.aborted).toBe(true);
+    let closeSettled = false;
+    void firstClose.finally(() => { closeSettled = true; }).catch(() => undefined);
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    expect(onCloseCalls).toBe(0);
+
+    releaseQuery();
+    await expect(health).resolves.toEqual({
+      status: "closed",
+      backend: "postgresql",
+      projectId: PROJECT_ID,
+    });
+    await firstClose;
+    expect(onCloseCalls).toBe(1);
+  });
+
+  it("dominates a sanitized health rejection when close begins", async () => {
+    let releaseQuery!: () => void;
+    let probeEntered!: () => void;
+    const queryReleased = new Promise<void>((resolve) => { releaseQuery = resolve; });
+    const entered = new Promise<void>((resolve) => { probeEntered = resolve; });
+    let onCloseCalls = 0;
+    const runtime = new FakeRuntime(async () => {
+      probeEntered();
+      await queryReleased;
+      throw new Error("private query detail");
+    });
+    const storage = new PostgreSqlProjectStorage(
+      runtime,
+      PROJECT_ID,
+      MACHINE_ID,
+      () => { onCloseCalls += 1; },
+    );
+
+    const health = storage.health();
+    await entered;
+    const firstClose = storage.close();
+    expect(storage.close()).toBe(firstClose);
+    expect(runtime.queryConfigs).toEqual([{ text: "SELECT 1" }]);
+    expect(runtime.queryOptions).toHaveLength(1);
+    expect(runtime.queryOptions[0]).toMatchObject({
+      domain: "factory",
+      operation: "health",
+      projectId: PROJECT_ID,
+      signal: expect.any(AbortSignal),
+    });
+    expect(runtime.queryOptions[0]?.signal?.aborted).toBe(true);
+    let closeSettled = false;
+    void firstClose.finally(() => { closeSettled = true; }).catch(() => undefined);
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    expect(onCloseCalls).toBe(0);
+
+    releaseQuery();
+    await expect(health).resolves.toEqual({
+      status: "closed",
+      backend: "postgresql",
+      projectId: PROJECT_ID,
+    });
+    await firstClose;
+    expect(onCloseCalls).toBe(1);
+  });
+
+  it("waits for an abort-aware health probe before returning closed", async () => {
+    let releaseRejection!: () => void;
+    let probeEntered!: () => void;
+    let abortObserved!: () => void;
+    const rejectionReleased = new Promise<void>((resolve) => { releaseRejection = resolve; });
+    const entered = new Promise<void>((resolve) => { probeEntered = resolve; });
+    const aborted = new Promise<void>((resolve) => { abortObserved = resolve; });
+    let onCloseCalls = 0;
+    const runtime = new FakeRuntime(async (_config, options) => {
+      probeEntered();
+      options.signal?.addEventListener("abort", () => { abortObserved(); }, { once: true });
+      await rejectionReleased;
+      throw new Error("private abort detail");
+    });
+    const storage = new PostgreSqlProjectStorage(
+      runtime,
+      PROJECT_ID,
+      MACHINE_ID,
+      () => { onCloseCalls += 1; },
+    );
+
+    const health = storage.health();
+    await entered;
+    const firstClose = storage.close();
+    expect(storage.close()).toBe(firstClose);
+    await aborted;
+    expect(runtime.queryConfigs).toEqual([{ text: "SELECT 1" }]);
+    expect(runtime.queryOptions).toHaveLength(1);
+    expect(runtime.queryOptions[0]).toMatchObject({
+      domain: "factory",
+      operation: "health",
+      projectId: PROJECT_ID,
+      signal: expect.any(AbortSignal),
+    });
+    expect(runtime.queryOptions[0]?.signal?.aborted).toBe(true);
+    let closeSettled = false;
+    void firstClose.finally(() => { closeSettled = true; }).catch(() => undefined);
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    expect(onCloseCalls).toBe(0);
+
+    releaseRejection();
+    await expect(health).resolves.toEqual({
+      status: "closed",
+      backend: "postgresql",
+      projectId: PROJECT_ID,
+    });
+    await firstClose;
+    expect(onCloseCalls).toBe(1);
   });
 
   it("aborts and awaits only its own work before unregistering", async () => {

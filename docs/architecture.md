@@ -281,6 +281,9 @@ adapter and logs' existing safety boundaries.
 Once factory shutdown begins, an in-flight factory health probe reports the
 closed state and exposes no runtime detail, even if the underlying probe later
 settles with a healthy, unavailable, or failed result.
+For PostgreSQL, once project shutdown begins, project health reports the
+closed state with the project identity and exposes no query detail, even if its
+probe settles later.
 
 ### Transactions
 
