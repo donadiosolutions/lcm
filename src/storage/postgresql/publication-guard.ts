@@ -210,11 +210,13 @@ function context(
   projectId: string,
   operation: string,
   signal?: AbortSignal,
+  machineId?: string,
 ): PostgreSqlQueryOptions {
   return {
     domain: "coordination",
     operation,
     projectId,
+    ...(machineId === undefined ? {} : { machineId }),
     ...(signal === undefined ? {} : { signal }),
   };
 }
@@ -468,7 +470,7 @@ export class PostgreSqlBackendPublicationGuard {
           const existing = await transaction.query<PublicationRow>({
             text: lockLeaseSql(),
             values: leaseKeyValues(normalized.projectId),
-          }, context(normalized.projectId, operation, input.signal));
+          }, context(normalized.projectId, operation, input.signal, normalized.machineId));
           if (existing.rows.length > 1) {
             return publicationError(normalized.projectId, operation, "invalid-row");
           }
@@ -504,7 +506,7 @@ export class PostgreSqlBackendPublicationGuard {
                 normalized.operationIdentity,
                 normalized.ttlMs,
               ],
-            }, context(normalized.projectId, operation, input.signal));
+            }, context(normalized.projectId, operation, input.signal, normalized.machineId));
             if (inserted.rows.length !== 1) {
               return publicationError(normalized.projectId, operation, "invalid-row");
             }
@@ -515,7 +517,7 @@ export class PostgreSqlBackendPublicationGuard {
           const currentResult = await transaction.query<PublicationRow>({
             text: selectLeaseSql(),
             values: leaseKeyValues(normalized.projectId),
-          }, context(normalized.projectId, operation, input.signal));
+          }, context(normalized.projectId, operation, input.signal, normalized.machineId));
           if (currentResult.rows.length !== 1) {
             return publicationError(normalized.projectId, operation, "invalid-row");
           }
@@ -594,7 +596,7 @@ export class PostgreSqlBackendPublicationGuard {
               normalized.ttlMs,
               currentFence.fencingToken.toString(),
             ],
-          }, context(normalized.projectId, operation, input.signal));
+          }, context(normalized.projectId, operation, input.signal, normalized.machineId));
           if (replaced.rows.length !== 1) {
             return publicationError(
               normalized.projectId,
@@ -606,7 +608,7 @@ export class PostgreSqlBackendPublicationGuard {
           return candidate;
         },
         {
-          ...context(normalized.projectId, operation, input.signal),
+          ...context(normalized.projectId, operation, input.signal, normalized.machineId),
           projectIds: [normalized.projectId],
           transactionMode: "read-committed-read-write",
         },
@@ -792,7 +794,7 @@ export class PostgreSqlBackendPublicationGuard {
       async (transaction) => {
         const locked = await transaction.query<PublicationRow>(
           { text: lockLeaseSql(), values: leaseKeyValues(normalized.projectId) },
-          context(normalized.projectId, operation, signal),
+          context(normalized.projectId, operation, signal, normalized.machineId),
         );
         if (locked.rows.length !== 1) {
           return publicationError(
@@ -803,7 +805,7 @@ export class PostgreSqlBackendPublicationGuard {
         }
         const mutation = await transaction.query<PublicationRow>(
           query,
-          context(normalized.projectId, operation, signal),
+          context(normalized.projectId, operation, signal, normalized.machineId),
         );
         if (mutation.rows.length !== 1) {
           return publicationError(
@@ -817,7 +819,7 @@ export class PostgreSqlBackendPublicationGuard {
         return fence;
       },
       {
-        ...context(normalized.projectId, operation, signal),
+        ...context(normalized.projectId, operation, signal, normalized.machineId),
         projectIds: [normalized.projectId],
         transactionMode: "read-committed-read-write",
       },

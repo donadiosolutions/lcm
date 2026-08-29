@@ -106,7 +106,9 @@ cannot weaken the configured CA, hostname verification, UTC session, or
 application identity. Queries accept parameter arrays without copying SQL or
 values into public errors. Aborted active queries are cancelled by a bounded,
 one-shot TLS client using the checked-out backend PID; an uncertain target
-connection is destroyed rather than returned to the pool.
+connection is destroyed rather than returned to the pool. Sanitized PostgreSQL
+cancellation errors retain scoped project and machine identity while excluding
+SQL text, query values, and driver details.
 
 Ordered SQL files are packaged in `dist` and checked against an explicit
 SHA-256 manifest before execution. The runner takes a database-scoped
