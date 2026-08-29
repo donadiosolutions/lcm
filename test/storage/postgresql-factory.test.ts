@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import type { ResolvedPostgreSqlConfig } from "../../src/daemon/config.js";
 import type {
@@ -121,15 +121,19 @@ class FakeRuntime {
   healthResult: PostgreSqlRuntimeHealth = healthy;
   closeFailure: Error | undefined;
   project: RemoteProject | null = remoteProject;
+  queryGate: Promise<void> | undefined;
+  observedSignals: AbortSignal[] = [];
 
   health(): Promise<PostgreSqlRuntimeHealth> {
     return Promise.resolve(this.healthResult);
   }
 
-  query<R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
+  async query<R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
     _config: QueryConfig<I>,
-    _options: PostgreSqlQueryOptions,
+    options: PostgreSqlQueryOptions,
   ): Promise<QueryResult<R>> {
+    this.observedSignals.push(options.signal);
+    await this.queryGate;
     const rows = this.project === null
       ? []
       : [{
@@ -494,6 +498,60 @@ describe("PostgreSQL storage backend factory", () => {
     await expect(factory.openExistingProject(identity)).rejects.toMatchObject({
       code: "STORAGE_INITIALIZATION_FAILED",
     });
+  });
+
+  it("classifies caller cancellation after pending identity I/O and permits a later reopen", async () => {
+    const { runtime, dependencies } = harness();
+    let release!: () => void;
+    runtime.queryGate = new Promise<void>(resolve => { release = resolve; });
+    const factory = await createPostgreSqlStorageBackendFactoryForTesting(config, "/home/operator", dependencies);
+    const controller = new AbortController();
+    const pending = factory.openExistingProject(identity, undefined, controller.signal);
+    await vi.waitFor(() => expect(runtime.observedSignals).toHaveLength(1));
+    controller.abort("disconnect");
+    expect(runtime.observedSignals[0]?.aborted).toBe(true);
+    expect(runtime.observedSignals[0]).not.toBe(controller.signal);
+    release();
+    await expect(pending).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", operation: "openExistingProject" });
+    expect(runtime.observedSignals[0]).toBeDefined();
+    expect(runtime.observedSignals[0]).not.toBe(controller.signal);
+    runtime.queryGate = undefined;
+    await expect(factory.openExistingProject(identity)).resolves.not.toBeNull();
+    await factory.close();
+  });
+
+  it("gives factory shutdown precedence over caller cancellation for a pending open", async () => {
+    for (const abortCallerFirst of [true, false]) {
+      const { runtime, dependencies } = harness();
+      let release!: () => void;
+      runtime.queryGate = new Promise<void>(resolve => { release = resolve; });
+      const factory = await createPostgreSqlStorageBackendFactoryForTesting(config, "/home/operator", dependencies);
+      const controller = new AbortController();
+      const pending = factory.openExistingProject(identity, undefined, controller.signal);
+      if (abortCallerFirst) controller.abort();
+      const closing = factory.close();
+      if (!abortCallerFirst) controller.abort();
+      release();
+      await expect(pending).rejects.toMatchObject({ code: "STORAGE_CLOSED", operation: "openExistingProject" });
+      await expect(closing).resolves.toBeUndefined();
+    }
+  });
+
+  it("closes a facade once when cancellation arrives after remote identity resolution", async () => {
+    const { runtime, dependencies } = harness();
+    const controller = new AbortController();
+    let closeCalls = 0;
+    const project = { close: async () => { closeCalls += 1; } } as unknown as ProjectStorage;
+    let factory!: Awaited<ReturnType<typeof createPostgreSqlStorageBackendFactoryForTesting>>;
+    dependencies.createProjectStorage = () => {
+      controller.abort();
+      return project;
+    };
+    factory = await createPostgreSqlStorageBackendFactoryForTesting(config, "/home/operator", dependencies);
+    await expect(factory.openExistingProject(identity, undefined, controller.signal))
+      .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", operation: "openExistingProject" });
+    expect(closeCalls).toBe(1);
+    await factory.close();
   });
 
   it("rejects missing or non-terminal PostgreSQL publication evidence", async () => {

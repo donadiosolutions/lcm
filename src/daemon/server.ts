@@ -44,6 +44,7 @@ import { createStatsHandler } from "./routes/stats.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { createInvocationControlHandler } from "./routes/invocation-control.js";
+import { throwIfAborted } from "./cancellation.js";
 import {
   createInvocationCoordinator,
   type InvocationCoordinator,
@@ -939,6 +940,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             invocationCoordinator,
           });
         });
+        throwIfAborted(requestSignal);
         bufferedResponse.flush();
         bufferedResponse = undefined;
       } else {
@@ -970,6 +972,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
               "daemon read storage admission changed during request execution",
             );
           }
+          throwIfAborted(requestSignal);
           bufferedResponse.flush();
           bufferedResponse = undefined;
         }

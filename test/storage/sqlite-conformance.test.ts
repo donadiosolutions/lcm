@@ -1292,6 +1292,49 @@ describe("SQLite storage backend conformance", () => {
     expect(isLcmConnectionOpen(dbPath)).toBe(false);
   });
 
+  it("pre-aborted opens do not create a file or acquire a connection", async () => {
+    const root = createTemporaryDirectory("lcm-storage-preaborted-open-");
+    const dbPath = join(root, "preaborted.db");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+    });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(factory.openProject(projectIdentity(root), undefined, controller.signal))
+      .rejects.toBeDefined();
+    expect(existsSync(dbPath)).toBe(false);
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    await factory.close();
+  });
+
+  it("keeps live missing existing opens non-creating and fences cancellation in feature detection", async () => {
+    const root = createTemporaryDirectory("lcm-storage-existing-cancel-");
+    const missingPath = join(root, "missing.db");
+    const missingFactory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath: missingPath }),
+    });
+    await expect(missingFactory.openExistingProject(projectIdentity(root))).resolves.toBeNull();
+    expect(existsSync(missingPath)).toBe(false);
+    await missingFactory.close();
+
+    const dbPath = join(root, "cancelled.db");
+    const controller = new AbortController();
+    let detected = false;
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+      detectFeatures: () => {
+        detected = true;
+        controller.abort();
+        return { fts5Available: false };
+      },
+    });
+    await expect(factory.openProject(projectIdentity(root), undefined, controller.signal))
+      .rejects.toBeDefined();
+    expect(detected).toBe(true);
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    await factory.close();
+  });
+
   it("settles repeated factory closes after every project close attempt", async () => {
     const root = createTemporaryDirectory("lcm-storage-best-effort-close-");
     const factory = new SqliteStorageBackendFactory({

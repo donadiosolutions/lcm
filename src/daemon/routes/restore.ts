@@ -25,6 +25,7 @@ import {
   withProjectStorage,
 } from "./storage-lifecycle.js";
 import { validateSessionInstructionsScope } from "../../storage/session-instructions.js";
+import { isAbortError } from "../cancellation.js";
 const MAX_SESSION_INSTRUCTIONS_BYTES = 1024 * 1024;
 
 type InstructionPath = { label: string; path: string; allowedRoot: string };
@@ -272,6 +273,7 @@ export function createRestoreHandler(
             )
           : null;
       } catch (error) {
+        if (isAbortError(error)) throw error;
         const storageFailure = storageRouteFailureResponse(config.storage.backend, error, "restore", storageFactory);
         if (storageFailure) {
           sendJson(res, storageFailure.status, storageFailure.body);
@@ -285,6 +287,7 @@ export function createRestoreHandler(
 
       sendJson(res, 200, responseBody ?? { context: orientation });
     } catch (err) {
+      if (isAbortError(err)) throw err;
       const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "restore", storageFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);

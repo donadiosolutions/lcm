@@ -17,6 +17,7 @@ import {
 } from "../staged-postgresql.js";
 import { sanitizeError } from "../safe-error.js";
 import type { BackendPublicationLockToken } from "../../storage/backend-publication.js";
+import { createAbortError, throwIfAborted } from "../cancellation.js";
 
 interface AsyncClosable {
   close(): Promise<void> | void;
@@ -121,8 +122,9 @@ export async function openExistingProject(
   factory: StorageBackendFactory,
   identity: StorageIdentityContext,
   publicationLockToken?: BackendPublicationLockToken,
+  signal?: AbortSignal,
 ): Promise<ProjectStorage | null> {
-  return factory.openExistingProject(identity, publicationLockToken);
+  return factory.openExistingProject(identity, publicationLockToken, signal);
 }
 
 /**
@@ -137,10 +139,13 @@ export async function withProjectStorage<T>(
   operation: ProjectStorageOperation<T>,
 ): Promise<T | null> {
   const signal = request.context?.signal ?? new AbortController().signal;
+  throwIfAborted(signal);
   let activeFactory = request.factory;
   let ownedFactory: StorageBackendFactory | undefined;
 
+  const state = { openPending: false };
   const run = async (publicationLockToken?: BackendPublicationLockToken): Promise<T | null> => {
+    throwIfAborted(signal);
     if (activeFactory === undefined) {
       activeFactory = await createStorageBackendFactory(
         request.config.storage,
@@ -170,36 +175,68 @@ export async function withProjectStorage<T>(
     };
 
     try {
-      project = request.mode === "existing"
-        ? await openExistingProject(activeFactory, identity, publicationLockToken) ?? undefined
-        : await activeFactory.openProject(identity, publicationLockToken);
+      state.openPending = true;
+      try {
+        project = request.mode === "existing"
+          ? await openExistingProject(activeFactory, identity, publicationLockToken, signal) ?? undefined
+          : await activeFactory.openProject(identity, publicationLockToken, signal);
+      } finally {
+        state.openPending = false;
+      }
+      throwIfAborted(signal);
       if (project === undefined) return null;
 
       signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted) {
         onAbort();
-        if (request.mode === "create") {
-          throw Object.assign(new Error("request cancelled"), { name: "AbortError" });
-        }
-        return null;
+        throw createAbortError(signal.reason);
       }
-      return await operation(project, signal);
+      const result = await operation(project, signal);
+      return result;
     } finally {
       signal.removeEventListener("abort", onAbort);
       await closeProject();
     }
   };
 
-  try {
-    if (request.context?.withPublicationAdmission !== undefined) {
-      return await request.context.withPublicationAdmission(run);
-    }
-    return await run(request.context?.publicationLockToken);
-  } finally {
-    // An owned factory is closed only after the admission callback has
-    // returned, so project cleanup and publication revalidation complete first.
+  const privateExecution = request.context?.withPublicationAdmission !== undefined
+    ? request.context.withPublicationAdmission(run)
+    : run(request.context?.publicationLockToken);
+  // Attach observers immediately so a prompt public cancellation never leaves
+  // a late open rejection unobserved.
+  const observedExecution = privateExecution.then(
+    value => value,
+    error => { throw error; },
+  );
+  const settledExecution = observedExecution.finally(async () => {
+    // An owned factory is closed only after admission release and all private
+    // project cleanup have completed.
     await closeRouteStorage(ownedFactory);
+  });
+  if (request.context?.withPublicationAdmission === undefined
+      && request.context?.publicationLockToken !== undefined) {
+    return settledExecution;
   }
+  return new Promise<T | null>((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+    const settle = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const onAbort = (): void => {
+      if (!state.openPending) return;
+      settle(() => reject(createAbortError(signal.reason)));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    settledExecution.then(
+      value => settle(() => resolve(value)),
+      error => settle(() => reject(error)),
+    );
+    if (signal.aborted) onAbort();
+  });
 }
 
 export function stagedPostgreSqlUnavailableResponse(
