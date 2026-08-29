@@ -3,7 +3,9 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -103,6 +105,16 @@ describe("installer defensive branches", () => {
     try {
       expect(() => installConnector("cline", "rules", directory)).toThrow(/unsafe connector registry path/iu);
       expect(existsSync(join(directory, "..", "escape"))).toBe(false);
+    } finally {
+      agent.configPaths.rules = original;
+    }
+  });
+  it("rejects a target whose resolved relative path is empty", () => {
+    const agent = AGENTS.find((candidate) => candidate.id === "cline")!;
+    const original = agent.configPaths.rules;
+    agent.configPaths.rules = "~/";
+    try {
+      expect(() => installConnector("cline", "rules", directory)).toThrow(/unsafe connector registry path/iu);
     } finally {
       agent.configPaths.rules = original;
     }
@@ -845,6 +857,7 @@ describe("installer defensive branches", () => {
     });
     try {
       const module = await import("../../src/connectors/installer.js");
+      mkdirSync(join(directory, ".clinerules"));
       const result = module.removeConnector("cline", { cwd: directory, configPath: join(directory, "string-cleanup-config.json") });
       expect(result).toEqual(expect.objectContaining({
         success: false,
@@ -1037,15 +1050,21 @@ describe("installer defensive branches", () => {
 
       const unclassifiedRemoveRoot = join(directory, "unclassified-remove-error");
       fault.path = join(unclassifiedRemoveRoot, ".claude", "skills", "lcm-memory", "SKILL.md");
+      mkdirSync(dirname(fault.path), { recursive: true });
+      writeFileSync(fault.path, "owned\n");
+      fault.oneShotOpenError = "EACCES";
+      expect(() => module.removeConnector("claude-code", "skill", unclassifiedRemoveRoot))
+        .toThrow(/Unable to inspect LCM skill.*EACCES/iu);
       fault.oneShotOpenWithoutCode = true;
       expect(() => module.removeConnector("claude-code", "skill", unclassifiedRemoveRoot))
         .toThrow(/Unable to inspect LCM skill/iu);
+      fault.oneShotOpenWithoutCode = undefined;
 
       const skillCreateRoot = join(directory, "skill-create-error");
       fault.path = join(skillCreateRoot, ".claude", "skills", "lcm-memory", "SKILL.md");
-      fault.createError = "EACCES";
+      fault.oneShotOpenError = "EACCES";
       expect(() => module.installConnector("claude-code", "skill", skillCreateRoot)).toThrow(/EACCES/iu);
-      fault.createError = undefined;
+      fault.oneShotOpenError = undefined;
 
       const installMismatchRoot = join(directory, "install-path-mismatch");
       const installMismatchSkill = join(installMismatchRoot, ".claude", "skills", "lcm-memory", "SKILL.md");
@@ -1188,6 +1207,139 @@ describe("installer defensive branches", () => {
 });
 
 describe("installer descriptor edge branches", () => {
+  it("uses a retained connector root when stdin is closed", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        readlinkSync: ((path: fs.PathLike, options?: fs.BufferEncoding | { encoding?: fs.BufferEncoding }) => {
+          if (String(path) === "/proc/self/fd/0") throw Object.assign(new Error("stdin closed"), { code: "ENOENT" });
+          return actual.readlinkSync(path, options as never);
+        }) as typeof actual.readlinkSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(module.installConnector("cline", "rules", directory).success).toBe(true);
+      expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(true);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("does not remove an existing home target through a symlink when the project cwd is absent", () => {
+    const originalHome = process.env.HOME;
+    const home = join(directory, "home");
+    const outside = join(directory, "outside");
+    const missingCwd = join(directory, "missing-project");
+    mkdirSync(home);
+    mkdirSync(outside);
+    const outsideCodex = join(outside, ".codex");
+    mkdirSync(outsideCodex);
+    writeFileSync(join(outsideCodex, "hooks.json"), "{\"hooks\":{}}\n");
+    symlinkSync(outsideCodex, join(home, ".codex"));
+    process.env.HOME = home;
+    try {
+      expect(() => removeConnector("codex", "hook", missingCwd)).toThrow(/unsafe connector parent/iu);
+      expect(readFileSync(join(outsideCodex, "hooks.json"), "utf-8")).toBe("{\"hooks\":{}}\n");
+      expect(existsSync(missingCwd)).toBe(false);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it("does not create roots or parents for an absent remove target", () => {
+    const originalHome = process.env.HOME;
+    const home = join(directory, "home");
+    const missingCwd = join(directory, "missing-project");
+    mkdirSync(home);
+    process.env.HOME = home;
+    try {
+      const result = removeConnector("cline", "rules", missingCwd);
+      expect(result).toBe(false);
+      expect(existsSync(missingCwd)).toBe(false);
+      expect(existsSync(join(home, ".clinerules"))).toBe(false);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it("leaves transport configuration unchanged when every remove target is absent", () => {
+    const originalHome = process.env.HOME;
+    const home = join(directory, "home");
+    const missingCwd = join(directory, "missing-project");
+    const configPath = join(directory, "transport.json");
+    mkdirSync(home);
+    writeFileSync(configPath, JSON.stringify({ connectors: { transports: { cline: "cli" } } }) + "\n");
+    process.env.HOME = home;
+    try {
+      const result = removeConnector("cline", { cwd: missingCwd, configPath });
+      expect(result).toMatchObject({ success: true, removed: false });
+      expect(readFileSync(configPath, "utf-8")).toBe(JSON.stringify({ connectors: { transports: { cline: "cli" } } }) + "\n");
+      expect(existsSync(missingCwd)).toBe(false);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it("rejects a backslash component before descriptor traversal", () => {
+    const agent = AGENTS.find((candidate) => candidate.id === "cline")!;
+    const original = agent.configPaths.rules;
+    agent.configPaths.rules = "nested\\\\rules.md";
+    try {
+      expect(() => installConnector("cline", "rules", directory)).toThrow(/unsafe connector registry path/iu);
+      expect(existsSync(join(directory, "nested"))).toBe(false);
+    } finally {
+      agent.configPaths.rules = original;
+    }
+  });
+
+  it("records an inspect target that disappears between preflight and preparation", async () => {
+    const parent = join(directory, ".clinerules");
+    mkdirSync(parent);
+    let directoryOpens = 0;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          if (String(path).startsWith("/proc/self/fd/") && (Number(flags) & actual.constants.O_DIRECTORY) !== 0) {
+            directoryOpens += 1;
+            if (directoryOpens === 2) throw Object.assign(new Error("parent disappeared"), { code: "ENOENT" });
+          }
+          return mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+        }) as typeof actual.openSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(module.removeConnector("cline", "rules", directory)).toBe(false);
+      expect(existsSync(parent)).toBe(true);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("handles missing and symlinked skill leaves after parent anchoring", () => {
+    const skillParent = join(directory, ".claude", "skills", "lcm-memory");
+    mkdirSync(skillParent, { recursive: true });
+    expect(removeConnector("claude-code", "skill", directory)).toBe(false);
+
+    const target = join(skillParent, "SKILL.md");
+    const outside = join(directory, "outside-skill.md");
+    writeFileSync(outside, "user-owned\n");
+    symlinkSync(outside, target);
+    expect(removeConnector("claude-code", "skill", directory)).toBe(false);
+    expect(readFileSync(outside, "utf-8")).toBe("user-owned\n");
+  });
+
   it("fails closed when a registry target changes after authority preparation", () => {
     const agent = AGENTS.find((candidate) => candidate.id === "cline")!;
     const original = agent.configPaths.rules;
@@ -1211,7 +1363,7 @@ describe("installer descriptor edge branches", () => {
     expect(existsSync(join(directory, "alternate"))).toBe(false);
     expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
   });
-  it("refuses when fd0 proc lookup returns an empty target", async () => {
+  it("does not require stdin for retained descriptor anchoring", async () => {
     vi.resetModules();
     vi.doMock("node:fs", async () => {
       const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
@@ -1219,8 +1371,68 @@ describe("installer descriptor edge branches", () => {
     });
     try {
       const module = await import("../../src/connectors/installer.js");
-      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/proc\/self\/fd descriptor lookup/iu);
+      expect(module.installConnector("cline", "rules", directory).success).toBe(true);
     } finally { vi.doUnmock("node:fs"); vi.resetModules(); }
+  });
+
+  it("refuses when the retained root descriptor cannot be read", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        readlinkSync: (path: fs.PathLike) => String(path) === "/proc/self/fd/0" ? actual.readlinkSync(path) : "",
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/empty proc descriptor target/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("does not treat a retained descriptor ENOENT as an absent remove target", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        readlinkSync: (path: fs.PathLike) => {
+          if (String(path) === "/proc/self/fd/0") return actual.readlinkSync(path);
+          throw Object.assign(new Error("retained descriptor missing"), { code: "ENOENT" });
+        },
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.removeConnector("cline", "rules", directory)).toThrow(/retained descriptor missing/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("sanitizes a root realpath failure without classifying it as absent", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        realpathSync: ((path: fs.PathLike) => {
+          if (String(path) === directory) throw Object.assign(new Error("root denied"), { code: "EACCES" });
+          return actual.realpathSync(path);
+        }) as typeof actual.realpathSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.removeConnector("cline", "rules", directory)).toThrow(/root denied/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
   });
 
   it("refuses when the retained root descriptor is not a directory", async () => {
@@ -1261,10 +1473,18 @@ describe("installer descriptor edge branches", () => {
   });
 
   it("refuses an empty proc descendant target without exposing proc paths", async () => {
+    let retainedLookups = 0;
     vi.resetModules();
     vi.doMock("node:fs", async () => {
       const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
-      return { ...actual, readlinkSync: (path: fs.PathLike) => String(path) === "/proc/self/fd/0" ? actual.readlinkSync(path) : "" };
+      return {
+        ...actual,
+        readlinkSync: (path: fs.PathLike) => {
+          if (String(path) === "/proc/self/fd/0") return actual.readlinkSync(path);
+          retainedLookups += 1;
+          return retainedLookups === 1 ? actual.readlinkSync(path) : "";
+        },
+      };
     });
     try {
       const module = await import("../../src/connectors/installer.js");
@@ -1367,7 +1587,12 @@ describe("installer descriptor edge branches", () => {
     });
     try {
       const module = await import("../../src/connectors/installer.js");
-      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/parent denied|EACCES/iu);
+      let caught: unknown;
+      try { module.installConnector("cline", "rules", directory); } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toMatch(/parent denied|EACCES/iu);
+      expect((caught as Error).message).toContain(join(directory, ".clinerules", "lcm.md"));
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
       expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
     } finally {
       vi.doUnmock("node:fs");
@@ -1468,7 +1693,7 @@ describe("installer descriptor edge branches", () => {
       let caught: unknown;
       try { module.installConnector("cline", "rules", directory); } catch (error) { caught = error; }
       expect(caught).toBeInstanceOf(Error);
-      expect((caught as Error).message).toMatch(/proc descendant lookup is unavailable/iu);
+      expect((caught as Error).message).toMatch(/descendant unavailable|proc descendant lookup is unavailable/iu);
       expect((caught as Error).message).not.toContain("/proc/self/fd/");
       expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
     } finally {
@@ -1526,7 +1751,7 @@ describe("installer descriptor edge branches", () => {
     });
     try {
       const module = await import("../../src/connectors/installer.js");
-      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/proc.*descriptor lookup/iu);
+      expect(() => module.installConnector("cline", "rules", directory)).toThrow(/proc missing|descriptor lookup/iu);
     } finally {
       vi.doUnmock("node:fs");
       vi.resetModules();

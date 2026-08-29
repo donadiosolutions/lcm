@@ -15,7 +15,7 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { join, dirname, relative, basename } from "node:path";
+import { join, dirname, relative, basename, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import type { Agent, ConnectorSurface, ConnectorTransport } from "./types.js";
 import { CONNECTOR_SURFACES } from "./types.js";
@@ -474,7 +474,11 @@ function skillCollision(filePath: string): Error {
 
 const NO_FOLLOW_FLAGS = constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
-type MutationTargetSpec = Readonly<{ displayPath: string; rootPath: string }>;
+type MutationTargetSpec = Readonly<{
+  displayPath: string;
+  rootPath: string;
+  allowCreate: boolean;
+}>;
 
 type RootHandle = Readonly<{ rootPath: string; canonicalPath: string; fd: number }>;
 
@@ -486,6 +490,8 @@ type RootHandle = Readonly<{ rootPath: string; canonicalPath: string; fd: number
 class ConnectorMutationAuthority {
   private readonly roots = new Map<string, RootHandle>();
   private readonly operations = new Map<string, string>();
+  private readonly procDisplays = new Map<string, string>();
+  private readonly absent = new Set<string>();
   private readonly descriptors: number[] = [];
 
   constructor(targets: readonly MutationTargetSpec[]) {
@@ -495,8 +501,9 @@ class ConnectorMutationAuthority {
       for (const target of unique) this.preflightTarget(target);
       for (const target of unique) this.prepareTarget(target);
     } catch (error) {
+      const sanitized = this.displayError(error);
       this.close();
-      throw error;
+      throw sanitized;
     }
   }
 
@@ -506,21 +513,40 @@ class ConnectorMutationAuthority {
         throw new Error("Connector filesystem mutation requires strict Linux open flags");
       }
     }
-    try {
-      const descriptorPath = "/proc/self/fd/0";
-      const target = readlinkSync(descriptorPath);
-      if (typeof target !== "string" || target.length === 0) throw new Error("empty proc descriptor target");
-    } catch (error) {
-      throw new Error("Connector filesystem mutation requires /proc/self/fd descriptor lookup", { cause: error });
-    }
   }
 
-  private root(rootPath: string): RootHandle {
+  private recordProcDisplay(operationPath: string, displayPath: string): void {
+    this.procDisplays.set(operationPath, displayPath);
+  }
+
+  private withDisplay(error: unknown, displayPath: string): Error {
+    const sanitized = this.displayError(error).message;
+    const message = sanitized.includes(displayPath) ? sanitized : `${sanitized} at ${displayPath}`;
+    const wrapped = new Error(message, { cause: error });
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (typeof code === "string") Object.assign(wrapped, { code });
+    return wrapped;
+  }
+
+  private root(rootPath: string, displayPath: string): RootHandle {
     const existing = this.roots.get(rootPath);
     if (existing) return existing;
-    const canonicalPath = realpathSync(rootPath);
-    const fd = openSync(canonicalPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let canonicalPath: string;
+    let fd: number;
     try {
+      canonicalPath = realpathSync(rootPath);
+      fd = openSync(canonicalPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    } catch (error) {
+      const wrapped = this.withDisplay(error, displayPath);
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") Object.assign(wrapped, { rootMissing: true });
+      throw wrapped;
+    }
+    try {
+      this.recordProcDisplay(`/proc/self/fd/${fd}`, rootPath);
+      const descriptorTarget = readlinkSync(`/proc/self/fd/${fd}`);
+      if (typeof descriptorTarget !== "string" || descriptorTarget.length === 0) {
+        throw new Error("empty proc descriptor target");
+      }
       const descriptorStatsValue = fstatSync(fd);
       if (!descriptorStatsValue.isDirectory()) throw new Error(`Connector root is not a directory: ${rootPath}`);
       const pathStats = lstatSync(canonicalPath);
@@ -534,24 +560,43 @@ class ConnectorMutationAuthority {
       return handle;
     } catch (error) {
       closeSync(fd);
-      throw error;
+      throw this.withDisplay(error, displayPath);
     }
   }
 
-  private components(target: MutationTargetSpec): { root: RootHandle; parts: string[] } {
-    const root = this.root(target.rootPath);
+  private components(target: MutationTargetSpec): { root: RootHandle; parts: string[] } | undefined {
+    let root: RootHandle;
+    try {
+      root = this.root(target.rootPath, target.displayPath);
+    } catch (error) {
+      if (!target.allowCreate
+        && (error as NodeJS.ErrnoException).code === "ENOENT"
+        && (error as { rootMissing?: boolean }).rootMissing === true) {
+        this.absent.add(target.displayPath);
+        return undefined;
+      }
+      throw error;
+    }
     const raw = relative(target.rootPath, target.displayPath);
+    if (isAbsolute(raw) || raw.length === 0 || raw === ".") {
+      throw new Error(`Refusing unsafe connector registry path ${target.displayPath}`);
+    }
     const parts = raw.split(/[\\/]/u);
+    if (parts.some((part) => part.length === 0 || part === "." || part === "..") || parts.includes("")) {
+      throw new Error(`Refusing unsafe connector registry path ${target.displayPath}`);
+    }
     return { root, parts };
   }
 
-  private childPath(fd: number, component: string): string {
+  private childPath(fd: number, component: string, displayPath: string): string {
     const path = `/proc/self/fd/${fd}/${component}`;
+    this.recordProcDisplay(`/proc/self/fd/${fd}`, dirname(displayPath));
+    this.recordProcDisplay(path, displayPath);
     try {
       const target = readlinkSync(`/proc/self/fd/${fd}`);
       if (typeof target !== "string" || target.length === 0) throw new Error("empty proc descriptor target");
     } catch (error) {
-      throw new Error("Connector proc descendant lookup is unavailable", { cause: error });
+      throw this.withDisplay(new Error("Connector proc descendant lookup is unavailable", { cause: error }), displayPath);
     }
     return path;
   }
@@ -563,9 +608,9 @@ class ConnectorMutationAuthority {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === "ELOOP" || code === "ENOTDIR" || code === "EISDIR") {
-        throw new Error(`Refusing unsafe connector parent ${displayPath}`, { cause: error });
+        throw this.withDisplay(new Error(`Refusing unsafe connector parent ${displayPath}`, { cause: error }), displayPath);
       }
-      throw error;
+      throw this.withDisplay(error, displayPath);
     }
     try {
       const descriptorStatsValue = fstatSync(fd);
@@ -577,24 +622,29 @@ class ConnectorMutationAuthority {
       return fd;
     } catch (error) {
       closeSync(fd);
-      throw error;
+      throw this.withDisplay(error, displayPath);
     }
   }
 
   private preflightTarget(target: MutationTargetSpec): void {
-    const { root, parts } = this.components(target);
+    const components = this.components(target);
+    if (!components) return;
+    const { root, parts } = components;
     let fd = root.fd;
     const temporary: number[] = [];
     try {
       for (let index = 0; index < parts.length - 1; index += 1) {
         const component = parts[index];
-        const path = this.childPath(fd, component);
+        const path = this.childPath(fd, component, target.displayPath);
         try {
           const next = this.openDirectory(path, target.displayPath);
           temporary.push(next);
           fd = next;
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            if (!target.allowCreate) this.absent.add(target.displayPath);
+            return;
+          }
           throw error;
         }
       }
@@ -606,21 +656,27 @@ class ConnectorMutationAuthority {
   }
 
   private prepareTarget(target: MutationTargetSpec): void {
-    const { root, parts } = this.components(target);
+    const components = this.components(target);
+    if (!components || this.absent.has(target.displayPath)) return;
+    const { root, parts } = components;
     let fd = root.fd;
     for (let index = 0; index < parts.length - 1; index += 1) {
       const component = parts[index];
-      const path = this.childPath(fd, component);
+      const path = this.childPath(fd, component, target.displayPath);
       try {
         const next = this.openDirectory(path, target.displayPath);
         this.descriptors.push(next);
         fd = next;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (!target.allowCreate) {
+          this.absent.add(target.displayPath);
+          return;
+        }
         try {
           mkdirSync(path, { mode: 0o755 });
         } catch (mkdirError) {
-          if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+          if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw this.withDisplay(mkdirError, target.displayPath);
         }
         const next = this.openDirectory(path, target.displayPath);
         this.descriptors.push(next);
@@ -628,26 +684,42 @@ class ConnectorMutationAuthority {
       }
     }
     const leaf = parts.at(-1)!;
-    this.operations.set(target.displayPath, this.childPath(fd, leaf));
+    this.operations.set(target.displayPath, this.childPath(fd, leaf, target.displayPath));
   }
 
   operationPath(displayPath: string): string {
     const operation = this.operations.get(displayPath);
+    if (this.absent.has(displayPath)) {
+      throw Object.assign(new Error(`Connector mutation target is absent: ${displayPath}`), { code: "ENOENT" });
+    }
     if (!operation) throw new Error(`Unmapped connector mutation target ${displayPath}`);
     return operation;
+  }
+
+  hasTarget(displayPath: string): boolean {
+    return this.operations.has(displayPath);
   }
 
   displayError(error: unknown): Error {
     const message = error instanceof Error ? error.message : String(error);
     let sanitized = message;
-    for (const [displayPath, operationPath] of this.operations) sanitized = sanitized.replaceAll(operationPath, displayPath);
-    return error instanceof Error ? new Error(sanitized, { cause: error }) : new Error(sanitized);
+    const mappings = new Map(this.procDisplays);
+    for (const [displayPath, operationPath] of this.operations) mappings.set(operationPath, displayPath);
+    for (const [operationPath, displayPath] of [...mappings.entries()].sort(([left], [right]) => right.length - left.length)) {
+      sanitized = sanitized.replaceAll(operationPath, displayPath);
+    }
+    if (!(error instanceof Error)) return new Error(sanitized);
+    const wrapped = new Error(sanitized, { cause: error });
+    const code = (error as NodeJS.ErrnoException).code;
+    if (typeof code === "string") Object.assign(wrapped, { code });
+    return wrapped;
   }
 
   close(): void {
     for (let index = this.descriptors.length - 1; index >= 0; index -= 1) {
       try { closeSync(this.descriptors[index]); } catch { /* preserve primary failure */ }
     }
+    this.descriptors.length = 0;
   }
 }
 
@@ -814,7 +886,8 @@ function preflightSkill(filePath: string, generated: string): void {
     if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
       throw skillCollision(filePath);
     }
-    throw new Error(`Unable to inspect LCM skill at ${filePath}`, { cause: error });
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new Error(`Unable to inspect LCM skill at ${filePath}${typeof code === "string" ? `: ${code}` : ""}`, { cause: error });
   }
   if (existing === undefined) return;
   if (!isOwnedSkill(existing, generated)) throw skillCollision(filePath);
@@ -870,7 +943,8 @@ function removeSkill(filePath: string, generated: string | readonly string[], st
       if (strict) throw skillCollision(filePath);
       return false;
     }
-    throw new Error(`Unable to inspect LCM skill at ${filePath}`, { cause: error });
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new Error(`Unable to inspect LCM skill at ${filePath}${typeof code === "string" ? `: ${code}` : ""}`, { cause: error });
   }
   try {
     let stats: ReturnType<typeof fstatSync>;
@@ -1720,7 +1794,12 @@ function allOwnedPaths(agent: Agent, cwd: string): string[] {
   return paths;
 }
 
-function mutationTargetSpecs(agent: Agent, cwd: string, surfaces: readonly ConnectorSurface[]): MutationTargetSpec[] {
+function mutationTargetSpecs(
+  agent: Agent,
+  cwd: string,
+  surfaces: readonly ConnectorSurface[],
+  allowCreate: boolean,
+): MutationTargetSpec[] {
   const specs: MutationTargetSpec[] = [];
   for (const surface of surfaces) {
     const configPath = agent.configPaths[surface];
@@ -1731,20 +1810,25 @@ function mutationTargetSpecs(agent: Agent, cwd: string, surfaces: readonly Conne
       throw new Error(`Refusing unsafe connector registry path ${configPath}`);
     }
     const path = surfacePath(agent, surface, cwd);
-    specs.push({ displayPath: path!, rootPath: configPath.startsWith("~/") ? homedir() : cwd });
+    specs.push({ displayPath: path!, rootPath: configPath.startsWith("~/") ? homedir() : cwd, allowCreate });
     if (surface === "hook" && agent.id === "codex") {
       const config = resolveConfigPath(CODEX_CONFIG_PATH, cwd);
-      specs.push({ displayPath: config, rootPath: homedir() });
+      specs.push({ displayPath: config, rootPath: homedir(), allowCreate });
       for (const legacy of LEGACY_CODEX_HOOKS_PATHS) {
-        specs.push({ displayPath: resolveConfigPath(legacy, cwd), rootPath: cwd });
+        specs.push({ displayPath: resolveConfigPath(legacy, cwd), rootPath: cwd, allowCreate });
       }
     }
   }
   return specs;
 }
 
-function mutationTargetsForPaths(agent: Agent, cwd: string, surfaces: readonly ConnectorSurface[]): readonly MutationTargetSpec[] {
-  return mutationTargetSpecs(agent, cwd, surfaces);
+function mutationTargetsForPaths(
+  agent: Agent,
+  cwd: string,
+  surfaces: readonly ConnectorSurface[],
+  allowCreate: boolean,
+): readonly MutationTargetSpec[] {
+  return mutationTargetSpecs(agent, cwd, surfaces, allowCreate);
 }
 
 function verifySurface(
@@ -1924,12 +2008,9 @@ function withInstallAuthority<T>(agent: Agent, surfaces: readonly ConnectorSurfa
   // installs create only the selected root itself, while removal remains a
   // read-only no-op when the project root is absent.
   if (process.platform !== "linux") throw new Error("Connector filesystem mutation requires Linux proc-descriptor anchoring");
-  if (!existsSync(cwd)) {
-    if (!createRoot) return callback();
-    mkdirSync(cwd);
-  }
-  if (!existsSync(homedir())) mkdirSync(homedir(), { recursive: true });
-  const specs = mutationTargetsForPaths(agent, cwd, surfaces);
+  if (!existsSync(cwd) && createRoot) mkdirSync(cwd);
+  if (createRoot && !existsSync(homedir())) mkdirSync(homedir(), { recursive: true });
+  const specs = mutationTargetsForPaths(agent, cwd, surfaces, createRoot);
   return withMutationAuthority(specs, callback);
 }
 
@@ -1984,6 +2065,7 @@ function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInst
   const configFile = options.configPath ?? defaultConfigPath();
   const failures: string[] = [];
   const paths: string[] = allOwnedPaths(agent, cwd);
+  const hadAnchoredTarget = paths.some((path) => activeMutationAuthority!.hasTarget(path));
   let removed = false;
   const codexMcp = agent.id === "codex"
     ? (options.codexCliRunner
@@ -2011,7 +2093,7 @@ function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInst
       failures.push(`${surface}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  if (failures.length === 0) {
+  if (failures.length === 0 && (removed || hadAnchoredTarget)) {
     try { clearConnectorTransport(configFile, agent.id); } catch (error) {
       failures.push(`transport config: ${error instanceof Error ? error.message : String(error)}`);
     }
