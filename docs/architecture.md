@@ -182,7 +182,11 @@ fingerprints preserve every no-ACL identity and accept only the reviewed
 column-limited runtime writes.
 Identity sequences retain permanent persistence, allocation parameters,
 internal dependency, and owning table/column. Migration transactions pin
-`quote_all_identifiers = off` before catalog deparsing. Any additional valid,
+`quote_all_identifiers = off` before catalog deparsing. Migration preflight and
+every setting-sensitive runtime readiness statement also pin
+`search_path = pg_catalog, public` transaction-locally before catalog
+deparsing or type formatting; these settings do not leak into pooled sessions.
+Any additional valid,
 ready, and live index, non-internal trigger, supported constraint, generated
 column, or ordinary column attached to a managed table, any foreign key
 targeting one from another schema or relation, or any non-view rewrite rule

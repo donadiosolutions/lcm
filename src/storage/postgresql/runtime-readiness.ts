@@ -1203,12 +1203,15 @@ async function inspectRequiredExtensionFunctions(
     )),
   );
   const result = await executor.query<RequiredExtensionFunctionRow, [readonly string[]]>({
-    text: `SELECT pg_catalog.concat(
+    text: `WITH ${runtimeDeparserSettingsSql()}
+           SELECT pg_catalog.concat(
                     namespace.nspname,
                     '.',
                     procedure.proname,
                     '(',
-                    pg_catalog.pg_get_function_identity_arguments(procedure.oid),
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.pg_get_function_identity_arguments(procedure.oid)",
+                    )},
                     ')'
                   ) AS function_identity,
                   extension.extname::pg_catalog.text AS extension_name,
@@ -1218,10 +1221,10 @@ async function inspectRequiredExtensionFunctions(
                   language.lanname::pg_catalog.text AS language_name,
                   procedure.probin,
                   procedure.prosrc,
-                  pg_catalog.format_type(
+                  ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
                     procedure.prorettype,
                     NULL::pg_catalog.int4
-                  ) AS return_type,
+                  )`)} AS return_type,
                   procedure.prosecdef AS security_definer,
                   procedure.proleakproof AS leakproof,
                   procedure.provolatile::pg_catalog.text AS volatility,
@@ -1237,7 +1240,9 @@ async function inspectRequiredExtensionFunctions(
                       '.',
                       support.proname,
                       '(',
-                      pg_catalog.pg_get_function_identity_arguments(support.oid),
+                      ${guardedRuntimeDeparserSql(
+                        "pg_catalog.pg_get_function_identity_arguments(support.oid)",
+                      )},
                       ')'
                     )
                   END AS support_function_identity,
@@ -1295,9 +1300,12 @@ async function inspectRequiredExtensionFunctions(
             AND extension_dependency.deptype OPERATOR(pg_catalog.=) 'e'
            LEFT JOIN pg_catalog.pg_extension AS extension
              ON extension.oid OPERATOR(pg_catalog.=) extension_dependency.refobjid
+           CROSS JOIN runtime_deparser_settings AS settings
            WHERE pg_catalog.concat(
                     namespace.nspname, '.', procedure.proname, '(',
-                    pg_catalog.pg_get_function_identity_arguments(procedure.oid), ')'
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.pg_get_function_identity_arguments(procedure.oid)",
+                    )}, ')'
                  ) OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])
            ORDER BY function_identity`,
     values: [[...expectedByIdentity.keys()]],
@@ -1344,21 +1352,22 @@ async function inspectRequiredExtensionOperator(
   signal: AbortSignal | undefined,
 ): Promise<void> {
   const result = await executor.query<RequiredExtensionOperatorRow, [string, string, string, string]>({
-    text: `SELECT namespace.nspname::pg_catalog.text AS schema_name,
+    text: `WITH ${runtimeDeparserSettingsSql()}
+           SELECT namespace.nspname::pg_catalog.text AS schema_name,
                   catalog_operator.oprname::pg_catalog.text AS operator_name,
                   catalog_operator.oprkind::pg_catalog.text AS operator_kind,
-                  pg_catalog.format_type(
+                  ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
                     catalog_operator.oprleft,
                     NULL::pg_catalog.int4
-                  ) AS left_type,
-                  pg_catalog.format_type(
+                  )`)} AS left_type,
+                  ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
                     catalog_operator.oprright,
                     NULL::pg_catalog.int4
-                  ) AS right_type,
-                  pg_catalog.format_type(
+                  )`)} AS right_type,
+                  ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
                     catalog_operator.oprresult,
                     NULL::pg_catalog.int4
-                  ) AS result_type,
+                  )`)} AS result_type,
                   extension.extname::pg_catalog.text AS extension_name,
                   catalog_operator.oprowner OPERATOR(pg_catalog.=) extension.extowner
                     AS owner_matches_extension,
@@ -1437,6 +1446,7 @@ async function inspectRequiredExtensionOperator(
             AND extension_dependency.deptype OPERATOR(pg_catalog.=) 'e'
            LEFT JOIN pg_catalog.pg_extension AS extension
              ON extension.oid OPERATOR(pg_catalog.=) extension_dependency.refobjid
+           CROSS JOIN runtime_deparser_settings AS settings
            WHERE namespace.nspname OPERATOR(pg_catalog.=) 'public'
              AND catalog_operator.oprname OPERATOR(pg_catalog.=) '%'
              AND catalog_operator.oprleft OPERATOR(pg_catalog.=)
@@ -1482,21 +1492,22 @@ async function inspectRequiredGinTrgmOperatorClass(
   signal: AbortSignal | undefined,
 ): Promise<void> {
   const result = await executor.query<RequiredGinTrgmOperatorClassRow>({
-    text: `SELECT operator_class_namespace.nspname::pg_catalog.text
+    text: `WITH ${runtimeDeparserSettingsSql()}
+           SELECT operator_class_namespace.nspname::pg_catalog.text
                     AS operator_class_schema,
                   operator_class.opcname::pg_catalog.text AS operator_class_name,
                   operator_family_namespace.nspname::pg_catalog.text
                     AS operator_family_schema,
                   operator_family.opfname::pg_catalog.text AS operator_family_name,
                   access_method.amname::pg_catalog.text AS access_method_name,
-                  pg_catalog.format_type(
+                  ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
                     operator_class.opcintype,
                     NULL::pg_catalog.int4
-                  ) AS input_type,
-                  pg_catalog.format_type(
+                  )`)} AS input_type,
+                  ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
                     operator_class.opckeytype,
                     NULL::pg_catalog.int4
-                  ) AS storage_type,
+                  )`)} AS storage_type,
                   operator_class.opcdefault AS is_default,
                   operator_class_extension.extname::pg_catalog.text
                     AS operator_class_extension,
@@ -1628,6 +1639,7 @@ async function inspectRequiredGinTrgmOperatorClass(
            LEFT JOIN pg_catalog.pg_extension AS operator_family_extension
              ON operator_family_extension.oid OPERATOR(pg_catalog.=)
                 operator_family_extension_dependency.refobjid
+           CROSS JOIN runtime_deparser_settings AS settings
            WHERE operator_class_namespace.nspname OPERATOR(pg_catalog.=) 'public'
              AND operator_class.opcname OPERATOR(pg_catalog.=) 'gin_trgm_ops'
              AND access_method.amname OPERATOR(pg_catalog.=) 'gin'`,
@@ -1660,7 +1672,7 @@ async function inspectRequiredGinTrgmOperatorClass(
 }
 
 function catalogOperatorIdentitySql(operatorAlias: string, namespaceAlias: string): string {
-  return `pg_catalog.concat(
+  return guardedRuntimeDeparserSql(`pg_catalog.concat(
             ${namespaceAlias}.nspname,
             '.',
             ${operatorAlias}.oprname,
@@ -1669,18 +1681,38 @@ function catalogOperatorIdentitySql(operatorAlias: string, namespaceAlias: strin
             ', ',
             pg_catalog.format_type(${operatorAlias}.oprright, NULL::pg_catalog.int4),
             ')'
-          )`;
+          )`);
 }
 
 function catalogFunctionIdentitySql(procedureAlias: string, namespaceAlias: string): string {
-  return `pg_catalog.concat(
+  return guardedRuntimeDeparserSql(`pg_catalog.concat(
             ${namespaceAlias}.nspname,
             '.',
             ${procedureAlias}.proname,
             '(',
             pg_catalog.pg_get_function_identity_arguments(${procedureAlias}.oid),
             ')'
-          )`;
+          )`);
+}
+
+function runtimeDeparserSettingsSql(): string {
+  return `runtime_deparser_settings AS MATERIALIZED (
+             SELECT pg_catalog.set_config(
+                      'search_path', 'pg_catalog, public', true
+                    ) AS search_path,
+                    pg_catalog.set_config(
+                      'quote_all_identifiers', 'off', true
+                    ) AS quote_all_identifiers
+           )`;
+}
+
+function guardedRuntimeDeparserSql(expression: string): string {
+  return `CASE
+            WHEN settings.search_path OPERATOR(pg_catalog.=) 'pg_catalog, public'
+             AND settings.quote_all_identifiers OPERATOR(pg_catalog.=) 'off'
+              THEN ${expression}
+            ELSE NULL
+          END`;
 }
 
 async function inspectRequiredGinTrgmOperators(
@@ -1688,23 +1720,24 @@ async function inspectRequiredGinTrgmOperators(
   signal: AbortSignal | undefined,
 ): Promise<void> {
   const result = await executor.query<RequiredGinTrgmOperatorRow>({
-    text: `SELECT mapping.amopstrategy AS strategy_number,
+    text: `WITH ${runtimeDeparserSettingsSql()}
+           SELECT mapping.amopstrategy AS strategy_number,
                   mapping.amoppurpose::pg_catalog.text AS purpose,
-                  pg_catalog.format_type(
+                  ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
                     mapping.amoplefttype,
                     NULL::pg_catalog.int4
-                  ) AS left_type,
-                  pg_catalog.format_type(
+                  )`)} AS left_type,
+                  ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
                     mapping.amoprighttype,
                     NULL::pg_catalog.int4
-                  ) AS right_type,
+                  )`)} AS right_type,
                   ${catalogOperatorIdentitySql("catalog_operator", "operator_namespace")}
                     AS operator_identity,
                   catalog_operator.oprkind::pg_catalog.text AS operator_kind,
-                  pg_catalog.format_type(
+                  ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
                     catalog_operator.oprresult,
                     NULL::pg_catalog.int4
-                  ) AS result_type,
+                  )`)} AS result_type,
                   ${catalogFunctionIdentitySql("implementation", "implementation_namespace")}
                     AS implementation_identity,
                   CASE
@@ -1854,6 +1887,7 @@ async function inspectRequiredGinTrgmOperators(
              ON sort_family.oid OPERATOR(pg_catalog.=) mapping.amopsortfamily
            LEFT JOIN pg_catalog.pg_namespace AS sort_family_namespace
              ON sort_family_namespace.oid OPERATOR(pg_catalog.=) sort_family.opfnamespace
+           CROSS JOIN runtime_deparser_settings AS settings
            LEFT JOIN pg_catalog.pg_depend AS operator_extension_dependency
              ON operator_extension_dependency.classid OPERATOR(pg_catalog.=)
                   pg_catalog.to_regclass('pg_catalog.pg_operator')
@@ -1925,15 +1959,16 @@ async function inspectRequiredGinTrgmSupportFunctions(
   signal: AbortSignal | undefined,
 ): Promise<void> {
   const result = await executor.query<RequiredGinTrgmSupportRow>({
-    text: `SELECT mapping.amprocnum AS support_number,
-                  pg_catalog.format_type(
+    text: `WITH ${runtimeDeparserSettingsSql()}
+           SELECT mapping.amprocnum AS support_number,
+                  ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
                     mapping.amproclefttype,
                     NULL::pg_catalog.int4
-                  ) AS left_type,
-                  pg_catalog.format_type(
+                  )`)} AS left_type,
+                  ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
                     mapping.amprocrighttype,
                     NULL::pg_catalog.int4
-                  ) AS right_type,
+                  )`)} AS right_type,
                   ${catalogFunctionIdentitySql("procedure", "procedure_namespace")}
                     AS function_identity,
                   (
@@ -2013,6 +2048,7 @@ async function inspectRequiredGinTrgmSupportFunctions(
              ON procedure.oid OPERATOR(pg_catalog.=) mapping.amproc
            JOIN pg_catalog.pg_namespace AS procedure_namespace
              ON procedure_namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
+           CROSS JOIN runtime_deparser_settings AS settings
            WHERE operator_family_namespace.nspname OPERATOR(pg_catalog.=) 'public'
              AND operator_family.opfname OPERATOR(pg_catalog.=) 'gin_trgm_ops'
              AND operator_class_namespace.nspname OPERATOR(pg_catalog.=) 'public'
@@ -2058,7 +2094,8 @@ async function inspectRequiredGinTrgmSupportFunctions(
 }
 
 function managedCatalogQuery(): string {
-  return `WITH expected_owner AS (
+  return `WITH ${runtimeDeparserSettingsSql()},
+           expected_owner AS (
              SELECT role.oid
              FROM pg_catalog.pg_roles AS role
              WHERE role.rolname OPERATOR(pg_catalog.=) $1
@@ -2083,12 +2120,15 @@ function managedCatalogQuery(): string {
                       'function|',
                       procedure.proname,
                       '|',
-                      pg_catalog.pg_get_function_identity_arguments(procedure.oid)
+                      ${guardedRuntimeDeparserSql(
+                        "pg_catalog.pg_get_function_identity_arguments(procedure.oid)",
+                      )}
                     ),
                     procedure.proowner
              FROM pg_catalog.pg_proc AS procedure
              JOIN pg_catalog.pg_namespace AS namespace
                ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
+             CROSS JOIN runtime_deparser_settings AS settings
              WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
                AND procedure.prokind OPERATOR(pg_catalog.=) 'f'
              UNION ALL
@@ -2520,12 +2560,15 @@ async function inspectFunctionAcl(
       .map(({ object }) => object),
   ];
   const result = await executor.query<FunctionAclRow, [readonly string[]]>({
-    text: `SELECT pg_catalog.concat(
+    text: `WITH ${runtimeDeparserSettingsSql()}
+           SELECT pg_catalog.concat(
                     namespace.nspname,
                     '.',
                     procedure.proname,
                     '(',
-                    pg_catalog.pg_get_function_identity_arguments(procedure.oid),
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.pg_get_function_identity_arguments(procedure.oid)",
+                    )},
                     ')'
                   ) AS function_identity,
                   privilege.grantee OPERATOR(pg_catalog.=) procedure.proowner
@@ -2548,6 +2591,7 @@ async function inspectFunctionAcl(
            FROM pg_catalog.pg_proc AS procedure
            JOIN pg_catalog.pg_namespace AS namespace
              ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
+           CROSS JOIN runtime_deparser_settings AS settings
            CROSS JOIN LATERAL pg_catalog.aclexplode(
              COALESCE(
                procedure.proacl,
@@ -2558,7 +2602,9 @@ async function inspectFunctionAcl(
              ON grantee.oid OPERATOR(pg_catalog.=) privilege.grantee
            WHERE pg_catalog.concat(
                     namespace.nspname, '.', procedure.proname, '(',
-                    pg_catalog.pg_get_function_identity_arguments(procedure.oid), ')'
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.pg_get_function_identity_arguments(procedure.oid)",
+                    )}, ')'
                  ) OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])
            ORDER BY function_identity, privilege.privilege_type`,
     values: [functionIdentities],
@@ -2633,11 +2679,15 @@ function definitionQuery(
     .filter(({ kind }) => kind === "column")
     .map((entry) => `${entry.object.replace(/^lcm\./u, "")}|${entry.column}|${entry.privilege}`);
   return {
-    text: `WITH actual_indexes AS (
+    text: `WITH ${runtimeDeparserSettingsSql()},
+           actual_indexes AS (
              SELECT index_relation.relname AS object_name,
-                    pg_catalog.pg_get_indexdef(index_relation.oid) AS definition,
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.pg_get_indexdef(index_relation.oid)",
+                    )} AS definition,
                     index_metadata.indisvalid AS is_valid
              FROM pg_catalog.pg_class AS index_relation
+             CROSS JOIN runtime_deparser_settings AS settings
              JOIN pg_catalog.pg_index AS index_metadata
                ON index_metadata.indexrelid OPERATOR(pg_catalog.=) index_relation.oid
              JOIN pg_catalog.pg_namespace AS index_namespace
@@ -2658,9 +2708,12 @@ function definitionQuery(
            ),
            actual_triggers AS (
              SELECT trigger.tgname AS object_name,
-                    pg_catalog.pg_get_triggerdef(trigger.oid, true) AS definition,
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.pg_get_triggerdef(trigger.oid, true)",
+                    )} AS definition,
                     trigger.tgenabled::pg_catalog.text AS enabled_mode
              FROM pg_catalog.pg_trigger AS trigger
+             CROSS JOIN runtime_deparser_settings AS settings
              JOIN pg_catalog.pg_class AS relation
                ON relation.oid OPERATOR(pg_catalog.=) trigger.tgrelid
              JOIN pg_catalog.pg_namespace AS namespace
@@ -2675,8 +2728,11 @@ function definitionQuery(
                     rewrite.ev_type::pg_catalog.text AS event_type,
                     rewrite.is_instead::pg_catalog.text AS is_instead,
                     rewrite.ev_enabled::pg_catalog.text AS enabled_mode,
-                    pg_catalog.pg_get_ruledef(rewrite.oid, true) AS definition
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.pg_get_ruledef(rewrite.oid, true)",
+                    )} AS definition
              FROM pg_catalog.pg_rewrite AS rewrite
+             CROSS JOIN runtime_deparser_settings AS settings
              JOIN pg_catalog.pg_class AS relation
                ON relation.oid OPERATOR(pg_catalog.=) rewrite.ev_class
              JOIN pg_catalog.pg_namespace AS namespace
@@ -2697,9 +2753,13 @@ function definitionQuery(
                       COALESCE(constraint_relation_namespace.nspname, ''),
                       COALESCE(constraint_relation.relname, ''),
                       pg_catalog.replace(
-                        pg_catalog.pg_get_triggerdef(trigger.oid, true),
-                        pg_catalog.quote_ident(trigger.tgname),
-                        pg_catalog.quote_ident(canonical_trigger.canonical_name)
+                        ${guardedRuntimeDeparserSql(
+                          "pg_catalog.pg_get_triggerdef(trigger.oid, true)",
+                        )},
+                        ${guardedRuntimeDeparserSql("pg_catalog.quote_ident(trigger.tgname)")},
+                        ${guardedRuntimeDeparserSql(
+                          "pg_catalog.quote_ident(canonical_trigger.canonical_name)",
+                        )}
                       ),
                       trigger.tgenabled::pg_catalog.text,
                       trigger.tgisinternal::pg_catalog.text,
@@ -2724,6 +2784,7 @@ function definitionQuery(
                       )
                     ) AS trigger_fingerprint
              FROM pg_catalog.pg_trigger AS trigger
+             CROSS JOIN runtime_deparser_settings AS settings
              JOIN pg_catalog.pg_class AS trigger_relation
                ON trigger_relation.oid OPERATOR(pg_catalog.=) trigger.tgrelid
              JOIN pg_catalog.pg_namespace AS trigger_namespace
@@ -2773,7 +2834,9 @@ function definitionQuery(
                     COALESCE(referenced_namespace.nspname, '') AS referenced_schema_name,
                     COALESCE(referenced_relation.relname, '') AS referenced_table_name,
                     constraint_metadata.contype::pg_catalog.text AS constraint_type,
-                    pg_catalog.pg_get_constraintdef(constraint_metadata.oid, true) AS definition,
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.pg_get_constraintdef(constraint_metadata.oid, true)",
+                    )} AS definition,
                     constraint_metadata.convalidated::pg_catalog.text AS validated,
                     constraint_metadata.conenforced::pg_catalog.text AS enforced,
                     constraint_metadata.connoinherit::pg_catalog.text AS no_inherit,
@@ -2789,6 +2852,7 @@ function definitionQuery(
                     COALESCE(constraint_trigger_states.trigger_fingerprints, '')
                       AS enforcement_triggers
              FROM pg_catalog.pg_constraint AS constraint_metadata
+             CROSS JOIN runtime_deparser_settings AS settings
              JOIN pg_catalog.pg_class AS owning_relation
                ON owning_relation.oid OPERATOR(pg_catalog.=) constraint_metadata.conrelid
              JOIN pg_catalog.pg_namespace AS owning_namespace
@@ -2834,7 +2898,9 @@ function definitionQuery(
                       namespace.nspname,
                       relation.relname,
                       constraint_metadata.conname,
-                      pg_catalog.pg_get_constraintdef(constraint_metadata.oid, true),
+                      ${guardedRuntimeDeparserSql(
+                        "pg_catalog.pg_get_constraintdef(constraint_metadata.oid, true)",
+                      )},
                       constraint_metadata.convalidated::pg_catalog.text,
                       constraint_metadata.conenforced::pg_catalog.text,
                       constraint_metadata.connoinherit::pg_catalog.text,
@@ -2846,6 +2912,7 @@ function definitionQuery(
                       COALESCE(parent_constraint.conname, '')
                     ) AS constraint_fingerprint
              FROM pg_catalog.pg_constraint AS constraint_metadata
+             CROSS JOIN runtime_deparser_settings AS settings
              JOIN pg_catalog.pg_class AS relation
                ON relation.oid OPERATOR(pg_catalog.=) constraint_metadata.conrelid
              JOIN pg_catalog.pg_namespace AS namespace
@@ -2879,10 +2946,14 @@ function definitionQuery(
            actual_generated_columns AS (
              SELECT relation.relname AS table_name,
                     attribute.attname AS column_name,
-                    pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) AS data_type,
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)",
+                    )} AS data_type,
                     attribute.attnotnull::pg_catalog.text AS not_null,
                     attribute.attgenerated::pg_catalog.text AS generation_kind,
-                    pg_catalog.pg_get_expr(attribute_default.adbin, attribute_default.adrelid, true)
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.pg_get_expr(attribute_default.adbin, attribute_default.adrelid, true)",
+                    )}
                       AS generation_expression,
                     pg_catalog.concat_ws('.', collation_namespace.nspname, collation_metadata.collname)
                       AS collation_name,
@@ -2891,6 +2962,7 @@ function definitionQuery(
                     COALESCE(not_null_constraint_states.constraint_fingerprints, '')
                       AS not_null_constraints
              FROM pg_catalog.pg_attribute AS attribute
+             CROSS JOIN runtime_deparser_settings AS settings
              JOIN pg_catalog.pg_class AS relation
                ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
              JOIN pg_catalog.pg_namespace AS namespace
@@ -2916,9 +2988,13 @@ function definitionQuery(
            actual_ordinary_columns AS (
              SELECT relation.relname AS table_name,
                     attribute.attname AS column_name,
-                    pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) AS data_type,
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)",
+                    )} AS data_type,
                     attribute.attnotnull::pg_catalog.text AS not_null,
-                    COALESCE(pg_catalog.pg_get_expr(attribute_default.adbin, attribute_default.adrelid, true), '')
+                    COALESCE(${guardedRuntimeDeparserSql(
+                      "pg_catalog.pg_get_expr(attribute_default.adbin, attribute_default.adrelid, true)",
+                    )}, '')
                       AS default_expression,
                     attribute.attidentity::pg_catalog.text AS identity_kind,
                     pg_catalog.concat_ws('.', collation_namespace.nspname, collation_metadata.collname)
@@ -2928,6 +3004,7 @@ function definitionQuery(
                     COALESCE(not_null_constraint_states.constraint_fingerprints, '')
                       AS not_null_constraints
              FROM pg_catalog.pg_attribute AS attribute
+             CROSS JOIN runtime_deparser_settings AS settings
              JOIN pg_catalog.pg_class AS relation
                ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
              JOIN pg_catalog.pg_namespace AS namespace
@@ -2953,7 +3030,9 @@ function definitionQuery(
            actual_identity_sequences AS (
              SELECT sequence_relation.relname AS sequence_name,
                     sequence_relation.relpersistence::pg_catalog.text AS persistence,
-                    pg_catalog.format_type(sequence_metadata.seqtypid, NULL) AS data_type,
+                    ${guardedRuntimeDeparserSql(
+                      "pg_catalog.format_type(sequence_metadata.seqtypid, NULL)",
+                    )} AS data_type,
                     sequence_metadata.seqincrement::pg_catalog.text AS increment_by,
                     sequence_metadata.seqmin::pg_catalog.text AS minimum_value,
                     sequence_metadata.seqmax::pg_catalog.text AS maximum_value,
@@ -2964,6 +3043,7 @@ function definitionQuery(
                     owning_relation.relname AS owning_table,
                     owning_attribute.attname AS owning_column
              FROM pg_catalog.pg_sequence AS sequence_metadata
+             CROSS JOIN runtime_deparser_settings AS settings
              JOIN pg_catalog.pg_class AS sequence_relation
                ON sequence_relation.oid OPERATOR(pg_catalog.=) sequence_metadata.seqrelid
              JOIN pg_catalog.pg_namespace AS namespace
