@@ -166,6 +166,16 @@ function expectSanitizedError(error: unknown, code: string, canaries: readonly s
   ]));
 }
 
+function expectSanitizedCode(operation: () => unknown, code: string): void {
+  try {
+    operation();
+  } catch (error) {
+    expectSanitizedError(error, code);
+    return;
+  }
+  throw new Error(`operation unexpectedly succeeded; expected ${code}`);
+}
+
 function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
   let resolve!: () => void;
   const promise = new Promise<void>((settle) => { resolve = settle; });
@@ -631,6 +641,10 @@ function withCheckpointChecksum(
   } as unknown as PortableCheckpoint;
 }
 
+function withManifestChecksum(body: Record<string, unknown>): Record<string, unknown> {
+  return { ...body, manifestSha256: referenceSha256(body) };
+}
+
 describe("portable record stream public seam", () => {
   it("re-exports the Task 1 consumer seam from the stream module", () => {
     const recordInput: PortableRecordInput<"machines"> = {
@@ -728,6 +742,109 @@ describe("portable record stream public seam", () => {
     const parsed = parsePortableManifest(serialized);
     expect(parsed).toEqual(manifest);
     expectDeepFrozen(parsed);
+  });
+
+  it("rejects authoritative-empty manifests with a nonzero record count", () => {
+    const domain: PortableDomain = "native-transcripts";
+    const sourceRecords = { ...records, [domain]: [] } as Record<PortableDomain, readonly PortableRecord[]>;
+    const source = makeSourceDescription({
+      coverage: makeCoverage({ [domain]: coverageEvidence(domain, "authoritative-empty") } as never),
+    });
+    const input = makeManifestInput(source, sourceRecords);
+    const domains = input.domains as PortableDomainManifest[];
+    const invalid = {
+      ...input,
+      domains: domains.map((entry) => entry.domain === domain
+        ? { ...entry, recordCount: 1 }
+        : entry),
+    };
+    invalid.contentSha256 = aggregateContentSha256(
+      PORTABLE_RECORD_SCHEMA_SHA256,
+      invalid.domains.map((entry) => entry.prefixSha256),
+    );
+
+    expectSanitizedCode(() => createPortableManifest(invalid as never), "malformed-manifest");
+  });
+
+  it("rejects authoritative-empty manifests with a non-seeded prefix", () => {
+    const domain: PortableDomain = "native-transcripts";
+    const sourceRecords = { ...records, [domain]: [] } as Record<PortableDomain, readonly PortableRecord[]>;
+    const source = makeSourceDescription({
+      coverage: makeCoverage({ [domain]: coverageEvidence(domain, "authoritative-empty") } as never),
+    });
+    const input = makeManifestInput(source, sourceRecords);
+    const domains = input.domains as PortableDomainManifest[];
+    const invalid = {
+      ...input,
+      domains: domains.map((entry) => entry.domain === domain
+        ? { ...entry, prefixSha256: HASH }
+        : entry),
+    };
+    invalid.contentSha256 = aggregateContentSha256(
+      PORTABLE_RECORD_SCHEMA_SHA256,
+      invalid.domains.map((entry) => entry.prefixSha256),
+    );
+
+    expectSanitizedCode(() => createPortableManifest(invalid as never), "malformed-manifest");
+  });
+
+  it.each([
+    ["nonzero record count", (entry: PortableDomainManifest) => ({ ...entry, recordCount: 1 })],
+    ["non-seeded prefix", (entry: PortableDomainManifest) => ({ ...entry, prefixSha256: HASH })],
+  ] as const)("parse rejects authoritative-empty manifests with %s", (_name, mutate) => {
+    const domain: PortableDomain = "native-transcripts";
+    const sourceRecords = { ...records, [domain]: [] } as Record<PortableDomain, readonly PortableRecord[]>;
+    const source = makeSourceDescription({
+      coverage: makeCoverage({ [domain]: coverageEvidence(domain, "authoritative-empty") } as never),
+    });
+    const input = makeManifestInput(source, sourceRecords);
+    const domains = input.domains as PortableDomainManifest[];
+    const body = {
+      ...input,
+      domains: domains.map((entry) => entry.domain === domain ? mutate(entry) : entry),
+    };
+    body.contentSha256 = aggregateContentSha256(
+      PORTABLE_RECORD_SCHEMA_SHA256,
+      body.domains.map((entry) => entry.prefixSha256),
+    );
+    const bytes = Buffer.from(`${referenceCanonicalJson(withManifestChecksum(body))}\n`, "utf8");
+
+    expectSanitizedCode(() => parsePortableManifest(bytes), "malformed-manifest");
+  });
+
+  it("round-trips an authoritative-empty manifest with exactly zero records and P0", () => {
+    const domain: PortableDomain = "native-transcripts";
+    const sourceRecords = { ...records, [domain]: [] } as Record<PortableDomain, readonly PortableRecord[]>;
+    const source = makeSourceDescription({
+      coverage: makeCoverage({ [domain]: coverageEvidence(domain, "authoritative-empty") } as never),
+    });
+    const manifest = makeManifest(source, sourceRecords);
+    const entry = manifest.domains.find((candidate) => candidate.domain === domain);
+    expect(entry).toMatchObject({
+      recordCount: 0,
+      prefixSha256: initialDomainPrefix(PORTABLE_RECORD_SCHEMA_SHA256, domain),
+    });
+    const serialized = serializePortableManifest(manifest);
+    const parsed = parsePortableManifest(serialized);
+    expectDeepFrozen(manifest);
+    expectDeepFrozen(parsed);
+    expect(serialized).toEqual(
+      Buffer.from(`${referenceCanonicalJson(manifest)}\n`, "utf8"),
+    );
+    expect(parsed).toEqual(manifest);
+  });
+
+  it("round-trips an available domain with zero records and its seeded P0", () => {
+    const domain: PortableDomain = "native-transcripts";
+    const sourceRecords = { ...records, [domain]: [] } as Record<PortableDomain, readonly PortableRecord[]>;
+    const manifest = makeManifest(makeSourceDescription(), sourceRecords);
+    const entry = manifest.domains.find((candidate) => candidate.domain === domain);
+    expect(entry).toMatchObject({
+      recordCount: 0,
+      prefixSha256: initialDomainPrefix(PORTABLE_RECORD_SCHEMA_SHA256, domain),
+      coverage: { state: "available" },
+    });
+    expect(parsePortableManifest(serializePortableManifest(manifest))).toEqual(manifest);
   });
 
   it.each([
@@ -864,6 +981,10 @@ describe("portable record stream public seam", () => {
     expect(manifest.source.coverage["native-transcripts"]).toMatchObject({
       state: "authoritative-empty",
       reason: "not-in-source-generation",
+    });
+    expect(manifest.domains.find((entry) => entry.domain === "native-transcripts")).toMatchObject({
+      recordCount: 0,
+      prefixSha256: initialDomainPrefix(PORTABLE_RECORD_SCHEMA_SHA256, "native-transcripts"),
     });
     expect(source.pageCalls.some((call) => call.domain === "native-transcripts")).toBe(false);
     await stream.close();

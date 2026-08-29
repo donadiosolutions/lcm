@@ -432,6 +432,13 @@ function validateManifest(value: unknown, requireChecksum = true): PortableManif
     ) fail("malformed-manifest");
     const coverage = validateCoverage(item.coverage);
     if (!sameCanonical(coverage, source.coverage[domain])) fail("malformed-manifest");
+    if (
+      coverage.state === "authoritative-empty"
+      && (
+        item.recordCount !== 0
+        || item.prefixSha256 !== initialDomainPrefix(PORTABLE_RECORD_SCHEMA_SHA256, domain)
+      )
+    ) fail("malformed-manifest");
     return deepFreeze({
       domain,
       domainVersion: 1,

@@ -58,7 +58,10 @@ permission to omit a domain. `available` coverage carries an evidence SHA-256.
 `authoritative-empty` is allowed only with the reason
 `not-in-source-generation` and its own evidence SHA-256. A source must not
 claim empty coverage because a read failed or because an adapter has not yet
-implemented the domain.
+implemented the domain. An authoritative-empty domain must also have
+`recordCount = 0` and the seeded boundary prefix for that domain. Its coverage
+evidence SHA-256 proves the source-generation claim; it is distinct from the
+boundary field `prefixSha256`.
 
 ## Construction versus wire data
 
@@ -152,6 +155,11 @@ and its terminal prefix `P(n)`. Aggregate the 22 prefixes in manifest order:
 C0      = SHA256(canonicalJson(["lcm-portable-content-v1", schemaSha256]))
 content = fold(prefix => SHA256(hexBytes(previous) || uint64be(32) || hexBytes(prefix)), C0)
 ```
+
+For an authoritative-empty domain, the terminal prefix is exactly `P0(D)`.
+Recomputing `contentSha256` and `manifestSha256` cannot substitute for this
+semantic invariant: those checksums authenticate the supplied fields, including
+an invalid empty-domain count or boundary prefix.
 
 The manifest checksum covers the canonical manifest body, excluding its own
 checksum:
