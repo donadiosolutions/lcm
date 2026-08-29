@@ -489,10 +489,15 @@ class ConnectorMutationAuthority {
   private readonly descriptors: number[] = [];
 
   constructor(targets: readonly MutationTargetSpec[]) {
-    this.requireSupport();
-    const unique = [...new Map(targets.map((target) => [target.displayPath, target])).values()];
-    for (const target of unique) this.preflightTarget(target);
-    for (const target of unique) this.prepareTarget(target);
+    try {
+      this.requireSupport();
+      const unique = [...new Map(targets.map((target) => [target.displayPath, target])).values()];
+      for (const target of unique) this.preflightTarget(target);
+      for (const target of unique) this.prepareTarget(target);
+    } catch (error) {
+      this.close();
+      throw error;
+    }
   }
 
   private requireSupport(): void {
@@ -627,7 +632,9 @@ class ConnectorMutationAuthority {
   }
 
   operationPath(displayPath: string): string {
-    return this.operations.get(displayPath) ?? displayPath;
+    const operation = this.operations.get(displayPath);
+    if (!operation) throw new Error(`Unmapped connector mutation target ${displayPath}`);
+    return operation;
   }
 
   displayError(error: unknown): Error {
@@ -647,12 +654,8 @@ class ConnectorMutationAuthority {
 let activeMutationAuthority: ConnectorMutationAuthority | undefined;
 
 function ioPath(displayPath: string): string {
-  return activeMutationAuthority?.operationPath(displayPath) ?? displayPath;
-}
-
-function ensureMutationParent(displayPath: string): void {
-  if (activeMutationAuthority && activeMutationAuthority.operationPath(displayPath) !== displayPath) return;
-  mkdirSync(dirname(displayPath), { recursive: true });
+  if (!activeMutationAuthority) return displayPath;
+  return activeMutationAuthority.operationPath(displayPath);
 }
 
 function withMutationAuthority<T>(targets: readonly MutationTargetSpec[], callback: () => T): T {
@@ -676,6 +679,11 @@ function openNoFollow(filePath: string, flags: number, mode?: number): number {
   return mode === undefined
     ? openSync(operationPath, safeFlags)
     : openSync(operationPath, safeFlags, mode);
+}
+
+function openNoFollowUnmapped(filePath: string, flags: number): number {
+  const safeFlags = flags | NO_FOLLOW_FLAGS;
+  return openSync(filePath, safeFlags);
 }
 
 function descriptorStats(descriptor: number, filePath: string): ReturnType<typeof fstatSync> {
@@ -815,7 +823,6 @@ function preflightSkill(filePath: string, generated: string): void {
 function installSkill(content: string, filePath: string): void {
   preflightSkill(filePath, content);
   const expected = Buffer.from(managedSkillContent(content), 'utf-8');
-  ensureMutationParent(filePath);
   let descriptor: number | undefined;
   let created = false;
   try {
@@ -901,7 +908,6 @@ function installMarkdown(
   writeMode: 'append' | 'overwrite',
   blankLineBeforeManagedBlock = false,
 ): void {
-  ensureMutationParent(filePath);
   if (writeMode === 'append') {
     updateRegularFileNoFollow(filePath, (existing) => (
       // Remove old markers if present before re-appending.
@@ -914,7 +920,6 @@ function installMarkdown(
 
 // Strategy 2: Structured targets (MCP JSON)
 function installMcpJson(filePath: string, strict = false): void {
-  ensureMutationParent(filePath);
   let changed = false;
   const verifiedBytes = updateRegularFileNoFollow(filePath, (existingBytes, created) => {
     let existing: Record<string, unknown> = {};
@@ -1630,12 +1635,12 @@ function compensateCodexMcp(runner: CodexMcpRunner, prior: readonly CodexMcpEntr
 
 type OwnedFileSnapshot = { readonly path: string; readonly content?: Buffer; readonly mode?: number; readonly nonFile?: boolean };
 
-function snapshotOwnedFiles(paths: readonly string[]): OwnedFileSnapshot[] {
+function snapshotOwnedFiles(paths: readonly string[], anchored = true): OwnedFileSnapshot[] {
   const snapshots: OwnedFileSnapshot[] = [];
   for (const path of [...new Set(paths)]) {
     let descriptor: number;
     try {
-      descriptor = openNoFollow(path, constants.O_RDONLY);
+      descriptor = anchored ? openNoFollow(path, constants.O_RDONLY) : openNoFollowUnmapped(path, constants.O_RDONLY);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         snapshots.push({ path });
@@ -1679,7 +1684,6 @@ function restoreOwnedFiles(snapshots: readonly OwnedFileSnapshot[]): void {
       try { unlinkRegularFileNoFollow(snapshot.path); } catch { /* preserve a non-file user surface */ }
       continue;
     }
-    ensureMutationParent(snapshot.path);
     // A file snapshot always records its mode; absent snapshots have no content
     // and return through the branch above.
     writeRegularFileNoFollow(snapshot.path, snapshot.content, snapshot.mode!);
@@ -1826,7 +1830,7 @@ function installTransportBundle(
       : options.codexMcpRunner ?? defaultCodexMcpRunner(cwd))
     : undefined;
   const priorCodexMcp = runner ? structuredClone(runner.get()) : undefined;
-  const configSnapshot = snapshotOwnedFiles([configFile]);
+  const configSnapshot = snapshotOwnedFiles([configFile], false);
   let filesMutated = false;
   let configMutated = false;
   let codexMcpMutationAttempted = false;
@@ -1871,7 +1875,7 @@ function installTransportBundle(
     if (persistTransport) {
       phase(options, "persist");
       setConnectorTransport(configFile, agent.id, transport);
-      configMutated ||= !fileSnapshotsEqual(configSnapshot, snapshotOwnedFiles([configFile]));
+      configMutated ||= !fileSnapshotsEqual(configSnapshot, snapshotOwnedFiles([configFile], false));
     }
     phase(options, "complete");
     const resultPaths = staged.map((result) => result.path).filter((path) => path.length > 0);
@@ -1886,7 +1890,7 @@ function installTransportBundle(
   } catch (error) {
     const failures: string[] = [];
     filesMutated ||= !fileSnapshotsEqual(snapshots, snapshotOwnedFiles(paths));
-    configMutated ||= !fileSnapshotsEqual(configSnapshot, snapshotOwnedFiles([configFile]));
+    configMutated ||= !fileSnapshotsEqual(configSnapshot, snapshotOwnedFiles([configFile], false));
     if (runner && priorCodexMcp && codexMcpMutationAttempted) {
       try {
         codexMcpMutated ||= !codexMcpEntriesEqual(runner.get(), priorCodexMcp);
@@ -1915,11 +1919,15 @@ function installTransportBundle(
   }
 }
 
-function withInstallAuthority<T>(agent: Agent, surfaces: readonly ConnectorSurface[], cwd: string, callback: () => T): T {
+function withInstallAuthority<T>(agent: Agent, surfaces: readonly ConnectorSurface[], cwd: string, callback: () => T, createRoot = true): T {
   // Preserve the legacy ability to bootstrap a not-yet-created project cwd;
-  // there is no selected root descriptor to anchor until that root exists.
+  // installs create only the selected root itself, while removal remains a
+  // read-only no-op when the project root is absent.
   if (process.platform !== "linux") throw new Error("Connector filesystem mutation requires Linux proc-descriptor anchoring");
-  if (!existsSync(cwd)) return callback();
+  if (!existsSync(cwd)) {
+    if (!createRoot) return callback();
+    mkdirSync(cwd);
+  }
   if (!existsSync(homedir())) mkdirSync(homedir(), { recursive: true });
   const specs = mutationTargetsForPaths(agent, cwd, surfaces);
   return withMutationAuthority(specs, callback);
@@ -2025,13 +2033,13 @@ export function removeConnector(
     if (cwdOrSurface === "mcp" && (!configPath || configPath.endsWith(".toml"))) {
       return removeComponent(agent, cwdOrSurface, cwd);
     }
-    return withInstallAuthority(agent, [cwdOrSurface], cwd, () => removeComponent(agent, cwdOrSurface, cwd));
+    return withInstallAuthority(agent, [cwdOrSurface], cwd, () => removeComponent(agent, cwdOrSurface, cwd), false);
   }
   if (cwdOrSurface === undefined && typeof cwdOrOptions === "string") {
-    return withInstallAuthority(agent, legacyDefaultSurfaces(agent), cwdOrOptions, () => removeLegacyDefault(agent, cwdOrOptions));
+    return withInstallAuthority(agent, legacyDefaultSurfaces(agent), cwdOrOptions, () => removeLegacyDefault(agent, cwdOrOptions), false);
   }
   const parsed = parseInstallerArguments(cwdOrSurface, typeof cwdOrOptions === "object" ? cwdOrOptions : undefined);
-  return withInstallAuthority(agent, CONNECTOR_SURFACES, parsed.cwd, () => removeTransportBundle(agent, parsed.cwd, parsed.options));
+  return withInstallAuthority(agent, CONNECTOR_SURFACES, parsed.cwd, () => removeTransportBundle(agent, parsed.cwd, parsed.options), false);
 }
 
 export function listConnectors(cwd: string = process.cwd()): InstalledConnector[] {

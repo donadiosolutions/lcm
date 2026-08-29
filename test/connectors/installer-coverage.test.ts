@@ -1188,6 +1188,29 @@ describe("installer defensive branches", () => {
 });
 
 describe("installer descriptor edge branches", () => {
+  it("fails closed when a registry target changes after authority preparation", () => {
+    const agent = AGENTS.find((candidate) => candidate.id === "cline")!;
+    const original = agent.configPaths.rules;
+    let caught: unknown;
+    try {
+      installConnector("cline", "cli", directory, {
+        persistTransport: true,
+        onPhase: (phase) => {
+          if (phase === "stage") agent.configPaths.rules = "alternate/rules.md";
+        },
+      });
+    } catch (error) {
+      caught = error;
+    } finally {
+      agent.configPaths.rules = original;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("Unmapped connector mutation target");
+    expect((caught as Error).message).toContain(join(directory, "alternate", "rules.md"));
+    expect((caught as Error).message).not.toContain("/proc/self/fd/");
+    expect(existsSync(join(directory, "alternate"))).toBe(false);
+    expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
+  });
   it("refuses when fd0 proc lookup returns an empty target", async () => {
     vi.resetModules();
     vi.doMock("node:fs", async () => {
