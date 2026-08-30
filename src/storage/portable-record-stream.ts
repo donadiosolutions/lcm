@@ -815,6 +815,7 @@ async function readSourcePage(
   try {
     return await source.readDomainPage(input);
   } catch (error) {
+    checkAbort(input.signal);
     if (error instanceof PortableStreamError) sourceFailure("source-invalid");
     sourceFailure("source-unavailable");
   }
