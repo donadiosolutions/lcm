@@ -705,6 +705,11 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
   if (records.length === 0 && page.complete === false) fail("partial-batch", { domain: request.domain });
   const normalized: PortableRecord[] = [];
   let framedBytes = 0;
+  let selectedBytes = 0;
+  let selectedCount = 0;
+  let selectionOpen = true;
+  let callerLimitOrdinal: number | undefined;
+  let prefix = prior?.prefixSha256 ?? initialDomainPrefix(manifest.schemaSha256, request.domain);
   let previous = predecessor;
   let previousIsPredecessor = predecessor !== null;
   const identities = new Set<string>();
@@ -729,6 +734,21 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
         fail("order-regression", { domain: request.domain, ordinal: candidate.record.ordinal });
       }
     }
+    if (selectionOpen) {
+      if (selectedCount === 0 && candidate.bytes.byteLength > request.maxBytes) {
+        callerLimitOrdinal = candidate.record.ordinal;
+        selectionOpen = false;
+      } else if (
+        selectedCount < request.maxRecords
+        && selectedBytes + candidate.bytes.byteLength <= request.maxBytes
+      ) {
+        selectedBytes += candidate.bytes.byteLength;
+        selectedCount += 1;
+        prefix = appendLengthPrefixed(prefix, candidate.bytes);
+      } else {
+        selectionOpen = false;
+      }
+    }
     previous = candidate.record;
     previousIsPredecessor = false;
     normalized.push(candidate.record);
@@ -742,20 +762,10 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
   if (pageNextOrdinal > terminal.recordCount) {
     fail("partial-batch", { domain: request.domain, ordinal: pageNextOrdinal });
   }
-  let selectedBytes = 0;
-  let selectedCount = 0;
-  for (const record of normalized) {
-    const bytes = recordBytes(record).byteLength;
-    if (selectedCount === 0 && bytes > request.maxBytes) {
-      fail("batch-limit-exceeded", { domain: request.domain, ordinal: record.ordinal, retryable: true });
-    }
-    if (selectedCount >= request.maxRecords || selectedBytes + bytes > request.maxBytes) break;
-    selectedBytes += bytes;
-    selectedCount += 1;
+  if (callerLimitOrdinal !== undefined) {
+    fail("batch-limit-exceeded", { domain: request.domain, ordinal: callerLimitOrdinal, retryable: true });
   }
   const selected = normalized.slice(0, selectedCount);
-  let prefix = prior?.prefixSha256 ?? initialDomainPrefix(manifest.schemaSha256, request.domain);
-  for (const record of selected) prefix = appendLengthPrefixed(prefix, recordBytes(record));
   const nextOrdinal = startOrdinal + selected.length;
   const complete = page.complete === true && selected.length === normalized.length;
   if (!page.complete && nextOrdinal >= terminal.recordCount) {
