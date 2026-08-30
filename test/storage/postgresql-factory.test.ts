@@ -8,6 +8,7 @@ import type {
 } from "../../src/storage/backend-publication.js";
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
 import type { ProjectStorage } from "../../src/storage/contracts.js";
+import { StorageOperationError } from "../../src/storage/errors.js";
 import {
   createPostgreSqlStorageBackendFactoryForTesting,
   createPostgreSqlStorageBackendFactoryWithHome,
@@ -712,6 +713,119 @@ describe("PostgreSQL storage backend factory", () => {
     expect(createProjectStorage).not.toHaveBeenCalled();
     expect(addListener).toHaveBeenCalledOnce();
     expect(removeListener).toHaveBeenCalledOnce();
+    await expect(factory.close()).resolves.toBeUndefined();
+    addListener.mockRestore();
+    removeListener.mockRestore();
+  });
+
+  it("rebuilds a cause-free closed publication failure with current identity", async () => {
+    const { runtime, dependencies, events } = harness();
+    dependencies.assertPublication = (_selection, _token) => {
+      events.push("assert");
+      throw new StorageOperationError(
+        "STORAGE_CLOSED",
+        "postgresql",
+        "injected-project",
+        "publication",
+        "injected-operation",
+      );
+    };
+    const createProjectStorage = vi.fn(() => ({ close: vi.fn() } as unknown as ProjectStorage));
+    dependencies.createProjectStorage = createProjectStorage;
+    const factory = await createPostgreSqlStorageBackendFactoryForTesting(
+      config,
+      "/home/operator",
+      dependencies,
+    );
+
+    const error = await factory.openProject(identity).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: "STORAGE_CLOSED",
+      backend: "postgresql",
+      projectId: PROJECT_ID,
+      domain: "factory",
+      operation: "openProject",
+    });
+    const serialized = JSON.stringify(error);
+    expect(serialized).not.toContain("injected-project");
+    expect(serialized).not.toContain("injected-operation");
+    expect(serialized).not.toContain("publication");
+    expect(events).toEqual(["readiness:lcm_migrator", "lock", "assert"]);
+    expect(runtime.observedSignals).toHaveLength(0);
+    expect(createProjectStorage).not.toHaveBeenCalled();
+    await expect(factory.close()).resolves.toBeUndefined();
+    expect(runtime.closeAttempts).toBe(1);
+  });
+
+  it("fences caller cancellation between the run and facade phases", async () => {
+    const { runtime, dependencies, events } = harness();
+    const controller = new AbortController();
+    const addListener = vi.spyOn(controller.signal, "addEventListener");
+    const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+    let publicationAssertions = 0;
+    let getterArmed = false;
+    let getterQueued = false;
+    let abortObserved = false;
+    const signal = new Proxy(controller.signal, {
+      get(target, property, receiver) {
+        if (property === "aborted") {
+          if (getterArmed && !getterQueued) {
+            getterQueued = true;
+            queueMicrotask(() => {
+              controller.abort("private post-run abort canary");
+              abortObserved = controller.signal.aborted;
+            });
+          }
+          return target.aborted;
+        }
+        if (property === "addEventListener" || property === "removeEventListener") {
+          const method = Reflect.get(target, property, target) as (...args: never[]) => unknown;
+          return method.bind(target);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as AbortSignal;
+    dependencies.assertPublication = (_selection, _token) => {
+      publicationAssertions += 1;
+      events.push("assert");
+      if (publicationAssertions === 2) getterArmed = true;
+    };
+    const createProjectStorage = vi.fn(() => ({ close: vi.fn() } as unknown as ProjectStorage));
+    dependencies.createProjectStorage = createProjectStorage;
+    const factory = await createPostgreSqlStorageBackendFactoryForTesting(
+      config,
+      "/home/operator",
+      dependencies,
+    );
+    const token = {} as BackendPublicationLockToken;
+
+    const error = await factory.openProject(identity, token, signal)
+      .catch((caught: unknown) => caught);
+
+    expect(getterArmed).toBe(true);
+    expect(getterQueued).toBe(true);
+    expect(abortObserved).toBe(true);
+    expect(publicationAssertions).toBe(2);
+    expect(events).toEqual(["readiness:lcm_migrator", "assert", "assert"]);
+    expect(runtime.observedSignals).toHaveLength(1);
+    expect(createProjectStorage).not.toHaveBeenCalled();
+    expect(error).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      backend: "postgresql",
+      projectId: undefined,
+      domain: "factory",
+      operation: "openProject",
+    });
+    expect(JSON.stringify(error)).not.toContain("post-run abort canary");
+    expect(addListener).toHaveBeenCalledOnce();
+    expect(removeListener).toHaveBeenCalledOnce();
+
+    getterArmed = false;
+    const secondController = new AbortController();
+    const storage = await factory.openProject(identity, token, secondController.signal);
+    expect(storage).not.toBeNull();
+    await storage?.close();
     await expect(factory.close()).resolves.toBeUndefined();
     addListener.mockRestore();
     removeListener.mockRestore();
