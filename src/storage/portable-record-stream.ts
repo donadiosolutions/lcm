@@ -1082,16 +1082,23 @@ export async function createPortableRecordStream(
           ? undefined
           : verifyPortableCheckpoint(input.after, manifest);
         if (prior !== undefined && prior.domain !== request.domain) fail("checkpoint-mismatch");
+        const terminal = manifestDomain(manifest, request.domain);
         await authenticateSource(source, sourceVerificationInput(manifest, input.signal));
         checkAbort(input.signal);
-        const page = await readSourcePage(source, {
-          domain: request.domain,
-          afterOrdinal: prior?.nextOrdinal ?? 0,
-          includePredecessor: prior !== undefined,
-          maxRecords: PORTABLE_LIMITS.maxBatchRecords,
-          maxBytes: PORTABLE_LIMITS.maxBatchBytes as 150994944,
-          ...(input.signal === undefined ? {} : { signal: input.signal }),
-        });
+        const page: PortableSourcePage = terminal.coverage.state === "authoritative-empty"
+          ? deepFreeze({
+              predecessor: null,
+              records: deepFreeze([] as PortableRecord[]),
+              complete: true,
+            })
+          : await readSourcePage(source, {
+              domain: request.domain,
+              afterOrdinal: prior?.nextOrdinal ?? 0,
+              includePredecessor: prior !== undefined,
+              maxRecords: PORTABLE_LIMITS.maxBatchRecords,
+              maxBytes: PORTABLE_LIMITS.maxBatchBytes as 150994944,
+              ...(input.signal === undefined ? {} : { signal: input.signal }),
+            });
         checkAbort(input.signal);
         await authenticateSource(source, sourceVerificationInput(manifest, input.signal));
         checkAbort(input.signal);
