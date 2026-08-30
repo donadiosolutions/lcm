@@ -540,7 +540,9 @@ export function createCompactHandler(
     const openProjectWithAdmission = async (): Promise<ProjectStorage> => {
       try {
         const project = await withProjectAdmission(async publicationLockToken => {
-          const project = await activeFactory!.openProject(admittedIdentity, publicationLockToken);
+          const project = signal === undefined
+            ? await activeFactory!.openProject(admittedIdentity, publicationLockToken)
+            : await activeFactory!.openProject(admittedIdentity, publicationLockToken, signal);
           openedProject = project;
           return project;
         });
@@ -555,6 +557,7 @@ export function createCompactHandler(
         // The admission wrapper can fail after its operation returns while it
         // revalidates publication state. Keep cleanup possible in that case.
         await closeOpenedProject();
+        throwIfAborted(signal);
         throw error;
       }
     };
