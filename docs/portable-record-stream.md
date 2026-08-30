@@ -114,9 +114,11 @@ The following rules apply to both adapter output and every parsed byte stream:
 
 Record serialization is canonical JSON encoded as UTF-8 with one terminating
 LF. A record is at most 128 MiB including that serialized envelope. Control
-objects (manifests and checkpoints) are at most 1 MiB. The default batch limit
-is 500 records and 144 MiB of framed record bytes; callers may request smaller
-limits but cannot exceed those defaults.
+objects (manifests and checkpoints) are at most 1 MiB. Every `readBatch()`
+request must supply both `maxRecords` and `maxBytes` as positive safe integers:
+`maxRecords` must be no greater than 500 and `maxBytes` must be no greater than
+144 MiB (150,994,944 bytes). These published constants are ceilings, not
+defaults for omitted fields. An unknown domain is rejected.
 
 ## Manifests, records, and checkpoints
 
@@ -191,17 +193,25 @@ The first checkpoint starts at ordinal zero and the domain's `P0`. A resumed
 page includes the predecessor record at the boundary; the stream verifies its
 ordinal, identity, and record digest before accepting the next records. Records
 must be contiguous, strictly ordered, dependency-valid, and duplicate-free.
-The source is authenticated before and after each page. If a page is partial,
-the caller persists the canonical checkpoint and resumes with that checkpoint;
-it must not skip an ordinal or treat an unverified destination write as
-complete. `verify(checkpoint)` re-authenticates the source boundary and returns
-an authoritative result only after the source confirms it is unchanged.
+The source is authenticated before and after each page. For `readBatch()`, a
+closed stream rejects before queued work or input inspection. For an open
+stream, a pre-aborted signal rejects before request validation; otherwise the
+domain and both limits are captured once and validated before an optional
+checkpoint is checked and before that request authenticates or pages the
+adapter. A validation failure does not poison the serial operation tail, so a
+later queued request can still run. If a page is partial, the caller persists
+the canonical checkpoint and resumes with that checkpoint; it must not skip an
+ordinal or treat an unverified destination write as complete. `verify(checkpoint)`
+re-authenticates the source boundary and returns an authoritative result only
+after the source confirms it is unchanged.
 
 ## Negotiation and failure handling
 
 Consumers negotiate version `1`, the exact
 `PORTABLE_RECORD_SCHEMA_SHA256`, the exact 22-domain order, and valid limits
-before reading records. Unsupported versions, unknown domains, schema-digest
+before reading records. A version-1 manifest's `limits` object must equal the
+published `PORTABLE_LIMITS` constants exactly; it does not establish a lower
+per-manifest ceiling. Unsupported versions, unknown domains, schema-digest
 mismatches, malformed manifests, invalid limits, and incompatible checkpoints
 are hard failures. There is no permissive field dropping, domain reordering,
 version guessing, or silent integer/timestamp conversion on the wire.

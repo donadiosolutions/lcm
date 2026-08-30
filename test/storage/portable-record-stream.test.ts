@@ -1899,6 +1899,199 @@ describe("portable record stream public seam", () => {
     await stream.close();
   });
 
+  it("rejects invalid read requests before source adapter calls", async () => {
+    const invalidRequests: readonly { readonly name: string; readonly input: PortableReadBatchInput; readonly code: string }[] = [
+      {
+        name: "unknown domain",
+        input: { domain: "unknown" as never, maxRecords: 1, maxBytes: PORTABLE_LIMITS.maxBatchBytes },
+        code: "unknown-domain",
+      },
+      ...([
+        ["maxRecords undefined", "maxRecords", undefined],
+        ["maxRecords string", "maxRecords", "1"],
+        ["maxRecords NaN", "maxRecords", Number.NaN],
+        ["maxRecords infinite", "maxRecords", Number.POSITIVE_INFINITY],
+        ["maxRecords fractional", "maxRecords", 1.5],
+        ["maxRecords negative", "maxRecords", -1],
+        ["maxRecords negative zero", "maxRecords", -0],
+        ["maxRecords zero", "maxRecords", 0],
+        ["maxRecords over cap", "maxRecords", PORTABLE_LIMITS.maxBatchRecords + 1],
+        ["maxBytes undefined", "maxBytes", undefined],
+        ["maxBytes string", "maxBytes", "1"],
+        ["maxBytes NaN", "maxBytes", Number.NaN],
+        ["maxBytes infinite", "maxBytes", Number.POSITIVE_INFINITY],
+        ["maxBytes fractional", "maxBytes", 1.5],
+        ["maxBytes negative", "maxBytes", -1],
+        ["maxBytes negative zero", "maxBytes", -0],
+        ["maxBytes zero", "maxBytes", 0],
+        ["maxBytes over cap", "maxBytes", PORTABLE_LIMITS.maxBatchBytes + 1],
+      ] as const).map(([name, field, value]) => ({
+        name,
+        input: {
+          domain: "messages",
+          maxRecords: field === "maxRecords" ? value : 1,
+          maxBytes: field === "maxBytes" ? value : PORTABLE_LIMITS.maxBatchBytes,
+        } as never,
+        code: "invalid-limit",
+      })),
+    ];
+
+    for (const { name, input, code } of invalidRequests) {
+      const source = new FakePortableSource();
+      const stream = await createPortableRecordStream(source);
+      source.pageFactory = () => ({ predecessor: null, records: [], complete: true });
+      const verifyBaseline = source.verifyCalls.length;
+      const pageBaseline = source.pageCalls.length;
+      await expectAsyncCode(() => stream.readBatch(input), code);
+      expect(source.verifyCalls, name).toHaveLength(verifyBaseline);
+      expect(source.pageCalls, name).toHaveLength(pageBaseline);
+      await stream.close();
+    }
+
+    const source = new FakePortableSource();
+    const stream = await createPortableRecordStream(source);
+    const verifyBaseline = source.verifyCalls.length;
+    const pageBaseline = source.pageCalls.length;
+    source.pageFactory = () => ({ predecessor: null, records: [], complete: true });
+    await expectAsyncCode(() => stream.readBatch({
+      domain: "unknown" as never,
+      after: {} as never,
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }), "unknown-domain");
+    await expectAsyncCode(() => stream.readBatch({
+      domain: "messages",
+      after: {} as never,
+      maxRecords: 0,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }), "invalid-limit");
+    expect(source.verifyCalls).toHaveLength(verifyBaseline);
+    expect(source.pageCalls).toHaveLength(pageBaseline);
+    await stream.close();
+
+    const abortedSource = new FakePortableSource();
+    const abortedStream = await createPortableRecordStream(abortedSource);
+    const abortController = new AbortController();
+    abortController.abort();
+    const abortedVerifyBaseline = abortedSource.verifyCalls.length;
+    const abortedPageBaseline = abortedSource.pageCalls.length;
+    await expectAsyncCode(() => abortedStream.readBatch({
+      domain: "unknown" as never,
+      maxRecords: 0,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+      signal: abortController.signal,
+    }), "aborted");
+    expect(abortedSource.verifyCalls).toHaveLength(abortedVerifyBaseline);
+    expect(abortedSource.pageCalls).toHaveLength(abortedPageBaseline);
+    await abortedStream.close();
+
+    const closedSource = new FakePortableSource();
+    const closedStream = await createPortableRecordStream(closedSource);
+    const closedVerifyBaseline = closedSource.verifyCalls.length;
+    const closedPageBaseline = closedSource.pageCalls.length;
+    await closedStream.close();
+    await expectAsyncCode(() => closedStream.readBatch({
+      domain: "unknown" as never,
+      maxRecords: 0,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }), "closed");
+    expect(closedSource.verifyCalls).toHaveLength(closedVerifyBaseline);
+    expect(closedSource.pageCalls).toHaveLength(closedPageBaseline);
+  });
+
+  it("keeps queued validation failures isolated", async () => {
+    const source = new FakePortableSource();
+    const stream = await createPortableRecordStream(source);
+    const verifyBaseline = source.verifyCalls.length;
+    const pageBaseline = source.pageCalls.length;
+    const invalid = stream.readBatch({ domain: "messages", maxRecords: 0, maxBytes: PORTABLE_LIMITS.maxBatchBytes });
+    const valid = stream.readBatch({ domain: "messages", maxRecords: 1, maxBytes: PORTABLE_LIMITS.maxBatchBytes });
+    await expectAsyncCode(() => invalid, "invalid-limit");
+    const batch = await valid;
+    expect(batch.records).toHaveLength(1);
+    expect(source.verifyCalls).toHaveLength(verifyBaseline + 2);
+    expect(source.pageCalls).toHaveLength(pageBaseline + 1);
+    await stream.close();
+  });
+
+  it("captures portable batch request values once", async () => {
+    const manifest = makeManifest();
+    const page: PortableSourcePage = {
+      predecessor: null,
+      records: records.messages,
+      complete: true,
+    };
+    let domainReads = 0;
+    let maxRecordsReads = 0;
+    let maxBytesReads = 0;
+    const standaloneInput = {
+      manifest,
+      page,
+      priorCheckpoint: undefined,
+      get domain(): PortableDomain {
+        domainReads += 1;
+        return (domainReads === 1 ? "messages" : "unknown") as PortableDomain;
+      },
+      get maxRecords(): number {
+        maxRecordsReads += 1;
+        return maxRecordsReads === 1 ? 1 : 0;
+      },
+      get maxBytes(): number {
+        maxBytesReads += 1;
+        return maxBytesReads === 1 ? PORTABLE_LIMITS.maxBatchBytes : 0;
+      },
+    } as CreatePortableBatchInput;
+    const standalone = createPortableBatch(standaloneInput);
+    expect(standalone.domain).toBe("messages");
+    expect(standalone.records).toEqual([records.messages[0]]);
+    expect(domainReads).toBe(1);
+    expect(maxRecordsReads).toBe(1);
+    expect(maxBytesReads).toBe(1);
+
+    const source = new FakePortableSource();
+    const stream = await createPortableRecordStream(source);
+    let queuedDomainReads = 0;
+    let queuedMaxRecordsReads = 0;
+    let queuedMaxBytesReads = 0;
+    let pageDomain: PortableDomain | undefined;
+    source.pageFactory = (input) => {
+      pageDomain = input.domain;
+      return { predecessor: null, records: records.messages, complete: true };
+    };
+    const queuedInput = {
+      get domain(): PortableDomain {
+        queuedDomainReads += 1;
+        return (queuedDomainReads === 1 ? "messages" : "unknown") as PortableDomain;
+      },
+      get maxRecords(): number {
+        queuedMaxRecordsReads += 1;
+        return queuedMaxRecordsReads === 1 ? 1 : 0;
+      },
+      get maxBytes(): number {
+        queuedMaxBytesReads += 1;
+        return queuedMaxBytesReads === 1 ? PORTABLE_LIMITS.maxBatchBytes : 0;
+      },
+    } as PortableReadBatchInput;
+    const queued = await stream.readBatch(queuedInput);
+    expect(queued.domain).toBe("messages");
+    expect(queued.records).toEqual([records.messages[0]]);
+    expect(pageDomain).toBe("messages");
+    expect(queuedDomainReads).toBe(1);
+    expect(queuedMaxRecordsReads).toBe(1);
+    expect(queuedMaxBytesReads).toBe(1);
+    await stream.close();
+  });
+
+  it("preserves manifest precedence over invalid standalone requests", () => {
+    const incompatible = { ...makeManifest(), schemaSha256: HASH };
+    expectCode(() => createPortableBatch(createBatchInput(
+      incompatible as never,
+      "messages",
+      { predecessor: null, records: [], complete: true },
+      { maxRecords: 0 },
+    )), "incompatible-schema");
+  });
+
   it("rejects forged partial boundaries and preserves the unchanged prior checkpoint after failures", async () => {
     const source = new FakePortableSource();
     const stream = await createPortableRecordStream(source);
