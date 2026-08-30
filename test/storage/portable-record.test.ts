@@ -1047,6 +1047,16 @@ describe("portable record public seam", () => {
     }
   });
 
+  it("serializes detached plain clones without identity-bound canonical state", () => {
+    const record = create("messages", representativeValues.messages);
+    const encoded = bytes(record);
+    const detached = JSON.parse(Buffer.from(encoded).toString("utf8")) as PortableRecord;
+    expect(bytes(detached)).toEqual(encoded);
+
+    const permuted = Object.fromEntries(Object.entries(detached).reverse());
+    expectCode(() => parsePortableRecord(Buffer.from(`${JSON.stringify(permuted)}\n`)), "malformed-record");
+  });
+
   it("uses canonical sorted object keys, UTF-8 escapes, and array order", () => {
     const record = create("promoted-memories", {
       ...representativeValues["promoted-memories"],
