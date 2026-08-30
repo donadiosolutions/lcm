@@ -50,8 +50,12 @@ from that session resolves against the same snapshot, even if the underlying
 conversation repository changes while the backfill is running.
 
 Each accepted JSONL record must decode as valid UTF-8 and contain a JSON object
-or array. LCM rejects malformed JSON, scalar JSON, U+0000, binary or invalid
-UTF-8 input, records larger than 10 MiB, and JSON nested beyond the exported
+or array. LCM independently rejects a raw JSONL representation or its
+post-scrub canonical UTF-8 representation when it exceeds the inclusive 10 MiB
+limit, classifying either boundary as `record-too-large` before payload
+persistence. A small raw record may therefore receive that reason after
+scrubbing expands it. LCM also rejects malformed JSON, scalar JSON, U+0000,
+binary or invalid UTF-8 input, and JSON nested beyond the exported
 `NATIVE_TRANSCRIPT_MAX_JSON_DEPTH` limit of 100 before a PostgreSQL repository
 operation begins. It rejects every integer-valued token outside JavaScript's
 safe-integer range, even when the value happens to round-trip exactly as a
@@ -327,7 +331,9 @@ Reason codes are bounded to `invalid-utf8`, `binary-input`,
 the source or active sensitive patterns, then rerun the explicit backfill—the
 source transcript remains read-only. Lossy numeric spellings and lone Unicode
 surrogates use `malformed-json`; their source bytes remain local and only the
-normal metadata fields are quarantined.
+normal metadata fields are quarantined. For either raw or post-scrub
+`record-too-large` rejection, the quarantine digest always identifies the raw
+physical record, never an expanded sanitized representation.
 
 Duplicate JSON object member names—including names that become equal after
 JSON escape decoding—also use `malformed-json`. LCM detects them in a bounded

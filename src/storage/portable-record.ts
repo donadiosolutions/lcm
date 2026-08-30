@@ -2291,7 +2291,12 @@ function buildRecordShape(
   }
 }
 
-function canonicalRecord(shape: PortableRecordShape): PortableRecord {
+interface CanonicalRecordResult {
+  readonly record: PortableRecord;
+  readonly canonical: string;
+}
+
+function canonicalRecordWithText(shape: PortableRecordShape): CanonicalRecordResult {
   const order = shape.order.map((scalar) => isPlainObject(scalar)
     ? Object.freeze({ $integer: scalar.$integer }) as PortableIntegerValue
     : scalar);
@@ -2309,10 +2314,15 @@ function canonicalRecord(shape: PortableRecordShape): PortableRecord {
     ...withoutRecordSha256,
     recordSha256: sha256(Buffer.from(canonicalEnvelopeJson(withoutRecordSha256), "utf8")),
   }) as PortableRecord;
-  if (Buffer.byteLength(canonicalEnvelopeJson(record), "utf8") + 1 > PORTABLE_LIMITS.maxRecordBytes) {
+  const canonical = canonicalEnvelopeJson(record);
+  if (Buffer.byteLength(canonical, "utf8") + 1 > PORTABLE_LIMITS.maxRecordBytes) {
     fail("record-unrepresentable", { domain: shape.domain, ordinal: shape.ordinal });
   }
-  return record;
+  return { record, canonical };
+}
+
+function canonicalRecord(shape: PortableRecordShape): PortableRecord {
+  return canonicalRecordWithText(shape).record;
 }
 
 function parseDependencies(value: unknown): readonly PortableDependency[] {
@@ -2380,7 +2390,7 @@ function snapshotPortableRecordEnvelope(value: unknown): Record<string, unknown>
   return snapshotExactObject(value, PORTABLE_RECORD_ENVELOPE_KEYS);
 }
 
-function parseJsonRecord(bytes: Uint8Array): Record<string, unknown> {
+function parseJsonRecord(bytes: Uint8Array): { readonly parsed: Record<string, unknown>; readonly text: string } {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength > PORTABLE_LIMITS.maxRecordBytes) {
     fail(bytes instanceof Uint8Array ? "record-unrepresentable" : "malformed-record");
   }
@@ -2402,7 +2412,7 @@ function parseJsonRecord(bytes: Uint8Array): Record<string, unknown> {
     malformed();
   }
   validatePortableRecordEnvelope(parsed);
-  return parsed;
+  return { parsed, text };
 }
 
 export function createPortableRecord<D extends PortableDomain>(
@@ -2419,28 +2429,44 @@ export function createPortableRecord(input: PortableRecordInput): PortableRecord
 }
 
 export function serializePortableRecord(record: PortableRecord): Uint8Array {
-  const validated = validatePortableRecord(record);
-  const canonical = canonicalEnvelopeJson(validated);
-  const bytes = Buffer.from(`${canonical}\n`, "utf8");
-  return bytes;
+  const envelope = snapshotPortableRecordEnvelope(record);
+  const validated = validatePortableRecordForSerialization(envelope);
+  return Buffer.from(`${validated.canonical}\n`, "utf8");
 }
 
 export function parsePortableRecord(bytes: Uint8Array): PortableRecord {
-  const parsed = parseJsonRecord(bytes);
-  return validatePortableRecord(parsed);
+  const { parsed, text } = parseJsonRecord(bytes);
+  const envelope = snapshotPortableRecordEnvelope(parsed);
+  return validatePortableRecordForParsing(envelope, text).record;
 }
 
-function validatePortableRecord(parsed: unknown): PortableRecord {
-  const envelope = snapshotPortableRecordEnvelope(parsed);
+function normalizePortableRecord(envelope: Record<string, unknown>): CanonicalRecordResult {
   if (envelope.version !== 1 || envelope.domainVersion !== 1) fail("unsupported-version");
   const domain = assertDomain(envelope.domain);
   const ordinal = validateOrdinal(envelope.ordinal);
   const value = normalizeDomainValue(domain, envelope.value, "wire");
   const evidence = evidenceFromWire(domain, envelope.order, envelope.dependencies);
-  const record = canonicalRecord(buildRecordShape(domain, ordinal, value, evidence));
+  const normalized = canonicalRecordWithText(buildRecordShape(domain, ordinal, value, evidence));
+  const { record } = normalized;
   if (canonicalJson(envelope.order) !== canonicalJson(record.order)) malformed();
   if (envelope.identitySha256 !== record.identitySha256) malformed();
   if (canonicalJson(envelope.dependencies) !== canonicalJson(record.dependencies)) malformed();
-  if (canonicalEnvelopeJson(envelope) !== canonicalEnvelopeJson(record)) malformed();
-  return record;
+  return normalized;
+}
+
+function validatePortableRecordForSerialization(
+  envelope: Record<string, unknown>,
+): CanonicalRecordResult {
+  const normalized = normalizePortableRecord(envelope);
+  if (canonicalEnvelopeJson(envelope) !== normalized.canonical) malformed();
+  return normalized;
+}
+
+function validatePortableRecordForParsing(
+  envelope: Record<string, unknown>,
+  text: string,
+): CanonicalRecordResult {
+  const normalized = normalizePortableRecord(envelope);
+  if (text !== normalized.canonical) malformed();
+  return normalized;
 }

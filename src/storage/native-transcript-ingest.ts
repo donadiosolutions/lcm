@@ -837,9 +837,11 @@ async function* readNativeTranscriptJsonlSnapshot(
       const parsed = parsedContainer(decodeRecord(bytes));
       assertJsonTreeSafe(parsed);
       const nativePayload = config.scrubber.scrubJson(parsed);
-      const contentSha256 = sha256(
-        canonicalNativeTranscriptJson(nativePayload),
-      );
+      const canonicalPayload = canonicalNativeTranscriptJson(nativePayload);
+      if (Buffer.byteLength(canonicalPayload, "utf8") > config.maxRecordBytes) {
+        throw new NativeTranscriptRecordError("record-too-large");
+      }
+      const contentSha256 = sha256(canonicalPayload);
       const occurrence = (occurrences.get(contentSha256) ?? 0) + 1;
       occurrences.set(contentSha256, occurrence);
       const observedAt = capturedClockDate(config.clock);

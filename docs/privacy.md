@@ -64,12 +64,15 @@ The daemon's PostgreSQL project routes store scrubbed messages, summaries,
 promoted memories, and related repository data only after local validation and
 redaction. The PostgreSQL native-transcript repository stores only client-native JSON
 records that passed local decoding, scrubbing, residual-secret validation, and
-canonicalization. Here, “raw transcript” means that sanitized native record and
-its provenance; LCM never sends the verbatim pre-redaction source record to
-PostgreSQL. Failed records produce only bounded metadata in private local
-quarantine stores separated by project and transcript client. The client
-identity exists only in the opaque database namespace, not in quarantine rows,
-so identical Claude and Codex metadata cannot deduplicate across clients.
+canonicalization. For the explicit embedded and backfill APIs, an accepted
+sanitized native record must also fit the same inclusive 10 MiB limit in
+canonical UTF-8, independently of the raw JSONL byte check. Here, “raw
+transcript” means that sanitized native record and its provenance; LCM never
+sends the verbatim pre-redaction source record to PostgreSQL. Failed records
+produce only bounded metadata in private local quarantine stores separated by
+project and transcript client. The client identity exists only in the opaque
+database namespace, not in quarantine rows, so identical Claude and Codex
+metadata cannot deduplicate across clients.
 Native-transcript daemon and CLI routing is not active; explicit backfill and
 adapter use are documented in
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md).
@@ -94,10 +97,14 @@ load and pass both effective custom-pattern arrays: global
 implicitly; missing or non-array values fail before source or repository
 access, while an explicit empty array means that scope has no configured custom
 rules. LCM applies those arrays plus the bundled rules recursively to every
-string key and value. Invalid UTF-8, malformed or scalar JSON, oversized
-records, U+0000, invalid custom patterns, redacted-key collisions, residual
-matches, and JSON nested beyond the exported depth limit of 100 are rejected
-locally. Integer-valued JSON tokens outside JavaScript's safe-integer range
+string key and value. Invalid UTF-8, malformed or scalar JSON, records
+oversized in raw JSONL bytes or after scrubbing in canonical UTF-8, U+0000,
+invalid custom patterns, redacted-key collisions, residual matches, and JSON
+nested beyond the exported depth limit of 100 are rejected locally. Either
+size rejection retains only the raw-record digest and bounded reason metadata
+in local quarantine; transient scrubbed expansion before rejection is not a
+peak-memory guarantee. Integer-valued JSON tokens outside JavaScript's
+safe-integer range
 are rejected regardless of integer, decimal, or exponent spelling, including
 values that happen to round-trip exactly as a `number`. Other numeric spellings
 that would lose their exact decimal value, and lone UTF-16 surrogate code units

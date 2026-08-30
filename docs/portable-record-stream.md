@@ -58,7 +58,10 @@ permission to omit a domain. `available` coverage carries an evidence SHA-256.
 `authoritative-empty` is allowed only with the reason
 `not-in-source-generation` and its own evidence SHA-256. A source must not
 claim empty coverage because a read failed or because an adapter has not yet
-implemented the domain.
+implemented the domain. An authoritative-empty domain must also have
+`recordCount = 0` and the seeded boundary prefix for that domain. Its coverage
+evidence SHA-256 proves the source-generation claim; it is distinct from the
+boundary field `prefixSha256`.
 
 ## Construction versus wire data
 
@@ -111,9 +114,11 @@ The following rules apply to both adapter output and every parsed byte stream:
 
 Record serialization is canonical JSON encoded as UTF-8 with one terminating
 LF. A record is at most 128 MiB including that serialized envelope. Control
-objects (manifests and checkpoints) are at most 1 MiB. The default batch limit
-is 500 records and 144 MiB of framed record bytes; callers may request smaller
-limits but cannot exceed those defaults.
+objects (manifests and checkpoints) are at most 1 MiB. Every `readBatch()`
+request must supply both `maxRecords` and `maxBytes` as positive safe integers:
+`maxRecords` must be no greater than 500 and `maxBytes` must be no greater than
+144 MiB (150,994,944 bytes). These published constants are ceilings, not
+defaults for omitted fields. An unknown domain is rejected.
 
 ## Manifests, records, and checkpoints
 
@@ -153,6 +158,21 @@ C0      = SHA256(canonicalJson(["lcm-portable-content-v1", schemaSha256]))
 content = fold(prefix => SHA256(hexBytes(previous) || uint64be(32) || hexBytes(prefix)), C0)
 ```
 
+For an authoritative-empty domain, the terminal prefix is exactly `P0(D)`.
+Recomputing `contentSha256` and `manifestSha256` cannot substitute for this
+semantic invariant: those checksums authenticate the supplied fields, including
+an invalid empty-domain count or boundary prefix.
+
+Coverage also controls transfer-page dispatch. After manifest-bound source
+authentication, a valid `authoritative-empty` domain is represented by a
+canonical empty complete page and its empty terminal batch/checkpoint; the
+wrapper never invokes the domain reader for that request. This does not apply
+to an `available` domain whose source currently contains zero records: that
+domain's reader is still invoked, and its returned empty terminal page is
+authenticated and validated normally. An adapter must not use a failed,
+missing, inaccessible, or unsupported reader as evidence for an
+`authoritative-empty` claim.
+
 The manifest checksum covers the canonical manifest body, excluding its own
 checksum:
 
@@ -183,17 +203,28 @@ The first checkpoint starts at ordinal zero and the domain's `P0`. A resumed
 page includes the predecessor record at the boundary; the stream verifies its
 ordinal, identity, and record digest before accepting the next records. Records
 must be contiguous, strictly ordered, dependency-valid, and duplicate-free.
-The source is authenticated before and after each page. If a page is partial,
-the caller persists the canonical checkpoint and resumes with that checkpoint;
-it must not skip an ordinal or treat an unverified destination write as
-complete. `verify(checkpoint)` re-authenticates the source boundary and returns
-an authoritative result only after the source confirms it is unchanged.
+The source is authenticated before and after each available adapter page. An
+authoritative-empty request retains the same two manifest-bound verification
+calls around synthetic page construction, without invoking the domain reader.
+For `readBatch()`, a closed stream rejects before queued work or input
+inspection. For an open stream, a pre-aborted signal rejects before request
+validation; otherwise the domain and both limits are captured once and
+validated before an optional checkpoint is checked and before that request
+authenticates or pages the adapter. A validation failure does not poison the
+serial operation tail, so a later queued request can still run. If a page is
+partial, the caller persists the canonical checkpoint and resumes with that
+checkpoint; it must not skip an ordinal or treat an unverified destination
+write as complete. `verify(checkpoint)` re-authenticates the source boundary
+and returns an authoritative result only after the source confirms it is
+unchanged.
 
 ## Negotiation and failure handling
 
 Consumers negotiate version `1`, the exact
 `PORTABLE_RECORD_SCHEMA_SHA256`, the exact 22-domain order, and valid limits
-before reading records. Unsupported versions, unknown domains, schema-digest
+before reading records. A version-1 manifest's `limits` object must equal the
+published `PORTABLE_LIMITS` constants exactly; it does not establish a lower
+per-manifest ceiling. Unsupported versions, unknown domains, schema-digest
 mismatches, malformed manifests, invalid limits, and incompatible checkpoints
 are hard failures. There is no permissive field dropping, domain reordering,
 version guessing, or silent integer/timestamp conversion on the wire.
@@ -208,18 +239,30 @@ retryable flag. The error classes are `unsupported-version`, `unknown-domain`,
 `source-unavailable`, `aborted`, and `closed`. Adapter exceptions, SQL, paths,
 credentials, payloads, and arbitrary backend messages must not escape through
 this error boundary. Source unavailability, oversized batches, and aborts may
-be retried according to the returned `retryable` flag; changed or invalid
-source evidence requires investigation or a fresh manifest.
+be retried according to the returned `retryable` flag. If an available-domain
+page reader rejects and the read's signal was already aborted when the failure
+was classified, the read fails as retryable `aborted` rather than
+`source-unavailable` or `source-invalid`. The adapter error and abort reason
+remain private, no checkpoint is returned or advanced, and the prior
+checkpoint may be retried. A rejection without observed cancellation retains
+the existing sanitized `source-unavailable` or `source-invalid`
+classification. Changed or invalid source evidence requires investigation or
+a fresh manifest.
 
 ## Source and destination duties
 
-The source adapter must describe one stable project snapshot, provide complete
-domain coverage evidence, read bounded pages after the requested ordinal, and
-return the exact predecessor when requested. It must implement verification for
-the source identity, witness, content/manifest digests, and optional boundary;
-it must report change or invalid evidence rather than guessing. It owns backend
-transactions, snapshots, locks, and cleanup and must close them even after
-abort.
+The source adapter must describe one stable project snapshot and provide
+complete domain coverage evidence. For every domain it advertises as
+`available`, it must read bounded pages after the requested ordinal and return
+the exact predecessor when requested. A domain carrying valid
+`authoritative-empty` generation evidence needs no page-reader implementation
+for transfer reads because the wrapper synthesizes its canonical empty page.
+Missing, inaccessible, failed, or merely unsupported readers must never be
+mislabelled as authoritative-empty. The adapter must implement verification
+for the source identity, witness, content/manifest digests, and optional
+boundary; it must report change or invalid evidence rather than guessing. It
+owns backend transactions, snapshots, locks, and cleanup and must close them
+even after abort.
 
 A destination consumer must negotiate before writing, apply records in domain
 order, validate every record and dependency, persist the canonical checkpoint,

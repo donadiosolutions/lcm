@@ -432,6 +432,13 @@ function validateManifest(value: unknown, requireChecksum = true): PortableManif
     ) fail("malformed-manifest");
     const coverage = validateCoverage(item.coverage);
     if (!sameCanonical(coverage, source.coverage[domain])) fail("malformed-manifest");
+    if (
+      coverage.state === "authoritative-empty"
+      && (
+        item.recordCount !== 0
+        || item.prefixSha256 !== initialDomainPrefix(PORTABLE_RECORD_SCHEMA_SHA256, domain)
+      )
+    ) fail("malformed-manifest");
     return deepFreeze({
       domain,
       domainVersion: 1,
@@ -647,28 +654,37 @@ function checkAbort(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) fail("aborted", { retryable: true });
 }
 
+function validateBatchRequest(
+  domain: PortableDomain,
+  maxRecords: number,
+  maxBytes: number,
+): Readonly<{ readonly domain: PortableDomain; readonly maxRecords: number; readonly maxBytes: number }> {
+  if (!PORTABLE_RECORD_DOMAIN_ORDER.includes(domain)) fail("unknown-domain");
+  if (
+    !Number.isSafeInteger(maxRecords)
+    || maxRecords <= 0
+    || maxRecords > PORTABLE_LIMITS.maxBatchRecords
+    || !Number.isSafeInteger(maxBytes)
+    || maxBytes <= 0
+    || maxBytes > PORTABLE_LIMITS.maxBatchBytes
+  ) fail("invalid-limit", { domain });
+  return { domain, maxRecords, maxBytes };
+}
+
 export function createPortableBatch(input: CreatePortableBatchInput): PortableBatch {
   checkAbort(input.signal);
   const manifest = validateManifest(input.manifest);
-  if (!PORTABLE_RECORD_DOMAIN_ORDER.includes(input.domain)) fail("unknown-domain");
-  if (
-    !Number.isSafeInteger(input.maxRecords)
-    || input.maxRecords <= 0
-    || input.maxRecords > PORTABLE_LIMITS.maxBatchRecords
-    || !Number.isSafeInteger(input.maxBytes)
-    || input.maxBytes <= 0
-    || input.maxBytes > PORTABLE_LIMITS.maxBatchBytes
-  ) fail("invalid-limit", { domain: input.domain });
-  const terminal = manifestDomain(manifest, input.domain);
+  const request = validateBatchRequest(input.domain, input.maxRecords, input.maxBytes);
+  const terminal = manifestDomain(manifest, request.domain);
   const prior = input.priorCheckpoint === undefined
     ? undefined
     : verifyPortableCheckpoint(input.priorCheckpoint, manifest);
-  if (prior !== undefined && prior.domain !== input.domain) fail("checkpoint-mismatch");
+  if (prior !== undefined && prior.domain !== request.domain) fail("checkpoint-mismatch");
   const page = snapshot(input.page, ["predecessor", "records", "complete"], "partial-batch");
-  if (typeof page.complete !== "boolean") fail("partial-batch", { domain: input.domain });
+  if (typeof page.complete !== "boolean") fail("partial-batch", { domain: request.domain });
   const records = arrayValues(page.records, "partial-batch");
   if (records.length > PORTABLE_LIMITS.maxBatchRecords) {
-    fail("batch-limit-exceeded", { domain: input.domain, retryable: true });
+    fail("batch-limit-exceeded", { domain: request.domain, retryable: true });
   }
   const startOrdinal = prior?.nextOrdinal ?? 0;
   let predecessor: PortableRecord | null = null;
@@ -676,41 +692,61 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
     predecessor = parsePortableRecord(recordBytes(page.predecessor as PortableRecord));
   }
   if (prior === undefined) {
-    if (predecessor !== null) fail("checkpoint-mismatch", { domain: input.domain });
+    if (predecessor !== null) fail("checkpoint-mismatch", { domain: request.domain });
   } else {
     if (
       predecessor === null
-      || predecessor.domain !== input.domain
+      || predecessor.domain !== request.domain
       || predecessor.ordinal !== prior.nextOrdinal - 1
       || predecessor.identitySha256 !== prior.lastRecordIdentitySha256
       || predecessor.recordSha256 !== prior.lastRecordSha256
-    ) fail("checkpoint-mismatch", { domain: input.domain });
+    ) fail("checkpoint-mismatch", { domain: request.domain });
   }
-  if (records.length === 0 && page.complete === false) fail("partial-batch", { domain: input.domain });
+  if (records.length === 0 && page.complete === false) fail("partial-batch", { domain: request.domain });
   const normalized: PortableRecord[] = [];
   let framedBytes = 0;
+  let selectedBytes = 0;
+  let selectedCount = 0;
+  let selectionOpen = true;
+  let callerLimitOrdinal: number | undefined;
+  let prefix = prior?.prefixSha256 ?? initialDomainPrefix(manifest.schemaSha256, request.domain);
   let previous = predecessor;
   let previousIsPredecessor = predecessor !== null;
   const identities = new Set<string>();
   for (let index = 0; index < records.length; index += 1) {
     const rawRecord = records[index] as PortableRecord;
-    validateDependencyContract(rawRecord, input.domain);
+    validateDependencyContract(rawRecord, request.domain);
     const candidate = validateRecordForBatch(rawRecord);
-    if (candidate.record.domain !== input.domain || candidate.record.domainVersion !== 1) {
-      fail("checkpoint-mismatch", { domain: input.domain, ordinal: candidate.record.ordinal });
+    if (candidate.record.domain !== request.domain || candidate.record.domainVersion !== 1) {
+      fail("checkpoint-mismatch", { domain: request.domain, ordinal: candidate.record.ordinal });
     }
     framedBytes += candidate.bytes.byteLength;
     if (framedBytes > PORTABLE_LIMITS.maxBatchBytes) {
-      fail("batch-limit-exceeded", { domain: input.domain, ordinal: candidate.record.ordinal, retryable: true });
+      fail("batch-limit-exceeded", { domain: request.domain, ordinal: candidate.record.ordinal, retryable: true });
     }
     if (identities.has(candidate.record.identitySha256)) {
-      fail("duplicate-identity", { domain: input.domain, ordinal: candidate.record.ordinal });
+      fail("duplicate-identity", { domain: request.domain, ordinal: candidate.record.ordinal });
     }
     identities.add(candidate.record.identitySha256);
     if (previous !== null) {
       const comparison = comparePortableOrder(previous.order, candidate.record.order);
       if (comparison > 0 || (comparison === 0 && previousIsPredecessor)) {
-        fail("order-regression", { domain: input.domain, ordinal: candidate.record.ordinal });
+        fail("order-regression", { domain: request.domain, ordinal: candidate.record.ordinal });
+      }
+    }
+    if (selectionOpen) {
+      if (selectedCount === 0 && candidate.bytes.byteLength > request.maxBytes) {
+        callerLimitOrdinal = candidate.record.ordinal;
+        selectionOpen = false;
+      } else if (
+        selectedCount < request.maxRecords
+        && selectedBytes + candidate.bytes.byteLength <= request.maxBytes
+      ) {
+        selectedBytes += candidate.bytes.byteLength;
+        selectedCount += 1;
+        prefix = appendLengthPrefixed(prefix, candidate.bytes);
+      } else {
+        selectionOpen = false;
       }
     }
     previous = candidate.record;
@@ -719,41 +755,31 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
   }
   for (let index = 0; index < normalized.length; index += 1) {
     if (normalized[index].ordinal !== startOrdinal + index) {
-      fail("checkpoint-mismatch", { domain: input.domain, ordinal: normalized[index].ordinal });
+      fail("checkpoint-mismatch", { domain: request.domain, ordinal: normalized[index].ordinal });
     }
   }
   const pageNextOrdinal = startOrdinal + normalized.length;
   if (pageNextOrdinal > terminal.recordCount) {
-    fail("partial-batch", { domain: input.domain, ordinal: pageNextOrdinal });
+    fail("partial-batch", { domain: request.domain, ordinal: pageNextOrdinal });
   }
-  let selectedBytes = 0;
-  let selectedCount = 0;
-  for (const record of normalized) {
-    const bytes = recordBytes(record).byteLength;
-    if (selectedCount === 0 && bytes > input.maxBytes) {
-      fail("batch-limit-exceeded", { domain: input.domain, ordinal: record.ordinal, retryable: true });
-    }
-    if (selectedCount >= input.maxRecords || selectedBytes + bytes > input.maxBytes) break;
-    selectedBytes += bytes;
-    selectedCount += 1;
+  if (callerLimitOrdinal !== undefined) {
+    fail("batch-limit-exceeded", { domain: request.domain, ordinal: callerLimitOrdinal, retryable: true });
   }
   const selected = normalized.slice(0, selectedCount);
-  let prefix = prior?.prefixSha256 ?? initialDomainPrefix(manifest.schemaSha256, input.domain);
-  for (const record of selected) prefix = appendLengthPrefixed(prefix, recordBytes(record));
   const nextOrdinal = startOrdinal + selected.length;
   const complete = page.complete === true && selected.length === normalized.length;
   if (!page.complete && nextOrdinal >= terminal.recordCount) {
-    fail("partial-batch", { domain: input.domain, ordinal: nextOrdinal });
+    fail("partial-batch", { domain: request.domain, ordinal: nextOrdinal });
   }
   if (complete && (nextOrdinal !== terminal.recordCount || prefix !== terminal.prefixSha256)) {
-    fail("partial-batch", { domain: input.domain, ordinal: nextOrdinal });
+    fail("partial-batch", { domain: request.domain, ordinal: nextOrdinal });
   }
   checkAbort(input.signal);
   const last = selected.at(-1) ?? predecessor;
   const checkpoint = makeCheckpoint({
     version: 1,
     manifestSha256: manifest.manifestSha256,
-    domain: input.domain,
+    domain: request.domain,
     nextOrdinal,
     recordCount: nextOrdinal,
     prefixSha256: prefix,
@@ -765,7 +791,7 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
   return deepFreeze({
     version: 1,
     manifestSha256: manifest.manifestSha256,
-    domain: input.domain,
+    domain: request.domain,
     records: deepFreeze(selected),
     framedBytes: selectedBytes,
     complete,
@@ -799,6 +825,7 @@ async function readSourcePage(
   try {
     return await source.readDomainPage(input);
   } catch (error) {
+    checkAbort(input.signal);
     if (error instanceof PortableStreamError) sourceFailure("source-invalid");
     sourceFailure("source-unavailable");
   }
@@ -1061,30 +1088,38 @@ export async function createPortableRecordStream(
     readBatch(input: PortableReadBatchInput): Promise<PortableBatch> {
       return enqueue(async () => {
         checkAbort(input.signal);
+        const request = validateBatchRequest(input.domain, input.maxRecords, input.maxBytes);
         const prior = input.after === undefined
           ? undefined
           : verifyPortableCheckpoint(input.after, manifest);
-        if (prior !== undefined && prior.domain !== input.domain) fail("checkpoint-mismatch");
+        if (prior !== undefined && prior.domain !== request.domain) fail("checkpoint-mismatch");
+        const terminal = manifestDomain(manifest, request.domain);
         await authenticateSource(source, sourceVerificationInput(manifest, input.signal));
         checkAbort(input.signal);
-        const page = await readSourcePage(source, {
-          domain: input.domain,
-          afterOrdinal: prior?.nextOrdinal ?? 0,
-          includePredecessor: prior !== undefined,
-          maxRecords: PORTABLE_LIMITS.maxBatchRecords,
-          maxBytes: PORTABLE_LIMITS.maxBatchBytes as 150994944,
-          ...(input.signal === undefined ? {} : { signal: input.signal }),
-        });
+        const page: PortableSourcePage = terminal.coverage.state === "authoritative-empty"
+          ? deepFreeze({
+              predecessor: null,
+              records: deepFreeze([] as PortableRecord[]),
+              complete: true,
+            })
+          : await readSourcePage(source, {
+              domain: request.domain,
+              afterOrdinal: prior?.nextOrdinal ?? 0,
+              includePredecessor: prior !== undefined,
+              maxRecords: PORTABLE_LIMITS.maxBatchRecords,
+              maxBytes: PORTABLE_LIMITS.maxBatchBytes as 150994944,
+              ...(input.signal === undefined ? {} : { signal: input.signal }),
+            });
         checkAbort(input.signal);
         await authenticateSource(source, sourceVerificationInput(manifest, input.signal));
         checkAbort(input.signal);
         return createPortableBatch({
           manifest,
-          domain: input.domain,
+          domain: request.domain,
           page,
           priorCheckpoint: prior,
-          maxRecords: input.maxRecords,
-          maxBytes: input.maxBytes,
+          maxRecords: request.maxRecords,
+          maxBytes: request.maxBytes,
           signal: input.signal,
         });
       });
