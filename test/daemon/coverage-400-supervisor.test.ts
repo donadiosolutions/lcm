@@ -20,6 +20,7 @@ const fsFaults = vi.hoisted(() => ({
   open: false,
   openCode: undefined as string | undefined,
   close: false,
+  mkdir: false,
   lstatPath: undefined as string | undefined,
   lstatHits: 0,
 }));
@@ -42,6 +43,10 @@ vi.mock("node:fs", async (importOriginal) => {
     closeSync: (...args: Parameters<typeof actual.closeSync>) => {
       if (fsFaults.close) throw new Error("close unavailable");
       return actual.closeSync(...args);
+    },
+    mkdirSync: (...args: Parameters<typeof actual.mkdirSync>) => {
+      if (fsFaults.mkdir) throw new Error("mkdir unavailable");
+      return actual.mkdirSync(...args);
     },
     lstatSync: (...args: Parameters<typeof actual.lstatSync>) => {
       const stats = actual.lstatSync(...args);
@@ -2373,6 +2378,13 @@ describe("supervisor coverage: credentials and private launch files", () => {
       await expect(createSupervisor("launchd-user", { run: openRunner.run, platform: "darwin", uid: 501 }).start(spec("launchd-user", root()))).rejects.toThrow("manager command");
     } finally {
       fsFaults.open = false;
+    }
+    const mkdirRunner = runQueue([absent, absent]);
+    fsFaults.mkdir = true;
+    try {
+      await expect(createSupervisor("launchd-user", { run: mkdirRunner.run, platform: "darwin", uid: 501 }).start(spec("launchd-user", root()))).rejects.toThrow("manager command");
+    } finally {
+      fsFaults.mkdir = false;
     }
     const closeRunner = runQueue([absent, absent]);
     fsFaults.close = true;

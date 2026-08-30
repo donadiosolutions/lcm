@@ -221,6 +221,95 @@ describe("canonical supervisor identity", () => {
     expect(managedLaunchEnvironment({ CODEX_HOME: "relative" })).toEqual({});
   });
 
+  it("normalizes caller temporary triples to the state-root daemon directory", () => {
+    const root = makeRoot();
+    const first = makeSpec("systemd-user", root, {
+      launchEnvironment: {
+        HOME: "/home/test",
+        PATH: "/usr/bin",
+        TMPDIR: "/lane/one",
+        TMP: "/lane/one",
+        TEMP: "/lane/one",
+      },
+    });
+    const second = makeSpec("systemd-user", root, {
+      nonce: first.nonce,
+      launchEnvironment: {
+        HOME: "/home/test",
+        PATH: "/usr/bin",
+        TMPDIR: "/lane/two",
+        TMP: "/lane/two",
+        TEMP: "/lane/two",
+      },
+    });
+    const firstDigest = managedLaunchEnvironmentDigest(first, "systemd-user", 501, first.launchEnvironment!);
+    const secondDigest = managedLaunchEnvironmentDigest(second, "systemd-user", 501, second.launchEnvironment!);
+    expect(firstDigest).toBe(secondDigest);
+    expect(managedLaunchEnvironment({ TMPDIR: "/lane/one", TMP: "/lane/one", TEMP: "/lane/one" })).toEqual({});
+  });
+
+  it("rejects an unsafe pre-existing daemon temporary directory before manager mutation", async () => {
+    const root = makeRoot();
+    const daemonTemp = join(root, "daemon-tmp");
+    mkdirSync(daemonTemp, { mode: 0o755 });
+    const spec = makeSpec("systemd-user", root);
+    const runner = fakeRunner([{ code: 1, stderr: "Unit is not-found" }]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      uid: 501,
+    }).start(spec)).rejects.toThrow();
+    expect(runner.calls.some(({ command }) => command === "systemd-run")).toBe(false);
+    expect(lstatSync(daemonTemp).mode & 0o777).toBe(0o755);
+  });
+
+  it("emits one stable temporary triple on systemd and launchd surfaces", async () => {
+    const root = makeRoot();
+    const daemonTemp = join(root, "daemon-tmp");
+    const environment = {
+      HOME: "/home/test",
+      PATH: "/usr/bin",
+      TMPDIR: "/lane/ambient",
+      TMP: "/lane/ambient",
+      TEMP: "/lane/ambient",
+    };
+    const systemdSpec = makeSpec("systemd-user", root, { launchEnvironment: environment });
+    const systemdRunner = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: managerText(systemdSpec, "active", 501, "running", environment) },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: systemdRunner.run,
+      platform: "linux",
+      uid: 501,
+      environment,
+    }).start(systemdSpec)).resolves.toMatchObject({ managerPid: 501 });
+    const systemdArgs = systemdRunner.calls[1]!.args;
+    for (const name of ["TMPDIR", "TMP", "TEMP"] as const) {
+      expect(systemdArgs).toContain(`--setenv=${name}=${daemonTemp}`);
+      expect(systemdArgs).toContain(`${name}=${daemonTemp}`);
+    }
+
+    const launchdSpec = makeSpec("launchd-user", root, { launchEnvironment: environment });
+    const launchdRunner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdPrintText(launchdSpec, "running", 502, environment) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: launchdRunner.run,
+      platform: "darwin",
+      uid: 501,
+      environment,
+    }).start(launchdSpec)).resolves.toMatchObject({ managerPid: 502 });
+    const plist = readFileSync(join(root, `daemon.${launchdSpec.shortDigest}.${launchdSpec.nonce}.plist`), "utf8");
+    for (const name of ["TMPDIR", "TMP", "TEMP"] as const) {
+      expect(plist).toContain(`<key>${name}</key><string>${daemonTemp}</string>`);
+      expect(plist).toContain(`<string>${name}=${daemonTemp}</string>`);
+    }
+  });
+
   it("uses the private directory owner when process.getuid is unavailable", () => {
     const root = makeRoot();
     const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
@@ -306,7 +395,7 @@ describe("canonical supervisor identity", () => {
         const plist = readFileSync(join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`), "utf8");
         expect(plist).toContain(`<string>LCM_POSTGRES_MIGRATION_ROLE=${normalizedMigrationRole}</string>`);
         expect(plist).not.toContain(`<string>LCM_POSTGRES_MIGRATION_ROLE=${migrationRole}</string>`);
-        expect(plist).not.toContain("<key>LCM_POSTGRES_MIGRATION_ROLE</key>");
+        expect(plist).toContain("<key>LCM_POSTGRES_MIGRATION_ROLE</key><string>lcm_migration</string>");
         expect(plist).not.toContain("LCM_CREDENTIAL_LCM_POSTGRES_MIGRATION_ROLE");
       }
     }
@@ -542,6 +631,30 @@ describe("managed one-launch credentials", () => {
 });
 
 describe("systemd-user supervisor", () => {
+  it("revalidates the retained daemon temporary witness before systemd-run", async () => {
+    const root = makeRoot();
+    const daemonTemp = join(root, "daemon-tmp");
+    const redirect = makeRoot();
+    let raced = false;
+    const race = (path: string, phase: "before-open" | "before-manager"): void => {
+      if (phase !== "before-manager" || raced) return;
+      raced = true;
+      rmSync(path, { recursive: true, force: true });
+      symlinkSync(redirect, path, "dir");
+    };
+    const spec = makeSpec("systemd-user", root);
+    const runner = fakeRunner([{ code: 1, stderr: "Unit is not-found" }]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      uid: 501,
+      _daemonTempRaceForTesting: race,
+    }).start(spec)).rejects.toThrow();
+    expect(raced).toBe(true);
+    expect(runner.calls.some(({ command }) => command === "systemd-run")).toBe(false);
+    expect(lstatSync(daemonTemp).isSymbolicLink()).toBe(true);
+  });
+
   it("admits the same stable launch identity from distinct caller directories", async () => {
     const root = makeRoot();
     const spawnCommand = "/usr/bin/node";
@@ -2054,6 +2167,53 @@ describe("systemd-user supervisor", () => {
 });
 
 describe("launchd-user supervisor", () => {
+  it("rejects partial or mismatched temporary plist surfaces before bootstrap", async () => {
+    const root = makeRoot();
+    const spec = makeSpec("launchd-user", root, {
+      launchEnvironment: { HOME: "/home/test", PATH: "/usr/bin", TMPDIR: "/ambient", TMP: "/ambient", TEMP: "/ambient" },
+    });
+    const initialRunner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdPrintText(spec, "running", 501) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: initialRunner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 501 });
+    const plistPath = join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
+    const original = readFileSync(plistPath, "utf8");
+    const legacy = original.replace(/<key>(?:TMPDIR|TMP|TEMP)<\/key><string>[^<]+<\/string>/gu, "");
+    writeFileSync(plistPath, legacy, { mode: 0o600 });
+    const legacyRunner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdPrintText(spec, "running", 502) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: legacyRunner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 502 });
+    const repaired = readFileSync(plistPath, "utf8");
+    expect(repaired).toContain(`<key>TMPDIR</key><string>${join(root, "daemon-tmp")}</string>`);
+    for (const tamper of [
+      (value: string) => value.replace(/<key>TMPDIR<\/key><string>[^<]+<\/string>/u, ""),
+      (value: string) => value.replace(/<key>TMP<\/key><string>[^<]+<\/string>/u, "<key>TMP</key><string>/other</string>"),
+    ]) {
+      writeFileSync(plistPath, tamper(original), { mode: 0o600 });
+      const replacementRunner = fakeRunner([{ code: 113, stderr: "Could not find service" }]);
+      await expect(createSupervisor("launchd-user", {
+        run: replacementRunner.run,
+        platform: "darwin",
+        uid: 501,
+      }).start(spec)).rejects.toThrow("manager command");
+      expect(replacementRunner.calls.some(({ args }) => args[0] === "bootstrap")).toBe(false);
+      writeFileSync(plistPath, original, { mode: 0o600 });
+    }
+  });
+
   it("classifies captured launchctl absence vocabulary without hiding permission or transport failures", async () => {
     const spec = makeSpec("launchd-user");
     const exactExitCode = fakeRunner([{ code: 36, stderr: "No such process" }]);

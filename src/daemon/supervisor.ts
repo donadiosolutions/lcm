@@ -5,6 +5,7 @@ import {
   constants,
   existsSync,
   lstatSync,
+  mkdirSync,
   openSync,
   realpathSync,
   unlinkSync,
@@ -12,7 +13,12 @@ import {
 } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { platform as hostPlatform } from "node:os";
-import { readBoundedRegularFileWithStat } from "../security-files.js";
+import {
+  assertPrivateDirectory,
+  openPrivateDirectory,
+  readBoundedRegularFileWithStat,
+  type PrivateDirectoryHandle,
+} from "../security-files.js";
 import {
   cleanupManagedCredentialDirectory,
   managedCredentialPath,
@@ -38,9 +44,6 @@ export const MANAGED_LAUNCH_ENV_ALLOWLIST = Object.freeze([
   "LOGNAME",
   "SHELL",
   "USERPROFILE",
-  "TMPDIR",
-  "TMP",
-  "TEMP",
   "XDG_RUNTIME_DIR",
   "DBUS_SESSION_BUS_ADDRESS",
   "LANG",
@@ -78,8 +81,15 @@ const MANAGED_LAUNCH_ENV_PRESENTATION_NAMES: ReadonlySet<string> = new Set([
   "TZ",
 ]);
 const MANAGED_LAUNCH_ENV_IDENTITY_NAMES: ReadonlySet<string> = new Set(
-  MANAGED_LAUNCH_ENV_ALLOWLIST.filter((name) => !MANAGED_LAUNCH_ENV_PRESENTATION_NAMES.has(name)),
+  [
+    ...MANAGED_LAUNCH_ENV_ALLOWLIST,
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+  ].filter((name) => !MANAGED_LAUNCH_ENV_PRESENTATION_NAMES.has(name)),
 );
+const MANAGED_DAEMON_TEMP_NAMES = Object.freeze(["TMPDIR", "TMP", "TEMP"] as const);
+const MANAGED_DAEMON_TEMP_DIRECTORY = "daemon-tmp";
 const MANAGED_LAUNCH_ENV_VALUE_MAX_BYTES = 4096;
 const MANAGED_ENV_EXECUTABLE = "/usr/bin/env";
 const MANAGED_LAUNCH_ENV_DIGEST_LENGTH = 64;
@@ -281,6 +291,11 @@ export interface SupervisorDependencies {
   readonly _plistRaceForTesting?: (
     path: string,
     phase: "before-open" | "after-read" | "before-unlink",
+  ) => void;
+  /** @internal Deterministic daemon-temp race seam for coverage tests. */
+  readonly _daemonTempRaceForTesting?: (
+    path: string,
+    phase: "before-open" | "before-manager",
   ) => void;
 }
 
@@ -544,6 +559,24 @@ export function managedLaunchEnvironment(
     result[name] = value;
   }
   return Object.freeze(result);
+}
+
+function managedDaemonTempPath(stateRoot: string): string {
+  return resolve(stateRoot, MANAGED_DAEMON_TEMP_DIRECTORY);
+}
+
+/**
+ * Resolve the launch environment from the spec or runner and bind all three
+ * process temporary-directory names to the canonical state-root leaf.
+ */
+function normalizedManagedLaunchEnvironment(
+  spec: SupervisorSpec,
+  environment: Readonly<Record<string, string>>,
+): Readonly<Record<string, string>> {
+  const values: Record<string, string> = { ...(spec.launchEnvironment ?? environment) };
+  const daemonTemp = managedDaemonTempPath(spec.stateRoot);
+  for (const name of MANAGED_DAEMON_TEMP_NAMES) values[name] = daemonTemp;
+  return Object.freeze(values);
 }
 
 /** Construct a fully validated manager specification from a canonical state root. */
@@ -1219,29 +1252,29 @@ function plistEnvironment(
   environment: Readonly<Record<string, string>>,
 ): string {
   const credentialFiles = spec.credentialFiles === undefined ? [] : spec.credentialFiles;
-  const values: Array<readonly [string, string]> = [
-    ["LCM_SUPERVISOR_MARKER", spec.marker],
-    ["LCM_SUPERVISOR_SCOPE", spec.scopeDigest],
-    ["LCM_SUPERVISOR_STATE_ROOT", spec.stateRoot],
-    ["LCM_SUPERVISOR_PORT", String(spec.port)],
-    ["LCM_SUPERVISOR_NONCE", spec.nonce],
-    ["LCM_SUPERVISOR_EXECUTABLE", spec.executable],
-    ["LCM_SUPERVISOR_ARGS", JSON.stringify(spec.args)],
-    ["LCM_SUPERVISOR_CWD", spec.cwd ?? ""],
-    ["LCM_SUPERVISOR_ENV_DIGEST", managedLaunchEnvironmentDigest(spec, "launchd-user", -1, environment)],
-  ];
-  if (spec.entrypoint !== undefined) values.push(["LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint]);
-  if (spec.runtimeDigest !== undefined) values.push(["LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest]);
-  if (spec.storageBackend !== undefined) values.push(["LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend]);
-  if (spec.postgresCaFile !== undefined) values.push(["LCM_POSTGRES_CA_FILE", spec.postgresCaFile]);
+  const values = new Map<string, string>();
+  for (const [name, value] of Object.entries(normalizedManagedLaunchEnvironment(spec, environment))) values.set(name, value);
+  values.set("LCM_SUPERVISOR_MARKER", spec.marker);
+  values.set("LCM_SUPERVISOR_SCOPE", spec.scopeDigest);
+  values.set("LCM_SUPERVISOR_STATE_ROOT", spec.stateRoot);
+  values.set("LCM_SUPERVISOR_PORT", String(spec.port));
+  values.set("LCM_SUPERVISOR_NONCE", spec.nonce);
+  values.set("LCM_SUPERVISOR_EXECUTABLE", spec.executable);
+  values.set("LCM_SUPERVISOR_ARGS", JSON.stringify(spec.args));
+  values.set("LCM_SUPERVISOR_CWD", spec.cwd ?? "");
+  values.set("LCM_SUPERVISOR_ENV_DIGEST", managedLaunchEnvironmentDigest(spec, "launchd-user", -1, environment));
+  if (spec.entrypoint !== undefined) values.set("LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint);
+  if (spec.runtimeDigest !== undefined) values.set("LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest);
+  if (spec.storageBackend !== undefined) values.set("LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend);
+  if (spec.postgresCaFile !== undefined) values.set("LCM_POSTGRES_CA_FILE", spec.postgresCaFile);
   if (spec.credentialDirectory !== undefined && credentialFiles.length > 0) {
-    values.push(["LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory]);
-    values.push(["LCM_SYSTEMD_CRED_IDS", credentialFiles.map(({ name }) => name).join(",")]);
+    values.set("LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory);
+    values.set("LCM_SYSTEMD_CRED_IDS", credentialFiles.map(({ name }) => name).join(","));
   }
   for (const credential of credentialFiles) {
-    values.push([`LCM_CREDENTIAL_${credential.name}_FILE`, credential.path]);
+    values.set(`LCM_CREDENTIAL_${credential.name}_FILE`, credential.path);
   }
-  return `<dict>${values.map(([key, value]) => `<key>${xmlEscape(key)}</key><string>${xmlEscape(value)}</string>`).join("")}</dict>`;
+  return `<dict>${[...values].map(([key, value]) => `<key>${xmlEscape(key)}</key><string>${xmlEscape(value)}</string>`).join("")}</dict>`;
 }
 
 function xmlUnescape(value: string): string {
@@ -1354,6 +1387,7 @@ function privatePlistMatchesStableIdentity(
 ): boolean {
   const parsed = parsePrivatePlistDocument(document);
   if (parsed === undefined || parsed.programArguments.length < 3) return false;
+  const normalizedEnvironment = normalizedManagedLaunchEnvironment(spec, environment);
   const programArguments = parsed.programArguments;
   const executableIndex = programArguments.length - spec.args.length - 1;
   if (executableIndex < 2 || programArguments[executableIndex] !== spec.executable) return false;
@@ -1392,6 +1426,18 @@ function privatePlistMatchesStableIdentity(
       ) return false;
     } else if (parsedValue !== expected || assignmentValue !== expected) return false;
   }
+  const temporarySurfaces = MANAGED_DAEMON_TEMP_NAMES.map((name) => ({
+    name,
+    environment: parsed.environment.get(name),
+    assignment: assignments.get(name),
+  }));
+  const temporaryValuesAreAbsent = temporarySurfaces.every(({ environment: value }) => value === undefined);
+  const legacyTemporaryAssignments = temporarySurfaces.every(({ assignment }) => typeof assignment === "string" && assignment.length > 0)
+    && new Set(temporarySurfaces.map(({ assignment }) => assignment)).size === 1
+    && temporarySurfaces.every(({ assignment }) => validManagedLaunchAssignment("TMPDIR", assignment!));
+  const temporaryValuesMatch = temporarySurfaces.every(({ name, environment: value, assignment }) =>
+    value === normalizedEnvironment[name] && assignment === normalizedEnvironment[name]);
+  if (!(temporaryValuesMatch || (allowEnvironmentDrift && temporaryValuesAreAbsent && (temporarySurfaces.every(({ assignment }) => assignment === undefined) || legacyTemporaryAssignments)))) return false;
   for (const [name, expected] of [
     ["LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint],
     ["LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest],
@@ -1466,12 +1512,16 @@ function privatePlistMatchesStableIdentity(
     if (ids !== credentialNames.join(",")) return false;
   }
   const expectedEnvironmentNames = new Set([
+    ...Object.keys(normalizedEnvironment),
     ...Object.keys(expectedMetadata),
     ...(spec.entrypoint === undefined ? [] : ["LCM_SUPERVISOR_ENTRYPOINT"]),
     ...(spec.runtimeDigest === undefined ? [] : ["LCM_SUPERVISOR_RUNTIME_DIGEST"]),
     ...(spec.storageBackend === undefined ? [] : ["LCM_SUPERVISOR_STORAGE_BACKEND"]),
     ...(spec.postgresCaFile === undefined ? [] : ["LCM_POSTGRES_CA_FILE"]),
   ]);
+  if (allowEnvironmentDrift && temporaryValuesAreAbsent) {
+    for (const name of MANAGED_DAEMON_TEMP_NAMES) expectedEnvironmentNames.delete(name);
+  }
   // Credential keys are validated individually above and are the only
   // EnvironmentVariables keys permitted to vary between a descriptor being
   // retired and its replacement: absence-only cleanup may remove or add one
@@ -1483,9 +1533,9 @@ function privatePlistMatchesStableIdentity(
       && name !== "LCM_SYSTEMD_CRED_IDS"
       && !/^LCM_CREDENTIAL_[A-Z0-9_]+_FILE$/u.test(name),
   ).length;
-  if (parsedEnvironmentKeyCount !== expectedEnvironmentNames.size) return false;
   const allowedNames = new Set([
     ...MANAGED_LAUNCH_ENV_ALLOWLIST,
+    ...MANAGED_DAEMON_TEMP_NAMES,
     "LCM_SUPERVISOR_MARKER",
     "LCM_SUPERVISOR_SCOPE",
     "LCM_SUPERVISOR_STATE_ROOT",
@@ -1502,6 +1552,8 @@ function privatePlistMatchesStableIdentity(
     "LCM_SYSTEMD_CRED_IDS",
     ...credentialNames.map((name) => `LCM_CREDENTIAL_${name}_FILE`),
   ]);
+  if (!allowEnvironmentDrift && parsedEnvironmentKeyCount !== expectedEnvironmentNames.size) return false;
+  if (![...parsed.environment.keys()].every((name) => allowedNames.has(name))) return false;
   if (![...assignments.keys()].every((name) => allowedNames.has(name))) return false;
   const expectedAssignmentNames = new Set<string>();
   const assignmentNames = allowEnvironmentDrift ? assignments.keys() : expectedAssignments.keys();
@@ -1803,7 +1855,7 @@ function managedLaunchEnvironmentValues(
 ): Map<string, string> {
   const values = new Map<string, string>();
   const credentialFiles = spec.credentialFiles === undefined ? [] : spec.credentialFiles;
-  for (const [name, value] of Object.entries(spec.launchEnvironment ?? environment)) {
+  for (const [name, value] of Object.entries(normalizedManagedLaunchEnvironment(spec, environment))) {
     launchEnvironmentValue(values, name, value);
   }
   // launchd persists the plist across manager probes.  The caller supplies
@@ -1853,7 +1905,7 @@ export function managedLaunchEnvironmentDigest(
   // Keep this computation pure: host runtime-root trust belongs to the actual
   // systemd launch-assignment path, after manager preflight has succeeded.
   const values = new Map<string, string>();
-  for (const [name, value] of Object.entries(spec.launchEnvironment ?? environment)) {
+  for (const [name, value] of Object.entries(normalizedManagedLaunchEnvironment(spec, environment))) {
     if (!MANAGED_LAUNCH_ENV_IDENTITY_NAMES.has(name)) continue;
     launchEnvironmentValue(values, name, value);
   }
@@ -1993,6 +2045,38 @@ function credentialsAreSafe(spec: SupervisorSpec): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+function prepareManagedDaemonTempDirectory(
+  spec: SupervisorSpec,
+  expectedUid: number | undefined,
+  raceFault?: SupervisorDependencies["_daemonTempRaceForTesting"],
+): PrivateDirectoryHandle {
+  const path = managedDaemonTempPath(spec.stateRoot);
+  try {
+    mkdirSync(path, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      throw new Error("supervisor daemon temporary directory is unavailable");
+    }
+  }
+  raceFault?.(path, "before-open");
+  let handle: PrivateDirectoryHandle | undefined;
+  try {
+    handle = openPrivateDirectory(path, { expectedUid });
+    // The path is constructed beneath the canonical state root, while
+    // openPrivateDirectory verifies the final component's canonical pathname,
+    // ownership, exact mode, non-symlink identity, and retained inode.
+    assertPrivateDirectory(handle, path, handle.witness, expectedUid);
+    return handle!;
+  } catch {
+    try {
+      handle?.close();
+    } catch {
+      // Preserve the fail-closed validation error.
+    }
+    throw new Error("supervisor daemon temporary directory is untrusted");
   }
 }
 
@@ -2709,11 +2793,24 @@ export function createSupervisor(
     const expectedLaunchEnvironmentDigest = managedLaunchEnvironmentDigest(spec, kind, runner.uid, runner.environment);
     let launchPath: string | undefined;
     let postMutationDeadline: number | undefined;
+    let daemonTempHandle: PrivateDirectoryHandle | undefined;
     try {
+      daemonTempHandle = prepareManagedDaemonTempDirectory(
+        spec,
+        typeof process.getuid === "function" ? process.getuid() : undefined,
+        dependencies._daemonTempRaceForTesting,
+      );
       if (kind === "launchd-user") launchPath = writePrivatePlist(spec, runner.environment, dependencies._plistRaceForTesting);
       const args = kind === "systemd-user"
         ? systemdStartArgs(spec, runner.uid, runner.environment)
         : ["bootstrap", launchdDomain(runner.uid), launchPath!];
+      dependencies._daemonTempRaceForTesting?.(managedDaemonTempPath(spec.stateRoot), "before-manager");
+      assertPrivateDirectory(
+        daemonTempHandle!,
+        managedDaemonTempPath(spec.stateRoot),
+        daemonTempHandle!.witness,
+        typeof process.getuid === "function" ? process.getuid() : undefined,
+      );
       const commandDeadline = operationDeadline ?? (kind === "launchd-user"
         ? now() + operationTimeout(undefined, configuredCommandTimeoutMs)
         : 0);
@@ -2848,6 +2945,12 @@ export function createSupervisor(
         return startInternal(spec, true, operationDeadline);
       }
       throw error instanceof SupervisorCommandError ? error : commandFailedError();
+    } finally {
+      try {
+        daemonTempHandle?.close();
+      } catch {
+        // Preserve the manager operation's primary result.
+      }
     }
   };
 
@@ -3102,34 +3205,33 @@ function metadataEnvironmentArgs(
   uid: number,
   environment: Readonly<Record<string, string>>,
 ): string[] {
-  const values = [
-    ["LCM_SUPERVISOR_MARKER", spec.marker],
-    ["LCM_SUPERVISOR_SCOPE", spec.scopeDigest],
-    ["LCM_SUPERVISOR_STATE_ROOT", spec.stateRoot],
-    ["LCM_SUPERVISOR_PORT", String(spec.port)],
-    ["LCM_SUPERVISOR_NONCE", spec.nonce],
-    ["LCM_SUPERVISOR_EXECUTABLE", spec.executable],
-    ["LCM_SUPERVISOR_ARGS", JSON.stringify(spec.args)],
-    ["LCM_SUPERVISOR_CWD", spec.cwd ?? ""],
-  ];
-  if (spec.entrypoint !== undefined) values.push(["LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint]);
-  if (spec.runtimeDigest !== undefined) values.push(["LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest]);
-  if (spec.storageBackend !== undefined) values.push(["LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend]);
-  if (spec.postgresCaFile !== undefined) values.push(["LCM_POSTGRES_CA_FILE", spec.postgresCaFile]);
-  values.push(["LCM_SUPERVISOR_ENV_DIGEST", managedLaunchEnvironmentDigest(spec, "systemd-user", uid, environment)]);
-  if (spec.credentialDirectory !== undefined) values.push(["LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory]);
+  const values = new Map<string, string>(Object.entries(normalizedManagedLaunchEnvironment(spec, environment)));
+  values.set("LCM_SUPERVISOR_MARKER", spec.marker);
+  values.set("LCM_SUPERVISOR_SCOPE", spec.scopeDigest);
+  values.set("LCM_SUPERVISOR_STATE_ROOT", spec.stateRoot);
+  values.set("LCM_SUPERVISOR_PORT", String(spec.port));
+  values.set("LCM_SUPERVISOR_NONCE", spec.nonce);
+  values.set("LCM_SUPERVISOR_EXECUTABLE", spec.executable);
+  values.set("LCM_SUPERVISOR_ARGS", JSON.stringify(spec.args));
+  values.set("LCM_SUPERVISOR_CWD", spec.cwd ?? "");
+  if (spec.entrypoint !== undefined) values.set("LCM_SUPERVISOR_ENTRYPOINT", spec.entrypoint);
+  if (spec.runtimeDigest !== undefined) values.set("LCM_SUPERVISOR_RUNTIME_DIGEST", spec.runtimeDigest);
+  if (spec.storageBackend !== undefined) values.set("LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend);
+  if (spec.postgresCaFile !== undefined) values.set("LCM_POSTGRES_CA_FILE", spec.postgresCaFile);
+  values.set("LCM_SUPERVISOR_ENV_DIGEST", managedLaunchEnvironmentDigest(spec, "systemd-user", uid, environment));
+  if (spec.credentialDirectory !== undefined) values.set("LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory);
   if (spec.credentialFiles !== undefined && spec.credentialFiles.length > 0) {
-    values.push(["LCM_SYSTEMD_CRED_IDS", spec.credentialFiles.map(({ name }) => name).join(",")]);
+    values.set("LCM_SYSTEMD_CRED_IDS", spec.credentialFiles.map(({ name }) => name).join(","));
     // Mirror the allow-listed LoadCredential source paths as manager
     // metadata.  systemd re-exports every --setenv assignment in the unit's
     // Environment= property, so a probe can re-authenticate exactly which
     // one-launch source staged each credential ID without ever seeing a
     // value.
     for (const credential of spec.credentialFiles) {
-      values.push([`LCM_CREDENTIAL_${credential.name}_FILE`, credential.path]);
+      values.set(`LCM_CREDENTIAL_${credential.name}_FILE`, credential.path);
     }
   }
-  return values.map(([key, value]) => `--setenv=${key}=${value}`);
+  return [...values].map(([key, value]) => `--setenv=${key}=${value}`);
 }
 
 function systemdStartArgs(
