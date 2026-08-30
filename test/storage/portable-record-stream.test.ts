@@ -998,6 +998,319 @@ describe("portable record stream public seam", () => {
     await expectAsyncCode(() => createPortableRecordStream(unsupported), "source-invalid");
   });
 
+  it("skips source reads for authenticated authoritative-empty domains", async () => {
+    const source = sourceWithEmptyDomains("native-transcripts", "native-transcript-message-links", "native-transcript-checkpoints");
+    const stream = await createPortableRecordStream(source);
+    const manifest = stream.describe();
+    const verifyBaseline = source.verifyCalls.length;
+    const pageBaseline = source.pageCalls.length;
+    const signal = new AbortController().signal;
+    const canary = "authoritative-empty reader must not be called";
+    source.pageFactory = () => { throw new Error(canary); };
+
+    const batch = await stream.readBatch({
+      domain: "native-transcripts",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+      signal,
+    });
+
+    const expectedPrefix = initialDomainPrefix(PORTABLE_RECORD_SCHEMA_SHA256, "native-transcripts");
+    expect(batch).toMatchObject({
+      version: 1,
+      manifestSha256: manifest.manifestSha256,
+      domain: "native-transcripts",
+      records: [],
+      framedBytes: 0,
+      complete: true,
+      priorCheckpointSha256: null,
+      checkpoint: {
+        nextOrdinal: 0,
+        recordCount: 0,
+        prefixSha256: expectedPrefix,
+        lastRecordIdentitySha256: null,
+        lastRecordSha256: null,
+        previousCheckpointSha256: null,
+        complete: true,
+      },
+    });
+    const checkpointBody = { ...batch.checkpoint };
+    delete (checkpointBody as { checkpointSha256?: string }).checkpointSha256;
+    expect(batch.checkpoint.checkpointSha256).toBe(referenceSha256(checkpointBody));
+    expect(source.verifyCalls).toHaveLength(verifyBaseline + 2);
+    expect(source.pageCalls).toHaveLength(pageBaseline);
+    expect(source.verifyCalls.slice(verifyBaseline)).toEqual([
+      {
+        sourceIdentitySha256: manifest.source.sourceIdentitySha256,
+        sourceWitnessSha256: manifest.source.sourceWitnessSha256,
+        contentSha256: manifest.contentSha256,
+        manifestSha256: manifest.manifestSha256,
+        signal,
+      },
+      {
+        sourceIdentitySha256: manifest.source.sourceIdentitySha256,
+        sourceWitnessSha256: manifest.source.sourceWitnessSha256,
+        contentSha256: manifest.contentSha256,
+        manifestSha256: manifest.manifestSha256,
+        signal,
+      },
+    ]);
+    expectDeepFrozen(manifest);
+    expectDeepFrozen(batch);
+    expectDeepFrozen(batch.records);
+    expectDeepFrozen(batch.checkpoint);
+    expect(() => (batch.records as PortableRecord[]).push(records.messages[0])).toThrow();
+    const verifyBeforeClose = source.verifyCalls.length;
+    const pageBeforeClose = source.pageCalls.length;
+    await stream.close();
+    expect(source.close).toHaveBeenCalledTimes(1);
+    await expectAsyncCode(() => stream.readBatch({
+      domain: "native-transcripts",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }), "closed");
+    expect(source.verifyCalls).toHaveLength(verifyBeforeClose);
+    expect(source.pageCalls).toHaveLength(pageBeforeClose);
+  });
+
+  it("keeps source authentication and abort fences around synthetic empty pages", async () => {
+    const firstFailure = sourceWithEmptyDomains("native-transcripts", "native-transcript-message-links", "native-transcript-checkpoints");
+    const firstStream = await createPortableRecordStream(firstFailure);
+    const firstVerifyBaseline = firstFailure.verifyCalls.length;
+    const firstPageBaseline = firstFailure.pageCalls.length;
+    firstFailure.pageFactory = () => { throw new Error("reader canary"); };
+    firstFailure.verifySource = async (input) => {
+      firstFailure.verifyCalls.push({ ...input });
+      return "changed";
+    };
+    await expectAsyncCode(() => firstStream.readBatch({
+      domain: "native-transcripts",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }), "source-changed");
+    expect(firstFailure.verifyCalls).toHaveLength(firstVerifyBaseline + 1);
+    expect(firstFailure.pageCalls).toHaveLength(firstPageBaseline);
+    await firstStream.close();
+
+    const secondFailure = sourceWithEmptyDomains("native-transcripts", "native-transcript-message-links", "native-transcript-checkpoints");
+    const secondStream = await createPortableRecordStream(secondFailure);
+    const secondVerifyBaseline = secondFailure.verifyCalls.length;
+    const secondPageBaseline = secondFailure.pageCalls.length;
+    let verification = 0;
+    secondFailure.pageFactory = () => { throw new Error("reader canary"); };
+    secondFailure.verifySource = async (input) => {
+      secondFailure.verifyCalls.push({ ...input });
+      verification += 1;
+      return verification === 1 ? "unchanged" : "changed";
+    };
+    await expectAsyncCode(() => secondStream.readBatch({
+      domain: "native-transcripts",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }), "source-changed");
+    expect(secondFailure.verifyCalls).toHaveLength(secondVerifyBaseline + 2);
+    expect(secondFailure.pageCalls).toHaveLength(secondPageBaseline);
+    await secondStream.close();
+
+    const preAborted = sourceWithEmptyDomains("native-transcripts", "native-transcript-message-links", "native-transcript-checkpoints");
+    const preAbortedStream = await createPortableRecordStream(preAborted);
+    const controller = new AbortController();
+    controller.abort();
+    const verifyBaseline = preAborted.verifyCalls.length;
+    const pageBaseline = preAborted.pageCalls.length;
+    preAborted.pageFactory = () => { throw new Error("reader canary"); };
+    await expectAsyncCode(() => preAbortedStream.readBatch({
+      domain: "native-transcripts",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+      signal: controller.signal,
+    }), "aborted");
+    expect(preAborted.verifyCalls).toHaveLength(verifyBaseline);
+    expect(preAborted.pageCalls).toHaveLength(pageBaseline);
+    await preAbortedStream.close();
+
+    const afterFirst = sourceWithEmptyDomains("native-transcripts", "native-transcript-message-links", "native-transcript-checkpoints");
+    const afterFirstStream = await createPortableRecordStream(afterFirst);
+    const afterFirstVerifyBaseline = afterFirst.verifyCalls.length;
+    const afterFirstPageBaseline = afterFirst.pageCalls.length;
+    const afterFirstController = new AbortController();
+    let afterFirstCalls = 0;
+    afterFirst.pageFactory = () => { throw new Error("reader canary"); };
+    afterFirst.verifySource = async (input) => {
+      afterFirst.verifyCalls.push({ ...input });
+      afterFirstCalls += 1;
+      if (afterFirstCalls === 1) afterFirstController.abort();
+      return "unchanged";
+    };
+    await expectAsyncCode(() => afterFirstStream.readBatch({
+      domain: "native-transcripts",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+      signal: afterFirstController.signal,
+    }), "aborted");
+    expect(afterFirst.verifyCalls).toHaveLength(afterFirstVerifyBaseline + 1);
+    expect(afterFirst.pageCalls).toHaveLength(afterFirstPageBaseline);
+    await afterFirstStream.close();
+
+    const duringSecond = sourceWithEmptyDomains("native-transcripts", "native-transcript-message-links", "native-transcript-checkpoints");
+    const duringSecondStream = await createPortableRecordStream(duringSecond);
+    const duringSecondVerifyBaseline = duringSecond.verifyCalls.length;
+    const duringSecondPageBaseline = duringSecond.pageCalls.length;
+    const duringSecondController = new AbortController();
+    let duringSecondCalls = 0;
+    duringSecond.pageFactory = () => { throw new Error("reader canary"); };
+    duringSecond.verifySource = async (input) => {
+      duringSecond.verifyCalls.push({ ...input });
+      duringSecondCalls += 1;
+      if (duringSecondCalls === 2) duringSecondController.abort();
+      return "unchanged";
+    };
+    await expectAsyncCode(() => duringSecondStream.readBatch({
+      domain: "native-transcripts",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+      signal: duringSecondController.signal,
+    }), "aborted");
+    expect(duringSecond.verifyCalls).toHaveLength(duringSecondVerifyBaseline + 2);
+    expect(duringSecond.pageCalls).toHaveLength(duringSecondPageBaseline);
+    await duringSecondStream.close();
+  });
+
+  it("still reads available zero-record domains", async () => {
+    const source = new FakePortableSource({ ...records, "passive-events": [] });
+    const stream = await createPortableRecordStream(source);
+    const verifyBaseline = source.verifyCalls.length;
+    const pageBaseline = source.pageCalls.length;
+    const batch = await stream.readBatch({
+      domain: "passive-events",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    });
+    expect(batch.records).toEqual([]);
+    expect(batch.framedBytes).toBe(0);
+    expect(batch.complete).toBe(true);
+    expect(source.verifyCalls).toHaveLength(verifyBaseline + 2);
+    expect(source.pageCalls).toHaveLength(pageBaseline + 1);
+    expect(source.pageCalls.at(-1)).toMatchObject({ domain: "passive-events", afterOrdinal: 0, includePredecessor: false });
+    await stream.close();
+  });
+
+  it("verifies and keeps completed zero-record checkpoints fail-closed", async () => {
+    const source = sourceWithEmptyDomains("native-transcripts", "native-transcript-message-links", "native-transcript-checkpoints");
+    const stream = await createPortableRecordStream(source);
+    const checkpointBatch = await stream.readBatch({
+      domain: "native-transcripts",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    });
+    const checkpoint = checkpointBatch.checkpoint;
+    const serializedBefore = Buffer.from(serializePortableCheckpoint(checkpoint));
+    const verifyBaseline = source.verifyCalls.length;
+    const pageBaseline = source.pageCalls.length;
+    const verification = await stream.verify(checkpoint);
+    expect(verification).toMatchObject({
+      domain: "native-transcripts",
+      nextOrdinal: 0,
+      recordCount: 0,
+      prefixSha256: initialDomainPrefix(PORTABLE_RECORD_SCHEMA_SHA256, "native-transcripts"),
+      complete: true,
+      matchesManifestBoundary: true,
+      authoritative: true,
+    });
+    expect(source.verifyCalls).toHaveLength(verifyBaseline + 1);
+    expect(source.verifyCalls.at(-1)?.boundary).toEqual({
+      domain: "native-transcripts",
+      nextOrdinal: 0,
+      recordCount: 0,
+      prefixSha256: initialDomainPrefix(PORTABLE_RECORD_SCHEMA_SHA256, "native-transcripts"),
+      lastRecordIdentitySha256: null,
+      lastRecordSha256: null,
+    });
+    expect(source.pageCalls).toHaveLength(pageBaseline);
+
+    await expectAsyncCode(() => stream.readBatch({
+      domain: "native-transcripts",
+      after: checkpoint,
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }), "checkpoint-mismatch");
+    expect(source.verifyCalls).toHaveLength(verifyBaseline + 3);
+    expect(source.pageCalls).toHaveLength(pageBaseline);
+    expect(Buffer.from(serializePortableCheckpoint(checkpoint))).toEqual(serializedBefore);
+    await stream.close();
+  });
+
+  it("preserves request and checkpoint admission for authoritative-empty reads", async () => {
+    const source = sourceWithEmptyDomains("native-transcripts", "native-transcript-message-links", "native-transcript-checkpoints");
+    const stream = await createPortableRecordStream(source);
+    const verifyBaseline = source.verifyCalls.length;
+    const pageBaseline = source.pageCalls.length;
+    source.pageFactory = () => { throw new Error("reader canary"); };
+    await expectAsyncCode(() => stream.readBatch({
+      domain: "native-transcripts",
+      maxRecords: 0,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }), "invalid-limit");
+    await expectAsyncCode(() => stream.readBatch({
+      domain: "unknown" as never,
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }), "unknown-domain");
+    await expectAsyncCode(() => stream.readBatch({
+      domain: "native-transcripts",
+      after: {} as never,
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }), "checkpoint-mismatch");
+    expect(source.verifyCalls).toHaveLength(verifyBaseline);
+    expect(source.pageCalls).toHaveLength(pageBaseline);
+    await stream.close();
+  });
+
+  it("serializes synthetic empty reads before queued available reads", async () => {
+    const source = sourceWithEmptyDomains("native-transcripts", "native-transcript-message-links", "native-transcript-checkpoints");
+    const stream = await createPortableRecordStream(source);
+    const verifyBaseline = source.verifyCalls.length;
+    const pageBaseline = source.pageCalls.length;
+    const firstVerificationStarted = deferred();
+    const releaseSecondVerification = deferred();
+    let verificationCount = 0;
+    const verify = source.verifySource.bind(source);
+    source.verifySource = async (input) => {
+      const result = await verify(input);
+      verificationCount += 1;
+      if (verificationCount === 2) {
+        firstVerificationStarted.resolve();
+        await releaseSecondVerification.promise;
+      }
+      return result;
+    };
+    const empty = stream.readBatch({
+      domain: "native-transcripts",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    });
+    await firstVerificationStarted.promise;
+    const available = stream.readBatch({
+      domain: "messages",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    });
+    await Promise.resolve();
+    expect(source.verifyCalls).toHaveLength(verifyBaseline + 2);
+    expect(source.pageCalls.filter((call) => call.domain === "messages")).toHaveLength(
+      source.pageCalls.slice(0, pageBaseline).filter((call) => call.domain === "messages").length,
+    );
+    releaseSecondVerification.resolve();
+    const [emptyBatch, availableBatch] = await Promise.all([empty, available]);
+    expect(emptyBatch.records).toEqual([]);
+    expect(availableBatch.records).toEqual([records.messages[0]]);
+    expect(source.verifyCalls).toHaveLength(verifyBaseline + 4);
+    expect(source.pageCalls).toHaveLength(pageBaseline + 1);
+    expect(source.pageCalls.at(-1)?.domain).toBe("messages");
+    await stream.close();
+  });
+
   it("rejects duplicate projects and binds every opaque project dependency to the one project identity", async () => {
     const duplicateProject = makeRecord("project", { identity: { scope: "local", projectId: "c".repeat(64) } }, 1);
     const sourceRecords = { ...records, project: [records.project[0], duplicateProject] };
