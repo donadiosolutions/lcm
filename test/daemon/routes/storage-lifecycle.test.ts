@@ -431,6 +431,54 @@ describe("route storage cleanup", () => {
     });
   });
 
+  it("cancels in the post-listener abort window without running the operation or leaking listeners", async () => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const controller = new AbortController();
+      let addCalls = 0;
+      let activeListeners = 0;
+      const signal = {
+        get aborted(): boolean { return controller.signal.aborted; },
+        get reason(): unknown { return controller.signal.reason; },
+        addEventListener: (
+          type: string,
+          listener: EventListenerOrEventListenerObject | null,
+          options?: AddEventListenerOptions | boolean,
+        ): void => {
+          addCalls += 1;
+          activeListeners += 1;
+          controller.signal.addEventListener(type, listener, options);
+          if (addCalls === 2) controller.abort();
+        },
+        removeEventListener: (
+          type: string,
+          listener: EventListenerOrEventListenerObject | null,
+          options?: EventListenerOptions | boolean,
+        ): void => {
+          activeListeners -= 1;
+          controller.signal.removeEventListener(type, listener, options);
+        },
+        dispatchEvent: controller.signal.dispatchEvent.bind(controller.signal),
+      } as unknown as AbortSignal;
+      const project = fakeProject(async () => undefined);
+      const factory = fakeFactory({ openProject: async () => project });
+      const operation = vi.fn(async () => "must not run");
+
+      await expect(withProjectStorage({
+        config,
+        cwd,
+        factory,
+        context: { signal },
+        mode: "create",
+      }, operation)).rejects.toSatisfy((error: unknown) =>
+        isAbortError(error) && error.message === "request cancelled");
+
+      expect(operation).not.toHaveBeenCalled();
+      expect(project.close).toHaveBeenCalledOnce();
+      expect(addCalls).toBe(2);
+      expect(activeListeners).toBe(0);
+    });
+  });
+
   it.each(["create", "existing"] as const)("rejects promptly while an ignored %s open is pending and closes a late facade once", async mode => {
     await withTemporaryProject(async ({ cwd, config }) => {
       let resolveOpen!: (project: ProjectStorage) => void;

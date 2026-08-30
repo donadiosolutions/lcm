@@ -11,6 +11,7 @@ import type { StorageBackendFactory } from "../../src/storage/contracts.js";
 import { normalizeStorageError, StorageOperationError } from "../../src/storage/errors.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import { SqliteExecutor } from "../../src/storage/sqlite/executor.js";
+import { SqliteProjectStorage } from "../../src/storage/sqlite/project-storage.js";
 import { assertSqliteReady } from "../../src/storage/sqlite/health.js";
 import {
   createSqliteRepositories,
@@ -1333,6 +1334,51 @@ describe("SQLite storage backend conformance", () => {
     expect(detected).toBe(true);
     expect(isLcmConnectionOpen(dbPath)).toBe(false);
     await factory.close();
+  });
+
+  it("closes a post-construction cancelled open once and suppresses cleanup detail", async () => {
+    const root = createTemporaryDirectory("lcm-storage-post-construction-cancel-");
+    const dbPath = join(root, "post-construction.db");
+    let abortedReads = 0;
+    const signal = {
+      get aborted(): boolean {
+        abortedReads += 1;
+        return abortedReads === 8;
+      },
+      reason: undefined,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(() => true),
+    } as unknown as AbortSignal;
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+    });
+    const originalClose = SqliteProjectStorage.prototype.close;
+    const close = vi.spyOn(SqliteProjectStorage.prototype, "close")
+      .mockImplementation(async function(this: SqliteProjectStorage): Promise<void> {
+        await originalClose.call(this);
+        throw new Error("private sqlite cleanup canary");
+      });
+
+    try {
+      const error = await factory.openProject(projectIdentity(root), undefined, signal)
+        .catch((caught: unknown) => caught);
+
+      expect(abortedReads).toBe(8);
+      expect(close).toHaveBeenCalledOnce();
+      expect(error).toMatchObject({
+        code: "STORAGE_INITIALIZATION_FAILED",
+        backend: "sqlite",
+        operation: "openProject",
+      });
+      expect(JSON.stringify(error)).not.toContain("private sqlite cleanup canary");
+      expect(isLcmConnectionOpen(dbPath)).toBe(false);
+      expect(getPoolStats().connections.some(connection => connection.path === dbPath)).toBe(false);
+    } finally {
+      close.mockRestore();
+      await factory.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("settles repeated factory closes after every project close attempt", async () => {

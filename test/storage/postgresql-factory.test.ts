@@ -554,6 +554,60 @@ describe("PostgreSQL storage backend factory", () => {
     await factory.close();
   });
 
+  it("sanitizes a generic post-facade publication failure and closes the facade once", async () => {
+    const { runtime, dependencies } = harness();
+    let facadeConstructed = false;
+    let fenceFailureInjected = false;
+    let abortedReads = 0;
+    const controller = new AbortController();
+    const signal = new Proxy(controller.signal, {
+      get(target, property, receiver) {
+        if (property === "aborted") {
+          abortedReads += 1;
+          if (facadeConstructed && !fenceFailureInjected) {
+            fenceFailureInjected = true;
+            throw new Error("private post-facade fence canary");
+          }
+          return false;
+        }
+        if (property === "addEventListener" || property === "removeEventListener") {
+          const method = Reflect.get(target, property, target) as (...args: never[]) => unknown;
+          return method.bind(target);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as AbortSignal;
+    const close = vi.fn(async () => undefined);
+    const project = { close } as unknown as ProjectStorage;
+    dependencies.createProjectStorage = () => {
+      facadeConstructed = true;
+      return project;
+    };
+    const factory = await createPostgreSqlStorageBackendFactoryForTesting(
+      config,
+      "/home/operator",
+      dependencies,
+    );
+
+    const error = await factory.openProject(identity, undefined, signal)
+      .catch((caught: unknown) => caught);
+
+    expect(facadeConstructed).toBe(true);
+    expect(fenceFailureInjected).toBe(true);
+    expect(abortedReads).toBeGreaterThanOrEqual(2);
+    expect(close).toHaveBeenCalledOnce();
+    expect(error).toMatchObject({
+      code: "STORAGE_INITIALIZATION_FAILED",
+      backend: "postgresql",
+      projectId: PROJECT_ID,
+      operation: "openProject",
+    });
+    expect(JSON.stringify(error)).not.toContain("private post-facade fence canary");
+    expect(error).not.toMatchObject({ code: "STORAGE_CLOSED" });
+    await expect(factory.close()).resolves.toBeUndefined();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it("rejects missing or non-terminal PostgreSQL publication evidence", async () => {
     for (const publicationJournal of [
       null,
