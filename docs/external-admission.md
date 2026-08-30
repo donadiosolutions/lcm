@@ -101,6 +101,66 @@ An invalid or missing SHA fails before a status can be safely written. The
 workflow normalizes a valid hexadecimal payload SHA to lowercase before status
 writes, PR association, and policy comparisons.
 
+## Code Quality baseline and admission
+
+`external-admission` success proves only that the exact pull-request head
+passed authenticated CI and DCO evaluation. It does not prove that the same
+head satisfies the separate Code Quality or other ruleset evaluations. The
+repository/default-branch Code Quality findings endpoint is a backlog
+inventory, never a candidate-diff attribution mechanism: do not infer
+pull-request attribution from an aggregate finding's `created_at` timestamp.
+
+For a read-only baseline, inspect ruleset `15870347` and count the complete
+repository/default-branch findings inventory. The documented endpoint supports
+pagination and the `state=open` and `per_page=100` parameters:
+
+```bash
+gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+  repos/donadiosolutions/lcm/rulesets/15870347 \
+  --jq '{name,target,enforcement,bypass_actors,conditions,rules}'
+gh api --paginate -H 'X-GitHub-Api-Version: 2026-03-10' \
+  'repos/donadiosolutions/lcm/code-quality/findings?state=open&per_page=100' \
+  --jq '.[].rule.severity' | sort | uniq -c
+```
+
+Record a UTC timestamp and count `.rule.severity` values from every page.
+Analysis success, or resolving a review discussion, does not clear a blocking
+finding.
+Fix the finding or, only when a justified irrelevant or false-positive case
+has been reviewed, use GitHub's explicit per-finding **Dismiss finding**
+action. A finding is not dismissed merely because its pull-request discussion
+was resolved. Preserve severity notes while triaging; do not bulk-dismiss the
+backlog, change the rule to `evaluate` or `disabled`, lower its threshold,
+alter unrelated rules, checks, or bypass actors, or use an administrator
+bypass.
+
+For rule-suite evidence, use GitHub's exact vocabulary: `pass` is protected
+admission, `fail` is rejection, and `bypass` records a bypass and is never
+acceptance evidence. Inspect a specific ruleset rule suite by its ID (this is
+not a workflow or check-run ID):
+
+```bash
+RULE_SUITE_ID=3871813831
+gh api --paginate -H 'X-GitHub-Api-Version: 2026-03-10' \
+  "repos/donadiosolutions/lcm/rulesets/rule-suites/$RULE_SUITE_ID" \
+  --jq '{id,result,rule_evaluations}'
+```
+
+On the dated 2026-08-30 snapshot, the active notes gate
+coexisted with 46 open backlog findings (43 `note`, 3 `warning`). Clean PR
+#771 had zero `github-code-quality[bot]` comments, and rule suite `3871813831`
+reported overall `pass` with its `code_quality` evaluation `pass`. PR #739 had
+one `js/missing-await` Code Quality bot comment; rule suite `3850764016`
+reported overall `bypass` with `code_quality` `fail`. Its neither-fixed-nor-
+dismissed finding remains open as warning #441 (`js/missing-await`). Do not
+call #441 a proven real defect; it may be the argued false positive.
+
+The dated counts are evidence, not configured constants, and will drift as
+findings are fixed or explicitly dismissed. The unchanged ruleset still gives
+`OrganizationAdmin` an `always` bypass. This increment forbids using that
+bypass; narrowing it is a separate governance decision requiring its own
+authorization, rollback, and review.
+
 ## Security and trusted revision
 
 `repository_dispatch` runs this workflow only when the workflow file exists on
