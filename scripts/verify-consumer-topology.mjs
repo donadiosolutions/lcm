@@ -100,7 +100,9 @@ export function verifyCli(directory, scratchRoot, {
     XDG_DATA_HOME: mkdtempSync(join(home, "data-")),
     XDG_RUNTIME_DIR: mkdtempSync(join(home, "runtime-")),
   };
-  for (const path of [home, ...Object.values(xdg)]) chmodSync(path, 0o700);
+  if (process.platform !== "win32") {
+    for (const path of [home, ...Object.values(xdg)]) chmodSync(path, 0o700);
+  }
   const env = {
     ...inheritedEnvironment,
     HOME: home,
@@ -196,7 +198,7 @@ function executeConsumerTopology(scratch) {
     verifyNoPublishedBuildDependencies(directory, label);
     verifyPostgreSqlApi(directory);
     console.log(
-      `${label}: lcm=${pkg.version} external-sdk=absent cli=${verifyCli(directory)}`,
+      `${label}: lcm=${pkg.version} external-sdk=absent cli=${verifyCli(directory, scratch)}`,
     );
   }
 

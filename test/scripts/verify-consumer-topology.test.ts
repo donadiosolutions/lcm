@@ -17,11 +17,20 @@ import { describe, expect, it, vi } from "vitest";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const scriptPath = resolve(repositoryRoot, "scripts/verify-consumer-topology.mjs");
-const laneTmp = resolve("/mnt/worktrees/.lcm-epic-744/lanes/L4/tmp");
-
 function isolatedRoot(prefix: string): string {
-  mkdirSync(laneTmp, { recursive: true });
-  return mkdtempSync(join(laneTmp, prefix));
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  const containment = relative(tmpdir(), root);
+  if (
+    !containment
+    || containment === ".."
+    || containment.startsWith("../")
+    || containment.startsWith("..\\")
+    || containment.startsWith("/")
+    || containment.startsWith("\\")
+  ) {
+    throw new Error(`fixture root escaped operating-system temp root: ${root}`);
+  }
+  return root;
 }
 
 function snapshotTree(root: string): Record<string, string> {
@@ -175,6 +184,7 @@ describe("verify-consumer-topology", () => {
         expect(path).not.toBe(developer[key]);
         expect(existsSync(join(path, "child-marker.txt"))).toBe(true);
       }
+      expect(existsSync(join(isolatedHome, "child-marker.txt"))).toBe(true);
       for (const key of Object.keys(developer)) {
         expect(observation.observed[key]).not.toBe(developer[key]);
       }
@@ -279,11 +289,16 @@ describe("verify-consumer-topology", () => {
 
     const reporterFailure = new Error("reporter failed");
     const primary = new Error("primary");
-    expect(() => module.runConsumerTopology({
-      execute: () => { throw primary; },
-      cleanup: () => { throw cleanupError; },
-      reportCleanupFailure: () => { throw reporterFailure; },
-    })).toThrow(primary);
+    try {
+      module.runConsumerTopology({
+        execute: () => { throw primary; },
+        cleanup: () => { throw cleanupError; },
+        reportCleanupFailure: () => { throw reporterFailure; },
+      });
+      throw new Error("expected operation to fail");
+    } catch (error) {
+      expect(error).toBe(primary);
+    }
   });
 
   it("keeps packed CLI failure diagnostics unchanged", async () => {
