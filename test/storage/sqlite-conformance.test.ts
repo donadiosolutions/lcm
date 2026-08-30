@@ -1336,6 +1336,54 @@ describe("SQLite storage backend conformance", () => {
     await factory.close();
   });
 
+  it("closes during feature detection before migration and drains the acquired connection", async () => {
+    const root = createTemporaryDirectory("lcm-storage-close-during-detection-");
+    const dbPath = join(root, "close-during-detection.db");
+    let factory!: SqliteStorageBackendFactory;
+    let capturedClose: Promise<void> | undefined;
+    let detectCalls = 0;
+    factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+      detectFeatures: () => {
+        detectCalls += 1;
+        capturedClose = factory.close();
+        return { fts5Available: false };
+      },
+    });
+
+    try {
+      const error = await factory.openProject(projectIdentity(root))
+        .catch((caught: unknown) => caught);
+
+      expect(detectCalls).toBe(1);
+      expect(error).toMatchObject({
+        code: "STORAGE_CLOSED",
+        backend: "sqlite",
+        projectId: projectIdentity(root).id,
+        domain: "factory",
+        operation: "openProject",
+      });
+      expect(JSON.stringify(error)).not.toContain("detectFeatures");
+      expect(capturedClose).toBeDefined();
+      await expect(capturedClose).resolves.toBeUndefined();
+
+      const database = new DatabaseSync(dbPath);
+      try {
+        expect(database.prepare(
+          "SELECT name FROM sqlite_schema WHERE type IN ('table', 'index', 'trigger', 'view')",
+        ).all()).toEqual([]);
+      } finally {
+        database.close();
+      }
+      expect(isLcmConnectionOpen(dbPath)).toBe(false);
+      expect(getPoolStats().connections.some(connection => connection.path === dbPath)).toBe(false);
+      await expect(factory.close()).resolves.toBeUndefined();
+    } finally {
+      await factory.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("closes a post-construction cancelled open once and suppresses cleanup detail", async () => {
     const root = createTemporaryDirectory("lcm-storage-post-construction-cancel-");
     const dbPath = join(root, "post-construction.db");
