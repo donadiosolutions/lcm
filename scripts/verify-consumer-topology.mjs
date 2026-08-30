@@ -1,5 +1,6 @@
 import {
   existsSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -10,10 +11,9 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const scratch = mkdtempSync(join(tmpdir(), "lcm-consumer-topology-"));
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 
 function runNpm(args, cwd, ignoreScripts = true) {
@@ -88,7 +88,25 @@ function verifyNoPublishedBuildDependencies(directory, label) {
   }
 }
 
-function verifyCli(directory) {
+export function verifyCli(directory, scratchRoot, {
+  inheritedEnvironment = process.env,
+  spawn = spawnSync,
+} = {}) {
+  const home = mkdtempSync(join(scratchRoot, "lcm-packed-cli-home-"));
+  const xdg = {
+    XDG_CONFIG_HOME: mkdtempSync(join(home, "config-")),
+    XDG_STATE_HOME: mkdtempSync(join(home, "state-")),
+    XDG_CACHE_HOME: mkdtempSync(join(home, "cache-")),
+    XDG_DATA_HOME: mkdtempSync(join(home, "data-")),
+    XDG_RUNTIME_DIR: mkdtempSync(join(home, "runtime-")),
+  };
+  for (const path of [home, ...Object.values(xdg)]) chmodSync(path, 0o700);
+  const env = {
+    ...inheritedEnvironment,
+    HOME: home,
+    USERPROFILE: home,
+    ...xdg,
+  };
   const executable = join(
     directory,
     "node_modules",
@@ -97,9 +115,10 @@ function verifyCli(directory) {
     "dist",
     "lcm.mjs",
   );
-  const result = spawnSync(process.execPath, [executable, "--version"], {
+  const result = spawn(process.execPath, [executable, "--version"], {
     cwd: directory,
     encoding: "utf8",
+    env,
   });
   if (result.status !== 0 || !result.stdout.trim()) {
     throw new Error(`packed LCM executable failed\n${result.stdout}\n${result.stderr}`);
@@ -124,7 +143,7 @@ function verifyPostgreSqlApi(directory) {
   }
 }
 
-try {
+function executeConsumerTopology(scratch) {
   const rootRequire = createRequire(join(root, "package.json"));
   const sdkServer = rootRequire.resolve("@modelcontextprotocol/sdk/server/index.js");
   const expressManifest = createRequire(sdkServer).resolve("express/package.json");
@@ -187,6 +206,62 @@ try {
     + `root-fast-uri=${installedVersion(conflicting, "fast-uri")} `
     + "sdk-express-body-parser=absent sdk-ajv-fast-uri=absent",
   );
-} finally {
-  rmSync(scratch, { recursive: true, force: true });
 }
+
+function defaultCleanupFailureReporter(scratchPath, cleanupError) {
+  console.error(
+    `verify-consumer-topology cleanup failed for ${scratchPath}\n${cleanupError}`,
+  );
+}
+
+export function runConsumerTopology({
+  execute = executeConsumerTopology,
+  cleanup = (path) => rmSync(path, { recursive: true, force: true }),
+  reportCleanupFailure = defaultCleanupFailureReporter,
+} = {}) {
+  const scratch = mkdtempSync(join(tmpdir(), "lcm-consumer-topology-"));
+  let verificationError;
+  let verificationFailed = false;
+  let result;
+  try {
+    result = execute(scratch);
+  } catch (error) {
+    verificationError = error;
+    verificationFailed = true;
+  }
+
+  let cleanupError;
+  let cleanupFailed = false;
+  try {
+    cleanup(scratch);
+  } catch (error) {
+    cleanupError = error;
+    cleanupFailed = true;
+  }
+
+  if (verificationFailed) {
+    if (cleanupFailed) {
+      try {
+        reportCleanupFailure(scratch, cleanupError);
+      } catch {
+        // Preserve the primary verification failure if reporting also fails.
+      }
+    }
+    throw verificationError;
+  }
+  if (cleanupError !== undefined) throw cleanupError;
+  return result;
+}
+
+export function runIfDirect({
+  invokedPath = process.argv[1],
+  moduleUrl = import.meta.url,
+  run = runConsumerTopology,
+} = {}) {
+  const invokedUrl = invokedPath ? pathToFileURL(resolve(invokedPath)).href : undefined;
+  if (invokedUrl !== moduleUrl) return false;
+  run();
+  return true;
+}
+
+runIfDirect();
