@@ -2446,6 +2446,122 @@ describe("portable record stream public seam", () => {
     await stream.close();
   });
 
+  it("preserves aborted and the prior checkpoint when an available page rejects after cancellation", async () => {
+    const source = new FakePortableSource();
+    const stream = await createPortableRecordStream(source);
+    const first = await stream.readBatch({
+      domain: "messages",
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    });
+    const checkpointBefore = Buffer.from(serializePortableCheckpoint(first.checkpoint));
+    const verifyBaseline = source.verifyCalls.length;
+    const pageBaseline = source.pageCalls.length;
+    const controller = new AbortController();
+    const readStarted = deferred();
+    const adapterCanary = "private adapter cancellation canary";
+    const abortCanary = "private abort reason canary";
+    source.pageFactory = (input) => new Promise<PortableSourcePage>((_resolve, reject) => {
+      input.signal?.addEventListener("abort", () => reject(new Error(adapterCanary)), { once: true });
+      readStarted.resolve();
+    });
+
+    const cancelled = stream.readBatch({
+      domain: "messages",
+      after: first.checkpoint,
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+      signal: controller.signal,
+    });
+    await readStarted.promise;
+    controller.abort(abortCanary);
+    source.pageFactory = null;
+    const queuedRetry = stream.readBatch({
+      domain: "messages",
+      after: first.checkpoint,
+      maxRecords: 1,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    });
+
+    try {
+      await cancelled;
+      throw new Error("cancelled read unexpectedly succeeded");
+    } catch (error) {
+      expectSanitizedError(error, "aborted", [adapterCanary, abortCanary]);
+      expect(error).toMatchObject({ retryable: true });
+    }
+    const retry = await queuedRetry;
+    expect(Buffer.from(serializePortableCheckpoint(first.checkpoint))).toEqual(checkpointBefore);
+    expect(retry).toMatchObject({
+      priorCheckpointSha256: first.checkpoint.checkpointSha256,
+      records: [records.messages[1]],
+      complete: true,
+      checkpoint: {
+        nextOrdinal: 2,
+        previousCheckpointSha256: first.checkpoint.checkpointSha256,
+      },
+    });
+    expect(source.verifyCalls).toHaveLength(verifyBaseline + 3);
+    expect(source.pageCalls).toHaveLength(pageBaseline + 2);
+    await stream.close();
+  });
+
+  it("uses wrapper cancellation state before classifying adapter rejections", async () => {
+    const cancelledSource = new FakePortableSource();
+    const cancelledStream = await createPortableRecordStream(cancelledSource);
+    const controller = new AbortController();
+    cancelledSource.pageFactory = () => {
+      controller.abort("private concurrent abort reason");
+      throw new PortableStreamError("malformed-record");
+    };
+    try {
+      await cancelledStream.readBatch({
+        domain: "messages",
+        maxRecords: 1,
+        maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+        signal: controller.signal,
+      });
+      throw new Error("cancelled read unexpectedly succeeded");
+    } catch (error) {
+      expectSanitizedError(error, "aborted", ["private concurrent abort reason"]);
+      expect(error).toMatchObject({ retryable: true });
+    }
+    await cancelledStream.close();
+
+    const invalidSource = new FakePortableSource();
+    const invalidStream = await createPortableRecordStream(invalidSource);
+    invalidSource.readFailure = new PortableStreamError("malformed-record");
+    try {
+      await invalidStream.readBatch({
+        domain: "messages",
+        maxRecords: 1,
+        maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+      });
+      throw new Error("invalid source read unexpectedly succeeded");
+    } catch (error) {
+      expectSanitizedError(error, "source-invalid");
+      expect(error).toMatchObject({ retryable: false });
+    }
+    await invalidStream.close();
+
+    const unavailableSource = new FakePortableSource();
+    const unavailableStream = await createPortableRecordStream(unavailableSource);
+    const adapterCanary = "private unavailable adapter canary";
+    unavailableSource.readFailure = new Error(adapterCanary);
+    try {
+      await unavailableStream.readBatch({
+        domain: "messages",
+        maxRecords: 1,
+        maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+      });
+      throw new Error("unavailable source read unexpectedly succeeded");
+    } catch (error) {
+      expectSanitizedError(error, "source-unavailable", [adapterCanary]);
+      expect(error).toMatchObject({ retryable: true });
+    }
+    await unavailableStream.close();
+  });
+
   it("returns a rejected Promise instead of throwing synchronously for a pre-aborted read", async () => {
     const source = new FakePortableSource();
     const stream = await createPortableRecordStream(source);

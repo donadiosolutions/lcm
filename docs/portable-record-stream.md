@@ -239,8 +239,15 @@ retryable flag. The error classes are `unsupported-version`, `unknown-domain`,
 `source-unavailable`, `aborted`, and `closed`. Adapter exceptions, SQL, paths,
 credentials, payloads, and arbitrary backend messages must not escape through
 this error boundary. Source unavailability, oversized batches, and aborts may
-be retried according to the returned `retryable` flag; changed or invalid
-source evidence requires investigation or a fresh manifest.
+be retried according to the returned `retryable` flag. If an available-domain
+page reader rejects and the read's signal was already aborted when the failure
+was classified, the read fails as retryable `aborted` rather than
+`source-unavailable` or `source-invalid`. The adapter error and abort reason
+remain private, no checkpoint is returned or advanced, and the prior
+checkpoint may be retried. A rejection without observed cancellation retains
+the existing sanitized `source-unavailable` or `source-invalid`
+classification. Changed or invalid source evidence requires investigation or
+a fresh manifest.
 
 ## Source and destination duties
 
