@@ -1383,7 +1383,10 @@ describe('installConnector — Codex native hooks', () => {
       SessionStart: [{ hooks: [{ type: 'command', command: 'lcm restore --client codex' }] }],
     } }));
     try {
-      expect(installConnector('codex', 'cli', tmpDir, { persistTransport: false }).success).toBe(true);
+      expect(installConnector('codex', 'cli', tmpDir, {
+        persistTransport: false,
+        codexMcpRunner: { get: () => [] },
+      }).success).toBe(true);
       expect(existsSync(legacyPath)).toBe(false);
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
@@ -1405,7 +1408,10 @@ describe('installConnector — Codex native hooks', () => {
       ] }],
     } }));
     try {
-      expect(installConnector('codex', 'cli', tmpDir, { persistTransport: false }).success).toBe(true);
+      expect(installConnector('codex', 'cli', tmpDir, {
+        persistTransport: false,
+        codexMcpRunner: { get: () => [] },
+      }).success).toBe(true);
       const rewritten = JSON.parse(readFileSync(legacyPath, 'utf8'));
       expect(rewritten.userMetadata).toBe('keep');
       expect(rewritten.hooks.SessionStart[0].hooks).toEqual([{ type: 'command', command: 'echo keep' }]);
