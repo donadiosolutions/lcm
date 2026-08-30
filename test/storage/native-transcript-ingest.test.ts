@@ -648,6 +648,74 @@ describe("native transcript scrub and JSONL reader", () => {
     }
   });
 
+  it("bounds scrubbed canonical UTF-8 bytes independently of raw bytes", async () => {
+    const rawLine = '{"v":"😀z"}';
+    const canonical = '{"v":"😀[REDACTED]"}';
+    expect(Buffer.byteLength(rawLine, "utf8")).toBe(13);
+    expect(canonical.length).toBe(20);
+    expect(Buffer.byteLength(canonical, "utf8")).toBe(22);
+
+    const accepted = await Array.fromAsync(readNativeTranscriptJsonl({
+      bytes: byteChunks(`${rawLine}\n`),
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      scrubber: createNativeTranscriptScrubber({
+        globalPatterns: ["z"],
+        projectPatterns: [],
+      }),
+      clock: () => new Date("2026-07-25T12:00:00.000Z"),
+      maxRecordBytes: 22,
+    }));
+    expect(accepted).toEqual([
+      expect.objectContaining({
+        kind: "record",
+        sourceOrdinal: 0,
+        endByteOffset: 14,
+        contentSha256:
+          "1ef29c5202b757fcf2a04a23a4ec9dd5c6ab0c9357b5d2b61c480dd9bf73437d",
+        nativePayload: { v: "😀[REDACTED]" },
+      }),
+    ]);
+
+    const rejected = await Array.fromAsync(readNativeTranscriptJsonl({
+      bytes: byteChunks(`${rawLine}\n`),
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      scrubber: createNativeTranscriptScrubber({
+        globalPatterns: ["z"],
+        projectPatterns: [],
+      }),
+      clock: () => new Date("2026-07-25T12:00:00.000Z"),
+      maxRecordBytes: 21,
+      onProgress: (progress) => {
+        expect(progress).toEqual({
+          startByteOffset: 0,
+          endByteOffset: 14,
+          rangeSha256:
+            "2439ae967c1b8c05520633077a1988e5335764f134365a50bd53c7eff285f8fe",
+          prefixSha256:
+            "2439ae967c1b8c05520633077a1988e5335764f134365a50bd53c7eff285f8fe",
+        });
+      },
+    }));
+    expect(rejected).toEqual([
+      {
+        kind: "quarantine",
+        sourceOrdinal: 0,
+        endByteOffset: 14,
+        prefixSha256:
+          "2439ae967c1b8c05520633077a1988e5335764f134365a50bd53c7eff285f8fe",
+        reason: "record-too-large",
+        contentSha256:
+          "7abc7b1a85b01ad249d758b01225338335ea95bf05aba898da87af26f3480109",
+        quarantinedAt: new Date("2026-07-25T12:00:00.000Z"),
+      },
+    ]);
+    expect(JSON.stringify(rejected)).not.toContain("[REDACTED]");
+  });
+
   it("does not treat non-ASCII bytes as blank JSONL whitespace", async () => {
     const outcomes = await collect(byteChunks(
       Uint8Array.of(0xa0, 0x0a),
@@ -2266,6 +2334,113 @@ describe("native transcript backfill coordinator", () => {
       messageResolver: { resolveExact: vi.fn(async () => null) },
     } as never)).rejects.toMatchObject({ code: "invalid-input" });
     expect(byteSource.openSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("quarantines expanded records before mapping and persists the next record", async () => {
+    const unsafe = '{"v":"z z z z z z z z z z"}';
+    const safe = '{"message":{"role":"user","content":"safe"}}';
+    const content = `${unsafe}\n${safe}\n`;
+    const repo = repository();
+    const quarantine = vi.fn(async (input) => ({
+      quarantineId: 1,
+      ...input,
+    }));
+    const resolveExact = vi.fn(async (input: {
+      readonly nativeSessionId: string;
+      readonly sessionSequence: number;
+      readonly role: "user" | "assistant" | "system";
+      readonly content: string;
+    }) => input.sessionSequence === 1
+      ? { conversationId: 7, messageId: 9 }
+      : null);
+
+    const result = await runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine,
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source(content),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      globalPatterns: ["z"],
+      maxRecordBytes: 100,
+      batchSize: 1,
+      clock: () => new Date("2026-07-25T12:00:00.000Z"),
+      messageResolver: { resolveExact },
+    });
+
+    expect(result).toEqual({
+      importedCount: 1,
+      skippedCount: 0,
+      quarantinedCount: 1,
+      resumedFromByteOffset: 0,
+      rescanned: false,
+    });
+    expect(quarantine).toHaveBeenCalledTimes(1);
+    expect(quarantine).toHaveBeenCalledWith({
+      sourceLocator: "sessions/session.jsonl",
+      sourceOrdinal: 0,
+      reason: "record-too-large",
+      contentSha256:
+        "46ab7dcb243c944522962b54096dd7f5156d563395bfb04f1db8f71e1ddd97c3",
+      quarantinedAt: new Date("2026-07-25T12:00:00.000Z"),
+    });
+    expect(resolveExact).toHaveBeenCalledTimes(2);
+    expect(resolveExact.mock.calls).toEqual([
+      [{
+        nativeSessionId: "session-1",
+        sessionSequence: 0,
+        role: "user",
+        content: "safe",
+      }],
+      [{
+        nativeSessionId: "session-1",
+        sessionSequence: 1,
+        role: "user",
+        content: "safe",
+      }],
+    ]);
+    expect(repo.batches).toHaveLength(2);
+    expect(repo.batches[0]).toMatchObject({
+      records: [],
+      quarantinedCount: 1,
+      checkpoint: {
+        lastSourceOrdinal: 0,
+        checkpoint: {
+          byteOffset: 28,
+          prefixSha256:
+            "f82cadff952e45ed42969efad1435475b1a5c0750f11b5e9fcc2f065ac6c15cd",
+        },
+      },
+    });
+    expect(repo.batches[1]).toMatchObject({
+      records: [expect.objectContaining({
+        sourceOrdinal: 1,
+        nativePayload: {
+          message: { role: "user", content: "safe" },
+        },
+        messageLinks: [{
+          conversationId: 7,
+          messageId: 9,
+          sourceOrdinal: 1,
+        }],
+      })],
+      quarantinedCount: 0,
+      checkpoint: {
+        lastSourceOrdinal: 1,
+        checkpoint: {
+          byteOffset: 73,
+          prefixSha256:
+            "e21bfb3b2a97ea827ade83c2bd575703e81afd1c772a6cdaa6a70a8cb95f3f2a",
+        },
+      },
+    });
   });
 
   it("snapshots every caller-owned option and dependency method before awaiting", async () => {
