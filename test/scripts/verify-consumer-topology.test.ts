@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -17,6 +17,25 @@ import { describe, expect, it, vi } from "vitest";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const scriptPath = resolve(repositoryRoot, "scripts/verify-consumer-topology.mjs");
+const childEnvironmentKeys = [
+  "HOME",
+  "USERPROFILE",
+  "XDG_CONFIG_HOME",
+  "XDG_STATE_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_DATA_HOME",
+  "XDG_RUNTIME_DIR",
+] as const;
+const xdgEnvironmentKeys = childEnvironmentKeys.slice(2);
+
+type SpawnRecord = {
+  command: string;
+  args: string[];
+  options: Record<string, unknown>;
+  productionEnvironment: NodeJS.ProcessEnv | undefined;
+  effectiveEnvironment: NodeJS.ProcessEnv;
+};
+
 function isolatedRoot(prefix: string): string {
   const root = mkdtempSync(join(tmpdir(), prefix));
   const containment = relative(tmpdir(), root);
@@ -31,6 +50,110 @@ function isolatedRoot(prefix: string): string {
     throw new Error(`fixture root escaped operating-system temp root: ${root}`);
   }
   return root;
+}
+
+function isStrictDescendant(parent: string, child: string): boolean {
+  const childRelative = relative(parent, child);
+  return Boolean(childRelative)
+    && childRelative !== ".."
+    && !childRelative.startsWith("../")
+    && !childRelative.startsWith("..\\")
+    && !childRelative.startsWith("/")
+    && !childRelative.startsWith("\\");
+}
+
+function createFallbackEnvironment(
+  operationRoot: string,
+  inheritedEnvironment: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const fallbackRoot = mkdtempSync(join(operationRoot, "test-owned-fallback-"));
+  const home = mkdtempSync(join(fallbackRoot, "home-"));
+  const xdg = Object.fromEntries(xdgEnvironmentKeys.map((key) => [
+    key,
+    mkdtempSync(join(home, `${key.toLowerCase()}-`)),
+  ])) as Record<typeof xdgEnvironmentKeys[number], string>;
+  if (process.platform !== "win32") {
+    for (const path of [fallbackRoot, home, ...Object.values(xdg)]) chmodSync(path, 0o700);
+  }
+  return {
+    ...inheritedEnvironment,
+    HOME: home,
+    USERPROFILE: home,
+    ...xdg,
+  };
+}
+
+function protectiveSpawn(
+  operationRoot: string,
+  inheritedEnvironment: NodeJS.ProcessEnv,
+  records: SpawnRecord[],
+) {
+  return (
+    command: string,
+    args: string[],
+    options: Record<string, unknown> = {},
+  ) => {
+    const productionEnvironment = options.env as NodeJS.ProcessEnv | undefined;
+    const complete = productionEnvironment !== undefined
+      && productionEnvironment !== null
+      && typeof productionEnvironment === "object"
+      && childEnvironmentKeys.every((key) => {
+        const path = productionEnvironment[key];
+        return typeof path === "string" && isStrictDescendant(operationRoot, path)
+          && existsSync(path) && lstatSync(path).isDirectory();
+      })
+      && productionEnvironment.HOME === productionEnvironment.USERPROFILE
+      && new Set(xdgEnvironmentKeys.map((key) => productionEnvironment[key])).size
+        === xdgEnvironmentKeys.length
+      && xdgEnvironmentKeys.every((key) => isStrictDescendant(
+        productionEnvironment.HOME!,
+        productionEnvironment[key]!,
+      ));
+    const effectiveEnvironment = complete
+      ? productionEnvironment!
+      : createFallbackEnvironment(operationRoot, inheritedEnvironment);
+    records.push({ command, args, options, productionEnvironment, effectiveEnvironment });
+    const effectiveOptions = complete
+      ? options
+      : { ...options, env: effectiveEnvironment };
+    return spawnSync(command, args, effectiveOptions);
+  };
+}
+
+function expectProductionEnvironment(
+  record: SpawnRecord,
+  operationRoot: string,
+  inheritedEnvironment: NodeJS.ProcessEnv,
+): asserts record is SpawnRecord & { productionEnvironment: NodeJS.ProcessEnv } {
+  expect(record.productionEnvironment).toBeDefined();
+  expect(Object.prototype.hasOwnProperty.call(record.options, "env")).toBe(true);
+  const environment = record.productionEnvironment!;
+  expect(childEnvironmentKeys.every((key) => typeof environment[key] === "string")).toBe(true);
+  expect(environment.HOME).toBe(environment.USERPROFILE);
+  expect(new Set(xdgEnvironmentKeys.map((key) => environment[key])).size)
+    .toBe(xdgEnvironmentKeys.length);
+  expect(isStrictDescendant(operationRoot, environment.HOME!)).toBe(true);
+  for (const key of xdgEnvironmentKeys) {
+    expect(isStrictDescendant(operationRoot, environment[key]!)).toBe(true);
+    expect(isStrictDescendant(environment.HOME!, environment[key]!)).toBe(true);
+    expect(existsSync(environment[key]!)).toBe(true);
+    expect(environment[key]).not.toBe(inheritedEnvironment[key]);
+  }
+  expect(existsSync(environment.HOME!)).toBe(true);
+  expect(environment.HOME).not.toBe(inheritedEnvironment.HOME);
+  expect(environment.USERPROFILE).not.toBe(inheritedEnvironment.USERPROFILE);
+}
+
+function expectEffectiveEnvironment(record: SpawnRecord, operationRoot: string): void {
+  const environment = record.effectiveEnvironment;
+  expect(childEnvironmentKeys.every((key) => typeof environment[key] === "string")).toBe(true);
+  expect(environment.HOME).toBe(environment.USERPROFILE);
+  expect(isStrictDescendant(operationRoot, environment.HOME!)).toBe(true);
+  for (const key of xdgEnvironmentKeys) {
+    expect(isStrictDescendant(operationRoot, environment[key]!)).toBe(true);
+    expect(isStrictDescendant(environment.HOME!, environment[key]!)).toBe(true);
+    expect(existsSync(environment[key]!)).toBe(true);
+  }
 }
 
 function snapshotTree(root: string): Record<string, string> {
@@ -153,9 +276,16 @@ describe("verify-consumer-topology", () => {
       ORDINARY_SENTINEL: "ordinary-value",
       LCM_DATABASE_PATH: "/developer/database.sqlite",
     };
+    const records: SpawnRecord[] = [];
     try {
-      const version = module.verifyCli(directory, root, { inheritedEnvironment: inherited });
+      const spawn = protectiveSpawn(root, inherited, records);
+      const version = module.verifyCli(directory, root, {
+        inheritedEnvironment: inherited,
+        spawn,
+      });
       expect(version).toBe("9.8.7");
+      expect(records).toHaveLength(1);
+      expectEffectiveEnvironment(records[0], root);
       const observation = JSON.parse(readFileSync(observationPath, "utf8")) as {
         observed: Record<string, string>;
         homedir: string;
@@ -195,6 +325,7 @@ describe("verify-consumer-topology", () => {
           expect(lstatSync(path).mode & 0o777).toBe(0o700);
         }
       }
+      expectProductionEnvironment(records[0], root, inherited);
     } finally {
       rmSync(root, { recursive: true, force: true });
       rmSync(developerRoot, { recursive: true, force: true });
@@ -208,16 +339,36 @@ describe("verify-consumer-topology", () => {
     mkdirSync(directory, { recursive: true });
     const firstObservation = join(root, "first.json");
     const secondObservation = join(root, "second.json");
+    const developerRoot = isolatedRoot("verify-distinct-developer-");
+    const inherited = {
+      ...process.env,
+      ...makeDeveloperRoots(developerRoot),
+      TMPDIR: "/lane/private/tmp",
+    };
+    const records: SpawnRecord[] = [];
     try {
+      const spawn = protectiveSpawn(root, inherited, records);
       fakeConsumer(directory, firstObservation);
-      expect(module.verifyCli(directory, root)).toBe("9.8.7");
+      expect(module.verifyCli(directory, root, {
+        inheritedEnvironment: inherited,
+        spawn,
+      })).toBe("9.8.7");
       fakeConsumer(directory, secondObservation);
-      expect(module.verifyCli(directory, root)).toBe("9.8.7");
+      expect(module.verifyCli(directory, root, {
+        inheritedEnvironment: inherited,
+        spawn,
+      })).toBe("9.8.7");
       const first = JSON.parse(readFileSync(firstObservation, "utf8"));
       const second = JSON.parse(readFileSync(secondObservation, "utf8"));
       expect(first.homedir).not.toBe(second.homedir);
+      expect(records).toHaveLength(2);
+      for (const record of records) {
+        expectEffectiveEnvironment(record, root);
+        expectProductionEnvironment(record, root, inherited);
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
+      rmSync(developerRoot, { recursive: true, force: true });
     }
   });
 
@@ -263,41 +414,58 @@ describe("verify-consumer-topology", () => {
       ["both", executeError, cleanupError, true, executeError],
     ];
     for (const [, executeFailure, cleanupFailure, report, expected] of cases) {
+      const createdScratchPaths: string[] = [];
       const cleanup = vi.fn(() => {
         if (cleanupFailure) throw cleanupFailure;
       });
       const reporter = vi.fn();
       const execute = vi.fn((scratch: string) => {
+        createdScratchPaths.push(scratch);
         expect(existsSync(scratch)).toBe(true);
         if (executeFailure) throw executeFailure;
         return "ok";
       });
       const operation = () => module.runConsumerTopology({ execute, cleanup, reportCleanupFailure: reporter });
-      if (expected) {
-        try {
-          operation();
-          throw new Error("expected operation to fail");
-        } catch (error) {
-          expect(error).toBe(expected);
-        }
-      } else expect(operation()).toBe("ok");
-      expect(cleanup).toHaveBeenCalledTimes(1);
-      expect(cleanup).toHaveBeenCalledWith(execute.mock.calls[0][0]);
-      expect(reporter).toHaveBeenCalledTimes(report ? 1 : 0);
-      if (report) expect(reporter).toHaveBeenCalledWith(execute.mock.calls[0][0], cleanupError);
+      try {
+        if (expected) {
+          try {
+            operation();
+            throw new Error("expected operation to fail");
+          } catch (error) {
+            expect(error).toBe(expected);
+          }
+        } else expect(operation()).toBe("ok");
+        expect(cleanup).toHaveBeenCalledTimes(1);
+        expect(cleanup).toHaveBeenCalledWith(execute.mock.calls[0][0]);
+        expect(reporter).toHaveBeenCalledTimes(report ? 1 : 0);
+        if (report) expect(reporter).toHaveBeenCalledWith(execute.mock.calls[0][0], cleanupError);
+      } finally {
+        for (const scratch of createdScratchPaths) rmSync(scratch, { recursive: true, force: true });
+      }
     }
 
     const reporterFailure = new Error("reporter failed");
     const primary = new Error("primary");
+    const reporterFailureScratchPaths: string[] = [];
     try {
-      module.runConsumerTopology({
-        execute: () => { throw primary; },
-        cleanup: () => { throw cleanupError; },
-        reportCleanupFailure: () => { throw reporterFailure; },
-      });
-      throw new Error("expected operation to fail");
-    } catch (error) {
-      expect(error).toBe(primary);
+      try {
+        module.runConsumerTopology({
+          execute: (scratch: string) => {
+            reporterFailureScratchPaths.push(scratch);
+            expect(existsSync(scratch)).toBe(true);
+            throw primary;
+          },
+          cleanup: () => { throw cleanupError; },
+          reportCleanupFailure: () => { throw reporterFailure; },
+        });
+        throw new Error("expected operation to fail");
+      } catch (error) {
+        expect(error).toBe(primary);
+      }
+    } finally {
+      for (const scratch of reporterFailureScratchPaths) {
+        rmSync(scratch, { recursive: true, force: true });
+      }
     }
   });
 
