@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -631,6 +632,32 @@ describe("managed one-launch credentials", () => {
 });
 
 describe("systemd-user supervisor", () => {
+  it("rejects a state-root parent redirect before systemd-run", async () => {
+    const root = makeRoot();
+    const outside = makeRoot();
+    mkdirSync(join(outside, "daemon-tmp"), { mode: 0o700 });
+    const movedRoot = `${root}-moved`;
+    roots.push(movedRoot);
+    let redirected = false;
+    const race = (path: string, phase: "before-open" | "before-manager"): void => {
+      if (phase !== "before-open" || redirected) return;
+      redirected = true;
+      renameSync(root, movedRoot);
+      symlinkSync(outside, root, "dir");
+      expect(path).toBe(join(root, "daemon-tmp"));
+    };
+    const spec = makeSpec("systemd-user", root);
+    const runner = fakeRunner([{ code: 1, stderr: "Unit is not-found" }]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      uid: 501,
+      _daemonTempRaceForTesting: race,
+    }).start(spec)).rejects.toThrow();
+    expect(redirected).toBe(true);
+    expect(runner.calls.some(({ command }) => command === "systemd-run")).toBe(false);
+  });
+
   it("revalidates the retained daemon temporary witness before systemd-run", async () => {
     const root = makeRoot();
     const daemonTemp = join(root, "daemon-tmp");
@@ -2167,6 +2194,40 @@ describe("systemd-user supervisor", () => {
 });
 
 describe("launchd-user supervisor", () => {
+  it("accepts the sparse legacy launchd temporary assignment shape during absence-only repair", async () => {
+    const root = makeRoot();
+    const spec = makeSpec("launchd-user", root, {
+      launchEnvironment: { HOME: "/home/test", PATH: "/usr/bin", TMPDIR: "/ambient" },
+    });
+    const initialRunner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdPrintText(spec, "running", 501) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: initialRunner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 501 });
+    const plistPath = join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
+    const original = readFileSync(plistPath, "utf8");
+    const sparseLegacy = original
+      .replace(/<key>(?:TMPDIR|TMP|TEMP)<\/key><string>[^<]+<\/string>/gu, "")
+      .replace(/<string>(?:TMP|TEMP)=[^<]+<\/string>/gu, "");
+    writeFileSync(plistPath, sparseLegacy, { mode: 0o600 });
+    const replacementRunner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdPrintText(spec, "running", 502) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: replacementRunner.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 502 });
+    expect(replacementRunner.calls.some(({ args }) => args[0] === "bootstrap")).toBe(true);
+  });
+
   it("rejects partial or mismatched temporary plist surfaces before bootstrap", async () => {
     const root = makeRoot();
     const spec = makeSpec("launchd-user", root, {

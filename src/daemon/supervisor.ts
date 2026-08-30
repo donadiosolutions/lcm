@@ -1432,9 +1432,10 @@ function privatePlistMatchesStableIdentity(
     assignment: assignments.get(name),
   }));
   const temporaryValuesAreAbsent = temporarySurfaces.every(({ environment: value }) => value === undefined);
-  const legacyTemporaryAssignments = temporarySurfaces.every(({ assignment }) => typeof assignment === "string" && assignment.length > 0)
-    && new Set(temporarySurfaces.map(({ assignment }) => assignment)).size === 1
-    && temporarySurfaces.every(({ assignment }) => validManagedLaunchAssignment("TMPDIR", assignment!));
+  const legacyTemporaryAssignments = temporarySurfaces.some(({ assignment }) => assignment !== undefined)
+    && temporarySurfaces.every(({ assignment }) =>
+      assignment === undefined
+      || (assignment.length > 0 && validManagedLaunchAssignment("TMPDIR", assignment)));
   const temporaryValuesMatch = temporarySurfaces.every(({ name, environment: value, assignment }) =>
     value === normalizedEnvironment[name] && assignment === normalizedEnvironment[name]);
   if (!(temporaryValuesMatch || (allowEnvironmentDrift && temporaryValuesAreAbsent && (temporarySurfaces.every(({ assignment }) => assignment === undefined) || legacyTemporaryAssignments)))) return false;
@@ -2068,6 +2069,9 @@ function prepareManagedDaemonTempDirectory(
     // The path is constructed beneath the canonical state root, while
     // openPrivateDirectory verifies the final component's canonical pathname,
     // ownership, exact mode, non-symlink identity, and retained inode.
+    if (realpathSync(path) !== managedDaemonTempPath(resolve(spec.stateRoot))) {
+      throw new Error("supervisor daemon temporary directory is outside state root");
+    }
     assertPrivateDirectory(handle, path, handle.witness, expectedUid);
     return handle!;
   } catch {
@@ -2805,6 +2809,9 @@ export function createSupervisor(
         ? systemdStartArgs(spec, runner.uid, runner.environment)
         : ["bootstrap", launchdDomain(runner.uid), launchPath!];
       dependencies._daemonTempRaceForTesting?.(managedDaemonTempPath(spec.stateRoot), "before-manager");
+      if (realpathSync(managedDaemonTempPath(spec.stateRoot)) !== managedDaemonTempPath(resolve(spec.stateRoot))) {
+        throw new Error("supervisor daemon temporary directory is outside state root");
+      }
       assertPrivateDirectory(
         daemonTempHandle!,
         managedDaemonTempPath(spec.stateRoot),
