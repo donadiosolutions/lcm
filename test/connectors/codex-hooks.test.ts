@@ -169,6 +169,79 @@ describe("Codex hook configuration boundaries", () => {
     }
   });
 
+  it.each([
+    ["non-file descriptor", "non-file", "unchanged"],
+    ["oversized descriptor", "oversized", "unchanged"],
+    ["negative descriptor size", "negative", "unchanged"],
+    ["short descriptor read", "short-read", "unchanged"],
+    ["zero-progress descriptor write", "short-write", "empty"],
+    ["changed descriptor identity", "changed-identity", "neutral"],
+    ["unreadable public leaf", "unreadable-leaf", "neutral"],
+  ] as const)("fails closed for a %s without unlinking by pathname", async (_label, fault, expected) => {
+    installCodexHooks(hooksPath, configPath);
+    const installed = readFileSync(hooksPath, "utf-8");
+    let fstatCalls = 0;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        fstatSync: ((descriptor: number) => {
+          fstatCalls += 1;
+          const value = actual.fstatSync(descriptor);
+          if (fstatCalls === 1 && fault === "non-file") {
+            return new Proxy(value, {
+              get(target, property) {
+                if (property === "isFile") return () => false;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          if (fstatCalls === 1 && (fault === "oversized" || fault === "negative")) {
+            return new Proxy(value, {
+              get(target, property) {
+                if (property === "size") return fault === "oversized" ? Number.MAX_SAFE_INTEGER + 1 : -1;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          if (fstatCalls === 2 && fault === "changed-identity") {
+            return new Proxy(value, {
+              get(target, property) {
+                if (property === "ino") return Number(target.ino) + 1;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          return value;
+        }) as typeof actual.fstatSync,
+        readSync: ((...args: Parameters<typeof actual.readSync>) => (
+          fault === "short-read" ? 0 : actual.readSync(...args)
+        )) as typeof actual.readSync,
+        writeSync: ((...args: Parameters<typeof actual.writeSync>) => (
+          fault === "short-write" ? 0 : actual.writeSync(...args)
+        )) as typeof actual.writeSync,
+        lstatSync: ((path: Parameters<typeof actual.lstatSync>[0], options?: Parameters<typeof actual.lstatSync>[1]) => {
+          if (fault === "unreadable-leaf" && String(path) === hooksPath) {
+            throw Object.assign(new Error("leaf denied"), { code: "EACCES" });
+          }
+          return actual.lstatSync(path, options as never);
+        }) as typeof actual.lstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      expect(module.removeCodexHooks(hooksPath)).toBe(false);
+      expect(readFileSync(hooksPath, "utf-8")).toBe(
+        expected === "unchanged" ? installed : expected === "empty" ? "" : "{}\n",
+      );
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("keeps broad discovery permissive while exact inspection requires the native PostToolUse hook", () => {
     writeFileSync(hooksPath, JSON.stringify({
       hooks: {

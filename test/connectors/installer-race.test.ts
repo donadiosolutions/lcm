@@ -189,6 +189,51 @@ describe("Claude connector removal races", () => {
     expect(() => readFileSync(replacement, "utf-8")).toThrow(/ENOENT/iu);
   });
 
+  it("reports a strict skill replacement and retains the stored transport", () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-strict-skill-race-"));
+    const configPath = join(tempHome, "config.json");
+    const installed = installConnector("claude-code", "skill", tempHome);
+    const replacement = join(tempHome, "strict-skill-replacement.md");
+    writeFileSync(replacement, `${readFileSync(installed.path, "utf-8")}\nreplacement\n`);
+    setConnectorTransport(configPath, "claude-code", "cli");
+
+    mocks.swapOpenPath = installed.path;
+    mocks.swapOpenReplacement = replacement;
+    const result = removeConnector("claude-code", { cwd: tempHome, configPath });
+
+    expect(result).toEqual(expect.objectContaining({
+      success: false,
+      failures: expect.arrayContaining([expect.stringMatching(/skill:.*path changed/iu)]),
+    }));
+    expect(readConnectorTransport(configPath, "claude-code")).toBe("cli");
+    expect(readFileSync(installed.path, "utf-8")).toContain("replacement");
+  });
+
+  it.each([
+    ["compatibility", false],
+    ["strict", true],
+  ] as const)("preserves an MCP replacement in %s removal mode", (_label, strict) => {
+    tempHome = mkdtempSync(join(tmpdir(), `lcm-connector-${strict ? "strict" : "compat"}-mcp-race-`));
+    const configPath = join(tempHome, "config.json");
+    const installed = installConnector("claude-code", "mcp", tempHome);
+    const replacement = join(tempHome, "mcp-replacement.json");
+    writeFileSync(replacement, readFileSync(installed.path));
+    setConnectorTransport(configPath, "claude-code", "mcp");
+
+    mocks.swapOpenPath = installed.path;
+    mocks.swapOpenReplacement = replacement;
+    if (strict) {
+      expect(removeConnector("claude-code", { cwd: tempHome, configPath })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/mcp:.*path changed/iu)]),
+      }));
+      expect(readConnectorTransport(configPath, "claude-code")).toBe("mcp");
+    } else {
+      expect(removeConnector("claude-code", "mcp", tempHome)).toBe(false);
+    }
+    expect(readFileSync(installed.path)).toEqual(readFileSync(`${installed.path}.original-before-remove-race`));
+  });
+
   it("neutralizes the authenticated skill inode when the public leaf is replaced at the destructive seam", () => {
     tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-skill-truncate-race-"));
     const installed = installConnector("claude-code", "skill", tempHome);
@@ -240,6 +285,30 @@ describe("Claude connector removal races", () => {
     expect(readFileSync(installed.path, "utf-8")).toBe('{"sentinel":"preserve"}\n');
     expect(readFileSync(original, "utf-8")).toBe("{}\n");
     expect(mocks.unlinkCalls).toBe(0);
+  });
+
+  it("reports a strict Codex hook replacement and retains the stored transport", () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-codex-hook-strict-race-"));
+    process.env.HOME = tempHome;
+    const configPath = join(tempHome, "config.json");
+    const installed = installConnector("codex", "cli", tempHome, { configPath });
+    const hookPath = installed.paths!.find((path) => path.endsWith("hooks.json"))!;
+    const replacement = join(tempHome, "strict-hook-replacement.json");
+    const original = join(tempHome, "strict-authenticated-hooks.json");
+    writeFileSync(replacement, '{"sentinel":"preserve"}\n');
+
+    mocks.swapTruncatePath = hookPath;
+    mocks.swapTruncateReplacement = replacement;
+    mocks.swapTruncateOriginal = original;
+    const result = removeConnector("codex", { cwd: tempHome, configPath });
+
+    expect(result).toEqual(expect.objectContaining({
+      success: false,
+      failures: expect.arrayContaining([expect.stringMatching(/hook:.*path changed/iu)]),
+    }));
+    expect(readConnectorTransport(configPath, "codex")).toBe("cli");
+    expect(readFileSync(hookPath, "utf-8")).toBe('{"sentinel":"preserve"}\n');
+    expect(readFileSync(original, "utf-8")).toBe("{}\n");
   });
 
   it("rewrites authenticated mixed Codex hooks while preserving a public replacement", () => {
