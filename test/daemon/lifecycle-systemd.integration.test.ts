@@ -75,6 +75,9 @@ const server = createServer((request, response) => {
       stateRoot,
       nonce,
       port,
+      tmpdir: process.env.TMPDIR,
+      tmp: process.env.TMP,
+      temp: process.env.TEMP,
     }));
     return;
   }
@@ -320,6 +323,9 @@ describe("real user-systemd daemon lifecycle", () => {
       expect(started.managerPid).toBeGreaterThan(0);
       const health = await waitForHealth(fixture, started.managerPid!);
       expect(health.entrypoint).toBe(fixture.spec.entrypoint);
+      expect(health.tmpdir).toBe(join(fixture.root, "daemon-tmp"));
+      expect(health.tmp).toBe(join(fixture.root, "daemon-tmp"));
+      expect(health.temp).toBe(join(fixture.root, "daemon-tmp"));
       expect(await fixture.supervisor.probe(fixture.spec)).toMatchObject({
         kind: "registered-running-valid",
         managerPid: started.managerPid,
@@ -328,6 +334,8 @@ describe("real user-systemd daemon lifecycle", () => {
         nonce: fixture.spec.nonce,
       });
       expect(fixture.spec.systemdUnit).toMatch(/^lcm-daemon-[0-9a-f]{20}\.service$/u);
+      await fixture.supervisor.stopAndAwaitAbsent(fixture.spec);
+      expect(existsSync(join(fixture.root, "daemon-tmp"))).toBe(true);
     } finally {
       await cleanupFixture(fixture);
     }

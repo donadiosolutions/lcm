@@ -28,6 +28,8 @@ detail you need.
 
 - [Managed daemon recovery](daemon-restart-recovery.md) — diagnose and recover
   the user-managed daemon safely.
+- [Managed daemon temporary storage](daemon-temporary-storage.md) — understand
+  the stable private temporary root used by background daemons.
 - [Backend publication safety](backend-publication.md) — understand secure
   `~/.lcm` establishment, publication recovery, PostgreSQL admission, and
   fail-closed operator behavior.

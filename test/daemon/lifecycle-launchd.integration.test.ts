@@ -119,6 +119,9 @@ const metadata = () => ({
   stateRoot: process.env.LCM_SUPERVISOR_STATE_ROOT,
   nonce: process.env.LCM_SUPERVISOR_NONCE,
   port,
+  tmpdir: process.env.TMPDIR,
+  tmp: process.env.TMP,
+  temp: process.env.TEMP,
   pid: process.pid,
 });
 const credentialPath = process.env.LCM_CREDENTIAL_OPENAI_API_KEY_FILE;
@@ -514,6 +517,9 @@ describe("real launchd daemon lifecycle", () => {
           name: spec.launchdLabel,
         });
         const health = await waitForExactHealth(spec, managerPid);
+        expect(health.tmpdir).toBe(join(fixture.stateRoot, "daemon-tmp"));
+        expect(health.tmp).toBe(join(fixture.stateRoot, "daemon-tmp"));
+        expect(health.temp).toBe(join(fixture.stateRoot, "daemon-tmp"));
         expect(health).toEqual({
           status: "ok",
           marker: spec.marker,
@@ -522,6 +528,9 @@ describe("real launchd daemon lifecycle", () => {
           nonce: spec.nonce,
           port: spec.port,
           pid: managerPid,
+          tmpdir: join(fixture.stateRoot, "daemon-tmp"),
+          tmp: join(fixture.stateRoot, "daemon-tmp"),
+          temp: join(fixture.stateRoot, "daemon-tmp"),
           credentialLength: "fixture-value".length,
           credentialMode: 0o600,
           credentialClaimed: true,
