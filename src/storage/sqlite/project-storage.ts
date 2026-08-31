@@ -85,6 +85,7 @@ export class SqliteProjectStorage implements ProjectStorage {
     if (this.closed) {
       return { status: "closed", backend: "sqlite", projectId: this.projectId };
     }
+    let candidate: StorageHealth;
     try {
       await this.executor.run("factory", "health", () => {
         try {
@@ -96,7 +97,7 @@ export class SqliteProjectStorage implements ProjectStorage {
           throw error;
         }
       });
-      return { status: "healthy", backend: "sqlite", projectId: this.projectId };
+      candidate = { status: "healthy", backend: "sqlite", projectId: this.projectId };
     } catch (error) {
       const normalized = normalizeStorageError(error, {
         backend: "sqlite",
@@ -104,13 +105,17 @@ export class SqliteProjectStorage implements ProjectStorage {
         domain: "factory",
         operation: "health",
       });
-      return {
+      candidate = {
         status: "unavailable",
         backend: "sqlite",
         projectId: this.projectId,
         error: normalized,
       };
     }
+    if (this.closed) {
+      return { status: "closed", backend: "sqlite", projectId: this.projectId };
+    }
+    return candidate;
   }
 
   close(): Promise<void> {

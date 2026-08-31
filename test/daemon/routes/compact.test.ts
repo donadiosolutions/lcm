@@ -19,9 +19,11 @@ import { runLcmMigrations } from "../../../src/db/migration.js";
 import { ConversationStore } from "../../../src/store/conversation-store.js";
 import {
   SqliteStorageBackendFactory,
+  StorageOperationError,
   type ProjectStorage,
   type StorageBackendFactory,
 } from "../../../src/storage/index.js";
+import { createInvocationCoordinator } from "../../../src/daemon/invocation-coordinator.js";
 import {
   assertBackendPublicationConsumerAccess,
   BackendPublicationJournalError,
@@ -929,6 +931,156 @@ describe("POST /compact", () => {
       else process.env.HOME = originalHome;
       if (originalUserProfile === undefined) delete process.env.USERPROFILE;
       else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it("cancels a pending project open through the composed invocation signal", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-compact-open-cancel-"));
+    tempDirs.push(tempDir);
+    const baseFactory = new SqliteStorageBackendFactory();
+    const openEntered = deferred<void>();
+    const cleanupRelease = deferred<void>();
+    const factoryClose = vi.fn(() => baseFactory.close());
+    let capturedSignal: AbortSignal | undefined;
+    const cancelledOpenError = (): StorageOperationError => new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "openProject",
+    );
+    const factory: StorageBackendFactory = {
+      backend: baseFactory.backend,
+      capabilities: baseFactory.capabilities,
+      projectExists: (identity, publicationLockToken) =>
+        baseFactory.projectExists(identity, publicationLockToken),
+      openExistingProject: (identity, publicationLockToken, signal) =>
+        baseFactory.openExistingProject(identity, publicationLockToken, signal),
+      openProject: async (_identity, _publicationLockToken, signal) => {
+        capturedSignal = signal;
+        openEntered.resolve();
+        if (signal === undefined) {
+          await cleanupRelease.promise;
+          throw cancelledOpenError();
+        }
+        await new Promise<never>((_resolve, reject) => {
+          let settled = false;
+          const cleanup = (): void => signal.removeEventListener("abort", rejectCancellation);
+          const rejectCancellation = (): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(cancelledOpenError());
+          };
+          signal.addEventListener("abort", rejectCancellation, { once: true });
+          void cleanupRelease.promise.then(rejectCancellation);
+          if (signal.aborted) rejectCancellation();
+        });
+      },
+      health: () => baseFactory.health(),
+      close: factoryClose,
+    };
+    const invocationId = "77777777-7777-4777-8777-777777777777";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const invocationTarget = { invocationId, command: "compact" as const, daemonInstanceId };
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start(invocationTarget);
+    const invocationSourceAdmission = coordinator.admitWork(invocationTarget);
+    const invocationSourceSignal = invocationSourceAdmission.signal;
+    invocationSourceAdmission.release();
+    const requestController = new AbortController();
+    const output = mockRes();
+    let handlerSettled = false;
+    const pending = createCompactHandlerProduction(makeConfig("openai"), factory)(
+      {} as never,
+      output.res,
+      JSON.stringify({
+        session_id: "pending-open-cancel",
+        cwd: tempDir,
+        invocation_id: invocationId,
+      }),
+      {
+        ...testCompactContext,
+        signal: requestController.signal,
+        invocationCoordinator: coordinator,
+      },
+    ).finally(() => {
+      handlerSettled = true;
+    });
+
+    try {
+      await openEntered.promise;
+      const initialTopology = {
+        defined: capturedSignal !== undefined,
+        isRequestSource: capturedSignal === requestController.signal,
+        isInvocationSource: capturedSignal === invocationSourceSignal,
+        aborted: capturedSignal?.aborted,
+      };
+      const activeDuringOpen = coordinator.snapshot(invocationId);
+
+      requestController.abort();
+      const nextTurn = deferred<boolean>();
+      setImmediate(() => nextTurn.resolve(false));
+      const settledWithinOneTurn = await Promise.race([
+        pending.then(() => true),
+        nextTurn.promise,
+      ]);
+      const finalInvocation = coordinator.snapshot(invocationId);
+
+      expect({
+        initialTopology,
+        activeDuringOpen: {
+          state: activeDuringOpen.state,
+          activeCount: activeDuringOpen.activeCount,
+          workCount: activeDuringOpen.workCount,
+          commitCount: activeDuringOpen.commitCount,
+        },
+        requestSourceAborted: requestController.signal.aborted,
+        invocationSourceAborted: invocationSourceSignal.aborted,
+        composedSignalAborted: capturedSignal?.aborted,
+        settledWithinOneTurn,
+        handlerSettled,
+        responseStatus: output.res.writeHead.mock.calls.at(-1)?.[0],
+        responseBody: output.getBody(),
+        finalInvocation: {
+          state: finalInvocation.state,
+          activeCount: finalInvocation.activeCount,
+          workCount: finalInvocation.workCount,
+          commitCount: finalInvocation.commitCount,
+        },
+      }).toEqual({
+        initialTopology: {
+          defined: true,
+          isRequestSource: false,
+          isInvocationSource: false,
+          aborted: false,
+        },
+        activeDuringOpen: {
+          state: "active",
+          activeCount: 1,
+          workCount: 1,
+          commitCount: 0,
+        },
+        requestSourceAborted: true,
+        invocationSourceAborted: true,
+        composedSignalAborted: true,
+        settledWithinOneTurn: true,
+        handlerSettled: true,
+        responseStatus: 499,
+        responseBody: { status: "cancelled", error: "compact cancelled" },
+        finalInvocation: {
+          state: "cancelled",
+          activeCount: 0,
+          workCount: 0,
+          commitCount: 0,
+        },
+      });
+      expect(factoryClose).not.toHaveBeenCalled();
+    } finally {
+      cleanupRelease.resolve();
+      await pending;
+      await coordinator.shutdown();
+      await baseFactory.close();
     }
   });
 

@@ -419,10 +419,12 @@ export interface StorageBackendFactory {
   openExistingProject(
     identity: StorageIdentityContext,
     publicationLockToken?: BackendPublicationLockToken,
+    signal?: AbortSignal,
   ): Promise<ProjectStorage | null>;
   openProject(
     identity: StorageIdentityContext,
     publicationLockToken?: BackendPublicationLockToken,
+    signal?: AbortSignal,
   ): Promise<ProjectStorage>;
   health(): Promise<StorageHealth>;
   close(): Promise<void>;

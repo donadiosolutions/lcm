@@ -6,7 +6,7 @@ import { StorageOperationError } from "../../../src/storage/errors.js";
 
 type MockStorageFactoryOptions = {
   projectExists?: StorageBackendFactory["projectExists"];
-  openProject: (identity: Parameters<StorageBackendFactory["openProject"]>[0]) => Promise<ProjectStorage>;
+  openProject: StorageBackendFactory["openProject"];
   close?: StorageBackendFactory["close"];
 };
 
@@ -23,8 +23,8 @@ export function makeMockStorageFactory(options: MockStorageFactoryOptions): Stor
       coordination: "local",
     },
     projectExists,
-    openExistingProject: async (identity) =>
-      await projectExists(identity) ? options.openProject(identity) : null,
+    openExistingProject: async (identity, token, signal) =>
+      await projectExists(identity, token) ? options.openProject(identity, token, signal) : null,
     openProject: options.openProject,
     health: async () => ({ status: "healthy", backend: "sqlite" }),
     close: options.close ?? (async () => undefined),

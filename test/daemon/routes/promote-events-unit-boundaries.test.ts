@@ -451,6 +451,7 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.openProject).toHaveBeenCalledWith(
       { id: "pid", canonical: "/cwd" },
       undefined,
+      expect.any(AbortSignal),
     );
     expect(mocks.closeProject).toHaveBeenCalledOnce();
     expect(mocks.closeFactory).not.toHaveBeenCalled();
@@ -478,6 +479,7 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.openProject).toHaveBeenCalledWith(
       { id: "pid", canonical: "/cwd" },
       publicationLockToken,
+      expect.any(AbortSignal),
     );
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, expect.objectContaining({
       message: "no unprocessed events",
@@ -499,6 +501,7 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.openProject).toHaveBeenCalledWith(
       { id: "pid", canonical: "/cwd" },
       publicationLockToken,
+      expect.any(AbortSignal),
     );
   });
 

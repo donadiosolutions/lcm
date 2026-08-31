@@ -21,6 +21,7 @@ import { sqliteExecutorFor } from "./executor.js";
 import { assertSqliteReady, SqliteReadinessRollbackError } from "./health.js";
 import { SqliteProjectStorage } from "./project-storage.js";
 import type { BackendPublicationLockToken } from "../backend-publication.js";
+import { throwIfAborted } from "../../daemon/cancellation.js";
 
 export class SqliteStorageBackendFactory implements StorageBackendFactory {
   readonly backend = "sqlite" as const;
@@ -57,15 +58,17 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
   async openProject(
     identity: ProjectIdentity,
     publicationLockToken?: BackendPublicationLockToken,
+    signal?: AbortSignal,
   ): Promise<ProjectStorage> {
-    return (await this.openResolvedProject(identity, "openProject", true, publicationLockToken))!;
+    return (await this.openResolvedProject(identity, "openProject", true, publicationLockToken, signal))!;
   }
 
   async openExistingProject(
     identity: ProjectIdentity,
     publicationLockToken?: BackendPublicationLockToken,
+    signal?: AbortSignal,
   ): Promise<ProjectStorage | null> {
-    return this.openResolvedProject(identity, "openExistingProject", false, publicationLockToken);
+    return this.openResolvedProject(identity, "openExistingProject", false, publicationLockToken, signal);
   }
 
   private async openResolvedProject(
@@ -73,24 +76,31 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     operation: "openProject" | "openExistingProject",
     createIfMissing: boolean,
     publicationLockToken?: BackendPublicationLockToken,
+    signal?: AbortSignal,
   ): Promise<ProjectStorage | null> {
     this.assertOpen(identity, operation);
+    throwIfAborted(signal);
     let finishOpen!: () => void;
     const pendingOpen = new Promise<void>((resolve): void => { finishOpen = resolve; });
     this.pendingOpens.add(pendingOpen);
     let dbPath: string | undefined;
     let db: ReturnType<typeof getLcmConnection> | undefined;
+    let storage: SqliteProjectStorage | undefined;
     try {
+      throwIfAborted(signal);
       const paths = this.resolveProject(identity, publicationLockToken);
       this.assertIdentity(identity, paths.id, operation);
       if (createIfMissing && !this.options.resolveProject) {
+        throwIfAborted(signal);
         ensureProjectDir(identity.canonical, publicationLockToken);
       }
       dbPath = paths.dbPath;
+      throwIfAborted(signal);
       db = createIfMissing
         ? getLcmConnection(paths.dbPath)
         : getExistingLcmConnection(paths.dbPath) ?? undefined;
       if (!db) return null;
+      throwIfAborted(signal);
       const executor = sqliteExecutorFor(
         db,
         paths.id,
@@ -99,11 +109,18 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       let features: LcmDbFeatures;
       try {
         features = await executor.run("factory", operation, () => {
+          throwIfAborted(signal);
+          if (this.closed) this.assertOpen(identity, operation);
           const detected = (this.options.detectFeatures ?? getLcmDbFeatures)(db!);
+          throwIfAborted(signal);
+          if (this.closed) this.assertOpen(identity, operation);
           runLcmMigrations(db!, detected);
           return detected;
         });
-      } catch {
+      } catch (error) {
+        if (error instanceof StorageOperationError && error.code === "STORAGE_CLOSED") {
+          throw error;
+        }
         throw new StorageOperationError(
           "STORAGE_INITIALIZATION_FAILED",
           "sqlite",
@@ -113,7 +130,8 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         );
       }
       this.assertOpen(identity, operation);
-      const storage = new SqliteProjectStorage(
+      throwIfAborted(signal);
+      storage = new SqliteProjectStorage(
         paths.id,
         paths.dbPath,
         db,
@@ -121,11 +139,21 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         sqliteStorageCapabilities(features.fts5Available),
         (closed): void => { this.projects.delete(closed); },
       );
+      throwIfAborted(signal);
+      this.assertOpen(identity, operation);
       this.projects.add(storage);
       this.knownProjects.set(`${paths.id}\0${paths.dbPath}`, { id: paths.id, dbPath: paths.dbPath });
       return storage;
     } catch (error) {
-      if (db && dbPath) closeLcmConnection(dbPath, db);
+      if (storage) {
+        try {
+          await storage.close();
+        } catch {
+          // Preserve the primary open failure.
+        }
+      } else if (db && dbPath) {
+        closeLcmConnection(dbPath, db);
+      }
       throw normalizeStorageError(
         error,
         { backend: "sqlite", projectId: identity.id, domain: "factory", operation },

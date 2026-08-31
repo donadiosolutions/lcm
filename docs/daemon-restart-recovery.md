@@ -331,6 +331,12 @@ authority.
 
 ## Connector recovery
 
+Pending project opens are cancelled when a request disconnects or the daemon
+shuts down. A request that remains writable during shutdown receives a
+cancellation or error response instead of a normal empty success; admitted
+cleanup still completes in order. After the daemon restarts, retry the
+request.
+
 Connector files are client configuration, not daemon ownership evidence. If an
 upgrade leaves a connector missing or stale, reinstall it through LCM and let
 the connector-specific doctor check the result:
