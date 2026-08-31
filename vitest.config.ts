@@ -30,7 +30,7 @@ function assertFreshExplicitRoot(
   root: string,
   createDirectory: typeof mkdirSync,
   inspectPath: typeof lstatSync,
-): boolean {
+): void {
   const parent = dirname(root);
   if (!basename(root)) {
     throw new Error("LCM_TEST_ARTIFACT_ROOT must name a fresh leaf");
@@ -46,7 +46,7 @@ function assertFreshExplicitRoot(
       throw error;
     }
     createDirectory(root, { mode: 0o700, recursive: false });
-    return true;
+    return;
   }
   throw new Error("LCM_TEST_ARTIFACT_ROOT must not preexist");
 }
@@ -64,18 +64,16 @@ export function createVitestRunRoot(
     ?? ((listener: (code: number) => void) => process.once("exit", listener));
   const override = environment.LCM_TEST_ARTIFACT_ROOT;
   let root: string;
-  let ownsRoot = false;
 
   if (override === undefined || override === "") {
     const temporaryRoot = dependencies.temporaryRoot ?? tmpdir;
     root = createTemporaryDirectory(join(temporaryRoot(), "lcm-vitest-run-"));
-    ownsRoot = true;
   } else {
     if (override.trim() !== override || override.trim() === "" || !isAbsolute(override)) {
       throw new Error("LCM_TEST_ARTIFACT_ROOT must be an absolute, unpadded path");
     }
 
-    ownsRoot = assertFreshExplicitRoot(override, createDirectory, inspectPath);
+    assertFreshExplicitRoot(override, createDirectory, inspectPath);
     root = override;
   }
 
@@ -96,7 +94,7 @@ export function createVitestRunRoot(
       registerProcessExit(cleanup);
     }
   } catch (error) {
-    if (ownsRoot) cleanup();
+    cleanup();
     throw error;
   }
 
