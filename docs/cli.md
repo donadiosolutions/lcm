@@ -53,10 +53,11 @@ for example `lcm export --tags decision,architecture`.
 An unknown command writes an error and the complete command list to the
 terminal, completes both outputs, and then exits with status 1.
 
-## Healthy-daemon read routing
+## Healthy-daemon routing
 
-The following daemon-backed reads use a migration-free preflight when the
-managed daemon is healthy:
+The following daemon-backed commands use a migration-free preflight when the
+managed daemon is healthy. The shared preflight acquires an authenticated
+daemon client for six reads and for `lcm store`:
 
 | Command | Read performed by the daemon |
 |---|---|
@@ -66,6 +67,7 @@ managed daemon is healthy:
 | `lcm expand <nodeId>` | Expand a summary into source detail |
 | `lcm status` | Read daemon and project status |
 | `lcm stats --pool` | Read daemon connection-pool statistics |
+| `lcm store <text>` | Store a durable memory entry |
 
 Before using this route, LCM reads a bounded, no-follow configuration snapshot
 without taking the private mutation/publication lock. If `config.json` is
@@ -90,7 +92,15 @@ of buffered output. If publication begins, completes, aborts, or changes
 evidence during the handler, the buffered result is discarded and the request
 returns a blocked response instead of leaking a stale or mixed-backend result.
 An existing publication directory without a journal is incomplete evidence,
-not the legacy SQLite no-evidence case.
+not the legacy SQLite no-evidence case. This response buffering applies to
+read routes; `lcm store` remains a mutation.
+
+For a proven `lcm store` client, the CLI skips redundant root bootstrap and
+defers storage selection to the authenticated daemon's request-time admission.
+The daemon still revalidates backend, configuration, and publication state and
+performs the write through operation-scoped publication admission. If the
+client preflight cannot prove identity, health, or a stable configuration,
+`lcm store` returns to the existing locked migration and daemon-lifecycle path.
 
 The route is fail closed. An unreadable, malformed, oversized, symlinked, or
 otherwise invalid configuration, missing token, failed or ambiguous health
@@ -100,7 +110,7 @@ path. Daemon request admission independently rejects an unsafe or replaced
 private root before reading storage and revalidates it before releasing the
 buffered response. LCM never treats an uncertain snapshot as
 permission to bypass migration, signal an unknown process, or mutate state.
-Mutation-requiring commands retain their existing migration and locking
+Other mutation-requiring commands retain their existing migration and locking
 behavior; pure exits and explicit read exceptions such as help, diagnose,
 usage-only parent actions, `connectors list`, and `connectors doctor` remain
 exempt according to the command-routing policy. When connector inspection is
