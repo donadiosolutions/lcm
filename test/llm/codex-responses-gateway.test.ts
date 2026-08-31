@@ -475,6 +475,9 @@ describe("Codex Responses zero-tools gateway", () => {
     const invalidUtf8 = utils.createResponsesSseObserver();
     invalidUtf8.observe(new Uint8Array([0xc3]));
     expect(() => invalidUtf8.finish()).toThrow();
+    expect(() => utils.flushResponsesSseDecoder({ decode: () => "post-terminal" })).toThrow(
+      "codex responses gateway did not complete",
+    );
   });
 
   it("ends terminal relay without entering ordinary backpressure or awaiting upstream cancellation", async () => {
@@ -1195,6 +1198,28 @@ describe("Codex Responses zero-tools gateway", () => {
         "event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n",
         { status: 200, headers: { "content-type": "text/event-stream" } },
       ),
+    });
+    gateways.push(gateway);
+
+    await fetchGateway(gateway)
+      .then(async (response) => response.arrayBuffer())
+      .catch(() => undefined);
+
+    await expect(gateway.waitForCompletion()).rejects.toThrow("codex responses gateway did not complete");
+    expect(gateway.requestCompleted).toBe(false);
+  });
+
+  it("rejects incomplete UTF-8 buffered after response.completed", async () => {
+    const terminalWithTruncatedUtf8 = Buffer.concat([
+      Buffer.from(COMPLETED_SSE, "utf8"),
+      Buffer.from([0xc3]),
+    ]);
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(terminalWithTruncatedUtf8, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
     });
     gateways.push(gateway);
 

@@ -421,6 +421,14 @@ type ResponsesSseObserver = {
   finish(): ResponsesTerminalState;
 };
 
+function flushResponsesSseDecoder(decoder: Pick<TextDecoder, "decode">): void {
+  try {
+    if (decoder.decode().length > 0) throw genericError();
+  } catch {
+    throw genericError();
+  }
+}
+
 function classifyResponsesSseEvent(eventType: string, data: string): ResponsesTerminalState {
   if (eventType.length === 0 && data.length === 0) return "pending";
   let payload: PlainRecord;
@@ -513,6 +521,7 @@ function createResponsesSseObserver(): ResponsesSseObserver {
     observe(chunk) {
       if (chunk.byteLength > MAX_SSE_CHUNK_BYTES || terminalState !== "pending") throw genericError();
       observeText(decoder.decode(chunk, { stream: true }));
+      if (terminalState !== "pending") flushResponsesSseDecoder(decoder);
     },
     finish() {
       observeText(decoder.decode());
@@ -854,6 +863,7 @@ export const __codexResponsesGatewayTestUtils = {
   relaySse,
   createResponsesSseObserver,
   classifyResponsesSseEvent,
+  flushResponsesSseDecoder,
   listen,
   closeServer,
 };
