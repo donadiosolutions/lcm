@@ -19,6 +19,7 @@ import {
 import { resolveCodexSessions } from "./codex-project-resolution.js";
 import { findAllCodexTranscripts } from "./codex-transcript.js";
 import { sanitizeTerminalText } from "./terminal-sanitize.js";
+import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
 
@@ -354,11 +355,16 @@ export async function importSessions(
         const canonical = normalizeProjectIdentityPath(requestedCwd);
         return { id: hashProjectPath(canonical), canonical };
       })()
-      : resolveProjectIdentity(requestedCwd);
-    // Register the current live Git identity before snapshotting the catalogue.
-    // Otherwise a first-ever import from a repository subdirectory cannot
-    // match that repository until a later invocation happens to populate the
-    // map. Dry runs add the same identity only to their in-memory snapshot.
+      : (() => {
+        ensureWorktreeProjectReconciled(requestedCwd, undefined, {
+          _codexDir: options._codexDir,
+        });
+        return resolveProjectIdentity(requestedCwd);
+      })();
+    // Reconcile and register the current live Git identity before snapshotting
+    // the catalogue. Otherwise legacy or first-import identities can be
+    // classified against stale map state. Dry runs add the normalized current
+    // identity only to their in-memory snapshot.
     const mapSnapshot = readProjectMapSnapshot();
     if (options.dryRun && mapSnapshot[current.id] === undefined) {
       mapSnapshot[current.id] = { canonical: current.canonical, aliases: [] };

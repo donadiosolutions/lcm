@@ -7,7 +7,12 @@ import { execFileSync } from "node:child_process";
 import { cwdToProjectHash, findSessionFiles, importSessions } from "../src/import.js";
 import type { DaemonClient } from "../src/daemon/client.js";
 import { projectId } from "../src/daemon/project.js";
-import { resolveProjectIdentity } from "../src/project-map.js";
+import {
+  clearProjectMapCache,
+  hashProjectPath,
+  resolveProjectIdentity,
+} from "../src/project-map.js";
+import { clearWorktreeReconciliationCache } from "../src/worktree-reconciliation.js";
 import * as codexTranscript from "../src/codex-transcript.js";
 
 // --- cwdToProjectHash ---
@@ -842,6 +847,8 @@ describe("importSessions — provider: codex", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+    clearProjectMapCache();
+    clearWorktreeReconciliationCache();
     for (const dir of dirs) {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -875,6 +882,233 @@ describe("importSessions — provider: codex", () => {
     if (register) resolveProjectIdentity(project);
     return project;
   }
+
+  function makeLinkedGitProject(remote: string): {
+    primary: string;
+    linked: string;
+  } {
+    const root = makeTmpDir();
+    const primary = join(root, "primary");
+    const linked = join(root, "linked");
+    mkdirSync(primary);
+    execFileSync("git", ["init", "-q"], { cwd: primary });
+    execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: primary });
+    execFileSync("git", ["config", "user.name", "LCM Test"], { cwd: primary });
+    execFileSync("git", ["remote", "add", "origin", remote], { cwd: primary });
+    writeFileSync(join(primary, "README.md"), "test\n");
+    execFileSync("git", ["add", "README.md"], { cwd: primary });
+    execFileSync("git", ["commit", "-qm", "initial"], { cwd: primary });
+    execFileSync("git", ["worktree", "add", "-qb", "linked", linked], { cwd: primary });
+    return { primary, linked };
+  }
+
+  it("reconciles before resolving and snapshotting a non-dry Codex import", async () => {
+    const events: string[] = [];
+    const requestedCwd = "/workspace/ordering";
+    const codexDir = "/catalogue/selected-codex";
+    const ensure = vi.fn(() => {
+      events.push("reconcile");
+    });
+    try {
+      vi.resetModules();
+      vi.doMock("../src/codex-transcript.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof import("../src/codex-transcript.js")>()),
+        findAllCodexTranscripts: vi.fn(() => {
+          events.push("catalogue");
+          return [{}];
+        }),
+      }));
+      vi.doMock("../src/worktree-reconciliation.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof import("../src/worktree-reconciliation.js")>()),
+        ensureWorktreeProjectReconciled: ensure,
+      }));
+      vi.doMock("../src/project-map.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof import("../src/project-map.js")>()),
+        resolveProjectIdentity: vi.fn(() => {
+          events.push("resolve");
+          return { id: "current-project", canonical: requestedCwd };
+        }),
+        readProjectMapSnapshot: vi.fn(() => {
+          events.push("snapshot");
+          return {};
+        }),
+      }));
+      vi.doMock("../src/codex-project-resolution.js", async (importOriginal) => ({
+        ...(await importOriginal<typeof import("../src/codex-project-resolution.js")>()),
+        resolveCodexSessions: vi.fn(() => {
+          events.push("sessions");
+          return [];
+        }),
+      }));
+      const isolated = await import("../src/import.js");
+
+      await isolated.importSessions(
+        makeMockClient(async () => ({ ingested: 0, totalTokens: 0 })),
+        { provider: "codex", cwd: requestedCwd, _codexDir: codexDir },
+      );
+
+      expect(events).toEqual([
+        "catalogue",
+        "reconcile",
+        "resolve",
+        "snapshot",
+        "sessions",
+      ]);
+      expect(ensure).toHaveBeenCalledExactlyOnceWith(
+        requestedCwd,
+        undefined,
+        { _codexDir: codexDir },
+      );
+    } finally {
+      vi.doUnmock("../src/codex-transcript.js");
+      vi.doUnmock("../src/worktree-reconciliation.js");
+      vi.doUnmock("../src/project-map.js");
+      vi.doUnmock("../src/codex-project-resolution.js");
+      vi.resetModules();
+    }
+  });
+
+  it("carries a legacy linked-worktree binding before importing", async () => {
+    const home = makeTmpDir();
+    vi.stubEnv("HOME", home);
+    const remote = "https://example.invalid/legacy-import.git";
+    const { primary, linked } = makeLinkedGitProject(remote);
+    const codexDir = makeTmpDir();
+    const archived = join(codexDir, "archived_sessions");
+    mkdirSync(archived, { recursive: true });
+    writeFileSync(join(archived, "legacy-linked.jsonl"), [
+      makeCodexSessionMetaLine("legacy-linked", linked),
+      makeCodexResponseItemLine("user", "preserve the binding"),
+    ].join("\n"));
+    const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
+    const linkedHash = hashProjectPath(linked);
+    const mapPath = writePrivateMapFixture(home, `${JSON.stringify({
+      [linkedHash]: {
+        canonical: linked,
+        aliases: [],
+        remoteProjectId,
+      },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const calls: unknown[] = [];
+
+    const result = await importSessions(makeMockClient(async (_path, body) => {
+      calls.push(body);
+      return { ingested: 1, totalTokens: 1 };
+    }), { provider: "codex", cwd: linked, _codexDir: codexDir });
+
+    expect(result).toMatchObject({ imported: 1, ambiguous: 0, unresolved: 0 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ session_id: "legacy-linked", cwd: primary });
+    expect(JSON.parse(readFileSync(mapPath, "utf8"))).toEqual({
+      [hashProjectPath(primary)]: {
+        canonical: primary,
+        aliases: [linked],
+        remoteProjectId,
+      },
+    });
+  });
+
+  it("uses the supplied Codex catalogue to carry a deleted-worktree binding", async () => {
+    const home = makeTmpDir();
+    vi.stubEnv("HOME", home);
+    const remote = "https://example.invalid/deleted-import.git";
+    const { primary } = makeLinkedGitProject(remote);
+    const codexDir = makeTmpDir();
+    const tombstone = join(codexDir, "worktrees", "token");
+    const deletedWorktree = join(tombstone, "project");
+    mkdirSync(tombstone, { recursive: true });
+    execFileSync(
+      "git",
+      ["worktree", "add", "-qb", "deleted", deletedWorktree],
+      { cwd: primary },
+    );
+    execFileSync("git", ["worktree", "remove", "--force", deletedWorktree], { cwd: primary });
+    const archived = join(codexDir, "archived_sessions");
+    mkdirSync(archived, { recursive: true });
+    writeFileSync(join(archived, "deleted-worktree.jsonl"), [
+      JSON.stringify({
+        type: "session_meta",
+        payload: {
+          id: "deleted-worktree",
+          cwd: deletedWorktree,
+          git: { repository_url: remote },
+        },
+      }),
+      makeCodexResponseItemLine("user", "recover the deleted worktree"),
+    ].join("\n"));
+    const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
+    const primaryHash = hashProjectPath(primary);
+    const sourceHash = hashProjectPath(deletedWorktree);
+    const mapPath = writePrivateMapFixture(home, `${JSON.stringify({
+      [primaryHash]: { canonical: primary, aliases: [] },
+      [sourceHash]: {
+        canonical: deletedWorktree,
+        aliases: [],
+        remoteProjectId,
+      },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const calls: unknown[] = [];
+
+    const result = await importSessions(makeMockClient(async (_path, body) => {
+      calls.push(body);
+      return { ingested: 1, totalTokens: 1 };
+    }), { provider: "codex", cwd: primary, _codexDir: codexDir });
+
+    expect(result).toMatchObject({ imported: 1, ambiguous: 0, unresolved: 0 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ session_id: "deleted-worktree", cwd: primary });
+    expect(JSON.parse(readFileSync(mapPath, "utf8"))).toEqual({
+      [primaryHash]: {
+        canonical: primary,
+        aliases: [deletedWorktree],
+        remoteProjectId,
+      },
+    });
+  });
+
+  it("blocks conflicting authenticated linked bindings before daemon access", async () => {
+    const home = makeTmpDir();
+    vi.stubEnv("HOME", home);
+    const remote = "https://example.invalid/conflicting-import.git";
+    const { primary, linked } = makeLinkedGitProject(remote);
+    const secondLinked = join(primary, "..", "linked-two");
+    execFileSync("git", ["worktree", "add", "-qb", "linked-two", secondLinked], {
+      cwd: primary,
+    });
+    const codexDir = makeTmpDir();
+    const archived = join(codexDir, "archived_sessions");
+    mkdirSync(archived, { recursive: true });
+    writeFileSync(
+      join(archived, "conflict.jsonl"),
+      makeCodexSessionMetaLine("conflict", linked),
+    );
+    const mapPath = writePrivateMapFixture(home, `${JSON.stringify({
+      [hashProjectPath(linked)]: {
+        canonical: linked,
+        aliases: [],
+        remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      },
+      [hashProjectPath(secondLinked)]: {
+        canonical: secondLinked,
+        aliases: [],
+        remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+      },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const before = readFileSync(mapPath, "utf8");
+    const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 1 }));
+
+    await expect(importSessions(client, {
+      provider: "codex",
+      cwd: linked,
+      _codexDir: codexDir,
+    })).rejects.toThrow("conflicting PostgreSQL project bindings");
+
+    expect(client.post).not.toHaveBeenCalled();
+    expect(readFileSync(mapPath, "utf8")).toBe(before);
+  });
 
   it("registers the current Git identity before resolving first-import subdirectory sessions", async () => {
     const project = makeGitProject("https://example.invalid/first-import.git", false);
