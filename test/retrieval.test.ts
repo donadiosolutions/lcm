@@ -198,6 +198,13 @@ describe("RetrievalEngine grep", () => {
     expect(conversation.searchMessages).toHaveBeenCalledTimes(scope === "summaries" ? 0 : 1);
     expect(summaries.searchSummaries).toHaveBeenCalledTimes(scope === "messages" ? 0 : 1);
   });
+
+  it("rejects an invalid runtime scope instead of treating it as both", async () => {
+    const { engine, conversation, summaries } = stores();
+    await expect(engine.grep({ query: "q", mode: "regex", scope: "invalid" as never })).rejects.toThrow("Invalid grep scope");
+    expect(conversation.searchMessages).not.toHaveBeenCalled();
+    expect(summaries.searchSummaries).not.toHaveBeenCalled();
+  });
 });
 
 describe("RetrievalEngine expand", () => {

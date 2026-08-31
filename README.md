@@ -250,13 +250,20 @@ flowchart LR
 
 | Tool | Purpose |
 |---|---|
-| `lcm_search` | Hybrid search across episodic memory (SQLite) and semantic memory |
-| `lcm_grep` | Regex or full-text search across raw messages and summaries |
+| `lcm_search` | Hybrid search across episodic and promoted memory (`layers` defaults to both) |
+| `lcm_grep` | Regex or full-text search across raw messages and summaries (`scope` defaults to `both`) |
 | `lcm_expand` | Decompress a summary node into its source content by traversing the DAG |
 | `lcm_describe` | Inspect metadata and lineage of a memory node (depth, token count, parent/child links) |
 | `lcm_store` | Persist durable memory manually with optional tags |
 | `lcm_stats` | Show token savings, compression ratios, and usage statistics |
 | `lcm_doctor` | Diagnose daemon, hooks, MCP registration, and summarizer setup |
+
+The canonical `lcm_search` layers are `episodic` and `promoted`; the deprecated
+`semantic` input alias is accepted for compatibility but is not advertised.
+The canonical `lcm_grep` scopes are `messages`, `summaries`, and `both`; the
+deprecated `all` input alias maps to `both` and is likewise not advertised.
+The package `SearchResult.promoted` type matches the daemon's existing runtime
+response; the previously published `semantic` property was never populated.
 
 ## CLI
 

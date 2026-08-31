@@ -1,7 +1,7 @@
 import type { DaemonConfig } from "../config.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
-import { createRetrievalEngine } from "../../retrieval.js";
+import { createRetrievalEngine, normalizeGrepScope } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
 import {
@@ -16,6 +16,12 @@ export function createGrepHandler(config: DaemonConfig, storageFactory?: Storage
 
     if (!query) {
       sendJson(res, 400, { error: "query is required" });
+      return;
+    }
+
+    const normalizedScope = normalizeGrepScope(scope);
+    if (!normalizedScope) {
+      sendJson(res, 400, { error: "invalid scope" });
       return;
     }
 
@@ -38,7 +44,7 @@ export function createGrepHandler(config: DaemonConfig, storageFactory?: Storage
         async (project) => createRetrievalEngine(project).grep({
           query,
           mode: mode ?? "full_text",
-          scope: scope ?? "both",
+          scope: normalizedScope,
           since,
         }),
       );

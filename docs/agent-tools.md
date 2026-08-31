@@ -19,7 +19,7 @@ match only when necessary.
 
 ### When to search vs. grep
 
-- **`lcm_search`** — Use after checking injected memory when looking for knowledge across sessions in natural language. Returns ranked results from both episodic (SQLite) and semantic memory layers.
+- **`lcm_search`** — Use after checking injected memory when looking for knowledge across sessions in natural language. Returns ranked results from both episodic (SQLite) and promoted memory layers.
 - **`lcm_grep`** — Use only after broad `lcm_search` recall is insufficient and you need an exact keyword, error message, or function name.
 
 ### When to expand
@@ -36,7 +36,7 @@ Summaries are lossy by design. The "Expand for details about:" footer at the end
 
 ### lcm_search
 
-Hybrid search across episodic memory (SQLite FTS5) and semantic memory. Returns two separate ranked lists. Use when looking for project knowledge spanning multiple sessions. Results can include passively captured context after it has been indexed, in addition to explicitly stored durable memories.
+Hybrid search across episodic memory (SQLite FTS5) and promoted memory. Returns two separate ranked lists. Use when looking for project knowledge spanning multiple sessions. Results can include passively captured context after it has been indexed, in addition to explicitly stored durable memories.
 
 **Parameters:**
 
@@ -44,7 +44,7 @@ Hybrid search across episodic memory (SQLite FTS5) and semantic memory. Returns 
 |-------|------|----------|---------|-------------|
 | `query` | string | ✅ | — | Natural language search query |
 | `limit` | number | | `5` | Max results per layer |
-| `layers` | string[] | | both | `"episodic"`, `"semantic"`, or both |
+| `layers` | string[] | | `["episodic", "promoted"]` | `"episodic"`, `"promoted"`, or both |
 | `tags` | string[] | | — | Filter to entries that include all specified tags |
 
 **Examples:**
@@ -53,9 +53,12 @@ Hybrid search across episodic memory (SQLite FTS5) and semantic memory. Returns 
 # Find past decisions about authentication
 lcm_search(query: "authentication decision")
 
-# Search only semantic layer, filtered by tag
-lcm_search(query: "database migration", layers: ["semantic"], tags: ["type:decision"])
+# Search only promoted layer, filtered by tag
+lcm_search(query: "database migration", layers: ["promoted"], tags: ["type:decision"])
 ```
+
+The deprecated `semantic` layer name remains accepted as a compatibility input
+and is normalized to `promoted`, but it is not advertised.
 
 ### lcm_grep
 
@@ -66,7 +69,7 @@ Search conversation history by keyword or regex across raw messages and summarie
 | Param | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `query` | string | ✅ | — | Keyword, phrase, or regex to search |
-| `scope` | string | | `"all"` | `"messages"`, `"summaries"`, or `"all"` |
+| `scope` | string | | `"both"` | `"messages"`, `"summaries"`, or `"both"` |
 | `sessionId` | string | | — | Filter to a specific session |
 | `since` | string | | — | ISO datetime lower bound |
 
@@ -81,6 +84,11 @@ lcm_grep(query: 'ECONNREFUSED')
 # Search only summaries for a specific term
 lcm_grep(query: 'config\\.threshold', scope: 'summaries')
 ```
+
+The deprecated `all` scope remains accepted as a compatibility input and is
+normalized to `both`, but it is not advertised. The package
+`SearchResult.promoted` property matches the daemon's existing runtime
+response; the previously published `semantic` property was never populated.
 
 ### lcm_describe
 

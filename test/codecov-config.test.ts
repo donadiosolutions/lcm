@@ -482,7 +482,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(205);
   });
 
-  test("keeps response-fence and #700/#726/#734/#737/#742 files in their intended components", () => {
+  test("keeps response-fence and #700/#709/#726/#734/#737/#742 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -499,6 +499,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/search.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
@@ -509,6 +511,10 @@ describe("Codecov configuration", () => {
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
+      ["src/mcp/tools/lcm-search.ts", "unit-mcp"],
+      ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],
+      ["src/memory/index.ts", "unit-memory-retrieval"],
+      ["src/retrieval.ts", "unit-memory-retrieval"],
     ] as const;
 
     for (const [file, expectedOwner] of expectedOwners) {
